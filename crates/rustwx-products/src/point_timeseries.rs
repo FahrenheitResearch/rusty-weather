@@ -144,10 +144,8 @@ pub struct PointTimeseriesGridStoreBuildReport {
 pub struct PointTimeseriesGridStore {
     store_id: String,
     run: PointTimeseriesRun,
-    bounds: GeoBounds,
     variables: Vec<PointVariable>,
     requested_forecast_hours: Vec<u16>,
-    loaded_forecast_hours: Vec<u16>,
     grid_nx: usize,
     grid_indices: Vec<usize>,
     grid_lat_deg: Vec<f32>,
@@ -503,10 +501,8 @@ pub fn build_point_timeseries_grid_store(
     let store = PointTimeseriesGridStore {
         store_id: store_id.clone(),
         run: run.clone(),
-        bounds: request.bounds,
         variables: variables.clone(),
         requested_forecast_hours: request.forecast_hours.clone(),
-        loaded_forecast_hours: loaded_forecast_hours.clone(),
         grid_nx,
         grid_indices,
         grid_lat_deg,

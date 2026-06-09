@@ -12,7 +12,6 @@ use crate::severe::build_severe_execution_plan;
 use crate::source::{ProductSourceMode, ProductSourceRoute};
 use crate::thermo_native::{NativeSemantics, NativeThermoRecipe, native_candidate};
 
-use super::KNOTS_PER_MS;
 use super::presentation::is_gdex_dataset_token;
 use super::recipes::{DerivedRecipe, derived_compute_recipes_need_pressure};
 use super::types::{DerivedBatchRequest, DerivedRecipeBlocker};
@@ -20,14 +19,8 @@ use super::types::{DerivedBatchRequest, DerivedRecipeBlocker};
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum NativeDerivedRecipe {
     Thermo(NativeThermoRecipe),
-    WrfGdexScalar {
-        variable: &'static str,
-    },
-    WrfGdexVectorMagnitude {
-        u_variable: &'static str,
-        v_variable: &'static str,
-        scale: f64,
-    },
+    WrfGdexScalar,
+    WrfGdexVectorMagnitude,
 }
 
 #[derive(Debug, Clone)]
@@ -126,65 +119,57 @@ fn wrf_gdex_native_candidate(
 
     let (native_recipe, label, detail) = match recipe {
         DerivedRecipe::Sbcape => (
-            NativeDerivedRecipe::WrfGdexScalar { variable: "SBCAPE" },
+            NativeDerivedRecipe::WrfGdexScalar,
             "surface CAPE",
             "WRF native SBCAPE from model diagnostics",
         ),
         DerivedRecipe::Sbcin => (
-            NativeDerivedRecipe::WrfGdexScalar { variable: "SBCINH" },
+            NativeDerivedRecipe::WrfGdexScalar,
             "surface CIN",
             "WRF native SBCINH from model diagnostics",
         ),
         DerivedRecipe::Sblcl => (
-            NativeDerivedRecipe::WrfGdexScalar { variable: "SBLCL" },
+            NativeDerivedRecipe::WrfGdexScalar,
             "surface LCL height",
             "WRF native SBLCL from model diagnostics",
         ),
         DerivedRecipe::Mlcape => (
-            NativeDerivedRecipe::WrfGdexScalar { variable: "MLCAPE" },
+            NativeDerivedRecipe::WrfGdexScalar,
             "mixed-layer CAPE",
             "WRF native MLCAPE from model diagnostics",
         ),
         DerivedRecipe::Mlcin => (
-            NativeDerivedRecipe::WrfGdexScalar { variable: "MLCINH" },
+            NativeDerivedRecipe::WrfGdexScalar,
             "mixed-layer CIN",
             "WRF native MLCINH from model diagnostics",
         ),
         DerivedRecipe::Mucape => (
-            NativeDerivedRecipe::WrfGdexScalar { variable: "MUCAPE" },
+            NativeDerivedRecipe::WrfGdexScalar,
             "most-unstable CAPE",
             "WRF native MUCAPE from model diagnostics",
         ),
         DerivedRecipe::Mucin => (
-            NativeDerivedRecipe::WrfGdexScalar { variable: "MUCINH" },
+            NativeDerivedRecipe::WrfGdexScalar,
             "most-unstable CIN",
             "WRF native MUCINH from model diagnostics",
         ),
         DerivedRecipe::Srh01km => (
-            NativeDerivedRecipe::WrfGdexScalar { variable: "SRH01" },
+            NativeDerivedRecipe::WrfGdexScalar,
             "0-1 km SRH",
             "WRF native SRH01 from model diagnostics",
         ),
         DerivedRecipe::Srh03km => (
-            NativeDerivedRecipe::WrfGdexScalar { variable: "SRH03" },
+            NativeDerivedRecipe::WrfGdexScalar,
             "0-3 km SRH",
             "WRF native SRH03 from model diagnostics",
         ),
         DerivedRecipe::BulkShear01km => (
-            NativeDerivedRecipe::WrfGdexVectorMagnitude {
-                u_variable: "USHR1",
-                v_variable: "VSHR1",
-                scale: KNOTS_PER_MS,
-            },
+            NativeDerivedRecipe::WrfGdexVectorMagnitude,
             "0-1 km bulk shear",
             "WRF native 0-1 km shear magnitude from model diagnostics",
         ),
         DerivedRecipe::BulkShear06km => (
-            NativeDerivedRecipe::WrfGdexVectorMagnitude {
-                u_variable: "USHR6",
-                v_variable: "VSHR6",
-                scale: KNOTS_PER_MS,
-            },
+            NativeDerivedRecipe::WrfGdexVectorMagnitude,
             "0-6 km bulk shear",
             "WRF native 0-6 km shear magnitude from model diagnostics",
         ),
@@ -213,14 +198,6 @@ fn wrf_gdex_native_surface_product(product: &str) -> bool {
             || (suffix.starts_with('d')
                 && suffix.len() == 3
                 && suffix[1..].chars().all(|ch| ch.is_ascii_digit())))
-}
-
-pub(crate) fn plan_native_thermo_routes(
-    model: ModelId,
-    recipes: &[DerivedRecipe],
-    mode: ProductSourceMode,
-) -> Result<PlannedDerivedSourceRoutes, Box<dyn std::error::Error>> {
-    plan_native_thermo_routes_with_surface_product(model, recipes, mode, None)
 }
 
 pub(crate) fn plan_native_thermo_routes_with_surface_product(

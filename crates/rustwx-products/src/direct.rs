@@ -76,11 +76,7 @@ pub use projection::{
     build_projected_map, build_projected_map_with_projection,
     build_requested_projected_map_with_projection, model_data_domain_frame_for_projection,
 };
-pub(crate) use query::{
-    build_direct_sampled_execution_plan, direct_component_slug,
-    load_direct_sampled_fields_from_latest, load_direct_sampled_fields_from_loaded,
-    load_single_direct_sampled_field_from_latest, required_direct_fetch_products,
-};
+pub(crate) use query::{load_direct_sampled_fields_from_latest, required_direct_fetch_products};
 #[cfg(test)]
 use rendering::{
     StreamlineSetting, barb_target_columns_rows, convert_filled_field, render_filled_field,
@@ -101,36 +97,6 @@ pub use types::{
     HrrrDirectRecipeBlocker, HrrrDirectRecipeTiming, HrrrDirectRenderedRecipe,
 };
 use types::{DirectRequestBuildTiming, OUTPUT_HEIGHT, OUTPUT_WIDTH};
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DirectCompositePanelLayout {
-    pub(crate) rows: u32,
-    pub(crate) columns: u32,
-    pub(crate) panel_width: u32,
-    pub(crate) panel_height: u32,
-    pub(crate) top_padding: u32,
-    pub(crate) component_slugs: &'static [&'static str],
-}
-
-pub(crate) fn direct_composite_component_slugs(slug: &str) -> Option<&'static [&'static str]> {
-    composite_panel_spec(slug).map(|spec| spec.component_slugs)
-}
-
-pub(crate) fn direct_composite_panel_layout(
-    slug: &str,
-    output_width: u32,
-    output_height: u32,
-) -> Option<DirectCompositePanelLayout> {
-    let spec = composite_panel_spec(slug)?.scaled_for_output(output_width, output_height);
-    Some(DirectCompositePanelLayout {
-        rows: spec.rows,
-        columns: spec.columns,
-        panel_width: spec.panel_width,
-        panel_height: spec.panel_height,
-        top_padding: spec.top_padding,
-        component_slugs: spec.component_slugs,
-    })
-}
 
 fn direct_data_layer_draw_ms(image_timing: &RenderImageTiming) -> u128 {
     image_timing.polygon_fill_ms

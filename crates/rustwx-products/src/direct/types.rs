@@ -217,37 +217,16 @@ pub(super) struct DirectRequestBuildTiming {
 #[derive(Debug, Clone)]
 pub(crate) struct DirectSampledProductField {
     pub recipe_slug: String,
-    pub title: String,
     pub source_route: ProductSourceRoute,
     pub field_selector: Option<FieldSelector>,
-    pub field: rustwx_core::Field2D,
-    pub input_fetches: Vec<PublishedFetchIdentity>,
-    pub components: Vec<DirectSampledComponentField>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct DirectSampledComponentField {
-    pub product_slug: String,
-    pub title: String,
     pub field: rustwx_core::Field2D,
     pub input_fetches: Vec<PublishedFetchIdentity>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct DirectSampledProductSet {
-    pub latest: LatestRun,
     pub fields: Vec<DirectSampledProductField>,
-    pub composites: Vec<DirectSampledCompositeProduct>,
     pub blockers: Vec<DirectRecipeBlocker>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct DirectSampledCompositeProduct {
-    pub recipe_slug: String,
-    pub title: String,
-    pub rows: u32,
-    pub columns: u32,
-    pub components: Vec<DirectSampledComponentField>,
 }
 
 #[derive(Debug, Clone)]

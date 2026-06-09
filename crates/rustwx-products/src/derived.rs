@@ -70,11 +70,7 @@ use presentation::{
     DerivedRenderOverrides, derived_output_suffix, derived_title_for_model,
     derived_title_for_request,
 };
-pub(crate) use query::{
-    build_derived_sampled_execution_plan, compute_derived_query_field,
-    load_derived_sampled_fields_from_latest, load_derived_sampled_fields_from_loaded,
-    required_derived_fetch_products,
-};
+pub(crate) use query::{load_derived_sampled_fields_from_latest, required_derived_fetch_products};
 use recipes::DerivedRequirements;
 pub(crate) use recipes::{DerivedRecipe, derived_compute_recipes_need_pressure};
 pub use types::{
@@ -1130,18 +1126,6 @@ pub(crate) fn run_model_derived_batch_without_loaded(
     Ok(into_hrrr_report(report))
 }
 
-/// Run the HRRR derived lane consuming a planner-loaded bundle set.
-/// Used by the unified `hrrr_non_ecape_hour` runner so direct + derived
-/// + windowed all share one fetch+decode pass.
-pub(crate) fn run_hrrr_derived_batch_from_loaded(
-    request: &HrrrDerivedBatchRequest,
-    recipes: &[DerivedRecipe],
-    loaded: &LoadedBundleSet,
-) -> Result<HrrrDerivedBatchReport, Box<dyn std::error::Error>> {
-    let generic_request = DerivedBatchRequest::from_hrrr(request);
-    run_model_derived_batch_from_loaded(&generic_request, recipes, loaded)
-}
-
 pub(crate) fn prepare_shared_derived_fields(
     request: &DerivedBatchRequest,
     recipes: &[DerivedRecipe],
@@ -1207,30 +1191,6 @@ pub(crate) fn prepare_shared_derived_fields(
             pressure_fetch: fetch_decode.pressure_fetch,
         }),
     }))
-}
-
-pub(crate) fn run_hrrr_derived_batch_from_loaded_with_precomputed(
-    request: &HrrrDerivedBatchRequest,
-    recipes: &[DerivedRecipe],
-    loaded: &LoadedBundleSet,
-    prepared: &PreparedSharedDerivedFields,
-) -> Result<HrrrDerivedBatchReport, Box<dyn std::error::Error>> {
-    let generic_request = DerivedBatchRequest::from_hrrr(request);
-    run_model_derived_batch_from_loaded_with_precomputed(
-        &generic_request,
-        recipes,
-        loaded,
-        prepared,
-    )
-}
-
-pub(crate) fn run_hrrr_derived_batch_without_loaded(
-    request: &HrrrDerivedBatchRequest,
-    recipes: &[DerivedRecipe],
-    latest: &rustwx_models::LatestRun,
-) -> Result<HrrrDerivedBatchReport, Box<dyn std::error::Error>> {
-    let generic_request = DerivedBatchRequest::from_hrrr(request);
-    run_model_derived_batch_without_loaded(&generic_request, recipes, latest)
 }
 
 fn into_hrrr_report(report: DerivedBatchReport) -> HrrrDerivedBatchReport {

@@ -57,23 +57,6 @@ pub fn run_hrrr_direct_batch(
     run_direct_batch(&DirectBatchRequest::from_hrrr(request))
 }
 
-/// Planner-loaded entry point used by `hrrr_non_ecape_hour`. Direct
-/// shares the unified `LoadedBundleSet` with the derived/severe lanes
-/// when they co-run.
-pub(crate) fn run_hrrr_direct_batch_from_loaded(
-    request: &HrrrDirectBatchRequest,
-    loaded: &LoadedBundleSet,
-) -> Result<HrrrDirectBatchReport, Box<dyn std::error::Error>> {
-    let generic = DirectBatchRequest::from_hrrr(request);
-    run_direct_batch_from_loaded(
-        &generic,
-        loaded,
-        &generic.cache_root,
-        generic.use_cache,
-        None,
-    )
-}
-
 pub(crate) fn run_direct_batch_from_loaded(
     request: &DirectBatchRequest,
     loaded: &LoadedBundleSet,

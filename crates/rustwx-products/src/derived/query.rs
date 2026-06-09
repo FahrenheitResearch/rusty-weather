@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use crate::gridded::{
     PressureFields as GenericPressureFields, SurfaceFields as GenericSurfaceFields,
 };
-use crate::planner::ExecutionPlanBuilder;
 use crate::publication::PublishedFetchIdentity;
 use crate::runtime::{BundleLoaderConfig, LoadedBundleSet, load_execution_plan};
 use crate::severe::build_planned_input_fetches;
@@ -78,26 +77,6 @@ pub(crate) fn load_derived_sampled_fields_from_latest(
         &BundleLoaderConfig::new(cache_root.to_path_buf(), use_cache),
     )?;
     load_derived_sampled_fields_from_loaded(recipe_slugs, &loaded)
-}
-
-pub(crate) fn build_derived_sampled_execution_plan(
-    latest: &LatestRun,
-    forecast_hour: u16,
-    recipe_slugs: &[String],
-) -> Result<crate::planner::ExecutionPlan, Box<dyn std::error::Error>> {
-    let recipes = plan_derived_recipes(recipe_slugs)?;
-    if recipes.is_empty() {
-        return Ok(ExecutionPlanBuilder::new(latest, forecast_hour).build());
-    }
-    Ok(build_derived_execution_plan(
-        latest,
-        forecast_hour,
-        None,
-        None,
-        true,
-        true,
-        &Vec::new(),
-    ))
 }
 
 pub(crate) fn load_derived_sampled_fields_from_loaded(

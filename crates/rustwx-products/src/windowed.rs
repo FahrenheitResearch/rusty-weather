@@ -534,30 +534,9 @@ pub(crate) struct WindowedSampledProductSet {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct WindowedSampledHourProductField {
-    pub forecast_hour: u16,
-    pub product: HrrrWindowedProduct,
-    pub field: rustwx_core::Field2D,
-    pub input_fetches: Vec<PublishedFetchIdentity>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct WindowedSampledHourBlocker {
-    pub forecast_hour: u16,
-    pub blocker: HrrrWindowedBlocker,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct WindowedSampledMultiHourProductSet {
-    pub fields: Vec<WindowedSampledHourProductField>,
-    pub blockers: Vec<WindowedSampledHourBlocker>,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct PreparedWindowedProduct {
     product: HrrrWindowedProduct,
     computed: crate::windowed_decoder::ComputedWindowedField,
-    compute_ms: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -579,7 +558,6 @@ struct PreparedWindowedGeometryContext {
     geometry_fetch: Option<HrrrFetchRuntimeInfo>,
     geometry_input_fetch: Option<PublishedFetchIdentity>,
     projected: ProjectedMap,
-    project_ms: u128,
     grid: rustwx_core::LatLonGrid,
     projection: Option<rustwx_core::GridProjection>,
 }
@@ -589,10 +567,6 @@ enum WindowedProductOutcome {
     Rendered {
         index: usize,
         rendered: HrrrWindowedRenderedProduct,
-    },
-    Blocker {
-        index: usize,
-        blocker: HrrrWindowedBlocker,
     },
 }
 
@@ -636,13 +610,11 @@ fn prepare_windowed_geometry_context_from_surface_bundle(
         &request.cache_root,
         request.use_cache,
     )?;
-    let project_start = Instant::now();
     let projected_maps = crate::gridded::build_projected_maps_for_sizes(
         &geometry.surface_decode.value,
         request.domain.bounds,
         &[(request.output_width, request.output_height)],
     )?;
-    let project_ms = project_start.elapsed().as_millis();
     let projected = projected_maps
         .projected_map(request.output_width, request.output_height)
         .cloned()
@@ -662,7 +634,6 @@ fn prepare_windowed_geometry_context_from_surface_bundle(
             &geometry.surface_file.fetched,
         )),
         projected,
-        project_ms,
         grid: geometry.grid,
         projection: geometry.surface_decode.value.projection.clone(),
     })
@@ -720,7 +691,6 @@ fn prepare_windowed_geometry_context_from_minimal_grib(
             &geometry_file.fetched,
         )),
         projected,
-        project_ms: 0,
         grid,
         projection: grid_layout.projection,
     })
@@ -1098,184 +1068,6 @@ pub(crate) fn load_windowed_sampled_fields_from_latest(
     Ok(WindowedSampledProductSet { fields, blockers })
 }
 
-pub(crate) fn load_windowed_sampled_fields_for_hours_from_latest(
-    latest: &LatestRun,
-    forecast_hours: &[u16],
-    cache_root: &std::path::Path,
-    use_cache: bool,
-    products: &[HrrrWindowedProduct],
-) -> Result<WindowedSampledMultiHourProductSet, Box<dyn std::error::Error>> {
-    if forecast_hours.is_empty() || products.is_empty() {
-        return Ok(WindowedSampledMultiHourProductSet {
-            fields: Vec::new(),
-            blockers: Vec::new(),
-        });
-    }
-
-    let mut planned_by_hour = BTreeMap::<u16, Vec<HrrrWindowedProduct>>::new();
-    let mut blockers = Vec::<WindowedSampledHourBlocker>::new();
-    let mut planned_surface_hours = BTreeSet::<u16>::new();
-    let mut nat_hours = BTreeSet::<u16>::new();
-    let mut wind_hours = BTreeSet::<u16>::new();
-    let mut temp_hours = BTreeSet::<u16>::new();
-
-    for &forecast_hour in forecast_hours {
-        let (planned_products, hour_blockers, hour_surface, hour_nat, hour_wind, hour_temp) =
-            plan_windowed_products(products, forecast_hour, Some(latest.cycle.hour_utc));
-        blockers.extend(
-            hour_blockers
-                .into_iter()
-                .map(|blocker| WindowedSampledHourBlocker {
-                    forecast_hour,
-                    blocker,
-                }),
-        );
-        if !planned_products.is_empty() {
-            planned_by_hour.insert(forecast_hour, planned_products);
-        }
-        planned_surface_hours.extend(hour_surface);
-        nat_hours.extend(hour_nat);
-        wind_hours.extend(hour_wind);
-        temp_hours.extend(hour_temp);
-    }
-
-    if planned_by_hour.is_empty() {
-        return Ok(WindowedSampledMultiHourProductSet {
-            fields: Vec::new(),
-            blockers,
-        });
-    }
-
-    let any_qpf = planned_by_hour
-        .values()
-        .flat_map(|products| products.iter())
-        .any(|product| product.is_qpf());
-    let mut surface_hours = if any_qpf {
-        planned_by_hour
-            .iter()
-            .filter(|(_, products)| products.iter().any(|product| product.is_qpf()))
-            .map(|(&hour, _)| hour)
-            .collect::<BTreeSet<_>>()
-    } else {
-        planned_surface_hours
-    };
-
-    let mut all_hours = BTreeSet::<u16>::new();
-    all_hours.extend(surface_hours.iter().copied());
-    all_hours.extend(nat_hours.iter().copied());
-    all_hours.extend(wind_hours.iter().copied());
-    all_hours.extend(temp_hours.iter().copied());
-
-    let fetch_product = windowed_fetch_product(latest.model);
-    let request = sampling_windowed_request(
-        latest.model,
-        forecast_hours[0],
-        latest.source,
-        cache_root,
-        use_cache,
-    );
-    let loaded = load_windowed_plan_for_hours(
-        &request,
-        latest,
-        &surface_hours,
-        &nat_hours,
-        &wind_hours,
-        &temp_hours,
-    )?
-    .ok_or("windowed multi-hour sampling produced no input bundle plan")?;
-    let geometry_hour = all_hours
-        .iter()
-        .next()
-        .copied()
-        .ok_or("windowed multi-hour sampling had no contributing hours")?;
-    let geometry = lookup_planner_bundle_for_hour(&loaded, geometry_hour, fetch_product.as_str())
-        .ok_or("windowed multi-hour sampling missing geometry bundle")?;
-    let surface_grid = decode_surface_grid(&geometry.file.bytes)?;
-    let grid = rustwx_core::LatLonGrid::new(
-        rustwx_core::GridShape::new(surface_grid.nx, surface_grid.ny)?,
-        surface_grid
-            .lat
-            .iter()
-            .copied()
-            .map(|value| value as f32)
-            .collect(),
-        surface_grid
-            .lon
-            .iter()
-            .copied()
-            .map(|value| value as f32)
-            .collect(),
-    )?;
-    let (mut apcp_by_hour, mut surface_hour_fetches, _, _) =
-        load_apcp_hours_from_plan(Some(&loaded), &request, &surface_hours)?;
-    let mut fallback_surface_hours = BTreeSet::new();
-    for (&forecast_hour, products) in &planned_by_hour {
-        for &product in products.iter().filter(|product| product.is_qpf()) {
-            if let Some(hours) = qpf_hourly_fallback_hours_if_allowed(
-                latest.model,
-                product,
-                forecast_hour,
-                &apcp_by_hour,
-            ) {
-                fallback_surface_hours.extend(
-                    hours
-                        .into_iter()
-                        .filter(|hour| !surface_hours.contains(hour)),
-                );
-            }
-        }
-    }
-    if !fallback_surface_hours.is_empty() {
-        let (fallback_apcp_by_hour, mut fallback_surface_hour_fetches, _, _) =
-            load_apcp_fallback_hours(Some(&loaded), &request, latest, &fallback_surface_hours)?;
-        apcp_by_hour.extend(fallback_apcp_by_hour);
-        surface_hour_fetches.append(&mut fallback_surface_hour_fetches);
-        surface_hours.extend(fallback_surface_hours);
-    }
-    let (uh_by_hour, uh_hour_fetches, _, _) =
-        load_uh_hours_from_plan(Some(&loaded), &request, &nat_hours)?;
-    let (wind_by_hour, wind_hour_fetches, _, _) =
-        load_wind10m_hours_from_plan(Some(&loaded), &request, &wind_hours)?;
-    let (snapshot_by_hour, temp_hour_fetches, _, _) =
-        load_surface_snapshot_hours_from_plan(Some(&loaded), &request, &temp_hours)?;
-
-    let mut fields = Vec::new();
-    for (forecast_hour, planned_products) in planned_by_hour {
-        for product in planned_products {
-            let computed = if product.is_qpf() {
-                compute_qpf_product(product, forecast_hour, &grid, &apcp_by_hour)
-            } else if product.is_wind10m() {
-                compute_wind10m_product(product, forecast_hour, &grid, &wind_by_hour)
-            } else if product.is_surface_snapshot() {
-                compute_surface_snapshot_product(product, &grid, &snapshot_by_hour)
-            } else {
-                compute_uh_product(product, forecast_hour, &grid, &uh_by_hour)
-            };
-            match computed {
-                Ok(computed) => fields.push(WindowedSampledHourProductField {
-                    forecast_hour,
-                    product,
-                    input_fetches: input_fetches_for_windowed_product(
-                        product,
-                        &computed.metadata.contributing_forecast_hours,
-                        &surface_hour_fetches,
-                        &uh_hour_fetches,
-                        &wind_hour_fetches,
-                        &temp_hour_fetches,
-                    ),
-                    field: computed.field,
-                }),
-                Err(reason) => blockers.push(WindowedSampledHourBlocker {
-                    forecast_hour,
-                    blocker: HrrrWindowedBlocker { product, reason },
-                }),
-            }
-        }
-    }
-
-    Ok(WindowedSampledMultiHourProductSet { fields, blockers })
-}
-
 fn sampling_windowed_request(
     model: ModelId,
     forecast_hour: u16,
@@ -1512,7 +1304,6 @@ fn compute_prepared_windowed_products(
         for (index, &product) in planned_products.iter().enumerate() {
             pending.push_back(
                 scope.spawn(move || -> Result<WindowedComputeOutcome, io::Error> {
-                    let compute_start = Instant::now();
                     let computed = if product.is_qpf() {
                         compute_qpf_product(product, forecast_hour, grid, apcp_by_hour)
                     } else if product.is_wind10m() {
@@ -1522,7 +1313,6 @@ fn compute_prepared_windowed_products(
                     } else {
                         compute_uh_product(product, forecast_hour, grid, uh_by_hour)
                     };
-                    let compute_ms = compute_start.elapsed().as_millis();
 
                     let computed = match computed {
                         Ok(value) => value,
@@ -1536,11 +1326,7 @@ fn compute_prepared_windowed_products(
 
                     Ok(WindowedComputeOutcome::Computed {
                         index,
-                        prepared: PreparedWindowedProduct {
-                            product,
-                            computed,
-                            compute_ms,
-                        },
+                        prepared: PreparedWindowedProduct { product, computed },
                     })
                 }),
             );
@@ -1704,14 +1490,12 @@ fn run_hrrr_windowed_batch_from_prepared_with_total_start(
     })?;
     outcomes.sort_by_key(|outcome| match outcome {
         WindowedProductOutcome::Rendered { index, .. } => *index,
-        WindowedProductOutcome::Blocker { index, .. } => *index,
     });
     let mut rendered = Vec::new();
-    let mut blockers = prepared.blockers.clone();
+    let blockers = prepared.blockers.clone();
     for outcome in outcomes {
         match outcome {
             WindowedProductOutcome::Rendered { rendered: item, .. } => rendered.push(item),
-            WindowedProductOutcome::Blocker { blocker, .. } => blockers.push(blocker),
         }
     }
     let mut shared_timing = prepared.shared_timing.clone();
