@@ -2,3 +2,6 @@
 /out
 /store
 *.tmp
+.cargo/
+Thumbs.db
+desktop.ini
