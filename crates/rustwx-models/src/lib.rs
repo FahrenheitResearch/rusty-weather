@@ -8217,6 +8217,9 @@ fn model_specific_surface_field_gap(field: &GribFieldSpec, model: ModelId) -> Op
     }
 }
 
+// NOTE: rustwx-io has a same-named fn with intentionally wider semantics
+// (every 25 hPa from 100 to 1000): that one is what extraction can admit;
+// this one is what recipe validation/UI exposes.
 fn is_supported_upper_air_level(level_hpa: u16) -> bool {
     matches!(level_hpa, 200 | 250 | 300 | 500 | 700 | 850)
 }

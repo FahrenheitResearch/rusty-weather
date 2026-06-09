@@ -44,9 +44,8 @@ const VOLUME_PLAN: &[(CanonicalField, &str)] = &[
 /// store names. These mirror the selector constructors the rustwx-models
 /// plot-recipe catalog uses for the same HRRR fields.
 ///
-/// Surface-based CAPE is intentionally absent: rustwx-core has no CAPE
-/// CanonicalField (CAPE products in this workspace are derived from
-/// soundings, not extracted directly), so "sbcape" is logged as skipped.
+/// CAPE is not in this plan: it is sounding-derived here (no CAPE
+/// CanonicalField) and arrives with derived-product precompute in a later plan.
 fn surface_plan() -> Vec<(&'static str, FieldSelector)> {
     vec![
         (
@@ -136,11 +135,6 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         args.store_root.display(),
         cache_root.display(),
     );
-    eprintln!(
-        "sbcape: skipped - rustwx-core has no CAPE CanonicalField; HRRR CAPE products in \
-         this workspace are sounding-derived, not direct GRIB extractions"
-    );
-
     for &hour in &hours {
         ingest_hour(
             args,
@@ -388,7 +382,7 @@ fn ingest_hour(
         written.path.display(),
         written.bytes as f64 / (1024.0 * 1024.0),
         fields_2d.len(),
-        surface_plan.len() + 1, // +1 = sbcape, planned but unavailable
+        surface_plan.len(),
     );
     for volume in &volumes_data {
         if volume.levels.len() >= 2 {
@@ -399,7 +393,7 @@ fn ingest_hour(
     }
 
     if args.verify {
-        verify_hour(&written.path, &fields_2d_owned)?;
+        verify_hour(&written.path, &fields_2d_owned, &volumes_data)?;
     }
     Ok(())
 }
@@ -409,10 +403,12 @@ fn cache_state(hit: bool) -> &'static str {
 }
 
 /// Re-open the just-written hour: bit-exact round-trip of the first 2D field
-/// and one center-of-grid profile per 3D variable.
+/// and one center-of-grid profile per 3D variable, each profile value checked
+/// against the source plane's center value within the quantization bound.
 fn verify_hour(
     hour_path: &Path,
     fields_2d: &[(&'static str, SelectedField2D)],
+    volumes_data: &[VolumeData],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let reader = HourReader::open(hour_path)?;
     let grid_path = hour_path
@@ -433,46 +429,121 @@ fn verify_hour(
         return Err(format!("verify: 2D round-trip of '{name}' is not bit-exact").into());
     }
 
-    let (fx, fy) = (grid.nx as f64 / 2.0, grid.ny as f64 / 2.0);
+    // Integer grid center: at exact integer coordinates the bilinear profile
+    // degenerates to the stored column at that point, so each profile value
+    // compares directly against the source plane's center value.
+    let (cx, cy) = (grid.nx / 2, grid.ny / 2);
+    let center = cy * grid.nx + cx;
     let mut profiles = Vec::new();
     for var in &reader.meta().variables {
-        if var.kind == "pressure3d" {
-            let profile = reader.read_profile_3d(&var.name, fx, fy)?;
-            if profile.len() != var.levels_hpa.len() {
+        if var.kind != "pressure3d" {
+            continue;
+        }
+        let profile = reader.read_profile_3d(&var.name, cx as f64, cy as f64)?;
+        if profile.len() != var.levels_hpa.len() {
+            return Err(format!(
+                "verify: profile of '{}' returned {} values for {} levels",
+                var.name,
+                profile.len(),
+                var.levels_hpa.len()
+            )
+            .into());
+        }
+        let source = volumes_data
+            .iter()
+            .find(|volume| volume.name == var.name)
+            .ok_or_else(|| {
+                format!("verify: no source volume for stored variable '{}'", var.name)
+            })?;
+        // Conservative quantization bound: the 3D codec quantizes whole
+        // [y][x][z] chunks with one scale per chunk, so every chunk's scale
+        // is <= (global variable range) / 65534; half of that is the max
+        // rounding error, leaving generous headroom for f32 decode noise.
+        let mut vmin = f32::INFINITY;
+        let mut vmax = f32::NEG_INFINITY;
+        for (_, plane) in &source.levels {
+            for value in plane {
+                if value.is_finite() {
+                    vmin = vmin.min(*value);
+                    vmax = vmax.max(*value);
+                }
+            }
+        }
+        let bound = if vmax >= vmin {
+            (vmax - vmin) / 65534.0 + 1e-3
+        } else {
+            1e-3 // no finite source values: only NaN-vs-NaN checks remain
+        };
+        for (k, &level) in var.levels_hpa.iter().enumerate() {
+            let (_, plane) = source
+                .levels
+                .iter()
+                .find(|(have, _)| *have == level)
+                .ok_or_else(|| {
+                    format!(
+                        "verify: stored level {level} hPa of '{}' missing from the source volume",
+                        var.name
+                    )
+                })?;
+            let expected = plane[center];
+            let got = profile[k];
+            if expected.is_nan() {
+                if !got.is_nan() {
+                    return Err(format!(
+                        "verify: '{}' {level} hPa at grid center: source is NaN \
+                         but profile is {got}",
+                        var.name
+                    )
+                    .into());
+                }
+                continue;
+            }
+            if !((got - expected).abs() <= bound) {
                 return Err(format!(
-                    "verify: profile of '{}' returned {} values for {} levels",
-                    var.name,
-                    profile.len(),
-                    var.levels_hpa.len()
+                    "verify: '{}' {level} hPa at grid center: profile {got} vs source \
+                     {expected} exceeds quantization bound {bound}",
+                    var.name
                 )
                 .into());
             }
-            profiles.push(format!("{}:{}", var.name, profile.len()));
         }
+        profiles.push(format!("{}:{}", var.name, profile.len()));
     }
     println!(
-        "  verify ok: '{name}' bit-exact, profiles at grid center [{}]",
+        "  verify ok: '{name}' bit-exact, profiles at grid center [{}], \
+         values within quantization bound",
         profiles.join(" ")
     );
     Ok(())
 }
 
+/// Parse the `--hours` spec: a single hour ("6"), an inclusive range
+/// ("0-6"), or a comma list of either ("12,0,4-6"). The output is sorted
+/// ascending and deduplicated.
 fn parse_hours(spec: &str) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
+    fn parse_token(token: &str) -> Result<u16, Box<dyn std::error::Error>> {
+        token.parse().map_err(|_| {
+            format!("--hours: invalid token '{token}' (expected N, N-M, or comma list)").into()
+        })
+    }
     let mut hours = Vec::new();
     for part in spec.split(',') {
         let part = part.trim();
         if part.is_empty() {
-            return Err(format!("invalid --hours '{spec}': empty entry").into());
+            return Err(format!(
+                "--hours: empty entry in '{spec}' (expected N, N-M, or comma list)"
+            )
+            .into());
         }
         if let Some((start, end)) = part.split_once('-') {
-            let start: u16 = start.trim().parse()?;
-            let end: u16 = end.trim().parse()?;
+            let start = parse_token(start.trim())?;
+            let end = parse_token(end.trim())?;
             if start > end {
-                return Err(format!("invalid --hours range '{part}': start > end").into());
+                return Err(format!("--hours: invalid range '{part}': start > end").into());
             }
             hours.extend(start..=end);
         } else {
-            hours.push(part.parse()?);
+            hours.push(parse_token(part)?);
         }
     }
     hours.sort_unstable();
@@ -481,4 +552,46 @@ fn parse_hours(spec: &str) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
         return Err("pass at least one forecast hour via --hours".into());
     }
     Ok(hours)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hours_single() {
+        assert_eq!(parse_hours("6").unwrap(), vec![6]);
+    }
+
+    #[test]
+    fn parse_hours_degenerate_range() {
+        assert_eq!(parse_hours("0-0").unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn parse_hours_list_sorts_ascending() {
+        assert_eq!(parse_hours("12,0,6").unwrap(), vec![0, 6, 12]);
+    }
+
+    #[test]
+    fn parse_hours_range_is_inclusive() {
+        assert_eq!(parse_hours("0-6").unwrap(), (0..=6).collect::<Vec<u16>>());
+    }
+
+    #[test]
+    fn parse_hours_rejects_junk_naming_the_flag() {
+        for spec in ["1x", "6-2", "", ","] {
+            let err = parse_hours(spec).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("--hours"),
+                "error for '{spec}' must name the flag, got: {message}"
+            );
+        }
+        let message = parse_hours("1x").unwrap_err().to_string();
+        assert!(
+            message.contains("invalid token '1x'"),
+            "error must name the offending token, got: {message}"
+        );
+    }
 }

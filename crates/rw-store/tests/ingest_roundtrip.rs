@@ -409,6 +409,55 @@ fn mismatched_grid_rejected() {
 }
 
 #[test]
+fn second_field_on_different_coords_rejected() {
+    let dir = test_dir("second-field-coords");
+    let store_root = dir.join("store");
+    let temp = temp_field();
+
+    // Same 80 x 60 dims, but the second field's lon coordinates are shifted:
+    // without the per-field bit-compare this would store silently under the
+    // first field's coordinates.
+    let mut shifted_grid = regular_grid();
+    for lon in &mut shifted_grid.lon_deg {
+        *lon += 0.05;
+    }
+    let dewpoint = SelectedField2D::new(
+        dewpoint_selector(),
+        "K",
+        shifted_grid,
+        dewpoint_field().values.clone(),
+    )
+    .unwrap();
+
+    let err = write_hour_from_fields(
+        &store_root,
+        MODEL,
+        RUN,
+        6,
+        &[("temp_2m", &temp), ("dewpoint_2m", &dewpoint)],
+        &[],
+        BUILD,
+        WRITTEN_UNIX,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, RwStoreError::Format(_)),
+        "expected Format error for second-field coordinate mismatch, got {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("dewpoint_2m"),
+        "error must name the offending field, got: {message}"
+    );
+    assert!(
+        !store_root.join(MODEL).exists(),
+        "rejected write must not create store directories"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn volume_levels_sorted_and_deduped() {
     let dir = test_dir("levels");
     let store_root = dir.join("store");

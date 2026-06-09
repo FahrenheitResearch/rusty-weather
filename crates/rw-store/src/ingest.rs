@@ -83,13 +83,40 @@ pub fn write_hour_from_fields(
         )));
     }
 
-    // Every input must agree on one (nx, ny) before anything touches disk.
-    for (name, field) in fields_2d {
+    // Every input must agree on one (nx, ny) before anything touches disk,
+    // and every 2D field after the first must sit on bit-identical
+    // coordinates: two same-dims fields from different grids must error,
+    // not store silently under the first field's coordinates.
+    for (index, (name, field)) in fields_2d.iter().enumerate() {
         let shape = field.grid.shape;
         if (shape.nx, shape.ny) != (nx, ny) {
             return Err(RwStoreError::Format(format!(
                 "2D field '{name}': grid {}x{} does not match the hour grid {nx}x{ny}",
                 shape.nx, shape.ny
+            )));
+        }
+        if index == 0 {
+            continue;
+        }
+        let coords_match = field.grid.lat_deg.len() == cells
+            && field.grid.lon_deg.len() == cells
+            && field
+                .grid
+                .lat_deg
+                .iter()
+                .zip(&reference.lat_deg)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+            && field
+                .grid
+                .lon_deg
+                .iter()
+                .zip(&reference.lon_deg)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+        if !coords_match {
+            return Err(RwStoreError::Format(format!(
+                "2D field '{name}': same {nx}x{ny} dims as the first field '{}' \
+                 but different coordinates",
+                fields_2d[0].0
             )));
         }
     }

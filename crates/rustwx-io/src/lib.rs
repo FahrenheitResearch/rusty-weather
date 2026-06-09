@@ -1889,6 +1889,10 @@ impl TryFrom<FieldSelector> for StructuredMessageSelector {
 /// 100 to 1000 inclusive — the operational plot levels plus the dense
 /// store-ingest grid. Levels a product file does not carry surface as
 /// partial-extraction misses, not errors.
+///
+/// NOTE: rustwx-models has a same-named fn with intentionally narrower
+/// semantics ({200,250,300,500,700,850}): this one is what extraction can
+/// admit; that one is what recipe validation/UI exposes.
 fn is_supported_upper_air_level(level_hpa: u16) -> bool {
     (100..=1000).contains(&level_hpa) && level_hpa % 25 == 0
 }
