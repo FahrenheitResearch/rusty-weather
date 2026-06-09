@@ -5,6 +5,7 @@ members = [
     "crates/rustwx-io",
     "crates/rustwx-models",
     "crates/rustwx-regrid",
+    "crates/rustwx-render",
 ]
 exclude = [
     "vendor/ecape-rs",

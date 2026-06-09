@@ -1,8 +1,10 @@
 /target
+**/target/
 /out
 /store
 vendor/*/target/
 vendor/*/Cargo.lock
+crates/rustwx-render/verify/Cargo.lock
 *.tmp
 .cargo/
 Thumbs.db
