@@ -1384,7 +1384,7 @@ fn extract_native_derived_field(
         NativeDerivedRecipe::WrfGdexScalar { .. } => {
             if model == ModelId::WrfGdex {
                 return Err(
-                    "WRF NetCDF support is not compiled; rebuild with --features wrf".into(),
+                    "WRF/GDEX NetCDF support is not available in this build".into(),
                 );
             }
             Ok(None)
@@ -1392,7 +1392,7 @@ fn extract_native_derived_field(
         NativeDerivedRecipe::WrfGdexVectorMagnitude { .. } => {
             if model == ModelId::WrfGdex {
                 return Err(
-                    "WRF NetCDF support is not compiled; rebuild with --features wrf".into(),
+                    "WRF/GDEX NetCDF support is not available in this build".into(),
                 );
             }
             Ok(None)

@@ -12,9 +12,7 @@ default = []
 [dependencies]
 bincode = "1.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["gif", "png"] }
-memmap2 = "0.9"
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,7 +23,3 @@ rustwx-io = { path = "../rustwx-io" }
 rustwx-models = { path = "../rustwx-models" }
 rustwx-render = { path = "../rustwx-render" }
 grib-core = { path = "../../vendor/grib-core" }
-rustls.workspace = true
-rustls-rustcrypto.workspace = true
-ureq.workspace = true
-zstd = "0.13"
