@@ -36,8 +36,8 @@ rusty-weather/
   .gitignore                    # Task 1
   README.md                     # Task 1 stub, finalized Task 12
   assets/basemap/               # Natural Earth + counties shapefiles (Task 6)
-  vendor/                       # 7 crates, copied byte-for-byte (Task 2)
-    wx-core/  wx-math/  wx-field/  grib-core/  metrust/  ecape-rs/  sharprs/
+  vendor/                       # 8 crates, copied byte-for-byte (Task 2; wx-radar rides along as metrust's dep)
+    wx-core/  wx-math/  wx-field/  wx-radar/  grib-core/  metrust/  ecape-rs/  sharprs/
   crates/
     rustwx-core/                # Task 3 — domain types
     rustwx-contour/             # Task 3 — contour topology
