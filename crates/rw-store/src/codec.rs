@@ -65,10 +65,14 @@ fn empty_chunk() -> EncodedChunk {
 }
 
 /// Encode a chunk of values as affine-quantized i16 (3D column codec).
-pub fn encode_affine_i16(values: &[f32]) -> EncodedChunk {
+///
+/// Errors when the value range cannot produce a finite positive scale
+/// (e.g. a range that overflows f32) — same guard the original codec had;
+/// silently quantizing through a non-finite scale would destroy data.
+pub fn encode_affine_i16(values: &[f32]) -> RwResult<EncodedChunk> {
     let scan = scan_values(values);
     if scan.valid_count == 0 {
-        return empty_chunk();
+        return Ok(empty_chunk());
     }
 
     if (scan.valid_max - scan.valid_min).abs() <= f32::EPSILON {
@@ -78,7 +82,7 @@ pub fn encode_affine_i16(values: &[f32]) -> EncodedChunk {
                 let q = if value.is_finite() { 0i16 } else { MISSING_Q };
                 payload.extend_from_slice(&q.to_le_bytes());
             }
-            return EncodedChunk {
+            return Ok(EncodedChunk {
                 flags: FLAG_CONSTANT | FLAG_HAS_MISSING,
                 center: scan.valid_min,
                 scale: 0.0,
@@ -86,9 +90,9 @@ pub fn encode_affine_i16(values: &[f32]) -> EncodedChunk {
                 max: scan.valid_max,
                 valid_count: scan.valid_count as u32,
                 payload,
-            };
+            });
         }
-        return EncodedChunk {
+        return Ok(EncodedChunk {
             flags: FLAG_CONSTANT,
             center: scan.valid_min,
             scale: 0.0,
@@ -96,11 +100,19 @@ pub fn encode_affine_i16(values: &[f32]) -> EncodedChunk {
             max: scan.valid_max,
             valid_count: scan.valid_count as u32,
             payload: Vec::new(),
-        };
+        });
     }
 
-    let center = 0.5 * (scan.valid_min + scan.valid_max);
-    let scale = (scan.valid_max - scan.valid_min) / (2.0 * f32::from(Q_MAX));
+    // Range math in f64 so extreme f32 spans cannot overflow to inf.
+    let range = f64::from(scan.valid_max) - f64::from(scan.valid_min);
+    let center = (f64::from(scan.valid_min) + 0.5 * range) as f32;
+    let scale = (range / (2.0 * f64::from(Q_MAX))) as f32;
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(RwStoreError::Chunk(format!(
+            "invalid affine quantization scale {scale} (range {} .. {})",
+            scan.valid_min, scan.valid_max
+        )));
+    }
 
     let mut payload = Vec::with_capacity(values.len() * 2);
     for value in values {
@@ -115,7 +127,7 @@ pub fn encode_affine_i16(values: &[f32]) -> EncodedChunk {
     }
 
     let flags = if scan.has_missing { FLAG_HAS_MISSING } else { 0 };
-    EncodedChunk {
+    Ok(EncodedChunk {
         flags,
         center,
         scale,
@@ -123,7 +135,7 @@ pub fn encode_affine_i16(values: &[f32]) -> EncodedChunk {
         max: scan.valid_max,
         valid_count: scan.valid_count as u32,
         payload,
-    }
+    })
 }
 
 /// Decode a chunk encoded by [`encode_affine_i16`].
@@ -248,7 +260,7 @@ mod tests {
             -0.875,
             1234.5,
         ];
-        let encoded = encode_affine_i16(&values);
+        let encoded = encode_affine_i16(&values).expect("encode");
         assert!(encoded.flags & FLAG_HAS_MISSING != 0);
         assert_eq!(encoded.payload.len(), values.len() * 2);
         let decoded = decode_affine_i16(
@@ -275,7 +287,7 @@ mod tests {
     #[test]
     fn affine_constant_chunk_has_no_payload() {
         let values = vec![12.5; 16];
-        let encoded = encode_affine_i16(&values);
+        let encoded = encode_affine_i16(&values).expect("encode");
         assert_eq!(encoded.flags, FLAG_CONSTANT);
         assert!(encoded.payload.is_empty());
         let decoded = decode_affine_i16(
@@ -292,7 +304,7 @@ mod tests {
     #[test]
     fn affine_constant_with_missing_keeps_sentinel_payload() {
         let values = vec![7.25, f32::NAN, 7.25, 7.25, f32::NAN, 7.25];
-        let encoded = encode_affine_i16(&values);
+        let encoded = encode_affine_i16(&values).expect("encode");
         assert_eq!(encoded.flags, FLAG_CONSTANT | FLAG_HAS_MISSING);
         assert_eq!(encoded.payload.len(), values.len() * 2);
         for (value, pair) in values.iter().zip(encoded.payload.chunks_exact(2)) {
@@ -321,9 +333,36 @@ mod tests {
     }
 
     #[test]
+    fn affine_extreme_range_stays_finite_and_bounded() {
+        // Regression: max - min overflows f32 to inf; the original port
+        // silently produced scale = inf and decoded everything to NaN.
+        // With f64 range math this must encode and round-trip normally.
+        let values = vec![-3.0e38_f32, 3.0e38_f32];
+        let encoded = encode_affine_i16(&values).expect("encode");
+        assert!(encoded.scale.is_finite() && encoded.scale > 0.0);
+        let decoded = decode_affine_i16(
+            encoded.flags,
+            encoded.center,
+            encoded.scale,
+            &encoded.payload,
+            values.len(),
+        )
+        .unwrap();
+        for (source, round_trip) in values.iter().zip(decoded.iter()) {
+            assert!(round_trip.is_finite());
+            assert!(
+                (source - round_trip).abs() <= encoded.scale,
+                "extreme-range error {} exceeds scale {}",
+                (source - round_trip).abs(),
+                encoded.scale
+            );
+        }
+    }
+
+    #[test]
     fn affine_all_missing_uses_empty_flag() {
         let values = vec![f32::NAN; 8];
-        let encoded = encode_affine_i16(&values);
+        let encoded = encode_affine_i16(&values).expect("encode");
         assert_eq!(encoded.flags, FLAG_EMPTY);
         assert!(encoded.payload.is_empty());
         assert_eq!(encoded.valid_count, 0);
