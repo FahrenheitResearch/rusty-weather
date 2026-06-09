@@ -9,6 +9,7 @@ members = [
     "crates/rustwx-regrid",
     "crates/rustwx-render",
     "crates/rustwx-sounding",
+    "crates/rusty-weather",
 ]
 exclude = [
     "vendor/ecape-rs",
