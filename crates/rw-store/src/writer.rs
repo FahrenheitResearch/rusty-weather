@@ -280,6 +280,12 @@ impl HourWriter {
 
     /// Assemble and atomically write the hour file, returning its metadata.
     pub fn finish(mut self, path: &Path) -> RwResult<RwsHourMeta> {
+        if self.nx == 0 || self.ny == 0 {
+            return Err(RwStoreError::Format(format!(
+                "degenerate grid {}x{} (nx and ny must be nonzero)",
+                self.nx, self.ny
+            )));
+        }
         self.chunks.sort_by_key(|chunk| chunk.record.sort_key());
 
         let meta = RwsHourMeta {

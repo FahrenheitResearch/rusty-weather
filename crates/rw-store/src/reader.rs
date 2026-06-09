@@ -104,6 +104,12 @@ impl HourReader {
                 meta.schema
             )));
         }
+        if meta.nx == 0 || meta.ny == 0 {
+            return Err(RwStoreError::Meta(format!(
+                "degenerate grid {}x{} (nx and ny must be nonzero)",
+                meta.nx, meta.ny
+            )));
+        }
 
         if (data.len() as u64) < header.payload_offset {
             return Err(RwStoreError::Format(format!(
@@ -450,12 +456,15 @@ impl HourReader {
             return Ok(vec![record.center; value_count]);
         }
         let compressed = self.payload_slice(var_name, record)?;
-        let raw = zstd::stream::decode_all(compressed).map_err(|err| {
-            RwStoreError::Chunk(format!(
-                "zstd decode failed for variable '{var_name}' column chunk ({},{}): {err}",
-                record.tile_y, record.tile_x
-            ))
-        })?;
+        // bulk::decompress caps the output at raw_len — a crafted chunk cannot
+        // balloon past the size the index promised.
+        let raw =
+            zstd::bulk::decompress(compressed, record.raw_len as usize).map_err(|err| {
+                RwStoreError::Chunk(format!(
+                    "zstd decode failed for variable '{var_name}' column chunk ({},{}): {err}",
+                    record.tile_y, record.tile_x
+                ))
+            })?;
         if raw.len() != record.raw_len as usize {
             return Err(RwStoreError::Chunk(format!(
                 "variable '{var_name}' column chunk ({},{}): decompressed {} bytes, \
@@ -484,12 +493,15 @@ impl HourReader {
             return Ok(vec![record.center; value_count]);
         }
         let compressed = self.payload_slice(var_name, record)?;
-        let raw = zstd::stream::decode_all(compressed).map_err(|err| {
-            RwStoreError::Chunk(format!(
-                "zstd decode failed for variable '{var_name}' tile ({},{}): {err}",
-                record.tile_y, record.tile_x
-            ))
-        })?;
+        // bulk::decompress caps the output at raw_len — a crafted chunk cannot
+        // balloon past the size the index promised.
+        let raw =
+            zstd::bulk::decompress(compressed, record.raw_len as usize).map_err(|err| {
+                RwStoreError::Chunk(format!(
+                    "zstd decode failed for variable '{var_name}' tile ({},{}): {err}",
+                    record.tile_y, record.tile_x
+                ))
+            })?;
         if raw.len() != record.raw_len as usize {
             return Err(RwStoreError::Chunk(format!(
                 "variable '{var_name}' tile ({},{}): decompressed {} bytes, index says raw_len {}",
@@ -542,6 +554,35 @@ mod tests {
 
     const NX: usize = 600; // columns -> x tiles of 256, 256, 88
     const NY: usize = 500; // rows    -> y tiles of 256, 244
+
+    #[test]
+    fn open_rejects_degenerate_grid() {
+        // Regression: nx == 0 reached read_profile_3d's `nx - 1` and panicked.
+        // A degenerate grid must be rejected at open().
+        let meta = serde_json::json!({
+            "schema": crate::format::SCHEMA_HOUR,
+            "model": "test", "run": "20260608_00z", "forecast_hour": 0,
+            "nx": 0, "ny": 5, "grid_hash": "none", "variables": [],
+            "chunking": {"tile_y": 256, "tile_x": 256, "col_y": 16, "col_x": 16},
+            "writer": {"name": "test", "version": "0", "build": "dev"}
+        });
+        let meta_bytes = serde_json::to_vec(&meta).unwrap();
+        let header = crate::header::RwsHeader::for_layout(meta_bytes.len() as u32, 0);
+        let mut bytes = header.pack().to_vec();
+        bytes.extend_from_slice(&meta_bytes);
+
+        let dir = test_dir("degenerate-grid");
+        let path = dir.join("f000.rws");
+        fs::write(&path, &bytes).unwrap();
+        let err = HourReader::open(&path).unwrap_err();
+        match err {
+            RwStoreError::Meta(msg) => {
+                assert!(msg.contains("degenerate"), "unexpected message: {msg}")
+            }
+            other => panic!("expected Meta error, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
