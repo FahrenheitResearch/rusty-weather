@@ -763,6 +763,9 @@ fn synthesize_nbm_10m_wind_components_from_speed_direction(
     Ok(())
 }
 
+/// `ModelId::WrfGdex` is still a registered model (URL builders and recipes
+/// reference it), so the extraction dispatch needs this arm even though
+/// rusty-weather ships without the NetCDF/WRF decode path.
 fn extract_wrf_gdex_fields_partial(
     _bytes: &[u8],
     _preferred_path: Option<&Path>,
