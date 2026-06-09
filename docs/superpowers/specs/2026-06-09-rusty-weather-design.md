@@ -123,7 +123,7 @@ Ported crates keep their existing names — renaming ~185K lines of imports buys
 
 **New crates:** `rw-store` (format above), `rw-server` (axum app, scheduler, job model), thin `rusty-weather` bin crate.
 
-**Vendored (copied byte-for-byte):** `sharprs`, `metrust`, `ecape-rs`, `grib-core`, `wx-core`, `wx-math`, `wx-field`. Left behind: `wx-radar`, `netcrust` (+ embedded hdf5-reader; WRF-only).
+**Vendored (copied byte-for-byte):** `sharprs`, `metrust`, `ecape-rs`, `grib-core`, `wx-core`, `wx-math`, `wx-field`, plus `wx-radar` (rides along solely as an unconditional path-dependency of metrust's io/plots re-exports — nothing else may use it). Left behind: `netcrust` (+ embedded hdf5-reader; WRF-only). Note: sharprs embeds a font from `crates/rustwx-render/assets/fonts/` via `include_bytes!`, so it only compiles once the render crate is present.
 
 **Assets:** `assets/basemap/` (Natural Earth shapefiles, counties) copied as-is.
 
