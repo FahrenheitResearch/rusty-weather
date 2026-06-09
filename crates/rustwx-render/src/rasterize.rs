@@ -9,6 +9,7 @@ fn projected_pixel_to_f64(point: (f32, f32)) -> (f64, f64) {
     (point.0 as f64, point.1 as f64)
 }
 
+// API-compat stubs mirroring the upstream no-cuda build; always empty.
 pub fn cuda_rasterize_stats() -> [(&'static str, usize); 0] {
     []
 }

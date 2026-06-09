@@ -4722,6 +4722,8 @@ pub fn render_to_image_profile(
     let (hires, mut timing) = render_to_image_profile_inner(data, ny, nx, &scaled_opts);
     let downsample_start = Instant::now();
 
+    // Upstream gates a cuda downsample+sharpen fast-path here; this port
+    // always takes the CPU Lanczos path.
     let image_opt: Option<RgbaImage> = None;
 
     let image = match image_opt {

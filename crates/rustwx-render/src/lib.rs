@@ -24,9 +24,8 @@ pub use contour_fill::{
 pub use error::RustwxRenderError;
 pub use rasterize::{cuda_rasterize_stats, print_cuda_rasterize_stats_if_enabled};
 
-/// Print fine-grained CUDA rasterize phase timings (flatten / upload /
-/// kernel / download / mesh-cache hits) to stderr if
-/// `RUSTWX_CUDA_RASTERIZE_TIMING=1`. No-op when the cuda feature is off.
+/// Always a no-op in this port (the upstream cuda feature was stripped);
+/// kept so downstream callers compile unchanged.
 pub fn print_cuda_rasterize_phase_timing_if_enabled() {}
 pub use features::{
     BasemapDetail, BasemapStyle, StyledLonLatLayer, StyledLonLatPolygonLayer,
