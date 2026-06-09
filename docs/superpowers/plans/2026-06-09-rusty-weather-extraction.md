@@ -61,7 +61,7 @@ rusty-weather/
 **Files:**
 - Create: `Cargo.toml`, `.gitignore`, `README.md`
 
-- [ ] **Step 1: Write the workspace manifest**
+- [x] **Step 1: Write the workspace manifest**
 
 Create `Cargo.toml` with exactly:
 
@@ -102,7 +102,7 @@ codegen-units = 1
 
 (Mirrors rustwx's manifest minus the dropped crates and minus the `hdf5-reader` patch — nothing in the keep-set uses it once Tasks 5 and 8 land. `members` fills in as crates arrive.)
 
-- [ ] **Step 2: Write `.gitignore`**
+- [x] **Step 2: Write `.gitignore`**
 
 ```gitignore
 /target
@@ -111,7 +111,7 @@ codegen-units = 1
 *.tmp
 ```
 
-- [ ] **Step 3: Write `README.md` stub**
+- [x] **Step 3: Write `README.md` stub**
 
 ```markdown
 # rusty-weather
@@ -124,7 +124,7 @@ Design: docs/superpowers/specs/2026-06-09-rusty-weather-design.md
 Status: extraction in progress (Plan 1).
 ```
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add -A; git commit -m "chore: scaffold rusty-weather workspace
@@ -139,7 +139,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 **Files:**
 - Create: `vendor/wx-core/`, `vendor/wx-math/`, `vendor/wx-field/`, `vendor/grib-core/`, `vendor/metrust/`, `vendor/ecape-rs/`, `vendor/sharprs/` (byte-for-byte copies)
 
-- [ ] **Step 1: Copy the seven vendor crates**
+- [x] **Step 1: Copy the seven vendor crates**
 
 ```powershell
 $src = 'C:\Users\drew\rustwx-fastplots-wt\vendor'
@@ -153,7 +153,7 @@ Do NOT copy `netcrust` (WRF/NetCDF-only — out of scope). `wx-radar` rides alon
 
 Add `"vendor/wx-radar",` to the workspace `exclude` list in the root `Cargo.toml`.
 
-- [ ] **Step 2: Check each vendor crate compiles standalone (except sharprs — deferred)**
+- [x] **Step 2: Check each vendor crate compiles standalone (except sharprs — deferred)**
 
 ```powershell
 foreach ($c in 'wx-core','wx-math','wx-field','wx-radar','grib-core','metrust','ecape-rs') {
@@ -163,7 +163,7 @@ foreach ($c in 'wx-core','wx-math','wx-field','wx-radar','grib-core','metrust','
 
 Expected: each finishes with `Finished` and no errors. **sharprs is NOT checked here:** its `src/render/canvas.rs` does `include_bytes!("../../../../crates/rustwx-render/assets/fonts/SourceSans3-Regular.ttf")`, which only resolves after Task 6 copies the render crate. Its standalone check moves to Task 7 Step 3 (alongside rustwx-sounding). *(Amended during execution.)*
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```powershell
 git add -A; git commit -m "feat: vendor wx-core, wx-math, wx-field, grib-core, metrust, ecape-rs, sharprs
@@ -181,7 +181,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Create: `crates/rustwx-core/`, `crates/rustwx-contour/`, `crates/rustwx-regrid/`
 - Modify: `Cargo.toml` (members)
 
-- [ ] **Step 1: Copy the three crates**
+- [x] **Step 1: Copy the three crates**
 
 ```powershell
 $src = 'C:\Users\drew\rustwx-fastplots-wt\crates'
@@ -189,7 +189,7 @@ New-Item -ItemType Directory -Force crates | Out-Null
 foreach ($c in 'rustwx-core','rustwx-contour','rustwx-regrid') { Copy-Item -Recurse "$src\$c" "crates\$c" }
 ```
 
-- [ ] **Step 2: Add them to workspace members**
+- [x] **Step 2: Add them to workspace members**
 
 In `Cargo.toml`, set:
 
@@ -201,7 +201,7 @@ members = [
 ]
 ```
 
-- [ ] **Step 3: Run their tests**
+- [x] **Step 3: Run their tests**
 
 ```powershell
 cargo test -p rustwx-core -p rustwx-contour -p rustwx-regrid
@@ -209,7 +209,7 @@ cargo test -p rustwx-core -p rustwx-contour -p rustwx-regrid
 
 Expected: PASS (these are leaf crates depending only on vendor crates and each other). Any failure here means the copy is bad — re-copy, don't patch.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add -A; git commit -m "feat: port rustwx-core, rustwx-contour, rustwx-regrid
@@ -225,7 +225,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Create: `crates/rustwx-models/`
 - Modify: `Cargo.toml` (members)
 
-- [ ] **Step 1: Copy, add member**
+- [x] **Step 1: Copy, add member**
 
 ```powershell
 Copy-Item -Recurse 'C:\Users\drew\rustwx-fastplots-wt\crates\rustwx-models' 'crates\rustwx-models'
@@ -233,7 +233,7 @@ Copy-Item -Recurse 'C:\Users\drew\rustwx-fastplots-wt\crates\rustwx-models' 'cra
 
 Add `"crates/rustwx-models",` to `members` (keep the list alphabetized).
 
-- [ ] **Step 2: Test**
+- [x] **Step 2: Test**
 
 ```powershell
 cargo test -p rustwx-models
@@ -241,7 +241,7 @@ cargo test -p rustwx-models
 
 Expected: PASS. Note: the crate still registers all ~18 models at this point. That is deliberate — `ModelId` match arms thread through `rustwx-products`, so model pruning is deferred to Task 11 (catalog surface) after the smoke proves the extraction. Do not prune anything here.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```powershell
 git add -A; git commit -m "feat: port rustwx-models (full registry; catalog prune deferred)
@@ -257,7 +257,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Create: `crates/rustwx-io/` (minus `src/earth2_archive.rs`)
 - Modify: `crates/rustwx-io/Cargo.toml`, `crates/rustwx-io/src/lib.rs`, workspace `Cargo.toml` (members)
 
-- [ ] **Step 1: Copy and delete the Earth2 module**
+- [x] **Step 1: Copy and delete the Earth2 module**
 
 ```powershell
 Copy-Item -Recurse 'C:\Users\drew\rustwx-fastplots-wt\crates\rustwx-io' 'crates\rustwx-io'
@@ -266,7 +266,7 @@ Remove-Item 'crates\rustwx-io\src\earth2_archive.rs'
 
 `earth2_archive.rs` is the ONLY user of `netcrust`/`hdf5-reader` in this crate (verified by grep) and serves AIFS local archives — out of scope.
 
-- [ ] **Step 2: Cut the dropped deps and the wrf feature from `crates/rustwx-io/Cargo.toml`**
+- [x] **Step 2: Cut the dropped deps and the wrf feature from `crates/rustwx-io/Cargo.toml`**
 
 Delete these lines:
 
@@ -278,11 +278,11 @@ rustwx-wrf = { path = "../rustwx-wrf", optional = true }
 
 and delete the feature line `wrf = ["dep:rustwx-wrf"]` (keep `default = []`).
 
-- [ ] **Step 3: Remove the module declaration and add the member**
+- [x] **Step 3: Remove the module declaration and add the member**
 
 In `crates/rustwx-io/src/lib.rs`, delete the `pub mod earth2_archive;` line. Add `"crates/rustwx-io",` to workspace members.
 
-- [ ] **Step 4: Delete the wrf-gated blocks, then compile and apply Rule R1**
+- [x] **Step 4: Delete the wrf-gated blocks, then compile and apply Rule R1**
 
 First find and delete every `#[cfg(feature = "wrf")]` item whole (the feature no longer exists; leftover gates would dangle as `unexpected_cfgs` warnings):
 
@@ -304,7 +304,7 @@ Select-String -Path 'crates\rustwx-io\src\*.rs' -Pattern 'earth2|netcrust|hdf5|r
 
 Expected: zero matches (comments mentioning them are fine to delete too).
 
-- [ ] **Step 5: Test and commit**
+- [x] **Step 5: Test and commit**
 
 ```powershell
 cargo test -p rustwx-io
@@ -328,7 +328,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Create: `crates/rustwx-render/`, `assets/basemap/`
 - Modify: `crates/rustwx-render/Cargo.toml`, workspace `Cargo.toml` (members)
 
-- [ ] **Step 1: Copy assets first, then the crate**
+- [x] **Step 1: Copy assets first, then the crate**
 
 ```powershell
 New-Item -ItemType Directory -Force assets | Out-Null
@@ -345,7 +345,7 @@ Basemap resolution in `features.rs` searches `<workspace_root>/assets/basemap` (
 
 Expected: identical byte totals.
 
-- [ ] **Step 2: Strip the cuda feature**
+- [x] **Step 2: Strip the cuda feature**
 
 Open `crates/rustwx-render/Cargo.toml`. Delete the `cuda = [...]` feature line and any optional dependency it enables (a path dep pointing outside the keep-set, e.g. `rustwx-cuda`). Then find and delete the gated code:
 
@@ -355,7 +355,7 @@ Select-String -Path 'crates\rustwx-render\src\*.rs' -Pattern 'feature = "cuda"' 
 
 For each hit, delete the whole `#[cfg(feature = "cuda")]` item (the CPU fallback is the unconditional path and stays). Do NOT touch any non-cfg-gated code.
 
-- [ ] **Step 3: Add member, run tests including the verify lane**
+- [x] **Step 3: Add member, run tests including the verify lane**
 
 Add `"crates/rustwx-render",` to members.
 
@@ -366,7 +366,7 @@ Get-ChildItem 'crates\rustwx-render\verify' -ErrorAction SilentlyContinue
 
 Expected: tests PASS. If a `verify/` directory exists with its own runner, note how it's invoked (check for a README or bin target inside) and run it; record the result in the commit message.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add -A; git commit -m "feat: port rustwx-render (cuda feature stripped) + basemap assets
@@ -382,7 +382,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - Create: `crates/rustwx-calc/`, `crates/rustwx-sounding/`
 - Modify: both crates' `Cargo.toml` if cuda-gated, workspace `Cargo.toml` (members)
 
-- [ ] **Step 1: Copy both crates, add members**
+- [x] **Step 1: Copy both crates, add members**
 
 ```powershell
 foreach ($c in 'rustwx-calc','rustwx-sounding') {
@@ -392,7 +392,7 @@ foreach ($c in 'rustwx-calc','rustwx-sounding') {
 
 Add `"crates/rustwx-calc",` and `"crates/rustwx-sounding",` to members.
 
-- [ ] **Step 2: Strip cuda from rustwx-calc (same procedure as Task 6 Step 2)**
+- [x] **Step 2: Strip cuda from rustwx-calc (same procedure as Task 6 Step 2)**
 
 ```powershell
 Select-String -Path 'crates\rustwx-calc\src\*.rs' -Pattern 'feature = "cuda"' -List
@@ -400,7 +400,7 @@ Select-String -Path 'crates\rustwx-calc\src\*.rs' -Pattern 'feature = "cuda"' -L
 
 Delete the feature line, the optional dep, and each gated item. CPU path stays untouched.
 
-- [ ] **Step 3: Test**
+- [x] **Step 3: Test**
 
 ```powershell
 cargo test -p rustwx-calc -p rustwx-sounding
@@ -408,7 +408,7 @@ cargo test -p rustwx-calc -p rustwx-sounding
 
 Expected: PASS. rustwx-calc exercises vendored metrust/ecape-rs; rustwx-sounding exercises vendored sharprs (its Cargo.toml already enables sharprs's render feature — copied as-is).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add -A; git commit -m "feat: port rustwx-calc (cuda stripped) and rustwx-sounding
@@ -426,7 +426,7 @@ This is the heart of the extraction. 24 modules drop; the direct/derived/gridded
 - Create: `crates/rustwx-products/` (pruned)
 - Modify: `crates/rustwx-products/Cargo.toml`, `crates/rustwx-products/src/lib.rs`, workspace `Cargo.toml` (members)
 
-- [ ] **Step 1: Copy, then delete the drop-list modules**
+- [x] **Step 1: Copy, then delete the drop-list modules**
 
 ```powershell
 Copy-Item -Recurse 'C:\Users\drew\rustwx-fastplots-wt\crates\rustwx-products' 'crates\rustwx-products'
@@ -445,7 +445,7 @@ foreach ($m in $drop) {
 
 (Some names are single files, some are directories with a same-named `.rs`; the loop removes both forms.)
 
-- [ ] **Step 2: Rewrite the module list in `src/lib.rs`**
+- [x] **Step 2: Rewrite the module list in `src/lib.rs`**
 
 Replace the block of `pub mod` declarations so that exactly these remain (preserving original order and any doc comments between them):
 
@@ -481,7 +481,7 @@ pub mod windowed_decoder;
 
 **Keep rationale, so review can sanity-check:** `direct`/`derived`/`gridded`/`hrrr`/`heavy`/`severe`/`ecape`/`non_ecape`/`qpf`/`thermo_native` are the product science + render flows; `places` is the city-label overlay used by direct plots (part of the dialed-in look); `publication` provides atomic writes + run manifests used by the batch drivers; `cache`/`source`/`spec`/`shared_context`/`plot_design`/`windowed`/`windowed_decoder`/`sampling`/`named_geometry`/`catalog`/`planner`/`runtime`/`point_timeseries` are shared infrastructure for those flows. If compilation proves any of the last group is *only* referenced by dropped modules, delete it too under R1 and note it in the commit.
 
-- [ ] **Step 3: Cut dropped deps and the wrf feature from `crates/rustwx-products/Cargo.toml`**
+- [x] **Step 3: Cut dropped deps and the wrf feature from `crates/rustwx-products/Cargo.toml`**
 
 Delete these dependency lines:
 
@@ -495,7 +495,7 @@ netcrust = { path = "../../vendor/netcrust" }
 
 and the feature line `wrf = ["dep:rustwx-wrf", "rustwx-io/wrf"]`.
 
-- [ ] **Step 4: Delete the wrf-gated blocks in kept modules**
+- [x] **Step 4: Delete the wrf-gated blocks in kept modules**
 
 The two known sites (verified by grep): `derived.rs:51` (`use rustwx_wrf::{WrfFile, looks_like_wrf};`) and `gridded.rs:27` (`use rustwx_wrf as wrf;`). Find every gated region and delete it whole:
 
@@ -505,7 +505,7 @@ Select-String -Path 'crates\rustwx-products\src\*.rs' -Pattern 'feature = "wrf"'
 
 Each hit is a `#[cfg(feature = "wrf")]` item (fn, use, match arm, or block) — delete the entire item, not just the attribute. If a WRF reference appears WITHOUT a cfg gate, treat it under R1.2 (WRF-only by name → delete the item).
 
-- [ ] **Step 5: Add member, compile, apply Rule R1 to convergence**
+- [x] **Step 5: Add member, compile, apply Rule R1 to convergence**
 
 Add `"crates/rustwx-products",` to members.
 
@@ -527,7 +527,7 @@ Select-String -Path 'crates\rustwx-products\src' -Pattern 'rustwx_radar|netcrust
 
 Expected: zero load-bearing matches (doc-comment mentions: delete them too).
 
-- [ ] **Step 6: Test and commit**
+- [x] **Step 6: Test and commit**
 
 ```powershell
 cargo test -p rustwx-products
@@ -558,7 +558,7 @@ Adapt rustwx's two proven batch drivers verbatim-minus-slop. These are scaffoldi
 - Create: `crates/rusty-weather/Cargo.toml`, `crates/rusty-weather/src/main.rs`, `crates/rusty-weather/src/contour_mode.rs`, `crates/rusty-weather/src/domain.rs`, `crates/rusty-weather/src/region.rs`, `crates/rusty-weather/src/bin/smoke_direct.rs`, `crates/rusty-weather/src/bin/smoke_derived.rs`
 - Modify: workspace `Cargo.toml` (members)
 
-- [ ] **Step 1: Create the crate manifest**
+- [x] **Step 1: Create the crate manifest**
 
 `crates/rusty-weather/Cargo.toml`:
 
@@ -589,7 +589,7 @@ rustwx-render = { path = "../rustwx-render" }
 rustwx-sounding = { path = "../rustwx-sounding" }
 ```
 
-- [ ] **Step 2: Create a placeholder main**
+- [x] **Step 2: Create a placeholder main**
 
 `crates/rusty-weather/src/main.rs`:
 
@@ -604,7 +604,7 @@ fn main() {
 }
 ```
 
-- [ ] **Step 3: Copy the shared CLI helper modules and the two drivers**
+- [x] **Step 3: Copy the shared CLI helper modules and the two drivers**
 
 ```powershell
 $cli = 'C:\Users\drew\rustwx-fastplots-wt\crates\rustwx-cli\src'
@@ -616,7 +616,7 @@ Copy-Item "$cli\bin\derived_batch.rs" 'crates\rusty-weather\src\bin\smoke_derive
 
 The `#[path = "../contour_mode.rs"]` attributes inside the bin files resolve to `src/` from `src/bin/` — the copied layout matches, no edits needed for those.
 
-- [ ] **Step 4: Trim the Earth2/AIFS surface from both smoke bins**
+- [x] **Step 4: Trim the Earth2/AIFS surface from both smoke bins**
 
 In `smoke_direct.rs`, known Earth2 items (from the source read): the import `use rustwx_io::earth2_archive::{Earth2EnsembleSelector, Earth2EnsembleStat};` (line 18), the `Earth2StatArg` enum + its `From` impl (lines 30–53), and every CLI arg/branch mentioning `earth2`. Find them all in both files:
 
@@ -626,7 +626,7 @@ Select-String -Path 'crates\rusty-weather\src\bin\*.rs','crates\rusty-weather\sr
 
 Delete each item whole (R1.2 — AIFS-only by name). Also change the hardcoded default output dir in both bins from `C:\\Users\\drew\\rustwx\\proof` to `out`.
 
-- [ ] **Step 5: Build, applying R1 to any further driver-level slop references**
+- [x] **Step 5: Build, applying R1 to any further driver-level slop references**
 
 Add `"crates/rusty-weather",` to members, then:
 
@@ -636,7 +636,7 @@ cargo build --release -p rusty-weather
 
 Expected: compiles after Earth2 trims. If the drivers reference other dropped products modules (e.g. a `--publish` path using provenance), R1 them. STOP per R1.3 if the core direct/derived flow breaks.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add -A; git commit -m "feat: add smoke_direct and smoke_derived extraction-validation binaries
@@ -653,7 +653,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 Requires network (AWS/NOMADS reachable). Use yesterday's 00z HRRR run so availability is guaranteed regardless of time of day.
 
-- [ ] **Step 1: Render direct products for one HRRR hour**
+- [x] **Step 1: Render direct products for one HRRR hour**
 
 ```powershell
 $d = (Get-Date).AddDays(-1).ToString('yyyyMMdd')
@@ -662,7 +662,7 @@ cargo run --release -p rusty-weather --bin smoke_direct -- --model hrrr --date $
 
 Expected: completes in a few minutes (download dominates); no panic; exit 0.
 
-- [ ] **Step 2: Verify the output is real**
+- [x] **Step 2: Verify the output is real**
 
 ```powershell
 Get-ChildItem -Recurse out\smoke_direct -Filter *.png | Measure-Object | Select-Object Count
@@ -671,7 +671,7 @@ Get-ChildItem -Recurse out\smoke_direct -Filter *.png | Sort-Object Length | Sel
 
 Expected: Count ≥ 10; smallest PNG > 50 KB (a blank/failed render is tiny). Open 2–3 PNGs (e.g. with `Invoke-Item`) and confirm: state/county basemap lines present, colorbar present, plot style matches rustwx output (the operator knows the dialed-in look on sight — flag for their eyeball).
 
-- [ ] **Step 3: Render derived products for the same hour**
+- [x] **Step 3: Render derived products for the same hour**
 
 ```powershell
 cargo run --release -p rusty-weather --bin smoke_derived -- --model hrrr --date $d --cycle 0 --forecast-hour 6 --region midwest --out-dir out\smoke_derived
@@ -679,7 +679,7 @@ cargo run --release -p rusty-weather --bin smoke_derived -- --model hrrr --date 
 
 (If `smoke_derived` requires explicit `--recipe` values, list them with `--help` and pick 3–4 severe/CAPE recipes.) Expected: PNGs with filled contour fields, no panic.
 
-- [ ] **Step 4: Run the full workspace test suite one more time**
+- [x] **Step 4: Run the full workspace test suite one more time**
 
 ```powershell
 cargo test --workspace
@@ -687,7 +687,7 @@ cargo test --workspace
 
 Expected: PASS across all 10 crates.
 
-- [ ] **Step 5: Commit any fixes; record timings**
+- [x] **Step 5: Commit any fixes; record timings**
 
 Note wall-clock for fetch+extract and for render in the commit message (these are the Plan-1 baseline for the spec's perf table).
 
@@ -709,7 +709,7 @@ The `ModelId` enum and its match arms stay (cheap, and threaded through products
 **Files:**
 - Modify: `crates/rustwx-models/src/lib.rs` (catalog/summary list only)
 
-- [ ] **Step 1: Locate the enumeration surface**
+- [x] **Step 1: Locate the enumeration surface**
 
 ```powershell
 Select-String -Path 'crates\rustwx-models\src\lib.rs' -Pattern 'fn (all_models|model_summaries|supported_models)|const (ALL_MODELS|MODEL)' | Select-Object LineNumber,Line
@@ -717,7 +717,7 @@ Select-String -Path 'crates\rustwx-models\src\lib.rs' -Pattern 'fn (all_models|m
 
 Identify the function/const that yields the full model list (the one `model_summary` lookups iterate, used by CLIs to enumerate).
 
-- [ ] **Step 2: Write a failing test for the new surface**
+- [x] **Step 2: Write a failing test for the new surface**
 
 Add to the models test module:
 
@@ -740,7 +740,7 @@ fn catalog_exposes_exactly_the_six_supported_models() {
 
 (Adjust variant names to the actual `ModelId` spelling found in `rustwx-core` — check with `Select-String -Path 'crates\rustwx-core\src\*.rs' -Pattern 'pub enum ModelId' -Context 0,25`. If REFS is not a distinct `ModelId` variant — it may be an ensemble mode of RRFS — note that in the commit and test for the five that exist; REFS plumbing is a later-plan concern.)
 
-- [ ] **Step 3: Run it to verify it fails**
+- [x] **Step 3: Run it to verify it fails**
 
 ```powershell
 cargo test -p rustwx-models catalog_exposes_exactly
@@ -748,7 +748,7 @@ cargo test -p rustwx-models catalog_exposes_exactly
 
 Expected: FAIL — `supported_models` doesn't exist yet.
 
-- [ ] **Step 4: Implement `supported_models()`**
+- [x] **Step 4: Implement `supported_models()`**
 
 In `crates/rustwx-models/src/lib.rs`, next to the existing full-list function:
 
@@ -771,7 +771,7 @@ pub fn supported_models() -> [rustwx_core::ModelId; 6] {
 
 (Same variant-name caveat as Step 2.) Do NOT delete the other models' registry entries in this plan — that deep prune happens once the daemon exists and dead code is provable.
 
-- [ ] **Step 5: Run tests, commit**
+- [x] **Step 5: Run tests, commit**
 
 ```powershell
 cargo test -p rustwx-models
@@ -787,7 +787,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 **Files:**
 - Modify: `README.md`, this plan file (check the boxes)
 
-- [ ] **Step 1: Update README with real build/run instructions**
+- [x] **Step 1: Update README with real build/run instructions**
 
 Replace the stub's status line with:
 
@@ -808,7 +808,7 @@ docs/superpowers/specs/2026-06-09-rusty-weather-design.md.
 - `assets/basemap/` — Natural Earth + US county shapefiles
 ```
 
-- [ ] **Step 2: Check every box in this plan, commit, tag**
+- [x] **Step 2: Check every box in this plan, commit, tag**
 
 ```powershell
 git add -A; git commit -m "docs: finalize Plan 1 (extraction) README and plan checkboxes
