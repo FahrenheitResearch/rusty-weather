@@ -1480,8 +1480,10 @@ fn normalize_and_rotate_longitude_rows_keeps_rows_monotone() {
     let mut lon = vec![0.0, 90.0, 180.0, 270.0, 0.0, 90.0, 180.0, 270.0];
     let mut values = vec![1.0, 2.0, 3.0, 4.0, 11.0, 12.0, 13.0, 14.0];
 
-    normalize_and_rotate_longitude_rows(&mut lat, &mut lon, &mut values, 4, 2);
+    let row_wraps = normalize_and_rotate_longitude_grid_rows(&mut lat, &mut lon, 4, 2);
+    rotate_rows_left(&mut values, 4, &row_wraps);
 
+    assert_eq!(row_wraps, [3, 3]);
     assert_eq!(lon[..4], [-90.0, 0.0, 90.0, 180.0]);
     assert_eq!(lon[4..], [-90.0, 0.0, 90.0, 180.0]);
     assert_eq!(values[..4], [4.0, 1.0, 2.0, 3.0]);

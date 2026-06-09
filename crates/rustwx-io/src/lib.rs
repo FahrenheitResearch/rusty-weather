@@ -18,7 +18,7 @@ use rustwx_core::{
 };
 use rustwx_models::{latest_available_run, model_summary, resolve_urls};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -547,6 +547,7 @@ pub fn extract_fields_from_grib2(
     }
 
     let mut out = Vec::with_capacity(prepared.len());
+    let mut grid_memo = GridMemo::new();
     for (prepared_selector, message) in prepared.iter().zip(matched.into_iter()) {
         let message = message
             .map(|(message, _)| message)
@@ -557,6 +558,7 @@ pub fn extract_fields_from_grib2(
             message,
             prepared_selector.selector,
             prepared_selector.selector.native_units(),
+            &mut grid_memo,
         )?);
     }
 
@@ -625,12 +627,14 @@ fn extract_fields_from_grib2_partial_inner(
         }
     }
 
+    let mut grid_memo = GridMemo::new();
     for (prepared_selector, message) in prepared.iter().zip(matched.into_iter()) {
         match message {
             Some((message, _)) => extracted.push(build_selected_field(
                 message,
                 prepared_selector.selector,
                 prepared_selector.selector.native_units(),
+                &mut grid_memo,
             )?),
             None => missing.push(prepared_selector.selector),
         }
@@ -724,8 +728,19 @@ fn synthesize_nbm_10m_wind_components_from_speed_direction(
         return Ok(());
     };
 
-    let speed = build_selected_field(speed_message, u_selector, speed_selector.units)?;
-    let direction = build_selected_field(direction_message, v_selector, direction_selector.units)?;
+    let mut grid_memo = GridMemo::new();
+    let speed = build_selected_field(
+        speed_message,
+        u_selector,
+        speed_selector.units,
+        &mut grid_memo,
+    )?;
+    let direction = build_selected_field(
+        direction_message,
+        v_selector,
+        direction_selector.units,
+        &mut grid_memo,
+    )?;
     if speed.grid.shape != direction.grid.shape || speed.values.len() != direction.values.len() {
         return Ok(());
     }
@@ -1929,34 +1944,149 @@ impl LevelMatch {
     }
 }
 
-fn build_selected_field(
-    message: &Grib2Message,
+/// Memo key for per-extraction-call coordinate caching.
+///
+/// The grid-side work in `build_selected_field` (`grid_latlon`, the lat/lon
+/// `flip_rows` for scan-mode bit 0x40, and the per-row longitude
+/// normalization/rotation) reads *only* `message.grid` — `nx`, `ny`, and
+/// `scan_mode` are themselves `GridDefinition` fields. The parser does not
+/// retain the raw section 3 bytes, so the key is instead composed from
+/// **every** field of the parsed `GridDefinition` (f64s compared by bit
+/// pattern). Because the key is a total snapshot of the only input, equal
+/// keys are guaranteed to produce identical lat/lon arrays and identical
+/// per-row value rotations; over-keying on fields a particular template
+/// ignores can only cost a memo miss, never a wrong hit.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GridMemoKey {
+    template: u16,
+    nx: u32,
+    ny: u32,
+    lat1: u64,
+    lon1: u64,
+    lat2: u64,
+    lon2: u64,
+    dx: u64,
+    dy: u64,
+    latin1: u64,
+    latin2: u64,
+    lov: u64,
+    scan_mode: u8,
+    lad: u64,
+    projection_center_flag: u8,
+    n_parallel: u32,
+    south_pole_lat: u64,
+    south_pole_lon: u64,
+    rotation_angle: u64,
+    satellite_lat: u64,
+    satellite_lon: u64,
+    xp: u64,
+    yp: u64,
+    altitude: u64,
+    pl: Option<Vec<u32>>,
+    is_reduced: bool,
+    num_data_points: u32,
+    shape_of_earth: u8,
+    resolution_flags: u8,
+}
+
+impl GridMemoKey {
+    fn from_grid(grid: &GridDefinition) -> Self {
+        Self {
+            template: grid.template,
+            nx: grid.nx,
+            ny: grid.ny,
+            lat1: grid.lat1.to_bits(),
+            lon1: grid.lon1.to_bits(),
+            lat2: grid.lat2.to_bits(),
+            lon2: grid.lon2.to_bits(),
+            dx: grid.dx.to_bits(),
+            dy: grid.dy.to_bits(),
+            latin1: grid.latin1.to_bits(),
+            latin2: grid.latin2.to_bits(),
+            lov: grid.lov.to_bits(),
+            scan_mode: grid.scan_mode,
+            lad: grid.lad.to_bits(),
+            projection_center_flag: grid.projection_center_flag,
+            n_parallel: grid.n_parallel,
+            south_pole_lat: grid.south_pole_lat.to_bits(),
+            south_pole_lon: grid.south_pole_lon.to_bits(),
+            rotation_angle: grid.rotation_angle.to_bits(),
+            satellite_lat: grid.satellite_lat.to_bits(),
+            satellite_lon: grid.satellite_lon.to_bits(),
+            xp: grid.xp.to_bits(),
+            yp: grid.yp.to_bits(),
+            altitude: grid.altitude.to_bits(),
+            pl: grid.pl.clone(),
+            is_reduced: grid.is_reduced,
+            num_data_points: grid.num_data_points,
+            shape_of_earth: grid.shape_of_earth,
+            resolution_flags: grid.resolution_flags,
+        }
+    }
+}
+
+/// Memoized grid-side result: the post-normalization coordinate grid exactly
+/// as `build_selected_field` historically produced it, plus the per-row
+/// rotate-left amounts so the matching values-side rotation can be replayed
+/// for every field that shares the grid.
+struct GridMemoEntry {
+    grid: LatLonGrid,
+    row_wraps: Vec<usize>,
+}
+
+type GridMemo = HashMap<GridMemoKey, GridMemoEntry>;
+
+fn build_grid_memo_entry(
+    grid_def: &GridDefinition,
+    shape: GridShape,
     selector: FieldSelector,
-    units: &str,
-) -> Result<SelectedField2D, IoError> {
-    let nx = message.grid.nx as usize;
-    let ny = message.grid.ny as usize;
-    let shape = GridShape::new(nx, ny)?;
-    let (mut lat, mut lon) = grid_latlon(&message.grid);
+) -> Result<GridMemoEntry, IoError> {
+    let nx = shape.nx;
+    let ny = shape.ny;
+    let (mut lat, mut lon) = grid_latlon(grid_def);
     if lat.is_empty() || lon.is_empty() {
         return Err(IoError::MissingGridCoordinates { selector });
     }
-    let mut values = unpack_message(message).map_err(|err| IoError::Grib(err.to_string()))?;
-    normalize_alternating_i_scan_rows(&mut values, nx, ny, message.grid.scan_mode);
-    if message.grid.scan_mode & 0x40 != 0 {
+    if grid_def.scan_mode & 0x40 != 0 {
         flip_rows(&mut lat, nx, ny);
         flip_rows(&mut lon, nx, ny);
-        flip_rows(&mut values, nx, ny);
     }
-    normalize_and_rotate_longitude_rows(&mut lat, &mut lon, &mut values, nx, ny);
-
+    let row_wraps = normalize_and_rotate_longitude_grid_rows(&mut lat, &mut lon, nx, ny);
     let grid = LatLonGrid::new(
         shape,
         lat.into_iter().map(|value| value as f32).collect(),
         lon.into_iter().map(|value| value as f32).collect(),
     )?;
+    Ok(GridMemoEntry { grid, row_wraps })
+}
+
+/// Build one `SelectedField2D`, memoizing the (expensive) coordinate-grid
+/// computation per distinct `GridDefinition` within one extraction call.
+/// Values-side normalization (unpack, alternating-i scan, row flip, row
+/// rotation) stays per-field; only the lat/lon arrays — identical for every
+/// message sharing a grid definition — are computed once and cloned out.
+fn build_selected_field(
+    message: &Grib2Message,
+    selector: FieldSelector,
+    units: &str,
+    grid_memo: &mut GridMemo,
+) -> Result<SelectedField2D, IoError> {
+    let nx = message.grid.nx as usize;
+    let ny = message.grid.ny as usize;
+    let shape = GridShape::new(nx, ny)?;
+    let entry = match grid_memo.entry(GridMemoKey::from_grid(&message.grid)) {
+        Entry::Occupied(slot) => slot.into_mut(),
+        Entry::Vacant(slot) => slot.insert(build_grid_memo_entry(&message.grid, shape, selector)?),
+    };
+    let mut values = unpack_message(message).map_err(|err| IoError::Grib(err.to_string()))?;
+    normalize_alternating_i_scan_rows(&mut values, nx, ny, message.grid.scan_mode);
+    if message.grid.scan_mode & 0x40 != 0 {
+        flip_rows(&mut values, nx, ny);
+    }
+    rotate_rows_left(&mut values, nx, &entry.row_wraps);
+
     let values = values.into_iter().map(|value| value as f32).collect();
-    let mut field = SelectedField2D::new(selector, units, grid, values)?;
+    let mut field = SelectedField2D::new(selector, units, entry.grid.clone(), values)?;
     if let Some(projection) = grid_projection_from_grib2_grid(&message.grid) {
         field = field.with_projection(projection);
     }
@@ -1989,23 +2119,26 @@ fn normalize_longitude(lon: f64) -> f64 {
     if lon > 180.0 { lon - 360.0 } else { lon }
 }
 
-fn normalize_and_rotate_longitude_rows(
+/// Grid-side half of the longitude normalization: normalize longitudes and
+/// rotate each lat/lon row so longitudes stay monotone. Returns the per-row
+/// rotate-left amount (0 = untouched) so `rotate_rows_left` can replay the
+/// identical rotation on each field's values.
+fn normalize_and_rotate_longitude_grid_rows(
     lat: &mut [f64],
     lon: &mut [f64],
-    values: &mut [f64],
     nx: usize,
     ny: usize,
-) {
+) -> Vec<usize> {
+    let mut row_wraps = vec![0usize; ny];
     if nx == 0 || ny == 0 {
-        return;
+        return row_wraps;
     }
 
-    for row in 0..ny {
+    for (row, row_wrap) in row_wraps.iter_mut().enumerate() {
         let start = row * nx;
         let end = start + nx;
         let lat_row = &mut lat[start..end];
         let lon_row = &mut lon[start..end];
-        let value_row = &mut values[start..end];
 
         for lon_value in lon_row.iter_mut() {
             *lon_value = normalize_longitude(*lon_value);
@@ -2014,8 +2147,21 @@ fn normalize_and_rotate_longitude_rows(
         if let Some(wrap_idx) = first_longitude_wrap(lon_row) {
             lat_row.rotate_left(wrap_idx);
             lon_row.rotate_left(wrap_idx);
-            value_row.rotate_left(wrap_idx);
+            *row_wrap = wrap_idx;
         }
+    }
+    row_wraps
+}
+
+/// Values-side replay of the per-row rotation computed by
+/// `normalize_and_rotate_longitude_grid_rows`.
+fn rotate_rows_left(values: &mut [f64], nx: usize, row_wraps: &[usize]) {
+    for (row, &wrap_idx) in row_wraps.iter().enumerate() {
+        if wrap_idx == 0 {
+            continue;
+        }
+        let start = row * nx;
+        values[start..start + nx].rotate_left(wrap_idx);
     }
 }
 
