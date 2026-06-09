@@ -9,6 +9,7 @@ pub mod error;
 pub mod format;
 pub mod header;
 pub mod index;
+pub mod reader;
 pub mod writer;
 
 pub use error::{RwResult, RwStoreError};
