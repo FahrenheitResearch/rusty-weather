@@ -10,11 +10,11 @@ use std::path::Path;
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-use crate::codec::decode_f32_tile;
+use crate::codec::{decode_affine_i16, decode_f32_tile};
 use crate::error::{RwResult, RwStoreError};
 use crate::format::{
-    FLAG_CONSTANT, FLAG_EMPTY, HEADER_LEN, INDEX_RECORD_LEN, KIND_TILE2D, RwsHourMeta,
-    RwsVariableMeta, SCHEMA_HOUR, TILE_X, TILE_Y,
+    COL_X, COL_Y, FLAG_CONSTANT, FLAG_EMPTY, HEADER_LEN, INDEX_RECORD_LEN, KIND_COLUMN3D,
+    KIND_TILE2D, RwsHourMeta, RwsVariableMeta, SCHEMA_HOUR, TILE_X, TILE_Y,
 };
 use crate::header::RwsHeader;
 use crate::index::ChunkRecord;
@@ -186,7 +186,7 @@ impl HourReader {
         // decompression work starts.
         let jobs = (0..tiles_y)
             .flat_map(|ty| (0..tiles_x).map(move |tx| (ty, tx)))
-            .map(|(ty, tx)| Ok((ty, tx, self.tile_record(var, ty, tx)?)))
+            .map(|(ty, tx)| Ok((ty, tx, self.chunk_record(var, KIND_TILE2D, ty, tx)?)))
             .collect::<RwResult<Vec<(usize, usize, &ChunkRecord)>>>()?;
 
         let decode = |&(ty, tx, record): &(usize, usize, &ChunkRecord)| {
@@ -239,7 +239,7 @@ impl HourReader {
 
         for ty in y0 / TILE_Y..=(y1 - 1) / TILE_Y {
             for tx in x0 / TILE_X..=(x1 - 1) / TILE_X {
-                let record = self.tile_record(var, ty, tx)?;
+                let record = self.chunk_record(var, KIND_TILE2D, ty, tx)?;
                 let (rows, cols) = self.tile_dims(ty, tx);
                 let (ty0, tx0) = (ty * TILE_Y, tx * TILE_X);
                 // Window/tile intersection in grid coordinates.
@@ -277,15 +277,129 @@ impl HourReader {
         })
     }
 
+    /// Read the full pressure column of 3D variable `name` at grid point
+    /// (`ix`, `iy`): one chunk decode, one contiguous slice. The result has
+    /// one value per entry of the variable's `levels_hpa` (descending
+    /// pressure: index 0 is the lowest level, e.g. 1000 hPa).
+    pub fn read_column_3d(&self, name: &str, ix: usize, iy: usize) -> RwResult<Vec<f32>> {
+        let var = self.lookup_3d(name)?;
+        let (nx, ny) = (self.meta.nx, self.meta.ny);
+        if ix >= nx || iy >= ny {
+            return Err(RwStoreError::Format(format!(
+                "column ({ix},{iy}) out of bounds for grid {nx} x {ny}"
+            )));
+        }
+        let levels = var.levels_hpa.len();
+        let (cy, cx) = (iy / COL_Y, ix / COL_X);
+        let record = self.chunk_record(var, KIND_COLUMN3D, cy, cx)?;
+        let (rows, cols) = self.col_chunk_dims(cy, cx);
+        let chunk = self.decode_column_chunk(&var.name, record, rows * cols * levels)?;
+        // [y][x][z] layout: the column's L values are contiguous.
+        let start = ((iy % COL_Y) * cols + (ix % COL_X)) * levels;
+        Ok(chunk[start..start + levels].to_vec())
+    }
+
+    /// Read a bilinearly interpolated pressure profile of 3D variable
+    /// `name` at fractional grid coordinates (`fx`, `fy`), clamped to the
+    /// grid. Per level the value is the weighted mean over the FINITE corner
+    /// columns only (weights renormalized); a level where all corners are
+    /// NaN yields NaN. Each underlying chunk is decoded at most once.
+    pub fn read_profile_3d(&self, name: &str, fx: f64, fy: f64) -> RwResult<Vec<f32>> {
+        let var = self.lookup_3d(name)?;
+        if !fx.is_finite() || !fy.is_finite() {
+            return Err(RwStoreError::Format(format!(
+                "profile coordinates must be finite, got ({fx}, {fy})"
+            )));
+        }
+        let levels = var.levels_hpa.len();
+        let fx = fx.clamp(0.0, (self.meta.nx - 1) as f64);
+        let fy = fy.clamp(0.0, (self.meta.ny - 1) as f64);
+        let (x0, x1) = (fx.floor() as usize, fx.ceil() as usize);
+        let (y0, y1) = (fy.floor() as usize, fy.ceil() as usize);
+        let wx = (fx - x0 as f64) as f32;
+        let wy = (fy - y0 as f64) as f32;
+        // Degenerate axes (exact integer / edge) produce duplicate corners;
+        // their weights still sum to 1, so no special-casing is needed.
+        let corners = [
+            (x0, y0, (1.0 - wx) * (1.0 - wy)),
+            (x1, y0, wx * (1.0 - wy)),
+            (x0, y1, (1.0 - wx) * wy),
+            (x1, y1, wx * wy),
+        ];
+
+        // Decode every chunk the corners touch exactly once (up to 4
+        // corners may share chunks); tiny linear map, max 4 entries.
+        let mut chunks: Vec<((usize, usize), Vec<f32>)> = Vec::with_capacity(4);
+        for &(ix, iy, _) in &corners {
+            let key = (iy / COL_Y, ix / COL_X);
+            if chunks.iter().any(|(have, _)| *have == key) {
+                continue;
+            }
+            let record = self.chunk_record(var, KIND_COLUMN3D, key.0, key.1)?;
+            let (rows, cols) = self.col_chunk_dims(key.0, key.1);
+            let decoded = self.decode_column_chunk(&var.name, record, rows * cols * levels)?;
+            chunks.push((key, decoded));
+        }
+        let corner_columns: Vec<(&[f32], f32)> = corners
+            .iter()
+            .map(|&(ix, iy, weight)| {
+                let key = (iy / COL_Y, ix / COL_X);
+                let (_, cols) = self.col_chunk_dims(key.0, key.1);
+                let chunk = &chunks.iter().find(|(have, _)| *have == key).unwrap().1;
+                let start = ((iy % COL_Y) * cols + (ix % COL_X)) * levels;
+                (&chunk[start..start + levels], weight)
+            })
+            .collect();
+
+        let mut profile = Vec::with_capacity(levels);
+        for k in 0..levels {
+            let mut weight_sum = 0.0f32;
+            let mut value_sum = 0.0f32;
+            for (column, weight) in &corner_columns {
+                let value = column[k];
+                if value.is_finite() {
+                    weight_sum += weight;
+                    value_sum += weight * value;
+                }
+            }
+            profile.push(if weight_sum > 0.0 {
+                value_sum / weight_sum
+            } else {
+                f32::NAN
+            });
+        }
+        Ok(profile)
+    }
+
     fn lookup(&self, name: &str) -> RwResult<&RwsVariableMeta> {
         self.variable(name)
             .ok_or_else(|| RwStoreError::UnknownVariable(name.to_string()))
     }
 
-    /// Find the index record for `var`'s 2D tile (`ty`, `tx`): binary search
-    /// over the variable's pre-computed contiguous record range, keyed by the
-    /// same (var_id, kind, tile_y, tile_x) order the index is sorted in.
-    fn tile_record(&self, var: &RwsVariableMeta, ty: usize, tx: usize) -> RwResult<&ChunkRecord> {
+    /// Like [`Self::lookup`], but additionally require a 3D pressure-level
+    /// variable.
+    fn lookup_3d(&self, name: &str) -> RwResult<&RwsVariableMeta> {
+        let var = self.lookup(name)?;
+        if var.kind != "pressure3d" {
+            return Err(RwStoreError::Format(format!(
+                "variable '{name}' has kind '{}', expected 'pressure3d'",
+                var.kind
+            )));
+        }
+        Ok(var)
+    }
+
+    /// Find the index record for `var`'s chunk (`ty`, `tx`) of `kind`:
+    /// binary search over the variable's pre-computed contiguous record
+    /// range, keyed by the same (var_id, kind, tile_y, tile_x) order the
+    /// index is sorted in.
+    fn chunk_record(
+        &self,
+        var: &RwsVariableMeta,
+        kind: u8,
+        ty: usize,
+        tx: usize,
+    ) -> RwResult<&ChunkRecord> {
         let range = self.var_ranges.get(&var.id).ok_or_else(|| {
             RwStoreError::Format(format!(
                 "variable '{}' (id {}) has no chunk index entries",
@@ -293,12 +407,12 @@ impl HourReader {
             ))
         })?;
         let slice = &self.records[range.clone()];
-        let key = (var.id, KIND_TILE2D, ty as u32, tx as u32);
+        let key = (var.id, kind, ty as u32, tx as u32);
         let position = slice
             .binary_search_by_key(&key, ChunkRecord::sort_key)
             .map_err(|_| {
                 RwStoreError::Format(format!(
-                    "missing 2D tile record for variable '{}' tile ({ty},{tx})",
+                    "missing kind-{kind} chunk record for variable '{}' chunk ({ty},{tx})",
                     var.name
                 ))
             })?;
@@ -310,6 +424,49 @@ impl HourReader {
         let rows = (self.meta.ny - ty * TILE_Y).min(TILE_Y);
         let cols = (self.meta.nx - tx * TILE_X).min(TILE_X);
         (rows, cols)
+    }
+
+    /// Footprint height/width of 3D column chunk (`cy`, `cx`) after clipping
+    /// to the grid edge.
+    fn col_chunk_dims(&self, cy: usize, cx: usize) -> (usize, usize) {
+        let rows = (self.meta.ny - cy * COL_Y).min(COL_Y);
+        let cols = (self.meta.nx - cx * COL_X).min(COL_X);
+        (rows, cols)
+    }
+
+    /// Decode one 3D column chunk to `value_count` f32s in `[y][x][z]`
+    /// order. EMPTY and CONSTANT chunks are produced from flags alone — no
+    /// payload bytes are read.
+    fn decode_column_chunk(
+        &self,
+        var_name: &str,
+        record: &ChunkRecord,
+        value_count: usize,
+    ) -> RwResult<Vec<f32>> {
+        if record.flags & FLAG_EMPTY != 0 {
+            return Ok(vec![f32::NAN; value_count]);
+        }
+        if record.flags & FLAG_CONSTANT != 0 && record.len == 0 {
+            return Ok(vec![record.center; value_count]);
+        }
+        let compressed = self.payload_slice(var_name, record)?;
+        let raw = zstd::stream::decode_all(compressed).map_err(|err| {
+            RwStoreError::Chunk(format!(
+                "zstd decode failed for variable '{var_name}' column chunk ({},{}): {err}",
+                record.tile_y, record.tile_x
+            ))
+        })?;
+        if raw.len() != record.raw_len as usize {
+            return Err(RwStoreError::Chunk(format!(
+                "variable '{var_name}' column chunk ({},{}): decompressed {} bytes, \
+                 index says raw_len {}",
+                record.tile_y,
+                record.tile_x,
+                raw.len(),
+                record.raw_len
+            )));
+        }
+        decode_affine_i16(record.flags, record.center, record.scale, &raw, value_count)
     }
 
     /// Decode one tile to `value_count` f32s. EMPTY and CONSTANT chunks are

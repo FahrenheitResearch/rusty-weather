@@ -10,11 +10,11 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::atomic::atomic_write_bytes;
-use crate::codec::encode_f32_tile;
+use crate::codec::{encode_affine_i16, encode_f32_tile};
 use crate::error::{RwResult, RwStoreError};
 use crate::format::{
-    CODEC_2D, COL_X, COL_Y, KIND_TILE2D, RwsChunking, RwsHourMeta, RwsVariableMeta,
-    RwsWriterInfo, SCHEMA_HOUR, TILE_X, TILE_Y,
+    CODEC_2D, CODEC_3D, COL_X, COL_Y, KIND_COLUMN3D, KIND_TILE2D, RwsChunking, RwsHourMeta,
+    RwsVariableMeta, RwsWriterInfo, SCHEMA_HOUR, TILE_X, TILE_Y,
 };
 use crate::header::RwsHeader;
 use crate::index::ChunkRecord;
@@ -83,16 +83,7 @@ impl HourWriter {
                 values.len()
             )));
         }
-        if self.variables.iter().any(|var| var.name == name) {
-            return Err(RwStoreError::Format(format!(
-                "duplicate variable name '{name}'"
-            )));
-        }
-        let var_id = u16::try_from(self.variables.len()).map_err(|_| {
-            RwStoreError::Format(format!(
-                "too many variables: var id for '{name}' exceeds u16"
-            ))
-        })?;
+        let var_id = self.next_var_id(name)?;
 
         let tiles_y = self.ny.div_ceil(TILE_Y);
         let tiles_x = self.nx.div_ceil(TILE_X);
@@ -153,6 +144,138 @@ impl HourWriter {
             selector,
         });
         Ok(var_id)
+    }
+
+    /// Add a 3D pressure-level field as `[y][x][z]` column chunks: within
+    /// each 16x16 chunk the L level values of a column are contiguous, so a
+    /// sounding pull decodes one chunk and slices one run. `levels_hpa` must
+    /// be strictly descending (1000 first) and `level_planes` holds one
+    /// row-major `ny * nx` plane per level, in that same order. The whole
+    /// chunk is affine-i16 quantized (one center/scale) then zstd-1.
+    pub fn add_pressure3d(
+        &mut self,
+        name: &str,
+        units: &str,
+        selector: serde_json::Value,
+        levels_hpa: &[u16],
+        level_planes: &[&[f32]],
+    ) -> RwResult<u16> {
+        if levels_hpa.is_empty() {
+            return Err(RwStoreError::Format(format!(
+                "variable '{name}': levels_hpa must not be empty"
+            )));
+        }
+        if let Some(pair) = levels_hpa.windows(2).find(|pair| pair[0] <= pair[1]) {
+            return Err(RwStoreError::Format(format!(
+                "variable '{name}': levels_hpa must be strictly descending, found {} then {}",
+                pair[0], pair[1]
+            )));
+        }
+        if level_planes.len() != levels_hpa.len() {
+            return Err(RwStoreError::Format(format!(
+                "variable '{name}': {} level planes for {} levels",
+                level_planes.len(),
+                levels_hpa.len()
+            )));
+        }
+        let expected = self.nx * self.ny;
+        for (k, plane) in level_planes.iter().enumerate() {
+            if plane.len() != expected {
+                return Err(RwStoreError::Format(format!(
+                    "variable '{name}' level {} ({} hPa): expected {expected} values \
+                     ({} x {}), got {}",
+                    k,
+                    levels_hpa[k],
+                    self.ny,
+                    self.nx,
+                    plane.len()
+                )));
+            }
+        }
+        let var_id = self.next_var_id(name)?;
+
+        let chunks_y = self.ny.div_ceil(COL_Y);
+        let chunks_x = self.nx.div_ceil(COL_X);
+        let chunk_coords: Vec<(usize, usize)> = (0..chunks_y)
+            .flat_map(|cy| (0..chunks_x).map(move |cx| (cy, cx)))
+            .collect();
+
+        let nx = self.nx;
+        let ny = self.ny;
+        let levels = levels_hpa.len();
+        // Parallel encode; collect preserves chunk_coords order so staging
+        // (and therefore the final file) is independent of rayon scheduling.
+        let encoded: Vec<StagedChunk> = chunk_coords
+            .par_iter()
+            .map(|&(cy, cx)| -> RwResult<StagedChunk> {
+                let y0 = cy * COL_Y;
+                let x0 = cx * COL_X;
+                let y1 = (y0 + COL_Y).min(ny);
+                let x1 = (x0 + COL_X).min(nx);
+                // Gather [y][x][z]: for each footprint cell, its L level
+                // values are contiguous, ordered by levels_hpa order.
+                let mut buffer = Vec::with_capacity((y1 - y0) * (x1 - x0) * levels);
+                for gy in y0..y1 {
+                    for gx in x0..x1 {
+                        let cell = gy * nx + gx;
+                        for plane in level_planes {
+                            buffer.push(plane[cell]);
+                        }
+                    }
+                }
+                let chunk = encode_affine_i16(&buffer)?;
+                let compressed = if chunk.payload.is_empty() {
+                    Vec::new()
+                } else {
+                    zstd::stream::encode_all(&chunk.payload[..], ZSTD_LEVEL)?
+                };
+                Ok(StagedChunk {
+                    record: ChunkRecord {
+                        var_id,
+                        kind: KIND_COLUMN3D,
+                        flags: chunk.flags,
+                        tile_y: cy as u32,
+                        tile_x: cx as u32,
+                        offset: 0, // assigned in finish()
+                        len: compressed.len() as u32,
+                        raw_len: chunk.payload.len() as u32,
+                        center: chunk.center,
+                        scale: chunk.scale,
+                        min: chunk.min,
+                        max: chunk.max,
+                        valid_count: chunk.valid_count,
+                    },
+                    compressed,
+                })
+            })
+            .collect::<RwResult<Vec<StagedChunk>>>()?;
+
+        self.chunks.extend(encoded);
+        self.variables.push(RwsVariableMeta {
+            id: var_id,
+            name: name.to_string(),
+            units: units.to_string(),
+            kind: "pressure3d".to_string(),
+            codec: CODEC_3D.to_string(),
+            levels_hpa: levels_hpa.to_vec(),
+            selector,
+        });
+        Ok(var_id)
+    }
+
+    /// Reserve the next variable id, enforcing name uniqueness across all
+    /// kinds and the u16 id budget.
+    fn next_var_id(&self, name: &str) -> RwResult<u16> {
+        if self.variables.iter().any(|var| var.name == name) {
+            return Err(RwStoreError::Format(format!(
+                "duplicate variable name '{name}'"
+            )));
+        }
+        u16::try_from(self.variables.len()).map_err(|_| {
+            RwStoreError::Format(format!(
+                "too many variables: var id for '{name}' exceeds u16"
+            ))
+        })
     }
 
     /// Assemble and atomically write the hour file, returning its metadata.
