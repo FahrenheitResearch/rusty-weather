@@ -10,8 +10,10 @@ pub mod format;
 pub mod grid;
 pub mod header;
 pub mod index;
+pub mod ingest;
 pub mod reader;
 pub mod run;
 pub mod writer;
 
 pub use error::{RwResult, RwStoreError};
+pub use ingest::{read_field_2d, write_hour_from_fields, PressureVolumeInput, WrittenHour};
