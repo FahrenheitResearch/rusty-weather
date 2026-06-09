@@ -220,8 +220,10 @@ impl HourReader {
     /// Read the half-open window `[x0,x1) x [y0,y1)` of `name`, clamped to
     /// the grid. Only tiles intersecting the window are touched: EMPTY tiles
     /// fill NaN and CONSTANT tiles fill their center without reading any
-    /// payload bytes; dense tiles are decompressed individually and only the
-    /// intersecting rows/cols are copied out.
+    /// payload bytes; dense tiles are decompressed individually (in parallel
+    /// when the window spans more than [`PARALLEL_TILE_THRESHOLD`] tiles,
+    /// same as [`Self::read_full_2d`]) and only the intersecting rows/cols
+    /// are copied out.
     pub fn read_window_2d(
         &self,
         name: &str,
@@ -243,33 +245,56 @@ impl HourReader {
         let wny = y1 - y0;
         let mut values = vec![f32::NAN; wny * wnx];
 
-        for ty in y0 / TILE_Y..=(y1 - 1) / TILE_Y {
-            for tx in x0 / TILE_X..=(x1 - 1) / TILE_X {
-                let record = self.chunk_record(var, KIND_TILE2D, ty, tx)?;
-                let (rows, cols) = self.tile_dims(ty, tx);
-                let (ty0, tx0) = (ty * TILE_Y, tx * TILE_X);
-                // Window/tile intersection in grid coordinates.
-                let gy0 = ty0.max(y0);
-                let gy1 = (ty0 + rows).min(y1);
-                let gx0 = tx0.max(x0);
-                let gx1 = (tx0 + cols).min(x1);
+        // Resolve every intersecting tile's record up front so index
+        // problems surface before any decompression work starts.
+        let jobs = (y0 / TILE_Y..=(y1 - 1) / TILE_Y)
+            .flat_map(|ty| (x0 / TILE_X..=(x1 - 1) / TILE_X).map(move |tx| (ty, tx)))
+            .map(|(ty, tx)| Ok((ty, tx, self.chunk_record(var, KIND_TILE2D, ty, tx)?)))
+            .collect::<RwResult<Vec<(usize, usize, &ChunkRecord)>>>()?;
 
-                if record.flags & FLAG_EMPTY != 0 {
-                    continue; // output is pre-filled with NaN
+        // Dense tiles decompress (in parallel above the threshold); EMPTY and
+        // CONSTANT tiles are handled from their records alone at placement.
+        let decode = |&(ty, tx, record): &(usize, usize, &ChunkRecord)| {
+            if record.flags & FLAG_EMPTY != 0
+                || (record.flags & FLAG_CONSTANT != 0 && record.len == 0)
+            {
+                return Ok(None);
+            }
+            let (rows, cols) = self.tile_dims(ty, tx);
+            Ok(Some(self.decode_tile(&var.name, record, rows * cols)?))
+        };
+        let decoded: Vec<Option<Vec<f32>>> = if jobs.len() > PARALLEL_TILE_THRESHOLD {
+            jobs.par_iter().map(decode).collect::<RwResult<_>>()?
+        } else {
+            jobs.iter().map(decode).collect::<RwResult<_>>()?
+        };
+
+        for (&(ty, tx, record), tile) in jobs.iter().zip(decoded) {
+            let (rows, cols) = self.tile_dims(ty, tx);
+            let (ty0, tx0) = (ty * TILE_Y, tx * TILE_X);
+            // Window/tile intersection in grid coordinates.
+            let gy0 = ty0.max(y0);
+            let gy1 = (ty0 + rows).min(y1);
+            let gx0 = tx0.max(x0);
+            let gx1 = (tx0 + cols).min(x1);
+
+            match tile {
+                None if record.flags & FLAG_EMPTY != 0 => {
+                    // Output is pre-filled with NaN.
                 }
-                if record.flags & FLAG_CONSTANT != 0 && record.len == 0 {
+                None => {
                     for gy in gy0..gy1 {
                         let out = (gy - y0) * wnx;
                         values[out + (gx0 - x0)..out + (gx1 - x0)].fill(record.center);
                     }
-                    continue;
                 }
-                let tile = self.decode_tile(&var.name, record, rows * cols)?;
-                for gy in gy0..gy1 {
-                    let src = (gy - ty0) * cols;
-                    let out = (gy - y0) * wnx;
-                    values[out + (gx0 - x0)..out + (gx1 - x0)]
-                        .copy_from_slice(&tile[src + (gx0 - tx0)..src + (gx1 - tx0)]);
+                Some(tile) => {
+                    for gy in gy0..gy1 {
+                        let src = (gy - ty0) * cols;
+                        let out = (gy - y0) * wnx;
+                        values[out + (gx0 - x0)..out + (gx1 - x0)]
+                            .copy_from_slice(&tile[src + (gx0 - tx0)..src + (gx1 - tx0)]);
+                    }
                 }
             }
         }
