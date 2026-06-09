@@ -5,6 +5,7 @@ members = [
     "crates/rustwx-core",
     "crates/rustwx-io",
     "crates/rustwx-models",
+    "crates/rustwx-products",
     "crates/rustwx-regrid",
     "crates/rustwx-render",
     "crates/rustwx-sounding",
