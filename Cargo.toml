@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/rw-store",
     "crates/rustwx-calc",
     "crates/rustwx-contour",
     "crates/rustwx-core",
