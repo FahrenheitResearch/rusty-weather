@@ -98,8 +98,16 @@ impl RwsHeader {
             )));
         }
 
-        let expected_payload_offset =
-            index_offset + index_count * INDEX_RECORD_LEN as u64;
+        // Checked math: a hostile index_count must not be able to wrap the
+        // multiply (release) or panic on overflow (debug).
+        let expected_payload_offset = index_count
+            .checked_mul(INDEX_RECORD_LEN as u64)
+            .and_then(|index_bytes| index_offset.checked_add(index_bytes))
+            .ok_or_else(|| {
+                RwStoreError::Format(format!(
+                    "index_count {index_count} overflows the index size computation"
+                ))
+            })?;
         if payload_offset != expected_payload_offset {
             return Err(RwStoreError::Format(format!(
                 "inconsistent payload_offset: expected {expected_payload_offset}, got {payload_offset}"
@@ -127,6 +135,22 @@ mod tests {
         assert_eq!(packed.len(), 64);
         let h2 = RwsHeader::parse(&packed).unwrap();
         assert_eq!(h, h2);
+    }
+
+    #[test]
+    fn header_rejects_overflowing_index_count() {
+        // Regression: index_count chosen so count * 64 wraps u64 to 0 made the
+        // unchecked math pass validation and later panic on Vec::with_capacity.
+        let mut packed = RwsHeader::for_layout(0, 0).pack();
+        packed[16..24].copy_from_slice(&(1u64 << 58).to_le_bytes());
+        let err = RwsHeader::parse(&packed).unwrap_err();
+        match err {
+            RwStoreError::Format(msg) => assert!(
+                msg.contains("overflow"),
+                "expected overflow message, got: {msg}"
+            ),
+            other => panic!("expected Format error, got {other:?}"),
+        }
     }
 
     #[test]
