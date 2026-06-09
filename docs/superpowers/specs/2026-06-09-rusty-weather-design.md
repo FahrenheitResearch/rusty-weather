@@ -111,14 +111,14 @@ Ported crates keep their existing names — renaming ~185K lines of imports buys
 | Crate | Action |
 |---|---|
 | `rustwx-core` | port as-is |
-| `rustwx-models` | port; keep only the 6 target models' registries, cycles, sources, URL builders |
+| `rustwx-models` | port whole, then prune in stages: a `supported_models()` catalog surface gates user-facing enumeration to the 6 targets immediately; deep removal of other models' registry/recipe code happens after the daemon exists and dead code is provable (ModelId match arms thread through rustwx-products, so premature enum surgery multiplies extraction risk) |
 | `rustwx-io` | port; byte-range fetch, idx parsing, selector extraction, cache layer |
 | `rustwx-render` | port as-is (plots are dialed in; custom projections, no PROJ) |
 | `rustwx-contour` | port as-is |
 | `rustwx-calc` | port as-is (CAPE/ECAPE/severe diagnostics) |
 | `rustwx-sounding` | port as-is |
 | `rustwx-regrid` | port as-is |
-| `rustwx-products` | port **pruned**: keep direct/derived/gridded product planning and recipes for the 6 models; drop satellite, radar, lightning, mesoanalysis, intelligence, wxmod, places/POI, publication/provenance, wxstore_* (replaced by rw-store) — roughly 40% of its 87K lines stays behind |
+| `rustwx-products` | port **pruned**: keep direct/derived/gridded product planning and recipes, plus their load-bearing infrastructure (`places` city-label overlays are part of the plot look; `publication` provides atomic writes/run manifests); drop satellite, radar, lightning, mesoanalysis, intelligence, agent/orchestrator, custom POI, publication provenance, native datasets, wxstore_*/volume_store (replaced by rw-store) — roughly 40% of its 87K lines stays behind |
 | `rustwx-cross-section` | not ported in v1; earmarked for v1.5 |
 
 **New crates:** `rw-store` (format above), `rw-server` (axum app, scheduler, job model), thin `rusty-weather` bin crate.
