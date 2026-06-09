@@ -144,22 +144,24 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ```powershell
 $src = 'C:\Users\drew\rustwx-fastplots-wt\vendor'
 New-Item -ItemType Directory -Force vendor | Out-Null
-foreach ($c in 'wx-core','wx-math','wx-field','grib-core','metrust','ecape-rs','sharprs') {
+foreach ($c in 'wx-core','wx-math','wx-field','wx-radar','grib-core','metrust','ecape-rs','sharprs') {
   Copy-Item -Recurse "$src\$c" "vendor\$c"
 }
 ```
 
-Do NOT copy `wx-radar` or `netcrust` (radar/WRF-only — out of scope).
+Do NOT copy `netcrust` (WRF/NetCDF-only — out of scope). `wx-radar` rides along ONLY because `metrust` path-depends on it unconditionally (re-exports in its `io`/`plots` modules); copying it preserves metrust byte-for-byte. Nothing else may depend on wx-radar. *(Amended during execution — original plan excluded wx-radar.)*
 
-- [ ] **Step 2: Check each vendor crate compiles standalone**
+Add `"vendor/wx-radar",` to the workspace `exclude` list in the root `Cargo.toml`.
+
+- [ ] **Step 2: Check each vendor crate compiles standalone (except sharprs — deferred)**
 
 ```powershell
-foreach ($c in 'wx-core','wx-math','wx-field','grib-core','metrust','ecape-rs','sharprs') {
+foreach ($c in 'wx-core','wx-math','wx-field','wx-radar','grib-core','metrust','ecape-rs') {
   cargo check --manifest-path "vendor\$c\Cargo.toml"; if (-not $?) { Write-Error "FAILED: $c"; break }
 }
 ```
 
-Expected: each finishes with `Finished` and no errors. If any vendor crate has an internal path dep on a non-copied crate, STOP and report (none is expected to — `netcrust`'s hdf5 vendoring stays behind with it).
+Expected: each finishes with `Finished` and no errors. **sharprs is NOT checked here:** its `src/render/canvas.rs` does `include_bytes!("../../../../crates/rustwx-render/assets/fonts/SourceSans3-Regular.ttf")`, which only resolves after Task 6 copies the render crate. Its standalone check moves to Task 7 Step 3 (alongside rustwx-sounding). *(Amended during execution.)*
 
 - [ ] **Step 3: Commit**
 
