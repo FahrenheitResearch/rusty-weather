@@ -1,11 +1,13 @@
 [workspace]
 members = [
+    "crates/rustwx-calc",
     "crates/rustwx-contour",
     "crates/rustwx-core",
     "crates/rustwx-io",
     "crates/rustwx-models",
     "crates/rustwx-regrid",
     "crates/rustwx-render",
+    "crates/rustwx-sounding",
 ]
 exclude = [
     "vendor/ecape-rs",
