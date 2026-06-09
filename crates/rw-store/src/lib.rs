@@ -7,9 +7,11 @@ pub mod atomic;
 pub mod codec;
 pub mod error;
 pub mod format;
+pub mod grid;
 pub mod header;
 pub mod index;
 pub mod reader;
+pub mod run;
 pub mod writer;
 
 pub use error::{RwResult, RwStoreError};
