@@ -353,6 +353,13 @@ impl GridLocator {
     /// Invert (lat, lon) to fractional grid coordinates (fx, fy), where
     /// integer values land exactly on grid points. Returns `None` for
     /// non-finite input or points far outside the grid. Allocation-free.
+    ///
+    /// Known limit: on lon-periodic 0-360 grids (e.g. GFS global) the
+    /// one-cell-wide seam between the last and first column has no
+    /// bracketing cell, so queries there fall back to the nearest grid
+    /// point (worst case ~half a cell off). Dateline-CROSSING cells invert
+    /// fine; only the periodic wrap cell is unmodeled. Revisit if sub-cell
+    /// seam accuracy ever matters.
     pub fn locate(&self, lat: f64, lon: f64) -> Option<(f64, f64)> {
         if !lat.is_finite() || !lon.is_finite() {
             return None;
