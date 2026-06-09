@@ -3,10 +3,12 @@
 //! windowed (regional) reads, and 3D pressure-level fields as quantized
 //! affine-i16 column chunks laid out for fast single-point sounding pulls.
 
+pub mod atomic;
 pub mod codec;
 pub mod error;
 pub mod format;
 pub mod header;
 pub mod index;
+pub mod writer;
 
 pub use error::{RwResult, RwStoreError};
