@@ -42,6 +42,7 @@ pub struct ChunkRecord {
 impl ChunkRecord {
     /// Append exactly 64 bytes to `out`.
     pub fn pack_into(&self, out: &mut Vec<u8>) {
+        out.reserve(64);
         out.extend_from_slice(&self.var_id.to_le_bytes()); // 0-1
         out.push(self.kind); // 2
         out.push(self.flags); // 3
