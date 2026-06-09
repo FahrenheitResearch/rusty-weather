@@ -771,14 +771,16 @@ fn structured_selector_matches_supported_upper_air_subset() {
     );
     assert!(uh_2_5km.matches(&uh_message));
 
+    // Off-grid isobaric levels (not a 25 hPa multiple in 100..=1000) stay
+    // unsupported; 500 mb dewpoint and 925 mb vorticity are now on-grid.
     assert!(matches!(
-        StructuredMessageSelector::try_from(FieldSelector::isobaric(CanonicalField::Dewpoint, 500)),
+        StructuredMessageSelector::try_from(FieldSelector::isobaric(CanonicalField::Dewpoint, 510)),
         Err(IoError::UnsupportedStructuredSelector { .. })
     ));
     assert!(matches!(
         StructuredMessageSelector::try_from(FieldSelector::isobaric(
             CanonicalField::AbsoluteVorticity,
-            925
+            935
         )),
         Err(IoError::UnsupportedStructuredSelector { .. })
     ));

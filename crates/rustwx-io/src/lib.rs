@@ -1586,7 +1586,7 @@ impl TryFrom<FieldSelector> for StructuredMessageSelector {
                 field: CanonicalField::Dewpoint,
                 vertical: VerticalSelector::IsobaricHpa(level_hpa),
                 ..
-            } if matches!(level_hpa, 700 | 850) => Ok(Self {
+            } if is_supported_upper_air_level(level_hpa) => Ok(Self {
                 parameters: PARAMETER_DPT,
                 level: LevelMatch::IsobaricHpa(level_hpa),
                 units: "K",
@@ -1885,8 +1885,12 @@ impl TryFrom<FieldSelector> for StructuredMessageSelector {
     }
 }
 
+/// Upper-air levels the structured extractor will select: every 25 hPa from
+/// 100 to 1000 inclusive — the operational plot levels plus the dense
+/// store-ingest grid. Levels a product file does not carry surface as
+/// partial-extraction misses, not errors.
 fn is_supported_upper_air_level(level_hpa: u16) -> bool {
-    matches!(level_hpa, 200 | 250 | 300 | 500 | 700 | 850)
+    (100..=1000).contains(&level_hpa) && level_hpa % 25 == 0
 }
 
 impl LevelMatch {
