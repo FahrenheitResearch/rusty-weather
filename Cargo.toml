@@ -1,5 +1,9 @@
 [workspace]
-members = []
+members = [
+    "crates/rustwx-contour",
+    "crates/rustwx-core",
+    "crates/rustwx-regrid",
+]
 exclude = [
     "vendor/ecape-rs",
     "vendor/grib-core",
