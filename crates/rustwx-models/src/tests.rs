@@ -47,6 +47,26 @@ fn built_in_models_are_real() {
 }
 
 #[test]
+fn catalog_exposes_exactly_the_six_supported_models() {
+    let expected = [
+        ModelId::Hrrr,
+        ModelId::Gfs,
+        ModelId::RrfsA,
+        ModelId::Refs,
+        ModelId::Nbm,
+        ModelId::Rap,
+    ];
+    assert_eq!(supported_models(), expected);
+
+    // Every supported model must have real registry plumbing behind it.
+    for model in supported_models() {
+        let summary = model_summary(model);
+        assert_eq!(summary.id, model);
+        assert!(!summary.default_product.is_empty());
+    }
+}
+
+#[test]
 fn canonical_bundle_products_resolve_through_model_adapter() {
     let hrrr_surface = resolve_canonical_bundle_product(
         ModelId::Hrrr,

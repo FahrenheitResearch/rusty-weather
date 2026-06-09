@@ -5726,6 +5726,21 @@ pub fn built_in_models() -> &'static [ModelSummary] {
     MODELS
 }
 
+/// The models rusty-weather exposes to users. The wider registry returned by
+/// [`built_in_models`] remains linked (`ModelId` match arms thread through
+/// rustwx-products), but every user-facing enumeration must go through this
+/// list.
+pub fn supported_models() -> [ModelId; 6] {
+    [
+        ModelId::Hrrr,
+        ModelId::Gfs,
+        ModelId::RrfsA,
+        ModelId::Refs,
+        ModelId::Nbm,
+        ModelId::Rap,
+    ]
+}
+
 pub fn built_in_plot_recipes() -> &'static [PlotRecipe] {
     PLOT_RECIPES
 }
