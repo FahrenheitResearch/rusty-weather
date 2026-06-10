@@ -18,7 +18,7 @@ use chrono::{DateTime, Datelike, Timelike, Utc};
 
 use rw_store::atomic::atomic_write_bytes;
 
-use crate::goes::GoesSatellite;
+use crate::goes::{GoesSatellite, parse_goes_abi_filename};
 
 /// One listed S3 object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,8 +221,13 @@ pub fn list_s3_objects(
     Ok(objects)
 }
 
-/// Download `object` into `cache_dir/satellite/{bucket}/{key}` (atomic
-/// write); a cache hit is an existing file with the exact listed byte size.
+/// Local cache path of one object: `cache_dir/satellite/{bucket}/{key}`.
+pub fn cached_object_path(cache_dir: &Path, bucket: &str, key: &str) -> PathBuf {
+    cache_dir.join("satellite").join(bucket).join(key)
+}
+
+/// Download `object` into [`cached_object_path`] (atomic write); a cache
+/// hit is an existing file with the exact listed byte size.
 pub fn download_object(
     agent: &ureq::Agent,
     bucket: &str,
@@ -230,7 +235,7 @@ pub fn download_object(
     object: &S3Object,
     use_cache: bool,
 ) -> Result<DownloadedObject, Box<dyn Error>> {
-    let target = cache_dir.join("satellite").join(bucket).join(&object.key);
+    let target = cached_object_path(cache_dir, bucket, &object.key);
     if use_cache && target.exists() && target.metadata()?.len() == object.size_bytes {
         return Ok(DownloadedObject {
             object: object.clone(),
@@ -263,6 +268,79 @@ pub fn download_object(
         path: target,
         cache_hit: false,
     })
+}
+
+/// What one [`prune_object_cache`] pass removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CachePruneReport {
+    pub removed_files: usize,
+    pub removed_bytes: u64,
+}
+
+/// Best-effort sweep of the raw object cache under
+/// `cache_dir/satellite/{bucket}`: every file whose scan start (the
+/// filename `s` token, via [`parse_goes_abi_filename`]) — or modified time
+/// when the name does not parse — is older than `cutoff` is deleted, and
+/// directories left empty are removed (downloads recreate them). The cache
+/// is exempt from the store's `enforce_window`, so without this sweep a
+/// continuous follow grows disk without bound. Individual IO errors skip
+/// the entry: cache housekeeping must never kill the poller.
+pub fn prune_object_cache(
+    cache_dir: &Path,
+    bucket: &str,
+    cutoff: DateTime<Utc>,
+) -> CachePruneReport {
+    let mut report = CachePruneReport::default();
+    let root = cache_dir.join("satellite").join(bucket);
+    let mut dirs = vec![root];
+    let mut index = 0;
+    while index < dirs.len() {
+        let dir = dirs[index].clone();
+        index += 1;
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let age_reference = parse_goes_abi_filename(&path)
+                .map(|parsed| parsed.start_time_utc)
+                .ok()
+                .or_else(|| {
+                    entry
+                        .metadata()
+                        .ok()
+                        .and_then(|meta| meta.modified().ok())
+                        .map(DateTime::<Utc>::from)
+                });
+            let Some(when) = age_reference else {
+                continue;
+            };
+            if when >= cutoff {
+                continue;
+            }
+            let bytes = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+            if std::fs::remove_file(&path).is_ok() {
+                report.removed_files += 1;
+                report.removed_bytes += bytes;
+            }
+        }
+    }
+    // Deepest-first so cascading empties collapse (`.../18` first, then a
+    // now-empty `.../161`, and so on up to the bucket dir itself).
+    for dir in dirs.iter().rev() {
+        let _ = std::fs::remove_dir(dir); // refuses (keeps) non-empty dirs
+    }
+    report
 }
 
 struct S3ListPage {
@@ -456,6 +534,69 @@ mod tests {
     fn query_encoding_escapes_reserved_bytes() {
         assert_eq!(url_query_encode("a/b c+d"), "a%2Fb%20c%2Bd");
         assert_eq!(url_query_encode("OR_ABI-L2"), "OR_ABI-L2");
+    }
+
+    #[test]
+    fn cache_prune_removes_stale_objects_and_empty_dirs() {
+        let dir = std::env::temp_dir().join(format!(
+            "rw-sat-cache-prune-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bucket = "noaa-goes19";
+        let old_key = "ABI-L2-CMIPC/2026/161/18/OR_ABI-L2-CMIPC-M6C13_G19_s20261611851176_e20261611853549_c20261611854020.nc";
+        let new_key = "ABI-L2-CMIPC/2026/161/19/OR_ABI-L2-CMIPC-M6C13_G19_s20261611901176_e20261611903549_c20261611904020.nc";
+        for key in [old_key, new_key] {
+            let path = cached_object_path(&dir, bucket, key);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"netcdf bytes").unwrap();
+        }
+
+        // Cutoff between the two scan starts: 18:51 goes, 19:01 stays.
+        let cutoff = Utc.with_ymd_and_hms(2026, 6, 10, 18, 55, 0).unwrap();
+        let report = prune_object_cache(&dir, bucket, cutoff);
+        assert_eq!(report.removed_files, 1);
+        assert_eq!(report.removed_bytes, 12);
+        assert!(!cached_object_path(&dir, bucket, old_key).exists());
+        assert!(
+            !cached_object_path(&dir, bucket, old_key)
+                .parent()
+                .unwrap()
+                .exists(),
+            "emptied hour dir removed"
+        );
+        assert!(cached_object_path(&dir, bucket, new_key).is_file());
+
+        // Second pass is a no-op; a missing cache root never errors.
+        assert_eq!(prune_object_cache(&dir, bucket, cutoff), CachePruneReport::default());
+        assert_eq!(
+            prune_object_cache(&dir.join("absent"), bucket, cutoff),
+            CachePruneReport::default()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_prune_falls_back_to_mtime_for_unparseable_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "rw-sat-cache-prune-mtime-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bucket = "noaa-goes19";
+        let path = cached_object_path(&dir, bucket, "leftover.partial");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"junk").unwrap();
+
+        // Fresh mtime survives a cutoff in the past...
+        let kept = prune_object_cache(&dir, bucket, Utc::now() - chrono::Duration::hours(1));
+        assert_eq!(kept, CachePruneReport::default());
+        assert!(path.is_file());
+        // ... and falls to a cutoff beyond it.
+        let removed = prune_object_cache(&dir, bucket, Utc::now() + chrono::Duration::hours(1));
+        assert_eq!(removed.removed_files, 1);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

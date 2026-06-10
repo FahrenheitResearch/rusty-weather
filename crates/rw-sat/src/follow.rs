@@ -21,7 +21,8 @@ use crate::events::{SatError, SatEvent, other};
 use crate::goes::{GoesSatellite, parse_goes_abi_filename};
 use crate::s3::{
     DownloadedObject, S3Object, Sector, abi_filename_product_matches_request, band_hour_prefix,
-    bucket_for_satellite, build_agent, download_object, list_s3_objects, object_filename,
+    bucket_for_satellite, build_agent, cached_object_path, download_object, list_s3_objects,
+    object_filename, prune_object_cache,
 };
 use crate::store::{WrittenFrame, downsample_field, frame_time, write_band_frame};
 use crate::window::{WindowConfig, enforce_window};
@@ -453,6 +454,21 @@ pub fn follow(
                         written_unix,
                         &mut *sink,
                     );
+                    // The store frame is the artifact of record; the raw
+                    // cached object never helps this session again
+                    // (SeenScans dedups) nor a restart (manifest-primed
+                    // dedup skips the fetch entirely). Dropping it on
+                    // success keeps the cache footprint bounded; dropping
+                    // it on failure makes the retry refetch fresh bytes
+                    // instead of replaying a size-matched corrupt cache
+                    // hit.
+                    if !matches!(result, Err(SatError::Cancelled)) {
+                        let _ = std::fs::remove_file(cached_object_path(
+                            &config.cache_dir,
+                            &bucket,
+                            &object.key,
+                        ));
+                    }
                     let (_download, frame) = result?;
                     summary.downloaded_keys.push(object.key.clone());
                     summary.frames.push(frame.clone());
@@ -519,6 +535,25 @@ pub fn follow(
         // Dedup memory stays bounded: anything older than a day is gone
         // from the hour prefixes we poll anyway.
         seen.prune_older_than(Utc::now() - chrono::Duration::days(1));
+        // The raw-object cache obeys the rolling window too: each ingest
+        // already deletes its own cached object (above); this sweep catches
+        // leftovers — interrupted sessions, repeatedly failing objects —
+        // so a 24/7 follow keeps a bounded disk footprint even though
+        // `enforce_window` only knows the store. Without a max-age the
+        // sweep uses the same one-day horizon as the dedup set.
+        let cache_cutoff = Utc::now()
+            - chrono::Duration::minutes(i64::from(
+                config.window.max_age_minutes.unwrap_or(24 * 60),
+            ));
+        let pruned = prune_object_cache(&config.cache_dir, &bucket, cache_cutoff);
+        if pruned.removed_files > 0 {
+            sink(SatEvent::Info {
+                message: format!(
+                    "cache pruned: {} object(s), {} bytes",
+                    pruned.removed_files, pruned.removed_bytes
+                ),
+            });
+        }
 
         consecutive_errors = if poll_failed {
             consecutive_errors.saturating_add(1)
