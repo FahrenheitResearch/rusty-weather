@@ -1108,6 +1108,13 @@ fn decode_surface_cropped(
 fn decode_pressure_with_shape(
     bytes: &[u8],
 ) -> Result<(PressureFields, usize, usize), Box<dyn std::error::Error>> {
+    decode_pressure_with_shape_opts(bytes, pressure_optional_decode_enabled())
+}
+
+fn decode_pressure_with_shape_opts(
+    bytes: &[u8],
+    include_optional: bool,
+) -> Result<(PressureFields, usize, usize), Box<dyn std::error::Error>> {
     let file = Grib2File::from_bytes(bytes)?;
     let (nx, ny) = pressure_grid_shape_from_messages(&file.messages)?;
     let temperature = collect_levels(&file.messages, 0, 0, 0, 100)?;
@@ -1115,7 +1122,6 @@ fn decode_pressure_with_shape(
     let v_wind = collect_levels(&file.messages, 0, 2, 3, 100)?;
     let gh = decode_height_levels(&file.messages)?;
     let moisture = decode_pressure_mixing_ratio_levels(&file.messages, &temperature)?;
-    let include_optional = pressure_optional_decode_enabled();
     let omega = if include_optional {
         collect_optional_levels(&file.messages, 0, 2, 8, 100)?
     } else {
@@ -2048,6 +2054,42 @@ pub fn decode_native_cape_planes(
         mlcape_jkg: decode_optional_native_cape(&file.messages, NativeCapeLayer::MixedLayer)?,
         mucape_jkg: decode_optional_native_cape(&file.messages, NativeCapeLayer::MostUnstable)?,
     })
+}
+
+/// Decode the surface + pressure thermodynamic pair from raw family GRIB
+/// bytes exactly as the derived/heavy render lanes decode them: the same
+/// message matching, the same moisture preference (2 m and isobaric
+/// specific humidity first, then dewpoint, then RH), the same f64
+/// precision, and the same level alignment. The optional pressure volumes
+/// (omega, absolute vorticity, cloud species) are skipped — no
+/// store-computed recipe consumes them and the required arrays are
+/// unaffected by their presence (level alignment uses only the required
+/// five). The store ingest computes its derived and heavy grids from this
+/// pair so the stored grids are bit-identical to what the render lanes
+/// compute from the same files.
+pub fn decode_store_thermo_pair(
+    surface_bytes: &[u8],
+    pressure_bytes: &[u8],
+) -> Result<(SurfaceFields, PressureFields), Box<dyn std::error::Error>> {
+    let surface = decode_surface(surface_bytes)?;
+    let (pressure, nx, ny) = decode_pressure_with_shape_opts(pressure_bytes, false)?;
+    if nx != surface.nx || ny != surface.ny {
+        return Err(format!(
+            "pressure decode shape {nx}x{ny} did not match surface shape {}x{}",
+            surface.nx, surface.ny
+        )
+        .into());
+    }
+    let expected = surface.nx * surface.ny * pressure.pressure_levels_hpa.len();
+    if pressure.temperature_c_3d.len() != expected
+        || pressure.qvapor_kgkg_3d.len() != expected
+        || pressure.u_ms_3d.len() != expected
+        || pressure.v_ms_3d.len() != expected
+        || pressure.gh_m_3d.len() != expected
+    {
+        return Err("pressure decode fields did not match the surface grid shape".into());
+    }
+    Ok((surface, pressure))
 }
 
 #[derive(Debug, Clone, Copy)]

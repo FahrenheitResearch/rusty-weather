@@ -1,12 +1,15 @@
 //! Live GRIB -> `.rws` store ingest for HRRR-class models.
 //!
 //! Per forecast hour: fetch the `prs` product file (cache-aware), extract the
-//! full 3D isobaric superset plus the sparse per-level vorticity planes in
-//! ONE decode pass, fetch the `sfc` product file, extract the 2D surface set
-//! in ONE decode pass (plus one re-select for the trailing 1 h APCP window
-//! and a native-CAPE decode of the same bytes for the heavy ratio recipes),
-//! compute every non-heavy derived recipe grid AND every heavy ECAPE-class
-//! recipe grid while the extracted fields are still in RAM (see
+//! full 3D isobaric superset plus the sparse per-level vorticity planes AND
+//! every isobaric plane a supported direct plot recipe consumes (stored as
+//! bit-exact 2D variables named by selector key — the 3D volume codec is
+//! quantized, so render-grade isobaric planes must ride the lossless f32
+//! 2D codec) in ONE decode pass, fetch the `sfc` product file, extract the
+//! 2D surface set in ONE decode pass (plus one re-select for the trailing
+//! 1 h APCP window), decode the surface + pressure thermo pair through the
+//! render lanes' own products decoder, and compute every non-heavy derived
+//! recipe grid AND every heavy ECAPE-class recipe grid from that pair (see
 //! `ingest_compute`; stored as ordinary 2D variables named by recipe slug,
 //! selector = the `{"derived": ...}` marker; the heavy stage is gated by
 //! `--heavy`/`--no-heavy`, default on), then write the hour into
@@ -32,10 +35,10 @@ use rustwx_core::{
 use rustwx_io::{
     FetchRequest, extract_fields_partial_from_model_bytes_at_forecast_hour, fetch_bytes_with_cache,
 };
-use rustwx_models::model_summary;
+use rustwx_models::{model_summary, plot_recipe_fetch_plan};
 use rustwx_products::cache::{default_proof_cache_dir, ensure_dir};
 use rustwx_products::derived::{store_derived_recipe_slugs, store_heavy_recipe_slugs};
-use rustwx_products::gridded::{NativeCapePlanes, decode_native_cape_planes};
+use rustwx_products::direct::supported_direct_recipe_slugs;
 use rw_store::grid::GridFile;
 use rw_store::ingest::{
     DerivedFieldInput, PressureVolumeInput, derived_selector, read_field_2d, read_grid_2d,
@@ -45,7 +48,7 @@ use rw_store::reader::HourReader;
 
 #[path = "../ingest_compute.rs"]
 mod ingest_compute;
-use ingest_compute::{DerivedGrid2D, IngestVolumes, MoistureKind};
+use ingest_compute::DerivedGrid2D;
 
 /// The derived CAPE kernels allocate per-column scratch across every rayon
 /// thread; mimalloc handles that churn better than the default Windows heap
@@ -221,6 +224,32 @@ fn surface_plan() -> Vec<(&'static str, FieldSelector)> {
     ]
 }
 
+/// Every isobaric plane a supported direct plot recipe consumes for this
+/// model, derived from the recipe catalog's own fetch plans so coverage is
+/// provable rather than hand-maintained. These are stored as bit-exact 2D
+/// variables named by selector key (e.g. `geopotential_height_500hpa`):
+/// the 3D volume codec quantizes to i16 per chunk, so a render-grade plane
+/// must ride the lossless f32 2D codec to keep store-rendered plots
+/// pixel-identical to the GRIB lane. Absolute vorticity is excluded — it
+/// already ships through `VORTICITY_PLAN` under its stable store names.
+fn direct_isobaric_plane_selectors(model: ModelId) -> Vec<FieldSelector> {
+    let mut selectors = Vec::new();
+    for slug in supported_direct_recipe_slugs(model) {
+        let Ok(plan) = plot_recipe_fetch_plan(&slug, model) else {
+            continue;
+        };
+        for selector in plan.selectors() {
+            if matches!(selector.vertical, VerticalSelector::IsobaricHpa(_))
+                && selector.field != CanonicalField::AbsoluteVorticity
+                && !selectors.contains(&selector)
+            {
+                selectors.push(selector);
+            }
+        }
+    }
+    selectors
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "rw-ingest",
@@ -357,6 +386,7 @@ fn ingest_hour(
     let prs_mb = prs.result.bytes.len() as f64 / (1024.0 * 1024.0);
 
     let levels = candidate_levels();
+    let direct_planes = direct_isobaric_plane_selectors(args.model);
     let mut prs_selectors =
         Vec::with_capacity(VOLUME_PLAN.len() * levels.len() + VORTICITY_PLAN.len());
     for (field, _) in VOLUME_PLAN {
@@ -369,6 +399,14 @@ fn ingest_hour(
             CanonicalField::AbsoluteVorticity,
             *level,
         ));
+    }
+    // Direct-recipe isobaric planes ride the same decode pass; most are
+    // already in the volume superset (T/Td/U/V/Z), but e.g. isobaric RH is
+    // plane-only and joins the request here.
+    for selector in &direct_planes {
+        if !prs_selectors.contains(selector) {
+            prs_selectors.push(*selector);
+        }
     }
     let extract_started = Instant::now();
     let prs_extraction = extract_fields_partial_from_model_bytes_at_forecast_hour(
@@ -389,16 +427,21 @@ fn ingest_hour(
             levels: Vec::new(),
         })
         .collect();
-    let mut prs_fields_2d: Vec<(&'static str, SelectedField2D)> = Vec::new();
+    let mut prs_fields_2d: Vec<(String, SelectedField2D)> = Vec::new();
     for extracted in prs_extraction.extracted {
         let VerticalSelector::IsobaricHpa(level) = extracted.selector.vertical else {
             continue;
         };
         if extracted.selector.field == CanonicalField::AbsoluteVorticity {
             if let Some((_, name)) = VORTICITY_PLAN.iter().find(|(have, _)| *have == level) {
-                prs_fields_2d.push((name, extracted));
+                prs_fields_2d.push((name.to_string(), extracted));
             }
             continue;
+        }
+        // Direct-recipe planes are stored as bit-exact 2D variables under
+        // their selector key, in addition to (not instead of) the volume.
+        if direct_planes.contains(&extracted.selector) {
+            prs_fields_2d.push((extracted.selector.key(), extracted.clone()));
         }
         if let Some(volume) = volumes_data
             .iter_mut()
@@ -414,6 +457,12 @@ fn ingest_hour(
                 "f{hour:03}: 2D field '{name}' (absolute vorticity {level} hPa) \
                  missing from the prs file; skipped"
             );
+        }
+    }
+    for selector in &direct_planes {
+        let key = selector.key();
+        if !prs_fields_2d.iter().any(|(have, _)| *have == key) {
+            eprintln!("f{hour:03}: direct-recipe plane '{key}' missing from the prs file; skipped");
         }
     }
 
@@ -458,7 +507,8 @@ fn ingest_hour(
             }
         }
     }
-    drop(prs);
+    // `prs` stays alive: the derived/heavy compute stage decodes the
+    // thermo pair from the raw prs + sfc bytes below.
 
     // --- sfc product file: 2D surface set, one decode pass ---
     let sfc_fetch = FetchRequest {
@@ -485,7 +535,7 @@ fn ingest_hour(
     )?;
     let mut sfc_extract_ms = extract_started.elapsed().as_millis();
 
-    let mut fields_2d_owned: Vec<(&'static str, SelectedField2D)> = Vec::new();
+    let mut fields_2d_owned: Vec<(String, SelectedField2D)> = Vec::new();
     for (name, selector) in &surface_plan {
         match sfc_extraction
             .extracted
@@ -493,7 +543,10 @@ fn ingest_hour(
             .position(|field| field.selector == *selector)
         {
             Some(index) => {
-                fields_2d_owned.push((name, sfc_extraction.extracted.swap_remove(index)));
+                fields_2d_owned.push((
+                    name.to_string(),
+                    sfc_extraction.extracted.swap_remove(index),
+                ));
             }
             None => eprintln!(
                 "f{hour:03}: 2D field '{name}' ({}) missing from the sfc file; skipped",
@@ -526,7 +579,7 @@ fn ingest_hour(
         )?;
         sfc_extract_ms += apcp_started.elapsed().as_millis();
         match apcp_extraction.extracted.into_iter().next() {
-            Some(field) => fields_2d_owned.push(("apcp_1h", field)),
+            Some(field) => fields_2d_owned.push(("apcp_1h".to_string(), field)),
             None => eprintln!(
                 "f{hour:03}: 2D field 'apcp_1h' (trailing 1 h APCP window) \
                  missing from the sfc file; skipped"
@@ -536,33 +589,10 @@ fn ingest_hour(
         eprintln!("f{hour:03}: 2D field 'apcp_1h' has no trailing 1 h window at analysis; skipped");
     }
 
-    // Native CAPE planes for the heavy native-ratio recipes, decoded from
-    // the same sfc bytes via the products decode lane (the exact message
-    // matching + normalization the heavy render lane's SurfaceFields
-    // carries; rustwx-io's extraction applies the same scan-mode flip and
-    // longitude-row rotation, so the planes line up with the extracted
-    // grid). rustwx-core has no CAPE CanonicalField, so this is the only
-    // route to the GRIB CAPE messages. The GRIB index re-parses; only the
-    // (up to three) CAPE messages decode. Failure degrades to "no native
-    // ratio recipes", never a failed ingest.
-    let native_cape_started = Instant::now();
-    let native_cape = match decode_native_cape_planes(&sfc.result.bytes) {
-        Ok(planes) => planes,
-        Err(err) => {
-            eprintln!(
-                "f{hour:03}: native CAPE decode failed: {err}; \
-                 native-ratio heavy recipes will be skipped"
-            );
-            NativeCapePlanes::default()
-        }
-    };
-    sfc_extract_ms += native_cape_started.elapsed().as_millis();
-    drop(sfc);
-
     // Sparse prs-sourced planes ride behind the sfc set so the grid carrier
     // stays the first surface-plan field (both files share the HRRR grid;
     // the store write bit-verifies that).
-    let planned_2d = surface_plan.len() + 1 + VORTICITY_PLAN.len();
+    let planned_2d = surface_plan.len() + 1 + VORTICITY_PLAN.len() + direct_planes.len();
     fields_2d_owned.extend(prs_fields_2d);
     if fields_2d_owned.is_empty() {
         return Err(format!(
@@ -571,18 +601,23 @@ fn ingest_hour(
         .into());
     }
 
-    // --- derived + heavy precompute: every non-heavy recipe grid and every
-    //     heavy ECAPE-class recipe grid, while the extracted inputs are
-    //     still in RAM (no refetch, no redecode; inputs assembled once) ---
+    // --- derived + heavy precompute: decode the surface + pressure thermo
+    //     pair from the still-resident raw bytes through the render lanes'
+    //     own products decoder (same messages, same moisture preference,
+    //     same f64 precision — the stored grids are bit-identical to a
+    //     render-lane compute over the same files), then run every
+    //     non-heavy recipe grid and every heavy ECAPE-class recipe grid ---
     let planned_derived = store_derived_recipe_slugs().len();
     let planned_heavy = store_heavy_recipe_slugs().len();
     let stages = compute_product_grids(
-        &fields_2d_owned,
-        &volumes_data,
-        native_cape,
+        &sfc.result.bytes,
+        &prs.result.bytes,
         hour,
         heavy_enabled(args),
     );
+    drop(sfc);
+    drop(prs);
+    let thermo_decode_ms = stages.decode_ms;
     let derived_ms = stages.derived_ms;
     let heavy_ms = stages.heavy_ms;
     let derived_grids = stages.derived;
@@ -591,7 +626,7 @@ fn ingest_hour(
     // --- assemble + write ---
     let fields_2d: Vec<(&str, &SelectedField2D)> = fields_2d_owned
         .iter()
-        .map(|(name, field)| (*name, field))
+        .map(|(name, field)| (name.as_str(), field))
         .collect();
     let mut volumes: Vec<PressureVolumeInput<'_>> = Vec::new();
     for volume in &volumes_data {
@@ -652,7 +687,7 @@ fn ingest_hour(
         .collect::<Vec<_>>()
         .join(" ");
     println!(
-        "f{hour:03}: prs fetch {prs_fetch_ms} ms ({}, {prs_mb:.1} MB) | sfc fetch {sfc_fetch_ms} ms ({}, {sfc_mb:.1} MB) | extract prs {prs_extract_ms} ms, sfc {sfc_extract_ms} ms | derived {derived_ms} ms | heavy {heavy_ms} ms | encode {} ms | total {total_ms} ms | {} {:.1} MB | 2d {}/{} | derived {}/{planned_derived} | heavy {}/{planned_heavy} | 3d {volume_summary}",
+        "f{hour:03}: prs fetch {prs_fetch_ms} ms ({}, {prs_mb:.1} MB) | sfc fetch {sfc_fetch_ms} ms ({}, {sfc_mb:.1} MB) | extract prs {prs_extract_ms} ms, sfc {sfc_extract_ms} ms | thermo decode {thermo_decode_ms} ms | derived {derived_ms} ms | heavy {heavy_ms} ms | encode {} ms | total {total_ms} ms | {} {:.1} MB | 2d {}/{} | derived {}/{planned_derived} | heavy {}/{planned_heavy} | 3d {volume_summary}",
         cache_state(prs_cache_hit),
         cache_state(sfc_cache_hit),
         written.encode_ms,
@@ -688,83 +723,40 @@ fn cache_state(hit: bool) -> &'static str {
 }
 
 /// Both compute stages' outputs for one hour, with per-stage wall times.
-/// `derived_ms` covers input assembly + the non-heavy pass (matching what
-/// the pre-heavy ingest reported as "derived"); `heavy_ms` is the heavy
+/// `decode_ms` is the products-lane thermo pair decode (the stage's input
+/// assembly); `derived_ms` is the non-heavy pass; `heavy_ms` is the heavy
 /// ECAPE stage alone (height-AGL prep + ECAPE triplet + composites).
 #[derive(Default)]
 struct ComputedProductGrids {
     derived: Vec<DerivedGrid2D>,
     heavy: Vec<DerivedGrid2D>,
+    decode_ms: u128,
     derived_ms: u128,
     heavy_ms: u128,
 }
 
-/// Route the extracted hour into the products compute lanes: pick each
-/// volume slot by canonical field (the moisture slot is dewpoint_iso, or
-/// rh_iso after the extraction fallback), assemble the f64 inputs once,
-/// then run the non-heavy derived pass and the heavy ECAPE pass. Each
-/// stage degrades independently to "no variables from this stage", never
-/// a failed ingest — the extracted fields still carry the hour.
+/// Decode the thermo pair from the raw sfc + prs bytes through the render
+/// lanes' own products decoder, then run the non-heavy derived pass and
+/// (when enabled) the heavy ECAPE pass. Each stage degrades independently
+/// to "no variables from this stage", never a failed ingest — the
+/// extracted fields still carry the hour.
 fn compute_product_grids(
-    fields_2d: &[(&'static str, SelectedField2D)],
-    volumes_data: &[VolumeData],
-    native_cape: NativeCapePlanes,
+    surface_bytes: &[u8],
+    pressure_bytes: &[u8],
     hour: u16,
     heavy_enabled: bool,
 ) -> ComputedProductGrids {
-    let volume_levels = |field: CanonicalField| {
-        volumes_data
-            .iter()
-            .find(|volume| volume.field == field && volume.levels.len() >= 2)
-            .map(|volume| volume.levels.as_slice())
-    };
-    let missing = |name: &str| {
-        eprintln!(
-            "f{hour:03}: derived/heavy precompute skipped: 3D variable '{name}' \
-             realized < 2 levels"
-        );
-        ComputedProductGrids::default()
-    };
-    let Some(temperature_k) = volume_levels(CanonicalField::Temperature) else {
-        return missing("temperature_iso");
-    };
-    let Some(u_ms) = volume_levels(CanonicalField::UWind) else {
-        return missing("u_iso");
-    };
-    let Some(v_ms) = volume_levels(CanonicalField::VWind) else {
-        return missing("v_iso");
-    };
-    let Some(height_m) = volume_levels(CanonicalField::GeopotentialHeight) else {
-        return missing("height_iso");
-    };
-    let (moisture, moisture_kind) = match volume_levels(CanonicalField::Dewpoint) {
-        Some(levels) => (levels, MoistureKind::DewpointK),
-        None => match volume_levels(CanonicalField::RelativeHumidity) {
-            Some(levels) => (levels, MoistureKind::RelativeHumidityPct),
-            None => return missing("dewpoint_iso/rh_iso"),
-        },
-    };
-
-    let derived_started = Instant::now();
-    let inputs = match ingest_compute::assemble_products_inputs(
-        fields_2d,
-        &IngestVolumes {
-            temperature_k,
-            moisture,
-            moisture_kind,
-            u_ms,
-            v_ms,
-            height_m,
-        },
-        native_cape,
-    ) {
+    let decode_started = Instant::now();
+    let inputs = match ingest_compute::decode_products_inputs(surface_bytes, pressure_bytes) {
         Ok(inputs) => inputs,
         Err(err) => {
-            eprintln!("f{hour:03}: derived/heavy precompute skipped: {err}");
+            eprintln!("f{hour:03}: derived/heavy precompute skipped: thermo decode failed: {err}");
             return ComputedProductGrids::default();
         }
     };
+    let decode_ms = decode_started.elapsed().as_millis();
 
+    let derived_started = Instant::now();
     let derived = match ingest_compute::compute_derived_2d_from_inputs(&inputs) {
         Ok(grids) => grids,
         Err(err) => {
@@ -779,6 +771,7 @@ fn compute_product_grids(
         return ComputedProductGrids {
             derived,
             heavy: Vec::new(),
+            decode_ms,
             derived_ms,
             heavy_ms: 0,
         };
@@ -818,6 +811,7 @@ fn compute_product_grids(
     ComputedProductGrids {
         derived,
         heavy,
+        decode_ms,
         derived_ms,
         heavy_ms,
     }
@@ -830,7 +824,7 @@ fn compute_product_grids(
 /// value within the quantization bound.
 fn verify_hour(
     hour_path: &Path,
-    fields_2d: &[(&'static str, SelectedField2D)],
+    fields_2d: &[(String, SelectedField2D)],
     derived_grids: &[DerivedGrid2D],
     heavy_grids: &[DerivedGrid2D],
     volumes_data: &[VolumeData],
@@ -842,17 +836,22 @@ fn verify_hour(
         .join("grid.rwg");
     let grid = GridFile::open(&grid_path)?;
 
-    let (name, original) = &fields_2d[0];
-    let round_trip = read_field_2d(&reader, &grid, name)?;
-    let exact = round_trip.values.len() == original.values.len()
-        && round_trip
-            .values
-            .iter()
-            .zip(&original.values)
-            .all(|(a, b)| a.to_bits() == b.to_bits());
-    if !exact {
-        return Err(format!("verify: 2D round-trip of '{name}' is not bit-exact").into());
+    // Every extracted 2D field must round-trip bit-exactly — not just the
+    // first. (A sub-epsilon constant-tile shortcut in the f32 codec once
+    // flattened the 8 m smoke plane while temperature_2m verified clean.)
+    for (name, original) in fields_2d {
+        let round_trip = read_field_2d(&reader, &grid, name)?;
+        let exact = round_trip.values.len() == original.values.len()
+            && round_trip
+                .values
+                .iter()
+                .zip(&original.values)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+        if !exact {
+            return Err(format!("verify: 2D round-trip of '{name}' is not bit-exact").into());
+        }
     }
+    let name = &fields_2d[0].0;
 
     let mut derived_note = String::from("no derived vars");
     if let Some(derived) = derived_grids.first() {
@@ -949,8 +948,9 @@ fn verify_hour(
         profiles.push(format!("{}:{}", var.name, profile.len()));
     }
     println!(
-        "  verify ok: '{name}' bit-exact, {derived_note}, {heavy_note}, \
-         profiles at grid center [{}], values within quantization bound",
+        "  verify ok: all {} 2D fields bit-exact (first '{name}'), {derived_note}, \
+         {heavy_note}, profiles at grid center [{}], values within quantization bound",
+        fields_2d.len(),
         profiles.join(" ")
     );
     Ok(())
@@ -1050,12 +1050,20 @@ mod tests {
 
     #[test]
     fn heavy_flag_defaults_on_and_no_heavy_turns_it_off() {
-        let base = ["rw-ingest", "--date", "20260608", "--cycle", "0", "--hours", "6"];
+        let base = [
+            "rw-ingest",
+            "--date",
+            "20260608",
+            "--cycle",
+            "0",
+            "--hours",
+            "6",
+        ];
         let args = Args::try_parse_from(base).expect("default args parse");
         assert!(heavy_enabled(&args), "heavy must default ON");
 
-        let explicit = Args::try_parse_from(base.iter().copied().chain(["--heavy"]))
-            .expect("--heavy parses");
+        let explicit =
+            Args::try_parse_from(base.iter().copied().chain(["--heavy"])).expect("--heavy parses");
         assert!(heavy_enabled(&explicit));
 
         let off = Args::try_parse_from(base.iter().copied().chain(["--no-heavy"]))

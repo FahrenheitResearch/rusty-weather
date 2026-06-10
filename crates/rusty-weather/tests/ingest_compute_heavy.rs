@@ -1,151 +1,109 @@
 //! Wiring proof for the ingest heavy (ECAPE-class) precompute path:
-//! `sbecape` computed through `ingest_compute::assemble_products_inputs` +
-//! `compute_heavy_2d_from_inputs` must match calling the rustwx-calc ECAPE
-//! triplet kernel directly with identically prepared inputs, bit-exactly —
-//! same code path, same f32->f64 conversions, same mixing-ratio math, same
-//! height-AGL assembly, same per-level pressure vector. This proves the
-//! wiring (input assembly, level alignment, slug fan-out, native-CAPE
-//! plumbing), not the science, which lives in rustwx-calc/metrust and is
-//! tested there.
+//! `sbecape` computed through `ingest_compute::compute_heavy_2d_from_inputs`
+//! must match calling the rustwx-calc ECAPE triplet kernel directly with
+//! identically prepared inputs, bit-exactly — same code path, same
+//! height-AGL assembly, same per-level pressure vector, same slug fan-out
+//! and native-CAPE plumbing, same final f64 -> f32 cast. Input decode no
+//! longer lives in the ingest module: the surface/pressure pair comes from
+//! the render lanes' own products decoder
+//! (`rustwx_products::gridded::decode_store_thermo_pair`, which also
+//! carries the native CAPE planes), so this test constructs the decoded
+//! pair directly and pins the compute fan-out.
 
 use rustwx_calc::{
     EcapeTripletOptions, EcapeVolumeInputs, GridShape as CalcGridShape, SurfaceInputs,
     compute_ecape_triplet_with_failure_mask_from_parts,
 };
-use rustwx_core::{CanonicalField, FieldSelector, GridShape, LatLonGrid, SelectedField2D};
 use rustwx_products::derived::store_heavy_recipe_slugs;
-use rustwx_products::gridded::{NativeCapePlanes, mixing_ratio_from_dewpoint_k};
+use rustwx_products::gridded::{PressureFields, SurfaceFields, mixing_ratio_from_dewpoint_k};
 
 // The bin-shared module carries both compute stages; this test exercises
 // only the heavy lane, so the non-heavy entry is intentionally unused here.
 #[path = "../src/ingest_compute.rs"]
 #[allow(dead_code)]
 mod ingest_compute;
-use ingest_compute::{IngestVolumes, MoistureKind};
+use ingest_compute::ProductsComputeInputs;
 
 const NX: usize = 3;
 const NY: usize = 2;
 const NXY: usize = NX * NY;
-/// Descending pressure (ground up) — the canonical aligned order. Deeper
-/// than the derived test's profile: ECAPE's entraining ascent and storm
-/// motion need a full troposphere to produce finite values.
+/// Descending pressure (ground up) — the order the decode lane aligns to.
+/// Deeper than the derived test's profile: ECAPE's entraining ascent and
+/// storm motion need a full troposphere to produce finite values.
 const LEVELS: [u16; 9] = [1000, 925, 850, 700, 500, 400, 300, 250, 200];
 const NZ: usize = LEVELS.len();
-
-fn grid() -> LatLonGrid {
-    let mut lat = Vec::with_capacity(NXY);
-    let mut lon = Vec::with_capacity(NXY);
-    for y in 0..NY {
-        for x in 0..NX {
-            lat.push(35.0 + 0.01 * y as f32);
-            lon.push(-97.0 + 0.01 * x as f32);
-        }
-    }
-    LatLonGrid::new(GridShape::new(NX, NY).unwrap(), lat, lon).unwrap()
-}
-
-fn field(selector: FieldSelector, units: &str, values: Vec<f32>) -> SelectedField2D {
-    SelectedField2D::new(selector, units, grid(), values).unwrap()
-}
 
 /// A warm, moist, strongly sheared synthetic hour with a conditionally
 /// unstable troposphere: enough instability and shear that sbecape is
 /// finite and nonzero somewhere, so the comparison is not all-NaN-trivial.
 struct Synthetic {
-    fields_2d: Vec<(&'static str, SelectedField2D)>,
-    temperature_k: Vec<(u16, Vec<f32>)>,
-    dewpoint_k: Vec<(u16, Vec<f32>)>,
-    u_ms: Vec<(u16, Vec<f32>)>,
-    v_ms: Vec<(u16, Vec<f32>)>,
-    height_m: Vec<(u16, Vec<f32>)>,
+    lat: Vec<f64>,
+    lon: Vec<f64>,
+    psfc_pa: Vec<f64>,
+    t2_k: Vec<f64>,
+    q2_kgkg: Vec<f64>,
+    u10_ms: Vec<f64>,
+    v10_ms: Vec<f64>,
+    orog_m: Vec<f64>,
+    temperature_k: Vec<(u16, Vec<f64>)>,
+    dewpoint_k: Vec<(u16, Vec<f64>)>,
+    u_ms: Vec<(u16, Vec<f64>)>,
+    v_ms: Vec<(u16, Vec<f64>)>,
+    height_m: Vec<(u16, Vec<f64>)>,
 }
 
 fn synthetic() -> Synthetic {
-    let psfc: Vec<f32> = (0..NXY).map(|ij| 97_500.0 + 50.0 * ij as f32).collect();
-    let t2: Vec<f32> = (0..NXY).map(|ij| 302.0 + 0.3 * ij as f32).collect();
-    let td2: Vec<f32> = (0..NXY).map(|ij| 296.0 + 0.2 * ij as f32).collect();
-    let u10: Vec<f32> = (0..NXY).map(|ij| 3.0 + 0.5 * ij as f32).collect();
-    let v10: Vec<f32> = (0..NXY).map(|ij| 6.0 - 0.25 * ij as f32).collect();
-    let orog: Vec<f32> = (0..NXY).map(|ij| 100.0 + 5.0 * ij as f32).collect();
-
-    let fields_2d = vec![
-        (
-            "temperature_2m",
-            field(
-                FieldSelector::height_agl(CanonicalField::Temperature, 2),
-                "K",
-                t2,
-            ),
-        ),
-        (
-            "dewpoint_2m",
-            field(
-                FieldSelector::height_agl(CanonicalField::Dewpoint, 2),
-                "K",
-                td2,
-            ),
-        ),
-        (
-            "u_10m",
-            field(
-                FieldSelector::height_agl(CanonicalField::UWind, 10),
-                "m s-1",
-                u10,
-            ),
-        ),
-        (
-            "v_10m",
-            field(
-                FieldSelector::height_agl(CanonicalField::VWind, 10),
-                "m s-1",
-                v10,
-            ),
-        ),
-        (
-            "surface_pressure",
-            field(FieldSelector::surface(CanonicalField::Pressure), "Pa", psfc),
-        ),
-        (
-            "orography",
-            field(
-                FieldSelector::surface(CanonicalField::GeopotentialHeight),
-                "gpm",
-                orog,
-            ),
-        ),
-    ];
+    let mut lat = Vec::with_capacity(NXY);
+    let mut lon = Vec::with_capacity(NXY);
+    for y in 0..NY {
+        for x in 0..NX {
+            lat.push(35.0 + 0.01 * y as f64);
+            lon.push(-97.0 + 0.01 * x as f64);
+        }
+    }
+    let psfc_pa: Vec<f64> = (0..NXY).map(|ij| 97_500.0 + 50.0 * ij as f64).collect();
+    let t2_k: Vec<f64> = (0..NXY).map(|ij| 302.0 + 0.3 * ij as f64).collect();
+    let td2_k: Vec<f64> = (0..NXY).map(|ij| 296.0 + 0.2 * ij as f64).collect();
+    let q2_kgkg: Vec<f64> = psfc_pa
+        .iter()
+        .zip(td2_k.iter())
+        .map(|(&psfc, &td_k)| mixing_ratio_from_dewpoint_k(psfc / 100.0, td_k))
+        .collect();
+    let u10_ms: Vec<f64> = (0..NXY).map(|ij| 3.0 + 0.5 * ij as f64).collect();
+    let v10_ms: Vec<f64> = (0..NXY).map(|ij| 6.0 - 0.25 * ij as f64).collect();
+    let orog_m: Vec<f64> = (0..NXY).map(|ij| 100.0 + 5.0 * ij as f64).collect();
 
     // Per-level base values keyed on (k, ij) so any reordering or
     // misalignment of levels/planes changes values and breaks the
     // bit-compare. The profile is a loaded, sheared springtime sounding.
-    let plane = |bases: [f32; NZ], dij: f32| -> Vec<(u16, Vec<f32>)> {
+    let plane = |bases: [f64; NZ], dij: f64| -> Vec<(u16, Vec<f64>)> {
         LEVELS
             .iter()
             .zip(bases.iter())
             .map(|(&level, &base)| {
                 (
                     level,
-                    (0..NXY).map(|ij| base + dij * ij as f32).collect::<Vec<f32>>(),
+                    (0..NXY)
+                        .map(|ij| base + dij * ij as f64)
+                        .collect::<Vec<f64>>(),
                 )
             })
             .collect()
     };
     let temperature_k = plane(
-        [300.0, 295.0, 290.0, 279.0, 258.0, 246.0, 230.0, 221.0, 213.0],
+        [
+            300.0, 295.0, 290.0, 279.0, 258.0, 246.0, 230.0, 221.0, 213.0,
+        ],
         0.2,
     );
     let dewpoint_k = plane(
-        [295.0, 292.0, 287.0, 271.0, 244.0, 230.0, 214.0, 205.0, 197.0],
+        [
+            295.0, 292.0, 287.0, 271.0, 244.0, 230.0, 214.0, 205.0, 197.0,
+        ],
         0.15,
     );
-    let u_ms = plane(
-        [4.0, 9.0, 13.0, 18.0, 24.0, 28.0, 33.0, 36.0, 38.0],
-        0.3,
-    );
-    let v_ms = plane(
-        [8.0, 11.0, 9.0, 6.0, 4.0, 3.0, 2.0, 1.0, 0.0],
-        -0.2,
-    );
+    let u_ms = plane([4.0, 9.0, 13.0, 18.0, 24.0, 28.0, 33.0, 36.0, 38.0], 0.3);
+    let v_ms = plane([8.0, 11.0, 9.0, 6.0, 4.0, 3.0, 2.0, 1.0, 0.0], -0.2);
     // Geopotential heights: above the orography and strictly increasing by
     // far more than the +1 m monotonic clamp, so the AGL assembly is a pure
     // (gh - orog) on this data.
@@ -157,7 +115,14 @@ fn synthetic() -> Synthetic {
     );
 
     Synthetic {
-        fields_2d,
+        lat,
+        lon,
+        psfc_pa,
+        t2_k,
+        q2_kgkg,
+        u10_ms,
+        v10_ms,
+        orog_m,
         temperature_k,
         dewpoint_k,
         u_ms,
@@ -166,13 +131,9 @@ fn synthetic() -> Synthetic {
     }
 }
 
-fn to_f64(values: &[f32]) -> Vec<f64> {
-    values.iter().map(|&value| f64::from(value)).collect()
-}
-
-/// Flatten `(level, plane)` pairs into `[k][ij]` f64 in LEVELS order with a
-/// per-value conversion — the reference prep the ingest path must match.
-fn flatten_with(planes: &[(u16, Vec<f32>)], convert: impl Fn(f32) -> f64) -> Vec<f64> {
+/// Flatten `(level, plane)` pairs into `[k][ij]` in LEVELS order with a
+/// per-value conversion — the layout the decode lane hands over.
+fn flatten_with(planes: &[(u16, Vec<f64>)], convert: impl Fn(f64) -> f64) -> Vec<f64> {
     let mut out = Vec::with_capacity(NZ * NXY);
     for &level in &LEVELS {
         let (_, plane) = planes
@@ -182,6 +143,74 @@ fn flatten_with(planes: &[(u16, Vec<f32>)], convert: impl Fn(f32) -> f64) -> Vec
         out.extend(plane.iter().map(|&value| convert(value)));
     }
     out
+}
+
+fn native_planes() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    (
+        (0..NXY).map(|ij| 600.0 + 40.0 * ij as f64).collect(),
+        (0..NXY).map(|ij| 450.0 + 30.0 * ij as f64).collect(),
+        (0..NXY).map(|ij| 700.0 + 25.0 * ij as f64).collect(),
+    )
+}
+
+/// The decoded pair exactly as `decode_store_thermo_pair` shapes it, with
+/// optional native CAPE planes riding on the surface fields.
+fn decoded_inputs(synthetic: &Synthetic, with_native_cape: bool) -> ProductsComputeInputs {
+    let qvapor_kgkg_3d: Vec<f64> = LEVELS
+        .iter()
+        .flat_map(|&level| {
+            let (_, plane) = synthetic
+                .dewpoint_k
+                .iter()
+                .find(|(have, _)| *have == level)
+                .unwrap();
+            plane
+                .iter()
+                .map(move |&td_k| mixing_ratio_from_dewpoint_k(f64::from(level), td_k))
+        })
+        .collect();
+    let (native_sb, native_ml, native_mu) = if with_native_cape {
+        let (sb, ml, mu) = native_planes();
+        (Some(sb), Some(ml), Some(mu))
+    } else {
+        (None, None, None)
+    };
+    ProductsComputeInputs {
+        surface: SurfaceFields {
+            lat: synthetic.lat.clone(),
+            lon: synthetic.lon.clone(),
+            nx: NX,
+            ny: NY,
+            projection: None,
+            psfc_pa: synthetic.psfc_pa.clone(),
+            orog_m: synthetic.orog_m.clone(),
+            orog_is_proxy: false,
+            t2_k: synthetic.t2_k.clone(),
+            q2_kgkg: synthetic.q2_kgkg.clone(),
+            u10_ms: synthetic.u10_ms.clone(),
+            v10_ms: synthetic.v10_ms.clone(),
+            native_sbcape_jkg: native_sb,
+            native_mlcape_jkg: native_ml,
+            native_mucape_jkg: native_mu,
+            native_pblh_m: None,
+        },
+        pressure: PressureFields {
+            pressure_levels_hpa: LEVELS.iter().map(|&level| f64::from(level)).collect(),
+            pressure_3d_pa: None,
+            temperature_c_3d: flatten_with(&synthetic.temperature_k, |v| v - 273.15),
+            qvapor_kgkg_3d,
+            u_ms_3d: flatten_with(&synthetic.u_ms, |v| v),
+            v_ms_3d: flatten_with(&synthetic.v_ms, |v| v),
+            gh_m_3d: flatten_with(&synthetic.height_m, |v| v),
+            omega_pa_s_3d: None,
+            absolute_vorticity_s_3d: None,
+            cloud_liquid_kgkg_3d: None,
+            cloud_ice_kgkg_3d: None,
+            rain_kgkg_3d: None,
+            snow_kgkg_3d: None,
+            graupel_kgkg_3d: None,
+        },
+    }
 }
 
 fn assert_bits_eq(actual: &[f32], expected: &[f32], context: &str) {
@@ -195,50 +224,13 @@ fn assert_bits_eq(actual: &[f32], expected: &[f32], context: &str) {
     }
 }
 
-/// Shuffle the input level order to also prove the descending-pressure
-/// alignment inside the assembly.
-fn shuffle(planes: &[(u16, Vec<f32>)]) -> Vec<(u16, Vec<f32>)> {
-    let mut shuffled = planes.to_vec();
-    shuffled.rotate_left(3);
-    shuffled.swap(0, 2);
-    shuffled
-}
-
-fn ingest_volumes(synthetic: &Synthetic) -> IngestVolumes<'_> {
-    // Leaked shuffles keep the borrows simple for the test's lifetime.
-    fn leak(planes: Vec<(u16, Vec<f32>)>) -> &'static [(u16, Vec<f32>)] {
-        Box::leak(planes.into_boxed_slice())
-    }
-    IngestVolumes {
-        temperature_k: leak(shuffle(&synthetic.temperature_k)),
-        moisture: leak(shuffle(&synthetic.dewpoint_k)),
-        moisture_kind: MoistureKind::DewpointK,
-        u_ms: leak(shuffle(&synthetic.u_ms)),
-        v_ms: leak(shuffle(&synthetic.v_ms)),
-        height_m: leak(shuffle(&synthetic.height_m)),
-    }
-}
-
-fn native_cape() -> NativeCapePlanes {
-    NativeCapePlanes {
-        sbcape_jkg: Some((0..NXY).map(|ij| 600.0 + 40.0 * ij as f64).collect()),
-        mlcape_jkg: Some((0..NXY).map(|ij| 450.0 + 30.0 * ij as f64).collect()),
-        mucape_jkg: Some((0..NXY).map(|ij| 700.0 + 25.0 * ij as f64).collect()),
-    }
-}
-
 #[test]
 fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
     let synthetic = synthetic();
 
-    // --- the new path: assemble once (with native CAPE), run the heavy
-    //     stage exactly as rw_ingest does ---
-    let inputs = ingest_compute::assemble_products_inputs(
-        &synthetic.fields_2d,
-        &ingest_volumes(&synthetic),
-        native_cape(),
-    )
-    .expect("input assembly must succeed on the synthetic hour");
+    // --- the ingest path: the decoded pair (with native CAPE) through the
+    //     heavy stage exactly as rw_ingest runs it ---
+    let inputs = decoded_inputs(&synthetic, true);
     let heavy = ingest_compute::compute_heavy_2d_from_inputs(&inputs)
         .expect("heavy precompute must succeed on the synthetic hour");
 
@@ -256,49 +248,18 @@ fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
 
     // --- the direct path: identical prep, then the rustwx-calc ECAPE
     //     triplet kernel the heavy lane dispatches to ---
-    let lookup = |name: &str| {
-        &synthetic
-            .fields_2d
-            .iter()
-            .find(|(have, _)| *have == name)
-            .unwrap()
-            .1
-    };
-    let psfc_pa = to_f64(&lookup("surface_pressure").values);
-    let t2_k = to_f64(&lookup("temperature_2m").values);
-    let q2_kgkg: Vec<f64> = psfc_pa
-        .iter()
-        .zip(lookup("dewpoint_2m").values.iter())
-        .map(|(&psfc, &td_k)| mixing_ratio_from_dewpoint_k(psfc / 100.0, f64::from(td_k)))
-        .collect();
-    let u10_ms = to_f64(&lookup("u_10m").values);
-    let v10_ms = to_f64(&lookup("v_10m").values);
-    let orog_m = to_f64(&lookup("orography").values);
-
-    let temperature_c_3d = flatten_with(&synthetic.temperature_k, |v| f64::from(v) - 273.15);
-    let qvapor_kgkg_3d: Vec<f64> = LEVELS
-        .iter()
-        .flat_map(|&level| {
-            let (_, plane) = synthetic
-                .dewpoint_k
-                .iter()
-                .find(|(have, _)| *have == level)
-                .unwrap();
-            plane
-                .iter()
-                .map(move |&td_k| mixing_ratio_from_dewpoint_k(f64::from(level), f64::from(td_k)))
-        })
-        .collect();
-    let u_3d = flatten_with(&synthetic.u_ms, f64::from);
-    let v_3d = flatten_with(&synthetic.v_ms, f64::from);
-    let gh_3d = flatten_with(&synthetic.height_m, f64::from);
+    let temperature_c_3d = flatten_with(&synthetic.temperature_k, |v| v - 273.15);
+    let qvapor_kgkg_3d = inputs.pressure.qvapor_kgkg_3d.clone();
+    let u_3d = flatten_with(&synthetic.u_ms, |v| v);
+    let v_3d = flatten_with(&synthetic.v_ms, |v| v);
+    let gh_3d = flatten_with(&synthetic.height_m, |v| v);
 
     // Height AGL exactly as the heavy lane assembles it: (gh - orog)
     // clamped at 0, then forced monotonic by >= 1 m per level upward.
     let mut height_agl_3d: Vec<f64> = gh_3d
         .iter()
         .enumerate()
-        .map(|(idx, &value)| (value - orog_m[idx % NXY]).max(0.0))
+        .map(|(idx, &value)| (value - synthetic.orog_m[idx % NXY]).max(0.0))
         .collect();
     for k in 1..NZ {
         for ij in 0..NXY {
@@ -329,11 +290,11 @@ fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
             nz: NZ,
         },
         SurfaceInputs {
-            psfc_pa: &psfc_pa,
-            t2_k: &t2_k,
-            q2_kgkg: &q2_kgkg,
-            u10_ms: &u10_ms,
-            v10_ms: &v10_ms,
+            psfc_pa: &synthetic.psfc_pa,
+            t2_k: &synthetic.t2_k,
+            q2_kgkg: &synthetic.q2_kgkg,
+            u10_ms: &synthetic.u10_ms,
+            v10_ms: &synthetic.v10_ms,
         },
         // The heavy lane pins right-moving storm motion (see
         // compute_ecape_map_fields_with_prepared_volume).
@@ -396,8 +357,7 @@ fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
     // Native ratio plumbing: stored ratio grid == stored ecape / native
     // plane wherever both are finite (the lane NaNs cells whose native
     // CAPE denominator is below its 100 J/kg floor).
-    let native = native_cape();
-    let native_sb = native.sbcape_jkg.as_ref().unwrap();
+    let (native_sb, _, _) = native_planes();
     let ratio = take("sb_ecape_native_cape_ratio");
     assert_eq!(ratio.units, "ratio", "sb native ratio units");
     let mut finite_ratio_checked = 0usize;
@@ -422,12 +382,7 @@ fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
 #[test]
 fn ingest_heavy_without_native_cape_skips_only_the_native_ratios() {
     let synthetic = synthetic();
-    let inputs = ingest_compute::assemble_products_inputs(
-        &synthetic.fields_2d,
-        &ingest_volumes(&synthetic),
-        NativeCapePlanes::default(),
-    )
-    .expect("input assembly must succeed on the synthetic hour");
+    let inputs = decoded_inputs(&synthetic, false);
     let heavy = ingest_compute::compute_heavy_2d_from_inputs(&inputs)
         .expect("heavy precompute must succeed without native CAPE");
 
