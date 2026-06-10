@@ -11,11 +11,15 @@
 //!
 //! Usage:
 //!   rusty-weather-ui [--store-root <dir>] [--cache-dir <dir>] [--synthetic]
+//!                    [--download-date YYYYMMDD] [--download-cycle N]
+//!                    [--download-hours SPEC] [--download-profile NAME]
 //!
 //! `--store-root` defaults to `store`. `--cache-dir` presets the Download
 //! panel's raw GRIB cache directory (default `out/cache`; point it at an
-//! existing cache to ingest without network). `--synthetic` writes a tiny
-//! synthetic store to a temp directory and opens that instead.
+//! existing cache to ingest without network). The `--download-*` flags
+//! preset the Download panel's pickers (handy for scripted/offline runs).
+//! `--synthetic` writes a tiny synthetic store to a temp directory and
+//! opens that instead.
 //!
 //! Profiling: build with `--features profiling` for puffin scopes, a
 //! puffin_http server on 127.0.0.1:8585 (external `puffin_viewer`), and
@@ -70,11 +74,10 @@ fn main() -> ExitCode {
             .with_title("rusty-weather"),
         ..Default::default()
     };
-    let cache_dir = args.cache_dir;
     let result = eframe::run_native(
         "rusty-weather",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, store_root, cache_dir)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, store_root, args.spec_overrides)))),
     );
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -85,28 +88,46 @@ fn main() -> ExitCode {
     }
 }
 
+/// CLI presets for the Download panel's initial spec.
+#[derive(Default)]
+struct SpecOverrides {
+    cache_dir: Option<String>,
+    date: Option<String>,
+    cycle: Option<u8>,
+    hours: Option<String>,
+    profile: Option<String>,
+}
+
 struct Args {
     store_root: PathBuf,
-    cache_dir: Option<String>,
     synthetic: bool,
+    spec_overrides: SpecOverrides,
 }
 
 impl Args {
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut store_root = PathBuf::from("store");
-        let mut cache_dir = None;
         let mut synthetic = false;
+        let mut spec_overrides = SpecOverrides::default();
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
+            let mut value = |flag: &str| -> Result<String, String> {
+                args.next().ok_or(format!("{flag} requires a value"))
+            };
             match arg.as_str() {
-                "--store-root" => {
-                    store_root = PathBuf::from(
-                        args.next().ok_or("--store-root requires a path argument")?,
+                "--store-root" => store_root = PathBuf::from(value("--store-root")?),
+                "--cache-dir" => spec_overrides.cache_dir = Some(value("--cache-dir")?),
+                "--download-date" => spec_overrides.date = Some(value("--download-date")?),
+                "--download-cycle" => {
+                    spec_overrides.cycle = Some(
+                        value("--download-cycle")?
+                            .parse()
+                            .map_err(|_| "--download-cycle expects 0-23".to_string())?,
                     );
                 }
-                "--cache-dir" => {
-                    cache_dir =
-                        Some(args.next().ok_or("--cache-dir requires a path argument")?);
+                "--download-hours" => spec_overrides.hours = Some(value("--download-hours")?),
+                "--download-profile" => {
+                    spec_overrides.profile = Some(value("--download-profile")?);
                 }
                 "--synthetic" => synthetic = true,
                 other => return Err(format!("unknown argument: {other}")),
@@ -114,8 +135,8 @@ impl Args {
         }
         Ok(Self {
             store_root,
-            cache_dir,
             synthetic,
+            spec_overrides,
         })
     }
 }
@@ -170,7 +191,7 @@ impl App {
     fn new(
         cc: &eframe::CreationContext<'_>,
         store_root: PathBuf,
-        cache_dir: Option<String>,
+        overrides: SpecOverrides,
     ) -> Self {
         // Belt and braces: pre-build the GLOBAL rayon pool small and
         // below-normal so any stray par_iter reached outside the ingest
@@ -196,12 +217,27 @@ impl App {
             ctx.request_repaint();
         });
 
-        let spec = DownloadSpec {
-            date: rw_ui::today_yyyymmdd_utc(),
-            hours: "0-6".to_string(),
-            cache_dir: cache_dir.unwrap_or_else(|| "out/cache".to_string()),
-            ..DownloadSpec::default()
+        let defaults = DownloadSpec::default();
+        let mut spec = DownloadSpec {
+            date: overrides.date.unwrap_or_else(rw_ui::today_yyyymmdd_utc),
+            hours: overrides.hours.unwrap_or_else(|| "0-6".to_string()),
+            cycle: overrides.cycle.unwrap_or(defaults.cycle),
+            profile: overrides.profile.unwrap_or(defaults.profile),
+            cache_dir: overrides.cache_dir.unwrap_or(defaults.cache_dir),
+            ..defaults
         };
+        // Presets follow the same toggle-snapping the profile combo does.
+        match spec.profile.as_str() {
+            "sounding" => {
+                spec.derived = false;
+                spec.heavy = false;
+            }
+            "view" => {
+                spec.derived = true;
+                spec.heavy = false;
+            }
+            _ => {}
+        }
         let mut download = DownloadPanel::new(spec.clone());
         download.set_model_options(model_options());
         Self::sync_run_pickers(&mut download, &spec);

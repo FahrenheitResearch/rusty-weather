@@ -698,7 +698,7 @@ pub fn process_fetched_hour(
         hour,
         profile.derived,
         profile.heavy,
-    );
+    )?;
     drop(sfc);
     drop(prs);
     config.check_cancel()?;
@@ -870,7 +870,9 @@ struct ComputedProductGrids {
 /// (when enabled) the heavy ECAPE pass. Each stage degrades independently
 /// to "no variables from this stage", never a failed ingest — the
 /// extracted fields still carry the hour. Profiles with both stages off
-/// (e.g. `sounding`) skip even the thermo decode.
+/// (e.g. `sounding`) skip even the thermo decode. The only error is
+/// `Cancelled`: the cancel flag is checked before each compute stage so a
+/// cancel never waits out the (long) heavy stage.
 fn compute_product_grids(
     config: &IngestConfig<'_>,
     surface_bytes: &[u8],
@@ -878,14 +880,15 @@ fn compute_product_grids(
     hour: u16,
     derived_enabled: bool,
     heavy_enabled: bool,
-) -> ComputedProductGrids {
+) -> Result<ComputedProductGrids, IngestError> {
     if !derived_enabled && !heavy_enabled {
         config.emit(IngestEvent::Info {
             hour,
             message: format!("f{hour:03}: derived/heavy compute stages skipped (profile)"),
         });
-        return ComputedProductGrids::default();
+        return Ok(ComputedProductGrids::default());
     }
+    config.check_cancel()?;
     config.emit(IngestEvent::StageStarted {
         hour,
         stage: IngestStage::ThermoDecode,
@@ -902,7 +905,7 @@ fn compute_product_grids(
                         "f{hour:03}: derived/heavy precompute skipped: thermo decode failed: {err}"
                     ),
                 });
-                return ComputedProductGrids::default();
+                return Ok(ComputedProductGrids::default());
             }
         }
     };
@@ -913,6 +916,7 @@ fn compute_product_grids(
         ms: decode_ms,
     });
 
+    config.check_cancel()?;
     config.emit(IngestEvent::StageStarted {
         hour,
         stage: IngestStage::Derived,
@@ -943,15 +947,16 @@ fn compute_product_grids(
             hour,
             message: format!("f{hour:03}: heavy ingest stage skipped (profile/--no-heavy)"),
         });
-        return ComputedProductGrids {
+        return Ok(ComputedProductGrids {
             derived,
             heavy: Vec::new(),
             decode_ms,
             derived_ms,
             heavy_ms: 0,
-        };
+        });
     }
 
+    config.check_cancel()?;
     config.emit(IngestEvent::StageStarted {
         hour,
         stage: IngestStage::Heavy,
@@ -1007,13 +1012,13 @@ fn compute_product_grids(
         ms: heavy_ms,
     });
 
-    ComputedProductGrids {
+    Ok(ComputedProductGrids {
         derived,
         heavy,
         decode_ms,
         derived_ms,
         heavy_ms,
-    }
+    })
 }
 
 /// Re-open the just-written hour: bit-exact round-trip of every 2D field
