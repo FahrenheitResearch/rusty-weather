@@ -590,6 +590,59 @@ mod tests {
     }
 
     #[test]
+    fn shared_filled_selectors_agree_on_style_and_scale() {
+        // `direct_recipe_for_selector` resolves a stored selector by
+        // FIRST-MATCH over the supported recipe catalog. That is only safe
+        // while every pair of supported recipes sharing a filled selector
+        // agrees on render style and operational fill scale — otherwise the
+        // viewer would silently pick whichever recipe happens to come first.
+        // Pin the invariant over ALL pairs (zero offending pairs required;
+        // the sweep guards future catalog additions even if no pair exists
+        // today).
+        let supported = supported_direct_recipe_slugs(ModelId::Hrrr);
+        let recipes: Vec<&PlotRecipe> = built_in_plot_recipes()
+            .iter()
+            .filter(|recipe| supported.iter().any(|slug| slug == recipe.slug))
+            .collect();
+        assert!(
+            !recipes.is_empty(),
+            "HRRR must support at least one direct recipe"
+        );
+        let mut shared_pairs = 0usize;
+        for (i, a) in recipes.iter().enumerate() {
+            for b in &recipes[i + 1..] {
+                let (Some(selector), Some(other)) = (a.filled.selector, b.filled.selector) else {
+                    continue;
+                };
+                if selector != other {
+                    continue;
+                }
+                shared_pairs += 1;
+                assert_eq!(
+                    a.style, b.style,
+                    "supported recipes '{}' and '{}' share filled selector {selector:?} but \
+                     disagree on render style — first-match resolution in \
+                     direct_recipe_for_selector is no longer safe",
+                    a.slug, b.slug,
+                );
+                assert_eq!(
+                    crate::plot_design::operational_fill_scale_for_recipe(a, selector),
+                    crate::plot_design::operational_fill_scale_for_recipe(b, selector),
+                    "supported recipes '{}' and '{}' share filled selector {selector:?} but \
+                     disagree on operational fill scale — first-match resolution in \
+                     direct_recipe_for_selector is no longer safe",
+                    a.slug, b.slug,
+                );
+            }
+        }
+        eprintln!(
+            "shared_filled_selectors_agree_on_style_and_scale: checked {shared_pairs} \
+             shared-selector pair(s) across {} supported recipes",
+            recipes.len()
+        );
+    }
+
+    #[test]
     fn unit_conversions_match_the_direct_lane_arithmetic() {
         assert_eq!(UnitConvert::KelvinToFahrenheit.apply(273.15), 32.0);
         assert_eq!(
