@@ -2,6 +2,9 @@
 **/target/
 /out
 /store
+/live-store
+/live-cache
+/cache
 vendor/*/target/
 vendor/*/Cargo.lock
 crates/rustwx-render/verify/Cargo.lock
