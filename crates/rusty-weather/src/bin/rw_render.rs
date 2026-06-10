@@ -18,6 +18,8 @@ mod domain;
 mod region;
 #[path = "../store_render.rs"]
 mod store_render;
+#[path = "../throttle.rs"]
+mod throttle;
 
 use clap::{Parser, ValueEnum};
 use contour_mode::ContourModeArg;
@@ -91,6 +93,17 @@ struct Args {
     png_compression: PngCompressionArg,
     #[arg(long = "place-label-density", default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=3))]
     place_label_density: u8,
+    #[arg(
+        long,
+        help = "Rayon thread count (default: all cores minus 2 in polite mode, all cores with --full-throttle)"
+    )]
+    threads: Option<usize>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Dedicated-node mode: keep normal process priority and use every core"
+    )]
+    full_throttle: bool,
 }
 
 /// Which products were asked for, and whether unresolvable ones fail the
@@ -199,6 +212,9 @@ fn static_output_dimension(name: &str, fallback: u32) -> u32 {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    // Scheduling policy must land before anything touches rayon (the
+    // global pool is built lazily on first use and cannot be resized).
+    throttle::apply(args.threads, args.full_throttle);
     run(&args)
 }
 

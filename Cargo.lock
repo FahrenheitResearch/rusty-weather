@@ -1966,6 +1966,7 @@ dependencies = [
  "rustwx-render",
  "rw-store",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

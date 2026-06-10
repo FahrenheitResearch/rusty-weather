@@ -23,6 +23,13 @@ rustwx-products = { path = "../rustwx-products" }
 rustwx-render = { path = "../rustwx-render" }
 rw-store = { path = "../rw-store" }
 
+# Polite-mode priority drop (src/throttle.rs): windows-sys is already in
+# the tree transitively (clap's anstyle stack pulls 0.61), so this adds one
+# feature, not a new crate. Win32_System_Threading carries
+# GetCurrentProcess / SetPriorityClass / BELOW_NORMAL_PRIORITY_CLASS.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
+
 [dev-dependencies]
 # The ingest derived-precompute test proves the wiring by calling the
 # underlying calc kernels directly with identically prepared inputs.

@@ -48,6 +48,8 @@ use rw_store::reader::HourReader;
 
 #[path = "../ingest_compute.rs"]
 mod ingest_compute;
+#[path = "../throttle.rs"]
+mod throttle;
 use ingest_compute::DerivedGrid2D;
 
 /// The derived CAPE kernels allocate per-column scratch across every rayon
@@ -291,6 +293,17 @@ struct Args {
         help = "Skip the heavy ECAPE ingest stage: the 16 heavy grids are not stored (derived 29 still are)"
     )]
     no_heavy: bool,
+    #[arg(
+        long,
+        help = "Rayon thread count (default: all cores minus 2 in polite mode, all cores with --full-throttle)"
+    )]
+    threads: Option<usize>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Dedicated-node mode: keep normal process priority and use every core"
+    )]
+    full_throttle: bool,
 }
 
 /// Resolve the `--heavy` / `--no-heavy` pair: heavy is ON unless
@@ -301,6 +314,9 @@ fn heavy_enabled(args: &Args) -> bool {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    // Scheduling policy must land before anything touches rayon (the
+    // global pool is built lazily on first use and cannot be resized).
+    throttle::apply(args.threads, args.full_throttle);
     run(&args)
 }
 
