@@ -5,6 +5,8 @@
 mod download;
 mod field_viewer;
 mod run_browser;
+mod sat_player;
+mod satellite;
 mod sounding;
 
 pub use download::{
@@ -14,4 +16,9 @@ pub use download::{
 };
 pub use field_viewer::{FieldViewerEvent, FieldViewerPanel};
 pub use run_browser::RunBrowserPanel;
+pub use sat_player::{SatFrameImage, SatPlayerEvent, SatPlayerPanel, SatRunKey, SatRunListing};
+pub use satellite::{
+    SatDiskUsage, SatFollowSpec, SatFollowState, SatLayerOption, SatSatelliteOption,
+    SatSectorOption, SatelliteEvent, SatellitePanel,
+};
 pub use sounding::SoundingPanel;

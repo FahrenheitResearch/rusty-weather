@@ -2,8 +2,11 @@
 //!
 //! Layout: run browser on the left, false-color field viewer in the center,
 //! sounding panel on the right (appears after a click on the field), an
-//! always-on stats strip along the bottom, and a toggleable Download window
-//! that runs in-process ingests through [`ingest_worker::IngestWorker`].
+//! always-on stats strip along the bottom, a toggleable Download window
+//! that runs in-process ingests through [`ingest_worker::IngestWorker`],
+//! and a toggleable Satellite window that follows the live GOES buckets
+//! through [`sat_worker::SatWorker`] (rolling-window store under
+//! `<store-root>/sat`) with loop playback of the stored frames.
 //! All store IO runs on the rw-ui store worker thread; all ingest work
 //! (network fetch + extraction/compute on a dedicated below-normal rayon
 //! pool) runs behind the ingest worker — this shell only wires panel
@@ -13,13 +16,15 @@
 //!   rusty-weather-ui [--store-root <dir>] [--cache-dir <dir>] [--synthetic]
 //!                    [--download-date YYYYMMDD] [--download-cycle N]
 //!                    [--download-hours SPEC] [--download-profile NAME]
+//!                    [--satellite]
 //!
 //! `--store-root` defaults to `store`. `--cache-dir` presets the Download
 //! panel's raw GRIB cache directory (default `out/cache`; point it at an
 //! existing cache to ingest without network). The `--download-*` flags
 //! preset the Download panel's pickers (handy for scripted/offline runs).
-//! `--synthetic` writes a tiny synthetic store to a temp directory and
-//! opens that instead.
+//! `--satellite` opens the Satellite window on launch. `--synthetic`
+//! writes a tiny synthetic store to a temp directory and opens that
+//! instead.
 //!
 //! Profiling: build with `--features profiling` for puffin scopes, a
 //! puffin_http server on 127.0.0.1:8585 (external `puffin_viewer`), and
@@ -30,6 +35,7 @@
 mod ingest_worker;
 #[cfg(feature = "profiling")]
 mod profiler;
+mod sat_worker;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -40,9 +46,10 @@ use ingest_worker::{IngestRequest, IngestResponse, IngestWorker};
 use rustwx_models::{model_summary, supported_forecast_hours, supported_models};
 use rw_ui::{
     DownloadEvent, DownloadPanel, DownloadSpec, FieldViewerEvent, FieldViewerPanel, HourKey,
-    ModelOption, RunBrowserPanel, SoundingPanel, StoreRequest, StoreResponse, StoreTree, StoreView,
-    StoreWorker,
+    ModelOption, RunBrowserPanel, SatFollowSpec, SatPlayerEvent, SatPlayerPanel, SatelliteEvent,
+    SatellitePanel, SoundingPanel, StoreRequest, StoreResponse, StoreTree, StoreView, StoreWorker,
 };
+use sat_worker::{SatRequest, SatResponse, SatWorker};
 
 fn main() -> ExitCode {
     let args = match Args::parse(std::env::args().skip(1)) {
@@ -77,7 +84,14 @@ fn main() -> ExitCode {
     let result = eframe::run_native(
         "rusty-weather",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, store_root, args.spec_overrides)))),
+        Box::new(move |cc| {
+            Ok(Box::new(App::new(
+                cc,
+                store_root,
+                args.spec_overrides,
+                args.satellite,
+            )))
+        }),
     );
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -101,6 +115,7 @@ struct SpecOverrides {
 struct Args {
     store_root: PathBuf,
     synthetic: bool,
+    satellite: bool,
     spec_overrides: SpecOverrides,
 }
 
@@ -108,6 +123,7 @@ impl Args {
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut store_root = PathBuf::from("store");
         let mut synthetic = false;
+        let mut satellite = false;
         let mut spec_overrides = SpecOverrides::default();
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
@@ -129,6 +145,7 @@ impl Args {
                 "--download-profile" => {
                     spec_overrides.profile = Some(value("--download-profile")?);
                 }
+                "--satellite" => satellite = true,
                 "--synthetic" => synthetic = true,
                 other => return Err(format!("unknown argument: {other}")),
             }
@@ -136,6 +153,7 @@ impl Args {
         Ok(Self {
             store_root,
             synthetic,
+            satellite,
             spec_overrides,
         })
     }
@@ -173,11 +191,19 @@ struct App {
     sounding: SoundingPanel,
     download: DownloadPanel,
     show_download: bool,
+    sat: SatWorker,
+    sat_panel: SatellitePanel,
+    sat_player: SatPlayerPanel,
+    show_satellite: bool,
+    /// First-open initialization of the Satellite window (validate + scan).
+    sat_initialized: bool,
     /// CPU time of the previous `App::ui` pass (stats strip).
     frame_ms: f32,
     /// Last texture-build wall already recorded into the stats registry
     /// (the panel re-reports the same value every frame).
     recorded_texture_ms: Option<f32>,
+    /// Same dedup for the sat player's texture uploads.
+    recorded_sat_texture_ms: Option<f32>,
     #[cfg(feature = "profiling")]
     profiler: profiler::ProfilerPanel,
     #[cfg(feature = "profiling")]
@@ -192,6 +218,7 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         store_root: PathBuf,
         overrides: SpecOverrides,
+        show_satellite: bool,
     ) -> Self {
         // Belt and braces: pre-build the GLOBAL rayon pool small and
         // below-normal so any stray par_iter reached outside the ingest
@@ -216,6 +243,17 @@ impl App {
         let ingest = IngestWorker::spawn(store_root.clone(), move || {
             ctx.request_repaint();
         });
+
+        // Satellite frames live under their own subroot so the model-run
+        // browser stays free of sat runs.
+        let ctx = cc.egui_ctx.clone();
+        let sat = SatWorker::spawn(store_root.join("sat"), move || {
+            ctx.request_repaint();
+        });
+        let mut sat_panel = SatellitePanel::new(SatFollowSpec::default());
+        sat_panel.set_satellite_options(sat_worker::satellite_options());
+        sat_panel.set_sector_options(sat_worker::sector_options());
+        sat_panel.set_layer_options(sat_worker::layer_options());
 
         let defaults = DownloadSpec::default();
         let mut spec = DownloadSpec {
@@ -271,8 +309,14 @@ impl App {
             sounding: SoundingPanel::new(),
             download,
             show_download: false,
+            sat,
+            sat_panel,
+            sat_player: SatPlayerPanel::new(),
+            show_satellite,
+            sat_initialized: false,
             frame_ms: 0.0,
             recorded_texture_ms: None,
+            recorded_sat_texture_ms: None,
             #[cfg(feature = "profiling")]
             profiler: profiler::ProfilerPanel::default(),
             #[cfg(feature = "profiling")]
@@ -426,6 +470,102 @@ impl App {
         }
     }
 
+    /// Drain sat-worker responses into the satellite panels (and record
+    /// the sat-path timings into the always-on stats registry).
+    fn handle_sat_responses(&mut self) {
+        while let Some(response) = self.sat.try_recv() {
+            match response {
+                SatResponse::SpecStatus(status) => self.sat_panel.set_spec_status(status),
+                SatResponse::Runs(runs) => self.sat_player.set_runs(runs),
+                SatResponse::FollowStarted => self.sat_panel.begin_follow(),
+                SatResponse::FollowFinished(result) => {
+                    if self.sat_panel.is_running() {
+                        self.sat_panel.finish_follow(result);
+                    } else if let Err(message) = result {
+                        // Pre-start validation failure: a spec problem.
+                        self.sat_panel.set_spec_status(Err(message));
+                    }
+                }
+                SatResponse::PollDone { band, new_keys, ms } => {
+                    self.worker.stats().record("sat.poll", ms as f32);
+                    self.sat_panel.apply_poll_done(band, new_keys, ms);
+                }
+                SatResponse::DownloadStarted { id, label, bytes } => {
+                    self.sat_panel.apply_download_started(id, label, bytes);
+                }
+                SatResponse::DownloadDone { id, ms, cache_hit } => {
+                    self.worker.stats().record("sat.download", ms as f32);
+                    self.sat_panel.apply_download_done(&id, ms, cache_hit);
+                }
+                SatResponse::FrameWritten {
+                    id,
+                    run,
+                    hhmm,
+                    bytes,
+                    encode_ms,
+                } => {
+                    self.worker.stats().record("sat.encode", encode_ms as f32);
+                    self.sat_panel
+                        .apply_frame_written(&id, run, hhmm, bytes, encode_ms);
+                    // The frame is on disk and run.json is updated: refresh
+                    // the player's timeline so it appears as it lands.
+                    self.sat.send(SatRequest::Scan);
+                }
+                SatResponse::Evicted { frames, bytes } => {
+                    self.sat_panel.apply_evicted(frames, bytes);
+                    // Evicted frames must leave the player's timeline too.
+                    self.sat.send(SatRequest::Scan);
+                }
+                SatResponse::Sleeping { ms } => self.sat_panel.apply_sleeping(ms),
+                SatResponse::Note(message) => self.sat_panel.apply_note(message),
+                SatResponse::DiskUsage(usage) => self.sat_panel.set_disk_usage(usage),
+                SatResponse::Frame { key, hhmm, result } => match *result {
+                    Ok(frame) => {
+                        self.worker.stats().record("sat.frame.read", frame.read_ms);
+                        self.sat_player.set_frame(frame);
+                    }
+                    Err(message) => {
+                        // Only clear the retry marker when the failure is
+                        // for the run the player is actually showing.
+                        if self.sat_player.selected_run() == Some(&key) {
+                            self.sat_player.frame_failed(hhmm);
+                        }
+                        self.sat_panel.apply_note(format!("frame load: {message}"));
+                    }
+                },
+            }
+        }
+    }
+
+    fn handle_satellite_events(&mut self, events: Vec<SatelliteEvent>) {
+        for event in events {
+            match event {
+                SatelliteEvent::SpecChanged(spec) => {
+                    self.sat.send(SatRequest::Validate(spec));
+                }
+                SatelliteEvent::StartRequested(spec) => {
+                    self.sat.send(SatRequest::Follow(spec));
+                }
+                SatelliteEvent::StopRequested => {
+                    self.sat.stop_follow();
+                }
+            }
+        }
+    }
+
+    fn handle_sat_player_events(&mut self, events: Vec<SatPlayerEvent>) {
+        for event in events {
+            match event {
+                SatPlayerEvent::FrameWanted { key, hhmm } => {
+                    self.sat.send(SatRequest::LoadFrame { key, hhmm });
+                }
+                SatPlayerEvent::RefreshRequested => {
+                    self.sat.send(SatRequest::Scan);
+                }
+            }
+        }
+    }
+
     fn handle_download_events(&mut self, events: Vec<DownloadEvent>) {
         for event in events {
             match event {
@@ -458,6 +598,7 @@ impl eframe::App for App {
 
         self.handle_responses();
         self.handle_ingest_responses();
+        self.handle_sat_responses();
 
         // Smooth progress while a download runs, even through long silent
         // stages (a 60 s heavy stage emits nothing between its events).
@@ -465,10 +606,17 @@ impl eframe::App for App {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(250));
         }
+        // Keep the next-poll countdown and frame rows live during a follow
+        // session (the engine sleeps between polls and emits nothing).
+        if self.sat_panel.is_running() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(250));
+        }
 
         egui::Panel::top("rw-toolbar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.toggle_value(&mut self.show_download, "⬇ Download");
+                ui.toggle_value(&mut self.show_satellite, "🛰 Satellite");
                 #[cfg(feature = "profiling")]
                 ui.toggle_value(&mut self.show_profiler, "🔍 Profiler");
                 #[cfg(not(feature = "profiling"))]
@@ -594,6 +742,44 @@ impl eframe::App for App {
                 });
             self.show_download = open;
             self.handle_download_events(events);
+        }
+
+        if self.show_satellite {
+            if !self.sat_initialized {
+                self.sat_initialized = true;
+                self.sat
+                    .send(SatRequest::Validate(self.sat_panel.spec().clone()));
+                self.sat.send(SatRequest::Scan);
+            }
+            let mut open = self.show_satellite;
+            let mut panel_events = Vec::new();
+            let mut player_events = Vec::new();
+            egui::Window::new("Satellite")
+                .open(&mut open)
+                .default_pos([40.0, 60.0])
+                .default_width(900.0)
+                .default_height(740.0)
+                .resizable(true)
+                .show(ui.ctx(), |ui| {
+                    egui::CollapsingHeader::new("Follow live")
+                        .id_salt("rw-sat-follow-section")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            panel_events = self.sat_panel.ui(ui);
+                        });
+                    ui.separator();
+                    player_events = self.sat_player.ui(ui);
+                });
+            self.show_satellite = open;
+            self.handle_satellite_events(panel_events);
+            self.handle_sat_player_events(player_events);
+            // Record sat texture-upload walls once per change.
+            if let Some(ms) = self.sat_player.last_texture_ms() {
+                if self.recorded_sat_texture_ms != Some(ms) {
+                    self.worker.stats().record("sat.texture", ms);
+                    self.recorded_sat_texture_ms = Some(ms);
+                }
+            }
         }
 
         #[cfg(feature = "profiling")]
