@@ -1,47 +1,34 @@
 //! Render every stored product from one rw-store hour to PNG, through the
 //! EXACT render paths the GRIB-lane smoke bins use (proven pixel-identical
 //! for representative direct and derived products — see the Task 4 parity
-//! matrix in the commit). Direct recipes resolve their fetch-plan
-//! `FieldSelector`s against the stored variable metadata; derived/heavy
-//! recipes read their precomputed slug-named grids. Products whose inputs
-//! are not in the store are reported as unresolvable with the missing
-//! selector — a failure only when the product was requested explicitly.
+//! matrix in the commit). The flow lives in the shared `render_all` module
+//! (also driven per-hour by `rw_batch`): direct recipes resolve their
+//! fetch-plan `FieldSelector`s against the stored variable metadata;
+//! derived/heavy recipes read their precomputed slug-named grids; windowed
+//! products accumulate across the run's stored hours. Products whose
+//! inputs are not in the store are reported as unresolvable with the
+//! missing selector — a failure only when requested explicitly.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 #[path = "../contour_mode.rs"]
 mod contour_mode;
-#[path = "../domain.rs"]
-mod domain;
 #[path = "../region.rs"]
 mod region;
-#[path = "../store_render.rs"]
-mod store_render;
+#[path = "../render_all.rs"]
+mod render_all;
 #[path = "../throttle.rs"]
 mod throttle;
-#[path = "../windowed_store.rs"]
-mod windowed_store;
 
 use clap::{Parser, ValueEnum};
 use contour_mode::ContourModeArg;
 use region::RegionPreset;
-use rustwx_core::{CycleSpec, ModelId, SourceId};
+use render_all::{StoreFieldSource, StoreRenderConfig, StoreRenderSkip};
+use rustwx_core::{ModelId, SourceId};
 use rustwx_models::model_summary;
-use rustwx_models::{LatestRun, plot_recipe};
-use rustwx_products::derived::{
-    DerivedBatchRequest, is_heavy_derived_recipe_slug, store_derived_recipe_slugs,
-    store_heavy_recipe_slugs,
-};
-use rustwx_products::direct::{DirectBatchRequest, supported_direct_recipe_slugs};
 use rustwx_products::places::{PlaceLabelDensityTier, default_place_label_overlay_for_domain};
 use rustwx_products::shared_context::DomainSpec;
-use rustwx_products::source::ProductSourceMode;
-use rustwx_products::windowed::{
-    HrrrWindowedBatchRequest, HrrrWindowedProduct, StoreWindowedGrid,
-    render_windowed_products_from_store_grids,
-};
-use store_render::{StoreFieldSource, StoreRenderSkip};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -114,117 +101,6 @@ struct Args {
     full_throttle: bool,
 }
 
-/// Which products were asked for, and whether unresolvable ones fail the
-/// run (only explicit slug lists are strict; the catalog keywords render
-/// what exists and report the rest).
-struct ProductRequest {
-    direct: Vec<String>,
-    derived: Vec<String>,
-    windowed: Vec<String>,
-    /// The windowed list came from the "all" keyword: render it only when
-    /// the run has more than one stored hour (a single hour realizes only
-    /// the degenerate 1 h windows, which the per-hour lanes already cover).
-    windowed_auto: bool,
-    strict: bool,
-}
-
-fn partition_products(
-    spec: &str,
-    model: ModelId,
-) -> Result<ProductRequest, Box<dyn std::error::Error>> {
-    let derived_catalog = || {
-        store_derived_recipe_slugs()
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    };
-    let heavy_catalog = || {
-        store_heavy_recipe_slugs()
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    };
-    let windowed_catalog = || {
-        HrrrWindowedProduct::supported_products()
-            .iter()
-            .map(|product| product.slug().to_string())
-            .collect::<Vec<_>>()
-    };
-    match spec.trim() {
-        "all" => Ok(ProductRequest {
-            direct: supported_direct_recipe_slugs(model),
-            derived: derived_catalog()
-                .into_iter()
-                .chain(heavy_catalog())
-                .collect(),
-            windowed: windowed_catalog(),
-            windowed_auto: true,
-            strict: false,
-        }),
-        "direct" => Ok(ProductRequest {
-            direct: supported_direct_recipe_slugs(model),
-            derived: Vec::new(),
-            windowed: Vec::new(),
-            windowed_auto: false,
-            strict: false,
-        }),
-        "derived" => Ok(ProductRequest {
-            direct: Vec::new(),
-            derived: derived_catalog(),
-            windowed: Vec::new(),
-            windowed_auto: false,
-            strict: false,
-        }),
-        "heavy" => Ok(ProductRequest {
-            direct: Vec::new(),
-            derived: heavy_catalog(),
-            windowed: Vec::new(),
-            windowed_auto: false,
-            strict: false,
-        }),
-        "windowed" => Ok(ProductRequest {
-            direct: Vec::new(),
-            derived: Vec::new(),
-            windowed: windowed_catalog(),
-            windowed_auto: false,
-            strict: false,
-        }),
-        list => {
-            let mut direct = Vec::new();
-            let mut derived = Vec::new();
-            let mut windowed = Vec::new();
-            for slug in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                let is_derived = store_derived_recipe_slugs().contains(&slug)
-                    || store_heavy_recipe_slugs().contains(&slug)
-                    || is_heavy_derived_recipe_slug(slug);
-                if HrrrWindowedProduct::from_slug(slug).is_some() {
-                    windowed.push(slug.to_string());
-                } else if is_derived {
-                    derived.push(slug.to_string());
-                } else if plot_recipe(slug).is_some() {
-                    direct.push(slug.to_string());
-                } else {
-                    return Err(format!(
-                        "unknown product '{slug}': neither a direct plot recipe, a \
-                         derived/heavy recipe slug, nor a windowed product slug"
-                    )
-                    .into());
-                }
-            }
-            if direct.is_empty() && derived.is_empty() && windowed.is_empty() {
-                return Err("pass at least one product slug via --products".into());
-            }
-            Ok(ProductRequest {
-                direct,
-                derived,
-                windowed,
-                windowed_auto: false,
-                strict: true,
-            })
-        }
-    }
-}
-
 /// `YYYYMMDD_CCz` -> (date, cycle).
 fn parse_run_slug(run: &str) -> Result<(String, u8), Box<dyn std::error::Error>> {
     let (date, cycle) = run
@@ -260,23 +136,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let total_started = Instant::now();
     let (date, cycle) = parse_run_slug(&args.run)?;
-    let request = partition_products(&args.products, args.model)?;
+    let request = render_all::partition_products(&args.products, args.model)?;
     let model_slug = args.model.as_str().replace('-', "_");
     let source = args
         .source
         .unwrap_or(model_summary(args.model).sources[0].id);
-    let latest = LatestRun {
-        model: args.model,
-        cycle: CycleSpec::new(date.clone(), cycle)?,
-        source,
-    };
     let domain = DomainSpec::new(args.region.slug(), args.region.bounds());
-    let place_label_overlay = default_place_label_overlay_for_domain(
-        &domain,
-        PlaceLabelDensityTier::from_numeric(args.place_label_density),
-    );
-    let output_width = static_output_dimension("RUSTWX_STATIC_OUTPUT_WIDTH", 1600);
-    let output_height = static_output_dimension("RUSTWX_STATIC_OUTPUT_HEIGHT", 900);
+    let config = StoreRenderConfig {
+        model: args.model,
+        date_yyyymmdd: date,
+        cycle_utc: cycle,
+        source,
+        domain: domain.clone(),
+        out_dir: args.out_dir.clone(),
+        contour_mode: args.contour_mode.into(),
+        native_fill_level_multiplier: args.native_fill_level_multiplier.max(1),
+        output_width: static_output_dimension("RUSTWX_STATIC_OUTPUT_WIDTH", 1600),
+        output_height: static_output_dimension("RUSTWX_STATIC_OUTPUT_HEIGHT", 900),
+        png_compression: args.png_compression.into(),
+        place_label_overlay: default_place_label_overlay_for_domain(
+            &domain,
+            PlaceLabelDensityTier::from_numeric(args.place_label_density),
+        ),
+    };
 
     let open_started = Instant::now();
     let store = StoreFieldSource::open(&args.store_root, &model_slug, &args.run, args.hour)?;
@@ -295,165 +177,58 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut timings: Vec<(String, u128)> = Vec::new();
     let mut skipped: Vec<StoreRenderSkip> = Vec::new();
 
-    if !request.direct.is_empty() {
-        let direct_request = DirectBatchRequest {
-            model: args.model,
-            date_yyyymmdd: date.clone(),
-            cycle_override_utc: Some(cycle),
-            forecast_hour: args.hour,
-            source,
-            domain: domain.clone(),
-            out_dir: args.out_dir.clone(),
-            cache_root: args.out_dir.join("cache"),
-            use_cache: false,
-            recipe_slugs: request.direct.clone(),
-            product_overrides: std::collections::HashMap::new(),
-            contour_mode: args.contour_mode.into(),
-            native_fill_level_multiplier: args.native_fill_level_multiplier.max(1),
-            output_width,
-            output_height,
-            png_compression: args.png_compression.into(),
-            place_label_overlay: place_label_overlay.clone(),
-            output_suffix: None,
-            subtitle_left_override: None,
-            subtitle_right_override: None,
-        };
-        let outcome = store_render::render_direct_recipes_from_store(
-            &store,
-            &direct_request,
-            &latest,
-            &request.direct,
-        )?;
-        for recipe in &outcome.rendered {
-            println!(
-                "{:>8} ms  {}  {}",
-                recipe.timing.total_ms,
-                recipe.recipe_slug,
-                recipe.output_path.display()
-            );
-            timings.push((recipe.recipe_slug.clone(), recipe.timing.total_ms));
-        }
-        skipped.extend(outcome.skipped);
+    let hour_outcome = render_all::render_hour_products(
+        &config,
+        &store,
+        args.hour,
+        &request.direct,
+        &request.derived,
+    )?;
+    for product in &hour_outcome.rendered {
+        println!(
+            "{:>8} ms  {}  {}",
+            product.total_ms,
+            product.slug,
+            product.output_path.display()
+        );
+        timings.push((product.slug.clone(), product.total_ms));
     }
-
-    if !request.derived.is_empty() {
-        let derived_request = DerivedBatchRequest {
-            model: args.model,
-            date_yyyymmdd: date.clone(),
-            cycle_override_utc: Some(cycle),
-            forecast_hour: args.hour,
-            source,
-            domain: domain.clone(),
-            out_dir: args.out_dir.clone(),
-            cache_root: args.out_dir.join("cache"),
-            use_cache: false,
-            recipe_slugs: request.derived.clone(),
-            surface_product_override: None,
-            pressure_product_override: None,
-            source_mode: ProductSourceMode::Canonical,
-            allow_large_heavy_domain: false,
-            contour_mode: args.contour_mode.into(),
-            native_fill_level_multiplier: args.native_fill_level_multiplier.max(1),
-            output_width,
-            output_height,
-            png_compression: args.png_compression.into(),
-            place_label_overlay: place_label_overlay.clone(),
-        };
-        let outcome = store_render::render_derived_recipes_from_store(
-            &store,
-            &derived_request,
-            cycle,
-            &request.derived,
-        )?;
-        for recipe in &outcome.rendered {
-            println!(
-                "{:>8} ms  {}  {}",
-                recipe.timing.total_ms,
-                recipe.recipe_slug,
-                recipe.output_path.display()
-            );
-            timings.push((recipe.recipe_slug.clone(), recipe.timing.total_ms));
-        }
-        skipped.extend(outcome.skipped);
-    }
+    skipped.extend(hour_outcome.skipped);
 
     if !request.windowed.is_empty() {
-        let stored_hours =
-            windowed_store::stored_run_hours(&args.store_root, &model_slug, &args.run)?;
-        if request.windowed_auto && stored_hours.len() <= 1 {
-            println!(
-                "windowed: skipped ({} stored hour(s); 'all' includes windowed products \
-                 only when more than one hour is stored)",
-                stored_hours.len(),
-            );
-        } else {
-            let compute_started = Instant::now();
-            let outcome = windowed_store::compute_windowed_products(
-                &args.store_root,
-                &model_slug,
-                &args.run,
-                &stored_hours,
-                &request.windowed,
-            )?;
-            let compute_ms = compute_started.elapsed().as_millis();
-            let windowed_request = HrrrWindowedBatchRequest {
-                model: args.model,
-                date_yyyymmdd: date.clone(),
-                cycle_override_utc: Some(cycle),
-                forecast_hour: outcome.anchor_hour,
-                source,
-                domain: domain.clone(),
-                out_dir: args.out_dir.clone(),
-                cache_root: args.out_dir.join("cache"),
-                use_cache: false,
-                products: Vec::new(),
-                output_width,
-                output_height,
-                png_compression: args.png_compression.into(),
-                place_label_overlay: place_label_overlay.clone(),
-            };
-            let grids: Vec<StoreWindowedGrid> = outcome
-                .grids
-                .into_iter()
-                .map(|grid| StoreWindowedGrid {
-                    slug: grid.slug,
-                    units: grid.units,
-                    values: grid.values,
-                    hours_used: grid.hours_used,
-                    window_hours: grid.window_hours,
-                    strategy: grid.strategy,
-                })
-                .collect();
-            let rendered = render_windowed_products_from_store_grids(
-                &windowed_request,
-                cycle,
-                &store.full_grid(),
-                store.projection(),
-                &grids,
-            )?;
-            println!(
-                "windowed: {} realized, {} blocked | anchor F{:03} over {} stored hour(s) | compute {} ms",
-                rendered.len(),
-                outcome.blockers.len(),
-                outcome.anchor_hour,
-                stored_hours.len(),
-                compute_ms,
-            );
-            for product in &rendered {
+        match render_all::render_windowed_products(
+            &config,
+            &store,
+            &args.store_root,
+            &model_slug,
+            &args.run,
+            &request.windowed,
+            request.windowed_auto,
+        )? {
+            None => println!(
+                "windowed: skipped (single stored hour; 'all' includes windowed products \
+                 only when more than one hour is stored)"
+            ),
+            Some(outcome) => {
                 println!(
-                    "{:>8} ms  {}  {}",
-                    product.timing.total_ms,
-                    product.product.slug(),
-                    product.output_path.display()
+                    "windowed: {} realized, {} blocked | anchor F{:03} over {} stored hour(s) | compute {} ms",
+                    outcome.rendered.len(),
+                    outcome.blocked.len(),
+                    outcome.anchor_hour,
+                    outcome.stored_hours,
+                    outcome.compute_ms,
                 );
-                timings.push((product.product.slug().to_string(), product.timing.total_ms));
+                for product in &outcome.rendered {
+                    println!(
+                        "{:>8} ms  {}  {}",
+                        product.total_ms,
+                        product.slug,
+                        product.output_path.display()
+                    );
+                    timings.push((product.slug.clone(), product.total_ms));
+                }
+                skipped.extend(outcome.blocked);
             }
-            skipped.extend(
-                outcome
-                    .blockers
-                    .into_iter()
-                    .map(|(slug, reason)| StoreRenderSkip { slug, reason }),
-            );
         }
     }
 
@@ -513,62 +288,5 @@ mod tests {
                 "error for '{bad}' must name --run: {err}"
             );
         }
-    }
-
-    #[test]
-    fn products_keywords_pull_the_catalogs() {
-        let all = partition_products("all", ModelId::Hrrr).unwrap();
-        assert!(!all.strict);
-        assert_eq!(all.direct, supported_direct_recipe_slugs(ModelId::Hrrr));
-        assert_eq!(
-            all.derived.len(),
-            store_derived_recipe_slugs().len() + store_heavy_recipe_slugs().len()
-        );
-        assert_eq!(
-            all.windowed.len(),
-            HrrrWindowedProduct::supported_products().len()
-        );
-        assert!(
-            all.windowed_auto,
-            "'all' must gate windowed on multi-hour stores"
-        );
-
-        let heavy = partition_products("heavy", ModelId::Hrrr).unwrap();
-        assert!(heavy.direct.is_empty());
-        assert_eq!(heavy.derived.len(), store_heavy_recipe_slugs().len());
-        assert!(heavy.windowed.is_empty());
-
-        let windowed = partition_products("windowed", ModelId::Hrrr).unwrap();
-        assert!(windowed.direct.is_empty() && windowed.derived.is_empty());
-        assert_eq!(
-            windowed.windowed.len(),
-            HrrrWindowedProduct::supported_products().len()
-        );
-        assert!(
-            !windowed.windowed_auto,
-            "explicit 'windowed' keyword must render even single-hour stores"
-        );
-        assert!(!windowed.strict);
-    }
-
-    #[test]
-    fn product_lists_classify_into_lanes_and_are_strict() {
-        let picked = partition_products(
-            "2m_temperature,sbcape,ecape_stp,qpf_6h,uh_2to5km_run_max",
-            ModelId::Hrrr,
-        )
-        .unwrap();
-        assert!(picked.strict);
-        assert_eq!(picked.direct, vec!["2m_temperature".to_string()]);
-        assert_eq!(
-            picked.derived,
-            vec!["sbcape".to_string(), "ecape_stp".to_string()]
-        );
-        assert_eq!(
-            picked.windowed,
-            vec!["qpf_6h".to_string(), "uh_2to5km_run_max".to_string()]
-        );
-        assert!(!picked.windowed_auto);
-        assert!(partition_products("definitely_not_a_product", ModelId::Hrrr).is_err());
     }
 }
