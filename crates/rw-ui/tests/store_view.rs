@@ -160,7 +160,8 @@ fn worker_round_trip_on_synthetic_store() {
     };
     worker.send(StoreRequest::LoadField(field_key.clone()));
     match worker.recv_timeout(timeout) {
-        Some(StoreResponse::Field(key, Ok(field))) => {
+        Some(StoreResponse::Field(key, result)) => {
+            let field = result.expect("synthetic field loads");
             assert_eq!(key, field_key);
             assert_eq!(field.values.len(), field.nx * field.ny);
             assert_eq!(field.units, "K");
@@ -187,7 +188,8 @@ fn worker_round_trip_on_synthetic_store() {
         var: "no_such_var".to_string(),
     }));
     match worker.recv_timeout(timeout) {
-        Some(StoreResponse::Field(_, Err(message))) => {
+        Some(StoreResponse::Field(_, result)) => {
+            let message = result.expect_err("unknown variable must surface an error");
             assert!(message.contains("no_such_var"), "got: {message}");
         }
         other => panic!("expected Field error response, got {other:?}"),
@@ -262,7 +264,8 @@ fn real_hrrr_store_field_is_north_to_south() {
     };
     worker.send(StoreRequest::LoadField(field_key.clone()));
     match worker.recv_timeout(Duration::from_secs(120)) {
-        Some(StoreResponse::Field(key, Ok(field))) => {
+        Some(StoreResponse::Field(key, result)) => {
+            let field = result.expect("real HRRR field loads");
             assert_eq!(key, field_key);
             assert!(
                 field.lat_descending,

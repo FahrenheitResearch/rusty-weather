@@ -163,7 +163,10 @@ pub enum StoreRequest {
 pub enum StoreResponse {
     Tree(StoreTree),
     HourVars(HourKey, Result<Vec<VarInfo>, String>),
-    Field(FieldKey, Result<FieldData, String>),
+    /// Boxed: [`FieldData`] carries the inline production style (color
+    /// scale levels, title, ...) and would otherwise dwarf the other
+    /// variants (`clippy::large_enum_variant`).
+    Field(FieldKey, Box<Result<FieldData, String>>),
     Sounding(HourKey, Result<SoundingData, String>),
 }
 
@@ -285,7 +288,7 @@ fn handle(state: &mut WorkerState, request: StoreRequest) -> StoreResponse {
         }
         StoreRequest::LoadField(key) => {
             let result = load_field(state, &key).map_err(|err| err.to_string());
-            StoreResponse::Field(key, result)
+            StoreResponse::Field(key, Box::new(result))
         }
         StoreRequest::LoadSounding { hour, fx, fy } => {
             let result = load_sounding(state, &hour, fx, fy).map_err(|err| err.to_string());
