@@ -1197,6 +1197,24 @@ fn min_window_fields(grid: rustwx_core::GridShape, fields: &[&[f64]]) -> Result<
     Ok(out)
 }
 
+/// The color scale each windowed product renders with — the same per-family
+/// scales the compute kernels above attach to their `ComputedWindowedField`,
+/// factored out so grids computed elsewhere (the rw-store windowed lane)
+/// render through identical styling. UH products return the same
+/// `WeatherProduct::Uh` preset the kernel does; the render-request builder
+/// routes them through `for_core_weather_product` either way.
+pub(crate) fn windowed_product_scale(product: HrrrWindowedProduct) -> ColorScale {
+    if product.is_qpf() {
+        ColorScale::Discrete(qpf_scale())
+    } else if product.is_wind10m() {
+        ColorScale::Discrete(wind10m_scale())
+    } else if let Some(spec) = surface_snapshot_window_spec(product) {
+        ColorScale::Discrete(spec.field.scale(spec.operation))
+    } else {
+        ColorScale::Weather(WeatherProduct::Uh.scale_preset())
+    }
+}
+
 pub(crate) fn select_window(records: &[WindowedFieldRecord], hours: u16) -> Option<&[f64]> {
     records
         .iter()

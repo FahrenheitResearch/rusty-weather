@@ -20,6 +20,8 @@ mod region;
 mod store_render;
 #[path = "../throttle.rs"]
 mod throttle;
+#[path = "../windowed_store.rs"]
+mod windowed_store;
 
 use clap::{Parser, ValueEnum};
 use contour_mode::ContourModeArg;
@@ -35,6 +37,10 @@ use rustwx_products::direct::{DirectBatchRequest, supported_direct_recipe_slugs}
 use rustwx_products::places::{PlaceLabelDensityTier, default_place_label_overlay_for_domain};
 use rustwx_products::shared_context::DomainSpec;
 use rustwx_products::source::ProductSourceMode;
+use rustwx_products::windowed::{
+    HrrrWindowedBatchRequest, HrrrWindowedProduct, StoreWindowedGrid,
+    render_windowed_products_from_store_grids,
+};
 use store_render::{StoreFieldSource, StoreRenderSkip};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -72,7 +78,9 @@ struct Args {
     #[arg(
         long,
         default_value = "all",
-        help = "all | direct | derived | heavy | comma-separated product slugs"
+        help = "all | direct | derived | heavy | windowed | comma-separated product slugs \
+                (windowed products span the run's stored hours, anchored at the max hour; \
+                'all' includes them only when more than one hour is stored)"
     )]
     products: String,
     #[arg(long, value_enum, default_value_t = RegionPreset::Midwest)]
@@ -112,6 +120,11 @@ struct Args {
 struct ProductRequest {
     direct: Vec<String>,
     derived: Vec<String>,
+    windowed: Vec<String>,
+    /// The windowed list came from the "all" keyword: render it only when
+    /// the run has more than one stored hour (a single hour realizes only
+    /// the degenerate 1 h windows, which the per-hour lanes already cover).
+    windowed_auto: bool,
     strict: bool,
 }
 
@@ -131,6 +144,12 @@ fn partition_products(
             .map(str::to_string)
             .collect::<Vec<_>>()
     };
+    let windowed_catalog = || {
+        HrrrWindowedProduct::supported_products()
+            .iter()
+            .map(|product| product.slug().to_string())
+            .collect::<Vec<_>>()
+    };
     match spec.trim() {
         "all" => Ok(ProductRequest {
             direct: supported_direct_recipe_slugs(model),
@@ -138,48 +157,68 @@ fn partition_products(
                 .into_iter()
                 .chain(heavy_catalog())
                 .collect(),
+            windowed: windowed_catalog(),
+            windowed_auto: true,
             strict: false,
         }),
         "direct" => Ok(ProductRequest {
             direct: supported_direct_recipe_slugs(model),
             derived: Vec::new(),
+            windowed: Vec::new(),
+            windowed_auto: false,
             strict: false,
         }),
         "derived" => Ok(ProductRequest {
             direct: Vec::new(),
             derived: derived_catalog(),
+            windowed: Vec::new(),
+            windowed_auto: false,
             strict: false,
         }),
         "heavy" => Ok(ProductRequest {
             direct: Vec::new(),
             derived: heavy_catalog(),
+            windowed: Vec::new(),
+            windowed_auto: false,
+            strict: false,
+        }),
+        "windowed" => Ok(ProductRequest {
+            direct: Vec::new(),
+            derived: Vec::new(),
+            windowed: windowed_catalog(),
+            windowed_auto: false,
             strict: false,
         }),
         list => {
             let mut direct = Vec::new();
             let mut derived = Vec::new();
+            let mut windowed = Vec::new();
             for slug in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 let is_derived = store_derived_recipe_slugs().contains(&slug)
                     || store_heavy_recipe_slugs().contains(&slug)
                     || is_heavy_derived_recipe_slug(slug);
-                if is_derived {
+                if HrrrWindowedProduct::from_slug(slug).is_some() {
+                    windowed.push(slug.to_string());
+                } else if is_derived {
                     derived.push(slug.to_string());
                 } else if plot_recipe(slug).is_some() {
                     direct.push(slug.to_string());
                 } else {
                     return Err(format!(
-                        "unknown product '{slug}': neither a direct plot recipe nor a \
-                         derived/heavy recipe slug"
+                        "unknown product '{slug}': neither a direct plot recipe, a \
+                         derived/heavy recipe slug, nor a windowed product slug"
                     )
                     .into());
                 }
             }
-            if direct.is_empty() && derived.is_empty() {
+            if direct.is_empty() && derived.is_empty() && windowed.is_empty() {
                 return Err("pass at least one product slug via --products".into());
             }
             Ok(ProductRequest {
                 direct,
                 derived,
+                windowed,
+                windowed_auto: false,
                 strict: true,
             })
         }
@@ -243,12 +282,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let store = StoreFieldSource::open(&args.store_root, &model_slug, &args.run, args.hour)?;
     let open_ms = open_started.elapsed().as_millis();
     println!(
-        "rw_render build {} | store {} | {} products requested ({} direct, {} derived/heavy) | open {} ms",
+        "rw_render build {} | store {} | {} products requested ({} direct, {} derived/heavy, {} windowed) | open {} ms",
         env!("RW_BUILD_SHA"),
         store.hour_path().display(),
-        request.direct.len() + request.derived.len(),
+        request.direct.len() + request.derived.len() + request.windowed.len(),
         request.direct.len(),
         request.derived.len(),
+        request.windowed.len(),
         open_ms,
     );
 
@@ -317,7 +357,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             output_width,
             output_height,
             png_compression: args.png_compression.into(),
-            place_label_overlay,
+            place_label_overlay: place_label_overlay.clone(),
         };
         let outcome = store_render::render_derived_recipes_from_store(
             &store,
@@ -335,6 +375,86 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             timings.push((recipe.recipe_slug.clone(), recipe.timing.total_ms));
         }
         skipped.extend(outcome.skipped);
+    }
+
+    if !request.windowed.is_empty() {
+        let stored_hours =
+            windowed_store::stored_run_hours(&args.store_root, &model_slug, &args.run)?;
+        if request.windowed_auto && stored_hours.len() <= 1 {
+            println!(
+                "windowed: skipped ({} stored hour(s); 'all' includes windowed products \
+                 only when more than one hour is stored)",
+                stored_hours.len(),
+            );
+        } else {
+            let compute_started = Instant::now();
+            let outcome = windowed_store::compute_windowed_products(
+                &args.store_root,
+                &model_slug,
+                &args.run,
+                &stored_hours,
+                &request.windowed,
+            )?;
+            let compute_ms = compute_started.elapsed().as_millis();
+            let windowed_request = HrrrWindowedBatchRequest {
+                model: args.model,
+                date_yyyymmdd: date.clone(),
+                cycle_override_utc: Some(cycle),
+                forecast_hour: outcome.anchor_hour,
+                source,
+                domain: domain.clone(),
+                out_dir: args.out_dir.clone(),
+                cache_root: args.out_dir.join("cache"),
+                use_cache: false,
+                products: Vec::new(),
+                output_width,
+                output_height,
+                png_compression: args.png_compression.into(),
+                place_label_overlay: place_label_overlay.clone(),
+            };
+            let grids: Vec<StoreWindowedGrid> = outcome
+                .grids
+                .into_iter()
+                .map(|grid| StoreWindowedGrid {
+                    slug: grid.slug,
+                    units: grid.units,
+                    values: grid.values,
+                    hours_used: grid.hours_used,
+                    window_hours: grid.window_hours,
+                    strategy: grid.strategy,
+                })
+                .collect();
+            let rendered = render_windowed_products_from_store_grids(
+                &windowed_request,
+                cycle,
+                &store.full_grid(),
+                store.projection(),
+                &grids,
+            )?;
+            println!(
+                "windowed: {} realized, {} blocked | anchor F{:03} over {} stored hour(s) | compute {} ms",
+                rendered.len(),
+                outcome.blockers.len(),
+                outcome.anchor_hour,
+                stored_hours.len(),
+                compute_ms,
+            );
+            for product in &rendered {
+                println!(
+                    "{:>8} ms  {}  {}",
+                    product.timing.total_ms,
+                    product.product.slug(),
+                    product.output_path.display()
+                );
+                timings.push((product.product.slug().to_string(), product.timing.total_ms));
+            }
+            skipped.extend(
+                outcome
+                    .blockers
+                    .into_iter()
+                    .map(|(slug, reason)| StoreRenderSkip { slug, reason }),
+            );
+        }
     }
 
     let total_ms = total_started.elapsed().as_millis();
@@ -404,21 +524,51 @@ mod tests {
             all.derived.len(),
             store_derived_recipe_slugs().len() + store_heavy_recipe_slugs().len()
         );
+        assert_eq!(
+            all.windowed.len(),
+            HrrrWindowedProduct::supported_products().len()
+        );
+        assert!(
+            all.windowed_auto,
+            "'all' must gate windowed on multi-hour stores"
+        );
 
         let heavy = partition_products("heavy", ModelId::Hrrr).unwrap();
         assert!(heavy.direct.is_empty());
         assert_eq!(heavy.derived.len(), store_heavy_recipe_slugs().len());
+        assert!(heavy.windowed.is_empty());
+
+        let windowed = partition_products("windowed", ModelId::Hrrr).unwrap();
+        assert!(windowed.direct.is_empty() && windowed.derived.is_empty());
+        assert_eq!(
+            windowed.windowed.len(),
+            HrrrWindowedProduct::supported_products().len()
+        );
+        assert!(
+            !windowed.windowed_auto,
+            "explicit 'windowed' keyword must render even single-hour stores"
+        );
+        assert!(!windowed.strict);
     }
 
     #[test]
     fn product_lists_classify_into_lanes_and_are_strict() {
-        let picked = partition_products("2m_temperature,sbcape,ecape_stp", ModelId::Hrrr).unwrap();
+        let picked = partition_products(
+            "2m_temperature,sbcape,ecape_stp,qpf_6h,uh_2to5km_run_max",
+            ModelId::Hrrr,
+        )
+        .unwrap();
         assert!(picked.strict);
         assert_eq!(picked.direct, vec!["2m_temperature".to_string()]);
         assert_eq!(
             picked.derived,
             vec!["sbcape".to_string(), "ecape_stp".to_string()]
         );
+        assert_eq!(
+            picked.windowed,
+            vec!["qpf_6h".to_string(), "uh_2to5km_run_max".to_string()]
+        );
+        assert!(!picked.windowed_auto);
         assert!(partition_products("definitely_not_a_product", ModelId::Hrrr).is_err());
     }
 }
