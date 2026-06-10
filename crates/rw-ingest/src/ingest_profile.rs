@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Ingest profiles: WHICH subset of the full per-hour ingest plan a run
 //! fetches, extracts, computes, and stores. Shared via `#[path]` inclusion
 //! as a child of `ingest_hour` (the single inclusion point, so every bin

@@ -18,8 +18,7 @@ mod contour_mode;
 mod region;
 #[path = "../render_all.rs"]
 mod render_all;
-#[path = "../throttle.rs"]
-mod throttle;
+use rw_ingest::throttle;
 
 use clap::{Parser, ValueEnum};
 use contour_mode::ContourModeArg;

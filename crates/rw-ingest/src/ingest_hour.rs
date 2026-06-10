@@ -1,11 +1,18 @@
-#![allow(dead_code)]
-
 //! Shared per-hour live-GRIB -> `.rws` ingest flow, used by `rw_ingest`
-//! (serial hours) and `rw_batch` (pipelined hours) via `#[path]` inclusion.
-//! Also the single inclusion point for the `ingest_profile` (what one run
+//! (serial hours), `rw_batch` (pipelined hours), and the UI shell's
+//! ingest worker. Also the parent of the `ingest_profile` (what one run
 //! fetches/extracts/computes/stores — the default `full` profile is the
 //! behavior described below, unchanged) and `size_estimate` (exact +
 //! predictive store/download sizing) child modules.
+//!
+//! Progress is reported through the [`IngestEvent`] sink on
+//! [`IngestConfig`] (stage start/done walls plus the historical
+//! stdout/stderr note lines — see [`crate::print_event`]); cancellation is
+//! observed at stage boundaries via the config's cancel flag and surfaces
+//! as [`IngestError::Cancelled`]. The store write is atomic (temp + rename
+//! inside rw-store), so a cancel mid-hour never leaves partial files — at
+//! worst the in-flight stage finishes and the hour is dropped before its
+//! write.
 //!
 //! Per forecast hour: fetch the `prs` product file (cache-aware), extract
 //! the full 3D isobaric superset plus the sparse per-level vorticity planes
@@ -40,6 +47,7 @@
 //! pulling any of the ~770 MB wrfnat file.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rustwx_core::{
@@ -66,6 +74,8 @@ pub mod ingest_compute;
 pub mod ingest_profile;
 #[path = "size_estimate.rs"]
 pub mod size_estimate;
+use crate::events::{IngestError, IngestEvent, IngestStage, other};
+use crate::profile_scope;
 use ingest_compute::DerivedGrid2D;
 use ingest_profile::{IngestProfile, VolumeChoice, surface_plan};
 
@@ -148,11 +158,39 @@ pub struct IngestConfig<'a> {
     /// After the write, re-open the hour and verify a bit-exact 2D
     /// round-trip of every field plus one profile per 3D variable.
     pub verify: bool,
+    /// Progress sink: stage start/done walls plus the historical
+    /// stdout/stderr note lines. Bins pass [`crate::print_event`] (which
+    /// reproduces the old inline prints byte-for-byte); UI hosts forward
+    /// events over a channel. `Sync` because `rw_batch` shares one config
+    /// across its fetch/process threads.
+    pub progress: &'a (dyn Fn(IngestEvent) + Sync),
+    /// Checked at stage boundaries (between the prs and sfc fetches, and
+    /// before each CPU stage); when set, the flow returns
+    /// [`IngestError::Cancelled`]. Callers without cancellation pass
+    /// [`crate::NEVER_CANCEL`].
+    pub cancel: &'a AtomicBool,
+}
+
+impl IngestConfig<'_> {
+    fn emit(&self, event: IngestEvent) {
+        (self.progress)(event);
+    }
+
+    /// `Err(Cancelled)` once the cancel flag is set; called at every stage
+    /// boundary.
+    fn check_cancel(&self) -> Result<(), IngestError> {
+        if self.cancel.load(Ordering::Relaxed) {
+            Err(IngestError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// The network half of one hour: both family files fetched (cache-aware),
 /// with per-file fetch walls. Everything here is `Send`, so a fetch thread
 /// can hand it across a channel to the CPU half.
+#[derive(Debug)]
 pub struct FetchedHour {
     pub hour: u16,
     pub prs: CachedFetchResult,
@@ -162,6 +200,7 @@ pub struct FetchedHour {
 }
 
 /// One realized 3D variable summary for reporting.
+#[derive(Debug, Clone)]
 pub struct VolumeSummary {
     pub name: String,
     pub levels: Vec<u16>,
@@ -169,6 +208,7 @@ pub struct VolumeSummary {
 
 /// One ingested hour: per-stage walls, cache provenance, store stats, and
 /// realized/planned counts for honest reporting.
+#[derive(Debug)]
 pub struct IngestedHour {
     pub hour: u16,
     pub prs_fetch_ms: u128,
@@ -211,28 +251,51 @@ pub fn cache_state(hit: bool) -> &'static str {
 }
 
 /// Fetch both family files for one hour (network or cache disk read; no
-/// decode, no rayon).
-pub fn fetch_hour(
-    config: &IngestConfig<'_>,
-    hour: u16,
-) -> Result<FetchedHour, Box<dyn std::error::Error>> {
+/// decode, no rayon). The cancel flag is observed before each file; a
+/// cancel mid-download takes effect once the in-flight file completes
+/// (the byte fetch has no abort hook today).
+pub fn fetch_hour(config: &IngestConfig<'_>, hour: u16) -> Result<FetchedHour, IngestError> {
+    config.check_cancel()?;
     let prs_fetch = FetchRequest {
-        request: ModelRunRequest::new(config.model, config.cycle.clone(), hour, "prs")?,
+        request: ModelRunRequest::new(config.model, config.cycle.clone(), hour, "prs")
+            .map_err(other)?,
         source_override: config.source_override,
         variable_patterns: Vec::new(),
     };
+    config.emit(IngestEvent::StageStarted {
+        hour,
+        stage: IngestStage::FetchPrs,
+    });
     let fetch_started = Instant::now();
-    let prs = fetch_bytes_with_cache(&prs_fetch, config.cache_root, config.use_cache)?;
+    let prs =
+        fetch_bytes_with_cache(&prs_fetch, config.cache_root, config.use_cache).map_err(other)?;
     let prs_fetch_ms = fetch_started.elapsed().as_millis();
+    config.emit(IngestEvent::StageDone {
+        hour,
+        stage: IngestStage::FetchPrs,
+        ms: prs_fetch_ms,
+    });
 
+    config.check_cancel()?;
     let sfc_fetch = FetchRequest {
-        request: ModelRunRequest::new(config.model, config.cycle.clone(), hour, "sfc")?,
+        request: ModelRunRequest::new(config.model, config.cycle.clone(), hour, "sfc")
+            .map_err(other)?,
         source_override: config.source_override,
         variable_patterns: Vec::new(),
     };
+    config.emit(IngestEvent::StageStarted {
+        hour,
+        stage: IngestStage::FetchSfc,
+    });
     let fetch_started = Instant::now();
-    let sfc = fetch_bytes_with_cache(&sfc_fetch, config.cache_root, config.use_cache)?;
+    let sfc =
+        fetch_bytes_with_cache(&sfc_fetch, config.cache_root, config.use_cache).map_err(other)?;
     let sfc_fetch_ms = fetch_started.elapsed().as_millis();
+    config.emit(IngestEvent::StageDone {
+        hour,
+        stage: IngestStage::FetchSfc,
+        ms: sfc_fetch_ms,
+    });
 
     Ok(FetchedHour {
         hour,
@@ -254,11 +317,13 @@ struct VolumeData {
 
 /// The CPU half of one hour: extract both files, compute derived/heavy
 /// grids, write the store hour, and (optionally) verify the round-trip.
-/// All parallelism rides the ONE global rayon pool.
+/// All parallelism rides the rayon pool of the CALLING thread — the global
+/// pool for the bins, or a dedicated below-normal pool when an interactive
+/// host runs this inside `ThreadPool::install` (see [`crate::throttle`]).
 pub fn process_fetched_hour(
     config: &IngestConfig<'_>,
     fetched: FetchedHour,
-) -> Result<IngestedHour, Box<dyn std::error::Error>> {
+) -> Result<IngestedHour, IngestError> {
     // The CLIs validate via resolve_profile; guard programmatic callers too
     // (e.g. derived=false + heavy=true would silently compute derived).
     debug_assert!(
@@ -266,6 +331,7 @@ pub fn process_fetched_hour(
         "process_fetched_hour called with an unvalidated profile: {:?}",
         config.profile.validate()
     );
+    config.check_cancel()?;
     let process_started = Instant::now();
     let FetchedHour {
         hour,
@@ -314,6 +380,10 @@ pub fn process_fetched_hour(
             prs_selectors.push(*selector);
         }
     }
+    config.emit(IngestEvent::StageStarted {
+        hour,
+        stage: IngestStage::ExtractPrs,
+    });
     let extract_started = Instant::now();
     let mut prs_extract_ms = 0u128;
     let mut volumes_data: Vec<VolumeData> = volume_plan
@@ -327,13 +397,15 @@ pub fn process_fetched_hour(
         .collect();
     let mut prs_fields_2d: Vec<(String, SelectedField2D)> = Vec::new();
     if !prs_selectors.is_empty() {
+        profile_scope!("ingest_extract_prs");
         let prs_extraction = extract_fields_partial_from_model_bytes_at_forecast_hour(
             config.model,
             &prs.result.bytes,
             Some(&prs.bytes_path),
             &prs_selectors,
             Some(hour),
-        )?;
+        )
+        .map_err(other)?;
         prs_extract_ms = extract_started.elapsed().as_millis();
         for extracted in prs_extraction.extracted {
             let VerticalSelector::IsobaricHpa(level) = extracted.selector.vertical else {
@@ -362,17 +434,25 @@ pub fn process_fetched_hour(
     if include_full_2d {
         for (level, name) in VORTICITY_PLAN {
             if !prs_fields_2d.iter().any(|(have, _)| have == name) {
-                eprintln!(
-                    "f{hour:03}: 2D field '{name}' (absolute vorticity {level} hPa) \
-                     missing from the prs file; skipped"
-                );
+                config.emit(IngestEvent::Warning {
+                    hour,
+                    message: format!(
+                        "f{hour:03}: 2D field '{name}' (absolute vorticity {level} hPa) \
+                         missing from the prs file; skipped"
+                    ),
+                });
             }
         }
     }
     for selector in &direct_planes {
         let key = selector.key();
         if !prs_fields_2d.iter().any(|(have, _)| *have == key) {
-            eprintln!("f{hour:03}: direct-recipe plane '{key}' missing from the prs file; skipped");
+            config.emit(IngestEvent::Warning {
+                hour,
+                message: format!(
+                    "f{hour:03}: direct-recipe plane '{key}' missing from the prs file; skipped"
+                ),
+            });
         }
     }
 
@@ -389,10 +469,13 @@ pub fn process_fetched_hour(
         .map(|volume| volume.levels.len())
         .unwrap_or(0);
     if dewpoint_planned && dewpoint_realized < 2 {
-        eprintln!(
-            "f{hour:03}: dewpoint_iso realized only {dewpoint_realized} level(s); \
-             falling back to relative humidity (rh_iso)"
-        );
+        config.emit(IngestEvent::Warning {
+            hour,
+            message: format!(
+                "f{hour:03}: dewpoint_iso realized only {dewpoint_realized} level(s); \
+                 falling back to relative humidity (rh_iso)"
+            ),
+        });
         let rh_selectors: Vec<FieldSelector> = levels
             .iter()
             .map(|&level| FieldSelector::isobaric(CanonicalField::RelativeHumidity, level))
@@ -404,7 +487,8 @@ pub fn process_fetched_hour(
             Some(&prs.bytes_path),
             &rh_selectors,
             Some(hour),
-        )?;
+        )
+        .map_err(other)?;
         prs_extract_ms += rh_started.elapsed().as_millis();
         let dewpoint = volumes_data
             .iter_mut()
@@ -423,10 +507,20 @@ pub fn process_fetched_hour(
     }
     // `prs` stays alive: the derived/heavy compute stage decodes the
     // thermo pair from the raw prs + sfc bytes below.
+    config.emit(IngestEvent::StageDone {
+        hour,
+        stage: IngestStage::ExtractPrs,
+        ms: prs_extract_ms,
+    });
+    config.check_cancel()?;
 
     // --- sfc product file: 2D surface set (profile-filtered, plan order
     //     so the grid carrier stays the first surface-plan field), one
     //     decode pass ---
+    config.emit(IngestEvent::StageStarted {
+        hour,
+        stage: IngestStage::ExtractSfc,
+    });
     let surface_plan: Vec<(&'static str, FieldSelector)> = surface_plan()
         .into_iter()
         .filter(|(name, _)| profile.includes_surface_field(name))
@@ -434,13 +528,17 @@ pub fn process_fetched_hour(
     let sfc_selectors: Vec<FieldSelector> =
         surface_plan.iter().map(|(_, selector)| *selector).collect();
     let extract_started = Instant::now();
-    let mut sfc_extraction = extract_fields_partial_from_model_bytes_at_forecast_hour(
-        config.model,
-        &sfc.result.bytes,
-        Some(&sfc.bytes_path),
-        &sfc_selectors,
-        Some(hour),
-    )?;
+    let mut sfc_extraction = {
+        profile_scope!("ingest_extract_sfc");
+        extract_fields_partial_from_model_bytes_at_forecast_hour(
+            config.model,
+            &sfc.result.bytes,
+            Some(&sfc.bytes_path),
+            &sfc_selectors,
+            Some(hour),
+        )
+        .map_err(other)?
+    };
     let mut sfc_extract_ms = extract_started.elapsed().as_millis();
 
     let mut fields_2d_owned: Vec<(String, SelectedField2D)> = Vec::new();
@@ -456,10 +554,13 @@ pub fn process_fetched_hour(
                     sfc_extraction.extracted.swap_remove(index),
                 ));
             }
-            None => eprintln!(
-                "f{hour:03}: 2D field '{name}' ({}) missing from the sfc file; skipped",
-                selector.key()
-            ),
+            None => config.emit(IngestEvent::Warning {
+                hour,
+                message: format!(
+                    "f{hour:03}: 2D field '{name}' ({}) missing from the sfc file; skipped",
+                    selector.key()
+                ),
+            }),
         }
     }
 
@@ -516,7 +617,8 @@ pub fn process_fetched_hour(
             Some(&sfc.bytes_path),
             &trailing_selectors,
             Some(hour - 1),
-        )?;
+        )
+        .map_err(other)?;
         sfc_extract_ms += trailing_started.elapsed().as_millis();
         for (name, selector) in &trailing_plan {
             match trailing_extraction
@@ -528,19 +630,32 @@ pub fn process_fetched_hour(
                     name.to_string(),
                     trailing_extraction.extracted.swap_remove(index),
                 )),
-                None => eprintln!(
-                    "f{hour:03}: 2D field '{name}' (trailing 1 h window of {}) \
-                     missing from the sfc file; skipped",
-                    selector.key()
-                ),
+                None => config.emit(IngestEvent::Warning {
+                    hour,
+                    message: format!(
+                        "f{hour:03}: 2D field '{name}' (trailing 1 h window of {}) \
+                         missing from the sfc file; skipped",
+                        selector.key()
+                    ),
+                }),
             }
         }
     } else if include_full_2d {
-        eprintln!(
-            "f{hour:03}: trailing 1 h window fields (apcp_1h, uh_2to5km_max_1h, \
-             wind_speed_10m_max_1h) have no window at analysis; skipped"
-        );
+        config.emit(IngestEvent::Warning {
+            hour,
+            message: format!(
+                "f{hour:03}: trailing 1 h window fields (apcp_1h, uh_2to5km_max_1h, \
+                 wind_speed_10m_max_1h) have no window at analysis; skipped"
+            ),
+        });
     }
+
+    config.emit(IngestEvent::StageDone {
+        hour,
+        stage: IngestStage::ExtractSfc,
+        ms: sfc_extract_ms,
+    });
+    config.check_cancel()?;
 
     // Sparse prs-sourced planes ride behind the sfc set so the grid carrier
     // stays the first surface-plan field (both files share the HRRR grid;
@@ -555,10 +670,9 @@ pub fn process_fetched_hour(
         };
     fields_2d_owned.extend(prs_fields_2d);
     if fields_2d_owned.is_empty() {
-        return Err(format!(
+        return Err(other(format!(
             "f{hour:03}: no 2D fields realized; cannot write an hour without a grid carrier"
-        )
-        .into());
+        )));
     }
 
     // --- derived + heavy precompute: decode the surface + pressure thermo
@@ -578,6 +692,7 @@ pub fn process_fetched_hour(
         0
     };
     let stages = compute_product_grids(
+        config,
         &sfc.result.bytes,
         &prs.result.bytes,
         hour,
@@ -586,6 +701,7 @@ pub fn process_fetched_hour(
     );
     drop(sfc);
     drop(prs);
+    config.check_cancel()?;
     let thermo_decode_ms = stages.decode_ms;
     let derived_ms = stages.derived_ms;
     let heavy_ms = stages.heavy_ms;
@@ -593,6 +709,10 @@ pub fn process_fetched_hour(
     let heavy_grids = stages.heavy;
 
     // --- assemble + write ---
+    config.emit(IngestEvent::StageStarted {
+        hour,
+        stage: IngestStage::Write,
+    });
     let write_started = Instant::now();
     let fields_2d: Vec<(&str, &SelectedField2D)> = fields_2d_owned
         .iter()
@@ -601,11 +721,14 @@ pub fn process_fetched_hour(
     let mut volumes: Vec<PressureVolumeInput<'_>> = Vec::new();
     for volume in &volumes_data {
         if volume.levels.len() < 2 {
-            eprintln!(
-                "f{hour:03}: 3D variable '{}' realized {} level(s) (< 2); skipped",
-                volume.name,
-                volume.levels.len()
-            );
+            config.emit(IngestEvent::Warning {
+                hour,
+                message: format!(
+                    "f{hour:03}: 3D variable '{}' realized {} level(s) (< 2); skipped",
+                    volume.name,
+                    volume.levels.len()
+                ),
+            });
             continue;
         }
         volumes.push(PressureVolumeInput {
@@ -635,29 +758,51 @@ pub fn process_fetched_hour(
 
     let unix_now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|err| format!("system clock before unix epoch: {err}"))?
+        .map_err(|err| other(format!("system clock before unix epoch: {err}")))?
         .as_secs();
-    let written = write_hour_from_fields_with_derived(
-        config.store_root,
-        config.model_slug,
-        config.run_slug,
-        hour,
-        &fields_2d,
-        &derived_inputs,
-        &volumes,
-        env!("RW_BUILD_SHA"),
-        unix_now,
-    )?;
+    let written = {
+        profile_scope!("ingest_write_hour");
+        write_hour_from_fields_with_derived(
+            config.store_root,
+            config.model_slug,
+            config.run_slug,
+            hour,
+            &fields_2d,
+            &derived_inputs,
+            &volumes,
+            env!("RW_BUILD_SHA"),
+            unix_now,
+        )
+        .map_err(other)?
+    };
     let write_ms = write_started.elapsed().as_millis();
+    config.emit(IngestEvent::StageDone {
+        hour,
+        stage: IngestStage::Write,
+        ms: write_ms,
+    });
 
     if config.verify {
+        config.emit(IngestEvent::StageStarted {
+            hour,
+            stage: IngestStage::Verify,
+        });
+        let verify_started = Instant::now();
         verify_hour(
+            config,
+            hour,
             &written.path,
             &fields_2d_owned,
             &derived_grids,
             &heavy_grids,
             &volumes_data,
-        )?;
+        )
+        .map_err(other)?;
+        config.emit(IngestEvent::StageDone {
+            hour,
+            stage: IngestStage::Verify,
+            ms: verify_started.elapsed().as_millis(),
+        });
     }
 
     let volumes_summary = volumes_data
@@ -702,10 +847,7 @@ pub fn process_fetched_hour(
 }
 
 /// Serial fetch + process for one hour (rw_ingest's flow).
-pub fn ingest_hour(
-    config: &IngestConfig<'_>,
-    hour: u16,
-) -> Result<IngestedHour, Box<dyn std::error::Error>> {
+pub fn ingest_hour(config: &IngestConfig<'_>, hour: u16) -> Result<IngestedHour, IngestError> {
     let fetched = fetch_hour(config, hour)?;
     process_fetched_hour(config, fetched)
 }
@@ -730,6 +872,7 @@ struct ComputedProductGrids {
 /// extracted fields still carry the hour. Profiles with both stages off
 /// (e.g. `sounding`) skip even the thermo decode.
 fn compute_product_grids(
+    config: &IngestConfig<'_>,
     surface_bytes: &[u8],
     pressure_bytes: &[u8],
     hour: u16,
@@ -737,31 +880,69 @@ fn compute_product_grids(
     heavy_enabled: bool,
 ) -> ComputedProductGrids {
     if !derived_enabled && !heavy_enabled {
-        println!("f{hour:03}: derived/heavy compute stages skipped (profile)");
+        config.emit(IngestEvent::Info {
+            hour,
+            message: format!("f{hour:03}: derived/heavy compute stages skipped (profile)"),
+        });
         return ComputedProductGrids::default();
     }
+    config.emit(IngestEvent::StageStarted {
+        hour,
+        stage: IngestStage::ThermoDecode,
+    });
     let decode_started = Instant::now();
-    let inputs = match ingest_compute::decode_products_inputs(surface_bytes, pressure_bytes) {
-        Ok(inputs) => inputs,
-        Err(err) => {
-            eprintln!("f{hour:03}: derived/heavy precompute skipped: thermo decode failed: {err}");
-            return ComputedProductGrids::default();
+    let inputs = {
+        profile_scope!("ingest_thermo_decode");
+        match ingest_compute::decode_products_inputs(surface_bytes, pressure_bytes) {
+            Ok(inputs) => inputs,
+            Err(err) => {
+                config.emit(IngestEvent::Warning {
+                    hour,
+                    message: format!(
+                        "f{hour:03}: derived/heavy precompute skipped: thermo decode failed: {err}"
+                    ),
+                });
+                return ComputedProductGrids::default();
+            }
         }
     };
     let decode_ms = decode_started.elapsed().as_millis();
+    config.emit(IngestEvent::StageDone {
+        hour,
+        stage: IngestStage::ThermoDecode,
+        ms: decode_ms,
+    });
 
+    config.emit(IngestEvent::StageStarted {
+        hour,
+        stage: IngestStage::Derived,
+    });
     let derived_started = Instant::now();
-    let derived = match ingest_compute::compute_derived_2d_from_inputs(&inputs) {
-        Ok(grids) => grids,
-        Err(err) => {
-            eprintln!("f{hour:03}: derived precompute skipped: {err}");
-            Vec::new()
+    let derived = {
+        profile_scope!("ingest_derived");
+        match ingest_compute::compute_derived_2d_from_inputs(&inputs) {
+            Ok(grids) => grids,
+            Err(err) => {
+                config.emit(IngestEvent::Warning {
+                    hour,
+                    message: format!("f{hour:03}: derived precompute skipped: {err}"),
+                });
+                Vec::new()
+            }
         }
     };
     let derived_ms = derived_started.elapsed().as_millis();
+    config.emit(IngestEvent::StageDone {
+        hour,
+        stage: IngestStage::Derived,
+        ms: derived_ms,
+    });
 
     if !heavy_enabled {
-        println!("f{hour:03}: heavy ingest stage skipped (profile/--no-heavy)");
+        config.emit(IngestEvent::Info {
+            hour,
+            message: format!("f{hour:03}: heavy ingest stage skipped (profile/--no-heavy)"),
+        });
         return ComputedProductGrids {
             derived,
             heavy: Vec::new(),
@@ -771,36 +952,60 @@ fn compute_product_grids(
         };
     }
 
+    config.emit(IngestEvent::StageStarted {
+        hour,
+        stage: IngestStage::Heavy,
+    });
     let heavy_started = Instant::now();
-    let heavy = match ingest_compute::compute_heavy_2d_from_inputs(&inputs) {
-        Ok(heavy) => {
-            for (slug, reason) in &heavy.skipped {
-                eprintln!("f{hour:03}: heavy recipe '{slug}' skipped: {reason}");
+    let heavy = {
+        profile_scope!("ingest_heavy");
+        match ingest_compute::compute_heavy_2d_from_inputs(&inputs) {
+            Ok(heavy) => {
+                for (slug, reason) in &heavy.skipped {
+                    config.emit(IngestEvent::Warning {
+                        hour,
+                        message: format!("f{hour:03}: heavy recipe '{slug}' skipped: {reason}"),
+                    });
+                }
+                if heavy.ecape_failure_count > 0 {
+                    config.emit(IngestEvent::Warning {
+                        hour,
+                        message: format!(
+                            "f{hour:03}: ECAPE triplet failed on {} column(s) (NaN in grids, \
+                             same as the render lane)",
+                            heavy.ecape_failure_count
+                        ),
+                    });
+                }
+                config.emit(IngestEvent::Info {
+                    hour,
+                    message: format!(
+                        "f{hour:03}: heavy breakdown: height-AGL prep {} ms | ECAPE triplet {} ms | \
+                         wind diagnostics {} ms | ML classic (STP LCL) {} ms | composites {} ms",
+                        heavy.timing.prepare_height_agl_ms,
+                        heavy.timing.kernels.ecape_triplet_ms,
+                        heavy.timing.kernels.wind_diagnostics_ms,
+                        heavy.timing.kernels.ml_classic_ms,
+                        heavy.timing.kernels.composites_ms,
+                    ),
+                });
+                heavy.grids
             }
-            if heavy.ecape_failure_count > 0 {
-                eprintln!(
-                    "f{hour:03}: ECAPE triplet failed on {} column(s) (NaN in grids, \
-                     same as the render lane)",
-                    heavy.ecape_failure_count
-                );
+            Err(err) => {
+                config.emit(IngestEvent::Warning {
+                    hour,
+                    message: format!("f{hour:03}: heavy precompute skipped: {err}"),
+                });
+                Vec::new()
             }
-            println!(
-                "f{hour:03}: heavy breakdown: height-AGL prep {} ms | ECAPE triplet {} ms | \
-                 wind diagnostics {} ms | ML classic (STP LCL) {} ms | composites {} ms",
-                heavy.timing.prepare_height_agl_ms,
-                heavy.timing.kernels.ecape_triplet_ms,
-                heavy.timing.kernels.wind_diagnostics_ms,
-                heavy.timing.kernels.ml_classic_ms,
-                heavy.timing.kernels.composites_ms,
-            );
-            heavy.grids
-        }
-        Err(err) => {
-            eprintln!("f{hour:03}: heavy precompute skipped: {err}");
-            Vec::new()
         }
     };
     let heavy_ms = heavy_started.elapsed().as_millis();
+    config.emit(IngestEvent::StageDone {
+        hour,
+        stage: IngestStage::Heavy,
+        ms: heavy_ms,
+    });
 
     ComputedProductGrids {
         derived,
@@ -816,13 +1021,16 @@ fn compute_product_grids(
 /// marker selector checked), plus one center-of-grid profile per 3D
 /// variable, each profile value checked against the source plane's center
 /// value within the quantization bound.
+#[allow(clippy::too_many_arguments)]
 fn verify_hour(
+    config: &IngestConfig<'_>,
+    hour: u16,
     hour_path: &Path,
     fields_2d: &[(String, SelectedField2D)],
     derived_grids: &[DerivedGrid2D],
     heavy_grids: &[DerivedGrid2D],
     volumes_data: &[VolumeData],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let reader = HourReader::open(hour_path)?;
     let grid_path = hour_path
         .parent()
@@ -942,12 +1150,15 @@ fn verify_hour(
         }
         profiles.push(format!("{}:{}", var.name, profile.len()));
     }
-    println!(
-        "  verify ok: all {} 2D fields bit-exact (first '{name}'), {derived_note}, \
-         {heavy_note}, profiles at grid center [{}], values within quantization bound",
-        fields_2d.len(),
-        profiles.join(" ")
-    );
+    config.emit(IngestEvent::Info {
+        hour,
+        message: format!(
+            "  verify ok: all {} 2D fields bit-exact (first '{name}'), {derived_note}, \
+             {heavy_note}, profiles at grid center [{}], values within quantization bound",
+            fields_2d.len(),
+            profiles.join(" ")
+        ),
+    });
     Ok(())
 }
 
@@ -957,7 +1168,7 @@ fn verify_marked_grid(
     reader: &HourReader,
     grid: &GridFile,
     expected: &DerivedGrid2D,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let stored = read_grid_2d(reader, grid, expected.name)?;
     if stored.selector != derived_selector(expected.name) {
         return Err(format!(
@@ -1264,6 +1475,69 @@ mod tests {
     #[test]
     fn parse_hours_range_is_inclusive() {
         assert_eq!(parse_hours("0-6").unwrap(), (0..=6).collect::<Vec<u16>>());
+    }
+
+    /// A pre-set cancel flag stops both halves at their first boundary —
+    /// before any network or extraction work — with the distinguishable
+    /// `Cancelled` error and no events emitted.
+    #[test]
+    fn cancel_flag_stops_fetch_and_process_before_any_work() {
+        use std::sync::Mutex;
+
+        let cycle = CycleSpec::new("20260608", 0).expect("valid cycle");
+        let profile = IngestProfile::sounding();
+        let cancel = AtomicBool::new(true);
+        let events: Mutex<Vec<IngestEvent>> = Mutex::new(Vec::new());
+        let sink = |event: IngestEvent| events.lock().unwrap().push(event);
+        let config = IngestConfig {
+            model: ModelId::Hrrr,
+            cycle: &cycle,
+            source_override: None,
+            cache_root: Path::new("nonexistent-cache"),
+            use_cache: false,
+            store_root: Path::new("nonexistent-store"),
+            model_slug: "hrrr",
+            run_slug: "20260608_00z",
+            profile: &profile,
+            verify: false,
+            progress: &sink,
+            cancel: &cancel,
+        };
+
+        let err = fetch_hour(&config, 6).expect_err("cancelled fetch must error");
+        assert!(err.is_cancelled(), "got: {err}");
+
+        let fetched = FetchedHour {
+            hour: 6,
+            prs: rustwx_io::CachedFetchResult {
+                result: rustwx_io::FetchResult {
+                    source: SourceId::Aws,
+                    url: String::new(),
+                    bytes: Vec::new(),
+                },
+                cache_hit: true,
+                bytes_path: PathBuf::new(),
+                metadata_path: PathBuf::new(),
+            },
+            sfc: rustwx_io::CachedFetchResult {
+                result: rustwx_io::FetchResult {
+                    source: SourceId::Aws,
+                    url: String::new(),
+                    bytes: Vec::new(),
+                },
+                cache_hit: true,
+                bytes_path: PathBuf::new(),
+                metadata_path: PathBuf::new(),
+            },
+            prs_fetch_ms: 0,
+            sfc_fetch_ms: 0,
+        };
+        let err = process_fetched_hour(&config, fetched).expect_err("cancelled process");
+        assert!(err.is_cancelled(), "got: {err}");
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "a pre-set cancel must stop the flow before any stage event"
+        );
     }
 
     #[test]

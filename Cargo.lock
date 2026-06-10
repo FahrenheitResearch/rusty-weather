@@ -3594,6 +3594,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "puffin"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84b514d95a258be801fde8a1ff1c974f4a4841d9750f5d1d6690fc07a5ad4049"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "cfg-if",
+ "itertools",
+ "parking_lot",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4143,6 +4156,7 @@ dependencies = [
  "rustwx-models",
  "rustwx-products",
  "rustwx-render",
+ "rw-ingest",
  "rw-store",
  "serde_json",
  "windows-sys 0.61.2",
@@ -4155,6 +4169,23 @@ dependencies = [
  "eframe",
  "egui",
  "rw-ui",
+]
+
+[[package]]
+name = "rw-ingest"
+version = "0.1.0"
+dependencies = [
+ "puffin",
+ "rayon",
+ "rustwx-calc",
+ "rustwx-core",
+ "rustwx-io",
+ "rustwx-models",
+ "rustwx-products",
+ "rw-store",
+ "serde_json",
+ "thiserror 2.0.18",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

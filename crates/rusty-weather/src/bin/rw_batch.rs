@@ -32,20 +32,19 @@ use std::time::Instant;
 
 #[path = "../contour_mode.rs"]
 mod contour_mode;
-#[path = "../ingest_hour.rs"]
-mod ingest_hour;
 #[path = "../region.rs"]
 mod region;
 #[path = "../render_all.rs"]
 mod render_all;
-#[path = "../throttle.rs"]
-mod throttle;
 
 use clap::{Parser, ValueEnum};
 use contour_mode::ContourModeArg;
-use ingest_hour::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile};
-use ingest_hour::{FetchedHour, IngestConfig, IngestedHour, cache_state, parse_hours};
 use region::RegionPreset;
+use rw_ingest::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile};
+use rw_ingest::throttle;
+use rw_ingest::{
+    FetchedHour, IngestConfig, IngestedHour, NEVER_CANCEL, cache_state, parse_hours, print_event,
+};
 use render_all::{StoreFieldSource, StoreRenderConfig, StoreRenderSkip};
 use rustwx_core::{CycleSpec, ModelId, SourceId};
 use rustwx_models::model_summary;
@@ -329,6 +328,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         run_slug: &run_slug,
         profile: &profile,
         verify: false,
+        progress: &print_event,
+        cancel: &NEVER_CANCEL,
     };
     let render_config = StoreRenderConfig {
         model: args.model,
@@ -363,7 +364,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             scope.spawn(move || {
                 for &hour in &fetch_hours {
                     let cpu_started = process_cpu_ms();
-                    match ingest_hour::fetch_hour(fetch_config, hour) {
+                    match rw_ingest::fetch_hour(fetch_config, hour) {
                         Ok(fetched) => {
                             let fetch_cpu = process_cpu_ms().saturating_sub(cpu_started);
                             // Receiver gone => downstream failed; just stop.
@@ -386,7 +387,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                         Ok((fetched, fetch_cpu)) => {
                             let hour = fetched.hour;
                             let cpu_started = process_cpu_ms();
-                            match ingest_hour::process_fetched_hour(process_config, fetched) {
+                            match rw_ingest::process_fetched_hour(process_config, fetched) {
                                 Ok(ingested) => {
                                     let ingest_cpu =
                                         process_cpu_ms().saturating_sub(cpu_started);

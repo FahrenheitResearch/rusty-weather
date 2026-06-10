@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/rw-ingest",
     "crates/rw-store",
     "crates/rw-ui",
     "crates/rustwx-calc",
