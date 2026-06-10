@@ -6,8 +6,11 @@
 //! bit-exact 2D variables named by selector key — the 3D volume codec is
 //! quantized, so render-grade isobaric planes must ride the lossless f32
 //! 2D codec) in ONE decode pass, fetch the `sfc` product file, extract the
-//! 2D surface set in ONE decode pass (plus one re-select for the trailing
-//! 1 h APCP window), decode the surface + pressure thermo pair through the
+//! 2D surface set in ONE decode pass (plus one re-select at `hour - 1` for
+//! the trailing 1 h window fields: the APCP increment, the native
+//! sub-hourly MXUPHL max, and the native sub-hourly WIND 10 m max — the two
+//! max fields the GRIB windowed lane consumed), decode the surface +
+//! pressure thermo pair through the
 //! render lanes' own products decoder, and compute every non-heavy derived
 //! recipe grid AND every heavy ECAPE-class recipe grid from that pair (see
 //! `ingest_compute`; stored as ordinary 2D variables named by recipe slug,
@@ -571,12 +574,27 @@ fn ingest_hour(
         }
     }
 
-    // apcp_1h: both sfc APCP accumulations end at hour h, tie on match
-    // score, and the run total wins as first in file order (stored above as
-    // `apcp_run_total`). Re-selecting at `hour - 1` matches only the
-    // trailing (h-1)->h window — its start hour scores an exact 0 while the
-    // run total's start and end both miss — isolating the 1 h accumulation.
-    // The GRIB index re-parses, but only the one APCP message decodes.
+    // Trailing (h-1)->h window fields, all selected at `hour - 1` in ONE
+    // re-select pass (the GRIB index re-parses, but only these three
+    // messages decode):
+    //
+    // * apcp_1h — both sfc APCP accumulations end at hour h and tie on
+    //   match score at hour h, where the run total wins as first in file
+    //   order (stored above as `apcp_run_total`). At `hour - 1` only the
+    //   trailing window matches: its start hour scores an exact 0 while
+    //   the run total's start and end both miss.
+    // * uh_2to5km_max_1h — the native sub-hourly MXUPHL max
+    //   (`MXUPHL:5000-2000 m above ground:(h-1)-h hour max fcst`), the
+    //   exact message the GRIB windowed lane reduced. The start-hour match
+    //   pins the statistical message even if a future HRRR build adds an
+    //   instantaneous UPHL message (which would win the plain `uh_2to5km`
+    //   selection at hour h; in current sfc files MXUPHL is the only 2-5 km
+    //   UH message, so `uh_2to5km` is the same plane selected by its
+    //   end-hour score).
+    // * wind_speed_10m_max_1h — the native sub-hourly
+    //   `WIND:10 m above ground:(h-1)-h hour max fcst` field the GRIB
+    //   windowed lane consumed; the sfc file carries no instantaneous wind
+    //   speed message (only UGRD/VGRD), so this is the only WIND match.
     //
     // LATENT FRAGILITY (review 2026-06-09): apcp_run_total's identity rests
     // on NOAA keeping the 0->h message ahead of the (h-1)->h message in the
@@ -584,31 +602,60 @@ fn ingest_hour(
     // becomes the 1 h window. A windowed-product sanity check (run_total >=
     // 1h sum for h > 1) is the cheap detector if this ever bites.
     if hour >= 1 {
-        let apcp_selectors = [FieldSelector::surface(CanonicalField::TotalPrecipitation)];
-        let apcp_started = Instant::now();
-        let apcp_extraction = extract_fields_partial_from_model_bytes_at_forecast_hour(
+        let trailing_plan = [
+            (
+                "apcp_1h",
+                FieldSelector::surface(CanonicalField::TotalPrecipitation),
+            ),
+            (
+                "uh_2to5km_max_1h",
+                FieldSelector::height_layer_agl(CanonicalField::UpdraftHelicity, 2000, 5000),
+            ),
+            (
+                "wind_speed_10m_max_1h",
+                FieldSelector::height_agl(CanonicalField::WindSpeed, 10),
+            ),
+        ];
+        let trailing_selectors: Vec<FieldSelector> =
+            trailing_plan.iter().map(|(_, selector)| *selector).collect();
+        let trailing_started = Instant::now();
+        let mut trailing_extraction = extract_fields_partial_from_model_bytes_at_forecast_hour(
             args.model,
             &sfc.result.bytes,
             Some(&sfc.bytes_path),
-            &apcp_selectors,
+            &trailing_selectors,
             Some(hour - 1),
         )?;
-        sfc_extract_ms += apcp_started.elapsed().as_millis();
-        match apcp_extraction.extracted.into_iter().next() {
-            Some(field) => fields_2d_owned.push(("apcp_1h".to_string(), field)),
-            None => eprintln!(
-                "f{hour:03}: 2D field 'apcp_1h' (trailing 1 h APCP window) \
-                 missing from the sfc file; skipped"
-            ),
+        sfc_extract_ms += trailing_started.elapsed().as_millis();
+        for (name, selector) in &trailing_plan {
+            match trailing_extraction
+                .extracted
+                .iter()
+                .position(|field| field.selector == *selector)
+            {
+                Some(index) => fields_2d_owned.push((
+                    name.to_string(),
+                    trailing_extraction.extracted.swap_remove(index),
+                )),
+                None => eprintln!(
+                    "f{hour:03}: 2D field '{name}' (trailing 1 h window of {}) \
+                     missing from the sfc file; skipped",
+                    selector.key()
+                ),
+            }
         }
     } else {
-        eprintln!("f{hour:03}: 2D field 'apcp_1h' has no trailing 1 h window at analysis; skipped");
+        eprintln!(
+            "f{hour:03}: trailing 1 h window fields (apcp_1h, uh_2to5km_max_1h, \
+             wind_speed_10m_max_1h) have no window at analysis; skipped"
+        );
     }
 
     // Sparse prs-sourced planes ride behind the sfc set so the grid carrier
     // stays the first surface-plan field (both files share the HRRR grid;
-    // the store write bit-verifies that).
-    let planned_2d = surface_plan.len() + 1 + VORTICITY_PLAN.len() + direct_planes.len();
+    // the store write bit-verifies that). The +3 is the trailing 1 h
+    // window set (apcp_1h, uh_2to5km_max_1h, wind_speed_10m_max_1h).
+    let planned_2d = surface_plan.len() + 3 + VORTICITY_PLAN.len() + direct_planes.len();
     fields_2d_owned.extend(prs_fields_2d);
     if fields_2d_owned.is_empty() {
         return Err(format!(

@@ -13,18 +13,23 @@
 //!   carries 6/12/24 h APCP messages, so that lane always summed hourly
 //!   increments too). Millimeters fold first, inches out — the GRIB lane's
 //!   conversion order.
-//! * 2-5 km UH — pointwise maxima of the stored hourly `uh_2to5km` plane.
-//!   DOCUMENTED SEMANTIC SHIFT: the stored plane is the instantaneous UPHL
-//!   message (extraction scores a start-hour match (0) above a statistical
-//!   end-hour match (1), so UPHL beats MXUPHL), while the GRIB windowed
-//!   lane reduced the native sub-hourly MXUPHL maxima. Store-side UH
-//!   windows are therefore maxima of top-of-hour snapshots — a lower bound
-//!   on the GRIB lane's sub-hourly maxima.
-//! * 10 m wind — pointwise maxima of hourly wind speed computed as
-//!   hypot(`u_10m`, `v_10m`) (m/s folds first, knots out). Same shift: the
-//!   GRIB lane used the native sub-hourly `WIND:10 m above ground` max
-//!   field, which the store does not carry; top-of-hour speeds are a lower
-//!   bound on it.
+//! * 2-5 km UH — pointwise maxima of the stored sub-hourly 1 h max planes
+//!   (`uh_2to5km_max_1h`, the native MXUPHL message selected at its window
+//!   start hour), the exact field the GRIB windowed lane reduced. Hours
+//!   ingested before the max field existed fall back to the stored hourly
+//!   `uh_2to5km` plane, with the fallback hours named in the strategy
+//!   note. (In current HRRR sfc files that plane is itself the MXUPHL
+//!   message — the file carries no instantaneous UPHL, so plain selection
+//!   matched MXUPHL by its end-hour score — but the note stays
+//!   conservative: a store written from a file that DOES carry
+//!   instantaneous UPHL holds top-of-hour snapshots, a lower bound on the
+//!   sub-hourly max.)
+//! * 10 m wind — pointwise maxima of `wind_speed_10m_max_1h` (the native
+//!   sub-hourly `WIND:10 m above ground` max field the GRIB lane
+//!   consumed); m/s folds first, knots out. Hours without the stored max
+//!   field fall back to top-of-hour hypot(`u_10m`, `v_10m`) speeds — a
+//!   genuine lower bound on the sub-hourly max (the sfc file carries no
+//!   instantaneous wind-speed message), named in the strategy note.
 //! * 2 m temp/RH/dewpoint/VPD — pointwise max/min/range over the fixed
 //!   F001-F024 / F025-F048 / F001-F048 snapshot windows. Temperature and
 //!   dewpoint convert K -> degC per hour before the fold and RH clamps to
@@ -212,10 +217,13 @@ pub fn compute_windowed_products(
                 continue;
             }
             match read_source_plane(&reader, &grid, kind, hour) {
-                Ok(values) => {
+                Ok(plane) => {
                     for accum in accums.iter_mut() {
                         if needs(accum, kind) {
-                            accum.fold(&values);
+                            accum.fold(&plane.values);
+                            if plane.instantaneous_fallback {
+                                accum.fallback_hours.push(hour);
+                            }
                         }
                     }
                 }
@@ -252,9 +260,12 @@ enum SourceKind {
     Apcp1h,
     /// `apcp_run_total` (kg/m^2 == mm), the 0->h run accumulation.
     ApcpRunTotal,
-    /// `uh_2to5km` (m^2/s^2), the hourly instantaneous UPHL plane.
+    /// `uh_2to5km_max_1h` (m^2/s^2), the native sub-hourly MXUPHL max;
+    /// falls back to the stored hourly `uh_2to5km` plane when the max
+    /// field is absent (stores ingested before it existed).
     Uh2to5km,
-    /// hypot(`u_10m`, `v_10m`) in m/s.
+    /// `wind_speed_10m_max_1h` (m/s), the native sub-hourly WIND max;
+    /// falls back to top-of-hour hypot(`u_10m`, `v_10m`) when absent.
     WindSpeed10m,
     /// `temperature_2m` converted K -> degC per hour.
     Temp2mC,
@@ -405,7 +416,7 @@ fn plan_product(product: HrrrWindowedProduct, end: u16) -> Result<ProductSpec, S
                 Some(1),
                 "m^2/s^2",
                 Finish::None,
-                format!("stored hourly 2-5 km UH plane (uh_2to5km) at F{end:03}"),
+                format!("stored sub-hourly 1 h max 2-5 km UH plane (uh_2to5km_max_1h) at F{end:03}"),
             )
         }
         Uh25km3h => {
@@ -419,7 +430,8 @@ fn plan_product(product: HrrrWindowedProduct, end: u16) -> Result<ProductSpec, S
                 Some(3),
                 "m^2/s^2",
                 Finish::None,
-                "pointwise max of stored hourly 2-5 km UH planes across trailing 3 hours"
+                "pointwise max of stored sub-hourly 1 h max 2-5 km UH planes across \
+                 trailing 3 hours"
                     .to_string(),
             )
         }
@@ -434,7 +446,7 @@ fn plan_product(product: HrrrWindowedProduct, end: u16) -> Result<ProductSpec, S
                 None,
                 "m^2/s^2",
                 Finish::None,
-                "run max of stored hourly 2-5 km UH planes".to_string(),
+                "run max of stored sub-hourly 1 h max 2-5 km UH planes".to_string(),
             )
         }
         Wind10m1hMax => {
@@ -451,7 +463,7 @@ fn plan_product(product: HrrrWindowedProduct, end: u16) -> Result<ProductSpec, S
                 Some(1),
                 "kt",
                 Finish::MsToKnots,
-                format!("stored 10 m wind speed (hypot of u_10m/v_10m) at F{end:03}"),
+                format!("stored sub-hourly 1 h max 10 m wind speed (wind_speed_10m_max_1h) at F{end:03}"),
             )
         }
         Wind10mRunMax => {
@@ -465,7 +477,7 @@ fn plan_product(product: HrrrWindowedProduct, end: u16) -> Result<ProductSpec, S
                 None,
                 "kt",
                 Finish::MsToKnots,
-                "run max of stored hourly 10 m wind speeds (hypot of u_10m/v_10m)".to_string(),
+                "run max of stored sub-hourly 1 h max 10 m wind speeds".to_string(),
             )
         }
         Wind10m0to24hMax => {
@@ -479,7 +491,7 @@ fn plan_product(product: HrrrWindowedProduct, end: u16) -> Result<ProductSpec, S
                 Some(24),
                 "kt",
                 Finish::MsToKnots,
-                "max of stored hourly 10 m wind speeds across F001-F024".to_string(),
+                "max of stored sub-hourly 1 h max 10 m wind speeds across F001-F024".to_string(),
             )
         }
         Wind10m24to48hMax => {
@@ -493,7 +505,7 @@ fn plan_product(product: HrrrWindowedProduct, end: u16) -> Result<ProductSpec, S
                 Some(24),
                 "kt",
                 Finish::MsToKnots,
-                "max of stored hourly 10 m wind speeds across F025-F048".to_string(),
+                "max of stored sub-hourly 1 h max 10 m wind speeds across F025-F048".to_string(),
             )
         }
         Wind10m0to48hMax => {
@@ -507,7 +519,7 @@ fn plan_product(product: HrrrWindowedProduct, end: u16) -> Result<ProductSpec, S
                 Some(48),
                 "kt",
                 Finish::MsToKnots,
-                "max of stored hourly 10 m wind speeds across F001-F048".to_string(),
+                "max of stored sub-hourly 1 h max 10 m wind speeds across F001-F048".to_string(),
             )
         }
         _ => unreachable!("surface snapshot window products are handled before the match"),
@@ -613,61 +625,144 @@ fn snapshot_plan(product: HrrrWindowedProduct) -> Option<SnapshotPlan> {
     })
 }
 
+/// One source plane read for one hour: the fold-ready values, plus whether
+/// the per-hour instantaneous fallback (not the stored sub-hourly max
+/// field) supplied them — recorded so the product's strategy note can name
+/// the lower-bound hours honestly.
+struct SourcePlane {
+    values: Vec<f64>,
+    instantaneous_fallback: bool,
+}
+
+impl SourcePlane {
+    fn exact(values: Vec<f64>) -> Self {
+        Self {
+            values,
+            instantaneous_fallback: false,
+        }
+    }
+}
+
+/// Why one stored-variable read failed: the variable is absent from the
+/// hour file (eligible for the documented instantaneous fallback) vs any
+/// other failure (unit drift, codec error — always a blocker, never a
+/// silent fallback).
+enum ReadFailure {
+    MissingVariable(String),
+    Failed(String),
+}
+
+impl ReadFailure {
+    fn into_reason(self) -> String {
+        match self {
+            Self::MissingVariable(reason) | Self::Failed(reason) => reason,
+        }
+    }
+}
+
 /// Read one source plane for one hour, unit-checked and transformed to the
 /// per-hour values the fold consumes (the GRIB lane's per-hour transforms:
 /// K -> degC, RH clamp; accumulation/UH/wind planes stay raw — their
-/// display conversion happens after the fold).
+/// display conversion happens after the fold). UH/wind prefer the stored
+/// sub-hourly max fields and fall back to the instantaneous planes ONLY
+/// when the max variable is absent (older stores); a max field present
+/// with wrong units blocks instead of falling back.
 fn read_source_plane(
     reader: &HourReader,
     grid: &GridFile,
     kind: SourceKind,
     hour: u16,
-) -> Result<Vec<f64>, String> {
-    let read = |name: &str, expected_units: &str| -> Result<Vec<f32>, String> {
+) -> Result<SourcePlane, String> {
+    let read = |name: &str, expected_units: &str| -> Result<Vec<f32>, ReadFailure> {
         match read_grid_2d(reader, grid, name) {
             Ok(stored) => {
                 if stored.units != expected_units {
-                    return Err(format!(
+                    return Err(ReadFailure::Failed(format!(
                         "stored '{name}' at F{hour:03} has units '{}', expected '{expected_units}'",
                         stored.units
-                    ));
+                    )));
                 }
                 Ok(stored.values)
             }
-            Err(RwStoreError::UnknownVariable(_)) => {
-                Err(format!("stored hour F{hour:03} has no '{name}' variable"))
-            }
-            Err(err) => Err(format!("read '{name}' from stored hour F{hour:03}: {err}")),
+            Err(RwStoreError::UnknownVariable(_)) => Err(ReadFailure::MissingVariable(format!(
+                "stored hour F{hour:03} has no '{name}' variable"
+            ))),
+            Err(err) => Err(ReadFailure::Failed(format!(
+                "read '{name}' from stored hour F{hour:03}: {err}"
+            ))),
         }
     };
+    let plain = |result: Result<Vec<f32>, ReadFailure>| -> Result<Vec<f32>, String> {
+        result.map_err(ReadFailure::into_reason)
+    };
     match kind {
-        SourceKind::Apcp1h => Ok(to_f64(read("apcp_1h", "kg/m^2")?)),
-        SourceKind::ApcpRunTotal => Ok(to_f64(read("apcp_run_total", "kg/m^2")?)),
-        SourceKind::Uh2to5km => Ok(to_f64(read("uh_2to5km", "m^2/s^2")?)),
-        SourceKind::WindSpeed10m => {
-            let u = read("u_10m", "m/s")?;
-            let v = read("v_10m", "m/s")?;
-            Ok(u.iter()
-                .zip(&v)
-                .map(|(&u, &v)| f64::from(u).hypot(f64::from(v)))
-                .collect())
-        }
+        SourceKind::Apcp1h => Ok(SourcePlane::exact(to_f64(plain(read(
+            "apcp_1h", "kg/m^2",
+        ))?))),
+        SourceKind::ApcpRunTotal => Ok(SourcePlane::exact(to_f64(plain(read(
+            "apcp_run_total",
+            "kg/m^2",
+        ))?))),
+        SourceKind::Uh2to5km => match read("uh_2to5km_max_1h", "m^2/s^2") {
+            Ok(values) => Ok(SourcePlane::exact(to_f64(values))),
+            Err(ReadFailure::Failed(reason)) => Err(reason),
+            Err(ReadFailure::MissingVariable(missing)) => {
+                match read("uh_2to5km", "m^2/s^2") {
+                    Ok(values) => Ok(SourcePlane {
+                        values: to_f64(values),
+                        instantaneous_fallback: true,
+                    }),
+                    Err(err) => Err(format!(
+                        "{missing}; hourly 'uh_2to5km' fallback also unavailable: {}",
+                        err.into_reason()
+                    )),
+                }
+            }
+        },
+        SourceKind::WindSpeed10m => match read("wind_speed_10m_max_1h", "m/s") {
+            Ok(values) => Ok(SourcePlane::exact(to_f64(values))),
+            Err(ReadFailure::Failed(reason)) => Err(reason),
+            Err(ReadFailure::MissingVariable(missing)) => {
+                let speeds = (|| -> Result<Vec<f64>, ReadFailure> {
+                    let u = read("u_10m", "m/s")?;
+                    let v = read("v_10m", "m/s")?;
+                    Ok(u.iter()
+                        .zip(&v)
+                        .map(|(&u, &v)| f64::from(u).hypot(f64::from(v)))
+                        .collect())
+                })();
+                match speeds {
+                    Ok(values) => Ok(SourcePlane {
+                        values,
+                        instantaneous_fallback: true,
+                    }),
+                    Err(err) => Err(format!(
+                        "{missing}; hypot(u_10m, v_10m) fallback also unavailable: {}",
+                        err.into_reason()
+                    )),
+                }
+            }
+        },
         SourceKind::Temp2mC | SourceKind::Dewpoint2mC => {
             let name = if kind == SourceKind::Temp2mC {
                 "temperature_2m"
             } else {
                 "dewpoint_2m"
             };
-            Ok(read(name, "K")?
-                .iter()
-                .map(|&value| f64::from(value) - 273.15)
-                .collect())
+            Ok(SourcePlane::exact(
+                plain(read(name, "K"))?
+                    .iter()
+                    .map(|&value| f64::from(value) - 273.15)
+                    .collect(),
+            ))
         }
-        SourceKind::Rh2mPct => Ok(read("rh_2m", "%")?
-            .iter()
-            .map(|&value| f64::from(value).clamp(0.0, 100.0))
-            .collect()),
-        SourceKind::Vpd2mHpa => Ok(to_f64(read("vpd_2m", "hPa")?)),
+        SourceKind::Rh2mPct => Ok(SourcePlane::exact(
+            plain(read("rh_2m", "%"))?
+                .iter()
+                .map(|&value| f64::from(value).clamp(0.0, 100.0))
+                .collect(),
+        )),
+        SourceKind::Vpd2mHpa => Ok(SourcePlane::exact(to_f64(plain(read("vpd_2m", "hPa"))?))),
     }
 }
 
@@ -678,10 +773,14 @@ fn to_f64(values: Vec<f32>) -> Vec<f64> {
 /// Per-product streaming accumulator: per-hour planes fold in ascending
 /// hour order; `failed` records the first per-hour read failure (the
 /// product's blocker reason — once failed, later hours stop folding).
+/// `fallback_hours` collects the hours whose plane came from the
+/// documented instantaneous fallback (no stored sub-hourly max field) so
+/// `finish` can stamp the lower-bound note into the strategy.
 struct Accum {
     spec: ProductSpec,
     state: Option<AccumState>,
     failed: Option<String>,
+    fallback_hours: Vec<u16>,
 }
 
 enum AccumState {
@@ -698,6 +797,7 @@ impl Accum {
             spec,
             state: None,
             failed: None,
+            fallback_hours: Vec::new(),
         }
     }
 
@@ -773,6 +873,18 @@ impl Accum {
                 }
             }
         }
+        let mut strategy = self.spec.strategy;
+        if !self.fallback_hours.is_empty() {
+            strategy.push_str(&format!(
+                " (top-of-hour instantaneous fallback at {}: no stored sub-hourly max \
+                 field — a lower bound on the native sub-hourly max)",
+                self.fallback_hours
+                    .iter()
+                    .map(|hour| format!("F{hour:03}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         Ok(WindowedGrid {
             slug: self.spec.product.slug().to_string(),
             units: self.spec.units.to_string(),
@@ -780,7 +892,7 @@ impl Accum {
             values,
             hours_used: self.spec.hours,
             window_hours: self.spec.window_hours,
-            strategy: self.spec.strategy,
+            strategy,
         })
     }
 }
@@ -852,6 +964,13 @@ mod tests {
         by_hour[(hour as usize - 1) % by_hour.len()].to_vec()
     }
 
+    /// Sub-hourly 1 h max UH planes (`uh_2to5km_max_1h`): the hourly plane
+    /// plus a positive sub-hourly excess, so a fold that wrongly read the
+    /// instantaneous fallback would miss every expectation.
+    fn uh_max_plane(hour: u16) -> Vec<f32> {
+        uh_plane(hour).iter().map(|value| value + 6.25).collect()
+    }
+
     /// Exact Pythagorean (u, v) pairs so hypot folds bit-exactly.
     fn wind_uv_planes(hour: u16) -> (Vec<f32>, Vec<f32>) {
         let by_hour: &[([f32; 4], [f32; 4])] = &[
@@ -864,6 +983,17 @@ mod tests {
         ];
         let (u, v) = &by_hour[(hour as usize - 1) % by_hour.len()];
         (u.to_vec(), v.to_vec())
+    }
+
+    /// Sub-hourly 1 h max wind speed plane (`wind_speed_10m_max_1h`, m/s):
+    /// strictly above the hourly hypot(u, v) snapshot, so a fold that
+    /// wrongly used the fallback would miss every expectation.
+    fn wind_max_plane(hour: u16) -> Vec<f32> {
+        let (u, v) = wind_uv_planes(hour);
+        u.iter()
+            .zip(&v)
+            .map(|(&u, &v)| u.hypot(v) + 1.5)
+            .collect()
     }
 
     /// Quadratic in hour (peak at F012) so max/min land mid-window.
@@ -937,6 +1067,16 @@ mod tests {
             "m^2/s^2",
             uh_plane(hour),
         );
+        let uh_max = field(
+            FieldSelector::height_layer_agl(CanonicalField::UpdraftHelicity, 2000, 5000),
+            "m^2/s^2",
+            uh_max_plane(hour),
+        );
+        let wind_max = field(
+            FieldSelector::height_agl(CanonicalField::WindSpeed, 10),
+            "m/s",
+            wind_max_plane(hour),
+        );
         let mut fields: Vec<(&str, &SelectedField2D)> = vec![
             ("temperature_2m", &temp),
             ("dewpoint_2m", &dewpoint),
@@ -946,6 +1086,8 @@ mod tests {
             ("apcp_run_total", &apcp_total),
             ("apcp_1h", &apcp_1h),
             ("uh_2to5km", &uh),
+            ("uh_2to5km_max_1h", &uh_max),
+            ("wind_speed_10m_max_1h", &wind_max),
         ];
         fields.retain(|(name, _)| !skip_vars.contains(name));
         let vpd_values = vpd_plane(hour);
@@ -1088,21 +1230,28 @@ mod tests {
         assert_eq!(qpf_total.hours_used, vec![6]);
         assert_eq!(qpf_total.window_hours, None);
 
-        // UH: direct F006 plane; trailing-3 and run maxima are pointwise.
+        // UH: direct F006 sub-hourly max plane; trailing-3 and run maxima
+        // fold the stored uh_2to5km_max_1h planes (NOT the instantaneous
+        // uh_2to5km fallback, whose values sit strictly below).
         let uh_1h = grid_named(&outcome, "uh_2to5km_1h_max");
         assert_values(
             uh_1h,
-            &uh_plane(6)
+            &uh_max_plane(6)
                 .iter()
                 .map(|&v| f64::from(v))
                 .collect::<Vec<_>>(),
         );
         assert_eq!(uh_1h.units, "m^2/s^2");
+        assert!(
+            uh_1h.strategy.contains("uh_2to5km_max_1h") && !uh_1h.strategy.contains("fallback"),
+            "strategy must name the stored max field with no fallback note: {}",
+            uh_1h.strategy
+        );
         let uh_3h = grid_named(&outcome, "uh_2to5km_3h_max");
         let expected: Vec<f64> = (0..CELLS)
             .map(|cell| {
                 (4..=6)
-                    .map(|hour| f64::from(uh_plane(hour)[cell]))
+                    .map(|hour| f64::from(uh_max_plane(hour)[cell]))
                     .fold(f64::NEG_INFINITY, f64::max)
             })
             .collect();
@@ -1113,28 +1262,31 @@ mod tests {
         let expected: Vec<f64> = (0..CELLS)
             .map(|cell| {
                 (1..=6)
-                    .map(|hour| f64::from(uh_plane(hour)[cell]))
+                    .map(|hour| f64::from(uh_max_plane(hour)[cell]))
                     .fold(f64::NEG_INFINITY, f64::max)
             })
             .collect();
         assert_values(uh_run, &expected);
 
-        // Wind: hourly speed = hypot(u, v) in m/s, maxed, THEN -> knots.
+        // Wind: the stored sub-hourly max speeds (m/s) fold, THEN -> knots.
         let wind_1h = grid_named(&outcome, "10m_wind_1h_max");
-        let (u, v) = wind_uv_planes(6);
-        let expected: Vec<f64> = (0..CELLS)
-            .map(|cell| f64::from(u[cell]).hypot(f64::from(v[cell])) * MS_TO_KT)
+        let expected: Vec<f64> = wind_max_plane(6)
+            .iter()
+            .map(|&speed| f64::from(speed) * MS_TO_KT)
             .collect();
         assert_values(wind_1h, &expected);
         assert_eq!(wind_1h.units, "kt");
+        assert!(
+            wind_1h.strategy.contains("wind_speed_10m_max_1h")
+                && !wind_1h.strategy.contains("fallback"),
+            "strategy must name the stored max field with no fallback note: {}",
+            wind_1h.strategy
+        );
         let wind_run = grid_named(&outcome, "10m_wind_run_max");
         let expected: Vec<f64> = (0..CELLS)
             .map(|cell| {
                 (1..=6)
-                    .map(|hour| {
-                        let (u, v) = wind_uv_planes(hour);
-                        f64::from(u[cell]).hypot(f64::from(v[cell]))
-                    })
+                    .map(|hour| f64::from(wind_max_plane(hour)[cell]))
                     .fold(f64::NEG_INFINITY, f64::max)
                     * MS_TO_KT
             })
@@ -1299,8 +1451,8 @@ mod tests {
     fn missing_variables_block_only_the_products_that_need_them() {
         let dir = test_dir("missing-vars");
         write_test_hour(&dir, "20260608_00z", 1, &[]);
-        write_test_hour(&dir, "20260608_00z", 2, &["uh_2to5km"]);
-        write_test_hour(&dir, "20260608_00z", 3, &["v_10m"]);
+        write_test_hour(&dir, "20260608_00z", 2, &["uh_2to5km_max_1h", "uh_2to5km"]);
+        write_test_hour(&dir, "20260608_00z", 3, &["wind_speed_10m_max_1h", "v_10m"]);
         let outcome = compute(
             &dir,
             "20260608_00z",
@@ -1313,18 +1465,25 @@ mod tests {
             ],
         );
 
-        // F002 lacks uh_2to5km: the 3 h window dies with the variable and
-        // hour named; the 1 h product (F003 only) still realizes.
+        // F002 lacks both the max field AND the instantaneous fallback:
+        // the 3 h window dies with both variables and the hour named; the
+        // 1 h product (F003 only) still realizes.
         let reason = blocker_reason(&outcome, "uh_2to5km_3h_max");
         assert!(
-            reason.contains("uh_2to5km") && reason.contains("F002"),
-            "reason must name the variable and hour: {reason}"
+            reason.contains("uh_2to5km_max_1h")
+                && reason.contains("uh_2to5km")
+                && reason.contains("F002"),
+            "reason must name both variables and the hour: {reason}"
         );
         assert!(outcome.grids.iter().any(|g| g.slug == "uh_2to5km_1h_max"));
 
-        // F003 lacks v_10m: the wind speed product blocks naming v_10m.
+        // F003 lacks the wind max field and v_10m: the wind speed product
+        // blocks naming the failed fallback input.
         let reason = blocker_reason(&outcome, "10m_wind_1h_max");
-        assert!(reason.contains("v_10m"), "{reason}");
+        assert!(
+            reason.contains("wind_speed_10m_max_1h") && reason.contains("v_10m"),
+            "{reason}"
+        );
 
         // Unrelated products are untouched.
         assert!(outcome.grids.iter().any(|g| g.slug == "qpf_1h"));
@@ -1333,10 +1492,105 @@ mod tests {
     }
 
     #[test]
+    fn missing_max_fields_fall_back_to_instantaneous_with_lower_bound_note() {
+        let dir = test_dir("fallback");
+        for hour in 1..=3 {
+            write_test_hour(
+                &dir,
+                "20260608_00z",
+                hour,
+                &["uh_2to5km_max_1h", "wind_speed_10m_max_1h"],
+            );
+        }
+        let outcome = compute(
+            &dir,
+            "20260608_00z",
+            &[1, 2, 3],
+            &["uh_2to5km_3h_max", "10m_wind_run_max", "qpf_1h"],
+        );
+
+        // UH folds the instantaneous uh_2to5km planes and says so.
+        let uh_3h = grid_named(&outcome, "uh_2to5km_3h_max");
+        let expected: Vec<f64> = (0..CELLS)
+            .map(|cell| {
+                (1..=3)
+                    .map(|hour| f64::from(uh_plane(hour)[cell]))
+                    .fold(f64::NEG_INFINITY, f64::max)
+            })
+            .collect();
+        assert_values(uh_3h, &expected);
+        assert!(
+            uh_3h.strategy.contains("F001, F002, F003")
+                && uh_3h.strategy.contains("lower bound"),
+            "strategy must name every fallback hour and the lower-bound caveat: {}",
+            uh_3h.strategy
+        );
+
+        // Wind folds hypot(u_10m, v_10m) and says so.
+        let wind_run = grid_named(&outcome, "10m_wind_run_max");
+        let expected: Vec<f64> = (0..CELLS)
+            .map(|cell| {
+                (1..=3)
+                    .map(|hour| {
+                        let (u, v) = wind_uv_planes(hour);
+                        f64::from(u[cell]).hypot(f64::from(v[cell]))
+                    })
+                    .fold(f64::NEG_INFINITY, f64::max)
+                    * MS_TO_KT
+            })
+            .collect();
+        assert_values(wind_run, &expected);
+        assert!(
+            wind_run.strategy.contains("lower bound"),
+            "{}",
+            wind_run.strategy
+        );
+
+        // Products that never touch the max fields carry no note.
+        let qpf_1h = grid_named(&outcome, "qpf_1h");
+        assert!(!qpf_1h.strategy.contains("fallback"), "{}", qpf_1h.strategy);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mixed_stores_fall_back_only_for_hours_missing_the_max_field() {
+        let dir = test_dir("mixed-fallback");
+        write_test_hour(&dir, "20260608_00z", 1, &[]);
+        write_test_hour(&dir, "20260608_00z", 2, &["uh_2to5km_max_1h"]);
+        write_test_hour(&dir, "20260608_00z", 3, &[]);
+        let outcome = compute(&dir, "20260608_00z", &[1, 2, 3], &["uh_2to5km_3h_max"]);
+
+        // F001/F003 fold the stored max planes; F002 folds the
+        // instantaneous fallback plane.
+        let uh_3h = grid_named(&outcome, "uh_2to5km_3h_max");
+        let expected: Vec<f64> = (0..CELLS)
+            .map(|cell| {
+                f64::from(uh_max_plane(1)[cell])
+                    .max(f64::from(uh_plane(2)[cell]))
+                    .max(f64::from(uh_max_plane(3)[cell]))
+            })
+            .collect();
+        assert_values(uh_3h, &expected);
+        assert!(
+            uh_3h.strategy.contains("F002")
+                && !uh_3h.strategy.contains("F001")
+                && !uh_3h.strategy.contains("F003"),
+            "the note must name exactly the fallback hour: {}",
+            uh_3h.strategy
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn unexpected_stored_units_block_instead_of_converting_blindly() {
         let dir = test_dir("bad-units");
-        // Hand-build an hour whose apcp_1h claims inches: the lane must
-        // refuse rather than divide by 25.4 again.
+        // Hand-build an hour whose apcp_1h claims inches and whose UH max
+        // field claims knots (beside a perfectly good instantaneous
+        // uh_2to5km): the lane must refuse rather than divide by 25.4
+        // again, and unit drift on the max field must block — NOT silently
+        // fall back to the instantaneous plane.
         let temp = field(
             FieldSelector::height_agl(CanonicalField::Temperature, 2),
             "K",
@@ -1347,23 +1601,43 @@ mod tests {
             "in",
             apcp_1h_plane(1),
         );
+        let uh = field(
+            FieldSelector::height_layer_agl(CanonicalField::UpdraftHelicity, 2000, 5000),
+            "m^2/s^2",
+            uh_plane(1),
+        );
+        let uh_max_bad = field(
+            FieldSelector::height_layer_agl(CanonicalField::UpdraftHelicity, 2000, 5000),
+            "kt",
+            uh_max_plane(1),
+        );
         write_hour_from_fields_with_derived(
             &dir,
             "hrrr",
             "20260608_00z",
             1,
-            &[("temperature_2m", &temp), ("apcp_1h", &apcp_bad)],
+            &[
+                ("temperature_2m", &temp),
+                ("apcp_1h", &apcp_bad),
+                ("uh_2to5km", &uh),
+                ("uh_2to5km_max_1h", &uh_max_bad),
+            ],
             &[],
             &[],
             "windowed-store-test",
             1_780_000_001,
         )
         .unwrap();
-        let outcome = compute(&dir, "20260608_00z", &[1], &["qpf_1h"]);
+        let outcome = compute(&dir, "20260608_00z", &[1], &["qpf_1h", "uh_2to5km_1h_max"]);
         let reason = blocker_reason(&outcome, "qpf_1h");
         assert!(
             reason.contains("units 'in'") && reason.contains("kg/m^2"),
             "reason must name actual and expected units: {reason}"
+        );
+        let reason = blocker_reason(&outcome, "uh_2to5km_1h_max");
+        assert!(
+            reason.contains("units 'kt'") && reason.contains("m^2/s^2"),
+            "unit drift on the max field must block, not fall back: {reason}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
