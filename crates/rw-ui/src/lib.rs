@@ -10,9 +10,10 @@
 //! - [`StoreWorker`]: a background IO thread so the UI never blocks on file
 //!   reads; plain-data requests/responses over channels.
 //! - [`RunBrowserPanel`], [`FieldViewerPanel`], [`SoundingPanel`],
-//!   [`DownloadPanel`]: the panels themselves — pure widgets over
-//!   host-pushed data (the download panel never touches the network; the
-//!   host owns the worker that resolves its events).
+//!   [`DownloadPanel`], [`SatellitePanel`], [`SatPlayerPanel`]: the panels
+//!   themselves — pure widgets over host-pushed data (the download and
+//!   satellite panels never touch the network; the host owns the workers
+//!   that resolve their events).
 //! - [`skewt`]: bridge from store sounding data to the production
 //!   `rustwx-sounding` (sharprs) skew-T renderer.
 //! - [`colormap`]: the false-color ramp used by the field viewer (a data
@@ -38,7 +39,10 @@ mod worker;
 pub use panels::{
     AvailabilityView, DownloadEvent, DownloadPanel, DownloadRunState, DownloadSpec, DownloadStage,
     EstimateView, FieldViewerEvent, FieldViewerPanel, HourDoneView, ModelOption, RunBrowserPanel,
-    SoundingPanel, StageState, format_bytes, shift_date_yyyymmdd, today_yyyymmdd_utc,
+    SatDiskUsage, SatFollowSpec, SatFollowState, SatFrameImage, SatLayerOption, SatPlayerEvent,
+    SatPlayerPanel, SatRunKey, SatRunListing, SatSatelliteOption, SatSectorOption, SatelliteEvent,
+    SatellitePanel, SoundingPanel, StageState, format_bytes, shift_date_yyyymmdd,
+    today_yyyymmdd_utc,
 };
 pub use store_view::{HourEntry, ModelEntry, RunEntry, StoreTree, StoreView};
 pub use worker::{
