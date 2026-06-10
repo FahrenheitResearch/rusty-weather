@@ -83,8 +83,10 @@ impl StoreView {
             Ok(dirs) => dirs,
             Err(err) => {
                 if self.root.exists() {
-                    tree.warnings
-                        .push(format!("cannot read store root {}: {err}", self.root.display()));
+                    tree.warnings.push(format!(
+                        "cannot read store root {}: {err}",
+                        self.root.display()
+                    ));
                 }
                 return tree;
             }
@@ -95,8 +97,10 @@ impl StoreView {
             let run_dirs = match read_subdirs(&model_dir) {
                 Ok(dirs) => dirs,
                 Err(err) => {
-                    tree.warnings
-                        .push(format!("cannot read model dir {}: {err}", model_dir.display()));
+                    tree.warnings.push(format!(
+                        "cannot read model dir {}: {err}",
+                        model_dir.display()
+                    ));
                     continue;
                 }
             };
@@ -153,7 +157,11 @@ fn run_entry(run_dir: &Path, manifest: RwsRunManifest) -> RunEntry {
         .collect();
     RunEntry {
         // Prefer the manifest's run name; the directory name should match.
-        run: if manifest.run.is_empty() { dir_name(run_dir) } else { manifest.run },
+        run: if manifest.run.is_empty() {
+            dir_name(run_dir)
+        } else {
+            manifest.run
+        },
         build: manifest.writer.build,
         writer_version: manifest.writer.version,
         nx: manifest.nx,

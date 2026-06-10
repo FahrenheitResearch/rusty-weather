@@ -1,17 +1,31 @@
 //! Field viewer: pick a 2D variable and inspect it as a false-color texture.
 //!
-//! This is a DATA VIEWER — a linear min..max ramp for eyeballing stored
-//! grids — not the production plot renderer, and it says so in its header.
+//! Variables with a production plot counterpart render through the EXACT
+//! production colortable (`rustwx_products::viewer` resolves the style; the
+//! pixels come from `rustwx_render::LeveledColormap::map`, the same function
+//! the PNG rasterizer calls), with a legend whose swatch colors, tick
+//! values, and labels are the production colorbar's. Variables with no
+//! counterpart keep a clearly-labeled generic min..max viridis ramp.
 //! The texture is cached and re-uploaded only when the loaded field changes;
-//! per-frame work is just drawing the cached texture.
+//! per-frame work is just drawing the cached textures.
 
 use egui::{
-    Color32, ComboBox, Image, Rect, RichText, Sense, Stroke, StrokeKind, TextureFilter,
-    TextureHandle, TextureOptions, Ui, Vec2, pos2,
+    Align2, Color32, ColorImage, ComboBox, FontId, Image, Rect, RichText, Sense, Stroke,
+    StrokeKind, TextureFilter, TextureHandle, TextureOptions, Ui, Vec2, pos2,
+};
+use rustwx_render::{
+    LeveledColormap, build_colormap, colorbar_ticks, format_tick, legend_color_at_rel,
+    legend_tick_rel,
 };
 
-use crate::colormap::{Colormap, VIRIDIS, field_to_color_image};
+use crate::colormap::{Colormap, VIRIDIS, field_to_color_image, field_to_production_color_image};
 use crate::worker::{FieldData, FieldKey, HourKey, VarInfo, VarKind};
+
+/// Horizontal room reserved for the production legend (bar + ticks + labels).
+const LEGEND_WIDTH: f32 = 78.0;
+/// Vertical resolution of the legend bar texture (one production colorbar
+/// sample per row, matching `draw_vertical_colorbar`'s per-pixel sampling).
+const LEGEND_BAR_RESOLUTION: usize = 512;
 
 /// What the user did this frame; the host turns these into worker requests.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +59,9 @@ pub struct FieldViewerPanel {
     /// Last clicked point in fractional grid coords (marker overlay).
     clicked: Option<(f64, f64)>,
     colormap: Colormap,
+    /// The production colormap for the loaded field (None = generic ramp).
+    cmap: Option<LeveledColormap>,
+    legend_texture: Option<TextureHandle>,
 }
 
 impl FieldViewerPanel {
@@ -60,10 +77,10 @@ impl FieldViewerPanel {
     /// `temperature_2m`, then the first 2D variable. The host should then
     /// fire a load for [`FieldViewerPanel::selected_var`].
     pub fn set_hour(&mut self, hour: HourKey, vars: Vec<VarInfo>) {
-        let keep = self
-            .selected_var
-            .take()
-            .filter(|name| vars.iter().any(|v| v.kind == VarKind::Surface2D && v.name == *name));
+        let keep = self.selected_var.take().filter(|name| {
+            vars.iter()
+                .any(|v| v.kind == VarKind::Surface2D && v.name == *name)
+        });
         self.selected_var = keep
             .or_else(|| {
                 vars.iter()
@@ -81,6 +98,8 @@ impl FieldViewerPanel {
         self.texture = None;
         self.texture_dirty = false;
         self.clicked = None;
+        self.cmap = None;
+        self.legend_texture = None;
         self.state = LoadState::Idle;
     }
 
@@ -137,7 +156,11 @@ impl FieldViewerPanel {
             let previous = self.selected_var.clone();
             let mut current = previous.clone().unwrap_or_default();
             ComboBox::from_id_salt("rw-ui-field-var")
-                .selected_text(if current.is_empty() { "pick a variable" } else { &current })
+                .selected_text(if current.is_empty() {
+                    "pick a variable"
+                } else {
+                    &current
+                })
                 .width(220.0)
                 .show_ui(ui, |ui| {
                     for var in self.vars.iter().filter(|v| v.kind == VarKind::Surface2D) {
@@ -154,6 +177,8 @@ impl FieldViewerPanel {
                 self.texture = None;
                 self.texture_dirty = false;
                 self.clicked = None;
+                self.cmap = None;
+                self.legend_texture = None;
                 event = Some(FieldViewerEvent::VarSelected(current));
             }
 
@@ -165,11 +190,27 @@ impl FieldViewerPanel {
                 ui.label(RichText::new(range).small().weak());
             }
         });
-        ui.label(
-            RichText::new("DATA VIEWER — linear min..max false color, not the production renderer")
-                .small()
-                .weak(),
-        );
+        match self.field.as_ref().and_then(|field| field.style.as_ref()) {
+            Some(style) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&style.title).small().strong());
+                    ui.label(
+                        RichText::new(format!("production colortable · {}", style.display_units))
+                            .small()
+                            .weak(),
+                    );
+                });
+            }
+            None => {
+                ui.label(
+                    RichText::new(
+                        "DATA VIEWER — generic ramp (no plot counterpart), linear min..max",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
+        }
         ui.separator();
 
         match &self.state {
@@ -205,18 +246,44 @@ impl FieldViewerPanel {
         // north-at-top; north-to-south storage renders rows as stored.
         let flip_y = !field.lat_descending;
 
-        // (Re-)upload the texture only when the loaded field changed.
+        // (Re-)upload the textures only when the loaded field changed.
         if self.texture_dirty {
-            let (vmin, vmax) = field.range.unwrap_or((0.0, 0.0));
-            let image = field_to_color_image(
-                &field.values,
-                field.nx,
-                field.ny,
-                vmin,
-                vmax,
-                &self.colormap,
-                flip_y,
-            );
+            let image = match &field.style {
+                Some(style) => {
+                    // Production path: the exact colormap the PNG rasterizer
+                    // builds for this product, mapped per value. Values were
+                    // already converted to display units by the worker.
+                    let cmap = build_colormap(&style.scale, style.colormap_options);
+                    let image = field_to_production_color_image(
+                        &field.values,
+                        field.nx,
+                        field.ny,
+                        &cmap,
+                        flip_y,
+                    );
+                    self.legend_texture = Some(ui.ctx().load_texture(
+                        "rw-ui-field-legend",
+                        legend_bar_image(&cmap, style.legend_mode),
+                        TextureOptions::LINEAR,
+                    ));
+                    self.cmap = Some(cmap);
+                    image
+                }
+                None => {
+                    self.cmap = None;
+                    self.legend_texture = None;
+                    let (vmin, vmax) = field.range.unwrap_or((0.0, 0.0));
+                    field_to_color_image(
+                        &field.values,
+                        field.nx,
+                        field.ny,
+                        vmin,
+                        vmax,
+                        &self.colormap,
+                        flip_y,
+                    )
+                }
+            };
             self.texture = Some(ui.ctx().load_texture(
                 "rw-ui-field",
                 image,
@@ -232,8 +299,15 @@ impl FieldViewerPanel {
             return event;
         };
 
-        // Fit the grid into the remaining space, preserving aspect.
-        let avail = ui.available_size();
+        // Fit the grid into the remaining space, preserving aspect; mapped
+        // fields reserve a strip on the right for the production legend.
+        let legend_width = if self.cmap.is_some() {
+            LEGEND_WIDTH
+        } else {
+            0.0
+        };
+        let mut avail = ui.available_size();
+        avail.x = (avail.x - legend_width).max(1.0);
         let scale = (avail.x / field.nx as f32)
             .min(avail.y / field.ny as f32)
             .max(0.01);
@@ -279,6 +353,13 @@ impl FieldViewerPanel {
             StrokeKind::Outside,
         );
 
+        // Production legend: swatch colors from the colormap's legend
+        // levels, tick VALUES from the production `pick_ticks`, labels from
+        // `format_tick` — the same data the PNG colorbar renders from.
+        if let Some(style) = &field.style {
+            self.draw_legend(ui, rect, style);
+        }
+
         // Hover readout: grid point + lat/lon + value. Lat/lon come FROM THE
         // STORED ARRAYS at the mapped (ix, iy) — the same indexing the
         // sounding uses — so the readout verifies the click mapping in-UI.
@@ -304,6 +385,94 @@ impl FieldViewerPanel {
 
         event
     }
+
+    /// Draw the vertical production colorbar to the right of `image_rect`:
+    /// bar pixels sampled exactly like `draw_vertical_colorbar`, tick marks
+    /// placed linear-by-value (`legend_tick_rel`), labels via `format_tick`,
+    /// topped with the display units.
+    fn draw_legend(
+        &self,
+        ui: &Ui,
+        image_rect: Rect,
+        style: &rustwx_products::viewer::StoreVariableStyle,
+    ) {
+        let (Some(cmap), Some(texture)) = (&self.cmap, &self.legend_texture) else {
+            return;
+        };
+        let painter = ui.painter();
+        let gap = 10.0;
+        let bar_w = 16.0;
+        let top_pad = 16.0; // room for the units label
+        let bar_rect = Rect::from_min_max(
+            pos2(image_rect.right() + gap, image_rect.top() + top_pad),
+            pos2(image_rect.right() + gap + bar_w, image_rect.bottom()),
+        );
+        if bar_rect.height() < 24.0 {
+            return;
+        }
+
+        painter.image(
+            texture.id(),
+            bar_rect,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        painter.rect_stroke(
+            bar_rect,
+            0.0,
+            Stroke::new(1.0, ui.visuals().weak_text_color()),
+            StrokeKind::Outside,
+        );
+
+        let text_color = ui.visuals().text_color();
+        let font = FontId::proportional(10.0);
+        painter.text(
+            pos2(bar_rect.left(), bar_rect.top() - 3.0),
+            Align2::LEFT_BOTTOM,
+            &style.display_units,
+            font.clone(),
+            text_color,
+        );
+
+        // Tick values/positions exactly as the production colorbar labels
+        // them; skip overlapping labels like the renderer does.
+        let mut last_label_top = f32::INFINITY;
+        let line_h = 11.0;
+        for tick in colorbar_ticks(cmap, style.cbar_tick_step) {
+            let Some(rel) = legend_tick_rel(cmap, tick) else {
+                continue;
+            };
+            let y = bar_rect.bottom() - rel as f32 * bar_rect.height();
+            painter.line_segment(
+                [pos2(bar_rect.right(), y), pos2(bar_rect.right() + 3.0, y)],
+                Stroke::new(1.0, text_color),
+            );
+            if y + line_h <= last_label_top || last_label_top.is_infinite() {
+                painter.text(
+                    pos2(bar_rect.right() + 5.0, y),
+                    Align2::LEFT_CENTER,
+                    format_tick(tick),
+                    font.clone(),
+                    text_color,
+                );
+                last_label_top = y - line_h;
+            }
+        }
+    }
+}
+
+/// One production colorbar sample per row, top = the highest legend level —
+/// the same per-pixel sampling `draw_vertical_colorbar` paints.
+fn legend_bar_image(cmap: &LeveledColormap, mode: rustwx_render::LegendMode) -> ColorImage {
+    let mut pixels = Vec::with_capacity(LEGEND_BAR_RESOLUTION);
+    for row in 0..LEGEND_BAR_RESOLUTION {
+        let rel = 1.0 - (row as f64 + 0.5) / LEGEND_BAR_RESOLUTION as f64;
+        let rgba = legend_color_at_rel(cmap, mode, rel);
+        pixels.push(Color32::from_rgba_unmultiplied(
+            rgba.r, rgba.g, rgba.b, rgba.a,
+        ));
+    }
+    ColorImage::new([1, LEGEND_BAR_RESOLUTION], pixels)
 }
 
 /// Normalized image coords (`u` rightward, `v` DOWNWARD from the image top,
@@ -338,7 +507,11 @@ mod tests {
     fn lats(descending: bool) -> Vec<f32> {
         (0..NY)
             .flat_map(|y| {
-                let lat = if descending { 50.0 - y as f32 } else { 20.0 + y as f32 };
+                let lat = if descending {
+                    50.0 - y as f32
+                } else {
+                    20.0 + y as f32
+                };
                 std::iter::repeat_n(lat, NX)
             })
             .collect()
@@ -352,21 +525,31 @@ mod tests {
         for descending in [false, true] {
             let lat = lats(descending);
             let flip_y = !descending; // what the viewer derives
-            let south = if descending { 50.0 - (NY - 1) as f32 } else { 20.0 };
-            let north = if descending { 50.0 } else { 20.0 + (NY - 1) as f32 };
+            let south = if descending {
+                50.0 - (NY - 1) as f32
+            } else {
+                20.0
+            };
+            let north = if descending {
+                50.0
+            } else {
+                20.0 + (NY - 1) as f32
+            };
 
             // v = 1 is the bottom edge of the image (screen-down).
             let (_, fy) = image_uv_to_grid(0.5, 0.999, NX, NY, flip_y);
             let iy = fy.round() as usize;
             assert_eq!(
-                lat[iy * NX], south,
+                lat[iy * NX],
+                south,
                 "bottom click must sample the southernmost row (descending={descending})"
             );
 
             let (_, fy) = image_uv_to_grid(0.5, 0.001, NX, NY, flip_y);
             let iy = fy.round() as usize;
             assert_eq!(
-                lat[iy * NX], north,
+                lat[iy * NX],
+                north,
                 "top click must sample the northernmost row (descending={descending})"
             );
         }

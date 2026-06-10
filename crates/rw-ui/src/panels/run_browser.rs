@@ -82,7 +82,11 @@ impl RunBrowserPanel {
             ui.add_space(8.0);
             ui.separator();
             for warning in &tree.warnings {
-                ui.label(RichText::new(warning).small().color(ui.visuals().warn_fg_color));
+                ui.label(
+                    RichText::new(warning)
+                        .small()
+                        .color(ui.visuals().warn_fg_color),
+                );
             }
         }
 

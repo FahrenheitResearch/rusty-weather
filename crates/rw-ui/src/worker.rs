@@ -12,6 +12,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use rustwx_products::viewer::{StoreVariableStyle, operational_style_for_store_variable};
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
 
@@ -76,6 +77,13 @@ pub struct FieldData {
     /// is missing or undecidable. The viewer flips rows for display — and
     /// inverts clicks — only when this is `false`.
     pub lat_descending: bool,
+    /// The variable's production plot styling, resolved from its stored
+    /// selector JSON ([`operational_style_for_store_variable`]). When
+    /// present, `values` and `units` are ALREADY converted to the style's
+    /// display units (the style's `convert` was applied), so the viewer
+    /// colors them with the production colormap directly. `None` for
+    /// variables with no plot counterpart — generic ramp.
+    pub style: Option<StoreVariableStyle>,
 }
 
 /// One 3D variable's profile at a point.
@@ -262,7 +270,10 @@ fn coalesce(batch: Vec<StoreRequest>) -> Vec<StoreRequest> {
             StoreRequest::LoadSounding { .. } => sounding = Some(request),
         }
     }
-    [enumerate, hour, field, sounding].into_iter().flatten().collect()
+    [enumerate, hour, field, sounding]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn handle(state: &mut WorkerState, request: StoreRequest) -> StoreResponse {
@@ -284,10 +295,7 @@ fn handle(state: &mut WorkerState, request: StoreRequest) -> StoreResponse {
 }
 
 /// Open (or reuse) the hour reader for `key`.
-fn reader_for<'s>(
-    state: &'s mut WorkerState,
-    key: &HourKey,
-) -> rw_store::RwResult<&'s HourReader> {
+fn reader_for<'s>(state: &'s mut WorkerState, key: &HourKey) -> rw_store::RwResult<&'s HourReader> {
     let cached = matches!(&state.hour, Some((have, _)) if have == key);
     if !cached {
         let reader = state.view.open_hour(&key.model, &key.run, key.hour)?;
@@ -343,11 +351,35 @@ fn load_field(state: &mut WorkerState, key: &FieldKey) -> rw_store::RwResult<Fie
         .as_deref()
         .and_then(GridFile::lat_descending)
         .unwrap_or(false);
-    let units = reader
+    // Resolve the variable's production plot styling from its stored
+    // selector JSON. Unknown models (e.g. the synthetic test store) and
+    // unmapped variables resolve to `None` -> the generic ramp.
+    let style = meta
+        .model
+        .parse::<rustwx_core::ModelId>()
+        .ok()
+        .and_then(|model| {
+            let var = reader.variable(&key.var)?;
+            operational_style_for_store_variable(&var.name, &var.selector, &var.units, model)
+        });
+    let stored_units = reader
         .variable(&key.var)
         .map(|var| var.units.clone())
         .unwrap_or_default();
-    let values = reader.read_full_2d(&key.var)?;
+    let mut values = reader.read_full_2d(&key.var)?;
+    // Convert to display units with the production arithmetic so the scale,
+    // the hover readout, and the range chip all speak the same units.
+    let units = match &style {
+        Some(style) => {
+            if !style.convert.is_none() {
+                for value in &mut values {
+                    *value = style.convert.apply(*value);
+                }
+            }
+            style.display_units.clone()
+        }
+        None => stored_units,
+    };
     let range = finite_min_max(&values);
     Ok(FieldData {
         key: key.clone(),
@@ -358,6 +390,7 @@ fn load_field(state: &mut WorkerState, key: &FieldKey) -> rw_store::RwResult<Fie
         range,
         grid,
         lat_descending,
+        style,
     })
 }
 

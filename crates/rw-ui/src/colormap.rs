@@ -5,6 +5,7 @@
 //! plot pipeline owns real styling. Keep it dumb and predictable.
 
 use egui::{Color32, ColorImage};
+use rustwx_render::LeveledColormap;
 
 /// Color used for NaN / missing values (dark neutral, clearly not data).
 pub const MISSING_COLOR: Color32 = Color32::from_rgb(28, 28, 32);
@@ -51,7 +52,9 @@ impl Colormap {
         let hi = (lo + 1).min(last);
         let frac = scaled - lo as f32;
         let lerp = |a: u8, b: u8| -> u8 {
-            (a as f32 + (b as f32 - a as f32) * frac).round().clamp(0.0, 255.0) as u8
+            (a as f32 + (b as f32 - a as f32) * frac)
+                .round()
+                .clamp(0.0, 255.0) as u8
         };
         let a = self.anchors[lo];
         let b = self.anchors[hi];
@@ -107,10 +110,46 @@ pub fn field_to_color_image(
     assert_eq!(values.len(), nx * ny, "field size must be ny * nx");
     let mut pixels = Vec::with_capacity(nx * ny);
     for image_row in 0..ny {
-        let grid_row = if flip_y { ny - 1 - image_row } else { image_row };
+        let grid_row = if flip_y {
+            ny - 1 - image_row
+        } else {
+            image_row
+        };
         let row = &values[grid_row * nx..(grid_row + 1) * nx];
         for &v in row {
             pixels.push(cmap.sample(normalize(v, vmin, vmax)));
+        }
+    }
+    ColorImage::new([nx, ny], pixels)
+}
+
+/// Build a false-color [`ColorImage`] by mapping each value through the
+/// PRODUCTION colormap (`LeveledColormap::map`) — the exact per-pixel
+/// function the plot rasterizer calls, so colors are bit-identical to the
+/// rendered PNG fill. NaN and below-`mask_below` values map to TRANSPARENT
+/// (production behavior: the basemap shows through); here the panel
+/// background shows instead. Same `flip_y` contract as
+/// [`field_to_color_image`].
+pub fn field_to_production_color_image(
+    values: &[f32],
+    nx: usize,
+    ny: usize,
+    cmap: &LeveledColormap,
+    flip_y: bool,
+) -> ColorImage {
+    assert_eq!(values.len(), nx * ny, "field size must be ny * nx");
+    let mut pixels = Vec::with_capacity(nx * ny);
+    for image_row in 0..ny {
+        let grid_row = if flip_y {
+            ny - 1 - image_row
+        } else {
+            image_row
+        };
+        for &value in &values[grid_row * nx..(grid_row + 1) * nx] {
+            let rgba = cmap.map(f64::from(value));
+            pixels.push(Color32::from_rgba_unmultiplied(
+                rgba.r, rgba.g, rgba.b, rgba.a,
+            ));
         }
     }
     ColorImage::new([nx, ny], pixels)
@@ -124,8 +163,14 @@ mod tests {
     fn sample_hits_endpoints_and_clamps() {
         let first = VIRIDIS.anchors[0];
         let last = *VIRIDIS.anchors.last().unwrap();
-        assert_eq!(VIRIDIS.sample(0.0), Color32::from_rgb(first[0], first[1], first[2]));
-        assert_eq!(VIRIDIS.sample(1.0), Color32::from_rgb(last[0], last[1], last[2]));
+        assert_eq!(
+            VIRIDIS.sample(0.0),
+            Color32::from_rgb(first[0], first[1], first[2])
+        );
+        assert_eq!(
+            VIRIDIS.sample(1.0),
+            Color32::from_rgb(last[0], last[1], last[2])
+        );
         // Out-of-range clamps to the endpoints; NaN is the missing color.
         assert_eq!(VIRIDIS.sample(-3.0), VIRIDIS.sample(0.0));
         assert_eq!(VIRIDIS.sample(7.0), VIRIDIS.sample(1.0));

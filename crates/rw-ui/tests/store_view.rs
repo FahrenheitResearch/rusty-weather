@@ -8,9 +8,7 @@ use rw_ui::synthetic::{
     SYNTHETIC_BUILD, SYNTHETIC_HOURS, SYNTHETIC_LEVELS, SYNTHETIC_MODEL, SYNTHETIC_RUN,
     write_synthetic_store,
 };
-use rw_ui::{
-    FieldKey, HourKey, StoreRequest, StoreResponse, StoreView, StoreWorker, VarKind,
-};
+use rw_ui::{FieldKey, HourKey, StoreRequest, StoreResponse, StoreView, StoreWorker, VarKind};
 
 fn test_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rw-ui-{}-{}", std::process::id(), name));
@@ -53,7 +51,10 @@ fn enumerate_missing_root_is_empty_not_error() {
     let dir = test_dir("missing-root");
     let tree = StoreView::new(dir.join("does-not-exist")).enumerate();
     assert!(tree.models.is_empty());
-    assert!(tree.warnings.is_empty(), "missing root is a clean empty state");
+    assert!(
+        tree.warnings.is_empty(),
+        "missing root is a clean empty state"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -72,11 +73,7 @@ fn enumerate_reports_broken_manifest_as_warning() {
 
     let tree = StoreView::new(&root).enumerate();
     assert_eq!(tree.models.len(), 1);
-    assert_eq!(
-        tree.models[0].runs.len(),
-        1,
-        "only the valid run is listed"
-    );
+    assert_eq!(tree.models[0].runs.len(), 1, "only the valid run is listed");
     assert_eq!(tree.models[0].runs[0].run, SYNTHETIC_RUN);
     assert_eq!(tree.warnings.len(), 1, "broken manifest becomes a warning");
     assert!(tree.warnings[0].contains("run.json"));
@@ -210,7 +207,11 @@ fn worker_round_trip_on_synthetic_store() {
             assert_eq!(temp.levels_hpa, SYNTHETIC_LEVELS.to_vec());
             assert_eq!(temp.values.len(), SYNTHETIC_LEVELS.len());
             // Plausible: warm at 1000 hPa, cold at 250 hPa, monotonic-ish.
-            assert!((270.0..300.0).contains(&temp.values[0]), "{:?}", temp.values);
+            assert!(
+                (270.0..300.0).contains(&temp.values[0]),
+                "{:?}",
+                temp.values
+            );
             assert!(temp.values.last().unwrap() < &240.0, "{:?}", temp.values);
             // Dewpoint below temperature everywhere.
             let dew = &sounding.vars[1];
