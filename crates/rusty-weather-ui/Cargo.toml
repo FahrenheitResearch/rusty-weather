@@ -15,6 +15,8 @@ rustwx-core = { path = "../rustwx-core" }
 rustwx-io = { path = "../rustwx-io" }
 rustwx-models = { path = "../rustwx-models" }
 rw-ingest = { path = "../rw-ingest" }
+rw-sat = { path = "../rw-sat" }
+rw-store = { path = "../rw-store" }
 rw-ui = { path = "../rw-ui" }
 # Deep profiling (feature "profiling", default off): puffin scopes across
 # rw-ui + rw-ingest, a puffin_http server for the external puffin_viewer,
@@ -23,6 +25,11 @@ rw-ui = { path = "../rw-ui" }
 # ships and swap the table for puffin_egui::profiler_window then.
 puffin = { version = "0.20", optional = true }
 puffin_http = { version = "0.17", optional = true }
+
+[dev-dependencies]
+# Constructing synthetic GOES scenes (rw-sat's public scene types carry
+# chrono timestamps) in the sat-worker tests.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [features]
 profiling = [
