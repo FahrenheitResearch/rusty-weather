@@ -1079,8 +1079,8 @@ mod tests {
     /// resolves to its production plot styling through the viewer resolver
     /// (`rustwx_products::viewer`) or is a known fallback with no production
     /// fill counterpart (barb inputs, compute inputs, contour-only height
-    /// planes). The fallback set is pinned exactly: a new plan entry that
-    /// silently falls back fails this test.
+    /// planes, contour-only mslp). The fallback set is pinned exactly: a new
+    /// plan entry that silently falls back fails this test.
     #[test]
     fn viewer_style_resolver_covers_the_full_ingest_plan() {
         use rustwx_products::viewer::operational_style_for_store_variable;
@@ -1134,12 +1134,15 @@ mod tests {
         }
 
         // The complete fallback set: u/v barb inputs (surface + isobaric),
-        // compute-only inputs, and the contour-only geopotential heights.
+        // compute-only inputs, the contour-only geopotential heights, and
+        // mslp (production contours mslp; its plot fills the companion
+        // 10 m wind speed, so no production colorbar exists for the plane).
         let mut expected_fallback: Vec<String> = vec![
             "u_10m".to_string(),
             "v_10m".to_string(),
             "surface_pressure".to_string(),
             "orography".to_string(),
+            "mslp".to_string(),
         ];
         for selector in direct_isobaric_plane_selectors(model) {
             if matches!(
@@ -1157,11 +1160,11 @@ mod tests {
             "every fallback variable must be a known no-counterpart input"
         );
         assert_eq!(mapped.len() + fallback.len(), planned.len());
-        // Pinned inventory counts (2026-06 full HRRR plan): 43 of the 65
-        // planned 2D planes carry production styling; the 22 fallbacks are
+        // Pinned inventory counts (2026-06 full HRRR plan): 42 of the 65
+        // planned 2D planes carry production styling; the 23 fallbacks are
         // the exact set asserted above.
-        assert_eq!(mapped.len(), 43, "mapped 2D plane count");
-        assert_eq!(fallback.len(), 22, "fallback 2D plane count");
+        assert_eq!(mapped.len(), 42, "mapped 2D plane count");
+        assert_eq!(fallback.len(), 23, "fallback 2D plane count");
 
         // Derived + heavy store grids resolve through their slug markers.
         for slug in store_derived_recipe_slugs()

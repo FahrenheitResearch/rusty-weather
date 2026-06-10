@@ -22,8 +22,9 @@
 //!
 //! Variables with NO production fill counterpart (u/v wind components,
 //! geopotential height planes — production only contours heights —
-//! `surface_pressure`, `orography`, 3D volumes) resolve to `None`: the
-//! viewer keeps its clearly-labeled generic ramp for those.
+//! `mslp` — production contours mslp and fills the companion 10 m wind
+//! speed — `surface_pressure`, `orography`, 3D volumes) resolve to
+//! `None`: the viewer keeps its clearly-labeled generic ramp for those.
 
 use rustwx_core::{CanonicalField, FieldSelector, ModelId};
 use rustwx_models::{PlotRecipe, built_in_plot_recipes};
@@ -151,15 +152,18 @@ pub fn operational_style_for_store_variable(
         return None;
     }
 
+    // Production never color-fills mslp values either: the `mslp_10m_winds`
+    // plot fills the companion 10 m wind speed (kt) and only CONTOURS mslp,
+    // so no production colorbar exists for the stored pressure plane.
+    // Claiming that plot's identity over the catalog WeatherPressure scale
+    // would show legend values (960..1044 hPa) that match no production
+    // colorbar — keep the clearly-labeled generic ramp instead.
+    if selector.field == CanonicalField::PressureReducedToMeanSeaLevel {
+        return None;
+    }
+
     let recipe = direct_recipe_for_selector(var_name, selector, model)?;
-    // CAVEAT (mslp): the production `mslp_10m_winds` plot fills the
-    // companion 10 m wind speed and contours mslp — the catalog's
-    // mslp-value scale is the WeatherPressure styling.
-    let scale = if selector.field == CanonicalField::PressureReducedToMeanSeaLevel {
-        ColorScale::Discrete(crate::plot_design::mslp_pressure_fill_scale())
-    } else {
-        crate::plot_design::operational_fill_scale_for_recipe(recipe, selector)
-    };
+    let scale = crate::plot_design::operational_fill_scale_for_recipe(recipe, selector);
     let (convert, units_override) = direct_fill_unit_conversion(recipe, selector);
     let (legend_mode_override, cbar_tick_step) = direct_recipe_render_controls(recipe, selector);
     let (render_density, mut legend) = operational_request_chrome();
@@ -475,18 +479,20 @@ mod tests {
     }
 
     #[test]
-    fn mslp_uses_the_catalog_pressure_scale_not_the_companion_wind_fill() {
-        let mslp = style_for(
-            "mslp",
-            &FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel),
-            "Pa",
-        )
-        .expect("mslp resolves");
-        assert_eq!(mslp.convert, UnitConvert::PaToHpa);
-        assert_eq!(mslp.display_units, "hPa");
-        let discrete = mslp.scale.resolved_discrete();
-        assert_eq!(discrete.levels.first().copied(), Some(960.0));
-        assert_eq!(discrete.levels.last().copied(), Some(1044.0));
+    fn mslp_falls_back_to_the_generic_ramp() {
+        // The production `mslp_10m_winds` plot fills the companion 10 m wind
+        // speed (legend 10..60 kt) and only contours mslp — there is no
+        // production colorbar for the stored pressure values, so claiming
+        // production parity with ANY pressure-valued legend would be false.
+        assert!(
+            style_for(
+                "mslp",
+                &FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel),
+                "Pa",
+            )
+            .is_none(),
+            "mslp must keep the generic ramp (no production fill counterpart)"
+        );
     }
 
     #[test]
@@ -534,8 +540,8 @@ mod tests {
 
     #[test]
     fn unmapped_variables_fall_back_to_none() {
-        // Barb inputs, compute inputs, and contour-only heights have no
-        // production fill counterpart.
+        // Barb inputs, compute inputs, contour-only heights, and the
+        // contour-only mslp plane have no production fill counterpart.
         for (name, selector) in [
             (
                 "u_10m",
@@ -548,6 +554,10 @@ mod tests {
             (
                 "surface_pressure",
                 FieldSelector::surface(CanonicalField::Pressure),
+            ),
+            (
+                "mslp",
+                FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel),
             ),
             (
                 "orography",

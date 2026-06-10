@@ -372,10 +372,11 @@ fn operational_pressure_contour_policy(
 }
 
 /// The catalog fill scale for MSLP values in hPa (the `WeatherPressure`
-/// recipe arm). NOTE: the production `mslp_10m_winds` plot fills the
-/// companion 10 m wind speed and only CONTOURS mslp at 2 hPa — this scale
-/// is the catalog's mslp-value styling, which the data viewer uses for the
-/// stored `mslp` plane itself.
+/// recipe arm, e.g. the HREF MSLP mean fill). NOTE: the production
+/// `mslp_10m_winds` plot fills the companion 10 m wind speed and only
+/// CONTOURS mslp at 2 hPa — no single-model production colorbar shows
+/// these pressure values, which is why the store viewer resolver keeps the
+/// generic ramp for the stored `mslp` plane instead of this scale.
 pub(crate) fn mslp_pressure_fill_scale() -> DiscreteColorScale {
     DiscreteColorScale {
         levels: range_step(960.0, 1045.0, 2.0),
