@@ -86,6 +86,7 @@ use rendering::{
     apply_source_raster_policy, build_render_request, sanitize_output_suffix,
     should_render_overlay_only, visual_mode_for_direct_recipe,
 };
+pub(crate) use rendering::{direct_fill_unit_conversion, direct_recipe_render_controls};
 #[cfg(test)]
 use titles::{apply_native_stat_title_prefix, native_stat_label_for_request};
 use titles::{direct_panel_title_for_request, direct_title_for_planned_product};

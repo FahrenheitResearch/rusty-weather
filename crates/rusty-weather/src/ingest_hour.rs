@@ -505,8 +505,10 @@ pub fn process_fetched_hour(
                 FieldSelector::height_agl(CanonicalField::WindSpeed, 10),
             ),
         ];
-        let trailing_selectors: Vec<FieldSelector> =
-            trailing_plan.iter().map(|(_, selector)| *selector).collect();
+        let trailing_selectors: Vec<FieldSelector> = trailing_plan
+            .iter()
+            .map(|(_, selector)| *selector)
+            .collect();
         let trailing_started = Instant::now();
         let mut trailing_extraction = extract_fields_partial_from_model_bytes_at_forecast_hour(
             config.model,
@@ -996,10 +998,7 @@ pub struct PlannedStoreVariables {
 /// Predictive by construction: candidate levels are assumed realized (true
 /// for HRRR's 25 hPa prs files) and the dewpoint volume keeps its planned
 /// `dewpoint_iso` name (the rh_iso fallback is a per-file degradation).
-pub fn planned_store_variables(
-    profile: &IngestProfile,
-    model: ModelId,
-) -> PlannedStoreVariables {
+pub fn planned_store_variables(profile: &IngestProfile, model: ModelId) -> PlannedStoreVariables {
     let level_count = profile.candidate_levels().len();
     let volumes = volume_plan(profile)
         .iter()
@@ -1076,6 +1075,115 @@ pub fn parse_hours(spec: &str) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
+    /// Every stored 2D variable the FULL ingest plan realizes either
+    /// resolves to its production plot styling through the viewer resolver
+    /// (`rustwx_products::viewer`) or is a known fallback with no production
+    /// fill counterpart (barb inputs, compute inputs, contour-only height
+    /// planes). The fallback set is pinned exactly: a new plan entry that
+    /// silently falls back fails this test.
+    #[test]
+    fn viewer_style_resolver_covers_the_full_ingest_plan() {
+        use rustwx_products::viewer::operational_style_for_store_variable;
+
+        let model = ModelId::Hrrr;
+        // (name, selector) for every planned 2D variable, mirroring
+        // `process_fetched_hour`'s stored selectors exactly.
+        let mut planned: Vec<(String, FieldSelector)> = surface_plan()
+            .into_iter()
+            .map(|(name, selector)| (name.to_string(), selector))
+            .collect();
+        planned.extend([
+            (
+                TRAILING_2D_NAMES[0].to_string(),
+                FieldSelector::surface(CanonicalField::TotalPrecipitation),
+            ),
+            (
+                TRAILING_2D_NAMES[1].to_string(),
+                FieldSelector::height_layer_agl(CanonicalField::UpdraftHelicity, 2000, 5000),
+            ),
+            (
+                TRAILING_2D_NAMES[2].to_string(),
+                FieldSelector::height_agl(CanonicalField::WindSpeed, 10),
+            ),
+        ]);
+        for (level, name) in VORTICITY_PLAN {
+            planned.push((
+                name.to_string(),
+                FieldSelector::isobaric(CanonicalField::AbsoluteVorticity, *level),
+            ));
+        }
+        for selector in direct_isobaric_plane_selectors(model) {
+            planned.push((selector.key(), selector));
+        }
+
+        let mut mapped = Vec::new();
+        let mut fallback = Vec::new();
+        for (name, selector) in &planned {
+            let selector_json = serde_json::to_value(selector).expect("selector json");
+            match operational_style_for_store_variable(name, &selector_json, "native", model) {
+                Some(style) => {
+                    assert!(!style.title.is_empty(), "'{name}' must carry a title");
+                    assert!(
+                        !style.display_units.is_empty(),
+                        "'{name}' must carry display units"
+                    );
+                    mapped.push(name.clone());
+                }
+                None => fallback.push(name.clone()),
+            }
+        }
+
+        // The complete fallback set: u/v barb inputs (surface + isobaric),
+        // compute-only inputs, and the contour-only geopotential heights.
+        let mut expected_fallback: Vec<String> = vec![
+            "u_10m".to_string(),
+            "v_10m".to_string(),
+            "surface_pressure".to_string(),
+            "orography".to_string(),
+        ];
+        for selector in direct_isobaric_plane_selectors(model) {
+            if matches!(
+                selector.field,
+                CanonicalField::GeopotentialHeight | CanonicalField::UWind | CanonicalField::VWind
+            ) {
+                expected_fallback.push(selector.key());
+            }
+        }
+        let mut actual_fallback = fallback.clone();
+        actual_fallback.sort();
+        expected_fallback.sort();
+        assert_eq!(
+            actual_fallback, expected_fallback,
+            "every fallback variable must be a known no-counterpart input"
+        );
+        assert_eq!(mapped.len() + fallback.len(), planned.len());
+        // Pinned inventory counts (2026-06 full HRRR plan): 43 of the 65
+        // planned 2D planes carry production styling; the 22 fallbacks are
+        // the exact set asserted above.
+        assert_eq!(mapped.len(), 43, "mapped 2D plane count");
+        assert_eq!(fallback.len(), 22, "fallback 2D plane count");
+
+        // Derived + heavy store grids resolve through their slug markers.
+        for slug in store_derived_recipe_slugs()
+            .into_iter()
+            .chain(store_heavy_recipe_slugs())
+        {
+            let marker = serde_json::json!({ "derived": slug });
+            assert!(
+                operational_style_for_store_variable(slug, &marker, "units", model).is_some(),
+                "derived/heavy slug '{slug}' must resolve to production styling"
+            );
+        }
+
+        eprintln!(
+            "viewer coverage: {} mapped 2D planes, {} fallback 2D planes, {} derived, {} heavy",
+            mapped.len(),
+            fallback.len(),
+            store_derived_recipe_slugs().len(),
+            store_heavy_recipe_slugs().len(),
+        );
+    }
+
     #[test]
     fn planned_store_variables_full_is_the_complete_plan() {
         let plan = planned_store_variables(&IngestProfile::full(), ModelId::Hrrr);
@@ -1084,14 +1192,23 @@ mod tests {
                 .iter()
                 .map(|(name, _)| *name)
                 .collect::<Vec<_>>(),
-            vec!["temperature_iso", "dewpoint_iso", "u_iso", "v_iso", "height_iso"],
+            vec![
+                "temperature_iso",
+                "dewpoint_iso",
+                "u_iso",
+                "v_iso",
+                "height_iso"
+            ],
         );
         assert!(plan.volumes.iter().all(|(_, levels)| *levels == 37));
         // Surface plan + trailing windows + vorticity + direct planes, in
         // stored order with the grid carrier first.
         assert_eq!(plan.fields_2d[0], "temperature_2m");
         assert!(plan.fields_2d.contains(&"apcp_1h".to_string()));
-        assert!(plan.fields_2d.contains(&"absolute_vorticity_500".to_string()));
+        assert!(
+            plan.fields_2d
+                .contains(&"absolute_vorticity_500".to_string())
+        );
         assert!(
             plan.fields_2d
                 .contains(&"geopotential_height_500hpa".to_string()),
@@ -1109,13 +1226,19 @@ mod tests {
         assert_eq!(sounding.volumes.len(), 5);
         assert!(sounding.volumes.iter().all(|(_, levels)| *levels == 19));
         assert_eq!(sounding.fields_2d.len(), 7);
-        assert_eq!(sounding.fields_2d[0], "temperature_2m", "grid carrier first");
+        assert_eq!(
+            sounding.fields_2d[0], "temperature_2m",
+            "grid carrier first"
+        );
         assert!(!sounding.fields_2d.contains(&"apcp_1h".to_string()));
         assert!(sounding.derived.is_empty() && sounding.heavy.is_empty());
 
         let view = planned_store_variables(&IngestProfile::view(), ModelId::Hrrr);
         assert!(view.volumes.is_empty());
-        assert!(view.fields_2d.contains(&"absolute_vorticity_500".to_string()));
+        assert!(
+            view.fields_2d
+                .contains(&"absolute_vorticity_500".to_string())
+        );
         assert!(!view.derived.is_empty());
         assert!(view.heavy.is_empty());
     }

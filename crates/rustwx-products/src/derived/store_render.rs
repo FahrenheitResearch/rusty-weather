@@ -205,7 +205,7 @@ pub fn render_derived_recipes_from_store_grids(
 /// Place one store-read plane into the computed-fields slot the render
 /// builder consumes for this recipe — the inverse of
 /// `derived_query_field_from_computed`'s recipe -> field mapping.
-fn assign_store_values(
+pub(super) fn assign_store_values(
     computed: &mut DerivedComputedFields,
     recipe: DerivedRecipe,
     values: Vec<f64>,
@@ -270,7 +270,7 @@ fn assign_store_values(
 /// The `WeatherProduct` each heavy recipe's panel field carries — the same
 /// constructors `compute_ecape_map_fields_with_prepared_volume` uses, whose
 /// product slug equals the recipe slug (pinned by test below).
-fn weather_product_for_heavy_recipe(
+pub(super) fn weather_product_for_heavy_recipe(
     recipe: DerivedRecipe,
 ) -> Result<rustwx_render::WeatherProduct, Box<dyn std::error::Error>> {
     use rustwx_render::WeatherProduct;

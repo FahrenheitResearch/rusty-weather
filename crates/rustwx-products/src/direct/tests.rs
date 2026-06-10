@@ -1212,8 +1212,7 @@ fn convert_filled_field_applies_operational_unit_transforms() {
         "Pa",
         vec![100000.0; 4],
     );
-    let converted_pressure =
-        convert_filled_field(pressure_recipe, &pressure_field);
+    let converted_pressure = convert_filled_field(pressure_recipe, &pressure_field);
     assert_eq!(converted_pressure.units, "hPa");
     assert_eq!(converted_pressure.values[0], 1000.0);
 
@@ -1263,8 +1262,7 @@ fn convert_filled_field_applies_operational_unit_transforms() {
         "K",
         vec![253.15; 4],
     );
-    let converted_upper_temp =
-        convert_filled_field(upper_temp_recipe, &upper_temp_field);
+    let converted_upper_temp = convert_filled_field(upper_temp_recipe, &upper_temp_field);
     assert_eq!(converted_upper_temp.units, "degC");
     assert!((converted_upper_temp.values[0] + 20.0).abs() < 1.0e-5);
 
@@ -1274,8 +1272,7 @@ fn convert_filled_field_applies_operational_unit_transforms() {
         "m/s",
         vec![10.0; 4],
     );
-    let converted_wind_speed =
-        convert_filled_field(wind_speed_recipe, &wind_speed_field);
+    let converted_wind_speed = convert_filled_field(wind_speed_recipe, &wind_speed_field);
     assert_eq!(converted_wind_speed.units, "kt");
     assert!((converted_wind_speed.values[0] - 19.438_445).abs() < 1.0e-5);
 }

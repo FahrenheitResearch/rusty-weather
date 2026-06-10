@@ -28,6 +28,7 @@ pub mod shared_context;
 pub mod source;
 pub mod spec;
 pub mod thermo_native;
+pub mod viewer;
 pub mod windowed;
 pub mod windowed_decoder;
 

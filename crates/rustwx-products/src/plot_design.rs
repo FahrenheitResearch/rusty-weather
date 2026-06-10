@@ -171,12 +171,7 @@ pub fn operational_fill_scale_for_recipe(
             mask_below: None,
         },
         RenderStyle::WeatherDewpoint => dewpoint_scale_for_selector(filled_selector),
-        RenderStyle::WeatherPressure => DiscreteColorScale {
-            levels: range_step(960.0, 1045.0, 2.0),
-            colors: weather_palette(WeatherPalette::Winds),
-            extend: ExtendMode::Both,
-            mask_below: None,
-        },
+        RenderStyle::WeatherPressure => mslp_pressure_fill_scale(),
         RenderStyle::WeatherHeight => DiscreteColorScale {
             levels: match filled_selector.vertical {
                 VerticalSelector::IsobaricHpa(200) | VerticalSelector::IsobaricHpa(250) => {
@@ -374,6 +369,20 @@ fn operational_pressure_contour_policy(
     levels: Vec<f64>,
 ) -> (Vec<f64>, Color, u32, bool, Option<usize>, Option<u32>, bool) {
     (levels, Color::BLACK, 1, true, Some(2), Some(2), true)
+}
+
+/// The catalog fill scale for MSLP values in hPa (the `WeatherPressure`
+/// recipe arm). NOTE: the production `mslp_10m_winds` plot fills the
+/// companion 10 m wind speed and only CONTOURS mslp at 2 hPa — this scale
+/// is the catalog's mslp-value styling, which the data viewer uses for the
+/// stored `mslp` plane itself.
+pub(crate) fn mslp_pressure_fill_scale() -> DiscreteColorScale {
+    DiscreteColorScale {
+        levels: range_step(960.0, 1045.0, 2.0),
+        colors: weather_palette(WeatherPalette::Winds),
+        extend: ExtendMode::Both,
+        mask_below: None,
+    }
 }
 
 fn reflectivity_dbz_scale() -> DiscreteColorScale {
