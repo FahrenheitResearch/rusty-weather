@@ -177,13 +177,21 @@ pub fn decode_affine_i16(
 
 /// Encode a chunk of values as raw little-endian f32 (2D tile codec).
 /// Constant-with-missing chunks are dense-encoded with NaNs inline.
+///
+/// The constant-tile shortcut requires EXACT constancy: an earlier
+/// epsilon-based check (`range <= f32::EPSILON`) silently collapsed any
+/// tile whose absolute value range was below ~1.2e-7 to a single value —
+/// which destroyed real fields with tiny absolute magnitudes (HRRR 8 m
+/// smoke mass density spans 1e-25..1e-7 kg/m^3, so essentially every tile
+/// flattened). This codec is the store's lossless lane; nothing here may
+/// round.
 pub fn encode_f32_tile(values: &[f32]) -> EncodedChunk {
     let scan = scan_values(values);
     if scan.valid_count == 0 {
         return empty_chunk();
     }
 
-    if (scan.valid_max - scan.valid_min).abs() <= f32::EPSILON && !scan.has_missing {
+    if scan.valid_max == scan.valid_min && !scan.has_missing {
         return EncodedChunk {
             flags: FLAG_CONSTANT,
             center: scan.valid_min,
@@ -401,6 +409,32 @@ mod tests {
             decode_f32_tile(encoded.flags, encoded.center, &encoded.payload, values.len())
                 .unwrap();
         assert_eq!(decoded.len(), values.len());
+        for (source, round_trip) in values.iter().zip(decoded.iter()) {
+            assert_eq!(source.to_bits(), round_trip.to_bits());
+        }
+    }
+
+    /// Regression: tiles whose values differ by less than f32::EPSILON in
+    /// ABSOLUTE terms are not constant. The old epsilon shortcut collapsed
+    /// them to a single value, flattening real small-magnitude fields
+    /// (HRRR 8 m smoke mass density lives entirely below 1.3e-7 kg/m^3).
+    /// The lossless 2D lane must round-trip them bit-exactly.
+    #[test]
+    fn f32_tile_keeps_sub_epsilon_ranges_bit_exact() {
+        let values = vec![1.226e-25_f32, 1.04e-9, 3.3e-8, 1.0e-7];
+        assert!(
+            (values[3] - values[0]).abs() <= f32::EPSILON,
+            "test data must span less than f32::EPSILON to pin the regression"
+        );
+        let encoded = encode_f32_tile(&values);
+        assert_eq!(
+            encoded.flags & FLAG_CONSTANT,
+            0,
+            "a non-constant tile must not take the constant shortcut"
+        );
+        let decoded =
+            decode_f32_tile(encoded.flags, encoded.center, &encoded.payload, values.len())
+                .unwrap();
         for (source, round_trip) in values.iter().zip(decoded.iter()) {
             assert_eq!(source.to_bits(), round_trip.to_bits());
         }

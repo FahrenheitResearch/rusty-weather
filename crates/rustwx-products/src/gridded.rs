@@ -1108,6 +1108,13 @@ fn decode_surface_cropped(
 fn decode_pressure_with_shape(
     bytes: &[u8],
 ) -> Result<(PressureFields, usize, usize), Box<dyn std::error::Error>> {
+    decode_pressure_with_shape_opts(bytes, pressure_optional_decode_enabled())
+}
+
+fn decode_pressure_with_shape_opts(
+    bytes: &[u8],
+    include_optional: bool,
+) -> Result<(PressureFields, usize, usize), Box<dyn std::error::Error>> {
     let file = Grib2File::from_bytes(bytes)?;
     let (nx, ny) = pressure_grid_shape_from_messages(&file.messages)?;
     let temperature = collect_levels(&file.messages, 0, 0, 0, 100)?;
@@ -1115,7 +1122,6 @@ fn decode_pressure_with_shape(
     let v_wind = collect_levels(&file.messages, 0, 2, 3, 100)?;
     let gh = decode_height_levels(&file.messages)?;
     let moisture = decode_pressure_mixing_ratio_levels(&file.messages, &temperature)?;
-    let include_optional = pressure_optional_decode_enabled();
     let omega = if include_optional {
         collect_optional_levels(&file.messages, 0, 2, 8, 100)?
     } else {
@@ -2018,6 +2024,74 @@ fn normalized_longitude_row_wraps_from_messages(
     Ok(normalized_longitude_row_wraps(&mut lon_raw, nx, ny))
 }
 
+/// The three native model CAPE planes a surface-product GRIB file may
+/// carry (HRRR `sfc` does), decoded with the exact message matching and
+/// scan/longitude normalization the surface decode lane uses for
+/// [`SurfaceFields::native_sbcape_jkg`] and friends. Planes the file does
+/// not carry come back `None` — same optionality as the decode lane.
+///
+/// This exists for the store-ingest path: `rw_ingest` extracts its 2D
+/// fields through rustwx-io (which applies the same scan-mode flip and
+/// per-row longitude rotation), so these planes line up row-for-row with
+/// the extracted grid, letting the heavy ECAPE stage compute the
+/// native-CAPE ratio recipes without a second decode lane.
+#[derive(Debug, Clone, Default)]
+pub struct NativeCapePlanes {
+    pub sbcape_jkg: Option<Vec<f64>>,
+    pub mlcape_jkg: Option<Vec<f64>>,
+    pub mucape_jkg: Option<Vec<f64>>,
+}
+
+/// Decode the native CAPE planes from raw surface-product GRIB bytes.
+/// Only the (up to three) matching CAPE messages unpack; the rest of the
+/// file is index-parsed only.
+pub fn decode_native_cape_planes(
+    bytes: &[u8],
+) -> Result<NativeCapePlanes, Box<dyn std::error::Error>> {
+    let file = Grib2File::from_bytes(bytes)?;
+    Ok(NativeCapePlanes {
+        sbcape_jkg: decode_optional_native_cape(&file.messages, NativeCapeLayer::Surface)?,
+        mlcape_jkg: decode_optional_native_cape(&file.messages, NativeCapeLayer::MixedLayer)?,
+        mucape_jkg: decode_optional_native_cape(&file.messages, NativeCapeLayer::MostUnstable)?,
+    })
+}
+
+/// Decode the surface + pressure thermodynamic pair from raw family GRIB
+/// bytes exactly as the derived/heavy render lanes decode them: the same
+/// message matching, the same moisture preference (2 m and isobaric
+/// specific humidity first, then dewpoint, then RH), the same f64
+/// precision, and the same level alignment. The optional pressure volumes
+/// (omega, absolute vorticity, cloud species) are skipped — no
+/// store-computed recipe consumes them and the required arrays are
+/// unaffected by their presence (level alignment uses only the required
+/// five). The store ingest computes its derived and heavy grids from this
+/// pair so the stored grids are bit-identical to what the render lanes
+/// compute from the same files.
+pub fn decode_store_thermo_pair(
+    surface_bytes: &[u8],
+    pressure_bytes: &[u8],
+) -> Result<(SurfaceFields, PressureFields), Box<dyn std::error::Error>> {
+    let surface = decode_surface(surface_bytes)?;
+    let (pressure, nx, ny) = decode_pressure_with_shape_opts(pressure_bytes, false)?;
+    if nx != surface.nx || ny != surface.ny {
+        return Err(format!(
+            "pressure decode shape {nx}x{ny} did not match surface shape {}x{}",
+            surface.nx, surface.ny
+        )
+        .into());
+    }
+    let expected = surface.nx * surface.ny * pressure.pressure_levels_hpa.len();
+    if pressure.temperature_c_3d.len() != expected
+        || pressure.qvapor_kgkg_3d.len() != expected
+        || pressure.u_ms_3d.len() != expected
+        || pressure.v_ms_3d.len() != expected
+        || pressure.gh_m_3d.len() != expected
+    {
+        return Err("pressure decode fields did not match the surface grid shape".into());
+    }
+    Ok((surface, pressure))
+}
+
 #[derive(Debug, Clone, Copy)]
 enum NativeCapeLayer {
     Surface,
@@ -2148,13 +2222,24 @@ fn q_to_mixing_ratio(values: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-fn mixing_ratio_from_dewpoint_k(pressure_hpa: f64, dewpoint_k: f64) -> f64 {
+/// Water-vapor mixing ratio (kg/kg) from dewpoint via Bolton (1980)
+/// saturation vapor pressure. Public so store-ingest derived precompute
+/// (`rw_ingest`) derives moisture with exactly the formula this crate's
+/// GRIB decode lane uses — do not duplicate it.
+pub fn mixing_ratio_from_dewpoint_k(pressure_hpa: f64, dewpoint_k: f64) -> f64 {
     let td_c = dewpoint_k - 273.15;
     let vapor_pressure_hpa = 6.112 * ((17.67 * td_c) / (td_c + 243.5)).exp();
     mixing_ratio_from_vapor_pressure(pressure_hpa, vapor_pressure_hpa)
 }
 
-fn mixing_ratio_from_relative_humidity(pressure_hpa: f64, temperature_k: f64, rh_pct: f64) -> f64 {
+/// Water-vapor mixing ratio (kg/kg) from relative humidity (%), the decode
+/// lane's last-resort moisture fallback. Public for the same store-ingest
+/// reuse as [`mixing_ratio_from_dewpoint_k`].
+pub fn mixing_ratio_from_relative_humidity(
+    pressure_hpa: f64,
+    temperature_k: f64,
+    rh_pct: f64,
+) -> f64 {
     let t_c = temperature_k - 273.15;
     let saturation_vapor_pressure_hpa = 6.112 * ((17.67 * t_c) / (t_c + 243.5)).exp();
     let vapor_pressure_hpa = (rh_pct / 100.0).clamp(0.0, 1.5) * saturation_vapor_pressure_hpa;

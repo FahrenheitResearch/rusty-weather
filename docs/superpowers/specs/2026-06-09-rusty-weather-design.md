@@ -91,16 +91,18 @@ Quantization is applied only to 3D volumes (plot-grade tolerance); 2D plot field
 
 ### Performance targets
 
-| Operation | Target | Baseline (rustwx, isolated) |
-|---|---|---|
-| HRRR GRIB → store, one hour | ≤ 20 s | ~20 s |
-| Store → 80 PNGs, one hour | ≤ 5 s | ~5 s |
-| RRFS-A GRIB → store, one hour | ≤ 60 s | ~60 s |
-| Point sounding from store | < 100 ms | n/a (new path) |
-| Regional plot vs full-domain plot | decode cost ∝ region area | full-grid decode today |
-| 3 models concurrently | ≤ 1.5× each model's isolated time | ~10× today |
+| Operation | Target | Baseline (rustwx, isolated) | Plan 3 measured |
+|---|---|---|---|
+| HRRR GRIB → store, one hour | ≤ 20 s | ~20 s | ~3.6 s extract + 2.3 s encode (warm cache) |
+| Store → 80 PNGs, one hour | ≤ 5 s | ~5 s | 9.0 s midwest / 12.0 s conus (97 products) |
+| RRFS-A GRIB → store, one hour | ≤ 60 s | ~60 s | not yet measured |
+| Point sounding from store | < 100 ms | n/a (new path) | 0.19 ms warm / 23 ms first-click (Plan 2) |
+| Regional plot vs full-domain plot | decode cost ∝ region area | full-grid decode today | windowed reads live; render crops in render space |
+| 3 models concurrently | ≤ 1.5× each model's isolated time | ~10× today | not yet measured (Plan 5) |
+| 3-hour all-products (warm, no-heavy) | ≤ 90 s | ~75 s / ~80 products | **59.8 s / 248 products** |
+| 3-hour all-products (warm, with-heavy) | — | — | 309.4 s / 296 products (ECAPE-dominated) |
 
-The last row is the acceptance test for the architecture; it is measured, not assumed.
+The 3-model concurrency row is the final acceptance test for the architecture; it is measured in Plan 5, not here.
 
 **Plan 2 measured:** sounding 0.19 ms warm / 23 ms first-click; full 2D read 3.6 ms; HRRR hour encode 1.6 s.
 
@@ -135,9 +137,15 @@ Ported crates keep their existing names — renaming ~185K lines of imports buys
 
 ## Web server and UI (`rw-server`)
 
-axum, localhost by default (`--bind` to override on trusted LANs — the nodes).
+> **Status (post Plan 3):** The axum HTTP server remains a future option but is
+> **superseded for v1** by an egui/eframe native UI (`rw-ui` library-first crate).
+> Owner decision: egui gives a single-binary install story without embedding HTML/JS
+> assets, keeps all rendering in Rust (no JS/WASM boundary), and maps naturally onto
+> the rw-store read path. The API surface below is still the right contract for the
+> scheduler/pipeline; `rw-server` ships as a later option for node operators who want
+> HTTP access. Plan 4 targets the egui UI integration.
 
-API (JSON unless noted):
+**Planned axum API (JSON unless noted; future HTTP option):**
 
 - `GET /api/models` — models, cycles, availability (idx probes, cached)
 - `POST /api/runs` — request (model, cycle, hours); returns job id
@@ -147,7 +155,10 @@ API (JSON unless noted):
 - `GET /api/sounding?model=&cycle=&hour=&lat=&lon=` — profile JSON (sharprs-derived parameters included)
 - `GET /sounding.png?...` — rendered sounding image
 
-Frontend: static vanilla HTML/JS served by the same binary (embedded via `include_dir` so the single-binary install story holds). Model picker → cycle/hour scrubber → product grid of plots → click-on-map → sounding panel. No framework, no build step.
+**v1 UI (egui/eframe, `rw-ui`):** native desktop window. Model picker → cycle/hour
+scrubber → product grid of plots → click-on-map → sounding panel. Single binary, no
+web server or HTML assets required. The rw-store read path (windowed tile reads,
+instant soundings) feeds the UI directly.
 
 ## Observability and reproducibility
 
@@ -176,6 +187,6 @@ Stand rusty-weather up on node3/node4 (192.168.68.56/.57) beside existing rustwx
 ## Open questions deferred to the implementation plan
 
 - ~~Exact 3D chunk footprint (16×16 vs 32×32 columns) and 2D tile size per model grid — tune with benchmarks, not guessed here.~~ **Settled in Plan 2 with benchmarks:** 256×256 2D tiles / 16×16-column 3D chunks. Measured numbers confirm targets: sounding 0.19 ms warm (gate ≤ 100 ms) / 23 ms first-click; full 2D read 3.6 ms.
-- Which derived products are precomputed into the store at ingest vs computed at render time (start with rustwx's current derived list for the 6 models).
+- ~~Which derived products are precomputed into the store at ingest vs computed at render time (start with rustwx's current derived list for the 6 models).~~ **Settled in Plan 3:** all 29 derived grids and all 16 ECAPE/heavy grids are precomputed at ingest (while the GRIB volume is in RAM) and stored as ordinary 2D variables. PNGs are generated on demand from the stored grids; windowed products accumulate across hour files at render time. "Process once, plots and regions are free" is fully realized.
 - REFS mean/spread: computed at ingest (stored as 2D fields) — confirm member-fetch strategy against current rustwx REFS lane.
-- Eager-render policy (render all products on ingest vs on first request) — default on-demand with warm-cache option; revisit after timing data.
+- ~~Eager-render policy (render all products on ingest vs on first request) — default on-demand with warm-cache option; revisit after timing data.~~ **Settled in Plan 3:** derived/heavy grids are precomputed eagerly at ingest; PNGs are rendered on demand from the stored grids (the 59.8 s benchmark includes all 248 PNGs for 3 hours — on-demand is fast enough that pre-rendering is unnecessary).

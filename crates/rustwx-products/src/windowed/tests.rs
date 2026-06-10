@@ -278,3 +278,54 @@ fn windowed_render_request_labels_fixed_window_instead_of_requested_end_hour() {
         Some("source: aws")
     );
 }
+
+#[test]
+fn from_slug_round_trips_every_supported_windowed_product() {
+    for &product in HrrrWindowedProduct::supported_products() {
+        assert_eq!(
+            HrrrWindowedProduct::from_slug(product.slug()),
+            Some(product),
+            "slug '{}' must parse back to its product",
+            product.slug()
+        );
+    }
+    assert_eq!(HrrrWindowedProduct::from_slug("not_a_windowed_slug"), None);
+}
+
+/// The store-render scale helper reproduces the per-family scales the GRIB
+/// compute kernels attach: QPF/wind/snapshot products get the family's
+/// discrete scale, UH products the Uh weather preset — for every supported
+/// product, so store-rendered windowed PNGs style identically.
+#[test]
+fn windowed_product_scale_matches_the_kernel_families() {
+    use rustwx_render::ColorScale;
+    for &product in HrrrWindowedProduct::supported_products() {
+        let scale = crate::windowed_decoder::windowed_product_scale(product);
+        if product.is_qpf() {
+            let ColorScale::Discrete(scale) = scale else {
+                panic!("{}: QPF must use a discrete scale", product.slug());
+            };
+            assert_eq!(scale.levels, crate::windowed_decoder::qpf_scale().levels);
+        } else if product.is_wind10m() {
+            let ColorScale::Discrete(scale) = scale else {
+                panic!("{}: wind must use a discrete scale", product.slug());
+            };
+            assert_eq!(
+                scale.levels,
+                crate::windowed_decoder::wind10m_scale().levels
+            );
+        } else if product.is_surface_snapshot() {
+            assert!(
+                matches!(scale, ColorScale::Discrete(_)),
+                "{}: snapshot windows use discrete scales",
+                product.slug()
+            );
+        } else {
+            assert!(
+                matches!(scale, ColorScale::Weather(_)),
+                "{}: UH products use the Uh weather preset",
+                product.slug()
+            );
+        }
+    }
+}

@@ -194,6 +194,68 @@ pub fn compute_cape_cin(
     })
 }
 
+/// Surface-based, mixed-layer, and most-unstable CAPE/CIN bundles from one
+/// shared pass over the columns: each column's profile is extracted and
+/// converted once, then lifted with the same `cape_cin_core` kernel the
+/// per-parcel entry points dispatch to, once per parcel type. Outputs are
+/// bit-identical to three separate `compute_{sb,ml,mu}cape_cin` calls; this
+/// exists because the store-ingest derived lane needs all three and the
+/// shared column prep + cache locality save a full pass of overhead.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapeCinTriplet {
+    pub sb: CapeCinOutputs,
+    pub ml: CapeCinOutputs,
+    pub mu: CapeCinOutputs,
+}
+
+pub fn compute_cape_cin_triplet(
+    grid: GridShape,
+    volume: EcapeVolumeInputs<'_>,
+    surface: SurfaceInputs<'_>,
+    top_m: Option<f64>,
+) -> Result<CapeCinTriplet, CalcError> {
+    validate_severe_inputs(grid, volume, surface)?;
+    if !pressure_is_levels(volume) {
+        // Full 3D pressure: no shared per-column prep to reuse here; defer
+        // to the per-parcel grid kernels (identical results, one pass each).
+        return Ok(CapeCinTriplet {
+            sb: compute_cape_cin(grid, volume, surface, "sb", top_m)?,
+            ml: compute_cape_cin(grid, volume, surface, "ml", top_m)?,
+            mu: compute_cape_cin(grid, volume, surface, "mu", top_m)?,
+        });
+    }
+
+    let n2d = grid.len();
+    let (pressure_levels_hpa, pressure_needs_reverse) = pressure_levels_prep(volume);
+    let results = (0..n2d)
+        .into_par_iter()
+        .map(|ij| {
+            let column = PreparedLevelsColumn::build(
+                volume,
+                surface,
+                &pressure_levels_hpa,
+                pressure_needs_reverse,
+                n2d,
+                ij,
+            );
+            (
+                column.cape_cin("sb", top_m),
+                column.cape_cin("ml", top_m),
+                column.cape_cin("mu", top_m),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let sb_tuples: Vec<_> = results.par_iter().map(|values| values.0).collect();
+    let ml_tuples: Vec<_> = results.par_iter().map(|values| values.1).collect();
+    let mu_tuples: Vec<_> = results.par_iter().map(|values| values.2).collect();
+    Ok(CapeCinTriplet {
+        sb: cape_cin_outputs_from_tuples(&sb_tuples),
+        ml: cape_cin_outputs_from_tuples(&ml_tuples),
+        mu: cape_cin_outputs_from_tuples(&mu_tuples),
+    })
+}
+
 pub fn compute_srh(wind: WindGridInputs<'_>, top_m: f64) -> Result<Vec<f64>, CalcError> {
     validate_wind_inputs(wind)?;
     Ok(metrust::calc::severe::grid::compute_srh(
@@ -754,6 +816,96 @@ fn dewpoint_from_q(q_kgkg: f64, pressure_hpa: f64) -> f64 {
     (243.5 * ln_e) / (17.67 - ln_e)
 }
 
+/// One grid column's profile, prepared exactly as the per-parcel CAPE path
+/// always has: pressure levels to hPa, columns extracted, dewpoint from Q,
+/// everything reversed to surface-first when the levels arrive top-first.
+struct PreparedLevelsColumn {
+    pressure_hpa: Vec<f64>,
+    temperature_c: Vec<f64>,
+    dewpoint_c: Vec<f64>,
+    height_agl_m: Vec<f64>,
+    psfc_hpa: f64,
+    t2m_c: f64,
+    td2m_c: f64,
+}
+
+impl PreparedLevelsColumn {
+    fn build(
+        volume: EcapeVolumeInputs<'_>,
+        surface: SurfaceInputs<'_>,
+        pressure_levels_hpa: &[f64],
+        pressure_needs_reverse: bool,
+        n2d: usize,
+        ij: usize,
+    ) -> Self {
+        let mut pressure_hpa = pressure_levels_hpa.to_vec();
+        let mut temperature_c = extract_column(volume.temperature_c, volume.nz, n2d, ij);
+        let mut height_agl_m = extract_column(volume.height_agl_m, volume.nz, n2d, ij);
+        let qvapor_kgkg = extract_column(volume.qvapor_kgkg, volume.nz, n2d, ij);
+        let mut dewpoint_c = pressure_hpa
+            .iter()
+            .enumerate()
+            .map(|(level, &pressure_hpa)| dewpoint_from_q(qvapor_kgkg[level], pressure_hpa))
+            .collect::<Vec<_>>();
+
+        if pressure_needs_reverse {
+            pressure_hpa.reverse();
+            temperature_c.reverse();
+            dewpoint_c.reverse();
+            height_agl_m.reverse();
+        }
+
+        let psfc_hpa = surface.psfc_pa[ij] / 100.0;
+        PreparedLevelsColumn {
+            pressure_hpa,
+            temperature_c,
+            dewpoint_c,
+            height_agl_m,
+            psfc_hpa,
+            t2m_c: surface.t2_k[ij] - ZEROCNK,
+            td2m_c: dewpoint_from_q(surface.q2_kgkg[ij], psfc_hpa),
+        }
+    }
+
+    fn cape_cin(&self, parcel_type: &str, top_m: Option<f64>) -> (f64, f64, f64, f64) {
+        metrust::calc::thermo::cape_cin_core(
+            &self.pressure_hpa,
+            &self.temperature_c,
+            &self.dewpoint_c,
+            &self.height_agl_m,
+            self.psfc_hpa,
+            self.t2m_c,
+            self.td2m_c,
+            parcel_type,
+            100.0,
+            300.0,
+            top_m,
+        )
+    }
+}
+
+fn pressure_levels_prep(volume: EcapeVolumeInputs<'_>) -> (Vec<f64>, bool) {
+    let pressure_levels_hpa = volume
+        .pressure_pa
+        .iter()
+        .map(|value| *value / 100.0)
+        .collect::<Vec<_>>();
+    let pressure_needs_reverse = pressure_levels_hpa.len() > 1
+        && pressure_levels_hpa[0] < pressure_levels_hpa[pressure_levels_hpa.len() - 1];
+    (pressure_levels_hpa, pressure_needs_reverse)
+}
+
+/// Unzip per-column `(cape, cin, lcl, lfc)` tuples into the output bundle,
+/// each plane in parallel.
+fn cape_cin_outputs_from_tuples(results: &[(f64, f64, f64, f64)]) -> CapeCinOutputs {
+    CapeCinOutputs {
+        cape_jkg: results.par_iter().map(|values| values.0).collect(),
+        cin_jkg: results.par_iter().map(|values| values.1).collect(),
+        lcl_m: results.par_iter().map(|values| values.2).collect(),
+        lfc_m: results.par_iter().map(|values| values.3).collect(),
+    }
+}
+
 fn compute_cape_cin_with_pressure_levels(
     grid: GridShape,
     volume: EcapeVolumeInputs<'_>,
@@ -762,64 +914,29 @@ fn compute_cape_cin_with_pressure_levels(
     top_m: Option<f64>,
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
     let n2d = grid.len();
-    let pressure_levels_hpa = volume
-        .pressure_pa
-        .iter()
-        .map(|value| *value / 100.0)
-        .collect::<Vec<_>>();
-    let pressure_needs_reverse = pressure_levels_hpa.len() > 1
-        && pressure_levels_hpa[0] < pressure_levels_hpa[pressure_levels_hpa.len() - 1];
-    let parcel_type = parcel_type.to_string();
+    let (pressure_levels_hpa, pressure_needs_reverse) = pressure_levels_prep(volume);
     let results = (0..n2d)
         .into_par_iter()
         .map(|ij| {
-            let mut pressure_hpa = pressure_levels_hpa.clone();
-            let mut temperature_c = extract_column(volume.temperature_c, volume.nz, n2d, ij);
-            let mut height_agl_m = extract_column(volume.height_agl_m, volume.nz, n2d, ij);
-            let qvapor_kgkg = extract_column(volume.qvapor_kgkg, volume.nz, n2d, ij);
-            let mut dewpoint_c = pressure_hpa
-                .iter()
-                .enumerate()
-                .map(|(level, &pressure_hpa)| dewpoint_from_q(qvapor_kgkg[level], pressure_hpa))
-                .collect::<Vec<_>>();
-
-            if pressure_needs_reverse {
-                pressure_hpa.reverse();
-                temperature_c.reverse();
-                dewpoint_c.reverse();
-                height_agl_m.reverse();
-            }
-
-            let psfc_hpa = surface.psfc_pa[ij] / 100.0;
-            let t2m_c = surface.t2_k[ij] - ZEROCNK;
-            let td2m_c = dewpoint_from_q(surface.q2_kgkg[ij], psfc_hpa);
-            metrust::calc::thermo::cape_cin_core(
-                &pressure_hpa,
-                &temperature_c,
-                &dewpoint_c,
-                &height_agl_m,
-                psfc_hpa,
-                t2m_c,
-                td2m_c,
-                &parcel_type,
-                100.0,
-                300.0,
-                top_m,
+            PreparedLevelsColumn::build(
+                volume,
+                surface,
+                &pressure_levels_hpa,
+                pressure_needs_reverse,
+                n2d,
+                ij,
             )
+            .cape_cin(parcel_type, top_m)
         })
         .collect::<Vec<_>>();
 
-    let mut cape = Vec::with_capacity(n2d);
-    let mut cin = Vec::with_capacity(n2d);
-    let mut lcl = Vec::with_capacity(n2d);
-    let mut lfc = Vec::with_capacity(n2d);
-    for (cape_value, cin_value, lcl_value, lfc_value) in results {
-        cape.push(cape_value);
-        cin.push(cin_value);
-        lcl.push(lcl_value);
-        lfc.push(lfc_value);
-    }
-    (cape, cin, lcl, lfc)
+    let outputs = cape_cin_outputs_from_tuples(&results);
+    (
+        outputs.cape_jkg,
+        outputs.cin_jkg,
+        outputs.lcl_m,
+        outputs.lfc_m,
+    )
 }
 
 #[derive(Debug, Clone)]

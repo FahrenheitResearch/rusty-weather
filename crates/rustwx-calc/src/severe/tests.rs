@@ -1,5 +1,17 @@
 use super::*;
 
+/// Assert two f64 slices are bit-identical, NaN-aware.
+fn assert_bits_eq(label: &str, left: &[f64], right: &[f64]) {
+    assert_eq!(left.len(), right.len(), "{label}: length mismatch");
+    for (i, (l, r)) in left.iter().zip(right.iter()).enumerate() {
+        assert_eq!(
+            l.to_bits(),
+            r.to_bits(),
+            "{label}[{i}]: left={l} right={r} differ in bit representation"
+        );
+    }
+}
+
 fn assert_close(actual: f64, expected: f64) {
     assert!(
         (actual - expected).abs() < 1.0e-9,
@@ -328,5 +340,141 @@ fn fused_wind_diagnostics_bundle_matches_individual_wrappers() {
     assert_eq!(
         fused.shear_06km_ms,
         compute_shear(wind, 0.0, 6000.0).unwrap()
+    );
+}
+
+/// Verify that `compute_cape_cin_triplet` is bit-identical to three separate
+/// `compute_cape_cin` calls for all 12 output planes (sb/ml/mu × cape/cin/lcl/lfc),
+/// exercised on a 7×5 grid with 9 pressure levels in both descending and
+/// ascending level orderings.  Also asserts that sb/ml/mu differ somewhere,
+/// guarding against a degenerate all-equal test.
+#[test]
+fn cape_cin_triplet_bit_identical_to_single_parcel_paths() {
+    // Grid: 7 columns × 5 rows = 35 columns.
+    let grid = GridShape::new(7, 5).unwrap();
+    let n2d = grid.len(); // 35
+    let nz: usize = 9;
+
+    // Pressure levels (Pa) in descending order (surface-to-top).
+    // Chosen so that for some columns psfc > level[0] (below-ground levels).
+    let pressure_levels_desc_pa: [f64; 9] = [
+        97_500.0, 92_500.0, 87_500.0, 82_500.0, 75_000.0, 65_000.0, 50_000.0, 40_000.0,
+        30_000.0,
+    ];
+
+    // psfc spread ~955–1005 hPa so that some columns have below-ground levels.
+    // psfc[ij] cycles across 35 columns spanning 955–1005 hPa.
+    let psfc_pa: Vec<f64> = (0..n2d)
+        .map(|ij| 95_500.0 + (ij as f64) * (50_000.0 / (n2d as f64 - 1.0)))
+        .collect();
+
+    // 2-metre fields: mild variation across columns.
+    let t2_k: Vec<f64> = (0..n2d)
+        .map(|ij| 295.0 + (ij as f64) * 0.3)
+        .collect();
+    let q2_kgkg: Vec<f64> = (0..n2d)
+        .map(|ij| 0.010 + (ij as f64) * 0.0003)
+        .collect();
+    let u10_ms: Vec<f64> = vec![5.0; n2d];
+    let v10_ms: Vec<f64> = vec![2.0; n2d];
+
+    // 3-D fields, level-major layout: index = k * n2d + ij.
+    // Temperature decreases with altitude; moisture falls off; height grows.
+    let mut temperature_c = vec![0.0f64; nz * n2d];
+    let mut qvapor_kgkg = vec![0.0f64; nz * n2d];
+    let mut height_agl_m = vec![0.0f64; nz * n2d];
+    let mut u_ms = vec![0.0f64; nz * n2d];
+    let mut v_ms = vec![0.0f64; nz * n2d];
+
+    // Approximate heights for the pressure levels using hypsometric spacing.
+    let approx_heights_m: [f64; 9] =
+        [250.0, 750.0, 1300.0, 1900.0, 2800.0, 4000.0, 5600.0, 7200.0, 9500.0];
+
+    for k in 0..nz {
+        for ij in 0..n2d {
+            let idx = k * n2d + ij;
+            let col_frac = ij as f64 / (n2d as f64 - 1.0);
+            // Surface temperature varies 18–28 °C; lapse ~6 °C/km.
+            let t_sfc = 18.0 + col_frac * 10.0;
+            let lapse = 6.0e-3 + col_frac * 1.5e-3; // 6–7.5 °C/km
+            temperature_c[idx] = t_sfc - lapse * approx_heights_m[k];
+            // Moisture: surface mixing ratio 8–16 g/kg, halves at mid-levels.
+            let q_sfc = 0.008 + col_frac * 0.008;
+            qvapor_kgkg[idx] = q_sfc * (-approx_heights_m[k] / 4500.0).exp();
+            height_agl_m[idx] = approx_heights_m[k];
+            u_ms[idx] = 5.0 + (k as f64) * 2.5 + col_frac * 3.0;
+            v_ms[idx] = 1.0 + (k as f64) * 1.5;
+        }
+    }
+
+    let surface = SurfaceInputs {
+        psfc_pa: &psfc_pa,
+        t2_k: &t2_k,
+        q2_kgkg: &q2_kgkg,
+        u10_ms: &u10_ms,
+        v10_ms: &v10_ms,
+    };
+
+    // --- Helper: run triplet + three individual calls and compare all 12 planes ---
+    let check_ordering = |label: &str, pressure_pa: &[f64]| {
+        let volume = EcapeVolumeInputs {
+            pressure_pa,
+            temperature_c: &temperature_c,
+            qvapor_kgkg: &qvapor_kgkg,
+            height_agl_m: &height_agl_m,
+            u_ms: &u_ms,
+            v_ms: &v_ms,
+            nz,
+        };
+
+        let triplet = compute_cape_cin_triplet(grid, volume, surface, None).unwrap();
+        let sb = compute_cape_cin(grid, volume, surface, "sb", None).unwrap();
+        let ml = compute_cape_cin(grid, volume, surface, "ml", None).unwrap();
+        let mu = compute_cape_cin(grid, volume, surface, "mu", None).unwrap();
+
+        // SB planes
+        assert_bits_eq(&format!("{label}/sb.cape"), &triplet.sb.cape_jkg, &sb.cape_jkg);
+        assert_bits_eq(&format!("{label}/sb.cin"),  &triplet.sb.cin_jkg,  &sb.cin_jkg);
+        assert_bits_eq(&format!("{label}/sb.lcl"),  &triplet.sb.lcl_m,    &sb.lcl_m);
+        assert_bits_eq(&format!("{label}/sb.lfc"),  &triplet.sb.lfc_m,    &sb.lfc_m);
+        // ML planes
+        assert_bits_eq(&format!("{label}/ml.cape"), &triplet.ml.cape_jkg, &ml.cape_jkg);
+        assert_bits_eq(&format!("{label}/ml.cin"),  &triplet.ml.cin_jkg,  &ml.cin_jkg);
+        assert_bits_eq(&format!("{label}/ml.lcl"),  &triplet.ml.lcl_m,    &ml.lcl_m);
+        assert_bits_eq(&format!("{label}/ml.lfc"),  &triplet.ml.lfc_m,    &ml.lfc_m);
+        // MU planes
+        assert_bits_eq(&format!("{label}/mu.cape"), &triplet.mu.cape_jkg, &mu.cape_jkg);
+        assert_bits_eq(&format!("{label}/mu.cin"),  &triplet.mu.cin_jkg,  &mu.cin_jkg);
+        assert_bits_eq(&format!("{label}/mu.lcl"),  &triplet.mu.lcl_m,    &mu.lcl_m);
+        assert_bits_eq(&format!("{label}/mu.lfc"),  &triplet.mu.lfc_m,    &mu.lfc_m);
+
+        // Return triplet for the non-degeneracy check
+        triplet
+    };
+
+    // Descending pressure (surface-first): the normal NWP layout.
+    let triplet_desc =
+        check_ordering("descending", &pressure_levels_desc_pa);
+
+    // Ascending pressure (top-first): the reversed layout the code must handle.
+    let mut pressure_levels_asc_pa = pressure_levels_desc_pa;
+    pressure_levels_asc_pa.reverse();
+    check_ordering("ascending", &pressure_levels_asc_pa);
+
+    // Non-degeneracy: sb, ml, and mu CAPE must differ somewhere across the grid,
+    // proving the test exercises distinct parcel computations.
+    let sb_cape = &triplet_desc.sb.cape_jkg;
+    let ml_cape = &triplet_desc.ml.cape_jkg;
+    let mu_cape = &triplet_desc.mu.cape_jkg;
+
+    let sb_differs_from_ml = sb_cape.iter().zip(ml_cape.iter()).any(|(s, m)| s != m);
+    let sb_differs_from_mu = sb_cape.iter().zip(mu_cape.iter()).any(|(s, m)| s != m);
+    assert!(
+        sb_differs_from_ml,
+        "sb and ml CAPE are identical everywhere — test may be degenerate"
+    );
+    assert!(
+        sb_differs_from_mu,
+        "sb and mu CAPE are identical everywhere — test may be degenerate"
     );
 }

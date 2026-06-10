@@ -62,8 +62,80 @@ informational target. Even the worst-case first click (sounding_cold: grid
 open + locator build + hour open + 5 profiles, dominated by the grid file's
 sha256 + coordinate decompress) is 23 ms.
 
-Next: the serve daemon with the global scheduler (render-from-store), then the
-web UI — see docs/superpowers/specs/2026-06-09-rusty-weather-design.md.
+## Plan 3 — every product from the store
+
+One `rw_batch` invocation fetches, ingests, computes, and renders the full HRRR
+product suite for a range of forecast hours in a pipelined std::thread pipeline:
+
+    cargo run --release -p rusty-weather --bin rw_batch -- \
+        --model hrrr --date 20260608 --cycle 0 --hours 4-6 \
+        --no-heavy --products all \
+        --store-root store --cache-dir out/cache --out-dir out/rw_batch
+
+Add `--heavy` to include the 16 ECAPE-class products (CAPE triplet, effective STP,
+VTP, etc.); omit it for the ~81-product/hour fast path. Add `--full-throttle` for
+dedicated nodes (default is polite: below-normal priority, `cores-2` rayon pool).
+
+### Product count
+
+| Lane          | Count | Notes                                                          |
+|---------------|-------|----------------------------------------------------------------|
+| Direct        |    52 | GRIB fields → render, no computation                          |
+| Derived       |    29 | Precomputed at ingest (CAPE/CIN triplets, shear, SRH, …)       |
+| Heavy         |    16 | ECAPE-class; gated by `--heavy`; CPU-saturating                |
+| Windowed      |    49 | Cross-hour accumulations (QPF, UH max, wind max, temp range, …)|
+| **Total**     | **146**| (5 windowed realized in a 3-hour store; 44 blocked structurally)|
+
+### Pixel-parity result
+
+95/97 direct+derived+heavy products are **byte-identical** between the GRIB
+render lane (smoke_direct/smoke_derived) and the store path (rw_render):
+
+- 52/52 direct — byte-identical after fixing a store codec bug (the f32
+  "lossless" tile shortcut for near-constant planes now uses exact-constancy only,
+  not an absolute epsilon; regression-pinned).
+- 43/45 derived — byte-identical including all 16 heavy. The two diffs are
+  `temperature_advection_700mb` and `temperature_advection_850mb` (max channel
+  delta 9): `estimate_grid_spacing_m` averages over the compute domain, so the
+  GRIB lane (crops before compute) uses midwest spacing while the store grid was
+  computed full-CONUS — same behavior as the existing `hrrr_non_ecape_hour` lane.
+
+### Benchmark (20260608 00z f004–f006, midwest, warm cache, polite 30-thread pool)
+
+**Run 1 — no heavy, `--products all` (the primary number):**
+
+| Hour | fetch | extract | thermo | derived | heavy | encode | render |
+|------|------:|--------:|-------:|--------:|------:|-------:|-------:|
+| f004 | 1500  | 3180    | 3723   | 7179    | 0     | 2335   | 12538  |
+| f005 | 1724  | 3818    | 3295   | 7084    | 0     | 2358   | 12292  |
+| f006 | 2208  | 3782    | 2984   | 7302    | 0     | 2138   | 8459   |
+
+Totals (ms): fetch 5432 | extract 10780 | thermo 10002 | derived 21565 |
+heavy 0 | encode 6831 | render 33289 | windowed 368  
+**TOTAL WALL: 59.8 s | process CPU 801.9 s | 248 products rendered**  
+Gate ≤ 90 s warm → **PASSED at 59.8 s**. Old node baseline: ~75 s for ~80
+products × 3 hours; rw_batch renders 81 × 3 + windowed in 59.8 s on the polite
+pool. Serial stage sum 88.3 s → pipelining recovered 28.5 s (32%).
+
+**Run 2 — with heavy (`--heavy`):**
+
+| Hour | fetch | extract | thermo | derived |  heavy | encode | render |
+|------|------:|--------:|-------:|--------:|-------:|-------:|-------:|
+| f004 | 1530  | 2616    | 2974   | 6984    | 84160  | 2479   | 14430  |
+| f005 | 1601  | 3817    | 3159   | 7335    | 83826  | 2148   | 14147  |
+| f006 | 1748  | 3753    | 3256   | 7189    | 82701  | 2253   | 8587   |
+
+Totals (ms): fetch 4879 | extract 10186 | thermo 9389 | derived 21508 |
+heavy 250687 | encode 6880 | render 37164 | windowed 374  
+**TOTAL WALL: 309.4 s | process CPU 7530.4 s | 296 products rendered**  
+ECAPE-dominated: 250.7 s of the 309.4 s wall (~82 s/hour) is the ECAPE triplet
+(`calc_ecape_parcel` runs two full ascents per parcel type — 6 ascents/column,
+~9 billion integration steps per CONUS hour). Pipelining cannot hide CPU-saturating
+work; the cost is the vendored `ecape-rs` physics kernel.
+
+**Next:** egui/eframe UI integration (`rw-ui` library-first crate) + multi-model
+validation (GFS, RRFS-A, REFS, NBM, RAP) — see
+docs/superpowers/specs/2026-06-09-rusty-weather-design.md.
 
 ## Layout
 

@@ -1,11 +1,12 @@
 use rayon::prelude::*;
 use rustwx_calc::{
-    CalcError, EcapeVolumeInputs, FixedStpInputs, GridShape as CalcGridShape, SurfaceInputs,
-    TemperatureAdvectionInputs, VolumeShape, WindGridInputs, compute_dcape, compute_ehi_01km,
-    compute_ehi_03km, compute_lapse_rate_0_3km, compute_lapse_rate_700_500, compute_lifted_index,
-    compute_mlcape_cin, compute_mucape_cin, compute_sbcape_cin, compute_shear_01km,
-    compute_shear_06km, compute_srh_01km_hemispheric, compute_srh_03km_hemispheric,
-    compute_stp_fixed, compute_surface_thermo,
+    CalcError, CapeCinOutputs, EcapeVolumeInputs, FixedStpInputs, GridShape as CalcGridShape,
+    SurfaceInputs, SurfaceThermoOutputs, TemperatureAdvectionInputs, VolumeShape, WindGridInputs,
+    compute_cape_cin_triplet, compute_dcape, compute_ehi_01km, compute_ehi_03km,
+    compute_lapse_rate_0_3km, compute_lapse_rate_700_500, compute_lifted_index, compute_mlcape_cin,
+    compute_mucape_cin, compute_sbcape_cin, compute_shear_01km, compute_shear_06km,
+    compute_srh_01km_hemispheric, compute_srh_03km_hemispheric, compute_stp_fixed,
+    compute_surface_thermo,
 };
 
 use crate::gridded::{
@@ -182,14 +183,41 @@ pub(super) struct DerivedComputedFields {
     pub(super) temperature_advection_850mb_cph: Option<Vec<f64>>,
 }
 
+/// What the parcel (CAPE) side of the kernel fork produced.
+type ParcelOutputs = (
+    Option<CapeCinOutputs>,
+    Option<CapeCinOutputs>,
+    Option<CapeCinOutputs>,
+);
+
+/// What the independent (non-parcel) side of the kernel fork produced, in
+/// the same units the sequential lane produced them.
+#[derive(Default)]
+struct IndependentOutputs {
+    dcape_jkg: Option<Vec<f64>>,
+    surface_thermo: Option<SurfaceThermoOutputs>,
+    lifted_index_c: Option<Vec<f64>>,
+    lapse_rate_700_500_cpkm: Option<Vec<f64>>,
+    lapse_rate_0_3km_cpkm: Option<Vec<f64>>,
+    shear_01km_ms: Option<Vec<f64>>,
+    shear_06km_ms: Option<Vec<f64>>,
+    srh_01km_m2s2: Option<Vec<f64>>,
+    srh_03km_m2s2: Option<Vec<f64>>,
+    temperature_advection_700mb_cph: Option<Vec<f64>>,
+    temperature_advection_850mb_cph: Option<Vec<f64>>,
+}
+
+/// Errors crossing the `rayon::join` boundary must be `Send + Sync`.
+type TaskError = Box<dyn std::error::Error + Send + Sync>;
+
 pub(super) fn compute_derived_fields_generic<S, P>(
     surface: &S,
     pressure: &P,
     recipes: &[DerivedRecipe],
 ) -> Result<DerivedComputedFields, Box<dyn std::error::Error>>
 where
-    S: SurfaceFieldSet,
-    P: PressureFieldSet,
+    S: SurfaceFieldSet + Sync,
+    P: PressureFieldSet + Sync,
 {
     fn missing_dependency(name: &str) -> std::io::Error {
         std::io::Error::other(format!(
@@ -197,23 +225,17 @@ where
         ))
     }
 
+    // Concrete error type so `?` converts into both the outer
+    // `Box<dyn Error>` and the join sides' `TaskError`.
     fn require_option_ref<'a, T>(
         option: &'a Option<T>,
         name: &str,
-    ) -> Result<&'a T, Box<dyn std::error::Error>> {
-        option
-            .as_ref()
-            .ok_or_else(|| missing_dependency(name))
-            .map_err(Into::into)
+    ) -> Result<&'a T, std::io::Error> {
+        option.as_ref().ok_or_else(|| missing_dependency(name))
     }
 
-    fn require_option_copy<T: Copy>(
-        option: Option<T>,
-        name: &str,
-    ) -> Result<T, Box<dyn std::error::Error>> {
-        option
-            .ok_or_else(|| missing_dependency(name))
-            .map_err(Into::into)
+    fn require_option_copy<T: Copy>(option: Option<T>, name: &str) -> Result<T, std::io::Error> {
+        option.ok_or_else(|| missing_dependency(name))
     }
 
     let requirements = DerivedRequirements::from_recipes(recipes);
@@ -263,7 +285,7 @@ where
         None
     };
 
-    let make_volume = || -> Result<EcapeVolumeInputs<'_>, Box<dyn std::error::Error>> {
+    let make_volume = || -> Result<EcapeVolumeInputs<'_>, std::io::Error> {
         Ok(EcapeVolumeInputs {
             pressure_pa: require_option_ref(
                 &pressure_pa,
@@ -280,7 +302,7 @@ where
             nz: require_option_copy(shape, "volume shape for derived thermodynamics")?.nz,
         })
     };
-    let make_wind = || -> Result<WindGridInputs<'_>, Box<dyn std::error::Error>> {
+    let make_wind = || -> Result<WindGridInputs<'_>, std::io::Error> {
         Ok(WindGridInputs {
             shape: require_option_copy(shape, "volume shape for wind diagnostics")?,
             u_3d_ms: pressure.u_ms_3d(),
@@ -289,36 +311,107 @@ where
         })
     };
 
-    let sb = if requirements.sb {
-        Some(compute_sbcape_cin(
-            grid,
-            make_volume()?,
-            surface_inputs,
-            None,
-        )?)
-    } else {
-        None
-    };
-    let ml = if requirements.ml {
-        Some(compute_mlcape_cin(
-            grid,
-            make_volume()?,
-            surface_inputs,
-            None,
-        )?)
-    } else {
-        None
-    };
-    let mu = if requirements.mu {
-        Some(compute_mucape_cin(
-            grid,
-            make_volume()?,
-            surface_inputs,
-            None,
-        )?)
-    } else {
-        None
-    };
+    // Fork the kernels into two concurrent groups: the heavy parcel (CAPE)
+    // pass on one side, every kernel that does not depend on it on the
+    // other. Each kernel is rayon-parallel inside, and both sides share the
+    // one global pool, so the light kernels fill scheduling gaps instead of
+    // serializing behind the parcel physics. Outputs are identical to the
+    // former sequential order — only the wall-clock interleaving changes.
+    let (parcels, independent) = rayon::join(
+        || -> Result<ParcelOutputs, TaskError> {
+            if requirements.sb && requirements.ml && requirements.mu {
+                // All three parcel types wanted (the store-ingest lane):
+                // one shared pass over the columns, bit-identical outputs.
+                let triplet = compute_cape_cin_triplet(grid, make_volume()?, surface_inputs, None)?;
+                return Ok((Some(triplet.sb), Some(triplet.ml), Some(triplet.mu)));
+            }
+            let sb = if requirements.sb {
+                Some(compute_sbcape_cin(
+                    grid,
+                    make_volume()?,
+                    surface_inputs,
+                    None,
+                )?)
+            } else {
+                None
+            };
+            let ml = if requirements.ml {
+                Some(compute_mlcape_cin(
+                    grid,
+                    make_volume()?,
+                    surface_inputs,
+                    None,
+                )?)
+            } else {
+                None
+            };
+            let mu = if requirements.mu {
+                Some(compute_mucape_cin(
+                    grid,
+                    make_volume()?,
+                    surface_inputs,
+                    None,
+                )?)
+            } else {
+                None
+            };
+            Ok((sb, ml, mu))
+        },
+        || -> Result<IndependentOutputs, TaskError> {
+            let mut outputs = IndependentOutputs::default();
+            if requirements.dcape {
+                outputs.dcape_jkg = Some(compute_dcape(grid, make_volume()?, surface_inputs)?);
+            }
+            if requirements.surface_thermo {
+                outputs.surface_thermo = Some(compute_surface_thermo(grid, surface_inputs)?);
+            }
+            if requirements.lifted_index {
+                outputs.lifted_index_c =
+                    Some(compute_lifted_index(grid, make_volume()?, surface_inputs)?);
+            }
+            if requirements.lapse_rate_700_500 {
+                outputs.lapse_rate_700_500_cpkm =
+                    Some(compute_lapse_rate_700_500(grid, make_volume()?)?);
+            }
+            if requirements.lapse_rate_0_3km {
+                outputs.lapse_rate_0_3km_cpkm = Some(compute_lapse_rate_0_3km(
+                    grid,
+                    make_volume()?,
+                    surface_inputs,
+                )?);
+            }
+            if requirements.shear_01km {
+                outputs.shear_01km_ms = Some(compute_shear_01km(make_wind()?)?);
+            }
+            if requirements.shear_06km {
+                outputs.shear_06km_ms = Some(compute_shear_06km(make_wind()?)?);
+            }
+            if requirements.srh_01km {
+                outputs.srh_01km_m2s2 =
+                    Some(compute_srh_01km_hemispheric(make_wind()?, surface.lat())?);
+            }
+            if requirements.srh_03km {
+                outputs.srh_03km_m2s2 =
+                    Some(compute_srh_03km_hemispheric(make_wind()?, surface.lat())?);
+            }
+            if requirements.needs_grid_spacing() {
+                let (dx_m, dy_m) = estimate_grid_spacing_m(surface)?;
+                if requirements.temperature_advection_700mb {
+                    outputs.temperature_advection_700mb_cph = Some(
+                        compute_temperature_advection_cph(pressure, grid, 700.0, dx_m, dy_m)?,
+                    );
+                }
+                if requirements.temperature_advection_850mb {
+                    outputs.temperature_advection_850mb_cph = Some(
+                        compute_temperature_advection_cph(pressure, grid, 850.0, dx_m, dy_m)?,
+                    );
+                }
+            }
+            Ok(outputs)
+        },
+    );
+    let (sb, ml, mu) = parcels.map_err(|err| err as Box<dyn std::error::Error>)?;
+    let independent = independent.map_err(|err| err as Box<dyn std::error::Error>)?;
 
     if let Some(sb) = sb.as_ref() {
         computed.sbcape_jkg = Some(sb.cape_jkg.clone());
@@ -333,12 +426,9 @@ where
         computed.mucape_jkg = Some(mu.cape_jkg.clone());
         computed.mucin_jkg = Some(mu.cin_jkg.clone());
     }
-    if requirements.dcape {
-        computed.dcape_jkg = Some(compute_dcape(grid, make_volume()?, surface_inputs)?);
-    }
+    computed.dcape_jkg = independent.dcape_jkg;
 
-    if requirements.surface_thermo {
-        let surface_thermo = compute_surface_thermo(grid, surface_inputs)?;
+    if let Some(surface_thermo) = independent.surface_thermo {
         if recipes.contains(&DerivedRecipe::ThetaE2m10mWinds) {
             computed.theta_e_2m_k = Some(surface_thermo.theta_e_2m_k);
             computed.surface_u10_ms = Some(surface.u10_ms().to_vec());
@@ -366,41 +456,15 @@ where
             computed.wind_chill_2m_c = Some(surface_thermo.wind_chill_2m_c);
         }
     }
-
-    if requirements.lifted_index {
-        computed.lifted_index_c = Some(compute_lifted_index(grid, make_volume()?, surface_inputs)?);
-    }
-    if requirements.lapse_rate_700_500 {
-        computed.lapse_rate_700_500_cpkm = Some(compute_lapse_rate_700_500(grid, make_volume()?)?);
-    }
-    if requirements.lapse_rate_0_3km {
-        computed.lapse_rate_0_3km_cpkm = Some(compute_lapse_rate_0_3km(
-            grid,
-            make_volume()?,
-            surface_inputs,
-        )?);
-    }
-
-    let shear_01km_ms = if requirements.shear_01km {
-        Some(compute_shear_01km(make_wind()?)?)
-    } else {
-        None
-    };
-    let shear_06km_ms = if requirements.shear_06km {
-        Some(compute_shear_06km(make_wind()?)?)
-    } else {
-        None
-    };
-    let srh_01km_m2s2 = if requirements.srh_01km {
-        Some(compute_srh_01km_hemispheric(make_wind()?, surface.lat())?)
-    } else {
-        None
-    };
-    let srh_03km_m2s2 = if requirements.srh_03km {
-        Some(compute_srh_03km_hemispheric(make_wind()?, surface.lat())?)
-    } else {
-        None
-    };
+    computed.lifted_index_c = independent.lifted_index_c;
+    computed.lapse_rate_700_500_cpkm = independent.lapse_rate_700_500_cpkm;
+    computed.lapse_rate_0_3km_cpkm = independent.lapse_rate_0_3km_cpkm;
+    computed.temperature_advection_700mb_cph = independent.temperature_advection_700mb_cph;
+    computed.temperature_advection_850mb_cph = independent.temperature_advection_850mb_cph;
+    let shear_01km_ms = independent.shear_01km_ms;
+    let shear_06km_ms = independent.shear_06km_ms;
+    let srh_01km_m2s2 = independent.srh_01km_m2s2;
+    let srh_03km_m2s2 = independent.srh_03km_m2s2;
 
     if let Some(values) = shear_01km_ms {
         computed.shear_01km_kt = Some(
@@ -460,67 +524,49 @@ where
         )?);
     }
 
-    if requirements.needs_grid_spacing() {
-        let (dx_m, dy_m) = estimate_grid_spacing_m(surface)?;
-        if requirements.temperature_advection_700mb {
-            let t700 = pressure_level_slice_or_interp(
-                pressure,
-                pressure.temperature_c_3d(),
-                700.0,
-                grid.len(),
-            )
-            .ok_or("missing 700 mb temperature slice in HRRR pressure bundle")?;
-            let u700 =
-                pressure_level_slice_or_interp(pressure, pressure.u_ms_3d(), 700.0, grid.len())
-                    .ok_or("missing 700 mb u-wind slice in HRRR pressure bundle")?;
-            let v700 =
-                pressure_level_slice_or_interp(pressure, pressure.v_ms_3d(), 700.0, grid.len())
-                    .ok_or("missing 700 mb v-wind slice in HRRR pressure bundle")?;
-            computed.temperature_advection_700mb_cph = Some(
-                rustwx_calc::compute_temperature_advection_700mb(TemperatureAdvectionInputs {
-                    grid,
-                    temperature_2d: &t700,
-                    u_2d_ms: &u700,
-                    v_2d_ms: &v700,
-                    dx_m,
-                    dy_m,
-                })?
-                .into_iter()
-                .map(|value| value * 3600.0)
-                .collect(),
-            );
-        }
-        if requirements.temperature_advection_850mb {
-            let t850 = pressure_level_slice_or_interp(
-                pressure,
-                pressure.temperature_c_3d(),
-                850.0,
-                grid.len(),
-            )
-            .ok_or("missing 850 mb temperature slice in HRRR pressure bundle")?;
-            let u850 =
-                pressure_level_slice_or_interp(pressure, pressure.u_ms_3d(), 850.0, grid.len())
-                    .ok_or("missing 850 mb u-wind slice in HRRR pressure bundle")?;
-            let v850 =
-                pressure_level_slice_or_interp(pressure, pressure.v_ms_3d(), 850.0, grid.len())
-                    .ok_or("missing 850 mb v-wind slice in HRRR pressure bundle")?;
-            computed.temperature_advection_850mb_cph = Some(
-                rustwx_calc::compute_temperature_advection_850mb(TemperatureAdvectionInputs {
-                    grid,
-                    temperature_2d: &t850,
-                    u_2d_ms: &u850,
-                    v_2d_ms: &v850,
-                    dx_m,
-                    dy_m,
-                })?
-                .into_iter()
-                .map(|value| value * 3600.0)
-                .collect(),
-            );
-        }
-    }
-
     Ok(computed)
+}
+
+/// Temperature advection (C/hour) at one pressure level, exactly as the
+/// sequential lane computed it inline: slice (or log-p interpolate) the
+/// level from the volume, run the kinematics kernel, scale C/s to C/hour.
+fn compute_temperature_advection_cph<P>(
+    pressure: &P,
+    grid: CalcGridShape,
+    level_hpa: f64,
+    dx_m: f64,
+    dy_m: f64,
+) -> Result<Vec<f64>, TaskError>
+where
+    P: PressureFieldSet,
+{
+    let missing = |what: &str| -> TaskError {
+        format!("missing {level_hpa:.0} mb {what} slice in HRRR pressure bundle").into()
+    };
+    let temperature = pressure_level_slice_or_interp(
+        pressure,
+        pressure.temperature_c_3d(),
+        level_hpa,
+        grid.len(),
+    )
+    .ok_or_else(|| missing("temperature"))?;
+    let u_ms = pressure_level_slice_or_interp(pressure, pressure.u_ms_3d(), level_hpa, grid.len())
+        .ok_or_else(|| missing("u-wind"))?;
+    let v_ms = pressure_level_slice_or_interp(pressure, pressure.v_ms_3d(), level_hpa, grid.len())
+        .ok_or_else(|| missing("v-wind"))?;
+    Ok(
+        rustwx_calc::compute_temperature_advection(TemperatureAdvectionInputs {
+            grid,
+            temperature_2d: &temperature,
+            u_2d_ms: &u_ms,
+            v_2d_ms: &v_ms,
+            dx_m,
+            dy_m,
+        })?
+        .into_iter()
+        .map(|value| value * 3600.0)
+        .collect(),
+    )
 }
 
 pub(super) fn compute_surface_only_derived_fields<S>(
@@ -528,7 +574,7 @@ pub(super) fn compute_surface_only_derived_fields<S>(
     recipes: &[DerivedRecipe],
 ) -> Result<DerivedComputedFields, Box<dyn std::error::Error>>
 where
-    S: SurfaceFieldSet,
+    S: SurfaceFieldSet + Sync,
 {
     if derived_compute_recipes_need_pressure(recipes) {
         return Err("surface-only derived compute received a pressure-dependent recipe".into());
@@ -613,25 +659,33 @@ where
     S: SurfaceFieldSet,
     P: PressureFieldSet,
 {
-    let mut height_agl_3d = pressure
-        .gh_m_3d()
-        .iter()
-        .enumerate()
-        .map(|(idx, &value)| {
-            let ij = idx % grid.len();
-            (value - surface.orog_m()[ij]).max(0.0)
-        })
-        .collect::<Vec<_>>();
-
-    for k in 1..shape.nz {
-        let level_offset = k * grid.len();
-        let prev_offset = (k - 1) * grid.len();
-        for ij in 0..grid.len() {
-            let min_height = height_agl_3d[prev_offset + ij] + 1.0;
-            if height_agl_3d[level_offset + ij] < min_height {
-                height_agl_3d[level_offset + ij] = min_height;
+    let n2d = grid.len();
+    let orog_m = surface.orog_m();
+    let mut height_agl_3d = vec![0.0f64; pressure.gh_m_3d().len()];
+    height_agl_3d
+        .par_chunks_mut(n2d)
+        .zip(pressure.gh_m_3d().par_chunks(n2d))
+        .for_each(|(out, gh)| {
+            for (ij, (dst, &value)) in out.iter_mut().zip(gh.iter()).enumerate() {
+                *dst = (value - orog_m[ij]).max(0.0);
             }
-        }
+        });
+
+    // The monotonic clamp recurs on the level below, so sweep levels in
+    // order but apply each level's clamp in parallel across the grid; the
+    // per-point math is unchanged from the serial sweep.
+    for k in 1..shape.nz {
+        let (below, level) = height_agl_3d.split_at_mut(k * n2d);
+        let prev = &below[(k - 1) * n2d..];
+        level[..n2d]
+            .par_iter_mut()
+            .zip(prev.par_iter())
+            .for_each(|(value, &prev_value)| {
+                let min_height = prev_value + 1.0;
+                if *value < min_height {
+                    *value = min_height;
+                }
+            });
     }
 
     height_agl_3d

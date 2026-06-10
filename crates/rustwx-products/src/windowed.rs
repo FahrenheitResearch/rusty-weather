@@ -113,6 +113,16 @@ impl HrrrWindowedProduct {
         SUPPORTED_HRRR_WINDOWED_PRODUCTS
     }
 
+    /// Parse a windowed product slug back to its enum value (the inverse
+    /// of [`Self::slug`]). Used by store-side callers that carry products
+    /// as slugs.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::supported_products()
+            .iter()
+            .copied()
+            .find(|product| product.slug() == slug)
+    }
+
     pub fn slug(self) -> &'static str {
         match self {
             Self::Qpf1h => "qpf_1h",
@@ -221,7 +231,7 @@ impl HrrrWindowedProduct {
         }
     }
 
-    fn is_qpf(self) -> bool {
+    pub(crate) fn is_qpf(self) -> bool {
         matches!(
             self,
             Self::Qpf1h | Self::Qpf6h | Self::Qpf12h | Self::Qpf24h | Self::QpfTotal
@@ -232,7 +242,7 @@ impl HrrrWindowedProduct {
         matches!(self, Self::Uh25km1h | Self::Uh25km3h | Self::Uh25kmRunMax)
     }
 
-    fn is_wind10m(self) -> bool {
+    pub(crate) fn is_wind10m(self) -> bool {
         matches!(
             self,
             Self::Wind10m1hMax
@@ -1362,6 +1372,117 @@ pub(crate) fn run_hrrr_windowed_batch_from_prepared(
     prepared: &PreparedWindowedBatch,
 ) -> Result<HrrrWindowedBatchReport, Box<dyn std::error::Error>> {
     run_hrrr_windowed_batch_from_prepared_with_total_start(request, prepared, Instant::now())
+}
+
+/// One windowed product grid computed outside this module — by the rw-store
+/// windowed lane, which mirrors this lane's window semantics over stored
+/// per-hour fields — ready to render through the windowed lane's own render
+/// path. `values` are full-grid row-major display values already in the
+/// product's display units (`units`); `hours_used`/`window_hours`/`strategy`
+/// feed the same metadata the GRIB kernels emit (the subtitle hour label and
+/// the report strategy line).
+#[derive(Debug, Clone)]
+pub struct StoreWindowedGrid {
+    pub slug: String,
+    pub units: String,
+    pub values: Vec<f64>,
+    pub hours_used: Vec<u16>,
+    pub window_hours: Option<u16>,
+    pub strategy: String,
+}
+
+/// Render windowed product grids computed from the store through the EXACT
+/// render half of the GRIB windowed batch (`run_hrrr_windowed_batch_from_prepared`:
+/// same domain crop, projected map, per-product scales/titles/subtitles,
+/// place-label overlay, and PNG save). No fetch, no decode, no compute —
+/// the grids already exist; the prepared batch is assembled directly with
+/// zeroed fetch/decode timing.
+pub fn render_windowed_products_from_store_grids(
+    request: &HrrrWindowedBatchRequest,
+    cycle_utc: u8,
+    full_grid: &rustwx_core::LatLonGrid,
+    projection: Option<&rustwx_core::GridProjection>,
+    grids: &[StoreWindowedGrid],
+) -> Result<Vec<HrrrWindowedRenderedProduct>, Box<dyn std::error::Error>> {
+    let latest = LatestRun {
+        model: request.model,
+        cycle: rustwx_core::CycleSpec::new(request.date_yyyymmdd.clone(), cycle_utc)?,
+        source: request.source,
+    };
+    let cells = full_grid.shape.len();
+    let mut products = Vec::with_capacity(grids.len());
+    for grid in grids {
+        let product = HrrrWindowedProduct::from_slug(&grid.slug)
+            .ok_or_else(|| format!("'{}' is not a windowed product slug", grid.slug))?;
+        if grid.values.len() != cells {
+            return Err(format!(
+                "windowed store grid '{}' holds {} values, expected {cells}",
+                grid.slug,
+                grid.values.len()
+            )
+            .into());
+        }
+        let field = Field2D::new(
+            rustwx_core::ProductKey::named(product.slug()),
+            grid.units.clone(),
+            full_grid.clone(),
+            grid.values.iter().map(|&value| value as f32).collect(),
+        )?;
+        products.push(PreparedWindowedProduct {
+            product,
+            computed: crate::windowed_decoder::ComputedWindowedField {
+                field,
+                title: product.title().to_string(),
+                metadata: HrrrWindowedProductMetadata {
+                    strategy: grid.strategy.clone(),
+                    contributing_forecast_hours: grid.hours_used.clone(),
+                    window_hours: grid.window_hours,
+                },
+                scale: crate::windowed_decoder::windowed_product_scale(product),
+            },
+        });
+    }
+    let prepared = PreparedWindowedBatch {
+        latest,
+        shared_timing: empty_windowed_shared_timing(),
+        products,
+        blockers: Vec::new(),
+        grid: full_grid.clone(),
+        projection: projection.cloned(),
+    };
+    Ok(run_hrrr_windowed_batch_from_prepared(request, &prepared)?.products)
+}
+
+/// Shared-timing placeholder for store-rendered windowed batches: nothing
+/// was fetched or decoded, so every counter is zero and every fetch list
+/// empty.
+fn empty_windowed_shared_timing() -> HrrrWindowedSharedTiming {
+    HrrrWindowedSharedTiming {
+        fetch_geometry_ms: 0,
+        decode_geometry_ms: 0,
+        project_ms: 0,
+        fetch_surface_ms: 0,
+        decode_surface_ms: 0,
+        fetch_nat_ms: 0,
+        decode_nat_ms: 0,
+        fetch_wind_ms: 0,
+        decode_wind_ms: 0,
+        fetch_temp_ms: 0,
+        decode_temp_ms: 0,
+        compute_products_ms: 0,
+        geometry_fetch_cache_hit: false,
+        geometry_decode_cache_hit: false,
+        surface_hours_loaded: Vec::new(),
+        nat_hours_loaded: Vec::new(),
+        wind_hours_loaded: Vec::new(),
+        temp_hours_loaded: Vec::new(),
+        geometry_fetch: None,
+        geometry_input_fetch: None,
+        surface_hour_fetches: Vec::new(),
+        uh_hour_fetches: Vec::new(),
+        wind_hour_fetches: Vec::new(),
+        temp_hour_fetches: Vec::new(),
+    }
 }
 
 fn run_hrrr_windowed_batch_from_prepared_with_total_start(

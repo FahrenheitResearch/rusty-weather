@@ -9,6 +9,12 @@ default-run = "rusty-weather"
 
 [dependencies]
 clap.workspace = true
+# Global allocator for the ingest binary: the derived CAPE kernels allocate
+# per-column scratch across every rayon thread; mimalloc handles that churn
+# better than the default Windows heap (~10% on the derived stage, ~15% on
+# GRIB extraction, measured on the 32-thread dev box).
+mimalloc = "0.1"
+rayon.workspace = true
 serde_json.workspace = true
 rustwx-core = { path = "../rustwx-core" }
 rustwx-io = { path = "../rustwx-io" }
@@ -16,3 +22,20 @@ rustwx-models = { path = "../rustwx-models" }
 rustwx-products = { path = "../rustwx-products" }
 rustwx-render = { path = "../rustwx-render" }
 rw-store = { path = "../rw-store" }
+
+# Polite-mode priority drop (src/throttle.rs): windows-sys is already in
+# the tree transitively (clap's anstyle stack pulls 0.61), so this adds one
+# feature, not a new crate. Win32_System_Threading carries
+# GetCurrentProcess / SetPriorityClass / BELOW_NORMAL_PRIORITY_CLASS plus
+# GetProcessTimes (rw_batch's per-stage CPU accounting); Win32_Foundation
+# carries the FILETIME it fills.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# The ingest derived-precompute test proves the wiring by calling the
+# underlying calc kernels directly with identically prepared inputs.
+rustwx-calc = { path = "../rustwx-calc" }
