@@ -385,8 +385,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             for _ in 0..hours.len() {
                 let (ingested, fetch_cpu_ms, ingest_cpu_ms) = ingested_rx
                     .recv()
-                    .map_err(|_| "pipeline: ingest thread exited without a result".to_string())?
-                    .map_err(|err| err)?;
+                    .map_err(|_| "pipeline: ingest thread exited without a result".to_string())??;
                 let hour = ingested.hour;
                 println!(
                     "f{hour:03} ingest: prs fetch {} ms ({}, {:.1} MB) | sfc fetch {} ms ({}, {:.1} MB) | extract prs {} ms, sfc {} ms | thermo decode {} ms | derived {} ms | heavy {} ms | encode {} ms | store {:.1} MB | 2d {}/{} | derived {}/{} | heavy {}/{}",

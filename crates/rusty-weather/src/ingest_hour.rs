@@ -995,7 +995,8 @@ fn verify_hour(
                 }
                 continue;
             }
-            if !((got - expected).abs() <= bound) {
+            let diff = (got - expected).abs();
+            if diff.is_nan() || diff > bound {
                 return Err(format!(
                     "verify: '{}' {level} hPa at grid center: profile {got} vs source \
                      {expected} exceeds quantization bound {bound}",

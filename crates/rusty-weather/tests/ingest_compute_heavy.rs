@@ -361,6 +361,7 @@ fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
     let ratio = take("sb_ecape_native_cape_ratio");
     assert_eq!(ratio.units, "ratio", "sb native ratio units");
     let mut finite_ratio_checked = 0usize;
+    #[allow(clippy::needless_range_loop)] // ij indexes four parallel arrays
     for ij in 0..NXY {
         let ecape = f64::from(sbecape.values[ij]);
         if ratio.values[ij].is_finite() && ecape.is_finite() {
