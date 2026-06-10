@@ -358,8 +358,7 @@ fn cape_cin_triplet_bit_identical_to_single_parcel_paths() {
     // Pressure levels (Pa) in descending order (surface-to-top).
     // Chosen so that for some columns psfc > level[0] (below-ground levels).
     let pressure_levels_desc_pa: [f64; 9] = [
-        97_500.0, 92_500.0, 87_500.0, 82_500.0, 75_000.0, 65_000.0, 50_000.0, 40_000.0,
-        30_000.0,
+        97_500.0, 92_500.0, 87_500.0, 82_500.0, 75_000.0, 65_000.0, 50_000.0, 40_000.0, 30_000.0,
     ];
 
     // psfc spread ~955–1005 hPa so that some columns have below-ground levels.
@@ -369,12 +368,8 @@ fn cape_cin_triplet_bit_identical_to_single_parcel_paths() {
         .collect();
 
     // 2-metre fields: mild variation across columns.
-    let t2_k: Vec<f64> = (0..n2d)
-        .map(|ij| 295.0 + (ij as f64) * 0.3)
-        .collect();
-    let q2_kgkg: Vec<f64> = (0..n2d)
-        .map(|ij| 0.010 + (ij as f64) * 0.0003)
-        .collect();
+    let t2_k: Vec<f64> = (0..n2d).map(|ij| 295.0 + (ij as f64) * 0.3).collect();
+    let q2_kgkg: Vec<f64> = (0..n2d).map(|ij| 0.010 + (ij as f64) * 0.0003).collect();
     let u10_ms: Vec<f64> = vec![5.0; n2d];
     let v10_ms: Vec<f64> = vec![2.0; n2d];
 
@@ -387,8 +382,9 @@ fn cape_cin_triplet_bit_identical_to_single_parcel_paths() {
     let mut v_ms = vec![0.0f64; nz * n2d];
 
     // Approximate heights for the pressure levels using hypsometric spacing.
-    let approx_heights_m: [f64; 9] =
-        [250.0, 750.0, 1300.0, 1900.0, 2800.0, 4000.0, 5600.0, 7200.0, 9500.0];
+    let approx_heights_m: [f64; 9] = [
+        250.0, 750.0, 1300.0, 1900.0, 2800.0, 4000.0, 5600.0, 7200.0, 9500.0,
+    ];
 
     for k in 0..nz {
         for ij in 0..n2d {
@@ -433,28 +429,39 @@ fn cape_cin_triplet_bit_identical_to_single_parcel_paths() {
         let mu = compute_cape_cin(grid, volume, surface, "mu", None).unwrap();
 
         // SB planes
-        assert_bits_eq(&format!("{label}/sb.cape"), &triplet.sb.cape_jkg, &sb.cape_jkg);
-        assert_bits_eq(&format!("{label}/sb.cin"),  &triplet.sb.cin_jkg,  &sb.cin_jkg);
-        assert_bits_eq(&format!("{label}/sb.lcl"),  &triplet.sb.lcl_m,    &sb.lcl_m);
-        assert_bits_eq(&format!("{label}/sb.lfc"),  &triplet.sb.lfc_m,    &sb.lfc_m);
+        assert_bits_eq(
+            &format!("{label}/sb.cape"),
+            &triplet.sb.cape_jkg,
+            &sb.cape_jkg,
+        );
+        assert_bits_eq(&format!("{label}/sb.cin"), &triplet.sb.cin_jkg, &sb.cin_jkg);
+        assert_bits_eq(&format!("{label}/sb.lcl"), &triplet.sb.lcl_m, &sb.lcl_m);
+        assert_bits_eq(&format!("{label}/sb.lfc"), &triplet.sb.lfc_m, &sb.lfc_m);
         // ML planes
-        assert_bits_eq(&format!("{label}/ml.cape"), &triplet.ml.cape_jkg, &ml.cape_jkg);
-        assert_bits_eq(&format!("{label}/ml.cin"),  &triplet.ml.cin_jkg,  &ml.cin_jkg);
-        assert_bits_eq(&format!("{label}/ml.lcl"),  &triplet.ml.lcl_m,    &ml.lcl_m);
-        assert_bits_eq(&format!("{label}/ml.lfc"),  &triplet.ml.lfc_m,    &ml.lfc_m);
+        assert_bits_eq(
+            &format!("{label}/ml.cape"),
+            &triplet.ml.cape_jkg,
+            &ml.cape_jkg,
+        );
+        assert_bits_eq(&format!("{label}/ml.cin"), &triplet.ml.cin_jkg, &ml.cin_jkg);
+        assert_bits_eq(&format!("{label}/ml.lcl"), &triplet.ml.lcl_m, &ml.lcl_m);
+        assert_bits_eq(&format!("{label}/ml.lfc"), &triplet.ml.lfc_m, &ml.lfc_m);
         // MU planes
-        assert_bits_eq(&format!("{label}/mu.cape"), &triplet.mu.cape_jkg, &mu.cape_jkg);
-        assert_bits_eq(&format!("{label}/mu.cin"),  &triplet.mu.cin_jkg,  &mu.cin_jkg);
-        assert_bits_eq(&format!("{label}/mu.lcl"),  &triplet.mu.lcl_m,    &mu.lcl_m);
-        assert_bits_eq(&format!("{label}/mu.lfc"),  &triplet.mu.lfc_m,    &mu.lfc_m);
+        assert_bits_eq(
+            &format!("{label}/mu.cape"),
+            &triplet.mu.cape_jkg,
+            &mu.cape_jkg,
+        );
+        assert_bits_eq(&format!("{label}/mu.cin"), &triplet.mu.cin_jkg, &mu.cin_jkg);
+        assert_bits_eq(&format!("{label}/mu.lcl"), &triplet.mu.lcl_m, &mu.lcl_m);
+        assert_bits_eq(&format!("{label}/mu.lfc"), &triplet.mu.lfc_m, &mu.lfc_m);
 
         // Return triplet for the non-degeneracy check
         triplet
     };
 
     // Descending pressure (surface-first): the normal NWP layout.
-    let triplet_desc =
-        check_ordering("descending", &pressure_levels_desc_pa);
+    let triplet_desc = check_ordering("descending", &pressure_levels_desc_pa);
 
     // Ascending pressure (top-first): the reversed layout the code must handle.
     let mut pressure_levels_asc_pa = pressure_levels_desc_pa;

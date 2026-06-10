@@ -75,7 +75,11 @@ struct Args {
     run: String,
     #[arg(long, default_value_t = 6)]
     hour: u16,
-    #[arg(long, default_value_t = 5, help = "Timed iterations per metric (after 1 warmup)")]
+    #[arg(
+        long,
+        default_value_t = 5,
+        help = "Timed iterations per metric (after 1 warmup)"
+    )]
     samples: usize,
 }
 
@@ -179,9 +183,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(&vars_2d[0])
         .clone();
 
-    let (fx, fy) = locator
-        .locate(SOUNDING_LAT, SOUNDING_LON)
-        .ok_or(format!("locate({SOUNDING_LAT}, {SOUNDING_LON}) is off-grid"))?;
+    let (fx, fy) = locator.locate(SOUNDING_LAT, SOUNDING_LON).ok_or(format!(
+        "locate({SOUNDING_LAT}, {SOUNDING_LON}) is off-grid"
+    ))?;
 
     println!(
         "rw_bench build {} | {} {} f{:03} | grid {} x {} | samples {} (median, 1 warmup)",
@@ -296,7 +300,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 7. sounding_cold: everything from scratch, the worst-case first click.
     rows.push((
-        format!("sounding_cold (open+build+locate+{} profiles)", vars_3d.len()),
+        format!(
+            "sounding_cold (open+build+locate+{} profiles)",
+            vars_3d.len()
+        ),
         bench(args.samples, || {
             let grid = GridFile::open(&grid_path).expect("open grid file");
             let locator = GridLocator::build(&grid);
@@ -331,7 +338,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     // --- timing table ---
-    let label_width = rows.iter().map(|(label, ..)| label.len()).max().unwrap_or(0);
+    let label_width = rows
+        .iter()
+        .map(|(label, ..)| label.len())
+        .max()
+        .unwrap_or(0);
     println!(
         "{:<label_width$}  {:>12}  {:>12}  {:>12}",
         "metric", "median", "min", "max"
@@ -403,7 +414,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_by(|a, b| a.1.median.total_cmp(&b.1.median))
         .expect("at least one 2D var");
     gate(
-        full_2d.iter().all(|(_, stats)| stats.median <= GATE_FULL_2D_S),
+        full_2d
+            .iter()
+            .all(|(_, stats)| stats.median <= GATE_FULL_2D_S),
         format!(
             "read_full_2d worst {:.2} ms ({worst_name}) <= {:.0} ms per var",
             worst_stats.median * 1e3,

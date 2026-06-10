@@ -92,8 +92,8 @@ impl RwsRunManifest {
 
     /// Atomically write the manifest as pretty JSON.
     pub fn save(&self, path: &Path) -> RwResult<()> {
-        let mut bytes = serde_json::to_vec_pretty(self)
-            .map_err(|err| RwStoreError::Meta(err.to_string()))?;
+        let mut bytes =
+            serde_json::to_vec_pretty(self).map_err(|err| RwStoreError::Meta(err.to_string()))?;
         bytes.push(b'\n');
         atomic_write_bytes(path, &bytes)
     }
@@ -108,11 +108,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rw-store-run-{}-{}",
-            std::process::id(),
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rw-store-run-{}-{}", std::process::id(), name));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

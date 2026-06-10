@@ -119,11 +119,7 @@ mod tests {
         let stats = StatsRegistry::new();
         stats.record("zeta", 1.0);
         stats.record("alpha", 2.0);
-        let names: Vec<String> = stats
-            .snapshot()
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
+        let names: Vec<String> = stats.snapshot().into_iter().map(|(name, _)| name).collect();
         assert_eq!(names, vec!["alpha", "zeta"]);
     }
 }

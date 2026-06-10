@@ -152,7 +152,7 @@ fn native_planes() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
 
 /// The decoded pair exactly as `decode_store_thermo_pair` shapes it, with
 /// optional native CAPE planes riding on the surface fields.
-fn decoded_inputs(synthetic: &Synthetic, with_native_cape: bool) -> ProductsComputeInputs {
+fn decoded_pair(synthetic: &Synthetic, with_native_cape: bool) -> (SurfaceFields, PressureFields) {
     let qvapor_kgkg_3d: Vec<f64> = LEVELS
         .iter()
         .flat_map(|&level| {
@@ -172,8 +172,8 @@ fn decoded_inputs(synthetic: &Synthetic, with_native_cape: bool) -> ProductsComp
     } else {
         (None, None, None)
     };
-    ProductsComputeInputs {
-        surface: SurfaceFields {
+    (
+        SurfaceFields {
             lat: synthetic.lat.clone(),
             lon: synthetic.lon.clone(),
             nx: NX,
@@ -191,7 +191,7 @@ fn decoded_inputs(synthetic: &Synthetic, with_native_cape: bool) -> ProductsComp
             native_mucape_jkg: native_mu,
             native_pblh_m: None,
         },
-        pressure: PressureFields {
+        PressureFields {
             pressure_levels_hpa: LEVELS.iter().map(|&level| f64::from(level)).collect(),
             pressure_3d_pa: None,
             temperature_c_3d: flatten_with(&synthetic.temperature_k, |v| v - 273.15),
@@ -207,7 +207,7 @@ fn decoded_inputs(synthetic: &Synthetic, with_native_cape: bool) -> ProductsComp
             snow_kgkg_3d: None,
             graupel_kgkg_3d: None,
         },
-    }
+    )
 }
 
 fn assert_bits_eq(actual: &[f32], expected: &[f32], context: &str) {
@@ -226,9 +226,13 @@ fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
     let synthetic = synthetic();
 
     // --- the ingest path: the decoded pair (with native CAPE) through the
-    //     heavy stage exactly as rw_ingest runs it ---
-    let inputs = decoded_inputs(&synthetic, true);
-    let heavy = ingest_compute::compute_heavy_2d_from_inputs(&inputs)
+    //     heavy stage exactly as rw_ingest runs it (by value; the shared
+    //     height-AGL volume comes from the in-place gh transform this test
+    //     re-derives serially below) ---
+    let (surface, pressure) = decoded_pair(&synthetic, true);
+    let qvapor_kgkg_3d_input = pressure.qvapor_kgkg_3d.clone();
+    let inputs = ProductsComputeInputs::new(surface, pressure);
+    let heavy = ingest_compute::compute_heavy_2d_from_inputs(inputs)
         .expect("heavy precompute must succeed on the synthetic hour");
 
     let expected_slugs = store_heavy_recipe_slugs();
@@ -246,7 +250,7 @@ fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
     // --- the direct path: identical prep, then the rustwx-calc ECAPE
     //     triplet kernel the heavy lane dispatches to ---
     let temperature_c_3d = flatten_with(&synthetic.temperature_k, |v| v - 273.15);
-    let qvapor_kgkg_3d = inputs.pressure.qvapor_kgkg_3d.clone();
+    let qvapor_kgkg_3d = qvapor_kgkg_3d_input;
     let u_3d = flatten_with(&synthetic.u_ms, |v| v);
     let v_3d = flatten_with(&synthetic.v_ms, |v| v);
     let gh_3d = flatten_with(&synthetic.height_m, |v| v);
@@ -380,8 +384,9 @@ fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
 #[test]
 fn ingest_heavy_without_native_cape_skips_only_the_native_ratios() {
     let synthetic = synthetic();
-    let inputs = decoded_inputs(&synthetic, false);
-    let heavy = ingest_compute::compute_heavy_2d_from_inputs(&inputs)
+    let (surface, pressure) = decoded_pair(&synthetic, false);
+    let inputs = ProductsComputeInputs::new(surface, pressure);
+    let heavy = ingest_compute::compute_heavy_2d_from_inputs(inputs)
         .expect("heavy precompute must succeed without native CAPE");
 
     let expected_realized: Vec<&str> = store_heavy_recipe_slugs()

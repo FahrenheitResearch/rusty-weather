@@ -275,8 +275,7 @@ fn profile_handles_nan_corners() {
     let profile = reader.read_profile_3d("temperature", 10.5, 20.5).unwrap();
     assert_eq!(profile.len(), L);
     for (k, value) in profile.iter().enumerate() {
-        let expected =
-            (analytic(11, 20, k) + analytic(10, 21, k) + analytic(11, 21, k)) / 3.0;
+        let expected = (analytic(11, 20, k) + analytic(10, 21, k) + analytic(11, 21, k)) / 3.0;
         assert!(value.is_finite(), "level {k} must be finite, got {value}");
         assert!(
             (value - expected).abs() <= bound,

@@ -115,7 +115,7 @@ fn flatten_with(planes: &[(u16, Vec<f64>)], convert: impl Fn(f64) -> f64) -> Vec
 /// The decoded pair exactly as `decode_store_thermo_pair` shapes it:
 /// f64 fields, descending-pressure flattened volumes, mixing ratio from
 /// the moisture planes, no optional volumes.
-fn decoded_inputs(synthetic: &Synthetic) -> ProductsComputeInputs {
+fn decoded_pair(synthetic: &Synthetic) -> (SurfaceFields, PressureFields) {
     let qvapor_kgkg_3d: Vec<f64> = LEVELS
         .iter()
         .flat_map(|&level| {
@@ -129,8 +129,8 @@ fn decoded_inputs(synthetic: &Synthetic) -> ProductsComputeInputs {
                 .map(move |&td_k| mixing_ratio_from_dewpoint_k(f64::from(level), td_k))
         })
         .collect();
-    ProductsComputeInputs {
-        surface: SurfaceFields {
+    (
+        SurfaceFields {
             lat: synthetic.lat.clone(),
             lon: synthetic.lon.clone(),
             nx: NX,
@@ -148,7 +148,7 @@ fn decoded_inputs(synthetic: &Synthetic) -> ProductsComputeInputs {
             native_mucape_jkg: None,
             native_pblh_m: None,
         },
-        pressure: PressureFields {
+        PressureFields {
             pressure_levels_hpa: LEVELS.iter().map(|&level| f64::from(level)).collect(),
             pressure_3d_pa: None,
             temperature_c_3d: flatten_with(&synthetic.temperature_k, |v| v - 273.15),
@@ -164,7 +164,7 @@ fn decoded_inputs(synthetic: &Synthetic) -> ProductsComputeInputs {
             snow_kgkg_3d: None,
             graupel_kgkg_3d: None,
         },
-    }
+    )
 }
 
 fn assert_bits_eq(actual: &[f32], expected: &[f32], context: &str) {
@@ -182,8 +182,12 @@ fn assert_bits_eq(actual: &[f32], expected: &[f32], context: &str) {
 fn ingest_derived_matches_direct_calc_kernels_bit_exactly() {
     let synthetic = synthetic();
 
-    // --- the ingest path: the decoded pair through the store compute lane ---
-    let inputs = decoded_inputs(&synthetic);
+    // --- the ingest path: the decoded pair through the store compute lane
+    //     (ProductsComputeInputs::new builds the shared height-AGL volume
+    //     by the in-place gh transform this test re-derives serially) ---
+    let (surface, pressure) = decoded_pair(&synthetic);
+    let qvapor_kgkg_3d_input = pressure.qvapor_kgkg_3d.clone();
+    let inputs = ProductsComputeInputs::new(surface, pressure);
     let derived = ingest_compute::compute_derived_2d_from_inputs(&inputs)
         .expect("derived precompute must succeed on the synthetic hour");
     assert_eq!(
@@ -202,7 +206,7 @@ fn ingest_derived_matches_direct_calc_kernels_bit_exactly() {
     // --- the direct path: identical prep, then the calc kernels the
     //     derived lane dispatches to ---
     let temperature_c_3d = flatten_with(&synthetic.temperature_k, |v| v - 273.15);
-    let qvapor_kgkg_3d = inputs.pressure.qvapor_kgkg_3d.clone();
+    let qvapor_kgkg_3d = qvapor_kgkg_3d_input;
     let u_3d = flatten_with(&synthetic.u_ms, |v| v);
     let v_3d = flatten_with(&synthetic.v_ms, |v| v);
     let gh_3d = flatten_with(&synthetic.height_m, |v| v);

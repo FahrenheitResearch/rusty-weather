@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use rustwx_core::{CanonicalField, FieldSelector, ModelId, SelectedField2D};
 use rustwx_io::extract_fields_partial_from_model_bytes_at_forecast_hour;
 use rw_store::grid::GridFile;
-use rw_store::ingest::{read_field_2d, write_hour_from_fields, PressureVolumeInput};
+use rw_store::ingest::{PressureVolumeInput, read_field_2d, write_hour_from_fields};
 use rw_store::reader::HourReader;
 use rw_store::run::RwsRunManifest;
 
@@ -226,7 +226,13 @@ fn fixture_extract_write_read_back_round_trips() {
     .expect("hour write must succeed");
     assert_eq!(
         written.vars,
-        vec!["temperature_2m", "u_500", "v_500", "height_500", "temperature_iso"]
+        vec![
+            "temperature_2m",
+            "u_500",
+            "v_500",
+            "height_500",
+            "temperature_iso"
+        ]
     );
 
     // --- 3. read back ---
@@ -260,7 +266,11 @@ fn fixture_extract_write_read_back_round_trips() {
     let crop: Vec<f32> = (y0..y1)
         .flat_map(|y| temp_2m.values[y * NX + x0..y * NX + x1].iter().copied())
         .collect();
-    assert_bits_eq(&window.values, &crop, "temperature_2m window (50,50,150,150)");
+    assert_bits_eq(
+        &window.values,
+        &crop,
+        "temperature_2m window (50,50,150,150)",
+    );
 
     // Volume columns at 3 sample points, within the quantization bound of
     // the extracted planes.
@@ -282,7 +292,11 @@ fn fixture_extract_write_read_back_round_trips() {
         for (k, value) in column.iter().enumerate() {
             let expected = planes[k][iy * NX + ix];
             if expected.is_nan() {
-                assert!(value.is_nan(), "column ({ix},{iy}) level {}: NaN must survive", VLEVELS[k]);
+                assert!(
+                    value.is_nan(),
+                    "column ({ix},{iy}) level {}: NaN must survive",
+                    VLEVELS[k]
+                );
                 continue;
             }
             assert!(
@@ -307,7 +321,11 @@ fn fixture_extract_write_read_back_round_trips() {
         .collect();
     for (k, (got, expected)) in profile.iter().zip(&expected_profile).enumerate() {
         if expected.is_nan() {
-            assert!(got.is_nan(), "profile level {}: NaN must survive", VLEVELS[k]);
+            assert!(
+                got.is_nan(),
+                "profile level {}: NaN must survive",
+                VLEVELS[k]
+            );
             continue;
         }
         assert!(

@@ -528,23 +528,7 @@ pub fn extract_fields_from_grib2(
         .copied()
         .map(PreparedSelector::new)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut matched: Vec<Option<(&Grib2Message, u8)>> = vec![None; prepared.len()];
-
-    for message in &grib.messages {
-        for (index, prepared_selector) in prepared.iter().enumerate() {
-            if prepared_selector.message.matches(message) {
-                let Some(score) = prepared_selector.match_score(message, None) else {
-                    continue;
-                };
-                let replace = matched[index]
-                    .map(|(_, best_score)| score < best_score)
-                    .unwrap_or(true);
-                if replace {
-                    matched[index] = Some((message, score));
-                }
-            }
-        }
-    }
+    let matched = match_prepared_selectors(grib, &prepared, None);
 
     let mut out = Vec::with_capacity(prepared.len());
     let mut grid_memo = GridMemo::new();
@@ -609,23 +593,7 @@ fn extract_fields_from_grib2_partial_inner(
         .copied()
         .map(PreparedSelector::new)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut matched: Vec<Option<(&Grib2Message, u8)>> = vec![None; prepared.len()];
-
-    for message in &grib.messages {
-        for (index, prepared_selector) in prepared.iter().enumerate() {
-            if prepared_selector.message.matches(message) {
-                let Some(score) = prepared_selector.match_score(message, forecast_hour) else {
-                    continue;
-                };
-                let replace = matched[index]
-                    .map(|(_, best_score)| score < best_score)
-                    .unwrap_or(true);
-                if replace {
-                    matched[index] = Some((message, score));
-                }
-            }
-        }
-    }
+    let matched = match_prepared_selectors(grib, &prepared, forecast_hour);
 
     let mut grid_memo = GridMemo::new();
     for (prepared_selector, message) in prepared.iter().zip(matched.into_iter()) {
@@ -643,12 +611,75 @@ fn extract_fields_from_grib2_partial_inner(
     Ok(PartialExtraction { extracted, missing })
 }
 
+/// The selector-to-message matching loop shared by every extraction lane:
+/// for each prepared selector, the best-scoring matching message (lower
+/// score wins, first wins ties via strict `<`).
+fn match_prepared_selectors<'a>(
+    grib: &'a Grib2File,
+    prepared: &[PreparedSelector],
+    forecast_hour: Option<u16>,
+) -> Vec<Option<(&'a Grib2Message, u8)>> {
+    let mut matched: Vec<Option<(&Grib2Message, u8)>> = vec![None; prepared.len()];
+    for message in &grib.messages {
+        for (index, prepared_selector) in prepared.iter().enumerate() {
+            if prepared_selector.message.matches(message) {
+                let Some(score) = prepared_selector.match_score(message, forecast_hour) else {
+                    continue;
+                };
+                let replace = matched[index]
+                    .map(|(_, best_score)| score < best_score)
+                    .unwrap_or(true);
+                if replace {
+                    matched[index] = Some((message, score));
+                }
+            }
+        }
+    }
+    matched
+}
+
 /// Result of a partial extraction: every selector the GRIB file served
 /// in `extracted`, every selector whose message was absent in `missing`.
 #[derive(Debug, Clone)]
 pub struct PartialExtraction {
     pub extracted: Vec<SelectedField2D>,
     pub missing: Vec<FieldSelector>,
+}
+
+/// One extracted field as bare values: the selector, its native units, the
+/// values after the exact normalization sequence the `SelectedField2D`
+/// lane applies (unpack, alternating-i scan, row flip, per-row longitude
+/// rotation, f64 -> f32), and the index of its shared coordinate grid in
+/// [`PartialValuesExtraction::grids`].
+#[derive(Debug, Clone)]
+pub struct ExtractedFieldValues {
+    pub selector: FieldSelector,
+    pub units: String,
+    pub values: Vec<f32>,
+    /// Index into [`PartialValuesExtraction::grids`].
+    pub grid_index: usize,
+}
+
+/// One distinct coordinate grid realized by a values-only extraction —
+/// bit-identical to the `grid` every `SelectedField2D` sharing the same
+/// GRIB `GridDefinition` would have carried, materialized once instead of
+/// cloned per field.
+#[derive(Debug, Clone)]
+pub struct SharedExtractionGrid {
+    pub grid: LatLonGrid,
+    pub projection: Option<GridProjection>,
+}
+
+/// Values-only sibling of [`PartialExtraction`] for callers (the store
+/// ingest) that hold many fields from one file at once: per-field values
+/// plus each distinct grid exactly once. A full HRRR `prs` extraction
+/// carries ~195 fields on one 15 MB grid — the per-field clones of the
+/// `SelectedField2D` shape cost ~2.8 GB at peak, this shape costs 15 MB.
+#[derive(Debug, Clone)]
+pub struct PartialValuesExtraction {
+    pub extracted: Vec<ExtractedFieldValues>,
+    pub missing: Vec<FieldSelector>,
+    pub grids: Vec<SharedExtractionGrid>,
 }
 
 pub fn extract_fields_partial_from_model_bytes(
@@ -689,6 +720,153 @@ pub fn extract_fields_partial_from_model_bytes_at_forecast_hour(
             Ok(partial)
         }
     }
+}
+
+/// Values-only sibling of
+/// [`extract_fields_partial_from_model_bytes_at_forecast_hour`]: the same
+/// model dispatch, the same selector matching and message scoring, the same
+/// per-field value normalization — but each distinct coordinate grid is
+/// returned exactly once in [`PartialValuesExtraction::grids`] instead of
+/// being cloned into every field.
+pub fn extract_field_values_partial_from_model_bytes_at_forecast_hour(
+    model: ModelId,
+    bytes: &[u8],
+    _preferred_path: Option<&Path>,
+    selectors: &[FieldSelector],
+    forecast_hour: Option<u16>,
+) -> Result<PartialValuesExtraction, IoError> {
+    match model {
+        ModelId::WrfGdex => Err(IoError::Wrf(
+            "WRF/GDEX NetCDF support is not available in this build".to_string(),
+        )),
+        _ => {
+            let grib =
+                Grib2File::from_bytes(bytes).map_err(|err| IoError::Grib(err.to_string()))?;
+            let mut extracted = Vec::new();
+            let mut missing = Vec::new();
+            let mut grid_memo = GridMemo::new();
+            if !selectors.is_empty() {
+                let prepared = selectors
+                    .iter()
+                    .copied()
+                    .map(PreparedSelector::new)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let matched = match_prepared_selectors(&grib, &prepared, forecast_hour);
+                for (prepared_selector, message) in prepared.iter().zip(matched.into_iter()) {
+                    match message {
+                        Some((message, _)) => extracted.push(build_field_values(
+                            message,
+                            prepared_selector.selector,
+                            prepared_selector.selector.native_units(),
+                            &mut grid_memo,
+                        )?),
+                        None => missing.push(prepared_selector.selector),
+                    }
+                }
+            }
+            if model == ModelId::Nbm {
+                synthesize_nbm_10m_wind_component_values_from_speed_direction(
+                    &grib,
+                    &mut extracted,
+                    &mut missing,
+                    &mut grid_memo,
+                )?;
+            }
+            Ok(PartialValuesExtraction {
+                extracted,
+                missing,
+                grids: grid_memo.into_shared_grids(),
+            })
+        }
+    }
+}
+
+/// Values-lane twin of
+/// [`synthesize_nbm_10m_wind_components_from_speed_direction`]: identical
+/// message selection and u/v arithmetic, shared-grid output shape.
+fn synthesize_nbm_10m_wind_component_values_from_speed_direction(
+    grib: &Grib2File,
+    extracted: &mut Vec<ExtractedFieldValues>,
+    missing: &mut Vec<FieldSelector>,
+    grid_memo: &mut GridMemo,
+) -> Result<(), IoError> {
+    let u_selector = FieldSelector::height_agl(CanonicalField::UWind, 10);
+    let v_selector = FieldSelector::height_agl(CanonicalField::VWind, 10);
+    let needs_u = missing.contains(&u_selector);
+    let needs_v = missing.contains(&v_selector);
+    if !needs_u && !needs_v {
+        return Ok(());
+    }
+
+    let speed_selector = StructuredMessageSelector {
+        parameters: PARAMETER_WIND_SPEED,
+        level: LevelMatch::HeightAboveGroundMeters(10),
+        units: "m/s",
+    };
+    let direction_selector = StructuredMessageSelector {
+        parameters: PARAMETER_WIND_DIRECTION,
+        level: LevelMatch::HeightAboveGroundMeters(10),
+        units: "deg",
+    };
+    let Some(speed_message) = grib
+        .messages
+        .iter()
+        .find(|message| speed_selector.matches(message))
+    else {
+        return Ok(());
+    };
+    let Some(direction_message) = grib
+        .messages
+        .iter()
+        .find(|message| direction_selector.matches(message))
+    else {
+        return Ok(());
+    };
+
+    let speed = build_field_values(speed_message, u_selector, speed_selector.units, grid_memo)?;
+    let direction = build_field_values(
+        direction_message,
+        v_selector,
+        direction_selector.units,
+        grid_memo,
+    )?;
+    let speed_shape = grid_memo.slots[speed.grid_index].0.grid.shape;
+    let direction_shape = grid_memo.slots[direction.grid_index].0.grid.shape;
+    if speed_shape != direction_shape || speed.values.len() != direction.values.len() {
+        return Ok(());
+    }
+
+    let mut u_values = Vec::with_capacity(speed.values.len());
+    let mut v_values = Vec::with_capacity(speed.values.len());
+    for (speed_ms, direction_deg) in speed.values.iter().zip(direction.values.iter()) {
+        if speed_ms.is_finite() && direction_deg.is_finite() {
+            let theta = f64::from(*direction_deg).to_radians();
+            u_values.push((-f64::from(*speed_ms) * theta.sin()) as f32);
+            v_values.push((-f64::from(*speed_ms) * theta.cos()) as f32);
+        } else {
+            u_values.push(f32::NAN);
+            v_values.push(f32::NAN);
+        }
+    }
+
+    if needs_u {
+        extracted.push(ExtractedFieldValues {
+            selector: u_selector,
+            units: "m/s".to_string(),
+            values: u_values,
+            grid_index: speed.grid_index,
+        });
+    }
+    if needs_v {
+        extracted.push(ExtractedFieldValues {
+            selector: v_selector,
+            units: "m/s".to_string(),
+            values: v_values,
+            grid_index: speed.grid_index,
+        });
+    }
+    missing.retain(|selector| *selector != u_selector && *selector != v_selector);
+    Ok(())
 }
 
 fn synthesize_nbm_10m_wind_components_from_speed_direction(
@@ -2034,7 +2212,52 @@ struct GridMemoEntry {
     row_wraps: Vec<usize>,
 }
 
-type GridMemo = HashMap<GridMemoKey, GridMemoEntry>;
+/// Per-extraction-call grid memo: each distinct `GridDefinition` resolves to
+/// one slot (coordinate grid + row wraps + projection). The slot indices are
+/// the `grid_index` values a values-only extraction hands out, and the
+/// `SelectedField2D` lane clones its per-field grid out of the same slots —
+/// one implementation, two output shapes.
+struct GridMemo {
+    index: HashMap<GridMemoKey, usize>,
+    slots: Vec<(GridMemoEntry, Option<GridProjection>)>,
+}
+
+impl GridMemo {
+    fn new() -> Self {
+        Self {
+            index: HashMap::new(),
+            slots: Vec::new(),
+        }
+    }
+
+    /// Resolve (building on first use) the slot for one message's grid.
+    fn slot_index(
+        &mut self,
+        message: &Grib2Message,
+        shape: GridShape,
+        selector: FieldSelector,
+    ) -> Result<usize, IoError> {
+        match self.index.entry(GridMemoKey::from_grid(&message.grid)) {
+            Entry::Occupied(slot) => Ok(*slot.get()),
+            Entry::Vacant(slot) => {
+                let entry = build_grid_memo_entry(&message.grid, shape, selector)?;
+                let projection = grid_projection_from_grib2_grid(&message.grid);
+                self.slots.push((entry, projection));
+                Ok(*slot.insert(self.slots.len() - 1))
+            }
+        }
+    }
+
+    fn into_shared_grids(self) -> Vec<SharedExtractionGrid> {
+        self.slots
+            .into_iter()
+            .map(|(entry, projection)| SharedExtractionGrid {
+                grid: entry.grid,
+                projection,
+            })
+            .collect()
+    }
+}
 
 fn build_grid_memo_entry(
     grid_def: &GridDefinition,
@@ -2060,24 +2283,23 @@ fn build_grid_memo_entry(
     Ok(GridMemoEntry { grid, row_wraps })
 }
 
-/// Build one `SelectedField2D`, memoizing the (expensive) coordinate-grid
+/// Build one field's bare values, memoizing the (expensive) coordinate-grid
 /// computation per distinct `GridDefinition` within one extraction call.
 /// Values-side normalization (unpack, alternating-i scan, row flip, row
-/// rotation) stays per-field; only the lat/lon arrays — identical for every
-/// message sharing a grid definition — are computed once and cloned out.
-fn build_selected_field(
+/// rotation) stays per-field and is exactly the sequence the
+/// `SelectedField2D` lane applies; the coordinate grid is referenced by
+/// slot index instead of being cloned out per field.
+fn build_field_values(
     message: &Grib2Message,
     selector: FieldSelector,
     units: &str,
     grid_memo: &mut GridMemo,
-) -> Result<SelectedField2D, IoError> {
+) -> Result<ExtractedFieldValues, IoError> {
     let nx = message.grid.nx as usize;
     let ny = message.grid.ny as usize;
     let shape = GridShape::new(nx, ny)?;
-    let entry = match grid_memo.entry(GridMemoKey::from_grid(&message.grid)) {
-        Entry::Occupied(slot) => slot.into_mut(),
-        Entry::Vacant(slot) => slot.insert(build_grid_memo_entry(&message.grid, shape, selector)?),
-    };
+    let grid_index = grid_memo.slot_index(message, shape, selector)?;
+    let entry = &grid_memo.slots[grid_index].0;
     let mut values = unpack_message(message).map_err(|err| IoError::Grib(err.to_string()))?;
     normalize_alternating_i_scan_rows(&mut values, nx, ny, message.grid.scan_mode);
     if message.grid.scan_mode & 0x40 != 0 {
@@ -2085,9 +2307,35 @@ fn build_selected_field(
     }
     rotate_rows_left(&mut values, nx, &entry.row_wraps);
 
-    let values = values.into_iter().map(|value| value as f32).collect();
-    let mut field = SelectedField2D::new(selector, units, entry.grid.clone(), values)?;
-    if let Some(projection) = grid_projection_from_grib2_grid(&message.grid) {
+    let values: Vec<f32> = values.into_iter().map(|value| value as f32).collect();
+    if values.len() != entry.grid.shape.len() {
+        return Err(IoError::Core(
+            rustwx_core::RustwxError::InvalidFieldDataLength {
+                expected: entry.grid.shape.len(),
+                actual: values.len(),
+            },
+        ));
+    }
+    Ok(ExtractedFieldValues {
+        selector,
+        units: units.to_string(),
+        values,
+        grid_index,
+    })
+}
+
+/// Build one `SelectedField2D`: [`build_field_values`] plus a per-field
+/// clone of the shared coordinate grid (the historical output shape).
+fn build_selected_field(
+    message: &Grib2Message,
+    selector: FieldSelector,
+    units: &str,
+    grid_memo: &mut GridMemo,
+) -> Result<SelectedField2D, IoError> {
+    let field_values = build_field_values(message, selector, units, grid_memo)?;
+    let (entry, projection) = &grid_memo.slots[field_values.grid_index];
+    let mut field = SelectedField2D::new(selector, units, entry.grid.clone(), field_values.values)?;
+    if let Some(projection) = projection.clone() {
         field = field.with_projection(projection);
     }
     Ok(field)

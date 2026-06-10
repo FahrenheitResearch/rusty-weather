@@ -643,7 +643,10 @@ mod tests {
     #[test]
     fn resolve_profile_rejects_unknown_preset_and_bad_step() {
         let message = resolve_profile("everything", &ProfileOverrides::default()).unwrap_err();
-        assert!(message.contains("unknown preset 'everything'"), "got: {message}");
+        assert!(
+            message.contains("unknown preset 'everything'"),
+            "got: {message}"
+        );
 
         let message = resolve_profile(
             "full",

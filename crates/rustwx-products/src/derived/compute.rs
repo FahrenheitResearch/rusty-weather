@@ -219,6 +219,25 @@ where
     S: SurfaceFieldSet + Sync,
     P: PressureFieldSet + Sync,
 {
+    compute_derived_fields_generic_with_height_agl(surface, pressure, recipes, None)
+}
+
+/// [`compute_derived_fields_generic`] with an optional precomputed
+/// height-AGL volume. `Some` skips the internal height-AGL assembly and
+/// must hold exactly the volume [`compute_height_agl_3d_generic`] would
+/// produce (the store-ingest lane builds it once, by an in-place transform
+/// of the gh volume with the identical per-element arithmetic, and shares
+/// it across the derived and heavy stages). `None` is the historical path.
+pub(super) fn compute_derived_fields_generic_with_height_agl<S, P>(
+    surface: &S,
+    pressure: &P,
+    recipes: &[DerivedRecipe],
+    height_agl_override: Option<&[f64]>,
+) -> Result<DerivedComputedFields, Box<dyn std::error::Error>>
+where
+    S: SurfaceFieldSet + Sync,
+    P: PressureFieldSet + Sync,
+{
     fn missing_dependency(name: &str) -> std::io::Error {
         std::io::Error::other(format!(
             "derived compute missing required dependency: {name}"
@@ -274,7 +293,7 @@ where
     } else {
         None
     };
-    let height_agl_3d = if requirements.needs_height_agl() {
+    let height_agl_owned = if requirements.needs_height_agl() && height_agl_override.is_none() {
         Some(compute_height_agl_3d_generic(
             surface,
             pressure,
@@ -284,6 +303,17 @@ where
     } else {
         None
     };
+    let height_agl_3d: Option<&[f64]> = height_agl_override.or(height_agl_owned.as_deref());
+    fn require_height_agl<'a>(
+        option: Option<&'a [f64]>,
+        name: &str,
+    ) -> Result<&'a [f64], std::io::Error> {
+        option.ok_or_else(|| {
+            std::io::Error::other(format!(
+                "derived compute missing required dependency: {name}"
+            ))
+        })
+    }
 
     let make_volume = || -> Result<EcapeVolumeInputs<'_>, std::io::Error> {
         Ok(EcapeVolumeInputs {
@@ -293,8 +323,8 @@ where
             )?,
             temperature_c: pressure.temperature_c_3d(),
             qvapor_kgkg: pressure.qvapor_kgkg_3d(),
-            height_agl_m: require_option_ref(
-                &height_agl_3d,
+            height_agl_m: require_height_agl(
+                height_agl_3d,
                 "height_agl for derived thermodynamics",
             )?,
             u_ms: pressure.u_ms_3d(),
@@ -307,7 +337,7 @@ where
             shape: require_option_copy(shape, "volume shape for wind diagnostics")?,
             u_3d_ms: pressure.u_ms_3d(),
             v_3d_ms: pressure.v_ms_3d(),
-            height_agl_3d_m: require_option_ref(&height_agl_3d, "height_agl for wind diagnostics")?,
+            height_agl_3d_m: require_height_agl(height_agl_3d, "height_agl for wind diagnostics")?,
         })
     };
 
@@ -413,19 +443,6 @@ where
     let (sb, ml, mu) = parcels.map_err(|err| err as Box<dyn std::error::Error>)?;
     let independent = independent.map_err(|err| err as Box<dyn std::error::Error>)?;
 
-    if let Some(sb) = sb.as_ref() {
-        computed.sbcape_jkg = Some(sb.cape_jkg.clone());
-        computed.sbcin_jkg = Some(sb.cin_jkg.clone());
-        computed.sblcl_m = Some(sb.lcl_m.clone());
-    }
-    if let Some(ml) = ml.as_ref() {
-        computed.mlcape_jkg = Some(ml.cape_jkg.clone());
-        computed.mlcin_jkg = Some(ml.cin_jkg.clone());
-    }
-    if let Some(mu) = mu.as_ref() {
-        computed.mucape_jkg = Some(mu.cape_jkg.clone());
-        computed.mucin_jkg = Some(mu.cin_jkg.clone());
-    }
     computed.dcape_jkg = independent.dcape_jkg;
 
     if let Some(surface_thermo) = independent.surface_thermo {
@@ -466,30 +483,10 @@ where
     let srh_01km_m2s2 = independent.srh_01km_m2s2;
     let srh_03km_m2s2 = independent.srh_03km_m2s2;
 
-    if let Some(values) = shear_01km_ms {
-        computed.shear_01km_kt = Some(
-            values
-                .into_iter()
-                .map(|value| value * KNOTS_PER_MS)
-                .collect(),
-        );
-    }
-    if let Some(values) = shear_06km_ms.as_ref() {
-        computed.shear_06km_kt = Some(
-            values
-                .iter()
-                .copied()
-                .map(|value| value * KNOTS_PER_MS)
-                .collect(),
-        );
-    }
-    if let Some(values) = srh_01km_m2s2.as_ref() {
-        computed.srh_01km_m2s2 = Some(values.clone());
-    }
-    if let Some(values) = srh_03km_m2s2.as_ref() {
-        computed.srh_03km_m2s2 = Some(values.clone());
-    }
-
+    // Composites first — they borrow the parcel and wind locals. The
+    // locals then MOVE into `computed` below; the historical order cloned
+    // ~150 MB of grids it was about to move anyway. Same kernels, same
+    // call order, same values.
     if requirements.ehi_01km {
         let sb = require_option_ref(&sb, "surface-based CAPE/CIN outputs for EHI 0-1 km")?;
         let srh_01km = require_option_ref(&srh_01km_m2s2, "0-1 km SRH for EHI 0-1 km")?;
@@ -523,6 +520,40 @@ where
             shear_06km,
         )?);
     }
+
+    // Move the parcel and wind outputs into `computed` (values unchanged;
+    // the kt conversions apply the same per-element scale as before).
+    if let Some(sb) = sb {
+        computed.sbcape_jkg = Some(sb.cape_jkg);
+        computed.sbcin_jkg = Some(sb.cin_jkg);
+        computed.sblcl_m = Some(sb.lcl_m);
+    }
+    if let Some(ml) = ml {
+        computed.mlcape_jkg = Some(ml.cape_jkg);
+        computed.mlcin_jkg = Some(ml.cin_jkg);
+    }
+    if let Some(mu) = mu {
+        computed.mucape_jkg = Some(mu.cape_jkg);
+        computed.mucin_jkg = Some(mu.cin_jkg);
+    }
+    if let Some(values) = shear_01km_ms {
+        computed.shear_01km_kt = Some(
+            values
+                .into_iter()
+                .map(|value| value * KNOTS_PER_MS)
+                .collect(),
+        );
+    }
+    if let Some(values) = shear_06km_ms {
+        computed.shear_06km_kt = Some(
+            values
+                .into_iter()
+                .map(|value| value * KNOTS_PER_MS)
+                .collect(),
+        );
+    }
+    computed.srh_01km_m2s2 = srh_01km_m2s2;
+    computed.srh_03km_m2s2 = srh_03km_m2s2;
 
     Ok(computed)
 }

@@ -72,10 +72,16 @@ pub enum IngestEvent {
     },
     /// Historical stdout line (e.g. the heavy per-kernel breakdown, the
     /// verify-ok line, profile-skip notes).
-    Info { hour: u16, message: String },
+    Info {
+        hour: u16,
+        message: String,
+    },
     /// Historical stderr line (missing-plane skips, fallbacks, degraded
     /// stages).
-    Warning { hour: u16, message: String },
+    Warning {
+        hour: u16,
+        message: String,
+    },
 }
 
 /// The sink the bins use: print `Info` to stdout and `Warning` to stderr,

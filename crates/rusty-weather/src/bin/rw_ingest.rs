@@ -27,6 +27,51 @@ use rw_ingest::{IngestConfig, NEVER_CANCEL, cache_state, parse_hours, print_even
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// `mi_option_purge_delay` from mimalloc's option enum — libmimalloc-sys
+/// 0.1.49 does not re-export this constant (its named options stop at
+/// v1.x-era names), but the linked mimalloc honors it; the neighbors it
+/// DOES export pin the numbering (eager_commit_delay = 14,
+/// use_numa_nodes = 16).
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+/// mimalloc's default purge delay (ms), restored around the heavy stage.
+const MI_DEFAULT_PURGE_DELAY_MS: std::ffi::c_long = 10;
+
+/// Decommit freed segments immediately instead of after mimalloc's default
+/// 10 ms batched purge delay. The ingest extract/decode/encode stages free
+/// and commit hundreds of MB per second; with the delay, the measured peak
+/// working set ran ~1.3 GB ABOVE the live set purely from purge lag
+/// (verified: MIMALLOC_PURGE_DELAY=0 cut a full-profile f006 ingest peak
+/// from ~5.2 GB to ~3.9 GB at identical wall time). Values and output
+/// bytes are unaffected — this only changes when freed pages return to
+/// the OS.
+fn disable_mimalloc_purge_delay() {
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) };
+}
+
+/// The one stage that WANTS purge batching is the heavy ECAPE pass: its
+/// kernels churn page-spanning per-column scratch across every rayon
+/// thread for minutes, and eager decommit turned that churn into a
+/// measured +25% on the triplet wall (92.5 s -> 115.4 s). Restore the
+/// default delay for exactly that window (its live set sits ~3.4 GB, far
+/// under the gate, so the lag is harmless there) and drop back to eager
+/// purge for everything else.
+fn progress_with_purge_policy(event: rw_ingest::IngestEvent) {
+    match &event {
+        rw_ingest::IngestEvent::StageStarted {
+            stage: rw_ingest::IngestStage::Heavy,
+            ..
+        } => unsafe {
+            libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, MI_DEFAULT_PURGE_DELAY_MS)
+        },
+        rw_ingest::IngestEvent::StageDone {
+            stage: rw_ingest::IngestStage::Heavy,
+            ..
+        } => unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) },
+        _ => {}
+    }
+    print_event(event);
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "rw-ingest",
@@ -130,6 +175,7 @@ fn profile_from_args(args: &Args) -> Result<IngestProfile, String> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    disable_mimalloc_purge_delay();
     let args = Args::parse();
     // Scheduling policy must land before anything touches rayon (the
     // global pool is built lazily on first use and cannot be resized).
@@ -149,16 +195,16 @@ fn calibration_paths(args: &Args, model_slug: &str) -> Vec<PathBuf> {
         }
         match std::fs::read_dir(from) {
             Ok(entries) => {
-                hour_files.extend(entries.flatten().map(|entry| entry.path()).filter(
-                    |path| path.extension().is_some_and(|ext| ext == "rws"),
-                ));
+                hour_files.extend(
+                    entries
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .filter(|path| path.extension().is_some_and(|ext| ext == "rws")),
+                );
             }
             Err(err) => {
                 // An explicit flag must fail loudly, not fall back silently.
-                eprintln!(
-                    "error: --calibrate-from {}: {err}",
-                    from.display()
-                );
+                eprintln!("error: --calibrate-from {}: {err}", from.display());
                 std::process::exit(1);
             }
         }
@@ -200,7 +246,11 @@ fn print_estimate(
     };
     let estimate = estimate(profile, args.model, hour_count, &calibration);
 
-    println!("estimate: profile {} ({})", args.profile, profile.describe());
+    println!(
+        "estimate: profile {} ({})",
+        args.profile,
+        profile.describe()
+    );
     println!("calibration: {}", calibration.source);
     println!();
     println!("{:<36} {:>12}", "variable (per hour)", "compressed");
@@ -219,7 +269,10 @@ fn print_estimate(
                 mb(calibration.sfc_file_bytes)
             )
         } else {
-            format!("sfc {:.1} MB full file only", mb(calibration.sfc_file_bytes))
+            format!(
+                "sfc {:.1} MB full file only",
+                mb(calibration.sfc_file_bytes)
+            )
         },
     );
     println!(
@@ -278,7 +331,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         run_slug: &run_slug,
         profile: &profile,
         verify: args.verify,
-        progress: &print_event,
+        progress: &progress_with_purge_policy,
         cancel: &NEVER_CANCEL,
     };
     for &hour in &hours {
@@ -346,10 +399,14 @@ mod tests {
     fn default_profile_is_full_with_heavy_on_and_no_heavy_turns_it_off() {
         let args = Args::try_parse_from(BASE).expect("default args parse");
         let profile = profile_from_args(&args).expect("default profile resolves");
-        assert_eq!(profile, IngestProfile::full(), "default must be today's behavior");
+        assert_eq!(
+            profile,
+            IngestProfile::full(),
+            "default must be today's behavior"
+        );
 
-        let explicit = Args::try_parse_from(BASE.iter().copied().chain(["--heavy"]))
-            .expect("--heavy parses");
+        let explicit =
+            Args::try_parse_from(BASE.iter().copied().chain(["--heavy"])).expect("--heavy parses");
         assert!(profile_from_args(&explicit).expect("resolves").heavy);
 
         let off = Args::try_parse_from(BASE.iter().copied().chain(["--no-heavy"]))
@@ -366,22 +423,24 @@ mod tests {
 
     #[test]
     fn profile_flags_compose() {
-        let args = Args::try_parse_from(
-            BASE.iter()
-                .copied()
-                .chain(["--profile", "sounding", "--level-step", "50"]),
-        )
+        let args = Args::try_parse_from(BASE.iter().copied().chain([
+            "--profile",
+            "sounding",
+            "--level-step",
+            "50",
+        ]))
         .expect("sounding @ 50 parses");
         let profile = profile_from_args(&args).expect("resolves");
         assert_eq!(profile.level_step_hpa, 50);
         assert!(!profile.derived && !profile.heavy);
 
-        let args = Args::try_parse_from(
-            BASE.iter()
-                .copied()
-                .chain(["--profile", "sounding", "--heavy"]),
-        )
-        .expect("parses; validation rejects");
+        let args =
+            Args::try_parse_from(
+                BASE.iter()
+                    .copied()
+                    .chain(["--profile", "sounding", "--heavy"]),
+            )
+            .expect("parses; validation rejects");
         let message = profile_from_args(&args).unwrap_err();
         assert!(message.contains("named surface subset"), "got: {message}");
 
@@ -392,17 +451,22 @@ mod tests {
 
         let args = Args::try_parse_from(BASE.iter().copied().chain(["--profile", "bogus"]))
             .expect("parses; validation rejects");
-        assert!(profile_from_args(&args).unwrap_err().contains("unknown preset"));
+        assert!(
+            profile_from_args(&args)
+                .unwrap_err()
+                .contains("unknown preset")
+        );
     }
 
     #[test]
     fn estimate_flag_parses_with_profile_flags() {
-        let args = Args::try_parse_from(BASE.iter().copied().chain([
-            "--estimate",
-            "--profile",
-            "view",
-        ]))
-        .expect("--estimate parses");
+        let args =
+            Args::try_parse_from(
+                BASE.iter()
+                    .copied()
+                    .chain(["--estimate", "--profile", "view"]),
+            )
+            .expect("--estimate parses");
         assert!(args.estimate);
         assert_eq!(args.profile, "view");
     }

@@ -40,23 +40,59 @@ mod render_all;
 use clap::{Parser, ValueEnum};
 use contour_mode::ContourModeArg;
 use region::RegionPreset;
-use rw_ingest::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile};
-use rw_ingest::throttle;
-use rw_ingest::{
-    FetchedHour, IngestConfig, IngestedHour, NEVER_CANCEL, cache_state, parse_hours, print_event,
-};
 use render_all::{StoreFieldSource, StoreRenderConfig, StoreRenderSkip};
 use rustwx_core::{CycleSpec, ModelId, SourceId};
 use rustwx_models::model_summary;
 use rustwx_products::cache::{default_proof_cache_dir, ensure_dir};
 use rustwx_products::places::{PlaceLabelDensityTier, default_place_label_overlay_for_domain};
 use rustwx_products::shared_context::DomainSpec;
+use rw_ingest::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile};
+use rw_ingest::throttle;
+use rw_ingest::{
+    FetchedHour, IngestConfig, IngestedHour, NEVER_CANCEL, cache_state, parse_hours, print_event,
+};
 
 /// The derived CAPE kernels allocate per-column scratch across every rayon
 /// thread; mimalloc handles that churn better than the default Windows heap
 /// (measured ~10% on the derived stage and ~15% on GRIB extraction).
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// `mi_option_purge_delay` in mimalloc's option enum (libmimalloc-sys
+/// 0.1.49 exports the neighbors: eager_commit_delay = 14,
+/// use_numa_nodes = 16).
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+/// mimalloc's default purge delay (ms), restored around the heavy stage.
+const MI_DEFAULT_PURGE_DELAY_MS: std::ffi::c_long = 10;
+
+/// Decommit freed segments immediately instead of after mimalloc's default
+/// 10 ms batched purge delay — see the matching helper in `rw_ingest.rs`:
+/// purge lag inflated the measured ingest peak working set ~1.3 GB above
+/// the live set at identical wall time.
+fn disable_mimalloc_purge_delay() {
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) };
+}
+
+/// Restore the default purge batching for exactly the heavy ECAPE window
+/// (whose per-column scratch churn measured +25% wall under eager purge;
+/// its live set sits far below the memory envelope) — see the matching
+/// helper in `rw_ingest.rs`.
+fn progress_with_purge_policy(event: rw_ingest::IngestEvent) {
+    match &event {
+        rw_ingest::IngestEvent::StageStarted {
+            stage: rw_ingest::IngestStage::Heavy,
+            ..
+        } => unsafe {
+            libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, MI_DEFAULT_PURGE_DELAY_MS)
+        },
+        rw_ingest::IngestEvent::StageDone {
+            stage: rw_ingest::IngestStage::Heavy,
+            ..
+        } => unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) },
+        _ => {}
+    }
+    print_event(event);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
@@ -233,6 +269,7 @@ fn static_output_dimension(name: &str, fallback: u32) -> u32 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    disable_mimalloc_purge_delay();
     let args = Args::parse();
     // Scheduling policy must land before anything touches rayon (the
     // global pool is built lazily on first use and cannot be resized).
@@ -258,7 +295,11 @@ fn ms_distribution(timings: &[u128]) -> (u128, u128, u128) {
     }
     let mut sorted = timings.to_vec();
     sorted.sort_unstable();
-    (sorted[0], sorted[sorted.len() / 2], sorted[sorted.len() - 1])
+    (
+        sorted[0],
+        sorted[sorted.len() / 2],
+        sorted[sorted.len() - 1],
+    )
 }
 
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -328,7 +369,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         run_slug: &run_slug,
         profile: &profile,
         verify: false,
-        progress: &print_event,
+        progress: &progress_with_purge_policy,
         cancel: &NEVER_CANCEL,
     };
     let render_config = StoreRenderConfig {
@@ -350,8 +391,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // --- the pipeline: fetch thread -> ingest thread -> render (main) ---
-    let pipeline: Result<(Vec<HourReport>, Option<StoreFieldSource>), String> =
-        std::thread::scope(|scope| {
+    let pipeline: Result<(Vec<HourReport>, Option<StoreFieldSource>), String> = std::thread::scope(
+        |scope| {
             // Raw bytes are ~575 MB/hour warm; capacity 1 bounds resident
             // raw-byte sets to <= 3 (fetching + queued + ingesting).
             let (fetched_tx, fetched_rx) =
@@ -389,8 +430,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                             let cpu_started = process_cpu_ms();
                             match rw_ingest::process_fetched_hour(process_config, fetched) {
                                 Ok(ingested) => {
-                                    let ingest_cpu =
-                                        process_cpu_ms().saturating_sub(cpu_started);
+                                    let ingest_cpu = process_cpu_ms().saturating_sub(cpu_started);
                                     if ingested_tx
                                         .send(Ok((ingested, fetch_cpu, ingest_cpu)))
                                         .is_err()
@@ -399,8 +439,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 Err(err) => {
-                                    let _ = ingested_tx
-                                        .send(Err(format!("f{hour:03}: ingest: {err}")));
+                                    let _ =
+                                        ingested_tx.send(Err(format!("f{hour:03}: ingest: {err}")));
                                     return;
                                 }
                             }
@@ -446,9 +486,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 );
 
                 let open_started = Instant::now();
-                let store =
-                    StoreFieldSource::open(&args.store_root, &model_slug, &run_slug, hour)
-                        .map_err(|err| format!("f{hour:03}: open store hour: {err}"))?;
+                let store = StoreFieldSource::open(&args.store_root, &model_slug, &run_slug, hour)
+                    .map_err(|err| format!("f{hour:03}: open store hour: {err}"))?;
                 let open_ms = open_started.elapsed().as_millis();
                 let render_started = Instant::now();
                 let render_cpu_started = process_cpu_ms();
@@ -507,7 +546,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 last_store = Some(store);
             }
             Ok((reports, last_store))
-        });
+        },
+    );
     let (reports, last_store) = pipeline?;
 
     // --- windowed products: after the last hour lands (they need all) ---
@@ -580,8 +620,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // --- totals + manifest ---
     let total_wall_ms = total_started.elapsed().as_millis();
     let total_cpu_ms = process_cpu_ms().saturating_sub(total_cpu_started);
-    let sum =
-        |field: fn(&HourReport) -> u128| -> u128 { reports.iter().map(field).sum() };
+    let sum = |field: fn(&HourReport) -> u128| -> u128 { reports.iter().map(field).sum() };
     let fetch_total = sum(|report| report.ingested.prs_fetch_ms + report.ingested.sfc_fetch_ms);
     let extract_total =
         sum(|report| report.ingested.prs_extract_ms + report.ingested.sfc_extract_ms);
@@ -590,10 +629,16 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let heavy_total = sum(|report| report.ingested.heavy_ms);
     let encode_total = sum(|report| report.ingested.write_ms);
     let render_total = sum(|report| report.render_ms);
-    let rendered_total: usize =
-        reports.iter().map(|report| report.rendered.len()).sum::<usize>() + windowed_rendered;
-    let skipped_total: usize =
-        reports.iter().map(|report| report.skipped.len()).sum::<usize>() + windowed_blocked.len();
+    let rendered_total: usize = reports
+        .iter()
+        .map(|report| report.rendered.len())
+        .sum::<usize>()
+        + windowed_rendered;
+    let skipped_total: usize = reports
+        .iter()
+        .map(|report| report.skipped.len())
+        .sum::<usize>()
+        + windowed_blocked.len();
 
     println!("per-hour stage walls (ms):");
     println!("  hour   fetch  extract  thermo  derived   heavy  encode  render");
@@ -743,13 +788,7 @@ mod tests {
     #[test]
     fn default_profile_is_full_and_heavy_flags_map_onto_it() {
         let base = [
-            "rw-batch",
-            "--date",
-            "20260608",
-            "--cycle",
-            "0",
-            "--hours",
-            "4-6",
+            "rw-batch", "--date", "20260608", "--cycle", "0", "--hours", "4-6",
         ];
         let args = Args::try_parse_from(base).expect("default args parse");
         let profile = profile_from_args(&args).expect("default profile resolves");
@@ -765,11 +804,12 @@ mod tests {
             Args::try_parse_from(base.iter().copied().chain(["--heavy", "--no-heavy"])).is_err(),
             "--heavy and --no-heavy must conflict"
         );
-        let sounding = Args::try_parse_from(
-            base.iter()
-                .copied()
-                .chain(["--profile", "sounding", "--level-step", "50"]),
-        )
+        let sounding = Args::try_parse_from(base.iter().copied().chain([
+            "--profile",
+            "sounding",
+            "--level-step",
+            "50",
+        ]))
         .expect("sounding @ 50 parses");
         let profile = profile_from_args(&sounding).expect("resolves");
         assert_eq!(profile.level_step_hpa, 50);

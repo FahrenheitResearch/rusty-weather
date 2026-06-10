@@ -126,7 +126,11 @@ pub fn encode_affine_i16(values: &[f32]) -> RwResult<EncodedChunk> {
         payload.extend_from_slice(&q.to_le_bytes());
     }
 
-    let flags = if scan.has_missing { FLAG_HAS_MISSING } else { 0 };
+    let flags = if scan.has_missing {
+        FLAG_HAS_MISSING
+    } else {
+        0
+    };
     Ok(EncodedChunk {
         flags,
         center,
@@ -208,7 +212,11 @@ pub fn encode_f32_tile(values: &[f32]) -> EncodedChunk {
         payload.extend_from_slice(&value.to_le_bytes());
     }
 
-    let flags = if scan.has_missing { FLAG_HAS_MISSING } else { 0 };
+    let flags = if scan.has_missing {
+        FLAG_HAS_MISSING
+    } else {
+        0
+    };
     EncodedChunk {
         flags,
         center: 0.5 * (scan.valid_min + scan.valid_max),
@@ -405,9 +413,13 @@ mod tests {
             .flat_map(|value| value.to_le_bytes())
             .collect();
         assert_eq!(encoded.payload, expected_payload);
-        let decoded =
-            decode_f32_tile(encoded.flags, encoded.center, &encoded.payload, values.len())
-                .unwrap();
+        let decoded = decode_f32_tile(
+            encoded.flags,
+            encoded.center,
+            &encoded.payload,
+            values.len(),
+        )
+        .unwrap();
         assert_eq!(decoded.len(), values.len());
         for (source, round_trip) in values.iter().zip(decoded.iter()) {
             assert_eq!(source.to_bits(), round_trip.to_bits());
@@ -432,9 +444,13 @@ mod tests {
             0,
             "a non-constant tile must not take the constant shortcut"
         );
-        let decoded =
-            decode_f32_tile(encoded.flags, encoded.center, &encoded.payload, values.len())
-                .unwrap();
+        let decoded = decode_f32_tile(
+            encoded.flags,
+            encoded.center,
+            &encoded.payload,
+            values.len(),
+        )
+        .unwrap();
         for (source, round_trip) in values.iter().zip(decoded.iter()) {
             assert_eq!(source.to_bits(), round_trip.to_bits());
         }
@@ -447,9 +463,13 @@ mod tests {
         let encoded = encode_f32_tile(&constant);
         assert_eq!(encoded.flags, FLAG_CONSTANT);
         assert!(encoded.payload.is_empty());
-        let decoded =
-            decode_f32_tile(encoded.flags, encoded.center, &encoded.payload, constant.len())
-                .unwrap();
+        let decoded = decode_f32_tile(
+            encoded.flags,
+            encoded.center,
+            &encoded.payload,
+            constant.len(),
+        )
+        .unwrap();
         assert_eq!(decoded, constant);
 
         // Empty: all NaN in, all NaN out, no payload.
@@ -458,8 +478,7 @@ mod tests {
         assert_eq!(encoded.flags, FLAG_EMPTY);
         assert!(encoded.payload.is_empty());
         let decoded =
-            decode_f32_tile(encoded.flags, encoded.center, &encoded.payload, empty.len())
-                .unwrap();
+            decode_f32_tile(encoded.flags, encoded.center, &encoded.payload, empty.len()).unwrap();
         assert!(decoded.iter().all(|value| value.is_nan()));
 
         // Constant with missing: dense-encoded raw f32 with NaNs inline.

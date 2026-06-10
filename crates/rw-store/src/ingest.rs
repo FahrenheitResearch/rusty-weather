@@ -11,13 +11,14 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rustwx_core::{GridProjection, GridShape, LatLonGrid, SelectedField2D};
 
+use crate::atomic::atomic_write_bytes;
 use crate::error::{RwResult, RwStoreError};
 use crate::format::RwsWriterInfo;
-use crate::grid::{GridFile, write_grid};
+use crate::grid::{GridFile, encode_grid_bytes};
 use crate::reader::HourReader;
 use crate::run::{RwsHourEntry, RwsRunManifest};
 use crate::writer::HourWriter;
@@ -189,133 +190,288 @@ pub fn write_hour_from_fields_with_derived(
             )));
         }
     }
-    // Sort each volume's levels descending (planes follow their levels) and
-    // reject duplicates and wrong-sized planes up front.
-    let mut sorted_volumes = Vec::with_capacity(volumes.len());
-    for volume in volumes {
-        let mut levels = volume.levels.clone();
-        levels.sort_by(|a, b| b.0.cmp(&a.0));
-        if let Some(pair) = levels.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-            return Err(RwStoreError::Format(format!(
-                "volume '{}': duplicate level {} hPa",
-                volume.name, pair[0].0
-            )));
-        }
-        for (level, plane) in &levels {
-            if plane.len() != cells {
-                return Err(RwStoreError::Format(format!(
-                    "volume '{}' level {level} hPa: plane holds {} values, \
-                     expected {cells} ({ny} x {nx})",
-                    volume.name,
-                    plane.len()
-                )));
-            }
-        }
-        sorted_volumes.push((volume, levels));
-    }
+    // Volume validation (level sort, duplicate levels, plane sizes) happens
+    // in HourIngestWriter::add_volume below, with the same error messages.
 
-    let run_dir = store_root.join(model).join(run);
-    fs::create_dir_all(&run_dir)?;
-
-    // grid.rwg: write once from the first 2D field; afterwards every hour
-    // must match it bit-for-bit (full coordinate compare, once per write).
-    let grid_path = run_dir.join("grid.rwg");
-    let grid_hash = if grid_path.exists() {
-        let existing = GridFile::open(&grid_path)?;
-        if (existing.nx, existing.ny) != (nx, ny) {
-            return Err(RwStoreError::Meta(format!(
-                "existing grid.rwg holds a {}x{} grid, but the input fields are on {nx}x{ny}",
-                existing.nx, existing.ny
-            )));
-        }
-        let coords_match = existing
-            .lat
-            .iter()
-            .zip(&reference.lat_deg)
-            .all(|(a, b)| a.to_bits() == b.to_bits())
-            && existing
-                .lon
-                .iter()
-                .zip(&reference.lon_deg)
-                .all(|(a, b)| a.to_bits() == b.to_bits());
-        if !coords_match {
-            return Err(RwStoreError::Meta(format!(
-                "existing grid.rwg ({}) and the input grid have the same {nx}x{ny} dims \
-                 but different coordinates",
-                existing.hash
-            )));
-        }
-        existing.hash
-    } else {
-        write_grid(&grid_path, reference, first.projection.as_ref())?
-    };
-
-    // Encode and write the hour file; encode_ms is a duration (Instant), not
-    // a stored wall timestamp, so the no-clock rule does not apply to it.
-    let started = Instant::now();
-    let mut writer = HourWriter::new(model, run, forecast_hour, nx, ny, &grid_hash, writer_build);
-    let mut vars = Vec::with_capacity(fields_2d.len() + derived_2d.len() + volumes.len());
+    let mut writer = HourIngestWriter::begin(
+        store_root,
+        model,
+        run,
+        forecast_hour,
+        reference,
+        first.projection.as_ref(),
+        writer_build,
+    )?;
     for (name, field) in fields_2d {
         let selector = serde_json::to_value(field.selector).map_err(|err| {
             RwStoreError::Meta(format!("2D field '{name}': selector JSON: {err}"))
         })?;
-        writer.add_surface2d(name, &field.units, selector, &field.values)?;
-        vars.push((*name).to_string());
+        writer.add_field_2d(name, &field.units, selector, &field.values)?;
     }
     for derived in derived_2d {
-        writer.add_surface2d(
-            derived.name,
-            derived.units,
-            derived_selector(derived.name),
-            derived.values,
-        )?;
-        vars.push(derived.name.to_string());
+        writer.add_derived_2d(derived.name, derived.units, derived.values)?;
     }
-    for (volume, levels) in &sorted_volumes {
-        let levels_hpa: Vec<u16> = levels.iter().map(|(level, _)| *level).collect();
-        let planes: Vec<&[f32]> = levels.iter().map(|(_, plane)| *plane).collect();
-        writer.add_pressure3d(
+    for volume in volumes {
+        writer.add_volume(
             volume.name,
             volume.units,
             volume.selector_template.clone(),
+            &volume.levels,
+        )?;
+    }
+    writer.finish(written_unix)
+}
+
+/// Incremental per-hour ingest writer: the staged seam behind
+/// [`write_hour_from_fields_with_derived`], also driven directly by the
+/// store-ingest flow so extracted planes can be encoded (and their raw f32
+/// buffers freed) BEFORE the derived/heavy compute stages run.
+///
+/// Output bytes are identical to the historical one-shot write:
+/// * 2D fields and derived grids take ids in add order;
+/// * volumes added through [`Self::add_volume`] are encoded immediately but
+///   numbered AFTER every 2D variable at finish (deferred ids), preserving
+///   the historical `fields, derived, heavy, volumes` order no matter when
+///   they are added;
+/// * encoded chunk payloads spill to a temp file next to the hour file, and
+///   `finish()` streams them into the atomic temp instead of assembling the
+///   whole hour in memory;
+/// * `grid.rwg` is validated against any existing file at `begin()` (same
+///   errors as before) and, when absent, its byte image is precomputed at
+///   `begin()` and written at `finish()` just before the hour file.
+pub struct HourIngestWriter {
+    run_dir: PathBuf,
+    grid_hash: String,
+    /// The `.rwg` image to write at finish when no grid.rwg exists yet.
+    pending_grid: Option<Vec<u8>>,
+    nx: usize,
+    ny: usize,
+    cells: usize,
+    forecast_hour: u16,
+    model: String,
+    run: String,
+    writer_build: String,
+    writer: HourWriter,
+    vars_normal: Vec<String>,
+    vars_deferred: Vec<String>,
+    encode_elapsed: Duration,
+}
+
+impl HourIngestWriter {
+    /// Open the run directory, settle the grid identity (validate an
+    /// existing `grid.rwg` bit-for-bit or stage a new one), and start the
+    /// hour writer in spill mode.
+    pub fn begin(
+        store_root: &Path,
+        model: &str,
+        run: &str,
+        forecast_hour: u16,
+        grid: &LatLonGrid,
+        projection: Option<&GridProjection>,
+        writer_build: &str,
+    ) -> RwResult<Self> {
+        let (nx, ny) = (grid.shape.nx, grid.shape.ny);
+        let cells = grid.shape.len();
+        if grid.lat_deg.len() != cells || grid.lon_deg.len() != cells {
+            return Err(RwStoreError::Grid(format!(
+                "hour grid coordinate arrays must hold {cells} values ({ny} x {nx}), \
+                 got lat {} / lon {}",
+                grid.lat_deg.len(),
+                grid.lon_deg.len()
+            )));
+        }
+        let run_dir = store_root.join(model).join(run);
+        fs::create_dir_all(&run_dir)?;
+
+        // grid.rwg: written once from the hour grid; afterwards every hour
+        // must match it bit-for-bit (full coordinate compare, once per
+        // write). When absent, the byte image is staged here and written at
+        // finish() so a failed hour leaves no grid file behind.
+        let grid_path = run_dir.join("grid.rwg");
+        let (grid_hash, pending_grid) = if grid_path.exists() {
+            let existing = GridFile::open(&grid_path)?;
+            if (existing.nx, existing.ny) != (nx, ny) {
+                return Err(RwStoreError::Meta(format!(
+                    "existing grid.rwg holds a {}x{} grid, but the input fields are on {nx}x{ny}",
+                    existing.nx, existing.ny
+                )));
+            }
+            let coords_match = existing
+                .lat
+                .iter()
+                .zip(&grid.lat_deg)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+                && existing
+                    .lon
+                    .iter()
+                    .zip(&grid.lon_deg)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+            if !coords_match {
+                return Err(RwStoreError::Meta(format!(
+                    "existing grid.rwg ({}) and the input grid have the same {nx}x{ny} dims \
+                     but different coordinates",
+                    existing.hash
+                )));
+            }
+            (existing.hash, None)
+        } else {
+            let (bytes, hash) = encode_grid_bytes(grid, projection)?;
+            (hash, Some(bytes))
+        };
+
+        let writer = HourWriter::new(model, run, forecast_hour, nx, ny, &grid_hash, writer_build)
+            .with_spill_dir(&run_dir);
+        Ok(Self {
+            run_dir,
+            grid_hash,
+            pending_grid,
+            nx,
+            ny,
+            cells,
+            forecast_hour,
+            model: model.to_string(),
+            run: run.to_string(),
+            writer_build: writer_build.to_string(),
+            writer,
+            vars_normal: Vec::new(),
+            vars_deferred: Vec::new(),
+            encode_elapsed: Duration::ZERO,
+        })
+    }
+
+    /// Add one extracted 2D field (raw selector JSON), id in add order.
+    pub fn add_field_2d(
+        &mut self,
+        name: &str,
+        units: &str,
+        selector: serde_json::Value,
+        values: &[f32],
+    ) -> RwResult<()> {
+        let started = Instant::now();
+        self.writer.add_surface2d(name, units, selector, values)?;
+        self.encode_elapsed += started.elapsed();
+        self.vars_normal.push(name.to_string());
+        Ok(())
+    }
+
+    /// Add one ingest-computed derived 2D grid (selector = the
+    /// [`derived_selector`] marker), id in add order.
+    pub fn add_derived_2d(&mut self, name: &str, units: &str, values: &[f32]) -> RwResult<()> {
+        if values.len() != self.cells {
+            return Err(RwStoreError::Format(format!(
+                "derived 2D field '{name}': plane holds {} values, expected {} ({} x {})",
+                values.len(),
+                self.cells,
+                self.ny,
+                self.nx
+            )));
+        }
+        let started = Instant::now();
+        self.writer
+            .add_surface2d(name, units, derived_selector(name), values)?;
+        self.encode_elapsed += started.elapsed();
+        self.vars_normal.push(name.to_string());
+        Ok(())
+    }
+
+    /// Add one 3D pressure volume: encoded (and spilled) now, numbered
+    /// after every 2D variable at finish. Levels may arrive in any order
+    /// and are sorted descending, planes following their levels.
+    pub fn add_volume(
+        &mut self,
+        name: &str,
+        units: &str,
+        selector_template: serde_json::Value,
+        levels: &[(u16, &[f32])],
+    ) -> RwResult<()> {
+        let mut sorted: Vec<(u16, &[f32])> = levels.to_vec();
+        sorted.sort_by(|a, b| b.0.cmp(&a.0));
+        if let Some(pair) = sorted.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+            return Err(RwStoreError::Format(format!(
+                "volume '{name}': duplicate level {} hPa",
+                pair[0].0
+            )));
+        }
+        for (level, plane) in &sorted {
+            if plane.len() != self.cells {
+                return Err(RwStoreError::Format(format!(
+                    "volume '{name}' level {level} hPa: plane holds {} values, \
+                     expected {} ({} x {})",
+                    plane.len(),
+                    self.cells,
+                    self.ny,
+                    self.nx
+                )));
+            }
+        }
+        let levels_hpa: Vec<u16> = sorted.iter().map(|(level, _)| *level).collect();
+        let planes: Vec<&[f32]> = sorted.iter().map(|(_, plane)| *plane).collect();
+        let started = Instant::now();
+        self.writer.add_pressure3d_deferred(
+            name,
+            units,
+            selector_template,
             &levels_hpa,
             &planes,
         )?;
-        vars.push(volume.name.to_string());
+        self.encode_elapsed += started.elapsed();
+        self.vars_deferred.push(name.to_string());
+        Ok(())
     }
-    let file_name = format!("f{forecast_hour:03}.rws");
-    let hour_path = run_dir.join(&file_name);
-    writer.finish(&hour_path)?;
-    let encode_ms = started.elapsed().as_millis() as u64;
-    let bytes = fs::metadata(&hour_path)?.len();
 
-    // Register the hour in run.json last, so a failed write never appears
-    // in the manifest.
-    let manifest_path = run_dir.join("run.json");
-    let writer_info = RwsWriterInfo {
-        name: "rw-store".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        build: writer_build.to_string(),
-    };
-    let mut manifest =
-        RwsRunManifest::load_or_new(&manifest_path, model, run, &grid_hash, nx, ny, writer_info)?;
-    manifest.register_hour(
-        forecast_hour,
-        RwsHourEntry {
-            file: file_name,
-            written_unix,
+    /// Write `grid.rwg` (when newly staged), stream-assemble the hour file
+    /// atomically, and register the hour in `run.json` last so a failed
+    /// write never appears in the manifest.
+    pub fn finish(mut self, written_unix: u64) -> RwResult<WrittenHour> {
+        let file_name = format!("f{:03}.rws", self.forecast_hour);
+        let hour_path = self.run_dir.join(&file_name);
+
+        if let Some(bytes) = self.pending_grid.take() {
+            atomic_write_bytes(&self.run_dir.join("grid.rwg"), &bytes)?;
+        }
+
+        let started = Instant::now();
+        self.writer.finish(&hour_path)?;
+        self.encode_elapsed += started.elapsed();
+        let encode_ms = self.encode_elapsed.as_millis() as u64;
+        let bytes = fs::metadata(&hour_path)?.len();
+
+        let mut vars = self.vars_normal;
+        vars.extend(self.vars_deferred);
+
+        let manifest_path = self.run_dir.join("run.json");
+        let writer_info = RwsWriterInfo {
+            name: "rw-store".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            build: self.writer_build.clone(),
+        };
+        let mut manifest = RwsRunManifest::load_or_new(
+            &manifest_path,
+            &self.model,
+            &self.run,
+            &self.grid_hash,
+            self.nx,
+            self.ny,
+            writer_info,
+        )?;
+        manifest.register_hour(
+            self.forecast_hour,
+            RwsHourEntry {
+                file: file_name,
+                written_unix,
+                encode_ms,
+                variables: vars.clone(),
+            },
+        );
+        manifest.save(&manifest_path)?;
+
+        Ok(WrittenHour {
+            path: hour_path,
             encode_ms,
-            variables: vars.clone(),
-        },
-    );
-    manifest.save(&manifest_path)?;
-
-    Ok(WrittenHour {
-        path: hour_path,
-        encode_ms,
-        bytes,
-        vars,
-    })
+            bytes,
+            vars,
+        })
+    }
 }
 
 /// A stored 2D variable read back without interpreting its selector: the

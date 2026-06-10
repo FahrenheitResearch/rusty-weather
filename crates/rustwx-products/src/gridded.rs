@@ -2,7 +2,7 @@ use crate::cache::{load_bincode, store_bincode};
 use crate::direct::build_projected_map_with_projection;
 use crate::shared_context::PreparedProjectedContext;
 use grib_core::grib2::{
-    Grib2File, Grib2Message, flip_rows, grid_latlon,
+    Grib2File, Grib2Message, GridDefinition, flip_rows, grid_latlon,
     unpack_message_normalized as unpack_message_scan_normalized,
     unpack_message_scan_normalized_row_window,
 };
@@ -1116,12 +1116,27 @@ fn decode_pressure_with_shape_opts(
     include_optional: bool,
 ) -> Result<(PressureFields, usize, usize), Box<dyn std::error::Error>> {
     let file = Grib2File::from_bytes(bytes)?;
+    decode_pressure_file_with_shape_opts(file, include_optional)
+}
+
+/// Owned-bytes variant for the store-ingest lane: the raw pressure GRIB
+/// bytes are freed as soon as the parser has its own copy of every
+/// message, instead of staying resident through the whole decode. Same
+/// parse, same decode, byte-identical `PressureFields`.
+fn decode_pressure_with_shape_opts_owned(
+    bytes: Vec<u8>,
+    include_optional: bool,
+) -> Result<(PressureFields, usize, usize), Box<dyn std::error::Error>> {
+    let file = Grib2File::from_bytes(&bytes)?;
+    drop(bytes);
+    decode_pressure_file_with_shape_opts(file, include_optional)
+}
+
+fn decode_pressure_file_with_shape_opts(
+    mut file: Grib2File,
+    include_optional: bool,
+) -> Result<(PressureFields, usize, usize), Box<dyn std::error::Error>> {
     let (nx, ny) = pressure_grid_shape_from_messages(&file.messages)?;
-    let temperature = collect_levels(&file.messages, 0, 0, 0, 100)?;
-    let u_wind = collect_levels(&file.messages, 0, 2, 2, 100)?;
-    let v_wind = collect_levels(&file.messages, 0, 2, 3, 100)?;
-    let gh = decode_height_levels(&file.messages)?;
-    let moisture = decode_pressure_mixing_ratio_levels(&file.messages, &temperature)?;
     let omega = if include_optional {
         collect_optional_levels(&file.messages, 0, 2, 8, 100)?
     } else {
@@ -1158,33 +1173,32 @@ fn decode_pressure_with_shape_opts(
         None
     };
 
-    let levels = common_isobaric_levels(&temperature, &[&moisture, &u_wind, &v_wind, &gh]);
-    if levels.is_empty() {
-        return Err("pressure family had no common thermodynamic levels".into());
-    }
-    let aligned_levels = levels.clone();
+    // Every optional volume is decoded; from here on only the five
+    // required variables' messages are touched. Free the raw bytes of
+    // everything else (~60% of an HRRR prs file's parsed copy).
+    strip_unneeded_required_var_raws(&mut file.messages);
+
+    // The five required volumes decode by direct write: each matched
+    // message unpacks straight into its slot of a preallocated flat
+    // volume, so the per-level collections (one full extra copy of the
+    // f64 volumes, the measured global ingest peak) never exist. Level
+    // selection, fallback order and failure semantics replicate the
+    // collect-then-flatten lane exactly; see `decode_required_volumes`.
+    let decoded = decode_required_volumes(&file, nx, ny)?;
+    let levels = decoded.common_levels;
+    // The parsed Grib2File (each message owns a copy of its raw bytes) is
+    // not consulted past this point; free it before the optional flatten.
+    drop(file);
 
     let expected = nx * ny;
-    let flatten = |records: &Vec<(f64, Vec<f64>)>| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
-        let mut out = Vec::with_capacity(levels.len() * expected);
-        for &level in &levels {
-            let values = level_values(records, level)
-                .ok_or_else(|| format!("missing aligned pressure level {level}"))?;
-            if values.len() != expected {
-                return Err("decoded pressure field had unexpected grid size".into());
-            }
-            out.extend_from_slice(values);
-        }
-        Ok(out)
-    };
     let flatten_optional =
-        |records: &Option<Vec<(f64, Vec<f64>)>>| -> Result<Option<Vec<f64>>, Box<dyn std::error::Error>> {
-            let Some(records) = records.as_ref() else {
+        |records: Option<Vec<(f64, Vec<f64>)>>| -> Result<Option<Vec<f64>>, Box<dyn std::error::Error>> {
+            let Some(records) = records else {
                 return Ok(None);
             };
             let mut out = Vec::with_capacity(levels.len() * expected);
             for &level in &levels {
-                let Some(values) = level_values(records, level) else {
+                let Some(values) = level_values(&records, level) else {
                     return Ok(None);
                 };
                 if values.len() != expected {
@@ -1197,26 +1211,24 @@ fn decode_pressure_with_shape_opts(
 
     Ok((
         PressureFields {
-            pressure_levels_hpa: aligned_levels
-                .into_iter()
+            pressure_levels_hpa: levels
+                .iter()
+                .copied()
                 .map(normalize_pressure_level_hpa)
                 .collect(),
             pressure_3d_pa: None,
-            temperature_c_3d: flatten(&temperature)?
-                .into_iter()
-                .map(|value| value - 273.15)
-                .collect(),
-            qvapor_kgkg_3d: flatten(&moisture)?,
-            u_ms_3d: flatten(&u_wind)?,
-            v_ms_3d: flatten(&v_wind)?,
-            gh_m_3d: flatten(&gh)?,
-            omega_pa_s_3d: flatten_optional(&omega)?,
-            absolute_vorticity_s_3d: flatten_optional(&absolute_vorticity)?,
-            cloud_liquid_kgkg_3d: flatten_optional(&cloud_liquid)?,
-            cloud_ice_kgkg_3d: flatten_optional(&cloud_ice)?,
-            rain_kgkg_3d: flatten_optional(&rain)?,
-            snow_kgkg_3d: flatten_optional(&snow)?,
-            graupel_kgkg_3d: flatten_optional(&graupel)?,
+            temperature_c_3d: decoded.temperature_c_3d,
+            qvapor_kgkg_3d: decoded.qvapor_kgkg_3d,
+            u_ms_3d: decoded.u_ms_3d,
+            v_ms_3d: decoded.v_ms_3d,
+            gh_m_3d: decoded.gh_m_3d,
+            omega_pa_s_3d: flatten_optional(omega)?,
+            absolute_vorticity_s_3d: flatten_optional(absolute_vorticity)?,
+            cloud_liquid_kgkg_3d: flatten_optional(cloud_liquid)?,
+            cloud_ice_kgkg_3d: flatten_optional(cloud_ice)?,
+            rain_kgkg_3d: flatten_optional(rain)?,
+            snow_kgkg_3d: flatten_optional(snow)?,
+            graupel_kgkg_3d: flatten_optional(graupel)?,
         },
         nx,
         ny,
@@ -1344,12 +1356,17 @@ fn decode_pressure_cropped_with_shape(
     if levels.is_empty() {
         return Err("pressure family had no common thermodynamic levels".into());
     }
+    // See decode_pressure_with_shape_opts: free the parsed message copies
+    // before the flatten pass.
+    drop(file);
 
     let expected = crop.width() * crop.height();
-    let flatten = |records: &Vec<(f64, Vec<f64>)>| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    // Consuming flatten — identical values, per-variable collection drop
+    // (see decode_pressure_with_shape_opts).
+    let flatten = |records: Vec<(f64, Vec<f64>)>| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
         let mut out = Vec::with_capacity(levels.len() * expected);
         for &level in &levels {
-            let values = level_values(records, level)
+            let values = level_values(&records, level)
                 .ok_or_else(|| format!("missing aligned pressure level {level}"))?;
             if values.len() != expected {
                 return Err("decoded cropped pressure field had unexpected grid size".into());
@@ -1359,13 +1376,13 @@ fn decode_pressure_cropped_with_shape(
         Ok(out)
     };
     let flatten_optional =
-        |records: &Option<Vec<(f64, Vec<f64>)>>| -> Result<Option<Vec<f64>>, Box<dyn std::error::Error>> {
-            let Some(records) = records.as_ref() else {
+        |records: Option<Vec<(f64, Vec<f64>)>>| -> Result<Option<Vec<f64>>, Box<dyn std::error::Error>> {
+            let Some(records) = records else {
                 return Ok(None);
             };
             let mut out = Vec::with_capacity(levels.len() * expected);
             for &level in &levels {
-                let Some(values) = level_values(records, level) else {
+                let Some(values) = level_values(&records, level) else {
                     return Ok(None);
                 };
                 if values.len() != expected {
@@ -1386,21 +1403,21 @@ fn decode_pressure_cropped_with_shape(
         PressureFields {
             pressure_levels_hpa,
             pressure_3d_pa: None,
-            temperature_c_3d: flatten(&temperature)?
+            temperature_c_3d: flatten(temperature)?
                 .into_iter()
                 .map(|value| value - 273.15)
                 .collect(),
-            qvapor_kgkg_3d: flatten(&moisture)?,
-            u_ms_3d: flatten(&u_wind)?,
-            v_ms_3d: flatten(&v_wind)?,
-            gh_m_3d: flatten(&gh)?,
-            omega_pa_s_3d: flatten_optional(&omega)?,
-            absolute_vorticity_s_3d: flatten_optional(&absolute_vorticity)?,
-            cloud_liquid_kgkg_3d: flatten_optional(&cloud_liquid)?,
-            cloud_ice_kgkg_3d: flatten_optional(&cloud_ice)?,
-            rain_kgkg_3d: flatten_optional(&rain)?,
-            snow_kgkg_3d: flatten_optional(&snow)?,
-            graupel_kgkg_3d: flatten_optional(&graupel)?,
+            qvapor_kgkg_3d: flatten(moisture)?,
+            u_ms_3d: flatten(u_wind)?,
+            v_ms_3d: flatten(v_wind)?,
+            gh_m_3d: flatten(gh)?,
+            omega_pa_s_3d: flatten_optional(omega)?,
+            absolute_vorticity_s_3d: flatten_optional(absolute_vorticity)?,
+            cloud_liquid_kgkg_3d: flatten_optional(cloud_liquid)?,
+            cloud_ice_kgkg_3d: flatten_optional(cloud_ice)?,
+            rain_kgkg_3d: flatten_optional(rain)?,
+            snow_kgkg_3d: flatten_optional(snow)?,
+            graupel_kgkg_3d: flatten_optional(graupel)?,
         },
         crop.width(),
         crop.height(),
@@ -1632,55 +1649,6 @@ fn decode_surface_mixing_ratio_cropped(
     Err("missing 2m specific humidity/dewpoint/RH field for surface thermodynamics".into())
 }
 
-fn decode_pressure_mixing_ratio_levels(
-    messages: &[Grib2Message],
-    temperature: &Vec<(f64, Vec<f64>)>,
-) -> Result<Vec<(f64, Vec<f64>)>, Box<dyn std::error::Error>> {
-    if let Ok(levels) = collect_levels(messages, 0, 1, 0, 100) {
-        return Ok(levels
-            .into_iter()
-            .map(|(level, values)| (level, q_to_mixing_ratio(&values)))
-            .collect());
-    }
-    if let Ok(dewpoint) = collect_levels(messages, 0, 0, 6, 100) {
-        let mut out = Vec::with_capacity(dewpoint.len());
-        for (level, td_k) in dewpoint {
-            out.push((
-                level,
-                td_k.into_iter()
-                    .map(|td_k| {
-                        mixing_ratio_from_dewpoint_k(normalize_pressure_level_hpa(level), td_k)
-                    })
-                    .collect(),
-            ));
-        }
-        return Ok(out);
-    }
-    if let Ok(rh) = collect_levels(messages, 0, 1, 1, 100) {
-        let mut out = Vec::with_capacity(rh.len());
-        for (level, rh_pct) in rh {
-            let temperature_k = level_values(temperature, level)
-                .ok_or_else(|| format!("missing temperature level {level} for RH fallback"))?;
-            out.push((
-                level,
-                temperature_k
-                    .iter()
-                    .zip(rh_pct.iter())
-                    .map(|(&t_k, &rh)| {
-                        mixing_ratio_from_relative_humidity(
-                            normalize_pressure_level_hpa(level),
-                            t_k,
-                            rh,
-                        )
-                    })
-                    .collect(),
-            ));
-        }
-        return Ok(out);
-    }
-    Err("missing pressure-level specific humidity/dewpoint/RH field for thermodynamics".into())
-}
-
 fn decode_pressure_mixing_ratio_levels_cropped(
     messages: &[Grib2Message],
     temperature: &Vec<(f64, Vec<f64>)>,
@@ -1737,29 +1705,6 @@ fn decode_pressure_mixing_ratio_levels_cropped(
         return Ok(out);
     }
     Err("missing pressure-level specific humidity/dewpoint/RH field for thermodynamics".into())
-}
-
-fn decode_height_levels(
-    messages: &[Grib2Message],
-) -> Result<Vec<(f64, Vec<f64>)>, Box<dyn std::error::Error>> {
-    if let Ok(levels) = collect_levels(messages, 0, 3, 5, 100) {
-        return Ok(levels);
-    }
-    if let Ok(levels) = collect_levels(messages, 0, 3, 4, 100) {
-        return Ok(levels
-            .into_iter()
-            .map(|(level, values)| {
-                (
-                    level,
-                    values
-                        .into_iter()
-                        .map(|value| value * GEOPOTENTIAL_M2S2_TO_M)
-                        .collect(),
-                )
-            })
-            .collect());
-    }
-    Err("missing pressure-level height/geopotential field".into())
 }
 
 fn decode_height_levels_cropped(
@@ -1939,6 +1884,590 @@ fn collect_optional_levels_any_cropped(
     Ok(None)
 }
 
+// ---------------------------------------------------------------------------
+// Direct-write decode of the five required pressure volumes.
+//
+// The collect-then-flatten lane materialized every variable's per-level
+// collection AND its flattened volume — a full extra copy of the ~2.9 GB of
+// f64 inputs, the measured global peak of a store ingest, with an allocator
+// churn profile (~200 15 MB frees racing five 580 MB commits) that kept the
+// working set inflated well past the live set. This lane unpacks each
+// matched message straight into its slot of a preallocated flat volume.
+//
+// Semantics replicate the collect lane exactly:
+// * level records filter + stable sort descending == collect_levels;
+// * the common level set is computed from the level keys with the same
+//   0.25-tolerance first-match (values never affected which levels were
+//   common — only unpack FAILURES could, see below);
+// * EVERY filtered message of a chosen branch is unpacked (results outside
+//   the common set are discarded), so an unpack failure anywhere in a
+//   variable fails that variable exactly as collect_levels did: a hard
+//   error for temperature/u/v, branch fallback for gh (height ->
+//   geopotential) and moisture (q -> dewpoint -> RH) via the retry loop;
+// * per-element conversions (q/dewpoint/RH -> mixing ratio, geopotential
+//   -> height, K -> C) are the identical formulas applied at the identical
+//   per-record granularity.
+// ---------------------------------------------------------------------------
+
+/// The five required volumes plus the aligned (common) level set, in the
+/// exact values and order the collect-then-flatten lane produced.
+struct DecodedRequiredVolumes {
+    common_levels: Vec<f64>,
+    temperature_c_3d: Vec<f64>,
+    qvapor_kgkg_3d: Vec<f64>,
+    u_ms_3d: Vec<f64>,
+    v_ms_3d: Vec<f64>,
+    gh_m_3d: Vec<f64>,
+}
+
+/// `(level_value, message_index)` records for one variable: the same
+/// filter and the same stable descending sort as `collect_levels`, without
+/// unpacking anything.
+fn level_records(
+    messages: &[Grib2Message],
+    discipline: u8,
+    category: u8,
+    number: u8,
+    level_type: u8,
+) -> Vec<(f64, usize)> {
+    let mut records: Vec<(f64, usize)> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, msg)| {
+            msg.discipline == discipline
+                && msg.product.parameter_category == category
+                && msg.product.parameter_number == number
+                && msg.product.level_type == level_type
+        })
+        .map(|(index, msg)| (msg.product.level_value, index))
+        .collect();
+    records.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    records
+}
+
+/// First record within the same 0.25 tolerance `level_values` used.
+fn find_record(records: &[(f64, usize)], level: f64) -> Option<usize> {
+    records
+        .iter()
+        .position(|(candidate, _)| (candidate - level).abs() < 0.25)
+}
+
+fn missing_records_error(discipline: u8, category: u8, number: u8, level_type: u8) -> String {
+    format!(
+        "missing GRIB records for discipline={discipline} category={category} number={number} level_type={level_type}"
+    )
+}
+
+/// Free the raw payload (and bitmap) of every message the required-volume
+/// decode can never touch. Called after the optional volumes are decoded,
+/// so only the five variables' candidate messages keep their bytes
+/// (~40% of an HRRR prs file's parsed copy).
+fn strip_unneeded_required_var_raws(messages: &mut [Grib2Message]) {
+    const KEEP: [(u8, u8, u8); 8] = [
+        (0, 0, 0), // temperature
+        (0, 2, 2), // u wind
+        (0, 2, 3), // v wind
+        (0, 3, 5), // geopotential height
+        (0, 3, 4), // geopotential (height fallback)
+        (0, 1, 0), // specific humidity
+        (0, 0, 6), // dewpoint (moisture fallback)
+        (0, 1, 1), // relative humidity (moisture fallback)
+    ];
+    for msg in messages {
+        let keep = msg.product.level_type == 100
+            && KEEP.contains(&(
+                msg.discipline,
+                msg.product.parameter_category,
+                msg.product.parameter_number,
+            ));
+        if !keep {
+            msg.raw_data = Vec::new();
+            msg.bitmap = None;
+        }
+    }
+}
+
+/// Total-field grid-definition equality (f64 by bit pattern) — the gate
+/// for reusing one precomputed set of longitude row wraps across messages.
+fn grid_definitions_identical(a: &GridDefinition, b: &GridDefinition) -> bool {
+    a.template == b.template
+        && a.nx == b.nx
+        && a.ny == b.ny
+        && a.lat1.to_bits() == b.lat1.to_bits()
+        && a.lon1.to_bits() == b.lon1.to_bits()
+        && a.lat2.to_bits() == b.lat2.to_bits()
+        && a.lon2.to_bits() == b.lon2.to_bits()
+        && a.dx.to_bits() == b.dx.to_bits()
+        && a.dy.to_bits() == b.dy.to_bits()
+        && a.latin1.to_bits() == b.latin1.to_bits()
+        && a.latin2.to_bits() == b.latin2.to_bits()
+        && a.lov.to_bits() == b.lov.to_bits()
+        && a.scan_mode == b.scan_mode
+        && a.lad.to_bits() == b.lad.to_bits()
+        && a.projection_center_flag == b.projection_center_flag
+        && a.n_parallel == b.n_parallel
+        && a.south_pole_lat.to_bits() == b.south_pole_lat.to_bits()
+        && a.south_pole_lon.to_bits() == b.south_pole_lon.to_bits()
+        && a.rotation_angle.to_bits() == b.rotation_angle.to_bits()
+        && a.satellite_lat.to_bits() == b.satellite_lat.to_bits()
+        && a.satellite_lon.to_bits() == b.satellite_lon.to_bits()
+        && a.xp.to_bits() == b.xp.to_bits()
+        && a.yp.to_bits() == b.yp.to_bits()
+        && a.altitude.to_bits() == b.altitude.to_bits()
+        && a.pl == b.pl
+        && a.is_reduced == b.is_reduced
+        && a.num_data_points == b.num_data_points
+        && a.shape_of_earth == b.shape_of_earth
+        && a.resolution_flags == b.resolution_flags
+}
+
+/// The per-row rotate-left amounts `rotate_values_to_normalized_longitude_rows`
+/// derives from one grid definition (identical derivation: lat/lon from the
+/// grid, scan-0x40 row flip, per-row longitude normalization + first wrap).
+fn row_wraps_for_grid(grid: &GridDefinition) -> Vec<usize> {
+    let nx = grid.nx as usize;
+    let ny = grid.ny as usize;
+    let (_lat, mut lon) = grid_latlon(grid);
+    if grid.scan_mode & 0x40 != 0 {
+        flip_rows(&mut lon, nx, ny);
+    }
+    normalized_longitude_row_wraps(&mut lon, nx, ny)
+}
+
+/// One precomputed row-wrap set, valid for every message whose grid
+/// definition is bit-identical to the primed one (true for every message
+/// of a single-grid file like HRRR prs). Messages with a different grid
+/// fall back to the per-message derivation — never a wrong wrap.
+#[derive(Default)]
+struct RowWrapCache {
+    def: Option<GridDefinition>,
+    wraps: Vec<usize>,
+}
+
+impl RowWrapCache {
+    fn prime(&mut self, grid: &GridDefinition) {
+        if self
+            .def
+            .as_ref()
+            .map(|have| grid_definitions_identical(have, grid))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.wraps = row_wraps_for_grid(grid);
+        self.def = Some(grid.clone());
+    }
+
+    fn get(&self, grid: &GridDefinition) -> Option<&[usize]> {
+        match &self.def {
+            Some(have) if grid_definitions_identical(have, grid) => Some(&self.wraps),
+            _ => None,
+        }
+    }
+}
+
+/// `unpack_message_normalized` with the row-wrap derivation hoisted out:
+/// identical unpack, identical early-out, identical per-row rotation.
+fn unpack_message_normalized_cached(
+    message: &Grib2Message,
+    cache: &RowWrapCache,
+) -> Result<Vec<f64>, String> {
+    let mut values = unpack_message_scan_normalized(message).map_err(|err| err.to_string())?;
+    let nx = message.grid.nx as usize;
+    let ny = message.grid.ny as usize;
+    if nx == 0 || ny == 0 || values.len() != nx * ny {
+        return Ok(values);
+    }
+    match cache.get(&message.grid) {
+        Some(wraps) => rotate_value_rows_left(&mut values, nx, wraps),
+        None => {
+            let wraps = row_wraps_for_grid(&message.grid);
+            rotate_value_rows_left(&mut values, nx, &wraps);
+        }
+    }
+    Ok(values)
+}
+
+fn rotate_value_rows_left(values: &mut [f64], nx: usize, wraps: &[usize]) {
+    for (row, &wrap) in wraps.iter().enumerate() {
+        if wrap == 0 {
+            continue;
+        }
+        let start = row * nx;
+        values[start..start + nx].rotate_left(wrap);
+    }
+}
+
+/// Per-element conversion applied while a record's values are written into
+/// its volume slot — each is the exact formula the collect lane applied
+/// per level (temperature stays K here; the K -> C map runs on the whole
+/// volume afterwards, as the flatten lane did).
+enum RequiredConvert<'a> {
+    Identity,
+    GeopotentialToHeightM,
+    QToMixingRatio,
+    DewpointToMixingRatio,
+    RhToMixingRatio {
+        temperature_records: &'a [(f64, usize)],
+        temperature_volume_k: &'a [f64],
+        file: &'a Grib2File,
+    },
+}
+
+fn decode_required_volumes(
+    file: &Grib2File,
+    nx: usize,
+    ny: usize,
+) -> Result<DecodedRequiredVolumes, Box<dyn std::error::Error>> {
+    let expected = nx * ny;
+    // Branch-failure flags: an unpack failure inside a fallback-capable
+    // variable marks its branch failed and restarts the decode with the
+    // next branch — the exact outcome of collect_levels' Err falling
+    // through to the next `if let Ok(..)` arm.
+    let mut gh_height_failed = false;
+    let mut q_failed = false;
+    let mut dewpoint_failed = false;
+    let mut rh_failed = false;
+    let mut wrap_cache = RowWrapCache::default();
+    loop {
+        let temperature = level_records(&file.messages, 0, 0, 0, 100);
+        if temperature.is_empty() {
+            return Err(missing_records_error(0, 0, 0, 100).into());
+        }
+        let u_wind = level_records(&file.messages, 0, 2, 2, 100);
+        if u_wind.is_empty() {
+            return Err(missing_records_error(0, 2, 2, 100).into());
+        }
+        let v_wind = level_records(&file.messages, 0, 2, 3, 100);
+        if v_wind.is_empty() {
+            return Err(missing_records_error(0, 2, 3, 100).into());
+        }
+        let gh_height = if gh_height_failed {
+            Vec::new()
+        } else {
+            level_records(&file.messages, 0, 3, 5, 100)
+        };
+        let (gh_records, gh_is_height_branch) = if !gh_height.is_empty() {
+            (gh_height, true)
+        } else {
+            let gh_geo = level_records(&file.messages, 0, 3, 4, 100);
+            if gh_geo.is_empty() {
+                return Err("missing pressure-level height/geopotential field".into());
+            }
+            (gh_geo, false)
+        };
+        #[derive(Clone, Copy, PartialEq)]
+        enum MoistureBranch {
+            Q,
+            Dewpoint,
+            Rh,
+        }
+        let (moisture_records, moisture_branch) = {
+            let q = if q_failed {
+                Vec::new()
+            } else {
+                level_records(&file.messages, 0, 1, 0, 100)
+            };
+            if !q.is_empty() {
+                (q, MoistureBranch::Q)
+            } else {
+                let dewpoint = if dewpoint_failed {
+                    Vec::new()
+                } else {
+                    level_records(&file.messages, 0, 0, 6, 100)
+                };
+                if !dewpoint.is_empty() {
+                    (dewpoint, MoistureBranch::Dewpoint)
+                } else {
+                    let rh = if rh_failed {
+                        Vec::new()
+                    } else {
+                        level_records(&file.messages, 0, 1, 1, 100)
+                    };
+                    if !rh.is_empty() {
+                        (rh, MoistureBranch::Rh)
+                    } else {
+                        return Err(
+                            "missing pressure-level specific humidity/dewpoint/RH field \
+                             for thermodynamics"
+                                .into(),
+                        );
+                    }
+                }
+            }
+        };
+        // RH branch: every moisture record's level must have a temperature
+        // record — the collect lane's conversion loop errored on the first
+        // missing one, before the common-level computation.
+        if moisture_branch == MoistureBranch::Rh {
+            for &(level, _) in &moisture_records {
+                if find_record(&temperature, level).is_none() {
+                    return Err(format!("missing temperature level {level} for RH fallback").into());
+                }
+            }
+        }
+
+        // Common levels from the level keys: the same base order (the
+        // temperature records), the same first-match 0.25 tolerance, and
+        // duplicates preserved — `common_isobaric_levels` over metadata.
+        let common: Vec<f64> = temperature
+            .iter()
+            .map(|&(level, _)| level)
+            .filter(|&level| {
+                [&moisture_records, &u_wind, &v_wind, &gh_records]
+                    .iter()
+                    .all(|records| find_record(records, level).is_some())
+            })
+            .collect();
+        if common.is_empty() {
+            return Err("pressure family had no common thermodynamic levels".into());
+        }
+
+        // Build the volumes in the collect lane's variable order, so on a
+        // multi-variable failure the same variable's error surfaces.
+        let mut temperature_volume_k = match build_required_volume(
+            file,
+            &temperature,
+            &common,
+            expected,
+            &RequiredConvert::Identity,
+            &mut wrap_cache,
+        ) {
+            Ok(volume) => volume,
+            Err(err) => return Err(Box::new(std::io::Error::other(err))),
+        };
+        let u_ms_3d = match build_required_volume(
+            file,
+            &u_wind,
+            &common,
+            expected,
+            &RequiredConvert::Identity,
+            &mut wrap_cache,
+        ) {
+            Ok(volume) => volume,
+            Err(err) => return Err(Box::new(std::io::Error::other(err))),
+        };
+        let v_ms_3d = match build_required_volume(
+            file,
+            &v_wind,
+            &common,
+            expected,
+            &RequiredConvert::Identity,
+            &mut wrap_cache,
+        ) {
+            Ok(volume) => volume,
+            Err(err) => return Err(Box::new(std::io::Error::other(err))),
+        };
+        let gh_convert = if gh_is_height_branch {
+            RequiredConvert::Identity
+        } else {
+            RequiredConvert::GeopotentialToHeightM
+        };
+        let gh_m_3d = match build_required_volume(
+            file,
+            &gh_records,
+            &common,
+            expected,
+            &gh_convert,
+            &mut wrap_cache,
+        ) {
+            Ok(volume) => volume,
+            Err(_) if gh_is_height_branch => {
+                gh_height_failed = true;
+                continue;
+            }
+            // A geopotential-branch failure fell through to the generic
+            // error in the collect lane.
+            Err(_) => return Err("missing pressure-level height/geopotential field".into()),
+        };
+        let moisture_convert = match moisture_branch {
+            MoistureBranch::Q => RequiredConvert::QToMixingRatio,
+            MoistureBranch::Dewpoint => RequiredConvert::DewpointToMixingRatio,
+            MoistureBranch::Rh => RequiredConvert::RhToMixingRatio {
+                temperature_records: &temperature,
+                temperature_volume_k: &temperature_volume_k,
+                file,
+            },
+        };
+        let qvapor_kgkg_3d = match build_required_volume(
+            file,
+            &moisture_records,
+            &common,
+            expected,
+            &moisture_convert,
+            &mut wrap_cache,
+        ) {
+            Ok(volume) => volume,
+            Err(_) => {
+                // The collect lane's moisture chain swallowed the branch
+                // error and tried the next branch (or the generic error,
+                // produced by the next loop iteration once every branch
+                // is marked failed).
+                match moisture_branch {
+                    MoistureBranch::Q => q_failed = true,
+                    MoistureBranch::Dewpoint => dewpoint_failed = true,
+                    MoistureBranch::Rh => rh_failed = true,
+                }
+                continue;
+            }
+        };
+
+        // K -> C, the same per-element op the flatten lane applied.
+        for value in &mut temperature_volume_k {
+            *value -= 273.15;
+        }
+
+        return Ok(DecodedRequiredVolumes {
+            common_levels: common,
+            temperature_c_3d: temperature_volume_k,
+            qvapor_kgkg_3d,
+            u_ms_3d,
+            v_ms_3d,
+            gh_m_3d,
+        });
+    }
+}
+
+/// Unpack every record of one variable in parallel; records selected for a
+/// common level write (with conversion) straight into their slot of the
+/// preallocated flat volume, the rest are unpacked and discarded (failure
+/// parity with collect_levels, which unpacked everything).
+fn build_required_volume(
+    file: &Grib2File,
+    records: &[(f64, usize)],
+    common: &[f64],
+    expected: usize,
+    convert: &RequiredConvert<'_>,
+    wrap_cache: &mut RowWrapCache,
+) -> Result<Vec<f64>, String> {
+    // slot k (common level k) -> the record `level_values` would pick.
+    let slot_records: Vec<usize> = common
+        .iter()
+        .map(|&level| {
+            find_record(records, level).expect("common levels have a record by construction")
+        })
+        .collect();
+    if let Some(&(_, message_index)) = records.first() {
+        wrap_cache.prime(&file.messages[message_index].grid);
+    }
+
+    let mut volume = vec![0.0f64; common.len() * expected];
+    let mut record_slots: Vec<Vec<usize>> = vec![Vec::new(); records.len()];
+    for (k, &record_index) in slot_records.iter().enumerate() {
+        record_slots[record_index].push(k);
+    }
+    // Disjoint per-slot mutable windows handed to the parallel jobs.
+    let mut slot_slices: Vec<Option<&mut [f64]>> = volume.chunks_mut(expected).map(Some).collect();
+    let mut jobs: Vec<(usize, Vec<(usize, &mut [f64])>)> = Vec::with_capacity(records.len());
+    for (record_index, slots) in record_slots.iter().enumerate() {
+        let targets: Vec<(usize, &mut [f64])> = slots
+            .iter()
+            .map(|&k| (k, slot_slices[k].take().expect("each slot is taken once")))
+            .collect();
+        jobs.push((record_index, targets));
+    }
+
+    let cache: &RowWrapCache = wrap_cache;
+    jobs.into_par_iter()
+        .try_for_each(|(record_index, mut targets)| -> Result<(), String> {
+            let (record_level, message_index) = records[record_index];
+            let message = &file.messages[message_index];
+            let values = unpack_message_normalized_cached(message, cache)?;
+            if targets.is_empty() {
+                return Ok(()); // unpacked for failure parity; value discarded
+            }
+            if values.len() != expected {
+                return Err("decoded pressure field had unexpected grid size".to_string());
+            }
+            let (first, rest) = targets.split_at_mut(1);
+            let (slot_k, dst0) = &mut first[0];
+            convert_into_slot(
+                dst0,
+                &values,
+                record_level,
+                *slot_k,
+                common[*slot_k],
+                expected,
+                convert,
+                cache,
+            )?;
+            for (_, dst) in rest {
+                dst.copy_from_slice(dst0);
+            }
+            Ok(())
+        })?;
+    Ok(volume)
+}
+
+/// Apply one record's conversion into its slot — each arm is the exact
+/// per-element formula the collect lane applied to that record's plane.
+#[allow(clippy::too_many_arguments)]
+fn convert_into_slot(
+    dst: &mut [f64],
+    values: &[f64],
+    record_level: f64,
+    slot_k: usize,
+    slot_common_level: f64,
+    expected: usize,
+    convert: &RequiredConvert<'_>,
+    cache: &RowWrapCache,
+) -> Result<(), String> {
+    match convert {
+        RequiredConvert::Identity => dst.copy_from_slice(values),
+        RequiredConvert::GeopotentialToHeightM => {
+            for (out, &value) in dst.iter_mut().zip(values.iter()) {
+                *out = value * GEOPOTENTIAL_M2S2_TO_M;
+            }
+        }
+        RequiredConvert::QToMixingRatio => {
+            for (out, &q) in dst.iter_mut().zip(values.iter()) {
+                *out = (q / (1.0 - q).max(1.0e-12)).max(1.0e-10);
+            }
+        }
+        RequiredConvert::DewpointToMixingRatio => {
+            let level_hpa = normalize_pressure_level_hpa(record_level);
+            for (out, &td_k) in dst.iter_mut().zip(values.iter()) {
+                *out = mixing_ratio_from_dewpoint_k(level_hpa, td_k);
+            }
+        }
+        RequiredConvert::RhToMixingRatio {
+            temperature_records,
+            temperature_volume_k,
+            file,
+        } => {
+            // The collect lane looked temperature up at the RH RECORD's
+            // level. The temperature volume row for this slot holds the
+            // record matched at the slot's COMMON level; whenever the two
+            // searches pick the same record (always, for real level
+            // spacings) the row is reused, otherwise the exact record the
+            // collect lane would have used is unpacked on demand.
+            let record_t = find_record(temperature_records, record_level)
+                .expect("RH temperature presence pre-checked");
+            let slot_record_t = find_record(temperature_records, slot_common_level);
+            let t_owned;
+            let t_values: &[f64] = if slot_record_t == Some(record_t) {
+                &temperature_volume_k[slot_k * expected..(slot_k + 1) * expected]
+            } else {
+                t_owned = unpack_message_normalized_cached(
+                    &file.messages[temperature_records[record_t].1],
+                    cache,
+                )?;
+                &t_owned
+            };
+            // The collect lane zipped temperature against RH (truncating)
+            // and the flatten length check then rejected short rows.
+            if t_values.len() < expected {
+                return Err("decoded pressure field had unexpected grid size".to_string());
+            }
+            let level_hpa = normalize_pressure_level_hpa(record_level);
+            for ((out, &rh), &t_k) in dst.iter_mut().zip(values.iter()).zip(t_values.iter()) {
+                *out = mixing_ratio_from_relative_humidity(level_hpa, t_k, rh);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn pressure_optional_decode_enabled() -> bool {
     pressure_optional_decode_enabled_from_env_value(
         std::env::var(PRESSURE_OPTIONAL_FIELDS_ENV).ok(),
@@ -2073,6 +2602,32 @@ pub fn decode_store_thermo_pair(
 ) -> Result<(SurfaceFields, PressureFields), Box<dyn std::error::Error>> {
     let surface = decode_surface(surface_bytes)?;
     let (pressure, nx, ny) = decode_pressure_with_shape_opts(pressure_bytes, false)?;
+    validate_store_thermo_pair(&surface, &pressure, nx, ny)?;
+    Ok((surface, pressure))
+}
+
+/// [`decode_store_thermo_pair`] taking ownership of both raw GRIB buffers
+/// so each is freed at its true last use — the surface bytes right after
+/// the surface decode, the pressure bytes as soon as the pressure parser
+/// holds its own copy of the messages — instead of staying resident
+/// through the whole thermo decode. Identical decode, identical output.
+pub fn decode_store_thermo_pair_owned(
+    surface_bytes: Vec<u8>,
+    pressure_bytes: Vec<u8>,
+) -> Result<(SurfaceFields, PressureFields), Box<dyn std::error::Error>> {
+    let surface = decode_surface(&surface_bytes)?;
+    drop(surface_bytes);
+    let (pressure, nx, ny) = decode_pressure_with_shape_opts_owned(pressure_bytes, false)?;
+    validate_store_thermo_pair(&surface, &pressure, nx, ny)?;
+    Ok((surface, pressure))
+}
+
+fn validate_store_thermo_pair(
+    surface: &SurfaceFields,
+    pressure: &PressureFields,
+    nx: usize,
+    ny: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     if nx != surface.nx || ny != surface.ny {
         return Err(format!(
             "pressure decode shape {nx}x{ny} did not match surface shape {}x{}",
@@ -2089,7 +2644,7 @@ pub fn decode_store_thermo_pair(
     {
         return Err("pressure decode fields did not match the surface grid shape".into());
     }
-    Ok((surface, pressure))
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]

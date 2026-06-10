@@ -631,7 +631,8 @@ mod tests {
                     "supported recipes '{}' and '{}' share filled selector {selector:?} but \
                      disagree on operational fill scale — first-match resolution in \
                      direct_recipe_for_selector is no longer safe",
-                    a.slug, b.slug,
+                    a.slug,
+                    b.slug,
                 );
             }
         }
