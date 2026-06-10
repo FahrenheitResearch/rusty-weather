@@ -113,14 +113,10 @@ impl IngestWorker {
 }
 
 /// Worker-side state: the dedicated below-normal compute pool (built once,
-/// lazily) and a per-session availability cache.
+/// lazily).
 struct WorkerState {
     store_root: PathBuf,
     pool: Option<rayon::ThreadPool>,
-    /// (model, date, cycle) -> probe result; probes are slow-ish network
-    /// round trips, the result for a fixed run almost never changes within
-    /// a session (a fresh run gains hours — re-probe via the button).
-    availability_cache: std::collections::HashMap<(String, String, u8), AvailabilityView>,
 }
 
 impl WorkerState {
@@ -140,7 +136,6 @@ fn worker_loop(
     let mut state = WorkerState {
         store_root,
         pool: None,
-        availability_cache: std::collections::HashMap::new(),
     };
     let send = |response: IngestResponse| {
         let ok = responses.send(response).is_ok();
@@ -156,15 +151,11 @@ fn worker_loop(
                 }
             }
             IngestRequest::Probe(spec) => {
-                let key = (spec.model.clone(), spec.date.clone(), spec.cycle);
-                let view = match state.availability_cache.get(&key) {
-                    Some(view) => view.clone(),
-                    None => {
-                        let view = probe_availability(&mut state, &spec);
-                        state.availability_cache.insert(key, view.clone());
-                        view
-                    }
-                };
+                // Probe unconditionally: the button is the only producer of
+                // Probe requests, and a click means "look again" — a fresh
+                // run gains hours over a session, so a per-run cache would
+                // freeze the chips while the spinner claims a fresh result.
+                let view = probe_availability(&mut state, &spec);
                 if !send(IngestResponse::Availability(view)) {
                     return;
                 }
@@ -617,6 +608,44 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// Every Probe request re-probes — a second button click on the same
+    /// run must never return a stale per-session cache entry (a fresh run
+    /// gains hours over the session; the chips must track that).
+    ///
+    /// Offline proof: two specs share the old cache key (model, date,
+    /// cycle) but carry different validation failures, and validation runs
+    /// inside the probe before any network I/O. A cache keyed on the run
+    /// would answer the second request with the first request's note.
+    #[test]
+    fn probe_reprobes_on_every_request() {
+        let worker = IngestWorker::spawn(PathBuf::from("missing-store"), || {});
+        let mut first = spec();
+        first.hours = "5x".to_string(); // parse failure -> "--hours" note
+        let mut second = spec();
+        second.heavy = true; // invalid on sounding -> "named surface subset"
+        worker.send(IngestRequest::Probe(first));
+        worker.send(IngestRequest::Probe(second));
+        let mut notes = Vec::new();
+        for _ in 0..2 {
+            let response = worker
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("worker responds");
+            match response {
+                IngestResponse::Availability(view) => {
+                    notes.push(view.note.expect("failed probe carries a note"));
+                }
+                other => panic!("expected Availability, got {other:?}"),
+            }
+        }
+        assert!(notes[0].contains("--hours"), "got: {}", notes[0]);
+        assert!(
+            notes[1].contains("named surface subset"),
+            "second probe must be fresh, not the first probe's cached view; got: {}",
+            notes[1]
+        );
     }
 
     /// Estimate requests round-trip through the worker thread.
