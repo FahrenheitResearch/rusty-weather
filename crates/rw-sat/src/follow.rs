@@ -23,9 +23,10 @@ use crate::s3::{
     DownloadedObject, S3Object, Sector, abi_filename_product_matches_request, band_hour_prefix,
     bucket_for_satellite, build_agent, download_object, list_s3_objects, object_filename,
 };
-use crate::store::{WrittenFrame, downsample_field, write_band_frame};
+use crate::store::{WrittenFrame, downsample_field, frame_time, write_band_frame};
 use crate::window::{WindowConfig, enforce_window};
 use crate::abi::read_goes_abi_field;
+use rw_store::run::RwsRunManifest;
 
 /// Minutes after the top of the hour during which the previous hour's
 /// prefix keeps being polled (stragglers + clock skew).
@@ -129,22 +130,25 @@ pub fn poll_delay(
     Duration::from_secs_f64(backoff.min(MAX_BACKOFF_SECS as f64).max(0.05))
 }
 
-/// Bounded dedup of already-ingested scans, keyed by (band, scan start).
-/// Re-listed keys (page overlap, prefix rollover) are dropped here even if
-/// `start-after` state was lost.
+/// Bounded dedup of already-ingested scans, keyed by (band, scan-start
+/// MINUTE). Minute granularity matches the store's `tHHMM.rws` frame
+/// slots, so entries primed from run manifests (which only know HHMM)
+/// dedup live keys (whose `s` token carries seconds + tenths) exactly.
+/// Re-listed keys (page overlap, prefix rollover, a session restart) are
+/// dropped here even if `start-after` state was lost.
 #[derive(Debug, Default)]
 pub struct SeenScans {
     seen: BTreeSet<(u8, DateTime<Utc>)>,
 }
 
 impl SeenScans {
-    /// Record (band, start). Returns `false` when already seen.
+    /// Record (band, start minute). Returns `false` when already seen.
     pub fn insert(&mut self, band: u8, start: DateTime<Utc>) -> bool {
-        self.seen.insert((band, start))
+        self.seen.insert((band, scan_minute(start)))
     }
 
     pub fn contains(&self, band: u8, start: DateTime<Utc>) -> bool {
-        self.seen.contains(&(band, start))
+        self.seen.contains(&(band, scan_minute(start)))
     }
 
     /// Drop entries older than `cutoff` (call with `now - window`).
@@ -159,6 +163,51 @@ impl SeenScans {
     pub fn is_empty(&self) -> bool {
         self.seen.is_empty()
     }
+}
+
+/// Truncate a scan start to its minute (the store's HHMM granularity).
+fn scan_minute(start: DateTime<Utc>) -> DateTime<Utc> {
+    start
+        .with_second(0)
+        .and_then(|time| time.with_nanosecond(0))
+        .unwrap_or(start)
+}
+
+/// Dedup state rebuilt from the run manifests already in the store, so a
+/// restarted session never re-downloads or re-ingests frames the rolling
+/// window already holds (the whole current-hour prefix is re-listed after
+/// a restart because `start-after` state is session-local).
+pub fn primed_seen_scans(
+    store_root: &std::path::Path,
+    model: &str,
+    sector_slug: &str,
+    bands: &[u8],
+) -> SeenScans {
+    let mut seen = SeenScans::default();
+    let Ok(entries) = std::fs::read_dir(store_root.join(model)) else {
+        return seen;
+    };
+    for entry in entries.flatten() {
+        let run_name = entry.file_name().to_string_lossy().to_string();
+        // Run dirs are `<sector>_c<band>_<YYYYMMDD>[_<k>]`.
+        let Some(band) = bands.iter().copied().find(|band| {
+            run_name.starts_with(&format!("{sector_slug}_c{band:02}_"))
+        }) else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(entry.path().join("run.json")) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_slice::<RwsRunManifest>(&bytes) else {
+            continue;
+        };
+        for &hhmm in manifest.hours.keys() {
+            if let Some(time) = frame_time(&run_name, hhmm) {
+                seen.insert(band, time);
+            }
+        }
+    }
+    seen
 }
 
 /// Cheap deterministic xorshift in `[0, 1)` for poll jitter.
@@ -252,7 +301,24 @@ pub fn follow(
     );
 
     let mut summary = FollowSummary::default();
-    let mut seen = SeenScans::default();
+    // Dedup survives restarts: every frame the rolling window already
+    // holds (per the run manifests) is pre-marked seen, so re-listing the
+    // whole current-hour prefix on session start fetches nothing twice.
+    let model = satellite.as_str().to_ascii_lowercase();
+    let mut seen = primed_seen_scans(
+        &config.store_root,
+        &model,
+        config.sector.slug(),
+        &config.bands,
+    );
+    if !seen.is_empty() {
+        sink(SatEvent::Info {
+            message: format!(
+                "dedup primed from store manifests: {} frame(s) already ingested",
+                seen.len()
+            ),
+        });
+    }
     // start-after state per (band, hour prefix).
     let mut last_key: HashMap<String, String> = HashMap::new();
     let mut consecutive_errors: u32 = 0;
@@ -308,6 +374,15 @@ pub fn follow(
                 if !abi_filename_product_matches_request(&parsed.product, abi_product)
                     || parsed.channel != Some(band)
                 {
+                    continue;
+                }
+                // Never ingest a scan the rolling window would evict on
+                // the spot: a restart (or cold start) re-lists the whole
+                // hour prefix, which can hold frames older than the
+                // window — pure download/encode/evict churn otherwise.
+                if config.window.max_age_minutes.is_some_and(|minutes| {
+                    parsed.start_time_utc < Utc::now() - chrono::Duration::minutes(i64::from(minutes))
+                }) {
                     continue;
                 }
                 if !seen.insert(band, parsed.start_time_utc) {
@@ -483,6 +558,51 @@ mod tests {
         seen.prune_older_than(t0 + chrono::Duration::minutes(1));
         assert_eq!(seen.len(), 1, "old entries pruned");
         assert!(seen.contains(13, t0 + chrono::Duration::minutes(5)));
+    }
+
+    #[test]
+    fn seen_scans_key_on_the_scan_minute() {
+        let mut seen = SeenScans::default();
+        let listed = Utc.with_ymd_and_hms(2026, 6, 10, 18, 51, 18).unwrap()
+            + chrono::Duration::milliseconds(100);
+        let manifest_slot = Utc.with_ymd_and_hms(2026, 6, 10, 18, 51, 0).unwrap();
+        assert!(seen.insert(13, manifest_slot), "primed from a manifest");
+        assert!(
+            seen.contains(13, listed),
+            "live key with seconds dedups against the primed minute"
+        );
+        assert!(!seen.insert(13, listed));
+    }
+
+    #[test]
+    fn priming_reads_run_manifests_per_band() {
+        use crate::store::test_support::{scan_start, synthetic_field};
+        use crate::store::write_band_frame;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rw-sat-follow-prime-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_band_frame(&dir, &synthetic_field(12, 10, scan_start(18, 51), 13, 0.0), 1).unwrap();
+        write_band_frame(&dir, &synthetic_field(12, 10, scan_start(18, 56), 13, 0.0), 2).unwrap();
+        write_band_frame(&dir, &synthetic_field(12, 10, scan_start(18, 51), 8, 0.0), 3).unwrap();
+
+        let seen = primed_seen_scans(&dir, "g19", "conus", &[13]);
+        assert_eq!(seen.len(), 2, "only the followed band primes");
+        // The live listing carries seconds; the primed minute still hits.
+        assert!(seen.contains(13, scan_start(18, 51)));
+        assert!(seen.contains(13, scan_start(18, 56)));
+        assert!(!seen.contains(8, scan_start(18, 51)));
+
+        let both = primed_seen_scans(&dir, "g19", "conus", &[8, 13]);
+        assert_eq!(both.len(), 3);
+
+        let missing = primed_seen_scans(&dir, "g18", "conus", &[13]);
+        assert!(missing.is_empty(), "absent model dir primes nothing");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
