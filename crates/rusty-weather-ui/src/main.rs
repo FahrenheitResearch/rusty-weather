@@ -255,6 +255,11 @@ impl App {
                 None
             }
         };
+        // Scope recording on by default when profiling is compiled in —
+        // otherwise the profiler panel and viewer show empty data until the
+        // "record scopes" switch is found (review finding).
+        #[cfg(feature = "profiling")]
+        puffin::set_scopes_on(true);
 
         Self {
             worker,
