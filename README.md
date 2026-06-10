@@ -8,12 +8,18 @@ Design: docs/superpowers/specs/2026-06-09-rusty-weather-design.md
 
 ## rw-store
 
-Each forecast hour is a self-contained `.rws` file: 256×256 spatial tiles of 2D surface fields, zstd-1 compressed f32, with true windowed reads so a regional plot decodes only the intersecting tile set. Pressure-level volumes are stored as 16×16-column 3D chunks (all levels contiguous per column), affine-i16 quantized then zstd-1, so a point sounding mmaps the file, binary-searches the index, and decodes 1–4 small chunks for instant bilinear profiles across all levels. Per-run provenance lives in `grid.rwg` (lat/lon arrays + projection, sha256-hashed for grid-identity checks) and `run.json` (model, cycle, hours present, format version, build-hash from `git rev-parse` compiled in at build time).
+Each forecast hour is a self-contained `.rws` file: 256×256 spatial tiles of 2D surface fields, zstd-1 compressed f32, with true windowed reads so a regional plot decodes only the intersecting tile set. Pressure-level volumes are stored as 16×16-column 3D chunks (all levels contiguous per column), affine-i16 quantized then zstd-1, so a point sounding mmaps the file, binary-searches the index, and decodes 1–4 small chunks for instant bilinear profiles across all levels. Per-run provenance lives in `grid.rwg` (lat/lon arrays + projection, sha256-hashed for grid-identity checks) and `run.json` (model, cycle, hours present, schema id `rw-store.run.v1`, build-hash from `git rev-parse` compiled in at build time).
 
     cargo run --release -p rusty-weather --bin rw_ingest -- --model hrrr --date YYYYMMDD --cycle 0 --hours 0-6 --store-root store --verify
     cargo run --release -p rusty-weather --bin rw_bench -- --run YYYYMMDD_00z
 
 Measured (HRRR 20260608_00z, 11 vars / 37 levels, 409 MB/hour): ingest ~6 s/hour warm-cache (2.6 s extract + 1.6 s encode); sounding warm 0.19 ms; full 2D read ~3.6 ms.
+
+The hour file lands above the spec's ~250 MB ballpark because five full 37-level
+volumes (45-102 MB each after i16 quantization + zstd-1) buy the instant
+soundings; trimming stored levels or variables is the lever if disk ever matters.
+locate() measured 75.8 us against an informational 50 us hope — moot in practice,
+the entire warm sounding is 0.19 ms.
 
 ## Status
 
@@ -56,8 +62,8 @@ informational target. Even the worst-case first click (sounding_cold: grid
 open + locator build + hour open + 5 profiles, dominated by the grid file's
 sha256 + coordinate decompress) is 23 ms.
 
-Next: unified store (rw-store), then the serve daemon, then the web UI — see
-docs/superpowers/specs/2026-06-09-rusty-weather-design.md.
+Next: the serve daemon with the global scheduler (render-from-store), then the
+web UI — see docs/superpowers/specs/2026-06-09-rusty-weather-design.md.
 
 ## Layout
 

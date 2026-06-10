@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn records_sort_key_orders_by_var_kind_tile() {
-        let mut records = vec![
+        let mut records = [
             ChunkRecord {
                 var_id: 2,
                 kind: 0,
