@@ -33,6 +33,9 @@ use rw_store::run::RwsRunManifest;
 const HOUR_ROLLOVER_GRACE_MINUTES: u32 = 5;
 /// Backoff cap after consecutive poll errors.
 const MAX_BACKOFF_SECS: u64 = 300;
+/// Ingest attempts before a repeatedly failing object is skipped for good
+/// (with poll backoff in between, this spreads the retries over minutes).
+const MAX_INGEST_ATTEMPTS: u32 = 5;
 /// Cancel-flag check granularity while sleeping.
 const SLEEP_SLICE_MS: u64 = 100;
 
@@ -272,6 +275,90 @@ pub fn fetch_and_ingest(
     Ok((download, frame))
 }
 
+/// Process one prefix's freshly listed objects in key order, advancing the
+/// `start-after` watermark in `last_key` only through objects that were
+/// skipped on purpose (not ours, stale, already seen) or successfully
+/// ingested. On a retryable ingest failure the watermark stays put and the
+/// rest of the prefix is left alone, so the next poll re-lists the failed
+/// object and retries it — a transient S3 503 or truncated read no longer
+/// leaves a permanent gap in the loop. `attempts` caps the retries per key
+/// ([`MAX_INGEST_ATTEMPTS`]) so one poisoned object cannot stall its
+/// prefix forever. `seen` is only marked on success.
+///
+/// Returns the warning messages to emit; every entry also means "this
+/// poll failed" for backoff purposes.
+#[allow(clippy::too_many_arguments)]
+fn process_listed_objects(
+    prefix: &str,
+    objects: &[S3Object],
+    band: u8,
+    abi_product: &str,
+    stale_cutoff: Option<DateTime<Utc>>,
+    seen: &mut SeenScans,
+    attempts: &mut HashMap<String, u32>,
+    last_key: &mut HashMap<String, String>,
+    cancel: &AtomicBool,
+    ingest: &mut dyn FnMut(&S3Object) -> Result<(), SatError>,
+) -> Result<Vec<String>, SatError> {
+    let mut warnings = Vec::new();
+    for object in objects {
+        check_cancel(cancel)?;
+        let scan_start = parse_goes_abi_filename(object_filename(&object.key))
+            .ok()
+            .filter(|parsed| {
+                object.key.ends_with(".nc")
+                    && abi_filename_product_matches_request(&parsed.product, abi_product)
+                    && parsed.channel == Some(band)
+                    // Never ingest a scan the rolling window would evict
+                    // on the spot: a (re)start re-lists the whole hour
+                    // prefix, which can hold frames older than the window
+                    // — pure download/encode/evict churn otherwise.
+                    && stale_cutoff.is_none_or(|cutoff| parsed.start_time_utc >= cutoff)
+            })
+            .map(|parsed| parsed.start_time_utc);
+        let Some(scan_start) = scan_start else {
+            last_key.insert(prefix.to_string(), object.key.clone());
+            continue;
+        };
+        if seen.contains(band, scan_start) {
+            last_key.insert(prefix.to_string(), object.key.clone());
+            continue;
+        }
+        match ingest(object) {
+            Ok(()) => {
+                seen.insert(band, scan_start);
+                attempts.remove(&object.key);
+                last_key.insert(prefix.to_string(), object.key.clone());
+            }
+            Err(SatError::Cancelled) => return Err(SatError::Cancelled),
+            Err(err) => {
+                let tried = {
+                    let entry = attempts.entry(object.key.clone()).or_insert(0);
+                    *entry += 1;
+                    *entry
+                };
+                if tried >= MAX_INGEST_ATTEMPTS {
+                    warnings.push(format!(
+                        "ingest {}: {err} (attempt {tried}/{MAX_INGEST_ATTEMPTS}, giving up on this object)",
+                        object.key
+                    ));
+                    attempts.remove(&object.key);
+                    last_key.insert(prefix.to_string(), object.key.clone());
+                } else {
+                    warnings.push(format!(
+                        "ingest {}: {err} (attempt {tried}/{MAX_INGEST_ATTEMPTS}, will retry after re-listing)",
+                        object.key
+                    ));
+                    // Hold the watermark before this object: the next
+                    // poll re-lists it and everything after it.
+                    break;
+                }
+            }
+        }
+    }
+    Ok(warnings)
+}
+
 /// Run a follow session. Returns when `max_polls`/`max_frames` is reached;
 /// observing the cancel flag at any boundary returns
 /// [`SatError::Cancelled`].
@@ -321,6 +408,8 @@ pub fn follow(
     }
     // start-after state per (band, hour prefix).
     let mut last_key: HashMap<String, String> = HashMap::new();
+    // Failed-ingest retry counts per S3 key (bounded: pruned with `seen`).
+    let mut ingest_attempts: HashMap<String, u32> = HashMap::new();
     let mut consecutive_errors: u32 = 0;
 
     loop {
@@ -335,106 +424,79 @@ pub fn follow(
                 prefixes: prefixes.clone(),
             });
             let poll_started = Instant::now();
-            let mut new_objects: Vec<S3Object> = Vec::new();
+            let mut ingested_this_poll = 0usize;
             for prefix in &prefixes {
                 let start_after = last_key.get(prefix).map(String::as_str);
-                match list_s3_objects(&agent, &bucket, prefix, start_after) {
-                    Ok(objects) => {
-                        if let Some(last) = objects.last() {
-                            last_key.insert(prefix.clone(), last.key.clone());
-                        }
-                        new_objects.extend(objects);
-                    }
+                let objects = match list_s3_objects(&agent, &bucket, prefix, start_after) {
+                    Ok(objects) => objects,
                     Err(err) => {
                         poll_failed = true;
                         sink(SatEvent::Warning {
                             message: format!("list {prefix}: {err}"),
                         });
+                        continue;
                     }
-                }
-            }
-            // Keep the start-after map small: only the prefixes still in
-            // rotation matter.
-            last_key.retain(|prefix, _| {
-                config
-                    .bands
-                    .iter()
-                    .any(|&b| poll_prefixes(abi_product, &satellite, config.mode, b, now).contains(prefix))
-            });
-
-            let mut ingested_this_poll = 0usize;
-            for object in &new_objects {
-                check_cancel(cancel)?;
-                if !object.key.ends_with(".nc") {
-                    continue;
-                }
-                let Ok(parsed) = parse_goes_abi_filename(object_filename(&object.key)) else {
-                    continue;
                 };
-                if !abi_filename_product_matches_request(&parsed.product, abi_product)
-                    || parsed.channel != Some(band)
-                {
-                    continue;
-                }
-                // Never ingest a scan the rolling window would evict on
-                // the spot: a restart (or cold start) re-lists the whole
-                // hour prefix, which can hold frames older than the
-                // window — pure download/encode/evict churn otherwise.
-                if config.window.max_age_minutes.is_some_and(|minutes| {
-                    parsed.start_time_utc < Utc::now() - chrono::Duration::minutes(i64::from(minutes))
-                }) {
-                    continue;
-                }
-                if !seen.insert(band, parsed.start_time_utc) {
-                    continue;
-                }
-                let written_unix = Utc::now().timestamp().max(0) as u64;
-                match fetch_and_ingest(
-                    &agent,
-                    &bucket,
-                    &config.cache_dir,
-                    &config.store_root,
-                    object,
-                    config.downsample,
-                    config.use_cache,
-                    written_unix,
-                    sink,
-                ) {
-                    Ok((_download, frame)) => {
-                        summary.downloaded_keys.push(object.key.clone());
-                        // Scope eviction to this followed band's runs.
-                        let run_prefix = format!("{}_c{band:02}", config.sector.slug());
-                        summary.frames.push(frame.clone());
-                        ingested_this_poll += 1;
-                        match enforce_window(
-                            &config.store_root,
-                            &frame.model,
-                            &run_prefix,
-                            Utc::now(),
-                            &config.window,
-                        ) {
-                            Ok(report) if report.removed_frames > 0 => {
-                                summary.evicted_frames += report.removed_frames;
-                                summary.evicted_bytes += report.removed_bytes;
-                                sink(SatEvent::Evicted {
-                                    model: frame.model.clone(),
-                                    frames: report.removed_frames,
-                                    bytes: report.removed_bytes,
-                                });
-                            }
-                            Ok(_) => {}
-                            Err(err) => sink(SatEvent::Warning {
-                                message: format!("window eviction: {err}"),
-                            }),
+                let stale_cutoff = config.window.max_age_minutes.map(|minutes| {
+                    Utc::now() - chrono::Duration::minutes(i64::from(minutes))
+                });
+                let mut ingest = |object: &S3Object| -> Result<(), SatError> {
+                    let written_unix = Utc::now().timestamp().max(0) as u64;
+                    let result = fetch_and_ingest(
+                        &agent,
+                        &bucket,
+                        &config.cache_dir,
+                        &config.store_root,
+                        object,
+                        config.downsample,
+                        config.use_cache,
+                        written_unix,
+                        &mut *sink,
+                    );
+                    let (_download, frame) = result?;
+                    summary.downloaded_keys.push(object.key.clone());
+                    summary.frames.push(frame.clone());
+                    ingested_this_poll += 1;
+                    // Scope eviction to this followed band's runs.
+                    let run_prefix = format!("{}_c{band:02}", config.sector.slug());
+                    match enforce_window(
+                        &config.store_root,
+                        &frame.model,
+                        &run_prefix,
+                        Utc::now(),
+                        &config.window,
+                    ) {
+                        Ok(report) if report.removed_frames > 0 => {
+                            summary.evicted_frames += report.removed_frames;
+                            summary.evicted_bytes += report.removed_bytes;
+                            sink(SatEvent::Evicted {
+                                model: frame.model.clone(),
+                                frames: report.removed_frames,
+                                bytes: report.removed_bytes,
+                            });
                         }
+                        Ok(_) => {}
+                        Err(err) => sink(SatEvent::Warning {
+                            message: format!("window eviction: {err}"),
+                        }),
                     }
-                    Err(SatError::Cancelled) => return Err(SatError::Cancelled),
-                    Err(err) => {
-                        poll_failed = true;
-                        sink(SatEvent::Warning {
-                            message: format!("ingest {}: {err}", object.key),
-                        });
-                    }
+                    Ok(())
+                };
+                let warnings = process_listed_objects(
+                    prefix,
+                    &objects,
+                    band,
+                    abi_product,
+                    stale_cutoff,
+                    &mut seen,
+                    &mut ingest_attempts,
+                    &mut last_key,
+                    cancel,
+                    &mut ingest,
+                )?;
+                for message in warnings {
+                    poll_failed = true;
+                    sink(SatEvent::Warning { message });
                 }
             }
             sink(SatEvent::PollDone {
@@ -443,6 +505,17 @@ pub fn follow(
                 ms: poll_started.elapsed().as_millis(),
             });
         }
+        // Keep the per-prefix bookkeeping bounded: drop start-after
+        // watermarks and retry counters for hour prefixes that rotated out
+        // of the poll set.
+        let now = Utc::now();
+        let active: Vec<String> = config
+            .bands
+            .iter()
+            .flat_map(|&band| poll_prefixes(abi_product, &satellite, config.mode, band, now))
+            .collect();
+        last_key.retain(|prefix, _| active.contains(prefix));
+        ingest_attempts.retain(|key, _| active.iter().any(|prefix| key.starts_with(prefix.as_str())));
         // Dedup memory stays bounded: anything older than a day is gone
         // from the hour prefixes we poll anyway.
         seen.prune_older_than(Utc::now() - chrono::Duration::days(1));
@@ -603,6 +676,218 @@ mod tests {
         let missing = primed_seen_scans(&dir, "g18", "conus", &[13]);
         assert!(missing.is_empty(), "absent model dir primes nothing");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const TEST_PREFIX: &str = "ABI-L2-CMIPC/2026/161/18/OR_ABI-L2-CMIPC-M6C13_G19_";
+
+    fn listed_object(key: impl Into<String>) -> S3Object {
+        S3Object {
+            key: key.into(),
+            size_bytes: 1,
+            last_modified: String::new(),
+        }
+    }
+
+    /// A C13 CONUS key under [`TEST_PREFIX`] starting at 18:`minute`.
+    fn c13_key(minute: u32) -> String {
+        format!(
+            "{TEST_PREFIX}s202616118{minute:02}176_e202616118{minute:02}549_c202616118{minute:02}590.nc"
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_process(
+        objects: &[S3Object],
+        stale_cutoff: Option<DateTime<Utc>>,
+        seen: &mut SeenScans,
+        attempts: &mut HashMap<String, u32>,
+        last_key: &mut HashMap<String, String>,
+        ingest: &mut dyn FnMut(&S3Object) -> Result<(), SatError>,
+    ) -> Vec<String> {
+        let cancel = AtomicBool::new(false);
+        process_listed_objects(
+            TEST_PREFIX,
+            objects,
+            13,
+            "ABI-L2-CMIPC",
+            stale_cutoff,
+            seen,
+            attempts,
+            last_key,
+            &cancel,
+            ingest,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn failed_ingest_holds_the_watermark_and_is_retried() {
+        let objects = vec![listed_object(c13_key(51)), listed_object(c13_key(56))];
+        let mut seen = SeenScans::default();
+        let mut attempts = HashMap::new();
+        let mut last_key = HashMap::new();
+
+        // First poll: the 18:51 ingest fails transiently.
+        let mut fail_first = |object: &S3Object| -> Result<(), SatError> {
+            if object.key == objects[0].key {
+                Err(other("503 slow down"))
+            } else {
+                Ok(())
+            }
+        };
+        let warnings = run_process(
+            &objects,
+            None,
+            &mut seen,
+            &mut attempts,
+            &mut last_key,
+            &mut fail_first,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("will retry"), "{}", warnings[0]);
+        assert!(
+            !last_key.contains_key(TEST_PREFIX),
+            "watermark held before the failed key so the next poll re-lists it"
+        );
+        assert!(seen.is_empty(), "failures are never marked seen");
+        assert_eq!(attempts.get(objects[0].key.as_str()), Some(&1));
+
+        // Next poll re-lists both keys (held watermark) and succeeds.
+        let mut ok = |_object: &S3Object| Ok(());
+        let warnings = run_process(
+            &objects,
+            None,
+            &mut seen,
+            &mut attempts,
+            &mut last_key,
+            &mut ok,
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(seen.len(), 2, "both scans ingested after the retry");
+        assert_eq!(
+            last_key.get(TEST_PREFIX),
+            Some(&objects[1].key),
+            "watermark advanced through the last success"
+        );
+        assert!(attempts.is_empty(), "retry counter cleared on success");
+    }
+
+    #[test]
+    fn poisoned_object_is_dropped_after_the_attempt_cap() {
+        let objects = vec![listed_object(c13_key(51)), listed_object(c13_key(56))];
+        let mut seen = SeenScans::default();
+        let mut attempts = HashMap::new();
+        let mut last_key = HashMap::new();
+        let mut ingest = |object: &S3Object| -> Result<(), SatError> {
+            if object.key == objects[0].key {
+                Err(other("truncated NetCDF"))
+            } else {
+                Ok(())
+            }
+        };
+
+        for attempt in 1..MAX_INGEST_ATTEMPTS {
+            let warnings = run_process(
+                &objects,
+                None,
+                &mut seen,
+                &mut attempts,
+                &mut last_key,
+                &mut ingest,
+            );
+            assert!(warnings[0].contains("will retry"), "{}", warnings[0]);
+            assert!(!last_key.contains_key(TEST_PREFIX));
+            assert_eq!(attempts.get(objects[0].key.as_str()), Some(&attempt));
+            assert!(seen.is_empty(), "the good key stays blocked behind the bad one");
+        }
+
+        // Final attempt: give up on the bad object, unblock the prefix.
+        let warnings = run_process(
+            &objects,
+            None,
+            &mut seen,
+            &mut attempts,
+            &mut last_key,
+            &mut ingest,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("giving up"), "{}", warnings[0]);
+        assert!(attempts.is_empty(), "no counter leak after giving up");
+        assert_eq!(seen.len(), 1, "the 18:56 frame finally ingested");
+        assert!(seen.contains(13, Utc.with_ymd_and_hms(2026, 6, 10, 18, 56, 0).unwrap()));
+        assert_eq!(
+            last_key.get(TEST_PREFIX),
+            Some(&objects[1].key),
+            "watermark moved past both keys"
+        );
+    }
+
+    #[test]
+    fn skipped_objects_advance_the_watermark_without_ingest() {
+        let stale_cutoff = Utc.with_ymd_and_hms(2026, 6, 10, 18, 45, 0).unwrap();
+        let already_seen = c13_key(51);
+        let objects = vec![
+            // Sidecar / non-NetCDF object.
+            listed_object(format!("{TEST_PREFIX}manifest.json")),
+            // Wrong band under a sibling prefix page.
+            listed_object(
+                "ABI-L2-CMIPC/2026/161/18/OR_ABI-L2-CMIPC-M6C08_G19_s20261611846176_e20261611848549_c20261611849020.nc",
+            ),
+            // Older than the rolling window: churn if ingested.
+            listed_object(c13_key(41)),
+            // Already in the store (restart priming or an earlier poll).
+            listed_object(already_seen.clone()),
+        ];
+        let mut seen = SeenScans::default();
+        seen.insert(13, Utc.with_ymd_and_hms(2026, 6, 10, 18, 51, 0).unwrap());
+        let mut attempts = HashMap::new();
+        let mut last_key = HashMap::new();
+        let mut ingest_calls = 0usize;
+        let mut ingest = |_object: &S3Object| -> Result<(), SatError> {
+            ingest_calls += 1;
+            Ok(())
+        };
+
+        let warnings = run_process(
+            &objects,
+            Some(stale_cutoff),
+            &mut seen,
+            &mut attempts,
+            &mut last_key,
+            &mut ingest,
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(ingest_calls, 0, "every object was skipped on purpose");
+        assert_eq!(
+            last_key.get(TEST_PREFIX),
+            Some(&already_seen),
+            "skips advance the watermark so they are never re-listed"
+        );
+    }
+
+    #[test]
+    fn cancel_mid_listing_propagates() {
+        let cancel = AtomicBool::new(true);
+        let objects = vec![listed_object(c13_key(51))];
+        let mut seen = SeenScans::default();
+        let mut attempts = HashMap::new();
+        let mut last_key = HashMap::new();
+        let mut ingest = |_object: &S3Object| -> Result<(), SatError> { Ok(()) };
+        let err = process_listed_objects(
+            TEST_PREFIX,
+            &objects,
+            13,
+            "ABI-L2-CMIPC",
+            None,
+            &mut seen,
+            &mut attempts,
+            &mut last_key,
+            &cancel,
+            &mut ingest,
+        )
+        .unwrap_err();
+        assert!(err.is_cancelled());
+        assert!(last_key.is_empty(), "nothing consumed after cancel");
     }
 
     #[test]
