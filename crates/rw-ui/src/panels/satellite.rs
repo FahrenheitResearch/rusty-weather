@@ -524,7 +524,10 @@ impl SatellitePanel {
             );
             ui.label("Cache");
             ui.add(TextEdit::singleline(&mut self.spec.cache_dir).desired_width(140.0))
-                .on_hover_text("raw NetCDF byte cache; re-ingests skip the download");
+                .on_hover_text(
+                    "raw NetCDF staging dir; follow deletes objects once their \
+                     frame is stored and prunes stale leftovers with the window",
+                );
         });
     }
 
