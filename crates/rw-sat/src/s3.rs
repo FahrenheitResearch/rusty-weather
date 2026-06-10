@@ -12,6 +12,7 @@
 use std::error::Error;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
 
@@ -324,8 +325,25 @@ fn url_query_encode(value: &str) -> String {
     out
 }
 
+/// Max duration for DNS resolution and for establishing the TCP+TLS
+/// connection. A half-open socket (sleep/resume, S3 hiccup) must surface
+/// as an `Err` that feeds the follow loop's backoff, never hang the
+/// 24/7 poller.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Max duration for sending the request line + headers.
+const SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Max duration for receiving the response headers.
+const RECV_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Max duration for receiving a response body — generous enough for
+/// full-disk objects on a slow link.
+const RECV_BODY_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Build the pure-Rust TLS agent. The OnceLock guards the process-global
 /// provider install so repeated calls (parallel downloads) never clash.
+///
+/// Every phase gets an explicit timeout: ureq 3 defaults them all to
+/// `None`, which would let one stalled connection block a poll (and the
+/// whole follow session) forever.
 pub fn build_agent() -> ureq::Agent {
     static CRYPTO_PROVIDER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     CRYPTO_PROVIDER.get_or_init(|| {
@@ -333,6 +351,11 @@ pub fn build_agent() -> ureq::Agent {
     });
     let crypto = std::sync::Arc::new(rustls_rustcrypto::provider());
     ureq::Agent::config_builder()
+        .timeout_resolve(Some(CONNECT_TIMEOUT))
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_send_request(Some(SEND_REQUEST_TIMEOUT))
+        .timeout_recv_response(Some(RECV_RESPONSE_TIMEOUT))
+        .timeout_recv_body(Some(RECV_BODY_TIMEOUT))
         .tls_config(
             ureq::tls::TlsConfig::builder()
                 .provider(ureq::tls::TlsProvider::Rustls)
@@ -433,5 +456,19 @@ mod tests {
     fn query_encoding_escapes_reserved_bytes() {
         assert_eq!(url_query_encode("a/b c+d"), "a%2Fb%20c%2Bd");
         assert_eq!(url_query_encode("OR_ABI-L2"), "OR_ABI-L2");
+    }
+
+    #[test]
+    fn agent_has_every_io_phase_timeout_set() {
+        let timeouts = build_agent().config().timeouts();
+        assert_eq!(timeouts.resolve, Some(CONNECT_TIMEOUT));
+        assert_eq!(timeouts.connect, Some(CONNECT_TIMEOUT));
+        assert_eq!(timeouts.send_request, Some(SEND_REQUEST_TIMEOUT));
+        assert_eq!(timeouts.recv_response, Some(RECV_RESPONSE_TIMEOUT));
+        assert_eq!(
+            timeouts.recv_body,
+            Some(RECV_BODY_TIMEOUT),
+            "body timeout must cover full-disk objects"
+        );
     }
 }
