@@ -160,14 +160,16 @@ impl App {
                 StoreResponse::HourVars(_, Err(message)) => {
                     self.viewer.set_error(message);
                 }
-                StoreResponse::Field(_, Ok(field)) => {
-                    self.viewer.set_field(field);
-                }
-                StoreResponse::Field(key, Err(message)) => {
-                    if self.viewer.wanted_field().as_ref() == Some(&key) {
-                        self.viewer.set_error(message);
+                StoreResponse::Field(key, result) => match *result {
+                    Ok(field) => {
+                        self.viewer.set_field(field);
                     }
-                }
+                    Err(message) => {
+                        if self.viewer.wanted_field().as_ref() == Some(&key) {
+                            self.viewer.set_error(message);
+                        }
+                    }
+                },
                 StoreResponse::Sounding(_, Ok(data)) => {
                     self.sounding.set_data(data);
                 }

@@ -12,5 +12,10 @@ egui = "0.34"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rw-store = { path = "../rw-store" }
 rustwx-core = { path = "../rustwx-core" }
+# Production styling for the field viewer: rustwx-products resolves each
+# stored variable's plot-counterpart style, rustwx-render builds/maps the
+# exact production colormap (both already in this tree via rustwx-sounding).
+rustwx-products = { path = "../rustwx-products" }
+rustwx-render = { path = "../rustwx-render" }
 rustwx-sounding = { path = "../rustwx-sounding" }
 serde_json.workspace = true

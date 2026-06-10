@@ -119,15 +119,7 @@ pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, Stri
     };
 
     // Level 0: the model surface.
-    push_level(
-        &mut column,
-        psfc_hpa,
-        orog_m,
-        t2_c,
-        td2_c,
-        u10_ms,
-        v10_ms,
-    );
+    push_level(&mut column, psfc_hpa, orog_m, t2_c, td2_c, u10_ms, v10_ms);
 
     // Isobaric levels, low to high (the store's levels are descending).
     for &level_hpa in &temperature.levels_hpa {
@@ -148,8 +140,7 @@ pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, Stri
             continue;
         };
         // Below-ground pruning (production convention, see module docs).
-        if pressure_hpa >= psfc_hpa - PRESSURE_EPSILON_HPA
-            || height_m <= orog_m + HEIGHT_EPSILON_M
+        if pressure_hpa >= psfc_hpa - PRESSURE_EPSILON_HPA || height_m <= orog_m + HEIGHT_EPSILON_M
         {
             continue;
         }
@@ -174,7 +165,11 @@ fn level_value(var: &ProfileVar, level_hpa: u16) -> Option<f64> {
     if !value.is_finite() {
         return None;
     }
-    Some(if var.units == "K" { value - 273.15 } else { value })
+    Some(if var.units == "K" {
+        value - 273.15
+    } else {
+        value
+    })
 }
 
 /// Append a level iff it keeps pressure strictly decreasing and height
@@ -198,8 +193,7 @@ fn push_level(
     {
         return;
     }
-    if let (Some(&last_p), Some(&last_z)) =
-        (column.pressure_hpa.last(), column.height_m_msl.last())
+    if let (Some(&last_p), Some(&last_z)) = (column.pressure_hpa.last(), column.height_m_msl.last())
     {
         if pressure_hpa >= last_p - 1.0e-6 || height_m_msl <= last_z + 1.0e-6 {
             return;
@@ -224,11 +218,7 @@ fn metadata_for(data: &SoundingData, orog_m: f64) -> SoundingMetadata {
     };
     SoundingMetadata {
         station_id,
-        valid_time: format!(
-            "{} F{:03}",
-            data.hour.run.replace('_', " "),
-            data.hour.hour
-        ),
+        valid_time: format!("{} F{:03}", data.hour.run.replace('_', " "), data.hour.hour),
         latitude_deg: data.lat.map(f64::from),
         longitude_deg: data.lon.map(f64::from).map(normalize_lon),
         elevation_m: Some(orog_m),
@@ -303,8 +293,16 @@ mod tests {
                         296.15, 295.15, 294.15, 293.15, 285.15, 268.15, 243.15, 213.15, 205.15,
                     ],
                 ),
-                var("u_iso", "m/s", &[2.0, 3.0, 4.0, 5.0, 8.0, 14.0, 25.0, 35.0, 38.0]),
-                var("v_iso", "m/s", &[5.0, 6.0, 7.0, 7.5, 8.0, 6.0, 2.0, -4.0, -6.0]),
+                var(
+                    "u_iso",
+                    "m/s",
+                    &[2.0, 3.0, 4.0, 5.0, 8.0, 14.0, 25.0, 35.0, 38.0],
+                ),
+                var(
+                    "v_iso",
+                    "m/s",
+                    &[5.0, 6.0, 7.0, 7.5, 8.0, 6.0, 2.0, -4.0, -6.0],
+                ),
                 var(
                     "height_iso",
                     "gpm",
@@ -346,7 +344,10 @@ mod tests {
         // (f32 store values: compare at f32 precision.)
         assert!((column.temperature_c[0] - 29.0).abs() < 1e-3, "2 m T in C");
         assert!((column.dewpoint_c[0] - 24.0).abs() < 1e-3, "2 m Td in C");
-        assert!((column.temperature_c[1] - 26.0).abs() < 1e-3, "950 hPa T in C");
+        assert!(
+            (column.temperature_c[1] - 26.0).abs() < 1e-3,
+            "950 hPa T in C"
+        );
         assert_eq!(column.u_ms[0], 1.5);
         assert_eq!(column.v_ms[0], 4.0);
 
@@ -372,7 +373,8 @@ mod tests {
     fn missing_inputs_are_reported_by_name() {
         let mut data = sample_data();
         data.vars.retain(|var| var.name != "height_iso");
-        data.surface.retain(|sample| sample.name != "surface_pressure");
+        data.surface
+            .retain(|sample| sample.name != "surface_pressure");
         let error = build_sounding_column(&data).expect_err("missing inputs must fail");
         assert!(error.contains("height_iso"), "got: {error}");
         assert!(error.contains("surface_pressure"), "got: {error}");
@@ -395,7 +397,11 @@ mod tests {
     fn renders_non_trivial_skewt_image() {
         let native = build_native_sounding(&sample_data()).expect("native sounding");
         let image = render_sounding_image(&native).expect("render should succeed");
-        assert!(image.width() >= 1000 && image.height() >= 800, "{:?}", image.size);
+        assert!(
+            image.width() >= 1000 && image.height() >= 800,
+            "{:?}",
+            image.size
+        );
         let background = image.pixels[0];
         let non_background = image
             .pixels

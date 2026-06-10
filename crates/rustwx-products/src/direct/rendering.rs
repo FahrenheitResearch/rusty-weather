@@ -17,6 +17,7 @@ use crate::shared_context::{
     static_chrome_scale, static_supersample_factor, static_supersample_sharpen,
     static_title_with_suffix,
 };
+use crate::viewer::UnitConvert;
 
 use super::domain::{
     is_global_scale_domain, longitude_bounds_span_deg, range_step, visible_grid_span,
@@ -28,27 +29,44 @@ use super::{
     SharedStreamlineLayerCache,
 };
 
-fn apply_direct_recipe_render_controls(
+/// The direct lane's per-recipe colorbar overrides: an optional legend-mode
+/// override and an optional tick step. Factored out of
+/// [`apply_direct_recipe_render_controls`] so the store viewer resolver
+/// reads the SAME controls the render request gets.
+pub(crate) fn direct_recipe_render_controls(
     recipe: &PlotRecipe,
     filled_selector: FieldSelector,
-    request: &mut MapRenderRequest,
-) {
+) -> (Option<LegendMode>, Option<f64>) {
     if matches!(recipe.style, RenderStyle::WeatherDewpoint) {
-        request.legend.mode = LegendMode::Stepped;
-        if matches!(
+        let tick = matches!(
             filled_selector.vertical,
             VerticalSelector::HeightAboveGroundMeters(2)
-        ) {
-            request.cbar_tick_step = Some(10.0);
-        }
+        )
+        .then_some(10.0);
+        (Some(LegendMode::Stepped), tick)
     } else if matches!(recipe.style, RenderStyle::WeatherRh)
         && matches!(
             filled_selector.vertical,
             VerticalSelector::HeightAboveGroundMeters(2)
         )
     {
-        request.legend.mode = LegendMode::Stepped;
-        request.cbar_tick_step = Some(25.0);
+        (Some(LegendMode::Stepped), Some(25.0))
+    } else {
+        (None, None)
+    }
+}
+
+fn apply_direct_recipe_render_controls(
+    recipe: &PlotRecipe,
+    filled_selector: FieldSelector,
+    request: &mut MapRenderRequest,
+) {
+    let (legend_mode, tick_step) = direct_recipe_render_controls(recipe, filled_selector);
+    if let Some(mode) = legend_mode {
+        request.legend.mode = mode;
+    }
+    if let Some(step) = tick_step {
+        request.cbar_tick_step = Some(step);
     }
 }
 
@@ -433,78 +451,69 @@ fn derived_companion_wind_speed_fill(
     Ok(Some(field))
 }
 
+/// The unit conversion + display-units override the direct lane applies to
+/// a filled field BEFORE its color scale — the single conversion table
+/// behind [`convert_filled_field`], factored out so the store viewer
+/// resolver converts raw stored values with the SAME arithmetic.
+pub(crate) fn direct_fill_unit_conversion(
+    recipe: &PlotRecipe,
+    selector: FieldSelector,
+) -> (UnitConvert, Option<&'static str>) {
+    if selector.field == CanonicalField::SmokeMassDensity {
+        (UnitConvert::KgM3ToUgM3, Some("ug/m^3"))
+    } else if selector.field == CanonicalField::ColumnIntegratedSmoke {
+        (UnitConvert::KgM2ToMgM2, Some("mg/m^2"))
+    } else if matches!(
+        recipe.style,
+        RenderStyle::WeatherTemperature | RenderStyle::WeatherDewpoint
+    ) {
+        if selector_is_spread_product(selector) {
+            (UnitConvert::None, Some("K"))
+        } else if matches!(
+            selector.vertical,
+            VerticalSelector::HeightAboveGroundMeters(2)
+        ) {
+            (UnitConvert::KelvinToFahrenheit, Some("degF"))
+        } else {
+            (UnitConvert::KelvinToCelsius, Some("degC"))
+        }
+    } else if selector.field == CanonicalField::PressureReducedToMeanSeaLevel {
+        (UnitConvert::PaToHpa, Some("hPa"))
+    } else if selector.field == CanonicalField::PrecipitableWater {
+        (UnitConvert::MmToInches, Some("in"))
+    } else if selector.field == CanonicalField::Visibility {
+        (UnitConvert::MetersToMiles, Some("mi"))
+    } else if selector.field == CanonicalField::AbsoluteVorticity {
+        (UnitConvert::PerSecondToE5PerSecond, Some("10^-5 s^-1"))
+    } else if matches!(
+        selector.field,
+        CanonicalField::WindSpeed | CanonicalField::WindGust
+    ) {
+        (UnitConvert::MsToKnots, Some("kt"))
+    } else if selector.field == CanonicalField::TotalPrecipitation {
+        if matches!(recipe.style, RenderStyle::WeatherQpf) {
+            (UnitConvert::MmToInches, Some("in"))
+        } else {
+            (UnitConvert::None, Some("mm"))
+        }
+    } else {
+        (UnitConvert::None, None)
+    }
+}
+
 pub(super) fn convert_filled_field(
     recipe: &PlotRecipe,
     field: &SelectedField2D,
 ) -> rustwx_core::Field2D {
     let mut core = field.clone().into_field2d();
-    if field.selector.field == CanonicalField::SmokeMassDensity {
+    let (convert, units_override) = direct_fill_unit_conversion(recipe, field.selector);
+    if !matches!(convert, UnitConvert::None) {
         for value in &mut core.values {
-            *value *= 1_000_000_000.0;
+            *value = convert.apply(*value);
         }
-        core.units = "ug/m^3".to_string();
-    } else if field.selector.field == CanonicalField::ColumnIntegratedSmoke {
-        for value in &mut core.values {
-            *value *= 1_000_000.0;
-        }
-        core.units = "mg/m^2".to_string();
-    } else if matches!(
-        recipe.style,
-        RenderStyle::WeatherTemperature | RenderStyle::WeatherDewpoint
-    ) {
-        if selector_is_spread_product(field.selector) {
-            core.units = "K".to_string();
-        } else if matches!(
-            field.selector.vertical,
-            VerticalSelector::HeightAboveGroundMeters(2)
-        ) {
-            for value in &mut core.values {
-                *value = (*value - 273.15) * 9.0 / 5.0 + 32.0;
-            }
-            core.units = "degF".to_string();
-        } else {
-            for value in &mut core.values {
-                *value -= 273.15;
-            }
-            core.units = "degC".to_string();
-        }
-    } else if field.selector.field == CanonicalField::PressureReducedToMeanSeaLevel {
-        for value in &mut core.values {
-            *value *= 0.01;
-        }
-        core.units = "hPa".to_string();
-    } else if field.selector.field == CanonicalField::PrecipitableWater {
-        for value in &mut core.values {
-            *value /= 25.4;
-        }
-        core.units = "in".to_string();
-    } else if field.selector.field == CanonicalField::Visibility {
-        for value in &mut core.values {
-            *value *= 0.000_621_371_2;
-        }
-        core.units = "mi".to_string();
-    } else if field.selector.field == CanonicalField::AbsoluteVorticity {
-        for value in &mut core.values {
-            *value *= 100_000.0;
-        }
-        core.units = "10^-5 s^-1".to_string();
-    } else if matches!(
-        field.selector.field,
-        CanonicalField::WindSpeed | CanonicalField::WindGust
-    ) {
-        for value in &mut core.values {
-            *value *= 1.943_844_5;
-        }
-        core.units = "kt".to_string();
-    } else if field.selector.field == CanonicalField::TotalPrecipitation {
-        if matches!(recipe.style, RenderStyle::WeatherQpf) {
-            for value in &mut core.values {
-                *value /= 25.4;
-            }
-            core.units = "in".to_string();
-        } else {
-            core.units = "mm".to_string();
-        }
+    }
+    if let Some(units) = units_override {
+        core.units = units.to_string();
     }
     core
 }

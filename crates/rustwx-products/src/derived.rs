@@ -3513,5 +3513,98 @@ fn range_step(start: f64, stop: f64, step: f64) -> Vec<f64> {
     values
 }
 
+/// The render styling one derived/heavy STORE variable carries in its
+/// production PNG: the request's color scale, tick step, density, and
+/// legend controls plus the recipe title.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DerivedLaneStyle {
+    pub scale: ColorScale,
+    pub cbar_tick_step: Option<f64>,
+    pub render_density: rustwx_render::RenderDensity,
+    pub legend: rustwx_render::LegendControls,
+    pub title: String,
+}
+
+/// Resolve the production render styling for one derived/heavy store slug
+/// by building a REAL render request over a tiny probe grid through the
+/// exact builders the render lanes run — non-heavy recipes through
+/// [`build_render_artifact_with_contour_mode`] (raster mode, the default),
+/// heavy recipes through [`build_weather_map_request`] — and reading the
+/// styling off the request. Identity with the plot output is therefore by
+/// construction, not by a hand-maintained scale table.
+pub(crate) fn derived_store_variable_style(
+    slug: &str,
+) -> Result<DerivedLaneStyle, Box<dyn std::error::Error>> {
+    /// Any non-global domain yields the operational regional styling
+    /// (`apply_static_map_design`'s regional branch), matching the CONUS
+    /// domains the production HRRR products render with.
+    const PROBE_DOMAIN_BOUNDS: (f64, f64, f64, f64) = (-125.0, -66.0, 24.0, 50.0);
+
+    let recipe = DerivedRecipe::parse(slug).map_err(std::io::Error::other)?;
+    let grid = rustwx_core::LatLonGrid {
+        shape: rustwx_core::GridShape::new(2, 2)?,
+        lat_deg: vec![35.0, 35.0, 36.0, 36.0],
+        lon_deg: vec![-100.0, -99.0, -100.0, -99.0],
+    };
+    let projected = ProjectedMap {
+        projected_x: grid.lon_deg.iter().map(|&v| f64::from(v)).collect(),
+        projected_y: grid.lat_deg.iter().map(|&v| f64::from(v)).collect(),
+        extent: ProjectedExtent {
+            x_min: -100.0,
+            x_max: -99.0,
+            y_min: 35.0,
+            y_max: 36.0,
+        },
+        lines: Vec::new(),
+        polygons: Vec::new(),
+        inverse_raster_projection: None,
+    };
+    let values = vec![0.0_f64; grid.shape.len()];
+
+    if recipe.is_heavy() {
+        let product = store_render::weather_product_for_heavy_recipe(recipe)?;
+        let field = WeatherPanelField::new(product, "probe", values);
+        let request = build_weather_map_request(&grid, &projected, &field, 320, 240, None, None)?;
+        return Ok(DerivedLaneStyle {
+            scale: request.scale,
+            cbar_tick_step: request.cbar_tick_step,
+            render_density: request.render_density,
+            legend: request.legend,
+            title: recipe.title().to_string(),
+        });
+    }
+
+    let mut computed = DerivedComputedFields::default();
+    store_render::assign_store_values(&mut computed, recipe, values.clone())?;
+    if matches!(recipe, DerivedRecipe::ThetaE2m10mWinds) {
+        // The theta-e request build also attaches its 10 m barb overlay.
+        computed.surface_u10_ms = Some(values.clone());
+        computed.surface_v10_ms = Some(values);
+    }
+    let artifact = build_render_artifact_with_contour_mode(
+        recipe,
+        &grid,
+        &projected,
+        PROBE_DOMAIN_BOUNDS,
+        "20260101",
+        0,
+        1,
+        SourceId::Aws,
+        ModelId::Hrrr,
+        320,
+        240,
+        &computed,
+        NativeContourRenderMode::Automatic,
+        1,
+    )?;
+    Ok(DerivedLaneStyle {
+        scale: artifact.request.scale,
+        cbar_tick_step: artifact.request.cbar_tick_step,
+        render_density: artifact.request.render_density,
+        legend: artifact.request.legend,
+        title: recipe.title().to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests;

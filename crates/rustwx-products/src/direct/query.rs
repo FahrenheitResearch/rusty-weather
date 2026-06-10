@@ -160,4 +160,3 @@ fn load_direct_sampled_fields_from_loaded_request(
 
     Ok(DirectSampledProductSet { fields, blockers })
 }
-

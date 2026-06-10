@@ -109,7 +109,10 @@ fn show_sounding(ui: &mut Ui, ready: &mut ReadySounding) {
     ui.label(RichText::new(format!("{}", data.hour)).strong());
     let place = match (data.lat, data.lon) {
         (Some(lat), Some(lon)) => {
-            format!("{lat:.3}°, {lon:.3}°  (grid {:.1}, {:.1})", data.fx, data.fy)
+            format!(
+                "{lat:.3}°, {lon:.3}°  (grid {:.1}, {:.1})",
+                data.fx, data.fy
+            )
         }
         _ => format!("grid ({:.1}, {:.1})", data.fx, data.fy),
     };
@@ -135,11 +138,7 @@ fn show_sounding(ui: &mut Ui, ready: &mut ReadySounding) {
                         ui.visuals().error_fg_color,
                         format!("skew-T unavailable: {message}"),
                     );
-                    ui.label(
-                        RichText::new("Raw per-level values below.")
-                            .small()
-                            .weak(),
-                    );
+                    ui.label(RichText::new("Raw per-level values below.").small().weak());
                 }
             }
 
