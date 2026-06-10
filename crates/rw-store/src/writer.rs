@@ -348,8 +348,7 @@ mod tests {
     use super::*;
     use crate::error::RwStoreError;
     use crate::format::{
-        CODEC_2D, FLAG_CONSTANT, FLAG_EMPTY, KIND_TILE2D, RwsHourMeta, SCHEMA_HOUR, TILE_X,
-        TILE_Y,
+        CODEC_2D, FLAG_CONSTANT, FLAG_EMPTY, KIND_TILE2D, RwsHourMeta, SCHEMA_HOUR, TILE_X, TILE_Y,
     };
     use crate::header::RwsHeader;
     use crate::index::ChunkRecord;
@@ -361,11 +360,8 @@ mod tests {
     const TILES_PER_VAR: usize = 6; // 3 x-tiles * 2 y-tiles
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rw-store-writer-{}-{}",
-            std::process::id(),
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rw-store-writer-{}-{}", std::process::id(), name));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -507,7 +503,11 @@ mod tests {
             .iter()
             .find(|r| r.var_id == 0 && r.tile_y == 0 && r.tile_x == 1)
             .expect("record for var 0 tile (0,1)");
-        assert_ne!(constant.flags & FLAG_CONSTANT, 0, "42.0 tile must be CONSTANT");
+        assert_ne!(
+            constant.flags & FLAG_CONSTANT,
+            0,
+            "42.0 tile must be CONSTANT"
+        );
         assert_eq!(constant.len, 0);
         assert_eq!(constant.center, 42.0);
 
@@ -537,8 +537,7 @@ mod tests {
             .iter()
             .find(|r| r.var_id == 1 && r.tile_y == 1 && r.tile_x == 2)
             .expect("record for var 1 tile (1,2)");
-        let compressed =
-            &bytes[spot.offset as usize..spot.offset as usize + spot.len as usize];
+        let compressed = &bytes[spot.offset as usize..spot.offset as usize + spot.len as usize];
         let raw = zstd::stream::decode_all(compressed).unwrap();
         assert_eq!(raw.len(), spot.raw_len as usize);
         let grid = grid_b();

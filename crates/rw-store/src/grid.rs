@@ -85,9 +85,9 @@ pub fn write_grid(
             "degenerate grid {nx}x{ny} (nx and ny must be nonzero)"
         )));
     }
-    let cells = nx.checked_mul(ny).ok_or_else(|| {
-        RwStoreError::Grid(format!("grid {nx}x{ny} overflows the cell count"))
-    })?;
+    let cells = nx
+        .checked_mul(ny)
+        .ok_or_else(|| RwStoreError::Grid(format!("grid {nx}x{ny} overflows the cell count")))?;
     if grid.lat_deg.len() != cells || grid.lon_deg.len() != cells {
         return Err(RwStoreError::Grid(format!(
             "coordinate arrays must hold {cells} values ({ny} x {nx}), \
@@ -113,7 +113,10 @@ pub fn write_grid(
     let meta_bytes =
         serde_json::to_vec(&meta).map_err(|err| RwStoreError::Meta(err.to_string()))?;
     let meta_len = u32::try_from(meta_bytes.len()).map_err(|_| {
-        RwStoreError::Format(format!("grid meta JSON too large: {} bytes", meta_bytes.len()))
+        RwStoreError::Format(format!(
+            "grid meta JSON too large: {} bytes",
+            meta_bytes.len()
+        ))
     })?;
 
     let mut header = [0u8; HEADER_LEN];
@@ -222,9 +225,8 @@ impl GridFile {
             )));
         }
 
-        let meta: RwsGridMeta =
-            serde_json::from_slice(&data[HEADER_LEN..meta_end as usize])
-                .map_err(|err| RwStoreError::Meta(format!("grid meta JSON: {err}")))?;
+        let meta: RwsGridMeta = serde_json::from_slice(&data[HEADER_LEN..meta_end as usize])
+            .map_err(|err| RwStoreError::Meta(format!("grid meta JSON: {err}")))?;
         if meta.schema != SCHEMA_GRID {
             return Err(RwStoreError::Meta(format!(
                 "unexpected schema '{}' (expected '{SCHEMA_GRID}')",
@@ -282,9 +284,8 @@ impl GridFile {
 /// Decompress one coordinate section (capacity-capped at `raw_len`) and
 /// decode it as little-endian f32s.
 fn decompress_coords(comp: &[u8], raw_len: usize, name: &str) -> RwResult<Vec<f32>> {
-    let raw = zstd::bulk::decompress(comp, raw_len).map_err(|err| {
-        RwStoreError::Format(format!("grid {name} array decompress: {err}"))
-    })?;
+    let raw = zstd::bulk::decompress(comp, raw_len)
+        .map_err(|err| RwStoreError::Format(format!("grid {name} array decompress: {err}")))?;
     if raw.len() != raw_len {
         return Err(RwStoreError::Format(format!(
             "grid {name} array decompressed to {} bytes, expected {raw_len}",
@@ -504,7 +505,13 @@ impl GridLocator {
     /// cell_y): Newton-solve lat/lon(s, t) = query for (s, t) in [0, 1]^2.
     /// Returns `None` when the cell is degenerate/NaN, Newton wanders
     /// outside, or the solution is not (within tolerance) inside the cell.
-    fn invert_cell(&self, cell_x: usize, cell_y: usize, qlat: f64, qlon: f64) -> Option<(f64, f64)> {
+    fn invert_cell(
+        &self,
+        cell_x: usize,
+        cell_y: usize,
+        qlat: f64,
+        qlon: f64,
+    ) -> Option<(f64, f64)> {
         let corner = |x: usize, y: usize| -> (f64, f64) {
             let idx = y * self.nx + x;
             (self.lat[idx] as f64, self.lon[idx] as f64)
@@ -530,7 +537,10 @@ impl GridLocator {
         let mut t = 0.5f64;
         for _ in 0..NEWTON_ITERATIONS {
             let bilin = |v00: f64, v10: f64, v01: f64, v11: f64| {
-                (1.0 - s) * (1.0 - t) * v00 + s * (1.0 - t) * v10 + (1.0 - s) * t * v01 + s * t * v11
+                (1.0 - s) * (1.0 - t) * v00
+                    + s * (1.0 - t) * v10
+                    + (1.0 - s) * t * v01
+                    + s * t * v11
             };
             let f_lat = bilin(lat00, lat10, lat01, lat11) - qlat;
             let f_lon = bilin(lon00, lon10, lon01, lon11) - qlon;
@@ -544,7 +554,11 @@ impl GridLocator {
             }
             s -= (dlat_dt * f_lon - dlon_dt * f_lat) / det;
             t -= (-dlat_ds * f_lon + dlon_ds * f_lat) / det;
-            if !s.is_finite() || !t.is_finite() || !(-1.0..=2.0).contains(&s) || !(-1.0..=2.0).contains(&t) {
+            if !s.is_finite()
+                || !t.is_finite()
+                || !(-1.0..=2.0).contains(&s)
+                || !(-1.0..=2.0).contains(&t)
+            {
                 return None; // Newton wandered outside the neighborhood
             }
         }
@@ -573,11 +587,8 @@ mod tests {
     const DLON: f64 = 0.05;
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rw-store-grid-{}-{}",
-            std::process::id(),
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rw-store-grid-{}-{}", std::process::id(), name));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -619,8 +630,7 @@ mod tests {
         let dir = test_dir("round-trip");
         let path = dir.join("grid.rwg");
         let grid = regular_grid();
-        let written_hash =
-            write_grid(&path, &grid, Some(&GridProjection::Geographic)).unwrap();
+        let written_hash = write_grid(&path, &grid, Some(&GridProjection::Geographic)).unwrap();
 
         let file = GridFile::open(&path).unwrap();
         assert_eq!(file.nx, NX);

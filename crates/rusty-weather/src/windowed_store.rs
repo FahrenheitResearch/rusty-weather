@@ -416,7 +416,9 @@ fn plan_product(product: HrrrWindowedProduct, end: u16) -> Result<ProductSpec, S
                 Some(1),
                 "m^2/s^2",
                 Finish::None,
-                format!("stored sub-hourly 1 h max 2-5 km UH plane (uh_2to5km_max_1h) at F{end:03}"),
+                format!(
+                    "stored sub-hourly 1 h max 2-5 km UH plane (uh_2to5km_max_1h) at F{end:03}"
+                ),
             )
         }
         Uh25km3h => {
@@ -463,7 +465,9 @@ fn plan_product(product: HrrrWindowedProduct, end: u16) -> Result<ProductSpec, S
                 Some(1),
                 "kt",
                 Finish::MsToKnots,
-                format!("stored sub-hourly 1 h max 10 m wind speed (wind_speed_10m_max_1h) at F{end:03}"),
+                format!(
+                    "stored sub-hourly 1 h max 10 m wind speed (wind_speed_10m_max_1h) at F{end:03}"
+                ),
             )
         }
         Wind10mRunMax => {
@@ -706,18 +710,16 @@ fn read_source_plane(
         SourceKind::Uh2to5km => match read("uh_2to5km_max_1h", "m^2/s^2") {
             Ok(values) => Ok(SourcePlane::exact(to_f64(values))),
             Err(ReadFailure::Failed(reason)) => Err(reason),
-            Err(ReadFailure::MissingVariable(missing)) => {
-                match read("uh_2to5km", "m^2/s^2") {
-                    Ok(values) => Ok(SourcePlane {
-                        values: to_f64(values),
-                        instantaneous_fallback: true,
-                    }),
-                    Err(err) => Err(format!(
-                        "{missing}; hourly 'uh_2to5km' fallback also unavailable: {}",
-                        err.into_reason()
-                    )),
-                }
-            }
+            Err(ReadFailure::MissingVariable(missing)) => match read("uh_2to5km", "m^2/s^2") {
+                Ok(values) => Ok(SourcePlane {
+                    values: to_f64(values),
+                    instantaneous_fallback: true,
+                }),
+                Err(err) => Err(format!(
+                    "{missing}; hourly 'uh_2to5km' fallback also unavailable: {}",
+                    err.into_reason()
+                )),
+            },
         },
         SourceKind::WindSpeed10m => match read("wind_speed_10m_max_1h", "m/s") {
             Ok(values) => Ok(SourcePlane::exact(to_f64(values))),
@@ -990,10 +992,7 @@ mod tests {
     /// wrongly used the fallback would miss every expectation.
     fn wind_max_plane(hour: u16) -> Vec<f32> {
         let (u, v) = wind_uv_planes(hour);
-        u.iter()
-            .zip(&v)
-            .map(|(&u, &v)| u.hypot(v) + 1.5)
-            .collect()
+        u.iter().zip(&v).map(|(&u, &v)| u.hypot(v) + 1.5).collect()
     }
 
     /// Quadratic in hour (peak at F012) so max/min land mid-window.
@@ -1520,8 +1519,7 @@ mod tests {
             .collect();
         assert_values(uh_3h, &expected);
         assert!(
-            uh_3h.strategy.contains("F001, F002, F003")
-                && uh_3h.strategy.contains("lower bound"),
+            uh_3h.strategy.contains("F001, F002, F003") && uh_3h.strategy.contains("lower bound"),
             "strategy must name every fallback hour and the lower-bound caveat: {}",
             uh_3h.strategy
         );

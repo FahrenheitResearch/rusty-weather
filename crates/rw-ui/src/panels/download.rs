@@ -158,7 +158,9 @@ impl DownloadStage {
 pub enum StageState {
     Pending,
     Running,
-    Done { ms: u128 },
+    Done {
+        ms: u128,
+    },
     /// Never ran for this hour (profile skipped it, or the hour finished
     /// without it).
     Skipped,
@@ -455,11 +457,8 @@ impl DownloadPanel {
                                 &option.label,
                             );
                         } else {
-                            ui.add_enabled(
-                                false,
-                                egui::Button::selectable(false, &option.label),
-                            )
-                            .on_disabled_hover_text(&option.note);
+                            ui.add_enabled(false, egui::Button::selectable(false, &option.label))
+                                .on_disabled_hover_text(&option.note);
                         }
                     }
                 });
@@ -542,11 +541,7 @@ impl DownloadPanel {
                 .width(100.0)
                 .show_ui(ui, |ui| {
                     for preset in ["full", "sounding", "view"] {
-                        ui.selectable_value(
-                            &mut self.spec.profile,
-                            preset.to_string(),
-                            preset,
-                        );
+                        ui.selectable_value(&mut self.spec.profile, preset.to_string(), preset);
                     }
                 });
             if self.spec.profile != previous_profile {

@@ -483,13 +483,12 @@ impl HourReader {
         let compressed = self.payload_slice(var_name, record)?;
         // bulk::decompress caps the output at raw_len — a crafted chunk cannot
         // balloon past the size the index promised.
-        let raw =
-            zstd::bulk::decompress(compressed, record.raw_len as usize).map_err(|err| {
-                RwStoreError::Chunk(format!(
-                    "zstd decode failed for variable '{var_name}' column chunk ({},{}): {err}",
-                    record.tile_y, record.tile_x
-                ))
-            })?;
+        let raw = zstd::bulk::decompress(compressed, record.raw_len as usize).map_err(|err| {
+            RwStoreError::Chunk(format!(
+                "zstd decode failed for variable '{var_name}' column chunk ({},{}): {err}",
+                record.tile_y, record.tile_x
+            ))
+        })?;
         if raw.len() != record.raw_len as usize {
             return Err(RwStoreError::Chunk(format!(
                 "variable '{var_name}' column chunk ({},{}): decompressed {} bytes, \
@@ -520,13 +519,12 @@ impl HourReader {
         let compressed = self.payload_slice(var_name, record)?;
         // bulk::decompress caps the output at raw_len — a crafted chunk cannot
         // balloon past the size the index promised.
-        let raw =
-            zstd::bulk::decompress(compressed, record.raw_len as usize).map_err(|err| {
-                RwStoreError::Chunk(format!(
-                    "zstd decode failed for variable '{var_name}' tile ({},{}): {err}",
-                    record.tile_y, record.tile_x
-                ))
-            })?;
+        let raw = zstd::bulk::decompress(compressed, record.raw_len as usize).map_err(|err| {
+            RwStoreError::Chunk(format!(
+                "zstd decode failed for variable '{var_name}' tile ({},{}): {err}",
+                record.tile_y, record.tile_x
+            ))
+        })?;
         if raw.len() != record.raw_len as usize {
             return Err(RwStoreError::Chunk(format!(
                 "variable '{var_name}' tile ({},{}): decompressed {} bytes, index says raw_len {}",
@@ -610,11 +608,8 @@ mod tests {
     }
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rw-store-reader-{}-{}",
-            std::process::id(),
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rw-store-reader-{}-{}", std::process::id(), name));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -754,8 +749,7 @@ mod tests {
             })
             .collect();
         let big_path = dir.join("big.rws");
-        let mut writer =
-            HourWriter::new("hrrr", "run", 0, big_nx, big_ny, "hash", "build");
+        let mut writer = HourWriter::new("hrrr", "run", 0, big_nx, big_ny, "hash", "build");
         writer
             .add_surface2d("gust_10m", "m s-1", serde_json::Value::Null, &big)
             .unwrap();
@@ -777,11 +771,11 @@ mod tests {
         // (request, expected clamped (x0, y0, nx, ny))
         type Rect = (usize, usize, usize, usize);
         let cases: &[(Rect, Rect)] = &[
-            ((10, 10, 50, 50), (10, 10, 40, 40)),        // tile-interior
-            ((200, 200, 400, 460), (200, 200, 200, 260)), // straddles 4 tiles
+            ((10, 10, 50, 50), (10, 10, 40, 40)),           // tile-interior
+            ((200, 200, 400, 460), (200, 200, 200, 260)),   // straddles 4 tiles
             ((500, 400, 9999, 9999), (500, 400, 100, 100)), // edge-clamped
-            ((599, 499, 600, 500), (599, 499, 1, 1)),    // single cell
-            ((0, 0, 600, 500), (0, 0, 600, 500)),        // full grid
+            ((599, 499, 600, 500), (599, 499, 1, 1)),       // single cell
+            ((0, 0, 600, 500), (0, 0, 600, 500)),           // full grid
         ];
 
         for name in ["temp_2m", "dewpoint_2m"] {
@@ -800,9 +794,11 @@ mod tests {
         }
 
         // Empty after clamping -> Format error, not a panic.
-        for &(x0, y0, x1, y1) in
-            &[(50usize, 50usize, 50usize, 90usize), (700, 0, 9999, 10), (30, 20, 10, 40)]
-        {
+        for &(x0, y0, x1, y1) in &[
+            (50usize, 50usize, 50usize, 90usize),
+            (700, 0, 9999, 10),
+            (30, 20, 10, 40),
+        ] {
             let err = reader
                 .read_window_2d("temp_2m", x0, y0, x1, y1)
                 .unwrap_err();
@@ -832,7 +828,11 @@ mod tests {
             .rev()
             .find(|r| r.var_id == 1 && r.flags & (FLAG_EMPTY | FLAG_CONSTANT) == 0)
             .expect("var B must have dense tiles");
-        assert_eq!((target.tile_y, target.tile_x), (1, 2), "last dense tile of var B");
+        assert_eq!(
+            (target.tile_y, target.tile_x),
+            (1, 2),
+            "last dense tile of var B"
+        );
         corrupt_payload(&mut bytes, target);
         let corrupted_path = dir.join("corrupted.rws");
         fs::write(&corrupted_path, &bytes).unwrap();
@@ -840,7 +840,9 @@ mod tests {
         let reader = HourReader::open(&corrupted_path).unwrap();
         // The window read never touches tile (1,2), so it must still succeed
         // and match the pristine data...
-        let window = reader.read_window_2d("dewpoint_2m", 10, 10, 50, 50).unwrap();
+        let window = reader
+            .read_window_2d("dewpoint_2m", 10, 10, 50, 50)
+            .unwrap();
         assert_bits_eq(
             &window.values,
             &crop(&full_b, NX, 10, 10, 50, 50),
@@ -888,7 +890,10 @@ mod tests {
         let constant = reader.read_window_2d("temp_2m", 256, 0, 512, 256).unwrap();
         assert_eq!((constant.nx, constant.ny), (256, 256));
         assert!(
-            constant.values.iter().all(|v| v.to_bits() == 42.0f32.to_bits()),
+            constant
+                .values
+                .iter()
+                .all(|v| v.to_bits() == 42.0f32.to_bits()),
             "CONSTANT tile window must be all center (42.0)"
         );
 
@@ -975,7 +980,10 @@ mod tests {
         );
         // The other variable is untouched and must still read fine.
         let ok = reader.read_window_2d("temp_2m", 0, 0, 50, 50).unwrap();
-        assert!(ok.values.iter().all(|v| v.is_nan()), "temp_2m tile (0,0) is EMPTY");
+        assert!(
+            ok.values.iter().all(|v| v.is_nan()),
+            "temp_2m tile (0,0) is EMPTY"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -993,7 +1001,9 @@ mod tests {
             matches!(&err, RwStoreError::UnknownVariable(name) if name == "no_such_var"),
             "expected UnknownVariable, got {err:?}"
         );
-        let err = reader.read_window_2d("no_such_var", 0, 0, 10, 10).unwrap_err();
+        let err = reader
+            .read_window_2d("no_such_var", 0, 0, 10, 10)
+            .unwrap_err();
         assert!(
             matches!(&err, RwStoreError::UnknownVariable(name) if name == "no_such_var"),
             "expected UnknownVariable, got {err:?}"

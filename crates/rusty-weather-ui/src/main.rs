@@ -40,8 +40,8 @@ use ingest_worker::{IngestRequest, IngestResponse, IngestWorker};
 use rustwx_models::{model_summary, supported_forecast_hours, supported_models};
 use rw_ui::{
     DownloadEvent, DownloadPanel, DownloadSpec, FieldViewerEvent, FieldViewerPanel, HourKey,
-    ModelOption, RunBrowserPanel, SoundingPanel, StoreRequest, StoreResponse, StoreTree,
-    StoreView, StoreWorker,
+    ModelOption, RunBrowserPanel, SoundingPanel, StoreRequest, StoreResponse, StoreTree, StoreView,
+    StoreWorker,
 };
 
 fn main() -> ExitCode {
@@ -291,20 +291,12 @@ impl App {
         let summary = model_summary(model);
         download.set_cycle_options(summary.cycle_hours_utc.to_vec());
         let mut sources = vec!["auto".to_string()];
-        sources.extend(
-            summary
-                .sources
-                .iter()
-                .map(|source| source.id.to_string()),
-        );
+        sources.extend(summary.sources.iter().map(|source| source.id.to_string()));
         download.set_source_options(sources);
         let supported = supported_forecast_hours(model, spec.cycle);
         match (supported.first(), supported.last()) {
             (Some(first), Some(last)) => {
-                download.set_hours_hint(format!(
-                    "supported: {first}-{last} ({:02}z)",
-                    spec.cycle
-                ));
+                download.set_hours_hint(format!("supported: {first}-{last} ({:02}z)", spec.cycle));
             }
             _ => download.set_hours_hint("no supported hours for this cycle".to_string()),
         }
@@ -574,7 +566,8 @@ impl eframe::App for App {
                 Some(FieldViewerEvent::PointClicked { fx, fy }) => {
                     if let Some(hour) = self.viewer.hour().cloned() {
                         self.sounding.set_loading();
-                        self.worker.send(StoreRequest::LoadSounding { hour, fx, fy });
+                        self.worker
+                            .send(StoreRequest::LoadSounding { hour, fx, fy });
                     }
                 }
                 None => {}

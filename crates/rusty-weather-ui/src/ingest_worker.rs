@@ -48,12 +48,24 @@ pub enum IngestResponse {
     /// `Err` carries a spec/validation problem for the panel's error slot.
     Estimate(Box<Result<EstimateView, String>>),
     Availability(AvailabilityView),
-    Latest { date: String, cycle: u8 },
+    Latest {
+        date: String,
+        cycle: u8,
+    },
     LatestFailed(String),
     /// A run began over these hours.
-    Started { hours: Vec<u16> },
-    StageStarted { hour: u16, stage: DownloadStage },
-    StageDone { hour: u16, stage: DownloadStage, ms: u128 },
+    Started {
+        hours: Vec<u16>,
+    },
+    StageStarted {
+        hour: u16,
+        stage: DownloadStage,
+    },
+    StageDone {
+        hour: u16,
+        stage: DownloadStage,
+        ms: u128,
+    },
     /// A historical ingest stdout/stderr line.
     Note(String),
     HourDone(HourDoneView),
@@ -224,7 +236,10 @@ fn source_override(spec: &DownloadSpec) -> Result<Option<SourceId>, String> {
 /// Local, no-network estimate: calibrate from the newest stored hours of
 /// the same model (else the built-in HRRR measurements) and price the
 /// profile.
-fn compute_estimate(store_root: &std::path::Path, spec: &DownloadSpec) -> Result<EstimateView, String> {
+fn compute_estimate(
+    store_root: &std::path::Path,
+    spec: &DownloadSpec,
+) -> Result<EstimateView, String> {
     let (model, profile, hours, _) = resolve_spec(spec)?;
     source_override(spec)?;
     let model_slug = model.as_str().replace('-', "_");
@@ -232,8 +247,7 @@ fn compute_estimate(store_root: &std::path::Path, spec: &DownloadSpec) -> Result
     let calibration = if paths.is_empty() {
         Calibration::builtin_default()
     } else {
-        Calibration::from_hour_files(&paths)
-            .unwrap_or_else(|_| Calibration::builtin_default())
+        Calibration::from_hour_files(&paths).unwrap_or_else(|_| Calibration::builtin_default())
     };
     let hour_count = hours.len() as u16;
     let estimate = estimate(&profile, model, hour_count, &calibration);
@@ -319,9 +333,8 @@ fn find_latest(spec: &DownloadSpec) -> Result<(String, u8), String> {
         .model
         .parse()
         .map_err(|_| format!("unknown model '{}'", spec.model))?;
-    let latest =
-        rustwx_models::latest_available_run(model, Some(SourceId::Aws), &spec.date)
-            .map_err(|err| format!("latest-run probe failed: {err}"))?;
+    let latest = rustwx_models::latest_available_run(model, Some(SourceId::Aws), &spec.date)
+        .map_err(|err| format!("latest-run probe failed: {err}"))?;
     Ok((latest.cycle.date_yyyymmdd, latest.cycle.hour_utc))
 }
 
@@ -438,7 +451,8 @@ fn run_download(
     let outcome: Result<(), IngestError> = std::thread::scope(|scope| {
         // Raw bytes are ~575 MB/hour warm; capacity 1 bounds resident
         // raw-byte sets to <= 3 (fetching + queued + processing).
-        let (fetched_tx, fetched_rx) = sync_channel::<Result<rw_ingest::FetchedHour, IngestError>>(1);
+        let (fetched_tx, fetched_rx) =
+            sync_channel::<Result<rw_ingest::FetchedHour, IngestError>>(1);
         let fetch_hours = hours.clone();
         let fetch_config = &config;
         scope.spawn(move || {
@@ -533,7 +547,11 @@ mod tests {
 
         let mut bad = spec();
         bad.hours = "5x".to_string();
-        assert!(resolve_spec(&bad).expect_err("bad hours").contains("--hours"));
+        assert!(
+            resolve_spec(&bad)
+                .expect_err("bad hours")
+                .contains("--hours")
+        );
 
         let mut bad = spec();
         bad.model = "gfs".to_string();
@@ -548,7 +566,10 @@ mod tests {
         bad.cycle = 1;
         bad.hours = "0-48".to_string(); // 01z HRRR tops out at 18
         let message = resolve_spec(&bad).expect_err("out-of-range hour");
-        assert!(message.contains("outside the supported range"), "got: {message}");
+        assert!(
+            message.contains("outside the supported range"),
+            "got: {message}"
+        );
     }
 
     #[test]

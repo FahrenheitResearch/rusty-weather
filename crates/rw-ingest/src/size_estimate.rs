@@ -102,8 +102,7 @@ pub struct HourSizes {
 /// sum compressed payload bytes per variable. Only the header, meta JSON,
 /// and index region are read — never the payload.
 pub fn walk_hour_sizes(path: &Path) -> Result<HourSizes, Box<dyn std::error::Error>> {
-    let mut file = File::open(path)
-        .map_err(|err| format!("open {}: {err}", path.display()))?;
+    let mut file = File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
     let file_bytes = file.metadata()?.len();
     let mut header_bytes = [0u8; HEADER_LEN];
     file.read_exact(&mut header_bytes)?;
@@ -353,7 +352,9 @@ impl Calibration {
     /// (per-LEVEL for volumes). Quantities a store hour cannot carry —
     /// the prs/sfc download sizes — stay at the built-in measured values,
     /// as does the grid file size unless a sibling `grid.rwg` exists.
-    pub fn from_hour_files(paths: &[std::path::PathBuf]) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_hour_files(
+        paths: &[std::path::PathBuf],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         if paths.is_empty() {
             return Err("calibration needs at least one hour file".into());
         }
@@ -408,11 +409,7 @@ impl Calibration {
             .map(|meta| meta.len())
             .unwrap_or(BUILTIN_GRID_FILE_BYTES);
         Ok(Self {
-            source: format!(
-                "{} hour file(s), first {}",
-                paths.len(),
-                paths[0].display()
-            ),
+            source: format!("{} hour file(s), first {}", paths.len(), paths[0].display()),
             nx,
             ny,
             bytes_2d: average(sums_2d),
@@ -560,10 +557,8 @@ mod tests {
     const NY: usize = 60;
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rw-size-estimate-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rw-size-estimate-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -638,7 +633,11 @@ mod tests {
         assert_eq!(sizes.file_bytes, written.bytes);
         assert_eq!((sizes.nx, sizes.ny), (NX, NY));
         assert_eq!(
-            sizes.vars.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            sizes
+                .vars
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["temperature_2m", "dewpoint_2m", "temperature_iso"],
         );
         // 80x60 with 256-tiles: one tile per 2D var; 16x16 columns: 5x4=20.
@@ -849,8 +848,7 @@ mod tests {
         let calibration = Calibration::builtin_default();
         let estimate = estimate(&profile, ModelId::Hrrr, 2, &calibration);
         assert_eq!(
-            estimate.per_hour_download_bytes,
-            BUILTIN_SFC_FILE_BYTES,
+            estimate.per_hour_download_bytes, BUILTIN_SFC_FILE_BYTES,
             "no volumes, no prs planes, no compute stages -> sfc only"
         );
         assert_eq!(estimate.download_bytes, BUILTIN_SFC_FILE_BYTES * 2);
