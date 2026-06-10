@@ -239,7 +239,7 @@ impl eframe::App for App {
         if self.sounding.has_content() {
             egui::Panel::right("rw-sounding")
                 .resizable(true)
-                .default_size(380.0)
+                .default_size(560.0)
                 .show_inside(ui, |ui| {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {

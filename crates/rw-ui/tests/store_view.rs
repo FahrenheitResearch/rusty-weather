@@ -222,6 +222,17 @@ fn worker_round_trip_on_synthetic_store() {
             let lon = sounding.lon.expect("grid file readable");
             assert!((30.0..37.0).contains(&lat), "lat {lat}");
             assert!((-105.0..-96.0).contains(&lon), "lon {lon}");
+            // Surface samples: only the skew-T-relevant 2D variables the
+            // synthetic hour actually has (wind_gust_10m is not sampled).
+            let names: Vec<&str> = sounding.surface.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(names, ["temperature_2m", "dewpoint_2m"]);
+            for sample in &sounding.surface {
+                assert_eq!(sample.units, "K");
+                assert!(
+                    (250.0..320.0).contains(&sample.value),
+                    "plausible Kelvin: {sample:?}"
+                );
+            }
         }
         other => panic!("expected Sounding response, got {other:?}"),
     }

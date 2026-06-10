@@ -88,6 +88,29 @@ pub struct ProfileVar {
     pub values: Vec<f32>,
 }
 
+/// One surface (2D) variable sampled at the sounding's nearest grid point,
+/// in store-native units (the meta's `units` string says which).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceSample {
+    pub name: String,
+    pub units: String,
+    pub value: f32,
+}
+
+/// Surface variables sampled alongside every sounding: what the skew-T
+/// bridge ([`crate::skewt`]) needs to anchor the column at the model
+/// surface, plus `mslp` for display. Variables absent from an hour are
+/// simply not sampled.
+pub const SURFACE_SAMPLE_VARS: &[&str] = &[
+    "temperature_2m",
+    "dewpoint_2m",
+    "u_10m",
+    "v_10m",
+    "surface_pressure",
+    "orography",
+    "mslp",
+];
+
 /// Profiles of every 3D variable at one clicked point.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SoundingData {
@@ -100,6 +123,18 @@ pub struct SoundingData {
     pub lat: Option<f32>,
     pub lon: Option<f32>,
     pub vars: Vec<ProfileVar>,
+    /// Surface 2D values at the nearest grid point (see
+    /// [`SURFACE_SAMPLE_VARS`]); store-native units.
+    pub surface: Vec<SurfaceSample>,
+    /// Worker wall-clock for profile reads + surface samples, in ms.
+    pub read_ms: f32,
+}
+
+impl SoundingData {
+    /// The surface sample named `name`, when it was readable for this hour.
+    pub fn surface_value(&self, name: &str) -> Option<&SurfaceSample> {
+        self.surface.iter().find(|sample| sample.name == name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -332,6 +367,7 @@ fn load_sounding(
     fx: f64,
     fy: f64,
 ) -> rw_store::RwResult<SoundingData> {
+    let read_start = std::time::Instant::now();
     // Grid first (separate borrow scope from the hour reader).
     let (lat, lon) = match grid_for(state, key) {
         Some(grid) => {
@@ -361,6 +397,28 @@ fn load_sounding(
             values,
         });
     }
+
+    // Surface samples at the nearest grid point: one 1x1 window each (a
+    // single tile decode), only for variables the hour actually has.
+    let ix = (fx.round().max(0.0) as usize).min(reader.meta().nx - 1);
+    let iy = (fy.round().max(0.0) as usize).min(reader.meta().ny - 1);
+    let mut surface = Vec::new();
+    for &name in SURFACE_SAMPLE_VARS {
+        let Some(units) = reader
+            .variable(name)
+            .filter(|var| var.kind == "surface2d")
+            .map(|var| var.units.clone())
+        else {
+            continue;
+        };
+        let window = reader.read_window_2d(name, ix, iy, ix + 1, iy + 1)?;
+        surface.push(SurfaceSample {
+            name: name.to_string(),
+            units,
+            value: window.values[0],
+        });
+    }
+
     Ok(SoundingData {
         hour: key.clone(),
         fx,
@@ -368,5 +426,7 @@ fn load_sounding(
         lat,
         lon,
         vars,
+        surface,
+        read_ms: read_start.elapsed().as_secs_f32() * 1000.0,
     })
 }

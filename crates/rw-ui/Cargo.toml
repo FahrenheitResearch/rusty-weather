@@ -9,7 +9,8 @@ description = "Reusable egui panels for browsing and viewing rw-store weather da
 
 [dependencies]
 egui = "0.34"
-egui_plot = "0.35"
+image = { version = "0.25", default-features = false, features = ["png"] }
 rw-store = { path = "../rw-store" }
 rustwx-core = { path = "../rustwx-core" }
+rustwx-sounding = { path = "../rustwx-sounding" }
 serde_json.workspace = true

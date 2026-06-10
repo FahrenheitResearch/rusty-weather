@@ -11,6 +11,8 @@
 //!   reads; plain-data requests/responses over channels.
 //! - [`RunBrowserPanel`], [`FieldViewerPanel`], [`SoundingPanel`]: the
 //!   panels themselves — pure widgets over host-pushed data.
+//! - [`skewt`]: bridge from store sounding data to the production
+//!   `rustwx-sounding` (sharprs) skew-T renderer.
 //! - [`colormap`]: the false-color ramp used by the field viewer (a data
 //!   inspection aid, not the production render palette).
 //! - [`synthetic`]: dev/test helper that writes a tiny synthetic store so
@@ -18,6 +20,7 @@
 
 pub mod colormap;
 mod panels;
+pub mod skewt;
 mod store_view;
 pub mod synthetic;
 mod worker;
@@ -26,7 +29,7 @@ pub use panels::{FieldViewerEvent, FieldViewerPanel, RunBrowserPanel, SoundingPa
 pub use store_view::{HourEntry, ModelEntry, RunEntry, StoreTree, StoreView};
 pub use worker::{
     FieldData, FieldKey, HourKey, ProfileVar, SoundingData, StoreRequest, StoreResponse,
-    StoreWorker, VarInfo, VarKind,
+    StoreWorker, SurfaceSample, VarInfo, VarKind,
 };
 
 // Re-export the egui this crate is built against so hosts can match
