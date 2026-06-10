@@ -59,10 +59,12 @@ state and no order-dependent floating-point reductions:
 * no `par_iter().sum()`/`reduce()`/hash-map iteration anywhere in the
   derived/heavy lanes.
 
-Remaining suspects, in rough likelihood order: the C FFI unpack codecs
-(OpenJPEG / libaec in `grib-core::unpack`, exercised from rayon worker
-threads — only relevant for messages using those packings), allocator
-poisoning, or a transient hardware fault.
+The C FFI unpack codecs (OpenJPEG / libaec in `grib-core::unpack`) were
+also exonerated for this dataset: a section-5 census of the cached
+20260608 00z f006 prs/sfc/nat blobs found only templates 5.0 (simple)
+and 5.3 (complex + spatial differencing) — both pure-Rust decode paths;
+no message uses the FFI codecs. Remaining suspects: allocator poisoning
+(mimalloc) or a transient hardware/environment fault.
 
 ### Reproduction attempts
 
