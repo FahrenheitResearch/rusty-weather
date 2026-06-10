@@ -4,7 +4,9 @@ Status: design only — nothing here is built. This note records what a
 sub-1-GB-peak store ingest would need, and confirms that the 2026-06
 memory-diet changes (the `ingest-ram-diet` branch) do not foreclose any of
 it. Today's measured envelope after that branch: ~3.7 GB peak working set
-no-heavy, ~4.0 GB with the heavy stage, byte-identical hour files.
+no-heavy, ~4.0 GB with the heavy stage, hour files byte-identical to
+main's majority outcome (main itself has a known run-to-run flake — see
+`docs/DETERMINISM.md` for the gate semantics and the verify machinery).
 
 ## Where today's floor comes from
 
