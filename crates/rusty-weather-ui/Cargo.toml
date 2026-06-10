@@ -10,4 +10,24 @@ description = "Native egui shell mounting the rw-ui store browser/viewer panels"
 [dependencies]
 eframe = "0.34"
 egui = "0.34"
+rayon.workspace = true
+rustwx-core = { path = "../rustwx-core" }
+rustwx-io = { path = "../rustwx-io" }
+rustwx-models = { path = "../rustwx-models" }
+rw-ingest = { path = "../rw-ingest" }
 rw-ui = { path = "../rw-ui" }
+# Deep profiling (feature "profiling", default off): puffin scopes across
+# rw-ui + rw-ingest, a puffin_http server for the external puffin_viewer,
+# and the in-app scope-stats table. puffin_egui 0.30 pins egui ^0.33 and
+# does not compile against this tree's egui 0.34 — re-check when a 0.31
+# ships and swap the table for puffin_egui::profiler_window then.
+puffin = { version = "0.20", optional = true }
+puffin_http = { version = "0.17", optional = true }
+
+[features]
+profiling = [
+    "rw-ui/profiling",
+    "rw-ingest/profiling",
+    "dep:puffin",
+    "dep:puffin_http",
+]

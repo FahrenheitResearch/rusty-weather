@@ -12,6 +12,7 @@ use egui::{
     Ui, Vec2,
 };
 
+use crate::profile_scope;
 use crate::skewt::{build_native_sounding, render_sounding_image};
 use crate::worker::SoundingData;
 
@@ -63,6 +64,7 @@ impl SoundingPanel {
     /// the skew-T image here — once per click, not per frame. (The GPU
     /// upload happens on the next `ui` call, which has the `Context`.)
     pub fn set_data(&mut self, data: SoundingData) {
+        profile_scope!("skewt_build_render");
         let render_start = std::time::Instant::now();
         let skewt = build_native_sounding(&data)
             .and_then(|native| render_sounding_image(&native))
@@ -74,6 +76,22 @@ impl SoundingPanel {
                 upload_ms: 0.0,
             });
         self.state = SoundingState::Ready(Box::new(ReadySounding { data, skewt }));
+    }
+
+    /// `(profile read ms, skew-T render ms)` of the last loaded sounding,
+    /// when one is showing (stats strip).
+    pub fn last_timings(&self) -> Option<(f32, f32)> {
+        match &self.state {
+            SoundingState::Ready(ready) => Some((
+                ready.data.read_ms,
+                ready
+                    .skewt
+                    .as_ref()
+                    .map(|skewt| skewt.render_ms)
+                    .unwrap_or(0.0),
+            )),
+            _ => None,
+        }
     }
 
     pub fn clear(&mut self) {

@@ -43,9 +43,7 @@ use clap::Parser;
 use rw_store::grid::{GridFile, GridLocator};
 use rw_store::reader::HourReader;
 
-#[path = "../ingest_hour.rs"]
-mod ingest_hour;
-use ingest_hour::size_estimate::walk_hour_sizes;
+use rw_ingest::size_estimate::walk_hour_sizes;
 
 /// Mid-CONUS sounding click point (central Kansas).
 const SOUNDING_LAT: f64 = 39.0;

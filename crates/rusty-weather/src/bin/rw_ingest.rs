@@ -16,13 +16,10 @@ use rustwx_core::{CycleSpec, ModelId, SourceId};
 use rustwx_models::model_summary;
 use rustwx_products::cache::{default_proof_cache_dir, ensure_dir};
 
-#[path = "../ingest_hour.rs"]
-mod ingest_hour;
-#[path = "../throttle.rs"]
-mod throttle;
-use ingest_hour::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile};
-use ingest_hour::size_estimate::{Calibration, estimate};
-use ingest_hour::{IngestConfig, cache_state, parse_hours};
+use rw_ingest::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile};
+use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate};
+use rw_ingest::throttle;
+use rw_ingest::{IngestConfig, NEVER_CANCEL, cache_state, parse_hours, print_event};
 
 /// The derived CAPE kernels allocate per-column scratch across every rayon
 /// thread; mimalloc handles that churn better than the default Windows heap
@@ -142,7 +139,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Calibration hour files for `--estimate`: an explicit `--calibrate-from`
 /// hour file or run directory, else the newest stored hours (up to 3) of
-/// the same model under the store root, else none (built-in defaults).
+/// the same model under the store root (`default_calibration_paths`), else
+/// none (built-in defaults).
 fn calibration_paths(args: &Args, model_slug: &str) -> Vec<PathBuf> {
     let mut hour_files: Vec<PathBuf> = Vec::new();
     if let Some(from) = &args.calibrate_from {
@@ -174,27 +172,7 @@ fn calibration_paths(args: &Args, model_slug: &str) -> Vec<PathBuf> {
         hour_files.sort();
         return hour_files;
     }
-    let model_dir = args.store_root.join(model_slug);
-    let Ok(runs) = std::fs::read_dir(&model_dir) else {
-        return Vec::new();
-    };
-    for run in runs.flatten() {
-        if let Ok(entries) = std::fs::read_dir(run.path()) {
-            hour_files.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
-                path.extension().is_some_and(|ext| ext == "rws")
-            }));
-        }
-    }
-    // Newest first by modification time; the 3 newest bound the walk cost.
-    hour_files.sort_by_key(|path| {
-        std::cmp::Reverse(
-            std::fs::metadata(path)
-                .and_then(|meta| meta.modified())
-                .ok(),
-        )
-    });
-    hour_files.truncate(3);
-    hour_files
+    default_calibration_paths(&args.store_root, model_slug)
 }
 
 fn mb(bytes: u64) -> f64 {
@@ -300,9 +278,11 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         run_slug: &run_slug,
         profile: &profile,
         verify: args.verify,
+        progress: &print_event,
+        cancel: &NEVER_CANCEL,
     };
     for &hour in &hours {
-        let ingested = ingest_hour::ingest_hour(&config, hour)?;
+        let ingested = rw_ingest::ingest_hour_serial(&config, hour)?;
         println!(
             "f{hour:03}: prs fetch {} ms ({}, {:.1} MB) | sfc fetch {} ms ({}, {:.1} MB) | extract prs {} ms, sfc {} ms | thermo decode {} ms | derived {} ms | heavy {} ms | encode {} ms | total {} ms | {} {:.1} MB | 2d {}/{} | derived {}/{} | heavy {}/{} | 3d {}",
             ingested.prs_fetch_ms,

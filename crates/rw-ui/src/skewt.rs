@@ -49,12 +49,14 @@ const HEIGHT_EPSILON_M: f64 = 1.0;
 /// Build the production sounding (sharprs profile + computed parameter
 /// table + verified ECAPE) from one worker [`SoundingData`].
 pub fn build_native_sounding(data: &SoundingData) -> Result<NativeSounding, String> {
+    crate::profile_scope!("skewt_build_native");
     let column = build_sounding_column(data)?;
     NativeSounding::from_column(&column).map_err(|err| err.to_string())
 }
 
 /// Render `native` to an RGBA [`ColorImage`] via the bridge's PNG renderer.
 pub fn render_sounding_image(native: &NativeSounding) -> Result<ColorImage, String> {
+    crate::profile_scope!("skewt_render_image");
     png_to_color_image(&native.render_full_png())
 }
 

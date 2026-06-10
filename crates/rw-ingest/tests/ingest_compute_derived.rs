@@ -15,12 +15,7 @@ use rustwx_calc::{
 };
 use rustwx_products::gridded::{PressureFields, SurfaceFields, mixing_ratio_from_dewpoint_k};
 
-// The bin-shared module carries both compute stages; this test exercises
-// only the non-heavy lane, so the heavy entry is intentionally unused here.
-#[path = "../src/ingest_compute.rs"]
-#[allow(dead_code)]
-mod ingest_compute;
-use ingest_compute::ProductsComputeInputs;
+use rw_ingest::ingest_compute::{self, ProductsComputeInputs};
 
 const NX: usize = 3;
 const NY: usize = 2;

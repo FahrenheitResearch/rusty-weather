@@ -19,6 +19,7 @@ use rustwx_render::{
 };
 
 use crate::colormap::{Colormap, VIRIDIS, field_to_color_image, field_to_production_color_image};
+use crate::profile_scope;
 use crate::worker::{FieldData, FieldKey, HourKey, VarInfo, VarKind};
 
 /// Horizontal room reserved for the production legend (bar + ticks + labels).
@@ -62,6 +63,9 @@ pub struct FieldViewerPanel {
     /// The production colormap for the loaded field (None = generic ramp).
     cmap: Option<LeveledColormap>,
     legend_texture: Option<TextureHandle>,
+    /// Wall time of the last colormap + texture-upload pass, for the
+    /// always-on stats strip.
+    last_texture_ms: Option<f32>,
 }
 
 impl FieldViewerPanel {
@@ -146,6 +150,11 @@ impl FieldViewerPanel {
             colormap: self.colormap,
             ..Self::default()
         };
+    }
+
+    /// Wall time of the last colormap + texture-upload pass (stats strip).
+    pub fn last_texture_ms(&self) -> Option<f32> {
+        self.last_texture_ms
     }
 
     /// Render the variable picker + field image. Returns at most one event.
@@ -248,6 +257,8 @@ impl FieldViewerPanel {
 
         // (Re-)upload the textures only when the loaded field changed.
         if self.texture_dirty {
+            profile_scope!("field_texture_build");
+            let texture_started = std::time::Instant::now();
             let image = match &field.style {
                 Some(style) => {
                     // Production path: the exact colormap the PNG rasterizer
@@ -293,6 +304,7 @@ impl FieldViewerPanel {
                     ..Default::default()
                 },
             ));
+            self.last_texture_ms = Some(texture_started.elapsed().as_secs_f32() * 1000.0);
             self.texture_dirty = false;
         }
         let Some(texture) = &self.texture else {

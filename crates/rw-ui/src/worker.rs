@@ -17,6 +17,8 @@ use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
 
 use crate::colormap::finite_min_max;
+use crate::profile_scope;
+use crate::stats::StatsRegistry;
 use crate::store_view::{StoreTree, StoreView};
 
 /// One forecast hour of one model run.
@@ -175,6 +177,7 @@ pub enum StoreResponse {
 pub struct StoreWorker {
     tx: Sender<StoreRequest>,
     rx: Receiver<StoreResponse>,
+    stats: Arc<StatsRegistry>,
     _thread: JoinHandle<()>,
 }
 
@@ -184,15 +187,25 @@ impl StoreWorker {
     pub fn spawn(view: StoreView, notify: impl Fn() + Send + 'static) -> Self {
         let (req_tx, req_rx) = channel::<StoreRequest>();
         let (resp_tx, resp_rx) = channel::<StoreResponse>();
+        let stats = Arc::new(StatsRegistry::new());
+        let worker_stats = Arc::clone(&stats);
         let thread = std::thread::Builder::new()
             .name("rw-ui-store-worker".to_string())
-            .spawn(move || worker_loop(view, &req_rx, &resp_tx, &notify))
+            .spawn(move || worker_loop(view, &req_rx, &resp_tx, &notify, &worker_stats))
             .expect("spawn rw-ui store worker thread");
         Self {
             tx: req_tx,
             rx: resp_rx,
+            stats,
             _thread: thread,
         }
+    }
+
+    /// Per-request-kind wall times recorded by the worker thread
+    /// (`store.enumerate` / `store.hour` / `store.field` /
+    /// `store.sounding`) — feeds the always-on stats strip.
+    pub fn stats(&self) -> &Arc<StatsRegistry> {
+        &self.stats
     }
 
     /// Queue a request. Silently drops it if the worker died (the UI keeps
@@ -226,6 +239,7 @@ fn worker_loop(
     requests: &Receiver<StoreRequest>,
     responses: &Sender<StoreResponse>,
     notify: &(impl Fn() + Send + 'static),
+    stats: &StatsRegistry,
 ) {
     let mut state = WorkerState {
         view,
@@ -249,12 +263,25 @@ fn worker_loop(
             }
         }
         for request in coalesce(batch) {
+            let stat_name = request_stat_name(&request);
+            let started = std::time::Instant::now();
             let response = handle(&mut state, request);
+            stats.record(stat_name, started.elapsed().as_secs_f32() * 1000.0);
             if responses.send(response).is_err() {
                 return; // StoreWorker dropped
             }
             notify();
         }
+    }
+}
+
+/// Stats-strip key for one request kind.
+fn request_stat_name(request: &StoreRequest) -> &'static str {
+    match request {
+        StoreRequest::Enumerate => "store.enumerate",
+        StoreRequest::LoadHour(_) => "store.hour",
+        StoreRequest::LoadField(_) => "store.field",
+        StoreRequest::LoadSounding { .. } => "store.sounding",
     }
 }
 
@@ -281,16 +308,22 @@ fn coalesce(batch: Vec<StoreRequest>) -> Vec<StoreRequest> {
 
 fn handle(state: &mut WorkerState, request: StoreRequest) -> StoreResponse {
     match request {
-        StoreRequest::Enumerate => StoreResponse::Tree(state.view.enumerate()),
+        StoreRequest::Enumerate => {
+            profile_scope!("store_enumerate");
+            StoreResponse::Tree(state.view.enumerate())
+        }
         StoreRequest::LoadHour(key) => {
+            profile_scope!("store_load_hour");
             let result = hour_vars(state, &key).map_err(|err| err.to_string());
             StoreResponse::HourVars(key, result)
         }
         StoreRequest::LoadField(key) => {
+            profile_scope!("store_load_field");
             let result = load_field(state, &key).map_err(|err| err.to_string());
             StoreResponse::Field(key, Box::new(result))
         }
         StoreRequest::LoadSounding { hour, fx, fy } => {
+            profile_scope!("store_load_sounding");
             let result = load_sounding(state, &hour, fx, fy).map_err(|err| err.to_string());
             StoreResponse::Sounding(hour, result)
         }
@@ -301,6 +334,7 @@ fn handle(state: &mut WorkerState, request: StoreRequest) -> StoreResponse {
 fn reader_for<'s>(state: &'s mut WorkerState, key: &HourKey) -> rw_store::RwResult<&'s HourReader> {
     let cached = matches!(&state.hour, Some((have, _)) if have == key);
     if !cached {
+        profile_scope!("store_open_hour");
         let reader = state.view.open_hour(&key.model, &key.run, key.hour)?;
         state.hour = Some((key.clone(), reader));
     }
@@ -369,7 +403,10 @@ fn load_field(state: &mut WorkerState, key: &FieldKey) -> rw_store::RwResult<Fie
         .variable(&key.var)
         .map(|var| var.units.clone())
         .unwrap_or_default();
-    let mut values = reader.read_full_2d(&key.var)?;
+    let mut values = {
+        profile_scope!("store_read_full_2d");
+        reader.read_full_2d(&key.var)?
+    };
     // Convert to display units with the production arithmetic so the scale,
     // the hover readout, and the range chip all speak the same units.
     let units = match &style {
@@ -425,7 +462,10 @@ fn load_sounding(
         .collect();
     let mut vars = Vec::with_capacity(vars_3d.len());
     for (name, units, levels_hpa) in vars_3d {
-        let values = reader.read_profile_3d(&name, fx, fy)?;
+        let values = {
+            profile_scope!("store_read_profile_3d");
+            reader.read_profile_3d(&name, fx, fy)?
+        };
         vars.push(ProfileVar {
             name,
             units,
@@ -447,7 +487,10 @@ fn load_sounding(
         else {
             continue;
         };
-        let window = reader.read_window_2d(name, ix, iy, ix + 1, iy + 1)?;
+        let window = {
+            profile_scope!("store_read_window_2d");
+            reader.read_window_2d(name, ix, iy, ix + 1, iy + 1)?
+        };
         surface.push(SurfaceSample {
             name: name.to_string(),
             units,
