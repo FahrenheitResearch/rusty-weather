@@ -2018,6 +2018,38 @@ fn normalized_longitude_row_wraps_from_messages(
     Ok(normalized_longitude_row_wraps(&mut lon_raw, nx, ny))
 }
 
+/// The three native model CAPE planes a surface-product GRIB file may
+/// carry (HRRR `sfc` does), decoded with the exact message matching and
+/// scan/longitude normalization the surface decode lane uses for
+/// [`SurfaceFields::native_sbcape_jkg`] and friends. Planes the file does
+/// not carry come back `None` — same optionality as the decode lane.
+///
+/// This exists for the store-ingest path: `rw_ingest` extracts its 2D
+/// fields through rustwx-io (which applies the same scan-mode flip and
+/// per-row longitude rotation), so these planes line up row-for-row with
+/// the extracted grid, letting the heavy ECAPE stage compute the
+/// native-CAPE ratio recipes without a second decode lane.
+#[derive(Debug, Clone, Default)]
+pub struct NativeCapePlanes {
+    pub sbcape_jkg: Option<Vec<f64>>,
+    pub mlcape_jkg: Option<Vec<f64>>,
+    pub mucape_jkg: Option<Vec<f64>>,
+}
+
+/// Decode the native CAPE planes from raw surface-product GRIB bytes.
+/// Only the (up to three) matching CAPE messages unpack; the rest of the
+/// file is index-parsed only.
+pub fn decode_native_cape_planes(
+    bytes: &[u8],
+) -> Result<NativeCapePlanes, Box<dyn std::error::Error>> {
+    let file = Grib2File::from_bytes(bytes)?;
+    Ok(NativeCapePlanes {
+        sbcape_jkg: decode_optional_native_cape(&file.messages, NativeCapeLayer::Surface)?,
+        mlcape_jkg: decode_optional_native_cape(&file.messages, NativeCapeLayer::MixedLayer)?,
+        mucape_jkg: decode_optional_native_cape(&file.messages, NativeCapeLayer::MostUnstable)?,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 enum NativeCapeLayer {
     Surface,

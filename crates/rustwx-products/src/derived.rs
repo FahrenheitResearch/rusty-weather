@@ -74,7 +74,11 @@ use presentation::{
 pub(crate) use query::{load_derived_sampled_fields_from_latest, required_derived_fetch_products};
 use recipes::DerivedRequirements;
 pub(crate) use recipes::{DerivedRecipe, derived_compute_recipes_need_pressure};
-pub use store::{StoreDerivedGrid, compute_store_derived_grids, store_derived_recipe_slugs};
+pub use store::{
+    StoreDerivedGrid, StoreHeavyGrids, StoreHeavySkip, StoreHeavyTiming,
+    compute_store_derived_grids, compute_store_heavy_grids, store_derived_recipe_slugs,
+    store_heavy_recipe_slugs,
+};
 pub use types::{
     DerivedBatchReport, DerivedBatchRequest, DerivedMemoryProfile, DerivedRecipeBlocker,
     DerivedRecipeTiming, DerivedRenderedRecipe, DerivedSharedTiming, HrrrDerivedBatchReport,

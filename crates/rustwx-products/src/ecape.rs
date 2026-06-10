@@ -529,11 +529,39 @@ pub fn compute_ecape_map_fields(
     compute_ecape_map_fields_with_prepared_volume(surface, pressure, &prepared)
 }
 
+/// Per-kernel wall times inside [`compute_ecape_map_fields_with_prepared_volume`],
+/// for callers (the store-ingest lane) that need an honest breakdown of
+/// where the heavy stage's time goes. Pure observation: the timed variant
+/// runs the exact same kernels in the exact same order.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct EcapeMapFieldsTiming {
+    /// The SB/ML/MU entraining-parcel ECAPE triplet (the dominant cost).
+    pub ecape_triplet_ms: u128,
+    /// SRH 0-1/0-3 km + 0-6 km bulk shear for the experimental composites.
+    pub wind_diagnostics_ms: u128,
+    /// The classic (non-entraining) ML parcel pass feeding the STP's LCL.
+    pub ml_classic_ms: u128,
+    /// Elementwise composites + ratios (SCP/EHI/STP, derived/native ratios).
+    pub composites_ms: u128,
+}
+
 pub fn compute_ecape_map_fields_with_prepared_volume(
     surface: &SurfaceFields,
     pressure: &PressureFields,
     prepared: &crate::gridded::PreparedHeavyVolume,
 ) -> Result<(Vec<WeatherPanelField>, usize), Box<dyn std::error::Error>> {
+    let (fields, failure_count, _) =
+        compute_ecape_map_fields_with_prepared_volume_timed(surface, pressure, prepared)?;
+    Ok((fields, failure_count))
+}
+
+pub fn compute_ecape_map_fields_with_prepared_volume_timed(
+    surface: &SurfaceFields,
+    pressure: &PressureFields,
+    prepared: &crate::gridded::PreparedHeavyVolume,
+) -> Result<(Vec<WeatherPanelField>, usize, EcapeMapFieldsTiming), Box<dyn std::error::Error>> {
+    let mut timing = EcapeMapFieldsTiming::default();
+    let triplet_start = Instant::now();
     let triplet = compute_ecape_triplet_with_failure_mask_from_parts(
         prepared.grid,
         EcapeVolumeInputs {
@@ -557,6 +585,8 @@ pub fn compute_ecape_map_fields_with_prepared_volume(
         },
         EcapeTripletOptions::new("right_moving"),
     )?;
+    timing.ecape_triplet_ms = triplet_start.elapsed().as_millis();
+    let wind_start = Instant::now();
     let wind = WindGridInputs {
         shape: prepared.shape,
         u_3d_ms: &pressure.u_ms_3d,
@@ -564,6 +594,8 @@ pub fn compute_ecape_map_fields_with_prepared_volume(
         height_agl_3d_m: &prepared.height_agl_3d,
     };
     let wind_diagnostics = compute_wind_diagnostics_bundle(wind)?;
+    timing.wind_diagnostics_ms = wind_start.elapsed().as_millis();
+    let composites_start = Instant::now();
     let experimental = compute_scp_ehi(ScpEhiInputs {
         grid: prepared.grid,
         scp_cape_jkg: &triplet.mu.fields.ecape_jkg,
@@ -577,6 +609,8 @@ pub fn compute_ecape_map_fields_with_prepared_volume(
         &triplet.sb.fields.ecape_jkg,
         &wind_diagnostics.srh_03km_m2s2,
     )?;
+    timing.composites_ms += composites_start.elapsed().as_millis();
+    let ml_classic_start = Instant::now();
     let ml_classic = compute_mlcape_cin(
         prepared.grid,
         EcapeVolumeInputs {
@@ -600,6 +634,8 @@ pub fn compute_ecape_map_fields_with_prepared_volume(
         },
         None,
     )?;
+    timing.ml_classic_ms = ml_classic_start.elapsed().as_millis();
+    let tail_start = Instant::now();
     let ecape_stp = compute_stp_effective(EffectiveStpInputs {
         grid: prepared.grid,
         mlcape_jkg: &triplet.ml.fields.ecape_jkg,
@@ -681,7 +717,8 @@ pub fn compute_ecape_map_fields_with_prepared_volume(
             ecape_cape_ratio(&fields[2].values, native_mucape_jkg),
         ));
     }
-    Ok((fields, failure_count))
+    timing.composites_ms += tail_start.elapsed().as_millis();
+    Ok((fields, failure_count, timing))
 }
 
 fn ecape_cape_ratio(ecape_jkg: &[f64], cape_jkg: &[f64]) -> Vec<f64> {

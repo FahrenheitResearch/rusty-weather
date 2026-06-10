@@ -1,19 +1,24 @@
 //! Wiring proof for the ingest derived precompute path: `sbcape` and
-//! `srh_0_3km` grids computed through `ingest_compute::compute_derived_2d`
-//! must match calling the underlying rustwx-calc kernels directly with
-//! identically prepared inputs, bit-exactly — same code path, same f32->f64
-//! conversions, same mixing-ratio math, same height-AGL assembly. This
-//! proves the wiring (input assembly, level alignment, recipe fan-out), not
-//! the science, which lives in rustwx-calc and is tested there.
+//! `srh_0_3km` grids computed through
+//! `ingest_compute::assemble_products_inputs` +
+//! `compute_derived_2d_from_inputs` must match calling the underlying
+//! rustwx-calc kernels directly with identically prepared inputs,
+//! bit-exactly — same code path, same f32->f64 conversions, same
+//! mixing-ratio math, same height-AGL assembly. This proves the wiring
+//! (input assembly, level alignment, recipe fan-out), not the science,
+//! which lives in rustwx-calc and is tested there.
 
 use rustwx_calc::{
     EcapeVolumeInputs, GridShape as CalcGridShape, SurfaceInputs, VolumeShape, WindGridInputs,
     compute_sbcape_cin, compute_srh_03km_hemispheric,
 };
 use rustwx_core::{CanonicalField, FieldSelector, GridShape, LatLonGrid, SelectedField2D};
-use rustwx_products::gridded::mixing_ratio_from_dewpoint_k;
+use rustwx_products::gridded::{NativeCapePlanes, mixing_ratio_from_dewpoint_k};
 
+// The bin-shared module carries both compute stages; this test exercises
+// only the non-heavy lane, so the heavy entry is intentionally unused here.
 #[path = "../src/ingest_compute.rs"]
+#[allow(dead_code)]
 mod ingest_compute;
 use ingest_compute::{IngestVolumes, MoistureKind};
 
@@ -193,7 +198,7 @@ fn ingest_derived_matches_direct_calc_kernels_bit_exactly() {
         shuffled.swap(0, 1);
         shuffled
     };
-    let derived = ingest_compute::compute_derived_2d(
+    let inputs = ingest_compute::assemble_products_inputs(
         &synthetic.fields_2d,
         &IngestVolumes {
             temperature_k: &shuffle(&synthetic.temperature_k),
@@ -203,8 +208,11 @@ fn ingest_derived_matches_direct_calc_kernels_bit_exactly() {
             v_ms: &shuffle(&synthetic.v_ms),
             height_m: &shuffle(&synthetic.height_m),
         },
+        NativeCapePlanes::default(),
     )
-    .expect("derived precompute must succeed on the synthetic hour");
+    .expect("input assembly must succeed on the synthetic hour");
+    let derived = ingest_compute::compute_derived_2d_from_inputs(&inputs)
+        .expect("derived precompute must succeed on the synthetic hour");
     assert_eq!(
         derived.len(),
         29,

@@ -3,13 +3,14 @@
 //! Per forecast hour: fetch the `prs` product file (cache-aware), extract the
 //! full 3D isobaric superset plus the sparse per-level vorticity planes in
 //! ONE decode pass, fetch the `sfc` product file, extract the 2D surface set
-//! in ONE decode pass (plus one re-select for the trailing 1 h APCP window),
-//! compute every non-heavy derived recipe grid while the extracted fields
-//! are still in RAM (see `ingest_compute`; stored as ordinary 2D variables
-//! named by recipe slug, selector = the `{"derived": ...}` marker), then
-//! write the hour into `<store-root>/<model>/<run>/f{hour:03}.rws` plus
-//! `grid.rwg` and `run.json` via
-//! `rw_store::ingest::write_hour_from_fields_with_derived`.
+//! in ONE decode pass (plus one re-select for the trailing 1 h APCP window
+//! and a native-CAPE decode of the same bytes for the heavy ratio recipes),
+//! compute every non-heavy derived recipe grid AND every heavy ECAPE-class
+//! recipe grid while the extracted fields are still in RAM (see
+//! `ingest_compute`; stored as ordinary 2D variables named by recipe slug,
+//! selector = the `{"derived": ...}` marker), then write the hour into
+//! `<store-root>/<model>/<run>/f{hour:03}.rws` plus `grid.rwg` and
+//! `run.json` via `rw_store::ingest::write_hour_from_fields_with_derived`.
 //!
 //! No `nat` (wrfnat) fetch: every formerly "native-only" 2D field this plan
 //! needs (composite reflectivity, 1 km AGL reflectivity, 2-5 km updraft
@@ -32,7 +33,8 @@ use rustwx_io::{
 };
 use rustwx_models::model_summary;
 use rustwx_products::cache::{default_proof_cache_dir, ensure_dir};
-use rustwx_products::derived::store_derived_recipe_slugs;
+use rustwx_products::derived::{store_derived_recipe_slugs, store_heavy_recipe_slugs};
+use rustwx_products::gridded::{NativeCapePlanes, decode_native_cape_planes};
 use rw_store::grid::GridFile;
 use rw_store::ingest::{
     DerivedFieldInput, PressureVolumeInput, derived_selector, read_field_2d, read_grid_2d,
@@ -513,6 +515,28 @@ fn ingest_hour(
     } else {
         eprintln!("f{hour:03}: 2D field 'apcp_1h' has no trailing 1 h window at analysis; skipped");
     }
+
+    // Native CAPE planes for the heavy native-ratio recipes, decoded from
+    // the same sfc bytes via the products decode lane (the exact message
+    // matching + normalization the heavy render lane's SurfaceFields
+    // carries; rustwx-io's extraction applies the same scan-mode flip and
+    // longitude-row rotation, so the planes line up with the extracted
+    // grid). rustwx-core has no CAPE CanonicalField, so this is the only
+    // route to the GRIB CAPE messages. The GRIB index re-parses; only the
+    // (up to three) CAPE messages decode. Failure degrades to "no native
+    // ratio recipes", never a failed ingest.
+    let native_cape_started = Instant::now();
+    let native_cape = match decode_native_cape_planes(&sfc.result.bytes) {
+        Ok(planes) => planes,
+        Err(err) => {
+            eprintln!(
+                "f{hour:03}: native CAPE decode failed: {err}; \
+                 native-ratio heavy recipes will be skipped"
+            );
+            NativeCapePlanes::default()
+        }
+    };
+    sfc_extract_ms += native_cape_started.elapsed().as_millis();
     drop(sfc);
 
     // Sparse prs-sourced planes ride behind the sfc set so the grid carrier
@@ -527,12 +551,16 @@ fn ingest_hour(
         .into());
     }
 
-    // --- derived precompute: every non-heavy recipe grid, while the
-    //     extracted inputs are still in RAM (no refetch, no redecode) ---
+    // --- derived + heavy precompute: every non-heavy recipe grid and every
+    //     heavy ECAPE-class recipe grid, while the extracted inputs are
+    //     still in RAM (no refetch, no redecode; inputs assembled once) ---
     let planned_derived = store_derived_recipe_slugs().len();
-    let derived_started = Instant::now();
-    let derived_grids = compute_derived_grids(&fields_2d_owned, &volumes_data, hour);
-    let derived_ms = derived_started.elapsed().as_millis();
+    let planned_heavy = store_heavy_recipe_slugs().len();
+    let stages = compute_product_grids(&fields_2d_owned, &volumes_data, native_cape, hour);
+    let derived_ms = stages.derived_ms;
+    let heavy_ms = stages.heavy_ms;
+    let derived_grids = stages.derived;
+    let heavy_grids = stages.heavy;
 
     // --- assemble + write ---
     let fields_2d: Vec<(&str, &SelectedField2D)> = fields_2d_owned
@@ -566,6 +594,7 @@ fn ingest_hour(
 
     let derived_inputs: Vec<DerivedFieldInput<'_>> = derived_grids
         .iter()
+        .chain(heavy_grids.iter())
         .map(|grid| DerivedFieldInput {
             name: grid.name,
             units: &grid.units,
@@ -597,7 +626,7 @@ fn ingest_hour(
         .collect::<Vec<_>>()
         .join(" ");
     println!(
-        "f{hour:03}: prs fetch {prs_fetch_ms} ms ({}, {prs_mb:.1} MB) | sfc fetch {sfc_fetch_ms} ms ({}, {sfc_mb:.1} MB) | extract prs {prs_extract_ms} ms, sfc {sfc_extract_ms} ms | derived {derived_ms} ms | encode {} ms | total {total_ms} ms | {} {:.1} MB | 2d {}/{} | derived {}/{planned_derived} | 3d {volume_summary}",
+        "f{hour:03}: prs fetch {prs_fetch_ms} ms ({}, {prs_mb:.1} MB) | sfc fetch {sfc_fetch_ms} ms ({}, {sfc_mb:.1} MB) | extract prs {prs_extract_ms} ms, sfc {sfc_extract_ms} ms | derived {derived_ms} ms | heavy {heavy_ms} ms | encode {} ms | total {total_ms} ms | {} {:.1} MB | 2d {}/{} | derived {}/{planned_derived} | heavy {}/{planned_heavy} | 3d {volume_summary}",
         cache_state(prs_cache_hit),
         cache_state(sfc_cache_hit),
         written.encode_ms,
@@ -606,6 +635,7 @@ fn ingest_hour(
         fields_2d.len(),
         planned_2d,
         derived_grids.len(),
+        heavy_grids.len(),
     );
     for volume in &volumes_data {
         if volume.levels.len() >= 2 {
@@ -620,6 +650,7 @@ fn ingest_hour(
             &written.path,
             &fields_2d_owned,
             &derived_grids,
+            &heavy_grids,
             &volumes_data,
         )?;
     }
@@ -630,16 +661,30 @@ fn cache_state(hit: bool) -> &'static str {
     if hit { "cache hit" } else { "cache miss" }
 }
 
-/// Route the extracted hour into the derived precompute lane: pick each
+/// Both compute stages' outputs for one hour, with per-stage wall times.
+/// `derived_ms` covers input assembly + the non-heavy pass (matching what
+/// the pre-heavy ingest reported as "derived"); `heavy_ms` is the heavy
+/// ECAPE stage alone (height-AGL prep + ECAPE triplet + composites).
+#[derive(Default)]
+struct ComputedProductGrids {
+    derived: Vec<DerivedGrid2D>,
+    heavy: Vec<DerivedGrid2D>,
+    derived_ms: u128,
+    heavy_ms: u128,
+}
+
+/// Route the extracted hour into the products compute lanes: pick each
 /// volume slot by canonical field (the moisture slot is dewpoint_iso, or
-/// rh_iso after the extraction fallback) and run all non-heavy recipes.
-/// Failures degrade to "no derived variables this hour", never a failed
-/// ingest — the extracted fields still carry the hour.
-fn compute_derived_grids(
+/// rh_iso after the extraction fallback), assemble the f64 inputs once,
+/// then run the non-heavy derived pass and the heavy ECAPE pass. Each
+/// stage degrades independently to "no variables from this stage", never
+/// a failed ingest — the extracted fields still carry the hour.
+fn compute_product_grids(
     fields_2d: &[(&'static str, SelectedField2D)],
     volumes_data: &[VolumeData],
+    native_cape: NativeCapePlanes,
     hour: u16,
-) -> Vec<DerivedGrid2D> {
+) -> ComputedProductGrids {
     let volume_levels = |field: CanonicalField| {
         volumes_data
             .iter()
@@ -648,10 +693,10 @@ fn compute_derived_grids(
     };
     let missing = |name: &str| {
         eprintln!(
-            "f{hour:03}: derived precompute skipped: 3D variable '{name}' \
+            "f{hour:03}: derived/heavy precompute skipped: 3D variable '{name}' \
              realized < 2 levels"
         );
-        Vec::new()
+        ComputedProductGrids::default()
     };
     let Some(temperature_k) = volume_levels(CanonicalField::Temperature) else {
         return missing("temperature_iso");
@@ -672,7 +717,9 @@ fn compute_derived_grids(
             None => return missing("dewpoint_iso/rh_iso"),
         },
     };
-    match ingest_compute::compute_derived_2d(
+
+    let derived_started = Instant::now();
+    let inputs = match ingest_compute::assemble_products_inputs(
         fields_2d,
         &IngestVolumes {
             temperature_k,
@@ -682,24 +729,73 @@ fn compute_derived_grids(
             v_ms,
             height_m,
         },
+        native_cape,
     ) {
+        Ok(inputs) => inputs,
+        Err(err) => {
+            eprintln!("f{hour:03}: derived/heavy precompute skipped: {err}");
+            return ComputedProductGrids::default();
+        }
+    };
+
+    let derived = match ingest_compute::compute_derived_2d_from_inputs(&inputs) {
         Ok(grids) => grids,
         Err(err) => {
             eprintln!("f{hour:03}: derived precompute skipped: {err}");
             Vec::new()
         }
+    };
+    let derived_ms = derived_started.elapsed().as_millis();
+
+    let heavy_started = Instant::now();
+    let heavy = match ingest_compute::compute_heavy_2d_from_inputs(&inputs) {
+        Ok(heavy) => {
+            for (slug, reason) in &heavy.skipped {
+                eprintln!("f{hour:03}: heavy recipe '{slug}' skipped: {reason}");
+            }
+            if heavy.ecape_failure_count > 0 {
+                eprintln!(
+                    "f{hour:03}: ECAPE triplet failed on {} column(s) (NaN in grids, \
+                     same as the render lane)",
+                    heavy.ecape_failure_count
+                );
+            }
+            println!(
+                "  heavy breakdown: height-AGL prep {} ms | ECAPE triplet {} ms | \
+                 wind diagnostics {} ms | ML classic (STP LCL) {} ms | composites {} ms",
+                heavy.timing.prepare_height_agl_ms,
+                heavy.timing.kernels.ecape_triplet_ms,
+                heavy.timing.kernels.wind_diagnostics_ms,
+                heavy.timing.kernels.ml_classic_ms,
+                heavy.timing.kernels.composites_ms,
+            );
+            heavy.grids
+        }
+        Err(err) => {
+            eprintln!("f{hour:03}: heavy precompute skipped: {err}");
+            Vec::new()
+        }
+    };
+    let heavy_ms = heavy_started.elapsed().as_millis();
+
+    ComputedProductGrids {
+        derived,
+        heavy,
+        derived_ms,
+        heavy_ms,
     }
 }
 
 /// Re-open the just-written hour: bit-exact round-trip of the first 2D field
-/// and the first derived variable (via `read_grid_2d`, marker selector
-/// checked), plus one center-of-grid profile per 3D variable, each profile
-/// value checked against the source plane's center value within the
-/// quantization bound.
+/// plus the first derived and first heavy variable (via `read_grid_2d`,
+/// marker selector checked), plus one center-of-grid profile per 3D
+/// variable, each profile value checked against the source plane's center
+/// value within the quantization bound.
 fn verify_hour(
     hour_path: &Path,
     fields_2d: &[(&'static str, SelectedField2D)],
     derived_grids: &[DerivedGrid2D],
+    heavy_grids: &[DerivedGrid2D],
     volumes_data: &[VolumeData],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let reader = HourReader::open(hour_path)?;
@@ -723,28 +819,13 @@ fn verify_hour(
 
     let mut derived_note = String::from("no derived vars");
     if let Some(derived) = derived_grids.first() {
-        let stored = read_grid_2d(&reader, &grid, derived.name)?;
-        if stored.selector != derived_selector(derived.name) {
-            return Err(format!(
-                "verify: derived '{}' stored selector {} is not the derived marker",
-                derived.name, stored.selector
-            )
-            .into());
-        }
-        let exact = stored.values.len() == derived.values.len()
-            && stored
-                .values
-                .iter()
-                .zip(&derived.values)
-                .all(|(a, b)| a.to_bits() == b.to_bits());
-        if !exact {
-            return Err(format!(
-                "verify: derived round-trip of '{}' is not bit-exact",
-                derived.name
-            )
-            .into());
-        }
+        verify_marked_grid(&reader, &grid, derived)?;
         derived_note = format!("derived '{}' bit-exact", derived.name);
+    }
+    let mut heavy_note = String::from("no heavy vars");
+    if let Some(heavy) = heavy_grids.first() {
+        verify_marked_grid(&reader, &grid, heavy)?;
+        heavy_note = format!("heavy '{}' bit-exact", heavy.name);
     }
 
     // Integer grid center: at exact integer coordinates the bilinear profile
@@ -831,10 +912,41 @@ fn verify_hour(
         profiles.push(format!("{}:{}", var.name, profile.len()));
     }
     println!(
-        "  verify ok: '{name}' bit-exact, {derived_note}, profiles at grid center [{}], \
-         values within quantization bound",
+        "  verify ok: '{name}' bit-exact, {derived_note}, {heavy_note}, \
+         profiles at grid center [{}], values within quantization bound",
         profiles.join(" ")
     );
+    Ok(())
+}
+
+/// Bit-exact round-trip of one derived/heavy grid via `read_grid_2d`,
+/// including the `{"derived": slug}` marker selector.
+fn verify_marked_grid(
+    reader: &HourReader,
+    grid: &GridFile,
+    expected: &DerivedGrid2D,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stored = read_grid_2d(reader, grid, expected.name)?;
+    if stored.selector != derived_selector(expected.name) {
+        return Err(format!(
+            "verify: derived '{}' stored selector {} is not the derived marker",
+            expected.name, stored.selector
+        )
+        .into());
+    }
+    let exact = stored.values.len() == expected.values.len()
+        && stored
+            .values
+            .iter()
+            .zip(&expected.values)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+    if !exact {
+        return Err(format!(
+            "verify: derived round-trip of '{}' is not bit-exact",
+            expected.name
+        )
+        .into());
+    }
     Ok(())
 }
 

@@ -1,21 +1,29 @@
-//! Ingest-time derived precompute: assemble the rustwx-products derived
-//! compute inputs from the extracted fields while they sit in RAM, run all
-//! 29 non-heavy derived recipes through the existing products compute lane
-//! (`rustwx_products::derived::compute_store_derived_grids` — the exact
-//! code path the render/query lanes use), and hand back f32 grids ready to
-//! store as ordinary 2D variables named by recipe slug.
+//! Ingest-time derived + heavy precompute: assemble the rustwx-products
+//! compute inputs from the extracted fields ONCE while they sit in RAM,
+//! then run all 29 non-heavy derived recipes
+//! (`rustwx_products::derived::compute_store_derived_grids`) and all 16
+//! heavy ECAPE-class recipes
+//! (`rustwx_products::derived::compute_store_heavy_grids` — the exact
+//! prep + kernel dispatch the heavy render lane runs) through the existing
+//! products compute lanes, handing back f32 grids ready to store as
+//! ordinary 2D variables named by recipe slug.
 //!
 //! No science lives here: moisture comes from the products crate's own
 //! mixing-ratio helpers, and every recipe kernel is the rustwx-calc function
-//! the derived render lane calls. This module only converts f32 extraction
-//! planes into the f64 `SurfaceFields`/`PressureFields` shape the lane
-//! consumes (in parallel — the conversions span ~350M values per HRRR hour).
+//! the render lanes call. This module only converts f32 extraction
+//! planes into the f64 `SurfaceFields`/`PressureFields` shape the lanes
+//! consume (in parallel — the conversions span ~350M values per HRRR hour).
+//! Native CAPE planes (the heavy native-ratio denominators) arrive already
+//! decoded as f64 from `rustwx_products::gridded::decode_native_cape_planes`
+//! and are passed through untouched.
 
 use rayon::prelude::*;
 use rustwx_core::SelectedField2D;
-use rustwx_products::derived::compute_store_derived_grids;
+use rustwx_products::derived::{
+    StoreHeavyTiming, compute_store_derived_grids, compute_store_heavy_grids,
+};
 use rustwx_products::gridded::{
-    PressureFields, SurfaceFields, mixing_ratio_from_dewpoint_k,
+    NativeCapePlanes, PressureFields, SurfaceFields, mixing_ratio_from_dewpoint_k,
     mixing_ratio_from_relative_humidity,
 };
 
@@ -25,6 +33,27 @@ pub struct DerivedGrid2D {
     pub name: &'static str,
     pub units: String,
     pub values: Vec<f32>,
+}
+
+/// The assembled products-side compute inputs for one extracted hour: the
+/// f64 `SurfaceFields`/`PressureFields` pair every store compute stage
+/// (derived and heavy) consumes. Built once per hour by
+/// [`assemble_products_inputs`] so the ~350M-value f32→f64 conversion is
+/// not repeated per stage.
+pub struct ProductsComputeInputs {
+    pub surface: SurfaceFields,
+    pub pressure: PressureFields,
+}
+
+/// Output of the heavy (ECAPE-class) compute stage: realized grids,
+/// recipes skipped with the products lane's documented reason, the ECAPE
+/// triplet's per-column failure count, and the products lane's per-kernel
+/// timing breakdown for honest stage reporting.
+pub struct HeavyGrids2D {
+    pub grids: Vec<DerivedGrid2D>,
+    pub skipped: Vec<(&'static str, String)>,
+    pub ecape_failure_count: usize,
+    pub timing: StoreHeavyTiming,
 }
 
 /// How the moisture planes are expressed. Dewpoint is preferred (it is the
@@ -59,14 +88,63 @@ const SURFACE_V_10M: &str = "v_10m";
 const SURFACE_PRESSURE: &str = "surface_pressure";
 const SURFACE_OROGRAPHY: &str = "orography";
 
-/// Compute every non-heavy derived recipe grid from the extracted hour.
-/// Builds the products-side inputs once (f64 conversion, mixing ratio,
-/// level alignment) and runs the shared compute pass; the expensive
-/// recipe kernels are rayon-parallel inside rustwx-calc.
-pub fn compute_derived_2d(
+/// Run the shared non-heavy compute pass on already-assembled inputs and
+/// convert the grids back to f32. The expensive recipe kernels are
+/// rayon-parallel inside rustwx-calc.
+pub fn compute_derived_2d_from_inputs(
+    inputs: &ProductsComputeInputs,
+) -> Result<Vec<DerivedGrid2D>, Box<dyn std::error::Error>> {
+    let grids = compute_store_derived_grids(&inputs.surface, &inputs.pressure)?;
+    Ok(grids
+        .into_iter()
+        .map(|grid| DerivedGrid2D {
+            name: grid.slug,
+            units: grid.units,
+            values: grid.values.par_iter().map(|&value| value as f32).collect(),
+        })
+        .collect())
+}
+
+/// Run the heavy ECAPE-class compute pass (the heavy render lane's exact
+/// prep + kernels via `compute_store_heavy_grids`) on already-assembled
+/// inputs and convert the grids back to f32. The native-CAPE ratio recipes
+/// realize only when [`assemble_products_inputs`] received the matching
+/// native plane; otherwise they come back in `skipped` with the products
+/// lane's documented reason.
+pub fn compute_heavy_2d_from_inputs(
+    inputs: &ProductsComputeInputs,
+) -> Result<HeavyGrids2D, Box<dyn std::error::Error>> {
+    let heavy = compute_store_heavy_grids(&inputs.surface, &inputs.pressure)?;
+    Ok(HeavyGrids2D {
+        grids: heavy
+            .grids
+            .into_iter()
+            .map(|grid| DerivedGrid2D {
+                name: grid.slug,
+                units: grid.units,
+                values: grid.values.par_iter().map(|&value| value as f32).collect(),
+            })
+            .collect(),
+        skipped: heavy
+            .skipped
+            .into_iter()
+            .map(|skip| (skip.slug, skip.reason))
+            .collect(),
+        ecape_failure_count: heavy.ecape_failure_count,
+        timing: heavy.timing,
+    })
+}
+
+/// Assemble the products-side compute inputs from the extracted hour: f64
+/// conversion, mixing-ratio math, and level alignment, all once. The
+/// native CAPE planes (if any) ride on the `SurfaceFields` exactly as the
+/// products decode lane carries them; the non-heavy compute ignores them
+/// and the heavy stage uses them as the native-ratio denominators.
+pub fn assemble_products_inputs(
     fields_2d: &[(&'static str, SelectedField2D)],
     volumes: &IngestVolumes<'_>,
-) -> Result<Vec<DerivedGrid2D>, Box<dyn std::error::Error>> {
+    native_cape: NativeCapePlanes,
+) -> Result<ProductsComputeInputs, Box<dyn std::error::Error>> {
     let find = |name: &str| {
         fields_2d
             .iter()
@@ -116,6 +194,22 @@ pub fn compute_derived_2d(
         )
         .into());
     }
+    for (name, plane) in [
+        ("native sbcape", native_cape.sbcape_jkg.as_ref()),
+        ("native mlcape", native_cape.mlcape_jkg.as_ref()),
+        ("native mucape", native_cape.mucape_jkg.as_ref()),
+    ] {
+        if let Some(plane) = plane {
+            if plane.len() != nxy {
+                return Err(format!(
+                    "derived precompute: {name} plane holds {} values, expected {nxy} \
+                     (surface GRIB grid disagrees with the extraction grid?)",
+                    plane.len()
+                )
+                .into());
+            }
+        }
+    }
 
     // --- surface inputs: f64 conversion + the decode lane's moisture math ---
     let psfc_pa = to_f64(&psfc.values);
@@ -148,9 +242,9 @@ pub fn compute_derived_2d(
         q2_kgkg,
         u10_ms: to_f64(&u10.values),
         v10_ms: to_f64(&v10.values),
-        native_sbcape_jkg: None,
-        native_mlcape_jkg: None,
-        native_mucape_jkg: None,
+        native_sbcape_jkg: native_cape.sbcape_jkg,
+        native_mlcape_jkg: native_cape.mlcape_jkg,
+        native_mucape_jkg: native_cape.mucape_jkg,
         native_pblh_m: None,
     };
 
@@ -189,16 +283,7 @@ pub fn compute_derived_2d(
         graupel_kgkg_3d: None,
     };
 
-    // --- one shared compute pass for all 29 recipes, then back to f32 ---
-    let grids = compute_store_derived_grids(&surface, &pressure)?;
-    Ok(grids
-        .into_iter()
-        .map(|grid| DerivedGrid2D {
-            name: grid.slug,
-            units: grid.units,
-            values: grid.values.par_iter().map(|&value| value as f32).collect(),
-        })
-        .collect())
+    Ok(ProductsComputeInputs { surface, pressure })
 }
 
 fn to_f64(values: &[f32]) -> Vec<f64> {
