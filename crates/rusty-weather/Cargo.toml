@@ -14,6 +14,12 @@ clap.workspace = true
 # better than the default Windows heap (~10% on the derived stage, ~15% on
 # GRIB extraction, measured on the 32-thread dev box).
 mimalloc = "0.1"
+# mi_option_set: the ingest bins disable mimalloc's purge delay so freed
+# decode/compute segments decommit immediately — with the default 10 ms
+# batched purge, a full-profile ingest's working-set PEAK measured ~1.3 GB
+# above its live set (purge lagging the 0.5 GB/s allocation bursts). Same
+# crate the mimalloc allocator wraps, so this adds a feature, not a build.
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
 rayon.workspace = true
 serde_json.workspace = true
 rustwx-core = { path = "../rustwx-core" }

@@ -27,6 +27,24 @@ use rw_ingest::{IngestConfig, NEVER_CANCEL, cache_state, parse_hours, print_even
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Decommit freed segments immediately instead of after mimalloc's default
+/// 10 ms batched purge delay. The ingest decode/compute stages free and
+/// commit hundreds of MB per second; with the delay, the measured peak
+/// working set ran ~1.3 GB ABOVE the live set purely from purge lag
+/// (verified: MIMALLOC_PURGE_DELAY=0 cut a full-profile f006 ingest peak
+/// from ~5.2 GB to ~3.9 GB at identical wall time). Values and output
+/// bytes are unaffected — this only changes when freed pages return to
+/// the OS.
+fn disable_mimalloc_purge_delay() {
+    /// `mi_option_purge_delay` from mimalloc's option enum — libmimalloc-sys
+    /// 0.1.49 does not re-export this constant (its named options stop at
+    /// v1.x-era names), but the linked mimalloc honors it; the neighbors it
+    /// DOES export pin the numbering (eager_commit_delay = 14,
+    /// use_numa_nodes = 16).
+    const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) };
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "rw-ingest",
@@ -130,6 +148,7 @@ fn profile_from_args(args: &Args) -> Result<IngestProfile, String> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    disable_mimalloc_purge_delay();
     let args = Args::parse();
     // Scheduling policy must land before anything touches rayon (the
     // global pool is built lazily on first use and cannot be resized).

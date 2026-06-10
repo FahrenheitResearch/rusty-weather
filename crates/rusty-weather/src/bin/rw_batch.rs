@@ -58,6 +58,18 @@ use rw_ingest::{
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Decommit freed segments immediately instead of after mimalloc's default
+/// 10 ms batched purge delay — see the matching helper in `rw_ingest.rs`:
+/// purge lag inflated the measured ingest peak working set ~1.3 GB above
+/// the live set at identical wall time.
+fn disable_mimalloc_purge_delay() {
+    /// `mi_option_purge_delay` in mimalloc's option enum (libmimalloc-sys
+    /// 0.1.49 exports the neighbors: eager_commit_delay = 14,
+    /// use_numa_nodes = 16).
+    const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 enum PngCompressionArg {
@@ -233,6 +245,7 @@ fn static_output_dimension(name: &str, fallback: u32) -> u32 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    disable_mimalloc_purge_delay();
     let args = Args::parse();
     // Scheduling policy must land before anything touches rayon (the
     // global pool is built lazily on first use and cannot be resized).
