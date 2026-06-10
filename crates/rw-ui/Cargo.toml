@@ -19,3 +19,9 @@ rustwx-products = { path = "../rustwx-products" }
 rustwx-render = { path = "../rustwx-render" }
 rustwx-sounding = { path = "../rustwx-sounding" }
 serde_json.workspace = true
+# Deep profiling scopes (default off; bowecho compiles without them). The
+# always-on stats strip has NO dependency on this - it is plain Instants.
+puffin = { version = "0.20", optional = true }
+
+[features]
+profiling = ["dep:puffin"]

@@ -4208,6 +4208,7 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "image",
+ "puffin",
  "rustwx-core",
  "rustwx-products",
  "rustwx-render",
