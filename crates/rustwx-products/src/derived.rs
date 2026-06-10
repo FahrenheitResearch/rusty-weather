@@ -51,6 +51,7 @@ mod planning;
 mod presentation;
 mod query;
 mod recipes;
+mod store;
 mod types;
 
 use compute::{
@@ -73,6 +74,7 @@ use presentation::{
 pub(crate) use query::{load_derived_sampled_fields_from_latest, required_derived_fetch_products};
 use recipes::DerivedRequirements;
 pub(crate) use recipes::{DerivedRecipe, derived_compute_recipes_need_pressure};
+pub use store::{StoreDerivedGrid, compute_store_derived_grids, store_derived_recipe_slugs};
 pub use types::{
     DerivedBatchReport, DerivedBatchRequest, DerivedMemoryProfile, DerivedRecipeBlocker,
     DerivedRecipeTiming, DerivedRenderedRecipe, DerivedSharedTiming, HrrrDerivedBatchReport,
@@ -1343,17 +1345,13 @@ fn extract_native_derived_field(
         }
         NativeDerivedRecipe::WrfGdexScalar { .. } => {
             if model == ModelId::WrfGdex {
-                return Err(
-                    "WRF/GDEX NetCDF support is not available in this build".into(),
-                );
+                return Err("WRF/GDEX NetCDF support is not available in this build".into());
             }
             Ok(None)
         }
         NativeDerivedRecipe::WrfGdexVectorMagnitude { .. } => {
             if model == ModelId::WrfGdex {
-                return Err(
-                    "WRF/GDEX NetCDF support is not available in this build".into(),
-                );
+                return Err("WRF/GDEX NetCDF support is not available in this build".into());
             }
             Ok(None)
         }

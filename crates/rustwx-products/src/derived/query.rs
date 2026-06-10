@@ -183,7 +183,7 @@ pub(crate) fn compute_derived_query_field(
     derived_query_field_from_computed(surface.nx, surface.ny, recipe, &computed)
 }
 
-fn derived_query_field_from_computed(
+pub(super) fn derived_query_field_from_computed(
     nx: usize,
     ny: usize,
     recipe: DerivedRecipe,

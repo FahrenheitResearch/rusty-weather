@@ -2148,13 +2148,24 @@ fn q_to_mixing_ratio(values: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-fn mixing_ratio_from_dewpoint_k(pressure_hpa: f64, dewpoint_k: f64) -> f64 {
+/// Water-vapor mixing ratio (kg/kg) from dewpoint via Bolton (1980)
+/// saturation vapor pressure. Public so store-ingest derived precompute
+/// (`rw_ingest`) derives moisture with exactly the formula this crate's
+/// GRIB decode lane uses — do not duplicate it.
+pub fn mixing_ratio_from_dewpoint_k(pressure_hpa: f64, dewpoint_k: f64) -> f64 {
     let td_c = dewpoint_k - 273.15;
     let vapor_pressure_hpa = 6.112 * ((17.67 * td_c) / (td_c + 243.5)).exp();
     mixing_ratio_from_vapor_pressure(pressure_hpa, vapor_pressure_hpa)
 }
 
-fn mixing_ratio_from_relative_humidity(pressure_hpa: f64, temperature_k: f64, rh_pct: f64) -> f64 {
+/// Water-vapor mixing ratio (kg/kg) from relative humidity (%), the decode
+/// lane's last-resort moisture fallback. Public for the same store-ingest
+/// reuse as [`mixing_ratio_from_dewpoint_k`].
+pub fn mixing_ratio_from_relative_humidity(
+    pressure_hpa: f64,
+    temperature_k: f64,
+    rh_pct: f64,
+) -> f64 {
     let t_c = temperature_k - 273.15;
     let saturation_vapor_pressure_hpa = 6.112 * ((17.67 * t_c) / (t_c + 243.5)).exp();
     let vapor_pressure_hpa = (rh_pct / 100.0).clamp(0.0, 1.5) * saturation_vapor_pressure_hpa;

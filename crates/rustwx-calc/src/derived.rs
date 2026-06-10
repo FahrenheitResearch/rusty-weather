@@ -560,76 +560,88 @@ fn validate_temperature_advection_inputs(
     Ok(())
 }
 
+/// One grid point's surface-thermo bundle, computed in a single pass so the
+/// shared intermediates (dewpoint, RH, wind speed, VPD) are evaluated once.
+/// Per-point math is exactly the former serial loop's; only the iteration
+/// is rayon-parallel now (each point is independent, results are identical).
+#[derive(Debug, Clone, Copy)]
+struct SurfaceThermoPoint {
+    dewpoint_c: f64,
+    relative_humidity_pct: f64,
+    theta_e_k: f64,
+    wetbulb_c: f64,
+    dewpoint_depression_c: f64,
+    vpd_hpa: f64,
+    fire_weather: f64,
+    heat_index_c: f64,
+    wind_chill_c: f64,
+    apparent_temperature_c: f64,
+}
+
 fn compute_surface_thermo_state(
     grid: GridShape,
     surface: SurfaceInputs<'_>,
 ) -> Result<SurfaceThermoState, CalcError> {
     validate_surface_inputs(grid, surface)?;
 
-    let mut dewpoint_2m_c = Vec::with_capacity(grid.len());
-    let mut relative_humidity_2m_pct = Vec::with_capacity(grid.len());
-    let mut theta_e_2m_k = Vec::with_capacity(grid.len());
-    let mut wetbulb_2m_c = Vec::with_capacity(grid.len());
-    let mut dewpoint_depression_2m_c = Vec::with_capacity(grid.len());
-    let mut vpd_2m_hpa = Vec::with_capacity(grid.len());
-    let mut fire_weather_composite = Vec::with_capacity(grid.len());
-    let mut heat_index_2m_c = Vec::with_capacity(grid.len());
-    let mut wind_chill_2m_c = Vec::with_capacity(grid.len());
-    let mut apparent_temperature_2m_c = Vec::with_capacity(grid.len());
+    let points: Vec<SurfaceThermoPoint> = (0..grid.len())
+        .into_par_iter()
+        .map(|idx| {
+            let pressure_hpa = surface.psfc_pa[idx] / 100.0;
+            let temperature_c = surface.t2_k[idx] - 273.15;
+            let dewpoint_c = dewpoint_from_mixing_ratio(pressure_hpa, surface.q2_kgkg[idx]);
+            let relative_humidity_pct =
+                metrust::calc::thermo::relative_humidity_from_dewpoint(temperature_c, dewpoint_c);
+            let wind_speed_ms = (surface.u10_ms[idx] * surface.u10_ms[idx]
+                + surface.v10_ms[idx] * surface.v10_ms[idx])
+                .sqrt();
+            let vpd_hpa = vapor_pressure_deficit_hpa(temperature_c, dewpoint_c);
+            SurfaceThermoPoint {
+                dewpoint_c,
+                relative_humidity_pct,
+                theta_e_k: metrust::calc::thermo::equivalent_potential_temperature(
+                    pressure_hpa,
+                    temperature_c,
+                    dewpoint_c,
+                ),
+                wetbulb_c: metrust::calc::wet_bulb_temperature(
+                    pressure_hpa,
+                    temperature_c,
+                    dewpoint_c,
+                ),
+                dewpoint_depression_c: (temperature_c - dewpoint_c).max(0.0),
+                vpd_hpa,
+                fire_weather: fire_weather_composite_value(
+                    temperature_c,
+                    relative_humidity_pct,
+                    wind_speed_ms,
+                    vpd_hpa,
+                ),
+                heat_index_c: metrust::calc::atmo::heat_index(temperature_c, relative_humidity_pct),
+                wind_chill_c: metrust::calc::atmo::windchill(temperature_c, wind_speed_ms),
+                apparent_temperature_c: metrust::calc::atmo::apparent_temperature(
+                    temperature_c,
+                    relative_humidity_pct,
+                    wind_speed_ms,
+                ),
+            }
+        })
+        .collect();
 
-    for idx in 0..grid.len() {
-        let pressure_hpa = surface.psfc_pa[idx] / 100.0;
-        let temperature_c = surface.t2_k[idx] - 273.15;
-        let dewpoint_c = dewpoint_from_mixing_ratio(pressure_hpa, surface.q2_kgkg[idx]);
-        let relative_humidity_pct =
-            metrust::calc::thermo::relative_humidity_from_dewpoint(temperature_c, dewpoint_c);
-        let wind_speed_ms = (surface.u10_ms[idx] * surface.u10_ms[idx]
-            + surface.v10_ms[idx] * surface.v10_ms[idx])
-            .sqrt();
-        let wetbulb_c =
-            metrust::calc::wet_bulb_temperature(pressure_hpa, temperature_c, dewpoint_c);
-        let dewpoint_depression_c = (temperature_c - dewpoint_c).max(0.0);
-        let vpd_hpa = vapor_pressure_deficit_hpa(temperature_c, dewpoint_c);
-
-        dewpoint_2m_c.push(dewpoint_c);
-        relative_humidity_2m_pct.push(relative_humidity_pct);
-        theta_e_2m_k.push(metrust::calc::thermo::equivalent_potential_temperature(
-            pressure_hpa,
-            temperature_c,
-            dewpoint_c,
-        ));
-        wetbulb_2m_c.push(wetbulb_c);
-        dewpoint_depression_2m_c.push(dewpoint_depression_c);
-        vpd_2m_hpa.push(vpd_hpa);
-        fire_weather_composite.push(fire_weather_composite_value(
-            temperature_c,
-            relative_humidity_pct,
-            wind_speed_ms,
-            vpd_hpa,
-        ));
-        heat_index_2m_c.push(metrust::calc::atmo::heat_index(
-            temperature_c,
-            relative_humidity_pct,
-        ));
-        wind_chill_2m_c.push(metrust::calc::atmo::windchill(temperature_c, wind_speed_ms));
-        apparent_temperature_2m_c.push(metrust::calc::atmo::apparent_temperature(
-            temperature_c,
-            relative_humidity_pct,
-            wind_speed_ms,
-        ));
-    }
-
+    let unzip = |field: fn(&SurfaceThermoPoint) -> f64| -> Vec<f64> {
+        points.par_iter().map(field).collect()
+    };
     Ok(SurfaceThermoState {
-        dewpoint_2m_c,
-        relative_humidity_2m_pct,
-        theta_e_2m_k,
-        wetbulb_2m_c,
-        dewpoint_depression_2m_c,
-        vpd_2m_hpa,
-        fire_weather_composite,
-        heat_index_2m_c,
-        wind_chill_2m_c,
-        apparent_temperature_2m_c,
+        dewpoint_2m_c: unzip(|p| p.dewpoint_c),
+        relative_humidity_2m_pct: unzip(|p| p.relative_humidity_pct),
+        theta_e_2m_k: unzip(|p| p.theta_e_k),
+        wetbulb_2m_c: unzip(|p| p.wetbulb_c),
+        dewpoint_depression_2m_c: unzip(|p| p.dewpoint_depression_c),
+        vpd_2m_hpa: unzip(|p| p.vpd_hpa),
+        fire_weather_composite: unzip(|p| p.fire_weather),
+        heat_index_2m_c: unzip(|p| p.heat_index_c),
+        wind_chill_2m_c: unzip(|p| p.wind_chill_c),
+        apparent_temperature_2m_c: unzip(|p| p.apparent_temperature_c),
     })
 }
 

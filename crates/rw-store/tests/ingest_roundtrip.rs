@@ -14,7 +14,10 @@ use rustwx_core::{
 };
 use rw_store::error::RwStoreError;
 use rw_store::grid::GridFile;
-use rw_store::ingest::{read_field_2d, write_hour_from_fields, PressureVolumeInput};
+use rw_store::ingest::{
+    DerivedFieldInput, PressureVolumeInput, derived_selector, derived_selector_slug, read_field_2d,
+    read_grid_2d, write_hour_from_fields, write_hour_from_fields_with_derived,
+};
 use rw_store::reader::HourReader;
 use rw_store::run::RwsRunManifest;
 
@@ -28,11 +31,7 @@ const WRITTEN_UNIX: u64 = 1_780_000_000;
 const VLEVELS: [u16; 5] = [1000, 850, 700, 500, 300];
 
 fn test_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rw-store-ingest-{}-{}",
-        std::process::id(),
-        name
-    ));
+    let dir = std::env::temp_dir().join(format!("rw-store-ingest-{}-{}", std::process::id(), name));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -180,7 +179,10 @@ fn hour_write_and_read_back_round_trips() {
     // All three artifacts exist where the layout says they live.
     let run_dir = run_dir(&store_root);
     let hour_path = run_dir.join("f006.rws");
-    assert_eq!(written.path, hour_path, "WrittenHour.path must be the hour file");
+    assert_eq!(
+        written.path, hour_path,
+        "WrittenHour.path must be the hour file"
+    );
     assert!(hour_path.exists(), "f006.rws must exist");
     assert!(run_dir.join("grid.rwg").exists(), "grid.rwg must exist");
     assert!(run_dir.join("run.json").exists(), "run.json must exist");
@@ -351,8 +353,7 @@ fn mismatched_grid_rejected() {
     // Second hour arrives on a 70 x 60 grid -> rejected, naming both dims.
     let narrow_grid = grid_with_dims(70, 60);
     let narrow_values = vec![1.5f32; 70 * 60];
-    let narrow =
-        SelectedField2D::new(temp_selector(), "K", narrow_grid, narrow_values).unwrap();
+    let narrow = SelectedField2D::new(temp_selector(), "K", narrow_grid, narrow_values).unwrap();
     let err = write_hour_from_fields(
         &store_root,
         MODEL,
@@ -378,8 +379,7 @@ fn mismatched_grid_rejected() {
     let mut shifted_grid = regular_grid();
     shifted_grid.lon_deg[123] += 0.25;
     let shifted_values = vec![2.5f32; NX * NY];
-    let shifted =
-        SelectedField2D::new(temp_selector(), "K", shifted_grid, shifted_values).unwrap();
+    let shifted = SelectedField2D::new(temp_selector(), "K", shifted_grid, shifted_values).unwrap();
     let err = write_hour_from_fields(
         &store_root,
         MODEL,
@@ -398,7 +398,11 @@ fn mismatched_grid_rejected() {
 
     // The failed writes left no trace: one hour registered, no f012.rws.
     let manifest = load_manifest(&store_root);
-    assert_eq!(manifest.hours.len(), 1, "run.json must still have only hour 6");
+    assert_eq!(
+        manifest.hours.len(),
+        1,
+        "run.json must still have only hour 6"
+    );
     assert!(manifest.hours.contains_key(&6));
     assert!(
         !run_dir(&store_root).join("f012.rws").exists(),
@@ -482,7 +486,9 @@ fn volume_levels_sorted_and_deduped() {
     .unwrap();
 
     let reader = HourReader::open(&written.path).unwrap();
-    let var = reader.variable("temperature").expect("volume variable present");
+    let var = reader
+        .variable("temperature")
+        .expect("volume variable present");
     assert_eq!(
         var.levels_hpa,
         VLEVELS.to_vec(),
@@ -565,6 +571,138 @@ fn no_2d_fields_errors() {
     assert!(
         !store_root.join(MODEL).exists(),
         "rejected write must not create store directories"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn derived_vars_round_trip_through_read_grid_2d() {
+    let dir = test_dir("derived");
+    let store_root = dir.join("store");
+    let temp = temp_field();
+
+    // Two derived grids, one with a NaN region, written behind the extracted
+    // field; their selector is the {"derived": "<slug>"} marker, not a
+    // FieldSelector.
+    let sbcape: Vec<f32> = (0..NY)
+        .flat_map(|y| (0..NX).map(move |x| 10.0 * x as f32 + 2.0 * y as f32))
+        .collect();
+    let mut srh: Vec<f32> = (0..NY)
+        .flat_map(|y| (0..NX).map(move |x| -50.0 + x as f32 - 0.5 * y as f32))
+        .collect();
+    for value in srh.iter_mut().take(40) {
+        *value = f32::NAN;
+    }
+    let derived = [
+        DerivedFieldInput {
+            name: "sbcape",
+            units: "J/kg",
+            values: &sbcape,
+        },
+        DerivedFieldInput {
+            name: "srh_0_3km",
+            units: "m^2/s^2",
+            values: &srh,
+        },
+    ];
+
+    let written = write_hour_from_fields_with_derived(
+        &store_root,
+        MODEL,
+        RUN,
+        6,
+        &[("temp_2m", &temp)],
+        &derived,
+        &[],
+        BUILD,
+        WRITTEN_UNIX,
+    )
+    .unwrap();
+    assert_eq!(
+        written.vars,
+        vec![
+            "temp_2m".to_string(),
+            "sbcape".to_string(),
+            "srh_0_3km".to_string()
+        ],
+        "derived vars ride behind the extracted 2D fields"
+    );
+
+    let reader = HourReader::open(&written.path).unwrap();
+    let grid_file = GridFile::open(&run_dir(&store_root).join("grid.rwg")).unwrap();
+
+    // read_grid_2d: bit-exact values, units, raw marker selector, grid.
+    for (name, units, original) in [("sbcape", "J/kg", &sbcape), ("srh_0_3km", "m^2/s^2", &srh)] {
+        let stored = read_grid_2d(&reader, &grid_file, name).unwrap();
+        assert_eq!(stored.units, units, "{name}: units");
+        assert_eq!(
+            stored.selector,
+            derived_selector(name),
+            "{name}: selector must be the derived marker"
+        );
+        assert_eq!(
+            derived_selector_slug(&stored.selector),
+            Some(name),
+            "{name}: marker slug must round-trip"
+        );
+        assert_eq!(stored.grid.shape, temp.grid.shape, "{name}: grid shape");
+        assert_bits_eq(&stored.values, original, &format!("{name}: values"));
+        assert_eq!(
+            stored.projection,
+            Some(GridProjection::Geographic),
+            "{name}: projection comes from the grid file"
+        );
+    }
+
+    // read_grid_2d also serves extracted fields, selector left raw.
+    let stored_temp = read_grid_2d(&reader, &grid_file, "temp_2m").unwrap();
+    assert_eq!(
+        stored_temp.selector,
+        serde_json::to_value(temp.selector).unwrap(),
+        "extracted field selector stays raw but intact"
+    );
+    assert!(
+        derived_selector_slug(&stored_temp.selector).is_none(),
+        "an extracted field must not look like a derived marker"
+    );
+
+    // read_field_2d on a derived var fails cleanly, pointing at read_grid_2d.
+    let err = read_field_2d(&reader, &grid_file, "sbcape").unwrap_err();
+    assert!(
+        matches!(err, RwStoreError::Meta(_)),
+        "expected Meta error for the derived marker selector, got {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("read_grid_2d"),
+        "error must point the caller at read_grid_2d, got: {message}"
+    );
+
+    // A wrong-sized derived plane is rejected before anything hits disk.
+    let err = write_hour_from_fields_with_derived(
+        &store_root,
+        MODEL,
+        RUN,
+        9,
+        &[("temp_2m", &temp)],
+        &[DerivedFieldInput {
+            name: "sbcape",
+            units: "J/kg",
+            values: &sbcape[..NX * NY - 1],
+        }],
+        &[],
+        BUILD,
+        WRITTEN_UNIX,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, RwStoreError::Format(_)),
+        "expected Format error for a wrong-sized derived plane, got {err:?}"
+    );
+    assert!(
+        !run_dir(&store_root).join("f009.rws").exists(),
+        "rejected hour must not leave an hour file behind"
     );
 
     let _ = fs::remove_dir_all(&dir);

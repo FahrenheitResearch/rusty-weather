@@ -4,8 +4,12 @@
 //! full 3D isobaric superset plus the sparse per-level vorticity planes in
 //! ONE decode pass, fetch the `sfc` product file, extract the 2D surface set
 //! in ONE decode pass (plus one re-select for the trailing 1 h APCP window),
-//! then write the hour into `<store-root>/<model>/<run>/f{hour:03}.rws` plus
-//! `grid.rwg` and `run.json` via `rw_store::ingest::write_hour_from_fields`.
+//! compute every non-heavy derived recipe grid while the extracted fields
+//! are still in RAM (see `ingest_compute`; stored as ordinary 2D variables
+//! named by recipe slug, selector = the `{"derived": ...}` marker), then
+//! write the hour into `<store-root>/<model>/<run>/f{hour:03}.rws` plus
+//! `grid.rwg` and `run.json` via
+//! `rw_store::ingest::write_hour_from_fields_with_derived`.
 //!
 //! No `nat` (wrfnat) fetch: every formerly "native-only" 2D field this plan
 //! needs (composite reflectivity, 1 km AGL reflectivity, 2-5 km updraft
@@ -28,9 +32,23 @@ use rustwx_io::{
 };
 use rustwx_models::model_summary;
 use rustwx_products::cache::{default_proof_cache_dir, ensure_dir};
+use rustwx_products::derived::store_derived_recipe_slugs;
 use rw_store::grid::GridFile;
-use rw_store::ingest::{PressureVolumeInput, read_field_2d, write_hour_from_fields};
+use rw_store::ingest::{
+    DerivedFieldInput, PressureVolumeInput, derived_selector, read_field_2d, read_grid_2d,
+    write_hour_from_fields_with_derived,
+};
 use rw_store::reader::HourReader;
+
+#[path = "../ingest_compute.rs"]
+mod ingest_compute;
+use ingest_compute::{DerivedGrid2D, IngestVolumes, MoistureKind};
+
+/// The derived CAPE kernels allocate per-column scratch across every rayon
+/// thread; mimalloc handles that churn better than the default Windows heap
+/// (measured ~10% on the derived stage and ~15% on GRIB extraction).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Candidate isobaric levels (hPa) requested for every 3D variable; absent
 /// levels come back in `PartialExtraction.missing` and are simply not stored.
@@ -72,8 +90,9 @@ const VORTICITY_PLAN: &[(u16, &str)] = &[
 /// store names. These mirror the selector constructors the rustwx-models
 /// plot-recipe catalog uses for the same HRRR fields.
 ///
-/// CAPE is not in this plan: it is sounding-derived here (no CAPE
-/// CanonicalField) and arrives with derived-product precompute in a later plan.
+/// CAPE has no plan entry: it is sounding-derived here (no CAPE
+/// CanonicalField) and ships through the derived precompute stage instead
+/// (`sbcape`/`mlcape`/`mucape`... — see `compute_derived_grids`).
 ///
 /// `apcp_run_total` is the plain TotalPrecipitation selection: the sfc file
 /// carries two APCP accumulations that both end at hour h (0->h run total
@@ -508,6 +527,13 @@ fn ingest_hour(
         .into());
     }
 
+    // --- derived precompute: every non-heavy recipe grid, while the
+    //     extracted inputs are still in RAM (no refetch, no redecode) ---
+    let planned_derived = store_derived_recipe_slugs().len();
+    let derived_started = Instant::now();
+    let derived_grids = compute_derived_grids(&fields_2d_owned, &volumes_data, hour);
+    let derived_ms = derived_started.elapsed().as_millis();
+
     // --- assemble + write ---
     let fields_2d: Vec<(&str, &SelectedField2D)> = fields_2d_owned
         .iter()
@@ -538,16 +564,26 @@ fn ingest_hour(
         });
     }
 
+    let derived_inputs: Vec<DerivedFieldInput<'_>> = derived_grids
+        .iter()
+        .map(|grid| DerivedFieldInput {
+            name: grid.name,
+            units: &grid.units,
+            values: &grid.values,
+        })
+        .collect();
+
     let unix_now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|err| format!("system clock before unix epoch: {err}"))?
         .as_secs();
-    let written = write_hour_from_fields(
+    let written = write_hour_from_fields_with_derived(
         &args.store_root,
         model_slug,
         run_slug,
         hour,
         &fields_2d,
+        &derived_inputs,
         &volumes,
         env!("RW_BUILD_SHA"),
         unix_now,
@@ -561,7 +597,7 @@ fn ingest_hour(
         .collect::<Vec<_>>()
         .join(" ");
     println!(
-        "f{hour:03}: prs fetch {prs_fetch_ms} ms ({}, {prs_mb:.1} MB) | sfc fetch {sfc_fetch_ms} ms ({}, {sfc_mb:.1} MB) | extract prs {prs_extract_ms} ms, sfc {sfc_extract_ms} ms | encode {} ms | total {total_ms} ms | {} {:.1} MB | 2d {}/{} | 3d {volume_summary}",
+        "f{hour:03}: prs fetch {prs_fetch_ms} ms ({}, {prs_mb:.1} MB) | sfc fetch {sfc_fetch_ms} ms ({}, {sfc_mb:.1} MB) | extract prs {prs_extract_ms} ms, sfc {sfc_extract_ms} ms | derived {derived_ms} ms | encode {} ms | total {total_ms} ms | {} {:.1} MB | 2d {}/{} | derived {}/{planned_derived} | 3d {volume_summary}",
         cache_state(prs_cache_hit),
         cache_state(sfc_cache_hit),
         written.encode_ms,
@@ -569,6 +605,7 @@ fn ingest_hour(
         written.bytes as f64 / (1024.0 * 1024.0),
         fields_2d.len(),
         planned_2d,
+        derived_grids.len(),
     );
     for volume in &volumes_data {
         if volume.levels.len() >= 2 {
@@ -579,7 +616,12 @@ fn ingest_hour(
     }
 
     if args.verify {
-        verify_hour(&written.path, &fields_2d_owned, &volumes_data)?;
+        verify_hour(
+            &written.path,
+            &fields_2d_owned,
+            &derived_grids,
+            &volumes_data,
+        )?;
     }
     Ok(())
 }
@@ -588,12 +630,76 @@ fn cache_state(hit: bool) -> &'static str {
     if hit { "cache hit" } else { "cache miss" }
 }
 
+/// Route the extracted hour into the derived precompute lane: pick each
+/// volume slot by canonical field (the moisture slot is dewpoint_iso, or
+/// rh_iso after the extraction fallback) and run all non-heavy recipes.
+/// Failures degrade to "no derived variables this hour", never a failed
+/// ingest — the extracted fields still carry the hour.
+fn compute_derived_grids(
+    fields_2d: &[(&'static str, SelectedField2D)],
+    volumes_data: &[VolumeData],
+    hour: u16,
+) -> Vec<DerivedGrid2D> {
+    let volume_levels = |field: CanonicalField| {
+        volumes_data
+            .iter()
+            .find(|volume| volume.field == field && volume.levels.len() >= 2)
+            .map(|volume| volume.levels.as_slice())
+    };
+    let missing = |name: &str| {
+        eprintln!(
+            "f{hour:03}: derived precompute skipped: 3D variable '{name}' \
+             realized < 2 levels"
+        );
+        Vec::new()
+    };
+    let Some(temperature_k) = volume_levels(CanonicalField::Temperature) else {
+        return missing("temperature_iso");
+    };
+    let Some(u_ms) = volume_levels(CanonicalField::UWind) else {
+        return missing("u_iso");
+    };
+    let Some(v_ms) = volume_levels(CanonicalField::VWind) else {
+        return missing("v_iso");
+    };
+    let Some(height_m) = volume_levels(CanonicalField::GeopotentialHeight) else {
+        return missing("height_iso");
+    };
+    let (moisture, moisture_kind) = match volume_levels(CanonicalField::Dewpoint) {
+        Some(levels) => (levels, MoistureKind::DewpointK),
+        None => match volume_levels(CanonicalField::RelativeHumidity) {
+            Some(levels) => (levels, MoistureKind::RelativeHumidityPct),
+            None => return missing("dewpoint_iso/rh_iso"),
+        },
+    };
+    match ingest_compute::compute_derived_2d(
+        fields_2d,
+        &IngestVolumes {
+            temperature_k,
+            moisture,
+            moisture_kind,
+            u_ms,
+            v_ms,
+            height_m,
+        },
+    ) {
+        Ok(grids) => grids,
+        Err(err) => {
+            eprintln!("f{hour:03}: derived precompute skipped: {err}");
+            Vec::new()
+        }
+    }
+}
+
 /// Re-open the just-written hour: bit-exact round-trip of the first 2D field
-/// and one center-of-grid profile per 3D variable, each profile value checked
-/// against the source plane's center value within the quantization bound.
+/// and the first derived variable (via `read_grid_2d`, marker selector
+/// checked), plus one center-of-grid profile per 3D variable, each profile
+/// value checked against the source plane's center value within the
+/// quantization bound.
 fn verify_hour(
     hour_path: &Path,
     fields_2d: &[(&'static str, SelectedField2D)],
+    derived_grids: &[DerivedGrid2D],
     volumes_data: &[VolumeData],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let reader = HourReader::open(hour_path)?;
@@ -613,6 +719,32 @@ fn verify_hour(
             .all(|(a, b)| a.to_bits() == b.to_bits());
     if !exact {
         return Err(format!("verify: 2D round-trip of '{name}' is not bit-exact").into());
+    }
+
+    let mut derived_note = String::from("no derived vars");
+    if let Some(derived) = derived_grids.first() {
+        let stored = read_grid_2d(&reader, &grid, derived.name)?;
+        if stored.selector != derived_selector(derived.name) {
+            return Err(format!(
+                "verify: derived '{}' stored selector {} is not the derived marker",
+                derived.name, stored.selector
+            )
+            .into());
+        }
+        let exact = stored.values.len() == derived.values.len()
+            && stored
+                .values
+                .iter()
+                .zip(&derived.values)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+        if !exact {
+            return Err(format!(
+                "verify: derived round-trip of '{}' is not bit-exact",
+                derived.name
+            )
+            .into());
+        }
+        derived_note = format!("derived '{}' bit-exact", derived.name);
     }
 
     // Integer grid center: at exact integer coordinates the bilinear profile
@@ -639,7 +771,10 @@ fn verify_hour(
             .iter()
             .find(|volume| volume.name == var.name)
             .ok_or_else(|| {
-                format!("verify: no source volume for stored variable '{}'", var.name)
+                format!(
+                    "verify: no source volume for stored variable '{}'",
+                    var.name
+                )
             })?;
         // Conservative quantization bound: the 3D codec quantizes whole
         // [y][x][z] chunks with one scale per chunk, so every chunk's scale
@@ -696,7 +831,7 @@ fn verify_hour(
         profiles.push(format!("{}:{}", var.name, profile.len()));
     }
     println!(
-        "  verify ok: '{name}' bit-exact, profiles at grid center [{}], \
+        "  verify ok: '{name}' bit-exact, {derived_note}, profiles at grid center [{}], \
          values within quantization bound",
         profiles.join(" ")
     );
