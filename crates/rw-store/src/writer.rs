@@ -4,12 +4,31 @@
 //! sort_key()][payload]`. Record offsets are absolute file offsets. Tiles
 //! are encoded in parallel with rayon but staged and sorted deterministically,
 //! so identical inputs always produce byte-identical files.
+//!
+//! Memory shape: with [`HourWriter::with_spill_dir`] every encoded chunk's
+//! compressed bytes are appended to a temp spill file as they are staged
+//! (only the 64-byte records stay resident), and [`HourWriter::finish`]
+//! streams header + meta + index + payload straight into the atomic temp
+//! file instead of assembling the whole hour (~650 MB at HRRR size) in one
+//! `Vec`. The output bytes are identical either way: chunk payload bytes
+//! never depend on staging location, and the index/payload order is the
+//! same deterministic `sort_key()` order.
+//!
+//! Variable ids are assigned in add order. `add_pressure3d_deferred` lets a
+//! caller encode a variable's chunks early (freeing the raw planes) while
+//! its id — and therefore its position in the meta/index — is assigned at
+//! `finish()` AFTER every normally-added variable, exactly as if it had
+//! been added last. The store ingest uses this to encode the extracted
+//! volumes before the derived/heavy compute stages run, without changing
+//! one byte of the resulting file.
 
-use std::path::Path;
+use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use crate::atomic::atomic_write_bytes;
+use crate::atomic::atomic_write_with;
 use crate::codec::{encode_affine_i16, encode_f32_tile};
 use crate::error::{RwResult, RwStoreError};
 use crate::format::{
@@ -23,10 +42,62 @@ use crate::index::ChunkRecord;
 const ZSTD_LEVEL: i32 = 1;
 
 /// One encoded chunk staged for assembly; `record.offset` is assigned in
-/// [`HourWriter::finish`] once the global chunk order is known.
+/// [`HourWriter::finish`] once the global chunk order is known. The
+/// compressed bytes live either inline (`compressed`) or in the spill file
+/// at `spill_offset` (in which case `compressed` is empty and the byte
+/// count is `record.len`).
 struct StagedChunk {
     record: ChunkRecord,
     compressed: Vec<u8>,
+    spill_offset: u64,
+    /// `Some(k)` for chunks of the k-th deferred variable: `record.var_id`
+    /// is rewritten to the final id in `finish()`.
+    deferred_index: Option<u16>,
+}
+
+/// The spill file holding staged compressed chunk bytes. Removed on drop,
+/// so an abandoned writer (error or cancel) never leaks the temp file.
+struct SpillFile {
+    path: PathBuf,
+    file: fs::File,
+    cursor: u64,
+}
+
+impl SpillFile {
+    fn create(dir: &Path) -> RwResult<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        fs::create_dir_all(dir)?;
+        let path = dir.join(format!(
+            ".rws-spill-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        Ok(Self {
+            path,
+            file,
+            cursor: 0,
+        })
+    }
+
+    /// Append one chunk's compressed bytes; returns its spill offset.
+    fn append(&mut self, bytes: &[u8]) -> RwResult<u64> {
+        let offset = self.cursor;
+        self.file.write_all(bytes)?;
+        self.cursor += bytes.len() as u64;
+        Ok(offset)
+    }
+}
+
+impl Drop for SpillFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 /// Incremental builder for a single per-hour store file.
@@ -39,7 +110,12 @@ pub struct HourWriter {
     grid_hash: String,
     writer_build: String,
     variables: Vec<RwsVariableMeta>,
+    /// Deferred variables (ids assigned in `finish()` after `variables`),
+    /// with their meta carrying a placeholder id until then.
+    deferred_variables: Vec<RwsVariableMeta>,
     chunks: Vec<StagedChunk>,
+    spill_dir: Option<PathBuf>,
+    spill: Option<SpillFile>,
 }
 
 impl HourWriter {
@@ -61,8 +137,41 @@ impl HourWriter {
             grid_hash: grid_hash.to_string(),
             writer_build: writer_build.to_string(),
             variables: Vec::new(),
+            deferred_variables: Vec::new(),
             chunks: Vec::new(),
+            spill_dir: None,
+            spill: None,
         }
+    }
+
+    /// Spill staged compressed chunk bytes to a temp file under `dir`
+    /// (created lazily on the first add) instead of holding them in memory
+    /// until `finish()`. Output bytes are unaffected.
+    pub fn with_spill_dir(mut self, dir: &Path) -> Self {
+        self.spill_dir = Some(dir.to_path_buf());
+        self
+    }
+
+    /// Move freshly encoded chunks into the staged set, spilling their
+    /// payload bytes when a spill dir is configured.
+    fn stage_chunks(&mut self, encoded: Vec<StagedChunk>) -> RwResult<()> {
+        if let Some(dir) = self.spill_dir.as_deref() {
+            if self.spill.is_none() {
+                self.spill = Some(SpillFile::create(dir)?);
+            }
+        }
+        match self.spill.as_mut() {
+            Some(spill) => {
+                for mut chunk in encoded {
+                    debug_assert_eq!(chunk.compressed.len() as u32, chunk.record.len);
+                    chunk.spill_offset = spill.append(&chunk.compressed)?;
+                    chunk.compressed = Vec::new();
+                    self.chunks.push(chunk);
+                }
+            }
+            None => self.chunks.extend(encoded),
+        }
+        Ok(())
     }
 
     /// Add a 2D surface field (row-major, `ny * nx` values). Tiles are
@@ -129,11 +238,13 @@ impl HourWriter {
                         valid_count: chunk.valid_count,
                     },
                     compressed,
+                    spill_offset: 0,
+                    deferred_index: None,
                 })
             })
             .collect::<RwResult<Vec<StagedChunk>>>()?;
 
-        self.chunks.extend(encoded);
+        self.stage_chunks(encoded)?;
         self.variables.push(RwsVariableMeta {
             id: var_id,
             name: name.to_string(),
@@ -160,6 +271,64 @@ impl HourWriter {
         levels_hpa: &[u16],
         level_planes: &[&[f32]],
     ) -> RwResult<u16> {
+        self.validate_pressure3d(name, levels_hpa, level_planes)?;
+        let var_id = self.next_var_id(name)?;
+        self.encode_pressure3d_chunks(var_id, None, level_planes)?;
+        self.variables.push(RwsVariableMeta {
+            id: var_id,
+            name: name.to_string(),
+            units: units.to_string(),
+            kind: "pressure3d".to_string(),
+            codec: CODEC_3D.to_string(),
+            levels_hpa: levels_hpa.to_vec(),
+            selector,
+        });
+        Ok(var_id)
+    }
+
+    /// [`Self::add_pressure3d`] with id assignment deferred to `finish()`:
+    /// chunks are encoded (and spilled) NOW, but the variable is numbered
+    /// after every normally-added variable, in deferred-add order — the
+    /// file comes out byte-identical to adding it last. This lets the
+    /// store ingest free its raw volume planes before the compute stages
+    /// run while keeping the historical variable order
+    /// (fields, derived, heavy, volumes).
+    pub fn add_pressure3d_deferred(
+        &mut self,
+        name: &str,
+        units: &str,
+        selector: serde_json::Value,
+        levels_hpa: &[u16],
+        level_planes: &[&[f32]],
+    ) -> RwResult<()> {
+        self.validate_pressure3d(name, levels_hpa, level_planes)?;
+        // Name-uniqueness must span both sets; the id itself is a
+        // placeholder rewritten in finish().
+        self.next_var_id(name)?;
+        let deferred_index = u16::try_from(self.deferred_variables.len()).map_err(|_| {
+            RwStoreError::Format(format!(
+                "too many deferred variables: index for '{name}' exceeds u16"
+            ))
+        })?;
+        self.encode_pressure3d_chunks(deferred_index, Some(deferred_index), level_planes)?;
+        self.deferred_variables.push(RwsVariableMeta {
+            id: deferred_index, // placeholder; final id assigned in finish()
+            name: name.to_string(),
+            units: units.to_string(),
+            kind: "pressure3d".to_string(),
+            codec: CODEC_3D.to_string(),
+            levels_hpa: levels_hpa.to_vec(),
+            selector,
+        });
+        Ok(())
+    }
+
+    fn validate_pressure3d(
+        &self,
+        name: &str,
+        levels_hpa: &[u16],
+        level_planes: &[&[f32]],
+    ) -> RwResult<()> {
         if levels_hpa.is_empty() {
             return Err(RwStoreError::Format(format!(
                 "variable '{name}': levels_hpa must not be empty"
@@ -192,8 +361,17 @@ impl HourWriter {
                 )));
             }
         }
-        let var_id = self.next_var_id(name)?;
+        Ok(())
+    }
 
+    /// Encode one 3D variable's column chunks and stage them under
+    /// `var_id` (the final id, or the placeholder for deferred variables).
+    fn encode_pressure3d_chunks(
+        &mut self,
+        var_id: u16,
+        deferred_index: Option<u16>,
+        level_planes: &[&[f32]],
+    ) -> RwResult<()> {
         let chunks_y = self.ny.div_ceil(COL_Y);
         let chunks_x = self.nx.div_ceil(COL_X);
         let chunk_coords: Vec<(usize, usize)> = (0..chunks_y)
@@ -202,7 +380,7 @@ impl HourWriter {
 
         let nx = self.nx;
         let ny = self.ny;
-        let levels = levels_hpa.len();
+        let levels = level_planes.len();
         // Parallel encode; collect preserves chunk_coords order so staging
         // (and therefore the final file) is independent of rayon scheduling.
         let encoded: Vec<StagedChunk> = chunk_coords
@@ -246,27 +424,24 @@ impl HourWriter {
                         valid_count: chunk.valid_count,
                     },
                     compressed,
+                    spill_offset: 0,
+                    deferred_index,
                 })
             })
             .collect::<RwResult<Vec<StagedChunk>>>()?;
 
-        self.chunks.extend(encoded);
-        self.variables.push(RwsVariableMeta {
-            id: var_id,
-            name: name.to_string(),
-            units: units.to_string(),
-            kind: "pressure3d".to_string(),
-            codec: CODEC_3D.to_string(),
-            levels_hpa: levels_hpa.to_vec(),
-            selector,
-        });
-        Ok(var_id)
+        self.stage_chunks(encoded)
     }
 
     /// Reserve the next variable id, enforcing name uniqueness across all
-    /// kinds and the u16 id budget.
+    /// kinds (normal and deferred) and the u16 id budget.
     fn next_var_id(&self, name: &str) -> RwResult<u16> {
-        if self.variables.iter().any(|var| var.name == name) {
+        if self
+            .variables
+            .iter()
+            .chain(self.deferred_variables.iter())
+            .any(|var| var.name == name)
+        {
             return Err(RwStoreError::Format(format!(
                 "duplicate variable name '{name}'"
             )));
@@ -279,12 +454,37 @@ impl HourWriter {
     }
 
     /// Assemble and atomically write the hour file, returning its metadata.
+    /// Deferred variables receive their final ids here (after every
+    /// normally-added variable, in deferred-add order); the index/payload
+    /// are then emitted in the same deterministic `sort_key()` order as
+    /// always, streamed from memory or the spill file straight into the
+    /// atomic temp file.
     pub fn finish(mut self, path: &Path) -> RwResult<RwsHourMeta> {
         if self.nx == 0 || self.ny == 0 {
             return Err(RwStoreError::Format(format!(
                 "degenerate grid {}x{} (nx and ny must be nonzero)",
                 self.nx, self.ny
             )));
+        }
+
+        // Final ids for deferred variables: numbered after the normal set.
+        let normal_count = self.variables.len();
+        let mut variables = self.variables;
+        for (index, mut var) in self.deferred_variables.into_iter().enumerate() {
+            let id = normal_count + index;
+            var.id = u16::try_from(id).map_err(|_| {
+                RwStoreError::Format(format!(
+                    "too many variables: var id for '{}' exceeds u16",
+                    var.name
+                ))
+            })?;
+            variables.push(var);
+        }
+        for chunk in &mut self.chunks {
+            if let Some(index) = chunk.deferred_index {
+                chunk.record.var_id = u16::try_from(normal_count + index as usize)
+                    .expect("deferred var id bounds checked above");
+            }
         }
         self.chunks.sort_by_key(|chunk| chunk.record.sort_key());
 
@@ -296,7 +496,7 @@ impl HourWriter {
             nx: self.nx,
             ny: self.ny,
             grid_hash: self.grid_hash,
-            variables: self.variables,
+            variables,
             chunking: RwsChunking {
                 tile_y: TILE_Y,
                 tile_x: TILE_X,
@@ -322,23 +522,55 @@ impl HourWriter {
         let mut cursor = header.payload_offset;
         for chunk in &mut self.chunks {
             chunk.record.offset = cursor;
-            cursor += chunk.compressed.len() as u64;
+            cursor += u64::from(chunk.record.len);
         }
+        let total_len = cursor;
 
-        let total_len = cursor as usize;
-        let mut bytes = Vec::with_capacity(total_len);
-        bytes.extend_from_slice(&header.pack());
-        bytes.extend_from_slice(&meta_bytes);
-        for chunk in &self.chunks {
-            chunk.record.pack_into(&mut bytes);
-        }
-        debug_assert_eq!(bytes.len() as u64, header.payload_offset);
-        for chunk in &self.chunks {
-            bytes.extend_from_slice(&chunk.compressed);
-        }
-        debug_assert_eq!(bytes.len(), total_len);
-
-        atomic_write_bytes(path, &bytes)?;
+        // Stream header + meta + index + payload into the atomic temp file
+        // (sorted order, exactly the bytes the historical Vec assembly
+        // produced). Spilled payloads are read back per chunk; the spill
+        // file was written in add order, so sorted emission seeks — the
+        // pages are warm from the just-finished writes.
+        let mut spill = self.spill;
+        let chunks = self.chunks;
+        let result = atomic_write_with(path, |writer| {
+            let mut written: u64 = 0;
+            writer.write_all(&header.pack())?;
+            written += 64;
+            writer.write_all(&meta_bytes)?;
+            written += meta_bytes.len() as u64;
+            let mut record_buf = Vec::with_capacity(64 * chunks.len());
+            for chunk in &chunks {
+                chunk.record.pack_into(&mut record_buf);
+            }
+            writer.write_all(&record_buf)?;
+            written += record_buf.len() as u64;
+            debug_assert_eq!(written, header.payload_offset);
+            let mut payload_buf: Vec<u8> = Vec::new();
+            for chunk in &chunks {
+                let len = chunk.record.len as usize;
+                if len == 0 {
+                    continue;
+                }
+                debug_assert_eq!(chunk.record.offset, written);
+                match spill.as_mut() {
+                    Some(spill) => {
+                        payload_buf.resize(len, 0);
+                        spill.file.seek(SeekFrom::Start(chunk.spill_offset))?;
+                        spill.file.read_exact(&mut payload_buf)?;
+                        writer.write_all(&payload_buf)?;
+                    }
+                    None => writer.write_all(&chunk.compressed)?,
+                }
+                written += len as u64;
+            }
+            debug_assert_eq!(written, total_len);
+            Ok(())
+        });
+        // Explicit for clarity: dropping the spill handle removes the temp
+        // spill file whether the write succeeded or failed.
+        drop(spill);
+        result?;
         Ok(meta)
     }
 }
@@ -564,6 +796,99 @@ mod tests {
         assert_eq!(
             bytes_one, bytes_two,
             "same inputs must produce byte-identical files"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The memory-diet seams must not change one output byte: a writer
+    /// with spilled chunks and an early-added (deferred-id) volume produces
+    /// exactly the bytes of the historical in-memory writer that adds the
+    /// volume last.
+    #[test]
+    fn deferred_and_spilled_writes_match_the_one_shot_bytes() {
+        let dir = test_dir("deferred-spill");
+        let plane_high: Vec<f32> = grid_b();
+        let plane_low: Vec<f32> = grid_b().iter().map(|v| v * 0.5 - 3.0).collect();
+
+        // Historical shape: in-memory staging, volume added last.
+        let path_one = dir.join("one.rws");
+        let mut writer = HourWriter::new("hrrr", "run", 6, NX, NY, "hash", "build");
+        writer
+            .add_surface2d("temp_2m", "K", serde_json::json!({"a": 1}), &grid_a())
+            .unwrap();
+        writer
+            .add_surface2d("dewpoint_2m", "K", serde_json::json!({"b": 2}), &grid_b())
+            .unwrap();
+        writer
+            .add_pressure3d(
+                "temperature_iso",
+                "K",
+                serde_json::json!({"vol": true}),
+                &[1000, 500],
+                &[&plane_low, &plane_high],
+            )
+            .unwrap();
+        let meta_one = writer.finish(&path_one).unwrap();
+
+        // Diet shape: spill dir + volume encoded FIRST with a deferred id.
+        let path_two = dir.join("two.rws");
+        let mut writer =
+            HourWriter::new("hrrr", "run", 6, NX, NY, "hash", "build").with_spill_dir(&dir);
+        writer
+            .add_pressure3d_deferred(
+                "temperature_iso",
+                "K",
+                serde_json::json!({"vol": true}),
+                &[1000, 500],
+                &[&plane_low, &plane_high],
+            )
+            .unwrap();
+        writer
+            .add_surface2d("temp_2m", "K", serde_json::json!({"a": 1}), &grid_a())
+            .unwrap();
+        writer
+            .add_surface2d("dewpoint_2m", "K", serde_json::json!({"b": 2}), &grid_b())
+            .unwrap();
+        let meta_two = writer.finish(&path_two).unwrap();
+
+        assert_eq!(meta_one, meta_two, "meta must be identical");
+        let bytes_one = fs::read(&path_one).unwrap();
+        let bytes_two = fs::read(&path_two).unwrap();
+        assert_eq!(
+            bytes_one, bytes_two,
+            "deferred + spilled write must be byte-identical to the one-shot order"
+        );
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("spill"))
+            .collect();
+        assert_eq!(
+            leftovers,
+            Vec::<String>::new(),
+            "spill temp files must be cleaned up"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An abandoned (dropped) spilling writer removes its spill temp file.
+    #[test]
+    fn dropped_spilling_writer_cleans_up_its_spill_file() {
+        let dir = test_dir("spill-drop");
+        let mut writer =
+            HourWriter::new("hrrr", "run", 0, NX, NY, "hash", "build").with_spill_dir(&dir);
+        writer
+            .add_surface2d("temp_2m", "K", serde_json::Value::Null, &grid_b())
+            .unwrap();
+        drop(writer);
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            leftovers,
+            Vec::<String>::new(),
+            "dropping the writer must remove the spill file"
         );
         let _ = fs::remove_dir_all(&dir);
     }

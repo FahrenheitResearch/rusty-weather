@@ -78,6 +78,18 @@ pub fn write_grid(
     grid: &LatLonGrid,
     projection: Option<&GridProjection>,
 ) -> RwResult<String> {
+    let (bytes, hash) = encode_grid_bytes(grid, projection)?;
+    atomic_write_bytes(path, &bytes)?;
+    Ok(hash)
+}
+
+/// Build the exact `.rwg` byte image [`write_grid`] would write, plus its
+/// sha256 hex hash, without touching disk — for writers that need the grid
+/// hash up front but want to defer the file write to their commit point.
+pub fn encode_grid_bytes(
+    grid: &LatLonGrid,
+    projection: Option<&GridProjection>,
+) -> RwResult<(Vec<u8>, String)> {
     let nx = grid.shape.nx;
     let ny = grid.shape.ny;
     if nx == 0 || ny == 0 {
@@ -135,8 +147,7 @@ pub fn write_grid(
     bytes.extend_from_slice(&lon_comp);
 
     let hash = sha256_hex(&bytes);
-    atomic_write_bytes(path, &bytes)?;
-    Ok(hash)
+    Ok((bytes, hash))
 }
 
 /// Decoded contents of a `.rwg` grid file. `lat`/`lon` are row-major

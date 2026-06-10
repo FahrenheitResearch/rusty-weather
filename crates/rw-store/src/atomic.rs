@@ -4,7 +4,7 @@
 //! the temp file is removed on any failure.
 
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,17 +32,38 @@ fn temp_path_for(path: &Path) -> PathBuf {
 /// content or holds exactly `bytes`, never a partial write. Parent
 /// directories are created as needed.
 pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> RwResult<()> {
+    atomic_write_with(path, |writer| {
+        writer.write_all(bytes)?;
+        Ok(())
+    })
+}
+
+/// Streaming sibling of [`atomic_write_bytes`]: the caller writes through a
+/// buffered handle on the hidden temp file instead of materializing the
+/// whole payload in memory first. Identical guarantees — create-new temp in
+/// the same directory, fsync, rename into place, temp removed on any
+/// failure — so the destination either keeps its old content or holds
+/// exactly what `write` produced.
+pub fn atomic_write_with<F>(path: &Path, write: F) -> RwResult<()>
+where
+    F: FnOnce(&mut io::BufWriter<fs::File>) -> RwResult<()>,
+{
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp_path = temp_path_for(path);
     let write_result = (|| -> RwResult<()> {
-        let mut file = fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&tmp_path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+        let mut writer = io::BufWriter::with_capacity(1 << 20, file);
+        write(&mut writer)?;
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|err| err.into_error())?
+            .sync_all()?;
         Ok(())
     })();
     if let Err(err) = write_result {

@@ -17,7 +17,7 @@ pub mod writer;
 
 pub use error::{RwResult, RwStoreError};
 pub use ingest::{
-    DerivedFieldInput, PressureVolumeInput, StoredField2D, WrittenHour, derived_selector,
-    derived_selector_slug, read_field_2d, read_grid_2d, write_hour_from_fields,
+    DerivedFieldInput, HourIngestWriter, PressureVolumeInput, StoredField2D, WrittenHour,
+    derived_selector, derived_selector_slug, read_field_2d, read_grid_2d, write_hour_from_fields,
     write_hour_from_fields_with_derived,
 };
