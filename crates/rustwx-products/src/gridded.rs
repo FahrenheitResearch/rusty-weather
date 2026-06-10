@@ -1163,12 +1163,21 @@ fn decode_pressure_with_shape_opts(
         return Err("pressure family had no common thermodynamic levels".into());
     }
     let aligned_levels = levels.clone();
+    // The parsed Grib2File (each message owns a copy of its raw bytes) is
+    // not consulted past this point; free it before the flatten pass so the
+    // message copies never overlap the flattened f64 volumes.
+    drop(file);
 
     let expected = nx * ny;
-    let flatten = |records: &Vec<(f64, Vec<f64>)>| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    // `flatten` consumes its per-level collection so each variable's
+    // collection is freed as soon as its flattened volume exists. The
+    // values and their level order are identical to flattening from a
+    // borrowed collection — only the peak co-residency changes (one
+    // collection + one volume instead of all collections + all volumes).
+    let flatten = |records: Vec<(f64, Vec<f64>)>| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
         let mut out = Vec::with_capacity(levels.len() * expected);
         for &level in &levels {
-            let values = level_values(records, level)
+            let values = level_values(&records, level)
                 .ok_or_else(|| format!("missing aligned pressure level {level}"))?;
             if values.len() != expected {
                 return Err("decoded pressure field had unexpected grid size".into());
@@ -1178,13 +1187,13 @@ fn decode_pressure_with_shape_opts(
         Ok(out)
     };
     let flatten_optional =
-        |records: &Option<Vec<(f64, Vec<f64>)>>| -> Result<Option<Vec<f64>>, Box<dyn std::error::Error>> {
-            let Some(records) = records.as_ref() else {
+        |records: Option<Vec<(f64, Vec<f64>)>>| -> Result<Option<Vec<f64>>, Box<dyn std::error::Error>> {
+            let Some(records) = records else {
                 return Ok(None);
             };
             let mut out = Vec::with_capacity(levels.len() * expected);
             for &level in &levels {
-                let Some(values) = level_values(records, level) else {
+                let Some(values) = level_values(&records, level) else {
                     return Ok(None);
                 };
                 if values.len() != expected {
@@ -1202,21 +1211,21 @@ fn decode_pressure_with_shape_opts(
                 .map(normalize_pressure_level_hpa)
                 .collect(),
             pressure_3d_pa: None,
-            temperature_c_3d: flatten(&temperature)?
+            temperature_c_3d: flatten(temperature)?
                 .into_iter()
                 .map(|value| value - 273.15)
                 .collect(),
-            qvapor_kgkg_3d: flatten(&moisture)?,
-            u_ms_3d: flatten(&u_wind)?,
-            v_ms_3d: flatten(&v_wind)?,
-            gh_m_3d: flatten(&gh)?,
-            omega_pa_s_3d: flatten_optional(&omega)?,
-            absolute_vorticity_s_3d: flatten_optional(&absolute_vorticity)?,
-            cloud_liquid_kgkg_3d: flatten_optional(&cloud_liquid)?,
-            cloud_ice_kgkg_3d: flatten_optional(&cloud_ice)?,
-            rain_kgkg_3d: flatten_optional(&rain)?,
-            snow_kgkg_3d: flatten_optional(&snow)?,
-            graupel_kgkg_3d: flatten_optional(&graupel)?,
+            qvapor_kgkg_3d: flatten(moisture)?,
+            u_ms_3d: flatten(u_wind)?,
+            v_ms_3d: flatten(v_wind)?,
+            gh_m_3d: flatten(gh)?,
+            omega_pa_s_3d: flatten_optional(omega)?,
+            absolute_vorticity_s_3d: flatten_optional(absolute_vorticity)?,
+            cloud_liquid_kgkg_3d: flatten_optional(cloud_liquid)?,
+            cloud_ice_kgkg_3d: flatten_optional(cloud_ice)?,
+            rain_kgkg_3d: flatten_optional(rain)?,
+            snow_kgkg_3d: flatten_optional(snow)?,
+            graupel_kgkg_3d: flatten_optional(graupel)?,
         },
         nx,
         ny,
@@ -1344,12 +1353,17 @@ fn decode_pressure_cropped_with_shape(
     if levels.is_empty() {
         return Err("pressure family had no common thermodynamic levels".into());
     }
+    // See decode_pressure_with_shape_opts: free the parsed message copies
+    // before the flatten pass.
+    drop(file);
 
     let expected = crop.width() * crop.height();
-    let flatten = |records: &Vec<(f64, Vec<f64>)>| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    // Consuming flatten — identical values, per-variable collection drop
+    // (see decode_pressure_with_shape_opts).
+    let flatten = |records: Vec<(f64, Vec<f64>)>| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
         let mut out = Vec::with_capacity(levels.len() * expected);
         for &level in &levels {
-            let values = level_values(records, level)
+            let values = level_values(&records, level)
                 .ok_or_else(|| format!("missing aligned pressure level {level}"))?;
             if values.len() != expected {
                 return Err("decoded cropped pressure field had unexpected grid size".into());
@@ -1359,13 +1373,13 @@ fn decode_pressure_cropped_with_shape(
         Ok(out)
     };
     let flatten_optional =
-        |records: &Option<Vec<(f64, Vec<f64>)>>| -> Result<Option<Vec<f64>>, Box<dyn std::error::Error>> {
-            let Some(records) = records.as_ref() else {
+        |records: Option<Vec<(f64, Vec<f64>)>>| -> Result<Option<Vec<f64>>, Box<dyn std::error::Error>> {
+            let Some(records) = records else {
                 return Ok(None);
             };
             let mut out = Vec::with_capacity(levels.len() * expected);
             for &level in &levels {
-                let Some(values) = level_values(records, level) else {
+                let Some(values) = level_values(&records, level) else {
                     return Ok(None);
                 };
                 if values.len() != expected {
@@ -1386,21 +1400,21 @@ fn decode_pressure_cropped_with_shape(
         PressureFields {
             pressure_levels_hpa,
             pressure_3d_pa: None,
-            temperature_c_3d: flatten(&temperature)?
+            temperature_c_3d: flatten(temperature)?
                 .into_iter()
                 .map(|value| value - 273.15)
                 .collect(),
-            qvapor_kgkg_3d: flatten(&moisture)?,
-            u_ms_3d: flatten(&u_wind)?,
-            v_ms_3d: flatten(&v_wind)?,
-            gh_m_3d: flatten(&gh)?,
-            omega_pa_s_3d: flatten_optional(&omega)?,
-            absolute_vorticity_s_3d: flatten_optional(&absolute_vorticity)?,
-            cloud_liquid_kgkg_3d: flatten_optional(&cloud_liquid)?,
-            cloud_ice_kgkg_3d: flatten_optional(&cloud_ice)?,
-            rain_kgkg_3d: flatten_optional(&rain)?,
-            snow_kgkg_3d: flatten_optional(&snow)?,
-            graupel_kgkg_3d: flatten_optional(&graupel)?,
+            qvapor_kgkg_3d: flatten(moisture)?,
+            u_ms_3d: flatten(u_wind)?,
+            v_ms_3d: flatten(v_wind)?,
+            gh_m_3d: flatten(gh)?,
+            omega_pa_s_3d: flatten_optional(omega)?,
+            absolute_vorticity_s_3d: flatten_optional(absolute_vorticity)?,
+            cloud_liquid_kgkg_3d: flatten_optional(cloud_liquid)?,
+            cloud_ice_kgkg_3d: flatten_optional(cloud_ice)?,
+            rain_kgkg_3d: flatten_optional(rain)?,
+            snow_kgkg_3d: flatten_optional(snow)?,
+            graupel_kgkg_3d: flatten_optional(graupel)?,
         },
         crop.width(),
         crop.height(),
