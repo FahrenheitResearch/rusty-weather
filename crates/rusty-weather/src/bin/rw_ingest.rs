@@ -1,10 +1,19 @@
 //! Live GRIB -> `.rws` store ingest for HRRR-class models.
 //!
 //! Per forecast hour: fetch the `prs` product file (cache-aware), extract the
-//! full 3D isobaric superset in ONE decode pass, fetch the `sfc` product file,
-//! extract the 2D surface set in ONE decode pass, then write the hour into
-//! `<store-root>/<model>/<run>/f{hour:03}.rws` plus `grid.rwg` and `run.json`
-//! via `rw_store::ingest::write_hour_from_fields`.
+//! full 3D isobaric superset plus the sparse per-level vorticity planes in
+//! ONE decode pass, fetch the `sfc` product file, extract the 2D surface set
+//! in ONE decode pass (plus one re-select for the trailing 1 h APCP window),
+//! then write the hour into `<store-root>/<model>/<run>/f{hour:03}.rws` plus
+//! `grid.rwg` and `run.json` via `rw_store::ingest::write_hour_from_fields`.
+//!
+//! No `nat` (wrfnat) fetch: every formerly "native-only" 2D field this plan
+//! needs (composite reflectivity, 1 km AGL reflectivity, 2-5 km updraft
+//! helicity, 8 m AGL smoke, column-integrated smoke, simulated IR) is also
+//! carried by the HRRR `sfc` file — verified against the live
+//! `hrrr.t00z.wrfsfcf06.grib2.idx` listing on AWS for the 2026-06-08 00z run
+//! — so they ride the existing sfc fetch + decode pass for free instead of
+//! pulling any of the ~770 MB wrfnat file.
 
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -32,6 +41,13 @@ fn candidate_levels() -> Vec<u16> {
 /// 3D variables pulled from the pressure ("prs") product file, with their
 /// stable store names. Dewpoint falls back to RelativeHumidity ("rh_iso")
 /// when the file realizes fewer than two dewpoint levels.
+///
+/// Moisture note: the derived/CAPE compute path (`rustwx_calc::ecape::
+/// {SurfaceInputs, EcapeVolumeInputs}`) consumes mixing ratio, which
+/// rustwx-products derives from dewpoint (preferred fallback after SPFH,
+/// which has no CanonicalField) plus pressure — `dewpoint_iso` here and
+/// `dewpoint_2m` + `surface_pressure` on the 2D side cover it, so no
+/// dedicated moisture volume is needed.
 const VOLUME_PLAN: &[(CanonicalField, &str)] = &[
     (CanonicalField::Temperature, "temperature_iso"),
     (CanonicalField::Dewpoint, "dewpoint_iso"),
@@ -40,12 +56,35 @@ const VOLUME_PLAN: &[(CanonicalField, &str)] = &[
     (CanonicalField::GeopotentialHeight, "height_iso"),
 ];
 
+/// Sparse per-level absolute vorticity planes pulled from the prs file in
+/// the same decode pass as the volumes, stored as five 2D variables (the
+/// direct plot recipes consume vorticity per-level, and five levels do not
+/// justify a 37-level volume slot).
+const VORTICITY_PLAN: &[(u16, &str)] = &[
+    (200, "absolute_vorticity_200"),
+    (300, "absolute_vorticity_300"),
+    (500, "absolute_vorticity_500"),
+    (700, "absolute_vorticity_700"),
+    (850, "absolute_vorticity_850"),
+];
+
 /// 2D fields pulled from the surface ("sfc") product file, with their stable
 /// store names. These mirror the selector constructors the rustwx-models
 /// plot-recipe catalog uses for the same HRRR fields.
 ///
 /// CAPE is not in this plan: it is sounding-derived here (no CAPE
 /// CanonicalField) and arrives with derived-product precompute in a later plan.
+///
+/// `apcp_run_total` is the plain TotalPrecipitation selection: the sfc file
+/// carries two APCP accumulations that both end at hour h (0->h run total
+/// and the trailing (h-1)->h hour); they tie on match score and the run
+/// total wins as first in file order. The trailing 1 h window is stored
+/// separately as `apcp_1h` via a dedicated re-select (see `ingest_hour`).
+///
+/// Lightning flash density is deliberately absent: rustwx-io has no
+/// structured selector for it (HRRR exposes LTNG, a non-dimensional
+/// lightning flag, and LTNGSD strike density — not flash density), and the
+/// recipe catalog blocks the slug for HRRR for the same mislabeling reason.
 fn surface_plan() -> Vec<(&'static str, FieldSelector)> {
     vec![
         (
@@ -71,6 +110,91 @@ fn surface_plan() -> Vec<(&'static str, FieldSelector)> {
         (
             "mslp",
             FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel),
+        ),
+        // --- surface state & moisture (feeds SurfaceInputs-derived products) ---
+        (
+            "rh_2m",
+            FieldSelector::height_agl(CanonicalField::RelativeHumidity, 2),
+        ),
+        (
+            "wind_gust_10m",
+            FieldSelector::height_agl(CanonicalField::WindGust, 10),
+        ),
+        (
+            "surface_pressure",
+            FieldSelector::surface(CanonicalField::Pressure),
+        ),
+        (
+            "orography",
+            FieldSelector::surface(CanonicalField::GeopotentialHeight),
+        ),
+        // --- precipitation & precip type ---
+        (
+            "apcp_run_total",
+            FieldSelector::surface(CanonicalField::TotalPrecipitation),
+        ),
+        (
+            "categorical_rain",
+            FieldSelector::surface(CanonicalField::CategoricalRain),
+        ),
+        (
+            "categorical_freezing_rain",
+            FieldSelector::surface(CanonicalField::CategoricalFreezingRain),
+        ),
+        (
+            "categorical_ice_pellets",
+            FieldSelector::surface(CanonicalField::CategoricalIcePellets),
+        ),
+        (
+            "categorical_snow",
+            FieldSelector::surface(CanonicalField::CategoricalSnow),
+        ),
+        // --- moisture column, clouds, visibility ---
+        (
+            "pwat",
+            FieldSelector::entire_atmosphere(CanonicalField::PrecipitableWater),
+        ),
+        (
+            "cloud_cover_low",
+            FieldSelector::entire_atmosphere(CanonicalField::LowCloudCover),
+        ),
+        (
+            "cloud_cover_mid",
+            FieldSelector::entire_atmosphere(CanonicalField::MiddleCloudCover),
+        ),
+        (
+            "cloud_cover_high",
+            FieldSelector::entire_atmosphere(CanonicalField::HighCloudCover),
+        ),
+        (
+            "cloud_cover_total",
+            FieldSelector::entire_atmosphere(CanonicalField::TotalCloudCover),
+        ),
+        (
+            "visibility",
+            FieldSelector::surface(CanonicalField::Visibility),
+        ),
+        // --- convection, smoke, satellite (also in wrfnat; sfc carries them
+        //     too, so they ride this fetch — see the module doc) ---
+        (
+            "reflectivity_1km",
+            FieldSelector::height_agl(CanonicalField::RadarReflectivity, 1000),
+        ),
+        (
+            "uh_2to5km",
+            FieldSelector::height_layer_agl(CanonicalField::UpdraftHelicity, 2000, 5000),
+        ),
+        (
+            "smoke_8m",
+            FieldSelector::height_agl(CanonicalField::SmokeMassDensity, 8),
+        ),
+        (
+            "smoke_column",
+            FieldSelector::entire_atmosphere(CanonicalField::ColumnIntegratedSmoke),
+        ),
+        (
+            "simulated_ir",
+            FieldSelector::nominal_top(CanonicalField::SimulatedInfraredBrightnessTemperature),
         ),
     ]
 }
@@ -192,11 +316,18 @@ fn ingest_hour(
     let prs_mb = prs.result.bytes.len() as f64 / (1024.0 * 1024.0);
 
     let levels = candidate_levels();
-    let mut prs_selectors = Vec::with_capacity(VOLUME_PLAN.len() * levels.len());
+    let mut prs_selectors =
+        Vec::with_capacity(VOLUME_PLAN.len() * levels.len() + VORTICITY_PLAN.len());
     for (field, _) in VOLUME_PLAN {
         for &level in &levels {
             prs_selectors.push(FieldSelector::isobaric(*field, level));
         }
+    }
+    for (level, _) in VORTICITY_PLAN {
+        prs_selectors.push(FieldSelector::isobaric(
+            CanonicalField::AbsoluteVorticity,
+            *level,
+        ));
     }
     let extract_started = Instant::now();
     let prs_extraction = extract_fields_partial_from_model_bytes_at_forecast_hour(
@@ -217,16 +348,31 @@ fn ingest_hour(
             levels: Vec::new(),
         })
         .collect();
+    let mut prs_fields_2d: Vec<(&'static str, SelectedField2D)> = Vec::new();
     for extracted in prs_extraction.extracted {
         let VerticalSelector::IsobaricHpa(level) = extracted.selector.vertical else {
             continue;
         };
+        if extracted.selector.field == CanonicalField::AbsoluteVorticity {
+            if let Some((_, name)) = VORTICITY_PLAN.iter().find(|(have, _)| *have == level) {
+                prs_fields_2d.push((name, extracted));
+            }
+            continue;
+        }
         if let Some(volume) = volumes_data
             .iter_mut()
             .find(|volume| volume.field == extracted.selector.field)
         {
             // Move the plane out; the per-field grid copy drops here.
             volume.levels.push((level, extracted.values));
+        }
+    }
+    for (level, name) in VORTICITY_PLAN {
+        if !prs_fields_2d.iter().any(|(have, _)| have == name) {
+            eprintln!(
+                "f{hour:03}: 2D field '{name}' (absolute vorticity {level} hPa) \
+                 missing from the prs file; skipped"
+            );
         }
     }
 
@@ -296,8 +442,7 @@ fn ingest_hour(
         &sfc_selectors,
         Some(hour),
     )?;
-    let sfc_extract_ms = extract_started.elapsed().as_millis();
-    drop(sfc);
+    let mut sfc_extract_ms = extract_started.elapsed().as_millis();
 
     let mut fields_2d_owned: Vec<(&'static str, SelectedField2D)> = Vec::new();
     for (name, selector) in &surface_plan {
@@ -315,6 +460,41 @@ fn ingest_hour(
             ),
         }
     }
+
+    // apcp_1h: both sfc APCP accumulations end at hour h, tie on match
+    // score, and the run total wins as first in file order (stored above as
+    // `apcp_run_total`). Re-selecting at `hour - 1` matches only the
+    // trailing (h-1)->h window — its start hour scores an exact 0 while the
+    // run total's start and end both miss — isolating the 1 h accumulation.
+    // The GRIB index re-parses, but only the one APCP message decodes.
+    if hour >= 1 {
+        let apcp_selectors = [FieldSelector::surface(CanonicalField::TotalPrecipitation)];
+        let apcp_started = Instant::now();
+        let apcp_extraction = extract_fields_partial_from_model_bytes_at_forecast_hour(
+            args.model,
+            &sfc.result.bytes,
+            Some(&sfc.bytes_path),
+            &apcp_selectors,
+            Some(hour - 1),
+        )?;
+        sfc_extract_ms += apcp_started.elapsed().as_millis();
+        match apcp_extraction.extracted.into_iter().next() {
+            Some(field) => fields_2d_owned.push(("apcp_1h", field)),
+            None => eprintln!(
+                "f{hour:03}: 2D field 'apcp_1h' (trailing 1 h APCP window) \
+                 missing from the sfc file; skipped"
+            ),
+        }
+    } else {
+        eprintln!("f{hour:03}: 2D field 'apcp_1h' has no trailing 1 h window at analysis; skipped");
+    }
+    drop(sfc);
+
+    // Sparse prs-sourced planes ride behind the sfc set so the grid carrier
+    // stays the first surface-plan field (both files share the HRRR grid;
+    // the store write bit-verifies that).
+    let planned_2d = surface_plan.len() + 1 + VORTICITY_PLAN.len();
+    fields_2d_owned.extend(prs_fields_2d);
     if fields_2d_owned.is_empty() {
         return Err(format!(
             "f{hour:03}: no 2D fields realized; cannot write an hour without a grid carrier"
@@ -382,7 +562,7 @@ fn ingest_hour(
         written.path.display(),
         written.bytes as f64 / (1024.0 * 1024.0),
         fields_2d.len(),
-        surface_plan.len(),
+        planned_2d,
     );
     for volume in &volumes_data {
         if volume.levels.len() >= 2 {
