@@ -1,6 +1,6 @@
 # rusty-weather Plan 2: rw-store — the unified storage format
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Build `rw-store` — the single format replacing both old wxstores — with real windowed 2D reads, column-chunked 3D for sub-100ms soundings, and an `rw_ingest` binary that takes a live HRRR hour from GRIB to `.rws` on disk, benchmarked.
 
@@ -98,7 +98,7 @@ Records sorted by `(var_id, kind, tile_y, tile_x)` — binary-searchable.
 - Create: `crates/rw-store/Cargo.toml`, `crates/rw-store/src/lib.rs`, `crates/rw-store/src/error.rs`, `crates/rw-store/src/format.rs`
 - Modify: root `Cargo.toml` (members — `rw-store` sorts before `rustwx-*` and `rusty-weather`)
 
-- [ ] **Step 1:** `crates/rw-store/Cargo.toml`:
+- [x] **Step 1:** `crates/rw-store/Cargo.toml`:
 
 ```toml
 [package]
@@ -120,11 +120,11 @@ zstd = "0.13"
 rustwx-core = { path = "../rustwx-core" }
 ```
 
-- [ ] **Step 2:** `src/error.rs` — `RwStoreError` via thiserror with variants: `Io(#[from] std::io::Error)`, `Format(String)` (bad magic/header/index), `UnsupportedVersion { found: u32, supported: &'static [u32] }`, `Meta(String)` (JSON/schema problems), `UnknownVariable(String)`, `Chunk(String)` (codec/decode), `Grid(String)`. `pub type RwResult<T> = Result<T, RwStoreError>;`
+- [x] **Step 2:** `src/error.rs` — `RwStoreError` via thiserror with variants: `Io(#[from] std::io::Error)`, `Format(String)` (bad magic/header/index), `UnsupportedVersion { found: u32, supported: &'static [u32] }`, `Meta(String)` (JSON/schema problems), `UnknownVariable(String)`, `Chunk(String)` (codec/decode), `Grid(String)`. `pub type RwResult<T> = Result<T, RwStoreError>;`
 
-- [ ] **Step 3:** `src/format.rs` — the normative constants: magic bytes, `VERSION: u32 = 1`, `SUPPORTED_VERSIONS: &[u32] = &[1]`, `HEADER_LEN: usize = 64`, `INDEX_RECORD_LEN: usize = 64`, `TILE_Y/TILE_X: usize = 256`, `COL_Y/COL_X: usize = 16`, flag bits (`FLAG_EMPTY: u8 = 1`, `FLAG_CONSTANT: u8 = 2`, `FLAG_HAS_MISSING: u8 = 4`), kind values (`KIND_TILE2D: u8 = 0`, `KIND_COLUMN3D: u8 = 1`), `SCHEMA_HOUR: &str = "rw-store.hour.v1"`. Plus `RwsHourMeta`/`RwsVariableMeta`/`RwsChunking`/`RwsWriterInfo` serde structs exactly as the format reference defines.
+- [x] **Step 3:** `src/format.rs` — the normative constants: magic bytes, `VERSION: u32 = 1`, `SUPPORTED_VERSIONS: &[u32] = &[1]`, `HEADER_LEN: usize = 64`, `INDEX_RECORD_LEN: usize = 64`, `TILE_Y/TILE_X: usize = 256`, `COL_Y/COL_X: usize = 16`, flag bits (`FLAG_EMPTY: u8 = 1`, `FLAG_CONSTANT: u8 = 2`, `FLAG_HAS_MISSING: u8 = 4`), kind values (`KIND_TILE2D: u8 = 0`, `KIND_COLUMN3D: u8 = 1`), `SCHEMA_HOUR: &str = "rw-store.hour.v1"`. Plus `RwsHourMeta`/`RwsVariableMeta`/`RwsChunking`/`RwsWriterInfo` serde structs exactly as the format reference defines.
 
-- [ ] **Step 4:** `lib.rs` declares `pub mod error; pub mod format;` with a crate doc-comment summarizing the format (condense the format reference). `cargo check -p rw-store` green; commit `feat: scaffold rw-store crate with format constants and error type`.
+- [x] **Step 4:** `lib.rs` declares `pub mod error; pub mod format;` with a crate doc-comment summarizing the format (condense the format reference). `cargo check -p rw-store` green; commit `feat: scaffold rw-store crate with format constants and error type`.
 
 ---
 
@@ -134,13 +134,13 @@ rustwx-core = { path = "../rustwx-core" }
 - Create: `crates/rw-store/src/codec.rs`
 - Source: `WT:crates/rustwx-products/src/volume_store/codec.rs` (lines 1–235)
 
-- [ ] **Step 1:** Write the test module FIRST in `codec.rs` by porting the old round-trip tests (WT codec.rs:192–235): `affine_i16_round_trip_keeps_error_bounded` (random-ish synthetic values; assert `|decoded - original| <= scale` per finite value, NaN positions preserved), `constant_chunk_uses_no_payload`, `all_missing_chunk_uses_empty_flag`. Adapt to the new types: `pub struct EncodedChunk { pub flags: u8, pub center: f32, pub scale: f32, pub min: f32, pub max: f32, pub valid_count: u32, pub payload: Vec<u8> }` and `pub fn encode_affine_i16(values: &[f32]) -> EncodedChunk`, `pub fn decode_affine_i16(flags: u8, center: f32, scale: f32, payload: &[u8], value_count: usize) -> RwResult<Vec<f32>>`. Run `cargo test -p rw-store codec` → compile failure (functions absent).
+- [x] **Step 1:** Write the test module FIRST in `codec.rs` by porting the old round-trip tests (WT codec.rs:192–235): `affine_i16_round_trip_keeps_error_bounded` (random-ish synthetic values; assert `|decoded - original| <= scale` per finite value, NaN positions preserved), `constant_chunk_uses_no_payload`, `all_missing_chunk_uses_empty_flag`. Adapt to the new types: `pub struct EncodedChunk { pub flags: u8, pub center: f32, pub scale: f32, pub min: f32, pub max: f32, pub valid_count: u32, pub payload: Vec<u8> }` and `pub fn encode_affine_i16(values: &[f32]) -> EncodedChunk`, `pub fn decode_affine_i16(flags: u8, center: f32, scale: f32, payload: &[u8], value_count: usize) -> RwResult<Vec<f32>>`. Run `cargo test -p rw-store codec` → compile failure (functions absent).
 
-- [ ] **Step 2:** Implement by porting WT codec.rs:60–189 with these adaptations: flags are the new u8 bits (EMPTY/CONSTANT/HAS_MISSING; the old `FLAG_DENSE_I16` becomes implicit — payload non-empty ⇔ dense, EXCEPT constant-with-missing which keeps a sentinel payload exactly like the old code); sentinel `i16::MIN`, clamp to `[i16::MIN+1, i16::MAX]`, `center = 0.5*(min+max)`, `scale = (max-min)/(2*i16::MAX as f32)`. Cite the port source in the module header comment.
+- [x] **Step 2:** Implement by porting WT codec.rs:60–189 with these adaptations: flags are the new u8 bits (EMPTY/CONSTANT/HAS_MISSING; the old `FLAG_DENSE_I16` becomes implicit — payload non-empty ⇔ dense, EXCEPT constant-with-missing which keeps a sentinel payload exactly like the old code); sentinel `i16::MIN`, clamp to `[i16::MIN+1, i16::MAX]`, `center = 0.5*(min+max)`, `scale = (max-min)/(2*i16::MAX as f32)`. Cite the port source in the module header comment.
 
-- [ ] **Step 3:** Also add `pub fn encode_f32_tile(values: &[f32]) -> EncodedChunk` / `pub fn decode_f32_tile(flags, center, payload, value_count) -> RwResult<Vec<f32>>` — the 2D path: same EMPTY/CONSTANT detection (port the min/max/valid scan), dense case = raw f32 LE bytes (no quantization). Tests: exact round-trip including NaN, constant, empty.
+- [x] **Step 3:** Also add `pub fn encode_f32_tile(values: &[f32]) -> EncodedChunk` / `pub fn decode_f32_tile(flags, center, payload, value_count) -> RwResult<Vec<f32>>` — the 2D path: same EMPTY/CONSTANT detection (port the min/max/valid scan), dense case = raw f32 LE bytes (no quantization). Tests: exact round-trip including NaN, constant, empty.
 
-- [ ] **Step 4:** All codec tests green. Note: NO zstd in this module — compression is applied by the writer above the codec (keeps codec pure and testable). Commit `feat: rw-store codec — affine-i16 (ported) and f32 tile encode/decode`.
+- [x] **Step 4:** All codec tests green. Note: NO zstd in this module — compression is applied by the writer above the codec (keeps codec pure and testable). Commit `feat: rw-store codec — affine-i16 (ported) and f32 tile encode/decode`.
 
 ---
 
@@ -149,11 +149,11 @@ rustwx-core = { path = "../rustwx-core" }
 **Files:**
 - Create: `crates/rw-store/src/index.rs`, `crates/rw-store/src/header.rs`
 
-- [ ] **Step 1 (TDD):** tests first: `index_record_round_trips_through_64_bytes` (pack → unpack → equality, including edge values), `header_round_trips`, `header_rejects_bad_magic`, `header_rejects_unsupported_version` (assert the error carries found+supported), `records_sort_key_orders_by_var_kind_tile`.
+- [x] **Step 1 (TDD):** tests first: `index_record_round_trips_through_64_bytes` (pack → unpack → equality, including edge values), `header_round_trips`, `header_rejects_bad_magic`, `header_rejects_unsupported_version` (assert the error carries found+supported), `records_sort_key_orders_by_var_kind_tile`.
 
-- [ ] **Step 2:** `index.rs`: `pub struct ChunkRecord { pub var_id: u16, pub kind: u8, pub flags: u8, pub tile_y: u32, pub tile_x: u32, pub offset: u64, pub len: u32, pub raw_len: u32, pub center: f32, pub scale: f32, pub min: f32, pub max: f32, pub valid_count: u32 }` with `pack_into(&self, out: &mut Vec<u8>)` / `unpack(bytes: &[u8; 64]) -> RwResult<Self>` per the byte layout in the format reference, plus `pub fn sort_key(&self) -> (u16, u8, u32, u32)`. `header.rs`: `pub struct RwsHeader { pub version: u32, pub meta_len: u32, pub index_count: u64, pub index_offset: u64, pub payload_offset: u64 }` with `pack` (writes exactly 64 bytes) / `parse(&[u8]) -> RwResult<RwsHeader>` (validates magic, version ∈ SUPPORTED_VERSIONS, offsets sane: `index_offset == HEADER_LEN + meta_len`, `payload_offset == index_offset + index_count*64`).
+- [x] **Step 2:** `index.rs`: `pub struct ChunkRecord { pub var_id: u16, pub kind: u8, pub flags: u8, pub tile_y: u32, pub tile_x: u32, pub offset: u64, pub len: u32, pub raw_len: u32, pub center: f32, pub scale: f32, pub min: f32, pub max: f32, pub valid_count: u32 }` with `pack_into(&self, out: &mut Vec<u8>)` / `unpack(bytes: &[u8; 64]) -> RwResult<Self>` per the byte layout in the format reference, plus `pub fn sort_key(&self) -> (u16, u8, u32, u32)`. `header.rs`: `pub struct RwsHeader { pub version: u32, pub meta_len: u32, pub index_count: u64, pub index_offset: u64, pub payload_offset: u64 }` with `pack` (writes exactly 64 bytes) / `parse(&[u8]) -> RwResult<RwsHeader>` (validates magic, version ∈ SUPPORTED_VERSIONS, offsets sane: `index_offset == HEADER_LEN + meta_len`, `payload_offset == index_offset + index_count*64`).
 
-- [ ] **Step 3:** green; commit `feat: rw-store binary header and chunk index records`.
+- [x] **Step 3:** green; commit `feat: rw-store binary header and chunk index records`.
 
 ---
 
@@ -162,11 +162,11 @@ rustwx-core = { path = "../rustwx-core" }
 **Files:**
 - Create: `crates/rw-store/src/writer.rs`, `crates/rw-store/src/atomic.rs`
 
-- [ ] **Step 1:** `atomic.rs` — port `atomic_write_bytes` from `WT:crates/rustwx-products/src/publication.rs:497-523` (temp file `create_new` → `write_all` → `sync_all` → remove-existing → rename, cleanup on error). Unit test: write, overwrite, content correct, no `.tmp` left behind.
+- [x] **Step 1:** `atomic.rs` — port `atomic_write_bytes` from `WT:crates/rustwx-products/src/publication.rs:497-523` (temp file `create_new` → `write_all` → `sync_all` → remove-existing → rename, cleanup on error). Unit test: write, overwrite, content correct, no `.tmp` left behind.
 
-- [ ] **Step 2 (TDD):** writer test: build two synthetic 2D fields (e.g. 600×500 — forces 3×2 tiling with edge tiles; one field containing a NaN region and a constant region), write via the new API, then assert with raw byte inspection: magic correct, index_count == expected tile count, records sorted, EMPTY/CONSTANT tiles have len==0.
+- [x] **Step 2 (TDD):** writer test: build two synthetic 2D fields (e.g. 600×500 — forces 3×2 tiling with edge tiles; one field containing a NaN region and a constant region), write via the new API, then assert with raw byte inspection: magic correct, index_count == expected tile count, records sorted, EMPTY/CONSTANT tiles have len==0.
 
-- [ ] **Step 3:** implement `writer.rs`:
+- [x] **Step 3:** implement `writer.rs`:
 
 ```rust
 pub struct HourWriter { /* model, run, forecast_hour, nx, ny, grid_hash, vars + staged chunks */ }
@@ -179,7 +179,7 @@ impl HourWriter {
 
 `add_surface2d` splits into 256×256 tiles (port the chunking loop shape from `WT:wxstore_wxa.rs:464-686` — y0/x0/y_count/x_count math), runs `encode_f32_tile` per tile, zstd-1 compresses dense payloads (`zstd::stream::encode_all(&payload[..], 1)`), records stats. **Rayon:** parallelize per-tile encode+compress with `par_iter` over tile coordinates, collect `(coord, EncodedChunk, compressed)` then assemble serially (deterministic offsets — assembly assigns offsets in sorted order). `finish` builds meta JSON, packs sorted index, concatenates payload, atomic-writes.
 
-- [ ] **Step 4:** tests green; commit `feat: rw-store hour writer with rayon-parallel 2D tile encode`.
+- [x] **Step 4:** tests green; commit `feat: rw-store hour writer with rayon-parallel 2D tile encode`.
 
 ---
 
@@ -188,9 +188,9 @@ impl HourWriter {
 **Files:**
 - Create: `crates/rw-store/src/reader.rs`
 
-- [ ] **Step 1 (TDD):** tests (using Task 4's writer to produce input): `read_full_round_trips_exactly` (f32 2D is lossless — bit-exact incl. NaN), `windowed_read_equals_full_read_crop` (several windows incl. tile-straddling, edge-clamped, and 1×1), `open_rejects_truncated_file`, `open_rejects_corrupt_index` (flip a byte in the index region → decode of affected chunk errors cleanly, not panic), `unknown_variable_errors`.
+- [x] **Step 1 (TDD):** tests (using Task 4's writer to produce input): `read_full_round_trips_exactly` (f32 2D is lossless — bit-exact incl. NaN), `windowed_read_equals_full_read_crop` (several windows incl. tile-straddling, edge-clamped, and 1×1), `open_rejects_truncated_file`, `open_rejects_corrupt_index` (flip a byte in the index region → decode of affected chunk errors cleanly, not panic), `unknown_variable_errors`.
 
-- [ ] **Step 2:** implement:
+- [x] **Step 2:** implement:
 
 ```rust
 pub struct HourReader { mmap: memmap2::Mmap, pub meta: RwsHourMeta, index: Vec<ChunkRecord> }
@@ -205,7 +205,7 @@ pub struct Window2D { pub x0: usize, pub y0: usize, pub nx: usize, pub ny: usize
 
 `read_window_2d` computes the intersecting tile range (`tile_y0 = y0/256 ..= (y1-1)/256` etc.), binary-searches the index per tile, decodes ONLY those tiles (zstd `decode_all` then `decode_f32_tile`), and copies the intersection rows into the output. **This is the windowed-read promise the old wxa never kept — the test in Step 1 is the contract.** `read_full_2d` = window over the whole grid; rayon-parallel tile decode when more than ~8 tiles.
 
-- [ ] **Step 3:** green; commit `feat: rw-store reader with true windowed 2D reads`.
+- [x] **Step 3:** green; commit `feat: rw-store reader with true windowed 2D reads`.
 
 ---
 
@@ -214,13 +214,13 @@ pub struct Window2D { pub x0: usize, pub y0: usize, pub nx: usize, pub ny: usize
 **Files:**
 - Modify: `crates/rw-store/src/writer.rs`, `crates/rw-store/src/reader.rs`
 
-- [ ] **Step 1 (TDD):** tests: synthetic volume from an analytic function (e.g. `v(x,y,z) = 0.1*x + 0.2*y - 1.5*z`) on a 100×80 grid × 10 levels; `volume_round_trips_within_quantization_bound` (per chunk: `|decoded-orig| <= chunk scale`), `column_read_matches_full_decode` (read_column(ix,iy) == the column extracted from full decode), `profile_bilinear_matches_analytic` (bilinear of analytic field at fractional point, tolerance = quantization bound + epsilon), NaN-column and constant-level cases.
+- [x] **Step 1 (TDD):** tests: synthetic volume from an analytic function (e.g. `v(x,y,z) = 0.1*x + 0.2*y - 1.5*z`) on a 100×80 grid × 10 levels; `volume_round_trips_within_quantization_bound` (per chunk: `|decoded-orig| <= chunk scale`), `column_read_matches_full_decode` (read_column(ix,iy) == the column extracted from full decode), `profile_bilinear_matches_analytic` (bilinear of analytic field at fractional point, tolerance = quantization bound + epsilon), NaN-column and constant-level cases.
 
-- [ ] **Step 2:** writer side: `pub fn add_pressure3d(&mut self, name, units, selector, levels_hpa: &[u16], level_planes: &[&[f32]]) -> RwResult<u16>` — validates levels descending + plane count/len, re-lays planes into 16×16-column chunks with `[y][x][z]` order (each column's levels contiguous), `encode_affine_i16` per chunk, zstd-1, rayon-parallel across chunks. `tile_y/tile_x` in records = column-chunk coordinates (grid divided by 16).
+- [x] **Step 2:** writer side: `pub fn add_pressure3d(&mut self, name, units, selector, levels_hpa: &[u16], level_planes: &[&[f32]]) -> RwResult<u16>` — validates levels descending + plane count/len, re-lays planes into 16×16-column chunks with `[y][x][z]` order (each column's levels contiguous), `encode_affine_i16` per chunk, zstd-1, rayon-parallel across chunks. `tile_y/tile_x` in records = column-chunk coordinates (grid divided by 16).
 
-- [ ] **Step 3:** reader side: `pub fn read_column_3d(&self, name: &str, ix: usize, iy: usize) -> RwResult<Vec<f32>>` (locate chunk `(iy/16, ix/16)`, decode, slice the column at `((iy%16)*x_count + (ix%16)) * levels .. + levels`) and `pub fn read_profile_3d(&self, name: &str, fx: f64, fy: f64) -> RwResult<Vec<f32>>` (bilinear across the 4 surrounding columns — up to 4 chunk decodes worst case, 1 typical; NaN-aware: a level with any NaN corner falls back to nearest finite corner weighting, port nothing — keep it simple: if any of the 4 is NaN at a level, use weighted mean of finite corners, all-NaN → NaN).
+- [x] **Step 3:** reader side: `pub fn read_column_3d(&self, name: &str, ix: usize, iy: usize) -> RwResult<Vec<f32>>` (locate chunk `(iy/16, ix/16)`, decode, slice the column at `((iy%16)*x_count + (ix%16)) * levels .. + levels`) and `pub fn read_profile_3d(&self, name: &str, fx: f64, fy: f64) -> RwResult<Vec<f32>>` (bilinear across the 4 surrounding columns — up to 4 chunk decodes worst case, 1 typical; NaN-aware: a level with any NaN corner falls back to nearest finite corner weighting, port nothing — keep it simple: if any of the 4 is NaN at a level, use weighted mean of finite corners, all-NaN → NaN).
 
-- [ ] **Step 4:** green; commit `feat: rw-store 3D column-chunked volumes with profile reads`.
+- [x] **Step 4:** green; commit `feat: rw-store 3D column-chunked volumes with profile reads`.
 
 ---
 
@@ -229,13 +229,13 @@ pub struct Window2D { pub x0: usize, pub y0: usize, pub nx: usize, pub ny: usize
 **Files:**
 - Create: `crates/rw-store/src/grid.rs`, `crates/rw-store/src/run.rs`
 
-- [ ] **Step 1 (TDD):** tests: grid file round-trip (write LatLonGrid+GridProjection → read → arrays bit-exact, hash stable); `locate_finds_nearest_grid_point` on a synthetic regular grid AND a synthetic curvilinear-ish grid (rotated/sheared coordinates) — assert the returned (ix, iy, fx, fy) brackets the query point; run.json round-trip + hour registration.
+- [x] **Step 1 (TDD):** tests: grid file round-trip (write LatLonGrid+GridProjection → read → arrays bit-exact, hash stable); `locate_finds_nearest_grid_point` on a synthetic regular grid AND a synthetic curvilinear-ish grid (rotated/sheared coordinates) — assert the returned (ix, iy, fx, fy) brackets the query point; run.json round-trip + hour registration.
 
-- [ ] **Step 2:** `grid.rs`: `.rwg` file = same 64-byte header pattern (magic `b"RWSGRID1"`, version, meta_len, then meta JSON `{ schema: "rw-store.grid.v1", nx, ny, projection: GridProjection (serde), lat_offset/lat_len/lon_offset/lon_len }`, then zstd-1 of lat f32 LE array, then zstd-1 of lon array). API: `write_grid(path, &LatLonGrid, Option<&GridProjection>) -> RwResult<String /* sha256 hex of file bytes */>`, `pub struct GridFile { pub nx, ny, pub lat: Vec<f32>, pub lon: Vec<f32>, pub projection: Option<GridProjection>, pub hash: String }` with `GridFile::open(path)`. (`LatLonGrid`/`GridProjection` come from rustwx-core and are serde-ready — verified.)
+- [x] **Step 2:** `grid.rs`: `.rwg` file = same 64-byte header pattern (magic `b"RWSGRID1"`, version, meta_len, then meta JSON `{ schema: "rw-store.grid.v1", nx, ny, projection: GridProjection (serde), lat_offset/lat_len/lon_offset/lon_len }`, then zstd-1 of lat f32 LE array, then zstd-1 of lon array). API: `write_grid(path, &LatLonGrid, Option<&GridProjection>) -> RwResult<String /* sha256 hex of file bytes */>`, `pub struct GridFile { pub nx, ny, pub lat: Vec<f32>, pub lon: Vec<f32>, pub projection: Option<GridProjection>, pub hash: String }` with `GridFile::open(path)`. (`LatLonGrid`/`GridProjection` come from rustwx-core and are serde-ready — verified.)
 
-- [ ] **Step 3:** the locator: `pub struct GridLocator { /* coarse index */ }` built lazily from a GridFile — downsample every 8th point into a coarse lat/lon mesh; `locate(lat, lon) -> Option<(f64, f64)>` (fractional grid coords) = nearest coarse cell scan, then local exhaustive refine over the surrounding 17×17 fine points, then bilinear inversion within the winning cell (solve fractional position from the 4 corners — straight 2D inverse bilinear with 2 Newton iterations, NaN-safe). Build time target: < 50 ms for 1799×1059 (measure in an `#[ignore]` test); locate: < 50 µs warm.
+- [x] **Step 3:** the locator: `pub struct GridLocator { /* coarse index */ }` built lazily from a GridFile — downsample every 8th point into a coarse lat/lon mesh; `locate(lat, lon) -> Option<(f64, f64)>` (fractional grid coords) = nearest coarse cell scan, then local exhaustive refine over the surrounding 17×17 fine points, then bilinear inversion within the winning cell (solve fractional position from the 4 corners — straight 2D inverse bilinear with 2 Newton iterations, NaN-safe). Build time target: < 50 ms for 1799×1059 (measure in an `#[ignore]` test); locate: < 50 µs warm.
 
-- [ ] **Step 4:** `run.rs`: `RwsRunManifest { schema: "rw-store.run.v1", model, run, grid_hash, nx, ny, hours: BTreeMap<u16, RwsHourEntry { file, written_unix, encode_ms, variables: Vec<String> }>, writer: RwsWriterInfo }`, `load_or_new`, `register_hour`, atomic save. Commit `feat: rw-store run manifest, grid file, and generic grid locator`.
+- [x] **Step 4:** `run.rs`: `RwsRunManifest { schema: "rw-store.run.v1", model, run, grid_hash, nx, ny, hours: BTreeMap<u16, RwsHourEntry { file, written_unix, encode_ms, variables: Vec<String> }>, writer: RwsWriterInfo }`, `load_or_new`, `register_hour`, atomic save. Commit `feat: rw-store run manifest, grid file, and generic grid locator`.
 
 ---
 
@@ -245,9 +245,9 @@ pub struct Window2D { pub x0: usize, pub y0: usize, pub nx: usize, pub ny: usize
 - Create: `crates/rw-store/src/ingest.rs`
 - Modify: `crates/rw-store/src/lib.rs` (re-exports: `HourWriter`, `HourReader`, `Window2D`, `GridFile`, `GridLocator`, `RwsRunManifest`, `ingest::*`)
 
-- [ ] **Step 1 (TDD):** test with hand-built `SelectedField2D`s (small grid): `write_hour_from_fields` writes grid.rwg (once — second hour reuses, asserts same hash, no rewrite), run.json registers hours, hour file contains all 2D vars + 3D var with the levels assembled in descending order from per-level `SelectedField2D`s, and a read-back through `HourReader` reconstructs a `SelectedField2D` equal to the input (selector, units, grid arrays via GridFile, values bit-exact for 2D).
+- [x] **Step 1 (TDD):** test with hand-built `SelectedField2D`s (small grid): `write_hour_from_fields` writes grid.rwg (once — second hour reuses, asserts same hash, no rewrite), run.json registers hours, hour file contains all 2D vars + 3D var with the levels assembled in descending order from per-level `SelectedField2D`s, and a read-back through `HourReader` reconstructs a `SelectedField2D` equal to the input (selector, units, grid arrays via GridFile, values bit-exact for 2D).
 
-- [ ] **Step 2:** implement:
+- [x] **Step 2:** implement:
 
 ```rust
 pub struct PressureVolumeInput<'a> {
@@ -263,7 +263,7 @@ pub fn write_hour_from_fields(
 
 Grid consistency: all inputs must share (nx, ny) — error otherwise; grid.rwg written from the first field's `LatLonGrid` + `projection` if absent, else hash-checked. Reconstruction helper: `pub fn read_field_2d(reader: &HourReader, grid: &GridFile, name: &str) -> RwResult<SelectedField2D>`.
 
-- [ ] **Step 3:** green; `cargo test --workspace` green; commit `feat: rw-store ingest API — SelectedField2D round-trip`.
+- [x] **Step 3:** green; `cargo test --workspace` green; commit `feat: rw-store ingest API — SelectedField2D round-trip`.
 
 ---
 
@@ -273,15 +273,15 @@ Grid consistency: all inputs must share (nx, ny) — error otherwise; grid.rwg w
 - Create: `crates/rusty-weather/src/bin/rw_ingest.rs`
 - Modify: `crates/rusty-weather/Cargo.toml` (add `rw-store = { path = "../rw-store" }`, re-add `rustwx-io` — it was trimmed as unused in Plan 1)
 
-- [ ] **Step 1:** CLI (clap, mirror smoke_direct's arg style): `--model` (default hrrr), `--date`, `--cycle`, `--hours` (e.g. `0,6` or `0-6`), `--store-root` (default `store`), `--cache-dir` (reuse the fetch cache pattern from smoke_direct).
+- [x] **Step 1:** CLI (clap, mirror smoke_direct's arg style): `--model` (default hrrr), `--date`, `--cycle`, `--hours` (e.g. `0,6` or `0-6`), `--store-root` (default `store`), `--cache-dir` (reuse the fetch cache pattern from smoke_direct).
 
 Also add a `build.rs` to `crates/rusty-weather` that captures the git SHA at compile time (`git rev-parse --short=12 HEAD` + `-dirty` suffix when the tree is dirty; fall back to `"unknown"` if git fails) into `RW_BUILD_SHA` via `cargo:rustc-env=`, with `cargo:rerun-if-changed=../../.git/HEAD`. rw_ingest passes `env!("RW_BUILD_SHA")` into `RwsWriterInfo.build` so every store written records exactly which build produced it — this is the spec's day-one deploy-lottery fix and is not optional.
 
-- [ ] **Step 2:** Field plan. 2D set: build `FieldSelector`s for: 2m temperature, 2m dewpoint, 10m U, 10m V, MSLP, composite reflectivity, surface CAPE — **verify each exists** as a CanonicalField/selector the HRRR catalog supports by checking `crates/rustwx-core` (CanonicalField variants) and how `rustwx-products` direct recipes build the same selectors (grep for the recipe definitions); use the exact same constructors. 3D set: for each var in [Temperature, Dewpoint (fall back to RelativeHumidity if HRRR prs lacks DPT), U, V, GeopotentialHeight] × candidate levels `(100..=1000).step_by(25)` build `FieldSelector::isobaric(field, hpa)`. Extraction TOLERATES absent selectors (`PartialExtraction.missing`) — request the superset, store what comes back, log the realized level list.
+- [x] **Step 2:** Field plan. 2D set: build `FieldSelector`s for: 2m temperature, 2m dewpoint, 10m U, 10m V, MSLP, composite reflectivity, surface CAPE — **verify each exists** as a CanonicalField/selector the HRRR catalog supports by checking `crates/rustwx-core` (CanonicalField variants) and how `rustwx-products` direct recipes build the same selectors (grep for the recipe definitions); use the exact same constructors. 3D set: for each var in [Temperature, Dewpoint (fall back to RelativeHumidity if HRRR prs lacks DPT), U, V, GeopotentialHeight] × candidate levels `(100..=1000).step_by(25)` build `FieldSelector::isobaric(field, hpa)`. Extraction TOLERATES absent selectors (`PartialExtraction.missing`) — request the superset, store what comes back, log the realized level list.
 
-- [ ] **Step 3:** Per hour: fetch the HRRR `prs` file (3D + MSLP/CAPE live there) and `sfc` file (2m/10m/reflectivity) via the same `FetchRequest`+cache machinery smoke_direct uses (mirror its fetch code; one download per product file); `extract_fields_partial_from_model_bytes_at_forecast_hour` once per file with ALL its selectors (single decode pass); group isobaric results into `PressureVolumeInput`s; call `write_hour_from_fields`. Print per-stage timings: fetch / extract / encode / total, plus file size and realized variable+level counts. Loop hours.
+- [x] **Step 3:** Per hour: fetch the HRRR `prs` file (3D + MSLP/CAPE live there) and `sfc` file (2m/10m/reflectivity) via the same `FetchRequest`+cache machinery smoke_direct uses (mirror its fetch code; one download per product file); `extract_fields_partial_from_model_bytes_at_forecast_hour` once per file with ALL its selectors (single decode pass); group isobaric results into `PressureVolumeInput`s; call `write_hour_from_fields`. Print per-stage timings: fetch / extract / encode / total, plus file size and realized variable+level counts. Loop hours.
 
-- [ ] **Step 4:** Build + run live: `cargo run --release -p rusty-weather --bin rw_ingest -- --model hrrr --date 20260608 --cycle 0 --hours 6` (the GRIB may already be in the smoke cache — note cache state with the timing). **Gate: encode stage ≤ 5 s.** If encode exceeds the gate, profile the obvious knobs first (rayon chunk parallelism actually engaged? zstd level 1 confirmed? avoidable copies in the chunk re-layout?) and fix before proceeding. Record everything in the commit message. Commit `feat: rw_ingest — live GRIB to .rws for HRRR`.
+- [x] **Step 4:** Build + run live: `cargo run --release -p rusty-weather --bin rw_ingest -- --model hrrr --date 20260608 --cycle 0 --hours 6` (the GRIB may already be in the smoke cache — note cache state with the timing). **Gate: encode stage ≤ 5 s.** If encode exceeds the gate, profile the obvious knobs first (rayon chunk parallelism actually engaged? zstd level 1 confirmed? avoidable copies in the chunk re-layout?) and fix before proceeding. Record everything in the commit message. Commit `feat: rw_ingest — live GRIB to .rws for HRRR`.
 
 ---
 
@@ -290,7 +290,7 @@ Also add a `build.rs` to `crates/rusty-weather` that captures the git SHA at com
 **Files:**
 - Create: `crates/rusty-weather/src/bin/rw_bench.rs`
 
-- [ ] **Step 1:** `rw_bench` CLI: `--store-root`, `--model`, `--run`, `--hour`. Measures and prints (median of 5 runs each, after 1 warmup):
+- [x] **Step 1:** `rw_bench` CLI: `--store-root`, `--model`, `--run`, `--hour`. Measures and prints (median of 5 runs each, after 1 warmup):
   - open hour file (header+meta+index parse)
   - read_full_2d of each 2D var
   - read_window_2d of a ¼-domain window and a 64×64 window
@@ -298,7 +298,7 @@ Also add a `build.rs` to `crates/rusty-weather` that captures the git SHA at com
   - full sounding: locate + read_profile_3d for ALL 3D vars (the user-facing "click → sounding data" cost)
   - whole-hour file size + per-var compressed sizes
 
-- [ ] **Step 2:** Run against the Task 9 output. **Gates: sounding ≤ 100 ms (expect ≤ 25 ms); full 2D read ≤ 150 ms; window read scales with area.** Investigate and fix if missed (likely suspects: index binary-search not engaged, zstd decode of more chunks than the window needs, locator rebuilt per call). Record all numbers in the commit message AND append a "Measured (Plan 2)" row-set to the README's baseline section. Commit `feat: rw_bench + measured rw-store baselines`.
+- [x] **Step 2:** Run against the Task 9 output. **Gates: sounding ≤ 100 ms (expect ≤ 25 ms); full 2D read ≤ 150 ms; window read scales with area.** Investigate and fix if missed (likely suspects: index binary-search not engaged, zstd decode of more chunks than the window needs, locator rebuilt per call). Record all numbers in the commit message AND append a "Measured (Plan 2)" row-set to the README's baseline section. Commit `feat: rw_bench + measured rw-store baselines`.
 
 ---
 
@@ -307,18 +307,18 @@ Also add a `build.rs` to `crates/rusty-weather` that captures the git SHA at com
 **Files:**
 - Create: `crates/rusty-weather/tests/fixtures/` (fixture GRIB), `crates/rusty-weather/tests/rw_store_e2e.rs`
 
-- [ ] **Step 1:** Build the fixture using idx byte-range subsetting (AWS supports it — `FetchRequest.variable_patterns`): fetch ONLY `TMP:500 mb`, `TMP:700 mb`, `TMP:850 mb`, `UGRD:500 mb`, `VGRD:500 mb`, `HGT:500 mb`, `TMP:2 m above ground` from one archived HRRR cycle (write a tiny throwaway script or temporarily extend rw_ingest with a `--fixture-out` flag — your choice; if a flag, keep it, it's useful). Target ≤ 8 MB. Commit the file with a README note naming its exact source URL + byte ranges date.
+- [x] **Step 1:** Build the fixture using idx byte-range subsetting (AWS supports it — `FetchRequest.variable_patterns`): fetch ONLY `TMP:500 mb`, `TMP:700 mb`, `TMP:850 mb`, `UGRD:500 mb`, `VGRD:500 mb`, `HGT:500 mb`, `TMP:2 m above ground` from one archived HRRR cycle (write a tiny throwaway script or temporarily extend rw_ingest with a `--fixture-out` flag — your choice; if a flag, keep it, it's useful). Target ≤ 8 MB. Commit the file with a README note naming its exact source URL + byte ranges date.
 
-- [ ] **Step 2:** `rw_store_e2e.rs` (offline, runs in default `cargo test`): bytes → `extract_fields_partial_from_model_bytes_at_forecast_hour` → `write_hour_from_fields` (3D = TMP at [850,700,500] + the 500mb wind/height as a second/third volume or 2D fields as extracted — match what the fixture provides) → `HourReader` reads back → assert: 2D bit-exact, 3D within quantization bounds, window==crop on real data, profile at a known lat/lon returns plausible values (e.g. 850→500 temperature decreases). This is the CI-smoke the spec promised.
+- [x] **Step 2:** `rw_store_e2e.rs` (offline, runs in default `cargo test`): bytes → `extract_fields_partial_from_model_bytes_at_forecast_hour` → `write_hour_from_fields` (3D = TMP at [850,700,500] + the 500mb wind/height as a second/third volume or 2D fields as extracted — match what the fixture provides) → `HourReader` reads back → assert: 2D bit-exact, 3D within quantization bounds, window==crop on real data, profile at a known lat/lon returns plausible values (e.g. 850→500 temperature decreases). This is the CI-smoke the spec promised.
 
-- [ ] **Step 3:** `cargo test --workspace` green; commit `test: committed HRRR fixture + offline rw-store e2e`.
+- [x] **Step 3:** `cargo test --workspace` green; commit `test: committed HRRR fixture + offline rw-store e2e`.
 
 ---
 
 ### Task 12: Docs + finish
 
-- [ ] **Step 1:** README: add an `rw-store` section (format one-paragraph summary, the rw_ingest/rw_bench commands, measured numbers). Update the spec's open-questions section: chunk shapes are now decided (256×256 / 16×16×L) — note "settled in Plan 2 with benchmarks".
-- [ ] **Step 2:** Check all boxes in this plan; `cargo test --workspace` final green; commit; merge `plan-2-rw-store` → `main` (no-ff) after final review; tag `rw-store-v1`.
+- [x] **Step 1:** README: add an `rw-store` section (format one-paragraph summary, the rw_ingest/rw_bench commands, measured numbers). Update the spec's open-questions section: chunk shapes are now decided (256×256 / 16×16×L) — note "settled in Plan 2 with benchmarks".
+- [x] **Step 2:** Check all boxes in this plan; `cargo test --workspace` final green; commit; merge `plan-2-rw-store` → `main` (no-ff) after final review; tag `rw-store-v1`.
 
 ---
 

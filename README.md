@@ -6,6 +6,15 @@ local webpage. Full Rust. Extracted from the rustwx fast path.
 
 Design: docs/superpowers/specs/2026-06-09-rusty-weather-design.md
 
+## rw-store
+
+Each forecast hour is a self-contained `.rws` file: 256×256 spatial tiles of 2D surface fields, zstd-1 compressed f32, with true windowed reads so a regional plot decodes only the intersecting tile set. Pressure-level volumes are stored as 16×16-column 3D chunks (all levels contiguous per column), affine-i16 quantized then zstd-1, so a point sounding mmaps the file, binary-searches the index, and decodes 1–4 small chunks for instant bilinear profiles across all levels. Per-run provenance lives in `grid.rwg` (lat/lon arrays + projection, sha256-hashed for grid-identity checks) and `run.json` (model, cycle, hours present, format version, build-hash from `git rev-parse` compiled in at build time).
+
+    cargo run --release -p rusty-weather --bin rw_ingest -- --model hrrr --date YYYYMMDD --cycle 0 --hours 0-6 --store-root store --verify
+    cargo run --release -p rusty-weather --bin rw_bench -- --run YYYYMMDD_00z
+
+Measured (HRRR 20260608_00z, 11 vars / 37 levels, 409 MB/hour): ingest ~6 s/hour warm-cache (2.6 s extract + 1.6 s encode); sounding warm 0.19 ms; full 2D read ~3.6 ms.
+
 ## Status
 
 Extraction complete (Plan 1). The workspace builds and renders live HRRR plots:
