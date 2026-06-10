@@ -757,9 +757,9 @@ mod tests {
         let calibration = Calibration::builtin_default();
         let estimate = estimate(&IngestProfile::full(), ModelId::Hrrr, 1, &calibration);
         // Every variable the 20260608 store realized must be priced: 110
-        // 2D (29 surface-plan + 3 trailing + 5 vorticity + 31 direct
-        // planes + 29 derived + 16 heavy... as measured) + 5 volumes +
-        // the overhead entry.
+        // 2D (26 surface-plan + 3 trailing + 5 vorticity + 31 direct
+        // planes + 29 derived + 16 heavy, as measured) + 5 volumes +
+        // the overhead entry = 115 + 1.
         assert_eq!(estimate.breakdown.len(), 115 + 1);
         // Within bookkeeping noise of the real measured hours (~677 MB).
         let measured_avg = 709_779_736u64;

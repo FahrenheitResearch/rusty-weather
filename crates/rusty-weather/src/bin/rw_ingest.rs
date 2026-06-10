@@ -149,10 +149,27 @@ fn calibration_paths(args: &Args, model_slug: &str) -> Vec<PathBuf> {
         if from.is_file() {
             return vec![from.clone()];
         }
-        if let Ok(entries) = std::fs::read_dir(from) {
-            hour_files.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
-                path.extension().is_some_and(|ext| ext == "rws")
-            }));
+        match std::fs::read_dir(from) {
+            Ok(entries) => {
+                hour_files.extend(entries.flatten().map(|entry| entry.path()).filter(
+                    |path| path.extension().is_some_and(|ext| ext == "rws"),
+                ));
+            }
+            Err(err) => {
+                // An explicit flag must fail loudly, not fall back silently.
+                eprintln!(
+                    "error: --calibrate-from {}: {err}",
+                    from.display()
+                );
+                std::process::exit(1);
+            }
+        }
+        if hour_files.is_empty() {
+            eprintln!(
+                "error: --calibrate-from {}: no .rws hour files found",
+                from.display()
+            );
+            std::process::exit(1);
         }
         hour_files.sort();
         return hour_files;

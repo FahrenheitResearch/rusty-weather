@@ -259,6 +259,13 @@ pub fn process_fetched_hour(
     config: &IngestConfig<'_>,
     fetched: FetchedHour,
 ) -> Result<IngestedHour, Box<dyn std::error::Error>> {
+    // The CLIs validate via resolve_profile; guard programmatic callers too
+    // (e.g. derived=false + heavy=true would silently compute derived).
+    debug_assert!(
+        config.profile.validate().is_ok(),
+        "process_fetched_hour called with an unvalidated profile: {:?}",
+        config.profile.validate()
+    );
     let process_started = Instant::now();
     let FetchedHour {
         hour,
@@ -752,7 +759,7 @@ fn compute_product_grids(
     let derived_ms = derived_started.elapsed().as_millis();
 
     if !heavy_enabled {
-        println!("f{hour:03}: heavy ingest stage skipped (--no-heavy)");
+        println!("f{hour:03}: heavy ingest stage skipped (profile/--no-heavy)");
         return ComputedProductGrids {
             derived,
             heavy: Vec::new(),
