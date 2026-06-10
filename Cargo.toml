@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/rw-store",
+    "crates/rw-ui",
     "crates/rustwx-calc",
     "crates/rustwx-contour",
     "crates/rustwx-core",
@@ -11,6 +12,7 @@ members = [
     "crates/rustwx-render",
     "crates/rustwx-sounding",
     "crates/rusty-weather",
+    "crates/rusty-weather-ui",
 ]
 exclude = [
     "vendor/ecape-rs",
