@@ -76,10 +76,9 @@ pub use crate::color::Rgba;
 pub use crate::colorbar::{legend_color_at_rel, legend_tick_rel};
 use crate::colormap::Extend;
 pub use crate::colormap::{
-    ColormapBuildOptions, LegendControls, LegendMode, LevelDensity, LeveledColormap,
-    RenderDensity, densify_discrete_scale,
+    ColormapBuildOptions, LegendControls, LegendMode, LevelDensity, LeveledColormap, RenderDensity,
+    densify_discrete_scale,
 };
-pub use crate::text::format_tick;
 use crate::overlay::{
     BarbOverlay, ContourOverlay, InverseProjectedGrid, MapExtent, ProjectedGrid,
     ProjectedPlaceLabelOverlay, ProjectedPointOverlay as RenderProjectedPointOverlay,
@@ -89,6 +88,7 @@ use crate::render::{
     RenderOpts, center_horizontal_canvas_content, encode_rgba_png_profile_with_options,
     render_to_image as native_render_to_image, render_to_png, trim_vertical_canvas_whitespace,
 };
+pub use crate::text::format_tick;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::path::Path;

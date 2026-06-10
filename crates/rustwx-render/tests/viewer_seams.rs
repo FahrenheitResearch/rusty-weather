@@ -5,7 +5,7 @@
 
 use rustwx_render::{
     Color, ColorScale, ColormapBuildOptions, DiscreteColorScale, ExtendMode, LegendControls,
-    LegendMode, LevelDensity, Rgba, RenderDensity, build_colormap, colorbar_ticks, format_tick,
+    LegendMode, LevelDensity, RenderDensity, Rgba, build_colormap, colorbar_ticks, format_tick,
     legend_color_at_rel, legend_tick_rel,
 };
 

@@ -4178,6 +4178,8 @@ dependencies = [
  "egui",
  "image",
  "rustwx-core",
+ "rustwx-products",
+ "rustwx-render",
  "rustwx-sounding",
  "rw-store",
  "serde_json",
