@@ -38,7 +38,7 @@ mod worker;
 pub use panels::{
     AvailabilityView, DownloadEvent, DownloadPanel, DownloadRunState, DownloadSpec, DownloadStage,
     EstimateView, FieldViewerEvent, FieldViewerPanel, HourDoneView, ModelOption, RunBrowserPanel,
-    SoundingPanel, StageState, format_bytes, shift_date_yyyymmdd,
+    SoundingPanel, StageState, format_bytes, shift_date_yyyymmdd, today_yyyymmdd_utc,
 };
 pub use store_view::{HourEntry, ModelEntry, RunEntry, StoreTree, StoreView};
 pub use worker::{

@@ -10,6 +10,7 @@ mod sounding;
 pub use download::{
     AvailabilityView, DownloadEvent, DownloadPanel, DownloadRunState, DownloadSpec, DownloadStage,
     EstimateView, HourDoneView, ModelOption, StageState, format_bytes, shift_date_yyyymmdd,
+    today_yyyymmdd_utc,
 };
 pub use field_viewer::{FieldViewerEvent, FieldViewerPanel};
 pub use run_browser::RunBrowserPanel;

@@ -223,6 +223,9 @@ pub struct DownloadPanel {
     spec_error: Option<String>,
     availability: Option<AvailabilityView>,
     probing: bool,
+    /// A failed probe / latest lookup (transient, cleared on the next
+    /// probe or spec change).
+    probe_error: Option<String>,
     run_state: DownloadRunState,
     progress: Vec<HourProgress>,
     /// Recent note lines from the ingest (warnings + infos), newest last.
@@ -245,6 +248,7 @@ impl DownloadPanel {
             spec_error: None,
             availability: None,
             probing: false,
+            probe_error: None,
             run_state: DownloadRunState::Idle,
             progress: Vec::new(),
             notes: Vec::new(),
@@ -287,6 +291,7 @@ impl DownloadPanel {
 
     pub fn set_availability(&mut self, availability: AvailabilityView) {
         self.probing = false;
+        self.probe_error = None;
         self.availability = Some(availability);
     }
 
@@ -294,9 +299,17 @@ impl DownloadPanel {
         self.probing = true;
     }
 
+    /// A probe / latest lookup failed (shown by the hours row until the
+    /// next probe or spec change).
+    pub fn set_probing_failed(&mut self, message: String) {
+        self.probing = false;
+        self.probe_error = Some(message);
+    }
+
     /// Snap date + cycle to a host-resolved latest run.
     pub fn set_latest(&mut self, date: String, cycle: u8) {
         self.probing = false;
+        self.probe_error = None;
         self.spec.date = date;
         self.spec.cycle = cycle;
     }
@@ -408,6 +421,7 @@ impl DownloadPanel {
 
         if self.spec != before {
             self.availability = None;
+            self.probe_error = None;
             events.push(DownloadEvent::SpecChanged(self.spec.clone()));
         }
 
@@ -510,6 +524,9 @@ impl DownloadPanel {
                 ui.spinner();
             }
         });
+        if let Some(message) = &self.probe_error {
+            ui.colored_label(ui.visuals().error_fg_color, message);
+        }
         if let Some(availability) = &self.availability {
             if availability.matches(&self.spec) {
                 availability_chips(ui, availability);
@@ -808,6 +825,16 @@ pub fn shift_date_yyyymmdd(date: &str, delta_days: i64) -> Option<String> {
     Some(format!("{year:04}{month:02}{day:02}"))
 }
 
+/// Today's date in UTC as YYYYMMDD (from the system clock; no chrono).
+pub fn today_yyyymmdd_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let (year, month, day) = civil_from_days((secs / 86_400) as i64);
+    format!("{year:04}{month:02}{day:02}")
+}
+
 /// Days since 1970-01-01 for a civil date (Hinnant's algorithm).
 fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
@@ -850,6 +877,15 @@ mod tests {
         assert_eq!(shift_date_yyyymmdd("garbage", 1), None);
         assert_eq!(shift_date_yyyymmdd("2026130", 1), None);
         assert_eq!(shift_date_yyyymmdd("20261301", 1), None, "month 13");
+    }
+
+    #[test]
+    fn today_utc_is_a_well_formed_shiftable_date() {
+        let today = today_yyyymmdd_utc();
+        assert_eq!(today.len(), 8);
+        // Round-trips through the same civil-date math.
+        assert_eq!(shift_date_yyyymmdd(&today, 0).as_deref(), Some(&*today));
+        assert!(today.as_str() >= "20260101", "clock sanity: {today}");
     }
 
     #[test]
