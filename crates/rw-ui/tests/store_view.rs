@@ -170,6 +170,16 @@ fn worker_round_trip_on_synthetic_store() {
             let (lo, hi) = field.range.expect("finite values exist");
             assert!(lo < hi, "temperature field has spread: {lo}..{hi}");
             assert!((250.0..320.0).contains(&lo), "plausible Kelvin: {lo}");
+            // Orientation DERIVED from the grid: synthetic storage is
+            // south-to-north (row 0 south), so lat_descending is false and
+            // the viewer will flip for display.
+            assert!(!field.lat_descending, "synthetic store is south-up");
+            let grid = field.grid.as_ref().expect("grid.rwg attached");
+            assert_eq!((grid.nx, grid.ny), (field.nx, field.ny));
+            assert!(
+                grid.lat[0] < grid.lat[(grid.ny - 1) * grid.nx],
+                "row 0 must be the southernmost row of the synthetic grid"
+            );
         }
         other => panic!("expected Field response, got {other:?}"),
     }
@@ -218,4 +228,40 @@ fn worker_round_trip_on_synthetic_store() {
 
     drop(worker);
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// Worker against the REAL ingested HRRR store: that data is stored
+/// north-to-south (row 0 = ~47.8N, last row = ~21.1N — verified 2026-06-09),
+/// so the field must arrive flagged `lat_descending` and the viewer must NOT
+/// flip it. Run with:
+/// `cargo test -p rw-ui real_hrrr -- --ignored --nocapture`
+#[test]
+#[ignore = "requires the real store at C:/Users/drew/rusty-weather/store"]
+fn real_hrrr_store_field_is_north_to_south() {
+    let view = StoreView::new("C:/Users/drew/rusty-weather/store");
+    let worker = StoreWorker::spawn(view, || {});
+    let field_key = FieldKey {
+        hour: HourKey {
+            model: "hrrr".to_string(),
+            run: "20260608_00z".to_string(),
+            hour: 4,
+        },
+        var: "temperature_2m".to_string(),
+    };
+    worker.send(StoreRequest::LoadField(field_key.clone()));
+    match worker.recv_timeout(Duration::from_secs(120)) {
+        Some(StoreResponse::Field(key, Ok(field))) => {
+            assert_eq!(key, field_key);
+            assert!(
+                field.lat_descending,
+                "ingested HRRR stores row 0 as the NORTHERNMOST row"
+            );
+            let grid = field.grid.as_ref().expect("grid.rwg attached");
+            let first = grid.lat[0];
+            let last = grid.lat[(grid.ny - 1) * grid.nx];
+            eprintln!("real HRRR: lat[0]={first}, lat[last row]={last}");
+            assert!(first > last, "lat must decrease down the rows");
+        }
+        other => panic!("expected Field response, got {other:?}"),
+    }
 }

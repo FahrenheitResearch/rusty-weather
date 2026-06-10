@@ -149,6 +149,33 @@ pub struct GridFile {
 }
 
 impl GridFile {
+    /// Whether stored row 0 is the NORTHERNMOST row, i.e. latitude decreases
+    /// as the row index grows. Derived from the data, never assumed: scan
+    /// down each column for the first pair of distinct finite latitudes
+    /// (NaN-safe — masked grids can have whole NaN rows/corners). `None`
+    /// when nothing decides (all-NaN or constant latitude).
+    ///
+    /// Display code should flip rows only when this is `Some(false)` /
+    /// defaulted-false: south-to-north storage needs a flip to render
+    /// north-up; north-to-south storage is already north-up.
+    pub fn lat_descending(&self) -> Option<bool> {
+        for x in 0..self.nx {
+            let mut first: Option<f32> = None;
+            for y in 0..self.ny {
+                let lat = self.lat[y * self.nx + x];
+                if !lat.is_finite() {
+                    continue;
+                }
+                match first {
+                    None => first = Some(lat),
+                    Some(earlier) if lat != earlier => return Some(lat < earlier),
+                    Some(_) => {}
+                }
+            }
+        }
+        None
+    }
+
     /// Open and fully validate a `.rwg` file (magic, version, lengths, all
     /// with checked math — trust nothing on disk).
     pub fn open(path: &Path) -> RwResult<Self> {
@@ -738,6 +765,64 @@ mod tests {
             );
         }
         eprintln!("rotated grid locator max error: {max_err:.2e} grid cells");
+    }
+
+    #[test]
+    fn lat_descending_derives_orientation() {
+        // South-to-north (synthetic/regular): row 0 is the southernmost.
+        let south_up = grid_file_from(&regular_grid());
+        assert_eq!(south_up.lat_descending(), Some(false));
+
+        // North-to-south: reverse the rows.
+        let mut north_up = south_up.clone();
+        for y in 0..NY {
+            let src = &south_up.lat[(NY - 1 - y) * NX..(NY - y) * NX];
+            north_up.lat[y * NX..(y + 1) * NX].copy_from_slice(src);
+        }
+        assert_eq!(north_up.lat_descending(), Some(true));
+
+        // NaN-safe: poison the first rows and the whole first column; the
+        // scan must skip NaNs and still decide from later finite pairs.
+        let mut holed = grid_file_from(&regular_grid());
+        for v in holed.lat[..2 * NX].iter_mut() {
+            *v = f32::NAN;
+        }
+        for y in 0..NY {
+            holed.lat[y * NX] = f32::NAN;
+        }
+        assert_eq!(holed.lat_descending(), Some(false));
+
+        // Undecidable: all-NaN and constant latitude.
+        let mut all_nan = grid_file_from(&regular_grid());
+        all_nan.lat.fill(f32::NAN);
+        assert_eq!(all_nan.lat_descending(), None);
+        let mut flat = grid_file_from(&regular_grid());
+        flat.lat.fill(42.0);
+        assert_eq!(flat.lat_descending(), None);
+    }
+
+    /// Probe the REAL ingested HRRR grid: definitively answer whether row 0
+    /// is south or north. Run with:
+    /// `cargo test -p rw-store real_hrrr_grid -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires the real store at C:/Users/drew/rusty-weather/store"]
+    fn real_hrrr_grid_row_order() {
+        let path = Path::new("C:/Users/drew/rusty-weather/store/hrrr/20260608_00z/grid.rwg");
+        let grid = GridFile::open(path).expect("real grid.rwg readable");
+        let (nx, ny) = (grid.nx, grid.ny);
+        let first = grid.lat[0];
+        let last = grid.lat[(ny - 1) * nx];
+        eprintln!("real HRRR grid {nx}x{ny}");
+        eprintln!("lat[row 0,    col 0] = {first}");
+        eprintln!("lat[row ny-1, col 0] = {last}");
+        eprintln!("lon[row 0,    col 0] = {}", grid.lon[0]);
+        eprintln!("lat_descending() = {:?}", grid.lat_descending());
+        let derived = grid.lat_descending().expect("real grid must decide");
+        assert_eq!(
+            derived,
+            first > last,
+            "helper must agree with the corner latitudes"
+        );
     }
 
     #[test]

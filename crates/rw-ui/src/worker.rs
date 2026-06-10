@@ -7,6 +7,7 @@
 //! The worker keeps a one-entry cache of the open [`HourReader`] and the
 //! run's [`GridFile`], so hour scrubbing inside one run only decodes chunks.
 
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -66,6 +67,15 @@ pub struct FieldData {
     pub values: Vec<f32>,
     /// Finite value range; `None` when the field is all-NaN.
     pub range: Option<(f32, f32)>,
+    /// The run's grid (lat/lon arrays), when `grid.rwg` is readable and its
+    /// dims match the field. Powers the hover/click lat/lon readout.
+    pub grid: Option<Arc<GridFile>>,
+    /// Whether stored row 0 is the NORTHERNMOST row, DERIVED from the grid
+    /// lat axis ([`GridFile::lat_descending`]) — never assumed from a model
+    /// convention. `false` (south-to-north, flip for display) when the grid
+    /// is missing or undecidable. The viewer flips rows for display — and
+    /// inverts clicks — only when this is `false`.
+    pub lat_descending: bool,
 }
 
 /// One 3D variable's profile at a point.
@@ -162,7 +172,7 @@ impl StoreWorker {
 struct WorkerState {
     view: StoreView,
     hour: Option<(HourKey, HourReader)>,
-    grid: Option<((String, String), GridFile)>,
+    grid: Option<((String, String), Arc<GridFile>)>,
 }
 
 fn worker_loop(
@@ -270,10 +280,34 @@ fn hour_vars(state: &mut WorkerState, key: &HourKey) -> rw_store::RwResult<Vec<V
         .collect())
 }
 
+/// Open (or reuse) the run grid for `key`'s run. Failures are tolerated —
+/// the grid is a nicety (display orientation + lat/lon labels); fields and
+/// profiles still work without it (orientation then defaults to
+/// south-to-north).
+fn grid_for(state: &mut WorkerState, key: &HourKey) -> Option<Arc<GridFile>> {
+    let run_id = (key.model.clone(), key.run.clone());
+    let cached = matches!(&state.grid, Some((have, _)) if *have == run_id);
+    if !cached {
+        match state.view.open_grid(&key.model, &key.run) {
+            Ok(grid) => state.grid = Some((run_id, Arc::new(grid))),
+            Err(_) => state.grid = None,
+        }
+    }
+    state.grid.as_ref().map(|(_, grid)| Arc::clone(grid))
+}
+
 fn load_field(state: &mut WorkerState, key: &FieldKey) -> rw_store::RwResult<FieldData> {
+    // Grid first (separate borrow scope from the hour reader).
+    let grid = grid_for(state, &key.hour);
     let reader = reader_for(state, &key.hour)?;
     let meta = reader.meta();
     let (nx, ny) = (meta.nx, meta.ny);
+    // Only trust a grid whose dims match this field's.
+    let grid = grid.filter(|grid| grid.nx == nx && grid.ny == ny);
+    let lat_descending = grid
+        .as_deref()
+        .and_then(GridFile::lat_descending)
+        .unwrap_or(false);
     let units = reader
         .variable(&key.var)
         .map(|var| var.units.clone())
@@ -287,6 +321,8 @@ fn load_field(state: &mut WorkerState, key: &FieldKey) -> rw_store::RwResult<Fie
         ny,
         values,
         range,
+        grid,
+        lat_descending,
     })
 }
 
@@ -297,18 +333,8 @@ fn load_sounding(
     fy: f64,
 ) -> rw_store::RwResult<SoundingData> {
     // Grid first (separate borrow scope from the hour reader).
-    let run_id = (key.model.clone(), key.run.clone());
-    let grid_cached = matches!(&state.grid, Some((have, _)) if *have == run_id);
-    if !grid_cached {
-        // The grid file is a nicety (lat/lon labels); profiles still work
-        // without it, so failures are tolerated here.
-        match state.view.open_grid(&key.model, &key.run) {
-            Ok(grid) => state.grid = Some((run_id.clone(), grid)),
-            Err(_) => state.grid = None,
-        }
-    }
-    let (lat, lon) = match &state.grid {
-        Some((_, grid)) => {
+    let (lat, lon) = match grid_for(state, key) {
+        Some(grid) => {
             let ix = (fx.round().max(0.0) as usize).min(grid.nx - 1);
             let iy = (fy.round().max(0.0) as usize).min(grid.ny - 1);
             let idx = iy * grid.nx + ix;

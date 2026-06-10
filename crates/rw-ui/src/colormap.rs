@@ -90,8 +90,11 @@ pub fn normalize(value: f32, vmin: f32, vmax: f32) -> f32 {
 
 /// Build a false-color [`ColorImage`] from a row-major `ny * nx` field.
 ///
-/// With `flip_y` the grid's row 0 lands at the BOTTOM of the image — the
-/// right choice for south-to-north grids (HRRR etc.) displayed north-up.
+/// With `flip_y` the grid's row 0 lands at the BOTTOM of the image — needed
+/// to display south-to-north storage north-up. Storage order varies per
+/// grid, so DERIVE the flag from the lat axis
+/// (`rw_store::grid::GridFile::lat_descending`); never assume a model
+/// convention.
 pub fn field_to_color_image(
     values: &[f32],
     nx: usize,
