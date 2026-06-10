@@ -76,9 +76,10 @@ pub(crate) use query::{load_derived_sampled_fields_from_latest, required_derived
 use recipes::DerivedRequirements;
 pub(crate) use recipes::{DerivedRecipe, derived_compute_recipes_need_pressure};
 pub use store::{
-    StoreDerivedGrid, StoreHeavyGrids, StoreHeavySkip, StoreHeavyTiming,
-    compute_store_derived_grids, compute_store_heavy_grids, store_derived_recipe_slugs,
-    store_heavy_recipe_slugs,
+    StoreComputeInputs, StoreDerivedGrid, StoreDerivedGridF32, StoreHeavyGrids, StoreHeavyGridsF32,
+    StoreHeavySkip, StoreHeavyTiming, compute_store_derived_grids, compute_store_derived_grids_f32,
+    compute_store_heavy_grids, compute_store_heavy_grids_f32, prepare_store_compute_inputs,
+    store_derived_recipe_slugs, store_heavy_recipe_slugs,
 };
 pub use store_render::{StoreProductGrid, render_derived_recipes_from_store_grids};
 pub use types::{

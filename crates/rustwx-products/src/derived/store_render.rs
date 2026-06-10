@@ -317,7 +317,7 @@ mod tests {
             assign_store_values(&mut computed, recipe, vec![1.0, 2.0])
                 .unwrap_or_else(|err| panic!("assign '{slug}': {err}"));
             let query =
-                super::super::query::derived_query_field_from_computed(2, 1, recipe, &computed)
+                super::super::query::derived_query_field_from_computed(2, 1, recipe, &mut computed)
                     .unwrap_or_else(|err| panic!("query '{slug}': {err}"));
             assert_eq!(query.values, vec![1.0, 2.0], "slot mismatch for '{slug}'");
         }

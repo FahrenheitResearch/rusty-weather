@@ -1090,7 +1090,9 @@ fn compute_product_grids(
     let heavy_started = Instant::now();
     let heavy = {
         profile_scope!("ingest_heavy");
-        match ingest_compute::compute_heavy_2d_from_inputs(&inputs) {
+        // By value: heavy is the last compute stage, and the products lane
+        // frees the f64 thermo volumes the moment the kernels finish.
+        match ingest_compute::compute_heavy_2d_from_inputs(inputs) {
             Ok(heavy) => {
                 for (slug, reason) in &heavy.skipped {
                     config.emit(IngestEvent::Warning {
