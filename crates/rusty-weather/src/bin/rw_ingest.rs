@@ -8,7 +8,8 @@
 //! compute every non-heavy derived recipe grid AND every heavy ECAPE-class
 //! recipe grid while the extracted fields are still in RAM (see
 //! `ingest_compute`; stored as ordinary 2D variables named by recipe slug,
-//! selector = the `{"derived": ...}` marker), then write the hour into
+//! selector = the `{"derived": ...}` marker; the heavy stage is gated by
+//! `--heavy`/`--no-heavy`, default on), then write the hour into
 //! `<store-root>/<model>/<run>/f{hour:03}.rws` plus `grid.rwg` and
 //! `run.json` via `rw_store::ingest::write_hour_from_fields_with_derived`.
 //!
@@ -248,6 +249,25 @@ struct Args {
         help = "After each write, re-open the hour and verify a 2D round-trip and one profile per 3D variable"
     )]
     verify: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "no_heavy",
+        help = "Run the heavy ECAPE ingest stage (the default; present so callers can be explicit)"
+    )]
+    heavy: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Skip the heavy ECAPE ingest stage: the 16 heavy grids are not stored (derived 29 still are)"
+    )]
+    no_heavy: bool,
+}
+
+/// Resolve the `--heavy` / `--no-heavy` pair: heavy is ON unless
+/// `--no-heavy` is passed (the flags conflict, so both set is unreachable).
+fn heavy_enabled(args: &Args) -> bool {
+    !args.no_heavy
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -556,7 +576,13 @@ fn ingest_hour(
     //     still in RAM (no refetch, no redecode; inputs assembled once) ---
     let planned_derived = store_derived_recipe_slugs().len();
     let planned_heavy = store_heavy_recipe_slugs().len();
-    let stages = compute_product_grids(&fields_2d_owned, &volumes_data, native_cape, hour);
+    let stages = compute_product_grids(
+        &fields_2d_owned,
+        &volumes_data,
+        native_cape,
+        hour,
+        heavy_enabled(args),
+    );
     let derived_ms = stages.derived_ms;
     let heavy_ms = stages.heavy_ms;
     let derived_grids = stages.derived;
@@ -684,6 +710,7 @@ fn compute_product_grids(
     volumes_data: &[VolumeData],
     native_cape: NativeCapePlanes,
     hour: u16,
+    heavy_enabled: bool,
 ) -> ComputedProductGrids {
     let volume_levels = |field: CanonicalField| {
         volumes_data
@@ -746,6 +773,16 @@ fn compute_product_grids(
         }
     };
     let derived_ms = derived_started.elapsed().as_millis();
+
+    if !heavy_enabled {
+        println!("heavy: skipped (--no-heavy)");
+        return ComputedProductGrids {
+            derived,
+            heavy: Vec::new(),
+            derived_ms,
+            heavy_ms: 0,
+        };
+    }
 
     let heavy_started = Instant::now();
     let heavy = match ingest_compute::compute_heavy_2d_from_inputs(&inputs) {
@@ -1009,6 +1046,26 @@ mod tests {
     #[test]
     fn parse_hours_range_is_inclusive() {
         assert_eq!(parse_hours("0-6").unwrap(), (0..=6).collect::<Vec<u16>>());
+    }
+
+    #[test]
+    fn heavy_flag_defaults_on_and_no_heavy_turns_it_off() {
+        let base = ["rw-ingest", "--date", "20260608", "--cycle", "0", "--hours", "6"];
+        let args = Args::try_parse_from(base).expect("default args parse");
+        assert!(heavy_enabled(&args), "heavy must default ON");
+
+        let explicit = Args::try_parse_from(base.iter().copied().chain(["--heavy"]))
+            .expect("--heavy parses");
+        assert!(heavy_enabled(&explicit));
+
+        let off = Args::try_parse_from(base.iter().copied().chain(["--no-heavy"]))
+            .expect("--no-heavy parses");
+        assert!(!heavy_enabled(&off), "--no-heavy must gate the stage off");
+
+        assert!(
+            Args::try_parse_from(base.iter().copied().chain(["--heavy", "--no-heavy"])).is_err(),
+            "--heavy and --no-heavy must conflict"
+        );
     }
 
     #[test]
