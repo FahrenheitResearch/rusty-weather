@@ -407,8 +407,13 @@ impl HourIngestWriter {
         let levels_hpa: Vec<u16> = sorted.iter().map(|(level, _)| *level).collect();
         let planes: Vec<&[f32]> = sorted.iter().map(|(_, plane)| *plane).collect();
         let started = Instant::now();
-        self.writer
-            .add_pressure3d_deferred(name, units, selector_template, &levels_hpa, &planes)?;
+        self.writer.add_pressure3d_deferred(
+            name,
+            units,
+            selector_template,
+            &levels_hpa,
+            &planes,
+        )?;
         self.encode_elapsed += started.elapsed();
         self.vars_deferred.push(name.to_string());
         Ok(())

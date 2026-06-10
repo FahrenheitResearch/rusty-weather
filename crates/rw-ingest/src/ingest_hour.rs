@@ -23,14 +23,19 @@
 //! 2D surface set in ONE decode pass (plus one re-select at `hour - 1` for
 //! the trailing 1 h window fields: the APCP increment, the native
 //! sub-hourly MXUPHL max, and the native sub-hourly WIND 10 m max — the two
-//! max fields the GRIB windowed lane consumed), decode the surface +
-//! pressure thermo pair through the render lanes' own products decoder, and
+//! max fields the GRIB windowed lane consumed), then ENCODE the extracted
+//! 2D planes and volumes into the spill-backed
+//! [`rw_store::ingest::HourIngestWriter`] immediately (freeing the raw f32
+//! planes; volumes ride deferred variable ids so the file keeps the
+//! historical fields/derived/heavy/volumes order), decode the surface +
+//! pressure thermo pair through the render lanes' own products decoder,
 //! compute every non-heavy derived recipe grid AND (when `heavy` is set)
 //! every heavy ECAPE-class recipe grid from that pair (see `ingest_compute`;
 //! stored as ordinary 2D variables named by recipe slug, selector = the
-//! `{"derived": ...}` marker), then write the hour into
+//! `{"derived": ...}` marker), and finish the hour into
 //! `<store-root>/<model>/<run>/f{hour:03}.rws` plus `grid.rwg` and
-//! `run.json` via `rw_store::ingest::write_hour_from_fields_with_derived`.
+//! `run.json`. Output bytes are identical to the historical
+//! assemble-everything-then-write flow; only the peak memory changed.
 //!
 //! The flow is split at the network/CPU boundary — [`fetch_hour`] (network
 //! or cache disk read only) and [`process_fetched_hour`] (extract, derived,

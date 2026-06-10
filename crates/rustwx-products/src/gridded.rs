@@ -2202,9 +2202,7 @@ fn decode_required_volumes(
         if moisture_branch == MoistureBranch::Rh {
             for &(level, _) in &moisture_records {
                 if find_record(&temperature, level).is_none() {
-                    return Err(
-                        format!("missing temperature level {level} for RH fallback").into(),
-                    );
+                    return Err(format!("missing temperature level {level} for RH fallback").into());
                 }
             }
         }

@@ -79,7 +79,8 @@ fn compare(path_a: &Path, path_b: &Path) -> Result<(), Difference> {
     let meta_b = meta_without_build(&bytes_b, &header_b, path_b)?;
     if meta_a != meta_b {
         return Err(Difference::Found(
-        "meta JSON differs beyond writer.build (variables/levels/selectors/grid_hash)".to_string(),
+            "meta JSON differs beyond writer.build (variables/levels/selectors/grid_hash)"
+                .to_string(),
         ));
     }
 
@@ -145,12 +146,11 @@ fn meta_without_build(
 ) -> Result<serde_json::Value, Difference> {
     let start = 64usize;
     let end = start + header.meta_len as usize;
-    let mut meta: serde_json::Value = serde_json::from_slice(
-        bytes
-            .get(start..end)
-            .ok_or_else(|| Difference::Io(format!("{}: meta region out of range", path.display())))?,
-    )
-    .map_err(|err| Difference::Io(format!("{}: meta JSON: {err}", path.display())))?;
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(bytes.get(start..end).ok_or_else(|| {
+            Difference::Io(format!("{}: meta region out of range", path.display()))
+        })?)
+        .map_err(|err| Difference::Io(format!("{}: meta JSON: {err}", path.display())))?;
     if let Some(writer) = meta.get_mut("writer") {
         if let Some(build) = writer.get_mut("build") {
             *build = serde_json::Value::Null;
@@ -166,9 +166,12 @@ fn record_at(
     path: &Path,
 ) -> Result<ChunkRecord, Difference> {
     let start = header.index_offset as usize + index * 64;
-    let slice = bytes
-        .get(start..start + 64)
-        .ok_or_else(|| Difference::Io(format!("{}: index record {index} out of range", path.display())))?;
+    let slice = bytes.get(start..start + 64).ok_or_else(|| {
+        Difference::Io(format!(
+            "{}: index record {index} out of range",
+            path.display()
+        ))
+    })?;
     ChunkRecord::unpack(slice)
         .map_err(|err| Difference::Io(format!("{}: index record {index}: {err}", path.display())))
 }
