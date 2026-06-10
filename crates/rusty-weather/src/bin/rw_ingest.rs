@@ -27,22 +27,49 @@ use rw_ingest::{IngestConfig, NEVER_CANCEL, cache_state, parse_hours, print_even
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// `mi_option_purge_delay` from mimalloc's option enum — libmimalloc-sys
+/// 0.1.49 does not re-export this constant (its named options stop at
+/// v1.x-era names), but the linked mimalloc honors it; the neighbors it
+/// DOES export pin the numbering (eager_commit_delay = 14,
+/// use_numa_nodes = 16).
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+/// mimalloc's default purge delay (ms), restored around the heavy stage.
+const MI_DEFAULT_PURGE_DELAY_MS: std::ffi::c_long = 10;
+
 /// Decommit freed segments immediately instead of after mimalloc's default
-/// 10 ms batched purge delay. The ingest decode/compute stages free and
-/// commit hundreds of MB per second; with the delay, the measured peak
+/// 10 ms batched purge delay. The ingest extract/decode/encode stages free
+/// and commit hundreds of MB per second; with the delay, the measured peak
 /// working set ran ~1.3 GB ABOVE the live set purely from purge lag
 /// (verified: MIMALLOC_PURGE_DELAY=0 cut a full-profile f006 ingest peak
 /// from ~5.2 GB to ~3.9 GB at identical wall time). Values and output
 /// bytes are unaffected — this only changes when freed pages return to
 /// the OS.
 fn disable_mimalloc_purge_delay() {
-    /// `mi_option_purge_delay` from mimalloc's option enum — libmimalloc-sys
-    /// 0.1.49 does not re-export this constant (its named options stop at
-    /// v1.x-era names), but the linked mimalloc honors it; the neighbors it
-    /// DOES export pin the numbering (eager_commit_delay = 14,
-    /// use_numa_nodes = 16).
-    const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
     unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) };
+}
+
+/// The one stage that WANTS purge batching is the heavy ECAPE pass: its
+/// kernels churn page-spanning per-column scratch across every rayon
+/// thread for minutes, and eager decommit turned that churn into a
+/// measured +25% on the triplet wall (92.5 s -> 115.4 s). Restore the
+/// default delay for exactly that window (its live set sits ~3.4 GB, far
+/// under the gate, so the lag is harmless there) and drop back to eager
+/// purge for everything else.
+fn progress_with_purge_policy(event: rw_ingest::IngestEvent) {
+    match &event {
+        rw_ingest::IngestEvent::StageStarted {
+            stage: rw_ingest::IngestStage::Heavy,
+            ..
+        } => unsafe {
+            libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, MI_DEFAULT_PURGE_DELAY_MS)
+        },
+        rw_ingest::IngestEvent::StageDone {
+            stage: rw_ingest::IngestStage::Heavy,
+            ..
+        } => unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) },
+        _ => {}
+    }
+    print_event(event);
 }
 
 #[derive(Debug, Parser)]
@@ -304,7 +331,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         run_slug: &run_slug,
         profile: &profile,
         verify: args.verify,
-        progress: &print_event,
+        progress: &progress_with_purge_policy,
         cancel: &NEVER_CANCEL,
     };
     for &hour in &hours {

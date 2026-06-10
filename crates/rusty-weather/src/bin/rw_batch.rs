@@ -58,16 +58,40 @@ use rw_ingest::{
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// `mi_option_purge_delay` in mimalloc's option enum (libmimalloc-sys
+/// 0.1.49 exports the neighbors: eager_commit_delay = 14,
+/// use_numa_nodes = 16).
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+/// mimalloc's default purge delay (ms), restored around the heavy stage.
+const MI_DEFAULT_PURGE_DELAY_MS: std::ffi::c_long = 10;
+
 /// Decommit freed segments immediately instead of after mimalloc's default
 /// 10 ms batched purge delay — see the matching helper in `rw_ingest.rs`:
 /// purge lag inflated the measured ingest peak working set ~1.3 GB above
 /// the live set at identical wall time.
 fn disable_mimalloc_purge_delay() {
-    /// `mi_option_purge_delay` in mimalloc's option enum (libmimalloc-sys
-    /// 0.1.49 exports the neighbors: eager_commit_delay = 14,
-    /// use_numa_nodes = 16).
-    const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
     unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) };
+}
+
+/// Restore the default purge batching for exactly the heavy ECAPE window
+/// (whose per-column scratch churn measured +25% wall under eager purge;
+/// its live set sits far below the memory envelope) — see the matching
+/// helper in `rw_ingest.rs`.
+fn progress_with_purge_policy(event: rw_ingest::IngestEvent) {
+    match &event {
+        rw_ingest::IngestEvent::StageStarted {
+            stage: rw_ingest::IngestStage::Heavy,
+            ..
+        } => unsafe {
+            libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, MI_DEFAULT_PURGE_DELAY_MS)
+        },
+        rw_ingest::IngestEvent::StageDone {
+            stage: rw_ingest::IngestStage::Heavy,
+            ..
+        } => unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) },
+        _ => {}
+    }
+    print_event(event);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -345,7 +369,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         run_slug: &run_slug,
         profile: &profile,
         verify: false,
-        progress: &print_event,
+        progress: &progress_with_purge_policy,
         cancel: &NEVER_CANCEL,
     };
     let render_config = StoreRenderConfig {
