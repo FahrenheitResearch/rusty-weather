@@ -630,7 +630,7 @@ pub fn map_frame_aspect_ratio_for_mode_with_domain_frame_and_chrome_scale(
     layout.map_w as f64 / (layout.map_h.max(1) as f64)
 }
 
-fn pick_ticks(levels: &[f64], step: Option<f64>) -> Vec<f64> {
+pub(crate) fn pick_ticks(levels: &[f64], step: Option<f64>) -> Vec<f64> {
     if levels.is_empty() {
         return vec![];
     }

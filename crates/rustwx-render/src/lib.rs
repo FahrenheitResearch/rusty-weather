@@ -72,12 +72,14 @@ pub use weather::{
     SEVERE_CLASSIC_PANEL_PRODUCTS, WeatherPalette, WeatherPreset, WeatherProduct, palette_scale,
 };
 
-use crate::color::Rgba;
+pub use crate::color::Rgba;
+pub use crate::colorbar::{legend_color_at_rel, legend_tick_rel};
+use crate::colormap::Extend;
 pub use crate::colormap::{
-    ColormapBuildOptions, LegendControls, LegendMode, LevelDensity, RenderDensity,
-    densify_discrete_scale,
+    ColormapBuildOptions, LegendControls, LegendMode, LevelDensity, LeveledColormap,
+    RenderDensity, densify_discrete_scale,
 };
-use crate::colormap::{Extend, LeveledColormap};
+pub use crate::text::format_tick;
 use crate::overlay::{
     BarbOverlay, ContourOverlay, InverseProjectedGrid, MapExtent, ProjectedGrid,
     ProjectedPlaceLabelOverlay, ProjectedPointOverlay as RenderProjectedPointOverlay,
@@ -721,7 +723,15 @@ fn with_render_state_profile_with_style<T>(
     })
 }
 
-fn build_colormap(scale: &ColorScale, options: ColormapBuildOptions) -> LeveledColormap {
+/// Build the exact [`LeveledColormap`] the rasterizer uses for `scale` under
+/// `options` — the same function the PNG render path calls, exposed so
+/// external viewers (e.g. the egui data viewer) can color values with
+/// literally `cmap.map(value)` and stay bit-identical to the plot output.
+///
+/// To match a production render, pass the request's options filtered through
+/// the active plot style:
+/// `ColormapBuildOptions { render_density: StaticPlotStyle::from_env().render_density(request.render_density), legend: request.legend }`.
+pub fn build_colormap(scale: &ColorScale, options: ColormapBuildOptions) -> LeveledColormap {
     let discrete = scale.resolved_discrete();
 
     let colors: Vec<Rgba> = discrete.colors.into_iter().map(Into::into).collect();
@@ -732,6 +742,15 @@ fn build_colormap(scale: &ColorScale, options: ColormapBuildOptions) -> LeveledC
         discrete.mask_below,
         options,
     )
+}
+
+/// The colorbar tick VALUES the PNG renderer would label for `cmap` with the
+/// request's `cbar_tick_step` — the same `pick_ticks` over the same legend
+/// levels the production colorbar uses. Label each value with
+/// [`format_tick`] and position it at [`legend_tick_rel`] to reproduce the
+/// production colorbar's numbers exactly.
+pub fn colorbar_ticks(cmap: &LeveledColormap, cbar_tick_step: Option<f64>) -> Vec<f64> {
+    crate::render::pick_ticks(cmap.legend_levels_for_display(), cbar_tick_step)
 }
 
 const OVERLAY_ONLY_FILL_VALUE: f64 = 0.5;

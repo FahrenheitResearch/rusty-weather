@@ -206,6 +206,26 @@ pub fn draw_vertical_colorbar(
     }
 }
 
+/// The colorbar color at fractional position `rel` in `[0, 1]` (0 = the
+/// lowest legend level, 1 = the highest) — exactly the per-pixel sampling
+/// [`draw_colorbar`]/[`draw_vertical_colorbar`] paint, exposed so external
+/// legend widgets reproduce the production colorbar's colors bit-for-bit.
+pub fn legend_color_at_rel(cmap: &LeveledColormap, mode: LegendMode, rel: f64) -> Rgba {
+    let legend_levels = cmap.legend_levels_for_display();
+    let legend_colors = cmap.legend_colors_for_display();
+    match mode {
+        LegendMode::Stepped => stepped_color_at_rel(legend_levels, legend_colors, rel),
+        LegendMode::SmoothRamp => smooth_color_at_rel(legend_levels, legend_colors, rel),
+    }
+}
+
+/// Fractional position of `value` along the colorbar (0 = lowest legend
+/// level, 1 = highest), the same linear-by-value placement the production
+/// tick labels use. `None` when the legend level range is degenerate.
+pub fn legend_tick_rel(cmap: &LeveledColormap, value: f64) -> Option<f64> {
+    level_fraction(cmap.legend_levels_for_display(), value)
+}
+
 fn level_range(levels: &[f64]) -> Option<(f64, f64)> {
     let lo = *levels.first()?;
     let hi = *levels.last()?;
