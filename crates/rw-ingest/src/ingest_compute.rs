@@ -28,7 +28,7 @@ use rayon::prelude::*;
 use rustwx_products::derived::{
     StoreHeavyTiming, compute_store_derived_grids, compute_store_heavy_grids,
 };
-use rustwx_products::gridded::decode_store_thermo_pair;
+use rustwx_products::gridded::decode_store_thermo_pair_owned;
 
 /// One derived grid ready to store: variable name (the recipe slug), display
 /// units, and full-grid row-major values.
@@ -63,11 +63,16 @@ pub struct HeavyGrids2D {
 /// skipped (no store-computed recipe consumes them); everything else —
 /// including the native CAPE planes the heavy native-ratio recipes
 /// divide by — is exactly what the render lane sees.
+///
+/// Takes the raw buffers by value so each is freed at its true last use
+/// inside the decode (surface bytes after the surface decode, pressure
+/// bytes once the parser owns its message copies) instead of riding
+/// resident through both compute stages.
 pub fn decode_products_inputs(
-    surface_bytes: &[u8],
-    pressure_bytes: &[u8],
+    surface_bytes: Vec<u8>,
+    pressure_bytes: Vec<u8>,
 ) -> Result<ProductsComputeInputs, Box<dyn std::error::Error>> {
-    let (surface, pressure) = decode_store_thermo_pair(surface_bytes, pressure_bytes)?;
+    let (surface, pressure) = decode_store_thermo_pair_owned(surface_bytes, pressure_bytes)?;
     Ok(ProductsComputeInputs { surface, pressure })
 }
 

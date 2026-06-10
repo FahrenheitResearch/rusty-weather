@@ -691,16 +691,18 @@ pub fn process_fetched_hour(
     } else {
         0
     };
+    // Hand the raw GRIB buffers to the compute stage by value: every
+    // earlier consumer (the dewpoint-fallback re-extract and the trailing
+    // (h-1) re-select) has already run, and the thermo decode frees each
+    // buffer at its last use instead of after both compute stages.
     let stages = compute_product_grids(
         config,
-        &sfc.result.bytes,
-        &prs.result.bytes,
+        sfc.result.bytes,
+        prs.result.bytes,
         hour,
         profile.derived,
         profile.heavy,
     )?;
-    drop(sfc);
-    drop(prs);
     config.check_cancel()?;
     let thermo_decode_ms = stages.decode_ms;
     let derived_ms = stages.derived_ms;
@@ -875,8 +877,8 @@ struct ComputedProductGrids {
 /// cancel never waits out the (long) heavy stage.
 fn compute_product_grids(
     config: &IngestConfig<'_>,
-    surface_bytes: &[u8],
-    pressure_bytes: &[u8],
+    surface_bytes: Vec<u8>,
+    pressure_bytes: Vec<u8>,
     hour: u16,
     derived_enabled: bool,
     heavy_enabled: bool,

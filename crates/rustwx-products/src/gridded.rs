@@ -1116,6 +1116,26 @@ fn decode_pressure_with_shape_opts(
     include_optional: bool,
 ) -> Result<(PressureFields, usize, usize), Box<dyn std::error::Error>> {
     let file = Grib2File::from_bytes(bytes)?;
+    decode_pressure_file_with_shape_opts(file, include_optional)
+}
+
+/// Owned-bytes variant for the store-ingest lane: the raw pressure GRIB
+/// bytes are freed as soon as the parser has its own copy of every
+/// message, instead of staying resident through the whole decode. Same
+/// parse, same decode, byte-identical `PressureFields`.
+fn decode_pressure_with_shape_opts_owned(
+    bytes: Vec<u8>,
+    include_optional: bool,
+) -> Result<(PressureFields, usize, usize), Box<dyn std::error::Error>> {
+    let file = Grib2File::from_bytes(&bytes)?;
+    drop(bytes);
+    decode_pressure_file_with_shape_opts(file, include_optional)
+}
+
+fn decode_pressure_file_with_shape_opts(
+    file: Grib2File,
+    include_optional: bool,
+) -> Result<(PressureFields, usize, usize), Box<dyn std::error::Error>> {
     let (nx, ny) = pressure_grid_shape_from_messages(&file.messages)?;
     let temperature = collect_levels(&file.messages, 0, 0, 0, 100)?;
     let u_wind = collect_levels(&file.messages, 0, 2, 2, 100)?;
@@ -2087,6 +2107,32 @@ pub fn decode_store_thermo_pair(
 ) -> Result<(SurfaceFields, PressureFields), Box<dyn std::error::Error>> {
     let surface = decode_surface(surface_bytes)?;
     let (pressure, nx, ny) = decode_pressure_with_shape_opts(pressure_bytes, false)?;
+    validate_store_thermo_pair(&surface, &pressure, nx, ny)?;
+    Ok((surface, pressure))
+}
+
+/// [`decode_store_thermo_pair`] taking ownership of both raw GRIB buffers
+/// so each is freed at its true last use — the surface bytes right after
+/// the surface decode, the pressure bytes as soon as the pressure parser
+/// holds its own copy of the messages — instead of staying resident
+/// through the whole thermo decode. Identical decode, identical output.
+pub fn decode_store_thermo_pair_owned(
+    surface_bytes: Vec<u8>,
+    pressure_bytes: Vec<u8>,
+) -> Result<(SurfaceFields, PressureFields), Box<dyn std::error::Error>> {
+    let surface = decode_surface(&surface_bytes)?;
+    drop(surface_bytes);
+    let (pressure, nx, ny) = decode_pressure_with_shape_opts_owned(pressure_bytes, false)?;
+    validate_store_thermo_pair(&surface, &pressure, nx, ny)?;
+    Ok((surface, pressure))
+}
+
+fn validate_store_thermo_pair(
+    surface: &SurfaceFields,
+    pressure: &PressureFields,
+    nx: usize,
+    ny: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     if nx != surface.nx || ny != surface.ny {
         return Err(format!(
             "pressure decode shape {nx}x{ny} did not match surface shape {}x{}",
@@ -2103,7 +2149,7 @@ pub fn decode_store_thermo_pair(
     {
         return Err("pressure decode fields did not match the surface grid shape".into());
     }
-    Ok((surface, pressure))
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
