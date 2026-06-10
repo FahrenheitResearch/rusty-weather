@@ -7,7 +7,7 @@
 //! The worker keeps a one-entry cache of the open [`HourReader`] and the
 //! run's [`GridFile`], so hour scrubbing inside one run only decodes chunks.
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -153,10 +153,7 @@ impl StoreWorker {
 
     /// Blocking poll with a timeout — for tests, not for UI frames.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<StoreResponse> {
-        match self.rx.recv_timeout(timeout) {
-            Ok(response) => Some(response),
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => None,
-        }
+        self.rx.recv_timeout(timeout).ok()
     }
 }
 

@@ -82,7 +82,7 @@ pub fn normalize(value: f32, vmin: f32, vmax: f32) -> f32 {
     if value.is_nan() {
         return f32::NAN;
     }
-    if !(vmax > vmin) {
+    if vmin.is_nan() || vmax.is_nan() || vmax <= vmin {
         return 0.5;
     }
     ((value - vmin) / (vmax - vmin)).clamp(0.0, 1.0)
