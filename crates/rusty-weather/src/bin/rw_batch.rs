@@ -43,6 +43,7 @@ mod throttle;
 
 use clap::{Parser, ValueEnum};
 use contour_mode::ContourModeArg;
+use ingest_hour::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile};
 use ingest_hour::{FetchedHour, IngestConfig, IngestedHour, cache_state, parse_hours};
 use region::RegionPreset;
 use render_all::{StoreFieldSource, StoreRenderConfig, StoreRenderSkip};
@@ -114,9 +115,28 @@ struct Args {
     region: RegionPreset,
     #[arg(
         long,
+        default_value = "full",
+        help = "Ingest profile: full (everything, today's default), sounding (5 volumes + 7 \
+                surface fields, no compute stages), view (all 2D incl. derived, no volumes). \
+                Products whose store variables a profile excludes skip at render"
+    )]
+    profile: String,
+    #[arg(
+        long,
+        help = "Override the isobaric level step in hPa: 25 (37 levels) or 50 (19 levels)"
+    )]
+    level_step: Option<u16>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Skip the derived compute stage (requires --no-heavy: the heavy stage builds on it)"
+    )]
+    no_derived: bool,
+    #[arg(
+        long,
         default_value_t = false,
         conflicts_with = "no_heavy",
-        help = "Run the heavy ECAPE ingest stage (the default; present so callers can be explicit)"
+        help = "Run the heavy ECAPE ingest stage (the full-profile default; present so callers can be explicit)"
     )]
     heavy: bool,
     #[arg(
@@ -150,8 +170,20 @@ struct Args {
     full_throttle: bool,
 }
 
-fn heavy_enabled(args: &Args) -> bool {
-    !args.no_heavy
+/// Resolve `--profile` + the override flags into a validated profile.
+fn profile_from_args(args: &Args) -> Result<IngestProfile, String> {
+    let overrides = ProfileOverrides {
+        level_step_hpa: args.level_step,
+        no_derived: args.no_derived,
+        heavy: if args.heavy {
+            Some(true)
+        } else if args.no_heavy {
+            Some(false)
+        } else {
+            None
+        },
+    };
+    resolve_profile(&args.profile, &overrides)
 }
 
 /// Process-wide CPU time (kernel + user) in milliseconds.
@@ -234,14 +266,15 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let total_started = Instant::now();
     let total_cpu_started = process_cpu_ms();
 
+    let profile = profile_from_args(args)?;
     let hours = parse_hours(&args.hours)?;
     let mut request = render_all::partition_products(&args.products, args.model)?;
-    if !heavy_enabled(args) {
+    if !profile.heavy {
         let dropped = request.drop_heavy_unless_strict();
         if dropped > 0 {
             println!(
-                "products: dropped {dropped} heavy recipe slug(s) (--no-heavy ingest stores no \
-                 heavy grids; pass them explicitly to force the blocked-product error instead)"
+                "products: dropped {dropped} heavy recipe slug(s) (this profile's ingest stores \
+                 no heavy grids; pass them explicitly to force the blocked-product error instead)"
             );
         }
     }
@@ -264,12 +297,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let domain = DomainSpec::new(args.region.slug(), args.region.bounds());
 
     println!(
-        "rw_batch build {} | model {} run {} | hours {:?} | heavy {} | source {} | store {} | cache {} | out {}",
+        "rw_batch build {} | model {} run {} | hours {:?} | profile {} ({}) | source {} | store {} | cache {} | out {}",
         env!("RW_BUILD_SHA"),
         model_slug,
         run_slug,
         hours,
-        heavy_enabled(args),
+        args.profile,
+        profile.describe(),
         args.source
             .map(|source| source.to_string())
             .unwrap_or_else(|| "any (catalog order)".to_string()),
@@ -293,7 +327,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         store_root: &args.store_root,
         model_slug: &model_slug,
         run_slug: &run_slug,
-        heavy: heavy_enabled(args),
+        profile: &profile,
         verify: false,
     };
     let render_config = StoreRenderConfig {
@@ -588,7 +622,9 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         "model": model_slug,
         "run": run_slug,
         "hours": hours,
-        "heavy": heavy_enabled(args),
+        "profile": args.profile,
+        "profile_detail": profile.describe(),
+        "heavy": profile.heavy,
         "products_spec": args.products,
         "region": domain.slug,
         "full_throttle": args.full_throttle,
@@ -704,7 +740,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn heavy_flag_defaults_on_and_no_heavy_turns_it_off() {
+    fn default_profile_is_full_and_heavy_flags_map_onto_it() {
         let base = [
             "rw-batch",
             "--date",
@@ -715,14 +751,28 @@ mod tests {
             "4-6",
         ];
         let args = Args::try_parse_from(base).expect("default args parse");
-        assert!(heavy_enabled(&args), "heavy must default ON");
+        let profile = profile_from_args(&args).expect("default profile resolves");
+        assert_eq!(
+            profile,
+            IngestProfile::full(),
+            "default must be today's behavior (heavy ON)"
+        );
         let off = Args::try_parse_from(base.iter().copied().chain(["--no-heavy"]))
             .expect("--no-heavy parses");
-        assert!(!heavy_enabled(&off));
+        assert!(!profile_from_args(&off).expect("resolves").heavy);
         assert!(
             Args::try_parse_from(base.iter().copied().chain(["--heavy", "--no-heavy"])).is_err(),
             "--heavy and --no-heavy must conflict"
         );
+        let sounding = Args::try_parse_from(
+            base.iter()
+                .copied()
+                .chain(["--profile", "sounding", "--level-step", "50"]),
+        )
+        .expect("sounding @ 50 parses");
+        let profile = profile_from_args(&sounding).expect("resolves");
+        assert_eq!(profile.level_step_hpa, 50);
+        assert!(!profile.derived && !profile.heavy);
     }
 
     #[test]
