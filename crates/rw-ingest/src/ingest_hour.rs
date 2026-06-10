@@ -46,26 +46,23 @@
 //! — so they ride the existing sfc fetch + decode pass for free instead of
 //! pulling any of the ~770 MB wrfnat file.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rustwx_core::{
-    CanonicalField, CycleSpec, FieldSelector, ModelId, ModelRunRequest, SelectedField2D, SourceId,
-    VerticalSelector,
+    CanonicalField, CycleSpec, FieldSelector, ModelId, ModelRunRequest, SourceId, VerticalSelector,
 };
 use rustwx_io::{
-    CachedFetchResult, FetchRequest, extract_fields_partial_from_model_bytes_at_forecast_hour,
-    fetch_bytes_with_cache,
+    CachedFetchResult, FetchRequest, SharedExtractionGrid,
+    extract_field_values_partial_from_model_bytes_at_forecast_hour, fetch_bytes_with_cache,
 };
 use rustwx_models::plot_recipe_fetch_plan;
 use rustwx_products::derived::{store_derived_recipe_slugs, store_heavy_recipe_slugs};
 use rustwx_products::direct::supported_direct_recipe_slugs;
 use rw_store::grid::GridFile;
-use rw_store::ingest::{
-    DerivedFieldInput, PressureVolumeInput, derived_selector, read_field_2d, read_grid_2d,
-    write_hour_from_fields_with_derived,
-};
+use rw_store::ingest::{HourIngestWriter, derived_selector, read_field_2d, read_grid_2d};
 use rw_store::reader::HourReader;
 
 #[path = "ingest_compute.rs"]
@@ -306,14 +303,34 @@ pub fn fetch_hour(config: &IngestConfig<'_>, hour: u16) -> Result<FetchedHour, I
     })
 }
 
-/// One owned 3D variable assembled from extraction, before borrowing into
-/// `PressureVolumeInput` for the store write.
+/// One owned 3D variable assembled from extraction. The level planes are
+/// encoded into the hour writer right after extraction and freed (kept
+/// only under `--verify`, which re-reads them for the round-trip checks);
+/// the `(level, ...)` list itself survives for the realized-level summary.
 struct VolumeData {
     name: &'static str,
     field: CanonicalField,
     units: &'static str,
     levels: Vec<(u16, Vec<f32>)>,
 }
+
+/// One extracted 2D plane staged for the hour write: bare values plus the
+/// selector/units meta. The coordinate grid is NOT carried per field (the
+/// historical `SelectedField2D` shape cost ~15 MB of identical grid clone
+/// per plane, ~950 MB per hour); `grid_ref` points at the shared grid of
+/// its extraction pass for the one-time identity check.
+struct FieldPlane2D {
+    selector: FieldSelector,
+    units: String,
+    values: Vec<f32>,
+    /// (extraction pass, grid slot) into the per-pass shared grids.
+    grid_ref: (usize, usize),
+}
+
+/// Extraction-pass indices for [`FieldPlane2D::grid_ref`].
+const PASS_PRS: usize = 0;
+const PASS_SFC: usize = 1;
+const PASS_TRAILING: usize = 2;
 
 /// The CPU half of one hour: extract both files, compute derived/heavy
 /// grids, write the store hour, and (optionally) verify the round-trip.
@@ -395,10 +412,11 @@ pub fn process_fetched_hour(
             levels: Vec::new(),
         })
         .collect();
-    let mut prs_fields_2d: Vec<(String, SelectedField2D)> = Vec::new();
+    let mut prs_fields_2d: Vec<(String, FieldPlane2D)> = Vec::new();
+    let mut prs_grids: Vec<SharedExtractionGrid> = Vec::new();
     if !prs_selectors.is_empty() {
         profile_scope!("ingest_extract_prs");
-        let prs_extraction = extract_fields_partial_from_model_bytes_at_forecast_hour(
+        let prs_extraction = extract_field_values_partial_from_model_bytes_at_forecast_hour(
             config.model,
             &prs.result.bytes,
             Some(&prs.bytes_path),
@@ -407,26 +425,44 @@ pub fn process_fetched_hour(
         )
         .map_err(other)?;
         prs_extract_ms = extract_started.elapsed().as_millis();
+        prs_grids = prs_extraction.grids;
         for extracted in prs_extraction.extracted {
             let VerticalSelector::IsobaricHpa(level) = extracted.selector.vertical else {
                 continue;
             };
             if extracted.selector.field == CanonicalField::AbsoluteVorticity {
                 if let Some((_, name)) = VORTICITY_PLAN.iter().find(|(have, _)| *have == level) {
-                    prs_fields_2d.push((name.to_string(), extracted));
+                    prs_fields_2d.push((
+                        name.to_string(),
+                        FieldPlane2D {
+                            selector: extracted.selector,
+                            units: extracted.units,
+                            values: extracted.values,
+                            grid_ref: (PASS_PRS, extracted.grid_index),
+                        },
+                    ));
                 }
                 continue;
             }
             // Direct-recipe planes are stored as bit-exact 2D variables under
-            // their selector key, in addition to (not instead of) the volume.
+            // their selector key, in addition to (not instead of) the volume —
+            // only the values clone, the grid is shared.
             if direct_planes.contains(&extracted.selector) {
-                prs_fields_2d.push((extracted.selector.key(), extracted.clone()));
+                prs_fields_2d.push((
+                    extracted.selector.key(),
+                    FieldPlane2D {
+                        selector: extracted.selector,
+                        units: extracted.units.clone(),
+                        values: extracted.values.clone(),
+                        grid_ref: (PASS_PRS, extracted.grid_index),
+                    },
+                ));
             }
             if let Some(volume) = volumes_data
                 .iter_mut()
                 .find(|volume| volume.field == extracted.selector.field)
             {
-                // Move the plane out; the per-field grid copy drops here.
+                // Move the plane out (bare values; nothing else to drop).
                 volume.levels.push((level, extracted.values));
             }
         }
@@ -481,7 +517,7 @@ pub fn process_fetched_hour(
             .map(|&level| FieldSelector::isobaric(CanonicalField::RelativeHumidity, level))
             .collect();
         let rh_started = Instant::now();
-        let rh_extraction = extract_fields_partial_from_model_bytes_at_forecast_hour(
+        let rh_extraction = extract_field_values_partial_from_model_bytes_at_forecast_hour(
             config.model,
             &prs.result.bytes,
             Some(&prs.bytes_path),
@@ -530,7 +566,7 @@ pub fn process_fetched_hour(
     let extract_started = Instant::now();
     let mut sfc_extraction = {
         profile_scope!("ingest_extract_sfc");
-        extract_fields_partial_from_model_bytes_at_forecast_hour(
+        extract_field_values_partial_from_model_bytes_at_forecast_hour(
             config.model,
             &sfc.result.bytes,
             Some(&sfc.bytes_path),
@@ -540,8 +576,9 @@ pub fn process_fetched_hour(
         .map_err(other)?
     };
     let mut sfc_extract_ms = extract_started.elapsed().as_millis();
+    let sfc_grids = std::mem::take(&mut sfc_extraction.grids);
 
-    let mut fields_2d_owned: Vec<(String, SelectedField2D)> = Vec::new();
+    let mut fields_2d_owned: Vec<(String, FieldPlane2D)> = Vec::new();
     for (name, selector) in &surface_plan {
         match sfc_extraction
             .extracted
@@ -549,9 +586,15 @@ pub fn process_fetched_hour(
             .position(|field| field.selector == *selector)
         {
             Some(index) => {
+                let extracted = sfc_extraction.extracted.swap_remove(index);
                 fields_2d_owned.push((
                     name.to_string(),
-                    sfc_extraction.extracted.swap_remove(index),
+                    FieldPlane2D {
+                        selector: extracted.selector,
+                        units: extracted.units,
+                        values: extracted.values,
+                        grid_ref: (PASS_SFC, extracted.grid_index),
+                    },
                 ));
             }
             None => config.emit(IngestEvent::Warning {
@@ -591,6 +634,7 @@ pub fn process_fetched_hour(
     // sfc file. If a future HRRR build reorders them, run_total silently
     // becomes the 1 h window. A windowed-product sanity check (run_total >=
     // 1h sum for h > 1) is the cheap detector if this ever bites.
+    let mut trailing_grids: Vec<SharedExtractionGrid> = Vec::new();
     if hour >= 1 && include_full_2d {
         let trailing_plan = [
             (
@@ -611,25 +655,35 @@ pub fn process_fetched_hour(
             .map(|(_, selector)| *selector)
             .collect();
         let trailing_started = Instant::now();
-        let mut trailing_extraction = extract_fields_partial_from_model_bytes_at_forecast_hour(
-            config.model,
-            &sfc.result.bytes,
-            Some(&sfc.bytes_path),
-            &trailing_selectors,
-            Some(hour - 1),
-        )
-        .map_err(other)?;
+        let mut trailing_extraction =
+            extract_field_values_partial_from_model_bytes_at_forecast_hour(
+                config.model,
+                &sfc.result.bytes,
+                Some(&sfc.bytes_path),
+                &trailing_selectors,
+                Some(hour - 1),
+            )
+            .map_err(other)?;
         sfc_extract_ms += trailing_started.elapsed().as_millis();
+        trailing_grids = std::mem::take(&mut trailing_extraction.grids);
         for (name, selector) in &trailing_plan {
             match trailing_extraction
                 .extracted
                 .iter()
                 .position(|field| field.selector == *selector)
             {
-                Some(index) => fields_2d_owned.push((
-                    name.to_string(),
-                    trailing_extraction.extracted.swap_remove(index),
-                )),
+                Some(index) => {
+                    let extracted = trailing_extraction.extracted.swap_remove(index);
+                    fields_2d_owned.push((
+                        name.to_string(),
+                        FieldPlane2D {
+                            selector: extracted.selector,
+                            units: extracted.units,
+                            values: extracted.values,
+                            grid_ref: (PASS_TRAILING, extracted.grid_index),
+                        },
+                    ));
+                }
                 None => config.emit(IngestEvent::Warning {
                     hour,
                     message: format!(
@@ -675,6 +729,121 @@ pub fn process_fetched_hour(
         )));
     }
 
+    // --- early encode: the 2D fields and the extracted volumes go into the
+    //     (spill-backed) hour writer NOW, before the compute stages, so
+    //     their raw f32 planes (~1.8 GB at HRRR size) never sit across the
+    //     derived/heavy window. Volumes ride deferred variable ids, so the
+    //     file bytes keep the historical fields/derived/heavy/volumes
+    //     order. Under --verify the planes are kept for the round-trip
+    //     checks (the historical memory shape). ---
+    let extraction_grids: [Vec<SharedExtractionGrid>; 3] = [prs_grids, sfc_grids, trailing_grids];
+    let mut hour_writer = {
+        let (ref_pass, ref_slot) = fields_2d_owned[0].1.grid_ref;
+        let first_name = fields_2d_owned[0].0.clone();
+        let reference = &extraction_grids[ref_pass][ref_slot];
+        // One-time grid identity check, once per distinct (pass, slot)
+        // pair: every stored 2D plane must sit on the grid carrier's exact
+        // coordinates — the same bit-compare the store writer used to run
+        // per field (65x on identical arrays).
+        let mut checked: HashSet<(usize, usize)> = HashSet::new();
+        checked.insert((ref_pass, ref_slot));
+        for (name, plane) in &fields_2d_owned {
+            if !checked.insert(plane.grid_ref) {
+                continue;
+            }
+            let candidate = &extraction_grids[plane.grid_ref.0][plane.grid_ref.1];
+            if candidate.grid.shape != reference.grid.shape {
+                return Err(other(format!(
+                    "2D field '{name}': grid {}x{} does not match the hour grid {}x{}",
+                    candidate.grid.shape.nx,
+                    candidate.grid.shape.ny,
+                    reference.grid.shape.nx,
+                    reference.grid.shape.ny
+                )));
+            }
+            let coords_match = candidate
+                .grid
+                .lat_deg
+                .iter()
+                .zip(&reference.grid.lat_deg)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+                && candidate
+                    .grid
+                    .lon_deg
+                    .iter()
+                    .zip(&reference.grid.lon_deg)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+            if !coords_match {
+                return Err(other(format!(
+                    "2D field '{name}': same {}x{} dims as the first field '{first_name}' \
+                     but different coordinates",
+                    reference.grid.shape.nx, reference.grid.shape.ny
+                )));
+            }
+        }
+        HourIngestWriter::begin(
+            config.store_root,
+            config.model_slug,
+            config.run_slug,
+            hour,
+            &reference.grid,
+            reference.projection.as_ref(),
+            env!("RW_BUILD_SHA"),
+        )
+        .map_err(other)?
+    };
+    let keep_planes = config.verify;
+    {
+        profile_scope!("ingest_encode_extracted");
+        for (name, plane) in &mut fields_2d_owned {
+            let selector = serde_json::to_value(plane.selector)
+                .map_err(|err| other(format!("2D field '{name}': selector JSON: {err}")))?;
+            hour_writer
+                .add_field_2d(name, &plane.units, selector, &plane.values)
+                .map_err(other)?;
+            if !keep_planes {
+                plane.values = Vec::new();
+            }
+        }
+        for volume in &mut volumes_data {
+            if volume.levels.len() < 2 {
+                config.emit(IngestEvent::Warning {
+                    hour,
+                    message: format!(
+                        "f{hour:03}: 3D variable '{}' realized {} level(s) (< 2); skipped",
+                        volume.name,
+                        volume.levels.len()
+                    ),
+                });
+                continue;
+            }
+            let levels: Vec<(u16, &[f32])> = volume
+                .levels
+                .iter()
+                .map(|(level, plane)| (*level, plane.as_slice()))
+                .collect();
+            hour_writer
+                .add_volume(
+                    volume.name,
+                    volume.units,
+                    serde_json::json!({
+                        "field": volume.field.as_str(),
+                        "vertical": "isobaric",
+                    }),
+                    &levels,
+                )
+                .map_err(other)?;
+            drop(levels);
+            if !keep_planes {
+                for (_, plane) in &mut volume.levels {
+                    *plane = Vec::new();
+                }
+            }
+        }
+    }
+    drop(extraction_grids);
+    config.check_cancel()?;
+
     // --- derived + heavy precompute: decode the surface + pressure thermo
     //     pair from the still-resident raw bytes through the render lanes'
     //     own products decoder (same messages, same moisture preference,
@@ -710,53 +879,19 @@ pub fn process_fetched_hour(
     let derived_grids = stages.derived;
     let heavy_grids = stages.heavy;
 
-    // --- assemble + write ---
+    // --- write: the derived/heavy grids join the already-encoded fields
+    //     and volumes (ids continue in add order; the deferred volumes are
+    //     numbered last at finish), then the hour streams to disk ---
     config.emit(IngestEvent::StageStarted {
         hour,
         stage: IngestStage::Write,
     });
     let write_started = Instant::now();
-    let fields_2d: Vec<(&str, &SelectedField2D)> = fields_2d_owned
-        .iter()
-        .map(|(name, field)| (name.as_str(), field))
-        .collect();
-    let mut volumes: Vec<PressureVolumeInput<'_>> = Vec::new();
-    for volume in &volumes_data {
-        if volume.levels.len() < 2 {
-            config.emit(IngestEvent::Warning {
-                hour,
-                message: format!(
-                    "f{hour:03}: 3D variable '{}' realized {} level(s) (< 2); skipped",
-                    volume.name,
-                    volume.levels.len()
-                ),
-            });
-            continue;
-        }
-        volumes.push(PressureVolumeInput {
-            name: volume.name,
-            units: volume.units,
-            selector_template: serde_json::json!({
-                "field": volume.field.as_str(),
-                "vertical": "isobaric",
-            }),
-            levels: volume
-                .levels
-                .iter()
-                .map(|(level, plane)| (*level, plane.as_slice()))
-                .collect(),
-        });
+    for grid in derived_grids.iter().chain(heavy_grids.iter()) {
+        hour_writer
+            .add_derived_2d(grid.name, &grid.units, &grid.values)
+            .map_err(other)?;
     }
-
-    let derived_inputs: Vec<DerivedFieldInput<'_>> = derived_grids
-        .iter()
-        .chain(heavy_grids.iter())
-        .map(|grid| DerivedFieldInput {
-            name: grid.name,
-            units: &grid.units,
-            values: &grid.values,
-        })
-        .collect();
 
     let unix_now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -764,18 +899,7 @@ pub fn process_fetched_hour(
         .as_secs();
     let written = {
         profile_scope!("ingest_write_hour");
-        write_hour_from_fields_with_derived(
-            config.store_root,
-            config.model_slug,
-            config.run_slug,
-            hour,
-            &fields_2d,
-            &derived_inputs,
-            &volumes,
-            env!("RW_BUILD_SHA"),
-            unix_now,
-        )
-        .map_err(other)?
+        hour_writer.finish(unix_now).map_err(other)?
     };
     let write_ms = write_started.elapsed().as_millis();
     config.emit(IngestEvent::StageDone {
@@ -1027,13 +1151,14 @@ fn compute_product_grids(
 /// plus the first derived and first heavy variable (via `read_grid_2d`,
 /// marker selector checked), plus one center-of-grid profile per 3D
 /// variable, each profile value checked against the source plane's center
-/// value within the quantization bound.
+/// value within the quantization bound. Only runs under `--verify`, which
+/// is also the mode that keeps the source planes resident after encode.
 #[allow(clippy::too_many_arguments)]
 fn verify_hour(
     config: &IngestConfig<'_>,
     hour: u16,
     hour_path: &Path,
-    fields_2d: &[(String, SelectedField2D)],
+    fields_2d: &[(String, FieldPlane2D)],
     derived_grids: &[DerivedGrid2D],
     heavy_grids: &[DerivedGrid2D],
     volumes_data: &[VolumeData],
