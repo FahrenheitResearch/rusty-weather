@@ -34,20 +34,18 @@
 //!                  full read itself is only a few ms)
 //!   locator_build  <= 50 ms (informational target, not a hard gate)
 
-use std::collections::BTreeMap;
 use std::fs;
-use std::fs::File;
 use std::hint::black_box;
-use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use rw_store::format::{HEADER_LEN, INDEX_RECORD_LEN};
 use rw_store::grid::{GridFile, GridLocator};
-use rw_store::header::RwsHeader;
-use rw_store::index::ChunkRecord;
 use rw_store::reader::HourReader;
+
+#[path = "../ingest_hour.rs"]
+mod ingest_hour;
+use ingest_hour::size_estimate::walk_hour_sizes;
 
 /// Mid-CONUS sounding click point (central Kansas).
 const SOUNDING_LAT: f64 = 39.0;
@@ -133,33 +131,6 @@ fn fmt_time(seconds: f64, unit: Unit) -> String {
         Unit::Millis => format!("{:.2} ms", seconds * 1e3),
         Unit::Micros => format!("{:.1} us", seconds * 1e6),
     }
-}
-
-/// Per-variable compressed payload totals from the on-disk chunk index
-/// (header + index region only — the payload is never read).
-fn per_var_sizes(
-    path: &std::path::Path,
-) -> Result<BTreeMap<u16, (usize, u64)>, Box<dyn std::error::Error>> {
-    let mut file = File::open(path)?;
-    let mut header_bytes = [0u8; HEADER_LEN];
-    file.read_exact(&mut header_bytes)?;
-    let header = RwsHeader::parse(&header_bytes)?;
-    let index_len = usize::try_from(header.index_count)
-        .ok()
-        .and_then(|count| count.checked_mul(INDEX_RECORD_LEN))
-        .ok_or("index size overflows usize")?;
-    let mut index_bytes = vec![0u8; index_len];
-    file.seek(SeekFrom::Start(header.index_offset))?;
-    file.read_exact(&mut index_bytes)?;
-
-    let mut by_var: BTreeMap<u16, (usize, u64)> = BTreeMap::new();
-    for record_bytes in index_bytes.chunks_exact(INDEX_RECORD_LEN) {
-        let record = ChunkRecord::unpack(record_bytes)?;
-        let entry = by_var.entry(record.var_id).or_insert((0, 0));
-        entry.0 += 1;
-        entry.1 += u64::from(record.len);
-    }
-    Ok(by_var)
 }
 
 fn mb(bytes: u64) -> f64 {
@@ -376,32 +347,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // 9. file size + per-variable compressed payload bytes from the index.
-    let by_var = per_var_sizes(&hour_path)?;
+    // 9. file size + per-variable compressed payload bytes from the index
+    //    (the shared EXACT size walk; the payload is never read).
+    let sizes = walk_hour_sizes(&hour_path)?;
     println!();
     println!(
         "{:<24} {:>10} {:>8} {:>12}",
         "variable", "kind", "chunks", "compressed"
     );
-    let mut payload_total = 0u64;
-    for var in &meta.variables {
-        let (chunks, bytes) = by_var.get(&var.id).copied().unwrap_or((0, 0));
-        payload_total += bytes;
+    for var in &sizes.vars {
         println!(
             "{:<24} {:>10} {:>8} {:>9.1} MB",
             var.name,
             var.kind,
-            chunks,
-            mb(bytes)
+            var.chunks,
+            mb(var.bytes)
         );
     }
     println!(
         "{:<24} {:>10} {:>8} {:>9.1} MB   (file {:.1} MB incl. header/meta/index)",
         "total payload",
         "",
-        by_var.values().map(|(chunks, _)| chunks).sum::<usize>(),
-        mb(payload_total),
-        mb(file_bytes),
+        sizes.vars.iter().map(|var| var.chunks).sum::<usize>(),
+        mb(sizes.payload_bytes),
+        mb(sizes.file_bytes),
     );
 
     // --- gates ---

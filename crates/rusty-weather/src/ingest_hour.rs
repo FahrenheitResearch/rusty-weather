@@ -2,6 +2,10 @@
 
 //! Shared per-hour live-GRIB -> `.rws` ingest flow, used by `rw_ingest`
 //! (serial hours) and `rw_batch` (pipelined hours) via `#[path]` inclusion.
+//! Also the single inclusion point for the `ingest_profile` (what one run
+//! fetches/extracts/computes/stores — the default `full` profile is the
+//! behavior described below, unchanged) and `size_estimate` (exact +
+//! predictive store/download sizing) child modules.
 //!
 //! Per forecast hour: fetch the `prs` product file (cache-aware), extract
 //! the full 3D isobaric superset plus the sparse per-level vorticity planes
@@ -58,17 +62,16 @@ use rw_store::reader::HourReader;
 
 #[path = "ingest_compute.rs"]
 pub mod ingest_compute;
+#[path = "ingest_profile.rs"]
+pub mod ingest_profile;
+#[path = "size_estimate.rs"]
+pub mod size_estimate;
 use ingest_compute::DerivedGrid2D;
+use ingest_profile::{IngestProfile, VolumeChoice, surface_plan};
 
-/// Candidate isobaric levels (hPa) requested for every 3D variable; absent
-/// levels come back in `PartialExtraction.missing` and are simply not stored.
-fn candidate_levels() -> Vec<u16> {
-    (100..=1000).step_by(25).collect()
-}
-
-/// 3D variables pulled from the pressure ("prs") product file, with their
-/// stable store names. Dewpoint falls back to RelativeHumidity ("rh_iso")
-/// when the file realizes fewer than two dewpoint levels.
+/// The volume plan under one profile: `(field, store name)` pairs in the
+/// stable full-ingest order. Dewpoint falls back to RelativeHumidity
+/// ("rh_iso") when the file realizes fewer than two dewpoint levels.
 ///
 /// Moisture note: the derived/CAPE compute path (`rustwx_calc::ecape::
 /// {SurfaceInputs, EcapeVolumeInputs}`) consumes mixing ratio, which
@@ -76,13 +79,17 @@ fn candidate_levels() -> Vec<u16> {
 /// which has no CanonicalField) plus pressure — `dewpoint_iso` here and
 /// `dewpoint_2m` + `surface_pressure` on the 2D side cover it, so no
 /// dedicated moisture volume is needed.
-const VOLUME_PLAN: &[(CanonicalField, &str)] = &[
-    (CanonicalField::Temperature, "temperature_iso"),
-    (CanonicalField::Dewpoint, "dewpoint_iso"),
-    (CanonicalField::UWind, "u_iso"),
-    (CanonicalField::VWind, "v_iso"),
-    (CanonicalField::GeopotentialHeight, "height_iso"),
-];
+fn volume_plan(profile: &IngestProfile) -> Vec<(CanonicalField, &'static str)> {
+    VolumeChoice::ALL
+        .iter()
+        .filter(|choice| profile.volumes.contains(choice))
+        .map(|choice| (choice.field(), choice.store_name()))
+        .collect()
+}
+
+/// The trailing (h-1)->h window field names (see the re-select pass in
+/// `process_fetched_hour`); stored only under a full-2D profile.
+const TRAILING_2D_NAMES: [&str; 3] = ["apcp_1h", "uh_2to5km_max_1h", "wind_speed_10m_max_1h"];
 
 /// Sparse per-level absolute vorticity planes pulled from the prs file in
 /// the same decode pass as the volumes, stored as five 2D variables (the
@@ -95,138 +102,6 @@ const VORTICITY_PLAN: &[(u16, &str)] = &[
     (700, "absolute_vorticity_700"),
     (850, "absolute_vorticity_850"),
 ];
-
-/// 2D fields pulled from the surface ("sfc") product file, with their stable
-/// store names. These mirror the selector constructors the rustwx-models
-/// plot-recipe catalog uses for the same HRRR fields.
-///
-/// CAPE has no plan entry: it is sounding-derived here (no CAPE
-/// CanonicalField) and ships through the derived precompute stage instead
-/// (`sbcape`/`mlcape`/`mucape`... — see `compute_derived_grids`).
-///
-/// `apcp_run_total` is the plain TotalPrecipitation selection: the sfc file
-/// carries two APCP accumulations that both end at hour h (0->h run total
-/// and the trailing (h-1)->h hour); they tie on match score and the run
-/// total wins as first in file order. The trailing 1 h window is stored
-/// separately as `apcp_1h` via a dedicated re-select (see `ingest_hour`).
-///
-/// Lightning flash density is deliberately absent: rustwx-io has no
-/// structured selector for it (HRRR exposes LTNG, a non-dimensional
-/// lightning flag, and LTNGSD strike density — not flash density), and the
-/// recipe catalog blocks the slug for HRRR for the same mislabeling reason.
-fn surface_plan() -> Vec<(&'static str, FieldSelector)> {
-    vec![
-        (
-            "temperature_2m",
-            FieldSelector::height_agl(CanonicalField::Temperature, 2),
-        ),
-        (
-            "dewpoint_2m",
-            FieldSelector::height_agl(CanonicalField::Dewpoint, 2),
-        ),
-        (
-            "u_10m",
-            FieldSelector::height_agl(CanonicalField::UWind, 10),
-        ),
-        (
-            "v_10m",
-            FieldSelector::height_agl(CanonicalField::VWind, 10),
-        ),
-        (
-            "composite_reflectivity",
-            FieldSelector::entire_atmosphere(CanonicalField::CompositeReflectivity),
-        ),
-        (
-            "mslp",
-            FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel),
-        ),
-        // --- surface state & moisture (feeds SurfaceInputs-derived products) ---
-        (
-            "rh_2m",
-            FieldSelector::height_agl(CanonicalField::RelativeHumidity, 2),
-        ),
-        (
-            "wind_gust_10m",
-            FieldSelector::height_agl(CanonicalField::WindGust, 10),
-        ),
-        (
-            "surface_pressure",
-            FieldSelector::surface(CanonicalField::Pressure),
-        ),
-        (
-            "orography",
-            FieldSelector::surface(CanonicalField::GeopotentialHeight),
-        ),
-        // --- precipitation & precip type ---
-        (
-            "apcp_run_total",
-            FieldSelector::surface(CanonicalField::TotalPrecipitation),
-        ),
-        (
-            "categorical_rain",
-            FieldSelector::surface(CanonicalField::CategoricalRain),
-        ),
-        (
-            "categorical_freezing_rain",
-            FieldSelector::surface(CanonicalField::CategoricalFreezingRain),
-        ),
-        (
-            "categorical_ice_pellets",
-            FieldSelector::surface(CanonicalField::CategoricalIcePellets),
-        ),
-        (
-            "categorical_snow",
-            FieldSelector::surface(CanonicalField::CategoricalSnow),
-        ),
-        // --- moisture column, clouds, visibility ---
-        (
-            "pwat",
-            FieldSelector::entire_atmosphere(CanonicalField::PrecipitableWater),
-        ),
-        (
-            "cloud_cover_low",
-            FieldSelector::entire_atmosphere(CanonicalField::LowCloudCover),
-        ),
-        (
-            "cloud_cover_mid",
-            FieldSelector::entire_atmosphere(CanonicalField::MiddleCloudCover),
-        ),
-        (
-            "cloud_cover_high",
-            FieldSelector::entire_atmosphere(CanonicalField::HighCloudCover),
-        ),
-        (
-            "cloud_cover_total",
-            FieldSelector::entire_atmosphere(CanonicalField::TotalCloudCover),
-        ),
-        (
-            "visibility",
-            FieldSelector::surface(CanonicalField::Visibility),
-        ),
-        // --- convection, smoke, satellite (also in wrfnat; sfc carries them
-        //     too, so they ride this fetch — see the module doc) ---
-        (
-            "reflectivity_1km",
-            FieldSelector::height_agl(CanonicalField::RadarReflectivity, 1000),
-        ),
-        (
-            "uh_2to5km",
-            FieldSelector::height_layer_agl(CanonicalField::UpdraftHelicity, 2000, 5000),
-        ),
-        (
-            "smoke_8m",
-            FieldSelector::height_agl(CanonicalField::SmokeMassDensity, 8),
-        ),
-        (
-            "smoke_column",
-            FieldSelector::entire_atmosphere(CanonicalField::ColumnIntegratedSmoke),
-        ),
-        (
-            "simulated_ir",
-            FieldSelector::nominal_top(CanonicalField::SimulatedInfraredBrightnessTemperature),
-        ),
-    ]
-}
 
 /// Every isobaric plane a supported direct plot recipe consumes for this
 /// model, derived from the recipe catalog's own fetch plans so coverage is
@@ -267,8 +142,9 @@ pub struct IngestConfig<'a> {
     pub store_root: &'a Path,
     pub model_slug: &'a str,
     pub run_slug: &'a str,
-    /// Run the heavy ECAPE ingest stage.
-    pub heavy: bool,
+    /// What to fetch/extract/compute/store — validated up front (see
+    /// `ingest_profile`); `IngestProfile::full()` is today's behavior.
+    pub profile: &'a IngestProfile,
     /// After the write, re-open the hour and verify a bit-exact 2D
     /// round-trip of every field plus one profile per 3D variable.
     pub verify: bool,
@@ -383,6 +259,13 @@ pub fn process_fetched_hour(
     config: &IngestConfig<'_>,
     fetched: FetchedHour,
 ) -> Result<IngestedHour, Box<dyn std::error::Error>> {
+    // The CLIs validate via resolve_profile; guard programmatic callers too
+    // (e.g. derived=false + heavy=true would silently compute derived).
+    debug_assert!(
+        config.profile.validate().is_ok(),
+        "process_fetched_hour called with an unvalidated profile: {:?}",
+        config.profile.validate()
+    );
     let process_started = Instant::now();
     let FetchedHour {
         hour,
@@ -397,20 +280,31 @@ pub fn process_fetched_hour(
     let sfc_mb = sfc.result.bytes.len() as f64 / (1024.0 * 1024.0);
 
     // --- prs product file: 3D isobaric superset, one decode pass ---
-    let levels = candidate_levels();
-    let direct_planes = direct_isobaric_plane_selectors(config.model);
+    // The profile picks the volumes and level step; the render-grade 2D
+    // planes (vorticity + direct-recipe) ride only with a full-2D profile.
+    let profile = config.profile;
+    let levels = profile.candidate_levels();
+    let volume_plan = volume_plan(profile);
+    let include_full_2d = profile.includes_full_2d();
+    let direct_planes = if include_full_2d {
+        direct_isobaric_plane_selectors(config.model)
+    } else {
+        Vec::new()
+    };
     let mut prs_selectors =
-        Vec::with_capacity(VOLUME_PLAN.len() * levels.len() + VORTICITY_PLAN.len());
-    for (field, _) in VOLUME_PLAN {
+        Vec::with_capacity(volume_plan.len() * levels.len() + VORTICITY_PLAN.len());
+    for (field, _) in &volume_plan {
         for &level in &levels {
             prs_selectors.push(FieldSelector::isobaric(*field, level));
         }
     }
-    for (level, _) in VORTICITY_PLAN {
-        prs_selectors.push(FieldSelector::isobaric(
-            CanonicalField::AbsoluteVorticity,
-            *level,
-        ));
+    if include_full_2d {
+        for (level, _) in VORTICITY_PLAN {
+            prs_selectors.push(FieldSelector::isobaric(
+                CanonicalField::AbsoluteVorticity,
+                *level,
+            ));
+        }
     }
     // Direct-recipe isobaric planes ride the same decode pass; most are
     // already in the volume superset (T/Td/U/V/Z), but e.g. isobaric RH is
@@ -421,16 +315,8 @@ pub fn process_fetched_hour(
         }
     }
     let extract_started = Instant::now();
-    let prs_extraction = extract_fields_partial_from_model_bytes_at_forecast_hour(
-        config.model,
-        &prs.result.bytes,
-        Some(&prs.bytes_path),
-        &prs_selectors,
-        Some(hour),
-    )?;
-    let mut prs_extract_ms = extract_started.elapsed().as_millis();
-
-    let mut volumes_data: Vec<VolumeData> = VOLUME_PLAN
+    let mut prs_extract_ms = 0u128;
+    let mut volumes_data: Vec<VolumeData> = volume_plan
         .iter()
         .map(|(field, name)| VolumeData {
             name,
@@ -440,35 +326,47 @@ pub fn process_fetched_hour(
         })
         .collect();
     let mut prs_fields_2d: Vec<(String, SelectedField2D)> = Vec::new();
-    for extracted in prs_extraction.extracted {
-        let VerticalSelector::IsobaricHpa(level) = extracted.selector.vertical else {
-            continue;
-        };
-        if extracted.selector.field == CanonicalField::AbsoluteVorticity {
-            if let Some((_, name)) = VORTICITY_PLAN.iter().find(|(have, _)| *have == level) {
-                prs_fields_2d.push((name.to_string(), extracted));
+    if !prs_selectors.is_empty() {
+        let prs_extraction = extract_fields_partial_from_model_bytes_at_forecast_hour(
+            config.model,
+            &prs.result.bytes,
+            Some(&prs.bytes_path),
+            &prs_selectors,
+            Some(hour),
+        )?;
+        prs_extract_ms = extract_started.elapsed().as_millis();
+        for extracted in prs_extraction.extracted {
+            let VerticalSelector::IsobaricHpa(level) = extracted.selector.vertical else {
+                continue;
+            };
+            if extracted.selector.field == CanonicalField::AbsoluteVorticity {
+                if let Some((_, name)) = VORTICITY_PLAN.iter().find(|(have, _)| *have == level) {
+                    prs_fields_2d.push((name.to_string(), extracted));
+                }
+                continue;
             }
-            continue;
-        }
-        // Direct-recipe planes are stored as bit-exact 2D variables under
-        // their selector key, in addition to (not instead of) the volume.
-        if direct_planes.contains(&extracted.selector) {
-            prs_fields_2d.push((extracted.selector.key(), extracted.clone()));
-        }
-        if let Some(volume) = volumes_data
-            .iter_mut()
-            .find(|volume| volume.field == extracted.selector.field)
-        {
-            // Move the plane out; the per-field grid copy drops here.
-            volume.levels.push((level, extracted.values));
+            // Direct-recipe planes are stored as bit-exact 2D variables under
+            // their selector key, in addition to (not instead of) the volume.
+            if direct_planes.contains(&extracted.selector) {
+                prs_fields_2d.push((extracted.selector.key(), extracted.clone()));
+            }
+            if let Some(volume) = volumes_data
+                .iter_mut()
+                .find(|volume| volume.field == extracted.selector.field)
+            {
+                // Move the plane out; the per-field grid copy drops here.
+                volume.levels.push((level, extracted.values));
+            }
         }
     }
-    for (level, name) in VORTICITY_PLAN {
-        if !prs_fields_2d.iter().any(|(have, _)| have == name) {
-            eprintln!(
-                "f{hour:03}: 2D field '{name}' (absolute vorticity {level} hPa) \
-                 missing from the prs file; skipped"
-            );
+    if include_full_2d {
+        for (level, name) in VORTICITY_PLAN {
+            if !prs_fields_2d.iter().any(|(have, _)| have == name) {
+                eprintln!(
+                    "f{hour:03}: 2D field '{name}' (absolute vorticity {level} hPa) \
+                     missing from the prs file; skipped"
+                );
+            }
         }
     }
     for selector in &direct_planes {
@@ -478,15 +376,19 @@ pub fn process_fetched_hour(
         }
     }
 
-    // Dewpoint fallback: when the prs file realizes < 2 dewpoint levels,
-    // re-select RelativeHumidity from the already-fetched bytes (the GRIB
-    // index re-parses, but only the RH messages decode).
+    // Dewpoint fallback: when the profile stores a dewpoint volume but the
+    // prs file realizes < 2 dewpoint levels, re-select RelativeHumidity
+    // from the already-fetched bytes (the GRIB index re-parses, but only
+    // the RH messages decode).
+    let dewpoint_planned = volumes_data
+        .iter()
+        .any(|volume| volume.field == CanonicalField::Dewpoint);
     let dewpoint_realized = volumes_data
         .iter()
         .find(|volume| volume.field == CanonicalField::Dewpoint)
         .map(|volume| volume.levels.len())
         .unwrap_or(0);
-    if dewpoint_realized < 2 {
+    if dewpoint_planned && dewpoint_realized < 2 {
         eprintln!(
             "f{hour:03}: dewpoint_iso realized only {dewpoint_realized} level(s); \
              falling back to relative humidity (rh_iso)"
@@ -522,8 +424,13 @@ pub fn process_fetched_hour(
     // `prs` stays alive: the derived/heavy compute stage decodes the
     // thermo pair from the raw prs + sfc bytes below.
 
-    // --- sfc product file: 2D surface set, one decode pass ---
-    let surface_plan = surface_plan();
+    // --- sfc product file: 2D surface set (profile-filtered, plan order
+    //     so the grid carrier stays the first surface-plan field), one
+    //     decode pass ---
+    let surface_plan: Vec<(&'static str, FieldSelector)> = surface_plan()
+        .into_iter()
+        .filter(|(name, _)| profile.includes_surface_field(name))
+        .collect();
     let sfc_selectors: Vec<FieldSelector> =
         surface_plan.iter().map(|(_, selector)| *selector).collect();
     let extract_started = Instant::now();
@@ -583,18 +490,18 @@ pub fn process_fetched_hour(
     // sfc file. If a future HRRR build reorders them, run_total silently
     // becomes the 1 h window. A windowed-product sanity check (run_total >=
     // 1h sum for h > 1) is the cheap detector if this ever bites.
-    if hour >= 1 {
+    if hour >= 1 && include_full_2d {
         let trailing_plan = [
             (
-                "apcp_1h",
+                TRAILING_2D_NAMES[0], // apcp_1h
                 FieldSelector::surface(CanonicalField::TotalPrecipitation),
             ),
             (
-                "uh_2to5km_max_1h",
+                TRAILING_2D_NAMES[1], // uh_2to5km_max_1h
                 FieldSelector::height_layer_agl(CanonicalField::UpdraftHelicity, 2000, 5000),
             ),
             (
-                "wind_speed_10m_max_1h",
+                TRAILING_2D_NAMES[2], // wind_speed_10m_max_1h
                 FieldSelector::height_agl(CanonicalField::WindSpeed, 10),
             ),
         ];
@@ -626,7 +533,7 @@ pub fn process_fetched_hour(
                 ),
             }
         }
-    } else {
+    } else if include_full_2d {
         eprintln!(
             "f{hour:03}: trailing 1 h window fields (apcp_1h, uh_2to5km_max_1h, \
              wind_speed_10m_max_1h) have no window at analysis; skipped"
@@ -636,8 +543,14 @@ pub fn process_fetched_hour(
     // Sparse prs-sourced planes ride behind the sfc set so the grid carrier
     // stays the first surface-plan field (both files share the HRRR grid;
     // the store write bit-verifies that). The +3 is the trailing 1 h
-    // window set (apcp_1h, uh_2to5km_max_1h, wind_speed_10m_max_1h).
-    let planned_2d = surface_plan.len() + 3 + VORTICITY_PLAN.len() + direct_planes.len();
+    // window set (apcp_1h, uh_2to5km_max_1h, wind_speed_10m_max_1h);
+    // everything past the surface set rides only with a full-2D profile.
+    let planned_2d = surface_plan.len()
+        + if include_full_2d {
+            TRAILING_2D_NAMES.len() + VORTICITY_PLAN.len() + direct_planes.len()
+        } else {
+            0
+        };
     fields_2d_owned.extend(prs_fields_2d);
     if fields_2d_owned.is_empty() {
         return Err(format!(
@@ -652,9 +565,23 @@ pub fn process_fetched_hour(
     //     same f64 precision — the stored grids are bit-identical to a
     //     render-lane compute over the same files), then run every
     //     non-heavy recipe grid and every heavy ECAPE-class recipe grid ---
-    let planned_derived = store_derived_recipe_slugs().len();
-    let planned_heavy = store_heavy_recipe_slugs().len();
-    let stages = compute_product_grids(&sfc.result.bytes, &prs.result.bytes, hour, config.heavy);
+    let planned_derived = if profile.derived {
+        store_derived_recipe_slugs().len()
+    } else {
+        0
+    };
+    let planned_heavy = if profile.heavy {
+        store_heavy_recipe_slugs().len()
+    } else {
+        0
+    };
+    let stages = compute_product_grids(
+        &sfc.result.bytes,
+        &prs.result.bytes,
+        hour,
+        profile.derived,
+        profile.heavy,
+    );
     drop(sfc);
     drop(prs);
     let thermo_decode_ms = stages.decode_ms;
@@ -798,13 +725,19 @@ struct ComputedProductGrids {
 /// lanes' own products decoder, then run the non-heavy derived pass and
 /// (when enabled) the heavy ECAPE pass. Each stage degrades independently
 /// to "no variables from this stage", never a failed ingest — the
-/// extracted fields still carry the hour.
+/// extracted fields still carry the hour. Profiles with both stages off
+/// (e.g. `sounding`) skip even the thermo decode.
 fn compute_product_grids(
     surface_bytes: &[u8],
     pressure_bytes: &[u8],
     hour: u16,
+    derived_enabled: bool,
     heavy_enabled: bool,
 ) -> ComputedProductGrids {
+    if !derived_enabled && !heavy_enabled {
+        println!("f{hour:03}: derived/heavy compute stages skipped (profile)");
+        return ComputedProductGrids::default();
+    }
     let decode_started = Instant::now();
     let inputs = match ingest_compute::decode_products_inputs(surface_bytes, pressure_bytes) {
         Ok(inputs) => inputs,
@@ -826,7 +759,7 @@ fn compute_product_grids(
     let derived_ms = derived_started.elapsed().as_millis();
 
     if !heavy_enabled {
-        println!("f{hour:03}: heavy ingest stage skipped (--no-heavy)");
+        println!("f{hour:03}: heavy ingest stage skipped (profile/--no-heavy)");
         return ComputedProductGrids {
             derived,
             heavy: Vec::new(),
@@ -1047,6 +980,61 @@ fn verify_marked_grid(
     Ok(())
 }
 
+/// The store variables one profile plans to write per hour, by stable
+/// store name — the single source of truth the size estimator prices.
+/// `volumes` carries the planned (candidate) level count; 2D names ride in
+/// stored order (surface plan, trailing windows, vorticity planes,
+/// direct-recipe planes), then the derived and heavy recipe slugs.
+pub struct PlannedStoreVariables {
+    pub volumes: Vec<(&'static str, usize)>,
+    pub fields_2d: Vec<String>,
+    pub derived: Vec<&'static str>,
+    pub heavy: Vec<&'static str>,
+}
+
+/// Resolve one profile into the variables it plans to store for `model`.
+/// Predictive by construction: candidate levels are assumed realized (true
+/// for HRRR's 25 hPa prs files) and the dewpoint volume keeps its planned
+/// `dewpoint_iso` name (the rh_iso fallback is a per-file degradation).
+pub fn planned_store_variables(
+    profile: &IngestProfile,
+    model: ModelId,
+) -> PlannedStoreVariables {
+    let level_count = profile.candidate_levels().len();
+    let volumes = volume_plan(profile)
+        .iter()
+        .map(|(_, name)| (*name, level_count))
+        .collect();
+    let mut fields_2d: Vec<String> = surface_plan()
+        .iter()
+        .filter(|(name, _)| profile.includes_surface_field(name))
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+    if profile.includes_full_2d() {
+        fields_2d.extend(TRAILING_2D_NAMES.iter().map(|name| (*name).to_string()));
+        fields_2d.extend(VORTICITY_PLAN.iter().map(|(_, name)| (*name).to_string()));
+        fields_2d.extend(
+            direct_isobaric_plane_selectors(model)
+                .iter()
+                .map(|selector| selector.key()),
+        );
+    }
+    PlannedStoreVariables {
+        volumes,
+        fields_2d,
+        derived: if profile.derived {
+            store_derived_recipe_slugs()
+        } else {
+            Vec::new()
+        },
+        heavy: if profile.heavy {
+            store_heavy_recipe_slugs()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
 /// Parse the `--hours` spec: a single hour ("6"), an inclusive range
 /// ("0-6"), or a comma list of either ("12,0,4-6"). The output is sorted
 /// ascending and deduplicated.
@@ -1087,6 +1075,50 @@ pub fn parse_hours(spec: &str) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planned_store_variables_full_is_the_complete_plan() {
+        let plan = planned_store_variables(&IngestProfile::full(), ModelId::Hrrr);
+        assert_eq!(
+            plan.volumes
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            vec!["temperature_iso", "dewpoint_iso", "u_iso", "v_iso", "height_iso"],
+        );
+        assert!(plan.volumes.iter().all(|(_, levels)| *levels == 37));
+        // Surface plan + trailing windows + vorticity + direct planes, in
+        // stored order with the grid carrier first.
+        assert_eq!(plan.fields_2d[0], "temperature_2m");
+        assert!(plan.fields_2d.contains(&"apcp_1h".to_string()));
+        assert!(plan.fields_2d.contains(&"absolute_vorticity_500".to_string()));
+        assert!(
+            plan.fields_2d
+                .contains(&"geopotential_height_500hpa".to_string()),
+            "direct-recipe planes must be planned under their selector keys"
+        );
+        assert!(plan.derived.contains(&"sbcape"));
+        assert!(plan.heavy.contains(&"sbecape"));
+    }
+
+    #[test]
+    fn planned_store_variables_respect_sounding_and_view() {
+        let mut profile = IngestProfile::sounding();
+        profile.level_step_hpa = 50;
+        let sounding = planned_store_variables(&profile, ModelId::Hrrr);
+        assert_eq!(sounding.volumes.len(), 5);
+        assert!(sounding.volumes.iter().all(|(_, levels)| *levels == 19));
+        assert_eq!(sounding.fields_2d.len(), 7);
+        assert_eq!(sounding.fields_2d[0], "temperature_2m", "grid carrier first");
+        assert!(!sounding.fields_2d.contains(&"apcp_1h".to_string()));
+        assert!(sounding.derived.is_empty() && sounding.heavy.is_empty());
+
+        let view = planned_store_variables(&IngestProfile::view(), ModelId::Hrrr);
+        assert!(view.volumes.is_empty());
+        assert!(view.fields_2d.contains(&"absolute_vorticity_500".to_string()));
+        assert!(!view.derived.is_empty());
+        assert!(view.heavy.is_empty());
+    }
 
     #[test]
     fn parse_hours_single() {
