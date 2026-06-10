@@ -11,6 +11,8 @@ default-run = "rusty-weather"
 clap.workspace = true
 serde_json.workspace = true
 rustwx-core = { path = "../rustwx-core" }
+rustwx-io = { path = "../rustwx-io" }
 rustwx-models = { path = "../rustwx-models" }
 rustwx-products = { path = "../rustwx-products" }
 rustwx-render = { path = "../rustwx-render" }
+rw-store = { path = "../rw-store" }

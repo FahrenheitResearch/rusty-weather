@@ -102,6 +102,8 @@ Quantization is applied only to 3D volumes (plot-grade tolerance); 2D plot field
 
 The last row is the acceptance test for the architecture; it is measured, not assumed.
 
+**Plan 2 measured:** sounding 0.19 ms warm / 23 ms first-click; full 2D read 3.6 ms; HRRR hour encode 1.6 s.
+
 ## Porting inventory
 
 Ported crates keep their existing names — renaming ~185K lines of imports buys nothing and destroys diffability against rustwx. New crates get new names.
@@ -173,7 +175,7 @@ Stand rusty-weather up on node3/node4 (192.168.68.56/.57) beside existing rustwx
 
 ## Open questions deferred to the implementation plan
 
-- Exact 3D chunk footprint (16×16 vs 32×32 columns) and 2D tile size per model grid — tune with benchmarks, not guessed here.
+- ~~Exact 3D chunk footprint (16×16 vs 32×32 columns) and 2D tile size per model grid — tune with benchmarks, not guessed here.~~ **Settled in Plan 2 with benchmarks:** 256×256 2D tiles / 16×16-column 3D chunks. Measured numbers confirm targets: sounding 0.19 ms warm (gate ≤ 100 ms) / 23 ms first-click; full 2D read 3.6 ms.
 - Which derived products are precomputed into the store at ingest vs computed at render time (start with rustwx's current derived list for the 6 models).
 - REFS mean/spread: computed at ingest (stored as 2D fields) — confirm member-fetch strategy against current rustwx REFS lane.
 - Eager-render policy (render all products on ingest vs on first request) — default on-demand with warm-cache option; revisit after timing data.
