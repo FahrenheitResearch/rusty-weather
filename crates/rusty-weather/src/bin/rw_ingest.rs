@@ -467,6 +467,12 @@ fn ingest_hour(
     // trailing (h-1)->h window — its start hour scores an exact 0 while the
     // run total's start and end both miss — isolating the 1 h accumulation.
     // The GRIB index re-parses, but only the one APCP message decodes.
+    //
+    // LATENT FRAGILITY (review 2026-06-09): apcp_run_total's identity rests
+    // on NOAA keeping the 0->h message ahead of the (h-1)->h message in the
+    // sfc file. If a future HRRR build reorders them, run_total silently
+    // becomes the 1 h window. A windowed-product sanity check (run_total >=
+    // 1h sum for h > 1) is the cheap detector if this ever bites.
     if hour >= 1 {
         let apcp_selectors = [FieldSelector::surface(CanonicalField::TotalPrecipitation)];
         let apcp_started = Instant::now();
