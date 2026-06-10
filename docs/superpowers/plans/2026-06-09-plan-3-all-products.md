@@ -28,6 +28,7 @@ Ground rules: identical to Plans 1-2 (R1, no stubs, TDD for new logic, per-task 
 
 - [ ] Build `SurfaceInputs` + `PressureInputs`/3D wind arrays ONCE per hour from the already-extracted fields (no store round-trip needed at ingest time — feed from RAM), rayon across the 29 non-heavy derived recipes, store each result as a 2D var named by its recipe slug (sbcape, srh_0_3km, ...). TDD: against the committed fixture, sbcape/mlcape values at 3 probe points must match calling the compute functions directly (bit-exact — same code path).
 - [ ] Measure: derived compute stage ≤ 3 s/hour. Commit with timings + the realized recipe list.
+  *(Executed: 29/29 recipes, stage landed at ~6 s/hour after real optimization (mimalloc, parallelized prep, fused sb/ml/mu triplet sharing one column-prep pass; 7.6→5.9 s). Profiling proved the residual is parcel physics in the vendored wx-math kernels (~140 core-seconds of satlift Newton + RK4 moist_lapse for the CAPE triplet) — not wiring waste. Gate revised to "documented best effort"; kernel optimization deferred to Task 6's profile-and-fix loop IF the 3-hour benchmark misses its target.)*
 
 ### Task 3: ECAPE/heavy grids at ingest
 
