@@ -12,6 +12,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 rw-store = { path = "../rw-store" }
 
+# Anonymous S3 listing/download for the follow engine (Task 3), mirroring
+# rw-sat: ureq over a pure-Rust rustls stack (no SDK, no credentials).
+rustls.workspace = true
+rustls-rustcrypto.workspace = true
+ureq.workspace = true
+
 # Pure-Rust NetCDF4/HDF5 reading for GLM L2 LCFA granule decode (Task 2),
 # mirroring rw-sat. hdf5-reader resolves to the vendored tree via the
 # workspace-root [patch.crates-io] pin.

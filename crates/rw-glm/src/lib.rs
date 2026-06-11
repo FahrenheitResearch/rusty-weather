@@ -20,18 +20,26 @@
 //! arrives in a later task.
 
 pub mod error;
+pub mod follow;
 pub mod format;
 pub mod granule;
 pub mod reader;
+pub mod s3;
 pub mod store;
 pub mod validate;
+pub mod window;
 
 pub use error::{RwlError, RwlResult};
+pub use follow::{
+    FetchError, FetchErrorKind, FollowSummary, GlmError, GlmEvent, GlmFollowSpec, GranuleSource,
+    ListedGranule, S3GranuleSource, SkipReason, follow_live, follow_with_source,
+};
 pub use format::{
     FLAG_DEGRADED_QUALITY, FlashRecord, KNOWN_FLAGS, RECORD_LEN, RwlHeader, VERSION, bucket_name,
     date_dir, saturate_duration_ms,
 };
 pub use granule::{DecodedGranule, decode_granule};
 pub use reader::{BBox, Flash, read_flashes};
-pub use store::{BucketWriter, WindowManifest, pack_bucket};
+pub use store::{BucketWriter, MAX_SEEN_GRANULE_KEYS, WindowManifest, pack_bucket};
 pub use validate::{ValidateDepth, ValidationReport, ValidationStats, validate_bucket_file};
+pub use window::{PruneReport, WindowConfig, enforce_window};

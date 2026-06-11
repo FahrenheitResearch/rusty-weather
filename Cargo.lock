@@ -4332,10 +4332,13 @@ version = "0.1.0"
 dependencies = [
  "hdf5-reader",
  "netcrust",
+ "rustls",
+ "rustls-rustcrypto",
  "rw-store",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "ureq",
 ]
 
 [[package]]

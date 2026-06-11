@@ -45,9 +45,24 @@ pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Schema string for `window.json`.
 pub const WINDOW_SCHEMA: &str = "rw-glm.window.v1";
 
+/// Cap on the number of seen-granule keys persisted in `window.json`.
+///
+/// The follow engine seeds its restart dedup set from this list, so the cap
+/// only needs to comfortably exceed the longest plausible re-listing horizon.
+/// At the 20 s default poll cadence, 2000 keys is ~11 hours of granules — far
+/// beyond any rolling window (2 h default) and beyond the few-hours of prefix
+/// re-listing a restart performs. Keeping the most-recent N bounds the manifest
+/// (and the dedup seed) without ever dropping a key that could still be re-seen
+/// inside the window.
+pub const MAX_SEEN_GRANULE_KEYS: usize = 2000;
+
 /// The `window.json` manifest sitting at `<root>/glm/<satellite>/window.json`.
-/// v1 records only enough to make the store self-describing; the follow engine
-/// (Task 3) will extend it with seen-granule keys and prune bookkeeping.
+///
+/// v1 records the store's time extent (a convenience index over the
+/// self-describing bucket files) plus the follow engine's restart-safe dedup
+/// state: the most-recent [`MAX_SEEN_GRANULE_KEYS`] granule keys that have been
+/// successfully ingested. The header `source_granule_count` is a provenance
+/// *count*, not dedup state — `seen_granule_keys` is the real mechanism.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowManifest {
     /// Exact schema string; readers reject a mismatch.
@@ -60,6 +75,13 @@ pub struct WindowManifest {
     /// Latest flash time currently stored, Unix ms (None if empty).
     #[serde(default)]
     pub time_max_unix_ms: Option<i64>,
+    /// Granule keys ingested into this store, most-recently-appended last,
+    /// capped at [`MAX_SEEN_GRANULE_KEYS`]. The follow engine seeds its dedup
+    /// set from this list on startup so a restart never re-ingests a granule the
+    /// rolling window still holds. Unknown to a raw-bytes reader, which needs
+    /// only the bucket files (FORMAT.md §10.3: readers ignore unknown keys).
+    #[serde(default)]
+    pub seen_granule_keys: Vec<String>,
 }
 
 impl WindowManifest {
@@ -69,6 +91,19 @@ impl WindowManifest {
             satellite: satellite.to_string(),
             time_min_unix_ms: None,
             time_max_unix_ms: None,
+            seen_granule_keys: Vec::new(),
+        }
+    }
+
+    /// Append `key` to the seen list (if not already present), keeping at most
+    /// the most-recent [`MAX_SEEN_GRANULE_KEYS`]. Re-recording an existing key
+    /// moves it to the most-recent end so it survives the cap.
+    pub fn record_seen_granule(&mut self, key: &str) {
+        self.seen_granule_keys.retain(|k| k != key);
+        self.seen_granule_keys.push(key.to_string());
+        let len = self.seen_granule_keys.len();
+        if len > MAX_SEEN_GRANULE_KEYS {
+            self.seen_granule_keys.drain(0..len - MAX_SEEN_GRANULE_KEYS);
         }
     }
 }
@@ -169,8 +204,58 @@ impl BucketWriter {
         Ok(())
     }
 
+    /// Path of this store's `window.json` manifest.
+    pub fn manifest_path(&self) -> PathBuf {
+        self.sat_dir.join("window.json")
+    }
+
+    /// The distinct on-disk bucket paths a slice of records maps to (by their
+    /// `(date_dir, bucket_name)`). Used by the follow engine to report each
+    /// affected bucket after an insert. Returns sorted, deduplicated paths.
+    pub fn affected_bucket_paths(&self, records: &[FlashRecord]) -> Vec<PathBuf> {
+        let mut keys: Vec<(String, String)> = records
+            .iter()
+            .map(|r| {
+                (
+                    format::date_dir(r.time_unix_ms),
+                    format::bucket_name(r.time_unix_ms),
+                )
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys.into_iter()
+            .map(|(date, name)| self.sat_dir.join(date).join(name))
+            .collect()
+    }
+
+    /// Load the existing `window.json` (preserving its `seen_granule_keys` and
+    /// any unknown fields), or a fresh empty manifest if it is absent or
+    /// unreadable. A schema mismatch is treated as "start fresh": the dedup
+    /// state is an optimization, never a correctness requirement (the in-window
+    /// `stale_cutoff` already prevents re-ingesting evicted granules).
+    pub fn load_manifest(&self) -> WindowManifest {
+        match std::fs::read(self.manifest_path()) {
+            Ok(bytes) => serde_json::from_slice::<WindowManifest>(&bytes)
+                .ok()
+                .filter(|m| m.schema == WINDOW_SCHEMA)
+                .unwrap_or_else(|| WindowManifest::new(&self.satellite)),
+            Err(_) => WindowManifest::new(&self.satellite),
+        }
+    }
+
+    /// Record `granule_key` in the persisted seen-set and refresh `window.json`
+    /// atomically (capped at [`MAX_SEEN_GRANULE_KEYS`]). Call this after the
+    /// granule's flashes are durably written so a restart skips it.
+    pub fn record_seen_granule(&self, granule_key: &str) -> RwlResult<()> {
+        let mut manifest = self.load_manifest();
+        manifest.record_seen_granule(granule_key);
+        self.write_manifest(&manifest)
+    }
+
     /// Recompute `window.json` from the min/max flash time across all buckets
-    /// on disk and write it atomically.
+    /// on disk and write it atomically, **preserving** the persisted
+    /// `seen_granule_keys` (the dedup state is independent of the time extent).
     fn refresh_window(&self) -> RwlResult<()> {
         let (mut min, mut max): (Option<i64>, Option<i64>) = (None, None);
         for path in self.bucket_files()? {
@@ -185,12 +270,17 @@ impl BucketWriter {
                 }
             }
         }
-        let mut manifest = WindowManifest::new(&self.satellite);
+        let mut manifest = self.load_manifest();
         manifest.time_min_unix_ms = min;
         manifest.time_max_unix_ms = max;
-        let json = serde_json::to_vec_pretty(&manifest)
+        self.write_manifest(&manifest)
+    }
+
+    /// Serialize and atomically write a manifest to `window.json`.
+    fn write_manifest(&self, manifest: &WindowManifest) -> RwlResult<()> {
+        let json = serde_json::to_vec_pretty(manifest)
             .map_err(|e| crate::RwlError::Format(format!("window.json serialize: {e}")))?;
-        atomic_write_bytes(&self.sat_dir.join("window.json"), &json)?;
+        atomic_write_bytes(&self.manifest_path(), &json)?;
         Ok(())
     }
 
@@ -279,5 +369,111 @@ fn read_bucket_granule_count(path: &Path) -> RwlResult<u32> {
     match RwlHeader::parse(&data) {
         Ok(h) => Ok(h.source_granule_count),
         Err(_) => Ok(0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_seen_granule_dedups_and_keeps_most_recent_cap() {
+        let mut m = WindowManifest::new("goes19");
+        // Insert 2100 distinct keys; only the most-recent 2000 survive.
+        for i in 0..2100 {
+            m.record_seen_granule(&format!("g{i:05}"));
+        }
+        assert_eq!(m.seen_granule_keys.len(), MAX_SEEN_GRANULE_KEYS);
+        // The oldest 100 (g00000..g00099) are gone; g00100 is the new oldest.
+        assert_eq!(m.seen_granule_keys.first().unwrap(), "g00100");
+        assert_eq!(m.seen_granule_keys.last().unwrap(), "g02099");
+
+        // Re-recording an existing key moves it to the most-recent end (so it
+        // survives the cap) and never duplicates.
+        m.record_seen_granule("g00100");
+        assert_eq!(m.seen_granule_keys.len(), MAX_SEEN_GRANULE_KEYS);
+        assert_eq!(m.seen_granule_keys.last().unwrap(), "g00100");
+        assert_eq!(
+            m.seen_granule_keys
+                .iter()
+                .filter(|k| *k == "g00100")
+                .count(),
+            1,
+            "no duplicate after re-record"
+        );
+    }
+
+    #[test]
+    fn manifest_round_trips_and_ignores_unknown_keys() {
+        let mut m = WindowManifest::new("goes19");
+        m.time_min_unix_ms = Some(1_767_225_600_000);
+        m.time_max_unix_ms = Some(1_767_226_200_000);
+        m.record_seen_granule("OR_GLM-L2-LCFA_G19_s1_e2_c3");
+        let json = serde_json::to_vec(&m).unwrap();
+        let back: WindowManifest = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.schema, WINDOW_SCHEMA);
+        assert_eq!(back.satellite, "goes19");
+        assert_eq!(back.time_min_unix_ms, Some(1_767_225_600_000));
+        assert_eq!(back.seen_granule_keys, vec!["OR_GLM-L2-LCFA_G19_s1_e2_c3"]);
+
+        // A forward-compatible manifest with an unknown field still parses
+        // (FORMAT.md §10.3: readers ignore unknown keys).
+        let with_extra = r#"{
+            "schema": "rw-glm.window.v1",
+            "satellite": "goes18",
+            "time_min_unix_ms": null,
+            "time_max_unix_ms": null,
+            "seen_granule_keys": ["a", "b"],
+            "future_prune_stats": {"removed": 7}
+        }"#;
+        let parsed: WindowManifest = serde_json::from_str(with_extra).unwrap();
+        assert_eq!(parsed.satellite, "goes18");
+        assert_eq!(parsed.seen_granule_keys, vec!["a", "b"]);
+        assert_eq!(parsed.time_min_unix_ms, None);
+    }
+
+    #[test]
+    fn record_seen_granule_persists_to_window_json() {
+        let dir = std::env::temp_dir().join(format!("rw-glm-store-seen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let writer = BucketWriter::open(&dir, "goes19").unwrap();
+        writer.record_seen_granule("OR_GLM-L2-LCFA_G19_sA").unwrap();
+        writer.record_seen_granule("OR_GLM-L2-LCFA_G19_sB").unwrap();
+        // A re-load sees both, in order.
+        let loaded = writer.load_manifest();
+        assert_eq!(
+            loaded.seen_granule_keys,
+            vec!["OR_GLM-L2-LCFA_G19_sA", "OR_GLM-L2-LCFA_G19_sB"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_window_preserves_seen_keys() {
+        let dir = std::env::temp_dir().join(format!("rw-glm-store-pres-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut writer = BucketWriter::open(&dir, "goes19").unwrap();
+        writer.record_seen_granule("OR_GLM-L2-LCFA_G19_sA").unwrap();
+        // An insert calls refresh_window, which must NOT drop the seen key.
+        let base: i64 = 1_767_225_600_000;
+        writer
+            .insert_flashes(
+                &[FlashRecord {
+                    time_unix_ms: base + 1000,
+                    lat: 30.0,
+                    lon: -95.0,
+                    energy: 1.0e-15,
+                    area: 25.0,
+                    flash_id: 1,
+                    flags: 0,
+                    duration_ms: 100,
+                }],
+                1,
+            )
+            .unwrap();
+        let loaded = writer.load_manifest();
+        assert_eq!(loaded.seen_granule_keys, vec!["OR_GLM-L2-LCFA_G19_sA"]);
+        assert_eq!(loaded.time_min_unix_ms, Some(base + 1000));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -44,9 +44,9 @@
 ### Task 3: Follow engine + window (lean)
 
 **Files:** `crates/rw-glm/src/follow.rs`, `src/window.rs`, `src/s3.rs` (adapt rw-sat's listing — extract-and-share only if trivial; copying the ~paginated-list fn with a comment is acceptable, no premature abstraction), events enum mirroring rw-sat's
-- [ ] Tests: granule-key dedup across restarts (state from existing buckets' granule provenance — header granule count is insufficient; persist seen-granule keys in window.json, capped); retry holdback on transient fetch error; window pruning age+bytes with RunLock skip-if-locked (mirror rw-sat window.rs tests incl. lock-held-skip); bucket rewrite per granule is atomic.
-- [ ] `GlmFollowSpec { satellite, poll_secs (default 20), window (default 2h), byte_budget }`; in-process runnable (SatWorker pattern — but NO UI work in this plan).
-- [ ] Workspace green; commit; push.
+- [x] Tests: granule-key dedup across restarts (state from existing buckets' granule provenance — header granule count is insufficient; persist seen-granule keys in window.json, capped at 2000); retry holdback on transient fetch error (incl. watermark-hold so a later success can't drop a held granule); window pruning age+bytes with RunLock skip-if-locked (mirror rw-sat window.rs tests incl. lock-held-skip); bucket rewrite per granule is atomic; boundary granule -> two buckets; seen-key cap; window.json round-trip with unknown-key tolerance.
+- [x] `GlmFollowSpec { satellite, poll_secs (default 20), window (default 2h), byte_budget }`; in-process runnable via `follow_live`/`follow_with_source` (SatWorker pattern — but NO UI work in this plan). Engine is written against a `GranuleSource` trait (S3 impl = `S3GranuleSource`; tests inject synthetic granules). `GlmEvent` enum + cancel `AtomicBool`. Lock lifetimes never overlap (ingest under the BucketWriter lock, then drop it before `enforce_window` re-acquires it — sequential, single-threaded).
+- [x] Workspace green; commit; push.
 
 ### Task 4: Live validation + handoff (lean)
 

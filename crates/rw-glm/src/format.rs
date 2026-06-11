@@ -234,6 +234,24 @@ pub fn bucket_start_ms(time_unix_ms: i64) -> i64 {
 /// Step from one bucket's start to the next (10 minutes in ms).
 pub const BUCKET_SPAN_MS: i64 = MS_PER_BUCKET;
 
+/// Convert a `(year, month, day)` civil date into a day count since the Unix
+/// epoch (1970-01-01 = 0). Howard Hinnant's `days_from_civil` (the inverse of
+/// [`civil_from_days`]). Returns `None` for an out-of-range month/day so the
+/// caller can treat a malformed date-dir name as "skip", never panic.
+pub fn days_from_civil(y: i64, m: u32, d: u32) -> Option<i64> {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let m = i64::from(m);
+    let d = i64::from(d);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    Some(era * 146_097 + doe - 719_468)
+}
+
 /// Convert a day count since the Unix epoch (1970-01-01 = 0) into a
 /// `(year, month, day)` civil date. From Howard Hinnant's `civil_from_days`.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -423,6 +441,29 @@ mod tests {
         assert_eq!(saturate_duration_ms(65_535), 65_535);
         assert_eq!(saturate_duration_ms(70_000), 65_535);
         assert_eq!(saturate_duration_ms(-5), 0);
+    }
+
+    #[test]
+    fn days_from_civil_inverts_date_dir() {
+        // Round-trip a span of days through date_dir and back.
+        for day in [-1000_i64, 0, 19_723, 20_454, 20_500] {
+            let ms = day * 86_400_000;
+            let dd = date_dir(ms);
+            let y: i64 = dd[0..4].parse().unwrap();
+            let m: u32 = dd[4..6].parse().unwrap();
+            let d: u32 = dd[6..8].parse().unwrap();
+            assert_eq!(
+                days_from_civil(y, m, d),
+                Some(day),
+                "round-trip {dd} (day {day})"
+            );
+        }
+        // Known anchors.
+        assert_eq!(days_from_civil(1970, 1, 1), Some(0));
+        assert_eq!(days_from_civil(2026, 1, 1), Some(20_454));
+        // Malformed components are rejected, not panicked.
+        assert_eq!(days_from_civil(2026, 13, 1), None);
+        assert_eq!(days_from_civil(2026, 1, 0), None);
     }
 
     #[test]
