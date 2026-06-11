@@ -132,6 +132,25 @@ fn main() -> ExitCode {
 
 // ── ls ────────────────────────────────────────────────────────────────────────
 
+/// One hour entry collected for human-readable `ls` output.
+struct HourListing {
+    hour: u16,
+    file: String,
+    variables: Vec<String>,
+    file_bytes: Option<u64>,
+}
+
+/// One run directory's manifest summary collected for human-readable `ls` output.
+struct RunListing {
+    model: String,
+    run: String,
+    grid_hash: String,
+    nx: usize,
+    ny: usize,
+    writer_build: String,
+    hours: Vec<HourListing>,
+}
+
 fn cmd_ls(args: LsArgs) -> ExitCode {
     let path = &args.path;
 
@@ -143,15 +162,7 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
     }
 
     let mut runs: Vec<serde_json::Value> = Vec::new();
-    let mut run_displays: Vec<(
-        String,
-        String,
-        String,
-        usize,
-        usize,
-        String,
-        Vec<(u16, String, Vec<String>, Option<u64>)>,
-    )> = Vec::new();
+    let mut run_displays: Vec<RunListing> = Vec::new();
     let mut any_error = false;
 
     for run_dir in &run_dirs {
@@ -169,26 +180,26 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
                     continue;
                 }
                 Ok(manifest) => {
-                    let hours: Vec<(u16, String, Vec<String>, Option<u64>)> = manifest
+                    let hours: Vec<HourListing> = manifest
                         .hours
                         .iter()
                         .map(|(&hour, entry)| {
                             let fpath = run_dir.join(&entry.file);
                             let file_bytes = std::fs::metadata(&fpath).ok().map(|m| m.len());
-                            (
+                            HourListing {
                                 hour,
-                                entry.file.clone(),
-                                entry.variables.clone(),
+                                file: entry.file.clone(),
+                                variables: entry.variables.clone(),
                                 file_bytes,
-                            )
+                            }
                         })
                         .collect();
                     let hour_json: Vec<serde_json::Value> = hours
                         .iter()
-                        .map(|(h, f, v, b)| {
+                        .map(|h| {
                             json!({
-                                "hour": h, "file": f, "variables": v,
-                                "file_bytes": b
+                                "hour": h.hour, "file": h.file, "variables": h.variables,
+                                "file_bytes": h.file_bytes
                             })
                         })
                         .collect();
@@ -201,15 +212,15 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
                         "writer_build": manifest.writer.build,
                         "hours": hour_json,
                     }));
-                    run_displays.push((
-                        manifest.model,
-                        manifest.run,
-                        manifest.grid_hash,
-                        manifest.nx,
-                        manifest.ny,
-                        manifest.writer.build,
+                    run_displays.push(RunListing {
+                        model: manifest.model,
+                        run: manifest.run,
+                        grid_hash: manifest.grid_hash,
+                        nx: manifest.nx,
+                        ny: manifest.ny,
+                        writer_build: manifest.writer.build,
                         hours,
-                    ));
+                    });
                 }
             },
         }
@@ -218,23 +229,23 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&runs).unwrap());
     } else {
-        for (model, run, grid_hash, nx, ny, writer_build, hours) in &run_displays {
+        for listing in &run_displays {
             println!(
                 "model={} run={} grid={}x{} build={}",
-                model, run, ny, nx, writer_build
+                listing.model, listing.run, listing.ny, listing.nx, listing.writer_build
             );
-            println!("  grid_hash: {grid_hash}");
-            for (hour, file, variables, file_bytes) in hours {
-                let size_str = match file_bytes {
+            println!("  grid_hash: {}", listing.grid_hash);
+            for hour in &listing.hours {
+                let size_str = match hour.file_bytes {
                     Some(b) => format!("{b} B"),
                     None => "?".to_string(),
                 };
                 println!(
                     "  f{:03}  {}  {}  vars: {}",
-                    hour,
-                    file,
+                    hour.hour,
+                    hour.file,
                     size_str,
-                    variables.join(", ")
+                    hour.variables.join(", ")
                 );
             }
         }
@@ -454,13 +465,13 @@ fn cmd_dump(args: DumpArgs) -> ExitCode {
         );
         println!();
         println!(
-            "  {:>3}  {:>12}  {:>10}  {:>6}  {:>5}  {:>6}",
+            "  {:>3}  {:>12}  {:>10}  {:>16}  {:>6}  {:>6}",
             "id", "name", "kind", "codec", "levels", "chunks"
         );
         for var in &meta.variables {
             let chunk_count = records.iter().filter(|r| r.var_id == var.id).count();
             println!(
-                "  {:>3}  {:>12}  {:>10}  {:>6}  {:>5}  {:>6}",
+                "  {:>3}  {:>12}  {:>10}  {:>16}  {:>6}  {:>6}",
                 var.id,
                 var.name,
                 var.kind,
