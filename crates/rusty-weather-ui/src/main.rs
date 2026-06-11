@@ -159,6 +159,19 @@ impl Args {
     }
 }
 
+/// A short cadence note for models whose forecast-hour stride changes within
+/// the supported range. Returns an empty string for models with a uniform
+/// stride (or no hours at all) so callers can skip appending it.
+///
+/// GFS: hourly out to f120, then 3-hourly from f123 to f384.
+fn cadence_hint(model: rustwx_core::ModelId, _cycle: u8) -> &'static str {
+    use rustwx_core::ModelId;
+    match model {
+        ModelId::Gfs => "hourly ≤120, 3-hourly 123-384",
+        _ => "",
+    }
+}
+
 /// Every user-facing model, honestly labeled: only ingest-supported ones
 /// are pickable; the rest are visible but disabled with a note.
 fn model_options() -> Vec<ModelOption> {
@@ -340,7 +353,18 @@ impl App {
         let supported = supported_forecast_hours(model, spec.cycle);
         match (supported.first(), supported.last()) {
             (Some(first), Some(last)) => {
-                download.set_hours_hint(format!("supported: {first}-{last} ({:02}z)", spec.cycle));
+                // Add a model-aware cadence note when the stride changes within
+                // the range (e.g. GFS: hourly ≤120, 3-hourly 123-384).
+                let cadence_note = cadence_hint(model, spec.cycle);
+                let hint = if cadence_note.is_empty() {
+                    format!("supported: {first}-{last} ({:02}z)", spec.cycle)
+                } else {
+                    format!(
+                        "supported: {first}-{last} ({:02}z) · {}",
+                        spec.cycle, cadence_note
+                    )
+                };
+                download.set_hours_hint(hint);
             }
             _ => download.set_hours_hint("no supported hours for this cycle".to_string()),
         }
@@ -796,5 +820,118 @@ impl eframe::App for App {
         }
 
         self.frame_ms = frame_started.elapsed().as_secs_f32() * 1000.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GFS is ingest-supported and therefore appears in model_options() as an
+    /// enabled entry — the download picker un-greys it without any hardcoded
+    /// special case.
+    #[test]
+    fn gfs_model_option_is_enabled() {
+        let options = model_options();
+        let gfs = options
+            .iter()
+            .find(|o| o.slug == "gfs")
+            .expect("GFS must appear in model options");
+        assert!(
+            gfs.enabled,
+            "GFS must be enabled (ingest_supported is true)"
+        );
+        assert!(
+            gfs.note.is_empty(),
+            "enabled entries have no disabled note, got: {:?}",
+            gfs.note
+        );
+    }
+
+    /// GFS cycle options from the model summary are exactly [0, 6, 12, 18].
+    #[test]
+    fn gfs_cycle_options_are_synoptic_only() {
+        let summary = rustwx_models::model_summary(rustwx_core::ModelId::Gfs);
+        assert_eq!(
+            summary.cycle_hours_utc,
+            &[0u8, 6, 12, 18],
+            "GFS publishes only the four synoptic cycles"
+        );
+    }
+
+    /// The hours hint for a GFS 00z cycle includes the cadence note so the
+    /// user knows hours above 120 are 3-hourly.
+    #[test]
+    fn gfs_hours_hint_includes_cadence_note() {
+        let hint = cadence_hint(rustwx_core::ModelId::Gfs, 0);
+        assert!(
+            !hint.is_empty(),
+            "GFS cadence_hint must return a non-empty string"
+        );
+        assert!(
+            hint.contains("120") && hint.contains("3"),
+            "GFS cadence note must mention the f120 boundary and 3-hourly stride, got: {hint}"
+        );
+    }
+
+    /// Non-GFS models (e.g. HRRR) get an empty cadence hint — the hint is
+    /// only appended when non-empty, so HRRR's hours row stays clean.
+    #[test]
+    fn hrrr_cadence_hint_is_empty() {
+        let hint = cadence_hint(rustwx_core::ModelId::Hrrr, 0);
+        assert!(
+            hint.is_empty(),
+            "HRRR has a uniform stride — no cadence note needed"
+        );
+    }
+
+    /// GFS store orientation: the 0.25° global grid is stored lat-descending
+    /// (row 0 = 90°N, last row = 90°S), so lat_descending must be true and
+    /// the viewer must NOT flip it. Requires the live GFS store.
+    #[test]
+    #[ignore = "requires the live GFS store at out/gfs_store"]
+    fn gfs_store_field_is_north_to_south_lat_descending() {
+        use rw_ui::{FieldKey, HourKey, StoreRequest, StoreResponse, StoreView, StoreWorker};
+        use std::time::Duration;
+
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let store_root = workspace.join("out/gfs_store");
+        let view = StoreView::new(&store_root);
+        let worker = StoreWorker::spawn(view, || {});
+        let field_key = FieldKey {
+            hour: HourKey {
+                model: "gfs".to_string(),
+                run: "20260611_00z".to_string(),
+                hour: 0,
+            },
+            var: "temperature_2m".to_string(),
+        };
+        worker.send(StoreRequest::LoadField(field_key.clone()));
+        match worker.recv_timeout(Duration::from_secs(30)) {
+            Some(StoreResponse::Field(key, result)) => {
+                assert_eq!(key, field_key);
+                let field = result.expect("GFS temperature_2m loads from the live store");
+                assert!(
+                    field.lat_descending,
+                    "GFS 0.25° global grid: row 0 must be 90°N (lat_descending = true)"
+                );
+                let grid = field.grid.as_ref().expect("grid.rwg attached");
+                let first_row_lat = grid.lat[0];
+                let last_row_lat = grid.lat[(grid.ny - 1) * grid.nx];
+                assert!(
+                    first_row_lat > last_row_lat,
+                    "lat must decrease top-to-bottom: first={first_row_lat}, last={last_row_lat}"
+                );
+                assert!(
+                    (89.5..=90.5).contains(&first_row_lat),
+                    "first row must be near 90°N, got {first_row_lat}"
+                );
+            }
+            other => panic!("expected Field response, got {other:?}"),
+        }
     }
 }
