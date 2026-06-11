@@ -163,7 +163,17 @@ const RRFS_PRS_IDX_PATTERNS: &[&str] = &["TMP", "RH", "DPT", "UGRD", "VGRD", "HG
 /// (`REFC`, `MSLET`, `PWAT`, the categorical precip flags) match the single
 /// message of that variable.
 ///
-/// Tiny: ~1.8% of the 9.1 GB file (measured against the live f001 `.idx`).
+/// `CAPE` (bare) pulls the native CAPE planes (surface / 90-0 mb ML /
+/// 255-0 mb MU, plus a harmless 180-0 mb layer) that the heavy native-ECAPE
+/// ratio recipes consume; `TCDC:entire atmosphere` is deliberately
+/// level-qualified — bare `TCDC` would drag ~60 per-hybrid-level cloud planes
+/// (hundreds of MB) instead of the 2 entire-atmosphere messages. LCDC/MCDC/HCDC
+/// exist in `natlev.na` only at their cloud-layer levels (live-idx verified
+/// 2026-06-11 — the original recon's "only TCDC" claim was wrong), so bare
+/// tokens are exact.
+///
+/// Tiny: ~2.6% of the 9.2 GB file (measured against the live f001 `.idx`:
+/// 33 messages, ~226 MB).
 const RRFS_NAT_IDX_PATTERNS: &[&str] = &[
     "TMP:2 m above ground",
     "DPT:2 m above ground",
@@ -188,6 +198,11 @@ const RRFS_NAT_IDX_PATTERNS: &[&str] = &[
     "WIND:10 m above ground",
     "MAXUW:10 m above ground",
     "MAXVW:10 m above ground",
+    "CAPE",
+    "TCDC:entire atmosphere",
+    "LCDC",
+    "MCDC",
+    "HCDC",
 ];
 
 /// The geographic CONUS crop box for a model whose native ingest domain is
@@ -363,7 +378,23 @@ mod tests {
             ("MXUPHL", "5000-2000 m above ground"),
             ("MXUPHL", "3000-0 m above ground"),
             ("WIND", "10 m above ground"),
+            // Native CAPE planes for the heavy native-ECAPE ratio recipes.
+            ("CAPE", "surface"),
+            ("CAPE", "90-0 mb above ground"),
+            ("CAPE", "255-0 mb above ground"),
+            // Cloud cover: TCDC entire-atmosphere + the per-layer LCDC set
+            // (natlev carries them; the original recon missed them).
+            ("TCDC", "entire atmosphere (considered as a single layer)"),
+            ("LCDC", "low cloud layer"),
+            ("MCDC", "middle cloud layer"),
+            ("HCDC", "high cloud layer"),
         ];
+        // Bare `TCDC` must NOT be a pattern: natlev carries ~60 per-hybrid-level
+        // TCDC planes and an unqualified token would fetch them all.
+        assert!(
+            !RRFS_NAT_IDX_PATTERNS.contains(&"TCDC"),
+            "TCDC must stay level-qualified (entire atmosphere)"
+        );
         for (var, level) in nat_rows {
             assert!(
                 RRFS_NAT_IDX_PATTERNS
