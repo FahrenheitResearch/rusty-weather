@@ -359,6 +359,34 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
     let col_y = chunking.col_y;
     let col_x = chunking.col_x;
 
+    // Issue 1: Guard against zero chunking values. Any zero causes a
+    // division-by-zero panic in checks 6, 8, and 10. Detect all bad fields,
+    // push errors, and skip every geometry-dependent check.
+    let mut chunking_bad = false;
+    for (field, value) in &[
+        ("tile_y", tile_y),
+        ("tile_x", tile_x),
+        ("col_y", col_y),
+        ("col_x", col_x),
+    ] {
+        if *value == 0 {
+            report.error(format!(
+                "meta: chunking.{field} is zero — chunking values must be nonzero"
+            ));
+            chunking_bad = true;
+        }
+    }
+    // Track which record indices have out-of-range tile coords (Check 6) so
+    // that Check 8, Check 10, and the deep phase can safely skip them.
+    let mut range_bad_records: HashSet<usize> = HashSet::new();
+    // Track which record indices failed payload-span validation (Check 7) so
+    // the deep phase can safely skip them.
+    let mut span_bad_records: HashSet<usize> = HashSet::new();
+    // Subset of span_bad_records: records where offset+len overflows u64.
+    // These must also be excluded from the overlap check and Check 9 because
+    // their end offset is arithmetically undefined.
+    let mut overflow_records: HashSet<usize> = HashSet::new();
+
     // Check 4: index region in bounds and every record parses.
     let index_region_end = header.payload_offset;
     if file_len < index_region_end {
@@ -451,49 +479,60 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
     // Build tile-count expectations per variable.
     let (nx, ny) = (meta.nx, meta.ny);
 
-    // Check 6: tile coords in range.
-    for (i, rec) in records.iter().enumerate() {
-        if let Some(var_meta) = var_id_map.get(&rec.var_id) {
-            match var_meta.kind.as_str() {
-                "surface2d" => {
-                    let max_ty = ny.div_ceil(tile_y) as u32;
-                    let max_tx = nx.div_ceil(tile_x) as u32;
-                    if rec.tile_y >= max_ty {
-                        report.error(format!(
-                            "index record {i} (var '{}'): tile_y {} >= max {} for ny={ny} tile_y={tile_y}",
-                            var_meta.name, rec.tile_y, max_ty
-                        ));
+    // Check 6: tile coords in range. Skipped entirely if any chunking value is
+    // zero (Issue 1 guard) since div_ceil would panic. Records with out-of-range
+    // coords are tracked in range_bad_records so that Check 8 and the deep phase
+    // can skip them safely (Issue 2 guard).
+    if !chunking_bad {
+        for (i, rec) in records.iter().enumerate() {
+            if let Some(var_meta) = var_id_map.get(&rec.var_id) {
+                match var_meta.kind.as_str() {
+                    "surface2d" => {
+                        let max_ty = ny.div_ceil(tile_y) as u32;
+                        let max_tx = nx.div_ceil(tile_x) as u32;
+                        if rec.tile_y >= max_ty {
+                            report.error(format!(
+                                "index record {i} (var '{}'): tile_y {} >= max {} for ny={ny} tile_y={tile_y}",
+                                var_meta.name, rec.tile_y, max_ty
+                            ));
+                            range_bad_records.insert(i);
+                        }
+                        if rec.tile_x >= max_tx {
+                            report.error(format!(
+                                "index record {i} (var '{}'): tile_x {} >= max {} for nx={nx} tile_x={tile_x}",
+                                var_meta.name, rec.tile_x, max_tx
+                            ));
+                            range_bad_records.insert(i);
+                        }
                     }
-                    if rec.tile_x >= max_tx {
-                        report.error(format!(
-                            "index record {i} (var '{}'): tile_x {} >= max {} for nx={nx} tile_x={tile_x}",
-                            var_meta.name, rec.tile_x, max_tx
-                        ));
+                    "pressure3d" => {
+                        let max_ty = ny.div_ceil(col_y) as u32;
+                        let max_tx = nx.div_ceil(col_x) as u32;
+                        if rec.tile_y >= max_ty {
+                            report.error(format!(
+                                "index record {i} (var '{}'): tile_y {} >= max {} for ny={ny} col_y={col_y}",
+                                var_meta.name, rec.tile_y, max_ty
+                            ));
+                            range_bad_records.insert(i);
+                        }
+                        if rec.tile_x >= max_tx {
+                            report.error(format!(
+                                "index record {i} (var '{}'): tile_x {} >= max {} for nx={nx} col_x={col_x}",
+                                var_meta.name, rec.tile_x, max_tx
+                            ));
+                            range_bad_records.insert(i);
+                        }
                     }
+                    _ => {}
                 }
-                "pressure3d" => {
-                    let max_ty = ny.div_ceil(col_y) as u32;
-                    let max_tx = nx.div_ceil(col_x) as u32;
-                    if rec.tile_y >= max_ty {
-                        report.error(format!(
-                            "index record {i} (var '{}'): tile_y {} >= max {} for ny={ny} col_y={col_y}",
-                            var_meta.name, rec.tile_y, max_ty
-                        ));
-                    }
-                    if rec.tile_x >= max_tx {
-                        report.error(format!(
-                            "index record {i} (var '{}'): tile_x {} >= max {} for nx={nx} col_x={col_x}",
-                            var_meta.name, rec.tile_x, max_tx
-                        ));
-                    }
-                }
-                _ => {}
             }
         }
     }
 
     // Check 7: payload spans within [payload_offset, file_len], no overlaps,
     // and len == 0 iff EMPTY or (CONSTANT without HAS_MISSING).
+    // Records that fail span validation are tracked in span_bad_records so the
+    // deep phase can safely skip them (Issue 3 gate).
     for (i, rec) in records.iter().enumerate() {
         let is_empty = rec.flags & FLAG_EMPTY != 0;
         let is_constant_no_missing =
@@ -505,11 +544,13 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                 "index record {i} (var_id {}): EMPTY/CONSTANT-without-missing chunk has len {} != 0",
                 rec.var_id, rec.len
             ));
+            span_bad_records.insert(i);
         } else if !expect_zero_len && rec.len == 0 {
             report.error(format!(
                 "index record {i} (var_id {}): non-empty chunk has len == 0",
                 rec.var_id
             ));
+            span_bad_records.insert(i);
         }
 
         if rec.len > 0 {
@@ -519,6 +560,7 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                     "index record {i} (var_id {}): offset {} < payload_offset {}",
                     rec.var_id, rec.offset, header.payload_offset
                 ));
+                span_bad_records.insert(i);
             }
             let end = match rec.offset.checked_add(rec.len as u64) {
                 Some(e) => e,
@@ -527,6 +569,8 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                         "index record {i} (var_id {}): offset+len overflows u64",
                         rec.var_id
                     ));
+                    span_bad_records.insert(i);
+                    overflow_records.insert(i);
                     continue;
                 }
             };
@@ -535,16 +579,25 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                     "index record {i} (var_id {}): payload [{},{}] exceeds file_len {file_len}",
                     rec.var_id, rec.offset, end
                 ));
+                span_bad_records.insert(i);
             }
             report.stats.payload_bytes += rec.len as u64;
         }
     }
 
-    // Check overlaps: collect non-empty records sorted by offset, check gaps.
-    let mut payload_records: Vec<&ChunkRecord> =
-        records.iter().filter(|r| r.len > 0).collect();
+    // Check overlaps and build payload_records for Check 9. Records that
+    // overflowed offset+len (overflow_records) are excluded — their end offset
+    // is undefined and would panic or produce nonsense. Records that merely
+    // exceed file_len are kept so Check 9 can still diagnose truncation.
+    let mut payload_records: Vec<&ChunkRecord> = records
+        .iter()
+        .enumerate()
+        .filter(|(idx, r)| r.len > 0 && !overflow_records.contains(idx))
+        .map(|(_, r)| r)
+        .collect();
     payload_records.sort_by_key(|r| r.offset);
     for pair in payload_records.windows(2) {
+        // overflow_records are excluded so offset+len cannot wrap here.
         let end_a = pair[0].offset + pair[0].len as u64;
         if end_a > pair[1].offset {
             report.error(format!(
@@ -554,49 +607,97 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
         }
     }
 
-    // Check 8: expected raw_len per record.
-    for (i, rec) in records.iter().enumerate() {
-        let Some(var_meta) = var_id_map.get(&rec.var_id) else {
-            continue;
-        };
-        let is_empty = rec.flags & FLAG_EMPTY != 0;
-        let is_constant_no_missing =
-            rec.flags & FLAG_CONSTANT != 0 && rec.flags & FLAG_HAS_MISSING == 0;
+    // Check 8: expected raw_len per record. Skipped if chunking is zero (Issue 1)
+    // or if the record has out-of-range tile coords (Issue 2) — both cases would
+    // cause subtract-with-overflow or divide-by-zero panics.
+    if !chunking_bad {
+        for (i, rec) in records.iter().enumerate() {
+            // Skip records whose tile coords are out of range — their y0/x0
+            // values would exceed ny/nx making (ny - y0) wrap around.
+            if range_bad_records.contains(&i) {
+                continue;
+            }
 
-        if is_empty || is_constant_no_missing {
-            if rec.raw_len != 0 {
+            let Some(var_meta) = var_id_map.get(&rec.var_id) else {
+                continue;
+            };
+            let is_empty = rec.flags & FLAG_EMPTY != 0;
+            let is_constant_no_missing =
+                rec.flags & FLAG_CONSTANT != 0 && rec.flags & FLAG_HAS_MISSING == 0;
+
+            if is_empty || is_constant_no_missing {
+                if rec.raw_len != 0 {
+                    report.error(format!(
+                        "index record {i} (var '{}'): EMPTY/CONSTANT-without-missing chunk has raw_len {} != 0",
+                        var_meta.name, rec.raw_len
+                    ));
+                }
+                continue;
+            }
+
+            let expected_raw_len: u32 = match var_meta.kind.as_str() {
+                "surface2d" => {
+                    // Belt-and-braces: use checked_mul so a hostile (but
+                    // range-valid) tile coord cannot wrap in release mode.
+                    let y0 = match (rec.tile_y as usize).checked_mul(tile_y) {
+                        Some(v) => v,
+                        None => {
+                            report.error(format!(
+                                "index record {i} (var '{}'): tile_y * tile_y overflows usize",
+                                var_meta.name
+                            ));
+                            continue;
+                        }
+                    };
+                    let x0 = match (rec.tile_x as usize).checked_mul(tile_x) {
+                        Some(v) => v,
+                        None => {
+                            report.error(format!(
+                                "index record {i} (var '{}'): tile_x * tile_x overflows usize",
+                                var_meta.name
+                            ));
+                            continue;
+                        }
+                    };
+                    let th = (ny - y0).min(tile_y);
+                    let tw = (nx - x0).min(tile_x);
+                    (4 * th * tw) as u32
+                }
+                "pressure3d" => {
+                    let y0 = match (rec.tile_y as usize).checked_mul(col_y) {
+                        Some(v) => v,
+                        None => {
+                            report.error(format!(
+                                "index record {i} (var '{}'): tile_y * col_y overflows usize",
+                                var_meta.name
+                            ));
+                            continue;
+                        }
+                    };
+                    let x0 = match (rec.tile_x as usize).checked_mul(col_x) {
+                        Some(v) => v,
+                        None => {
+                            report.error(format!(
+                                "index record {i} (var '{}'): tile_x * col_x overflows usize",
+                                var_meta.name
+                            ));
+                            continue;
+                        }
+                    };
+                    let ch = (ny - y0).min(col_y);
+                    let cw = (nx - x0).min(col_x);
+                    let levels = var_meta.levels_hpa.len();
+                    (2 * ch * cw * levels) as u32
+                }
+                _ => continue,
+            };
+
+            if rec.raw_len != expected_raw_len {
                 report.error(format!(
-                    "index record {i} (var '{}'): EMPTY/CONSTANT-without-missing chunk has raw_len {} != 0",
+                    "index record {i} (var '{}'): raw_len {} != expected {expected_raw_len}",
                     var_meta.name, rec.raw_len
                 ));
             }
-            continue;
-        }
-
-        let expected_raw_len: u32 = match var_meta.kind.as_str() {
-            "surface2d" => {
-                let y0 = rec.tile_y as usize * tile_y;
-                let x0 = rec.tile_x as usize * tile_x;
-                let th = (ny - y0).min(tile_y);
-                let tw = (nx - x0).min(tile_x);
-                (4 * th * tw) as u32
-            }
-            "pressure3d" => {
-                let y0 = rec.tile_y as usize * col_y;
-                let x0 = rec.tile_x as usize * col_x;
-                let ch = (ny - y0).min(col_y);
-                let cw = (nx - x0).min(col_x);
-                let levels = var_meta.levels_hpa.len();
-                (2 * ch * cw * levels) as u32
-            }
-            _ => continue,
-        };
-
-        if rec.raw_len != expected_raw_len {
-            report.error(format!(
-                "index record {i} (var '{}'): raw_len {} != expected {expected_raw_len}",
-                var_meta.name, rec.raw_len
-            ));
         }
     }
 
@@ -619,44 +720,54 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
         }
     }
 
-    // Check 10: per-variable chunk-set completeness.
-    for var_meta in &meta.variables {
-        let (tiles_y, tiles_x) = match var_meta.kind.as_str() {
-            "surface2d" => (ny.div_ceil(tile_y), nx.div_ceil(tile_x)),
-            "pressure3d" => (ny.div_ceil(col_y), nx.div_ceil(col_x)),
-            _ => continue,
-        };
-        let expected_count = tiles_y * tiles_x;
-        let present: HashSet<(u32, u32)> = records
-            .iter()
-            .filter(|r| r.var_id == var_meta.id)
-            .map(|r| (r.tile_y, r.tile_x))
-            .collect();
-        if present.len() != expected_count {
-            let missing: Vec<(u32, u32)> = (0..tiles_y as u32)
-                .flat_map(|ty| (0..tiles_x as u32).map(move |tx| (ty, tx)))
-                .filter(|coord| !present.contains(coord))
-                .take(5) // report up to 5 examples
-                .collect();
-            let extra_msg = if present.len() + missing.len() < expected_count {
-                " (too many missing to list)".to_string()
-            } else {
-                String::new()
+    // Check 10: per-variable chunk-set completeness. Skipped if chunking is
+    // zero (Issue 1 guard) since div_ceil would panic.
+    if !chunking_bad {
+        for var_meta in &meta.variables {
+            let (tiles_y, tiles_x) = match var_meta.kind.as_str() {
+                "surface2d" => (ny.div_ceil(tile_y), nx.div_ceil(tile_x)),
+                "pressure3d" => (ny.div_ceil(col_y), nx.div_ceil(col_x)),
+                _ => continue,
             };
-            report.error(format!(
-                "variable '{}': expected {expected_count} chunks, found {}; missing tiles: {:?}{extra_msg}",
-                var_meta.name,
-                present.len(),
-                missing
-            ));
-        }
-        // Check for duplicate (tile_y, tile_x) per variable.
-        let total_for_var = records.iter().filter(|r| r.var_id == var_meta.id).count();
-        if total_for_var != present.len() {
-            report.error(format!(
-                "variable '{}': {} index records but only {} distinct (tile_y, tile_x) positions (duplicates present)",
-                var_meta.name, total_for_var, present.len()
-            ));
+            let expected_count = tiles_y * tiles_x;
+            // Exclude range-bad records from the present set: they already have
+            // errors from Check 6, and their tile coords are lies.
+            let present: HashSet<(u32, u32)> = records
+                .iter()
+                .enumerate()
+                .filter(|(idx, r)| r.var_id == var_meta.id && !range_bad_records.contains(idx))
+                .map(|(_, r)| (r.tile_y, r.tile_x))
+                .collect();
+            if present.len() != expected_count {
+                let missing: Vec<(u32, u32)> = (0..tiles_y as u32)
+                    .flat_map(|ty| (0..tiles_x as u32).map(move |tx| (ty, tx)))
+                    .filter(|coord| !present.contains(coord))
+                    .take(5) // report up to 5 examples
+                    .collect();
+                let extra_msg = if present.len() + missing.len() < expected_count {
+                    " (too many missing to list)".to_string()
+                } else {
+                    String::new()
+                };
+                report.error(format!(
+                    "variable '{}': expected {expected_count} chunks, found {}; missing tiles: {:?}{extra_msg}",
+                    var_meta.name,
+                    present.len(),
+                    missing
+                ));
+            }
+            // Check for duplicate (tile_y, tile_x) per variable (exclude range-bad).
+            let total_for_var = records
+                .iter()
+                .enumerate()
+                .filter(|(idx, r)| r.var_id == var_meta.id && !range_bad_records.contains(idx))
+                .count();
+            if total_for_var != present.len() {
+                report.error(format!(
+                    "variable '{}': {} index records but only {} distinct (tile_y, tile_x) positions (duplicates present)",
+                    var_meta.name, total_for_var, present.len()
+                ));
+            }
         }
     }
 
@@ -671,8 +782,17 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
 
     // =======================================================================
     // Deep checks: decompress each non-empty chunk and verify content.
+    // Structurally-invalid records (bad payload spans or out-of-range tile
+    // coords) never reach this phase — they are gated out to avoid panics on
+    // hostile input (Issues 2 and 3).
     // =======================================================================
     for (i, rec) in records.iter().enumerate() {
+        // Gate: skip records that failed structural payload-span validation or
+        // had out-of-range tile coords. Their errors are already in the report.
+        if span_bad_records.contains(&i) || range_bad_records.contains(&i) {
+            continue;
+        }
+
         let Some(var_meta) = var_id_map.get(&rec.var_id) else {
             continue;
         };
@@ -708,8 +828,19 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
             continue;
         }
 
-        // Check 11: decompress.
-        let end = rec.offset + rec.len as u64;
+        // Check 11: decompress. Use checked_add for the end offset (Issue 3
+        // belt-and-braces: even though span_bad_records already gates overflow
+        // cases, be explicit here to avoid any latent panic in release mode).
+        let end = match rec.offset.checked_add(rec.len as u64) {
+            Some(e) => e,
+            None => {
+                report.error(format!(
+                    "index record {i} (var '{}'): offset+len overflows u64 in deep phase",
+                    var_meta.name
+                ));
+                continue;
+            }
+        };
         if end > file_len {
             continue; // already reported in structural
         }
@@ -1184,6 +1315,151 @@ mod tests {
             "bad version must produce errors: {:?}",
             report.errors
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Hostile-input / panic-guard tests
+    // -----------------------------------------------------------------------
+
+    /// A file whose meta JSON has chunking.tile_y=0 must return Ok(report) with
+    /// errors mentioning "chunking", never panic with divide-by-zero.
+    #[test]
+    fn zero_chunking_reports_error_not_panic() {
+        let dir = test_dir("zero-chunking");
+        let bytes = load_valid_bytes(&dir);
+        let header = RwsHeader::parse(&bytes).unwrap();
+
+        // Locate the meta region and replace "tile_y":256 with "tile_y":  0
+        // (same byte length, value becomes 0; leading spaces are valid JSON).
+        let meta_start = HEADER_LEN;
+        let meta_end = meta_start + header.meta_len as usize;
+        let meta_str = std::str::from_utf8(&bytes[meta_start..meta_end]).unwrap();
+        assert!(
+            meta_str.contains("\"tile_y\":256"),
+            "test assumption: meta must contain tile_y:256; got: {meta_str}"
+        );
+        // "tile_y":256  (12 chars) -> "tile_y":  0  (12 chars, valid JSON, value=0)
+        let patched_meta = meta_str.replace("\"tile_y\":256", "\"tile_y\":  0");
+        assert_eq!(
+            patched_meta.len(),
+            meta_str.len(),
+            "patched meta must have same byte length to keep header offsets valid"
+        );
+
+        let mut corrupt = bytes.clone();
+        corrupt[meta_start..meta_end].copy_from_slice(patched_meta.as_bytes());
+        let path = write_corrupt(&dir, "zero-chunking.rws", &corrupt);
+
+        let structural = validate_hour_file(&path, ValidateDepth::Structural).unwrap();
+        assert!(
+            !structural.is_ok(),
+            "zero chunking must produce errors (structural): {:?}",
+            structural.errors
+        );
+        let joined_s = structural.errors.join(" ");
+        assert!(
+            joined_s.contains("chunking"),
+            "structural error must mention 'chunking': {joined_s}"
+        );
+
+        let deep = validate_hour_file(&path, ValidateDepth::Deep).unwrap();
+        assert!(
+            !deep.is_ok(),
+            "zero chunking must produce errors (deep): {:?}",
+            deep.errors
+        );
+        let joined_d = deep.errors.join(" ");
+        assert!(
+            joined_d.contains("chunking"),
+            "deep error must mention 'chunking': {joined_d}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file with a record whose tile_y is out of range (9999) must return
+    /// Ok(report) with errors mentioning the out-of-range tile, never panic
+    /// with subtract-with-overflow.
+    #[test]
+    fn out_of_range_tile_reports_error_not_panic() {
+        let dir = test_dir("oor-tile");
+        let bytes = load_valid_bytes(&dir);
+        let header = RwsHeader::parse(&bytes).unwrap();
+
+        // Patch the first index record's tile_y field (bytes 4..8 within the
+        // 64-byte record) to 9999.
+        let rec_start = header.index_offset as usize;
+        let mut corrupt = bytes.clone();
+        corrupt[rec_start + 4..rec_start + 8].copy_from_slice(&9999u32.to_le_bytes());
+        let path = write_corrupt(&dir, "oor-tile.rws", &corrupt);
+
+        let structural = validate_hour_file(&path, ValidateDepth::Structural).unwrap();
+        assert!(
+            !structural.is_ok(),
+            "out-of-range tile must produce errors (structural): {:?}",
+            structural.errors
+        );
+        let joined_s = structural.errors.join(" ");
+        assert!(
+            joined_s.contains("tile_y") || joined_s.contains("range") || joined_s.contains("tile"),
+            "structural error must mention tile range: {joined_s}"
+        );
+
+        let deep = validate_hour_file(&path, ValidateDepth::Deep).unwrap();
+        assert!(
+            !deep.is_ok(),
+            "out-of-range tile must produce errors (deep): {:?}",
+            deep.errors
+        );
+        let joined_d = deep.errors.join(" ");
+        assert!(
+            joined_d.contains("tile_y") || joined_d.contains("range") || joined_d.contains("tile"),
+            "deep error must mention tile range: {joined_d}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file with a record whose offset is u64::MAX-1 must return Ok(report)
+    /// with errors, never panic with integer overflow in the deep phase.
+    #[test]
+    fn huge_offset_record_no_panic_deep() {
+        let dir = test_dir("huge-offset");
+        let bytes = load_valid_bytes(&dir);
+        let header = RwsHeader::parse(&bytes).unwrap();
+
+        // Find the first dense chunk record and set its offset to u64::MAX-1.
+        // The index record offset field is bytes 12..20 within the 64-byte record.
+        let record_count = header.index_count as usize;
+        let mut target_rec_start: Option<usize> = None;
+        for i in 0..record_count {
+            let start = header.index_offset as usize + i * INDEX_RECORD_LEN;
+            let rec = ChunkRecord::unpack(&bytes[start..start + INDEX_RECORD_LEN]).unwrap();
+            if rec.len > 0 {
+                target_rec_start = Some(start);
+                break;
+            }
+        }
+        let rec_start = target_rec_start.expect("must have at least one dense chunk");
+        let mut corrupt = bytes.clone();
+        corrupt[rec_start + 12..rec_start + 20].copy_from_slice(&(u64::MAX - 1).to_le_bytes());
+        let path = write_corrupt(&dir, "huge-offset.rws", &corrupt);
+
+        let structural = validate_hour_file(&path, ValidateDepth::Structural).unwrap();
+        assert!(
+            !structural.is_ok(),
+            "huge offset must produce errors (structural): {:?}",
+            structural.errors
+        );
+
+        let deep = validate_hour_file(&path, ValidateDepth::Deep).unwrap();
+        assert!(
+            !deep.is_ok(),
+            "huge offset must produce errors (deep): {:?}",
+            deep.errors
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 
