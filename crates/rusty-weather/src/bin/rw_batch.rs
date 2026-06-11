@@ -268,8 +268,40 @@ fn static_output_dimension(name: &str, fallback: u32) -> u32 {
         .unwrap_or(fallback)
 }
 
+/// Default direct-render worker cap for the batch context. Each direct
+/// render worker holds full per-recipe crop/raster/contour/PNG scratch
+/// (~200 MB measured at HRRR size), and the batch pipeline renders WHILE
+/// the next hour extracts/derives on the same global rayon pool. The
+/// products-crate default (`available_parallelism / 2`, 16 workers on the
+/// 32-logical-core benchmark box) measured 8198 MB peak working set on the
+/// 3-hour all-products run; capping to 4 measured 6768 MB peak AND a
+/// faster wall (61.0 s -> 57.7 s) because it also relieves the
+/// 30-rayon + 16-render-worker oversubscription. Cores-aware so small
+/// machines are not forced up to 4: `min(4, cores / 4)`, floor 1 — always
+/// at or below the historical `cores / 2` default.
+fn default_render_worker_cap() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| (count.get() / 4).clamp(1, 4))
+        .unwrap_or(1)
+}
+
+/// Apply the batch render-worker cap unless the caller already chose via
+/// `RUSTWX_RENDER_THREADS` (the products crate's existing knob, read by
+/// every render lane the batch drives: direct, derived, hrrr, windowed).
+fn apply_render_worker_cap() {
+    const RENDER_THREADS_ENV: &str = "RUSTWX_RENDER_THREADS";
+    if std::env::var_os(RENDER_THREADS_ENV).is_some() {
+        return;
+    }
+    // SAFETY: called from `main` before any other thread exists (the
+    // pipeline threads and the rayon pool spawn later), which is the
+    // documented sound window for mutating the process environment.
+    unsafe { std::env::set_var(RENDER_THREADS_ENV, default_render_worker_cap().to_string()) };
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     disable_mimalloc_purge_delay();
+    apply_render_worker_cap();
     let args = Args::parse();
     // Scheduling policy must land before anything touches rayon (the
     // global pool is built lazily on first use and cannot be resized).
@@ -814,6 +846,18 @@ mod tests {
         let profile = profile_from_args(&sounding).expect("resolves");
         assert_eq!(profile.level_step_hpa, 50);
         assert!(!profile.derived && !profile.heavy);
+    }
+
+    #[test]
+    fn render_worker_cap_is_cores_aware_and_bounded() {
+        let cap = default_render_worker_cap();
+        assert!((1..=4).contains(&cap), "cap {cap} must stay in 1..=4");
+        if let Ok(cores) = std::thread::available_parallelism() {
+            assert!(
+                cap <= (cores.get() / 2).max(1),
+                "cap {cap} must never exceed the products-crate default of cores/2"
+            );
+        }
     }
 
     #[test]
