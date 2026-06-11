@@ -21,7 +21,7 @@ use crate::format::{
 use crate::grid::GridFile;
 use crate::header::RwsHeader;
 use crate::index::ChunkRecord;
-use crate::run::{SCHEMA_RUN, RwsRunManifest};
+use crate::run::{RwsRunManifest, SCHEMA_RUN};
 
 /// How deeply to validate a store file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,8 +43,11 @@ pub struct ValidationReport {
 /// Counts collected during validation.
 #[derive(Debug, Default)]
 pub struct ValidationStats {
+    /// Number of variables found in the hour-file meta block.
     pub variables: usize,
+    /// Total index records seen, including EMPTY and CONSTANT chunks.
     pub chunks: u64,
+    /// Sum of compressed payload lengths (bytes) across all non-empty records.
     pub payload_bytes: u64,
 }
 
@@ -161,7 +164,7 @@ pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<Valida
         // directory entirely, allowing path traversal outside the run dir.
         if !is_plain_filename(&entry.file) {
             report.error(format!(
-                "run.json: hour {hour} file '{}' is not a plain filename",
+                "run.json: hour {hour} file '{}' must be a relative path without '..', root, or drive components",
                 entry.file
             ));
             continue;
@@ -175,7 +178,10 @@ pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<Valida
         let hour_data = match std::fs::read(&hour_path) {
             Ok(b) => b,
             Err(err) => {
-                report.error(format!("hour {hour}: I/O error reading '{}': {err}", entry.file));
+                report.error(format!(
+                    "hour {hour}: I/O error reading '{}': {err}",
+                    entry.file
+                ));
                 continue;
             }
         };
@@ -539,14 +545,12 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
     }
     // Only check the product if both nx and ny are within bounds (geometry_bad
     // not yet set above); otherwise the multiply itself could overflow.
-    if !geometry_bad {
-        if nx.saturating_mul(ny) > MAX_NX_NY_PRODUCT {
-            report.error(format!(
-                "meta: nx*ny={} exceeds sanity bound {MAX_NX_NY_PRODUCT} — file may be hostile",
-                nx * ny
-            ));
-            geometry_bad = true;
-        }
+    if !geometry_bad && nx.saturating_mul(ny) > MAX_NX_NY_PRODUCT {
+        report.error(format!(
+            "meta: nx*ny={} exceeds sanity bound {MAX_NX_NY_PRODUCT} — file may be hostile",
+            nx * ny
+        ));
+        geometry_bad = true;
     }
     for (field, value) in &[
         ("tile_y", tile_y),
@@ -942,7 +946,10 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
         let is_empty_for_cap = rec.flags & FLAG_EMPTY != 0;
         let is_constant_no_missing_for_cap =
             rec.flags & FLAG_CONSTANT != 0 && rec.flags & FLAG_HAS_MISSING == 0;
-        if !is_empty_for_cap && !is_constant_no_missing_for_cap && rec.raw_len > MAX_DEEP_CHUNK_RAW_LEN {
+        if !is_empty_for_cap
+            && !is_constant_no_missing_for_cap
+            && rec.raw_len > MAX_DEEP_CHUNK_RAW_LEN
+        {
             if let Some(vm) = var_id_map.get(&rec.var_id) {
                 report.error(format!(
                     "index record {i} (var '{}' chunk ({},{})): raw_len {} exceeds deep-validation cap {}",
@@ -1040,7 +1047,11 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
         if raw.len() != rec.raw_len as usize {
             report.error(format!(
                 "index record {i} (var '{}' chunk ({},{})): decompressed {} bytes, raw_len says {}",
-                var_meta.name, rec.tile_y, rec.tile_x, raw.len(), rec.raw_len
+                var_meta.name,
+                rec.tile_y,
+                rec.tile_x,
+                raw.len(),
+                rec.raw_len
             ));
             continue;
         }
@@ -1065,7 +1076,10 @@ fn check_tile2d_deep(
     if raw.len() % 4 != 0 {
         report.error(format!(
             "index record {i} (var '{}' tile ({},{})): raw payload length {} not divisible by 4",
-            var_meta.name, rec.tile_y, rec.tile_x, raw.len()
+            var_meta.name,
+            rec.tile_y,
+            rec.tile_x,
+            raw.len()
         ));
         return;
     }
@@ -1145,7 +1159,10 @@ fn check_column3d_deep(
     if raw.len() % 2 != 0 {
         report.error(format!(
             "index record {i} (var '{}' chunk ({},{})): raw payload length {} not divisible by 2",
-            var_meta.name, rec.tile_y, rec.tile_x, raw.len()
+            var_meta.name,
+            rec.tile_y,
+            rec.tile_x,
+            raw.len()
         ));
         return;
     }
@@ -1155,7 +1172,7 @@ fn check_column3d_deep(
         .collect();
 
     let valid_count: u32 = quants.iter().filter(|&&q| q != MISSING_Q).count() as u32;
-    let has_missing = quants.iter().any(|&q| q == MISSING_Q);
+    let has_missing = quants.contains(&MISSING_Q);
 
     if valid_count != rec.valid_count {
         report.error(format!(
@@ -1208,8 +1225,8 @@ mod tests {
     const NY: usize = 30;
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("rw-store-validate-{}-{}", std::process::id(), name));
+        let dir =
+            std::env::temp_dir().join(format!("rw-store-validate-{}-{}", std::process::id(), name));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -1314,6 +1331,11 @@ mod tests {
             report.errors
         );
         assert_eq!(report.stats.variables, 2, "expected 2 variables");
+        assert!(report.stats.chunks > 0, "expected at least one chunk");
+        assert!(
+            report.stats.payload_bytes > 0,
+            "expected non-zero payload bytes"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1660,8 +1682,7 @@ mod tests {
         let values: Vec<f32> = (0..NY)
             .flat_map(|y| (0..NX).map(move |x| 280.0 + 0.05 * x as f32 - 0.02 * y as f32))
             .collect();
-        let selector =
-            FieldSelector::height_agl(rustwx_core::CanonicalField::Temperature, 2);
+        let selector = FieldSelector::height_agl(rustwx_core::CanonicalField::Temperature, 2);
         let field = SelectedField2D::new(selector, "K", grid, values)
             .unwrap()
             .with_projection(GridProjection::Geographic);
@@ -1697,8 +1718,7 @@ mod tests {
         let grid = small_grid();
 
         let values: Vec<f32> = vec![280.0f32; NX * NY];
-        let selector =
-            FieldSelector::height_agl(rustwx_core::CanonicalField::Temperature, 2);
+        let selector = FieldSelector::height_agl(rustwx_core::CanonicalField::Temperature, 2);
         let field = SelectedField2D::new(selector, "K", grid, values)
             .unwrap()
             .with_projection(GridProjection::Geographic);
@@ -1741,8 +1761,7 @@ mod tests {
         let grid = small_grid();
 
         let values: Vec<f32> = vec![280.0f32; NX * NY];
-        let selector =
-            FieldSelector::height_agl(rustwx_core::CanonicalField::Temperature, 2);
+        let selector = FieldSelector::height_agl(rustwx_core::CanonicalField::Temperature, 2);
         let field = SelectedField2D::new(selector, "K", grid, values)
             .unwrap()
             .with_projection(GridProjection::Geographic);
@@ -1796,8 +1815,7 @@ mod tests {
         let grid = small_grid();
 
         let values: Vec<f32> = vec![280.0f32; NX * NY];
-        let selector =
-            FieldSelector::height_agl(rustwx_core::CanonicalField::Temperature, 2);
+        let selector = FieldSelector::height_agl(rustwx_core::CanonicalField::Temperature, 2);
         let field = SelectedField2D::new(selector, "K", grid, values)
             .unwrap()
             .with_projection(GridProjection::Geographic);
@@ -1848,7 +1866,11 @@ mod tests {
         );
 
         // Overwrite run.json with the tampered manifest.
-        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
 
         let report = validate_run_dir(&run_dir_path, ValidateDepth::Structural).unwrap();
 
@@ -1859,23 +1881,23 @@ mod tests {
             report.errors
         );
 
-        // Both hostile hours must produce "not a plain filename" errors.
+        // Both hostile hours must produce path-rejection errors.
         let errors_for_h6 = report
             .errors
             .iter()
-            .any(|e| e.contains("hour 6") && e.contains("not a plain filename"));
+            .any(|e| e.contains("hour 6") && e.contains("must be a relative path"));
         let errors_for_h9 = report
             .errors
             .iter()
-            .any(|e| e.contains("hour 9") && e.contains("not a plain filename"));
+            .any(|e| e.contains("hour 9") && e.contains("must be a relative path"));
         assert!(
             errors_for_h6,
-            "hour 6 (absolute path) must produce 'not a plain filename' error; errors: {:?}",
+            "hour 6 (absolute path) must produce a path-rejection error; errors: {:?}",
             report.errors
         );
         assert!(
             errors_for_h9,
-            "hour 9 (.. traversal) must produce 'not a plain filename' error; errors: {:?}",
+            "hour 9 (.. traversal) must produce a path-rejection error; errors: {:?}",
             report.errors
         );
 
@@ -2078,7 +2100,8 @@ mod tests {
             let start = header.index_offset as usize + i * INDEX_RECORD_LEN;
             let rec = ChunkRecord::unpack(&bytes[start..start + INDEX_RECORD_LEN]).unwrap();
             let is_empty = rec.flags & FLAG_EMPTY != 0;
-            let is_constant_no_missing = rec.flags & FLAG_CONSTANT != 0 && rec.flags & FLAG_HAS_MISSING == 0;
+            let is_constant_no_missing =
+                rec.flags & FLAG_CONSTANT != 0 && rec.flags & FLAG_HAS_MISSING == 0;
             if rec.len > 0 && !is_empty && !is_constant_no_missing {
                 // raw_len is at bytes 24..28 within the 64-byte index record.
                 bytes[start + 24..start + 28].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -2188,6 +2211,212 @@ mod tests {
         assert!(
             !joined.contains("zstd decompress failed"),
             "deep must not attempt decompression for over-cap chunk: {joined}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Negative tests for deep stat checks (Checks 12/13/14)
+    // -----------------------------------------------------------------------
+
+    /// Build a valid hour with NO NaN values in the 2D field (all finite).
+    /// Used by tests that need a TILE2D record without HAS_MISSING set.
+    fn write_valid_hour_no_nan(path: &std::path::Path) {
+        let values_2d: Vec<f32> = (0..NY)
+            .flat_map(|y| (0..NX).map(move |x| 0.1 * x as f32 + 0.2 * y as f32 + 273.15))
+            .collect();
+
+        let levels: [u16; 2] = [1000, 500];
+        let planes: Vec<Vec<f32>> = levels
+            .iter()
+            .map(|&level| {
+                (0..NY)
+                    .flat_map(|_y| {
+                        (0..NX).map(move |x| 100.0 + 0.5 * x as f32 + 0.01 * level as f32)
+                    })
+                    .collect()
+            })
+            .collect();
+        let plane_refs: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
+
+        let mut writer = HourWriter::new(
+            "hrrr",
+            "2026-06-10T00:00:00Z",
+            3,
+            NX,
+            NY,
+            "test-grid-hash",
+            "validate-test",
+        );
+        writer
+            .add_surface2d(
+                "temp_2m",
+                "K",
+                serde_json::json!({"test": true}),
+                &values_2d,
+            )
+            .unwrap();
+        writer
+            .add_pressure3d(
+                "wind_iso",
+                "m/s",
+                serde_json::json!({"test3d": true}),
+                &levels,
+                &plane_refs,
+            )
+            .unwrap();
+        writer.finish(path).unwrap();
+    }
+
+    /// Helper: find the first TILE2D index record (kind == KIND_TILE2D) with
+    /// len > 0 (dense, not EMPTY or CONSTANT-without-missing). Returns the
+    /// byte offset of the 64-byte record within the file.
+    fn find_dense_tile2d_record_offset(bytes: &[u8]) -> usize {
+        let header = RwsHeader::parse(bytes).unwrap();
+        for i in 0..header.index_count as usize {
+            let start = header.index_offset as usize + i * INDEX_RECORD_LEN;
+            let rec = ChunkRecord::unpack(&bytes[start..start + INDEX_RECORD_LEN]).unwrap();
+            let is_empty = rec.flags & FLAG_EMPTY != 0;
+            let is_constant_no_missing =
+                rec.flags & FLAG_CONSTANT != 0 && rec.flags & FLAG_HAS_MISSING == 0;
+            if rec.kind == KIND_TILE2D && rec.len > 0 && !is_empty && !is_constant_no_missing {
+                return start;
+            }
+        }
+        panic!("no dense TILE2D record found in test file");
+    }
+
+    /// Patch a dense TILE2D record's valid_count (bytes [44..48]) to value+1.
+    /// Structural must not flag this (valid_count is not structurally checked).
+    /// Deep must report an error mentioning "valid_count".
+    #[test]
+    fn deep_catches_wrong_valid_count() {
+        let dir = test_dir("deep-valid-count");
+        let base_path = dir.join("base.rws");
+        write_valid_hour(&base_path);
+        let mut bytes = fs::read(&base_path).unwrap();
+
+        let rec_start = find_dense_tile2d_record_offset(&bytes);
+        // valid_count is at bytes [44..48] within the 64-byte record.
+        let current = u32::from_le_bytes(bytes[rec_start + 44..rec_start + 48].try_into().unwrap());
+        let patched = current.wrapping_add(1);
+        bytes[rec_start + 44..rec_start + 48].copy_from_slice(&patched.to_le_bytes());
+
+        let path = write_corrupt(&dir, "wrong-valid-count.rws", &bytes);
+
+        // Structural: valid_count is not checked structurally — must pass.
+        let structural = validate_hour_file(&path, ValidateDepth::Structural).unwrap();
+        assert!(
+            structural.is_ok(),
+            "wrong valid_count must not affect structural: {:?}",
+            structural.errors
+        );
+
+        // Deep: must catch the mismatch.
+        let deep = validate_hour_file(&path, ValidateDepth::Deep).unwrap();
+        assert!(
+            !deep.is_ok(),
+            "wrong valid_count must fail deep: {:?}",
+            deep.errors
+        );
+        assert!(
+            deep.errors.iter().any(|e| e.contains("valid_count")),
+            "deep error must mention valid_count: {:?}",
+            deep.errors
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Patch a dense TILE2D record's min (bytes [36..40]) to a different finite value.
+    /// Structural must pass. Deep must report an error mentioning "min".
+    #[test]
+    fn deep_catches_wrong_min_max() {
+        let dir = test_dir("deep-min-max");
+        let base_path = dir.join("base.rws");
+        write_valid_hour(&base_path);
+        let mut bytes = fs::read(&base_path).unwrap();
+
+        let rec_start = find_dense_tile2d_record_offset(&bytes);
+        // min is at bytes [36..40] within the 64-byte record.
+        let current_min =
+            f32::from_le_bytes(bytes[rec_start + 36..rec_start + 40].try_into().unwrap());
+        // Replace with a clearly different finite value.
+        let patched_min = current_min + 9999.0;
+        bytes[rec_start + 36..rec_start + 40].copy_from_slice(&patched_min.to_le_bytes());
+
+        let path = write_corrupt(&dir, "wrong-min.rws", &bytes);
+
+        // Structural: min is not checked structurally — must pass.
+        let structural = validate_hour_file(&path, ValidateDepth::Structural).unwrap();
+        assert!(
+            structural.is_ok(),
+            "wrong min must not affect structural: {:?}",
+            structural.errors
+        );
+
+        // Deep: must catch the mismatch.
+        let deep = validate_hour_file(&path, ValidateDepth::Deep).unwrap();
+        assert!(!deep.is_ok(), "wrong min must fail deep: {:?}", deep.errors);
+        assert!(
+            deep.errors
+                .iter()
+                .any(|e| e.contains("min") || e.contains("max")),
+            "deep error must mention min or max: {:?}",
+            deep.errors
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Patch a dense TILE2D record (no NaN values) to set the HAS_MISSING flag.
+    /// Structural must pass (len > 0, not EMPTY, not CONSTANT-without-missing,
+    /// so the len==0-iff rules are unaffected). Deep must error that HAS_MISSING
+    /// is set but no non-finite values were decoded.
+    #[test]
+    fn deep_catches_wrong_missing_flag() {
+        let dir = test_dir("deep-missing-flag");
+        let base_path = dir.join("base.rws");
+        // Use the no-NaN variant so the target TILE2D record has HAS_MISSING=0.
+        write_valid_hour_no_nan(&base_path);
+        let mut bytes = fs::read(&base_path).unwrap();
+
+        let rec_start = find_dense_tile2d_record_offset(&bytes);
+        // Verify the record truly has no HAS_MISSING flag before patching.
+        assert_eq!(
+            bytes[rec_start + 3] & FLAG_HAS_MISSING,
+            0,
+            "pre-condition: no-NaN file must not have HAS_MISSING set"
+        );
+        // Set HAS_MISSING bit in the flags byte (offset [3]).
+        bytes[rec_start + 3] |= FLAG_HAS_MISSING;
+
+        let path = write_corrupt(&dir, "wrong-missing-flag.rws", &bytes);
+
+        // Structural: setting HAS_MISSING on a dense non-CONSTANT record keeps
+        // len > 0 legal (expect_zero_len = is_empty || is_constant_no_missing,
+        // neither of which is true here). Must pass.
+        let structural = validate_hour_file(&path, ValidateDepth::Structural).unwrap();
+        assert!(
+            structural.is_ok(),
+            "setting HAS_MISSING on dense record must not affect structural: {:?}",
+            structural.errors
+        );
+
+        // Deep: must catch that HAS_MISSING is set but decoded data has no NaN.
+        let deep = validate_hour_file(&path, ValidateDepth::Deep).unwrap();
+        assert!(
+            !deep.is_ok(),
+            "wrong HAS_MISSING flag must fail deep: {:?}",
+            deep.errors
+        );
+        assert!(
+            deep.errors.iter().any(|e| e.contains("HAS_MISSING")
+                || e.contains("has_missing")
+                || e.contains("has_non_finite")),
+            "deep error must mention HAS_MISSING or related field: {:?}",
+            deep.errors
         );
 
         let _ = fs::remove_dir_all(&dir);
