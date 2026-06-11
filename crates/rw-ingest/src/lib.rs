@@ -129,47 +129,65 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
     }
 }
 
-/// `.idx` substring patterns for the RRFS-A `prs-na` (pressure) file: the
-/// isobaric volume field types the ingest plan decodes (T/RH/DPT for the
+/// `.idx` message-selection patterns for the RRFS-A `prs-na` (pressure) file:
+/// the isobaric volume field types the ingest plan decodes (T/RH/DPT for the
 /// dewpoint→rh fallback, U/V, geopotential height) plus absolute vorticity
-/// (the sparse per-level planes). Each pattern matches every isobaric level of
-/// that field; the level subset the profile stores is realized at decode.
-/// Over-fetches the few stratospheric levels above the stored set (idx
-/// substring patterns can't express "≥100 mb"), but still ~86% of the file
-/// since the isobaric volumes ARE most of the pressure file.
-const RRFS_PRS_IDX_PATTERNS: &[&str] = &[
-    ":TMP:", ":RH:", ":DPT:", ":UGRD:", ":VGRD:", ":HGT:", ":ABSV:",
-];
+/// (the sparse per-level planes). Each is a bare `VARIABLE` token (no level
+/// filter) so it matches every isobaric level of that field via
+/// [`wx_core::download::find_entries`]; the level subset the profile stores is
+/// realized at decode.
+///
+/// **Pattern format (load-bearing):** `find_entries` parses a pattern as
+/// `VARIABLE[:level-substring]`, matching the GRIB variable name EXACTLY and the
+/// level as a substring — it does NOT wrap the token in `.idx` field colons.
+/// A `:VAR:` form would split at the leading colon into an empty variable name
+/// and match nothing (the fetcher would then silently fall back to a whole-file
+/// GET — a ~4 GB regression). So these are bare `TMP`, `RH`, … exactly as every
+/// other model's `idx_patterns` are written.
+///
+/// Over-fetches the few stratospheric levels above the stored set (substring
+/// patterns can't express "≥100 mb"), so the realized subset is ~69% of the
+/// file (measured against the live f001 `.idx`, 2026-06-11) — the isobaric
+/// volumes ARE most of the pressure file.
+const RRFS_PRS_IDX_PATTERNS: &[&str] = &["TMP", "RH", "DPT", "UGRD", "VGRD", "HGT", "ABSV"];
 
-/// `.idx` substring patterns for the RRFS-A `nat-na` (surface) file: the 2D
-/// surface set the ingest plan extracts plus the trailing 1 h window messages
+/// `.idx` message-selection patterns for the RRFS-A `nat-na` (surface) file: the
+/// 2D surface set the ingest plan extracts plus the trailing 1 h window messages
 /// (APCP 0-1 h acc, MXUPHL 2-5 km 0-1 h max, WIND 10 m 0-1 h max). `MSLET`
 /// (mean sea level) covers the `mslp` selector (`PARAMETER_MSLP` matches it).
-/// Tiny: ~1.8% of the 9.1 GB file.
+///
+/// Same `VARIABLE[:level-substring]` format as [`RRFS_PRS_IDX_PATTERNS`] — bare
+/// variable names and `VAR:level` tokens, never `:VAR:level:` (see that doc for
+/// why colon-wrapping silently disables subsetting). Level-qualified entries
+/// pin the height/surface variant (e.g. `TMP:2 m above ground`); bare entries
+/// (`REFC`, `MSLET`, `PWAT`, the categorical precip flags) match the single
+/// message of that variable.
+///
+/// Tiny: ~1.8% of the 9.1 GB file (measured against the live f001 `.idx`).
 const RRFS_NAT_IDX_PATTERNS: &[&str] = &[
-    ":TMP:2 m above ground:",
-    ":DPT:2 m above ground:",
-    ":RH:2 m above ground:",
-    ":SPFH:2 m above ground:",
-    ":UGRD:10 m above ground:",
-    ":VGRD:10 m above ground:",
-    ":REFC:",
-    ":MSLET:",
-    ":PRES:surface:",
-    ":HGT:surface:",
-    ":GUST:surface:",
-    ":PWAT:",
-    ":APCP:surface:",
-    ":CRAIN:",
-    ":CSNOW:",
-    ":CICEP:",
-    ":CFRZR:",
-    ":VIS:surface:",
-    ":MXUPHL:5000-2000 m above ground:",
-    ":MXUPHL:3000-0 m above ground:",
-    ":WIND:10 m above ground:",
-    ":MAXUW:10 m above ground:",
-    ":MAXVW:10 m above ground:",
+    "TMP:2 m above ground",
+    "DPT:2 m above ground",
+    "RH:2 m above ground",
+    "SPFH:2 m above ground",
+    "UGRD:10 m above ground",
+    "VGRD:10 m above ground",
+    "REFC",
+    "MSLET",
+    "PRES:surface",
+    "HGT:surface",
+    "GUST:surface",
+    "PWAT",
+    "APCP:surface",
+    "CRAIN",
+    "CSNOW",
+    "CICEP",
+    "CFRZR",
+    "VIS:surface",
+    "MXUPHL:5000-2000 m above ground",
+    "MXUPHL:3000-0 m above ground",
+    "WIND:10 m above ground",
+    "MAXUW:10 m above ground",
+    "MAXVW:10 m above ground",
 ];
 
 /// The geographic CONUS crop box for a model whose native ingest domain is
@@ -291,7 +309,7 @@ mod tests {
         assert!(nat.iter().any(|p| p.contains("MSLET")));
         // The pressure plan must reach the isobaric volume field types.
         let prs = plan[0].idx_patterns;
-        for need in [":TMP:", ":RH:", ":UGRD:", ":VGRD:", ":HGT:"] {
+        for need in ["TMP", "RH", "UGRD", "VGRD", "HGT"] {
             assert!(prs.contains(&need), "prs subset missing {need}");
         }
     }
@@ -307,12 +325,86 @@ mod tests {
         assert!(w < e && s < n, "box must be well-ordered");
     }
 
+    /// Replica of `wx_core::download::find_entries`'s match rule (split the
+    /// pattern on its FIRST colon into an exact variable name + a level
+    /// substring) so this crate can assert its `.idx` patterns actually select
+    /// messages WITHOUT taking a dev-dep on wx-core. Kept deliberately tiny and
+    /// in lock-step with the real parser; the real parser is itself covered by
+    /// a regression test in `vendor/wx-core/src/download/idx.rs`.
+    fn idx_line_matches(pattern: &str, variable: &str, level: &str) -> bool {
+        let (var_pat, level_pat) = match pattern.find(':') {
+            Some(i) => (&pattern[..i], Some(&pattern[i + 1..])),
+            None => (pattern, None),
+        };
+        variable == var_pat && level_pat.is_none_or(|lp| level.contains(lp))
+    }
+
+    /// REGRESSION (root cause of the first live ingest fetching whole 4.3+9.1 GB
+    /// files instead of subsetting): the patterns MUST be bare
+    /// `VARIABLE[:level]` tokens, NOT colon-wrapped `:VARIABLE:level:`.
+    /// `find_entries` splits on the first colon, so a leading colon yields an
+    /// empty variable name that matches nothing, and the fetcher then silently
+    /// falls back to a whole-file GET. This test proves the live-idx field rows
+    /// (variable, level taken verbatim from the 2026-06-11 f001 `.idx` files)
+    /// are selected by the current patterns, and that the old `:VAR:` framing
+    /// would select nothing.
     #[test]
-    fn rrfs_a_prs_subset_patterns_match_a_real_idx_field_set() {
-        // Guard against a typo silently dropping a volume: every prs pattern is
-        // a `:FIELD:` token that the prslev.na idx uses (no level filter).
-        for pattern in RRFS_PRS_IDX_PATTERNS {
-            assert!(pattern.starts_with(':') && pattern.ends_with(':'));
+    fn rrfs_a_idx_patterns_select_real_idx_rows() {
+        // (variable, level) rows that must be reachable, verbatim from the live
+        // natlev.na / prslev.na .idx files.
+        let nat_rows = [
+            ("TMP", "2 m above ground"),
+            ("DPT", "2 m above ground"),
+            ("UGRD", "10 m above ground"),
+            ("VGRD", "10 m above ground"),
+            ("REFC", "entire atmosphere (considered as a single layer)"),
+            ("MSLET", "mean sea level"),
+            ("APCP", "surface"),
+            ("MXUPHL", "5000-2000 m above ground"),
+            ("MXUPHL", "3000-0 m above ground"),
+            ("WIND", "10 m above ground"),
+        ];
+        for (var, level) in nat_rows {
+            assert!(
+                RRFS_NAT_IDX_PATTERNS
+                    .iter()
+                    .any(|p| idx_line_matches(p, var, level)),
+                "nat patterns select nothing for {var}:{level}"
+            );
+        }
+        // prslev.na isobaric rows (one example level per field type).
+        let prs_rows = [
+            ("TMP", "500 mb"),
+            ("RH", "850 mb"),
+            ("DPT", "700 mb"),
+            ("UGRD", "250 mb"),
+            ("VGRD", "250 mb"),
+            ("HGT", "500 mb"),
+            ("ABSV", "500 mb"),
+        ];
+        for (var, level) in prs_rows {
+            assert!(
+                RRFS_PRS_IDX_PATTERNS
+                    .iter()
+                    .any(|p| idx_line_matches(p, var, level)),
+                "prs patterns select nothing for {var}:{level}"
+            );
+        }
+        // No pattern may be colon-wrapped — that is the exact shape that
+        // silently disabled subsetting and must never regress.
+        for pattern in RRFS_NAT_IDX_PATTERNS.iter().chain(RRFS_PRS_IDX_PATTERNS) {
+            assert!(
+                !pattern.starts_with(':') && !pattern.ends_with(':'),
+                "idx pattern {pattern:?} is colon-wrapped (matches nothing in find_entries)"
+            );
+            // And prove the colon-wrapped form really would match nothing, so
+            // the guard above is meaningful and not cosmetic.
+            let wrapped = format!(":{pattern}:");
+            assert!(
+                !idx_line_matches(&wrapped, "TMP", "2 m above ground")
+                    && !idx_line_matches(&wrapped, "REFC", "entire atmosphere"),
+                "colon-wrapped {wrapped:?} unexpectedly matched"
+            );
         }
     }
 
