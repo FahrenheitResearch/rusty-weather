@@ -4330,6 +4330,8 @@ dependencies = [
 name = "rw-glm"
 version = "0.1.0"
 dependencies = [
+ "hdf5-reader",
+ "netcrust",
  "rw-store",
  "serde",
  "serde_json",

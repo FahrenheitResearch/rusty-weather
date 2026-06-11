@@ -1,2 +1,4 @@
 crates/rw-store/tests/golden/** -text
 crates/rw-glm/tests/golden/** -text
+# Real NOAA GLM granule fixture — binary NetCDF, must stay byte-identical.
+crates/rw-glm/tests/fixtures/*.nc -text -diff

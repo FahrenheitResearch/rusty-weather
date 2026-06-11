@@ -11,3 +11,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 rw-store = { path = "../rw-store" }
+
+# Pure-Rust NetCDF4/HDF5 reading for GLM L2 LCFA granule decode (Task 2),
+# mirroring rw-sat. hdf5-reader resolves to the vendored tree via the
+# workspace-root [patch.crates-io] pin.
+hdf5-reader = "0.3"
+netcrust = { path = "../../vendor/netcrust" }

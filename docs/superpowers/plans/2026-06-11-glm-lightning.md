@@ -35,9 +35,11 @@
 ### Task 2: Granule decode (lean + one real-granule pin)
 
 **Files:** `crates/rw-glm/src/granule.rs` (+ netcrust dep), fixture `crates/rw-glm/tests/fixtures/<one real small granule>.nc` (~100-400 KB, fetch the most recent G19 granule once via S3 — list bucket anonymously like rw-sat/s3.rs, document provenance in a fixture README)
-- [ ] Failing test against the committed real granule: decode_granule(path) → flashes with: count == NetCDF flash dim, every lat within ±66 (GLM disk), lon within disk extent, energy > 0 finite (raw J ~1e-15..1e-10 range sanity), duration_ms saturation logic, flags bit0 set iff quality != 0, time = product epoch + first-event offset (assert one flash's absolute time against a hand-computed value from the granule's raw attrs — print the attrs in the test comment).
-- [ ] Implement with netcrust scaled reads (pattern: rw-sat netcdf.rs read_scaled_f32). Area m²→km².
-- [ ] Workspace green; commit; push.
+- [x] Failing test against the committed real granule: decode_granule(path) → flashes with: count == NetCDF flash dim, every lat within ±66 (GLM disk), lon within disk extent, energy > 0 finite (raw J ~1e-15..1e-10 range sanity), duration_ms saturation logic, flags bit0 set iff quality != 0, time = product epoch + first-event offset (assert one flash's absolute time against a hand-computed value from the granule's raw attrs — print the attrs in the test comment).
+- [x] Implement with netcrust scaled reads (pattern: rw-sat netcdf.rs read_scaled_f32). Area m²→km².
+- [x] Workspace green; commit; push.
+
+> **Task 2 pin (verified against the committed granule `OR_GLM-L2-LCFA_G19_s20261620805000_…`, 245,564 B, 107 flashes):** the L2 LCFA variable names matched the plan's assumption exactly — `number_of_flashes` dim; `product_time` (F64 scalar, J2000 seconds; epoch = 946_728_000 Unix s); scaled-i16 `flash_time_offset_of_first/last_event` (seconds vs product_time, may be slightly negative), `flash_energy` (J, `scale_factor ≈ 9.99996e-16`), `flash_area` (m²→km²); f32 `flash_lat`/`flash_lon`; i16 `flash_quality_flag` (0 good). **Energy precision:** netcrust's raw read returns the int promoted to f64 *without* applying scale; rw-glm applies `scale_factor`/`add_offset` in **f64** and narrows to f32 only on the final joule value, so the ~1e-15 energies survive (`energy0 = 2.285e-15 J`). One quirk noted, not a spec change: energy/area carry a sign-bogus `valid_range = [0, -6]` (i16), so rw-glm deliberately does **not** use rw-sat's `read_scaled_f32` valid-range filtering — it applies scale/offset itself and only drops `_FillValue` (=-1) flashes.
 
 ### Task 3: Follow engine + window (lean)
 
