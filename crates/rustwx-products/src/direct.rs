@@ -344,11 +344,14 @@ pub fn render_direct_recipes_chunked_from_loader(
         .collect();
     let crop_bounds = match planned.iter().find_map(|item| {
         let selector = item.recipe.filled.selector?;
-        needed.contains(&selector).then_some((item.recipe, selector))
+        needed
+            .contains(&selector)
+            .then_some((item.recipe, selector))
     }) {
         Some((recipe, selector)) => {
             let field = load_field(&selector)?;
-            let overlay_only = should_render_overlay_only(field.selector, recipe.contours.is_some());
+            let overlay_only =
+                should_render_overlay_only(field.selector, recipe.contours.is_some());
             let visual_mode = visual_mode_for_direct_recipe(recipe, field.selector, overlay_only);
             render_bounds_for_direct_field(
                 request.domain.bounds,

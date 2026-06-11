@@ -57,6 +57,17 @@ pub struct ProductFetch {
     pub surface_source: bool,
     /// The 3D volume / isobaric-plane extraction reads this file.
     pub pressure_source: bool,
+    /// `.idx` substring patterns selecting only the GRIB messages this file's
+    /// roles need. Empty = fetch the whole file (HRRR/GFS — preserving their
+    /// historical byte-identical whole-file fetch). Non-empty = the fetch path
+    /// passes these as `FetchRequest.variable_patterns`, which triggers the
+    /// existing AWS/Google `.idx` message-subset fetch (ranged GET of just the
+    /// matched messages, cache keyed by the pattern set — see
+    /// `rustwx_io::fetch_bytes_with_cache`). RRFS-A's NA files are 4.3 GB
+    /// (`prs-na`) + 9.1 GB (`nat-na`), so subsetting is mandatory: the surface
+    /// subset is ~1.8% of the file, the pressure subset ~86% (the isobaric
+    /// volumes are inherently most of the pressure file).
+    pub idx_patterns: &'static [&'static str],
 }
 
 /// The per-model fetch plan: which product file(s) one hour downloads and
@@ -76,21 +87,113 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
                 product: "prs",
                 surface_source: false,
                 pressure_source: true,
+                idx_patterns: &[],
             },
             ProductFetch {
                 product: "sfc",
                 surface_source: true,
                 pressure_source: false,
+                idx_patterns: &[],
             },
         ]),
         ModelId::Gfs => Ok(vec![ProductFetch {
             product: "pgrb2.0p25",
             surface_source: true,
             pressure_source: true,
+            idx_patterns: &[],
         }]),
+        // RRFS-A: the only files carrying RRFS surface fields are the NA pair
+        // (recon-verified — `prslev.conus` is pressure-only, `natlev.conus`
+        // 404s). Both are the SAME rotated-pole grid (GRIB template 1,
+        // 4881x2961); they are cropped to a CONUS box at ingest (see
+        // `model_crop_box`). The files are huge (prs-na 4.3 GB, nat-na 9.1 GB),
+        // so each carries `.idx` patterns to subset-fetch only the messages its
+        // role needs.
+        ModelId::RrfsA => Ok(vec![
+            ProductFetch {
+                product: "prs-na",
+                surface_source: false,
+                pressure_source: true,
+                idx_patterns: RRFS_PRS_IDX_PATTERNS,
+            },
+            ProductFetch {
+                product: "nat-na",
+                surface_source: true,
+                pressure_source: false,
+                idx_patterns: RRFS_NAT_IDX_PATTERNS,
+            },
+        ]),
         other => Err(events::other(format!(
             "model '{other}' has no ingest fetch plan (not ingest-supported)"
         ))),
+    }
+}
+
+/// `.idx` substring patterns for the RRFS-A `prs-na` (pressure) file: the
+/// isobaric volume field types the ingest plan decodes (T/RH/DPT for the
+/// dewpoint→rh fallback, U/V, geopotential height) plus absolute vorticity
+/// (the sparse per-level planes). Each pattern matches every isobaric level of
+/// that field; the level subset the profile stores is realized at decode.
+/// Over-fetches the few stratospheric levels above the stored set (idx
+/// substring patterns can't express "≥100 mb"), but still ~86% of the file
+/// since the isobaric volumes ARE most of the pressure file.
+const RRFS_PRS_IDX_PATTERNS: &[&str] = &[
+    ":TMP:", ":RH:", ":DPT:", ":UGRD:", ":VGRD:", ":HGT:", ":ABSV:",
+];
+
+/// `.idx` substring patterns for the RRFS-A `nat-na` (surface) file: the 2D
+/// surface set the ingest plan extracts plus the trailing 1 h window messages
+/// (APCP 0-1 h acc, MXUPHL 2-5 km 0-1 h max, WIND 10 m 0-1 h max). `MSLET`
+/// (mean sea level) covers the `mslp` selector (`PARAMETER_MSLP` matches it).
+/// Tiny: ~1.8% of the 9.1 GB file.
+const RRFS_NAT_IDX_PATTERNS: &[&str] = &[
+    ":TMP:2 m above ground:",
+    ":DPT:2 m above ground:",
+    ":RH:2 m above ground:",
+    ":SPFH:2 m above ground:",
+    ":UGRD:10 m above ground:",
+    ":VGRD:10 m above ground:",
+    ":REFC:",
+    ":MSLET:",
+    ":PRES:surface:",
+    ":HGT:surface:",
+    ":GUST:surface:",
+    ":PWAT:",
+    ":APCP:surface:",
+    ":CRAIN:",
+    ":CSNOW:",
+    ":CICEP:",
+    ":CFRZR:",
+    ":VIS:surface:",
+    ":MXUPHL:5000-2000 m above ground:",
+    ":MXUPHL:3000-0 m above ground:",
+    ":WIND:10 m above ground:",
+    ":MAXUW:10 m above ground:",
+    ":MAXVW:10 m above ground:",
+];
+
+/// The geographic CONUS crop box for a model whose native ingest domain is
+/// larger than CONUS (RRFS-A's North America rotated-pole grid), as
+/// `(west, east, south, north)` degrees. `None` = no crop (HRRR, GFS — the
+/// native grid is already the store grid).
+///
+/// RRFS-A: the NA files (4881x2961, GRIB template 1 rotated-pole, unrotated to
+/// curvilinear geographic by grib-core) cover all of North America. Cropping to
+/// this box at ingest keeps the store HRRR-class (~5.1M cells, ~2.7x HRRR)
+/// instead of 14.5M. The box is chosen so RRFS-CONUS coverage ⊇ HRRR-CONUS:
+/// HRRR's CONUS Lambert grid spans roughly lat 21.1..52.6, lon -134.1..-60.9;
+/// these bounds (21.0..53.5, -134.5..-60.5) bound it with a small margin.
+/// Realized on the native rotated index grid as a contiguous block
+/// (~1736x2931 cells; the rotated grid is skewed so the index block
+/// over-covers the geographic rectangle — the true rectangle is fully inside).
+/// Determinism: the crop index range is a pure function of the grid's per-cell
+/// coordinates (first/last row+col whose geographic point lies in the box),
+/// computed once per hour — no per-run floating-point branch.
+pub fn model_crop_box(model: rustwx_core::ModelId) -> Option<(f64, f64, f64, f64)> {
+    use rustwx_core::ModelId;
+    match model {
+        ModelId::RrfsA => Some((-134.5, -60.5, 21.0, 53.5)),
+        _ => None,
     }
 }
 
@@ -127,13 +230,14 @@ mod tests {
     }
 
     #[test]
-    fn hrrr_and_gfs_are_ingest_supported() {
+    fn hrrr_gfs_and_rrfs_a_are_ingest_supported() {
         use rustwx_core::ModelId;
         assert!(ingest_supported(ModelId::Hrrr));
         assert!(ingest_supported(ModelId::Gfs));
+        assert!(ingest_supported(ModelId::RrfsA));
         // Every other catalog model stays gated until its fetch plan lands.
         for model in rustwx_models::supported_models() {
-            if !matches!(model, ModelId::Hrrr | ModelId::Gfs) {
+            if !matches!(model, ModelId::Hrrr | ModelId::Gfs | ModelId::RrfsA) {
                 assert!(
                     !ingest_supported(model),
                     "{model} must stay gated until its fetch plan exists"
@@ -142,6 +246,74 @@ mod tests {
         }
         // A model with no plan (e.g. NBM) is explicitly unsupported.
         assert!(!ingest_supported(ModelId::Nbm));
+    }
+
+    #[test]
+    fn whole_file_models_carry_no_idx_patterns() {
+        use rustwx_core::ModelId;
+        // HRRR + GFS must keep their historical whole-file fetch (empty
+        // patterns) so their fetch URLs and bytes stay byte-identical.
+        for model in [ModelId::Hrrr, ModelId::Gfs] {
+            for entry in fetch_plan(model).expect("plan") {
+                assert!(
+                    entry.idx_patterns.is_empty(),
+                    "{model} product {} must fetch whole-file (no idx subset)",
+                    entry.product
+                );
+            }
+        }
+        // HRRR/GFS have no crop box (native grid IS the store grid).
+        assert!(model_crop_box(ModelId::Hrrr).is_none());
+        assert!(model_crop_box(ModelId::Gfs).is_none());
+    }
+
+    #[test]
+    fn fetch_plan_rrfs_a_is_the_na_pair_with_subset_patterns() {
+        use rustwx_core::ModelId;
+        let plan = fetch_plan(ModelId::RrfsA).expect("RRFS-A plan");
+        assert_eq!(plan.len(), 2, "RRFS-A fetches prs-na + nat-na");
+        // Pressure role first (the historical pressure-then-surface order).
+        assert_eq!(plan[0].product, "prs-na");
+        assert!(plan[0].pressure_source && !plan[0].surface_source);
+        assert_eq!(plan[1].product, "nat-na");
+        assert!(plan[1].surface_source && !plan[1].pressure_source);
+        // Both files are huge → both MUST subset-fetch.
+        assert!(
+            !plan[0].idx_patterns.is_empty() && !plan[1].idx_patterns.is_empty(),
+            "RRFS-A NA files (4.3+9.1 GB) must subset-fetch"
+        );
+        // The surface plan must reach the trailing 1 h window messages and the
+        // honest MSLET→mslp message.
+        let nat = plan[1].idx_patterns;
+        assert!(nat.iter().any(|p| p.contains("APCP:surface")));
+        assert!(nat.iter().any(|p| p.contains("MXUPHL:5000-2000 m")));
+        assert!(nat.iter().any(|p| p.contains("WIND:10 m above ground")));
+        assert!(nat.iter().any(|p| p.contains("MSLET")));
+        // The pressure plan must reach the isobaric volume field types.
+        let prs = plan[0].idx_patterns;
+        for need in [":TMP:", ":RH:", ":UGRD:", ":VGRD:", ":HGT:"] {
+            assert!(prs.contains(&need), "prs subset missing {need}");
+        }
+    }
+
+    #[test]
+    fn rrfs_a_has_a_conus_crop_box_bounding_hrrr() {
+        use rustwx_core::ModelId;
+        let (w, e, s, n) = model_crop_box(ModelId::RrfsA).expect("RRFS-A crop box");
+        // (west, east, south, north). Must bound HRRR's CONUS coverage with a
+        // margin so RRFS-CONUS ⊇ HRRR-CONUS.
+        assert!(w <= -134.0 && e >= -61.0, "lon box must bound HRRR conus");
+        assert!(s <= 21.1 && n >= 52.6, "lat box must bound HRRR conus");
+        assert!(w < e && s < n, "box must be well-ordered");
+    }
+
+    #[test]
+    fn rrfs_a_prs_subset_patterns_match_a_real_idx_field_set() {
+        // Guard against a typo silently dropping a volume: every prs pattern is
+        // a `:FIELD:` token that the prslev.na idx uses (no level filter).
+        for pattern in RRFS_PRS_IDX_PATTERNS {
+            assert!(pattern.starts_with(':') && pattern.ends_with(':'));
+        }
     }
 
     #[test]

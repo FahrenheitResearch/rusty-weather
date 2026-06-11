@@ -449,7 +449,14 @@ where
     );
     let (sb, ml, mu) = parcels.map_err(|err| err as Box<dyn std::error::Error>)?;
     let independent = independent.map_err(|err| err as Box<dyn std::error::Error>)?;
-    assemble_derived_outputs(surface, recipes, &requirements, grid, (sb, ml, mu), independent)
+    assemble_derived_outputs(
+        surface,
+        recipes,
+        &requirements,
+        grid,
+        (sb, ml, mu),
+        independent,
+    )
 }
 
 /// Fold the kernel outputs into [`DerivedComputedFields`] — the composites
@@ -826,8 +833,14 @@ where
     independent.temperature_advection_700mb_cph = wind_outputs.temperature_advection_700mb_cph;
     independent.temperature_advection_850mb_cph = wind_outputs.temperature_advection_850mb_cph;
 
-    let computed =
-        assemble_derived_outputs(surface, recipes, &requirements, grid, (sb, ml, mu), independent)?;
+    let computed = assemble_derived_outputs(
+        surface,
+        recipes,
+        &requirements,
+        grid,
+        (sb, ml, mu),
+        independent,
+    )?;
     Ok((computed, kept_winds))
 }
 

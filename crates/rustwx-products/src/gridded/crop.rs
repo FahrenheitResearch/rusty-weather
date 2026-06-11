@@ -175,6 +175,68 @@ pub fn crop_latlon_grid(
     )?)
 }
 
+/// Compute the tightest [`GridCrop`] (contiguous index block) whose cells'
+/// geographic coordinates intersect `bounds = (west, east, south, north)`, on a
+/// per-cell `LatLonGrid` (regular, Lambert, or rotated-pole-unrotated — same
+/// generic per-cell scan the heavy-compute crop uses). `None` when no cell is
+/// in bounds; the full grid (no crop) is reported as `Some(full)` so callers
+/// can compare. The crop index range is a deterministic pure function of the
+/// grid's per-cell lat/lon — no per-run floating-point branch — so re-ingesting
+/// an hour yields a bit-identical cropped grid.
+pub fn grid_crop_for_bounds(grid: &LatLonGrid, bounds: (f64, f64, f64, f64)) -> Option<GridCrop> {
+    let nx = grid.shape.nx;
+    let ny = grid.shape.ny;
+    let mut min_x = nx;
+    let mut max_x = 0usize;
+    let mut min_y = ny;
+    let mut max_y = 0usize;
+    let mut found = false;
+    for y in 0..ny {
+        let row_offset = y * nx;
+        for x in 0..nx {
+            let idx = row_offset + x;
+            let lat = grid.lat_deg[idx] as f64;
+            let lon = grid.lon_deg[idx] as f64;
+            if point_in_geographic_bounds(lon, lat, bounds) {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+                found = true;
+            }
+        }
+    }
+    if !found {
+        return None;
+    }
+    Some(GridCrop {
+        x_start: min_x,
+        x_end: max_x + 1,
+        y_start: min_y,
+        y_end: max_y + 1,
+    })
+}
+
+/// Crop a decoded surface+pressure pair by an explicit [`GridCrop`] (the index
+/// block the caller already computed from the store grid), plus the recomputed
+/// `LatLonGrid`. Used by the ingest crop, where ONE crop spec — computed from
+/// the extraction reference grid — must drive both the extracted field planes
+/// AND the derived/heavy compute domain in lock-step.
+pub fn crop_heavy_domain_with(
+    surface: &SurfaceFields,
+    pressure: &PressureFields,
+    crop: GridCrop,
+) -> Result<CroppedHeavyDomain, Box<dyn std::error::Error>> {
+    let cropped_surface = crop_surface_fields(surface, crop);
+    let cropped_pressure = crop_pressure_fields(pressure, surface.nx, surface.ny, crop)?;
+    let grid = cropped_surface.core_grid()?;
+    Ok(CroppedHeavyDomain {
+        surface: cropped_surface,
+        pressure: cropped_pressure,
+        grid,
+    })
+}
+
 pub(super) fn crop_rect_for_layout(
     layout: &SurfaceGridLayout,
     bounds: (f64, f64, f64, f64),

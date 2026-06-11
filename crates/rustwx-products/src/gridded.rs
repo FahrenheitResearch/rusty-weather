@@ -35,8 +35,8 @@ mod fetch;
 
 pub use crop::{
     CroppedHeavyDomain, GridCrop, ProjectedGridIntersection, classify_projected_grid_intersection,
-    crop_heavy_domain, crop_heavy_domain_for_projected_extent, crop_latlon_grid, crop_values_f32,
-    crop_values_f64,
+    crop_heavy_domain, crop_heavy_domain_for_projected_extent, crop_heavy_domain_with,
+    crop_latlon_grid, crop_values_f32, crop_values_f64, grid_crop_for_bounds,
 };
 use crop::{crop_2d_values, crop_rect_for_layout, cropped_decode_cache_path};
 pub(crate) use fetch::{

@@ -473,9 +473,7 @@ mod tests {
             .collect();
         let volume = |base: f64, dk: f64, dij: f64| -> Vec<f64> {
             (0..LEVELS.len())
-                .flat_map(|k| {
-                    (0..NXY).map(move |ij| base + dk * k as f64 + dij * ij as f64)
-                })
+                .flat_map(|k| (0..NXY).map(move |ij| base + dk * k as f64 + dij * ij as f64))
                 .collect()
         };
         let qvapor_kgkg_3d: Vec<f64> = LEVELS
