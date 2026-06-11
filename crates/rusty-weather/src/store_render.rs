@@ -28,7 +28,8 @@ use rustwx_products::derived::{
     render_derived_recipes_from_store_grids,
 };
 use rustwx_products::direct::{
-    DirectBatchRequest, DirectRenderedRecipe, render_direct_recipes_from_selected_fields,
+    DirectBatchRequest, DirectRenderedRecipe, direct_render_chunk_size,
+    render_direct_recipes_chunked_from_loader,
 };
 use rw_store::error::RwStoreError;
 use rw_store::grid::GridFile;
@@ -188,8 +189,10 @@ pub struct DirectStoreOutcome {
 }
 
 /// Render the requested direct recipes from stored fields through the
-/// direct lane's own from-selected-fields entry (the same planning, crop,
-/// render-request build, and save path the GRIB lane runs). A recipe is
+/// direct lane's chunked render entry (the same planning, crop,
+/// render-request build, and save path the GRIB lane runs — recipes render
+/// in bounded chunks whose fields are loaded from the store on demand, so
+/// the full ~2 GB selector set never sits in RAM at once). A recipe is
 /// renderable iff every selector in its fetch plan resolves in the store;
 /// unresolvable recipes are returned as skips with the missing selectors.
 pub fn render_direct_recipes_from_store(
@@ -200,7 +203,6 @@ pub fn render_direct_recipes_from_store(
 ) -> Result<DirectStoreOutcome, Box<dyn std::error::Error>> {
     let mut renderable = Vec::new();
     let mut skipped = Vec::new();
-    let mut needed = Vec::<FieldSelector>::new();
     for slug in recipe_slugs {
         let plan = match plot_recipe_fetch_plan(slug, request.model) {
             Ok(plan) => plan,
@@ -212,18 +214,13 @@ pub fn render_direct_recipes_from_store(
                 continue;
             }
         };
-        let selectors = plan.selectors();
-        let missing: Vec<String> = selectors
+        let missing: Vec<String> = plan
+            .selectors()
             .iter()
             .filter(|selector| source.resolve(selector).is_none())
             .map(|selector| selector.key())
             .collect();
         if missing.is_empty() {
-            for selector in selectors {
-                if !needed.contains(&selector) {
-                    needed.push(selector);
-                }
-            }
             renderable.push(slug.clone());
         } else {
             skipped.push(StoreRenderSkip {
@@ -239,15 +236,13 @@ pub fn render_direct_recipes_from_store(
         });
     }
 
-    let mut extracted = HashMap::with_capacity(needed.len());
-    for selector in needed {
-        extracted.insert(selector, source.fetch(&selector)?);
-    }
-    let rendered = render_direct_recipes_from_selected_fields(
+    let mut load_field = |selector: &FieldSelector| source.fetch(selector);
+    let rendered = render_direct_recipes_chunked_from_loader(
         request,
         latest,
         &renderable,
-        &extracted,
+        &mut load_field,
+        direct_render_chunk_size(),
         "rw-store",
         source.hour_path().display().to_string(),
         source.fetch_key(),

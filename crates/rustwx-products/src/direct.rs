@@ -244,25 +244,14 @@ pub fn render_direct_recipes_from_selected_fields(
 ) -> Result<Vec<DirectRenderedRecipe>, Box<dyn std::error::Error>> {
     fs::create_dir_all(&request.out_dir)?;
     let planned = plan_direct_recipes(request.model, recipe_slugs)?;
-    let groups = group_direct_fetches(request, &planned);
-    let fetched_product = fetched_product.into();
-    let resolved_url = resolved_url.into();
-    let fetch_key = fetch_key.into();
-    let mut fetch_truth_by_actual_product = HashMap::<String, DirectFetchRuntimeInfo>::new();
-    for group in &groups {
-        fetch_truth_by_actual_product.insert(
-            group.product.clone(),
-            DirectFetchRuntimeInfo {
-                fetch_key: fetch_key.clone(),
-                planned_product: group.product.clone(),
-                fetched_product: fetched_product.clone(),
-                planned_family_aliases: group.planned_family_aliases.iter().cloned().collect(),
-                requested_source: request.source,
-                resolved_source: latest.source,
-                resolved_url: resolved_url.clone(),
-            },
-        );
-    }
+    let fetch_truth_by_actual_product = direct_fetch_truth_for_planned(
+        request,
+        latest,
+        &planned,
+        fetched_product.into(),
+        resolved_url.into(),
+        fetch_key.into(),
+    );
 
     let missing = planned
         .iter()
@@ -283,6 +272,169 @@ pub fn render_direct_recipes_from_selected_fields(
     )
 }
 
+/// Default recipe-chunk size for [`render_direct_recipes_chunked_from_loader`],
+/// overridable via `RUSTWX_DIRECT_RENDER_CHUNK`. Sized so one chunk's
+/// full-grid input fields (~23 MB per selector at HRRR size, transient
+/// until the domain crop lands) plus its cropped fields and worker scratch
+/// stay well under ~1.5 GB, while chunks stay large enough that the
+/// shared-selector reloads across chunks cost only a few store reads.
+pub fn direct_render_chunk_size() -> usize {
+    std::env::var("RUSTWX_DIRECT_RENDER_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(16)
+}
+
+/// Chunked sibling of [`render_direct_recipes_from_selected_fields`] for
+/// callers that can load fields on demand (the `.rws` store render lane):
+/// instead of holding every needed full-grid field across the whole pass
+/// (~2 GB at HRRR size for the all-products list), recipes render in
+/// chunks of `chunk_recipes`; each chunk loads only its own selectors,
+/// crops them to the render domain, and FREES the full-grid copies before
+/// rendering. Pixel identity with the unchunked pass holds because:
+///
+/// * the crop bounds are derived once, by the exact selection rule of
+///   `crop_bounds_for_direct_request` over the full planned list, so every
+///   chunk crops with the same bounds the unchunked pass used;
+/// * each recipe sees the same cropped fields, the same fetch truth (built
+///   from the full planned list), and the same render path;
+/// * the shared layer/projected-map caches persist across chunks, and
+///   every cached entry is a pure function of its key inputs, so chunk
+///   grouping changes only WHEN an entry is built, never its content.
+pub fn render_direct_recipes_chunked_from_loader(
+    request: &DirectBatchRequest,
+    latest: &LatestRun,
+    recipe_slugs: &[String],
+    load_field: &mut dyn FnMut(
+        &FieldSelector,
+    ) -> Result<SelectedField2D, Box<dyn std::error::Error>>,
+    chunk_recipes: usize,
+    fetched_product: impl Into<String>,
+    resolved_url: impl Into<String>,
+    fetch_key: impl Into<String>,
+) -> Result<Vec<DirectRenderedRecipe>, Box<dyn std::error::Error>> {
+    fs::create_dir_all(&request.out_dir)?;
+    let planned = plan_direct_recipes(request.model, recipe_slugs)?;
+    if planned.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fetch_truth_by_actual_product = direct_fetch_truth_for_planned(
+        request,
+        latest,
+        &planned,
+        fetched_product.into(),
+        resolved_url.into(),
+        fetch_key.into(),
+    );
+
+    // Crop bounds exactly as `crop_bounds_for_direct_request` would pick
+    // them from the full extracted map: the first planned recipe whose
+    // filled selector the (full) pass would have loaded.
+    let needed: HashSet<FieldSelector> = planned
+        .iter()
+        .flat_map(|item| item.plan.selectors())
+        .collect();
+    let crop_bounds = match planned.iter().find_map(|item| {
+        let selector = item.recipe.filled.selector?;
+        needed.contains(&selector).then_some((item.recipe, selector))
+    }) {
+        Some((recipe, selector)) => {
+            let field = load_field(&selector)?;
+            let overlay_only = should_render_overlay_only(field.selector, recipe.contours.is_some());
+            let visual_mode = visual_mode_for_direct_recipe(recipe, field.selector, overlay_only);
+            render_bounds_for_direct_field(
+                request.domain.bounds,
+                &field,
+                visual_mode,
+                request.output_width,
+                request.output_height,
+            )
+        }
+        None => request.domain.bounds,
+    };
+
+    let shared = DirectSharedRenderCaches::default();
+    let mut prepared_accum: HashMap<ProjectedMapCacheKey, ProjectedMap> = HashMap::new();
+    let mut completed = Vec::with_capacity(planned.len());
+    for chunk in planned.chunks(chunk_recipes.max(1)) {
+        let mut extracted = HashMap::<FieldSelector, SelectedField2D>::new();
+        for item in chunk {
+            for selector in item.plan.selectors() {
+                if !extracted.contains_key(&selector) {
+                    extracted.insert(selector, load_field(&selector)?);
+                }
+            }
+        }
+        let domain_extracted = crop_direct_fields_for_domain(&extracted, crop_bounds)?;
+        // The full-grid inputs leave RAM before any rendering starts; the
+        // render workers only ever see the domain-cropped fields.
+        drop(extracted);
+        extend_prepared_projected_maps(request, chunk, &domain_extracted, &mut prepared_accum)?;
+        let prepared: PreparedProjectedMaps = Arc::new(prepared_accum.clone());
+        if prepared.is_empty() {
+            // Mirrors the unchunked pass: no projected map means no
+            // renderable recipe in this chunk (and, in practice, none at
+            // all — a chunk only lacks maps when its fields are absent).
+            continue;
+        }
+        completed.extend(render_cropped_direct_recipes(
+            request,
+            latest,
+            chunk,
+            &domain_extracted,
+            &fetch_truth_by_actual_product,
+            None,
+            &shared,
+            &prepared,
+        )?);
+    }
+    Ok(completed)
+}
+
+/// Fetch-provenance truth per canonical product family, shared verbatim by
+/// the whole-pass and chunked direct render entries (report metadata only,
+/// never pixels).
+fn direct_fetch_truth_for_planned(
+    request: &DirectBatchRequest,
+    latest: &LatestRun,
+    planned: &[PlannedDirectRecipe],
+    fetched_product: String,
+    resolved_url: String,
+    fetch_key: String,
+) -> HashMap<String, DirectFetchRuntimeInfo> {
+    let groups = group_direct_fetches(request, planned);
+    let mut fetch_truth_by_actual_product = HashMap::<String, DirectFetchRuntimeInfo>::new();
+    for group in &groups {
+        fetch_truth_by_actual_product.insert(
+            group.product.clone(),
+            DirectFetchRuntimeInfo {
+                fetch_key: fetch_key.clone(),
+                planned_product: group.product.clone(),
+                fetched_product: fetched_product.clone(),
+                planned_family_aliases: group.planned_family_aliases.iter().cloned().collect(),
+                requested_source: request.source,
+                resolved_source: latest.source,
+                resolved_url: resolved_url.clone(),
+            },
+        );
+    }
+    fetch_truth_by_actual_product
+}
+
+/// The shared mutable caches one direct render pass carries across its
+/// recipes (and, in the chunked entry, across its chunks). Every entry is
+/// a pure function of its cache key inputs, so sharing changes only when
+/// an entry is built, never its content.
+#[derive(Default)]
+struct DirectSharedRenderCaches {
+    contour_layer_cache: SharedContourLayerCache,
+    barb_layer_cache: SharedBarbLayerCache,
+    streamline_layer_cache: SharedStreamlineLayerCache,
+    barb_stride_cache: SharedBarbStrideCache,
+    projected_map_cache: SharedProjectedMapCache,
+}
+
 fn render_direct_recipes(
     request: &DirectBatchRequest,
     latest: &LatestRun,
@@ -298,15 +450,46 @@ fn render_direct_recipes(
     let crop_bounds = crop_bounds_for_direct_request(request, planned, extracted);
     let domain_extracted = crop_direct_fields_for_domain(extracted, crop_bounds)?;
     let extracted = &domain_extracted;
-    let contour_layer_cache = Arc::new(Mutex::new(HashMap::new()));
-    let barb_layer_cache = Arc::new(Mutex::new(HashMap::new()));
-    let streamline_layer_cache = Arc::new(Mutex::new(HashMap::new()));
-    let barb_stride_cache = Arc::new(Mutex::new(HashMap::new()));
-    let projected_map_cache = Arc::new(Mutex::new(HashMap::new()));
+    let shared = DirectSharedRenderCaches::default();
     let prepared_projected_maps = build_prepared_projected_maps(request, planned, extracted)?;
     if prepared_projected_maps.is_empty() {
         return Ok(Vec::new());
     }
+    render_cropped_direct_recipes(
+        request,
+        latest,
+        planned,
+        extracted,
+        fetch_truth_by_actual_product,
+        shared_context,
+        &shared,
+        &prepared_projected_maps,
+    )
+}
+
+/// The worker-loop core of one direct render pass over ALREADY
+/// domain-cropped fields: the exact per-recipe render path, parallelized
+/// over `render_worker_count` self-scheduling workers. Factored out so the
+/// chunked store-render entry drives the identical code with bounded
+/// per-chunk inputs.
+#[allow(clippy::too_many_arguments)]
+fn render_cropped_direct_recipes(
+    request: &DirectBatchRequest,
+    latest: &LatestRun,
+    planned: &[PlannedDirectRecipe],
+    extracted: &HashMap<FieldSelector, SelectedField2D>,
+    fetch_truth_by_actual_product: &HashMap<String, DirectFetchRuntimeInfo>,
+    shared_context: Option<&dyn ProjectedMapProvider>,
+    shared: &DirectSharedRenderCaches,
+    prepared_projected_maps: &PreparedProjectedMaps,
+) -> Result<Vec<DirectRenderedRecipe>, Box<dyn std::error::Error>> {
+    let DirectSharedRenderCaches {
+        contour_layer_cache,
+        barb_layer_cache,
+        streamline_layer_cache,
+        barb_stride_cache,
+        projected_map_cache,
+    } = shared;
     let worker_count = render_worker_count(planned.len());
     if worker_count <= 1 {
         return planned
@@ -319,12 +502,12 @@ fn render_direct_recipes(
                     extracted,
                     fetch_truth_by_actual_product,
                     shared_context,
-                    &contour_layer_cache,
-                    &barb_layer_cache,
-                    &streamline_layer_cache,
-                    &barb_stride_cache,
-                    &projected_map_cache,
-                    &prepared_projected_maps,
+                    contour_layer_cache,
+                    barb_layer_cache,
+                    streamline_layer_cache,
+                    barb_stride_cache,
+                    projected_map_cache,
+                    prepared_projected_maps,
                 )
             })
             .collect();
@@ -336,12 +519,12 @@ fn render_direct_recipes(
     thread::scope(|scope| -> Result<(), std::io::Error> {
         let mut handles = Vec::new();
         for _ in 0..worker_count {
-            let barb_stride_cache = Arc::clone(&barb_stride_cache);
-            let contour_layer_cache = Arc::clone(&contour_layer_cache);
-            let barb_layer_cache = Arc::clone(&barb_layer_cache);
-            let streamline_layer_cache = Arc::clone(&streamline_layer_cache);
-            let projected_map_cache = Arc::clone(&projected_map_cache);
-            let prepared_projected_maps = Arc::clone(&prepared_projected_maps);
+            let barb_stride_cache = Arc::clone(barb_stride_cache);
+            let contour_layer_cache = Arc::clone(contour_layer_cache);
+            let barb_layer_cache = Arc::clone(barb_layer_cache);
+            let streamline_layer_cache = Arc::clone(streamline_layer_cache);
+            let projected_map_cache = Arc::clone(projected_map_cache);
+            let prepared_projected_maps = Arc::clone(prepared_projected_maps);
             let next_index = &next_index;
             handles.push(scope.spawn(
                 move || -> Result<Vec<(usize, DirectRenderedRecipe)>, std::io::Error> {
@@ -483,6 +666,22 @@ fn build_prepared_projected_maps(
     planned: &[PlannedDirectRecipe],
     extracted: &HashMap<FieldSelector, SelectedField2D>,
 ) -> Result<PreparedProjectedMaps, Box<dyn std::error::Error>> {
+    let mut prepared = HashMap::new();
+    extend_prepared_projected_maps(request, planned, extracted, &mut prepared)?;
+    Ok(Arc::new(prepared))
+}
+
+/// Build the projected maps `planned` needs into `prepared`, skipping keys
+/// already present. The chunked render entry calls this once per chunk so
+/// maps persist across chunks; each map is a pure function of its cache
+/// key (output size, visual mode, grid shape/projection) and the request
+/// bounds, so build order cannot change its content.
+fn extend_prepared_projected_maps(
+    request: &DirectBatchRequest,
+    planned: &[PlannedDirectRecipe],
+    extracted: &HashMap<FieldSelector, SelectedField2D>,
+    prepared: &mut HashMap<ProjectedMapCacheKey, ProjectedMap>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut requested = Vec::<(ProjectedMapCacheKey, ProductVisualMode, &SelectedField2D)>::new();
     for item in planned {
         if let Some(spec) = composite_panel_spec(item.recipe.slug) {
@@ -519,11 +718,7 @@ fn build_prepared_projected_maps(
             ));
         }
     }
-    if requested.is_empty() {
-        return Ok(Arc::new(HashMap::new()));
-    }
 
-    let mut prepared = HashMap::new();
     for (cache_key, visual_mode, sample_field) in requested {
         if prepared.contains_key(&cache_key) {
             continue;
@@ -544,7 +739,7 @@ fn build_prepared_projected_maps(
         )?;
         prepared.insert(cache_key, projected);
     }
-    Ok(Arc::new(prepared))
+    Ok(())
 }
 
 fn render_direct_recipe(
