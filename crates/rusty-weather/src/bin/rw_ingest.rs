@@ -292,6 +292,7 @@ fn print_estimate(
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let profile = profile_from_args(args)?;
     let hours = parse_hours(&args.hours)?;
+    rw_ingest::validate_forecast_hours(args.model, args.cycle, &hours)?;
     let model_slug = args.model.as_str().replace('-', "_");
     if args.estimate {
         return print_estimate(args, &profile, hours.len() as u16, &model_slug);

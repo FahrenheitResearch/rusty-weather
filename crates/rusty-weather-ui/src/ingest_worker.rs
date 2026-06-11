@@ -23,7 +23,7 @@ use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::thread::JoinHandle;
 
 use rustwx_core::{CycleSpec, ModelId, SourceId};
-use rustwx_models::supported_forecast_hours;
+use rustwx_models::{supported_forecast_hours, supported_models};
 use rw_ingest::ingest_profile::IngestProfile;
 use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate};
 use rw_ingest::{IngestConfig, IngestError, IngestEvent, IngestStage, parse_hours, throttle};
@@ -199,9 +199,18 @@ fn resolve_spec(
         .parse()
         .map_err(|_| format!("unknown model '{}'", spec.model))?;
     if !rw_ingest::ingest_supported(model) {
+        // Derive the supported list so the message self-updates as per-model
+        // fetch plans land, rather than naming HRRR by hand.
+        let mut supported: Vec<String> = supported_models()
+            .into_iter()
+            .filter(|candidate| rw_ingest::ingest_supported(*candidate))
+            .map(|candidate| candidate.as_str().to_uppercase())
+            .collect();
+        supported.sort();
         return Err(format!(
-            "model '{}' is not ingest-supported yet (HRRR only today)",
-            spec.model
+            "model '{}' is not ingest-supported yet (supported: {})",
+            spec.model,
+            supported.join(", ")
         ));
     }
     let mut profile = IngestProfile::preset(&spec.profile)?;
@@ -599,9 +608,23 @@ mod tests {
         );
 
         let mut bad = spec();
-        bad.model = "gfs".to_string();
+        bad.model = "nbm".to_string();
         let message = resolve_spec(&bad).expect_err("unsupported model");
         assert!(message.contains("not ingest-supported"), "got: {message}");
+        // The supported list is derived, so it names the models that DO have
+        // a fetch plan (HRRR and now GFS) rather than a hardcoded "HRRR only".
+        assert!(
+            message.contains("GFS"),
+            "supported list must include GFS: {message}"
+        );
+
+        // GFS now resolves through the model gate (its fetch plan landed); a
+        // GFS sounding spec validates end-to-end.
+        let mut gfs = spec();
+        gfs.model = "gfs".to_string();
+        let (model, _, hours, _) = resolve_spec(&gfs).expect("GFS spec now resolves");
+        assert_eq!(model, ModelId::Gfs);
+        assert_eq!(hours, vec![4, 5, 6]);
 
         let mut bad = spec();
         bad.date = "not-a-date".to_string();

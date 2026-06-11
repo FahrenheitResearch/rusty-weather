@@ -463,6 +463,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let profile = profile_from_args(args)?;
     let hours = parse_hours(&args.hours)?;
+    rw_ingest::validate_forecast_hours(args.model, args.cycle, &hours)?;
     let mut request = render_all::partition_products(&args.products, args.model)?;
     if !profile.heavy {
         let dropped = request.drop_heavy_unless_strict();
