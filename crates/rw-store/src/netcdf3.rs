@@ -414,7 +414,9 @@ fn put_att_list(buf: &mut Vec<u8>, attrs: &[Nc3Attr]) {
 fn vsize_field(elems: u64) -> u32 {
     // bytes = elems * 4, padded to 4 (already aligned for f32).
     let bytes = elems.saturating_mul(4);
-    let padded = pad4(bytes);
+    // Use saturating arithmetic instead of pad4() to avoid a debug-mode panic
+    // (or release-mode wraparound to 0) when bytes ≈ u64::MAX.
+    let padded = bytes.saturating_add(3) & !3; // was: pad4(bytes)
     if padded > (u32::MAX as u64) - 3 {
         u32::MAX
     } else {
@@ -834,6 +836,16 @@ mod tests {
         let parsed = ParsedNc::parse(&bytes).unwrap();
         assert!(parsed.gattrs.is_empty());
         assert!(parsed.vars[0].attrs.is_empty());
+    }
+
+    #[test]
+    fn vsize_field_clamps_at_u64_max() {
+        // bytes = u64::MAX * 4 saturates to u64::MAX; saturating_add(3) stays
+        // u64::MAX; the guard `> u32::MAX - 3` triggers ⇒ returns u32::MAX.
+        assert_eq!(super::vsize_field(u64::MAX), u32::MAX);
+        // A normal small case should still round-trip: 6 elems * 4 = 24, already
+        // aligned, fits in u32.
+        assert_eq!(super::vsize_field(6), 24);
     }
 
     #[test]
