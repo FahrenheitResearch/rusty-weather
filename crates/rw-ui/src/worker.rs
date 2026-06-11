@@ -309,10 +309,10 @@ fn coalesce(batch: Vec<StoreRequest>) -> Vec<StoreRequest> {
 fn handle(state: &mut WorkerState, request: StoreRequest) -> StoreResponse {
     match request {
         StoreRequest::Enumerate => {
-                // A re-ingested hour (same key, new variables) must not
-                // serve the previously opened file's metadata: drop the
-                // cached reader so the next LoadHour re-opens from disk.
-                state.hour = None;
+            // A re-ingested hour (same key, new variables) must not
+            // serve the previously opened file's metadata: drop the
+            // cached reader so the next LoadHour re-opens from disk.
+            state.hour = None;
             profile_scope!("store_enumerate");
             StoreResponse::Tree(state.view.enumerate())
         }
