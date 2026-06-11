@@ -24,6 +24,12 @@ use crate::reader::HourReader;
 use crate::run::{RwsHourEntry, RwsRunManifest};
 use crate::writer::HourWriter;
 
+/// How long [`HourIngestWriter::begin`] waits for the run-dir advisory lock
+/// before giving up with [`RwStoreError::Locked`]. 60 s because the normal
+/// contention is a competing hour encode finishing (seconds), which we want
+/// to wait out rather than fail on.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// One 3D pressure volume to ingest: a selector template plus one full-grid
 /// row-major plane per level. Levels may arrive in any order; they are
 /// sorted descending (1000 hPa first) internally, planes following their
@@ -240,12 +246,8 @@ pub fn write_hour_from_fields_with_derived(
 /// * `grid.rwg` is validated against any existing file at `begin()` (same
 ///   errors as before) and, when absent, its byte image is precomputed at
 ///   `begin()` and written at `finish()` just before the hour file.
-/// How long [`HourIngestWriter::begin`] waits for the run-dir advisory lock
-/// before giving up with [`RwStoreError::Locked`]. 60s because the normal
-/// contention is a competing hour encode finishing (seconds), which we want
-/// to wait out rather than fail on.
-const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
-
+///
+/// See also: [`LOCK_TIMEOUT`] for the advisory-lock wait budget.
 pub struct HourIngestWriter {
     run_dir: PathBuf,
     grid_hash: String,

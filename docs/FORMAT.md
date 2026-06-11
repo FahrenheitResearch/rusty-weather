@@ -512,10 +512,14 @@ must conform to.
   the same path would end up locking a different inode). The **one** place it
   is removed is when an entire run directory is torn down (the satellite
   rolling-window prune deleting a fully-evicted run dir, grid.rwg included):
-  the pruner holds the run's lock through the teardown, drops it, then removes
-  the now-stale `.rw-lock` and the empty dir. If a writer races back in
-  through that drop→delete window the removal fails harmlessly and the prune
-  retries on a later cycle (see the Windows pruning caveat below);
+  the pruner holds the run's lock through the teardown. While holding the lock
+  it deletes ALL store content — hour files (`f*.rws`), `grid.rwg`, and
+  `run.json` — so a concurrent reader can never observe a half-deleted run.
+  Only after all store content is gone does the pruner release the lock, then
+  remove the now-stale `.rw-lock` and the empty dir. A writer that races in
+  through that release→delete window can at worst cause the `.rw-lock` removal
+  to fail harmlessly; the prune retries on a later cycle (see the Windows
+  pruning caveat below);
   `rw_store::LOCK_FILE_NAME` is the canonical name (`.rw-lock`).
 - **Readers are lock-free.** Because every file mutation is atomic
   temp+fsync+rename (§1), a reader never observes a partial file and so needs no
