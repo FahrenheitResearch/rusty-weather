@@ -11,6 +11,7 @@ pub mod grid;
 pub mod header;
 pub mod index;
 pub mod ingest;
+pub mod netcdf3;
 pub mod reader;
 pub mod run;
 pub mod validate;
