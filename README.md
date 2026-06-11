@@ -34,6 +34,8 @@ fails GOES-19 CMIP files with a checksum mismatch on the `x` variable.
 
 ## rw-store
 
+Format spec: docs/FORMAT.md
+
 Each forecast hour is a self-contained `.rws` file: 256×256 spatial tiles of 2D surface fields, zstd-1 compressed f32, with true windowed reads so a regional plot decodes only the intersecting tile set. Pressure-level volumes are stored as 16×16-column 3D chunks (all levels contiguous per column), affine-i16 quantized then zstd-1, so a point sounding mmaps the file, binary-searches the index, and decodes 1–4 small chunks for instant bilinear profiles across all levels. Per-run provenance lives in `grid.rwg` (lat/lon arrays + projection, sha256-hashed for grid-identity checks) and `run.json` (model, cycle, hours present, schema id `rw-store.run.v1`, build-hash from `git rev-parse` compiled in at build time).
 
     cargo run --release -p rusty-weather --bin rw_ingest -- --model hrrr --date YYYYMMDD --cycle 0 --hours 0-6 --store-root store --verify
