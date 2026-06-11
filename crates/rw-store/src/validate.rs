@@ -238,6 +238,15 @@ pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<Valida
 }
 
 // ---------------------------------------------------------------------------
+// Validation bounds constants
+// ---------------------------------------------------------------------------
+
+/// Hard ceiling for a single chunk's uncompressed size in deep validation.
+/// Legitimate chunks are <= 256 KiB (2D 256x256 f32) or ~a few MiB (3D
+/// columns); anything larger is hostile or corrupt, not worth decoding.
+const MAX_DEEP_CHUNK_RAW_LEN: u32 = 64 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
 // Core hour-file checker (operates on in-memory bytes)
 // ---------------------------------------------------------------------------
 
@@ -899,6 +908,29 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
     // out to avoid panics or unbounded allocation on hostile input.
     // =======================================================================
     for (i, rec) in records.iter().enumerate() {
+        // Absolute-backstop cap check: runs before all other gates so it fires
+        // even when Check 8 also flagged the record (raw_len_bad_records). A
+        // crafted geometry can make the geometry-expected raw_len exceed the cap
+        // while still satisfying the Check 8 equality; this guard stops that
+        // allocation regardless of how raw_len was reached.
+        let is_empty_for_cap = rec.flags & FLAG_EMPTY != 0;
+        let is_constant_no_missing_for_cap =
+            rec.flags & FLAG_CONSTANT != 0 && rec.flags & FLAG_HAS_MISSING == 0;
+        if !is_empty_for_cap && !is_constant_no_missing_for_cap && rec.raw_len > MAX_DEEP_CHUNK_RAW_LEN {
+            if let Some(vm) = var_id_map.get(&rec.var_id) {
+                report.error(format!(
+                    "index record {i} (var '{}' chunk ({},{})): raw_len {} exceeds deep-validation cap {}",
+                    vm.name, rec.tile_y, rec.tile_x, rec.raw_len, MAX_DEEP_CHUNK_RAW_LEN
+                ));
+            } else {
+                report.error(format!(
+                    "index record {i} (var_id {} chunk ({},{})): raw_len {} exceeds deep-validation cap {}",
+                    rec.var_id, rec.tile_y, rec.tile_x, rec.raw_len, MAX_DEEP_CHUNK_RAW_LEN
+                ));
+            }
+            continue;
+        }
+
         // Gate: skip records that failed structural payload-span validation,
         // had out-of-range tile coords, or failed the raw_len geometry check
         // (Issue D guard: those records' raw_len is untrustworthy, and we must
@@ -1928,6 +1960,76 @@ mod tests {
         assert!(
             !joined.contains("zstd decompress failed"),
             "deep must skip the oversized-raw_len record, not attempt decompression: {joined}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Patch a dense chunk's raw_len to (MAX_DEEP_CHUNK_RAW_LEN + 1) — a value
+    /// that Check 8 will also flag as mismatching geometry, but crucially the
+    /// deep phase must emit the cap-exceeded error and never attempt to
+    /// decompress (no "zstd decompress failed" in the error list).
+    ///
+    /// This directly tests the absolute-backstop gate added after Check 8's
+    /// raw_len_bad guard: even if a crafted file somehow passed Check 8, the
+    /// cap prevents a multi-GiB allocation.
+    #[test]
+    fn deep_caps_chunk_decode_size() {
+        let dir = test_dir("deep-cap");
+        let mut bytes = load_valid_bytes(&dir);
+        let header = RwsHeader::parse(&bytes).unwrap();
+
+        // Find the first dense, non-EMPTY, non-CONSTANT chunk.
+        let mut patched_idx: Option<usize> = None;
+        for i in 0..header.index_count as usize {
+            let start = header.index_offset as usize + i * INDEX_RECORD_LEN;
+            let rec = ChunkRecord::unpack(&bytes[start..start + INDEX_RECORD_LEN]).unwrap();
+            let is_empty = rec.flags & FLAG_EMPTY != 0;
+            let is_constant_no_missing =
+                rec.flags & FLAG_CONSTANT != 0 && rec.flags & FLAG_HAS_MISSING == 0;
+            if rec.len > 0 && !is_empty && !is_constant_no_missing {
+                // Patch raw_len (bytes 24..28 in the 64-byte record) to cap + 1.
+                let over_cap = MAX_DEEP_CHUNK_RAW_LEN + 1;
+                bytes[start + 24..start + 28].copy_from_slice(&over_cap.to_le_bytes());
+                patched_idx = Some(i);
+                break;
+            }
+        }
+        assert!(
+            patched_idx.is_some(),
+            "test requires at least one dense non-empty chunk"
+        );
+
+        let path = write_corrupt(&dir, "deep-cap.rws", &bytes);
+
+        // Structural must flag the raw_len mismatch (Check 8).
+        let structural = validate_hour_file(&path, ValidateDepth::Structural).unwrap();
+        assert!(
+            !structural.is_ok(),
+            "patched raw_len must fail structural: {:?}",
+            structural.errors
+        );
+        assert!(
+            structural.errors.iter().any(|e| e.contains("raw_len")),
+            "structural error must mention raw_len: {:?}",
+            structural.errors
+        );
+
+        // Deep must emit the cap error and must NOT attempt decompression.
+        let deep = validate_hour_file(&path, ValidateDepth::Deep).unwrap();
+        assert!(
+            !deep.is_ok(),
+            "patched raw_len must fail deep: {:?}",
+            deep.errors
+        );
+        let joined = deep.errors.join(" ");
+        assert!(
+            joined.contains("exceeds deep-validation cap"),
+            "deep error must mention cap: {joined}"
+        );
+        assert!(
+            !joined.contains("zstd decompress failed"),
+            "deep must not attempt decompression for over-cap chunk: {joined}"
         );
 
         let _ = fs::remove_dir_all(&dir);
