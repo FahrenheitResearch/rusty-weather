@@ -1,10 +1,36 @@
 # rusty-weather
 
-A self-contained weather model viewer: fetch HRRR / GFS / RRFS-A / REFS / NBM / RAP,
-store hours in a fast-access format, and serve map plots + instant soundings on a
-local webpage. Full Rust. Extracted from the rustwx fast path.
+A self-contained weather model viewer: fetch HRRR (more models coming),
+store hours in a fast-access format, and view map plots, instant soundings,
+and live GOES satellite loops in a native egui app. Full Rust, MIT licensed.
+Extracted and rebuilt from the rustwx fast path.
 
 Design: docs/superpowers/specs/2026-06-09-rusty-weather-design.md
+
+## Using crates from this repo as dependencies
+
+The embeddable pieces (`rw-ui` panels, `rw-store`, `rw-ingest`, `rw-sat`) work
+as git dependencies:
+
+```toml
+[dependencies]
+rw-ui = { git = "https://github.com/FahrenheitResearch/rusty-weather" }
+rw-sat = { git = "https://github.com/FahrenheitResearch/rusty-weather" }
+```
+
+**FOOTGUN — `hdf5-reader` patch required by rw-sat consumers.** `rw-sat`'s
+NetCDF stack (`netcrust`) depends on `hdf5-reader = "0.3"` from crates.io,
+which this repo patches to a vendored (and bug-fixed) copy. **`[patch]`
+sections do not propagate to dependent workspaces**, so any project depending
+on `rw-sat` must add to its OWN workspace `Cargo.toml`:
+
+```toml
+[patch.crates-io]
+hdf5-reader = { git = "https://github.com/FahrenheitResearch/rusty-weather" }
+```
+
+Without it you get the crates.io `hdf5-reader`, which (among other things)
+fails GOES-19 CMIP files with a checksum mismatch on the `x` variable.
 
 ## rw-store
 
