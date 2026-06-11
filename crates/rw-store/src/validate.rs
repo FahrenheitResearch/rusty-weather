@@ -10,7 +10,7 @@
 //! than stopping at the first. `Err(_)` is reserved for I/O failures.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Component, Path};
 
 use crate::codec::MISSING_Q;
 use crate::error::RwResult;
@@ -85,6 +85,19 @@ pub fn validate_hour_file(path: &Path, depth: ValidateDepth) -> RwResult<Validat
     Ok(report)
 }
 
+/// Return `true` iff every component of `s` is a plain filename component
+/// (`Component::Normal`). Rejects absolute paths (RootDir/Prefix), parent
+/// traversals (`..`, `ParentDir`), and current-dir dots (`.`, `CurDir`).
+fn is_plain_filename(s: &str) -> bool {
+    let p = Path::new(s);
+    let mut components = p.components().peekable();
+    // Must have at least one component and every one must be Normal.
+    if components.peek().is_none() {
+        return false;
+    }
+    components.all(|c| matches!(c, Component::Normal(_)))
+}
+
 /// Validate all hour files referenced by the run manifest in `run_dir`, plus
 /// the directory structure itself (run.json, grid.rwg, stray files).
 pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<ValidationReport> {
@@ -141,6 +154,19 @@ pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<Valida
     let mut referenced_files: HashSet<String> = HashSet::new();
     for (hour, entry) in &manifest.hours {
         referenced_files.insert(entry.file.clone());
+
+        // Security: reject any manifest-supplied filename that is not a plain
+        // component (no absolute paths, no `..` traversals, no `.` components).
+        // An absolute path passed to `run_dir.join()` silently replaces the base
+        // directory entirely, allowing path traversal outside the run dir.
+        if !is_plain_filename(&entry.file) {
+            report.error(format!(
+                "run.json: hour {hour} file '{}' is not a plain filename",
+                entry.file
+            ));
+            continue;
+        }
+
         let hour_path = run_dir.join(&entry.file);
         if !hour_path.exists() {
             report.error(format!("hour {hour}: file '{}' not found", entry.file));
@@ -1742,6 +1768,138 @@ mod tests {
             "stray file must produce a warning: {:?}",
             report.warnings
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Path-traversal rejection test
+    // -----------------------------------------------------------------------
+
+    /// A run.json with two hostile `file` values — one absolute path and one
+    /// `..`-relative path — must be rejected before any filesystem join occurs.
+    ///
+    /// Assertions:
+    ///  - `validate_run_dir` returns `Ok` (no I/O error)
+    ///  - `report.is_ok()` is false (at least one error)
+    ///  - every error for the hostile hours contains "not a plain filename"
+    ///  - no error or warning text contains content from the absolute-path target
+    ///    (guards against reading outside the run dir and leaking file content
+    ///    via error messages such as the bad-magic bytes echo)
+    #[test]
+    fn run_dir_rejects_traversal_file_entries() {
+        use crate::run::{RwsHourEntry, RwsRunManifest};
+        use rustwx_core::{FieldSelector, GridProjection, SelectedField2D};
+
+        // Build a valid run dir so we have a real grid.rwg and baseline run.json.
+        let dir = test_dir("rundir-traversal");
+        let store_root = dir.join("store");
+        let grid = small_grid();
+
+        let values: Vec<f32> = vec![280.0f32; NX * NY];
+        let selector =
+            FieldSelector::height_agl(rustwx_core::CanonicalField::Temperature, 2);
+        let field = SelectedField2D::new(selector, "K", grid, values)
+            .unwrap()
+            .with_projection(GridProjection::Geographic);
+
+        crate::ingest::write_hour_from_fields(
+            &store_root,
+            "hrrr",
+            "20260610_00z",
+            3,
+            &[("temp_2m", &field)],
+            &[],
+            "validate-test",
+            1_000_000,
+        )
+        .unwrap();
+
+        let run_dir_path = store_root.join("hrrr").join("20260610_00z");
+
+        // Load the real manifest so we can borrow its schema/grid_hash/etc.
+        let manifest_path = run_dir_path.join("run.json");
+        let mut manifest: RwsRunManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+
+        // Pick a file that exists outside the run dir as the absolute-path target.
+        // Using grid.rwg itself (a real file in the run dir's parent hierarchy)
+        // is the clearest choice — we know it exists and has real bytes.
+        let outside_file = run_dir_path.join("grid.rwg");
+        let absolute_target = outside_file.to_string_lossy().into_owned();
+
+        // Inject two hostile hour entries.
+        manifest.hours.insert(
+            6,
+            RwsHourEntry {
+                file: absolute_target.clone(),
+                written_unix: 0,
+                encode_ms: 0,
+                variables: vec!["temp_2m".to_string()],
+            },
+        );
+        manifest.hours.insert(
+            9,
+            RwsHourEntry {
+                file: r"..\evil.rws".to_string(),
+                written_unix: 0,
+                encode_ms: 0,
+                variables: vec!["temp_2m".to_string()],
+            },
+        );
+
+        // Overwrite run.json with the tampered manifest.
+        fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+
+        let report = validate_run_dir(&run_dir_path, ValidateDepth::Structural).unwrap();
+
+        // Must have errors (not ok).
+        assert!(
+            !report.is_ok(),
+            "traversal entries must produce errors; errors: {:?}",
+            report.errors
+        );
+
+        // Both hostile hours must produce "not a plain filename" errors.
+        let errors_for_h6 = report
+            .errors
+            .iter()
+            .any(|e| e.contains("hour 6") && e.contains("not a plain filename"));
+        let errors_for_h9 = report
+            .errors
+            .iter()
+            .any(|e| e.contains("hour 9") && e.contains("not a plain filename"));
+        assert!(
+            errors_for_h6,
+            "hour 6 (absolute path) must produce 'not a plain filename' error; errors: {:?}",
+            report.errors
+        );
+        assert!(
+            errors_for_h9,
+            "hour 9 (.. traversal) must produce 'not a plain filename' error; errors: {:?}",
+            report.errors
+        );
+
+        // Key: no error or warning text must contain content bytes from the
+        // absolute-path target. We read the first 8 bytes of grid.rwg to know
+        // what a content-leak would look like (the bad-magic error path echoes
+        // raw bytes). Then assert none of the error/warning strings contain it.
+        let target_bytes = fs::read(&outside_file).unwrap();
+        if target_bytes.len() >= 8 {
+            let snippet = format!("{:?}", &target_bytes[..8]);
+            let all_messages: Vec<&str> = report
+                .errors
+                .iter()
+                .chain(report.warnings.iter())
+                .map(|s| s.as_str())
+                .collect();
+            for msg in &all_messages {
+                assert!(
+                    !msg.contains(&snippet),
+                    "error/warning must not contain content bytes from outside target: {msg}"
+                );
+            }
+        }
+
         let _ = fs::remove_dir_all(&dir);
     }
 
