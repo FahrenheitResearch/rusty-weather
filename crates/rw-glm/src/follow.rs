@@ -80,6 +80,11 @@ pub enum SkipReason {
     PermanentDecodeError,
     /// Exceeded the transient-retry cap; given up on.
     RetriesExhausted,
+    /// Held awaiting its retry timer after a transient failure: this poll did
+    /// not touch the granule (it stays in holdback). `retry_in_secs` is the
+    /// remaining time before the next retry is eligible. Unlike the other
+    /// reasons this is *not* terminal — the granule is re-listed next cycle.
+    Holdback { retry_in_secs: u64 },
 }
 
 impl SkipReason {
@@ -88,6 +93,7 @@ impl SkipReason {
             SkipReason::AlreadySeen => "already_seen",
             SkipReason::PermanentDecodeError => "permanent_decode_error",
             SkipReason::RetriesExhausted => "retries_exhausted",
+            SkipReason::Holdback { .. } => "holdback",
         }
     }
 }
@@ -145,9 +151,12 @@ pub fn print_event(event: &GlmEvent) {
         GlmEvent::BucketWritten { path, records } => {
             println!("bucket {} <- {records} record(s)", path.display())
         }
-        GlmEvent::GranuleSkipped { key, reason } => {
-            println!("skipped {key} ({})", reason.as_str())
-        }
+        GlmEvent::GranuleSkipped { key, reason } => match reason {
+            SkipReason::Holdback { retry_in_secs } => {
+                println!("held {key} (holdback, retry in {retry_in_secs}s)")
+            }
+            other => println!("skipped {key} ({})", other.as_str()),
+        },
         GlmEvent::Pruned { report } => println!(
             "pruned {} bucket(s) / {} bytes ({} date dir(s) removed)",
             report.removed_buckets,
@@ -615,8 +624,17 @@ fn process_one_granule(
 
     // Holdback gate: a granule waiting out its retry timer is left alone (the
     // watermark is NOT advanced, so it is re-listed and retried next cycle).
+    // Emit a GranuleSkipped{Holdback} so the wait is observable rather than a
+    // silent no-op poll (a reviewer could not otherwise tell a held granule
+    // from one that simply never landed).
     if let Some(hb) = holdbacks.get(&dedup_key) {
-        if Instant::now() < hb.next_retry {
+        let now = Instant::now();
+        if now < hb.next_retry {
+            let retry_in_secs = hb.next_retry.saturating_duration_since(now).as_secs();
+            sink(GlmEvent::GranuleSkipped {
+                key: dedup_key,
+                reason: SkipReason::Holdback { retry_in_secs },
+            });
             return Ok(ProcessFlow::HoldPrefix);
         }
     }
@@ -717,6 +735,7 @@ fn write_decoded(
     summary: &mut FollowSummary,
     sink: &mut dyn FnMut(GlmEvent),
 ) -> Result<(), GlmError> {
+    let decoded_count = decoded.flashes.len();
     let records: Vec<FlashRecord> = decoded
         .flashes
         .iter()
@@ -735,7 +754,19 @@ fn write_decoded(
     summary.ingested_flashes += records.len();
     if records.is_empty() {
         // A quiet (or fully-stale) granule still counts as ingested for dedup;
-        // there is just nothing to write.
+        // there is just nothing to write. Distinguish the two cases so a
+        // reviewer can tell a genuinely empty granule from one whose flashes
+        // were all evicted by the rolling-window stale cutoff (which on a
+        // restart re-lists the whole hour — a stream of "wrote 0 (all stale)"
+        // is expected churn, not lost data).
+        if decoded_count > 0 {
+            sink(GlmEvent::Info {
+                message: format!(
+                    "granule decoded {decoded_count} flash(es) but wrote 0 \
+                     (all older than the window cutoff {stale_cutoff} ms)"
+                ),
+            });
+        }
         return Ok(());
     }
     writer

@@ -399,6 +399,104 @@ fn holdback_gates_retry_within_a_session() {
 }
 
 #[test]
+fn holdback_gate_emits_a_holdback_skip_event() {
+    // Observability nit 1: a granule held awaiting its retry timer must emit a
+    // GranuleSkipped{Holdback} event (with seconds remaining) rather than a
+    // silent no-op poll. The granule fails transiently on poll 1 (setting a
+    // >=20 s holdback) and is gated on polls 2..4 — each gated poll emits the
+    // Holdback skip.
+    let root = test_root("holdback-event");
+    let source = FakeSource::new(vec![(
+        listed(1, 1000),
+        Resp::TransientThenOk {
+            decoded: decoded(1, vec![flash(BASE + 1000, 1)]),
+            remaining: 100, // never recovers within the session
+        },
+    )]);
+    let (summary, events) = run(&spec(&root, 4), &source);
+    assert_eq!(summary.ingested_granules, 0);
+    // Poll 1 fails (Warning + sets holdback); polls 2,3,4 are gated and emit a
+    // Holdback skip each → at least 3 Holdback events, all carrying a key and a
+    // plausible (>0, <=300) retry countdown.
+    let holdbacks: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match e {
+            GlmEvent::GranuleSkipped {
+                key,
+                reason: SkipReason::Holdback { retry_in_secs },
+            } => {
+                assert_eq!(key, &stem(1), "holdback skip names the held granule");
+                Some(*retry_in_secs)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        holdbacks.len() >= 3,
+        "each gated poll emits a Holdback skip event: {holdbacks:?}"
+    );
+    assert!(
+        holdbacks.iter().all(|&s| s <= 300),
+        "retry countdown within the holdback cap: {holdbacks:?}"
+    );
+}
+
+#[test]
+fn all_stale_granule_emits_a_distinct_info_event() {
+    // Observability nit 2: a granule that decoded N>0 flashes but wrote 0
+    // because every flash is older than the rolling-window stale cutoff must
+    // emit an Info event distinguishing it from a genuinely quiet (decoded 0)
+    // granule. BASE is 2026-01-01; a short finite window makes the live "now"
+    // cutoff land long after those flashes, so all of them are stale-dropped.
+    let root = test_root("all-stale");
+    let stale_source = FakeSource::new(vec![(
+        listed(1, 1000),
+        Resp::Ok(decoded(
+            1,
+            vec![flash(BASE + 1000, 1), flash(BASE + 2000, 2)],
+        )),
+    )]);
+    let mut stale_spec = spec(&root, 1);
+    // 1-hour window: cutoff = now - 1h ≫ BASE flashes → all stale-dropped.
+    stale_spec.window = Duration::from_secs(3600);
+    let (summary, events) = run(&stale_spec, &stale_source);
+    // The granule still counts as ingested (dedup) but wrote nothing.
+    assert_eq!(summary.ingested_granules, 1);
+    assert_eq!(summary.ingested_flashes, 0, "all flashes stale-dropped");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, GlmEvent::BucketWritten { .. })),
+        "no bucket written when every flash is stale"
+    );
+    let stale_info = events.iter().any(|e| {
+        matches!(
+            e,
+            GlmEvent::Info { message } if message.contains("all") && message.contains("wrote 0")
+        )
+    });
+    assert!(
+        stale_info,
+        "an all-stale granule emits a distinguishing Info: {events:?}"
+    );
+
+    // A genuinely quiet granule (decoded 0) must NOT emit that Info — the two
+    // cases are distinguishable.
+    let quiet_root = test_root("all-stale-quiet");
+    let quiet_source = FakeSource::new(vec![(listed(1, 200), Resp::Ok(decoded(1, vec![])))]);
+    let mut quiet_spec = spec(&quiet_root, 1);
+    quiet_spec.window = Duration::from_secs(3600);
+    let (_qs, quiet_events) = run(&quiet_spec, &quiet_source);
+    assert!(
+        !quiet_events.iter().any(|e| matches!(
+            e,
+            GlmEvent::Info { message } if message.contains("wrote 0")
+        )),
+        "a quiet (decoded 0) granule does not emit the all-stale Info: {quiet_events:?}"
+    );
+}
+
+#[test]
 fn permanent_decode_error_is_skipped_and_not_retried() {
     let root = test_root("permanent");
     let source = FakeSource::new(vec![(listed(1, 1000), Resp::Permanent)]);
