@@ -23,10 +23,13 @@ use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::thread::JoinHandle;
 
 use rustwx_core::{CycleSpec, ModelId, SourceId};
-use rustwx_models::supported_forecast_hours;
+use rustwx_models::{supported_forecast_hours, supported_models};
 use rw_ingest::ingest_profile::IngestProfile;
 use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate};
-use rw_ingest::{IngestConfig, IngestError, IngestEvent, IngestStage, parse_hours, throttle};
+use rw_ingest::{
+    IngestConfig, IngestError, IngestEvent, IngestStage, parse_hours, throttle,
+    validate_forecast_hours,
+};
 use rw_ui::{AvailabilityView, DownloadSpec, DownloadStage, EstimateView, HourDoneView};
 
 /// Requests from the UI thread.
@@ -199,9 +202,18 @@ fn resolve_spec(
         .parse()
         .map_err(|_| format!("unknown model '{}'", spec.model))?;
     if !rw_ingest::ingest_supported(model) {
+        // Derive the supported list so the message self-updates as per-model
+        // fetch plans land, rather than naming HRRR by hand.
+        let mut supported: Vec<String> = supported_models()
+            .into_iter()
+            .filter(|candidate| rw_ingest::ingest_supported(*candidate))
+            .map(|candidate| candidate.as_str().to_uppercase())
+            .collect();
+        supported.sort();
         return Err(format!(
-            "model '{}' is not ingest-supported yet (HRRR only today)",
-            spec.model
+            "model '{}' is not ingest-supported yet (supported: {})",
+            spec.model,
+            supported.join(", ")
         ));
     }
     let mut profile = IngestProfile::preset(&spec.profile)?;
@@ -211,14 +223,12 @@ fn resolve_spec(
     profile.validate()?;
     let hours = parse_hours(&spec.hours).map_err(|err| err.to_string())?;
     let cycle = CycleSpec::new(spec.date.clone(), spec.cycle).map_err(|err| err.to_string())?;
-    let supported = supported_forecast_hours(model, spec.cycle);
-    if let Some(&bad) = hours.iter().find(|hour| !supported.contains(hour)) {
-        return Err(format!(
-            "hour {bad} is outside the supported range for the {:02}z cycle (max {})",
-            spec.cycle,
-            supported.last().copied().unwrap_or(0)
-        ));
-    }
+    // Defense-in-depth seam: validate cycle against the model's published cycle
+    // table AND every hour against the supported cadence — the same check the
+    // CLI bins (rw_ingest / rw_batch) run via `validate_forecast_hours`.  The UI
+    // picker is already constrained, but this ensures the validation is shared
+    // and not accidentally bypassed if the spec is constructed programmatically.
+    validate_forecast_hours(model, spec.cycle, &hours).map_err(|err| err.to_string())?;
     Ok((model, profile, hours, cycle))
 }
 
@@ -245,9 +255,10 @@ fn compute_estimate(
     let model_slug = model.as_str().replace('-', "_");
     let paths = default_calibration_paths(store_root, &model_slug);
     let calibration = if paths.is_empty() {
-        Calibration::builtin_default()
+        Calibration::builtin_for_model(model)
     } else {
-        Calibration::from_hour_files(&paths).unwrap_or_else(|_| Calibration::builtin_default())
+        Calibration::from_hour_files(&paths, model)
+            .unwrap_or_else(|_| Calibration::builtin_for_model(model))
     };
     let hour_count = hours.len() as u16;
     let estimate = estimate(&profile, model, hour_count, &calibration);
@@ -599,21 +610,53 @@ mod tests {
         );
 
         let mut bad = spec();
-        bad.model = "gfs".to_string();
+        bad.model = "nbm".to_string();
         let message = resolve_spec(&bad).expect_err("unsupported model");
         assert!(message.contains("not ingest-supported"), "got: {message}");
+        // The supported list is derived, so it names the models that DO have
+        // a fetch plan (HRRR and now GFS) rather than a hardcoded "HRRR only".
+        assert!(
+            message.contains("GFS"),
+            "supported list must include GFS: {message}"
+        );
+
+        // GFS now resolves through the model gate (its fetch plan landed); a
+        // GFS sounding spec validates end-to-end.
+        let mut gfs = spec();
+        gfs.model = "gfs".to_string();
+        let (model, _, hours, _) = resolve_spec(&gfs).expect("GFS spec now resolves");
+        assert_eq!(model, ModelId::Gfs);
+        assert_eq!(hours, vec![4, 5, 6]);
 
         let mut bad = spec();
         bad.date = "not-a-date".to_string();
         assert!(resolve_spec(&bad).is_err());
 
+        // Hour outside the model's cadence: 01z HRRR tops out at f018.
         let mut bad = spec();
         bad.cycle = 1;
         bad.hours = "0-48".to_string(); // 01z HRRR tops out at 18
         let message = resolve_spec(&bad).expect_err("out-of-range hour");
+        // validate_forecast_hours names the flag ("--hours") and the bad hour.
+        assert!(message.contains("--hours"), "got: {message}");
+        assert!(message.contains("f019"), "got: {message}");
+
+        // Cycle not in the model's published cycle table: GFS runs only at
+        // 00/06/12/18z, so cycle=3 must be rejected with a message naming
+        // "--cycle" and the valid cycles.
+        let mut bad = spec();
+        bad.model = "gfs".to_string();
+        bad.cycle = 3;
+        let message = resolve_spec(&bad).expect_err("03z is not a published GFS cycle");
+        assert!(message.contains("--cycle"), "must name the flag: {message}");
         assert!(
-            message.contains("outside the supported range"),
-            "got: {message}"
+            message.contains("03z") || message.contains("3"),
+            "must name the bad cycle: {message}"
+        );
+        // The error must enumerate valid cycles so the user can self-correct.
+        assert!(
+            message.contains("06z") || message.contains("6"),
+            "must list 06z: {message}"
         );
     }
 
@@ -644,6 +687,36 @@ mod tests {
         );
         assert!(!estimate.breakdown.is_empty());
         assert!(estimate.time_hint.contains("cache-cold"));
+    }
+
+    /// GFS estimate with an empty store uses the GFS builtins (not HRRR's)
+    /// and names GFS in the provenance string.  The download must price
+    /// exactly one pgrb2 file, not the HRRR prs+sfc pair.
+    #[test]
+    fn gfs_estimate_uses_gfs_builtins_and_prices_single_file_download() {
+        let mut gfs_spec = spec();
+        gfs_spec.model = "gfs".to_string();
+        let estimate =
+            compute_estimate(std::path::Path::new("definitely-missing-store"), &gfs_spec)
+                .expect("GFS estimate resolves");
+        assert!(
+            estimate.calibration.contains("GFS"),
+            "GFS spec must use the GFS builtin calibration, got: {}",
+            estimate.calibration
+        );
+        // GFS single pgrb2 download is larger than HRRR's sfc-only download
+        // (≈517 MiB) but smaller than HRRR's prs+sfc combined (≈550 MiB).
+        // Sounding profile always needs the pressure file.
+        assert!(
+            estimate.per_hour_download_bytes > 500 * 1024 * 1024,
+            "GFS download should be ~517 MiB, got {} bytes",
+            estimate.per_hour_download_bytes
+        );
+        assert!(
+            estimate.per_hour_download_bytes < 600 * 1024 * 1024,
+            "GFS download should be ~517 MiB, got {} bytes",
+            estimate.per_hour_download_bytes
+        );
     }
 
     #[test]

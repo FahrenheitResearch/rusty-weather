@@ -463,6 +463,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let profile = profile_from_args(args)?;
     let hours = parse_hours(&args.hours)?;
+    rw_ingest::validate_forecast_hours(args.model, args.cycle, &hours)?;
     let mut request = render_all::partition_products(&args.products, args.model)?;
     if !profile.heavy {
         let dropped = request.drop_heavy_unless_strict();
@@ -675,14 +676,27 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     .recv()
                     .map_err(|_| "pipeline: ingest thread exited without a result".to_string())??;
                 let hour = ingested.hour;
+                let fetch_line = if ingested.single_file_model {
+                    format!(
+                        "fetch {} ms ({}, {:.1} MB, single file)",
+                        ingested.prs_fetch_ms,
+                        cache_state(ingested.prs_cache_hit),
+                        ingested.prs_mb,
+                    )
+                } else {
+                    format!(
+                        "prs fetch {} ms ({}, {:.1} MB) | sfc fetch {} ms ({}, {:.1} MB)",
+                        ingested.prs_fetch_ms,
+                        cache_state(ingested.prs_cache_hit),
+                        ingested.prs_mb,
+                        ingested.sfc_fetch_ms,
+                        cache_state(ingested.sfc_cache_hit),
+                        ingested.sfc_mb,
+                    )
+                };
                 println!(
-                    "f{hour:03} ingest: prs fetch {} ms ({}, {:.1} MB) | sfc fetch {} ms ({}, {:.1} MB) | extract prs {} ms, sfc {} ms | thermo decode {} ms | derived {} ms | heavy {} ms | encode {} ms | store {:.1} MB | 2d {}/{} | derived {}/{} | heavy {}/{}",
-                    ingested.prs_fetch_ms,
-                    cache_state(ingested.prs_cache_hit),
-                    ingested.prs_mb,
-                    ingested.sfc_fetch_ms,
-                    cache_state(ingested.sfc_cache_hit),
-                    ingested.sfc_mb,
+                    "f{hour:03} ingest: {} | extract prs {} ms, sfc {} ms | thermo decode {} ms | derived {} ms | heavy {} ms | encode {} ms | store {:.1} MB | 2d {}/{} | derived {}/{} | heavy {}/{}",
+                    fetch_line,
                     ingested.prs_extract_ms,
                     ingested.sfc_extract_ms,
                     ingested.thermo_decode_ms,
@@ -905,15 +919,30 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             let (min_ms, median_ms, max_ms) = ms_distribution(&per_product);
             serde_json::json!({
                 "hour": ingested.hour,
-                "fetch": {
-                    "wall_ms": ingested.prs_fetch_ms + ingested.sfc_fetch_ms,
-                    "cpu_ms": report.fetch_cpu_ms,
-                    "prs_ms": ingested.prs_fetch_ms,
-                    "sfc_ms": ingested.sfc_fetch_ms,
-                    "prs_cache_hit": ingested.prs_cache_hit,
-                    "sfc_cache_hit": ingested.sfc_cache_hit,
-                    "prs_mb": ingested.prs_mb,
-                    "sfc_mb": ingested.sfc_mb,
+                "fetch": if ingested.single_file_model {
+                    // Single-file model (e.g. GFS pgrb2.0p25): one download
+                    // serves both the pressure and surface roles. Report the
+                    // one real download size under "file_mb"; omit "sfc_mb"
+                    // to avoid implying a double-size download.
+                    serde_json::json!({
+                        "wall_ms": ingested.prs_fetch_ms,
+                        "cpu_ms": report.fetch_cpu_ms,
+                        "single_file": true,
+                        "file_ms": ingested.prs_fetch_ms,
+                        "file_cache_hit": ingested.prs_cache_hit,
+                        "file_mb": ingested.prs_mb,
+                    })
+                } else {
+                    serde_json::json!({
+                        "wall_ms": ingested.prs_fetch_ms + ingested.sfc_fetch_ms,
+                        "cpu_ms": report.fetch_cpu_ms,
+                        "prs_ms": ingested.prs_fetch_ms,
+                        "sfc_ms": ingested.sfc_fetch_ms,
+                        "prs_cache_hit": ingested.prs_cache_hit,
+                        "sfc_cache_hit": ingested.sfc_cache_hit,
+                        "prs_mb": ingested.prs_mb,
+                        "sfc_mb": ingested.sfc_mb,
+                    })
                 },
                 "extract": {
                     "wall_ms": ingested.prs_extract_ms + ingested.sfc_extract_ms,

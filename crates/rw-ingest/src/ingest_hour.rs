@@ -77,7 +77,7 @@ pub mod ingest_profile;
 #[path = "size_estimate.rs"]
 pub mod size_estimate;
 use crate::events::{IngestError, IngestEvent, IngestStage, other};
-use crate::profile_scope;
+use crate::{fetch_plan, profile_scope};
 use ingest_compute::DerivedGrid2D;
 use ingest_profile::{IngestProfile, VolumeChoice, surface_plan};
 
@@ -100,8 +100,25 @@ fn volume_plan(profile: &IngestProfile) -> Vec<(CanonicalField, &'static str)> {
 }
 
 /// The trailing (h-1)->h window field names (see the re-select pass in
-/// `process_fetched_hour`); stored only under a full-2D profile.
+/// `process_fetched_hour`); stored only under a full-2D profile for models
+/// that carry them (see [`model_has_trailing_1h_window`]).
 const TRAILING_2D_NAMES: [&str; 3] = ["apcp_1h", "uh_2to5km_max_1h", "wind_speed_10m_max_1h"];
+
+/// Whether `model` carries the HRRR-style trailing 1 h window fields
+/// (`apcp_1h`, `uh_2to5km_max_1h`, `wind_speed_10m_max_1h`) the re-select
+/// pass produces.
+///
+/// These rest on HRRR-class native sub-hourly statistical messages
+/// (`MXUPHL`/`WIND ... hour max fcst`) and an HOURLY APCP accumulation. GFS
+/// `pgrb2` APCP is a BUCKETED accumulation that resets every 6 h (0-6, 6-12,
+/// ...), so the trailing-window re-select at `hour - 1` would NOT yield an
+/// honest 1 h precip increment — and GFS carries no native sub-hourly UH/
+/// wind-max messages at all. So GFS (and any future non-HRRR model) excludes
+/// the trailing set rather than claim a 1 h field it can't produce. Honest
+/// GFS windowed QPF (bucket-difference logic) is a separate, deferred feature.
+fn model_has_trailing_1h_window(model: ModelId) -> bool {
+    matches!(model, ModelId::Hrrr | ModelId::HrrrAk)
+}
 
 /// Sparse per-level absolute vorticity planes pulled from the prs file in
 /// the same decode pass as the volumes, stored as five 2D variables (the
@@ -349,7 +366,14 @@ pub struct IngestedHour {
     pub sfc_fetch_ms: u128,
     pub prs_cache_hit: bool,
     pub sfc_cache_hit: bool,
+    /// True when the model's fetch plan has exactly one file serving both the
+    /// pressure and surface roles (GFS `pgrb2.0p25`). In that case `prs_mb`
+    /// holds the one download size and `sfc_mb` is `0.0` — the download is
+    /// priced once, not twice. Consumers must check this flag before summing
+    /// `prs_mb + sfc_mb` to avoid double-counting.
+    pub single_file_model: bool,
     pub prs_mb: f64,
+    /// Zero for single-file models (`single_file_model == true`).
     pub sfc_mb: f64,
     pub prs_extract_ms: u128,
     pub sfc_extract_ms: u128,
@@ -384,53 +408,85 @@ pub fn cache_state(hit: bool) -> &'static str {
     if hit { "cache hit" } else { "cache miss" }
 }
 
-/// Fetch both family files for one hour (network or cache disk read; no
-/// decode, no rayon). The cancel flag is observed before each file; a
-/// cancel mid-download takes effect once the in-flight file completes
-/// (the byte fetch has no abort hook today).
+/// Download one product file (network or cache disk read; no decode, no
+/// rayon), bracketed by the given stage's start/done events.
+fn fetch_product(
+    config: &IngestConfig<'_>,
+    hour: u16,
+    product: &str,
+    stage: IngestStage,
+) -> Result<(CachedFetchResult, u128), IngestError> {
+    let fetch = FetchRequest {
+        request: ModelRunRequest::new(config.model, config.cycle.clone(), hour, product)
+            .map_err(other)?,
+        source_override: config.source_override,
+        variable_patterns: Vec::new(),
+    };
+    config.emit(IngestEvent::StageStarted { hour, stage });
+    let fetch_started = Instant::now();
+    let fetched =
+        fetch_bytes_with_cache(&fetch, config.cache_root, config.use_cache).map_err(other)?;
+    let fetch_ms = fetch_started.elapsed().as_millis();
+    config.emit(IngestEvent::StageDone {
+        hour,
+        stage,
+        ms: fetch_ms,
+    });
+    Ok((fetched, fetch_ms))
+}
+
+/// Fetch the per-model product file(s) for one hour (network or cache disk
+/// read; no decode, no rayon) and bind them to the two extraction roles —
+/// the pressure-source slot ([`FetchedHour::prs`]) and the surface-source
+/// slot ([`FetchedHour::sfc`]). The cancel flag is observed before each
+/// download; a cancel mid-download takes effect once the in-flight file
+/// completes (the byte fetch has no abort hook today).
+///
+/// HRRR keeps its historical two-file sequence exactly: the `prs` file
+/// (pressure role, `FetchPrs` stage) downloads first, then the `sfc` file
+/// (surface role, `FetchSfc` stage) — same URLs, same order, same events.
+/// GFS's single `pgrb2.0p25` file is fetched once under the `FetchPrs`
+/// stage and bound to BOTH slots (the surface slot clones it; only one
+/// HTTP fetch happens), so `process_fetched_hour` reads the same bytes for
+/// the surface and pressure passes.
 pub fn fetch_hour(config: &IngestConfig<'_>, hour: u16) -> Result<FetchedHour, IngestError> {
-    config.check_cancel()?;
-    let prs_fetch = FetchRequest {
-        request: ModelRunRequest::new(config.model, config.cycle.clone(), hour, "prs")
-            .map_err(other)?,
-        source_override: config.source_override,
-        variable_patterns: Vec::new(),
-    };
-    config.emit(IngestEvent::StageStarted {
-        hour,
-        stage: IngestStage::FetchPrs,
-    });
-    let fetch_started = Instant::now();
-    let prs =
-        fetch_bytes_with_cache(&prs_fetch, config.cache_root, config.use_cache).map_err(other)?;
-    let prs_fetch_ms = fetch_started.elapsed().as_millis();
-    config.emit(IngestEvent::StageDone {
-        hour,
-        stage: IngestStage::FetchPrs,
-        ms: prs_fetch_ms,
-    });
-
-    config.check_cancel()?;
-    let sfc_fetch = FetchRequest {
-        request: ModelRunRequest::new(config.model, config.cycle.clone(), hour, "sfc")
-            .map_err(other)?,
-        source_override: config.source_override,
-        variable_patterns: Vec::new(),
-    };
-    config.emit(IngestEvent::StageStarted {
-        hour,
-        stage: IngestStage::FetchSfc,
-    });
-    let fetch_started = Instant::now();
-    let sfc =
-        fetch_bytes_with_cache(&sfc_fetch, config.cache_root, config.use_cache).map_err(other)?;
-    let sfc_fetch_ms = fetch_started.elapsed().as_millis();
-    config.emit(IngestEvent::StageDone {
-        hour,
-        stage: IngestStage::FetchSfc,
-        ms: sfc_fetch_ms,
-    });
-
+    let plan = fetch_plan(config.model)?;
+    let mut pressure: Option<(CachedFetchResult, u128)> = None;
+    let mut surface: Option<(CachedFetchResult, u128)> = None;
+    // First entry downloads under the FetchPrs stage, the second (HRRR's
+    // sfc) under FetchSfc — preserving the historical two-stage sequence;
+    // GFS has a single entry and only emits FetchPrs.
+    for (index, product) in plan.iter().enumerate() {
+        config.check_cancel()?;
+        let stage = if index == 0 {
+            IngestStage::FetchPrs
+        } else {
+            IngestStage::FetchSfc
+        };
+        let (fetched, fetch_ms) = fetch_product(config, hour, product.product, stage)?;
+        // Same file serving both roles (GFS): clone into the second slot so
+        // each extraction pass reads its own bytes without a second fetch.
+        if product.pressure_source && product.surface_source {
+            surface = Some((fetched.clone(), fetch_ms));
+            pressure = Some((fetched, fetch_ms));
+        } else if product.pressure_source {
+            pressure = Some((fetched, fetch_ms));
+        } else if product.surface_source {
+            surface = Some((fetched, fetch_ms));
+        }
+    }
+    let (prs, prs_fetch_ms) = pressure.ok_or_else(|| {
+        other(format!(
+            "fetch plan for {} has no pressure-source product",
+            config.model
+        ))
+    })?;
+    let (sfc, sfc_fetch_ms) = surface.ok_or_else(|| {
+        other(format!(
+            "fetch plan for {} has no surface-source product",
+            config.model
+        ))
+    })?;
     Ok(FetchedHour {
         hour,
         prs,
@@ -497,7 +553,17 @@ pub fn process_fetched_hour(
     let prs_cache_hit = prs.cache_hit;
     let prs_mb = prs.result.bytes.len() as f64 / (1024.0 * 1024.0);
     let sfc_cache_hit = sfc.cache_hit;
-    let sfc_mb = sfc.result.bytes.len() as f64 / (1024.0 * 1024.0);
+    // Single-file models (GFS): the sfc slot is a clone of the prs file; the
+    // download was one fetch, not two. Price the download once by zeroing sfc_mb
+    // so callers that sum prs_mb + sfc_mb get the honest single-file total.
+    let single_file_model = fetch_plan(config.model)
+        .map(|plan| plan.len() == 1)
+        .unwrap_or(false);
+    let sfc_mb = if single_file_model {
+        0.0
+    } else {
+        sfc.result.bytes.len() as f64 / (1024.0 * 1024.0)
+    };
 
     // --- prs product file: 3D isobaric superset, one decode pass ---
     // The profile picks the volumes and level step; the render-grade 2D
@@ -771,8 +837,13 @@ pub fn process_fetched_hour(
     // sfc file. If a future HRRR build reorders them, run_total silently
     // becomes the 1 h window. A windowed-product sanity check (run_total >=
     // 1h sum for h > 1) is the cheap detector if this ever bites.
+    // GFS (and any non-HRRR model) excludes the trailing 1 h window set: its
+    // bucketed APCP can't honestly produce a 1 h increment and it has no
+    // native sub-hourly UH/wind-max messages (see
+    // `model_has_trailing_1h_window`).
+    let include_trailing = include_full_2d && model_has_trailing_1h_window(config.model);
     let mut trailing_grids: Vec<SharedExtractionGrid> = Vec::new();
-    if hour >= 1 && include_full_2d {
+    if hour >= 1 && include_trailing {
         let trailing_plan = [
             (
                 TRAILING_2D_NAMES[0], // apcp_1h
@@ -831,7 +902,7 @@ pub fn process_fetched_hour(
                 }),
             }
         }
-    } else if include_full_2d {
+    } else if include_trailing {
         config.emit(IngestEvent::Warning {
             hour,
             message: format!(
@@ -849,13 +920,19 @@ pub fn process_fetched_hour(
     config.check_cancel()?;
 
     // Sparse prs-sourced planes ride behind the sfc set so the grid carrier
-    // stays the first surface-plan field (both files share the HRRR grid;
-    // the store write bit-verifies that). The +3 is the trailing 1 h
-    // window set (apcp_1h, uh_2to5km_max_1h, wind_speed_10m_max_1h);
-    // everything past the surface set rides only with a full-2D profile.
+    // stays the first surface-plan field (both files share the model grid;
+    // the store write bit-verifies that). The vorticity + direct-recipe
+    // planes ride with any full-2D profile; the trailing 1 h window set
+    // (apcp_1h, uh_2to5km_max_1h, wind_speed_10m_max_1h) rides only for
+    // models that carry it (HRRR-class) — GFS omits it (bucketed APCP).
     let planned_2d = surface_plan.len()
         + if include_full_2d {
-            TRAILING_2D_NAMES.len() + VORTICITY_PLAN.len() + direct_planes.len()
+            VORTICITY_PLAN.len() + direct_planes.len()
+        } else {
+            0
+        }
+        + if include_trailing {
+            TRAILING_2D_NAMES.len()
         } else {
             0
         };
@@ -1087,6 +1164,7 @@ pub fn process_fetched_hour(
         sfc_fetch_ms,
         prs_cache_hit,
         sfc_cache_hit,
+        single_file_model,
         prs_mb,
         sfc_mb,
         prs_extract_ms,
@@ -1496,7 +1574,12 @@ pub fn planned_store_variables(profile: &IngestProfile, model: ModelId) -> Plann
         .map(|(name, _)| (*name).to_string())
         .collect();
     if profile.includes_full_2d() {
-        fields_2d.extend(TRAILING_2D_NAMES.iter().map(|name| (*name).to_string()));
+        // Trailing 1 h window fields ride only for models that carry them
+        // (HRRR-class); GFS omits them (bucketed APCP — see
+        // `model_has_trailing_1h_window`).
+        if model_has_trailing_1h_window(model) {
+            fields_2d.extend(TRAILING_2D_NAMES.iter().map(|name| (*name).to_string()));
+        }
         fields_2d.extend(VORTICITY_PLAN.iter().map(|(_, name)| (*name).to_string()));
         fields_2d.extend(
             direct_isobaric_plane_selectors(model)
@@ -1555,6 +1638,53 @@ pub fn parse_hours(spec: &str) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
         return Err("pass at least one forecast hour via --hours".into());
     }
     Ok(hours)
+}
+
+/// Validate that the run cycle and every requested forecast hour sit on the
+/// model's published grids, delegating to rustwx-models' authoritative cycle
+/// table (`model_summary(model).cycle_hours_utc`) and
+/// [`rustwx_models::supported_forecast_hours`] cadence table (so each rule has
+/// exactly one home). This is the spec-resolution gate the bins run after
+/// `parse_hours`:
+///
+/// * **Cycle:** GFS publishes only `[0, 6, 12, 18]z`, so `--cycle 3` is
+///   rejected here. Without this gate the cycle flows straight into
+///   `build_gfs_url`, which does NOT validate it, building a non-existent
+///   `gfs.t03z...` URL that only fails as a download 404. HRRR's all-24-hour
+///   cycle table accepts every cycle, so HRRR is unaffected.
+/// * **Forecast hour:** GFS is hourly to f120 then 3-hourly to f384, so f121
+///   is rejected while f123/f384 pass; HRRR's 0..=18/0..=48 range is
+///   unchanged. (`ModelRunRequest::new`/`build_gfs_url` do NOT gate the GFS
+///   hour either, so without this an off-cadence hour would silently build a
+///   non-existent URL.)
+pub fn validate_forecast_hours(
+    model: ModelId,
+    cycle_hour_utc: u8,
+    hours: &[u16],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cycles = rustwx_models::model_summary(model).cycle_hours_utc;
+    if !cycles.contains(&cycle_hour_utc) {
+        let valid = cycles
+            .iter()
+            .map(|cycle| format!("{cycle:02}z"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "--cycle: {cycle_hour_utc:02}z is not a published {model} cycle \
+             (valid cycles: {valid})"
+        )
+        .into());
+    }
+    let supported = rustwx_models::supported_forecast_hours(model, cycle_hour_utc);
+    if let Some(&bad) = hours.iter().find(|hour| !supported.contains(hour)) {
+        let max = supported.last().copied().unwrap_or(0);
+        return Err(format!(
+            "--hours: f{bad:03} is not a valid {model} forecast hour for the {cycle_hour_utc:02}z \
+             cycle (valid hours run 0..={max}; GFS is hourly to f120 then 3-hourly to f384)"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1825,6 +1955,37 @@ mod tests {
         assert!(plan.heavy.contains(&"sbecape"));
     }
 
+    /// APCP honesty: the GFS full 2D plan must NOT claim `apcp_1h` (nor the
+    /// other HRRR-trick trailing fields), because GFS `pgrb2` APCP is a
+    /// bucketed accumulation (0-6h resets) the re-select can't honestly turn
+    /// into a 1 h increment. HRRR's plan keeps the trailing set unchanged.
+    #[test]
+    fn gfs_full_plan_excludes_apcp_1h_but_hrrr_keeps_it() {
+        let hrrr = planned_store_variables(&IngestProfile::full(), ModelId::Hrrr);
+        assert!(
+            hrrr.fields_2d.contains(&"apcp_1h".to_string()),
+            "HRRR must still carry the trailing 1 h apcp window"
+        );
+        assert!(hrrr.fields_2d.contains(&"uh_2to5km_max_1h".to_string()));
+        assert!(
+            hrrr.fields_2d
+                .contains(&"wind_speed_10m_max_1h".to_string())
+        );
+
+        let gfs = planned_store_variables(&IngestProfile::full(), ModelId::Gfs);
+        for trailing in TRAILING_2D_NAMES {
+            assert!(
+                !gfs.fields_2d.contains(&trailing.to_string()),
+                "GFS plan must not claim the trailing 1 h field '{trailing}' (bucketed APCP)"
+            );
+        }
+        // The honest GFS run total is still planned (the plain accumulation).
+        assert!(
+            gfs.fields_2d.contains(&"apcp_run_total".to_string()),
+            "GFS still stores the plain run-total accumulation"
+        );
+    }
+
     #[test]
     fn planned_store_variables_respect_sounding_and_view() {
         let mut profile = IngestProfile::sounding();
@@ -1930,6 +2091,90 @@ mod tests {
         assert!(
             events.lock().unwrap().is_empty(),
             "a pre-set cancel must stop the flow before any stage event"
+        );
+    }
+
+    /// GFS hour-cadence validation: hourly to f120, then 3-hourly to f384.
+    /// f121 (off the 3-hourly grid past 120) is rejected; f123 and f384 are
+    /// accepted; f385 (past the horizon) is rejected. The error names the
+    /// flag and the offending hour.
+    #[test]
+    fn validate_forecast_hours_enforces_gfs_cadence() {
+        let cycle = 0;
+        validate_forecast_hours(ModelId::Gfs, cycle, &[0, 1, 120, 123, 384])
+            .expect("on-cadence GFS hours pass");
+
+        let err = validate_forecast_hours(ModelId::Gfs, cycle, &[121])
+            .expect_err("f121 is off the GFS cadence");
+        let message = err.to_string();
+        assert!(message.contains("--hours"), "must name the flag: {message}");
+        assert!(message.contains("f121"), "must name the hour: {message}");
+
+        validate_forecast_hours(ModelId::Gfs, cycle, &[123]).expect("f123 is on the 3-hourly grid");
+        validate_forecast_hours(ModelId::Gfs, cycle, &[384]).expect("f384 is the horizon");
+        assert!(
+            validate_forecast_hours(ModelId::Gfs, cycle, &[385]).is_err(),
+            "f385 is past the GFS horizon"
+        );
+    }
+
+    /// The cycle must sit on the model's published cycle table: GFS runs only
+    /// at 00/06/12/18z, so `--cycle 3` is rejected (with a message listing the
+    /// valid cycles) BEFORE it can build a dead `gfs.t03z` URL; 06z passes.
+    /// HRRR's all-24-hour table accepts every cycle (e.g. 17z).
+    #[test]
+    fn validate_forecast_hours_enforces_the_cycle_table() {
+        let err = validate_forecast_hours(ModelId::Gfs, 3, &[0])
+            .expect_err("03z is not a published GFS cycle");
+        let message = err.to_string();
+        assert!(message.contains("--cycle"), "must name the flag: {message}");
+        assert!(
+            message.contains("03z"),
+            "must name the bad cycle: {message}"
+        );
+        for cycle in ["00z", "06z", "12z", "18z"] {
+            assert!(
+                message.contains(cycle),
+                "must list valid cycle {cycle}: {message}"
+            );
+        }
+
+        validate_forecast_hours(ModelId::Gfs, 6, &[0, 3]).expect("06z is a published GFS cycle");
+        validate_forecast_hours(ModelId::Hrrr, 17, &[0, 3])
+            .expect("HRRR runs hourly, so 17z is valid");
+    }
+
+    /// HRRR cadence is unchanged: f018 is valid on every cycle, the 6-hourly
+    /// cycles reach f048, and f019 is rejected on an off-synoptic cycle.
+    #[test]
+    fn validate_forecast_hours_leaves_hrrr_unchanged() {
+        validate_forecast_hours(ModelId::Hrrr, 0, &[0, 18, 48]).expect("00z HRRR reaches f048");
+        validate_forecast_hours(ModelId::Hrrr, 1, &[0, 18]).expect("01z HRRR reaches f018");
+        assert!(
+            validate_forecast_hours(ModelId::Hrrr, 1, &[19]).is_err(),
+            "01z HRRR stops at f018"
+        );
+    }
+
+    /// `single_file_model` in IngestedHour is driven by the fetch plan: GFS
+    /// has a one-entry plan (single file), HRRR has two. Verify the flag
+    /// derivation used inside process_fetched_hour matches the canonical plan.
+    #[test]
+    fn single_file_flag_matches_fetch_plan_entry_count() {
+        let gfs_is_single = fetch_plan(ModelId::Gfs)
+            .map(|plan| plan.len() == 1)
+            .unwrap_or(false);
+        assert!(
+            gfs_is_single,
+            "GFS fetch plan has one entry → single_file_model"
+        );
+
+        let hrrr_is_single = fetch_plan(ModelId::Hrrr)
+            .map(|plan| plan.len() == 1)
+            .unwrap_or(false);
+        assert!(
+            !hrrr_is_single,
+            "HRRR fetch plan has two entries → not single_file"
         );
     }
 
