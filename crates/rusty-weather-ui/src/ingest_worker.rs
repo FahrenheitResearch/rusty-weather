@@ -255,9 +255,10 @@ fn compute_estimate(
     let model_slug = model.as_str().replace('-', "_");
     let paths = default_calibration_paths(store_root, &model_slug);
     let calibration = if paths.is_empty() {
-        Calibration::builtin_default()
+        Calibration::builtin_for_model(model)
     } else {
-        Calibration::from_hour_files(&paths).unwrap_or_else(|_| Calibration::builtin_default())
+        Calibration::from_hour_files(&paths, model)
+            .unwrap_or_else(|_| Calibration::builtin_for_model(model))
     };
     let hour_count = hours.len() as u16;
     let estimate = estimate(&profile, model, hour_count, &calibration);
@@ -686,6 +687,36 @@ mod tests {
         );
         assert!(!estimate.breakdown.is_empty());
         assert!(estimate.time_hint.contains("cache-cold"));
+    }
+
+    /// GFS estimate with an empty store uses the GFS builtins (not HRRR's)
+    /// and names GFS in the provenance string.  The download must price
+    /// exactly one pgrb2 file, not the HRRR prs+sfc pair.
+    #[test]
+    fn gfs_estimate_uses_gfs_builtins_and_prices_single_file_download() {
+        let mut gfs_spec = spec();
+        gfs_spec.model = "gfs".to_string();
+        let estimate =
+            compute_estimate(std::path::Path::new("definitely-missing-store"), &gfs_spec)
+                .expect("GFS estimate resolves");
+        assert!(
+            estimate.calibration.contains("GFS"),
+            "GFS spec must use the GFS builtin calibration, got: {}",
+            estimate.calibration
+        );
+        // GFS single pgrb2 download is larger than HRRR's sfc-only download
+        // (≈517 MiB) but smaller than HRRR's prs+sfc combined (≈550 MiB).
+        // Sounding profile always needs the pressure file.
+        assert!(
+            estimate.per_hour_download_bytes > 500 * 1024 * 1024,
+            "GFS download should be ~517 MiB, got {} bytes",
+            estimate.per_hour_download_bytes
+        );
+        assert!(
+            estimate.per_hour_download_bytes < 600 * 1024 * 1024,
+            "GFS download should be ~517 MiB, got {} bytes",
+            estimate.per_hour_download_bytes
+        );
     }
 
     #[test]

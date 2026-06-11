@@ -234,13 +234,13 @@ fn print_estimate(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let paths = calibration_paths(args, model_slug);
     let calibration = if paths.is_empty() {
-        Calibration::builtin_default()
+        Calibration::builtin_for_model(args.model)
     } else {
-        match Calibration::from_hour_files(&paths) {
+        match Calibration::from_hour_files(&paths, args.model) {
             Ok(calibration) => calibration,
             Err(err) => {
                 eprintln!("calibration from stored hours failed ({err}); using built-in defaults");
-                Calibration::builtin_default()
+                Calibration::builtin_for_model(args.model)
             }
         }
     };

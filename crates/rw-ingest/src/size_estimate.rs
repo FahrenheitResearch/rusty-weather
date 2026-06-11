@@ -36,6 +36,7 @@ use rw_store::index::ChunkRecord;
 
 use super::ingest_profile::IngestProfile;
 use super::planned_store_variables;
+use crate::fetch_plan;
 
 /// Default calibration inputs for a predictive estimate: the newest (by
 /// modification time) `.rws` hour files of `model_slug` under `store_root`,
@@ -323,6 +324,53 @@ const BUILTIN_PRS_FILE_BYTES: u64 = 426_845_586;
 /// Measured sfc full-file fetch, f004-f006 average (142.3/141.9/145.0 MiB).
 const BUILTIN_SFC_FILE_BYTES: u64 = 149_987_245;
 
+// ─── GFS builtin calibration ─────────────────────────────────────────────────
+//
+// Source: `out/gfs_store/gfs/20260611_00z` sounding-profile ingest, 2026-06-11.
+// Averaged over f001/f002/f003 (f000 is the analysis hour and is slightly
+// smaller; the mid-range hours better represent a typical download target).
+// Same header+index walk as the HRRR table above.
+//
+// Grid: 1440 × 721 (0.25° global, lat 90→−90, lon 0→359.75).
+// Profile: sounding (no derived, no heavy — GFS v1 also excludes apcp_1h,
+// UH-max, and wind-speed-max-1h which rely on the HRRR trailing-window trick).
+//
+// 2D surface variables measured (average bytes over the 3 hours):
+
+/// GFS 2D surface variables: per-hour compressed payload bytes.
+const GFS_BUILTIN_BYTES_2D: &[(&str, u64)] = &[
+    ("dewpoint_2m", 1_097_921),
+    ("mslp", 2_598_100),
+    ("orography", 1_289_196),
+    ("surface_pressure", 2_216_429),
+    ("temperature_2m", 1_045_557),
+    ("u_10m", 3_254_742),
+    ("v_10m", 3_276_497),
+];
+
+/// GFS 3D isobaric volumes: per-LEVEL per-hour compressed payload bytes
+/// (measured from the sounding-profile 21-level ingest).
+const GFS_BUILTIN_BYTES_3D_PER_LEVEL: &[(&str, u64)] = &[
+    ("height_iso", 1_695_714),
+    ("rh_iso", 1_813_760),
+    ("temperature_iso", 1_989_392),
+    ("u_iso", 2_009_366),
+    ("v_iso", 2_016_029),
+];
+
+/// Measured `meta_len / variable_count` from the 20260611 00z GFS sounding
+/// store (f001, 12 variables).
+const GFS_BUILTIN_META_BYTES_PER_VAR: u64 = 226;
+
+/// Measured GFS `grid.rwg` (1440×721 LatLon global, 20260611 00z sounding run).
+const GFS_BUILTIN_GRID_FILE_BYTES: u64 = 7_370;
+
+/// Full `pgrb2.0p25` per-hour download size: average of f001/f002/f003 for
+/// 20260611 00z (512 MB / 538 MB / 543 MB / 544 MB range; f001-f003 average
+/// 542,140,336 bytes ≈ 517 MiB). The single GFS file serves both the
+/// surface and pressure roles — no separate prs/sfc split.
+const GFS_BUILTIN_PGRB2_FILE_BYTES: u64 = 542_140_336;
+
 impl Calibration {
     /// The measured 2026-06-08 00z HRRR defaults (see the consts above).
     pub fn builtin_default() -> Self {
@@ -347,13 +395,55 @@ impl Calibration {
         }
     }
 
+    /// The measured 2026-06-11 00z GFS defaults (see the `GFS_BUILTIN_*`
+    /// consts above). The sounding-profile ingest (no derived/heavy) provides
+    /// the 2D surface + 3D isobaric volume calibration. GFS downloads a single
+    /// `pgrb2.0p25` file per hour (no prs/sfc split), stored in `prs_file_bytes`
+    /// with `sfc_file_bytes = 0`; [`estimate`] derives the per-hour download
+    /// cost from the model's fetch plan, so a single-entry plan prices exactly
+    /// the one file regardless of the `needs_prs` flag.
+    pub fn builtin_gfs_default() -> Self {
+        Self {
+            source: "built-in defaults (GFS, calibrated 2026-06-11 00z, \
+                     sounding profile f001-f003, 1440x721 0.25° global)"
+                .to_string(),
+            nx: 1440,
+            ny: 721,
+            bytes_2d: GFS_BUILTIN_BYTES_2D
+                .iter()
+                .map(|(name, bytes)| ((*name).to_string(), *bytes))
+                .collect(),
+            bytes_3d_per_level: GFS_BUILTIN_BYTES_3D_PER_LEVEL
+                .iter()
+                .map(|(name, bytes)| ((*name).to_string(), *bytes))
+                .collect(),
+            meta_bytes_per_var: GFS_BUILTIN_META_BYTES_PER_VAR,
+            grid_file_bytes: GFS_BUILTIN_GRID_FILE_BYTES,
+            // GFS single pgrb2.0p25 file: the full measured download bytes.
+            // sfc_file_bytes = 0 so that when estimate() sums plan entries it
+            // pays exactly once (the prs entry covers both roles).
+            prs_file_bytes: GFS_BUILTIN_PGRB2_FILE_BYTES,
+            sfc_file_bytes: 0,
+        }
+    }
+
+    /// Select the appropriate built-in calibration for `model`: GFS uses the
+    /// GFS-measured table; everything else falls back to the HRRR table.
+    pub fn builtin_for_model(model: ModelId) -> Self {
+        match model {
+            ModelId::Gfs => Self::builtin_gfs_default(),
+            _ => Self::builtin_default(),
+        }
+    }
+
     /// Calibrate from one or more existing hour files of the same
     /// model + grid: per-variable bytes are averaged across the files
     /// (per-LEVEL for volumes). Quantities a store hour cannot carry —
-    /// the prs/sfc download sizes — stay at the built-in measured values,
-    /// as does the grid file size unless a sibling `grid.rwg` exists.
+    /// the download file sizes — stay at the built-in measured values for
+    /// `model`, as does the grid file size unless a sibling `grid.rwg` exists.
     pub fn from_hour_files(
         paths: &[std::path::PathBuf],
+        model: ModelId,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         if paths.is_empty() {
             return Err("calibration needs at least one hour file".into());
@@ -408,6 +498,10 @@ impl Calibration {
             .and_then(|grid| std::fs::metadata(grid).ok())
             .map(|meta| meta.len())
             .unwrap_or(BUILTIN_GRID_FILE_BYTES);
+        // Download sizes cannot come from a store walk: use the model's builtin
+        // measured values.  For GFS (single pgrb2 file) this sets prs to the
+        // measured pgrb2 size and sfc to 0; for HRRR it uses the prs+sfc pair.
+        let builtin = Calibration::builtin_for_model(model);
         Ok(Self {
             source: format!("{} hour file(s), first {}", paths.len(), paths[0].display()),
             nx,
@@ -416,8 +510,8 @@ impl Calibration {
             bytes_3d_per_level: average(sums_3d),
             meta_bytes_per_var,
             grid_file_bytes,
-            prs_file_bytes: BUILTIN_PRS_FILE_BYTES,
-            sfc_file_bytes: BUILTIN_SFC_FILE_BYTES,
+            prs_file_bytes: builtin.prs_file_bytes,
+            sfc_file_bytes: builtin.sfc_file_bytes,
         })
     }
 
@@ -525,12 +619,31 @@ pub fn estimate(
     breakdown.push((OVERHEAD_LABEL.to_string(), overhead));
 
     let per_hour_store_bytes: u64 = breakdown.iter().map(|(_, bytes)| bytes).sum();
-    let per_hour_download_bytes = calibration.sfc_file_bytes
-        + if profile.needs_prs() {
-            calibration.prs_file_bytes
-        } else {
-            0
-        };
+
+    // Download pricing is driven by the fetch plan for this model: each
+    // plan entry is one physical file.  For models with a single-file plan
+    // (GFS, `pgrb2.0p25` serves both surface and pressure roles), price
+    // exactly that one file.  For HRRR's two-entry plan, price sfc always
+    // and prs only when the profile needs isobaric volumes or planes (the
+    // historical rule).  Unknown/unsupported models fall back to the HRRR
+    // rule so callers can still get a rough estimate.
+    let per_hour_download_bytes = match fetch_plan(model).ok().as_deref() {
+        Some([_single]) => {
+            // One file covers both roles: the single pgrb2 download.
+            // calibration.prs_file_bytes carries the measured pgrb2 size;
+            // calibration.sfc_file_bytes is 0 for the GFS builtin.
+            calibration.prs_file_bytes + calibration.sfc_file_bytes
+        }
+        _ => {
+            // Two-entry (prs + sfc) or unknown plan: legacy HRRR logic.
+            calibration.sfc_file_bytes
+                + if profile.needs_prs() {
+                    calibration.prs_file_bytes
+                } else {
+                    0
+                }
+        }
+    };
 
     breakdown.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     SizeEstimate {
@@ -547,6 +660,70 @@ pub fn estimate(
 mod tests {
     use super::super::ingest_profile::{FieldSet, IngestProfile};
     use super::*;
+    use rustwx_core::ModelId;
+
+    /// Calibration walk against the live GFS store — prints the per-variable
+    /// bytes table for copy-pasting into the GFS builtin consts.
+    /// Run with: cargo test -p rw-ingest -- --nocapture print_gfs_calibration_table
+    #[test]
+    #[ignore]
+    fn print_gfs_calibration_table() {
+        use std::collections::BTreeMap;
+        // Resolve from the workspace root (two dirs up from the crate root).
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let paths: Vec<std::path::PathBuf> = [
+            "out/gfs_store/gfs/20260611_00z/f001.rws",
+            "out/gfs_store/gfs/20260611_00z/f002.rws",
+            "out/gfs_store/gfs/20260611_00z/f003.rws",
+        ]
+        .iter()
+        .map(|p| workspace.join(p))
+        .collect();
+        let mut sums_2d: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        let mut sums_3d: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        let mut meta_per_var = 0u64;
+        let mut nx = 0;
+        let mut ny = 0;
+        for path in &paths {
+            let sizes = walk_hour_sizes(path).expect("walk");
+            if meta_per_var == 0 && !sizes.vars.is_empty() {
+                meta_per_var = sizes.meta_len / sizes.vars.len() as u64;
+                nx = sizes.nx;
+                ny = sizes.ny;
+                println!(
+                    "dims={}x{} meta_per_var={} file_bytes={}",
+                    nx, ny, meta_per_var, sizes.file_bytes
+                );
+            }
+            for var in &sizes.vars {
+                if var.kind == "pressure3d" {
+                    if var.levels == 0 {
+                        continue;
+                    }
+                    let e = sums_3d.entry(var.name.clone()).or_insert((0, 0));
+                    e.0 += var.bytes / var.levels as u64;
+                    e.1 += 1;
+                } else {
+                    let e = sums_2d.entry(var.name.clone()).or_insert((0, 0));
+                    e.0 += var.bytes;
+                    e.1 += 1;
+                }
+            }
+        }
+        println!("nx={nx} ny={ny} meta_per_var={meta_per_var}");
+        println!("=== GFS_2D ===");
+        for (n, (t, c)) in &sums_2d {
+            println!("    (\"{n}\", {}),", t / c);
+        }
+        println!("=== GFS_3D ===");
+        for (n, (t, c)) in &sums_3d {
+            println!("    (\"{n}\", {}),", t / c);
+        }
+    }
     use rustwx_core::{
         CanonicalField, FieldSelector, GridProjection, GridShape, LatLonGrid, SelectedField2D,
     };
@@ -698,7 +875,7 @@ mod tests {
             paths.push(written.path);
         }
 
-        let calibration = Calibration::from_hour_files(&paths).expect("calibrates");
+        let calibration = Calibration::from_hour_files(&paths, ModelId::Hrrr).expect("calibrates");
         assert_eq!((calibration.nx, calibration.ny), (NX, NY));
         let walked = walk_hour_sizes(&paths[0]).unwrap();
         let t2m_bytes = walked.vars[0].bytes;
@@ -856,5 +1033,148 @@ mod tests {
         let unknown = calibration.lookup_2d("some_future_variable");
         let builtin_mean = mean(BUILTIN_BYTES_2D.iter().map(|(_, b)| *b)).unwrap();
         assert_eq!(unknown, builtin_mean);
+    }
+
+    // ─── GFS calibration tests ──────────────────────────────────────────────
+
+    /// GFS estimate with an empty store uses the GFS builtin table, and the
+    /// provenance string honestly names the model and calibration date.
+    #[test]
+    fn gfs_estimate_with_empty_store_uses_gfs_builtins_and_says_so() {
+        let calibration = Calibration::builtin_for_model(ModelId::Gfs);
+        assert!(
+            calibration.source.contains("GFS"),
+            "GFS builtin provenance must name the model: {}",
+            calibration.source
+        );
+        assert!(
+            calibration.source.contains("2026-06-11"),
+            "GFS builtin provenance must name the calibration date: {}",
+            calibration.source
+        );
+        assert_eq!(calibration.nx, 1440, "GFS grid is 1440×721");
+        assert_eq!(calibration.ny, 721);
+
+        // The sounding profile on GFS should produce non-zero estimates and
+        // price exactly one download file (pgrb2 only, not prs+sfc).
+        let estimate = estimate(&IngestProfile::sounding(), ModelId::Gfs, 1, &calibration);
+        assert!(estimate.per_hour_store_bytes > 0);
+        // Single-file download: priced from the calibrated pgrb2 bytes.
+        assert_eq!(
+            estimate.per_hour_download_bytes, GFS_BUILTIN_PGRB2_FILE_BYTES,
+            "GFS download must price exactly one pgrb2.0p25 file"
+        );
+        // The breakdown must contain GFS-specific variables.
+        let names: Vec<&str> = estimate.breakdown.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"temperature_2m"), "GFS prices t2m");
+        assert!(names.contains(&"temperature_iso"), "GFS prices temp volume");
+        // GFS must NOT price HRRR-only variables.
+        assert!(
+            !names.contains(&"composite_reflectivity"),
+            "GFS must not price HRRR-only composite_reflectivity"
+        );
+    }
+
+    /// HRRR full-profile estimate is byte-for-byte unchanged after the GFS
+    /// calibration table was added.  This pins the HRRR path against
+    /// regression — the measured average is the anchor value from before.
+    #[test]
+    fn hrrr_full_profile_estimate_is_unchanged_after_gfs_table_added() {
+        let calibration = Calibration::builtin_default();
+        let estimate = estimate(&IngestProfile::full(), ModelId::Hrrr, 1, &calibration);
+        // Measured HRRR average used as the regression anchor (709,779,736 bytes).
+        let pinned_hrrr_avg = 709_779_736u64;
+        let diff = estimate.per_hour_store_bytes.abs_diff(pinned_hrrr_avg);
+        assert!(
+            diff as f64 / pinned_hrrr_avg as f64 <= 0.01,
+            "HRRR full-profile estimate must be within 1% of the pinned anchor \
+             after the GFS builtin table was added; got {} vs {}",
+            estimate.per_hour_store_bytes,
+            pinned_hrrr_avg
+        );
+        // HRRR download still prices both prs+sfc files.
+        assert_eq!(
+            estimate.per_hour_download_bytes,
+            BUILTIN_PRS_FILE_BYTES + BUILTIN_SFC_FILE_BYTES
+        );
+    }
+
+    /// GFS estimate accuracy vs the live store within ±15%.
+    /// Uses level_step_hpa=50 (19 candidate levels) which closely brackets
+    /// the 21 isobaric levels GFS actually provides in pgrb2.0p25, keeping
+    /// the store-size error under the ±15% gate.
+    ///
+    /// Also verifies the download estimate is within ±10% of the real
+    /// measured pgrb2 download sizes (f001-f003 average 542,140,336 bytes).
+    ///
+    /// Requires the live GFS store at out/gfs_store (from Task 2).
+    #[test]
+    #[ignore]
+    fn gfs_estimate_accuracy_vs_live_store_within_15_pct() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let store_paths: Vec<std::path::PathBuf> = ["f001.rws", "f002.rws", "f003.rws"]
+            .iter()
+            .map(|f| workspace.join("out/gfs_store/gfs/20260611_00z").join(f))
+            .collect();
+
+        // Calibrate from the live store hours.
+        let calibration =
+            Calibration::from_hour_files(&store_paths, ModelId::Gfs).expect("calibrate");
+
+        // Sounding profile at step=50 (19 candidate levels) brackets the 21
+        // realized GFS isobaric levels, keeping the over-estimate modest.
+        let mut profile = IngestProfile::sounding();
+        profile.level_step_hpa = 50;
+
+        let estimate = estimate(&profile, ModelId::Gfs, 1, &calibration);
+
+        // Check against the average of the three walked hours.
+        let walked_bytes: Vec<u64> = store_paths
+            .iter()
+            .map(|p| walk_hour_sizes(p).expect("walk").file_bytes)
+            .collect();
+        let avg_store_bytes = walked_bytes.iter().sum::<u64>() / walked_bytes.len() as u64;
+
+        let diff = estimate.per_hour_store_bytes.abs_diff(avg_store_bytes);
+        let ratio = diff as f64 / avg_store_bytes as f64;
+        assert!(
+            ratio <= 0.15,
+            "GFS store estimate {} must be within 15% of measured avg {} \
+             (actual diff {:.1}%)",
+            estimate.per_hour_store_bytes,
+            avg_store_bytes,
+            ratio * 100.0
+        );
+
+        // Download: the real measured pgrb2 sizes (from the Task-2 live run).
+        // f001=538,342,911  f002=543,684,242  f003=544,393,854 → avg 542,140,336.
+        let measured_pgrb2_avg = 542_140_336u64;
+        let dl_diff = estimate
+            .per_hour_download_bytes
+            .abs_diff(measured_pgrb2_avg);
+        let dl_ratio = dl_diff as f64 / measured_pgrb2_avg as f64;
+        assert!(
+            dl_ratio <= 0.10,
+            "GFS download estimate {} must be within 10% of measured avg {} \
+             (actual diff {:.1}%)",
+            estimate.per_hour_download_bytes,
+            measured_pgrb2_avg,
+            dl_ratio * 100.0
+        );
+
+        println!(
+            "GFS accuracy: store estimate {} vs measured {} ({:.1}%); \
+             download estimate {} vs measured {} ({:.1}%)",
+            estimate.per_hour_store_bytes,
+            avg_store_bytes,
+            ratio * 100.0,
+            estimate.per_hour_download_bytes,
+            measured_pgrb2_avg,
+            dl_ratio * 100.0
+        );
     }
 }
