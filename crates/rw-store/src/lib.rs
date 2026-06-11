@@ -6,6 +6,7 @@
 pub mod atomic;
 pub mod codec;
 pub mod error;
+pub mod export;
 pub mod format;
 pub mod grid;
 pub mod header;
@@ -18,6 +19,7 @@ pub mod validate;
 pub mod writer;
 
 pub use error::{RwResult, RwStoreError};
+pub use export::{ExportSummary, export_hour_to_netcdf3};
 pub use ingest::{
     DerivedFieldInput, HourIngestWriter, PressureVolumeInput, StoredField2D, WrittenHour,
     derived_selector, derived_selector_slug, read_field_2d, read_grid_2d, write_hour_from_fields,
