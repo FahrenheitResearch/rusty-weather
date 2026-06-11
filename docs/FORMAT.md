@@ -494,10 +494,9 @@ The `.rwg` grid file versions separately (`GRID_VERSION`,
 
 ## 7. Concurrency contract
 
-Source of truth: this section is the normative contract. The lock implementation
-lands in Task 7 of `docs/superpowers/plans/2026-06-10-rw-store-hardening.md`;
-the writer-side advisory lock described here is the spec that implementation
-must conform to.
+Source of truth: this section is the normative contract; the implementation
+lives in `crates/rw-store/src/lock.rs` (`RunLock`) and is integrated into
+`HourIngestWriter` and the rw-sat writer/pruner.
 
 - **Single writer per run directory.** At most one process may write a given
   `<store_root>/<model>/<run>/` directory at a time. A writer MUST hold an
@@ -537,10 +536,9 @@ must conform to.
 
 ## 8. Interop — NetCDF3 export
 
-Source of truth: this is the export mapping contract. The exporter
-(`rws export` → `export_hour_to_netcdf3`) and the NetCDF3 writer land in Tasks
-5/6 of the hardening plan; this section is the spec they must conform to. Treat
-it as a forward reference until those land.
+Source of truth: this is the export mapping contract; the implementation lives
+in `crates/rw-store/src/export.rs` (`export_hour_to_netcdf3`, surfaced as
+`rws export`) over the writer in `crates/rw-store/src/netcdf3.rs`.
 
 `rws export` writes a self-contained **NetCDF classic 64-bit-offset (CDF-2)**
 file — readable by xarray (scipy backend), MetPy, and Panoply with no extra
@@ -601,7 +599,8 @@ Three independent conformance checks back this spec:
   `golden_v1_reader_values_match_expected` reads the committed fixtures and
   checks decoded values against `expected.json` (2-D bit-exact, 3-D within
   quantization tolerance) and that deep validation passes.
-- **Equivalence diff** (`rw_store_diff`, to be surfaced as `rws diff`).
+- **Equivalence diff** (`rws diff`; the `rw_store_diff` binary is the same
+  logic with the legacy CLI surface).
   Two hour files compare **equivalent** when their header `version`/`index_count`,
   meta JSON (with `writer.build` masked out), index records, and payload bytes
   match — with index `offset` compared **relative to each file's
