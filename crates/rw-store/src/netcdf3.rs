@@ -257,7 +257,10 @@ impl Nc3Writer {
 
 /// First char must be a letter or underscore; the rest are restricted to the
 /// NC-safe subset `[A-Za-z0-9_+.@-]`. Rejects (never renames) on violation.
-fn name_is_valid(name: &str) -> bool {
+///
+/// `pub(crate)` so the export glue (`export.rs`) checks variable names against
+/// the exact same rule the writer enforces, with no second copy to drift.
+pub(crate) fn name_is_valid(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}

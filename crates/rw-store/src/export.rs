@@ -49,26 +49,12 @@ use std::path::Path;
 
 use crate::error::{RwResult, RwStoreError};
 use crate::grid::GridFile;
-use crate::netcdf3::{Nc3Attr, Nc3Dim, Nc3VarDef, Nc3Writer};
+use crate::netcdf3::{Nc3Attr, Nc3Dim, Nc3VarDef, Nc3Writer, name_is_valid};
 use crate::reader::HourReader;
 
 // ── quantization disclosure string (matches FORMAT.md §8 / §3.2) ──────────
 const RW_QUANTIZATION: &str = "affine-i16 per 16x16-column chunk at ingest; \
      ~ (chunk max-min)/65534 absolute step";
-
-// ── NC name guard ───────────────────────────────────────────────────────────
-
-/// The same rule as `netcdf3::name_is_valid`.  Inlined here so we can emit
-/// `RwStoreError::Format` (not `RwStoreError::Format` from the writer) with
-/// a message that names the variable clearly before any writer allocation.
-fn nc_name_ok(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '.' | '@' | '-'))
-}
 
 // ── ExportSummary ───────────────────────────────────────────────────────────
 
@@ -130,8 +116,11 @@ pub fn export_hour_to_netcdf3(
     };
 
     // ── 2. Validate NC names ──────────────────────────────────────────────
+    // Shares `netcdf3::name_is_valid` (the exact rule the writer enforces) so
+    // there is no second copy to drift; we wrap it here only to emit a clearer,
+    // variable-naming `Format` error before any writer allocation.
     for v in &export_vars {
-        if !nc_name_ok(&v.name) {
+        if !name_is_valid(&v.name) {
             return Err(RwStoreError::Format(format!(
                 "export: variable name '{}' is not NC-safe \
                  (must start [A-Za-z_], rest [A-Za-z0-9_+.@-])",
