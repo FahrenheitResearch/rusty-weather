@@ -36,6 +36,11 @@ quality flag.
   floored to 10 min) plus a `window.json` manifest, pruned by the same
   rolling-window pattern as rw-sat (age + byte budget), writer-locked per
   directory with `.rw-lock`.
+  - **Amendment (Task 1 build, 2026-06-11):** the bucket path gained a per-day
+    level — `<root>/glm/<satellite>/<YYYYMMDD>/tHHMM.rwl` — because the flat
+    `tHHMM` namespace collides across days when the rolling window crosses UTC
+    midnight, and per-day directories make pruning a cheap directory drop;
+    `window.json` stays at `<root>/glm/<satellite>/window.json`.
 - File = 64-byte header (magic `RWLIGHT1`, version, record count, time range,
   source-granule count) + fixed **32-byte LE records sorted by time**:
 

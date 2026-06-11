@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/rw-glm",
     "crates/rw-ingest",
     "crates/rw-sat",
     "crates/rw-store",

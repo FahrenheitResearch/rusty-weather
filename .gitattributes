@@ -1,1 +1,2 @@
 crates/rw-store/tests/golden/** -text
+crates/rw-glm/tests/golden/** -text

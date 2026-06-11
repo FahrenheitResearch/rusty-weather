@@ -26,11 +26,11 @@
 - Modify: `docs/FORMAT.md` — new §10 “.rwl flash files” (header/record tables, flags bits, bucket scheme, concurrency = same RunLock contract, versioning = golden fixtures freeze v1)
 
 **Steps (TDD):**
-- [ ] Failing tests: record pack/unpack round-trip with exact byte-offset assertions (mirror rw-store's index_record_pack_layout_is_exact); bucket-name math (t0000/t2350, floor behavior, day boundary); writer insert keeps sort + atomic rewrite visible to a concurrent reader (write, read mid-stream from second handle); `read_flashes` time-range file selection (range spanning 3 buckets returns only in-range flashes, half-open vs inclusive semantics — pick inclusive start/exclusive end and DOCUMENT), bbox filter, empty-range, missing-satellite-dir → clean empty; validator catches truncation/unsorted/bad-magic/count-mismatch/time-range-header-lies without panics.
-- [ ] Implement format/store/reader/validate.
-- [ ] Golden fixture + regen harness; FORMAT.md §10.
-- [ ] Gates: `cargo test -p rw-glm` green, `cargo test --workspace` green, fmt/clippy clean for rw-glm.
-- [ ] Commit `feat(rw-glm): .rwl flash store format + reader API` ; **push branch to origin** (bowecho starts here).
+- [x] Failing tests: record pack/unpack round-trip with exact byte-offset assertions (mirror rw-store's index_record_pack_layout_is_exact); bucket-name math (t0000/t2350, floor behavior, day boundary); writer insert keeps sort + atomic rewrite visible to a concurrent reader (write, read mid-stream from second handle); `read_flashes` time-range file selection (range spanning 3 buckets returns only in-range flashes, half-open vs inclusive semantics — picked **inclusive start / exclusive end `[t0, t1)`**, documented on `read_flashes`), bbox filter, empty-range, missing-satellite-dir → clean empty; validator catches truncation/unsorted/bad-magic/count-mismatch/time-range-header-lies without panics.
+- [x] Implement format/store/reader/validate.
+- [x] Golden fixture + regen harness; FORMAT.md §10.
+- [x] Gates: `cargo test -p rw-glm` green, `cargo test --workspace` green, fmt/clippy clean for rw-glm.
+- [x] Commit `feat(rw-glm): .rwl flash store format + reader API` ; **push branch to origin** (bowecho starts here).
 
 ### Task 2: Granule decode (lean + one real-granule pin)
 
