@@ -27,11 +27,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rustwx_core::{GridShape, LatLonGrid};
 use rw_store::grid::GridFile;
 use rw_store::ingest::{HourIngestWriter, PressureVolumeInput};
 use rw_store::reader::HourReader;
 use rw_store::validate::{ValidateDepth, validate_hour_file, validate_run_dir};
-use rustwx_core::{GridShape, LatLonGrid};
 
 // ---------------------------------------------------------------------------
 // Fixture constants — the single source of truth for all three tests
@@ -177,7 +177,12 @@ fn build_golden_store(store_root: &Path) -> PathBuf {
         .expect("add const_demo");
 
     writer
-        .add_volume("temp_iso", "K", serde_json::json!({ "var": "TMP", "level": "{level} mb" }), &volume.levels)
+        .add_volume(
+            "temp_iso",
+            "K",
+            serde_json::json!({ "var": "TMP", "level": "{level} mb" }),
+            &volume.levels,
+        )
         .expect("add temp_iso volume");
 
     writer.finish(WRITTEN_UNIX).expect("finish");
@@ -187,19 +192,12 @@ fn build_golden_store(store_root: &Path) -> PathBuf {
 
 /// Path to the committed golden fixture directory.
 fn committed_dir() -> PathBuf {
-    PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/golden/v1"
-    ))
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/v1"))
 }
 
 /// Unique temp dir for a test run.
 fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "rw-store-golden-{}-{}",
-        std::process::id(),
-        name
-    ));
+    let dir = std::env::temp_dir().join(format!("rw-store-golden-{}-{}", std::process::id(), name));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -221,23 +219,54 @@ fn golden_v1_bytes_are_stable() {
     let rebuilt_rws = fs::read(rebuilt_run_dir.join("f000.rws")).expect("rebuilt f000.rws");
     let committed_rws = fs::read(committed.join("f000.rws")).expect("committed f000.rws");
     assert_eq!(
-        rebuilt_rws, committed_rws,
-        "f000.rws byte content changed — this is a FORMAT CHANGE requiring a version bump discussion"
+        rebuilt_rws.len(),
+        committed_rws.len(),
+        "f000.rws length changed: committed={} bytes, rebuilt={} bytes — \
+         FORMAT CHANGE requiring a version bump discussion",
+        committed_rws.len(),
+        rebuilt_rws.len()
     );
+    if rebuilt_rws != committed_rws {
+        let offset = rebuilt_rws
+            .iter()
+            .zip(committed_rws.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        panic!(
+            "f000.rws first divergence at byte offset {offset} — \
+             FORMAT CHANGE requiring a version bump discussion"
+        );
+    }
 
     // grid.rwg: byte-exact
     let rebuilt_rwg = fs::read(rebuilt_run_dir.join("grid.rwg")).expect("rebuilt grid.rwg");
     let committed_rwg = fs::read(committed.join("grid.rwg")).expect("committed grid.rwg");
     assert_eq!(
-        rebuilt_rwg, committed_rwg,
-        "grid.rwg byte content changed — this is a FORMAT CHANGE"
+        rebuilt_rwg.len(),
+        committed_rwg.len(),
+        "grid.rwg length changed: committed={} bytes, rebuilt={} bytes — \
+         FORMAT CHANGE requiring a version bump discussion",
+        committed_rwg.len(),
+        rebuilt_rwg.len()
     );
+    if rebuilt_rwg != committed_rwg {
+        let offset = rebuilt_rwg
+            .iter()
+            .zip(committed_rwg.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        panic!(
+            "grid.rwg first divergence at byte offset {offset} — \
+             FORMAT CHANGE requiring a version bump discussion"
+        );
+    }
 
     // run.json: parsed-value equality, excluding encode_ms (a wall-clock timing
     // that varies per run and is intentionally not pinned).
-    let rebuilt_json: serde_json::Value =
-        serde_json::from_slice(&fs::read(rebuilt_run_dir.join("run.json")).expect("rebuilt run.json"))
-            .expect("parse rebuilt run.json");
+    let rebuilt_json: serde_json::Value = serde_json::from_slice(
+        &fs::read(rebuilt_run_dir.join("run.json")).expect("rebuilt run.json"),
+    )
+    .expect("parse rebuilt run.json");
     let committed_json: serde_json::Value =
         serde_json::from_slice(&fs::read(committed.join("run.json")).expect("committed run.json"))
             .expect("parse committed run.json");
@@ -284,12 +313,10 @@ fn golden_v1_reader_values_match_expected() {
 
     // ---- grid_hash ----
     let expected_grid_hash = expected["grid_hash"].as_str().expect("expected.grid_hash");
+    assert_eq!(grid_file.hash, expected_grid_hash, "grid_hash mismatch");
     assert_eq!(
-        grid_file.hash, expected_grid_hash,
-        "grid_hash mismatch"
-    );
-    assert_eq!(
-        reader.meta().grid_hash, expected_grid_hash,
+        reader.meta().grid_hash,
+        expected_grid_hash,
         "hour file grid_hash mismatch"
     );
 
@@ -297,6 +324,7 @@ fn golden_v1_reader_values_match_expected() {
     let t2m_full = reader.read_full_2d("t2m").expect("read t2m full_2d");
     let expected_t2m = &expected["t2m_spot"];
 
+    // flat_idx 4105 => gx=5, gy=205;  flat_idx 5999 => gx=19, gy=299
     let spot_indices = [0usize, 4105usize, 5999usize];
     for (i, &flat_idx) in spot_indices.iter().enumerate() {
         let got = t2m_full[flat_idx];
@@ -309,7 +337,9 @@ fn golden_v1_reader_values_match_expected() {
     }
 
     // ---- mask_demo NaN positions ----
-    let mask_full = reader.read_full_2d("mask_demo").expect("read mask_demo full_2d");
+    let mask_full = reader
+        .read_full_2d("mask_demo")
+        .expect("read mask_demo full_2d");
     // Flat index 3: gx=3, gy=0 (which satisfies gx==3 && gy<10) -> NaN
     assert!(
         mask_full[3].is_nan(),
@@ -321,13 +351,31 @@ fn golden_v1_reader_values_match_expected() {
         "mask_demo[256*NX] (gy=256) must be NaN"
     );
 
+    // ---- const_demo: CONSTANT-tile reader path — all values must be exactly 101325.0 ----
+    let const_full = reader
+        .read_full_2d("const_demo")
+        .expect("read const_demo full_2d");
+    assert_eq!(
+        const_full.len(),
+        NX * NY,
+        "const_demo read_full_2d length mismatch"
+    );
+    assert!(
+        const_full.iter().all(|&v| v == 101325.0_f32),
+        "const_demo read_full_2d: all values must be 101325.0 (CONSTANT-tile reader path)"
+    );
+
     // ---- temp_iso profile at (fx=5.5, fy=10.5) ----
     let profile = reader
         .read_profile_3d("temp_iso", 5.5, 10.5)
         .expect("read temp_iso profile");
     assert_eq!(profile.len(), 3, "temp_iso profile must have 3 levels");
     let expected_profile = &expected["temp_iso_profile_5p5_10p5"];
-    for (k, (got, expected_entry)) in profile.iter().zip(expected_profile.as_array().unwrap().iter()).enumerate() {
+    for (k, (got, expected_entry)) in profile
+        .iter()
+        .zip(expected_profile.as_array().unwrap().iter())
+        .enumerate()
+    {
         let expected_val = expected_entry.as_f64().expect("profile value") as f32;
         let rel_err = (got - expected_val).abs() / expected_val.abs().max(1e-6);
         assert!(
@@ -347,23 +395,25 @@ fn golden_v1_reader_values_match_expected() {
         .map(|&v| v as f64)
         .sum();
     let checksum_str = format!("{:.6}", checksum);
-    let expected_checksum = expected["t2m_window_checksum"].as_str().expect("window checksum");
+    let expected_checksum = expected["t2m_window_checksum"]
+        .as_str()
+        .expect("window checksum");
     assert_eq!(
         checksum_str, expected_checksum,
         "t2m window checksum mismatch"
     );
 
     // ---- validate both hour file and run dir (Deep) ----
-    let hour_report = validate_hour_file(&hour_path, ValidateDepth::Deep)
-        .expect("validate_hour_file I/O");
+    let hour_report =
+        validate_hour_file(&hour_path, ValidateDepth::Deep).expect("validate_hour_file I/O");
     assert!(
         hour_report.is_ok(),
         "validate_hour_file(Deep) must pass on committed fixture; errors: {:?}",
         hour_report.errors
     );
 
-    let run_report = validate_run_dir(&committed, ValidateDepth::Deep)
-        .expect("validate_run_dir I/O");
+    let run_report =
+        validate_run_dir(&committed, ValidateDepth::Deep).expect("validate_run_dir I/O");
     assert!(
         run_report.is_ok(),
         "validate_run_dir(Deep) must pass on committed fixture; errors: {:?}",
@@ -419,13 +469,15 @@ fn regen_golden_v1() {
 
     // Verify temp_iso profile reads within quantization tolerance.
     let quant_bound = {
-        let vmin = temp_iso_value(0, 0, 2);   // level_idx=2 (500 hPa), gx=0, gy=0
+        let vmin = temp_iso_value(0, 0, 2); // level_idx=2 (500 hPa), gx=0, gy=0
         let vmax = temp_iso_value(NX - 1, NY - 1, 0); // level_idx=0 (850 hPa)
         (vmax - vmin) / (2.0 * 32767.0) + 1e-5
     };
     // Sample a few column reads
     for &(gx, gy) in &[(0usize, 0usize), (10, 150), (19, 299)] {
-        let column = reader.read_column_3d("temp_iso", gx, gy).expect("read column");
+        let column = reader
+            .read_column_3d("temp_iso", gx, gy)
+            .expect("read column");
         assert_eq!(column.len(), 3, "column length must be 3 levels");
         for (k, &val) in column.iter().enumerate() {
             let want = temp_iso_value(gx, gy, k);
@@ -443,11 +495,8 @@ fn regen_golden_v1() {
     // grid_hash
     let grid_hash = grid_file.hash.clone();
 
-    // t2m spot values at flat indices 0, 4105, 5999
-    let t2m_spots: Vec<f32> = [0usize, 4105, 5999]
-        .iter()
-        .map(|&i| t2m_full[i])
-        .collect();
+    // t2m spot values at flat indices 0, 4105 (gx=5,gy=205), 5999 (gx=19,gy=299)
+    let t2m_spots: Vec<f32> = [0usize, 4105, 5999].iter().map(|&i| t2m_full[i]).collect();
 
     // temp_iso profile at (fx=5.5, fy=10.5)
     let profile = reader
@@ -474,42 +523,42 @@ fn regen_golden_v1() {
     });
 
     // ---- Write the fixture files ----
-    let fixture_dir = PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/golden/v1"
-    ));
+    let fixture_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/v1"));
     fs::create_dir_all(&fixture_dir).expect("create fixture dir");
 
     // Copy f000.rws
-    fs::copy(
-        built_run_dir.join("f000.rws"),
-        fixture_dir.join("f000.rws"),
-    )
-    .expect("copy f000.rws");
+    fs::copy(built_run_dir.join("f000.rws"), fixture_dir.join("f000.rws")).expect("copy f000.rws");
 
     // Copy grid.rwg
-    fs::copy(
-        built_run_dir.join("grid.rwg"),
-        fixture_dir.join("grid.rwg"),
-    )
-    .expect("copy grid.rwg");
+    fs::copy(built_run_dir.join("grid.rwg"), fixture_dir.join("grid.rwg")).expect("copy grid.rwg");
 
     // Copy run.json
-    fs::copy(
-        built_run_dir.join("run.json"),
-        fixture_dir.join("run.json"),
-    )
-    .expect("copy run.json");
+    fs::copy(built_run_dir.join("run.json"), fixture_dir.join("run.json")).expect("copy run.json");
 
     // Write expected.json
-    let expected_bytes = serde_json::to_vec_pretty(&expected_json).expect("serialize expected.json");
+    let expected_bytes =
+        serde_json::to_vec_pretty(&expected_json).expect("serialize expected.json");
     fs::write(fixture_dir.join("expected.json"), &expected_bytes).expect("write expected.json");
 
     eprintln!("Fixture files written to: {}", fixture_dir.display());
-    eprintln!("  f000.rws  ({} bytes)", fs::metadata(fixture_dir.join("f000.rws")).unwrap().len());
-    eprintln!("  grid.rwg  ({} bytes)", fs::metadata(fixture_dir.join("grid.rwg")).unwrap().len());
-    eprintln!("  run.json  ({} bytes)", fs::metadata(fixture_dir.join("run.json")).unwrap().len());
-    eprintln!("  expected.json  ({} bytes)", fs::metadata(fixture_dir.join("expected.json")).unwrap().len());
+    eprintln!(
+        "  f000.rws  ({} bytes)",
+        fs::metadata(fixture_dir.join("f000.rws")).unwrap().len()
+    );
+    eprintln!(
+        "  grid.rwg  ({} bytes)",
+        fs::metadata(fixture_dir.join("grid.rwg")).unwrap().len()
+    );
+    eprintln!(
+        "  run.json  ({} bytes)",
+        fs::metadata(fixture_dir.join("run.json")).unwrap().len()
+    );
+    eprintln!(
+        "  expected.json  ({} bytes)",
+        fs::metadata(fixture_dir.join("expected.json"))
+            .unwrap()
+            .len()
+    );
 
     let _ = fs::remove_dir_all(&tmp);
 }
