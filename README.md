@@ -34,6 +34,8 @@ fails GOES-19 CMIP files with a checksum mismatch on the `x` variable.
 
 ## rw-store
 
+Format spec: docs/FORMAT.md
+
 Each forecast hour is a self-contained `.rws` file: 256×256 spatial tiles of 2D surface fields, zstd-1 compressed f32, with true windowed reads so a regional plot decodes only the intersecting tile set. Pressure-level volumes are stored as 16×16-column 3D chunks (all levels contiguous per column), affine-i16 quantized then zstd-1, so a point sounding mmaps the file, binary-searches the index, and decodes 1–4 small chunks for instant bilinear profiles across all levels. Per-run provenance lives in `grid.rwg` (lat/lon arrays + projection, sha256-hashed for grid-identity checks) and `run.json` (model, cycle, hours present, schema id `rw-store.run.v1`, build-hash from `git rev-parse` compiled in at build time).
 
     cargo run --release -p rusty-weather --bin rw_ingest -- --model hrrr --date YYYYMMDD --cycle 0 --hours 0-6 --store-root store --verify
@@ -46,6 +48,22 @@ volumes (45-102 MB each after i16 quantization + zstd-1) buy the instant
 soundings; trimming stored levels or variables is the lever if disk ever matters.
 locate() measured 75.8 us against an informational 50 us hope — moot in practice,
 the entire warm sounding is 0.19 ms.
+
+### Inspecting and exporting stores (`rws`)
+
+`rws` fronts the whole format: list, inspect, validate, diff, and export to NetCDF3.
+
+    rws ls store/hrrr                            # walk run.json manifests: model/run/hours/vars/sizes
+    rws dump store/hrrr/20260611_04z/f000.rws --var temperature_iso   # header/meta; per-var index records
+    rws validate store/hrrr/20260611_04z --deep  # conformance gate (decompresses every chunk)
+    rws diff a.rws b.rws                          # structural compare (writer.build masked); exit 0 = same
+    rws export store/hrrr/20260611_04z/f000.rws -o f000_subset.nc --vars temperature_2m,dewpoint_2m,temperature_iso
+
+`validate --deep` is the conformance gate: it parses every header/meta/index, decompresses each chunk, and cross-checks raw lengths, stats, and flags — a clean run means the store matches `docs/FORMAT.md`. `export` writes a dependency-free NetCDF3 (CDF-2) file any scientist can open; 2D fields round-trip bit-exact, and 3D pressure values carry an `rw_quantization` attribute disclosing the lossy affine-i16 step applied at ingest. The output reads natively in xarray via the SciPy backend:
+
+    import xarray as xr
+    ds = xr.open_dataset("f000_subset.nc")   # scipy backend reads NetCDF3 natively
+    print(ds["temperature_2m"].sel(y=500, x=900).values)
 
 ## Status
 

@@ -492,3 +492,131 @@ fn empty_and_constant_3d_chunks() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Task 4: read_full_3d
+// ---------------------------------------------------------------------------
+
+/// Build a file with:
+///   - "temperature" (pressure3d, 3 levels [500, 300, 200])
+///   - "temp_2m" (surface2d) — for the wrong-kind error test
+///   - chunk (0,0) is EMPTY (all NaN at every level)
+///   - chunk (1,1) is CONSTANT 5.0 at every level
+///   - all other cells use the analytic formula (index k over the 3 levels)
+///
+/// Grid is the same NX x NY (100 x 80) as the rest of this file.
+fn write_volume_for_full3d(path: &Path) {
+    const LEVELS_3: [u16; 3] = [500, 300, 200];
+    let l3: usize = LEVELS_3.len();
+
+    // Build planes using the same analytic formula (k = 0..l3).
+    let mut planes: Vec<Vec<f32>> = (0..l3)
+        .map(|k| {
+            (0..NY)
+                .flat_map(|y| (0..NX).map(move |x| analytic(x, y, k)))
+                .collect()
+        })
+        .collect();
+
+    // Chunk (0,0): footprint rows 0..16 x cols 0..16 -> all NaN (EMPTY).
+    for plane in &mut planes {
+        for y in 0..COL_Y {
+            for x in 0..COL_X {
+                plane[y * NX + x] = f32::NAN;
+            }
+        }
+    }
+    // Chunk (1,1): rows 16..32 x cols 16..32 -> constant 5.0 (CONSTANT).
+    for plane in &mut planes {
+        for y in COL_Y..2 * COL_Y {
+            for x in COL_X..2 * COL_X {
+                plane[y * NX + x] = 5.0;
+            }
+        }
+    }
+
+    let surface: Vec<f32> = (0..NY)
+        .flat_map(|y| (0..NX).map(move |x| 2.0 * x as f32 + 3.0 * y as f32))
+        .collect();
+    let plane_refs: Vec<&[f32]> = planes.iter().map(|p| p.as_slice()).collect();
+
+    let mut writer = new_writer();
+    writer
+        .add_surface2d("temp_2m", "K", serde_json::Value::Null, &surface)
+        .unwrap();
+    writer
+        .add_pressure3d(
+            "temperature",
+            "K",
+            serde_json::Value::Null,
+            &LEVELS_3,
+            &plane_refs,
+        )
+        .unwrap();
+    writer.finish(path).unwrap();
+}
+
+#[test]
+fn read_full_3d_matches_column_reads() {
+    let dir = test_dir("full3d");
+    let path = dir.join("hour.rws");
+    write_volume_for_full3d(&path);
+
+    let reader = HourReader::open(&path).unwrap();
+    let nl = 3usize; // 3 levels in this file
+
+    let full = reader.read_full_3d("temperature").unwrap();
+    assert_eq!(
+        full.len(),
+        nl * NY * NX,
+        "full3d length must be levels * ny * nx"
+    );
+
+    // Coarse lattice: every 7th x, every 5th y, plus all 4 corners.
+    let mut sample_points: Vec<(usize, usize)> = Vec::new();
+    let mut iy = 0usize;
+    while iy < NY {
+        let mut ix = 0usize;
+        while ix < NX {
+            sample_points.push((ix, iy));
+            ix += 7;
+        }
+        iy += 5;
+    }
+    // Add all 4 corners explicitly (some may already be in the lattice).
+    for &corner in &[(0, 0), (NX - 1, 0), (0, NY - 1), (NX - 1, NY - 1)] {
+        sample_points.push(corner);
+    }
+
+    for (ix, iy) in sample_points {
+        let col = reader.read_column_3d("temperature", ix, iy).unwrap();
+        assert_eq!(col.len(), nl);
+        for lvl in 0..nl {
+            let full_val = full[lvl * NY * NX + iy * NX + ix];
+            let col_val = col[lvl];
+            // NaN-safe bit-exact comparison.
+            assert_eq!(
+                full_val.to_bits(),
+                col_val.to_bits(),
+                "mismatch at ix={ix} iy={iy} lvl={lvl}: \
+                 full={full_val} col={col_val}"
+            );
+        }
+    }
+
+    // Unknown variable -> UnknownVariable error.
+    let err = reader.read_full_3d("no_such_var").unwrap_err();
+    assert!(
+        matches!(&err, RwStoreError::UnknownVariable(name) if name == "no_such_var"),
+        "expected UnknownVariable, got {err:?}"
+    );
+
+    // 2D variable name -> Format error (same class as read_column_3d).
+    let err_2d = reader.read_full_3d("temp_2m").unwrap_err();
+    assert!(
+        matches!(err_2d, RwStoreError::Format(_)),
+        "read_full_3d on 2D var: expected Format error, got {err_2d:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}

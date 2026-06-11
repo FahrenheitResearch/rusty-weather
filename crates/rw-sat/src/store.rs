@@ -30,18 +30,24 @@ use std::error::Error;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
 
 use rustwx_core::{GridShape, LatLonGrid};
 use rw_store::grid::{GridFile, write_grid};
+use rw_store::lock::RunLock;
 use rw_store::reader::HourReader;
 use rw_store::run::{RwsHourEntry, RwsRunManifest};
 use rw_store::writer::HourWriter;
 
 use crate::abi::{AbiFixedGrid, AbiSector, GoesAbiField};
 use crate::geostationary::SweepAngleAxis;
+
+/// How long [`write_band_frame`] waits for the run-dir advisory lock before
+/// failing with `RwStoreError::Locked`. Matches the ingest writer's 60s; the
+/// normal contention is the rolling-window prune holding the lock briefly.
+const FRAME_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What one frame write produced.
 #[derive(Debug, Clone)]
@@ -190,6 +196,17 @@ pub fn write_band_frame(
     let resolved = resolve_run_dir(&model_dir, &run_base, &grid)?;
     let run_dir = model_dir.join(&resolved.run_name);
     fs::create_dir_all(&run_dir)?;
+
+    // Single-writer-per-run-dir (FORMAT.md §7). This frame writer does NOT go
+    // through `HourIngestWriter` (it drives the lower-level `HourWriter` plus
+    // its own run.json update), so it must take the same advisory lock around
+    // its critical section: grid.rwg, the t*.rws frame, and the manifest. The
+    // real incident this guards against was two processes (bowecho +
+    // rusty-weather) writing one sat store's rolling window. 60s mirrors the
+    // ingest writer; the normal contention is the window prune holding the
+    // lock for a moment. Held until `_lock` drops at function return.
+    let _lock = RunLock::acquire(&run_dir, FRAME_LOCK_TIMEOUT)?;
+
     let grid_path = run_dir.join("grid.rwg");
     let grid_hash = match resolved.existing_grid_hash {
         Some(hash) => hash,

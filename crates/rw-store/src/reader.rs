@@ -330,6 +330,64 @@ impl HourReader {
         Ok(chunk[start..start + levels].to_vec())
     }
 
+    /// Read the full pressure volume for 3D variable `name` as a
+    /// **level-major** flat array in `[level][y][x]` order (length =
+    /// `levels * ny * nx`; flat index = `lvl * ny * nx + iy * nx + ix`).
+    /// NaN is returned for missing/EMPTY cells.
+    ///
+    /// Each column chunk is decoded exactly once; the `[y][x][level]`
+    /// chunk payload is scattered into the level-major output without any
+    /// per-column re-decode.
+    ///
+    /// Errors:
+    /// - [`RwStoreError::UnknownVariable`] if `name` is not in the file.
+    /// - [`RwStoreError::Format`] if `name` is not a `pressure3d` variable
+    ///   (consistent with [`Self::read_column_3d`]).
+    pub fn read_full_3d(&self, name: &str) -> RwResult<Vec<f32>> {
+        let var = self.lookup_3d(name)?;
+        let (nx, ny) = (self.meta.nx, self.meta.ny);
+        let levels = var.levels_hpa.len();
+        // Checked arithmetic: these are all small counts for any realistic grid.
+        let total = levels
+            .checked_mul(ny)
+            .and_then(|n| n.checked_mul(nx))
+            .ok_or_else(|| {
+                RwStoreError::Format(format!(
+                    "variable '{name}': volume size levels={levels} * ny={ny} * nx={nx} \
+                     overflows usize"
+                ))
+            })?;
+
+        let chunks_y = ny.div_ceil(COL_Y);
+        let chunks_x = nx.div_ceil(COL_X);
+
+        let mut output = vec![f32::NAN; total];
+
+        for cy in 0..chunks_y {
+            for cx in 0..chunks_x {
+                let record = self.chunk_record(var, KIND_COLUMN3D, cy, cx)?;
+                let (rows, cols) = self.col_chunk_dims(cy, cx);
+                let chunk = self.decode_column_chunk(&var.name, record, rows * cols * levels)?;
+                // chunk layout: [y_local][x_local][level] (contiguous per column).
+                // Scatter into output: [level][y_global][x_global].
+                let y0 = cy * COL_Y;
+                let x0 = cx * COL_X;
+                for gy_local in 0..rows {
+                    let gy = y0 + gy_local;
+                    for gx_local in 0..cols {
+                        let gx = x0 + gx_local;
+                        let chunk_base = (gy_local * cols + gx_local) * levels;
+                        for lvl in 0..levels {
+                            output[lvl * ny * nx + gy * nx + gx] = chunk[chunk_base + lvl];
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(output)
+    }
+
     /// Read a bilinearly interpolated pressure profile of 3D variable
     /// `name` at fractional grid coordinates (`fx`, `fy`), clamped to the
     /// grid. Per level the value is the weighted mean over the FINITE corner

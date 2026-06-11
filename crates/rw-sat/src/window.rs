@@ -5,10 +5,12 @@
 
 use std::error::Error;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
 
+use rw_store::lock::RunLock;
 use rw_store::run::RwsRunManifest;
 
 use crate::store::{frame_time, run_day};
@@ -33,6 +35,10 @@ pub struct EvictionReport {
     pub removed_bytes: u64,
     /// Run dirs that became empty and were deleted.
     pub removed_runs: Vec<String>,
+    /// Run dirs that would have been pruned this pass but were skipped
+    /// because another writer held the run-dir lock (FORMAT.md §7). The next
+    /// cycle retries them. Sorted, like `removed_runs`.
+    pub skipped_locked: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -129,9 +135,26 @@ pub fn enforce_window(
         }
     }
 
-    // Apply: delete files, prune manifests, drop empty run dirs.
+    // Apply: delete files, prune manifests, drop empty run dirs. The prune
+    // is a writer (it deletes f*.rws / run.json / grid.rwg), so each run dir
+    // is mutated only while we hold its advisory lock (FORMAT.md §7). If a
+    // frame writer (ours or another process's) holds the lock, skip this dir
+    // this pass and let the next cycle retry — this is exactly the fix for
+    // the two-process rolling-window collision that motivated the lock.
     for run_name in &run_names {
         let run_dir = model_dir.join(run_name);
+        let _lock = match RunLock::try_acquire(&run_dir)? {
+            Some(lock) => lock,
+            None => {
+                eprintln!(
+                    "window prune: skipping {} this pass (run dir locked by another writer); \
+                     will retry next cycle",
+                    run_dir.display()
+                );
+                report.skipped_locked.push(run_name.clone());
+                continue;
+            }
+        };
         let manifest_path = run_dir.join("run.json");
         let mut manifest: RwsRunManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
         let mut changed = false;
@@ -156,17 +179,72 @@ pub fn enforce_window(
             if grid_path.is_file() {
                 fs::remove_file(&grid_path)?;
             }
-            // Only remove the dir when nothing else lives in it.
-            if fs::read_dir(&run_dir)?.next().is_none() {
-                fs::remove_dir(&run_dir)?;
+            // The store content is gone; all that can remain is the `.rw-lock`
+            // file. Tearing down the whole run dir is the one place that file
+            // is removed (FORMAT.md §7's documented exception) — every other
+            // path leaves it in place. Release the OS lock and close our
+            // handle FIRST (drop the guard), so deleting the file is clean on
+            // Windows (you cannot unlink a file you still hold locked-open).
+            // A drop+delete window lets another writer re-acquire and re-open
+            // the run dir; per §7's Windows pruning caveat we tolerate that —
+            // if the lock file or the dir can no longer be removed, leave them
+            // and record a skip so the next cycle retries instead of erroring.
+            let lock_path = run_dir.join(rw_store::LOCK_FILE_NAME);
+            drop(_lock);
+            let removed = remove_emptied_run_dir(&run_dir, &lock_path)?;
+            if removed {
+                report.removed_runs.push(run_name.clone());
+            } else {
+                report.skipped_locked.push(run_name.clone());
             }
-            report.removed_runs.push(run_name.clone());
         } else {
             manifest.save(&manifest_path)?;
         }
     }
     report.removed_runs.sort();
+    report.skipped_locked.sort();
     Ok(report)
+}
+
+/// Remove the `.rw-lock` file and then the (otherwise-empty) run dir, after
+/// the caller has already dropped its lock guard and deleted all store
+/// content. Returns `Ok(true)` when the dir was removed.
+///
+/// Both removals are best-effort against a writer that raced back in through
+/// the drop+delete window: a failure to delete the lock file (it was re-
+/// opened/locked) or a non-empty dir means someone is using it again, so we
+/// return `Ok(false)` and let the next prune cycle retry, rather than
+/// erroring the whole pass (FORMAT.md §7 Windows pruning caveat). Genuine I/O
+/// errors unrelated to contention still propagate.
+fn remove_emptied_run_dir(run_dir: &Path, lock_path: &Path) -> Result<bool, Box<dyn Error>> {
+    if lock_path.is_file() {
+        match fs::remove_file(lock_path) {
+            Ok(()) => {}
+            // A racing writer re-opened/locked the file: don't tear down.
+            Err(err) if is_contention(&err) => return Ok(false),
+            Err(err) => return Err(err.into()),
+        }
+    }
+    match fs::remove_dir(run_dir) {
+        Ok(()) => Ok(true),
+        // Re-created lock file (or other fresh content) means the dir is no
+        // longer empty: a writer is back. Retry next cycle.
+        Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty || is_contention(&err) => {
+            Ok(false)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Whether an I/O error reflects another process holding/using the file
+/// rather than a hard failure — on Windows a still-open locked handle yields
+/// `PermissionDenied` (sharing violation); we treat that (and `WouldBlock`)
+/// as "retry next cycle".
+fn is_contention(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::WouldBlock
+    )
 }
 
 #[cfg(test)]
@@ -329,6 +407,60 @@ mod tests {
             dir.join("g19/conus_c08_20260610/t1000.rws").is_file(),
             "other band untouched"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locked_run_dir_is_skipped_then_pruned_after_release() {
+        let dir = test_dir("locked-skip");
+        // Two stale frames in one run dir; both would be evicted by max_age.
+        write_frames(&dir, &[(18, 41), (18, 46)]);
+        let run_dir = dir.join("g19/conus_c13_20260610");
+
+        let config = WindowConfig {
+            max_age_minutes: Some(5),
+            max_bytes: None,
+        };
+
+        // Hold the run-dir lock as a competing writer would (fs4 locks are
+        // per-handle, so this in-process guard contends exactly like another
+        // process). enforce_window must NOT mutate the dir this pass.
+        let held = RunLock::try_acquire(&run_dir)
+            .unwrap()
+            .expect("take the run-dir lock");
+
+        let skipped = enforce_window(&dir, "g19", "conus_c13", now_at(19, 0), &config).unwrap();
+        assert_eq!(
+            skipped.removed_frames, 0,
+            "a locked run dir must not be pruned this pass"
+        );
+        assert_eq!(
+            skipped.skipped_locked,
+            vec!["conus_c13_20260610".to_string()]
+        );
+        assert!(
+            run_dir.join("t1841.rws").is_file() && run_dir.join("t1846.rws").is_file(),
+            "frames survive while the dir is locked"
+        );
+        let manifest: RwsRunManifest =
+            serde_json::from_slice(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
+        assert_eq!(manifest.hours.len(), 2, "manifest untouched while locked");
+
+        // Release the lock; the next pass prunes normally.
+        drop(held);
+        let pruned = enforce_window(&dir, "g19", "conus_c13", now_at(19, 0), &config).unwrap();
+        assert_eq!(
+            pruned.removed_frames, 2,
+            "both stale frames go once unlocked"
+        );
+        assert!(pruned.skipped_locked.is_empty());
+        // The dir is fully evicted, so it (and its grid.rwg + .rw-lock) is gone.
+        assert_eq!(pruned.removed_runs, vec!["conus_c13_20260610".to_string()]);
+        assert!(
+            !run_dir.exists(),
+            "fully-evicted run dir removed once unlocked (lock file included)"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
