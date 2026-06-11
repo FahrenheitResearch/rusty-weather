@@ -7,6 +7,7 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -23,3 +24,10 @@ ureq.workspace = true
 # workspace-root [patch.crates-io] pin.
 hdf5-reader = "0.3"
 netcrust = { path = "../../vendor/netcrust" }
+
+# rw_glm_follow: the thin ops CLI over follow_live + the reader/validator.
+# Lives in-crate (matching rw-sat's rw_sat bin) so the follow engine ships
+# with a runnable front end and no extra crate.
+[[bin]]
+name = "rw_glm_follow"
+path = "src/bin/rw_glm_follow.rs"
