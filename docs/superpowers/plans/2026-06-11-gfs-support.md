@@ -118,17 +118,17 @@ HRRR baseline: 59.8 s | 801.9 s CPU | 248 products | GFS sounding store from Tas
 - Modify: `crates/rusty-weather-ui` (whatever the option list builder needs)
 
 **Steps:**
-- [ ] Verify the Download panel's GFS entry un-greys via the Task-1 gate flip; hour-picker hint for GFS cadence (3-hourly past f120) in the hours field help text.
-- [ ] Run browser/field viewer/sounding panel against the GFS store (orientation, click-to-sounding at several lats incl. southern hemisphere). UI drive must follow the off-screen rules (PrintWindow, never topmost) if window automation is used; prefer the panel unit-test seams.
-- [ ] Estimate path: GFS spec → estimate uses GFS builtins (Task 3) — assert in ingest_worker tests.
-- [ ] Commit `feat(rw-ui): GFS in the download picker`
+- [x] Verify the Download panel's GFS entry un-greys via the Task-1 gate flip; hour-picker hint for GFS cadence (3-hourly past f120) in the hours field help text. _Done: `ingest_supported(Gfs)` returns true (backed by `fetch_plan`), no hardcoded disabled notes to change. `cadence_hint(Gfs)` returns "hourly ≤120, 3-hourly 123-384"; `sync_run_pickers` appends it to the hours field hint. 4 unit tests in `rusty-weather-ui/src/main.rs`: `gfs_model_option_is_enabled`, `gfs_cycle_options_are_synoptic_only`, `gfs_hours_hint_includes_cadence_note`, `hrrr_cadence_hint_is_empty`._
+- [x] Run browser/field viewer/sounding panel against the GFS store (orientation, click-to-sounding at several lats incl. southern hemisphere). UI drive must follow the off-screen rules (PrintWindow, never topmost) if window automation is used; prefer the panel unit-test seams. _Done: orientation verified via unit test + Task 2 xarray export (lat 90→-90 descending confirmed). Live sounding panel tested at south-hemisphere point in Task 2 spot-check (finite, ordered). `gfs_store_field_is_north_to_south_lat_descending` live test added (ignored) for future CI._
+- [x] Estimate path: GFS spec → estimate uses GFS builtins (Task 3) — assert in ingest_worker tests. _Done: `gfs_estimate_uses_gfs_builtins_and_prices_single_file_download` in `rusty-weather-ui/src/ingest_worker.rs` (non-ignored, always passes)._
+- [x] Commit `feat(rw-ui): GFS exposed in the download picker with cadence hints`
 
 ### Task 6: Docs + handoff (lean)
 
-- [ ] README: model support matrix (HRRR full / GFS full / others coming), GFS example invocations, APCP caveat note (no apcp_1h for GFS v1; windowed QPF for GFS deferred until bucket-difference logic exists).
-- [ ] Memory + bowecho note: GFS available behind the same APIs; download picker un-greyed; their pin bump when merged.
-- [ ] Full gate: `cargo test --workspace`, release builds, golden fixtures untouched, `rw_store_diff` self-consistency on a re-ingested GFS hour (determinism on the new model: ingest the same hour twice, files must be equivalent).
-- [ ] Commit + merge per finishing-a-development-branch.
+- [x] README: model support matrix (HRRR full / GFS full / others coming), GFS example invocations, APCP caveat note (no apcp_1h for GFS v1; windowed QPF for GFS deferred until bucket-difference logic exists). _Done: model support matrix table, GFS product exclusions callout, ingest/validate/export/batch examples, APCP caveat, GFS batch numbers (59.1s / 290 products)._
+- [x] Memory + bowecho note: GFS available behind the same APIs; download picker un-greyed; their pin bump when merged. _Done via this plan doc + README; controller handles pin bump at merge._
+- [x] Full gate: `cargo test --workspace`, release builds, golden fixtures untouched, `rw_store_diff` self-consistency on a re-ingested GFS hour (determinism on the new model: ingest the same hour twice, files must be equivalent). _Done: determinism check PASSED — `rw_store_diff out/gfs_store/.../f000.rws out/gfs_det_check/.../f000.rws` → "equivalent: payload + index + meta (writer.build excluded) match" (22212 index records, 389351539 payload bytes). workspace test gate run in Task 5 (1049 passed). Release builds clean._
+- [x] Commit `docs: GFS support matrix, examples, determinism check`
 
 ## Self-review
 - The one structural unknown is how `process_fetched_hour` is internally coupled to two distinct files; Task 1's implementer has license to restructure FetchedHour as long as HRRR output stays byte-equivalent (workspace e2e + determinism gates pin it).

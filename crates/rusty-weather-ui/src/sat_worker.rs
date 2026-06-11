@@ -163,20 +163,25 @@ pub fn satellite_options() -> Vec<SatSatelliteOption> {
 
 /// Every pickable sector, with the live timing the panel displays.
 pub fn sector_options() -> Vec<SatSectorOption> {
-    [Sector::Conus, Sector::FullDisk, Sector::Meso1, Sector::Meso2]
-        .into_iter()
-        .map(|sector| SatSectorOption {
-            slug: sector.slug().to_string(),
-            label: match sector {
-                Sector::Conus => "CONUS".to_string(),
-                Sector::FullDisk => "Full disk".to_string(),
-                Sector::Meso1 => "Meso 1".to_string(),
-                Sector::Meso2 => "Meso 2".to_string(),
-            },
-            default_poll_secs: sector.default_poll_secs(),
-            cadence_secs: sector.cadence_secs(),
-        })
-        .collect()
+    [
+        Sector::Conus,
+        Sector::FullDisk,
+        Sector::Meso1,
+        Sector::Meso2,
+    ]
+    .into_iter()
+    .map(|sector| SatSectorOption {
+        slug: sector.slug().to_string(),
+        label: match sector {
+            Sector::Conus => "CONUS".to_string(),
+            Sector::FullDisk => "Full disk".to_string(),
+            Sector::Meso1 => "Meso 1".to_string(),
+            Sector::Meso2 => "Meso 2".to_string(),
+        },
+        default_poll_secs: sector.default_poll_secs(),
+        cadence_secs: sector.cadence_secs(),
+    })
+    .collect()
 }
 
 /// ABI band display names (UI copy; the science lives in rw-sat).
@@ -262,8 +267,8 @@ struct ResolvedSpec {
 
 fn resolve_spec(spec: &SatFollowSpec) -> Result<ResolvedSpec, String> {
     bucket_for_satellite(&spec.satellite).map_err(|err| err.to_string())?;
-    let sector = Sector::parse(&spec.sector)
-        .ok_or_else(|| format!("unknown sector '{}'", spec.sector))?;
+    let sector =
+        Sector::parse(&spec.sector).ok_or_else(|| format!("unknown sector '{}'", spec.sector))?;
     let (bands, layer_desc) = resolve_layer(&spec.layer)?;
     if ![1usize, 2, 4].contains(&spec.downsample) {
         return Err(format!("unsupported detail stride {}", spec.downsample));
@@ -338,14 +343,20 @@ fn run_prefixes(spec: &SatFollowSpec) -> Result<(String, Vec<String>), String> {
 /// Live on-disk footprint of the followed band(s): frame files only (the
 /// same accounting the rolling window budgets).
 fn disk_usage(store_root: &Path, model: &str, prefixes: &[String]) -> SatDiskUsage {
-    let mut usage = SatDiskUsage { bytes: 0, frames: 0 };
+    let mut usage = SatDiskUsage {
+        bytes: 0,
+        frames: 0,
+    };
     let model_dir = store_root.join(model);
     let Ok(runs) = std::fs::read_dir(&model_dir) else {
         return usage;
     };
     for run in runs.flatten() {
         let name = run.file_name().to_string_lossy().to_string();
-        if !prefixes.iter().any(|prefix| name.starts_with(prefix.as_str())) {
+        if !prefixes
+            .iter()
+            .any(|prefix| name.starts_with(prefix.as_str()))
+        {
             continue;
         }
         let Ok(files) = std::fs::read_dir(run.path()) else {
@@ -686,9 +697,7 @@ fn worker_loop(
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use rw_sat::abi::{
-        AbiFixedGrid, AbiSector, GoesAbiField, GoesAbiScene, GoesImagerProjection,
-    };
+    use rw_sat::abi::{AbiFixedGrid, AbiSector, GoesAbiField, GoesAbiScene, GoesImagerProjection};
     use rw_sat::geostationary::SweepAngleAxis;
     use rw_sat::store::write_band_frame;
 
@@ -704,7 +713,10 @@ mod tests {
 
         let (bands, desc) = resolve_layer("geocolor").expect("composite layer");
         assert_eq!(bands, vec![1, 2, 3]);
-        assert!(desc.contains("GeoColor") && desc.contains("C01+C02+C03"), "got: {desc}");
+        assert!(
+            desc.contains("GeoColor") && desc.contains("C01+C02+C03"),
+            "got: {desc}"
+        );
 
         assert!(resolve_layer("c0").is_err());
         assert!(resolve_layer("c17").is_err());
@@ -738,7 +750,10 @@ mod tests {
         let config = follow_config(&spec, Path::new("sat-root")).expect("valid spec");
         assert_eq!(config.bands, vec![1, 2, 3]);
         assert_eq!(config.sector, Sector::Conus);
-        assert_eq!(config.poll_interval, Some(std::time::Duration::from_secs(45)));
+        assert_eq!(
+            config.poll_interval,
+            Some(std::time::Duration::from_secs(45))
+        );
         assert_eq!(config.downsample, 2);
         assert_eq!(config.window.max_age_minutes, Some(360));
         assert_eq!(config.window.max_bytes, Some(2 * 1024 * 1024 * 1024));
@@ -803,10 +818,7 @@ mod tests {
     }
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "rw-sat-worker-{}-{name}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rw-sat-worker-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -821,7 +833,10 @@ mod tests {
 
         let runs = scan_runs(&dir);
         assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].key.run, "conus_c13_20260610", "c13 sorts after c08 -> newest-first puts it first");
+        assert_eq!(
+            runs[0].key.run, "conus_c13_20260610",
+            "c13 sorts after c08 -> newest-first puts it first"
+        );
         assert_eq!(runs[0].frames, vec![1851, 1856]);
         assert_eq!(runs[0].title, "g19 · conus C13 · 2026-06-10");
         assert_eq!((runs[0].nx, runs[0].ny), (8, 6));
@@ -870,10 +885,20 @@ mod tests {
 
         let usage = disk_usage(&dir, "g19", &["conus_c13".to_string()]);
         assert_eq!(usage.frames, 2);
-        assert_eq!(usage.bytes, one.bytes + two.bytes, "grid.rwg/run.json not counted");
+        assert_eq!(
+            usage.bytes,
+            one.bytes + two.bytes,
+            "grid.rwg/run.json not counted"
+        );
 
         let none = disk_usage(&dir, "g19", &["meso1_c02".to_string()]);
-        assert_eq!(none, SatDiskUsage { bytes: 0, frames: 0 });
+        assert_eq!(
+            none,
+            SatDiskUsage {
+                bytes: 0,
+                frames: 0
+            }
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -898,8 +923,10 @@ mod tests {
             &mut current,
         );
         assert_eq!(started.len(), 1);
-        assert!(matches!(&started[0], SatResponse::DownloadStarted { id, label, bytes: 42 }
-            if id == &key && label == "C13 19:21:18Z"));
+        assert!(
+            matches!(&started[0], SatResponse::DownloadStarted { id, label, bytes: 42 }
+            if id == &key && label == "C13 19:21:18Z")
+        );
 
         let written = map_event(
             SatEvent::FrameWritten {
@@ -913,7 +940,9 @@ mod tests {
             },
             &mut current,
         );
-        assert!(matches!(&written[0], SatResponse::FrameWritten { id, hhmm: 1921, .. } if id == &key));
+        assert!(
+            matches!(&written[0], SatResponse::FrameWritten { id, hhmm: 1921, .. } if id == &key)
+        );
         assert!(current.is_none(), "id consumed by the frame");
     }
 

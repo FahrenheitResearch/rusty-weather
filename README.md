@@ -65,10 +65,43 @@ the entire warm sounding is 0.19 ms.
     ds = xr.open_dataset("f000_subset.nc")   # scipy backend reads NetCDF3 natively
     print(ds["temperature_2m"].sel(y=500, x=900).values)
 
+## Model support
+
+| Model | Ingest | Store | Render | Soundings | Download UI | Notes |
+|-------|--------|-------|--------|-----------|-------------|-------|
+| HRRR  | full   | full  | full   | full      | enabled     | 1799×1059 CONUS, hourly f000-f048 |
+| GFS   | full   | full  | full   | full      | enabled     | 1440×721 global 0.25°, synoptic cycles, hourly f000-f120 then 3-hourly f123-f384 |
+| RRFS-A / REFS / NBM / RAP | — | — | — | — | coming soon | each needs a fetch-plan entry + validation pass |
+
+**GFS product exclusions (not available in pgrb2.0p25):** composite\_reflectivity, UH/rotation tracks, smoke columns, simulated IR, 1-hour APCP (GFS uses bucketed 0-6h accumulations; windowed QPF requires bucket-difference logic, deferred to v2). All other HRRR products are supported for GFS.
+
+**GFS ingest examples:**
+
+    # Ingest 4 hours (f000-f003) from the 00z cycle, full profile
+    cargo run --release -p rusty-weather --bin rw_ingest -- \
+        --model gfs --date 20260611 --cycle 0 --hours 0-3 \
+        --store-root out/gfs_store --cache-dir out/cache --verify
+
+    # Validate the stored hours (conformance gate)
+    cargo run --release -p rusty-weather --bin rws -- \
+        validate out/gfs_store/gfs/20260611_00z --deep
+
+    # Export one hour to NetCDF3 (readable by xarray/scipy)
+    cargo run --release -p rusty-weather --bin rws -- \
+        export out/gfs_store/gfs/20260611_00z/f000.rws \
+        -o gfs_f000_subset.nc --vars temperature_2m,dewpoint_2m,temperature_iso
+
+    # Batch render all products for f000-f003
+    cargo run --release -p rusty-weather --bin rw_batch -- \
+        --model gfs --date 20260611 --cycle 0 --hours 0-3 \
+        --no-heavy --products all \
+        --store-root out/gfs_store --cache-dir out/cache --out-dir out/gfs_batch
+
 ## Status
 
-Extraction complete (Plan 1). The workspace builds and renders live HRRR plots:
+HRRR and GFS are both fully supported end-to-end. The workspace builds and renders live plots for both models. GFS is exposed in the download picker alongside HRRR (hours field shows the cadence hint: "hourly ≤120, 3-hourly 123-384").
 
+    # HRRR quick smoke test
     cargo run --release -p rusty-weather --bin smoke_direct -- --model hrrr --date YYYYMMDD --cycle 0 --forecast-hour 6 --region midwest --all-supported --out-dir out
 
 Measured baseline (HRRR f006, midwest, cold cache, 2026-06-09): 72s wall —
@@ -177,9 +210,17 @@ ECAPE-dominated: 250.7 s of the 309.4 s wall (~82 s/hour) is the ECAPE triplet
 ~9 billion integration steps per CONUS hour). Pipelining cannot hide CPU-saturating
 work; the cost is the vendored `ecape-rs` physics kernel.
 
-**Next:** egui/eframe UI integration (`rw-ui` library-first crate) + multi-model
-validation (GFS, RRFS-A, REFS, NBM, RAP) — see
-docs/superpowers/specs/2026-06-09-rusty-weather-design.md.
+### GFS batch numbers (20260611 00z f000-f003, CONUS, warm cache, polite 30-thread pool)
+
+    cargo run --release -p rusty-weather --bin rw_batch -- \
+        --model gfs --date 20260611 --cycle 0 --hours 0-3 \
+        --no-heavy --products all \
+        --store-root out/gfs_store --cache-dir out/cache --out-dir out/gfs_batch
+
+**TOTAL WALL: 59.1 s | process CPU 657.7 s | 290 products rendered (47 skipped/blocked)**  
+GFS vs HRRR baseline (59.8 s / 248 products): GFS is slightly faster (smaller cells: 1.04 M vs 1.9 M CONUS grid points) and renders more products (full global field set vs midwest-region subset).
+
+**Next:** RRFS-A / REFS / NBM / RAP support — each follows the GFS pattern (fetch-plan entry + validation pass) — see docs/superpowers/specs/2026-06-09-rusty-weather-design.md.
 
 ## Layout
 
