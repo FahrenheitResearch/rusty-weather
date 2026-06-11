@@ -26,7 +26,10 @@ use rustwx_core::{CycleSpec, ModelId, SourceId};
 use rustwx_models::{supported_forecast_hours, supported_models};
 use rw_ingest::ingest_profile::IngestProfile;
 use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate};
-use rw_ingest::{IngestConfig, IngestError, IngestEvent, IngestStage, parse_hours, throttle};
+use rw_ingest::{
+    IngestConfig, IngestError, IngestEvent, IngestStage, parse_hours, throttle,
+    validate_forecast_hours,
+};
 use rw_ui::{AvailabilityView, DownloadSpec, DownloadStage, EstimateView, HourDoneView};
 
 /// Requests from the UI thread.
@@ -220,14 +223,12 @@ fn resolve_spec(
     profile.validate()?;
     let hours = parse_hours(&spec.hours).map_err(|err| err.to_string())?;
     let cycle = CycleSpec::new(spec.date.clone(), spec.cycle).map_err(|err| err.to_string())?;
-    let supported = supported_forecast_hours(model, spec.cycle);
-    if let Some(&bad) = hours.iter().find(|hour| !supported.contains(hour)) {
-        return Err(format!(
-            "hour {bad} is outside the supported range for the {:02}z cycle (max {})",
-            spec.cycle,
-            supported.last().copied().unwrap_or(0)
-        ));
-    }
+    // Defense-in-depth seam: validate cycle against the model's published cycle
+    // table AND every hour against the supported cadence — the same check the
+    // CLI bins (rw_ingest / rw_batch) run via `validate_forecast_hours`.  The UI
+    // picker is already constrained, but this ensures the validation is shared
+    // and not accidentally bypassed if the spec is constructed programmatically.
+    validate_forecast_hours(model, spec.cycle, &hours).map_err(|err| err.to_string())?;
     Ok((model, profile, hours, cycle))
 }
 
@@ -630,13 +631,31 @@ mod tests {
         bad.date = "not-a-date".to_string();
         assert!(resolve_spec(&bad).is_err());
 
+        // Hour outside the model's cadence: 01z HRRR tops out at f018.
         let mut bad = spec();
         bad.cycle = 1;
         bad.hours = "0-48".to_string(); // 01z HRRR tops out at 18
         let message = resolve_spec(&bad).expect_err("out-of-range hour");
+        // validate_forecast_hours names the flag ("--hours") and the bad hour.
+        assert!(message.contains("--hours"), "got: {message}");
+        assert!(message.contains("f019"), "got: {message}");
+
+        // Cycle not in the model's published cycle table: GFS runs only at
+        // 00/06/12/18z, so cycle=3 must be rejected with a message naming
+        // "--cycle" and the valid cycles.
+        let mut bad = spec();
+        bad.model = "gfs".to_string();
+        bad.cycle = 3;
+        let message = resolve_spec(&bad).expect_err("03z is not a published GFS cycle");
+        assert!(message.contains("--cycle"), "must name the flag: {message}");
         assert!(
-            message.contains("outside the supported range"),
-            "got: {message}"
+            message.contains("03z") || message.contains("3"),
+            "must name the bad cycle: {message}"
+        );
+        // The error must enumerate valid cycles so the user can self-correct.
+        assert!(
+            message.contains("06z") || message.contains("6"),
+            "must list 06z: {message}"
         );
     }
 
