@@ -1594,7 +1594,24 @@ fn default_product_template_match_score(
 
     if selector.field == CanonicalField::TotalPrecipitation {
         return match message.product.template {
-            8 | 11 | 12 if message.product.derived_forecast_type.is_none() => Some(0),
+            8 | 11 | 12 if message.product.derived_forecast_type.is_none() => {
+                // A surface file may carry BOTH the run-total (0→h) and the
+                // trailing-window ((h−1)→h) accumulation; both end at hour h
+                // and tie on the end-hour forecast score, so without this the
+                // winner is file order (HRRR puts the run total first — by
+                // luck correct; RRFS-A puts the window first, which silently
+                // stored the 1 h window as `apcp_run_total`, caught live on
+                // f002 2026-06-11). Prefer the accumulation that starts at
+                // the run start. The trailing-window selection is unaffected:
+                // it re-selects at h−1, where only the window's start hour
+                // matches (the run total's start and end both miss) — the
+                // start-mismatch penalty still leaves it the only candidate.
+                let starts_at_run_start = time_value_to_hours(
+                    message.product.time_range_unit,
+                    message.product.forecast_time,
+                ) == Some(0);
+                Some(if starts_at_run_start { 0 } else { 2 })
+            }
             8 | 11 | 12 if matches!(message.product.derived_forecast_type, Some(0) | Some(1)) => {
                 Some(20)
             }
