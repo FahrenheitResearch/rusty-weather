@@ -13,6 +13,7 @@ pub mod index;
 pub mod ingest;
 pub mod reader;
 pub mod run;
+pub mod validate;
 pub mod writer;
 
 pub use error::{RwResult, RwStoreError};
@@ -21,3 +22,4 @@ pub use ingest::{
     derived_selector, derived_selector_slug, read_field_2d, read_grid_2d, write_hour_from_fields,
     write_hour_from_fields_with_derived,
 };
+pub use validate::{ValidateDepth, ValidationReport, ValidationStats, validate_hour_file, validate_run_dir};
