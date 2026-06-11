@@ -42,16 +42,19 @@ pub struct DownloadSpec {
 }
 
 impl Default for DownloadSpec {
+    /// The safe default profile: `sounding` (no derived/heavy compute stages)
+    /// so a first-time user is never surprised by core-saturating ECAPE work.
+    /// `heavy` is an explicit opt-in — it is never set automatically.
     fn default() -> Self {
         Self {
             model: "hrrr".to_string(),
             date: String::new(),
             cycle: 0,
             hours: "0-6".to_string(),
-            profile: "full".to_string(),
+            profile: "sounding".to_string(),
             level_step_hpa: 25,
-            derived: true,
-            heavy: true,
+            derived: false,
+            heavy: false,
             source: "auto".to_string(),
             cache_dir: "out/cache".to_string(),
             verify: false,
@@ -545,15 +548,14 @@ impl DownloadPanel {
                     }
                 });
             if self.spec.profile != previous_profile {
-                // Snap the toggles to the preset's defaults so the combo
-                // always lands on a valid combination.
-                let (derived, heavy) = match self.spec.profile.as_str() {
-                    "sounding" => (false, false),
-                    "view" => (true, false),
-                    _ => (true, true),
-                };
-                self.spec.derived = derived;
-                self.spec.heavy = heavy;
+                // Snap `derived` to the preset's default so the combo always
+                // lands on a valid combination.  `heavy` is ONLY turned OFF
+                // automatically (safe direction); it is NEVER turned ON
+                // automatically — the user must opt in via the checkbox.
+                self.spec.derived = self.spec.profile != "sounding";
+                if self.spec.profile == "sounding" || self.spec.profile == "view" {
+                    self.spec.heavy = false;
+                }
             }
             ComboBox::from_id_salt("rw-ui-download-levelstep")
                 .selected_text(format!("{} hPa", self.spec.level_step_hpa))
@@ -569,6 +571,13 @@ impl DownloadPanel {
                 });
             ui.checkbox(&mut self.spec.derived, "derived");
             ui.checkbox(&mut self.spec.heavy, "heavy");
+            if self.spec.heavy {
+                ui.label(
+                    RichText::new("ECAPE: saturates all cores for ≈1-1.5 min per hour")
+                        .small()
+                        .weak(),
+                );
+            }
             ui.checkbox(&mut self.spec.verify, "verify")
                 .on_hover_text("re-open each written hour and verify a bit-exact round-trip");
         });
@@ -1026,6 +1035,23 @@ mod tests {
             breakdown: vec![],
         });
         assert!(panel.spec_error.is_none());
+    }
+
+    #[test]
+    fn default_spec_is_light() {
+        let spec = DownloadSpec::default();
+        assert_eq!(
+            spec.profile, "sounding",
+            "default profile must be sounding (light)"
+        );
+        assert!(
+            !spec.heavy,
+            "heavy must be false by default (explicit opt-in)"
+        );
+        assert!(
+            !spec.derived,
+            "derived must be false by default for sounding"
+        );
     }
 
     #[test]

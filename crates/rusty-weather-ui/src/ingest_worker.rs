@@ -259,24 +259,69 @@ fn compute_estimate(
         per_hour_store_bytes: estimate.per_hour_store_bytes,
         per_hour_download_bytes: estimate.per_hour_download_bytes,
         calibration: calibration.source.clone(),
-        time_hint: format_time_hint(estimate.download_bytes),
+        time_hint: format_time_hint(
+            estimate.download_bytes,
+            u64::from(hour_count),
+            profile.derived,
+            profile.heavy,
+        ),
         breakdown: estimate.breakdown,
     })
 }
 
-/// Rough cache-cold download wall-clock at an assumed 40 MB/s — labeled as
-/// such; a warm raw-byte cache makes the fetch a disk read.
-pub fn format_time_hint(download_bytes: u64) -> String {
+/// Rough cache-cold download wall-clock at an assumed 40 MB/s, plus a
+/// fast-desktop compute estimate based on the profile's stages. All figures
+/// are labeled so honest provenance is always visible.
+///
+/// Per-hour compute constants (measured on a fast desktop, HRRR CONUS):
+/// - non-derived (extract + thermo decode only): ≈7 s/hr
+/// - derived (extract + thermo + 29 recipe grids + encode): ≈17 s/hr
+/// - heavy ECAPE stage: ≈72 s/hr (midpoint of measured 62-82); saturates
+///   all cores
+pub fn format_time_hint(
+    download_bytes: u64,
+    hour_count: u64,
+    derived: bool,
+    heavy: bool,
+) -> String {
     const ASSUMED_BYTES_PER_SEC: f64 = 40.0 * 1024.0 * 1024.0;
-    let secs = download_bytes as f64 / ASSUMED_BYTES_PER_SEC;
-    if secs < 90.0 {
-        format!("≈{secs:.0} s download @ 40 MB/s (cache-cold)")
+    const SECS_PER_HOUR_DERIVED: u64 = 17;
+    const SECS_PER_HOUR_NON_DERIVED: u64 = 7;
+    const SECS_PER_HOUR_HEAVY: u64 = 72;
+
+    let dl_secs = download_bytes as f64 / ASSUMED_BYTES_PER_SEC;
+    let dl_part = if dl_secs < 90.0 {
+        format!("≈{dl_secs:.0} s download @ 40 MB/s (cache-cold)")
     } else {
         format!(
             "≈{:.0} m {:02.0} s download @ 40 MB/s (cache-cold)",
-            (secs / 60.0).floor(),
-            secs % 60.0
+            (dl_secs / 60.0).floor(),
+            dl_secs % 60.0
         )
+    };
+
+    let compute_secs = if derived {
+        hour_count * SECS_PER_HOUR_DERIVED
+    } else {
+        hour_count * SECS_PER_HOUR_NON_DERIVED
+    };
+    let compute_part = format_duration_secs(compute_secs);
+
+    if heavy {
+        let heavy_secs = hour_count * SECS_PER_HOUR_HEAVY;
+        let heavy_part = format_duration_secs(heavy_secs);
+        format!("{dl_part} + ≈{compute_part} compute + ≈{heavy_part} ECAPE (saturates all cores)")
+    } else {
+        format!("{dl_part} + ≈{compute_part} compute")
+    }
+}
+
+/// Format a duration in seconds: use plain seconds below 90 s, else `Xm Ys`.
+fn format_duration_secs(secs: u64) -> String {
+    if secs < 90 {
+        format!("{secs} s")
+    } else {
+        format!("{} m {:02} s", secs / 60, secs % 60)
     }
 }
 
@@ -603,12 +648,60 @@ mod tests {
 
     #[test]
     fn time_hint_formats_seconds_and_minutes() {
-        assert_eq!(format_time_hint(0), "≈0 s download @ 40 MB/s (cache-cold)");
-        // 1.6 GB at 40 MB/s ≈ 41 s.
-        let hint = format_time_hint(1_677_721_600);
-        assert_eq!(hint, "≈40 s download @ 40 MB/s (cache-cold)");
-        let hint = format_time_hint(40 * 1024 * 1024 * 150);
+        // 0 bytes, no compute (non-derived, 0 hours)
+        assert_eq!(
+            format_time_hint(0, 0, false, false),
+            "≈0 s download @ 40 MB/s (cache-cold) + ≈0 s compute"
+        );
+        // 1.6 GB at 40 MB/s ≈ 40 s download; non-derived 1 hour = 7 s compute.
+        let hint = format_time_hint(1_677_721_600, 1, false, false);
+        assert_eq!(hint, "≈40 s download @ 40 MB/s (cache-cold) + ≈7 s compute");
+        // 40 MB/s * 150 s = 6 GB -> ≈2 m 30 s download.
+        let hint = format_time_hint(40 * 1024 * 1024 * 150, 1, false, false);
         assert!(hint.starts_with("≈2 m 30 s"), "got: {hint}");
+    }
+
+    #[test]
+    fn time_hint_heavy_contains_core_saturation_warning() {
+        // heavy=true must always surface the saturation warning.
+        let hint = format_time_hint(0, 1, true, true);
+        assert!(
+            hint.contains("saturates all cores"),
+            "heavy hint must warn about core saturation, got: {hint}"
+        );
+        assert!(hint.contains("ECAPE"), "got: {hint}");
+    }
+
+    #[test]
+    fn time_hint_sounding_6hr_uses_small_compute_figure() {
+        // sounding = non-derived: 6 hrs * 7 s/hr = 42 s compute.
+        let hint = format_time_hint(0, 6, false, false);
+        assert!(
+            hint.contains("+ ≈42 s compute"),
+            "sounding 6-hr hint must show 42 s compute, got: {hint}"
+        );
+        assert!(
+            !hint.contains("ECAPE"),
+            "sounding must not mention ECAPE, got: {hint}"
+        );
+    }
+
+    #[test]
+    fn time_hint_download_portion_unchanged_for_same_bytes() {
+        // The download-only portion should be identical for same bytes regardless
+        // of compute flags.
+        let bytes = 1_677_721_600u64; // ≈40 s download
+        let hint_light = format_time_hint(bytes, 1, false, false);
+        let hint_heavy = format_time_hint(bytes, 1, true, true);
+        // Both must start with the same download prefix.
+        assert!(
+            hint_light.starts_with("≈40 s download @ 40 MB/s (cache-cold)"),
+            "got: {hint_light}"
+        );
+        assert!(
+            hint_heavy.starts_with("≈40 s download @ 40 MB/s (cache-cold)"),
+            "got: {hint_heavy}"
+        );
     }
 
     /// A Start over an invalid spec responds Failed without spawning any
