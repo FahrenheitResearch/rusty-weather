@@ -49,6 +49,22 @@ soundings; trimming stored levels or variables is the lever if disk ever matters
 locate() measured 75.8 us against an informational 50 us hope — moot in practice,
 the entire warm sounding is 0.19 ms.
 
+### Inspecting and exporting stores (`rws`)
+
+`rws` fronts the whole format: list, inspect, validate, diff, and export to NetCDF3.
+
+    rws ls store/hrrr                            # walk run.json manifests: model/run/hours/vars/sizes
+    rws dump store/hrrr/20260611_04z/f000.rws --var temperature_iso   # header/meta; per-var index records
+    rws validate store/hrrr/20260611_04z --deep  # conformance gate (decompresses every chunk)
+    rws diff a.rws b.rws                          # structural compare (writer.build masked); exit 0 = same
+    rws export store/hrrr/20260611_04z/f000.rws -o f000_subset.nc --vars temperature_2m,dewpoint_2m,temperature_iso
+
+`validate --deep` is the conformance gate: it parses every header/meta/index, decompresses each chunk, and cross-checks raw lengths, stats, and flags — a clean run means the store matches `docs/FORMAT.md`. `export` writes a dependency-free NetCDF3 (CDF-2) file any scientist can open; 2D fields round-trip bit-exact, and 3D pressure values carry an `rw_quantization` attribute disclosing the lossy affine-i16 step applied at ingest. The output reads natively in xarray via the SciPy backend:
+
+    import xarray as xr
+    ds = xr.open_dataset("f000_subset.nc")   # scipy backend reads NetCDF3 natively
+    print(ds["temperature_2m"].sel(y=500, x=900).values)
+
 ## Status
 
 Extraction complete (Plan 1). The workspace builds and renders live HRRR plots:
