@@ -19,7 +19,20 @@
 use std::path::Path;
 
 use crate::error::RwlResult;
-use crate::format::{FlashRecord, HEADER_LEN, KNOWN_FLAGS, MAGIC, RECORD_LEN, SUPPORTED_VERSIONS};
+use crate::format::{
+    FlashRecord, HEADER_LEN, KNOWN_FLAGS, MAGIC, RECORD_LEN, SUPPORTED_VERSIONS, bucket_name,
+    date_dir,
+};
+
+/// The bucket coordinates a file's own path declares: its `tHHMM.rwl` name and
+/// its `YYYYMMDD` parent-directory name. When supplied to the checker, every
+/// record's computed bucket must match these or it is a structural error.
+struct ExpectedBucket {
+    /// File name, e.g. `t0010.rwl`.
+    name: String,
+    /// Parent directory name, e.g. `20260101`.
+    date: String,
+}
 
 /// How deeply to validate a bucket file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,12 +79,35 @@ impl ValidationReport {
 pub fn validate_bucket_file(path: &Path, depth: ValidateDepth) -> RwlResult<ValidationReport> {
     let data = std::fs::read(path)?;
     let mut report = ValidationReport::default();
-    check_bucket(&data, depth, &mut report);
+    let expected = expected_bucket_from_path(path);
+    check_bucket(&data, depth, expected.as_ref(), &mut report);
     Ok(report)
 }
 
+/// Derive the `(tHHMM.rwl, YYYYMMDD)` the file's own path declares, or `None`
+/// when the path lacks a file name or a parent directory (in which case the
+/// membership check is skipped — there is nothing to compare against).
+fn expected_bucket_from_path(path: &Path) -> Option<ExpectedBucket> {
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let date = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|d| d.to_string_lossy().into_owned())?;
+    Some(ExpectedBucket { name, date })
+}
+
 /// Core checker operating on in-memory bytes. Never panics on hostile input.
-fn check_bucket(data: &[u8], depth: ValidateDepth, report: &mut ValidationReport) {
+///
+/// `expected` carries the bucket coordinates the file's path declares; when
+/// `Some`, every record must fall in that bucket (a flash placed in the wrong
+/// `tHHMM.rwl` or `YYYYMMDD/` directory is a structural error). Byte-only
+/// callers (unit tests with no real path) pass `None` to skip that check.
+fn check_bucket(
+    data: &[u8],
+    depth: ValidateDepth,
+    expected: Option<&ExpectedBucket>,
+    report: &mut ValidationReport,
+) {
     // Check 1: at least a header's worth of bytes.
     if data.len() < HEADER_LEN {
         report.error(format!(
@@ -195,6 +231,30 @@ fn check_bucket(data: &[u8], depth: ValidateDepth, report: &mut ValidationReport
             ));
         }
 
+        // Check 8b: bucket membership. The file lives at
+        // `<...>/<YYYYMMDD>/tHHMM.rwl`; every record's own
+        // `bucket_name(time)`/`date_dir(time)` must match the file's name and
+        // parent-dir name. A flash routed into the wrong 10-minute bucket (or
+        // the wrong day) is a structural defect, not a value defect.
+        if let Some(exp) = expected {
+            let actual_name = bucket_name(rec.time_unix_ms);
+            let actual_date = date_dir(rec.time_unix_ms);
+            if actual_name != exp.name {
+                report.error(format!(
+                    "record {i} time {} belongs in bucket {actual_name}, \
+                     but this file is named {}",
+                    rec.time_unix_ms, exp.name
+                ));
+            }
+            if actual_date != exp.date {
+                report.error(format!(
+                    "record {i} time {} belongs in date dir {actual_date}, \
+                     but this file's parent dir is {}",
+                    rec.time_unix_ms, exp.date
+                ));
+            }
+        }
+
         seen_min = seen_min.min(rec.time_unix_ms);
         seen_max = seen_max.max(rec.time_unix_ms);
 
@@ -240,8 +300,13 @@ fn check_record_values(i: usize, rec: &FlashRecord, report: &mut ValidationRepor
             rec.lon
         ));
     }
-    if !rec.energy.is_finite() {
-        report.error(format!("record {i}: energy {} not finite", rec.energy));
+    // Radiant energy is a physical magnitude: it must be finite AND
+    // non-negative (a negative joule count is physically impossible).
+    if !rec.energy.is_finite() || rec.energy < 0.0 {
+        report.error(format!(
+            "record {i}: energy {} not a finite, non-negative value",
+            rec.energy
+        ));
     }
     if !rec.area.is_finite() {
         report.error(format!("record {i}: area {} not finite", rec.area));
@@ -285,7 +350,8 @@ mod tests {
 
     fn check(bytes: &[u8], depth: ValidateDepth) -> ValidationReport {
         let mut r = ValidationReport::default();
-        check_bucket(bytes, depth, &mut r);
+        // Byte-only checks skip the path-derived bucket-membership check.
+        check_bucket(bytes, depth, None, &mut r);
         r
     }
 
@@ -462,6 +528,71 @@ mod tests {
         let mut records = vec![rec(1000, 30.0, -95.0)];
         records[0].energy = f32::NAN;
         let bytes = pack_bucket(&records, 1);
+        let d = check(&bytes, ValidateDepth::Deep);
+        assert!(!d.is_ok());
+        assert!(
+            d.errors.iter().any(|e| e.contains("energy")),
+            "{:?}",
+            d.errors
+        );
+    }
+
+    #[test]
+    fn misfiled_flash_is_a_bucket_membership_error() {
+        // Reviewer's probe: hand-place a flash whose time floors to t0000 into a
+        // file named t0010.rwl. validate_bucket_file (which has the path) must
+        // flag the misfiling as a structural error naming the bucket.
+        //
+        // 2026-01-01 00:00:00 UTC = t0000; we write it into t0010.rwl under the
+        // correct date dir so only the bucket-name check trips.
+        let base: i64 = 1_767_225_600_000; // 2026-01-01 00:00:00 UTC -> t0000
+        assert_eq!(bucket_name(base), "t0000.rwl");
+        let bytes = pack_bucket(&[rec(base, 30.0, -95.0)], 1);
+
+        let tmp =
+            std::env::temp_dir().join(format!("rw-glm-validate-misfile-{}", std::process::id()));
+        let day = tmp.join("20260101");
+        std::fs::create_dir_all(&day).unwrap();
+        let misfiled = day.join("t0010.rwl"); // wrong bucket for a t0000 flash
+        std::fs::write(&misfiled, &bytes).unwrap();
+
+        let report = validate_bucket_file(&misfiled, ValidateDepth::Structural).unwrap();
+        assert!(
+            !report.is_ok(),
+            "misfiled flash must fail structural validation"
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("bucket") && e.contains("t0000") && e.contains("t0010")),
+            "error must name the expected bucket and the file: {:?}",
+            report.errors
+        );
+
+        // A correctly-filed copy under t0000.rwl validates cleanly.
+        let correct = day.join("t0000.rwl");
+        std::fs::write(&correct, &bytes).unwrap();
+        let ok = validate_bucket_file(&correct, ValidateDepth::Structural).unwrap();
+        assert!(
+            ok.is_ok(),
+            "correctly-filed flash must pass: {:?}",
+            ok.errors
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn deep_catches_negative_energy() {
+        // A negative joule count is physically impossible, so Deep must flag it
+        // even though it is a finite value.
+        let mut records = vec![rec(1000, 30.0, -95.0)];
+        records[0].energy = -1.0e-15;
+        let bytes = pack_bucket(&records, 1);
+        // Structural is layout-only and still passes.
+        let s = check(&bytes, ValidateDepth::Structural);
+        assert!(s.is_ok(), "structural should pass: {:?}", s.errors);
         let d = check(&bytes, ValidateDepth::Deep);
         assert!(!d.is_ok());
         assert!(

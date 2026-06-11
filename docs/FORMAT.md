@@ -734,6 +734,11 @@ Within a bucket, every record's `time_unix_ms` lies in the file's
 `[time_min_unix_ms, time_max_unix_ms]` extent, and the extent equals the actual
 min/max for a non-empty file.
 
+**`time_unix_ms` sign.** The field is a signed i64, so negative (pre-1970) times
+are representable. Live GLM data is always well after 1970, so a negative flash
+time is unexpected in practice; the validator nonetheless accepts it as an
+internally consistent value and leaves any such filtering to the consumer.
+
 **`flags` bit semantics (v1).** Bit 0 (`0x0001`) = `degraded_quality`: the
 source granule's per-flash quality flag was anything but its nominal/good value.
 Consumers QC-filter on bit 0 the way surface-obs consumers filter on quality.
@@ -792,8 +797,12 @@ Source of truth: `crates/rw-glm/src/validate.rs`,
   slice access bounds-checked, every length/count checked-arithmetic). Two
   depths: **Structural** (magic, version, exact size vs `64 + 32*record_count`,
   header `time_min <= time_max`, non-decreasing record sort, header-extent
-  agreement) and **Deep** (structural + per-record value sanity: finite
-  lat/lon/energy/area, lat ∈ `[-90, 90]`, lon ∈ `[-180, 180]`, no unknown flag
+  agreement, and — when the file is validated by path — **bucket membership**:
+  every record's `bucket_name(time)`/`date_dir(time)` must match the file's own
+  `tHHMM.rwl` name and `YYYYMMDD` parent-dir name, so a misfiled flash is caught)
+  and **Deep** (structural + per-record value sanity: finite
+  lat/lon/energy/area, **energy non-negative** (a negative joule count is
+  physically impossible), lat ∈ `[-90, 90]`, lon ∈ `[-180, 180]`, no unknown flag
   bits).
 - **Golden fixtures** (`tests/golden.rs`). `golden_v1_bytes_are_stable` rebuilds
   the synthetic 40-flash store (literal formulas — `time = 1_767_225_600_000 +

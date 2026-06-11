@@ -108,6 +108,13 @@ impl RwlHeader {
 
 /// One fixed 32-byte flash record.
 ///
+/// `time_unix_ms` is a signed i64 so the format can represent any instant,
+/// including negative (pre-1970) times. Live GLM data is always well after
+/// 1970, so a negative or pre-epoch flash time is unexpected in practice; the
+/// validator nonetheless *accepts* it (it is a representable, internally
+/// consistent value, not a structural defect) and leaves any such filtering to
+/// the consumer.
+///
 /// Byte layout (little-endian, 32 bytes):
 /// ```text
 ///  0- 7  time_unix_ms  i64   first-event time of the flash

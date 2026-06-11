@@ -257,8 +257,13 @@ fn golden_v1_reader_values_match_expected() {
     );
 
     // ---- every committed bucket Deep-validates ----
+    // Validate the nested copies under `day` (<root>/glm/<sat>/<date>/tHHMM.rwl),
+    // not the flat committed fixtures: Deep validation now includes the
+    // bucket-membership check, which compares each record against the file's own
+    // name and parent-dir (`YYYYMMDD`) name. The committed fixtures live in a
+    // flat `v1/` dir, so only the properly-nested layout exercises that check.
     for name in BUCKET_FILES {
-        let report = validate_bucket_file(&committed.join(name), ValidateDepth::Deep).unwrap();
+        let report = validate_bucket_file(&day.join(name), ValidateDepth::Deep).unwrap();
         assert!(
             report.is_ok(),
             "committed {name} must deep-validate; errors: {:?}",

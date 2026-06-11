@@ -21,7 +21,12 @@ use rw_store::RwStoreError;
 pub type RwlResult<T> = Result<T, RwlError>;
 
 /// Errors produced while reading or writing `.rwl` flash files.
+///
+/// `#[non_exhaustive]`: downstream crates (e.g. bowecho's layer work) must not
+/// write exhaustive `match` arms over this enum, so new variants can be added
+/// in a future release without a breaking change. Match with a `_` arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RwlError {
     /// An underlying I/O failure (open/read/write/rename). The reader and
     /// validator reserve this variant for real I/O — every *format* problem is
