@@ -1,4 +1,4 @@
-# RRFS-A Ingest Support — Recon + Design Decision (Multi-Model Phase A, model 3)
+# RRFS-A Ingest Support — Crop-at-Ingest Design (Multi-Model Phase A, model 3)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development /
 > superpowers:executing-plans. Steps use checkbox (`- [ ]`) tracking. This doc is the
@@ -9,12 +9,57 @@
 **Goal:** `rw_ingest --model rrfs-a` works end-to-end (fetch → store → derived → render →
 soundings → UI) with the HRRR/GFS verification bar.
 
-**Status: BLOCKED on a structural scope decision (DONE_WITH_CONCERNS).** The empirical
-recon below falsifies the clean "one-file like GFS" hypothesis AND the "two-file CONUS
-pair" fallback. The only non-domain-mixing path that exists on AWS is an **all-NA** pair on
-a 14.5M-cell lat-lon grid — a scope change (default product, grid, ~7.6× data volume) that
-the brief explicitly reserved for the controller ("if only nat-NA exists, STOP; do NOT mix
-domains"). Engine/validation/render/calibration work is **not** started pending that call.
+**Status: DECISION TAKEN — crop-at-ingest (2026-06-11, Drew).** The recon below falsified
+the clean "one-file like GFS" hypothesis AND the "two-file CONUS pair" fallback: the only
+files carrying RRFS surface fields are the **all-NA** pair (`prslev.na` + `natlev.na`), both
+on the same 14.5M-cell grid. Drew approved the path the recon recommended as a follow-up,
+with one addition that keeps the store HRRR-class instead of NA-sized: **ingest the NA pair
+but CROP to a CONUS box at extraction**, storing a consistent ~HRRR-sized grid. Combined
+with **.idx message-subset fetch** (mandatory — see the measured GB sizes below), this is
+both download-cheap and store-cheap. The design + amended checklist are below; the recon
+evidence that drove it is preserved verbatim.
+
+### Two recon facts the original probe missed (verified 2026-06-11 before implementing)
+
+1. **The NA grid is GRIB template 1 — a ROTATED-pole lat/lon grid**, not template 0. South
+   pole of projection (−35.0, 247.0), rotation −2.0°, native axes La1=−37..La2=37,
+   Lo1=299(−61)..Lo2=61, Di=Dj=0.025°, 4881×2961. `grib-core::grid_latlon` **unrotates it
+   to true geographic per-cell lat/lon** (`vendor/grib-core/src/grib2/grid.rs:355`
+   `rotated_latlon_grid`). So the extraction grid is a **curvilinear** geographic grid (lat
+   varies along rows, lon down columns) — exactly like HRRR's Lambert grid, which already
+   flows through store+render+sounding end-to-end. rw-store stores full per-cell lat/lon and
+   `GridLocator::locate` (`crates/rw-store/src/grid.rs:339`) is a generic curvilinear
+   inverter (regular / Lambert / rotated), so a curvilinear cropped RRFS grid is natively
+   supported — **no regular-axis assumption is violated.**
+2. **A geographic CONUS box is a contiguous block on the NATIVE rotated index grid.** The
+   box N=53.5 S=21.0 W=−134.5 E=−60.5 maps to native indices **j[120,1855] × i[1430,4360] =
+   1736 × 2931 ≈ 5.09 M cells** (~2.7× HRRR's 1.9M, but only 35% of the 14.5M full NA). The
+   pole-sweep / non-monotone-row pathology that the full unrotated grid shows at its NA-wide
+   edges does **not** occur inside the CONUS sub-block: every cropped row is monotone in
+   geographic longitude (verified by computing the rotation over the block). The cropped
+   block over-covers the geographic rectangle (lat[6.8,64.0] lon[−157.8,−40.5]) because the
+   rotated grid is skewed; the true CONUS rectangle is fully contained. → **crop on the
+   native rotated index grid (a clean contiguous slice), NOT on a "regular geographic
+   lat-lon box with descending lat" — that framing in the brief does not apply to a rotated
+   grid.**
+
+### Measured full-file sizes (HEAD, 00z/06z/12z 2026-06-11) → subset-fetch is MANDATORY
+
+| file        | f001 size (00z / 06z / 12z)         |
+|-------------|-------------------------------------|
+| `prslev.na` | 4.33 / 4.46 / 4.34 **GB**           |
+| `natlev.na` | 9.14 / 9.33 / 9.34 **GB**           |
+
+A full-file pair is **~13.4 GB per hour** (~54 GB for f000-f003). That is not acceptable for
+v1. The .idx-subset fetch machinery **already exists and is fully wired** into
+`fetch_bytes_with_cache` — it triggers purely on a non-empty `FetchRequest.variable_patterns`
+(AWS/Google + idx_url present → `.idx` GET → `idx_subset_ranges` → ranged GET;
+`crates/rustwx-io/src/lib.rs:1160` `try_fetch_one`, `:1200` `idx_subset_ranges`), and the
+fetch cache is keyed by the patterns (`crates/rustwx-io/src/cache.rs:167`
+`variable_patterns_slug`, mismatch-checked at `:250`) so subsetted fetches are cache-coherent
+by construction. The ingest fetch path currently passes empty patterns (whole file); the
+RRFS work is to populate `variable_patterns` from the plan's needed messages. **NOT coupled
+to the old plot lane — reused as-is.**
 
 ---
 
@@ -111,22 +156,55 @@ real scope change the controller must approve:
 - Every CONUS-oriented assumption in the brief (Lambert 1799×1059 grid-mapper note, the
   selector-gating tests, the "same dims as HRRR" expectation) does not apply.
 
-If the controller wants RRFS-A on NA: it becomes a straightforward two-file `fetch_plan`
-entry (`prslev_na` = pressure_source, `natlev_na` = surface_source) + the live validation
-pass — the GFS template, just on the bigger grid. That is the recommended follow-up, but it
-is a deliberate product decision, not a mechanical port.
+**Drew's call (2026-06-11):** take this NA pair, but **crop to CONUS at ingest** so the store
+stays HRRR-class. The design that realizes that is below.
 
-## Design decision 2 — trailing 1 h window (`model_has_trailing_1h_window`)
+---
 
-**Evidence-backed verdict: ENABLE for RRFS-A *if and only if* we ingest `natlev` (i.e. the
-NA path).** `natlev.na` carries exactly the HRRR-class messages the trailing re-select
-consumes — `APCP @ surface : 0-1 hour acc fcst` (hourly-bucketed, NOT GFS's 6 h reset),
-`MXUPHL @ 5000-2000 m : 0-1 hour max fcst`, `MXUPHL @ 3000-0 m : 0-1 hour max fcst`, and
-`WIND/MAXUW/MAXVW @ 10 m : 0-1 hour max fcst`. This is genuinely HRRR-grade, so the
-`apcp_1h` / `uh_2to5km_max_1h` / `wind_speed_10m_max_1h` fields would be honest.
-**Caveat:** these live in `natlev` only — so the gate can only be enabled together with an
-NA ingest. With no CONUS surface file, there is no honest CONUS trailing set. **No gate flip
-is committed in this recon** (it would be dead/dishonest without the NA fetch plan).
+## APPROVED DESIGN — crop-at-ingest (the contract)
+
+**1. Fetch plan.** `fetch_plan(RrfsA) = [prs-na (pressure role), nat-na (surface role)]` —
+two files, same grid/domain (recon-verified identical GDS). Tokens resolve through
+`build_rrfs_a_url` already (`prs-na`→`prslev.3km.fNNN.na.grib2`,
+`nat-na`→`natlev.3km.fNNN.na.grib2`; `rustwx-models/src/lib.rs:7394`).
+
+**2. Subset fetch (MANDATORY — files are 4.3+9.1 GB).** Each `ProductFetch` carries the
+.idx `variable_patterns` the plan needs; `fetch_hour` puts them on the `FetchRequest` so the
+existing `fetch_bytes_with_cache` idx-subset path fires (AWS + idx → ranged GET of just the
+matched messages, cache keyed by the pattern set). HRRR/GFS keep empty patterns → whole-file,
+byte-identical to today. A single REFC message is ~9.5 MB; the full plan's message set is a
+small fraction of the 13.4 GB pair.
+
+**3. Crop-at-ingest core.** A per-model optional **CONUS crop box** in the ingest table. For
+RrfsA: geographic bounds N=53.5 S=21.0 W=−134.5 E=−60.5 (chosen so RRFS-CONUS ⊇ HRRR-CONUS
+coverage). Because the NA grid is rotated-pole (template 1), the box is realized as a
+**contiguous native-rotated-index block** `j[120,1855] × i[1430,4360]` (1736×2931 ≈ 5.09 M
+cells) — computed once, deterministically, from the GDS rotation constants (pure
+float→index math: first/last native row+col whose unrotated geographic coord lies in the
+box, fixed rounding rule). The crop slices the native lat/lon arrays AND every field plane's
+values with the SAME index spec, applied on the native rotated grid **before** the per-row
+normalize/rotate (so the smaller block normalizes cleanly — its rows are monotone in
+geographic lon, unlike the full NA grid). One shared crop spec per hour; coords and fields
+provably in lock-step. The cropped curvilinear grid flows into the store exactly like HRRR's
+Lambert grid; `grid.rwg` hash covers identity; `GridLocator` (generic curvilinear inverter)
+handles point lookup. **Determinism:** crop ranges are a pure function of grid constants — no
+per-run floating-point decisions.
+
+**4. Trailing-max gate.** `model_has_trailing_1h_window(RrfsA) = true`. Recon-verified
+`natlev.na` messages (00z 2026-06-11): `APCP:surface:0-1 hour acc fcst` (HOURLY, not GFS's
+6 h reset), `MXUPHL:5000-2000 m above ground:0-1 hour max fcst` (UH 2-5 km),
+`WIND:10 m above ground:0-1 hour max fcst`. So `apcp_1h`/`uh_2to5km_max_1h`/
+`wind_speed_10m_max_1h` are honest. Quote these in the gate comment.
+
+**5. Selectors / mapping.** Surface set from `natlev` (2m TMP/DPT/RH/SPFH, 10m UGRD/VGRD,
+REFC, categorical precip, gust, surface pressure, orography, PWAT); isobaric volumes from
+`prslev` (45 levels available; the profile's 100..=1000 step-25 realizes the matching
+subset). **MSLP mapping:** `natlev` carries **MSLET** (mean sea level), NOT PRMSL — but the
+`mslp` selector's `PARAMETER_MSLP` already matches discipline 0 / category 3 / number **1**
+(MSLET) alongside number 0 (PRMSL) (`rustwx-io/src/lib.rs:1401`). So the store's `mslp`
+variable is honestly sourced from MSLET with no code change; documented in the README crop
+note. (Low/mid/high cloud cover are absent from `natlev` — only TCDC — so `cloud_cover_*`
+gracefully skip with warnings, as GFS already does for fields it lacks.)
 
 ## What is already correct (verified, no change needed)
 
@@ -143,40 +221,50 @@ is committed in this recon** (it would be dead/dishonest without the NA fetch pl
 
 ---
 
-## Task checklist (gated on the controller's domain decision)
+## Task checklist (UN-GATED — crop-at-ingest approved)
 
-- [x] **Recon**: pull real `.idx` + grid headers; settle the fetch-plan + trailing-window
-      questions empirically; record evidence + options (this doc).
-- [ ] **DECISION (controller):** ship RRFS-A on the **NA** domain (14.5M-cell lat-lon), or
-      defer RRFS-A until a CONUS surface file is published. *No-CONUS-surface-file = no
-      CONUS ingest; the prs-conus + nat-na bundle is not a valid single grid.*
-
-If NA is approved, the remaining work mirrors GFS exactly:
-- [ ] **Engine**: `fetch_plan(RrfsA) = [prslev_na (pressure), natlev_na (surface)]`;
-      `model_has_trailing_1h_window(RrfsA) = true` (evidence: the natlev `0-1 hour …`
-      messages above); tests (hourly cycles valid, f061 rejected, f060 ok; RRFS plan
-      *includes* apcp_1h/uh/wind-max; ingest_supported true).
-- [ ] **Live validation** on the NA grid: ingest f000-f003 `--verify`; `rws validate
-      --deep` exit 0; `rws export` + xarray spot-check (lat-lon ranges, bit-equal spot vs
-      `read_full_2d`); sounding probe; record wall/sizes/**RAM** (expect large — re-baseline
-      the memory envelope first).
-- [ ] **Calibration**: RRFS-A NA builtin table from the live store; accuracy test.
-- [ ] **Render + batch**: rw_render direct+derived; read 2-3 PNGs (coastlines sane on the
-      NA lat-lon grid); rw_batch f000-f003 `--no-heavy --products all` — RRFS should support
-      MORE products than GFS (reflectivity/UH via the trailing set); timing table.
-- [ ] **Determinism**: re-ingest one hour, store-diff equivalent.
-- [ ] **Docs**: README model-support row → RRFS-A (NA) full, with the CONUS caveat.
-- [ ] **Gates**: workspace tests green; fmt/clippy clean on touched crates; release builds;
-      tree clean (discard pre-existing sat_worker.rs/compute.rs churn).
+- [x] **Recon**: real `.idx` + grid headers; fetch-plan + trailing-window settled (this doc).
+- [x] **DECISION (Drew, 2026-06-11):** ingest the NA pair, crop to CONUS at ingest, subset
+      fetch via .idx. Recorded above; checklist un-gated.
+- [ ] **Engine — fetch plan + subset patterns**: `fetch_plan(RrfsA) = [prs-na (pressure),
+      nat-na (surface)]`, each carrying its `.idx` `variable_patterns`; `fetch_hour` wires
+      patterns onto the `FetchRequest`. HRRR/GFS unchanged (empty patterns). Tests: plan
+      shape, `ingest_supported(RrfsA)`, RRFS plan includes apcp_1h/uh/wind-max,
+      f060 ok / f061 rejected, hourly cycles valid.
+- [ ] **Engine — crop core (full verification)**: per-model CONUS crop box; native-rotated
+      index block computed from GDS constants; one shared crop spec slices grid + every
+      field plane + derived/heavy grids in lock-step, applied before normalize/rotate.
+      Tests: deterministic index ranges from constants; cropped dims; coords/fields lock-step;
+      HRRR/GFS untouched (no crop box → no-op).
+- [ ] **`model_has_trailing_1h_window(RrfsA) = true`** with the quoted natlev `.idx` lines.
+- [ ] **Live validation**: ingest f000-f003 `--verify`; `rws validate --deep` exit 0;
+      `rws export` + xarray (bit-exact spot vs `read_full_2d`; cropped lat/lon ranges ≈ box);
+      sounding probe ×3 (incl. one near a box edge); record wall/sizes/RAM + **download MB
+      fetched vs full-file MB** (the subsetting win); realized isobaric level count.
+- [ ] **Calibration**: RRFS-A builtin table from the live cropped store; accuracy test.
+- [ ] **Render + batch**: rw_render direct+derived; READ 2-3 PNGs (CONUS geography correct —
+      crop didn't shift georeferencing — THE key visual check); rw_batch f000-f003
+      `--no-heavy --products all` (expect MORE than GFS's 290: UH/reflectivity/hourly QPF);
+      timing table.
+- [ ] **Determinism**: re-ingest one hour → `rw_store_diff` equivalent.
+- [ ] **Docs**: README matrix row RRFS-A full + crop note (NA source cropped to CONUS at
+      ingest, box constants, MSLET→mslp); examples.
+- [ ] **Gates**: `cargo test --workspace` green; fmt/clippy clean on touched; release builds;
+      tree clean (discard pre-existing sat_worker.rs/compute.rs churn); do NOT push.
 
 ## Self-review / honesty notes
 
 - The clean GFS-style single-file path is **impossible** for RRFS-A: `prslev` has no surface
-  set, and the only surface file (`natlev`) exists for **NA only**. This is a data-feed
-  fact, re-verified across 00z/06z/12z on 2026-06-11 (and dates 06-09/06-10).
-- Shipping `prs-conus + nat-na` would silently mix a Lambert 1.9M-cell grid with a lat-lon
-  14.5M-cell grid — the store would either reject it or, worse, mis-georeference. Honesty
-  over coverage: not shipping a broken CONUS pairing.
-- The all-NA path is real and recommended, but it is a product-scope decision (default
-  domain, ~7.6× data/memory), so it is surfaced for the controller rather than shipped
-  unilaterally. Estimated engine delta if approved: ~1 day, GFS-shaped.
+  set, and the only surface file (`natlev`) exists for **NA only** (re-verified 00z/06z/12z
+  2026-06-11). Crop-at-ingest is the path that turns the NA-only feed into an HRRR-class
+  CONUS store without mixing domains.
+- The NA grid is **rotated-pole (template 1)**, not plain lat/lon — the original recon read
+  only the GDS dims/template and missed this. The unrotated grid is curvilinear; the crop is
+  therefore a **native-rotated-index** slice, not a regular-axis box. This is fine: HRRR's
+  Lambert grid is equally curvilinear and already flows through store+render+sounding, and
+  `GridLocator` is a generic curvilinear inverter.
+- Subset fetch is **not optional** at 13.4 GB/hour for the full pair. The machinery already
+  exists and is cache-coherent; the work is to populate `variable_patterns` from the plan.
+- `mslp` is honestly sourced from **MSLET** (the existing `PARAMETER_MSLP` already matches
+  it); documented in the README crop note. Cloud-cover low/mid/high are absent from natlev
+  and skip gracefully.
