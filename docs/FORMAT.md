@@ -648,3 +648,168 @@ The matching `grid.rwg` first decodes as `magic="RWSGRID1"`, `version=1`,
 (`24000 = 20*300*4`). Its SHA-256 is
 `f3c7edfa3b093ea606ac51f29afb67ebf8eb787c2ebc6fa283cde95001b8760e`, the
 `grid_hash` carried by `f000.rws` and `run.json`.
+
+---
+
+## 10. The `.rwl` flash file (rw-glm)
+
+Source of truth: `crates/rw-glm/src/format.rs` (`RwlHeader`/`FlashRecord`
+pack/unpack, bucket-name math), `crates/rw-glm/src/store.rs` (`BucketWriter`,
+`pack_bucket`), `crates/rw-glm/src/reader.rs` (`read_flashes`),
+`crates/rw-glm/src/validate.rs`, `crates/rw-glm/tests/golden/v1/`.
+
+The `.rwl` format is a **point-event** store for GOES GLM lightning flashes — a
+sibling to the gridded `.rws` format, not a variant of it. It shares this spec's
+core guarantees (little-endian, fixed layout, atomic temp+fsync+rename
+visibility, the §7 advisory-lock concurrency contract) but stores a sorted run
+of fixed flash records instead of compressed grid chunks. There is no codec and
+no compression: a `.rwl` file is a 64-byte header followed by `record_count`
+fixed 32-byte records.
+
+### Directory layout and bucketing
+
+```
+<root>/glm/<satellite>/window.json          rolling-window manifest
+<root>/glm/<satellite>/<YYYYMMDD>/tHHMM.rwl  one file per 10-minute UTC bucket
+```
+
+- `<satellite>` is an opaque id string, e.g. `goes19`.
+- `<YYYYMMDD>` is the flash's UTC calendar day. (This per-day level is an
+  amendment to the original spec, which placed buckets directly under
+  `<satellite>/`; the flat scheme collides across days when the rolling window
+  crosses UTC midnight, and per-day dirs make pruning a directory drop.)
+- `tHHMM` is the flash's UTC hour and minute floored to a 10-minute boundary:
+  `t0000`, `t0010`, …, `t2350` (`format.rs::bucket_name`). A flash belongs to
+  the bucket selected by its `time_unix_ms`.
+- The active bucket is rewritten atomically per granule; closed buckets are
+  immutable until the rolling window prunes them. A reader selects candidate
+  files by date-dir + bucket-name math over a query time range and never scans
+  unrelated days (`reader.rs::read_flashes`).
+
+### 10.1 Header table (64 bytes)
+
+Source of truth: `format.rs` (`RwlHeader::pack_into`/`parse`).
+
+| bytes  | field                  | type | value / rule                               |
+|--------|------------------------|------|--------------------------------------------|
+| 0..8   | `magic`                | u8×8 | `b"RWLIGHT1"` (0x52 0x57 0x4C 0x49 0x47 0x48 0x54 0x31) |
+| 8..12  | `version`              | u32  | `1` (current); must be in `SUPPORTED_VERSIONS` |
+| 12..16 | `record_count`         | u32  | number of 32-byte flash records            |
+| 16..24 | `time_min_unix_ms`     | i64  | earliest record `time_unix_ms` (0 if empty)|
+| 24..32 | `time_max_unix_ms`     | i64  | latest record `time_unix_ms` (0 if empty)  |
+| 32..36 | `source_granule_count` | u32  | provenance: granules merged into this file |
+| 36..64 | `reserved`             | u8×28| zeros; writers write zero, readers ignore  |
+
+A conforming reader MUST reject a file when:
+
+- the buffer is shorter than 64 bytes;
+- `magic` is not `b"RWLIGHT1"`;
+- `version` is not a supported version;
+- the file size is not exactly `64 + 32*record_count` — computed with checked
+  arithmetic so a hostile `record_count` cannot wrap the multiply;
+- `time_min_unix_ms > time_max_unix_ms`.
+
+### 10.2 Flash record (32 bytes each)
+
+Source of truth: `format.rs` (`FlashRecord::pack_into`/`unpack`).
+
+There are `record_count` records, each 32 bytes, starting at byte 64.
+
+| bytes  | field          | type | meaning                                          |
+|--------|----------------|------|--------------------------------------------------|
+| 0..8   | `time_unix_ms` | i64  | **first-event** time of the flash, Unix ms       |
+| 8..12  | `lat`          | f32  | degrees north                                    |
+| 12..16 | `lon`          | f32  | degrees east                                     |
+| 16..20 | `energy`       | f32  | **raw SI joules** (no normalization; client log-scales) |
+| 20..24 | `area`         | f32  | km²                                              |
+| 24..28 | `flash_id`     | u32  | GLM flash id (granule-scoped)                    |
+| 28..30 | `flags`        | u16  | quality bitfield, see below                      |
+| 30..32 | `duration_ms`  | u16  | flash duration (last-event − first-event), **saturating at 65535** |
+
+**Sort order.** Records are sorted **ascending** by `time_unix_ms`; ties keep a
+stable order (insertion order within a bucket, existing records before newly
+merged ones — `store.rs::rewrite_bucket` uses a stable `sort_by_key`). A reader
+MUST verify non-decreasing time on open and reject a file that violates it.
+Within a bucket, every record's `time_unix_ms` lies in the file's
+`[time_min_unix_ms, time_max_unix_ms]` extent, and the extent equals the actual
+min/max for a non-empty file.
+
+**`time_unix_ms` sign.** The field is a signed i64, so negative (pre-1970) times
+are representable. Live GLM data is always well after 1970, so a negative flash
+time is unexpected in practice; the validator nonetheless accepts it as an
+internally consistent value and leaves any such filtering to the consumer.
+
+**`flags` bit semantics (v1).** Bit 0 (`0x0001`) = `degraded_quality`: the
+source granule's per-flash quality flag was anything but its nominal/good value.
+Consumers QC-filter on bit 0 the way surface-obs consumers filter on quality.
+Bits 1..15 are reserved, written zero, and reader-ignored. A record with any bit
+outside the v1 known set (`0x0001`) is a deep-validation error.
+
+**`duration_ms` saturation.** Durations are clamped into `u16` by
+`format.rs::saturate_duration_ms`: a value `>= 65535` ms stores `65535`
+(saturated); a negative value (malformed granule) stores `0`. The golden
+fixture pins this with one flash forced to 70 000 ms → `65535`.
+
+### 10.3 `window.json` manifest
+
+Source of truth: `store.rs` (`WindowManifest`).
+
+A small JSON manifest at `<root>/glm/<satellite>/window.json`, refreshed
+atomically on every insert from the on-disk extent:
+
+```jsonc
+{
+  "schema": "rw-glm.window.v1",   // exact string; readers reject mismatch
+  "satellite": "goes19",
+  "time_min_unix_ms": 1767225600000,  // null when the store is empty
+  "time_max_unix_ms": 1767226081000   // null when the store is empty
+}
+```
+
+The manifest is a convenience index over the bucket files; the bucket files are
+self-describing and a raw-bytes reader needs only them. Readers MUST ignore
+unknown keys (the follow engine extends this manifest with seen-granule keys and
+prune bookkeeping in a later release without a binary version bump).
+
+### 10.4 Concurrency and versioning
+
+`.rwl` writes obey the §7 concurrency contract verbatim: a single writer per
+**satellite** store holds the advisory lock on
+`<root>/glm/<satellite>/.rw-lock` (`rw_store::lock::RunLock`, acquired in
+`BucketWriter::open` and held for the writer's lifetime), and every bucket and
+the manifest are written by `rw_store::atomic::atomic_write_bytes`. Readers are
+lock-free.
+
+`.rwl` versions independently of `.rws`/`.rwg`. v1 is frozen by the golden
+fixtures in `crates/rw-glm/tests/golden/v1/` (`t0000.rwl`, `t0010.rwl`,
+`t0020.rwl`, `expected.json`); regenerating them is a format change requiring a
+`format.rs::VERSION` bump (old versions added to `SUPPORTED_VERSIONS`, kept
+readable, fixtures kept forever), exactly as §6 prescribes for `.rws`.
+
+### 10.5 Conformance
+
+Source of truth: `crates/rw-glm/src/validate.rs`,
+`crates/rw-glm/tests/golden.rs`, `crates/rw-glm/tests/store_reader.rs`.
+
+- **Validation library** (`validate.rs`, `validate_bucket_file`). Same contract
+  as `.rws` validation: `Ok(report)` for any file that opens, format problems in
+  `report.errors`, `Err` only for I/O. Never panics on hostile bytes (every
+  slice access bounds-checked, every length/count checked-arithmetic). Two
+  depths: **Structural** (magic, version, exact size vs `64 + 32*record_count`,
+  header `time_min <= time_max`, non-decreasing record sort, header-extent
+  agreement, and — when the file is validated by path — **bucket membership**:
+  every record's `bucket_name(time)`/`date_dir(time)` must match the file's own
+  `tHHMM.rwl` name and `YYYYMMDD` parent-dir name, so a misfiled flash is caught)
+  and **Deep** (structural + per-record value sanity: finite
+  lat/lon/energy/area, **energy non-negative** (a negative joule count is
+  physically impossible), lat ∈ `[-90, 90]`, lon ∈ `[-180, 180]`, no unknown flag
+  bits).
+- **Golden fixtures** (`tests/golden.rs`). `golden_v1_bytes_are_stable` rebuilds
+  the synthetic 40-flash store (literal formulas — `time = 1_767_225_600_000 +
+  i*37_000`, etc.; bucket split 17/16/7) and byte-compares the three committed
+  `.rwl` files with first-divergence-offset failure messages.
+  `golden_v1_reader_values_match_expected` reads the committed fixtures through
+  `read_flashes` and checks decoded values, the degraded-quality bit set, the
+  duration saturation, and a range+bbox count and energy checksum against
+  `expected.json`, and that every bucket deep-validates. `regen_golden_v1` is
+  `#[ignore]`d and prints a loud format-change warning.

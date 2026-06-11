@@ -1,8 +1,15 @@
 # GLM lightning ingest — joint spec (CONVERGED)
 
-Status: **APPROVED by the bowecho agent 2026-06-11** with answers folded in
-below. Build starts when Drew slots it; bowecho's layer work starts the day
-the reader API exists on a branch. Nothing here is built yet.
+Status: **BUILT / live-validated 2026-06-11** (branch `glm-lightning`). All
+four plan tasks landed: `.rwl` format + reader/validator (golden v1 +
+FORMAT.md §10), real-granule decode pin, follow engine (dedup/holdback/
+rolling-window), and live validation. A ≥10-minute live follow against
+`noaa-goes19` ingested thousands of in-disk flashes; every `.rwl` bucket
+Deep-validates, `read_flashes` returns sorted in-range flashes whose count
+matches the bucket records, and prune/restart-dedup were confirmed live. The
+thin ops CLI is `rw_glm_follow` (`cargo run -p rw-glm --bin rw_glm_follow`).
+Originally **APPROVED by the bowecho agent 2026-06-11** with answers folded in
+below; bowecho's layer work starts from the pushed reader API.
 Consumer contract source: bowecho's stated shape — "flash events with
 lat/lon/time/energy in a rolling window; any reasonable store form works;
 bowecho's layer/render side is already proven on point data."
@@ -36,6 +43,11 @@ quality flag.
   floored to 10 min) plus a `window.json` manifest, pruned by the same
   rolling-window pattern as rw-sat (age + byte budget), writer-locked per
   directory with `.rw-lock`.
+  - **Amendment (Task 1 build, 2026-06-11):** the bucket path gained a per-day
+    level — `<root>/glm/<satellite>/<YYYYMMDD>/tHHMM.rwl` — because the flat
+    `tHHMM` namespace collides across days when the rolling window crosses UTC
+    midnight, and per-day directories make pruning a cheap directory drop;
+    `window.json` stays at `<root>/glm/<satellite>/window.json`.
 - File = 64-byte header (magic `RWLIGHT1`, version, record count, time range,
   source-granule count) + fixed **32-byte LE records sorted by time**:
 

@@ -65,6 +65,57 @@ the entire warm sounding is 0.19 ms.
     ds = xr.open_dataset("f000_subset.nc")   # scipy backend reads NetCDF3 natively
     print(ds["temperature_2m"].sel(y=500, x=900).values)
 
+## GLM lightning (rw-glm)
+
+Format spec: docs/FORMAT.md §10 ("The `.rwl` flash file")
+
+`rw-glm` is a **point-event** ingest family for GOES Geostationary Lightning
+Mapper (GLM) flashes — a sibling to the gridded `rw-store`, not a variant. It
+mirrors `rw-sat`'s architecture (anonymous S3 poll → vendored-netcrust NetCDF
+decode → rolling-window store with restart-safe dedup and retry holdback) but
+stores flashes as fixed **32-byte records** in 10-minute `.rwl` buckets instead
+of compressed grids. Each flash carries first-event time, lat/lon, raw-joule
+radiant energy, area (km²), flash id, a `flags` bitfield, and saturating
+duration. There is no codec: a `.rwl` file is a 64-byte header followed by
+time-sorted records. Buckets live at
+`<root>/glm/<satellite>/<YYYYMMDD>/tHHMM.rwl` with a `window.json` manifest;
+the rolling window prunes by age + byte budget. See **FORMAT.md §10** for the
+byte layout, the **§10.2 flags bit semantics** (bit 0 = `degraded_quality`,
+the QC-filter bit; bits 1–15 reserved/zero), and the `window.json` schema.
+
+Run the live follow engine (`rw_glm_follow`, in-crate like `rw_sat`):
+
+    cargo run --release -p rw-glm --bin rw_glm_follow -- follow \
+        --satellite goes19 --store-root out/glm_store \
+        --window-mins 120 --poll-secs 20 --duration-mins 11
+
+It polls the live `GLM-L2-LCFA` bucket every `--poll-secs`, ingests new
+granules (deduped across restarts via the persisted seen-key set), prunes the
+rolling window each cycle, and — unless `--no-validate` — closes with a report:
+every bucket Deep-validated, a full-window `read_flashes` scan (count +
+ascending-order check), and a CONUS bbox query. `list --satellite goes18`
+prints a few keys from the live bucket as a one-shot cross-satellite sanity
+check.
+
+Read the store from any consumer (the layer/render side):
+
+    let flashes = rw_glm::read_flashes(&root, "goes19", t0, t1, Some(bbox))?; // [t0, t1)
+
+**FOOTGUN — the same `[patch.crates-io] hdf5-reader` pin applies.** `rw-glm`'s
+granule decode goes through the vendored `netcrust` → `hdf5-reader` stack, so a
+project depending on `rw-glm` must add the same patch shown above for `rw-sat`
+(`[patch]` sections do not propagate to dependent workspaces). Without it the
+crates.io `hdf5-reader` fails GOES NetCDF4 reads.
+
+Measured (live G19 follow, 2026-06-11 ~10:00–10:30 UTC, very active CONUS/Gulf
+convection): ~110–145 flashes per ~20 s granule (~250–350 KB each), order
+~6 flashes/s into the store; a 10-minute `.rwl` bucket at these rates is
+~6,000 records / ~190 KB. The first poll back-fills the current UTC hour's
+already-landed granules, so a fresh ≥10-minute run ingests well over the ~30
+granules a steady-state 20 s cadence alone would (it catches the hour up, then
+tracks live). Every bucket Deep-validated and the full-window `read_flashes`
+count matched the sum of bucket records.
+
 ## Status
 
 Extraction complete (Plan 1). The workspace builds and renders live HRRR plots:

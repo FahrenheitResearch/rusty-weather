@@ -4327,6 +4327,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rw-glm"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hdf5-reader",
+ "netcrust",
+ "rustls",
+ "rustls-rustcrypto",
+ "rw-store",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "ureq",
+]
+
+[[package]]
 name = "rw-ingest"
 version = "0.1.0"
 dependencies = [

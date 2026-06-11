@@ -26,31 +26,35 @@
 - Modify: `docs/FORMAT.md` — new §10 “.rwl flash files” (header/record tables, flags bits, bucket scheme, concurrency = same RunLock contract, versioning = golden fixtures freeze v1)
 
 **Steps (TDD):**
-- [ ] Failing tests: record pack/unpack round-trip with exact byte-offset assertions (mirror rw-store's index_record_pack_layout_is_exact); bucket-name math (t0000/t2350, floor behavior, day boundary); writer insert keeps sort + atomic rewrite visible to a concurrent reader (write, read mid-stream from second handle); `read_flashes` time-range file selection (range spanning 3 buckets returns only in-range flashes, half-open vs inclusive semantics — pick inclusive start/exclusive end and DOCUMENT), bbox filter, empty-range, missing-satellite-dir → clean empty; validator catches truncation/unsorted/bad-magic/count-mismatch/time-range-header-lies without panics.
-- [ ] Implement format/store/reader/validate.
-- [ ] Golden fixture + regen harness; FORMAT.md §10.
-- [ ] Gates: `cargo test -p rw-glm` green, `cargo test --workspace` green, fmt/clippy clean for rw-glm.
-- [ ] Commit `feat(rw-glm): .rwl flash store format + reader API` ; **push branch to origin** (bowecho starts here).
+- [x] Failing tests: record pack/unpack round-trip with exact byte-offset assertions (mirror rw-store's index_record_pack_layout_is_exact); bucket-name math (t0000/t2350, floor behavior, day boundary); writer insert keeps sort + atomic rewrite visible to a concurrent reader (write, read mid-stream from second handle); `read_flashes` time-range file selection (range spanning 3 buckets returns only in-range flashes, half-open vs inclusive semantics — picked **inclusive start / exclusive end `[t0, t1)`**, documented on `read_flashes`), bbox filter, empty-range, missing-satellite-dir → clean empty; validator catches truncation/unsorted/bad-magic/count-mismatch/time-range-header-lies without panics.
+- [x] Implement format/store/reader/validate.
+- [x] Golden fixture + regen harness; FORMAT.md §10.
+- [x] Gates: `cargo test -p rw-glm` green, `cargo test --workspace` green, fmt/clippy clean for rw-glm.
+- [x] Commit `feat(rw-glm): .rwl flash store format + reader API` ; **push branch to origin** (bowecho starts here).
 
 ### Task 2: Granule decode (lean + one real-granule pin)
 
 **Files:** `crates/rw-glm/src/granule.rs` (+ netcrust dep), fixture `crates/rw-glm/tests/fixtures/<one real small granule>.nc` (~100-400 KB, fetch the most recent G19 granule once via S3 — list bucket anonymously like rw-sat/s3.rs, document provenance in a fixture README)
-- [ ] Failing test against the committed real granule: decode_granule(path) → flashes with: count == NetCDF flash dim, every lat within ±66 (GLM disk), lon within disk extent, energy > 0 finite (raw J ~1e-15..1e-10 range sanity), duration_ms saturation logic, flags bit0 set iff quality != 0, time = product epoch + first-event offset (assert one flash's absolute time against a hand-computed value from the granule's raw attrs — print the attrs in the test comment).
-- [ ] Implement with netcrust scaled reads (pattern: rw-sat netcdf.rs read_scaled_f32). Area m²→km².
-- [ ] Workspace green; commit; push.
+- [x] Failing test against the committed real granule: decode_granule(path) → flashes with: count == NetCDF flash dim, every lat within ±66 (GLM disk), lon within disk extent, energy > 0 finite (raw J ~1e-15..1e-10 range sanity), duration_ms saturation logic, flags bit0 set iff quality != 0, time = product epoch + first-event offset (assert one flash's absolute time against a hand-computed value from the granule's raw attrs — print the attrs in the test comment).
+- [x] Implement with netcrust scaled reads (pattern: rw-sat netcdf.rs read_scaled_f32). Area m²→km².
+- [x] Workspace green; commit; push.
+
+> **Task 2 pin (verified against the committed granule `OR_GLM-L2-LCFA_G19_s20261620805000_…`, 245,564 B, 107 flashes):** the L2 LCFA variable names matched the plan's assumption exactly — `number_of_flashes` dim; `product_time` (F64 scalar, J2000 seconds; epoch = 946_728_000 Unix s); scaled-i16 `flash_time_offset_of_first/last_event` (seconds vs product_time, may be slightly negative), `flash_energy` (J, `scale_factor ≈ 9.99996e-16`), `flash_area` (m²→km²); f32 `flash_lat`/`flash_lon`; i16 `flash_quality_flag` (0 good). **Energy precision:** netcrust's raw read returns the int promoted to f64 *without* applying scale; rw-glm applies `scale_factor`/`add_offset` in **f64** and narrows to f32 only on the final joule value, so the ~1e-15 energies survive (`energy0 = 2.285e-15 J`). One quirk noted, not a spec change: energy/area carry a sign-bogus `valid_range = [0, -6]` (i16), so rw-glm deliberately does **not** use rw-sat's `read_scaled_f32` valid-range filtering — it applies scale/offset itself and only drops `_FillValue` (=-1) flashes.
 
 ### Task 3: Follow engine + window (lean)
 
 **Files:** `crates/rw-glm/src/follow.rs`, `src/window.rs`, `src/s3.rs` (adapt rw-sat's listing — extract-and-share only if trivial; copying the ~paginated-list fn with a comment is acceptable, no premature abstraction), events enum mirroring rw-sat's
-- [ ] Tests: granule-key dedup across restarts (state from existing buckets' granule provenance — header granule count is insufficient; persist seen-granule keys in window.json, capped); retry holdback on transient fetch error; window pruning age+bytes with RunLock skip-if-locked (mirror rw-sat window.rs tests incl. lock-held-skip); bucket rewrite per granule is atomic.
-- [ ] `GlmFollowSpec { satellite, poll_secs (default 20), window (default 2h), byte_budget }`; in-process runnable (SatWorker pattern — but NO UI work in this plan).
-- [ ] Workspace green; commit; push.
+- [x] Tests: granule-key dedup across restarts (state from existing buckets' granule provenance — header granule count is insufficient; persist seen-granule keys in window.json, capped at 2000); retry holdback on transient fetch error (incl. watermark-hold so a later success can't drop a held granule); window pruning age+bytes with RunLock skip-if-locked (mirror rw-sat window.rs tests incl. lock-held-skip); bucket rewrite per granule is atomic; boundary granule -> two buckets; seen-key cap; window.json round-trip with unknown-key tolerance.
+- [x] `GlmFollowSpec { satellite, poll_secs (default 20), window (default 2h), byte_budget }`; in-process runnable via `follow_live`/`follow_with_source` (SatWorker pattern — but NO UI work in this plan). Engine is written against a `GranuleSource` trait (S3 impl = `S3GranuleSource`; tests inject synthetic granules). `GlmEvent` enum + cancel `AtomicBool`. Lock lifetimes never overlap (ingest under the BucketWriter lock, then drop it before `enforce_window` re-acquires it — sequential, single-threaded).
+- [x] Workspace green; commit; push.
 
 ### Task 4: Live validation + handoff (lean)
 
-- [ ] Run the follow engine against live G19 for ≥10 min (and one G18 listing sanity check): buckets appear, flash counts plausible (nonzero if any CONUS/SA convection — check both satellites if quiet), `read_flashes` over the live window returns sorted in-range flashes, validator Deep-passes every bucket, prune respects budget. Capture numbers (flashes/min, bytes/bucket).
-- [ ] README section (rw-glm usage + the hdf5-reader patch footgun applies — netcrust dep), memory update, bowecho note: reader API shape final, branch/rev to pin.
-- [ ] Full gate + merge per finishing-a-development-branch (drew's call on merge timing vs GFS).
+- [x] Run the follow engine against live G19 for ≥10 min (and one G18 listing sanity check): buckets appear, flash counts plausible (nonzero if any CONUS/SA convection — check both satellites if quiet), `read_flashes` over the live window returns sorted in-range flashes, validator Deep-passes every bucket, prune respects budget. Capture numbers (flashes/min, bytes/bucket). **DONE 2026-06-11:** built a permanent in-crate `rw_glm_follow` bin (mirrors rw-sat's rw_sat). 11-min G19 follow → 89 granules / 10,665 flashes (~970 flashes/min) / 4 buckets (~108 KB each); every bucket Deep-valid; full-window `read_flashes` = 10,665 sorted, == sum of bucket records; CONUS bbox 6,512 (61%). Restart re-run seeded 89 keys from window.json and skipped all 89 as already-seen (ingested 9 fresh). A `--window-mins 6` run evicted 3 buckets / 232,960 bytes (t0950/t1000/t1010 gone, t1020/t1030 survive). G18 `list` printed 3 keys.
+- [x] README section (rw-glm usage + the hdf5-reader patch footgun applies — netcrust dep), memory update, bowecho note: reader API shape final, branch/rev to pin. **DONE:** README "GLM lightning (rw-glm)" section (runner usage, reader one-liner, hdf5-reader footgun, FORMAT.md §10 + flags-bit pointer, live numbers); spec Status marked BUILT/validated; bowecho note below.
+- [x] Full gate + merge per finishing-a-development-branch (drew's call on merge timing vs GFS). **Gate DONE** (`cargo test --workspace` green; rw-glm fmt/clippy clean; branch pushed). **Merge deferred to the controller** per the Task 4 brief (do not self-merge).
+
+**Bowecho handoff (2026-06-11):** the reader API is final and unchanged from Task 1 — `rw_glm::read_flashes(root, satellite, t0, t1, Option<BBox>) -> Vec<Flash>`, half-open `[t0, t1)`, ascending by time, missing store → empty. `Flash` fields: `time_unix_ms i64`, `lat/lon/energy/area f32`, `flash_id u32`, `flags u16` (bit 0 = degraded; `Flash::is_degraded()`), `duration_ms u16`. Pin to branch `glm-lightning` at the Task 4 head; the only cross-track file with GFS is the root Cargo.toml workspace `members` line (trivial merge).
 
 ## Self-review
 - Bowecho dependency is Task 1 only — hence push-per-task and format-first ordering.

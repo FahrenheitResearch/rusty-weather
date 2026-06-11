@@ -1,0 +1,33 @@
+[package]
+name = "rw-glm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rw-store = { path = "../rw-store" }
+
+# Anonymous S3 listing/download for the follow engine (Task 3), mirroring
+# rw-sat: ureq over a pure-Rust rustls stack (no SDK, no credentials).
+rustls.workspace = true
+rustls-rustcrypto.workspace = true
+ureq.workspace = true
+
+# Pure-Rust NetCDF4/HDF5 reading for GLM L2 LCFA granule decode (Task 2),
+# mirroring rw-sat. hdf5-reader resolves to the vendored tree via the
+# workspace-root [patch.crates-io] pin.
+hdf5-reader = "0.3"
+netcrust = { path = "../../vendor/netcrust" }
+
+# rw_glm_follow: the thin ops CLI over follow_live + the reader/validator.
+# Lives in-crate (matching rw-sat's rw_sat bin) so the follow engine ships
+# with a runnable front end and no extra crate.
+[[bin]]
+name = "rw_glm_follow"
+path = "src/bin/rw_glm_follow.rs"
