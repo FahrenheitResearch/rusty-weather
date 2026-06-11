@@ -258,22 +258,34 @@ fn print_estimate(
         println!("{name:<36} {:>9.2} MB", mb(*bytes));
     }
     println!();
+    // Download detail depends on the fetch plan: single-file models (GFS) fetch
+    // one pgrb2 that serves both roles; HRRR-style models fetch prs + sfc separately.
+    let download_detail = match rw_ingest::fetch_plan(args.model) {
+        Ok(plan) if plan.len() == 1 => format!(
+            "{} {:.1} MB, single file (both roles)",
+            plan[0].product,
+            mb(calibration.prs_file_bytes),
+        ),
+        _ => {
+            if profile.needs_prs() {
+                format!(
+                    "prs {:.1} MB + sfc {:.1} MB, full files",
+                    mb(calibration.prs_file_bytes),
+                    mb(calibration.sfc_file_bytes)
+                )
+            } else {
+                format!(
+                    "sfc {:.1} MB full file only",
+                    mb(calibration.sfc_file_bytes)
+                )
+            }
+        }
+    };
     println!(
         "per hour: store {:.1} MB | download {:.1} MB ({})",
         mb(estimate.per_hour_store_bytes),
         mb(estimate.per_hour_download_bytes),
-        if profile.needs_prs() {
-            format!(
-                "prs {:.1} MB + sfc {:.1} MB, full files",
-                mb(calibration.prs_file_bytes),
-                mb(calibration.sfc_file_bytes)
-            )
-        } else {
-            format!(
-                "sfc {:.1} MB full file only",
-                mb(calibration.sfc_file_bytes)
-            )
-        },
+        download_detail,
     );
     println!(
         "total for {hour_count} hour(s): store {:.1} MB (incl. grid.rwg {:.1} MB, once per run) \
@@ -337,14 +349,27 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     };
     for &hour in &hours {
         let ingested = rw_ingest::ingest_hour_serial(&config, hour)?;
+        let fetch_summary = if ingested.single_file_model {
+            format!(
+                "fetch {} ms ({}, {:.1} MB, single file)",
+                ingested.prs_fetch_ms,
+                cache_state(ingested.prs_cache_hit),
+                ingested.prs_mb,
+            )
+        } else {
+            format!(
+                "prs fetch {} ms ({}, {:.1} MB) | sfc fetch {} ms ({}, {:.1} MB)",
+                ingested.prs_fetch_ms,
+                cache_state(ingested.prs_cache_hit),
+                ingested.prs_mb,
+                ingested.sfc_fetch_ms,
+                cache_state(ingested.sfc_cache_hit),
+                ingested.sfc_mb,
+            )
+        };
         println!(
-            "f{hour:03}: prs fetch {} ms ({}, {:.1} MB) | sfc fetch {} ms ({}, {:.1} MB) | extract prs {} ms, sfc {} ms | thermo decode {} ms | derived {} ms | heavy {} ms | encode {} ms | total {} ms | {} {:.1} MB | 2d {}/{} | derived {}/{} | heavy {}/{} | 3d {}",
-            ingested.prs_fetch_ms,
-            cache_state(ingested.prs_cache_hit),
-            ingested.prs_mb,
-            ingested.sfc_fetch_ms,
-            cache_state(ingested.sfc_cache_hit),
-            ingested.sfc_mb,
+            "f{hour:03}: {} | extract prs {} ms, sfc {} ms | thermo decode {} ms | derived {} ms | heavy {} ms | encode {} ms | total {} ms | {} {:.1} MB | 2d {}/{} | derived {}/{} | heavy {}/{} | 3d {}",
+            fetch_summary,
             ingested.prs_extract_ms,
             ingested.sfc_extract_ms,
             ingested.thermo_decode_ms,

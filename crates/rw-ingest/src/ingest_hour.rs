@@ -366,7 +366,14 @@ pub struct IngestedHour {
     pub sfc_fetch_ms: u128,
     pub prs_cache_hit: bool,
     pub sfc_cache_hit: bool,
+    /// True when the model's fetch plan has exactly one file serving both the
+    /// pressure and surface roles (GFS `pgrb2.0p25`). In that case `prs_mb`
+    /// holds the one download size and `sfc_mb` is `0.0` — the download is
+    /// priced once, not twice. Consumers must check this flag before summing
+    /// `prs_mb + sfc_mb` to avoid double-counting.
+    pub single_file_model: bool,
     pub prs_mb: f64,
+    /// Zero for single-file models (`single_file_model == true`).
     pub sfc_mb: f64,
     pub prs_extract_ms: u128,
     pub sfc_extract_ms: u128,
@@ -546,7 +553,17 @@ pub fn process_fetched_hour(
     let prs_cache_hit = prs.cache_hit;
     let prs_mb = prs.result.bytes.len() as f64 / (1024.0 * 1024.0);
     let sfc_cache_hit = sfc.cache_hit;
-    let sfc_mb = sfc.result.bytes.len() as f64 / (1024.0 * 1024.0);
+    // Single-file models (GFS): the sfc slot is a clone of the prs file; the
+    // download was one fetch, not two. Price the download once by zeroing sfc_mb
+    // so callers that sum prs_mb + sfc_mb get the honest single-file total.
+    let single_file_model = fetch_plan(config.model)
+        .map(|plan| plan.len() == 1)
+        .unwrap_or(false);
+    let sfc_mb = if single_file_model {
+        0.0
+    } else {
+        sfc.result.bytes.len() as f64 / (1024.0 * 1024.0)
+    };
 
     // --- prs product file: 3D isobaric superset, one decode pass ---
     // The profile picks the volumes and level step; the render-grade 2D
@@ -1147,6 +1164,7 @@ pub fn process_fetched_hour(
         sfc_fetch_ms,
         prs_cache_hit,
         sfc_cache_hit,
+        single_file_model,
         prs_mb,
         sfc_mb,
         prs_extract_ms,
@@ -2135,6 +2153,28 @@ mod tests {
         assert!(
             validate_forecast_hours(ModelId::Hrrr, 1, &[19]).is_err(),
             "01z HRRR stops at f018"
+        );
+    }
+
+    /// `single_file_model` in IngestedHour is driven by the fetch plan: GFS
+    /// has a one-entry plan (single file), HRRR has two. Verify the flag
+    /// derivation used inside process_fetched_hour matches the canonical plan.
+    #[test]
+    fn single_file_flag_matches_fetch_plan_entry_count() {
+        let gfs_is_single = fetch_plan(ModelId::Gfs)
+            .map(|plan| plan.len() == 1)
+            .unwrap_or(false);
+        assert!(
+            gfs_is_single,
+            "GFS fetch plan has one entry → single_file_model"
+        );
+
+        let hrrr_is_single = fetch_plan(ModelId::Hrrr)
+            .map(|plan| plan.len() == 1)
+            .unwrap_or(false);
+        assert!(
+            !hrrr_is_single,
+            "HRRR fetch plan has two entries → not single_file"
         );
     }
 
