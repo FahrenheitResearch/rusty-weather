@@ -96,9 +96,7 @@ fn process_working_set_mb() -> f64 {
     };
     // SAFETY: the process pseudo-handle is always valid; the out-param is
     // a plain POD struct sized via `cb`.
-    let ok = unsafe {
-        GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb)
-    };
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
     if ok == 0 {
         return 0.0;
     }
@@ -183,8 +181,8 @@ impl RenderMemoryGate {
             .expect("render memory gate poisoned");
         loop {
             let ws_mb = process_working_set_mb();
-            let blocked = ws_mb > self.high_watermark_mb
-                || (*window && ws_mb > self.low_watermark_mb);
+            let blocked =
+                ws_mb > self.high_watermark_mb || (*window && ws_mb > self.low_watermark_mb);
             if !blocked || started.elapsed() >= MAX_WAIT {
                 return;
             }
