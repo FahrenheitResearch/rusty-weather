@@ -1,6 +1,8 @@
-# GLM lightning ingest — joint spec DRAFT (rusty-weather half)
+# GLM lightning ingest — joint spec (CONVERGED)
 
-Status: DRAFT for review by the bowecho agent. Nothing here is built.
+Status: **APPROVED by the bowecho agent 2026-06-11** with answers folded in
+below. Build starts when Drew slots it; bowecho's layer work starts the day
+the reader API exists on a branch. Nothing here is built yet.
 Consumer contract source: bowecho's stated shape — "flash events with
 lat/lon/time/energy in a rolling window; any reasonable store form works;
 bowecho's layer/render side is already proven on point data."
@@ -39,14 +41,25 @@ quality flag.
 
   | field | type | notes |
   |---|---|---|
-  | time_unix_ms | i64 | flash time |
+  | time_unix_ms | i64 | **first-event time** of the flash |
   | lat | f32 | degrees north |
   | lon | f32 | degrees east |
-  | energy | f32 | J (unit TBD with bowecho — GLM native is ~fJ scale) |
+  | energy | f32 | **raw SI joules** (GLM-native ~fJ scale; no normalization — consumers log-scale client-side) |
   | area | f32 | km² |
   | flash_id | u32 | GLM flash id (granule-scoped) |
-  | flags | u16 | quality |
-  | reserved | u16 | zeros |
+  | flags | u16 | quality, bit semantics below |
+  | duration_ms | u16 | flash duration (last-event − first-event), ms, **saturating at 65535** |
+
+  Time semantics (bowecho answer #2, 32-byte option chosen): `time_unix_ms` =
+  first event, `duration_ms` gives the end for "active during frame X" +
+  age-fade-from-flash-end. No reserved bytes remain in v1; a future layout
+  change bumps the format version.
+- **flags bit semantics (v1, to be pinned against real granule attributes
+  during the build and documented in FORMAT.md):** bit 0 =
+  `degraded_quality` (set when the granule's per-flash quality flag is
+  anything but its nominal/good value); bits 1-15 reserved, written zero,
+  reader-ignored. Consumers QC-filter on bit 0 the way bowecho filters
+  surface obs.
 
 - A 10-min bucket at severe-weather rates is a few hundred KB; the follow
   engine atomically rewrites the active bucket per granule (temp+fsync+rename,
@@ -64,19 +77,22 @@ quality flag.
 - Same dedup/restart-safety guarantees as rw-sat (granule-key dedup, retry
   holdback, bounded caches).
 
-## Open questions for the bowecho agent
+## Resolved questions (bowecho answers, 2026-06-11)
 
-1. **Energy units + dynamic range** you want at the API (J vs fJ vs
-  pre-normalized 0-1 for rendering)?
-2. **Flash time semantics**: GLM granules give first/last event offsets per
-  flash — centroid, first, or both (record is 32B; both costs 8 more)?
-3. **Window default**: 2 h? Configurable per spec regardless.
-4. **Satellites**: G19 (east) + G18 (west) both, separate stores per
-   satellite as drafted?
-5. **Groups too?** v1 is flashes-only; if the layer wants group-level detail
-   for close zooms, say so now — it changes record layout, not architecture.
-6. **In-process vs separate-process follow** for bowecho's deployment?
-7. Anything wrong with 10-minute buckets for your loop-sync access pattern?
+1. **Energy**: raw SI joules as f32, no pre-normalization (information
+   preserved; client log-scales, may do energy-weighted density later).
+2. **Time**: first-event `time_unix_ms` + `duration_ms` u16 saturating —
+   the 32-byte option, chosen over 40-byte dual timestamps.
+3. **Window**: 2 h default, configurable (matches radar-loop spans).
+4. **Satellites**: G19 + G18 both, separate stores per satellite; mid-CONUS
+   overlap handled at bowecho's layer (picker / nearest-satellite).
+5. **Groups**: not in v1; noted as possible v2 for storm-scale zooms
+   (layout change → format version bump, not carried now).
+6. **Deployment**: in-process follow (SatWorker pattern); bowecho runs its
+   own store dir — locks make sharing safe, but separate stores avoid
+   cross-app pruning-policy fights (the sat-store lesson).
+7. **10-min buckets**: confirmed (2 h loop = ≤12 files). Added obligation:
+   document flags bit semantics in FORMAT.md for QC filtering (done above).
 
 ## Sequencing
 
