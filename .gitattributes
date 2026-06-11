@@ -1,1 +1,2 @@
 crates/rw-store/tests/golden/** -text
+crates/rusty-weather/tests/fixtures/*.grib2 -text binary

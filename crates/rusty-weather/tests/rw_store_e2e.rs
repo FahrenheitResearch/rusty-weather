@@ -1,13 +1,16 @@
 //! Offline end-to-end proof of the GRIB -> store pipeline, on the committed
-//! fixture `tests/fixtures/hrrr_mini.grib2` (see `tests/fixtures/README.md`
-//! for provenance): GRIB bytes -> `extract_fields_partial_from_model_bytes_at_forecast_hour`
-//! -> `write_hour_from_fields` -> read back through `HourReader` /
-//! `read_field_2d`. No network: the fixture ships in the repo.
+//! fixtures `tests/fixtures/hrrr_mini.grib2` and `tests/fixtures/gfs_mini.grib2`
+//! (see `tests/fixtures/README.md` for provenance): GRIB bytes ->
+//! `extract_fields_partial_from_model_bytes_at_forecast_hour` ->
+//! `write_hour_from_fields` -> read back through `HourReader` /
+//! `read_field_2d`. No network: the fixtures ship in the repo.
 //!
-//! Layout under test mirrors `rw_ingest`: 2m temperature as a 2D field, TMP
-//! at 850/700/500 hPa as one 3-level pressure volume, and the 500 hPa
-//! U/V/HGT planes stored as additional 2D fields (a valid use of the 2D
-//! path that exercises multi-2D writes).
+//! The body is shared across models via [`Case`]; each model contributes its
+//! own grid dims, fixture, expected 2D fields, and one pressure volume:
+//!   * HRRR (Lambert, 1799x1059): 2m temperature + 500 hPa U/V/HGT as 2D, and
+//!     TMP at 850/700/500 hPa as one 3-level volume.
+//!   * GFS (lat/lon, 1440x721): 2m temperature/dewpoint + MSLP + 850/500 hPa
+//!     HGT as 2D, and TMP at 850/500 hPa as one 2-level volume.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,42 +22,116 @@ use rw_store::ingest::{PressureVolumeInput, read_field_2d, write_hour_from_field
 use rw_store::reader::HourReader;
 use rw_store::run::RwsRunManifest;
 
-const MODEL: &str = "hrrr";
-const RUN: &str = "20260608_00z";
-const HOUR: u16 = 6;
 const BUILD: &str = "rw-store-e2e-test";
 const WRITTEN_UNIX: u64 = 1_780_000_000;
-/// HRRR CONUS grid dims; also guards against a truncated fixture.
-const NX: usize = 1799;
-const NY: usize = 1059;
-/// Volume levels in canonical (descending) order.
-const VLEVELS: [u16; 3] = [850, 700, 500];
 
-fn fixture_path() -> PathBuf {
+/// One model's end-to-end case: which fixture, on what grid, and the exact
+/// fields it was built to serve.
+struct Case {
+    model: ModelId,
+    fixture: &'static str,
+    run: &'static str,
+    hour: u16,
+    nx: usize,
+    ny: usize,
+    /// 2D fields stored as plain tiles: (store name, selector). The first is
+    /// used for the windowed-read crop check.
+    fields_2d: Vec<(&'static str, FieldSelector)>,
+    /// One pressure volume: (store name, canonical field, levels descending).
+    volume_name: &'static str,
+    volume_field: CanonicalField,
+    volume_levels: Vec<u16>,
+    /// Grid sample points (ix, iy) for the column checks; all in-bounds.
+    sample_points: Vec<(usize, usize)>,
+    /// Fractional point for the bilinear profile check.
+    profile_fx: f64,
+    profile_fy: f64,
+    /// Window for the windowed-read crop check (x0, y0, x1, y1).
+    window: (usize, usize, usize, usize),
+}
+
+fn hrrr_case() -> Case {
+    Case {
+        model: ModelId::Hrrr,
+        fixture: "hrrr_mini.grib2",
+        run: "20260608_00z",
+        hour: 6,
+        nx: 1799,
+        ny: 1059,
+        fields_2d: vec![
+            (
+                "temperature_2m",
+                FieldSelector::height_agl(CanonicalField::Temperature, 2),
+            ),
+            ("u_500", FieldSelector::isobaric(CanonicalField::UWind, 500)),
+            ("v_500", FieldSelector::isobaric(CanonicalField::VWind, 500)),
+            (
+                "height_500",
+                FieldSelector::isobaric(CanonicalField::GeopotentialHeight, 500),
+            ),
+        ],
+        volume_name: "temperature_iso",
+        volume_field: CanonicalField::Temperature,
+        volume_levels: vec![850, 700, 500],
+        sample_points: vec![(100, 100), (900, 500), (1700, 1000)],
+        profile_fx: 500.5,
+        profile_fy: 300.5,
+        window: (50, 50, 150, 150),
+    }
+}
+
+fn gfs_case() -> Case {
+    Case {
+        model: ModelId::Gfs,
+        fixture: "gfs_mini.grib2",
+        run: "20260611_00z",
+        hour: 0,
+        nx: 1440,
+        ny: 721,
+        fields_2d: vec![
+            (
+                "temperature_2m",
+                FieldSelector::height_agl(CanonicalField::Temperature, 2),
+            ),
+            (
+                "dewpoint_2m",
+                FieldSelector::height_agl(CanonicalField::Dewpoint, 2),
+            ),
+            (
+                "mslp",
+                FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel),
+            ),
+            (
+                "height_850",
+                FieldSelector::isobaric(CanonicalField::GeopotentialHeight, 850),
+            ),
+            (
+                "height_500",
+                FieldSelector::isobaric(CanonicalField::GeopotentialHeight, 500),
+            ),
+        ],
+        volume_name: "temperature_iso",
+        volume_field: CanonicalField::Temperature,
+        volume_levels: vec![850, 500],
+        sample_points: vec![(100, 100), (720, 360), (1439, 720)],
+        profile_fx: 700.5,
+        profile_fy: 300.5,
+        window: (50, 50, 150, 150),
+    }
+}
+
+fn fixture_path(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
-        .join("hrrr_mini.grib2")
+        .join(name)
 }
 
-fn test_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("rw-store-e2e-{}", std::process::id()));
+fn test_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rw-store-e2e-{tag}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
-}
-
-/// The exact selector set the fixture was built to contain.
-fn fixture_selectors() -> Vec<FieldSelector> {
-    vec![
-        FieldSelector::isobaric(CanonicalField::Temperature, 850),
-        FieldSelector::isobaric(CanonicalField::Temperature, 700),
-        FieldSelector::isobaric(CanonicalField::Temperature, 500),
-        FieldSelector::isobaric(CanonicalField::UWind, 500),
-        FieldSelector::isobaric(CanonicalField::VWind, 500),
-        FieldSelector::isobaric(CanonicalField::GeopotentialHeight, 500),
-        FieldSelector::height_agl(CanonicalField::Temperature, 2),
-    ]
 }
 
 /// Pull the field for `selector` out of the extracted set (panics with the
@@ -101,7 +178,7 @@ fn quant_bound(planes: &[&[f32]]) -> f32 {
 /// Bilinear interpolation of `plane` at fractional grid coordinates, with
 /// the same finite-corner weight renormalization `read_profile_3d` applies,
 /// so expected values stay comparable in the presence of NaN corners.
-fn bilinear_finite(plane: &[f32], fx: f64, fy: f64) -> f32 {
+fn bilinear_finite(plane: &[f32], nx: usize, fx: f64, fy: f64) -> f32 {
     let (x0, x1) = (fx.floor() as usize, fx.ceil() as usize);
     let (y0, y1) = (fy.floor() as usize, fy.ceil() as usize);
     let wx = (fx - x0 as f64) as f32;
@@ -115,7 +192,7 @@ fn bilinear_finite(plane: &[f32], fx: f64, fy: f64) -> f32 {
     let mut weight_sum = 0.0f32;
     let mut value_sum = 0.0f32;
     for (ix, iy, weight) in corners {
-        let value = plane[iy * NX + ix];
+        let value = plane[iy * nx + ix];
         if value.is_finite() {
             weight_sum += weight;
             value_sum += weight * value;
@@ -128,22 +205,44 @@ fn bilinear_finite(plane: &[f32], fx: f64, fy: f64) -> f32 {
     }
 }
 
-#[test]
-fn fixture_extract_write_read_back_round_trips() {
+/// The shared extract -> write -> read-back proof, run per model.
+fn run_case(case: Case) {
+    let Case {
+        model,
+        fixture,
+        run,
+        hour,
+        nx,
+        ny,
+        fields_2d: planned_2d,
+        volume_name,
+        volume_field,
+        volume_levels,
+        sample_points,
+        profile_fx,
+        profile_fy,
+        window,
+    } = case;
+    let model_slug = model.as_str();
+
     // --- 1. fixture bytes -> extraction: everything present, nothing extra ---
-    let bytes = fs::read(fixture_path()).expect("committed fixture must be readable");
-    let selectors = fixture_selectors();
+    let bytes = fs::read(fixture_path(fixture)).expect("committed fixture must be readable");
+    let mut selectors: Vec<FieldSelector> = planned_2d.iter().map(|(_, sel)| *sel).collect();
+    for &level in &volume_levels {
+        selectors.push(FieldSelector::isobaric(volume_field, level));
+    }
+    let expected_field_count = selectors.len();
     let extraction = extract_fields_partial_from_model_bytes_at_forecast_hour(
-        ModelId::Hrrr,
+        model,
         &bytes,
         None,
         &selectors,
-        Some(HOUR),
+        Some(hour),
     )
     .expect("fixture must parse as GRIB2");
     assert!(
         extraction.missing.is_empty(),
-        "fixture must serve every selector; missing: {:?}",
+        "{model_slug} fixture must serve every selector; missing: {:?}",
         extraction
             .missing
             .iter()
@@ -152,97 +251,82 @@ fn fixture_extract_write_read_back_round_trips() {
     );
     assert_eq!(
         extraction.extracted.len(),
-        7,
-        "fixture holds exactly the 7 requested fields"
+        expected_field_count,
+        "{model_slug} fixture holds exactly the requested fields"
     );
 
     let mut extracted = extraction.extracted;
-    let temp_2m = take(
-        &mut extracted,
-        FieldSelector::height_agl(CanonicalField::Temperature, 2),
-    );
-    let u_500 = take(
-        &mut extracted,
-        FieldSelector::isobaric(CanonicalField::UWind, 500),
-    );
-    let v_500 = take(
-        &mut extracted,
-        FieldSelector::isobaric(CanonicalField::VWind, 500),
-    );
-    let height_500 = take(
-        &mut extracted,
-        FieldSelector::isobaric(CanonicalField::GeopotentialHeight, 500),
-    );
-    let tmp_planes: Vec<(u16, SelectedField2D)> = VLEVELS
+    // Pull the planned 2D fields (in declared order) out of the extracted set.
+    let surface_fields: Vec<(&'static str, SelectedField2D)> = planned_2d
+        .iter()
+        .map(|(name, sel)| (*name, take(&mut extracted, *sel)))
+        .collect();
+    // Pull the volume planes (in declared level order).
+    let volume_planes: Vec<(u16, SelectedField2D)> = volume_levels
         .iter()
         .map(|&level| {
             (
                 level,
-                take(
-                    &mut extracted,
-                    FieldSelector::isobaric(CanonicalField::Temperature, level),
-                ),
+                take(&mut extracted, FieldSelector::isobaric(volume_field, level)),
             )
         })
         .collect();
-    assert!(extracted.is_empty(), "no unexpected extra fields");
+    assert!(
+        extracted.is_empty(),
+        "{model_slug}: no unexpected extra fields"
+    );
+    let first = &surface_fields[0].1;
     assert_eq!(
-        (temp_2m.grid.shape.nx, temp_2m.grid.shape.ny),
-        (NX, NY),
-        "fixture must be on the full HRRR CONUS grid"
+        (first.grid.shape.nx, first.grid.shape.ny),
+        (nx, ny),
+        "{model_slug} fixture must be on the full model grid"
     );
 
-    // --- 2. write the hour: multi-2D + one 3-level TMP volume ---
-    let dir = test_dir();
+    // --- 2. write the hour: multi-2D + one pressure volume ---
+    let dir = test_dir(model_slug);
     let store_root = dir.join("store");
-    let fields_2d: Vec<(&str, &SelectedField2D)> = vec![
-        ("temperature_2m", &temp_2m),
-        ("u_500", &u_500),
-        ("v_500", &v_500),
-        ("height_500", &height_500),
-    ];
+    let fields_2d: Vec<(&str, &SelectedField2D)> = surface_fields
+        .iter()
+        .map(|(name, field)| (*name, field))
+        .collect();
     let volume = PressureVolumeInput {
-        name: "temperature_iso",
-        units: FieldSelector::isobaric(CanonicalField::Temperature, 500).native_units(),
+        name: volume_name,
+        units: FieldSelector::isobaric(volume_field, volume_levels[0]).native_units(),
         selector_template: serde_json::json!({
-            "field": CanonicalField::Temperature.as_str(),
+            "field": volume_field.as_str(),
             "vertical": "isobaric",
         }),
-        levels: tmp_planes
+        levels: volume_planes
             .iter()
             .map(|(level, field)| (*level, field.values.as_slice()))
             .collect(),
     };
     let written = write_hour_from_fields(
         &store_root,
-        MODEL,
-        RUN,
-        HOUR,
+        model_slug,
+        run,
+        hour,
         &fields_2d,
         &[volume],
         BUILD,
         WRITTEN_UNIX,
     )
     .expect("hour write must succeed");
+    let mut expected_vars: Vec<&str> = planned_2d.iter().map(|(name, _)| *name).collect();
+    expected_vars.push(volume_name);
     assert_eq!(
-        written.vars,
-        vec![
-            "temperature_2m",
-            "u_500",
-            "v_500",
-            "height_500",
-            "temperature_iso"
-        ]
+        written.vars, expected_vars,
+        "{model_slug}: stored var order"
     );
 
     // --- 3. read back ---
-    let run_dir = store_root.join(MODEL).join(RUN);
+    let run_dir = store_root.join(model_slug).join(run);
     let reader = HourReader::open(&written.path).expect("hour file must open");
     let grid = GridFile::open(&run_dir.join("grid.rwg")).expect("grid.rwg must open");
-    assert_eq!((grid.nx, grid.ny), (NX, NY));
+    assert_eq!((grid.nx, grid.ny), (nx, ny));
 
     // Every 2D field round-trips bit-exactly: values, selector, units.
-    for (name, original) in &fields_2d {
+    for (name, original) in &surface_fields {
         let round_trip = read_field_2d(&reader, &grid, name).expect("2D read-back");
         assert_eq!(
             round_trip.selector, original.selector,
@@ -256,102 +340,106 @@ fn fixture_extract_write_read_back_round_trips() {
         );
     }
 
-    // Window read == crop of the full field.
-    let (x0, y0, x1, y1) = (50usize, 50usize, 150usize, 150usize);
-    let window = reader
-        .read_window_2d("temperature_2m", x0, y0, x1, y1)
+    // Window read == crop of the full field (first 2D field).
+    let (x0, y0, x1, y1) = window;
+    let crop_field = &surface_fields[0].1;
+    let crop_name = surface_fields[0].0;
+    let win = reader
+        .read_window_2d(crop_name, x0, y0, x1, y1)
         .expect("window read");
-    assert_eq!((window.x0, window.y0), (x0, y0));
-    assert_eq!((window.nx, window.ny), (x1 - x0, y1 - y0));
+    assert_eq!((win.x0, win.y0), (x0, y0));
+    assert_eq!((win.nx, win.ny), (x1 - x0, y1 - y0));
     let crop: Vec<f32> = (y0..y1)
-        .flat_map(|y| temp_2m.values[y * NX + x0..y * NX + x1].iter().copied())
+        .flat_map(|y| crop_field.values[y * nx + x0..y * nx + x1].iter().copied())
         .collect();
     assert_bits_eq(
-        &window.values,
+        &win.values,
         &crop,
-        "temperature_2m window (50,50,150,150)",
+        &format!("{crop_name} window ({x0},{y0},{x1},{y1})"),
     );
 
-    // Volume columns at 3 sample points, within the quantization bound of
-    // the extracted planes.
-    let planes: Vec<&[f32]> = tmp_planes
+    // Volume columns at the sample points, within the quantization bound.
+    let planes: Vec<&[f32]> = volume_planes
         .iter()
         .map(|(_, field)| field.values.as_slice())
         .collect();
     let bound = quant_bound(&planes);
     let var = reader
-        .variable("temperature_iso")
+        .variable(volume_name)
         .expect("volume variable present");
-    assert_eq!(var.levels_hpa, VLEVELS.to_vec(), "levels stored descending");
-    let sample_points = [(100usize, 100usize), (900, 500), (1700, 1000)];
+    assert_eq!(var.levels_hpa, volume_levels, "levels stored descending");
     for &(ix, iy) in &sample_points {
         let column = reader
-            .read_column_3d("temperature_iso", ix, iy)
+            .read_column_3d(volume_name, ix, iy)
             .expect("column read");
-        assert_eq!(column.len(), VLEVELS.len());
+        assert_eq!(column.len(), volume_levels.len());
         for (k, value) in column.iter().enumerate() {
-            let expected = planes[k][iy * NX + ix];
+            let expected = planes[k][iy * nx + ix];
             if expected.is_nan() {
                 assert!(
                     value.is_nan(),
                     "column ({ix},{iy}) level {}: NaN must survive",
-                    VLEVELS[k]
+                    volume_levels[k]
                 );
                 continue;
             }
             assert!(
                 (value - expected).abs() <= bound,
                 "column ({ix},{iy}) level {} hPa: got {value}, expected {expected}, bound {bound}",
-                VLEVELS[k]
+                volume_levels[k]
             );
         }
     }
 
-    // Bilinear profile at a fractional point between the first two sample
-    // points: each value within the quantization bound of the same
-    // interpolation of the extracted planes.
-    let (fx, fy) = (500.5f64, 300.5f64);
+    // Bilinear profile at a fractional point: each value within the
+    // quantization bound of the same interpolation of the extracted planes.
     let profile = reader
-        .read_profile_3d("temperature_iso", fx, fy)
+        .read_profile_3d(volume_name, profile_fx, profile_fy)
         .expect("profile read");
-    assert_eq!(profile.len(), VLEVELS.len());
+    assert_eq!(profile.len(), volume_levels.len());
     let expected_profile: Vec<f32> = planes
         .iter()
-        .map(|plane| bilinear_finite(plane, fx, fy))
+        .map(|plane| bilinear_finite(plane, nx, profile_fx, profile_fy))
         .collect();
     for (k, (got, expected)) in profile.iter().zip(&expected_profile).enumerate() {
         if expected.is_nan() {
             assert!(
                 got.is_nan(),
                 "profile level {}: NaN must survive",
-                VLEVELS[k]
+                volume_levels[k]
             );
             continue;
         }
         assert!(
             (got - expected).abs() <= bound,
             "profile level {} hPa: got {got}, expected {expected}, bound {bound}",
-            VLEVELS[k]
+            volume_levels[k]
         );
     }
-    // Vertical ordering consistency: assert 850 > 500 (or the reverse) only
-    // when the extracted data itself says so beyond the quantization noise —
-    // this checks the store against the data, not the data against
-    // meteorology (even though 850 hPa being warmer is the normal case).
-    let delta = expected_profile[0] - expected_profile[2];
+    // Vertical ordering consistency: assert the lowest vs highest level
+    // relationship only when the extracted data itself says so beyond the
+    // quantization noise — this checks the store against the data, not the
+    // data against meteorology (the lowest pressure level being warmest is the
+    // normal case).
+    let last = volume_levels.len() - 1;
+    let delta = expected_profile[0] - expected_profile[last];
     if delta > 2.0 * bound {
         assert!(
-            profile[0] > profile[2],
-            "850 hPa ({}) must stay warmer than 500 hPa ({}) as in the source data",
+            profile[0] > profile[last],
+            "{} hPa ({}) must stay warmer than {} hPa ({}) as in the source data",
+            volume_levels[0],
             profile[0],
-            profile[2]
+            volume_levels[last],
+            profile[last]
         );
     } else if delta < -2.0 * bound {
         assert!(
-            profile[0] < profile[2],
-            "850 hPa ({}) must stay colder than 500 hPa ({}) as in the source data",
+            profile[0] < profile[last],
+            "{} hPa ({}) must stay colder than {} hPa ({}) as in the source data",
+            volume_levels[0],
             profile[0],
-            profile[2]
+            volume_levels[last],
+            profile[last]
         );
     }
 
@@ -359,11 +447,11 @@ fn fixture_extract_write_read_back_round_trips() {
     let manifest_bytes = fs::read(run_dir.join("run.json")).expect("run.json must exist");
     let manifest: RwsRunManifest =
         serde_json::from_slice(&manifest_bytes).expect("run.json must parse");
-    assert_eq!(manifest.model, MODEL);
-    assert_eq!(manifest.run, RUN);
-    assert_eq!((manifest.nx, manifest.ny), (NX, NY));
-    let entry = manifest.hours.get(&HOUR).expect("hour 6 registered");
-    assert_eq!(entry.file, "f006.rws");
+    assert_eq!(manifest.model, model_slug);
+    assert_eq!(manifest.run, run);
+    assert_eq!((manifest.nx, manifest.ny), (nx, ny));
+    let entry = manifest.hours.get(&hour).expect("hour registered");
+    assert_eq!(entry.file, format!("f{hour:03}.rws"));
     assert_eq!(entry.written_unix, WRITTEN_UNIX);
     assert_eq!(entry.variables, written.vars);
     assert_eq!(
@@ -377,4 +465,14 @@ fn fixture_extract_write_read_back_round_trips() {
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hrrr_fixture_extract_write_read_back_round_trips() {
+    run_case(hrrr_case());
+}
+
+#[test]
+fn gfs_fixture_extract_write_read_back_round_trips() {
+    run_case(gfs_case());
 }
