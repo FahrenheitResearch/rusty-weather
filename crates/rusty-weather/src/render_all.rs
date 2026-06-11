@@ -215,6 +215,11 @@ pub fn render_hour_products(
     hour: u16,
     direct_slugs: &[String],
     derived_slugs: &[String],
+    // Optional pacing hook for the direct lane's chunked render: called
+    // before each chunk loads its fields. `rw_batch` passes its memory
+    // gate (defer chunks inside high-memory ingest windows); `rw_render`
+    // passes None. Timing-only — pixels are gate-independent.
+    direct_chunk_gate: Option<&dyn Fn()>,
 ) -> Result<HourRenderOutcome, Box<dyn std::error::Error>> {
     let mut rendered = Vec::new();
     let mut skipped = Vec::new();
@@ -247,6 +252,7 @@ pub fn render_hour_products(
             &direct_request,
             &config.latest_run()?,
             direct_slugs,
+            direct_chunk_gate,
         )?;
         rendered.extend(outcome.rendered.into_iter().map(|recipe| RenderedProduct {
             slug: recipe.recipe_slug,
@@ -257,6 +263,12 @@ pub fn render_hour_products(
     }
 
     if !derived_slugs.is_empty() {
+        // The derived/heavy store-render pass loads every requested grid
+        // as f64 up front (~0.5-0.7 GB at HRRR size); defer its START out
+        // of high-memory ingest windows the same way direct chunks defer.
+        if let Some(gate) = direct_chunk_gate {
+            gate();
+        }
         let derived_request = DerivedBatchRequest {
             model: config.model,
             date_yyyymmdd: config.date_yyyymmdd.clone(),

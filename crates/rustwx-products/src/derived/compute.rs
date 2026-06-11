@@ -228,6 +228,29 @@ where
 /// produce (the store-ingest lane builds it once, by an in-place transform
 /// of the gh volume with the identical per-element arithmetic, and shares
 /// it across the derived and heavy stages). `None` is the historical path.
+fn missing_dependency(name: &str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "derived compute missing required dependency: {name}"
+    ))
+}
+
+// Concrete error type so `?` converts into both the outer
+// `Box<dyn Error>` and the join sides' `TaskError`.
+fn require_option_ref<'a, T>(option: &'a Option<T>, name: &str) -> Result<&'a T, std::io::Error> {
+    option.as_ref().ok_or_else(|| missing_dependency(name))
+}
+
+fn require_option_copy<T: Copy>(option: Option<T>, name: &str) -> Result<T, std::io::Error> {
+    option.ok_or_else(|| missing_dependency(name))
+}
+
+fn require_height_agl<'a>(
+    option: Option<&'a [f64]>,
+    name: &str,
+) -> Result<&'a [f64], std::io::Error> {
+    option.ok_or_else(|| missing_dependency(name))
+}
+
 pub(super) fn compute_derived_fields_generic_with_height_agl<S, P>(
     surface: &S,
     pressure: &P,
@@ -238,28 +261,8 @@ where
     S: SurfaceFieldSet + Sync,
     P: PressureFieldSet + Sync,
 {
-    fn missing_dependency(name: &str) -> std::io::Error {
-        std::io::Error::other(format!(
-            "derived compute missing required dependency: {name}"
-        ))
-    }
-
-    // Concrete error type so `?` converts into both the outer
-    // `Box<dyn Error>` and the join sides' `TaskError`.
-    fn require_option_ref<'a, T>(
-        option: &'a Option<T>,
-        name: &str,
-    ) -> Result<&'a T, std::io::Error> {
-        option.as_ref().ok_or_else(|| missing_dependency(name))
-    }
-
-    fn require_option_copy<T: Copy>(option: Option<T>, name: &str) -> Result<T, std::io::Error> {
-        option.ok_or_else(|| missing_dependency(name))
-    }
-
     let requirements = DerivedRequirements::from_recipes(recipes);
     let grid = CalcGridShape::new(surface.nx(), surface.ny())?;
-    let mut computed = DerivedComputedFields::default();
 
     let surface_inputs = SurfaceInputs {
         psfc_pa: surface.psfc_pa(),
@@ -304,16 +307,6 @@ where
         None
     };
     let height_agl_3d: Option<&[f64]> = height_agl_override.or(height_agl_owned.as_deref());
-    fn require_height_agl<'a>(
-        option: Option<&'a [f64]>,
-        name: &str,
-    ) -> Result<&'a [f64], std::io::Error> {
-        option.ok_or_else(|| {
-            std::io::Error::other(format!(
-                "derived compute missing required dependency: {name}"
-            ))
-        })
-    }
 
     let make_volume = || -> Result<EcapeVolumeInputs<'_>, std::io::Error> {
         Ok(EcapeVolumeInputs {
@@ -427,14 +420,28 @@ where
             if requirements.needs_grid_spacing() {
                 let (dx_m, dy_m) = estimate_grid_spacing_m(surface)?;
                 if requirements.temperature_advection_700mb {
-                    outputs.temperature_advection_700mb_cph = Some(
-                        compute_temperature_advection_cph(pressure, grid, 700.0, dx_m, dy_m)?,
-                    );
+                    outputs.temperature_advection_700mb_cph =
+                        Some(compute_temperature_advection_cph(
+                            pressure,
+                            pressure.u_ms_3d(),
+                            pressure.v_ms_3d(),
+                            grid,
+                            700.0,
+                            dx_m,
+                            dy_m,
+                        )?);
                 }
                 if requirements.temperature_advection_850mb {
-                    outputs.temperature_advection_850mb_cph = Some(
-                        compute_temperature_advection_cph(pressure, grid, 850.0, dx_m, dy_m)?,
-                    );
+                    outputs.temperature_advection_850mb_cph =
+                        Some(compute_temperature_advection_cph(
+                            pressure,
+                            pressure.u_ms_3d(),
+                            pressure.v_ms_3d(),
+                            grid,
+                            850.0,
+                            dx_m,
+                            dy_m,
+                        )?);
                 }
             }
             Ok(outputs)
@@ -442,6 +449,26 @@ where
     );
     let (sb, ml, mu) = parcels.map_err(|err| err as Box<dyn std::error::Error>)?;
     let independent = independent.map_err(|err| err as Box<dyn std::error::Error>)?;
+    assemble_derived_outputs(surface, recipes, &requirements, grid, (sb, ml, mu), independent)
+}
+
+/// Fold the kernel outputs into [`DerivedComputedFields`] — the composites
+/// (which borrow parcel + wind locals) first, then the moves and unit
+/// conversions. Shared verbatim by the generic single-join path and the
+/// store lane's phased path so the two cannot drift.
+fn assemble_derived_outputs<S>(
+    surface: &S,
+    recipes: &[DerivedRecipe],
+    requirements: &DerivedRequirements,
+    grid: CalcGridShape,
+    parcels: ParcelOutputs,
+    independent: IndependentOutputs,
+) -> Result<DerivedComputedFields, Box<dyn std::error::Error>>
+where
+    S: SurfaceFieldSet,
+{
+    let (sb, ml, mu) = parcels;
+    let mut computed = DerivedComputedFields::default();
 
     computed.dcape_jkg = independent.dcape_jkg;
 
@@ -558,11 +585,262 @@ where
     Ok(computed)
 }
 
+/// The wind volumes taken OUT of a `PressureFields` for the store lane's
+/// phased compute (~565 MB each at HRRR size).
+pub(super) struct TakenWindVolumes {
+    pub u_ms_3d: Vec<f64>,
+    pub v_ms_3d: Vec<f64>,
+}
+
+/// Store-lane variant of [`compute_derived_fields_generic_with_height_agl`]
+/// with an early wind release: the caller takes the u/v volumes out of
+/// `pressure` and hands them in OWNED; every wind-consuming kernel (the
+/// 0-1/0-6 km shears, the 0-1/0-3 km SRHs, and the 700/850 mb temperature
+/// advections) runs FIRST, then the wind volumes either leave RAM
+/// (`keep_winds = false` — the no-heavy ingest, where nothing downstream
+/// reads them; ~1.13 GB off the long parcel window) or come back to the
+/// caller (`keep_winds = true` — the heavy stage still needs them). The
+/// remaining kernels then run under the exact `rayon::join` fork of the
+/// generic path, with empty wind slices in `EcapeVolumeInputs` — the
+/// kernels dispatched there are purely thermodynamic and validate winds
+/// as present-or-absent (see rustwx-calc), so outputs are bit-identical;
+/// `derived::store` pins that equivalence with a synthetic-hour test.
+pub(super) fn compute_store_derived_fields_phased<S, P>(
+    surface: &S,
+    pressure: &P,
+    winds: TakenWindVolumes,
+    recipes: &[DerivedRecipe],
+    height_agl_override: Option<&[f64]>,
+    keep_winds: bool,
+) -> Result<(DerivedComputedFields, Option<TakenWindVolumes>), Box<dyn std::error::Error>>
+where
+    S: SurfaceFieldSet + Sync,
+    P: PressureFieldSet + Sync,
+{
+    let requirements = DerivedRequirements::from_recipes(recipes);
+    let grid = CalcGridShape::new(surface.nx(), surface.ny())?;
+
+    let surface_inputs = SurfaceInputs {
+        psfc_pa: surface.psfc_pa(),
+        t2_k: surface.t2_k(),
+        q2_kgkg: surface.q2_kgkg(),
+        u10_ms: surface.u10_ms(),
+        v10_ms: surface.v10_ms(),
+    };
+
+    let shape = if requirements.needs_height_agl() {
+        Some(VolumeShape::new(
+            grid,
+            pressure.pressure_levels_hpa().len(),
+        )?)
+    } else {
+        None
+    };
+    let pressure_pa = if requirements.needs_volume() {
+        Some(
+            pressure
+                .pressure_3d_pa()
+                .map(|values| values.to_vec())
+                .unwrap_or_else(|| {
+                    pressure
+                        .pressure_levels_hpa()
+                        .iter()
+                        .map(|level_hpa| level_hpa * 100.0)
+                        .collect()
+                }),
+        )
+    } else {
+        None
+    };
+    let height_agl_owned = if requirements.needs_height_agl() && height_agl_override.is_none() {
+        Some(compute_height_agl_3d_generic(
+            surface,
+            pressure,
+            grid,
+            require_option_copy(shape, "volume shape for height_agl")?,
+        ))
+    } else {
+        None
+    };
+    let height_agl_3d: Option<&[f64]> = height_agl_override.or(height_agl_owned.as_deref());
+
+    // --- the wind-consuming kernels, in the historical in-closure order
+    // (shear 0-1, shear 0-6, SRH 0-1, SRH 0-3, temperature advections);
+    // each is rayon-parallel inside and independent of the others, so
+    // running them ahead of the join changes scheduling, never values ---
+    let make_wind = || -> Result<WindGridInputs<'_>, std::io::Error> {
+        Ok(WindGridInputs {
+            shape: require_option_copy(shape, "volume shape for wind diagnostics")?,
+            u_3d_ms: &winds.u_ms_3d,
+            v_3d_ms: &winds.v_ms_3d,
+            height_agl_3d_m: require_height_agl(height_agl_3d, "height_agl for wind diagnostics")?,
+        })
+    };
+    let mut wind_outputs = IndependentOutputs::default();
+    if requirements.shear_01km {
+        wind_outputs.shear_01km_ms = Some(compute_shear_01km(make_wind()?)?);
+    }
+    if requirements.shear_06km {
+        wind_outputs.shear_06km_ms = Some(compute_shear_06km(make_wind()?)?);
+    }
+    if requirements.srh_01km {
+        wind_outputs.srh_01km_m2s2 =
+            Some(compute_srh_01km_hemispheric(make_wind()?, surface.lat())?);
+    }
+    if requirements.srh_03km {
+        wind_outputs.srh_03km_m2s2 =
+            Some(compute_srh_03km_hemispheric(make_wind()?, surface.lat())?);
+    }
+    if requirements.needs_grid_spacing() {
+        let (dx_m, dy_m) = estimate_grid_spacing_m(surface)?;
+        if requirements.temperature_advection_700mb {
+            wind_outputs.temperature_advection_700mb_cph = Some(
+                compute_temperature_advection_cph(
+                    pressure,
+                    &winds.u_ms_3d,
+                    &winds.v_ms_3d,
+                    grid,
+                    700.0,
+                    dx_m,
+                    dy_m,
+                )
+                .map_err(|err| err as Box<dyn std::error::Error>)?,
+            );
+        }
+        if requirements.temperature_advection_850mb {
+            wind_outputs.temperature_advection_850mb_cph = Some(
+                compute_temperature_advection_cph(
+                    pressure,
+                    &winds.u_ms_3d,
+                    &winds.v_ms_3d,
+                    grid,
+                    850.0,
+                    dx_m,
+                    dy_m,
+                )
+                .map_err(|err| err as Box<dyn std::error::Error>)?,
+            );
+        }
+    }
+
+    // --- last wind read is behind us: free (or hand back) ~1.13 GB ---
+    let kept_winds = if keep_winds {
+        Some(winds)
+    } else {
+        drop(winds);
+        None
+    };
+
+    // The thermodynamic kernels below never read the wind members; both
+    // modes pass them absent so the two cannot diverge.
+    let make_volume = || -> Result<EcapeVolumeInputs<'_>, std::io::Error> {
+        Ok(EcapeVolumeInputs {
+            pressure_pa: require_option_ref(
+                &pressure_pa,
+                "pressure volume for derived thermodynamics",
+            )?,
+            temperature_c: pressure.temperature_c_3d(),
+            qvapor_kgkg: pressure.qvapor_kgkg_3d(),
+            height_agl_m: require_height_agl(
+                height_agl_3d,
+                "height_agl for derived thermodynamics",
+            )?,
+            u_ms: &[],
+            v_ms: &[],
+            nz: require_option_copy(shape, "volume shape for derived thermodynamics")?.nz,
+        })
+    };
+
+    // Same fork as the generic path; the wind kernels merely moved out of
+    // the independent closure (they already ran above).
+    let (parcels, independent) = rayon::join(
+        || -> Result<ParcelOutputs, TaskError> {
+            if requirements.sb && requirements.ml && requirements.mu {
+                let triplet = compute_cape_cin_triplet(grid, make_volume()?, surface_inputs, None)?;
+                return Ok((Some(triplet.sb), Some(triplet.ml), Some(triplet.mu)));
+            }
+            let sb = if requirements.sb {
+                Some(compute_sbcape_cin(
+                    grid,
+                    make_volume()?,
+                    surface_inputs,
+                    None,
+                )?)
+            } else {
+                None
+            };
+            let ml = if requirements.ml {
+                Some(compute_mlcape_cin(
+                    grid,
+                    make_volume()?,
+                    surface_inputs,
+                    None,
+                )?)
+            } else {
+                None
+            };
+            let mu = if requirements.mu {
+                Some(compute_mucape_cin(
+                    grid,
+                    make_volume()?,
+                    surface_inputs,
+                    None,
+                )?)
+            } else {
+                None
+            };
+            Ok((sb, ml, mu))
+        },
+        || -> Result<IndependentOutputs, TaskError> {
+            let mut outputs = IndependentOutputs::default();
+            if requirements.dcape {
+                outputs.dcape_jkg = Some(compute_dcape(grid, make_volume()?, surface_inputs)?);
+            }
+            if requirements.surface_thermo {
+                outputs.surface_thermo = Some(compute_surface_thermo(grid, surface_inputs)?);
+            }
+            if requirements.lifted_index {
+                outputs.lifted_index_c =
+                    Some(compute_lifted_index(grid, make_volume()?, surface_inputs)?);
+            }
+            if requirements.lapse_rate_700_500 {
+                outputs.lapse_rate_700_500_cpkm =
+                    Some(compute_lapse_rate_700_500(grid, make_volume()?)?);
+            }
+            if requirements.lapse_rate_0_3km {
+                outputs.lapse_rate_0_3km_cpkm = Some(compute_lapse_rate_0_3km(
+                    grid,
+                    make_volume()?,
+                    surface_inputs,
+                )?);
+            }
+            Ok(outputs)
+        },
+    );
+    let (sb, ml, mu) = parcels.map_err(|err| err as Box<dyn std::error::Error>)?;
+    let mut independent = independent.map_err(|err| err as Box<dyn std::error::Error>)?;
+    independent.shear_01km_ms = wind_outputs.shear_01km_ms;
+    independent.shear_06km_ms = wind_outputs.shear_06km_ms;
+    independent.srh_01km_m2s2 = wind_outputs.srh_01km_m2s2;
+    independent.srh_03km_m2s2 = wind_outputs.srh_03km_m2s2;
+    independent.temperature_advection_700mb_cph = wind_outputs.temperature_advection_700mb_cph;
+    independent.temperature_advection_850mb_cph = wind_outputs.temperature_advection_850mb_cph;
+
+    let computed =
+        assemble_derived_outputs(surface, recipes, &requirements, grid, (sb, ml, mu), independent)?;
+    Ok((computed, kept_winds))
+}
+
 /// Temperature advection (C/hour) at one pressure level, exactly as the
 /// sequential lane computed it inline: slice (or log-p interpolate) the
 /// level from the volume, run the kinematics kernel, scale C/s to C/hour.
+/// The wind volumes ride as explicit slices so the store lane's phased
+/// path can pass its taken-out copies; the generic path passes
+/// `pressure.u_ms_3d()` / `pressure.v_ms_3d()` (same data, same math).
 fn compute_temperature_advection_cph<P>(
     pressure: &P,
+    u_ms_3d: &[f64],
+    v_ms_3d: &[f64],
     grid: CalcGridShape,
     level_hpa: f64,
     dx_m: f64,
@@ -581,9 +859,9 @@ where
         grid.len(),
     )
     .ok_or_else(|| missing("temperature"))?;
-    let u_ms = pressure_level_slice_or_interp(pressure, pressure.u_ms_3d(), level_hpa, grid.len())
+    let u_ms = pressure_level_slice_or_interp(pressure, u_ms_3d, level_hpa, grid.len())
         .ok_or_else(|| missing("u-wind"))?;
-    let v_ms = pressure_level_slice_or_interp(pressure, pressure.v_ms_3d(), level_hpa, grid.len())
+    let v_ms = pressure_level_slice_or_interp(pressure, v_ms_3d, level_hpa, grid.len())
         .ok_or_else(|| missing("v-wind"))?;
     Ok(
         rustwx_calc::compute_temperature_advection(TemperatureAdvectionInputs {

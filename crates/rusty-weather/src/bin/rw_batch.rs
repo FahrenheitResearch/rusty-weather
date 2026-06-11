@@ -28,7 +28,8 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 #[path = "../contour_mode.rs"]
 mod contour_mode;
@@ -49,7 +50,8 @@ use rustwx_products::shared_context::DomainSpec;
 use rw_ingest::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile};
 use rw_ingest::throttle;
 use rw_ingest::{
-    FetchedHour, IngestConfig, IngestedHour, NEVER_CANCEL, cache_state, parse_hours, print_event,
+    IngestConfig, IngestedHour, NEVER_CANCEL, SpilledFetchedHour, cache_state, parse_hours,
+    print_event,
 };
 
 /// The derived CAPE kernels allocate per-column scratch across every rayon
@@ -71,6 +73,129 @@ const MI_DEFAULT_PURGE_DELAY_MS: std::ffi::c_long = 10;
 /// the live set at identical wall time.
 fn disable_mimalloc_purge_delay() {
     unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 0) };
+}
+
+/// This process's current working set, in MiB (the owner gate's metric).
+#[cfg(windows)]
+fn process_working_set_mb() -> f64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        PageFaultCount: 0,
+        PeakWorkingSetSize: 0,
+        WorkingSetSize: 0,
+        QuotaPeakPagedPoolUsage: 0,
+        QuotaPagedPoolUsage: 0,
+        QuotaPeakNonPagedPoolUsage: 0,
+        QuotaNonPagedPoolUsage: 0,
+        PagefileUsage: 0,
+        PeakPagefileUsage: 0,
+    };
+    // SAFETY: the process pseudo-handle is always valid; the out-param is
+    // a plain POD struct sized via `cb`.
+    let ok = unsafe {
+        GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb)
+    };
+    if ok == 0 {
+        return 0.0;
+    }
+    counters.WorkingSetSize as f64 / (1024.0 * 1024.0)
+}
+
+/// Off Windows there is no working-set probe wired up; the memory gate
+/// reads 0 MB and never blocks (the benchmark/gate box is Windows).
+#[cfg(not(windows))]
+fn process_working_set_mb() -> f64 {
+    0.0
+}
+
+/// Render-side memory gate: the ingest thread publishes when it is inside
+/// a HIGH-MEMORY window, and the render side defers its next direct chunk
+/// while that flag is up AND the process working set is above the low
+/// watermark (plus an unconditional high watermark for everything else).
+///
+/// The high-memory windows (from the measured stage timelines):
+/// * ExtractPrs start -> ThermoDecode done: full-grid extraction planes +
+///   volume encode + the thermo-decode transient (~2.1-3.7 GB), covering
+///   the unbracketed early-encode gap between the extract and decode
+///   stage events;
+/// * Derived start -> done, only when the heavy stage follows (winds are
+///   kept resident, so the derived window holds ~3.6 GB; without heavy
+///   the early wind free keeps it ~2.5 GB and the window stays open);
+/// * Heavy start -> done (the ECAPE scratch oscillates; the watermark
+///   lets chunks through its low phases).
+///
+/// Purely a scheduler: chunk content and pixels are gate-independent, and
+/// a bounded wait (plus the gauge being best-effort) guarantees progress
+/// even if the ingest thread dies mid-stage.
+struct RenderMemoryGate {
+    high_mem_window: Mutex<bool>,
+    changed: Condvar,
+    /// Defer while inside a published window and WS exceeds this.
+    low_watermark_mb: f64,
+    /// Defer while WS exceeds this, window or not.
+    high_watermark_mb: f64,
+}
+
+impl RenderMemoryGate {
+    /// Watermark defaults sized for the 4096 MB peak-working-set gate:
+    /// one render chunk's transient (inputs + crops + worker scratch)
+    /// measured well under 800 MB, so deferring pickup above ~3.3 GB
+    /// keeps the combined peak under the gate while letting chunks run
+    /// through every low-memory phase. Env overrides for tuning:
+    /// RUSTWX_BATCH_GATE_LOW_MB / RUSTWX_BATCH_GATE_HIGH_MB.
+    fn from_env() -> Self {
+        let watermark = |name: &str, default: f64| -> f64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(default)
+        };
+        Self {
+            high_mem_window: Mutex::new(false),
+            changed: Condvar::new(),
+            low_watermark_mb: watermark("RUSTWX_BATCH_GATE_LOW_MB", 2900.0),
+            high_watermark_mb: watermark("RUSTWX_BATCH_GATE_HIGH_MB", 3300.0),
+        }
+    }
+
+    fn set_high_mem_window(&self, active: bool) {
+        *self
+            .high_mem_window
+            .lock()
+            .expect("render memory gate poisoned") = active;
+        self.changed.notify_all();
+    }
+
+    /// Block until there is headroom for one render chunk, or the bounded
+    /// wait expires (progress guarantee — the gate is best-effort).
+    fn wait_for_headroom(&self) {
+        const MAX_WAIT: Duration = Duration::from_secs(45);
+        const POLL: Duration = Duration::from_millis(50);
+        let started = Instant::now();
+        let mut window = self
+            .high_mem_window
+            .lock()
+            .expect("render memory gate poisoned");
+        loop {
+            let ws_mb = process_working_set_mb();
+            let blocked = ws_mb > self.high_watermark_mb
+                || (*window && ws_mb > self.low_watermark_mb);
+            if !blocked || started.elapsed() >= MAX_WAIT {
+                return;
+            }
+            // Timed wait: WS changes without any notify, so poll either way.
+            let (guard, _) = self
+                .changed
+                .wait_timeout(window, POLL)
+                .expect("render memory gate poisoned");
+            window = guard;
+        }
+    }
 }
 
 /// Restore the default purge batching for exactly the heavy ECAPE window
@@ -268,8 +393,40 @@ fn static_output_dimension(name: &str, fallback: u32) -> u32 {
         .unwrap_or(fallback)
 }
 
+/// Default direct-render worker cap for the batch context. Each direct
+/// render worker holds full per-recipe crop/raster/contour/PNG scratch
+/// (~200 MB measured at HRRR size), and the batch pipeline renders WHILE
+/// the next hour extracts/derives on the same global rayon pool. The
+/// products-crate default (`available_parallelism / 2`, 16 workers on the
+/// 32-logical-core benchmark box) measured 8198 MB peak working set on the
+/// 3-hour all-products run; capping to 4 measured 6768 MB peak AND a
+/// faster wall (61.0 s -> 57.7 s) because it also relieves the
+/// 30-rayon + 16-render-worker oversubscription. Cores-aware so small
+/// machines are not forced up to 4: `min(4, cores / 4)`, floor 1 — always
+/// at or below the historical `cores / 2` default.
+fn default_render_worker_cap() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| (count.get() / 4).clamp(1, 4))
+        .unwrap_or(1)
+}
+
+/// Apply the batch render-worker cap unless the caller already chose via
+/// `RUSTWX_RENDER_THREADS` (the products crate's existing knob, read by
+/// every render lane the batch drives: direct, derived, hrrr, windowed).
+fn apply_render_worker_cap() {
+    const RENDER_THREADS_ENV: &str = "RUSTWX_RENDER_THREADS";
+    if std::env::var_os(RENDER_THREADS_ENV).is_some() {
+        return;
+    }
+    // SAFETY: called from `main` before any other thread exists (the
+    // pipeline threads and the rayon pool spawn later), which is the
+    // documented sound window for mutating the process environment.
+    unsafe { std::env::set_var(RENDER_THREADS_ENV, default_render_worker_cap().to_string()) };
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     disable_mimalloc_purge_delay();
+    apply_render_worker_cap();
     let args = Args::parse();
     // Scheduling policy must land before anything touches rayon (the
     // global pool is built lazily on first use and cannot be resized).
@@ -358,6 +515,40 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         request.windowed.len(),
     );
 
+    // Memory gate between the pipelined ingest and render sides: the
+    // ingest-side progress hook publishes the high-memory windows, and the
+    // direct render lane defers chunk pickup inside them (see
+    // RenderMemoryGate). The derived window is only fenced when heavy
+    // follows: there the wind volumes stay resident (~3.6 GB live);
+    // without heavy the early wind free keeps it low enough to share.
+    let render_gate = RenderMemoryGate::from_env();
+    let fence_derived_window = profile.heavy;
+    let progress_hook = |event: rw_ingest::IngestEvent| {
+        use rw_ingest::IngestStage;
+        match &event {
+            rw_ingest::IngestEvent::StageStarted { stage, .. } => match stage {
+                IngestStage::ExtractPrs | IngestStage::Heavy => {
+                    render_gate.set_high_mem_window(true)
+                }
+                IngestStage::Derived if fence_derived_window => {
+                    render_gate.set_high_mem_window(true)
+                }
+                // Write always runs (every profile), so it doubles as the
+                // clear-everything boundary for profiles without compute
+                // stages (sounding/view never emit ThermoDecode).
+                IngestStage::Write => render_gate.set_high_mem_window(false),
+                _ => {}
+            },
+            rw_ingest::IngestEvent::StageDone { stage, .. } => match stage {
+                IngestStage::ThermoDecode | IngestStage::Derived | IngestStage::Heavy => {
+                    render_gate.set_high_mem_window(false)
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        progress_with_purge_policy(event);
+    };
     let ingest_config = IngestConfig {
         model: args.model,
         cycle: &cycle,
@@ -369,7 +560,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         run_slug: &run_slug,
         profile: &profile,
         verify: false,
-        progress: &progress_with_purge_policy,
+        progress: &progress_hook,
         cancel: &NEVER_CANCEL,
     };
     let render_config = StoreRenderConfig {
@@ -390,31 +581,46 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         ),
     };
 
+    // Raw-byte spill target for queued pipeline hours; only written when a
+    // family file has no usable fetch-cache copy (--no-cache).
+    let spill_dir = args.out_dir.join("raw_spill");
+
     // --- the pipeline: fetch thread -> ingest thread -> render (main) ---
     let pipeline: Result<(Vec<HourReport>, Option<StoreFieldSource>), String> = std::thread::scope(
         |scope| {
-            // Raw bytes are ~575 MB/hour warm; capacity 1 bounds resident
-            // raw-byte sets to <= 3 (fetching + queued + ingesting).
+            // Queued hours ride as SPILLED fetches (raw bytes on disk, not
+            // in RAM): resident raw bytes used to peak at ~3 sets
+            // (fetching + queued channel slot + the fetch thread blocked in
+            // send), ~1.1 GB of which sat across the next hour's compute
+            // peaks. Now only the actively-fetching and actively-ingesting
+            // hours hold bytes; rehydration is a pipelined ~0.4 s read.
             let (fetched_tx, fetched_rx) =
-                mpsc::sync_channel::<Result<(FetchedHour, u128), String>>(1);
+                mpsc::sync_channel::<Result<(SpilledFetchedHour, u128), String>>(1);
             let (ingested_tx, ingested_rx) =
                 mpsc::channel::<Result<(IngestedHour, u128, u128), String>>();
 
             let fetch_hours = hours.clone();
             let fetch_config = &ingest_config;
+            let spill_dir = &spill_dir;
             scope.spawn(move || {
                 for &hour in &fetch_hours {
                     let cpu_started = process_cpu_ms();
-                    match rw_ingest::fetch_hour(fetch_config, hour) {
-                        Ok(fetched) => {
+                    match rw_ingest::fetch_hour(fetch_config, hour)
+                        .map_err(|err| format!("f{hour:03}: fetch: {err}"))
+                        .and_then(|fetched| {
+                            fetched
+                                .spill(spill_dir)
+                                .map_err(|err| format!("f{hour:03}: spill raw bytes: {err}"))
+                        }) {
+                        Ok(spilled) => {
                             let fetch_cpu = process_cpu_ms().saturating_sub(cpu_started);
                             // Receiver gone => downstream failed; just stop.
-                            if fetched_tx.send(Ok((fetched, fetch_cpu))).is_err() {
+                            if fetched_tx.send(Ok((spilled, fetch_cpu))).is_err() {
                                 return;
                             }
                         }
                         Err(err) => {
-                            let _ = fetched_tx.send(Err(format!("f{hour:03}: fetch: {err}")));
+                            let _ = fetched_tx.send(Err(err));
                             return;
                         }
                     }
@@ -425,8 +631,17 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             scope.spawn(move || {
                 while let Ok(message) = fetched_rx.recv() {
                     match message {
-                        Ok((fetched, fetch_cpu)) => {
-                            let hour = fetched.hour;
+                        Ok((spilled, fetch_cpu)) => {
+                            let hour = spilled.hour;
+                            let fetched = match spilled.rehydrate() {
+                                Ok(fetched) => fetched,
+                                Err(err) => {
+                                    let _ = ingested_tx.send(Err(format!(
+                                        "f{hour:03}: rehydrate raw bytes: {err}"
+                                    )));
+                                    return;
+                                }
+                            };
                             let cpu_started = process_cpu_ms();
                             match rw_ingest::process_fetched_hour(process_config, fetched) {
                                 Ok(ingested) => {
@@ -491,12 +706,14 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 let open_ms = open_started.elapsed().as_millis();
                 let render_started = Instant::now();
                 let render_cpu_started = process_cpu_ms();
+                let chunk_gate = || render_gate.wait_for_headroom();
                 let outcome = render_all::render_hour_products(
                     &render_config,
                     &store,
                     hour,
                     &request.direct,
                     &request.derived,
+                    Some(&chunk_gate),
                 )
                 .map_err(|err| format!("f{hour:03}: render: {err}"))?;
                 let render_ms = render_started.elapsed().as_millis();
@@ -814,6 +1031,18 @@ mod tests {
         let profile = profile_from_args(&sounding).expect("resolves");
         assert_eq!(profile.level_step_hpa, 50);
         assert!(!profile.derived && !profile.heavy);
+    }
+
+    #[test]
+    fn render_worker_cap_is_cores_aware_and_bounded() {
+        let cap = default_render_worker_cap();
+        assert!((1..=4).contains(&cap), "cap {cap} must stay in 1..=4");
+        if let Ok(cores) = std::thread::available_parallelism() {
+            assert!(
+                cap <= (cores.get() / 2).max(1),
+                "cap {cap} must never exceed the products-crate default of cores/2"
+            );
+        }
     }
 
     #[test]

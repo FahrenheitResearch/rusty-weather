@@ -201,6 +201,138 @@ pub struct FetchedHour {
     pub sfc_fetch_ms: u128,
 }
 
+/// One family file of a [`SpilledFetchedHour`]: the fetch provenance plus
+/// where the raw bytes live ON DISK instead of in RAM.
+#[derive(Debug)]
+struct SpilledFetch {
+    source: SourceId,
+    url: String,
+    cache_hit: bool,
+    bytes_path: PathBuf,
+    metadata_path: PathBuf,
+    bytes_len: usize,
+    /// Set when the bytes had to be written to a dedicated spill file
+    /// (no readable cache copy); deleted right after rehydration.
+    temp_spill: Option<PathBuf>,
+}
+
+/// A [`FetchedHour`] whose raw GRIB bytes have left RAM: queued pipeline
+/// hours carry ~555 MB of raw bytes per hour, and `rw_batch`'s measured
+/// peak coincides with TWO queued raw-byte sets (the channel slot plus the
+/// fetch thread blocked in `send`) riding across the next hour's compute
+/// peaks (~1.1 GB of the 8.2 GB baseline peak). Spilling — not gating —
+/// keeps the fetch overlap fully intact, warm and cold: on a cache hit the
+/// bytes are already on disk (the fetch cache file), so the spill is a
+/// metadata check; without a usable cache copy the bytes are written to a
+/// spill file once. Rehydration is a single sequential file read (~0.4 s
+/// at HRRR size on NVMe), hidden inside the pipeline.
+#[derive(Debug)]
+pub struct SpilledFetchedHour {
+    pub hour: u16,
+    prs: SpilledFetch,
+    sfc: SpilledFetch,
+    prs_fetch_ms: u128,
+    sfc_fetch_ms: u128,
+}
+
+fn spill_fetch(
+    fetched: CachedFetchResult,
+    spill_dir: &Path,
+    label: &str,
+) -> std::io::Result<SpilledFetch> {
+    let CachedFetchResult {
+        result,
+        cache_hit,
+        bytes_path,
+        metadata_path,
+    } = fetched;
+    let bytes_len = result.bytes.len();
+    // The fetch cache file carries exactly these bytes whenever it exists
+    // with the matching length: on a cache hit the bytes were just read
+    // from it, and on a cache-mediated miss the fetch wrote them to it.
+    // Any doubt (missing file, length mismatch, --no-cache) falls through
+    // to writing a dedicated spill file — never a wrong-bytes risk.
+    let cache_copy_usable = std::fs::metadata(&bytes_path)
+        .map(|meta| meta.is_file() && meta.len() == bytes_len as u64)
+        .unwrap_or(false);
+    let temp_spill = if cache_copy_usable {
+        None
+    } else {
+        std::fs::create_dir_all(spill_dir)?;
+        let temp_path = spill_dir.join(format!("{label}.grib2.spill"));
+        std::fs::write(&temp_path, &result.bytes)?;
+        Some(temp_path)
+    };
+    Ok(SpilledFetch {
+        source: result.source,
+        url: result.url,
+        cache_hit,
+        bytes_path,
+        metadata_path,
+        bytes_len,
+        temp_spill,
+    })
+}
+
+fn rehydrate_fetch(spilled: SpilledFetch) -> std::io::Result<CachedFetchResult> {
+    let read_path = spilled.temp_spill.as_deref().unwrap_or(&spilled.bytes_path);
+    let bytes = std::fs::read(read_path)?;
+    if bytes.len() != spilled.bytes_len {
+        return Err(std::io::Error::other(format!(
+            "rehydrate {}: expected {} bytes, read {}",
+            read_path.display(),
+            spilled.bytes_len,
+            bytes.len()
+        )));
+    }
+    if let Some(temp_path) = &spilled.temp_spill {
+        // Best effort: a leftover spill file costs disk, never correctness
+        // (the next spill of the same label overwrites it).
+        let _ = std::fs::remove_file(temp_path);
+    }
+    Ok(CachedFetchResult {
+        result: rustwx_io::FetchResult {
+            source: spilled.source,
+            url: spilled.url,
+            bytes,
+        },
+        cache_hit: spilled.cache_hit,
+        bytes_path: spilled.bytes_path,
+        metadata_path: spilled.metadata_path,
+    })
+}
+
+impl FetchedHour {
+    /// Move this hour's raw bytes out of RAM (see [`SpilledFetchedHour`]).
+    /// `spill_dir` is only written when a family file has no usable fetch
+    /// cache copy (e.g. `--no-cache`).
+    pub fn spill(self, spill_dir: &Path) -> std::io::Result<SpilledFetchedHour> {
+        let hour = self.hour;
+        Ok(SpilledFetchedHour {
+            hour,
+            prs: spill_fetch(self.prs, spill_dir, &format!("f{hour:03}_prs"))?,
+            sfc: spill_fetch(self.sfc, spill_dir, &format!("f{hour:03}_sfc"))?,
+            prs_fetch_ms: self.prs_fetch_ms,
+            sfc_fetch_ms: self.sfc_fetch_ms,
+        })
+    }
+}
+
+impl SpilledFetchedHour {
+    /// Read the raw bytes back from disk, reproducing the exact
+    /// [`FetchedHour`] that was spilled (same bytes, same provenance, same
+    /// fetch walls) — `process_fetched_hour` sees no difference.
+    pub fn rehydrate(self) -> std::io::Result<FetchedHour> {
+        Ok(FetchedHour {
+            hour: self.hour,
+            prs: rehydrate_fetch(self.prs)?,
+            sfc: rehydrate_fetch(self.sfc)?,
+            prs_fetch_ms: self.prs_fetch_ms,
+            sfc_fetch_ms: self.sfc_fetch_ms,
+        })
+    }
+}
+
 /// One realized 3D variable summary for reporting.
 #[derive(Debug, Clone)]
 pub struct VolumeSummary {
@@ -1025,7 +1157,7 @@ fn compute_product_grids(
         stage: IngestStage::ThermoDecode,
     });
     let decode_started = Instant::now();
-    let inputs = {
+    let mut inputs = {
         profile_scope!("ingest_thermo_decode");
         match ingest_compute::decode_products_inputs(surface_bytes, pressure_bytes) {
             Ok(inputs) => inputs,
@@ -1055,7 +1187,11 @@ fn compute_product_grids(
     let derived_started = Instant::now();
     let derived = {
         profile_scope!("ingest_derived");
-        match ingest_compute::compute_derived_2d_from_inputs(&inputs) {
+        // `heavy_enabled` keeps the wind volumes resident for the heavy
+        // ECAPE stage; without it they leave RAM as soon as the derived
+        // lane's wind-consuming kernels are done (~1.13 GB off the long
+        // parcel window).
+        match ingest_compute::compute_derived_2d_from_inputs(&mut inputs, heavy_enabled) {
             Ok(grids) => grids,
             Err(err) => {
                 config.emit(IngestEvent::Warning {
@@ -1424,6 +1560,124 @@ pub fn parse_hours(spec: &str) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fetched_hour_fixture(
+        dir: &Path,
+        write_cache_copies: bool,
+    ) -> (FetchedHour, Vec<u8>, Vec<u8>) {
+        let prs_bytes: Vec<u8> = (0u32..40_000).flat_map(|v| v.to_le_bytes()).collect();
+        let sfc_bytes: Vec<u8> = prs_bytes.iter().rev().copied().collect();
+        let make = |label: &str, bytes: &[u8]| {
+            let bytes_path = dir.join(format!("{label}.grib2"));
+            if write_cache_copies {
+                std::fs::write(&bytes_path, bytes).unwrap();
+            }
+            CachedFetchResult {
+                result: rustwx_io::FetchResult {
+                    source: SourceId::Aws,
+                    url: format!("https://example.invalid/{label}"),
+                    bytes: bytes.to_vec(),
+                },
+                cache_hit: write_cache_copies,
+                bytes_path,
+                metadata_path: dir.join(format!("{label}.json")),
+            }
+        };
+        let fetched = FetchedHour {
+            hour: 4,
+            prs: make("prs", &prs_bytes),
+            sfc: make("sfc", &sfc_bytes),
+            prs_fetch_ms: 123,
+            sfc_fetch_ms: 456,
+        };
+        (fetched, prs_bytes, sfc_bytes)
+    }
+
+    fn assert_round_trip(rehydrated: &FetchedHour, prs_bytes: &[u8], sfc_bytes: &[u8]) {
+        assert_eq!(rehydrated.hour, 4);
+        assert_eq!(rehydrated.prs_fetch_ms, 123);
+        assert_eq!(rehydrated.sfc_fetch_ms, 456);
+        assert_eq!(rehydrated.prs.result.bytes, prs_bytes);
+        assert_eq!(rehydrated.sfc.result.bytes, sfc_bytes);
+        assert_eq!(rehydrated.prs.result.url, "https://example.invalid/prs");
+        assert_eq!(rehydrated.sfc.result.url, "https://example.invalid/sfc");
+    }
+
+    /// Cache-hit shape: the fetch cache file holds the exact bytes, so the
+    /// spill writes nothing and rehydration reads the cache copy back.
+    #[test]
+    fn spill_reuses_cache_copy_and_rehydrates_identically() {
+        let dir = std::env::temp_dir().join("rw_ingest_spill_test_cache_hit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spill_dir = dir.join("spill");
+
+        let (fetched, prs_bytes, sfc_bytes) = fetched_hour_fixture(&dir, true);
+        let spilled = fetched.spill(&spill_dir).unwrap();
+        assert!(
+            spilled.prs.temp_spill.is_none() && spilled.sfc.temp_spill.is_none(),
+            "a usable cache copy must spill without writing"
+        );
+        assert!(
+            !spill_dir.exists(),
+            "the spill dir must not even be created on the cache-copy path"
+        );
+        let rehydrated = spilled.rehydrate().unwrap();
+        assert_round_trip(&rehydrated, &prs_bytes, &sfc_bytes);
+        assert!(rehydrated.prs.cache_hit && rehydrated.sfc.cache_hit);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No-cache shape: no file at `bytes_path`, so the bytes go to a spill
+    /// file that is deleted again after rehydration.
+    #[test]
+    fn spill_writes_temp_file_without_cache_copy_and_cleans_up() {
+        let dir = std::env::temp_dir().join("rw_ingest_spill_test_no_cache");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spill_dir = dir.join("spill");
+
+        let (fetched, prs_bytes, sfc_bytes) = fetched_hour_fixture(&dir, false);
+        let spilled = fetched.spill(&spill_dir).unwrap();
+        let prs_temp = spilled.prs.temp_spill.clone().expect("prs spill file");
+        let sfc_temp = spilled.sfc.temp_spill.clone().expect("sfc spill file");
+        assert_eq!(std::fs::read(&prs_temp).unwrap(), prs_bytes);
+        assert_eq!(std::fs::read(&sfc_temp).unwrap(), sfc_bytes);
+        let rehydrated = spilled.rehydrate().unwrap();
+        assert_round_trip(&rehydrated, &prs_bytes, &sfc_bytes);
+        assert!(!rehydrated.prs.cache_hit && !rehydrated.sfc.cache_hit);
+        assert!(
+            !prs_temp.exists() && !sfc_temp.exists(),
+            "spill files must be deleted after rehydration"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cache file whose length disagrees with the fetched bytes must NOT
+    /// be trusted as the spill copy.
+    #[test]
+    fn spill_distrusts_cache_copy_with_wrong_length() {
+        let dir = std::env::temp_dir().join("rw_ingest_spill_test_bad_len");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spill_dir = dir.join("spill");
+
+        let (fetched, prs_bytes, sfc_bytes) = fetched_hour_fixture(&dir, true);
+        // Truncate the prs cache copy: its length no longer matches.
+        std::fs::write(&fetched.prs.bytes_path, &prs_bytes[..100]).unwrap();
+        let spilled = fetched.spill(&spill_dir).unwrap();
+        assert!(
+            spilled.prs.temp_spill.is_some(),
+            "mismatched cache copy must force a spill file"
+        );
+        assert!(
+            spilled.sfc.temp_spill.is_none(),
+            "the intact sfc cache copy must still be reused"
+        );
+        let rehydrated = spilled.rehydrate().unwrap();
+        assert_round_trip(&rehydrated, &prs_bytes, &sfc_bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Every stored 2D variable the FULL ingest plan realizes either
     /// resolves to its production plot styling through the viewer resolver

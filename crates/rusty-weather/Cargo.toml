@@ -40,6 +40,10 @@ rw-store = { path = "../rw-store" }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    # GetProcessMemoryInfo: rw_batch's render-chunk memory gate polls its
+    # own working set to defer chunk pickup inside high-memory ingest
+    # windows (the owner gate is peak working set).
+    "Win32_System_ProcessStatus",
 ] }
 
 [dev-dependencies]

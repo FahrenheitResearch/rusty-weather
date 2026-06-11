@@ -686,6 +686,23 @@ pub(crate) fn validate_len(
     }
 }
 
+/// [`validate_len`] for inputs a kernel validates but never reads: the
+/// array may be ABSENT (empty) — the store-ingest derived lane frees the
+/// wind volumes after the wind-consuming kernels and still runs the
+/// purely thermodynamic kernels over the same `EcapeVolumeInputs` shape —
+/// but a non-empty array of the wrong length is still rejected.
+pub(crate) fn validate_len_or_absent(
+    field: &'static str,
+    actual: usize,
+    expected: usize,
+) -> Result<(), CalcError> {
+    if actual == 0 {
+        Ok(())
+    } else {
+        validate_len(field, actual, expected)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
