@@ -49,7 +49,8 @@ use rustwx_products::shared_context::DomainSpec;
 use rw_ingest::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile};
 use rw_ingest::throttle;
 use rw_ingest::{
-    FetchedHour, IngestConfig, IngestedHour, NEVER_CANCEL, cache_state, parse_hours, print_event,
+    IngestConfig, IngestedHour, NEVER_CANCEL, SpilledFetchedHour, cache_state, parse_hours,
+    print_event,
 };
 
 /// The derived CAPE kernels allocate per-column scratch across every rayon
@@ -422,31 +423,46 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         ),
     };
 
+    // Raw-byte spill target for queued pipeline hours; only written when a
+    // family file has no usable fetch-cache copy (--no-cache).
+    let spill_dir = args.out_dir.join("raw_spill");
+
     // --- the pipeline: fetch thread -> ingest thread -> render (main) ---
     let pipeline: Result<(Vec<HourReport>, Option<StoreFieldSource>), String> = std::thread::scope(
         |scope| {
-            // Raw bytes are ~575 MB/hour warm; capacity 1 bounds resident
-            // raw-byte sets to <= 3 (fetching + queued + ingesting).
+            // Queued hours ride as SPILLED fetches (raw bytes on disk, not
+            // in RAM): resident raw bytes used to peak at ~3 sets
+            // (fetching + queued channel slot + the fetch thread blocked in
+            // send), ~1.1 GB of which sat across the next hour's compute
+            // peaks. Now only the actively-fetching and actively-ingesting
+            // hours hold bytes; rehydration is a pipelined ~0.4 s read.
             let (fetched_tx, fetched_rx) =
-                mpsc::sync_channel::<Result<(FetchedHour, u128), String>>(1);
+                mpsc::sync_channel::<Result<(SpilledFetchedHour, u128), String>>(1);
             let (ingested_tx, ingested_rx) =
                 mpsc::channel::<Result<(IngestedHour, u128, u128), String>>();
 
             let fetch_hours = hours.clone();
             let fetch_config = &ingest_config;
+            let spill_dir = &spill_dir;
             scope.spawn(move || {
                 for &hour in &fetch_hours {
                     let cpu_started = process_cpu_ms();
-                    match rw_ingest::fetch_hour(fetch_config, hour) {
-                        Ok(fetched) => {
+                    match rw_ingest::fetch_hour(fetch_config, hour)
+                        .map_err(|err| format!("f{hour:03}: fetch: {err}"))
+                        .and_then(|fetched| {
+                            fetched
+                                .spill(spill_dir)
+                                .map_err(|err| format!("f{hour:03}: spill raw bytes: {err}"))
+                        }) {
+                        Ok(spilled) => {
                             let fetch_cpu = process_cpu_ms().saturating_sub(cpu_started);
                             // Receiver gone => downstream failed; just stop.
-                            if fetched_tx.send(Ok((fetched, fetch_cpu))).is_err() {
+                            if fetched_tx.send(Ok((spilled, fetch_cpu))).is_err() {
                                 return;
                             }
                         }
                         Err(err) => {
-                            let _ = fetched_tx.send(Err(format!("f{hour:03}: fetch: {err}")));
+                            let _ = fetched_tx.send(Err(err));
                             return;
                         }
                     }
@@ -457,8 +473,17 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             scope.spawn(move || {
                 while let Ok(message) = fetched_rx.recv() {
                     match message {
-                        Ok((fetched, fetch_cpu)) => {
-                            let hour = fetched.hour;
+                        Ok((spilled, fetch_cpu)) => {
+                            let hour = spilled.hour;
+                            let fetched = match spilled.rehydrate() {
+                                Ok(fetched) => fetched,
+                                Err(err) => {
+                                    let _ = ingested_tx.send(Err(format!(
+                                        "f{hour:03}: rehydrate raw bytes: {err}"
+                                    )));
+                                    return;
+                                }
+                            };
                             let cpu_started = process_cpu_ms();
                             match rw_ingest::process_fetched_hour(process_config, fetched) {
                                 Ok(ingested) => {

@@ -32,9 +32,9 @@ pub use ingest_hour::size_estimate;
 
 pub use events::{IngestError, IngestEvent, IngestStage, NEVER_CANCEL, print_event};
 pub use ingest_hour::{
-    FetchedHour, IngestConfig, IngestedHour, PlannedStoreVariables, VolumeSummary, cache_state,
-    fetch_hour, ingest_hour as ingest_hour_serial, parse_hours, planned_store_variables,
-    process_fetched_hour,
+    FetchedHour, IngestConfig, IngestedHour, PlannedStoreVariables, SpilledFetchedHour,
+    VolumeSummary, cache_state, fetch_hour, ingest_hour as ingest_hour_serial, parse_hours,
+    planned_store_variables, process_fetched_hour,
 };
 
 /// Short git SHA (plus `-dirty`) of the build that produced this crate, the
