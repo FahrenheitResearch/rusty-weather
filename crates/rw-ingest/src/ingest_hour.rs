@@ -1622,20 +1622,41 @@ pub fn parse_hours(spec: &str) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
     Ok(hours)
 }
 
-/// Validate that every requested forecast hour sits on the model's published
-/// forecast-hour grid for `cycle_hour_utc`, delegating to rustwx-models'
-/// authoritative [`rustwx_models::supported_forecast_hours`] cadence table
-/// (so the cadence rule has exactly one home). This is the spec-resolution
-/// gate the bins run after `parse_hours`: GFS is hourly to f120 then 3-hourly
-/// to f384, so f121 is rejected while f123/f384 pass; HRRR's 0..=18/0..=48
-/// range is unchanged. (`ModelRunRequest::new`/`build_gfs_url` do NOT gate
-/// the GFS hour, so without this an off-cadence hour would silently build a
-/// non-existent URL.)
+/// Validate that the run cycle and every requested forecast hour sit on the
+/// model's published grids, delegating to rustwx-models' authoritative cycle
+/// table (`model_summary(model).cycle_hours_utc`) and
+/// [`rustwx_models::supported_forecast_hours`] cadence table (so each rule has
+/// exactly one home). This is the spec-resolution gate the bins run after
+/// `parse_hours`:
+///
+/// * **Cycle:** GFS publishes only `[0, 6, 12, 18]z`, so `--cycle 3` is
+///   rejected here. Without this gate the cycle flows straight into
+///   `build_gfs_url`, which does NOT validate it, building a non-existent
+///   `gfs.t03z...` URL that only fails as a download 404. HRRR's all-24-hour
+///   cycle table accepts every cycle, so HRRR is unaffected.
+/// * **Forecast hour:** GFS is hourly to f120 then 3-hourly to f384, so f121
+///   is rejected while f123/f384 pass; HRRR's 0..=18/0..=48 range is
+///   unchanged. (`ModelRunRequest::new`/`build_gfs_url` do NOT gate the GFS
+///   hour either, so without this an off-cadence hour would silently build a
+///   non-existent URL.)
 pub fn validate_forecast_hours(
     model: ModelId,
     cycle_hour_utc: u8,
     hours: &[u16],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let cycles = rustwx_models::model_summary(model).cycle_hours_utc;
+    if !cycles.contains(&cycle_hour_utc) {
+        let valid = cycles
+            .iter()
+            .map(|cycle| format!("{cycle:02}z"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "--cycle: {cycle_hour_utc:02}z is not a published {model} cycle \
+             (valid cycles: {valid})"
+        )
+        .into());
+    }
     let supported = rustwx_models::supported_forecast_hours(model, cycle_hour_utc);
     if let Some(&bad) = hours.iter().find(|hour| !supported.contains(hour)) {
         let max = supported.last().copied().unwrap_or(0);
@@ -2077,6 +2098,32 @@ mod tests {
             validate_forecast_hours(ModelId::Gfs, cycle, &[385]).is_err(),
             "f385 is past the GFS horizon"
         );
+    }
+
+    /// The cycle must sit on the model's published cycle table: GFS runs only
+    /// at 00/06/12/18z, so `--cycle 3` is rejected (with a message listing the
+    /// valid cycles) BEFORE it can build a dead `gfs.t03z` URL; 06z passes.
+    /// HRRR's all-24-hour table accepts every cycle (e.g. 17z).
+    #[test]
+    fn validate_forecast_hours_enforces_the_cycle_table() {
+        let err = validate_forecast_hours(ModelId::Gfs, 3, &[0])
+            .expect_err("03z is not a published GFS cycle");
+        let message = err.to_string();
+        assert!(message.contains("--cycle"), "must name the flag: {message}");
+        assert!(
+            message.contains("03z"),
+            "must name the bad cycle: {message}"
+        );
+        for cycle in ["00z", "06z", "12z", "18z"] {
+            assert!(
+                message.contains(cycle),
+                "must list valid cycle {cycle}: {message}"
+            );
+        }
+
+        validate_forecast_hours(ModelId::Gfs, 6, &[0, 3]).expect("06z is a published GFS cycle");
+        validate_forecast_hours(ModelId::Hrrr, 17, &[0, 3])
+            .expect("HRRR runs hourly, so 17z is valid");
     }
 
     /// HRRR cadence is unchanged: f018 is valid on every cycle, the 6-hourly
