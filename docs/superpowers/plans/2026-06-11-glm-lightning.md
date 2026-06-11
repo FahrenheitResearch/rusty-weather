@@ -50,9 +50,11 @@
 
 ### Task 4: Live validation + handoff (lean)
 
-- [ ] Run the follow engine against live G19 for ≥10 min (and one G18 listing sanity check): buckets appear, flash counts plausible (nonzero if any CONUS/SA convection — check both satellites if quiet), `read_flashes` over the live window returns sorted in-range flashes, validator Deep-passes every bucket, prune respects budget. Capture numbers (flashes/min, bytes/bucket).
-- [ ] README section (rw-glm usage + the hdf5-reader patch footgun applies — netcrust dep), memory update, bowecho note: reader API shape final, branch/rev to pin.
-- [ ] Full gate + merge per finishing-a-development-branch (drew's call on merge timing vs GFS).
+- [x] Run the follow engine against live G19 for ≥10 min (and one G18 listing sanity check): buckets appear, flash counts plausible (nonzero if any CONUS/SA convection — check both satellites if quiet), `read_flashes` over the live window returns sorted in-range flashes, validator Deep-passes every bucket, prune respects budget. Capture numbers (flashes/min, bytes/bucket). **DONE 2026-06-11:** built a permanent in-crate `rw_glm_follow` bin (mirrors rw-sat's rw_sat). 11-min G19 follow → 89 granules / 10,665 flashes (~970 flashes/min) / 4 buckets (~108 KB each); every bucket Deep-valid; full-window `read_flashes` = 10,665 sorted, == sum of bucket records; CONUS bbox 6,512 (61%). Restart re-run seeded 89 keys from window.json and skipped all 89 as already-seen (ingested 9 fresh). A `--window-mins 6` run evicted 3 buckets / 232,960 bytes (t0950/t1000/t1010 gone, t1020/t1030 survive). G18 `list` printed 3 keys.
+- [x] README section (rw-glm usage + the hdf5-reader patch footgun applies — netcrust dep), memory update, bowecho note: reader API shape final, branch/rev to pin. **DONE:** README "GLM lightning (rw-glm)" section (runner usage, reader one-liner, hdf5-reader footgun, FORMAT.md §10 + flags-bit pointer, live numbers); spec Status marked BUILT/validated; bowecho note below.
+- [x] Full gate + merge per finishing-a-development-branch (drew's call on merge timing vs GFS). **Gate DONE** (`cargo test --workspace` green; rw-glm fmt/clippy clean; branch pushed). **Merge deferred to the controller** per the Task 4 brief (do not self-merge).
+
+**Bowecho handoff (2026-06-11):** the reader API is final and unchanged from Task 1 — `rw_glm::read_flashes(root, satellite, t0, t1, Option<BBox>) -> Vec<Flash>`, half-open `[t0, t1)`, ascending by time, missing store → empty. `Flash` fields: `time_unix_ms i64`, `lat/lon/energy/area f32`, `flash_id u32`, `flags u16` (bit 0 = degraded; `Flash::is_degraded()`), `duration_ms u16`. Pin to branch `glm-lightning` at the Task 4 head; the only cross-track file with GFS is the root Cargo.toml workspace `members` line (trivial merge).
 
 ## Self-review
 - Bowecho dependency is Task 1 only — hence push-per-task and format-first ordering.
