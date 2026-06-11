@@ -86,17 +86,30 @@ pub fn fetch_plan(model: ModelId) -> Result<Vec<ProductFetch>, IngestError> {
 - Modify: `crates/rw-ingest/src/size_estimate.rs`
 
 **Steps:**
-- [ ] From the Task-2 live store, run the calibration walk (the exact-bytes path rw_bench/size_estimate share) and add a GFS builtin table next to the HRRR one (constants + provenance comment with run date). Estimator selects builtin by model; unknown-model fallback unchanged.
-- [ ] Test: GFS estimate with empty store uses GFS builtins (provenance string says so); accuracy assertion vs the live store within ±15%.
-- [ ] Commit `feat(rw-ingest): GFS builtin size calibration`
+- [x] From the Task-2 live store, run the calibration walk (the exact-bytes path rw_bench/size_estimate share) and add a GFS builtin table next to the HRRR one (constants + provenance comment with run date). Estimator selects builtin by model; unknown-model fallback unchanged. _Done: GFS_BUILTIN_BYTES_2D (7 vars), GFS_BUILTIN_BYTES_3D_PER_LEVEL (5 volumes), meta_per_var=226, grid_file_bytes=7370, pgrb2=542,140,336 bytes (f001-f003 avg). Calibration::builtin_for_model() dispatches by model. Download pricing in estimate() uses fetch_plan entry count (1 = single file = price once; 2 = prs+sfc = old logic). from_hour_files() takes model to seed download fallback from the right builtin._
+- [x] Test: GFS estimate with empty store uses GFS builtins (provenance string says so); accuracy assertion vs the live store within ±15%. _Done: gfs_estimate_with_empty_store_uses_gfs_builtins_and_says_so (non-ignored, passes always); gfs_estimate_accuracy_vs_live_store_within_15_pct (ignored, passes with live store: 0.7% store error, 0.0% download error); hrrr_full_profile_estimate_is_unchanged_after_gfs_table_added pins 709,779,736-byte anchor; gfs_estimate_uses_gfs_builtins_and_prices_single_file_download in rusty-weather-ui._
+- [x] Commit `feat(rw-ingest): GFS builtin size calibration; download priced via fetch plan` _Done: 34a56da._
 
 ### Task 4: Render lane validation (lean)
 
 **Steps:**
-- [ ] `rw_render` the GFS store hours: direct + derived products for regions `conus` AND a lon-seam-crossing region if the region table has one (check `rustwx-products` region defs; if none crosses 0°, render a global/full-domain view if supported). Confirm products render, colortables resolve (the resolver is selector-keyed — GFS shares selectors), maps look sane (PrintWindow/off-screen rules don't apply — these are PNG files; eyeball via reading 2-3 PNGs).
-- [ ] `rw_batch --model gfs --hours 0-3 --no-heavy` end-to-end; record wall + RAM peak vs HRRR baseline (expect cheaper: 1.04M vs 1.9M cells).
-- [ ] Any failures → fix in this task (model-gated product lists are the likely culprits — `supported_direct_recipe_slugs(Gfs)`).
-- [ ] Commit `feat: GFS render + batch validated` (with numbers in message)
+- [x] `rw_render` the GFS store hours: direct + derived products for regions `conus` AND a lon-seam-crossing region if the region table has one (check `rustwx-products` region defs; if none crosses 0°, render a global/full-domain view if supported). Confirm products render, colortables resolve (the resolver is selector-keyed — GFS shares selectors), maps look sane (PrintWindow/off-screen rules don't apply — these are PNG files; eyeball via reading 2-3 PNGs). _Done: rw_render ran for conus and europe (europe = lon-seam crossing [-25,45°]). 5 direct products rendered on conus (2m_temperature, 2m_dewpoint, 2m_dewpoint_10m_winds, 2m_temperature_10m_winds, mslp_10m_winds) + 2 windowed (10m_wind_1h_max, 10m_wind_run_max). All 3 rendered PNGs visually verified: correct geography, correct colorbar, no 180° shift, plausible June temperatures, lon-seam crossing renders correctly for Europe._
+- [x] `rw_batch --model gfs --hours 0-3 --no-heavy` end-to-end; record wall + RAM peak vs HRRR baseline (expect cheaper: 1.04M vs 1.9M cells). _Done: wall 59.1 s, 290 products rendered (47 skipped/blocked), peak RAM ~4490 MB. HRRR baseline 59.8 s / 248 products. GFS slightly faster wall, more products because full 0.25° global grid has more vars stored than HRRR midwest sounding. See timing table below._
+- [x] Any failures → fix in this task (model-gated product lists are the likely culprits — `supported_direct_recipe_slugs(Gfs)`). _Done: No fixes needed. total_qpf correctly skips at f000 (no APCP at analysis hour); apcp_1h/uh_2to5km/smoke correctly absent for GFS; windowed hour-gated products correctly blocked (f000-f003 only, need >=24h)._
+- [x] Commit `feat: GFS render + batch validated` (with numbers in message) _Done: see next commit._
+
+**GFS batch timing table (20260611 00z f000-f003, conus, warm cache, polite 30-thread pool):**
+
+| Hour | fetch | extract | thermo | derived | heavy | encode | render |
+|------|------:|--------:|-------:|--------:|------:|-------:|-------:|
+| f000 | 2838  | 1169    | 1044   | 5133    | 0     | 370    | 14220  |
+| f001 | 3326  | 1544    | 1226   | 5153    | 0     | 374    | 14143  |
+| f002 | 4278  | 1435    | 1133   | 5115    | 0     | 407    | 8658   |
+| f003 | 4176  | 1608    | 1196   | 5340    | 0     | 396    | 11445  |
+
+Totals (ms): fetch 14618 | extract 5756 | thermo 4599 | derived 20741 | heavy 0 | encode 1547 | render 48466 | windowed 212
+**TOTAL WALL: 59.1 s | process CPU 657.7 s | 290 products rendered (47 skipped/blocked) | peak RAM ~4490 MB**
+HRRR baseline: 59.8 s | 801.9 s CPU | 248 products | GFS sounding store from Task 2 overridden by full-profile batch ingest.
 
 ### Task 5: UI exposure (lean)
 
