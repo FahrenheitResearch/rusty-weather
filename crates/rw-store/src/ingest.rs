@@ -19,6 +19,7 @@ use crate::atomic::atomic_write_bytes;
 use crate::error::{RwResult, RwStoreError};
 use crate::format::RwsWriterInfo;
 use crate::grid::{GridFile, encode_grid_bytes};
+use crate::lock::RunLock;
 use crate::reader::HourReader;
 use crate::run::{RwsHourEntry, RwsRunManifest};
 use crate::writer::HourWriter;
@@ -239,6 +240,12 @@ pub fn write_hour_from_fields_with_derived(
 /// * `grid.rwg` is validated against any existing file at `begin()` (same
 ///   errors as before) and, when absent, its byte image is precomputed at
 ///   `begin()` and written at `finish()` just before the hour file.
+/// How long [`HourIngestWriter::begin`] waits for the run-dir advisory lock
+/// before giving up with [`RwStoreError::Locked`]. 60s because the normal
+/// contention is a competing hour encode finishing (seconds), which we want
+/// to wait out rather than fail on.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct HourIngestWriter {
     run_dir: PathBuf,
     grid_hash: String,
@@ -255,6 +262,12 @@ pub struct HourIngestWriter {
     vars_normal: Vec<String>,
     vars_deferred: Vec<String>,
     encode_elapsed: Duration,
+    /// Exclusive advisory lock on this run dir, held for the whole
+    /// begin→finish critical section (grid validation + hour write +
+    /// manifest update). Released when this writer drops (after `finish`,
+    /// or early on an aborted write). Underscore-prefixed: it is a drop
+    /// guard, never read directly.
+    _lock: RunLock,
 }
 
 impl HourIngestWriter {
@@ -282,6 +295,15 @@ impl HourIngestWriter {
         }
         let run_dir = store_root.join(model).join(run);
         fs::create_dir_all(&run_dir)?;
+
+        // Single-writer-per-run-dir (FORMAT.md §7). Take the exclusive
+        // advisory lock before reading or writing grid.rwg / f*.rws /
+        // run.json — the whole begin→finish span is the critical section.
+        // 60s: the normal contention is another process finishing an hour
+        // encode on this same run dir (seconds, not minutes); waiting that
+        // out is correct, and on a true overrun the `Locked` error names
+        // the contended path so the operator can find the other writer.
+        let lock = RunLock::acquire(&run_dir, LOCK_TIMEOUT)?;
 
         // grid.rwg: written once from the hour grid; afterwards every hour
         // must match it bit-for-bit (full coordinate compare, once per
@@ -336,6 +358,7 @@ impl HourIngestWriter {
             vars_normal: Vec::new(),
             vars_deferred: Vec::new(),
             encode_elapsed: Duration::ZERO,
+            _lock: lock,
         })
     }
 

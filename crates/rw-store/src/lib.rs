@@ -12,6 +12,7 @@ pub mod grid;
 pub mod header;
 pub mod index;
 pub mod ingest;
+pub mod lock;
 pub mod netcdf3;
 pub mod reader;
 pub mod run;
@@ -25,6 +26,7 @@ pub use ingest::{
     derived_selector, derived_selector_slug, read_field_2d, read_grid_2d, write_hour_from_fields,
     write_hour_from_fields_with_derived,
 };
+pub use lock::{LOCK_FILE_NAME, RunLock};
 pub use validate::{
     ValidateDepth, ValidationReport, ValidationStats, validate_hour_file, validate_run_dir,
 };

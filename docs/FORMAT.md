@@ -506,8 +506,17 @@ must conform to.
   after the manifest is committed).
 - **The lock is an OS advisory lock**, not a pidfile: it is automatically
   released when the holding process exits (including a crash). The `.rw-lock`
-  file is zero-length, created on demand, and **never deleted** — its presence
-  is normal and is not itself the lock.
+  file is zero-length, created on demand, and is **never deleted as part of
+  releasing the lock** — its presence is normal and is not itself the lock.
+  Deleting it on unlock would be racy (a second writer mid-`open`/`lock` on
+  the same path would end up locking a different inode). The **one** place it
+  is removed is when an entire run directory is torn down (the satellite
+  rolling-window prune deleting a fully-evicted run dir, grid.rwg included):
+  the pruner holds the run's lock through the teardown, drops it, then removes
+  the now-stale `.rw-lock` and the empty dir. If a writer races back in
+  through that drop→delete window the removal fails harmlessly and the prune
+  retries on a later cycle (see the Windows pruning caveat below);
+  `rw_store::LOCK_FILE_NAME` is the canonical name (`.rw-lock`).
 - **Readers are lock-free.** Because every file mutation is atomic
   temp+fsync+rename (§1), a reader never observes a partial file and so needs no
   lock. Readers MUST NOT create or take the lock.

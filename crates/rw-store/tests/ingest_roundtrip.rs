@@ -15,9 +15,11 @@ use rustwx_core::{
 use rw_store::error::RwStoreError;
 use rw_store::grid::GridFile;
 use rw_store::ingest::{
-    DerivedFieldInput, PressureVolumeInput, derived_selector, derived_selector_slug, read_field_2d,
-    read_grid_2d, write_hour_from_fields, write_hour_from_fields_with_derived,
+    DerivedFieldInput, HourIngestWriter, PressureVolumeInput, derived_selector,
+    derived_selector_slug, read_field_2d, read_grid_2d, write_hour_from_fields,
+    write_hour_from_fields_with_derived,
 };
+use rw_store::lock::RunLock;
 use rw_store::reader::HourReader;
 use rw_store::run::RwsRunManifest;
 
@@ -752,6 +754,58 @@ fn read_field_2d_rejects_mismatched_grid_file() {
     assert!(
         matches!(err, RwStoreError::Grid(_)),
         "expected Grid error for grid-hash mismatch, got {err:?}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A live `HourIngestWriter` (post-`begin`, pre-`finish`) holds the run-dir
+/// advisory lock, so a competing writer's `RunLock::try_acquire` sees it as
+/// held; once the writer `finish`es and its guard drops, the lock is free.
+/// (fs4 locks are per-handle, so a second handle in this same process probes
+/// the lock exactly as a second process would.)
+#[test]
+fn ingest_writer_holds_run_lock_until_finish() {
+    let dir = test_dir("ingest-lock");
+    let store_root = dir.join("store");
+    let temp = temp_field();
+    let run_dir = run_dir(&store_root);
+
+    // Before any writer: the run dir does not exist, so a probe is an I/O
+    // error (begin creates the dir), not a held lock — sanity that we are not
+    // accidentally locking nothing.
+    assert!(RunLock::try_acquire(&run_dir).is_err());
+
+    let mut writer = HourIngestWriter::begin(
+        &store_root,
+        MODEL,
+        RUN,
+        6,
+        &temp.grid,
+        temp.projection.as_ref(),
+        BUILD,
+    )
+    .unwrap();
+    writer
+        .add_field_2d(
+            "temp_2m",
+            "K",
+            serde_json::json!({"v": "TMP"}),
+            &temp.values,
+        )
+        .unwrap();
+
+    // While the writer is live the lock is held: a competing acquire backs off.
+    assert!(
+        RunLock::try_acquire(&run_dir).unwrap().is_none(),
+        "the live ingest writer must hold the run-dir lock"
+    );
+
+    // Finishing drops the writer (and its lock guard) — now the lock is free.
+    writer.finish(WRITTEN_UNIX).unwrap();
+    assert!(
+        RunLock::try_acquire(&run_dir).unwrap().is_some(),
+        "after finish the run-dir lock must be released"
     );
 
     let _ = fs::remove_dir_all(&dir);

@@ -23,4 +23,6 @@ pub enum RwStoreError {
     Chunk(String),
     #[error("grid mismatch: {0}")]
     Grid(String),
+    #[error("run directory locked: {0}")]
+    Locked(String),
 }
