@@ -2144,6 +2144,25 @@ mod tests {
             .expect("HRRR runs hourly, so 17z is valid");
     }
 
+    /// RRFS-A cadence comes straight from the registry and is domain-neutral
+    /// (it does not depend on the unsettled CONUS-vs-NA fetch-plan question —
+    /// see `docs/superpowers/plans/2026-06-11-rrfs-support.md`). Cycles run
+    /// HOURLY 00z-23z and the forecast horizon is f000..=f060, so every cycle
+    /// is valid, f060 passes, and f061 is rejected with the flag named.
+    #[test]
+    fn validate_forecast_hours_enforces_rrfs_a_horizon() {
+        // Hourly cycle table: an off-synoptic cycle like 13z is valid.
+        validate_forecast_hours(ModelId::RrfsA, 13, &[0, 1, 30, 60])
+            .expect("RRFS-A runs hourly to f060 on every cycle");
+        // f060 is the horizon; f061 is past it.
+        validate_forecast_hours(ModelId::RrfsA, 0, &[60]).expect("f060 is the RRFS-A horizon");
+        let err = validate_forecast_hours(ModelId::RrfsA, 0, &[61])
+            .expect_err("f061 is past the RRFS-A horizon");
+        let message = err.to_string();
+        assert!(message.contains("--hours"), "must name the flag: {message}");
+        assert!(message.contains("f061"), "must name the hour: {message}");
+    }
+
     /// HRRR cadence is unchanged: f018 is valid on every cycle, the 6-hourly
     /// cycles reach f048, and f019 is rejected on an off-synoptic cycle.
     #[test]
