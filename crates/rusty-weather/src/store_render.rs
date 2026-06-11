@@ -200,6 +200,7 @@ pub fn render_direct_recipes_from_store(
     request: &DirectBatchRequest,
     latest: &LatestRun,
     recipe_slugs: &[String],
+    chunk_gate: Option<&dyn Fn()>,
 ) -> Result<DirectStoreOutcome, Box<dyn std::error::Error>> {
     let mut renderable = Vec::new();
     let mut skipped = Vec::new();
@@ -243,6 +244,7 @@ pub fn render_direct_recipes_from_store(
         &renderable,
         &mut load_field,
         direct_render_chunk_size(),
+        chunk_gate,
         "rw-store",
         source.hour_path().display().to_string(),
         source.fetch_key(),

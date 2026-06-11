@@ -102,10 +102,18 @@ pub fn decode_products_inputs(
 /// building its `Field2D`, so the stored f32 grid equals the render lane's
 /// raster input bit for bit. The expensive recipe kernels are
 /// rayon-parallel inside rustwx-calc.
+///
+/// `keep_winds` controls the u/v f64 wind volumes (~1.13 GB at HRRR size)
+/// after the derived lane's wind-consuming kernels finish: `true` keeps
+/// them resident on `inputs` for the heavy ECAPE stage (which reads them);
+/// `false` frees them mid-stage — the no-heavy ingest, where nothing
+/// downstream reads winds. Either way the computed grids are bit-identical
+/// (the products lane pins that with a synthetic-hour test).
 pub fn compute_derived_2d_from_inputs(
-    inputs: &ProductsComputeInputs,
+    inputs: &mut ProductsComputeInputs,
+    keep_winds: bool,
 ) -> Result<Vec<DerivedGrid2D>, Box<dyn std::error::Error>> {
-    let grids = compute_store_derived_grids_f32(&inputs.inner)?;
+    let grids = compute_store_derived_grids_f32(&mut inputs.inner, keep_winds)?;
     Ok(grids
         .into_iter()
         .map(|grid| DerivedGrid2D {

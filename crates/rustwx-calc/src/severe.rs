@@ -1,7 +1,9 @@
 use rayon::prelude::*;
 use rustwx_core::GridShape;
 
-use crate::ecape::{EcapeVolumeInputs, SurfaceInputs, VolumeShape, validate_len};
+use crate::ecape::{
+    EcapeVolumeInputs, SurfaceInputs, VolumeShape, validate_len, validate_len_or_absent,
+};
 use crate::error::CalcError;
 
 const ZEROCNK: f64 = 273.15;
@@ -167,7 +169,7 @@ pub fn compute_cape_cin(
     parcel_type: &str,
     top_m: Option<f64>,
 ) -> Result<CapeCinOutputs, CalcError> {
-    validate_severe_inputs(grid, volume, surface)?;
+    validate_cape_cin_inputs(grid, volume, surface)?;
     let (cape, cin, lcl, lfc) = if pressure_is_levels(volume) {
         compute_cape_cin_with_pressure_levels(grid, volume, surface, parcel_type, top_m)
     } else {
@@ -214,7 +216,7 @@ pub fn compute_cape_cin_triplet(
     surface: SurfaceInputs<'_>,
     top_m: Option<f64>,
 ) -> Result<CapeCinTriplet, CalcError> {
-    validate_severe_inputs(grid, volume, surface)?;
+    validate_cape_cin_inputs(grid, volume, surface)?;
     if !pressure_is_levels(volume) {
         // Full 3D pressure: no shared per-column prep to reuse here; defer
         // to the per-parcel grid kernels (identical results, one pass each).
@@ -793,6 +795,36 @@ fn validate_severe_inputs(
     validate_len("height_agl_m", volume.height_agl_m.len(), n3d)?;
     validate_len("u_ms", volume.u_ms.len(), n3d)?;
     validate_len("v_ms", volume.v_ms.len(), n3d)?;
+    validate_len("psfc_pa", surface.psfc_pa.len(), n2d)?;
+    validate_len("t2_k", surface.t2_k.len(), n2d)?;
+    validate_len("q2_kgkg", surface.q2_kgkg.len(), n2d)?;
+    validate_len("u10_ms", surface.u10_ms.len(), n2d)?;
+    validate_len("v10_ms", surface.v10_ms.len(), n2d)?;
+    Ok(())
+}
+
+/// [`validate_severe_inputs`] for the pure CAPE/CIN entry points
+/// (`compute_cape_cin`, `compute_cape_cin_triplet`), which never read the
+/// wind volumes: winds may be absent (empty) so the store-ingest derived
+/// lane can free them before the long parcel pass. Wrong-length non-empty
+/// winds are still rejected.
+fn validate_cape_cin_inputs(
+    grid: GridShape,
+    volume: EcapeVolumeInputs<'_>,
+    surface: SurfaceInputs<'_>,
+) -> Result<(), CalcError> {
+    let n2d = grid.len();
+    let n3d = n2d * volume.nz;
+    if pressure_is_levels(volume) {
+        validate_len("pressure_levels_pa", volume.pressure_pa.len(), volume.nz)?;
+    } else {
+        validate_len("pressure_pa", volume.pressure_pa.len(), n3d)?;
+    }
+    validate_len("temperature_c", volume.temperature_c.len(), n3d)?;
+    validate_len("qvapor_kgkg", volume.qvapor_kgkg.len(), n3d)?;
+    validate_len("height_agl_m", volume.height_agl_m.len(), n3d)?;
+    validate_len_or_absent("u_ms", volume.u_ms.len(), n3d)?;
+    validate_len_or_absent("v_ms", volume.v_ms.len(), n3d)?;
     validate_len("psfc_pa", surface.psfc_pa.len(), n2d)?;
     validate_len("t2_k", surface.t2_k.len(), n2d)?;
     validate_len("q2_kgkg", surface.q2_kgkg.len(), n2d)?;

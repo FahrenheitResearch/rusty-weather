@@ -1,7 +1,7 @@
 use rayon::prelude::*;
 use rustwx_core::GridShape;
 
-use crate::ecape::{EcapeVolumeInputs, SurfaceInputs, validate_len};
+use crate::ecape::{EcapeVolumeInputs, SurfaceInputs, validate_len, validate_len_or_absent};
 use crate::error::CalcError;
 use crate::severe::{
     CapeCinOutputs, WindGridInputs, compute_cape_cin, compute_ehi, compute_shear, compute_srh,
@@ -523,6 +523,11 @@ fn validate_surface_inputs(grid: GridShape, surface: SurfaceInputs<'_>) -> Resul
     Ok(())
 }
 
+/// Volume validation for the purely thermodynamic kernels in this module
+/// (lifted index, DCAPE, lapse rates), none of which read the wind
+/// members: winds may be absent (empty) so the store-ingest derived lane
+/// can free them before these kernels run. Wrong-length non-empty winds
+/// are still rejected.
 fn validate_volume_inputs(grid: GridShape, volume: EcapeVolumeInputs<'_>) -> Result<(), CalcError> {
     let n3d = grid.len() * volume.nz;
     if pressure_is_levels(volume) {
@@ -533,8 +538,8 @@ fn validate_volume_inputs(grid: GridShape, volume: EcapeVolumeInputs<'_>) -> Res
     validate_len("temperature_c", volume.temperature_c.len(), n3d)?;
     validate_len("qvapor_kgkg", volume.qvapor_kgkg.len(), n3d)?;
     validate_len("height_agl_m", volume.height_agl_m.len(), n3d)?;
-    validate_len("u_ms", volume.u_ms.len(), n3d)?;
-    validate_len("v_ms", volume.v_ms.len(), n3d)?;
+    validate_len_or_absent("u_ms", volume.u_ms.len(), n3d)?;
+    validate_len_or_absent("v_ms", volume.v_ms.len(), n3d)?;
     Ok(())
 }
 

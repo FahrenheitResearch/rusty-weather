@@ -302,6 +302,7 @@ pub fn direct_render_chunk_size() -> usize {
 /// * the shared layer/projected-map caches persist across chunks, and
 ///   every cached entry is a pure function of its key inputs, so chunk
 ///   grouping changes only WHEN an entry is built, never its content.
+#[allow(clippy::too_many_arguments)]
 pub fn render_direct_recipes_chunked_from_loader(
     request: &DirectBatchRequest,
     latest: &LatestRun,
@@ -310,6 +311,12 @@ pub fn render_direct_recipes_chunked_from_loader(
         &FieldSelector,
     ) -> Result<SelectedField2D, Box<dyn std::error::Error>>,
     chunk_recipes: usize,
+    // Called before each chunk loads its fields. Hosts that pipeline this
+    // render against other memory-hungry work (rw_batch) pass a gate that
+    // blocks while the process is inside a declared high-memory window;
+    // pixel output is independent of WHEN a chunk runs, so the gate can
+    // only trade wall time for peak working set.
+    chunk_gate: Option<&dyn Fn()>,
     fetched_product: impl Into<String>,
     resolved_url: impl Into<String>,
     fetch_key: impl Into<String>,
@@ -358,6 +365,9 @@ pub fn render_direct_recipes_chunked_from_loader(
     let mut prepared_accum: HashMap<ProjectedMapCacheKey, ProjectedMap> = HashMap::new();
     let mut completed = Vec::with_capacity(planned.len());
     for chunk in planned.chunks(chunk_recipes.max(1)) {
+        if let Some(gate) = chunk_gate {
+            gate();
+        }
         let mut extracted = HashMap::<FieldSelector, SelectedField2D>::new();
         for item in chunk {
             for selector in item.plan.selectors() {

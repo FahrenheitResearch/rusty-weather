@@ -187,8 +187,10 @@ fn ingest_derived_matches_direct_calc_kernels_bit_exactly() {
     //     by the in-place gh transform this test re-derives serially) ---
     let (surface, pressure) = decoded_pair(&synthetic);
     let qvapor_kgkg_3d_input = pressure.qvapor_kgkg_3d.clone();
-    let inputs = ProductsComputeInputs::new(surface, pressure);
-    let derived = ingest_compute::compute_derived_2d_from_inputs(&inputs)
+    let mut inputs = ProductsComputeInputs::new(surface, pressure);
+    // keep_winds = false: the no-heavy shape, where the wind volumes leave
+    // RAM mid-stage — outputs must still match the direct kernels exactly.
+    let derived = ingest_compute::compute_derived_2d_from_inputs(&mut inputs, false)
         .expect("derived precompute must succeed on the synthetic hour");
     assert_eq!(
         derived.len(),

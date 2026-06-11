@@ -182,6 +182,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         args.hour,
         &request.direct,
         &request.derived,
+        // Solo render: nothing else competes for memory, no chunk gate.
+        None,
     )?;
     for product in &hour_outcome.rendered {
         println!(

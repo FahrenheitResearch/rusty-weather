@@ -1157,7 +1157,7 @@ fn compute_product_grids(
         stage: IngestStage::ThermoDecode,
     });
     let decode_started = Instant::now();
-    let inputs = {
+    let mut inputs = {
         profile_scope!("ingest_thermo_decode");
         match ingest_compute::decode_products_inputs(surface_bytes, pressure_bytes) {
             Ok(inputs) => inputs,
@@ -1187,7 +1187,11 @@ fn compute_product_grids(
     let derived_started = Instant::now();
     let derived = {
         profile_scope!("ingest_derived");
-        match ingest_compute::compute_derived_2d_from_inputs(&inputs) {
+        // `heavy_enabled` keeps the wind volumes resident for the heavy
+        // ECAPE stage; without it they leave RAM as soon as the derived
+        // lane's wind-consuming kernels are done (~1.13 GB off the long
+        // parcel window).
+        match ingest_compute::compute_derived_2d_from_inputs(&mut inputs, heavy_enabled) {
             Ok(grids) => grids,
             Err(err) => {
                 config.emit(IngestEvent::Warning {

@@ -26,7 +26,7 @@ use crate::gridded::{
 };
 
 use super::compute::{
-    compute_derived_fields_generic, compute_derived_fields_generic_with_height_agl,
+    TakenWindVolumes, compute_derived_fields_generic, compute_store_derived_fields_phased,
 };
 use super::inventory::supported_derived_recipe_inventory;
 use super::query::{derived_query_field_from_computed, derived_query_field_take_from_computed};
@@ -173,20 +173,39 @@ pub fn prepare_store_compute_inputs(
 /// [`compute_store_derived_grids`] through the shared inputs, emitting f32
 /// grids recipe by recipe (take semantics — each computed f64 grid is
 /// freed as soon as its f32 twin exists). Identical kernels, identical
-/// recipe order, identical stored values.
+/// recipe order, identical stored values — pinned bit-exactly against the
+/// generic path by `phased_store_derived_compute_matches_generic_path`.
+///
+/// Memory shape: the compute runs PHASED (see
+/// [`compute_store_derived_fields_phased`]) — every wind-consuming kernel
+/// first, after which the u/v f64 volumes (~1.13 GB at HRRR size) leave
+/// RAM for the rest of the derived window when `keep_winds` is false (the
+/// no-heavy ingest). With `keep_winds` true the volumes return to
+/// `inputs` untouched for the heavy ECAPE stage, which does read them.
 pub fn compute_store_derived_grids_f32(
-    inputs: &StoreComputeInputs,
+    inputs: &mut StoreComputeInputs,
+    keep_winds: bool,
 ) -> Result<Vec<StoreDerivedGridF32>, Box<dyn std::error::Error>> {
     let recipes = store_derived_recipe_slugs()
         .into_iter()
         .map(|slug| DerivedRecipe::parse(slug).map_err(std::io::Error::other))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut computed = compute_derived_fields_generic_with_height_agl(
+    let winds = TakenWindVolumes {
+        u_ms_3d: std::mem::take(&mut inputs.pressure.u_ms_3d),
+        v_ms_3d: std::mem::take(&mut inputs.pressure.v_ms_3d),
+    };
+    let (mut computed, kept_winds) = compute_store_derived_fields_phased(
         &inputs.surface,
         &inputs.pressure,
+        winds,
         &recipes,
         inputs.height_agl_3d.as_deref(),
+        keep_winds,
     )?;
+    if let Some(kept) = kept_winds {
+        inputs.pressure.u_ms_3d = kept.u_ms_3d;
+        inputs.pressure.v_ms_3d = kept.v_ms_3d;
+    }
     let mut grids = Vec::with_capacity(recipes.len());
     for recipe in recipes {
         let query = derived_query_field_take_from_computed(
@@ -423,6 +442,153 @@ pub fn compute_store_heavy_grids_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gridded::mixing_ratio_from_dewpoint_k;
+
+    const NX: usize = 3;
+    const NY: usize = 2;
+    const NXY: usize = NX * NY;
+    /// Descending pressure (ground up) — the order the decode lane aligns
+    /// to. 850/700/500 are present so the advection and lapse recipes
+    /// realize.
+    const LEVELS: [u16; 5] = [1000, 925, 850, 700, 500];
+
+    /// A warm, moist, sheared synthetic hour (mirrors the rw-ingest wiring
+    /// test fixture): enough instability that sbcape is finite and nonzero
+    /// somewhere, so the bit-compares are not all-NaN-trivial.
+    fn synthetic_pair() -> (SurfaceFields, PressureFields) {
+        let mut lat = Vec::with_capacity(NXY);
+        let mut lon = Vec::with_capacity(NXY);
+        for y in 0..NY {
+            for x in 0..NX {
+                lat.push(35.0 + 0.01 * y as f64);
+                lon.push(-97.0 + 0.01 * x as f64);
+            }
+        }
+        let psfc_pa: Vec<f64> = (0..NXY).map(|ij| 97_500.0 + 50.0 * ij as f64).collect();
+        let td2_k: Vec<f64> = (0..NXY).map(|ij| 295.0 + 0.2 * ij as f64).collect();
+        let q2_kgkg: Vec<f64> = psfc_pa
+            .iter()
+            .zip(td2_k.iter())
+            .map(|(&psfc, &td_k)| mixing_ratio_from_dewpoint_k(psfc / 100.0, td_k))
+            .collect();
+        let volume = |base: f64, dk: f64, dij: f64| -> Vec<f64> {
+            (0..LEVELS.len())
+                .flat_map(|k| {
+                    (0..NXY).map(move |ij| base + dk * k as f64 + dij * ij as f64)
+                })
+                .collect()
+        };
+        let qvapor_kgkg_3d: Vec<f64> = LEVELS
+            .iter()
+            .enumerate()
+            .flat_map(|(k, &level)| {
+                (0..NXY).map(move |ij| {
+                    let td_k = 294.0 - 8.5 * k as f64 + 0.15 * ij as f64;
+                    mixing_ratio_from_dewpoint_k(f64::from(level), td_k)
+                })
+            })
+            .collect();
+        (
+            SurfaceFields {
+                lat,
+                lon,
+                nx: NX,
+                ny: NY,
+                projection: None,
+                psfc_pa,
+                orog_m: (0..NXY).map(|ij| 300.0 + 5.0 * ij as f64).collect(),
+                orog_is_proxy: false,
+                t2_k: (0..NXY).map(|ij| 302.0 + 0.3 * ij as f64).collect(),
+                q2_kgkg,
+                u10_ms: (0..NXY).map(|ij| 2.0 + 0.5 * ij as f64).collect(),
+                v10_ms: (0..NXY).map(|ij| 5.0 - 0.25 * ij as f64).collect(),
+                native_sbcape_jkg: None,
+                native_mlcape_jkg: None,
+                native_mucape_jkg: None,
+                native_pblh_m: None,
+            },
+            PressureFields {
+                pressure_levels_hpa: LEVELS.iter().map(|&level| f64::from(level)).collect(),
+                pressure_3d_pa: None,
+                temperature_c_3d: volume(301.0 - 273.15, -7.5, 0.2),
+                qvapor_kgkg_3d,
+                u_ms_3d: volume(3.0, 4.0, 0.3),
+                v_ms_3d: volume(6.0, 2.5, -0.2),
+                // Heights well above the orography and rising far faster
+                // than the +1 m monotonic clamp.
+                gh_m_3d: volume(400.0, 1400.0, 2.0),
+                omega_pa_s_3d: None,
+                absolute_vorticity_s_3d: None,
+                cloud_liquid_kgkg_3d: None,
+                cloud_ice_kgkg_3d: None,
+                rain_kgkg_3d: None,
+                snow_kgkg_3d: None,
+                graupel_kgkg_3d: None,
+            },
+        )
+    }
+
+    /// The phased store compute (wind kernels first, winds freed or handed
+    /// back before the parcel pass) must be bit-identical to the generic
+    /// single-join path, in BOTH wind modes, across all 29 recipes — this
+    /// is the determinism contract behind the early wind free.
+    #[test]
+    fn phased_store_derived_compute_matches_generic_path() {
+        let (surface, pressure) = synthetic_pair();
+        let legacy = compute_store_derived_grids(&surface, &pressure)
+            .expect("generic-path store compute succeeds");
+        assert_eq!(legacy.len(), 29, "all 29 non-heavy recipes realize");
+
+        let mut keep = prepare_store_compute_inputs(surface.clone(), pressure.clone());
+        let kept_grids =
+            compute_store_derived_grids_f32(&mut keep, true).expect("phased compute (keep winds)");
+        assert!(
+            !keep.pressure().u_ms_3d.is_empty() && !keep.pressure().v_ms_3d.is_empty(),
+            "keep_winds must hand the wind volumes back for the heavy stage"
+        );
+
+        let mut free = prepare_store_compute_inputs(surface, pressure);
+        let freed_grids =
+            compute_store_derived_grids_f32(&mut free, false).expect("phased compute (free winds)");
+        assert!(
+            free.pressure().u_ms_3d.is_empty() && free.pressure().v_ms_3d.is_empty(),
+            "freeing must leave the wind volumes empty"
+        );
+
+        assert_eq!(legacy.len(), kept_grids.len());
+        assert_eq!(legacy.len(), freed_grids.len());
+        let mut finite = 0usize;
+        for ((reference, kept), freed) in legacy.iter().zip(&kept_grids).zip(&freed_grids) {
+            assert_eq!(reference.slug, kept.slug);
+            assert_eq!(reference.slug, freed.slug);
+            assert_eq!(reference.units, kept.units, "{}: units", reference.slug);
+            assert_eq!(reference.units, freed.units, "{}: units", reference.slug);
+            assert_eq!(reference.values.len(), kept.values.len());
+            assert_eq!(reference.values.len(), freed.values.len());
+            for (i, &expected_f64) in reference.values.iter().enumerate() {
+                let expected = expected_f64 as f32;
+                assert_eq!(
+                    expected.to_bits(),
+                    kept.values[i].to_bits(),
+                    "{}[{i}]: keep-winds mismatch",
+                    reference.slug
+                );
+                assert_eq!(
+                    expected.to_bits(),
+                    freed.values[i].to_bits(),
+                    "{}[{i}]: free-winds mismatch",
+                    reference.slug
+                );
+                if expected.is_finite() {
+                    finite += 1;
+                }
+            }
+        }
+        assert!(
+            finite > 0,
+            "synthetic hour must produce finite values or the compare is NaN-trivial"
+        );
+    }
 
     /// The heavy store inventory is the 16 ECAPE-class recipes, in
     /// inventory order, and every slug maps 1:1 onto a heavy-lane panel
