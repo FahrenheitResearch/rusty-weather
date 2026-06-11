@@ -1,4 +1,4 @@
-# rw-store on-disk format (v1)
+﻿# rw-store on-disk format (v1)
 
 This is the byte-level specification of the rw-store format. It is sufficient
 to write a conforming reader or writer in any language without reading the Rust
@@ -218,7 +218,11 @@ last chunk's end.
 at `(tile_y, tile_x)` covers grid rows `[tile_y*256, min((tile_y+1)*256, ny))`
 and columns `[tile_x*256, min((tile_x+1)*256, nx))`. The decoded tile payload is
 the tile window's f32 values in **row-major order within the tile** (row 0 of
-the window first, left to right), then run through the §3 codec.
+the window first, left to right), then run through the §3 codec. For a tile at
+`(tile_y, tile_x)` the clipped window dimensions are `th = min((tile_y+1)*256,
+ny) - tile_y*256` rows and `tw = min((tile_x+1)*256, nx) - tile_x*256` columns;
+the row stride inside the decoded f32 buffer is `tw` — not 256 and not `nx`.
+The decoded value count for a dense 2D tile is `th * tw` (= `raw_len / 4`).
 
 **3D pressure fields (`kind = COLUMN3D`).** The `ny × nx` footprint is chunked
 into `COL_Y × COL_X = 16 × 16` column blocks. `chunks_y = ceil(ny/16)`,
@@ -254,9 +258,9 @@ Source: `codec.rs::encode_f32_tile`/`decode_f32_tile` (lines 192–258).
 
 The uncompressed payload is the tile's values as **raw little-endian f32 bytes**
 in row-major-within-tile order, then zstd-1. This lane is **exactly lossless**:
-values round-trip bit-for-bit (including the exact bit pattern of NaNs). The
-index `center`/`scale` are not used to reconstruct values here — decoding reads
-the f32 bytes directly.
+values round-trip bit-for-bit (including the exact bit pattern of NaNs). For
+dense tiles, the index `center`/`scale` are not used to reconstruct values —
+decoding reads the f32 bytes directly.
 
 Index fields for a 2D tile:
 
@@ -605,7 +609,7 @@ levels `[850, 700, 500]`). Its first 64 bytes decode as:
 ```
 raw hex (bytes 0..64):
 52 57 53 54 4f 52 45 31  01 00 00 00  64 03 00 00
-00 00 00 00 00 00 00 00  a4 03 00 00 00 00 00 00
+2c 00 00 00 00 00 00 00  a4 03 00 00 00 00 00 00
 a4 0e 00 00 00 00 00 00  00 00 00 00 00 00 00 00
 00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
 
