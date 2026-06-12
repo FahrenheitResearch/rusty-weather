@@ -56,6 +56,7 @@ use rw_ui::{
     SatellitePanel, SoundingPanel, StoreRequest, StoreResponse, StoreTree, StoreView, StoreWorker,
 };
 use sat_worker::{SatRequest, SatResponse, SatWorker};
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Storage path resolution
@@ -98,64 +99,36 @@ struct StoragePaths {
 
 /// The subset of [`StoragePaths`] that is persisted across launches.
 /// Stored as a JSON object under [`STORAGE_KEY`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 struct PersistedPaths {
     store_root: Option<String>,
     cache_dir: Option<String>,
 }
 
-/// Serialize [`PersistedPaths`] to a JSON string (no external deps — hand-roll).
+/// Serialize [`PersistedPaths`] to a JSON string via serde_json.
 ///
-/// Format: `{"store_root":"<value>","cache_dir":"<value>"}`. Fields that are
-/// `None` are omitted.  JSON-escapes backslashes so Windows paths survive the
-/// round-trip.
+/// serde_json correctly JSON-escapes backslashes and other special characters,
+/// so Windows paths (e.g. `C:\Users\drew\store`) survive the round-trip.
+///
+/// # Persistence feature note
+///
+/// This function is only called from `App::save` / `StorageSettingsUi::ui`,
+/// which are themselves only exercised when eframe's persistence feature is
+/// compiled in.  The `eframe` dependency MUST carry `features = ["persistence"]`
+/// in Cargo.toml — without it `cc.storage` is always `None`, `App::save` is
+/// never invoked, and the entire persisted-settings path is a compile-time
+/// no-op (even though the Rust code compiles fine without the flag).
 fn serialize_persisted(p: &PersistedPaths) -> String {
-    fn escape(s: &str) -> String {
-        s.replace('\\', "\\\\").replace('"', "\\\"")
-    }
-    let mut parts = Vec::new();
-    if let Some(ref v) = p.store_root {
-        parts.push(format!("\"store_root\":\"{}\"", escape(v)));
-    }
-    if let Some(ref v) = p.cache_dir {
-        parts.push(format!("\"cache_dir\":\"{}\"", escape(v)));
-    }
-    format!("{{{}}}", parts.join(","))
+    // Infallible for this type: all fields are Option<String>.
+    serde_json::to_string(p).unwrap_or_default()
 }
 
-/// Deserialize [`PersistedPaths`] from the JSON produced by [`serialize_persisted`].
+/// Deserialize [`PersistedPaths`] from JSON produced by [`serialize_persisted`].
 ///
-/// Deliberately minimal: only recognises the exact keys produced by the
-/// serializer.  Unknown keys, malformed JSON, or missing keys all yield `None`
-/// for the affected field rather than an error.
+/// Returns a value with `None` fields on any parse error so that garbled or
+/// stale storage data degrades gracefully to built-in defaults.
 fn deserialize_persisted(s: &str) -> PersistedPaths {
-    fn extract(json: &str, key: &str) -> Option<String> {
-        let needle = format!("\"{}\":\"", key);
-        let start = json.find(&needle)? + needle.len();
-        let rest = &json[start..];
-        let mut value = String::new();
-        let mut chars = rest.chars();
-        loop {
-            match chars.next()? {
-                '"' => break,
-                '\\' => match chars.next()? {
-                    '"' => value.push('"'),
-                    '\\' => value.push('\\'),
-                    'n' => value.push('\n'),
-                    other => {
-                        value.push('\\');
-                        value.push(other);
-                    }
-                },
-                c => value.push(c),
-            }
-        }
-        Some(value)
-    }
-    PersistedPaths {
-        store_root: extract(s, "store_root"),
-        cache_dir: extract(s, "cache_dir"),
-    }
+    serde_json::from_str(s).unwrap_or_default()
 }
 
 /// Pure resolution function: merges CLI overrides + persisted settings +
@@ -1564,6 +1537,35 @@ mod tests {
             hint.is_empty(),
             "HRRR has a uniform stride — no cadence note needed"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // eframe persistence feature gate
+    // ------------------------------------------------------------------
+
+    /// Verify that the eframe `persistence` feature is compiled in.
+    ///
+    /// `eframe::storage_dir` is `#[cfg(feature = "persistence")]`-gated and
+    /// only exported from eframe's public API when that feature is enabled.
+    /// If `Cargo.toml` carries only `eframe = "0.34"` (no features list) this
+    /// test FAILS TO COMPILE with "unresolved import" — making the missing flag
+    /// a hard compile-time failure rather than a silent runtime bug.
+    ///
+    /// Without the persistence feature:
+    ///   - `cc.storage` is always `None` in `CreationContext`
+    ///   - `App::save` is never called by eframe
+    ///   - the entire persisted-settings path is a no-op at runtime
+    ///
+    /// Adding `features = ["persistence"]` is therefore load-bearing for the
+    /// configurable storage-paths feature introduced in commit 90d72d8.
+    #[test]
+    fn eframe_persistence_feature_is_enabled() {
+        // eframe::storage_dir is only compiled when the "persistence" feature
+        // is active (see eframe/src/lib.rs: #[cfg(feature = "persistence")]).
+        // Calling it with a dummy app-id verifies the symbol exists and that
+        // the eframe dep was built with the flag.  The return value (the OS
+        // config-dir path for the app) is not relevant to this check.
+        let _ = eframe::storage_dir("rusty-weather-persistence-probe");
     }
 
     /// GFS store orientation: the 0.25° global grid is stored lat-descending
