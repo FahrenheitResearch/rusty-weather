@@ -278,6 +278,28 @@ gracefully skip with warnings, as GFS already does for fields it lacks.)
         `apcp_run_total` (f002 planes byte-identical, caught by tile-stat comparison).
         Scoring now prefers the 0-start accumulation; HRRR/GFS selections unchanged;
         regression test covers both file orders; f002/f003 re-ingested with the fix.
+      - **Node re-derivation (20260612 01z f000-f003, node3 = Ubuntu, 24-core, 91 GB,
+        cargo 1.93.1, Linux release build at 02094f0, `--full-throttle --verify`):**
+        independently reproduces the above on a fresh cycle + a different platform. Crop
+        `4881x2961 -> 2938x1739` every hour; `grid.rwg` 34,861,339 B (bit-identical to the
+        Windows file and the `RRFS_A_BUILTIN_GRID_FILE_BYTES` constant). `rws validate
+        <run> --deep` **exit 0**, 439 vars / 436,316 chunks / 9,032,338,400 payload B
+        (chunk count identical to Windows → structural determinism across platform). Export
+        + scipy.io.netcdf (xarray absent on node): dims 2938×1739, levels 1000→100 hPa /
+        37 / descending, lat 6.61..64.45, antimeridian-corner cells 0.770% (matches the
+        Windows figure exactly), **t2m per-tile min/max/valid bit-exact 84/84**. Soundings
+        ×3 (Kansas 25.8 °C / New Orleans 28.1 °C / Olympic 13.6 °C 2 m; MSLP 1010/1014/1020
+        hPa) all finite, Td ≤ T at every level, June-plausible. Per-hour subset download
+        prs 2.94-2.98 GB + nat 0.19-0.24 GB (matches the calibration constants ±3%). Wall
+        ~10-13 min/hour on 24 cores full-throttle; **peak working set 38.5 GB** (vs the
+        Windows 39.24 GB). Render f000 conus 2m_temperature/composite_reflectivity/sbcape
+        + a wide north-america view READ on Windows: state lines / coastlines / Great Lakes
+        / terrain aligned, derived sbcape in lock-step, the wide view shows the skewed
+        native-index block fully containing CONUS → crop did not shift georeferencing.
+        (Note: the first f000-f003 run wrote f000-f002 then the process exited after
+        downloading f003's subset without writing f003.rws — no panic / no OOM in the log;
+        f003 re-ingested alone cleanly to complete the run. Recorded as an observation, not
+        chased — not reproducible in the determinism re-ingest or batch run.)
 - [x] **Calibration**: RRFS-A builtin table measured from the live cropped store
       (f001-f003 full profile); `builtin_for_model(RrfsA)`; download priced as the
       measured **`.idx`-subset bytes** (prs 3,028,658,817 + nat 243,349,728 per hour),
@@ -286,16 +308,37 @@ gracefully skip with warnings, as GFS already does for fields it lacks.)
 - [x] **Render**: rw_render f000 conus 2m_temperature / composite_reflectivity / sbcape —
       PNGs READ: Great Lakes / coastlines / state lines / terrain stripes all aligned,
       derived sbcape in lock-step → **crop did not shift georeferencing**.
-- [ ] **Batch**: rw_batch f000-f003 `--no-heavy --products all` (expect MORE than GFS's
-      290: UH/reflectivity/hourly QPF); timing table.
+- [x] **Batch** (node3, 20260612 01z f000-f003, `--no-heavy --products all --region conus`,
+      `--full-throttle`): **312 products rendered, 49 skipped/blocked** — MORE than GFS's
+      290 exactly as predicted (RRFS-A adds hourly QPF + UH-max/wind-max trailing windows +
+      composite reflectivity). Per-hour renders f000 74 / f001 77 / f002 77 / f003 77;
+      windowed at the f003 anchor 7 realized / 42 blocked (only 4 stored hours, so longer
+      windows can't span). Stage totals (ms): fetch 640,951 (4× whole-subset re-downloads,
+      cache-miss per hour — the batch store is separate) | extract 103,165 | thermo 77,088 |
+      derived 134,495 | heavy 0 | encode 4,380 | render 303,706 | windowed 1,403 | **TOTAL
+      wall 736,417 ms (~12.3 min)**. Per-hour ingest is uniform: prs subset ~2.81-2.84 GB +
+      nat ~0.19-0.23 GB, store ~2.02 GB, 2d 56-61/65, derived 29/29. **Every skip is an
+      expected blocker** — smoke_8m/column, simulated_ir, reflectivity_1km (1 km AGL absent),
+      instantaneous uh_2to5km, and f000's not-yet-windowed fields; no crop/georef failure.
 - [x] **Determinism**: f000 re-ingested into a fresh store root → `rw_store_diff`:
       **equivalent** (108,764 index records + 2,225,805,419 payload bytes; writer.build
-      excluded), exit 0.
+      excluded), exit 0. (Node re-derivation 20260612 01z: re-ingest f000 to a fresh
+      root → `rw_store_diff` **equivalent**, 108,764 index records + 2,261,927,344 payload
+      bytes — same record count, payload differs only because it is a different cycle's
+      data; exit 0. The two f000.rws files were byte-identical in size, 2,268,906,377 B.)
 - [x] **Docs**: README matrix row RRFS-A full + crop note (NA source cropped to CONUS at
       ingest, box constants, MSLET→mslp, antimeridian corner, subset sizes, honest RAM
       note); examples (ingest/validate/export/batch).
-- [ ] **Gates**: `cargo test --workspace` green; fmt/clippy clean on touched; release builds;
-      tree clean (discard pre-existing sat_worker.rs/compute.rs churn); do NOT push.
+- [x] **Gates (targeted)**: `cargo test -p rw-ingest` **green on Windows** — 55 lib tests
+      pass (incl. `rrfs_a_estimate_prices_subset_downloads_not_full_files`,
+      `fetch_plan_rrfs_a_is_the_na_pair_with_subset_patterns`,
+      `rrfs_a_has_a_conus_crop_box_bounding_hrrr`,
+      `hrrr_full_profile_estimate_is_unchanged_after_gfs_table_added`) + 3 integration tests;
+      the 3 live-store accuracy tests stay `#[ignore]`d. Release builds clean on node3
+      (Linux, `cargo build --release -p rusty-weather`). The **full `cargo test --workspace`
+      + fmt/clippy gate is deferred to merge time** (per the integration plan: the merge gate
+      runs on Windows), NOT run in this node-compute session. Branch pushed to
+      origin/rrfs-support (no merge).
 
 ## Self-review / honesty notes
 

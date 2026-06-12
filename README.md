@@ -180,13 +180,15 @@ like HRRR sfc files). Everything else is HRRR-grade, including hourly APCP, UH-m
 and wind-max trailing windows, native CAPE planes (heavy 16/16) and layered cloud
 cover.
 
-**RRFS-A ingest cost (honest numbers, polite 30-thread BelowNormal pool):** a
-full-profile hour is ~12-14 min wall, ~10 min of which is the heavy ECAPE triplet at
-5.1 M cells; store ≈ 2.1-2.2 GB/hour (37 isobaric levels). **Peak working set
-~39 GB**: the NA-grid isobaric decode materializes full 14.5 M-cell planes before
-the crop applies — plan for a 64 GB machine for full-profile RRFS-A ingests (HRRR
-peaks ~5 GB by comparison). `--no-heavy` or the sounding profile cut both wall and
-RAM dramatically.
+**RRFS-A ingest cost (honest numbers):** a full-profile hour is ~12-14 min wall on a
+polite 30-thread BelowNormal pool (~10 min of which is the heavy ECAPE triplet at
+5.1 M cells), or ~10-12 min wall on a dedicated 24-core node (`--full-throttle`);
+store ≈ 2.1-2.2 GB/hour (37 isobaric levels). **Peak working set ~38-39 GB**: the
+NA-grid isobaric decode materializes full 14.5 M-cell planes before the crop applies
+— measured at 39.24 GB on a 64 GB / 32-thread Windows box (2026-06-11 16z) and 38.5 GB
+re-derived on the 91 GB / 24-core Linux node (`--full-throttle`, 2026-06-12 01z), so
+plan for ≥48 GB RAM for full-profile RRFS-A ingests (HRRR peaks ~5 GB by comparison).
+`--no-heavy` or the sounding profile cut both wall and RAM dramatically.
 
 **RRFS-A ingest examples:**
 
