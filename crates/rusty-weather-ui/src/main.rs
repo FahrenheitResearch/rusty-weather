@@ -26,6 +26,12 @@
 //! writes a tiny synthetic store to a temp directory and opens that
 //! instead.
 //!
+//! Storage paths (`--store-root`, `--cache-dir`) are configurable in the
+//! app via the "Storage" collapsible section in the left browser panel;
+//! values are persisted across launches via eframe's built-in storage.
+//! Precedence: CLI arg > persisted setting > built-in default ("store" /
+//! "out/cache"). Relative paths resolve against the working directory.
+//!
 //! Profiling: build with `--features profiling` for puffin scopes, a
 //! puffin_http server on 127.0.0.1:8585 (external `puffin_viewer`), and
 //! the in-app scope-stats window. The stats strip is always available.
@@ -51,6 +57,412 @@ use rw_ui::{
 };
 use sat_worker::{SatRequest, SatResponse, SatWorker};
 
+// ---------------------------------------------------------------------------
+// Storage path resolution
+// ---------------------------------------------------------------------------
+
+/// eframe Storage key for the serialized [`PersistedPaths`].
+const STORAGE_KEY: &str = "rw.storage_paths";
+
+/// Default store root when neither CLI nor persisted settings provide one.
+const DEFAULT_STORE_ROOT: &str = "store";
+/// Default download cache dir when neither CLI nor persisted settings provide one.
+const DEFAULT_CACHE_DIR: &str = "out/cache";
+
+/// Where a resolved storage path came from — shown in the Settings UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathSource {
+    Cli,
+    Saved,
+    Default,
+}
+
+impl PathSource {
+    fn label(&self) -> &'static str {
+        match self {
+            PathSource::Cli => "cli",
+            PathSource::Saved => "saved",
+            PathSource::Default => "default",
+        }
+    }
+}
+
+/// Fully resolved storage paths + their sources, computed once at startup.
+#[derive(Debug, Clone)]
+struct StoragePaths {
+    store_root: PathBuf,
+    store_root_source: PathSource,
+    cache_dir: PathBuf,
+    cache_dir_source: PathSource,
+}
+
+/// The subset of [`StoragePaths`] that is persisted across launches.
+/// Stored as a JSON object under [`STORAGE_KEY`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedPaths {
+    store_root: Option<String>,
+    cache_dir: Option<String>,
+}
+
+/// Serialize [`PersistedPaths`] to a JSON string (no external deps — hand-roll).
+///
+/// Format: `{"store_root":"<value>","cache_dir":"<value>"}`. Fields that are
+/// `None` are omitted.  JSON-escapes backslashes so Windows paths survive the
+/// round-trip.
+fn serialize_persisted(p: &PersistedPaths) -> String {
+    fn escape(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+    let mut parts = Vec::new();
+    if let Some(ref v) = p.store_root {
+        parts.push(format!("\"store_root\":\"{}\"", escape(v)));
+    }
+    if let Some(ref v) = p.cache_dir {
+        parts.push(format!("\"cache_dir\":\"{}\"", escape(v)));
+    }
+    format!("{{{}}}", parts.join(","))
+}
+
+/// Deserialize [`PersistedPaths`] from the JSON produced by [`serialize_persisted`].
+///
+/// Deliberately minimal: only recognises the exact keys produced by the
+/// serializer.  Unknown keys, malformed JSON, or missing keys all yield `None`
+/// for the affected field rather than an error.
+fn deserialize_persisted(s: &str) -> PersistedPaths {
+    fn extract(json: &str, key: &str) -> Option<String> {
+        let needle = format!("\"{}\":\"", key);
+        let start = json.find(&needle)? + needle.len();
+        let rest = &json[start..];
+        let mut value = String::new();
+        let mut chars = rest.chars();
+        loop {
+            match chars.next()? {
+                '"' => break,
+                '\\' => match chars.next()? {
+                    '"' => value.push('"'),
+                    '\\' => value.push('\\'),
+                    'n' => value.push('\n'),
+                    other => {
+                        value.push('\\');
+                        value.push(other);
+                    }
+                },
+                c => value.push(c),
+            }
+        }
+        Some(value)
+    }
+    PersistedPaths {
+        store_root: extract(s, "store_root"),
+        cache_dir: extract(s, "cache_dir"),
+    }
+}
+
+/// Pure resolution function: merges CLI overrides + persisted settings +
+/// compiled-in defaults and returns the effective paths + their sources.
+///
+/// Precedence (highest first): CLI arg → persisted saved value → built-in default.
+///
+/// Relative paths are accepted as-is; they resolve against the process's
+/// working directory (documented in the storage settings UI).
+fn resolve_storage_paths(
+    cli_store: Option<&str>,
+    cli_cache: Option<&str>,
+    saved: Option<&PersistedPaths>,
+) -> StoragePaths {
+    let (store_root, store_root_source) = if let Some(v) = cli_store {
+        (PathBuf::from(v), PathSource::Cli)
+    } else if let Some(v) = saved.and_then(|s| s.store_root.as_deref()) {
+        (PathBuf::from(v), PathSource::Saved)
+    } else {
+        (PathBuf::from(DEFAULT_STORE_ROOT), PathSource::Default)
+    };
+
+    let (cache_dir, cache_dir_source) = if let Some(v) = cli_cache {
+        (PathBuf::from(v), PathSource::Cli)
+    } else if let Some(v) = saved.and_then(|s| s.cache_dir.as_deref()) {
+        (PathBuf::from(v), PathSource::Saved)
+    } else {
+        (PathBuf::from(DEFAULT_CACHE_DIR), PathSource::Default)
+    };
+
+    StoragePaths {
+        store_root,
+        store_root_source,
+        cache_dir,
+        cache_dir_source,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Disk-usage helper
+// ---------------------------------------------------------------------------
+
+/// Recursively sum the sizes of all files under `dir`.
+///
+/// Returns `None` if `dir` does not exist or cannot be read.  Errors on
+/// individual entries are silently skipped (permission-denied sub-dirs, etc.).
+/// This is a one-shot blocking call — never invoke it per-frame; callers must
+/// cache the result.
+fn dir_size_bytes(dir: &std::path::Path) -> Option<u64> {
+    if !dir.exists() {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    Some(total)
+}
+
+/// Format a byte count as a human-readable string (B / KB / MB / GB).
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Storage settings UI (app-shell only — not in the rw-ui library)
+// ---------------------------------------------------------------------------
+
+/// State for the collapsible "Storage" section in the browser panel.
+///
+/// Fields are edit buffers separate from the effective runtime paths so the
+/// user can type and discard without affecting the live workers.
+struct StorageSettingsUi {
+    /// Edit buffer for the store root text field.
+    store_root_edit: String,
+    /// Edit buffer for the download cache dir text field.
+    cache_dir_edit: String,
+    /// Source labels for the current effective values (shown as hints).
+    store_root_source: PathSource,
+    cache_dir_source: PathSource,
+    /// Inline error text after a failed Apply (validation error).
+    apply_error: Option<String>,
+    /// Status text shown after a successful Apply.
+    apply_status: Option<String>,
+    /// Cached disk-usage results (populated on Apply or first open).
+    store_size: Option<u64>,
+    cache_size: Option<u64>,
+    /// Guard so we run the initial size scan exactly once.
+    sizes_computed: bool,
+}
+
+impl StorageSettingsUi {
+    fn new(paths: &StoragePaths) -> Self {
+        Self {
+            store_root_edit: paths.store_root.display().to_string(),
+            cache_dir_edit: paths.cache_dir.display().to_string(),
+            store_root_source: paths.store_root_source.clone(),
+            cache_dir_source: paths.cache_dir_source.clone(),
+            apply_error: None,
+            apply_status: None,
+            store_size: None,
+            cache_size: None,
+            sizes_computed: false,
+        }
+    }
+
+    /// Run the disk-size scan once (lazily on first open).
+    fn compute_sizes_once(&mut self, store_root: &std::path::Path, cache_dir: &std::path::Path) {
+        if !self.sizes_computed {
+            self.sizes_computed = true;
+            self.store_size = dir_size_bytes(store_root);
+            self.cache_size = dir_size_bytes(cache_dir);
+        }
+    }
+
+    /// Render the Storage section into `ui`.
+    ///
+    /// Returns `Some(PersistedPaths)` when the user clicks Apply and
+    /// validation succeeds — the caller must persist the value and show a
+    /// restart notice.
+    fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        effective_store_root: &std::path::Path,
+        effective_cache_dir: &std::path::Path,
+    ) -> Option<PersistedPaths> {
+        self.compute_sizes_once(effective_store_root, effective_cache_dir);
+
+        let mut new_paths: Option<PersistedPaths> = None;
+
+        egui::CollapsingHeader::new("Storage")
+            .id_salt("rw-storage-settings")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+
+                // Store root row
+                ui.label(egui::RichText::new("Store root").small().strong());
+                let store_hint = if self.store_root_source == PathSource::Cli {
+                    "overridden by --store-root for this session"
+                } else {
+                    self.store_root_source.label()
+                };
+                ui.horizontal(|ui| {
+                    let resp = ui.add_enabled(
+                        self.store_root_source != PathSource::Cli,
+                        egui::TextEdit::singleline(&mut self.store_root_edit)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("path/to/store"),
+                    );
+                    if resp.changed() {
+                        self.apply_error = None;
+                        self.apply_status = None;
+                    }
+                    ui.label(egui::RichText::new(store_hint).small().weak());
+                });
+                // Disk usage hint for store root
+                ui.label(
+                    egui::RichText::new(match self.store_size {
+                        Some(bytes) => format!("disk: {}", format_bytes(bytes)),
+                        None => "disk: (dir not found)".to_string(),
+                    })
+                    .small()
+                    .weak(),
+                );
+
+                ui.add_space(4.0);
+
+                // Cache dir row
+                ui.label(egui::RichText::new("Download cache").small().strong());
+                let cache_hint = if self.cache_dir_source == PathSource::Cli {
+                    "overridden by --cache-dir for this session"
+                } else {
+                    self.cache_dir_source.label()
+                };
+                ui.horizontal(|ui| {
+                    let resp = ui.add_enabled(
+                        self.cache_dir_source != PathSource::Cli,
+                        egui::TextEdit::singleline(&mut self.cache_dir_edit)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("path/to/cache"),
+                    );
+                    if resp.changed() {
+                        self.apply_error = None;
+                        self.apply_status = None;
+                    }
+                    ui.label(egui::RichText::new(cache_hint).small().weak());
+                });
+                ui.label(
+                    egui::RichText::new(match self.cache_size {
+                        Some(bytes) => format!("disk: {}", format_bytes(bytes)),
+                        None => "disk: (dir not found)".to_string(),
+                    })
+                    .small()
+                    .weak(),
+                );
+
+                ui.add_space(6.0);
+
+                // Apply button + status
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.store_root_source != PathSource::Cli
+                                || self.cache_dir_source != PathSource::Cli,
+                            egui::Button::new("Apply"),
+                        )
+                        .on_disabled_hover_text(
+                            "Both paths are overridden by CLI arguments for this session",
+                        )
+                        .clicked()
+                    {
+                        // Validate: try create_dir_all for any path not
+                        // overridden by CLI (editable fields only).
+                        let store_ok = if self.store_root_source != PathSource::Cli {
+                            let p = PathBuf::from(&self.store_root_edit);
+                            std::fs::create_dir_all(&p).map_err(|e| format!("store root: {e}"))
+                        } else {
+                            Ok(())
+                        };
+                        let cache_ok = if self.cache_dir_source != PathSource::Cli {
+                            let p = PathBuf::from(&self.cache_dir_edit);
+                            std::fs::create_dir_all(&p).map_err(|e| format!("cache dir: {e}"))
+                        } else {
+                            Ok(())
+                        };
+                        match (store_ok, cache_ok) {
+                            (Err(e), _) | (_, Err(e)) => {
+                                self.apply_error = Some(e);
+                                self.apply_status = None;
+                            }
+                            (Ok(()), Ok(())) => {
+                                // Refresh disk sizes after Apply
+                                let new_store = PathBuf::from(&self.store_root_edit);
+                                let new_cache = PathBuf::from(&self.cache_dir_edit);
+                                self.store_size = dir_size_bytes(&new_store);
+                                self.cache_size = dir_size_bytes(&new_cache);
+                                self.apply_error = None;
+                                self.apply_status =
+                                    Some("Saved — restart to apply to live workers".to_string());
+                                // Only persist the editable (non-CLI) values
+                                new_paths = Some(PersistedPaths {
+                                    store_root: if self.store_root_source != PathSource::Cli {
+                                        Some(self.store_root_edit.clone())
+                                    } else {
+                                        None
+                                    },
+                                    cache_dir: if self.cache_dir_source != PathSource::Cli {
+                                        Some(self.cache_dir_edit.clone())
+                                    } else {
+                                        None
+                                    },
+                                });
+                            }
+                        }
+                    }
+
+                    if let Some(ref err) = self.apply_error {
+                        ui.label(
+                            egui::RichText::new(err)
+                                .small()
+                                .color(ui.visuals().error_fg_color),
+                        );
+                    } else if let Some(ref status) = self.apply_status {
+                        ui.label(egui::RichText::new(status).small().weak());
+                    }
+                });
+
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Relative paths resolve against the working directory. \
+                         Changes take effect on the next launch (workers hold the \
+                         old paths until restart).",
+                    )
+                    .small()
+                    .weak(),
+                );
+            });
+
+        new_paths
+    }
+}
+
+// ---------------------------------------------------------------------------
+// main + CLI parsing
+// ---------------------------------------------------------------------------
+
 fn main() -> ExitCode {
     let args = match Args::parse(std::env::args().skip(1)) {
         Ok(args) => args,
@@ -63,16 +475,16 @@ fn main() -> ExitCode {
         }
     };
 
-    let store_root = if args.synthetic {
-        let root = std::env::temp_dir().join("rusty-weather-ui-synthetic");
-        if let Err(err) = rw_ui::synthetic::write_synthetic_store(&root) {
-            eprintln!("failed to write the synthetic store: {err}");
-            return ExitCode::FAILURE;
-        }
-        root
-    } else {
-        args.store_root
-    };
+    // --synthetic overrides everything: ignore persisted / CLI store-root.
+    // Extract owned copies up front so the closure can move them without
+    // borrowing `args` across the move boundary.
+    let synthetic = args.synthetic;
+    let satellite = args.satellite;
+    // `cli_store_owned` / `cli_cache_owned` are the raw CLI strings (owned),
+    // `None` when not provided on the command line.
+    let cli_store_owned: Option<String> = if synthetic { None } else { args.store_root };
+    let cli_cache_owned: Option<String> = args.spec_overrides.cache_dir.clone();
+    let spec_overrides = args.spec_overrides;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -85,11 +497,29 @@ fn main() -> ExitCode {
         "rusty-weather",
         options,
         Box::new(move |cc| {
+            let cli_store = cli_store_owned.as_deref();
+            let cli_cache = cli_cache_owned.as_deref();
+            let store_root = if synthetic {
+                let root = std::env::temp_dir().join("rusty-weather-ui-synthetic");
+                rw_ui::synthetic::write_synthetic_store(&root)
+                    .map_err(|e| format!("failed to write the synthetic store: {e}"))?;
+                root
+            } else {
+                // Read persisted paths from eframe Storage.
+                let saved = cc
+                    .storage
+                    .and_then(|s| s.get_string(STORAGE_KEY).map(|v| deserialize_persisted(&v)));
+                let paths = resolve_storage_paths(cli_store, cli_cache, saved.as_ref());
+                paths.store_root
+            };
+
             Ok(Box::new(App::new(
                 cc,
                 store_root,
-                args.spec_overrides,
-                args.satellite,
+                spec_overrides,
+                satellite,
+                cli_store_owned.clone(),
+                cli_cache_owned.clone(),
             )))
         }),
     );
@@ -113,7 +543,8 @@ struct SpecOverrides {
 }
 
 struct Args {
-    store_root: PathBuf,
+    /// Raw CLI value; `None` means not provided (use persisted/default).
+    store_root: Option<String>,
     synthetic: bool,
     satellite: bool,
     spec_overrides: SpecOverrides,
@@ -121,7 +552,7 @@ struct Args {
 
 impl Args {
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
-        let mut store_root = PathBuf::from("store");
+        let mut store_root: Option<String> = None;
         let mut synthetic = false;
         let mut satellite = false;
         let mut spec_overrides = SpecOverrides::default();
@@ -131,7 +562,7 @@ impl Args {
                 args.next().ok_or(format!("{flag} requires a value"))
             };
             match arg.as_str() {
-                "--store-root" => store_root = PathBuf::from(value("--store-root")?),
+                "--store-root" => store_root = Some(value("--store-root")?),
                 "--cache-dir" => spec_overrides.cache_dir = Some(value("--cache-dir")?),
                 "--download-date" => spec_overrides.date = Some(value("--download-date")?),
                 "--download-cycle" => {
@@ -197,6 +628,7 @@ struct App {
     worker: StoreWorker,
     ingest: IngestWorker,
     store_root: PathBuf,
+    cache_dir: PathBuf,
     /// `None` until the first scan lands.
     tree: Option<StoreTree>,
     browser: RunBrowserPanel,
@@ -217,6 +649,13 @@ struct App {
     recorded_texture_ms: Option<f32>,
     /// Same dedup for the sat player's texture uploads.
     recorded_sat_texture_ms: Option<f32>,
+    /// State for the collapsible Storage settings section.
+    storage_ui: StorageSettingsUi,
+    /// Pending JSON to write via `App::save` on the next eframe save tick.
+    ///
+    /// Set by `StorageSettingsUi` when the user clicks Apply; drained in
+    /// `App::save` which eframe calls after every frame (and on exit).
+    pending_persist: Option<String>,
     #[cfg(feature = "profiling")]
     profiler: profiler::ProfilerPanel,
     #[cfg(feature = "profiling")]
@@ -232,6 +671,8 @@ impl App {
         store_root: PathBuf,
         overrides: SpecOverrides,
         show_satellite: bool,
+        cli_store: Option<String>,
+        cli_cache: Option<String>,
     ) -> Self {
         // Belt and braces: pre-build the GLOBAL rayon pool small and
         // below-normal so any stray par_iter reached outside the ingest
@@ -268,13 +709,24 @@ impl App {
         sat_panel.set_sector_options(sat_worker::sector_options());
         sat_panel.set_layer_options(sat_worker::layer_options());
 
+        // Resolve the full StoragePaths so the settings UI shows correct
+        // source labels (cli / saved / default).
+        let saved = cc
+            .storage
+            .and_then(|s| s.get_string(STORAGE_KEY).map(|v| deserialize_persisted(&v)));
+        let paths =
+            resolve_storage_paths(cli_store.as_deref(), cli_cache.as_deref(), saved.as_ref());
+        let cache_dir = paths.cache_dir.clone();
+
         let defaults = DownloadSpec::default();
         let mut spec = DownloadSpec {
             date: overrides.date.unwrap_or_else(rw_ui::today_yyyymmdd_utc),
             hours: overrides.hours.unwrap_or_else(|| "0-6".to_string()),
             cycle: overrides.cycle.unwrap_or(defaults.cycle),
             profile: overrides.profile.unwrap_or(defaults.profile),
-            cache_dir: overrides.cache_dir.unwrap_or(defaults.cache_dir),
+            cache_dir: overrides
+                .cache_dir
+                .unwrap_or_else(|| cache_dir.display().to_string()),
             ..defaults
         };
         // Presets follow the same toggle-snapping the profile combo does.
@@ -312,10 +764,13 @@ impl App {
         #[cfg(feature = "profiling")]
         puffin::set_scopes_on(true);
 
+        let storage_ui = StorageSettingsUi::new(&paths);
+
         Self {
             worker,
             ingest,
             store_root,
+            cache_dir,
             tree: None,
             browser: RunBrowserPanel::new(),
             viewer: FieldViewerPanel::new(),
@@ -330,6 +785,8 @@ impl App {
             frame_ms: 0.0,
             recorded_texture_ms: None,
             recorded_sat_texture_ms: None,
+            storage_ui,
+            pending_persist: None,
             #[cfg(feature = "profiling")]
             profiler: profiler::ProfilerPanel::default(),
             #[cfg(feature = "profiling")]
@@ -615,6 +1072,15 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // Drain the pending JSON written by StorageSettingsUi on Apply.
+        // eframe calls this after every frame and on clean exit, so the
+        // value persists within one frame of the user clicking Apply.
+        if let Some(json) = self.pending_persist.take() {
+            storage.set_string(STORAGE_KEY, json);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         #[cfg(feature = "profiling")]
         puffin::GlobalProfiler::lock().new_frame();
@@ -673,6 +1139,20 @@ impl eframe::App for App {
                         .weak(),
                 );
                 ui.separator();
+
+                // Storage settings: collapsible section for path config +
+                // persistence.  Lives right below the store-root label so
+                // users can find it near the path they want to change.
+                let store_root = self.store_root.clone();
+                let cache_dir = self.cache_dir.clone();
+                if let Some(new_paths) = self.storage_ui.ui(ui, &store_root, &cache_dir) {
+                    // Queue the JSON for App::save, which eframe calls after
+                    // each frame and on clean exit.
+                    self.pending_persist = Some(serialize_persisted(&new_paths));
+                }
+
+                ui.separator();
+
                 let mut picked = None;
                 match &self.tree {
                     None => {
@@ -690,7 +1170,8 @@ impl eframe::App for App {
                         ui.add_space(4.0);
                         ui.label(
                             egui::RichText::new(
-                                "Point --store-root at an rw-store directory, run \
+                                "Point --store-root at an rw-store directory, or \
+                                 configure it in the Storage section above, run \
                                  with --synthetic for demo data, or use the \
                                  Download panel to ingest a run.",
                             )
@@ -826,6 +1307,206 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // resolve_storage_paths: precedence unit tests
+    // ------------------------------------------------------------------
+
+    /// No CLI, no saved: resolve to built-in defaults.
+    #[test]
+    fn resolve_defaults_when_nothing_provided() {
+        let paths = resolve_storage_paths(None, None, None);
+        assert_eq!(paths.store_root, PathBuf::from(DEFAULT_STORE_ROOT));
+        assert_eq!(paths.cache_dir, PathBuf::from(DEFAULT_CACHE_DIR));
+        assert_eq!(paths.store_root_source, PathSource::Default);
+        assert_eq!(paths.cache_dir_source, PathSource::Default);
+    }
+
+    /// CLI arg wins over both saved and default.
+    #[test]
+    fn cli_wins_over_saved_and_default() {
+        let saved = PersistedPaths {
+            store_root: Some("/saved/store".to_string()),
+            cache_dir: Some("/saved/cache".to_string()),
+        };
+        let paths = resolve_storage_paths(Some("/cli/store"), Some("/cli/cache"), Some(&saved));
+        assert_eq!(paths.store_root, PathBuf::from("/cli/store"));
+        assert_eq!(paths.cache_dir, PathBuf::from("/cli/cache"));
+        assert_eq!(paths.store_root_source, PathSource::Cli);
+        assert_eq!(paths.cache_dir_source, PathSource::Cli);
+    }
+
+    /// Saved value wins over default when no CLI arg.
+    #[test]
+    fn saved_wins_over_default() {
+        let saved = PersistedPaths {
+            store_root: Some("/saved/store".to_string()),
+            cache_dir: Some("/saved/cache".to_string()),
+        };
+        let paths = resolve_storage_paths(None, None, Some(&saved));
+        assert_eq!(paths.store_root, PathBuf::from("/saved/store"));
+        assert_eq!(paths.cache_dir, PathBuf::from("/saved/cache"));
+        assert_eq!(paths.store_root_source, PathSource::Saved);
+        assert_eq!(paths.cache_dir_source, PathSource::Saved);
+    }
+
+    /// CLI wins for store_root; saved wins for cache_dir (independent fields).
+    #[test]
+    fn cli_and_saved_can_mix_per_field() {
+        let saved = PersistedPaths {
+            store_root: Some("/saved/store".to_string()),
+            cache_dir: Some("/saved/cache".to_string()),
+        };
+        let paths = resolve_storage_paths(Some("/cli/store"), None, Some(&saved));
+        assert_eq!(paths.store_root, PathBuf::from("/cli/store"));
+        assert_eq!(paths.store_root_source, PathSource::Cli);
+        assert_eq!(paths.cache_dir, PathBuf::from("/saved/cache"));
+        assert_eq!(paths.cache_dir_source, PathSource::Saved);
+    }
+
+    /// Saved with `None` fields falls through to default for those fields.
+    #[test]
+    fn saved_none_fields_fall_through_to_default() {
+        let saved = PersistedPaths {
+            store_root: None,
+            cache_dir: Some("/saved/cache".to_string()),
+        };
+        let paths = resolve_storage_paths(None, None, Some(&saved));
+        assert_eq!(paths.store_root, PathBuf::from(DEFAULT_STORE_ROOT));
+        assert_eq!(paths.store_root_source, PathSource::Default);
+        assert_eq!(paths.cache_dir, PathBuf::from("/saved/cache"));
+        assert_eq!(paths.cache_dir_source, PathSource::Saved);
+    }
+
+    // ------------------------------------------------------------------
+    // Persistence round-trip (no eframe context needed)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn persist_roundtrip_both_fields() {
+        let original = PersistedPaths {
+            store_root: Some("C:\\Users\\drew\\store".to_string()),
+            cache_dir: Some("out/cache".to_string()),
+        };
+        let json = serialize_persisted(&original);
+        let decoded = deserialize_persisted(&json);
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn persist_roundtrip_only_store_root() {
+        let original = PersistedPaths {
+            store_root: Some("/my/store".to_string()),
+            cache_dir: None,
+        };
+        let json = serialize_persisted(&original);
+        let decoded = deserialize_persisted(&json);
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn persist_roundtrip_empty() {
+        let original = PersistedPaths {
+            store_root: None,
+            cache_dir: None,
+        };
+        let json = serialize_persisted(&original);
+        let decoded = deserialize_persisted(&json);
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn persist_roundtrip_windows_backslash_path() {
+        let original = PersistedPaths {
+            store_root: Some("C:\\Users\\drew\\rw\\store".to_string()),
+            cache_dir: Some("C:\\Temp\\cache".to_string()),
+        };
+        let json = serialize_persisted(&original);
+        // The JSON must not contain bare backslashes (they'd break decoding).
+        // Every backslash must appear as \\ in the JSON string value.
+        let store_field_start = json.find("\"store_root\":\"").unwrap();
+        let after_key = &json[store_field_start + "\"store_root\":\"".len()..];
+        let end = after_key.find('"').unwrap();
+        let encoded_value = &after_key[..end];
+        assert!(
+            !encoded_value.contains('\\') || encoded_value.contains("\\\\"),
+            "backslashes must be escaped in JSON: {encoded_value}"
+        );
+        let decoded = deserialize_persisted(&json);
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn persist_roundtrip_garbled_input_returns_none_fields() {
+        // Garbage input must not panic; unrecognised fields return None.
+        let decoded = deserialize_persisted("not json at all {{{}}}");
+        assert_eq!(decoded.store_root, None);
+        assert_eq!(decoded.cache_dir, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Path validation behavior
+    // ------------------------------------------------------------------
+
+    /// A non-existent path with a valid parent (relative, under temp) is
+    /// accepted by create_dir_all without panicking.
+    #[test]
+    fn path_validation_creates_dir_without_panic() {
+        let tmp = std::env::temp_dir().join("rw_ui_path_validation_test_dir");
+        // Clean up in case a previous run left it
+        let _ = std::fs::remove_dir_all(&tmp);
+        let result = std::fs::create_dir_all(&tmp);
+        assert!(
+            result.is_ok(),
+            "create_dir_all must succeed for a valid path"
+        );
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An invalid path (null byte in path) produces an Err, not a panic.
+    #[cfg(unix)]
+    #[test]
+    fn path_validation_bad_path_returns_error_not_panic() {
+        // Null bytes in path names are invalid on Unix.
+        let bad = PathBuf::from("/tmp/bad\x00path");
+        let result = std::fs::create_dir_all(&bad);
+        assert!(result.is_err(), "null byte in path must fail");
+    }
+
+    // ------------------------------------------------------------------
+    // dir_size_bytes
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dir_size_none_for_nonexistent() {
+        let path = PathBuf::from("/this/path/definitely/does/not/exist/rw_test");
+        assert_eq!(dir_size_bytes(&path), None);
+    }
+
+    #[test]
+    fn dir_size_returns_some_for_existing_dir() {
+        let tmp = std::env::temp_dir();
+        // temp dir always exists; we just want Some(_) back.
+        assert!(dir_size_bytes(&tmp).is_some());
+    }
+
+    // ------------------------------------------------------------------
+    // format_bytes
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn format_bytes_ranges() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    // ------------------------------------------------------------------
+    // Existing model / cadence tests (unchanged)
+    // ------------------------------------------------------------------
 
     /// GFS is ingest-supported and therefore appears in model_options() as an
     /// enabled entry — the download picker un-greys it without any hardcoded

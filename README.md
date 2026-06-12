@@ -5,6 +5,10 @@ store hours in a fast-access format, and view map plots, instant soundings,
 and live GOES satellite loops in a native egui app. Full Rust, MIT licensed.
 Extracted and rebuilt from the rustwx fast path.
 
+Storage paths (`--store-root`, `--cache-dir`) are configurable in-app via
+the collapsible "Storage" section in the left panel and are persisted across
+launches (precedence: CLI arg > persisted setting > built-in default).
+
 Design: docs/superpowers/specs/2026-06-09-rusty-weather-design.md
 
 ## Using crates from this repo as dependencies
