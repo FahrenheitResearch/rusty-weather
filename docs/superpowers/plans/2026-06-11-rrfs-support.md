@@ -226,29 +226,74 @@ gracefully skip with warnings, as GFS already does for fields it lacks.)
 - [x] **Recon**: real `.idx` + grid headers; fetch-plan + trailing-window settled (this doc).
 - [x] **DECISION (Drew, 2026-06-11):** ingest the NA pair, crop to CONUS at ingest, subset
       fetch via .idx. Recorded above; checklist un-gated.
-- [ ] **Engine — fetch plan + subset patterns**: `fetch_plan(RrfsA) = [prs-na (pressure),
+- [x] **Engine — fetch plan + subset patterns**: `fetch_plan(RrfsA) = [prs-na (pressure),
       nat-na (surface)]`, each carrying its `.idx` `variable_patterns`; `fetch_hour` wires
       patterns onto the `FetchRequest`. HRRR/GFS unchanged (empty patterns). Tests: plan
       shape, `ingest_supported(RrfsA)`, RRFS plan includes apcp_1h/uh/wind-max,
-      f060 ok / f061 rejected, hourly cycles valid.
-- [ ] **Engine — crop core (full verification)**: per-model CONUS crop box; native-rotated
+      f060 ok / f061 rejected, hourly cycles valid. (9f6c6ef; **plus the c3b40ca bugfix** —
+      the first cut wrote the patterns colon-wrapped `:VAR:level:`, which `find_entries`
+      parses as an empty variable name → zero matches → silent whole-file fallback. The
+      first live run downloaded the full 4.37+9.25 GB pair because of this. Patterns are
+      bare `VAR[:level]`; a regression test pins the format.)
+- [x] **Engine — crop core (full verification)**: per-model CONUS crop box; native-rotated
       index block computed from GDS constants; one shared crop spec slices grid + every
       field plane + derived/heavy grids in lock-step, applied before normalize/rotate.
       Tests: deterministic index ranges from constants; cropped dims; coords/fields lock-step;
-      HRRR/GFS untouched (no crop box → no-op).
-- [ ] **`model_has_trailing_1h_window(RrfsA) = true`** with the quoted natlev `.idx` lines.
-- [ ] **Live validation**: ingest f000-f003 `--verify`; `rws validate --deep` exit 0;
-      `rws export` + xarray (bit-exact spot vs `read_full_2d`; cropped lat/lon ranges ≈ box);
-      sounding probe ×3 (incl. one near a box edge); record wall/sizes/RAM + **download MB
-      fetched vs full-file MB** (the subsetting win); realized isobaric level count.
-- [ ] **Calibration**: RRFS-A builtin table from the live cropped store; accuracy test.
-- [ ] **Render + batch**: rw_render direct+derived; READ 2-3 PNGs (CONUS geography correct —
-      crop didn't shift georeferencing — THE key visual check); rw_batch f000-f003
-      `--no-heavy --products all` (expect MORE than GFS's 290: UH/reflectivity/hourly QPF);
-      timing table.
-- [ ] **Determinism**: re-ingest one hour → `rw_store_diff` equivalent.
-- [ ] **Docs**: README matrix row RRFS-A full + crop note (NA source cropped to CONUS at
-      ingest, box constants, MSLET→mslp); examples.
+      HRRR/GFS untouched (no crop box → no-op). (9f6c6ef; live-verified: 4881×2961 →
+      **2938×1739** = 5,109,182 cells.)
+- [x] **`model_has_trailing_1h_window(RrfsA) = true`** with the quoted natlev `.idx` lines.
+      (9f6c6ef.)
+- [x] **Recon correction (c5d2040):** the recon's "natlev has only TCDC, no native CAPE"
+      claim was **wrong** — the live f001 `.idx` carries `CAPE:surface`, `CAPE:90-0 mb`,
+      `CAPE:255-0 mb` (the exact native planes the heavy ECAPE-ratio recipes need) AND
+      `LCDC/MCDC/HCDC` cloud-layer covers + `TCDC:entire atmosphere`. The nat subset
+      patterns now reach them (33 messages, ~226 MB, 2.6% of the file). Honest absences
+      that stay skipped: REFD@1000m AGL, instantaneous UH 2-5 km, smoke MASSDEN-8m/COLMD,
+      HRRR-style SBT channels (RRFS publishes ABI `SBTA16x` instead). (A later correction
+      to the correction: natlev DOES carry run-total APCP at every hour — `0-2 hour acc`
+      at f002, `0-3` at f003 — ALONGSIDE the 1 h window; see the live-validation bug note
+      below.)
+- [x] **Live validation** (20260611 16z f000-f003, all `--verify` passed — 52-61 2D fields
+      bit-exact per hour, derived `sbcape` + heavy `sbecape` bit-exact, 5 profiles × 37
+      levels within quant bound; `rws validate <run dir> --deep` **exit 0**, 439 variables /
+      436,316 chunks / 8.97 GB payload):
+      - **Subset-vs-full download** (the win): prs-na subset 2,889-2,899 MB vs 4.37 GB full
+        (~69%); nat-na subset 189-245 MB vs 9.25 GB full (~2.6%) → **~3.05 GiB/hour
+        transferred vs ~12.7 GiB whole-file (4.2×)**. (The first live run had downloaded
+        the FULL pair — the c3b40ca pattern-format bug.)
+      - **Crop**: every hour logs `crop-at-ingest 4881x2961 -> 2938x1739` (deterministic).
+        Export + xarray: dims 2938×1739; CONUS box fully covered (lat 6.6..64.5, lon
+        −193.8..−32.2 continuous; ~0.77% of cells past the antimeridian in one far corner
+        of the index block — outside CONUS, never sampled). t2m per-tile min/max/valid
+        **bit-exact** vs the store index records (84/84 tiles). Levels 1000→100 hPa, 37
+        realized, monotone.
+      - **Sounding probes ×3** (Kansas center / New Orleans / Olympic-peninsula box edge):
+        finite, Td ≤ T, June-plausible (24.4 °C / 31.6 °C / 11.2 °C 2 m; MSLP 1005-1021 hPa).
+      - **Wall/RAM/sizes** (polite BelowNormal 30 threads): ~710-860 s per full-profile
+        hour (heavy ECAPE triplet 563-601 s of it); store 2.13-2.16 GB/hour; `grid.rwg`
+        34.9 MB; **peak working set 39.24 GB** (NA-grid isobaric decode before crop —
+        the honest RAM ceiling for full-profile RRFS-A on a 64 GB box).
+      - **Live bug found & fixed (305eae4)**: natlev orders the trailing-window APCP ahead
+        of the run-total; the end-hour tie-break by file order stored the 1 h window as
+        `apcp_run_total` (f002 planes byte-identical, caught by tile-stat comparison).
+        Scoring now prefers the 0-start accumulation; HRRR/GFS selections unchanged;
+        regression test covers both file orders; f002/f003 re-ingested with the fix.
+- [x] **Calibration**: RRFS-A builtin table measured from the live cropped store
+      (f001-f003 full profile); `builtin_for_model(RrfsA)`; download priced as the
+      measured **`.idx`-subset bytes** (prs 3,028,658,817 + nat 243,349,728 per hour),
+      NOT the 13 GB whole-file pair — provenance string discloses it. Accuracy test vs
+      the live store (ignored, like GFS's) + an always-on subset-pricing unit test.
+- [x] **Render**: rw_render f000 conus 2m_temperature / composite_reflectivity / sbcape —
+      PNGs READ: Great Lakes / coastlines / state lines / terrain stripes all aligned,
+      derived sbcape in lock-step → **crop did not shift georeferencing**.
+- [ ] **Batch**: rw_batch f000-f003 `--no-heavy --products all` (expect MORE than GFS's
+      290: UH/reflectivity/hourly QPF); timing table.
+- [x] **Determinism**: f000 re-ingested into a fresh store root → `rw_store_diff`:
+      **equivalent** (108,764 index records + 2,225,805,419 payload bytes; writer.build
+      excluded), exit 0.
+- [x] **Docs**: README matrix row RRFS-A full + crop note (NA source cropped to CONUS at
+      ingest, box constants, MSLET→mslp, antimeridian corner, subset sizes, honest RAM
+      note); examples (ingest/validate/export/batch).
 - [ ] **Gates**: `cargo test --workspace` green; fmt/clippy clean on touched; release builds;
       tree clean (discard pre-existing sat_worker.rs/compute.rs churn); do NOT push.
 

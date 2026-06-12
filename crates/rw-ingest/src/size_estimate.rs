@@ -371,6 +371,164 @@ const GFS_BUILTIN_GRID_FILE_BYTES: u64 = 7_370;
 /// surface and pressure roles — no separate prs/sfc split.
 const GFS_BUILTIN_PGRB2_FILE_BYTES: u64 = 542_140_336;
 
+// ─── RRFS-A builtin calibration ──────────────────────────────────────────────
+//
+// Source: `out/rrfs_store/rrfs_a/20260611_16z` FULL-profile crop-at-ingest
+// store (2026-06-11 16z), averaged over f001/f002/f003 (f000 is the analysis
+// hour: no trailing 1 h window fields, slightly smaller). Same header+index
+// walk as the HRRR/GFS tables above.
+//
+// Grid: 2938 × 1739 (≈5.1 M cells) — the NA rotated-pole grid (4881×2961)
+// cropped at ingest to the CONUS box (−134.5, −60.5, 21.0, 53.5).
+// Profile: full (all 2D + derived + heavy + 5 isobaric volumes @ 37 levels).
+//
+// DOWNLOAD PRICING IS SUBSET PRICING: RRFS-A fetches via `.idx` message
+// subsetting (the NA pair is 4.4 + 9.2 GB whole-file — see the fetch plan in
+// `crate::fetch_plan`), so `prs/sfc_file_bytes` below are the measured
+// SUBSET bytes actually transferred (f001-f003 average), NOT the full file
+// sizes. Estimating with full-file sizes would over-state the download ~4×.
+
+/// RRFS-A 2D variables: per-hour compressed payload bytes (full profile,
+/// incl. derived + heavy grids).
+const RRFS_A_BUILTIN_BYTES_2D: &[(&str, u64)] = &[
+    ("absolute_vorticity_200", 4_390_808),
+    ("absolute_vorticity_300", 6_902_895),
+    ("absolute_vorticity_500", 4_400_155),
+    ("absolute_vorticity_700", 6_820_782),
+    ("absolute_vorticity_850", 12_504_916),
+    ("apcp_1h", 771_712),
+    ("apcp_run_total", 771_712),
+    ("apparent_temperature_2m", 12_058_937),
+    ("bulk_shear_0_1km", 17_419_622),
+    ("bulk_shear_0_6km", 17_130_770),
+    ("categorical_freezing_rain", 3_097),
+    ("categorical_ice_pellets", 246),
+    ("categorical_rain", 246_257),
+    ("categorical_snow", 514),
+    ("cloud_cover_high", 1_679_037),
+    ("cloud_cover_low", 2_629_384),
+    ("cloud_cover_mid", 1_401_755),
+    ("cloud_cover_total", 2_897_057),
+    ("composite_reflectivity", 4_530_565),
+    ("dcape", 13_322_140),
+    ("dewpoint_2m", 9_415_021),
+    ("dewpoint_700hpa", 14_922_850),
+    ("dewpoint_850hpa", 11_551_245),
+    ("dewpoint_depression_2m", 17_261_644),
+    ("ecape_ehi_0_1km", 12_374_223),
+    ("ecape_ehi_0_3km", 12_144_440),
+    ("ecape_scp", 4_346_256),
+    ("ecape_stp", 2_643_656),
+    ("ehi_0_1km", 13_775_526),
+    ("ehi_0_3km", 13_543_561),
+    ("fire_weather_composite", 17_317_167),
+    ("geopotential_height_200hpa", 9_210_857),
+    ("geopotential_height_250hpa", 9_124_755),
+    ("geopotential_height_300hpa", 8_935_956),
+    ("geopotential_height_500hpa", 10_293_514),
+    ("geopotential_height_700hpa", 10_585_929),
+    ("geopotential_height_850hpa", 13_096_748),
+    ("heat_index_2m", 16_446_599),
+    ("lapse_rate_0_3km", 16_672_191),
+    ("lapse_rate_700_500", 16_208_968),
+    ("lifted_index", 17_246_940),
+    ("ml_ecape_derived_cape_ratio", 6_684_881),
+    ("ml_ecape_native_cape_ratio", 6_426_728),
+    ("mlcape", 10_566_460),
+    ("mlcin", 9_152_883),
+    ("mlecape", 11_988_731),
+    ("mlecin", 15_502_192),
+    ("mslp", 10_965_202),
+    ("mu_ecape_derived_cape_ratio", 8_771_860),
+    ("mu_ecape_native_cape_ratio", 8_242_431),
+    ("mucape", 11_674_312),
+    ("mucin", 6_360_643),
+    ("muecape", 10_869_694),
+    ("orography", 6_853_188),
+    ("pwat", 5_050_325),
+    ("relative_humidity_200hpa", 2_577_382),
+    ("relative_humidity_300hpa", 2_842_388),
+    ("relative_humidity_500hpa", 2_810_978),
+    ("relative_humidity_700hpa", 2_961_726),
+    ("relative_humidity_850hpa", 3_348_716),
+    ("rh_2m", 6_422_411),
+    ("sb_ecape_derived_cape_ratio", 8_155_105),
+    ("sb_ecape_native_cape_ratio", 7_396_620),
+    ("sbcape", 13_155_944),
+    ("sbcin", 4_595_530),
+    ("sbecape", 11_660_786),
+    ("sbecin", 10_319_613),
+    ("sblcl", 17_297_616),
+    ("sbncape", 11_007_538),
+    ("scp_mu_0_3km_0_6km_proxy", 4_652_927),
+    ("srh_0_1km", 18_056_058),
+    ("srh_0_3km", 17_715_579),
+    ("stp_fixed", 2_509_935),
+    ("surface_pressure", 8_754_293),
+    ("temperature_200hpa", 2_187_107),
+    ("temperature_250hpa", 2_099_405),
+    ("temperature_2m", 8_814_778),
+    ("temperature_300hpa", 2_030_705),
+    ("temperature_500hpa", 2_323_497),
+    ("temperature_700hpa", 2_802_979),
+    ("temperature_850hpa", 3_357_067),
+    ("temperature_advection_700mb", 15_093_841),
+    ("temperature_advection_850mb", 16_675_906),
+    ("theta_e_2m_10m_winds", 15_054_024),
+    ("u_10m", 11_573_496),
+    ("u_wind_200hpa", 9_283_662),
+    ("u_wind_250hpa", 4_182_420),
+    ("u_wind_300hpa", 4_135_229),
+    ("u_wind_500hpa", 11_298_087),
+    ("u_wind_700hpa", 11_273_728),
+    ("u_wind_850hpa", 11_730_071),
+    ("uh_2to5km", 171_333),
+    ("uh_2to5km_max_1h", 171_333),
+    ("v_10m", 11_714_177),
+    ("v_wind_200hpa", 4_011_911),
+    ("v_wind_250hpa", 4_140_185),
+    ("v_wind_300hpa", 4_097_928),
+    ("v_wind_500hpa", 11_342_272),
+    ("v_wind_700hpa", 11_417_216),
+    ("v_wind_850hpa", 11_961_239),
+    ("visibility", 13_640_378),
+    ("vpd_2m", 17_328_958),
+    ("wetbulb_2m", 16_341_982),
+    ("wind_chill_2m", 16_513_637),
+    ("wind_gust_10m", 4_371_284),
+    ("wind_speed_10m_max_1h", 4_817_503),
+];
+
+/// RRFS-A 3D isobaric volumes: per-LEVEL per-hour compressed payload bytes
+/// (measured from the full-profile 37-level ingest).
+const RRFS_A_BUILTIN_BYTES_3D_PER_LEVEL: &[(&str, u64)] = &[
+    ("dewpoint_iso", 9_274_226),
+    ("height_iso", 4_548_152),
+    ("temperature_iso", 3_608_394),
+    ("u_iso", 9_180_297),
+    ("v_iso", 9_307_722),
+];
+
+/// Measured `meta_len / variable_count` from the 20260611 16z RRFS-A full
+/// store (f001, 111 variables).
+const RRFS_A_BUILTIN_META_BYTES_PER_VAR: u64 = 171;
+
+/// Measured RRFS-A `grid.rwg` (2938×1739 cropped curvilinear grid with full
+/// per-cell lat/lon — much larger than HRRR's because the cropped rotated
+/// grid stores both coordinate planes at 5.1 M cells).
+const RRFS_A_BUILTIN_GRID_FILE_BYTES: u64 = 34_861_339;
+
+/// Measured `prslev.na` `.idx`-SUBSET download per hour (f001-f003 average:
+/// 3,029,622,550 / 3,039,520,938 / 3,016,832,963 bytes ≈ 2.82 GiB). The
+/// whole file is ~4.4 GB; the subset is the 7 isobaric volume field types
+/// (~69% of the file).
+const RRFS_A_BUILTIN_PRS_SUBSET_BYTES: u64 = 3_028_658_817;
+
+/// Measured `natlev.na` `.idx`-SUBSET download per hour (f001-f003 average:
+/// 241,292,518 / 244,572,538 / 244,184,130 bytes ≈ 232 MiB). The whole file
+/// is ~9.2 GB; the subset is the 33-message surface set (~2.6% of the file).
+const RRFS_A_BUILTIN_NAT_SUBSET_BYTES: u64 = 243_349_728;
+
 impl Calibration {
     /// The measured 2026-06-08 00z HRRR defaults (see the consts above).
     pub fn builtin_default() -> Self {
@@ -427,11 +585,42 @@ impl Calibration {
         }
     }
 
-    /// Select the appropriate built-in calibration for `model`: GFS uses the
-    /// GFS-measured table; everything else falls back to the HRRR table.
+    /// The measured 2026-06-11 16z RRFS-A defaults (see the `RRFS_A_BUILTIN_*`
+    /// consts above), from the full-profile crop-at-ingest store. RRFS-A keeps
+    /// the two-file prs+sfc plan shape (`prs-na` + `nat-na`), so the standard
+    /// two-entry download rule applies — but **both download constants are the
+    /// measured `.idx`-SUBSET transfer sizes**, not the multi-GB whole files
+    /// (the provenance string discloses this).
+    pub fn builtin_rrfs_a_default() -> Self {
+        Self {
+            source: "built-in defaults (RRFS-A, calibrated 2026-06-11 16z full profile \
+                     f001-f003, 2938x1739 CONUS crop of the NA grid; downloads priced as \
+                     .idx-subset bytes: prs-na ~2.8 GiB of a 4.4 GB file, nat-na ~232 MiB \
+                     of a 9.2 GB file)"
+                .to_string(),
+            nx: 2938,
+            ny: 1739,
+            bytes_2d: RRFS_A_BUILTIN_BYTES_2D
+                .iter()
+                .map(|(name, bytes)| ((*name).to_string(), *bytes))
+                .collect(),
+            bytes_3d_per_level: RRFS_A_BUILTIN_BYTES_3D_PER_LEVEL
+                .iter()
+                .map(|(name, bytes)| ((*name).to_string(), *bytes))
+                .collect(),
+            meta_bytes_per_var: RRFS_A_BUILTIN_META_BYTES_PER_VAR,
+            grid_file_bytes: RRFS_A_BUILTIN_GRID_FILE_BYTES,
+            prs_file_bytes: RRFS_A_BUILTIN_PRS_SUBSET_BYTES,
+            sfc_file_bytes: RRFS_A_BUILTIN_NAT_SUBSET_BYTES,
+        }
+    }
+
+    /// Select the appropriate built-in calibration for `model`: GFS and RRFS-A
+    /// use their measured tables; everything else falls back to the HRRR table.
     pub fn builtin_for_model(model: ModelId) -> Self {
         match model {
             ModelId::Gfs => Self::builtin_gfs_default(),
+            ModelId::RrfsA => Self::builtin_rrfs_a_default(),
             _ => Self::builtin_default(),
         }
     }
@@ -1096,6 +1285,108 @@ mod tests {
         assert_eq!(
             estimate.per_hour_download_bytes,
             BUILTIN_PRS_FILE_BYTES + BUILTIN_SFC_FILE_BYTES
+        );
+    }
+
+    /// RRFS-A builtin pricing is honest about subsetting: the download
+    /// estimate for a full-profile hour must equal the measured prs+nat
+    /// `.idx`-SUBSET bytes (the two-entry plan rule prices sfc always and
+    /// prs when the profile needs isobaric data) — a tiny fraction of the
+    /// 13+ GB whole-file pair — and the provenance string must disclose the
+    /// subset pricing. HRRR's table stays untouched (pinned elsewhere by
+    /// `hrrr_full_profile_estimate_is_unchanged_after_gfs_table_added`).
+    #[test]
+    fn rrfs_a_estimate_prices_subset_downloads_not_full_files() {
+        let calibration = Calibration::builtin_for_model(ModelId::RrfsA);
+        assert!(
+            calibration.source.contains("subset"),
+            "provenance must disclose subset pricing: {}",
+            calibration.source
+        );
+        assert_eq!((calibration.nx, calibration.ny), (2938, 1739));
+
+        let profile = IngestProfile::full();
+        let priced = estimate(&profile, ModelId::RrfsA, 1, &calibration);
+        assert_eq!(
+            priced.per_hour_download_bytes,
+            RRFS_A_BUILTIN_PRS_SUBSET_BYTES + RRFS_A_BUILTIN_NAT_SUBSET_BYTES,
+            "full profile prices prs+nat subset bytes"
+        );
+        // The whole-file pair is ~12.7 GiB (4.37 + 9.25 GB measured live);
+        // the subset estimate must be far below it.
+        assert!(
+            priced.per_hour_download_bytes < 4_000_000_000,
+            "subset pricing must not approach whole-file sizes, got {}",
+            priced.per_hour_download_bytes
+        );
+    }
+
+    /// RRFS-A estimate accuracy vs the live cropped store within ±15%
+    /// (store) and ±10% (download), mirroring the GFS accuracy gate.
+    /// Requires the live RRFS-A store at out/rrfs_store (2026-06-11 16z
+    /// full-profile crop-at-ingest run).
+    #[test]
+    #[ignore]
+    fn rrfs_a_estimate_accuracy_vs_live_store_within_15_pct() {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let run_dir = workspace.join("out/rrfs_store/rrfs_a/20260611_16z");
+        let store_paths: Vec<std::path::PathBuf> = ["f001.rws", "f002.rws", "f003.rws"]
+            .iter()
+            .map(|f| run_dir.join(f))
+            .collect();
+
+        let calibration =
+            Calibration::from_hour_files(&store_paths, ModelId::RrfsA).expect("calibrate");
+        // Full profile at the 25 hPa step — exactly the live ingest shape
+        // (37 realized levels).
+        let profile = IngestProfile::full();
+        let estimate = estimate(&profile, ModelId::RrfsA, 1, &calibration);
+
+        let walked_bytes: Vec<u64> = store_paths
+            .iter()
+            .map(|p| walk_hour_sizes(p).expect("walk").file_bytes)
+            .collect();
+        let avg_store_bytes = walked_bytes.iter().sum::<u64>() / walked_bytes.len() as u64;
+        let diff = estimate.per_hour_store_bytes.abs_diff(avg_store_bytes);
+        let ratio = diff as f64 / avg_store_bytes as f64;
+        assert!(
+            ratio <= 0.15,
+            "RRFS-A store estimate {} must be within 15% of measured avg {} \
+             (actual diff {:.1}%)",
+            estimate.per_hour_store_bytes,
+            avg_store_bytes,
+            ratio * 100.0
+        );
+
+        // Download: the measured .idx-subset transfer sizes (f001-f003
+        // average, from the live fetch cache metas).
+        let measured_subset_avg = RRFS_A_BUILTIN_PRS_SUBSET_BYTES + RRFS_A_BUILTIN_NAT_SUBSET_BYTES;
+        let dl_diff = estimate
+            .per_hour_download_bytes
+            .abs_diff(measured_subset_avg);
+        let dl_ratio = dl_diff as f64 / measured_subset_avg as f64;
+        assert!(
+            dl_ratio <= 0.10,
+            "RRFS-A download estimate {} must be within 10% of measured subset avg {} \
+             (actual diff {:.1}%)",
+            estimate.per_hour_download_bytes,
+            measured_subset_avg,
+            dl_ratio * 100.0
+        );
+
+        println!(
+            "RRFS-A accuracy: store estimate {} vs measured {} ({:.1}%); \
+             download estimate {} vs measured subset {} ({:.1}%)",
+            estimate.per_hour_store_bytes,
+            avg_store_bytes,
+            ratio * 100.0,
+            estimate.per_hour_download_bytes,
+            measured_subset_avg,
+            dl_ratio * 100.0
         );
     }
 

@@ -122,7 +122,8 @@ count matched the sum of bucket records.
 |-------|--------|-------|--------|-----------|-------------|-------|
 | HRRR  | full   | full  | full   | full      | enabled     | 1799×1059 CONUS, hourly f000-f048 |
 | GFS   | full   | full  | full   | full      | enabled     | 1440×721 global 0.25°, synoptic cycles, hourly f000-f120 then 3-hourly f123-f384 |
-| RRFS-A / REFS / NBM / RAP | — | — | — | — | coming soon | each needs a fetch-plan entry + validation pass |
+| RRFS-A | full  | full  | full   | full      | enabled     | 2938×1739 CONUS **cropped at ingest** from the 4881×2961 rotated-pole NA grid, hourly cycles 00-23z, f000-f060 |
+| REFS / NBM / RAP | — | — | — | — | coming soon | each needs a fetch-plan entry + validation pass |
 
 **GFS product exclusions (not available in pgrb2.0p25):** composite\_reflectivity, UH/rotation tracks, smoke columns, simulated IR, 1-hour APCP (GFS uses bucketed 0-6h accumulations; windowed QPF requires bucket-difference logic, deferred to v2). All other HRRR products are supported for GFS.
 
@@ -148,9 +149,70 @@ count matched the sum of bucket records.
         --no-heavy --products all \
         --store-root out/gfs_store --cache-dir out/cache --out-dir out/gfs_batch
 
+**RRFS-A crop-at-ingest (validated live 2026-06-11 16z f000-f003):** the only RRFS-A
+files carrying the surface field set are the **North-America** pair
+(`prslev.3km.fNNN.na.grib2` + `natlev.3km.fNNN.na.grib2`, both 4881×2961 GRIB
+template-1 rotated-pole; `prslev.conus` is pressure-only and `natlev.conus` does not
+exist). The ingest therefore:
+
+- **Subset-fetches via `.idx`** (the whole-file pair is 4.4 + 9.2 GB/hour): the
+  pressure subset is ~2.8 GiB (~69% — the isobaric volumes *are* most of that file),
+  the surface subset ~232 MiB (~2.6%). Measured live: **~3.05 GiB/hour transferred
+  vs ~12.7 GiB whole-file — a 4.2× download cut.** Size estimates price these subset
+  bytes, not the full files.
+- **Crops to a CONUS box at extraction**: geographic box (west −134.5, east −60.5,
+  south 21.0, north 53.5) — chosen so RRFS-CONUS coverage ⊇ HRRR-CONUS — realized
+  deterministically as a contiguous native-index block **2938×1739 (≈5.1 M cells,
+  ~2.7× HRRR)** instead of the 14.5 M-cell NA grid. One crop spec slices the
+  coordinate grid, every 2D plane, every volume level, and the derived/heavy compute
+  domain in lock-step (re-ingest is structurally bit-identical; `rw_store_diff`
+  verified). The block over-covers the box (rotated-grid skew; lat 6.6..64.5,
+  lon −193.8..−32.2 with ~0.8% of cells past the antimeridian in one far corner —
+  all far outside CONUS and never sampled by CONUS renders or probes).
+- **`mslp` is honestly sourced from MSLET** (natlev carries MSLET, not PRMSL; the
+  selector already matches it).
+
+**RRFS-A product exclusions (not in `natlev.na`):** smoke (MASSDEN 8 m / column),
+HRRR-style simulated IR (RRFS publishes ABI `SBTA16x` channels instead), 1 km AGL
+reflectivity (only 263 K + hybrid-level REFD), instantaneous 2-5 km UH (`uh_2to5km`
+stores the native 0-1 h MXUPHL max — the same plane as `uh_2to5km_max_1h`, exactly
+like HRRR sfc files). Everything else is HRRR-grade, including hourly APCP, UH-max
+and wind-max trailing windows, native CAPE planes (heavy 16/16) and layered cloud
+cover.
+
+**RRFS-A ingest cost (honest numbers, polite 30-thread BelowNormal pool):** a
+full-profile hour is ~12-14 min wall, ~10 min of which is the heavy ECAPE triplet at
+5.1 M cells; store ≈ 2.1-2.2 GB/hour (37 isobaric levels). **Peak working set
+~39 GB**: the NA-grid isobaric decode materializes full 14.5 M-cell planes before
+the crop applies — plan for a 64 GB machine for full-profile RRFS-A ingests (HRRR
+peaks ~5 GB by comparison). `--no-heavy` or the sounding profile cut both wall and
+RAM dramatically.
+
+**RRFS-A ingest examples:**
+
+    # Ingest 4 hours (f000-f003) from the 16z cycle, full profile
+    cargo run --release -p rusty-weather --bin rw_ingest -- \
+        --model rrfs-a --date 20260611 --cycle 16 --hours 0-3 \
+        --store-root out/rrfs_store --cache-dir out/rrfs_cache --verify
+
+    # Validate the stored hours (conformance gate)
+    cargo run --release -p rusty-weather --bin rws -- \
+        validate out/rrfs_store/rrfs_a/20260611_16z --deep
+
+    # Export one hour to NetCDF3 (readable by xarray/scipy)
+    cargo run --release -p rusty-weather --bin rws -- \
+        export out/rrfs_store/rrfs_a/20260611_16z/f000.rws \
+        -o rrfs_f000_subset.nc --vars temperature_2m,composite_reflectivity,temperature_iso
+
+    # Batch render all products for f000-f003
+    cargo run --release -p rusty-weather --bin rw_batch -- \
+        --model rrfs-a --date 20260611 --cycle 16 --hours 0-3 \
+        --no-heavy --products all --region conus \
+        --store-root out/rrfs_batch_store --cache-dir out/rrfs_cache --out-dir out/rrfs_batch
+
 ## Status
 
-HRRR and GFS are both fully supported end-to-end. The workspace builds and renders live plots for both models. GFS is exposed in the download picker alongside HRRR (hours field shows the cadence hint: "hourly ≤120, 3-hourly 123-384").
+HRRR, GFS, and RRFS-A are fully supported end-to-end. The workspace builds and renders live plots for all three models. GFS is exposed in the download picker alongside HRRR (hours field shows the cadence hint: "hourly ≤120, 3-hourly 123-384"); RRFS-A auto-enables in the picker via `ingest_supported`.
 
     # HRRR quick smoke test
     cargo run --release -p rusty-weather --bin smoke_direct -- --model hrrr --date YYYYMMDD --cycle 0 --forecast-hour 6 --region midwest --all-supported --out-dir out
@@ -271,7 +333,7 @@ work; the cost is the vendored `ecape-rs` physics kernel.
 **TOTAL WALL: 59.1 s | process CPU 657.7 s | 290 products rendered (47 skipped/blocked)**  
 GFS vs HRRR baseline (59.8 s / 248 products): GFS is slightly faster (smaller cells: 1.04 M vs 1.9 M CONUS grid points) and renders more products (full global field set vs midwest-region subset).
 
-**Next:** RRFS-A / REFS / NBM / RAP support — each follows the GFS pattern (fetch-plan entry + validation pass) — see docs/superpowers/specs/2026-06-09-rusty-weather-design.md.
+**Next:** REFS / NBM / RAP support — each follows the GFS pattern (fetch-plan entry + validation pass; RRFS-A added the crop-at-ingest + `.idx`-subset machinery any oversized-domain model can now reuse) — see docs/superpowers/specs/2026-06-09-rusty-weather-design.md.
 
 ## Layout
 
