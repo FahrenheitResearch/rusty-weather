@@ -93,7 +93,30 @@ pub fn decode_products_inputs(
     surface_bytes: Vec<u8>,
     pressure_bytes: Vec<u8>,
 ) -> Result<ProductsComputeInputs, Box<dyn std::error::Error>> {
+    decode_products_inputs_cropped(surface_bytes, pressure_bytes, None)
+}
+
+/// [`decode_products_inputs`] with an optional crop: when `crop` is set, the
+/// decoded surface+pressure pair is sliced to that index block via the
+/// products lane's own `crop_heavy_domain_with` (the same crop the extracted
+/// field planes used), so the derived/heavy grids land on the identical cropped
+/// grid as the stored 2D fields — provably in lock-step. The crop's
+/// `(x_end, y_end)` must lie within the decoded surface shape (it does: it was
+/// computed from the same GRIB grid).
+pub fn decode_products_inputs_cropped(
+    surface_bytes: Vec<u8>,
+    pressure_bytes: Vec<u8>,
+    crop: Option<rustwx_products::gridded::GridCrop>,
+) -> Result<ProductsComputeInputs, Box<dyn std::error::Error>> {
     let (surface, pressure) = decode_store_thermo_pair_owned(surface_bytes, pressure_bytes)?;
+    let (surface, pressure) = match crop {
+        Some(crop) => {
+            let cropped =
+                rustwx_products::gridded::crop_heavy_domain_with(&surface, &pressure, crop)?;
+            (cropped.surface, cropped.pressure)
+        }
+        None => (surface, pressure),
+    };
     Ok(ProductsComputeInputs::new(surface, pressure))
 }
 

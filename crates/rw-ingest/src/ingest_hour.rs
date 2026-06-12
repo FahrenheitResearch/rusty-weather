@@ -116,8 +116,104 @@ const TRAILING_2D_NAMES: [&str; 3] = ["apcp_1h", "uh_2to5km_max_1h", "wind_speed
 /// wind-max messages at all. So GFS (and any future non-HRRR model) excludes
 /// the trailing set rather than claim a 1 h field it can't produce. Honest
 /// GFS windowed QPF (bucket-difference logic) is a separate, deferred feature.
+///
+/// RRFS-A's `natlev.na` is genuinely HRRR-grade here — recon-verified messages
+/// from `rrfs.t00z.natlev.3km.f001.na.grib2.idx` (2026-06-11 00z):
+/// ```text
+/// APCP:surface:0-1 hour acc fcst              (HOURLY, not GFS's 6 h reset)
+/// MXUPHL:5000-2000 m above ground:0-1 hour max fcst   (UH 2-5 km)
+/// WIND:10 m above ground:0-1 hour max fcst
+/// ```
+/// so `apcp_1h`/`uh_2to5km_max_1h`/`wind_speed_10m_max_1h` are honest for
+/// RRFS-A. The RRFS fetch plan subsets exactly these messages from `nat-na`.
 fn model_has_trailing_1h_window(model: ModelId) -> bool {
-    matches!(model, ModelId::Hrrr | ModelId::HrrrAk)
+    matches!(model, ModelId::Hrrr | ModelId::HrrrAk | ModelId::RrfsA)
+}
+
+/// Compute the crop-at-ingest spec for this hour, or `None` for models with no
+/// crop box (HRRR/GFS — no-op) or whose grid already fits the box. The spec is
+/// the contiguous index block whose cells' geographic coordinates intersect the
+/// model's CONUS box, computed ONCE from the reference (grid carrier) grid so
+/// every stored plane and the compute domain share the identical block.
+///
+/// Errors only when a crop box is configured but no cell of the grid lies in it
+/// (a misconfigured box or a wrong-domain file) — failing loud beats silently
+/// storing an off-target or full-domain grid.
+fn compute_ingest_crop(
+    model: ModelId,
+    reference_plane: &FieldPlane2D,
+    extraction_grids: &[Vec<SharedExtractionGrid>; 3],
+    hour: u16,
+    config: &IngestConfig<'_>,
+) -> Result<Option<rustwx_products::gridded::GridCrop>, IngestError> {
+    let Some(bounds) = crate::model_crop_box(model) else {
+        return Ok(None);
+    };
+    let (ref_pass, ref_slot) = reference_plane.grid_ref;
+    let reference = &extraction_grids[ref_pass][ref_slot].grid;
+    let Some(crop) = rustwx_products::gridded::grid_crop_for_bounds(reference, bounds) else {
+        return Err(other(format!(
+            "f{hour:03}: crop box {bounds:?} for {model} selected no grid cells \
+             (wrong domain file?)"
+        )));
+    };
+    // A crop covering the whole grid is a no-op; skip it so the bytes match a
+    // crop-less ingest of the same already-CONUS grid.
+    if crop.width() == reference.shape.nx && crop.height() == reference.shape.ny {
+        return Ok(None);
+    }
+    config.emit(IngestEvent::Info {
+        hour,
+        message: format!(
+            "f{hour:03}: crop-at-ingest {}x{} -> {}x{} (CONUS box {bounds:?})",
+            reference.shape.nx,
+            reference.shape.ny,
+            crop.width(),
+            crop.height()
+        ),
+    });
+    Ok(Some(crop))
+}
+
+/// Slice every extraction grid, every 2D field plane, and every realized volume
+/// level plane to the one crop block, in lock-step. Each distinct extraction
+/// grid is cropped once; each plane's values are cropped using that plane's
+/// source grid width (the pre-crop `nx`), so coords and values stay aligned.
+fn apply_crop_to_extraction(
+    crop: rustwx_products::gridded::GridCrop,
+    extraction_grids: &mut [Vec<SharedExtractionGrid>; 3],
+    fields_2d: &mut [(String, FieldPlane2D)],
+    volumes_data: &mut [VolumeData],
+) -> Result<(), String> {
+    use rustwx_products::gridded::{crop_latlon_grid, crop_values_f32};
+    // Source widths per (pass, slot), captured before any grid is replaced.
+    let mut source_nx: [Vec<usize>; 3] = Default::default();
+    for (pass, grids) in extraction_grids.iter().enumerate() {
+        source_nx[pass] = grids.iter().map(|g| g.grid.shape.nx).collect();
+    }
+    // Crop each distinct extraction grid's coordinates.
+    for grids in extraction_grids.iter_mut() {
+        for shared in grids.iter_mut() {
+            shared.grid = crop_latlon_grid(&shared.grid, crop).map_err(|err| err.to_string())?;
+        }
+    }
+    // Crop each 2D field plane's values by its source grid width. Every plane's
+    // values are exactly source nx*ny (pre-crop), so the row slice is in bounds.
+    for (_, plane) in fields_2d.iter_mut() {
+        let (pass, slot) = plane.grid_ref;
+        let nx = source_nx[pass][slot];
+        plane.values = crop_values_f32(&plane.values, nx, crop);
+    }
+    // Crop each realized volume level plane (all on the prs-pass grid width).
+    let prs_nx = source_nx[PASS_PRS].first().copied();
+    if let Some(nx) = prs_nx {
+        for volume in volumes_data.iter_mut() {
+            for (_, plane) in volume.levels.iter_mut() {
+                *plane = crop_values_f32(plane, nx, crop);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Sparse per-level absolute vorticity planes pulled from the prs file in
@@ -410,17 +506,23 @@ pub fn cache_state(hit: bool) -> &'static str {
 
 /// Download one product file (network or cache disk read; no decode, no
 /// rayon), bracketed by the given stage's start/done events.
+///
+/// `idx_patterns` selects which GRIB messages to fetch: empty = the whole file
+/// (HRRR/GFS, byte-identical to history); non-empty = the `.idx` message-subset
+/// path (RRFS-A's multi-GB NA files), keyed in the fetch cache by the pattern
+/// set so subsetted fetches stay cache-coherent.
 fn fetch_product(
     config: &IngestConfig<'_>,
     hour: u16,
     product: &str,
+    idx_patterns: &[&str],
     stage: IngestStage,
 ) -> Result<(CachedFetchResult, u128), IngestError> {
     let fetch = FetchRequest {
         request: ModelRunRequest::new(config.model, config.cycle.clone(), hour, product)
             .map_err(other)?,
         source_override: config.source_override,
-        variable_patterns: Vec::new(),
+        variable_patterns: idx_patterns.iter().map(|p| p.to_string()).collect(),
     };
     config.emit(IngestEvent::StageStarted { hour, stage });
     let fetch_started = Instant::now();
@@ -463,7 +565,8 @@ pub fn fetch_hour(config: &IngestConfig<'_>, hour: u16) -> Result<FetchedHour, I
         } else {
             IngestStage::FetchSfc
         };
-        let (fetched, fetch_ms) = fetch_product(config, hour, product.product, stage)?;
+        let (fetched, fetch_ms) =
+            fetch_product(config, hour, product.product, product.idx_patterns, stage)?;
         // Same file serving both roles (GFS): clone into the second slot so
         // each extraction pass reads its own bytes without a second fetch.
         if product.pressure_source && product.surface_source {
@@ -943,6 +1046,34 @@ pub fn process_fetched_hour(
         )));
     }
 
+    let mut extraction_grids: [Vec<SharedExtractionGrid>; 3] =
+        [prs_grids, sfc_grids, trailing_grids];
+
+    // --- crop-at-ingest: for models whose native domain is larger than the
+    //     store target (RRFS-A's North America rotated-pole grid), slice every
+    //     extraction grid + field plane + volume level plane to one CONUS index
+    //     block, computed ONCE from the reference grid so coords and values stay
+    //     provably in lock-step. The same `GridCrop` drives the compute stage
+    //     (`compute_product_grids`) so the derived/heavy grids land on the
+    //     identical cropped grid. HRRR/GFS have no crop box → this is a no-op
+    //     and their bytes stay identical. ---
+    let crop_spec = compute_ingest_crop(
+        config.model,
+        &fields_2d_owned[0].1,
+        &extraction_grids,
+        hour,
+        config,
+    )?;
+    if let Some(crop) = crop_spec {
+        apply_crop_to_extraction(
+            crop,
+            &mut extraction_grids,
+            &mut fields_2d_owned,
+            &mut volumes_data,
+        )
+        .map_err(other)?;
+    }
+
     // --- early encode: the 2D fields and the extracted volumes go into the
     //     (spill-backed) hour writer NOW, before the compute stages, so
     //     their raw f32 planes (~1.8 GB at HRRR size) never sit across the
@@ -950,7 +1081,6 @@ pub fn process_fetched_hour(
     //     file bytes keep the historical fields/derived/heavy/volumes
     //     order. Under --verify the planes are kept for the round-trip
     //     checks (the historical memory shape). ---
-    let extraction_grids: [Vec<SharedExtractionGrid>; 3] = [prs_grids, sfc_grids, trailing_grids];
     let mut hour_writer = {
         let (ref_pass, ref_slot) = fields_2d_owned[0].1.grid_ref;
         let first_name = fields_2d_owned[0].0.clone();
@@ -1085,6 +1215,7 @@ pub fn process_fetched_hour(
         hour,
         profile.derived,
         profile.heavy,
+        crop_spec,
     )?;
     config.check_cancel()?;
     let thermo_decode_ms = stages.decode_ms;
@@ -1221,6 +1352,7 @@ fn compute_product_grids(
     hour: u16,
     derived_enabled: bool,
     heavy_enabled: bool,
+    crop: Option<rustwx_products::gridded::GridCrop>,
 ) -> Result<ComputedProductGrids, IngestError> {
     if !derived_enabled && !heavy_enabled {
         config.emit(IngestEvent::Info {
@@ -1237,7 +1369,7 @@ fn compute_product_grids(
     let decode_started = Instant::now();
     let mut inputs = {
         profile_scope!("ingest_thermo_decode");
-        match ingest_compute::decode_products_inputs(surface_bytes, pressure_bytes) {
+        match ingest_compute::decode_products_inputs_cropped(surface_bytes, pressure_bytes, crop) {
             Ok(inputs) => inputs,
             Err(err) => {
                 config.emit(IngestEvent::Warning {
@@ -2142,6 +2274,25 @@ mod tests {
         validate_forecast_hours(ModelId::Gfs, 6, &[0, 3]).expect("06z is a published GFS cycle");
         validate_forecast_hours(ModelId::Hrrr, 17, &[0, 3])
             .expect("HRRR runs hourly, so 17z is valid");
+    }
+
+    /// RRFS-A cadence comes straight from the registry and is domain-neutral
+    /// (it does not depend on the unsettled CONUS-vs-NA fetch-plan question —
+    /// see `docs/superpowers/plans/2026-06-11-rrfs-support.md`). Cycles run
+    /// HOURLY 00z-23z and the forecast horizon is f000..=f060, so every cycle
+    /// is valid, f060 passes, and f061 is rejected with the flag named.
+    #[test]
+    fn validate_forecast_hours_enforces_rrfs_a_horizon() {
+        // Hourly cycle table: an off-synoptic cycle like 13z is valid.
+        validate_forecast_hours(ModelId::RrfsA, 13, &[0, 1, 30, 60])
+            .expect("RRFS-A runs hourly to f060 on every cycle");
+        // f060 is the horizon; f061 is past it.
+        validate_forecast_hours(ModelId::RrfsA, 0, &[60]).expect("f060 is the RRFS-A horizon");
+        let err = validate_forecast_hours(ModelId::RrfsA, 0, &[61])
+            .expect_err("f061 is past the RRFS-A horizon");
+        let message = err.to_string();
+        assert!(message.contains("--hours"), "must name the flag: {message}");
+        assert!(message.contains("f061"), "must name the hour: {message}");
     }
 
     /// HRRR cadence is unchanged: f018 is valid on every cycle, the 6-hourly

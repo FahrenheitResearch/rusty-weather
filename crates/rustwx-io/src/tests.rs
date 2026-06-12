@@ -918,6 +918,82 @@ fn partial_extract_at_forecast_hour_matches_statistical_window_end() {
     assert_eq!(partial.extracted[0].values, vec![7.5]);
 }
 
+/// REGRESSION (found live on RRFS-A f002, 2026-06-11): a surface file may
+/// carry BOTH the run-total (0→h) and the trailing-window ((h−1)→h) APCP
+/// accumulation, and both end at hour h so both tie on the end-hour forecast
+/// score. Selection of the run total must NOT depend on which message comes
+/// first in the file: HRRR orders the run total first (accidentally correct),
+/// RRFS-A orders the window first — which silently stored the 1 h window as
+/// `apcp_run_total`. The run-total selection must prefer the accumulation
+/// that starts at the run start (hour 0) in BOTH file orders, and the
+/// trailing re-select at h−1 must still find the window.
+#[test]
+fn qpf_run_total_prefers_zero_start_accumulation_in_either_file_order() {
+    let make_apcp = |start_hour: u32, length: u32, values: &[f32]| {
+        let mut message = ieee_f32_message(
+            PARAMETER_TOTAL_PRECIPITATION[0],
+            1,
+            0.0,
+            values,
+            -99.0,
+            -99.0,
+        );
+        message.product.template = 8;
+        message.product.time_range_unit = 1;
+        message.product.forecast_time = start_hour;
+        message.product.statistical_time_range_unit = Some(1);
+        message.product.time_range_length = Some(length);
+        message
+    };
+    // f002: window = 1→2 hour acc, run total = 0→2 hour acc.
+    let window = make_apcp(1, 1, &[1.5]);
+    let run_total = make_apcp(0, 2, &[9.0]);
+    let selector = FieldSelector::surface(CanonicalField::TotalPrecipitation);
+
+    // RRFS-A file order: window FIRST (this is the order that bit live).
+    let rrfs_order = Grib2File {
+        messages: vec![window.clone(), run_total.clone()],
+    };
+    let picked = extract_fields_from_grib2_partial_at_forecast_hour(&rrfs_order, &[selector], 2)
+        .unwrap()
+        .extracted
+        .swap_remove(0);
+    assert_eq!(
+        picked.values,
+        vec![9.0],
+        "run total must be the 0->2 accumulation even when the window comes first"
+    );
+
+    // HRRR file order: run total first (the historical accidental pass).
+    let hrrr_order = Grib2File {
+        messages: vec![run_total.clone(), window.clone()],
+    };
+    let picked = extract_fields_from_grib2_partial_at_forecast_hour(&hrrr_order, &[selector], 2)
+        .unwrap()
+        .extracted
+        .swap_remove(0);
+    assert_eq!(picked.values, vec![9.0]);
+
+    // The trailing-window re-select at h−1 = 1 must still find the WINDOW
+    // (its start hour matches exactly; the run total's start and end both
+    // miss) — in both orders.
+    for messages in [
+        vec![window.clone(), run_total.clone()],
+        vec![run_total, window],
+    ] {
+        let grib = Grib2File { messages };
+        let picked = extract_fields_from_grib2_partial_at_forecast_hour(&grib, &[selector], 1)
+            .unwrap()
+            .extracted
+            .swap_remove(0);
+        assert_eq!(
+            picked.values,
+            vec![1.5],
+            "the h-1 re-select must still pick the trailing window"
+        );
+    }
+}
+
 #[test]
 fn extract_distinguishes_pop_from_accumulated_qpf() {
     let mut probability = ieee_f32_message(
