@@ -48,7 +48,8 @@ pub fn build_sha() -> &'static str {
 /// 3D isobaric volumes + render-grade isobaric planes + the prs-side thermo
 /// decode) and a surface-source file (the 2D surface set + the surface-side
 /// thermo decode). HRRR splits them across two physical files (`prs`/`sfc`);
-/// GFS's single `pgrb2.0p25` carries both, so one entry sets both roles.
+/// GFS/RAP single pressure-grid files carry both, so one entry sets both
+/// roles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProductFetch {
     /// Product token passed to [`rustwx_core::ModelRunRequest::new`].
@@ -62,8 +63,8 @@ pub struct ProductFetch {
 /// The per-model fetch plan: which product file(s) one hour downloads and
 /// which extraction roles each serves. HRRR keeps its historical two-file
 /// pair (pressure = `prs`, surface = `sfc`) in that exact order so its
-/// fetch URLs and extraction sequence stay byte-identical; GFS fetches its
-/// single `pgrb2.0p25` file once and serves both roles from it.
+/// fetch URLs and extraction sequence stay byte-identical; GFS/RAP fetch
+/// one pressure-grid file once and serve both roles from it.
 ///
 /// Models that are not ingest-supported (see [`ingest_supported`]) return an
 /// error rather than a plan — callers gate on `ingest_supported` first, so
@@ -88,6 +89,11 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
             surface_source: true,
             pressure_source: true,
         }]),
+        ModelId::Rap => Ok(vec![ProductFetch {
+            product: "awp130pgrb",
+            surface_source: true,
+            pressure_source: true,
+        }]),
         other => Err(events::other(format!(
             "model '{other}' has no ingest fetch plan (not ingest-supported)"
         ))),
@@ -96,8 +102,9 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
 
 /// Whether this crate can ingest `model` today. Backed by [`fetch_plan`]:
 /// a model is ingest-supported exactly when a per-model fetch plan exists
-/// for it (HRRR's `prs`/`sfc` pair, GFS's single `pgrb2.0p25`). UI pickers
-/// gate enablement on this so the list self-updates as plans land.
+/// for it (HRRR's `prs`/`sfc` pair, GFS/RAP single pressure-grid files).
+/// UI pickers gate enablement on this so the list self-updates as plans
+/// land.
 pub fn ingest_supported(model: rustwx_core::ModelId) -> bool {
     fetch_plan(model).is_ok()
 }
@@ -127,13 +134,14 @@ mod tests {
     }
 
     #[test]
-    fn hrrr_and_gfs_are_ingest_supported() {
+    fn hrrr_gfs_and_rap_are_ingest_supported() {
         use rustwx_core::ModelId;
         assert!(ingest_supported(ModelId::Hrrr));
         assert!(ingest_supported(ModelId::Gfs));
+        assert!(ingest_supported(ModelId::Rap));
         // Every other catalog model stays gated until its fetch plan lands.
         for model in rustwx_models::supported_models() {
-            if !matches!(model, ModelId::Hrrr | ModelId::Gfs) {
+            if !matches!(model, ModelId::Hrrr | ModelId::Gfs | ModelId::Rap) {
                 assert!(
                     !ingest_supported(model),
                     "{model} must stay gated until its fetch plan exists"
@@ -170,6 +178,18 @@ mod tests {
     }
 
     #[test]
+    fn fetch_plan_rap_is_one_file_serving_both_roles() {
+        use rustwx_core::ModelId;
+        let plan = fetch_plan(ModelId::Rap).expect("RAP plan");
+        assert_eq!(plan.len(), 1, "RAP fetches a single awp130pgrb file");
+        assert_eq!(plan[0].product, "awp130pgrb");
+        assert!(
+            plan[0].surface_source && plan[0].pressure_source,
+            "the RAP pressure-grid file serves both the surface and pressure roles"
+        );
+    }
+
+    #[test]
     fn fetch_plan_rejects_unsupported_model() {
         use rustwx_core::ModelId;
         let err = fetch_plan(ModelId::Nbm).expect_err("NBM has no fetch plan");
@@ -199,6 +219,24 @@ mod tests {
         assert_eq!(
             aws.grib_url,
             "https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.20260414/18/atmos/gfs.t18z.pgrb2.0p25.f012"
+        );
+    }
+
+    #[test]
+    fn rap_fetch_plan_token_resolves_a_well_formed_aws_url() {
+        use rustwx_core::{CycleSpec, ModelId, ModelRunRequest, SourceId};
+        let plan = fetch_plan(ModelId::Rap).expect("RAP plan");
+        let cycle = CycleSpec::new("20260502", 0).expect("valid cycle");
+        let request =
+            ModelRunRequest::new(ModelId::Rap, cycle, 21, plan[0].product).expect("RAP request");
+        let urls = rustwx_models::resolve_urls(&request).expect("RAP urls resolve");
+        let aws = urls
+            .iter()
+            .find(|url| url.source == SourceId::Aws)
+            .expect("AWS is a RAP source");
+        assert_eq!(
+            aws.grib_url,
+            "https://noaa-rap-pds.s3.amazonaws.com/rap.20260502/rap.t00z.awp130pgrbf21.grib2"
         );
     }
 }
