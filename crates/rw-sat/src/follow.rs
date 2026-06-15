@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Timelike, Utc};
 
+use crate::abi::read_goes_abi_field;
 use crate::events::{SatError, SatEvent, other};
 use crate::goes::{GoesSatellite, parse_goes_abi_filename};
 use crate::s3::{
@@ -26,7 +27,6 @@ use crate::s3::{
 };
 use crate::store::{WrittenFrame, downsample_field, frame_time, write_band_frame};
 use crate::window::{WindowConfig, enforce_window};
-use crate::abi::read_goes_abi_field;
 use rw_store::run::RwsRunManifest;
 
 /// Minutes after the top of the hour during which the previous hour's
@@ -113,7 +113,13 @@ pub fn poll_prefixes(
     let mut prefixes = Vec::with_capacity(2);
     if now.minute() < HOUR_ROLLOVER_GRACE_MINUTES {
         let previous = now - chrono::Duration::hours(1);
-        prefixes.push(band_hour_prefix(abi_product, satellite, mode, band, previous));
+        prefixes.push(band_hour_prefix(
+            abi_product,
+            satellite,
+            mode,
+            band,
+            previous,
+        ));
     }
     prefixes.push(band_hour_prefix(abi_product, satellite, mode, band, now));
     prefixes
@@ -194,9 +200,11 @@ pub fn primed_seen_scans(
     for entry in entries.flatten() {
         let run_name = entry.file_name().to_string_lossy().to_string();
         // Run dirs are `<sector>_c<band>_<YYYYMMDD>[_<k>]`.
-        let Some(band) = bands.iter().copied().find(|band| {
-            run_name.starts_with(&format!("{sector_slug}_c{band:02}_"))
-        }) else {
+        let Some(band) = bands
+            .iter()
+            .copied()
+            .find(|band| run_name.starts_with(&format!("{sector_slug}_c{band:02}_")))
+        else {
             continue;
         };
         let Ok(bytes) = std::fs::read(entry.path().join("run.json")) else {
@@ -438,9 +446,10 @@ pub fn follow(
                         continue;
                     }
                 };
-                let stale_cutoff = config.window.max_age_minutes.map(|minutes| {
-                    Utc::now() - chrono::Duration::minutes(i64::from(minutes))
-                });
+                let stale_cutoff = config
+                    .window
+                    .max_age_minutes
+                    .map(|minutes| Utc::now() - chrono::Duration::minutes(i64::from(minutes)));
                 let mut ingest = |object: &S3Object| -> Result<(), SatError> {
                     let written_unix = Utc::now().timestamp().max(0) as u64;
                     let result = fetch_and_ingest(
@@ -531,7 +540,8 @@ pub fn follow(
             .flat_map(|&band| poll_prefixes(abi_product, &satellite, config.mode, band, now))
             .collect();
         last_key.retain(|prefix, _| active.contains(prefix));
-        ingest_attempts.retain(|key, _| active.iter().any(|prefix| key.starts_with(prefix.as_str())));
+        ingest_attempts
+            .retain(|key, _| active.iter().any(|prefix| key.starts_with(prefix.as_str())));
         // Dedup memory stays bounded: anything older than a day is gone
         // from the hour prefixes we poll anyway.
         seen.prune_older_than(Utc::now() - chrono::Duration::days(1));
@@ -633,8 +643,14 @@ mod tests {
         // Day (and year-prefix) rollover comes for free from chrono.
         let new_day = Utc.with_ymd_and_hms(2026, 6, 11, 0, 0, 0).unwrap();
         let prefixes = poll_prefixes("ABI-L2-CMIPC", &satellite, 6, 13, new_day);
-        assert_eq!(prefixes[0], "ABI-L2-CMIPC/2026/161/23/OR_ABI-L2-CMIPC-M6C13_G19_");
-        assert_eq!(prefixes[1], "ABI-L2-CMIPC/2026/162/00/OR_ABI-L2-CMIPC-M6C13_G19_");
+        assert_eq!(
+            prefixes[0],
+            "ABI-L2-CMIPC/2026/161/23/OR_ABI-L2-CMIPC-M6C13_G19_"
+        );
+        assert_eq!(
+            prefixes[1],
+            "ABI-L2-CMIPC/2026/162/00/OR_ABI-L2-CMIPC-M6C13_G19_"
+        );
     }
 
     #[test]
@@ -687,16 +703,28 @@ mod tests {
         use crate::store::test_support::{scan_start, synthetic_field};
         use crate::store::write_band_frame;
 
-        let dir = std::env::temp_dir().join(format!(
-            "rw-sat-follow-prime-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rw-sat-follow-prime-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        write_band_frame(&dir, &synthetic_field(12, 10, scan_start(18, 51), 13, 0.0), 1).unwrap();
-        write_band_frame(&dir, &synthetic_field(12, 10, scan_start(18, 56), 13, 0.0), 2).unwrap();
-        write_band_frame(&dir, &synthetic_field(12, 10, scan_start(18, 51), 8, 0.0), 3).unwrap();
+        write_band_frame(
+            &dir,
+            &synthetic_field(12, 10, scan_start(18, 51), 13, 0.0),
+            1,
+        )
+        .unwrap();
+        write_band_frame(
+            &dir,
+            &synthetic_field(12, 10, scan_start(18, 56), 13, 0.0),
+            2,
+        )
+        .unwrap();
+        write_band_frame(
+            &dir,
+            &synthetic_field(12, 10, scan_start(18, 51), 8, 0.0),
+            3,
+        )
+        .unwrap();
 
         let seen = primed_seen_scans(&dir, "g19", "conus", &[13]);
         assert_eq!(seen.len(), 2, "only the followed band primes");
@@ -833,7 +861,10 @@ mod tests {
             assert!(warnings[0].contains("will retry"), "{}", warnings[0]);
             assert!(!last_key.contains_key(TEST_PREFIX));
             assert_eq!(attempts.get(objects[0].key.as_str()), Some(&attempt));
-            assert!(seen.is_empty(), "the good key stays blocked behind the bad one");
+            assert!(
+                seen.is_empty(),
+                "the good key stays blocked behind the bad one"
+            );
         }
 
         // Final attempt: give up on the bad object, unblock the prefix.

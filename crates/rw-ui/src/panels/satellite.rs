@@ -317,7 +317,19 @@ impl SatellitePanel {
         store_bytes: u64,
         encode_ms: u64,
     ) {
-        self.frames_ingested += 1;
+        let already_counted = self.rows.iter().any(|row| {
+            matches!(
+                &row.stage,
+                SatFrameStage::Done {
+                    run: done_run,
+                    hhmm: done_hhmm,
+                    ..
+                } if done_run == &run && *done_hhmm == hhmm
+            )
+        });
+        if !already_counted {
+            self.frames_ingested += 1;
+        }
         if let Some(row) = self.rows.iter_mut().rev().find(|row| row.id == id) {
             row.stage = SatFrameStage::Done {
                 run,
@@ -784,7 +796,13 @@ mod tests {
             }
         ));
 
-        panel.apply_frame_written("key-1", "conus_c13_20260610".to_string(), 1921, 8_431_077, 950);
+        panel.apply_frame_written(
+            "key-1",
+            "conus_c13_20260610".to_string(),
+            1921,
+            8_431_077,
+            950,
+        );
         assert_eq!(panel.frames_ingested, 1);
         match &panel.rows[0].stage {
             SatFrameStage::Done {
@@ -800,6 +818,29 @@ mod tests {
             }
             other => panic!("expected Done, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn multipart_rows_count_one_stored_frame() {
+        let mut panel = panel();
+        panel.begin_follow();
+
+        panel.apply_download_started("seg-1".to_string(), "H09 B13 S01/10".to_string(), 1);
+        panel.apply_download_started("seg-2".to_string(), "H09 B13 S02/10".to_string(), 1);
+        panel.apply_download_done("seg-1", 10, false);
+        panel.apply_download_done("seg-2", 12, false);
+
+        for id in ["seg-1", "seg-2"] {
+            panel.apply_frame_written(id, "fulldisk_c13_20260615".to_string(), 510, 86_000, 2);
+        }
+
+        assert_eq!(panel.frames_ingested, 1);
+        assert!(
+            panel
+                .rows
+                .iter()
+                .all(|row| matches!(row.stage, SatFrameStage::Done { .. }))
+        );
     }
 
     #[test]
@@ -828,7 +869,10 @@ mod tests {
         );
         assert!(matches!(
             panel.rows[1].stage,
-            SatFrameStage::Storing { cache_hit: true, .. }
+            SatFrameStage::Storing {
+                cache_hit: true,
+                ..
+            }
         ));
     }
 

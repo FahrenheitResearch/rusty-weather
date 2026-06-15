@@ -1013,6 +1013,7 @@ impl App {
                 SatPlayerEvent::FrameWanted { key, hhmm } => {
                     self.sat.send(SatRequest::LoadFrame { key, hhmm });
                 }
+                SatPlayerEvent::FrameSelected { .. } => {}
                 SatPlayerEvent::RefreshRequested => {
                     self.sat.send(SatRequest::Scan);
                 }

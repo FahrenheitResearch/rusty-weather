@@ -20,9 +20,9 @@ rustls-rustcrypto.workspace = true
 ureq.workspace = true
 
 # Pure-Rust NetCDF4/HDF5 reading for GLM L2 LCFA granule decode (Task 2),
-# mirroring rw-sat. hdf5-reader resolves to the vendored tree via the
-# workspace-root [patch.crates-io] pin.
-hdf5-reader = "0.3"
+# mirroring rw-sat. Use a repo-relative path so downstream git consumers do
+# not need machine-local root patches.
+hdf5-reader = { path = "../../vendor/netcrust/vendor/hdf5-reader" }
 netcrust = { path = "../../vendor/netcrust" }
 
 # rw_glm_follow: the thin ops CLI over follow_live + the reader/validator.

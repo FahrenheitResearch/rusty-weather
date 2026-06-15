@@ -60,6 +60,9 @@ pub struct SatFrameImage {
 pub enum SatPlayerEvent {
     /// A frame's texture is missing from the cache — load it.
     FrameWanted { key: SatRunKey, hhmm: u16 },
+    /// The visible playhead changed. Hosts can use this to keep a map layer
+    /// synchronized with the player without polling panel internals.
+    FrameSelected { key: SatRunKey, hhmm: u16 },
     /// The refresh button — re-scan the sat store.
     RefreshRequested,
 }
@@ -207,6 +210,8 @@ pub struct SatPlayerPanel {
     buffering: bool,
     /// Wall of the last texture-upload pass, for the stats strip.
     last_texture_ms: Option<f32>,
+    /// Last playhead selection emitted to the host.
+    last_emitted_selection: Option<(SatRunKey, u16)>,
 }
 
 impl Default for SatPlayerPanel {
@@ -230,11 +235,30 @@ impl SatPlayerPanel {
             last_advance: None,
             buffering: false,
             last_texture_ms: None,
+            last_emitted_selection: None,
         }
     }
 
     pub fn selected_run(&self) -> Option<&SatRunKey> {
         self.selected.as_ref()
+    }
+
+    /// Host-side jump to a known run after an external ingest writes a
+    /// frame. The next UI pass will request the selected frame if needed.
+    pub fn select_frame(&mut self, key: SatRunKey, hhmm: u16) {
+        if self.selected.as_ref() != Some(&key) {
+            self.selected = Some(key);
+            self.cache.clear();
+            self.pending.clear();
+            self.queued.clear();
+        }
+        let frames = self.current_frames().to_vec();
+        self.index = nearest_index(&frames, hhmm);
+        self.live = true;
+        self.playing = false;
+        self.last_advance = None;
+        self.buffering = false;
+        self.last_emitted_selection = None;
     }
 
     /// Wall of the last texture-upload pass (stats strip).
@@ -337,6 +361,7 @@ impl SatPlayerPanel {
                 self.pending.clear();
                 self.queued.clear();
                 self.index = self.current_frames().len().saturating_sub(1);
+                self.last_emitted_selection = None;
             }
             if ui
                 .button("⟳")
@@ -362,9 +387,7 @@ impl SatPlayerPanel {
         let frames = self.current_frames().to_vec();
         if frames.is_empty() {
             ui.add_space(12.0);
-            ui.label(
-                RichText::new("No frames yet — start a follow session above.").weak(),
-            );
+            ui.label(RichText::new("No frames yet — start a follow session above.").weak());
             return events;
         }
         self.index = self.index.min(frames.len() - 1);
@@ -482,6 +505,7 @@ impl SatPlayerPanel {
                 }
             }
         }
+        self.emit_selection_event(&mut events);
 
         // --- image ---
         let current = frames[self.index];
@@ -521,6 +545,27 @@ impl SatPlayerPanel {
         );
 
         events
+    }
+
+    fn current_selection(&self) -> Option<(SatRunKey, u16)> {
+        let key = self.selected.clone()?;
+        let hhmm = *self.current_frames().get(self.index)?;
+        Some((key, hhmm))
+    }
+
+    fn emit_selection_event(&mut self, events: &mut Vec<SatPlayerEvent>) {
+        let Some((key, hhmm)) = self.current_selection() else {
+            return;
+        };
+        if self
+            .last_emitted_selection
+            .as_ref()
+            .is_some_and(|(last_key, last_hhmm)| last_key == &key && *last_hhmm == hhmm)
+        {
+            return;
+        }
+        self.last_emitted_selection = Some((key.clone(), hhmm));
+        events.push(SatPlayerEvent::FrameSelected { key, hhmm });
     }
 
     /// Upload host-pushed images to the GPU (LRU-bounded).
@@ -711,6 +756,36 @@ mod tests {
             read_ms: 1.0,
         });
         assert_eq!(panel.queued.len(), 1, "matching frame queued for upload");
+    }
+
+    #[test]
+    fn playhead_selection_event_emits_once_per_frame() {
+        let mut panel = SatPlayerPanel::new();
+        let key = SatRunKey {
+            model: "g19".to_string(),
+            run: "conus_c13_20260610".to_string(),
+        };
+        panel.set_runs(vec![listing(&key.model, &key.run, vec![1845, 1850, 1855])]);
+
+        let mut events = Vec::new();
+        panel.emit_selection_event(&mut events);
+        assert_eq!(
+            events,
+            vec![SatPlayerEvent::FrameSelected {
+                key: key.clone(),
+                hhmm: 1855
+            }]
+        );
+
+        panel.emit_selection_event(&mut events);
+        assert_eq!(events.len(), 1, "same frame does not spam the host");
+
+        panel.index = 1;
+        panel.emit_selection_event(&mut events);
+        assert_eq!(
+            events.last(),
+            Some(&SatPlayerEvent::FrameSelected { key, hhmm: 1850 })
+        );
     }
 
     #[test]

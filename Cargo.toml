@@ -3,6 +3,7 @@ members = [
     "crates/rw-glm",
     "crates/rw-ingest",
     "crates/rw-sat",
+    "crates/rw-sat-check",
     "crates/rw-store",
     "crates/rw-ui",
     "crates/rustwx-calc",

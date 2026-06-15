@@ -20,9 +20,12 @@
 //!   (`1851` = 18:51 UTC) and the frame file is `t{HHMM:04}.rws`.
 //! - each frame holds one 2D variable `cmi_c<band>` (CMI: reflectance
 //!   factor 0..1 for C01-06, brightness temperature Kelvin for C07-16) with
-//!   a self-describing `{"goes": {...}}` selector carrying satellite,
-//!   product, band, scan times, and the geostationary projection
-//!   parameters. The `.rwg` projection slot is `None` — `GridProjection`
+//!   a self-describing selector. New frames carry a generic
+//!   `{"satellite": {...}}` block plus the legacy `{"goes": {...}}` block
+//!   so non-GOES providers can share the same UI/export path without breaking
+//!   existing stores. The selector carries satellite, product, band, scan
+//!   times, and the geostationary projection parameters. The `.rwg`
+//!   projection slot is `None` — `GridProjection`
 //!   has no geostationary variant; the per-pixel lat/lon mesh is the
 //!   geometry of record.
 
@@ -82,6 +85,66 @@ pub struct StoredFrame {
     pub lat_descending: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SatelliteProjection {
+    pub perspective_point_height_m: f64,
+    pub semi_major_axis_m: f64,
+    pub semi_minor_axis_m: f64,
+    pub longitude_of_projection_origin_deg: f64,
+    pub sweep_angle_axis: SweepAngleAxis,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SatelliteGridScene {
+    /// rw-store model slug (`g19`, `h9`, `mtg-i1`, ...).
+    pub model: String,
+    /// Provider/platform display name (`G19`, `H09`, ...).
+    pub satellite: String,
+    pub provider: String,
+    pub instrument: String,
+    pub product: String,
+    pub sector: String,
+    pub band: u8,
+    pub layer: String,
+    pub source_variable: String,
+    pub start_time_utc: DateTime<Utc>,
+    pub end_time_utc: DateTime<Utc>,
+    pub projection: SatelliteProjection,
+    pub fixed_grid: AbiFixedGrid,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SatelliteGridField {
+    pub scene: SatelliteGridScene,
+    pub variable_name: String,
+    pub units: String,
+    pub values: Vec<f32>,
+}
+
+impl SatelliteGridScene {
+    pub fn lat_lon_mesh(&self) -> (Vec<f32>, Vec<f32>) {
+        let len = self.fixed_grid.nx.saturating_mul(self.fixed_grid.ny);
+        let mut lat = Vec::with_capacity(len);
+        let mut lon = Vec::with_capacity(len);
+        for &y in &self.fixed_grid.y_scan_rad {
+            for &x in &self.fixed_grid.x_scan_rad {
+                match scan_angles_to_lat_lon_generic(&self.projection, x, y) {
+                    Some((lat_value, lon_value)) => {
+                        lat.push(lat_value);
+                        lon.push(lon_value);
+                    }
+                    None => {
+                        lat.push(f32::NAN);
+                        lon.push(f32::NAN);
+                    }
+                }
+            }
+        }
+        (lat, lon)
+    }
+}
+
 /// `t{HHMM:04}.rws`
 pub fn frame_file_name(hhmm: u16) -> String {
     format!("t{hhmm:04}.rws")
@@ -90,6 +153,21 @@ pub fn frame_file_name(hhmm: u16) -> String {
 /// Variable name for a band frame (`cmi_c13`).
 pub fn band_variable_name(band: u8) -> String {
     format!("cmi_c{band:02}")
+}
+
+/// Extract the spectral band/channel from either the generic satellite
+/// selector or the legacy GOES selector, falling back to known variable names.
+pub fn selector_band(selector: &serde_json::Value, variable_name: &str) -> Option<u8> {
+    selector["satellite"]["band"]
+        .as_u64()
+        .or_else(|| selector["goes"]["band"].as_u64())
+        .and_then(|value| u8::try_from(value).ok())
+        .or_else(|| {
+            variable_name
+                .strip_prefix("cmi_c")
+                .or_else(|| variable_name.strip_prefix("fci_c"))
+                .and_then(|raw| raw.parse::<u8>().ok())
+        })
 }
 
 /// Sector slug used in run names.
@@ -275,6 +353,101 @@ pub fn write_band_frame(
     })
 }
 
+pub fn write_satellite_grid_frame(
+    store_root: &Path,
+    field: &SatelliteGridField,
+    written_unix: u64,
+) -> Result<WrittenFrame, Box<dyn Error>> {
+    let scene = &field.scene;
+    let band = scene.band;
+    let model = sanitize_token(&scene.model);
+    let sector = sanitize_token(&scene.sector);
+    let day = scene.start_time_utc.format("%Y%m%d").to_string();
+    let hhmm = (scene.start_time_utc.hour() * 100 + scene.start_time_utc.minute()) as u16;
+    let run_base = format!("{sector}_c{band:02}_{day}");
+
+    let (nx, ny) = (scene.fixed_grid.nx, scene.fixed_grid.ny);
+    if field.values.len() != nx.saturating_mul(ny) {
+        return Err(boxed_error(format!(
+            "field length {} does not match grid {nx}x{ny}",
+            field.values.len()
+        )));
+    }
+    let (lat, lon) = scene.lat_lon_mesh();
+    let grid = LatLonGrid::new(GridShape::new(nx, ny)?, lat, lon)?;
+
+    let model_dir = store_root.join(&model);
+    let resolved = resolve_run_dir(&model_dir, &run_base, &grid)?;
+    let run_dir = model_dir.join(&resolved.run_name);
+    fs::create_dir_all(&run_dir)?;
+
+    let _lock = RunLock::acquire(&run_dir, FRAME_LOCK_TIMEOUT)?;
+
+    let grid_path = run_dir.join("grid.rwg");
+    let grid_hash = match resolved.existing_grid_hash {
+        Some(hash) => hash,
+        None => write_grid(&grid_path, &grid, None)?,
+    };
+
+    let started = Instant::now();
+    let variable = field.variable_name.clone();
+    let selector = satellite_selector(field);
+    let mut writer = HourWriter::new(
+        &model,
+        &resolved.run_name,
+        hhmm,
+        nx,
+        ny,
+        &grid_hash,
+        concat!("rw-sat ", env!("CARGO_PKG_VERSION")),
+    );
+    writer.add_surface2d(&variable, &field.units, selector, &field.values)?;
+    let file_name = frame_file_name(hhmm);
+    let frame_path = run_dir.join(&file_name);
+    writer.finish(&frame_path)?;
+    let encode_ms = started.elapsed().as_millis() as u64;
+    let bytes = fs::metadata(&frame_path)?.len();
+
+    let manifest_path = run_dir.join("run.json");
+    let writer_info = rw_store::format::RwsWriterInfo {
+        name: "rw-sat".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build: concat!("rw-sat ", env!("CARGO_PKG_VERSION")).to_string(),
+    };
+    let mut manifest = RwsRunManifest::load_or_new(
+        &manifest_path,
+        &model,
+        &resolved.run_name,
+        &grid_hash,
+        nx,
+        ny,
+        writer_info,
+    )?;
+    manifest.register_hour(
+        hhmm,
+        RwsHourEntry {
+            file: file_name,
+            written_unix,
+            encode_ms,
+            variables: vec![variable.clone()],
+        },
+    );
+    manifest.save(&manifest_path)?;
+
+    Ok(WrittenFrame {
+        model,
+        run: resolved.run_name,
+        hhmm,
+        scan_time_utc: scene.start_time_utc,
+        path: frame_path,
+        bytes,
+        encode_ms,
+        grid_hash,
+        created_run: resolved.created,
+        variable,
+    })
+}
+
 /// Read one frame back: the first 2D variable of the hour file, with the
 /// run grid validated against the hour's `grid_hash` (rw-store's check).
 pub fn read_frame(
@@ -382,7 +555,31 @@ fn coords_bit_identical(a: &[f32], b: &[f32]) -> bool {
 
 fn goes_selector(field: &GoesAbiField, band: u8) -> serde_json::Value {
     let scene = &field.scene;
+    let sweep_angle_axis = match scene.projection.sweep_angle_axis {
+        SweepAngleAxis::X => "x",
+        SweepAngleAxis::Y => "y",
+    };
+    let projection = serde_json::json!({
+        "perspective_point_height_m": scene.projection.perspective_point_height_m,
+        "semi_major_axis_m": scene.projection.semi_major_axis_m,
+        "semi_minor_axis_m": scene.projection.semi_minor_axis_m,
+        "longitude_of_projection_origin_deg":
+            scene.projection.longitude_of_projection_origin_deg,
+        "sweep_angle_axis": sweep_angle_axis,
+    });
     serde_json::json!({
+        "satellite": {
+            "provider": "noaa",
+            "instrument": "abi",
+            "satellite": scene.satellite.as_str(),
+            "product": scene.product,
+            "band": band,
+            "layer": format!("c{band:02}"),
+            "source_variable": field.variable_name,
+            "scan_start_utc": scene.start_time_utc.to_rfc3339(),
+            "scan_end_utc": scene.end_time_utc.to_rfc3339(),
+            "projection": projection.clone(),
+        },
         "goes": {
             "satellite": scene.satellite.as_str(),
             "product": scene.product,
@@ -390,19 +587,76 @@ fn goes_selector(field: &GoesAbiField, band: u8) -> serde_json::Value {
             "source_variable": field.variable_name,
             "scan_start_utc": scene.start_time_utc.to_rfc3339(),
             "scan_end_utc": scene.end_time_utc.to_rfc3339(),
-            "projection": {
-                "perspective_point_height_m": scene.projection.perspective_point_height_m,
-                "semi_major_axis_m": scene.projection.semi_major_axis_m,
-                "semi_minor_axis_m": scene.projection.semi_minor_axis_m,
-                "longitude_of_projection_origin_deg":
-                    scene.projection.longitude_of_projection_origin_deg,
-                "sweep_angle_axis": match scene.projection.sweep_angle_axis {
-                    SweepAngleAxis::X => "x",
-                    SweepAngleAxis::Y => "y",
-                },
-            },
+            "projection": projection,
         }
     })
+}
+
+fn satellite_selector(field: &SatelliteGridField) -> serde_json::Value {
+    let scene = &field.scene;
+    let sweep_angle_axis = scene.projection.sweep_angle_axis.as_str();
+    let projection = serde_json::json!({
+        "perspective_point_height_m": scene.projection.perspective_point_height_m,
+        "semi_major_axis_m": scene.projection.semi_major_axis_m,
+        "semi_minor_axis_m": scene.projection.semi_minor_axis_m,
+        "longitude_of_projection_origin_deg":
+            scene.projection.longitude_of_projection_origin_deg,
+        "sweep_angle_axis": sweep_angle_axis,
+    });
+    serde_json::json!({
+        "satellite": {
+            "provider": scene.provider,
+            "instrument": scene.instrument,
+            "satellite": scene.satellite,
+            "model": scene.model,
+            "product": scene.product,
+            "sector": scene.sector,
+            "band": scene.band,
+            "layer": scene.layer,
+            "source_variable": scene.source_variable,
+            "scan_start_utc": scene.start_time_utc.to_rfc3339(),
+            "scan_end_utc": scene.end_time_utc.to_rfc3339(),
+            "projection": projection,
+            "metadata": scene.metadata,
+        }
+    })
+}
+
+fn scan_angles_to_lat_lon_generic(
+    projection: &SatelliteProjection,
+    x_rad: f64,
+    y_rad: f64,
+) -> Option<(f32, f32)> {
+    crate::geostationary::scan_angles_to_lat_lon(
+        projection.perspective_point_height_m,
+        projection.semi_major_axis_m,
+        projection.semi_minor_axis_m,
+        projection.longitude_of_projection_origin_deg,
+        projection.sweep_angle_axis,
+        x_rad,
+        y_rad,
+    )
+}
+
+fn sanitize_token(value: &str) -> String {
+    let sanitized = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn boxed_error(message: impl Into<String>) -> Box<dyn Error> {
@@ -517,7 +771,26 @@ mod tests {
             "selector is self-describing"
         );
         assert_eq!(frame.selector["goes"]["satellite"], "G19");
+        assert_eq!(frame.selector["satellite"]["provider"], "noaa");
+        assert_eq!(frame.selector["satellite"]["instrument"], "abi");
+        assert_eq!(frame.selector["satellite"]["band"], 13);
+        assert_eq!(selector_band(&frame.selector, &frame.variable), Some(13));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selector_band_accepts_generic_legacy_and_variable_names() {
+        assert_eq!(
+            selector_band(&serde_json::json!({"satellite": {"band": 12}}), "any"),
+            Some(12)
+        );
+        assert_eq!(
+            selector_band(&serde_json::json!({"goes": {"band": 13}}), "any"),
+            Some(13)
+        );
+        assert_eq!(selector_band(&serde_json::json!({}), "cmi_c08"), Some(8));
+        assert_eq!(selector_band(&serde_json::json!({}), "fci_c09"), Some(9));
+        assert_eq!(selector_band(&serde_json::json!({}), "bad"), None);
     }
 
     #[test]
