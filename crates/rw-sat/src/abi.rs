@@ -152,23 +152,7 @@ pub fn read_goes_abi_scene(path: impl AsRef<Path>) -> Result<GoesAbiScene, Box<d
         )));
     }
 
-    let projection_var = file
-        .variable("goes_imager_projection")
-        .ok_or_else(|| boxed_error("variable not found: goes_imager_projection"))?;
-    let projection = GoesImagerProjection {
-        perspective_point_height_m: required_attr_f64(&projection_var, "perspective_point_height")?,
-        semi_major_axis_m: required_attr_f64(&projection_var, "semi_major_axis")?,
-        semi_minor_axis_m: required_attr_f64(&projection_var, "semi_minor_axis")?,
-        longitude_of_projection_origin_deg: required_attr_f64(
-            &projection_var,
-            "longitude_of_projection_origin",
-        )?,
-        sweep_angle_axis: projection_var
-            .attribute("sweep_angle_axis")
-            .and_then(|attr| attr.as_string())
-            .map(SweepAngleAxis::parse)
-            .unwrap_or(SweepAngleAxis::X),
-    };
+    let projection = read_goes_projection(path, &file)?;
 
     Ok(GoesAbiScene {
         path: path.to_path_buf(),
@@ -306,10 +290,67 @@ fn validate_window_shape(
     Ok(())
 }
 
+fn read_goes_projection(
+    path: &Path,
+    file: &netcrust::File,
+) -> Result<GoesImagerProjection, Box<dyn Error>> {
+    if let Some(projection_var) = file.variable("goes_imager_projection") {
+        return Ok(GoesImagerProjection {
+            perspective_point_height_m: required_attr_f64(
+                &projection_var,
+                "perspective_point_height",
+            )?,
+            semi_major_axis_m: required_attr_f64(&projection_var, "semi_major_axis")?,
+            semi_minor_axis_m: required_attr_f64(&projection_var, "semi_minor_axis")?,
+            longitude_of_projection_origin_deg: required_attr_f64(
+                &projection_var,
+                "longitude_of_projection_origin",
+            )?,
+            sweep_angle_axis: projection_var
+                .attribute("sweep_angle_axis")
+                .and_then(|attr| attr.as_string())
+                .map(SweepAngleAxis::parse)
+                .unwrap_or(SweepAngleAxis::X),
+        });
+    }
+
+    let hdf5 = hdf5_reader::Hdf5File::open(path)?;
+    let projection = hdf5.dataset("goes_imager_projection")?;
+    Ok(GoesImagerProjection {
+        perspective_point_height_m: required_hdf5_attr_f64(
+            &projection,
+            "perspective_point_height",
+        )?,
+        semi_major_axis_m: required_hdf5_attr_f64(&projection, "semi_major_axis")?,
+        semi_minor_axis_m: required_hdf5_attr_f64(&projection, "semi_minor_axis")?,
+        longitude_of_projection_origin_deg: required_hdf5_attr_f64(
+            &projection,
+            "longitude_of_projection_origin",
+        )?,
+        sweep_angle_axis: projection
+            .attribute("sweep_angle_axis")
+            .ok()
+            .and_then(|attr| attr.read_string().ok())
+            .map(|value| SweepAngleAxis::parse(&value))
+            .unwrap_or(SweepAngleAxis::X),
+    })
+}
+
 fn required_attr_f64(variable: &netcrust::Variable, name: &str) -> Result<f64, Box<dyn Error>> {
     variable
         .attribute(name)
         .and_then(|attr| attr.as_f64())
+        .ok_or_else(|| boxed_error(format!("missing numeric projection attribute: {name}")))
+}
+
+fn required_hdf5_attr_f64(
+    dataset: &hdf5_reader::Dataset,
+    name: &str,
+) -> Result<f64, Box<dyn Error>> {
+    dataset
+        .attribute(name)
+        .ok()
+        .and_then(|attr| attr.read_scalar::<f64>().ok())
         .ok_or_else(|| boxed_error(format!("missing numeric projection attribute: {name}")))
 }
 
