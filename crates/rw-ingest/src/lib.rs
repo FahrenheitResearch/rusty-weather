@@ -102,6 +102,12 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
             pressure_source: true,
             idx_patterns: &[],
         }]),
+        ModelId::Rap => Ok(vec![ProductFetch {
+            product: "awp130pgrb",
+            surface_source: true,
+            pressure_source: true,
+            idx_patterns: &[],
+        }]),
         // RRFS-A: the only files carrying RRFS surface fields are the NA pair
         // (recon-verified — `prslev.conus` is pressure-only, `natlev.conus`
         // 404s). Both are the SAME rotated-pole grid (GRIB template 1,
@@ -263,14 +269,18 @@ mod tests {
     }
 
     #[test]
-    fn hrrr_gfs_and_rrfs_a_are_ingest_supported() {
+    fn hrrr_gfs_rap_and_rrfs_a_are_ingest_supported() {
         use rustwx_core::ModelId;
         assert!(ingest_supported(ModelId::Hrrr));
         assert!(ingest_supported(ModelId::Gfs));
+        assert!(ingest_supported(ModelId::Rap));
         assert!(ingest_supported(ModelId::RrfsA));
         // Every other catalog model stays gated until its fetch plan lands.
         for model in rustwx_models::supported_models() {
-            if !matches!(model, ModelId::Hrrr | ModelId::Gfs | ModelId::RrfsA) {
+            if !matches!(
+                model,
+                ModelId::Hrrr | ModelId::Gfs | ModelId::Rap | ModelId::RrfsA
+            ) {
                 assert!(
                     !ingest_supported(model),
                     "{model} must stay gated until its fetch plan exists"
@@ -284,9 +294,9 @@ mod tests {
     #[test]
     fn whole_file_models_carry_no_idx_patterns() {
         use rustwx_core::ModelId;
-        // HRRR + GFS must keep their historical whole-file fetch (empty
+        // HRRR + GFS + RAP must keep their whole-file fetch (empty
         // patterns) so their fetch URLs and bytes stay byte-identical.
-        for model in [ModelId::Hrrr, ModelId::Gfs] {
+        for model in [ModelId::Hrrr, ModelId::Gfs, ModelId::Rap] {
             for entry in fetch_plan(model).expect("plan") {
                 assert!(
                     entry.idx_patterns.is_empty(),
@@ -295,9 +305,10 @@ mod tests {
                 );
             }
         }
-        // HRRR/GFS have no crop box (native grid IS the store grid).
+        // HRRR/GFS/RAP have no crop box (native grid IS the store grid).
         assert!(model_crop_box(ModelId::Hrrr).is_none());
         assert!(model_crop_box(ModelId::Gfs).is_none());
+        assert!(model_crop_box(ModelId::Rap).is_none());
     }
 
     #[test]
@@ -462,6 +473,19 @@ mod tests {
             plan[0].surface_source && plan[0].pressure_source,
             "the one GFS file serves both the surface and pressure roles"
         );
+    }
+
+    #[test]
+    fn fetch_plan_rap_is_one_file_serving_both_roles() {
+        use rustwx_core::ModelId;
+        let plan = fetch_plan(ModelId::Rap).expect("RAP plan");
+        assert_eq!(plan.len(), 1, "RAP fetches a single awp130pgrb file");
+        assert_eq!(plan[0].product, "awp130pgrb");
+        assert!(
+            plan[0].surface_source && plan[0].pressure_source,
+            "the one RAP file serves both the surface and pressure roles"
+        );
+        assert!(plan[0].idx_patterns.is_empty());
     }
 
     #[test]
