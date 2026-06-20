@@ -7,13 +7,15 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rw_glm::follow::{
     FetchError, GlmEvent, GlmFollowSpec, GranuleSource, ListedGranule, SkipReason,
     follow_with_source,
 };
-use rw_glm::{DecodedGranule, Flash, ValidateDepth, read_flashes, validate_bucket_file};
+use rw_glm::{
+    BucketWriter, DecodedGranule, Flash, ValidateDepth, read_flashes, validate_bucket_file,
+};
 
 /// 2026-01-01 00:00:00 UTC in Unix ms.
 const BASE: i64 = 1_767_225_600_000;
@@ -490,7 +492,7 @@ fn all_stale_granule_emits_a_distinct_info_event() {
     assert!(
         !quiet_events.iter().any(|e| matches!(
             e,
-            GlmEvent::Info { message } if message.contains("wrote 0")
+            GlmEvent::Info { message } if message.contains("all older than the window cutoff")
         )),
         "a quiet (decoded 0) granule does not emit the all-stale Info: {quiet_events:?}"
     );
@@ -500,8 +502,8 @@ fn all_stale_granule_emits_a_distinct_info_event() {
 fn permanent_decode_error_is_skipped_and_not_retried() {
     let root = test_root("permanent");
     let source = FakeSource::new(vec![(listed(1, 1000), Resp::Permanent)]);
-    // Several polls: a permanent failure is recorded-skipped once, marked seen,
-    // and never re-fetched.
+    // Several polls: a permanent failure is recorded-skipped once, marked seen
+    // only in memory, and never re-fetched inside the same running session.
     let (summary, events) = run(&spec(&root, 3), &source);
     assert_eq!(summary.skipped_granules, 1);
     assert_eq!(summary.ingested_granules, 0);
@@ -515,11 +517,35 @@ fn permanent_decode_error_is_skipped_and_not_retried() {
         1,
         "exactly one PermanentDecodeError skip"
     );
-    // It is persisted as seen so a restart never re-attempts it.
-    let manifest: rw_glm::WindowManifest =
-        serde_json::from_slice(&std::fs::read(root.join("glm/goes19/window.json")).unwrap())
-            .unwrap();
-    assert!(manifest.seen_granule_keys.contains(&stem(1)));
+    // It is not persisted as ingested. A future decoder/library fix or clean
+    // restart must be able to retry this granule instead of being stuck stale.
+    let manifest_path = root.join("glm/goes19/window.json");
+    if let Ok(bytes) = std::fs::read(manifest_path) {
+        let manifest: rw_glm::WindowManifest = serde_json::from_slice(&bytes).unwrap();
+        assert!(!manifest.seen_granule_keys.contains(&stem(1)));
+    }
+}
+
+#[test]
+fn follower_does_not_block_on_writer_lock_when_only_reading_state() {
+    let root = test_root("lock-reader");
+    let _held = BucketWriter::open(&root, "goes19").unwrap();
+    let source = FakeSource::new(Vec::new());
+    let started = Instant::now();
+
+    let (summary, events) = run(&spec(&root, 1), &source);
+
+    assert_eq!(summary.polls, 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "empty reader/follower path should not wait for the 30s writer-lock timeout"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, GlmEvent::Pruned { report } if report.skipped_locked == vec!["goes19".to_string()])),
+        "prune reports the held lock while the follower keeps running"
+    );
 }
 
 #[test]
@@ -543,32 +569,47 @@ fn rolling_window_runs_in_loop_without_evicting_in_window_data() {
 }
 
 #[test]
-fn quiet_granule_with_no_flashes_is_marked_seen() {
+fn quiet_granule_with_no_flashes_is_not_persisted_seen() {
     let root = test_root("quiet");
     let source = FakeSource::new(vec![(listed(1, 200), Resp::Ok(decoded(1, vec![])))]);
     let (summary, _events) = run(&spec(&root, 2), &source);
-    // No flashes written, but the granule counts as ingested (dedup) and is not
-    // re-fetched on the second poll.
+    // No flashes written, but the granule counts as ingested and is deduped
+    // for this running session. It must not persist into window.json because
+    // that creates a null-extent manifest that suppresses future retries.
     assert_eq!(summary.ingested_flashes, 0);
     assert_eq!(
         source.fetch_count(&stem(1)),
         1,
         "quiet granule fetched once"
     );
-    let manifest: rw_glm::WindowManifest =
-        serde_json::from_slice(&std::fs::read(root.join("glm/goes19/window.json")).unwrap())
-            .unwrap();
-    assert!(manifest.seen_granule_keys.contains(&stem(1)));
+    let manifest_path = root.join("glm/goes19/window.json");
+    if let Ok(bytes) = std::fs::read(manifest_path) {
+        let manifest: rw_glm::WindowManifest = serde_json::from_slice(&bytes).unwrap();
+        assert!(!manifest.seen_granule_keys.contains(&stem(1)));
+    }
 }
 
 #[test]
-fn transient_failure_holds_the_prefix_so_later_success_does_not_skip_it() {
-    // Two granules in one listing; the EARLIER one fails transiently. The
-    // watermark must be held BEFORE the failed granule so it is re-listed next
-    // cycle — a later granule's success must not advance the watermark past it
-    // (which would silently drop the failed granule). On the next session the
-    // (now-recovered) granule ingests, so both end up stored.
-    let root = test_root("hold-prefix");
+fn zero_write_granule_is_retried_after_restart() {
+    let root = test_root("quiet-restart");
+    let source = FakeSource::new(vec![(listed(1, 200), Resp::Ok(decoded(1, vec![])))]);
+    let (_summary, _events) = run(&spec(&root, 1), &source);
+    assert_eq!(source.fetch_count(&stem(1)), 1);
+
+    let (_summary2, _events2) = run(&spec(&root, 1), &source);
+    assert_eq!(
+        source.fetch_count(&stem(1)),
+        2,
+        "zero-write granules are not persisted as seen across restarts"
+    );
+}
+
+#[test]
+fn transient_failure_does_not_block_newer_live_granules() {
+    // Two granules in one listing; the EARLIER one fails transiently. Live
+    // acquisition must still ingest the newest object immediately, while the
+    // prefix watermark is restored so the failed older object is retried.
+    let root = test_root("hold-prefix-live-first");
     let source = FakeSource::new(vec![
         (
             listed(1, 100),
@@ -583,23 +624,32 @@ fn transient_failure_holds_the_prefix_so_later_success_does_not_skip_it() {
         ),
     ]);
 
-    // Poll 1: granule 1 fails transiently -> HoldPrefix -> the loop breaks
-    // before granule 2, so granule 2 is NOT fetched and the watermark stays put.
+    // Poll 1 is newest-first: granule 2 lands, then granule 1 enters holdback.
+    // The live edge is visible instead of being starved behind the failure.
     let (s1, _e1) = run(&spec(&root, 1), &source);
-    assert_eq!(s1.ingested_granules, 0);
+    assert_eq!(s1.ingested_granules, 1);
     assert_eq!(source.fetch_count(&stem(1)), 1);
+    assert_eq!(source.fetch_count(&stem(2)), 1);
     assert_eq!(
-        source.fetch_count(&stem(2)),
-        0,
-        "granule after the held one is not processed this cycle"
+        source.fetched.borrow().as_slice(),
+        &[stem(2), stem(1)],
+        "cold-start acquisition processes the newest granule first"
+    );
+    let first_pass = read_flashes(&root, "goes19", BASE, BASE + 600_000, None).unwrap();
+    assert_eq!(
+        first_pass
+            .iter()
+            .map(|flash| flash.flash_id)
+            .collect::<Vec<_>>(),
+        vec![2]
     );
 
-    // A fresh session has no holdback; it re-lists from the start (watermark was
-    // never advanced) and both granules now ingest.
+    // A fresh session has no in-memory holdback. The persisted seen key skips
+    // granule 2, while the restored watermark lets granule 1 retry and land.
     let (s2, _e2) = run(&spec(&root, 1), &source);
     assert_eq!(
-        s2.ingested_granules, 2,
-        "both granules ingest after recovery"
+        s2.ingested_granules, 1,
+        "held granule ingests after recovery"
     );
     let got = read_flashes(&root, "goes19", BASE, BASE + 600_000, None).unwrap();
     let ids: Vec<u32> = got.iter().map(|f| f.flash_id).collect();
