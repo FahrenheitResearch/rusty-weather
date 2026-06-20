@@ -47,7 +47,7 @@ use crate::s3::{
     S3Object, ScratchFile, bucket_for_satellite, build_agent, download_object_to, glm_hour_prefix,
     list_s3_objects, object_filename,
 };
-use crate::store::BucketWriter;
+use crate::store::{BucketWriter, load_window_manifest};
 use crate::window::{PruneReport, WindowConfig, enforce_window};
 
 /// Default poll cadence (seconds): GLM granules land roughly every 20 s.
@@ -337,6 +337,9 @@ pub struct GlmFollowSpec {
     pub byte_budget: Option<u64>,
     /// Store root; buckets land under `<root>/glm/<satellite>/...`.
     pub store_root: PathBuf,
+    /// Optional lower bound for listed GLM granule start times. Older objects
+    /// are skipped before download so live viewers can start near "now".
+    pub min_granule_start_unix_ms: Option<i64>,
     /// Stop after this many poll cycles (`None` = until cancelled).
     pub max_polls: Option<u32>,
 }
@@ -351,6 +354,7 @@ impl GlmFollowSpec {
             window: DEFAULT_WINDOW,
             byte_budget: None,
             store_root,
+            min_granule_start_unix_ms: None,
             max_polls: None,
         }
     }
@@ -416,20 +420,72 @@ fn utc_year_doy_hour(unix_ms: i64) -> (i64, u32, u32) {
     (year, doy, hour)
 }
 
-/// The hour prefixes one poll must cover: the current hour, preceded by the
-/// previous hour during the first [`HOUR_ROLLOVER_GRACE_MINUTES`]. Pure for
-/// testing (takes the instant).
+/// The hour prefixes one poll must cover: the current hour first, followed by
+/// the previous hour during the first [`HOUR_ROLLOVER_GRACE_MINUTES`]. Pure for
+/// testing (takes the instant). Current-first matters for live displays: around
+/// UTC hour rollover the freshest granules are in the new hour, and the older
+/// prefix must not delay them.
 pub fn poll_prefixes(now_unix_ms: i64) -> Vec<String> {
     let (year, doy, hour) = utc_year_doy_hour(now_unix_ms);
     let into_hour_min = ((now_unix_ms.div_euclid(60_000)) % 60) as u32;
     let mut prefixes = Vec::with_capacity(2);
+    prefixes.push(glm_hour_prefix(year, doy, hour));
     if into_hour_min < HOUR_ROLLOVER_GRACE_MINUTES {
         let prev = now_unix_ms - 3_600_000;
         let (py, pdoy, ph) = utc_year_doy_hour(prev);
         prefixes.push(glm_hour_prefix(py, pdoy, ph));
     }
-    prefixes.push(glm_hour_prefix(year, doy, hour));
     prefixes
+}
+
+fn parse_granule_start_unix_ms(key: &str) -> Option<i64> {
+    let start = key.find("_s")? + 2;
+    let stamp = key.get(start..start + 13)?;
+    let year = stamp.get(0..4)?.parse::<i64>().ok()?;
+    let doy = stamp.get(4..7)?.parse::<i64>().ok()?;
+    let hour = stamp.get(7..9)?.parse::<i64>().ok()?;
+    let minute = stamp.get(9..11)?.parse::<i64>().ok()?;
+    let second = stamp.get(11..13)?.parse::<i64>().ok()?;
+    if !(1..=366).contains(&doy)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
+    let jan1 = crate::format::days_from_civil(year, 1, 1)?;
+    let day = jan1 + doy - 1;
+    Some(
+        day.saturating_mul(86_400_000)
+            .saturating_add(hour.saturating_mul(3_600_000))
+            .saturating_add(minute.saturating_mul(60_000))
+            .saturating_add(second.saturating_mul(1_000)),
+    )
+}
+
+fn retain_granules_at_or_after(
+    prefix: &str,
+    listed: Vec<ListedGranule>,
+    min_start_ms: Option<i64>,
+    last_key: &mut HashMap<String, String>,
+) -> Vec<ListedGranule> {
+    let Some(min_start_ms) = min_start_ms else {
+        return listed;
+    };
+    let mut newest_skipped_old_key = None;
+    let mut kept = Vec::with_capacity(listed.len());
+    for granule in listed {
+        match parse_granule_start_unix_ms(&granule.key) {
+            Some(start_ms) if start_ms < min_start_ms => {
+                newest_skipped_old_key = Some(granule.key);
+            }
+            _ => kept.push(granule),
+        }
+    }
+    if let Some(key) = newest_skipped_old_key {
+        last_key.insert(prefix.to_string(), key);
+    }
+    kept
 }
 
 fn check_cancel(cancel: &AtomicBool) -> Result<(), GlmError> {
@@ -468,16 +524,11 @@ pub fn follow_with_source(
     let mut summary = FollowSummary::default();
     let window = spec.window_config();
 
-    // Restart-safe dedup: seed the seen-set from window.json. Opening a writer
-    // briefly to read the manifest also creates the store dir; we drop it right
-    // away so nothing holds the lock outside the write phase.
+    // Restart-safe dedup: seed the seen-set from window.json. The manifest is
+    // published by atomic rename, so this read does not need the writer lock.
     let mut seen = SeenGranules::default();
-    {
-        let writer = BucketWriter::open(&spec.store_root, &spec.satellite)
-            .map_err(|e| other(e.to_string()))?;
-        for key in writer.load_manifest().seen_granule_keys {
-            seen.insert(key);
-        }
+    for key in load_window_manifest(&spec.store_root, &spec.satellite).seen_granule_keys {
+        seen.insert(key);
     }
     if !seen.is_empty() {
         sink(GlmEvent::Info {
@@ -506,8 +557,6 @@ pub fn follow_with_source(
         // write phase, then drop it BEFORE pruning (lock lifetimes never
         // overlap — ingest-then-enforce, single threaded).
         {
-            let mut writer = BucketWriter::open(&spec.store_root, &spec.satellite)
-                .map_err(|e| other(e.to_string()))?;
             for prefix in &prefixes {
                 check_cancel(cancel)?;
                 let start_after = last_key.get(prefix).cloned();
@@ -520,6 +569,22 @@ pub fn follow_with_source(
                         continue;
                     }
                 };
+                let mut listed = retain_granules_at_or_after(
+                    prefix,
+                    listed,
+                    spec.min_granule_start_unix_ms,
+                    &mut last_key,
+                );
+
+                // Live-first catch-up: S3 lists oldest-first, which used to
+                // make a cold start download the entire recent backlog before
+                // the newest flash could appear. Bucket writes are time-sorted,
+                // so process newest-first without changing the stored result.
+                let retry_watermark = last_key.get(prefix).cloned();
+                let newest_listed_key = listed.iter().map(|item| item.key.clone()).max();
+                listed.sort_unstable_by(|left, right| right.key.cmp(&left.key));
+                let mut held_prefix = false;
+
                 for granule in listed {
                     check_cancel(cancel)?;
                     let flow = process_one_granule(
@@ -527,21 +592,35 @@ pub fn follow_with_source(
                         &granule,
                         stale_cutoff,
                         source,
-                        &mut writer,
+                        &spec.store_root,
+                        &spec.satellite,
                         &mut seen,
                         &mut holdbacks,
                         &mut last_key,
                         &mut summary,
                         sink,
                     )?;
-                    // A granule in active holdback holds the prefix watermark
-                    // before it: stop here so the next poll re-lists it (and
-                    // everything after) rather than letting a later success
-                    // advance the watermark past the held granule. Mirrors
-                    // rw-sat's `break` on a held object.
-                    if flow == ProcessFlow::HoldPrefix {
-                        break;
+                    // A transiently bad older object must not starve every
+                    // newer live object. Continue through the listing, then
+                    // restore the pre-list watermark so the held object is
+                    // still re-listed on the next poll. Successful later files
+                    // are cheap AlreadySeen skips on that retry.
+                    held_prefix |= flow == ProcessFlow::HoldPrefix;
+                }
+
+                if held_prefix {
+                    match retry_watermark {
+                        Some(key) => {
+                            last_key.insert(prefix.to_string(), key);
+                        }
+                        None => {
+                            last_key.remove(prefix);
+                        }
                     }
+                } else if let Some(key) = newest_listed_key {
+                    // Newest-first processing would otherwise leave the
+                    // watermark at whichever older item happened to run last.
+                    last_key.insert(prefix.to_string(), key);
                 }
             }
             // writer (and its satellite lock) dropped here.
@@ -579,15 +658,16 @@ pub fn follow_with_source(
     }
 }
 
-/// Whether the prefix loop should keep advancing or stop (hold the watermark
-/// before a granule still in its retry holdback).
+/// Whether a listed granule reached a terminal state or requires the prefix
+/// watermark to be restored after the rest of this poll is processed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessFlow {
     /// This granule reached a terminal state (ingested, or permanently/
     /// exhaustively skipped) and the watermark advanced past it.
     Continue,
-    /// This granule is in active holdback; the watermark is held before it so
-    /// it is re-listed next cycle. The caller must stop the prefix here.
+    /// This granule is in active holdback. The caller may continue processing
+    /// newer objects, but must restore the prefix's pre-list watermark so this
+    /// object is re-listed next cycle.
     HoldPrefix,
 }
 
@@ -595,15 +675,17 @@ enum ProcessFlow {
 /// record-seen. Advances the prefix watermark for granules handled to a
 /// terminal state (seen, written, permanently/exhaustively skipped) and returns
 /// [`ProcessFlow::Continue`]; a granule in active holdback returns
-/// [`ProcessFlow::HoldPrefix`] without advancing the watermark, so it (and
-/// everything after it) is re-listed next cycle.
+/// [`ProcessFlow::HoldPrefix`] without advancing the watermark. The caller
+/// continues through newer objects and restores the prefix watermark afterward,
+/// so the held object is retried without starving live data.
 #[allow(clippy::too_many_arguments)]
 fn process_one_granule(
     prefix: &str,
     granule: &ListedGranule,
     stale_cutoff: i64,
     source: &dyn GranuleSource,
-    writer: &mut BucketWriter,
+    store_root: &Path,
+    satellite: &str,
     seen: &mut SeenGranules,
     holdbacks: &mut HashMap<String, Holdback>,
     last_key: &mut HashMap<String, String>,
@@ -649,12 +731,25 @@ fn process_one_granule(
                 key: dedup_key.clone(),
                 flashes: decoded.flashes.len(),
             });
-            write_decoded(writer, &decoded, stale_cutoff, summary, sink)?;
-            // Mark seen, persist it, clear any holdback, advance the watermark.
+            let write_outcome = write_decoded_to_store(
+                store_root,
+                satellite,
+                &dedup_key,
+                &decoded,
+                stale_cutoff,
+                summary,
+                sink,
+            )?;
+            // Mark seen in this session, clear any holdback, advance the
+            // watermark. Persist the dedup key only after real bucket records
+            // are committed; zero-write/current decode attempts must not poison
+            // window.json across restarts.
             seen.insert(dedup_key.clone());
-            if let Err(e) = writer.record_seen_granule(&dedup_key) {
-                sink(GlmEvent::Warning {
-                    message: format!("persist seen {dedup_key}: {e}"),
+            if matches!(write_outcome, WriteOutcome::NoWritableRecords) {
+                sink(GlmEvent::Info {
+                    message: format!(
+                        "dedup not persisted for {dedup_key}: decoded but wrote 0 records"
+                    ),
                 });
             }
             holdbacks.remove(&dedup_key);
@@ -671,10 +766,10 @@ fn process_one_granule(
                     key: dedup_key.clone(),
                     reason: SkipReason::PermanentDecodeError,
                 });
-                // A permanent failure is terminal: never retry. Mark it seen so
-                // a restart does not re-attempt it, and advance the watermark.
+                // A permanent failure is terminal for this running session, but
+                // do not persist it as ingested. Decoder/library fixes or a
+                // clean restart must be allowed to retry current granules.
                 seen.insert(dedup_key.clone());
-                let _ = writer.record_seen_granule(&dedup_key);
                 holdbacks.remove(&dedup_key);
                 summary.skipped_granules += 1;
                 last_key.insert(prefix.to_string(), granule.key.clone());
@@ -697,8 +792,10 @@ fn process_one_granule(
                         key: dedup_key.clone(),
                         reason: SkipReason::RetriesExhausted,
                     });
+                    // Terminal for this running session only. Persisting this
+                    // key would turn transient network/decode trouble into a
+                    // stale store across restarts.
                     seen.insert(dedup_key.clone());
-                    let _ = writer.record_seen_granule(&dedup_key);
                     holdbacks.remove(&dedup_key);
                     summary.skipped_granules += 1;
                     last_key.insert(prefix.to_string(), granule.key.clone());
@@ -715,8 +812,9 @@ fn process_one_granule(
                             delay.as_secs()
                         ),
                     });
-                    // Hold the watermark before this granule: re-list it (and
-                    // everything after) next cycle.
+                    // Ask the caller to restore the pre-list watermark after
+                    // processing newer objects, so this granule is retried
+                    // without blocking the live edge.
                     Ok(ProcessFlow::HoldPrefix)
                 }
             }
@@ -728,13 +826,15 @@ fn process_one_granule(
 /// than `stale_cutoff` (a restart re-lists the whole hour, which can hold
 /// granules the rolling window would immediately evict — pure write/prune churn
 /// otherwise). Emits a `BucketWritten` event per affected bucket.
-fn write_decoded(
-    writer: &mut BucketWriter,
+fn write_decoded_to_store(
+    store_root: &Path,
+    satellite: &str,
+    dedup_key: &str,
     decoded: &DecodedGranule,
     stale_cutoff: i64,
     summary: &mut FollowSummary,
     sink: &mut dyn FnMut(GlmEvent),
-) -> Result<(), GlmError> {
+) -> Result<WriteOutcome, GlmError> {
     let decoded_count = decoded.flashes.len();
     let records: Vec<FlashRecord> = decoded
         .flashes
@@ -767,7 +867,20 @@ fn write_decoded(
                 ),
             });
         }
-        return Ok(());
+        return Ok(WriteOutcome::NoWritableRecords);
+    }
+    let mut writer = BucketWriter::open(store_root, satellite).map_err(|e| other(e.to_string()))?;
+    if writer
+        .load_manifest()
+        .seen_granule_keys
+        .iter()
+        .any(|seen| seen == dedup_key)
+    {
+        sink(GlmEvent::GranuleSkipped {
+            key: dedup_key.to_owned(),
+            reason: SkipReason::AlreadySeen,
+        });
+        return Ok(WriteOutcome::AlreadyInStore);
     }
     writer
         .insert_flashes(&records, 1)
@@ -780,7 +893,19 @@ fn write_decoded(
             records: count,
         });
     }
-    Ok(())
+    if let Err(e) = writer.record_seen_granule(dedup_key) {
+        sink(GlmEvent::Warning {
+            message: format!("persist seen {dedup_key}: {e}"),
+        });
+    }
+    Ok(WriteOutcome::WroteRecords)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteOutcome {
+    WroteRecords,
+    NoWritableRecords,
+    AlreadyInStore,
 }
 
 /// Read a bucket's record count from its header (0 if unreadable).
@@ -954,22 +1079,45 @@ mod tests {
         let p = poll_prefixes(mid);
         assert_eq!(p, vec!["GLM-L2-LCFA/2026/001/18/".to_string()]);
 
-        // 19:02 -> previous hour included.
+        // 19:02 -> current hour first, previous hour second.
         let rolled = BASE + (19 * 3600 + 2 * 60) * 1000;
         let p = poll_prefixes(rolled);
         assert_eq!(
             p,
             vec![
-                "GLM-L2-LCFA/2026/001/18/".to_string(),
                 "GLM-L2-LCFA/2026/001/19/".to_string(),
+                "GLM-L2-LCFA/2026/001/18/".to_string(),
             ]
         );
 
-        // Day + year rollover: 2026-01-01 00:01 includes 2025-12-31 23:00.
+        // Day + year rollover: 2026-01-01 00:01 checks current year first,
+        // then includes 2025-12-31 23:00.
         let new_year = BASE + 60_000;
         let p = poll_prefixes(new_year);
-        assert_eq!(p[0], "GLM-L2-LCFA/2025/365/23/".to_string());
-        assert_eq!(p[1], "GLM-L2-LCFA/2026/001/00/".to_string());
+        assert_eq!(p[0], "GLM-L2-LCFA/2026/001/00/".to_string());
+        assert_eq!(p[1], "GLM-L2-LCFA/2025/365/23/".to_string());
+    }
+
+    #[test]
+    fn min_granule_start_skips_old_objects_without_fetching() {
+        let mut last_key = HashMap::new();
+        let old = ListedGranule {
+            key: "GLM-L2-LCFA/2026/001/00/OR_GLM-L2-LCFA_G19_s20260010001000_e_x.nc".to_string(),
+            bytes: 100,
+        };
+        let fresh = ListedGranule {
+            key: "GLM-L2-LCFA/2026/001/00/OR_GLM-L2-LCFA_G19_s20260010004500_e_x.nc".to_string(),
+            bytes: 100,
+        };
+        let cutoff = parse_granule_start_unix_ms(&fresh.key).unwrap();
+        let kept = retain_granules_at_or_after(
+            "GLM-L2-LCFA/2026/001/00/",
+            vec![old.clone(), fresh.clone()],
+            Some(cutoff),
+            &mut last_key,
+        );
+        assert_eq!(kept, vec![fresh]);
+        assert_eq!(last_key.get("GLM-L2-LCFA/2026/001/00/"), Some(&old.key));
     }
 
     #[test]

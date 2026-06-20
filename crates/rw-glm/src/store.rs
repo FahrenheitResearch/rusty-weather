@@ -235,13 +235,7 @@ impl BucketWriter {
     /// state is an optimization, never a correctness requirement (the in-window
     /// `stale_cutoff` already prevents re-ingesting evicted granules).
     pub fn load_manifest(&self) -> WindowManifest {
-        match std::fs::read(self.manifest_path()) {
-            Ok(bytes) => serde_json::from_slice::<WindowManifest>(&bytes)
-                .ok()
-                .filter(|m| m.schema == WINDOW_SCHEMA)
-                .unwrap_or_else(|| WindowManifest::new(&self.satellite)),
-            Err(_) => WindowManifest::new(&self.satellite),
-        }
+        load_manifest_path(&self.manifest_path(), &self.satellite)
     }
 
     /// Record `granule_key` in the persisted seen-set and refresh `window.json`
@@ -305,6 +299,28 @@ impl BucketWriter {
             }
         }
         Ok(out)
+    }
+}
+
+/// Lock-free manifest read for followers/readers.
+///
+/// `window.json` is published by atomic rename, so readers either see the old
+/// complete manifest or the new complete manifest. No writer lock is needed for
+/// this restart-dedup seed path.
+pub fn load_window_manifest(root: &Path, satellite: &str) -> WindowManifest {
+    load_manifest_path(
+        &root.join("glm").join(satellite).join("window.json"),
+        satellite,
+    )
+}
+
+fn load_manifest_path(path: &Path, satellite: &str) -> WindowManifest {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<WindowManifest>(&bytes)
+            .ok()
+            .filter(|m| m.schema == WINDOW_SCHEMA)
+            .unwrap_or_else(|| WindowManifest::new(satellite)),
+        Err(_) => WindowManifest::new(satellite),
     }
 }
 
