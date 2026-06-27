@@ -138,6 +138,14 @@ struct SoundingOverlaySettings {
     dcape: bool,
     #[serde(default = "default_dashed_trace_style")]
     dcape_style: SoundingTraceStyle,
+    #[serde(default = "default_text_scale")]
+    text_scale: f32,
+    #[serde(default = "default_table_text_scale")]
+    table_text_scale: f32,
+    #[serde(default = "default_hodo_dot_radius")]
+    hodo_dot_radius: f32,
+    #[serde(default = "default_slinky_dot_radius")]
+    slinky_dot_radius: f32,
 }
 
 impl Default for SoundingOverlaySettings {
@@ -155,6 +163,10 @@ impl Default for SoundingOverlaySettings {
             mu_parcel_style: SoundingTraceStyle::Dashed,
             dcape: true,
             dcape_style: SoundingTraceStyle::Dashed,
+            text_scale: default_text_scale(),
+            table_text_scale: default_table_text_scale(),
+            hodo_dot_radius: default_hodo_dot_radius(),
+            slinky_dot_radius: default_slinky_dot_radius(),
         }
     }
 }
@@ -165,6 +177,22 @@ fn default_true() -> bool {
 
 fn default_dashed_trace_style() -> SoundingTraceStyle {
     SoundingTraceStyle::Dashed
+}
+
+fn default_text_scale() -> f32 {
+    1.0
+}
+
+fn default_table_text_scale() -> f32 {
+    1.18
+}
+
+fn default_hodo_dot_radius() -> f32 {
+    4.0
+}
+
+fn default_slinky_dot_radius() -> f32 {
+    4.0
 }
 
 impl Default for SoundingTraceStyle {
@@ -434,6 +462,7 @@ struct SceneCanvas {
     layout_h: f32,
     source: ComponentFrame,
     dest: ComponentFrame,
+    text_scale: f32,
 }
 
 impl SceneCanvas {
@@ -449,7 +478,13 @@ impl SceneCanvas {
             layout_h: layout.canvas_h,
             source,
             dest,
+            text_scale: 1.0,
         }
+    }
+
+    fn with_text_scale(mut self, text_scale: f32) -> Self {
+        self.text_scale = text_scale.clamp(0.65, 2.2);
+        self
     }
 
     fn map_pos(self, x: f32, y: f32) -> Pos2 {
@@ -535,6 +570,24 @@ impl SoundingPanel {
                 build_ms: build_start.elapsed().as_secs_f32() * 1000.0,
             })
         });
+        self.loading = false;
+        self.state = SoundingState::Ready(Box::new(ReadySounding { data, scene }));
+    }
+
+    /// Install a sounding whose exact vertical column was assembled by the
+    /// host, while still carrying [`SoundingData`] for labels, hovers, and
+    /// the level table. Used for observed RAOBs where significant levels are
+    /// not a regular model isobaric grid.
+    pub fn set_native_column(&mut self, data: SoundingData, column: SoundingColumn) {
+        profile_scope!("skewt_build_scene_native_column");
+        let build_start = std::time::Instant::now();
+        let scene = NativeSounding::from_column(&column)
+            .map(|native| SoundingScene {
+                column,
+                native,
+                build_ms: build_start.elapsed().as_secs_f32() * 1000.0,
+            })
+            .map_err(|err| err.to_string());
         self.loading = false;
         self.state = SoundingState::Ready(Box::new(ReadySounding { data, scene }));
     }
@@ -674,7 +727,9 @@ fn show_sounding(
             CollapsingHeader::new("Level table")
                 .id_salt("rw-ui-sounding-levels")
                 .default_open(ready.scene.is_err())
-                .show(ui, |ui| show_level_table(ui, data));
+                .show(ui, |ui| {
+                    show_level_table(ui, data, overlays.table_text_scale)
+                });
         });
 }
 
@@ -759,6 +814,13 @@ fn show_overlay_controls(ui: &mut Ui, overlays: &mut SoundingOverlaySettings) {
                 ui.checkbox(&mut overlays.height_markers, "Height marks");
                 ui.checkbox(&mut overlays.level_markers, "LCL/LFC/EL");
                 ui.checkbox(&mut overlays.wind_barbs, "Wind barbs");
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().slider_width = 98.0;
+                ui.add(Slider::new(&mut overlays.text_scale, 0.7..=1.8).text("plot text"));
+                ui.add(Slider::new(&mut overlays.table_text_scale, 0.8..=2.2).text("table text"));
+                ui.add(Slider::new(&mut overlays.hodo_dot_radius, 2.0..=9.0).text("hodo dots"));
+                ui.add(Slider::new(&mut overlays.slinky_dot_radius, 2.0..=9.0).text("slinky dots"));
             });
             ui.horizontal_wrapped(|ui| {
                 trace_overlay_control(
@@ -983,25 +1045,29 @@ fn draw_sounding_scene(
         layout,
         ComponentFrame::new(0.0, 0.0, FULL_IMAGE_W, TITLE_H),
         layout.title,
-    );
+    )
+    .with_text_scale(overlays.text_scale);
     let skewt_canvas = SceneCanvas::new(
         screen,
         layout,
         SoundingLayout::source_frame(SoundingPanelRegion::Skewt),
         layout.skewt,
-    );
+    )
+    .with_text_scale(overlays.text_scale);
     let hodo_canvas = SceneCanvas::new(
         screen,
         layout,
         SoundingLayout::source_frame(SoundingPanelRegion::Hodograph),
         layout.hodograph,
-    );
+    )
+    .with_text_scale(overlays.text_scale);
     let slinky_canvas = SceneCanvas::new(
         screen,
         layout,
         SoundingLayout::source_frame(SoundingPanelRegion::Slinky),
         layout.slinky,
-    );
+    )
+    .with_text_scale(overlays.text_scale);
     let table_canvas = SceneCanvas::new(
         screen,
         layout,
@@ -1012,12 +1078,13 @@ fn draw_sounding_scene(
             FULL_IMAGE_H - TITLE_H - SKEWT_UPPER_H,
         ),
         layout.tables,
-    );
+    )
+    .with_text_scale(overlays.table_text_scale);
 
     draw_title(&painter, title_canvas, data);
     draw_skewt_panel(&painter, skewt_canvas, scene, zooms.skewt, overlays);
-    draw_hodograph_panel(&painter, hodo_canvas, data, zooms.hodograph);
-    draw_slinky_panel(&painter, slinky_canvas, data, zooms.slinky);
+    draw_hodograph_panel(&painter, hodo_canvas, data, zooms.hodograph, overlays);
+    draw_slinky_panel(&painter, slinky_canvas, data, zooms.slinky, overlays);
     draw_native_tables(&painter, table_canvas, scene, data);
 
     if edit_layout {
@@ -1300,6 +1367,7 @@ fn draw_hodograph_panel(
     rect: SceneCanvas,
     data: &SoundingData,
     view: PanelViewport,
+    overlays: &SoundingOverlaySettings,
 ) {
     draw_rect_outline_base(
         painter,
@@ -1329,6 +1397,7 @@ fn draw_hodograph_panel(
     let xform = view.transform_around(cx, cy);
     let content_painter = painter.with_clip_rect(base_rect(rect, HODO_X, HODO_Y, HODO_W, HODO_H));
     let painter = &content_painter;
+    let marker_radius = overlays.hodo_dot_radius.clamp(2.0, 9.0);
     for kt in [20.0, 40.0, 60.0, 80.0] {
         draw_circle_xform(
             painter,
@@ -1402,14 +1471,14 @@ fn draw_hodograph_panel(
         }
         let x = cx + (point.u_kt * scale) as f32;
         let y = cy - (point.v_kt * scale) as f32;
-        draw_circle_filled_xform(painter, rect, xform, x, y, 7.0, Color32::WHITE);
+        draw_circle_filled_xform(painter, rect, xform, x, y, marker_radius, Color32::WHITE);
         draw_circle_xform(
             painter,
             rect,
             xform,
             x,
             y,
-            7.0,
+            marker_radius,
             hodo_color(point.height_agl_m),
             2.0,
         );
@@ -1418,7 +1487,15 @@ fn draw_hodograph_panel(
     if let Some((ru, rv)) = bunkers_right_motion(data) {
         let x = cx + (ru * scale) as f32;
         let y = cy - (rv * scale) as f32;
-        draw_circle_filled_xform(painter, rect, xform, x, y, 6.0, color(255, 45, 45));
+        draw_circle_filled_xform(
+            painter,
+            rect,
+            xform,
+            x,
+            y,
+            (marker_radius - 1.0).max(2.5),
+            color(255, 45, 45),
+        );
         let (dir, spd) = dir_speed_from_uv_kt(ru, rv);
         draw_text_xform(
             painter,
@@ -1439,6 +1516,7 @@ fn draw_slinky_panel(
     rect: SceneCanvas,
     data: &SoundingData,
     view: PanelViewport,
+    overlays: &SoundingOverlaySettings,
 ) {
     draw_rect_outline_base(
         painter,
@@ -1489,6 +1567,7 @@ fn draw_slinky_panel(
     let content_painter =
         painter.with_clip_rect(base_rect(rect, INSET_X, INSET_Y, INSET_W, INSET_H));
     let painter = &content_painter;
+    let marker_radius = overlays.slinky_dot_radius.clamp(2.0, 9.0);
     let max_disp = points
         .iter()
         .map(|point| (point.u_kt - storm_u).hypot(point.v_kt - storm_v))
@@ -1558,10 +1637,19 @@ fn draw_slinky_panel(
             xform,
             x,
             y,
-            7.0,
+            marker_radius,
             hodo_color(point.height_agl_m),
         );
-        draw_circle_xform(painter, rect, xform, x, y, 7.0, Color32::WHITE, 1.0);
+        draw_circle_xform(
+            painter,
+            rect,
+            xform,
+            x,
+            y,
+            marker_radius,
+            Color32::WHITE,
+            1.0,
+        );
     }
 }
 
@@ -1584,7 +1672,7 @@ fn draw_native_tables(
         FULL_IMAGE_H - top,
         color(0, 0, 0),
     );
-    for x in [600.0, 1165.0, 1715.0] {
+    for x in [760.0, 1370.0, 1850.0] {
         draw_line_base(
             painter,
             rect,
@@ -1600,16 +1688,16 @@ fn draw_native_tables(
     draw_table_header(painter, rect, 14.0, top + 12.0, "PARCELS");
     for (i, (label, x)) in [
         ("PCL", 14.0),
-        ("CAPE", 82.0),
-        ("CINH", 132.0),
-        ("3CAPE", 197.0),
-        ("6CAPE", 262.0),
-        ("LCL", 318.0),
-        ("LFC", 372.0),
-        ("EL", 426.0),
-        ("LI", 472.0),
-        ("ECAPE", 535.0),
-        ("NCAPE", 596.0),
+        ("CAPE", 105.0),
+        ("CINH", 165.0),
+        ("3CAPE", 240.0),
+        ("6CAPE", 315.0),
+        ("LCL", 390.0),
+        ("LFC", 455.0),
+        ("EL", 520.0),
+        ("LI", 575.0),
+        ("ECAPE", 660.0),
+        ("NCAPE", 735.0),
     ]
     .iter()
     .enumerate()
@@ -1706,14 +1794,14 @@ fn draw_native_tables(
         draw_kv(
             painter,
             rect,
-            300.0,
+            380.0,
             top + 212.0 + i as f32 * 25.0,
             label,
             value,
         );
     }
 
-    draw_table_header(painter, rect, 626.0, top + 12.0, "SHEAR / HELICITY");
+    draw_table_header(painter, rect, 790.0, top + 12.0, "SHEAR / HELICITY");
     for (i, (label, srh, shear)) in [
         (
             "SFC-1km",
@@ -1736,7 +1824,7 @@ fn draw_native_tables(
         draw_text_base(
             painter,
             rect,
-            626.0,
+            790.0,
             y,
             label,
             color(230, 230, 230),
@@ -1746,7 +1834,7 @@ fn draw_native_tables(
         draw_text_base(
             painter,
             rect,
-            790.0,
+            955.0,
             y,
             &format!("SRH {}", fmt_optional_number(*srh, 0, "")),
             value_color((*srh).unwrap_or(f64::NAN)),
@@ -1756,7 +1844,7 @@ fn draw_native_tables(
         draw_text_base(
             painter,
             rect,
-            980.0,
+            1160.0,
             y,
             &format!("Shr {}", fmt_optional_number(*shear, 0, " kt")),
             color(255, 210, 80),
@@ -1765,7 +1853,7 @@ fn draw_native_tables(
         );
     }
 
-    draw_table_header(painter, rect, 626.0, top + 226.0, "STORM MOTION");
+    draw_table_header(painter, rect, 790.0, top + 226.0, "STORM MOTION");
     for (i, (label, value)) in [
         ("Bunkers RM", fmt_uv_motion(p.rstu, p.rstv)),
         ("Bunkers LM", fmt_uv_motion(p.lstu, p.lstv)),
@@ -1780,14 +1868,14 @@ fn draw_native_tables(
         draw_kv(
             painter,
             rect,
-            630.0,
+            794.0,
             top + 262.0 + i as f32 * 25.0,
             label,
             value,
         );
     }
 
-    draw_table_header(painter, rect, 1190.0, top + 12.0, "COMPOSITES");
+    draw_table_header(painter, rect, 1400.0, top + 12.0, "COMPOSITES");
     for (i, (label, value, col)) in [
         (
             "STP cin",
@@ -1820,7 +1908,7 @@ fn draw_native_tables(
         draw_kv_colored(
             painter,
             rect,
-            1194.0,
+            1404.0,
             top + 48.0 + i as f32 * 27.0,
             label,
             value,
@@ -1828,11 +1916,11 @@ fn draw_native_tables(
         );
     }
 
-    draw_table_header(painter, rect, 1190.0, top + 298.0, "WATCH TYPE");
+    draw_table_header(painter, rect, 1400.0, top + 298.0, "WATCH TYPE");
     draw_text_base(
         painter,
         rect,
-        1194.0,
+        1404.0,
         top + 338.0,
         p.watch_type.label(),
         watch_color(p.watch_type.label()),
@@ -1840,7 +1928,7 @@ fn draw_native_tables(
         Align2::LEFT_TOP,
     );
 
-    draw_table_header(painter, rect, 1740.0, top + 12.0, "MODEL POINT");
+    draw_table_header(painter, rect, 1880.0, top + 12.0, "MODEL POINT");
     if let (Some(t), Some(td)) = (
         scene.column.temperature_c.first(),
         scene.column.dewpoint_c.first(),
@@ -1848,7 +1936,7 @@ fn draw_native_tables(
         draw_kv(
             painter,
             rect,
-            1744.0,
+            1884.0,
             top + 48.0,
             "Sfc T/Td",
             &format!("{:.0}/{:.0} F", c_to_f(*t), c_to_f(*td)),
@@ -1859,7 +1947,7 @@ fn draw_native_tables(
         draw_kv(
             painter,
             rect,
-            1744.0,
+            1884.0,
             top + 75.0,
             "Local RM",
             &format!("{dir:03.0}/{spd:.0} kt"),
@@ -1868,7 +1956,7 @@ fn draw_native_tables(
     draw_kv(
         painter,
         rect,
-        1744.0,
+        1884.0,
         top + 102.0,
         "Levels",
         &scene.column.len().to_string(),
@@ -1876,7 +1964,7 @@ fn draw_native_tables(
     draw_text_base(
         painter,
         rect,
-        1744.0,
+        1884.0,
         top + 152.0,
         "Native egui scene",
         color(255, 210, 80),
@@ -1916,16 +2004,16 @@ fn draw_parcel_calc_row(
         Align2::LEFT_TOP,
     );
     for (x, value, decimals, suffix, col) in [
-        (82.0, cape, 0, "", cape_color(cape)),
-        (132.0, cinh, 0, "", color(255, 120, 120)),
-        (197.0, cape3, 0, "", cape_color(cape3)),
-        (262.0, cape6, 0, "", cape_color(cape6)),
-        (318.0, lcl, 0, "", color(230, 230, 230)),
-        (372.0, lfc, 0, "", color(230, 230, 230)),
-        (426.0, el, 0, "", color(230, 230, 230)),
-        (472.0, li, 0, "", value_color(-li)),
-        (535.0, ecape, 0, "", cape_color(ecape)),
-        (596.0, ncape, 2, "", color(255, 210, 80)),
+        (105.0, cape, 0, "", cape_color(cape)),
+        (165.0, cinh, 0, "", color(255, 120, 120)),
+        (240.0, cape3, 0, "", cape_color(cape3)),
+        (315.0, cape6, 0, "", cape_color(cape6)),
+        (390.0, lcl, 0, "", color(230, 230, 230)),
+        (455.0, lfc, 0, "", color(230, 230, 230)),
+        (520.0, el, 0, "", color(230, 230, 230)),
+        (575.0, li, 0, "", value_color(-li)),
+        (660.0, ecape, 0, "", cape_color(ecape)),
+        (735.0, ncape, 2, "", color(255, 210, 80)),
     ] {
         draw_text_base(
             painter,
@@ -2301,12 +2389,12 @@ fn draw_height_markers_native(
             painter,
             rect,
             xform,
-            5.0,
-            y - 10.0,
+            SKEWT_MARGIN_LEFT - 36.0,
+            y,
             &format!("{km:.0}KM"),
             color(0, 230, 230),
-            22.0,
-            Align2::LEFT_TOP,
+            16.0,
+            Align2::RIGHT_CENTER,
         );
     }
 }
@@ -2623,7 +2711,7 @@ fn draw_text_base(
         base_pos(rect, x, y),
         align,
         text,
-        FontId::monospace((base_size * TEXT_SCALE * scale).clamp(7.0, 34.0)),
+        FontId::monospace((base_size * TEXT_SCALE * rect.text_scale * scale).clamp(7.0, 44.0)),
         col,
     );
 }
@@ -3163,11 +3251,13 @@ fn dir_speed_from_uv_kt(u_kt: f64, v_kt: f64) -> (f64, f64) {
 
 /// Numeric table: rows = union of levels (descending pressure), one column
 /// per 3D variable. Raw store values and units — no conversions.
-fn show_level_table(ui: &mut Ui, data: &SoundingData) {
+fn show_level_table(ui: &mut Ui, data: &SoundingData, table_text_scale: f32) {
     if data.vars.is_empty() {
         ui.label(RichText::new("This hour has no 3D pressure-level variables.").weak());
         return;
     }
+    let header_size = (13.0 * table_text_scale).clamp(10.0, 26.0);
+    let row_size = (12.0 * table_text_scale).clamp(9.0, 24.0);
     let mut levels: Vec<u16> = data
         .vars
         .iter()
@@ -3183,14 +3273,14 @@ fn show_level_table(ui: &mut Ui, data: &SoundingData) {
                 .striped(true)
                 .min_col_width(56.0)
                 .show(ui, |ui| {
-                    ui.label(RichText::new("hPa").strong());
+                    ui.label(RichText::new("hPa").strong().size(header_size));
                     for var in &data.vars {
-                        ui.label(RichText::new(&var.name).strong())
+                        ui.label(RichText::new(&var.name).strong().size(header_size))
                             .on_hover_text(format!("units: {}", var.units));
                     }
                     ui.end_row();
                     for &level in &levels {
-                        ui.label(format!("{level}"));
+                        ui.label(RichText::new(format!("{level}")).size(row_size));
                         for var in &data.vars {
                             let value = var
                                 .levels_hpa
@@ -3198,9 +3288,11 @@ fn show_level_table(ui: &mut Ui, data: &SoundingData) {
                                 .position(|&have| have == level)
                                 .map(|i| var.values[i]);
                             match value {
-                                Some(v) if v.is_finite() => ui.label(format!("{v:.1}")),
-                                Some(_) => ui.label("—"),
-                                None => ui.label(""),
+                                Some(v) if v.is_finite() => {
+                                    ui.label(RichText::new(format!("{v:.1}")).size(row_size))
+                                }
+                                Some(_) => ui.label(RichText::new("—").size(row_size)),
+                                None => ui.label(RichText::new("").size(row_size)),
                             };
                         }
                         ui.end_row();

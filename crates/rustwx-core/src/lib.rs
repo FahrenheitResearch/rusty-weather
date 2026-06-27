@@ -431,6 +431,7 @@ impl std::fmt::Display for CanonicalField {
 pub enum VerticalSelector {
     Surface,
     MeanSeaLevel,
+    AltitudeMeters(u16),
     HeightAboveGroundMeters(u16),
     HeightAboveGroundLayerMeters { bottom_m: u16, top_m: u16 },
     HybridLevel(u16),
@@ -444,6 +445,7 @@ impl VerticalSelector {
         match self {
             Self::Surface => "surface".to_string(),
             Self::MeanSeaLevel => "mean_sea_level".to_string(),
+            Self::AltitudeMeters(height_m) => format!("{height_m}m_msl"),
             Self::HeightAboveGroundMeters(height_m) => format!("{height_m}m_agl"),
             Self::HeightAboveGroundLayerMeters { bottom_m, top_m } => {
                 format!("{bottom_m}m_to_{top_m}m_agl")
@@ -461,6 +463,7 @@ impl std::fmt::Display for VerticalSelector {
         match self {
             Self::Surface => f.write_str("surface"),
             Self::MeanSeaLevel => f.write_str("mean_sea_level"),
+            Self::AltitudeMeters(height_m) => write!(f, "{height_m}m_msl"),
             Self::HeightAboveGroundMeters(height_m) => write!(f, "{height_m}m_agl"),
             Self::HeightAboveGroundLayerMeters { bottom_m, top_m } => {
                 write!(f, "{bottom_m}-{top_m}m_agl")
@@ -641,6 +644,10 @@ impl FieldSelector {
 
     pub const fn height_agl(field: CanonicalField, height_m: u16) -> Self {
         Self::new(field, VerticalSelector::HeightAboveGroundMeters(height_m))
+    }
+
+    pub const fn altitude_msl(field: CanonicalField, height_m: u16) -> Self {
+        Self::new(field, VerticalSelector::AltitudeMeters(height_m))
     }
 
     pub const fn entire_atmosphere(field: CanonicalField) -> Self {

@@ -4275,7 +4275,9 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "chrono",
+ "flate2",
  "grib-core",
+ "hdf5-reader",
  "rayon",
  "rustwx-core",
  "rustwx-models",

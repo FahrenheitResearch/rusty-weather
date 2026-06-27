@@ -10,6 +10,7 @@ pub use cache::{
 use grib_core::grib2::{
     Grib2File, Grib2Message, GridDefinition, flip_rows, grid_latlon, unpack_message,
 };
+use hdf5_reader::{Datatype, Hdf5File};
 use rayon::prelude::*;
 use rustwx_core::{
     CanonicalField, FieldProduct, FieldSelector, GridProjection, GridShape, LatLonGrid, ModelId,
@@ -20,7 +21,7 @@ use rustwx_models::{latest_available_run, model_summary, resolve_urls};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -51,6 +52,8 @@ pub enum IoError {
     MissingGridCoordinates { selector: FieldSelector },
     #[error("wrf error: {0}")]
     Wrf(String),
+    #[error("ODIM HDF5 error: {0}")]
+    Odim(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -206,6 +209,525 @@ pub fn available_forecast_hours(
     let mut available = available;
     available.sort_unstable();
     Ok(available)
+}
+
+pub fn mrms_latest_product_url(product: &str) -> Result<String, IoError> {
+    validate_mrms_product_token(product)?;
+    Ok(format!(
+        "https://mrms.ncep.noaa.gov/2D/{product}/MRMS_{product}.latest.grib2.gz"
+    ))
+}
+
+pub fn fetch_mrms_latest_product(product: &str) -> Result<Vec<u8>, IoError> {
+    let url = mrms_latest_product_url(product)?;
+    let bytes = client()?
+        .get_bytes(&url)
+        .map_err(|err| IoError::Download(err.to_string()))?;
+    maybe_decompress_grib_payload(&url, bytes).map_err(IoError::Download)
+}
+
+pub fn extract_mrms_latest_reflectivity_at_lowest_altitude() -> Result<SelectedField2D, IoError> {
+    let bytes = fetch_mrms_latest_product("ReflectivityAtLowestAltitude")?;
+    extract_field_from_bytes(
+        &bytes,
+        FieldSelector::altitude_msl(CanonicalField::RadarReflectivity, 500),
+    )
+}
+
+pub fn extract_mrms_latest_composite_reflectivity() -> Result<SelectedField2D, IoError> {
+    let bytes = fetch_mrms_latest_product("MergedReflectivityQCComposite")?;
+    extract_field_from_bytes(
+        &bytes,
+        FieldSelector::altitude_msl(CanonicalField::CompositeReflectivity, 500),
+    )
+}
+
+fn validate_mrms_product_token(product: &str) -> Result<(), IoError> {
+    let valid = !product.is_empty()
+        && product
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if valid {
+        Ok(())
+    } else {
+        Err(IoError::Download(format!(
+            "invalid MRMS product token '{product}'"
+        )))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperaDownloadLink {
+    pub href: String,
+    pub title: Option<String>,
+    pub length: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperaRadarMeta {
+    pub projdef: String,
+    pub xsize: usize,
+    pub ysize: usize,
+    pub xscale_m: f64,
+    pub yscale_m: f64,
+    pub ll_lon_deg: f64,
+    pub ll_lat_deg: f64,
+    pub ul_lon_deg: f64,
+    pub ul_lat_deg: f64,
+    pub ur_lon_deg: f64,
+    pub ur_lat_deg: f64,
+    pub lr_lon_deg: f64,
+    pub lr_lat_deg: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperaDbzhCoverage {
+    pub download_links: Vec<OperaDownloadLink>,
+    pub radar_meta: Option<OperaRadarMeta>,
+}
+
+impl OperaDbzhCoverage {
+    pub fn latest_odim_link(&self) -> Option<&OperaDownloadLink> {
+        self.download_links.last()
+    }
+}
+
+pub fn eumetnet_opera_dbzh_coverage_url(datetime_range: &str) -> Result<String, IoError> {
+    validate_eumetnet_datetime_range(datetime_range)?;
+    Ok(format!(
+        "https://api.meteogate.eu/eu-eumetnet-weather-radar/collections/observations/locations/0-20010-0-OPERA?datetime={}&f=CoverageJSON&standard_name=DBZH&format=ODIM&method=comp",
+        encode_query_component(datetime_range)
+    ))
+}
+
+pub fn fetch_eumetnet_opera_dbzh_coverage(
+    datetime_range: &str,
+) -> Result<OperaDbzhCoverage, IoError> {
+    let url = eumetnet_opera_dbzh_coverage_url(datetime_range)?;
+    let bytes = client()?
+        .get_bytes(&url)
+        .map_err(|err| IoError::Download(err.to_string()))?;
+    parse_eumetnet_opera_dbzh_coverage_json(&bytes)
+}
+
+pub fn fetch_eumetnet_opera_latest_dbzh_for_range(
+    datetime_range: &str,
+) -> Result<SelectedField2D, IoError> {
+    let coverage = fetch_eumetnet_opera_dbzh_coverage(datetime_range)?;
+    let link = coverage.latest_odim_link().ok_or_else(|| {
+        IoError::Download("EUMETNET OPERA coverage has no ODIM HDF5 links".into())
+    })?;
+    let bytes = fetch_eumetnet_opera_odim_h5(&link.href)?;
+    extract_eumetnet_opera_dbzh_from_odim_h5(&bytes)
+}
+
+pub fn fetch_eumetnet_opera_odim_h5(url: &str) -> Result<Vec<u8>, IoError> {
+    validate_eumetnet_opera_odim_url(url)?;
+    client()?
+        .get_bytes(url)
+        .map_err(|err| IoError::Download(err.to_string()))
+}
+
+pub fn extract_eumetnet_opera_dbzh_from_odim_h5(bytes: &[u8]) -> Result<SelectedField2D, IoError> {
+    let file = Hdf5File::from_bytes(bytes).map_err(|err| IoError::Odim(err.to_string()))?;
+    let dataset = file
+        .dataset("/dataset1/data1/data")
+        .map_err(|err| IoError::Odim(format!("missing /dataset1/data1/data: {err}")))?;
+    let shape = dataset.shape();
+    let &[ny_u64, nx_u64] = shape else {
+        return Err(IoError::Odim(format!(
+            "OPERA DBZH dataset must be 2D, got shape {shape:?}"
+        )));
+    };
+    let nx = usize::try_from(nx_u64)
+        .map_err(|_| IoError::Odim(format!("OPERA x size exceeds usize: {nx_u64}")))?;
+    let ny = usize::try_from(ny_u64)
+        .map_err(|_| IoError::Odim(format!("OPERA y size exceeds usize: {ny_u64}")))?;
+
+    let data_what = file
+        .group("/dataset1/data1/what")
+        .map_err(|err| IoError::Odim(format!("missing /dataset1/data1/what: {err}")))?;
+    let quantity = hdf5_group_attr_string(&data_what, "quantity")?;
+    if quantity != "DBZH" {
+        return Err(IoError::Odim(format!(
+            "expected OPERA quantity DBZH, got {quantity}"
+        )));
+    }
+    let gain = hdf5_group_attr_f64_default(&data_what, "gain", 1.0)?;
+    let offset = hdf5_group_attr_f64_default(&data_what, "offset", 0.0)?;
+    let nodata = hdf5_group_attr_f64_optional(&data_what, "nodata")?;
+    let undetect = hdf5_group_attr_f64_optional(&data_what, "undetect")?;
+
+    let raw = hdf5_dataset_values_f64(&dataset)?;
+    let values = raw
+        .into_iter()
+        .map(|value| {
+            let missing = !value.is_finite()
+                || nodata.is_some_and(|sentinel| (value - sentinel).abs() < 0.5)
+                || undetect.is_some_and(|sentinel| (value - sentinel).abs() < 0.5);
+            if missing {
+                f32::NAN
+            } else {
+                (value * gain + offset) as f32
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let meta = opera_radar_meta_from_hdf5(&file)?;
+    if meta.xsize != nx || meta.ysize != ny {
+        return Err(IoError::Odim(format!(
+            "OPERA data shape {nx}x{ny} does not match metadata {}x{}",
+            meta.xsize, meta.ysize
+        )));
+    }
+    let grid = opera_laea_latlon_grid(&meta)?;
+    SelectedField2D::new(
+        FieldSelector::entire_atmosphere(CanonicalField::CompositeReflectivity),
+        "dBZ",
+        grid,
+        values,
+    )
+    .map_err(Into::into)
+}
+
+fn parse_eumetnet_opera_dbzh_coverage_json(bytes: &[u8]) -> Result<OperaDbzhCoverage, IoError> {
+    let root: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|err| IoError::Odim(format!("invalid EUMETNET CoverageJSON: {err}")))?;
+    let download_links = root
+        .get("links")
+        .and_then(serde_json::Value::as_array)
+        .map(|links| {
+            links
+                .iter()
+                .filter_map(|link| {
+                    let href = link.get("href")?.as_str()?;
+                    let mime = link.get("type").and_then(serde_json::Value::as_str);
+                    if mime != Some("application/x-odim") && !href.ends_with(".h5") {
+                        return None;
+                    }
+                    Some(OperaDownloadLink {
+                        href: href.to_string(),
+                        title: link
+                            .get("title")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        length: link.get("length").and_then(serde_json::Value::as_u64),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let radar_meta = root
+        .get("metocean:radar_meta")
+        .map(opera_radar_meta_from_json)
+        .transpose()?;
+
+    Ok(OperaDbzhCoverage {
+        download_links,
+        radar_meta,
+    })
+}
+
+fn opera_radar_meta_from_json(value: &serde_json::Value) -> Result<OperaRadarMeta, IoError> {
+    Ok(OperaRadarMeta {
+        projdef: json_string(value, "projdef")?,
+        xsize: json_usize(value, "xsize")?,
+        ysize: json_usize(value, "ysize")?,
+        xscale_m: json_f64(value, "xscale")?,
+        yscale_m: json_f64(value, "yscale")?,
+        ll_lon_deg: json_f64(value, "LL_lon")?,
+        ll_lat_deg: json_f64(value, "LL_lat")?,
+        ul_lon_deg: json_f64(value, "UL_lon")?,
+        ul_lat_deg: json_f64(value, "UL_lat")?,
+        ur_lon_deg: json_f64(value, "UR_lon")?,
+        ur_lat_deg: json_f64(value, "UR_lat")?,
+        lr_lon_deg: json_f64(value, "LR_lon")?,
+        lr_lat_deg: json_f64(value, "LR_lat")?,
+    })
+}
+
+fn opera_radar_meta_from_hdf5(file: &Hdf5File) -> Result<OperaRadarMeta, IoError> {
+    let where_group = file
+        .group("/where")
+        .map_err(|err| IoError::Odim(format!("missing /where group: {err}")))?;
+    Ok(OperaRadarMeta {
+        projdef: hdf5_group_attr_string(&where_group, "projdef")?,
+        xsize: hdf5_group_attr_usize(&where_group, "xsize")?,
+        ysize: hdf5_group_attr_usize(&where_group, "ysize")?,
+        xscale_m: hdf5_group_attr_f64(&where_group, "xscale")?,
+        yscale_m: hdf5_group_attr_f64(&where_group, "yscale")?,
+        ll_lon_deg: hdf5_group_attr_f64(&where_group, "LL_lon")?,
+        ll_lat_deg: hdf5_group_attr_f64(&where_group, "LL_lat")?,
+        ul_lon_deg: hdf5_group_attr_f64(&where_group, "UL_lon")?,
+        ul_lat_deg: hdf5_group_attr_f64(&where_group, "UL_lat")?,
+        ur_lon_deg: hdf5_group_attr_f64(&where_group, "UR_lon")?,
+        ur_lat_deg: hdf5_group_attr_f64(&where_group, "UR_lat")?,
+        lr_lon_deg: hdf5_group_attr_f64(&where_group, "LR_lon")?,
+        lr_lat_deg: hdf5_group_attr_f64(&where_group, "LR_lat")?,
+    })
+}
+
+fn opera_laea_latlon_grid(meta: &OperaRadarMeta) -> Result<LatLonGrid, IoError> {
+    if !meta
+        .projdef
+        .split_whitespace()
+        .any(|part| part == "+proj=laea")
+    {
+        return Err(IoError::Odim(format!(
+            "OPERA projection is not LAEA: {}",
+            meta.projdef
+        )));
+    }
+    let lat0 = projdef_value(&meta.projdef, "+lat_0=")
+        .ok_or_else(|| IoError::Odim(format!("missing +lat_0 in {}", meta.projdef)))?
+        .to_radians();
+    let lon0 = projdef_value(&meta.projdef, "+lon_0=")
+        .ok_or_else(|| IoError::Odim(format!("missing +lon_0 in {}", meta.projdef)))?
+        .to_radians();
+    let false_easting = projdef_value(&meta.projdef, "+x_0=")
+        .ok_or_else(|| IoError::Odim(format!("missing +x_0 in {}", meta.projdef)))?;
+    let false_northing = projdef_value(&meta.projdef, "+y_0=")
+        .ok_or_else(|| IoError::Odim(format!("missing +y_0 in {}", meta.projdef)))?;
+    let shape = GridShape::new(meta.xsize, meta.ysize)?;
+    let mut lat_deg = Vec::with_capacity(shape.len());
+    let mut lon_deg = Vec::with_capacity(shape.len());
+    for y in 0..meta.ysize {
+        let projected_y = -((y as f64) + 0.5) * meta.yscale_m;
+        for x in 0..meta.xsize {
+            let projected_x = ((x as f64) + 0.5) * meta.xscale_m;
+            let (lat, lon) = inverse_spherical_laea(
+                projected_x,
+                projected_y,
+                lat0,
+                lon0,
+                false_easting,
+                false_northing,
+            );
+            lat_deg.push(lat as f32);
+            lon_deg.push(lon as f32);
+        }
+    }
+    LatLonGrid::new(shape, lat_deg, lon_deg).map_err(Into::into)
+}
+
+fn inverse_spherical_laea(
+    x: f64,
+    y: f64,
+    lat0: f64,
+    lon0: f64,
+    false_easting: f64,
+    false_northing: f64,
+) -> (f64, f64) {
+    const AUTHALIC_RADIUS_M: f64 = 6_371_007.181;
+    let dx = x - false_easting;
+    let dy = y - false_northing;
+    let rho = dx.hypot(dy);
+    if rho <= f64::EPSILON {
+        return (lat0.to_degrees(), normalize_longitude(lon0.to_degrees()));
+    }
+    let c = 2.0 * (rho / (2.0 * AUTHALIC_RADIUS_M)).clamp(-1.0, 1.0).asin();
+    let sin_c = c.sin();
+    let cos_c = c.cos();
+    let sin_lat0 = lat0.sin();
+    let cos_lat0 = lat0.cos();
+    let lat = (cos_c * sin_lat0 + dy * sin_c * cos_lat0 / rho).asin();
+    let lon = lon0 + (dx * sin_c).atan2(rho * cos_lat0 * cos_c - dy * sin_lat0 * sin_c);
+    (lat.to_degrees(), normalize_longitude(lon.to_degrees()))
+}
+
+fn projdef_value(projdef: &str, key: &str) -> Option<f64> {
+    projdef
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix(key)?.parse::<f64>().ok())
+}
+
+fn hdf5_dataset_values_f64(dataset: &hdf5_reader::Dataset) -> Result<Vec<f64>, IoError> {
+    match dataset.dtype() {
+        Datatype::FloatingPoint { size: 4, .. } => Ok(dataset
+            .read_array::<f32>()
+            .map_err(|err| IoError::Odim(err.to_string()))?
+            .iter()
+            .map(|&value| f64::from(value))
+            .collect()),
+        Datatype::FloatingPoint { size: 8, .. } => Ok(dataset
+            .read_array::<f64>()
+            .map_err(|err| IoError::Odim(err.to_string()))?
+            .iter()
+            .copied()
+            .collect()),
+        Datatype::FixedPoint {
+            size: 1,
+            signed: true,
+            ..
+        } => Ok(dataset
+            .read_array::<i8>()
+            .map_err(|err| IoError::Odim(err.to_string()))?
+            .iter()
+            .map(|&value| f64::from(value))
+            .collect()),
+        Datatype::FixedPoint {
+            size: 1,
+            signed: false,
+            ..
+        } => Ok(dataset
+            .read_array::<u8>()
+            .map_err(|err| IoError::Odim(err.to_string()))?
+            .iter()
+            .map(|&value| f64::from(value))
+            .collect()),
+        Datatype::FixedPoint {
+            size: 2,
+            signed: true,
+            ..
+        } => Ok(dataset
+            .read_array::<i16>()
+            .map_err(|err| IoError::Odim(err.to_string()))?
+            .iter()
+            .map(|&value| f64::from(value))
+            .collect()),
+        Datatype::FixedPoint {
+            size: 2,
+            signed: false,
+            ..
+        } => Ok(dataset
+            .read_array::<u16>()
+            .map_err(|err| IoError::Odim(err.to_string()))?
+            .iter()
+            .map(|&value| f64::from(value))
+            .collect()),
+        Datatype::FixedPoint {
+            size: 4,
+            signed: true,
+            ..
+        } => Ok(dataset
+            .read_array::<i32>()
+            .map_err(|err| IoError::Odim(err.to_string()))?
+            .iter()
+            .map(|&value| f64::from(value))
+            .collect()),
+        Datatype::FixedPoint {
+            size: 4,
+            signed: false,
+            ..
+        } => Ok(dataset
+            .read_array::<u32>()
+            .map_err(|err| IoError::Odim(err.to_string()))?
+            .iter()
+            .map(|&value| f64::from(value))
+            .collect()),
+        dtype => Err(IoError::Odim(format!(
+            "unsupported OPERA DBZH dataset dtype: {dtype:?}"
+        ))),
+    }
+}
+
+fn hdf5_group_attr_f64(group: &hdf5_reader::group::Group, name: &str) -> Result<f64, IoError> {
+    group
+        .attribute(name)
+        .map_err(|err| IoError::Odim(format!("missing attribute {}@{name}: {err}", group.name())))?
+        .read_as_f64()
+        .map_err(|err| IoError::Odim(format!("invalid numeric attribute {name}: {err}")))
+}
+
+fn hdf5_group_attr_f64_optional(
+    group: &hdf5_reader::group::Group,
+    name: &str,
+) -> Result<Option<f64>, IoError> {
+    match group.attribute(name) {
+        Ok(attr) => attr
+            .read_as_f64()
+            .map(Some)
+            .map_err(|err| IoError::Odim(format!("invalid numeric attribute {name}: {err}"))),
+        Err(_) => Ok(None),
+    }
+}
+
+fn hdf5_group_attr_f64_default(
+    group: &hdf5_reader::group::Group,
+    name: &str,
+    default: f64,
+) -> Result<f64, IoError> {
+    Ok(hdf5_group_attr_f64_optional(group, name)?.unwrap_or(default))
+}
+
+fn hdf5_group_attr_usize(group: &hdf5_reader::group::Group, name: &str) -> Result<usize, IoError> {
+    let value = hdf5_group_attr_f64(group, name)?;
+    if value < 0.0 || value.fract() != 0.0 || value > usize::MAX as f64 {
+        return Err(IoError::Odim(format!(
+            "attribute {name} cannot be represented as usize: {value}"
+        )));
+    }
+    Ok(value as usize)
+}
+
+fn hdf5_group_attr_string(
+    group: &hdf5_reader::group::Group,
+    name: &str,
+) -> Result<String, IoError> {
+    group
+        .attribute(name)
+        .map_err(|err| IoError::Odim(format!("missing attribute {}@{name}: {err}", group.name())))?
+        .read_string()
+        .map_err(|err| IoError::Odim(format!("invalid string attribute {name}: {err}")))
+}
+
+fn validate_eumetnet_datetime_range(datetime_range: &str) -> Result<(), IoError> {
+    let valid = !datetime_range.is_empty()
+        && datetime_range
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':' | b'/' | b'.'));
+    if valid {
+        Ok(())
+    } else {
+        Err(IoError::Download(format!(
+            "invalid EUMETNET datetime range '{datetime_range}'"
+        )))
+    }
+}
+
+fn validate_eumetnet_opera_odim_url(url: &str) -> Result<(), IoError> {
+    if url.starts_with("https://s3.waw3-1.cloudferro.com/openradar-24h/") && url.ends_with(".h5") {
+        Ok(())
+    } else {
+        Err(IoError::Download(format!(
+            "invalid EUMETNET OPERA ODIM URL '{url}'"
+        )))
+    }
+}
+
+fn encode_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Result<String, IoError> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| IoError::Odim(format!("missing string JSON field {key}")))
+}
+
+fn json_f64(value: &serde_json::Value, key: &str) -> Result<f64, IoError> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| IoError::Odim(format!("missing numeric JSON field {key}")))
+}
+
+fn json_usize(value: &serde_json::Value, key: &str) -> Result<usize, IoError> {
+    let raw = value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| IoError::Odim(format!("missing unsigned JSON field {key}")))?;
+    usize::try_from(raw).map_err(|_| IoError::Odim(format!("{key} exceeds usize: {raw}")))
 }
 
 pub fn fetch_bytes(fetch: &FetchRequest) -> Result<FetchResult, IoError> {
@@ -1163,18 +1685,20 @@ fn try_fetch_one(
     variable_patterns: &[&str],
 ) -> Result<Vec<u8>, String> {
     if resolved.source == SourceId::Nomads {
-        return client
+        let bytes = client
             .get_bytes(&resolved.grib_url)
-            .map_err(|err| err.to_string());
+            .map_err(|err| err.to_string())?;
+        return maybe_decompress_grib_payload(&resolved.grib_url, bytes);
     }
 
     if should_use_idx_subset_fetch(resolved.source) && !variable_patterns.is_empty() {
         if let Some(idx_url) = &resolved.idx_url {
             if let Ok(idx_text) = client.get_text(idx_url) {
                 if let Some(ranges) = idx_subset_ranges(&idx_text, variable_patterns)? {
-                    return client
+                    let bytes = client
                         .get_ranges(&resolved.grib_url, &ranges)
-                        .map_err(|err| err.to_string());
+                        .map_err(|err| err.to_string())?;
+                    return maybe_decompress_grib_payload(&resolved.grib_url, bytes);
                 }
             }
         }
@@ -1184,7 +1708,25 @@ fn try_fetch_one(
     } else {
         client.get_bytes(&resolved.grib_url)
     };
-    result.map_err(|err| err.to_string())
+    let bytes = result.map_err(|err| err.to_string())?;
+    maybe_decompress_grib_payload(&resolved.grib_url, bytes)
+}
+
+fn maybe_decompress_grib_payload(url: &str, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    let is_gzip = url.to_ascii_lowercase().ends_with(".gz")
+        || bytes
+            .get(0..2)
+            .is_some_and(|magic| magic == [0x1f_u8, 0x8b_u8]);
+    if !is_gzip {
+        return Ok(bytes);
+    }
+
+    let mut decoder = flate2::read::GzDecoder::new(bytes.as_slice());
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .map_err(|err| format!("gzip decompress {url}: {err}"))?;
+    Ok(decompressed)
 }
 
 fn should_use_parallel_whole_file_fetch(source: SourceId) -> bool {
@@ -1260,6 +1802,7 @@ struct ParameterCode {
 enum LevelMatch {
     Surface,
     MeanSeaLevel,
+    AltitudeMeters(u16),
     IsobaricHpa(u16),
     HybridLevel(u16),
     EntireAtmosphere,
@@ -1456,6 +1999,12 @@ const PARAMETER_SIMULATED_IR: &[ParameterCode] = &[ParameterCode {
     number: 7,
 }];
 const PARAMETER_RADAR_REFLECTIVITY: &[ParameterCode] = &[
+    // MRMS ReflectivityAtLowestAltitude.
+    ParameterCode {
+        discipline: 209,
+        category: 3,
+        number: 57,
+    },
     ParameterCode {
         discipline: 0,
         category: 16,
@@ -1468,6 +2017,12 @@ const PARAMETER_RADAR_REFLECTIVITY: &[ParameterCode] = &[
     },
 ];
 const PARAMETER_COMPOSITE_REFLECTIVITY: &[ParameterCode] = &[
+    // MRMS MergedReflectivityQCComposite.
+    ParameterCode {
+        discipline: 209,
+        category: 10,
+        number: 0,
+    },
     ParameterCode {
         discipline: 0,
         category: 16,
@@ -2049,6 +2604,15 @@ impl TryFrom<FieldSelector> for StructuredMessageSelector {
             }),
             FieldSelector {
                 field: CanonicalField::RadarReflectivity,
+                vertical: VerticalSelector::AltitudeMeters(500),
+                ..
+            } => Ok(Self {
+                parameters: PARAMETER_RADAR_REFLECTIVITY,
+                level: LevelMatch::AltitudeMeters(500),
+                units: "dBZ",
+            }),
+            FieldSelector {
+                field: CanonicalField::RadarReflectivity,
                 vertical: VerticalSelector::HeightAboveGroundMeters(1000),
                 ..
             } => Ok(Self {
@@ -2064,6 +2628,15 @@ impl TryFrom<FieldSelector> for StructuredMessageSelector {
                 parameters: PARAMETER_LANDSEA_MASK,
                 level: LevelMatch::Surface,
                 units: "fraction",
+            }),
+            FieldSelector {
+                field: CanonicalField::CompositeReflectivity,
+                vertical: VerticalSelector::AltitudeMeters(500),
+                ..
+            } => Ok(Self {
+                parameters: PARAMETER_COMPOSITE_REFLECTIVITY,
+                level: LevelMatch::AltitudeMeters(500),
+                units: "dBZ",
             }),
             FieldSelector {
                 field: CanonicalField::CompositeReflectivity,
@@ -2112,6 +2685,10 @@ impl LevelMatch {
         match self {
             Self::Surface => message.product.level_type == 1,
             Self::MeanSeaLevel => message.product.level_type == 101,
+            Self::AltitudeMeters(height_m) => {
+                message.product.level_type == 102
+                    && (message.product.level_value - f64::from(height_m)).abs() < 0.25
+            }
             Self::IsobaricHpa(level_hpa) => {
                 message.product.level_type == 100
                     && (normalize_pressure_level_hpa(message.product.level_value)

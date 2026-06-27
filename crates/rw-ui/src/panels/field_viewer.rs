@@ -299,7 +299,7 @@ impl FieldViewerPanel {
                 "rw-ui-field",
                 image,
                 TextureOptions {
-                    magnification: TextureFilter::Nearest,
+                    magnification: TextureFilter::Linear,
                     minification: TextureFilter::Linear,
                     ..Default::default()
                 },

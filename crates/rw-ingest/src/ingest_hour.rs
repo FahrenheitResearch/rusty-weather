@@ -1810,13 +1810,38 @@ pub fn validate_forecast_hours(
     let supported = rustwx_models::supported_forecast_hours(model, cycle_hour_utc);
     if let Some(&bad) = hours.iter().find(|hour| !supported.contains(hour)) {
         let max = supported.last().copied().unwrap_or(0);
+        let cadence = forecast_hour_cadence_note(model, cycle_hour_utc, max);
         return Err(format!(
             "--hours: f{bad:03} is not a valid {model} forecast hour for the {cycle_hour_utc:02}z \
-             cycle (valid hours run 0..={max}; GFS is hourly to f120 then 3-hourly to f384)"
+             cycle (valid hours run 0..={max}; {cadence})"
         )
         .into());
     }
     Ok(())
+}
+
+fn forecast_hour_cadence_note(model: ModelId, cycle_hour_utc: u8, max: u16) -> String {
+    match model {
+        ModelId::Hrrr | ModelId::HrrrAk => {
+            if cycle_hour_utc % 6 == 0 {
+                "hourly to f048 on 00/06/12/18z cycles".to_string()
+            } else {
+                "hourly to f018 on off-synoptic cycles".to_string()
+            }
+        }
+        ModelId::Gfs => "GFS is hourly to f120, then 3-hourly to f384".to_string(),
+        ModelId::Gdas => "GDAS is hourly to f009".to_string(),
+        ModelId::Gefs => "GEFS is 3-hourly to f240, then 6-hourly to f384".to_string(),
+        ModelId::Aigfs | ModelId::Aigefs => "AI global feeds are 6-hourly".to_string(),
+        ModelId::Hgefs => "HGEFS is 6-hourly to f240".to_string(),
+        ModelId::EcmwfOpenData => {
+            "ECMWF Open Data is 3-hourly to f144, then 6-hourly on 00/12z cycles".to_string()
+        }
+        ModelId::Rap => "RAP is hourly; 03/09/15/21z cycles extend to f051".to_string(),
+        ModelId::Nam => "NAM is hourly to f036, then 3-hourly to f084".to_string(),
+        ModelId::RrfsA => "RRFS-A is hourly to f060".to_string(),
+        _ => format!("see the model cadence table for supported hours through f{max:03}"),
+    }
 }
 
 #[cfg(test)]
@@ -2247,6 +2272,18 @@ mod tests {
         assert!(
             validate_forecast_hours(ModelId::Gfs, cycle, &[385]).is_err(),
             "f385 is past the GFS horizon"
+        );
+    }
+
+    #[test]
+    fn validate_forecast_hours_uses_model_specific_cadence_note() {
+        let err = validate_forecast_hours(ModelId::Aigefs, 0, &[1])
+            .expect_err("AI-GEFS is 6-hourly, so f001 is invalid");
+        let message = err.to_string();
+        assert!(message.contains("AI global feeds"), "got: {message}");
+        assert!(
+            !message.contains("GFS is hourly"),
+            "AI-GEFS errors must not carry the GFS cadence note: {message}"
         );
     }
 

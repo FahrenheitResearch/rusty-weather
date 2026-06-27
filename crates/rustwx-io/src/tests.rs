@@ -11,6 +11,292 @@ const SAMPLE_IDX: &str = "\
 ";
 
 #[test]
+fn gzip_grib_payloads_are_decompressed_before_decode() {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(b"GRIBtest").unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let decoded = maybe_decompress_grib_payload(
+        "https://example.invalid/MRMS_ReflectivityAtLowestAltitude.latest.grib2.gz",
+        compressed,
+    )
+    .expect("gzip payload decodes");
+
+    assert_eq!(decoded, b"GRIBtest");
+}
+
+#[test]
+fn plain_grib_payloads_are_left_unchanged() {
+    let decoded = maybe_decompress_grib_payload(
+        "https://example.invalid/hrrr.t00z.wrfsfcf006.grib2",
+        b"GRIBtest".to_vec(),
+    )
+    .expect("plain payload passes through");
+
+    assert_eq!(decoded, b"GRIBtest");
+}
+
+#[test]
+fn mrms_latest_product_url_rejects_pathlike_tokens() {
+    assert_eq!(
+        mrms_latest_product_url("ReflectivityAtLowestAltitude").unwrap(),
+        "https://mrms.ncep.noaa.gov/2D/ReflectivityAtLowestAltitude/MRMS_ReflectivityAtLowestAltitude.latest.grib2.gz"
+    );
+    assert!(mrms_latest_product_url("../ReflectivityAtLowestAltitude").is_err());
+}
+
+#[test]
+fn mrms_lowest_altitude_reflectivity_maps_to_500m_msl_selector() {
+    let message = ieee_f32_message(
+        ParameterCode {
+            discipline: 209,
+            category: 3,
+            number: 57,
+        },
+        102,
+        500.0,
+        &[10.0, 20.0],
+        -130.0,
+        -129.0,
+    );
+    let grib = Grib2File {
+        messages: vec![message],
+    };
+
+    let field = extract_field_from_grib2(
+        &grib,
+        FieldSelector::altitude_msl(CanonicalField::RadarReflectivity, 500),
+    )
+    .expect("MRMS lowest-altitude reflectivity selector matches");
+
+    assert_eq!(field.values, vec![10.0, 20.0]);
+}
+
+#[test]
+fn mrms_composite_reflectivity_maps_to_composite_selector() {
+    let message = ieee_f32_message(
+        ParameterCode {
+            discipline: 209,
+            category: 10,
+            number: 0,
+        },
+        102,
+        500.0,
+        &[30.0, 40.0],
+        -130.0,
+        -129.0,
+    );
+    let grib = Grib2File {
+        messages: vec![message],
+    };
+
+    let field = extract_field_from_grib2(
+        &grib,
+        FieldSelector::altitude_msl(CanonicalField::CompositeReflectivity, 500),
+    )
+    .expect("MRMS composite reflectivity selector matches");
+
+    assert_eq!(field.values, vec![30.0, 40.0]);
+}
+
+#[test]
+fn eumetnet_opera_dbzh_coverage_url_encodes_datetime_range() {
+    let url = eumetnet_opera_dbzh_coverage_url("2026-06-27T05:00Z/2026-06-27T05:30Z")
+        .expect("range encodes");
+    assert!(url.contains("datetime=2026-06-27T05%3A00Z%2F2026-06-27T05%3A30Z"));
+    assert!(url.contains("standard_name=DBZH"));
+    assert!(eumetnet_opera_dbzh_coverage_url("2026-06-27T05:00Z\\bad").is_err());
+}
+
+#[test]
+fn eumetnet_opera_coverage_json_extracts_odim_links_and_meta() {
+    let json = br#"{
+        "type": "Coverage",
+        "links": [
+            {"href":"https://eumetnet.eu/","type":"text/html","title":"Website"},
+            {"href":"https://s3.waw3-1.cloudferro.com/openradar-24h/2026/06/27/OPERA/COMP/OPERA@20260627T0530@0@DBZH.h5","rel":"items","type":"application/x-odim","title":"Data download link.","length":1940764},
+            {"href":"https://s3.waw3-1.cloudferro.com/openradar-24h/2026/06/27/OPERA/COMP/OPERA@20260627T0535@0@DBZH.h5","rel":"items","type":"application/x-odim","title":"Data download link.","length":1953411}
+        ],
+        "metocean:radar_meta": {
+            "projdef":"+proj=laea +lat_0=55.0 +lon_0=10.0 +x_0=1950000.0 +y_0=-2100000.0 +units=m +ellps=WGS84",
+            "xsize":3800,
+            "ysize":4400,
+            "xscale":1000.0,
+            "yscale":1000.0,
+            "LL_lon":-10.4345768386404,
+            "LL_lat":31.7462153182675,
+            "UL_lon":-39.5357864125034,
+            "UL_lat":67.0228327624372,
+            "UR_lon":57.8119647501499,
+            "UR_lat":67.6210371071631,
+            "LR_lon":29.421038635578,
+            "LR_lat":31.987650276733
+        }
+    }"#;
+
+    let coverage = parse_eumetnet_opera_dbzh_coverage_json(json).expect("coverage parses");
+
+    assert_eq!(coverage.download_links.len(), 2);
+    assert_eq!(
+        coverage.latest_odim_link().map(|link| link.length),
+        Some(Some(1_953_411))
+    );
+    let meta = coverage.radar_meta.expect("radar metadata exists");
+    assert_eq!(meta.xsize, 3800);
+    assert_eq!(meta.ysize, 4400);
+    assert_eq!(meta.xscale_m, 1000.0);
+}
+
+#[test]
+fn opera_spherical_laea_inverse_is_close_to_documented_corners() {
+    let lat0 = 55.0_f64.to_radians();
+    let lon0 = 10.0_f64.to_radians();
+    let false_easting = 1_950_000.0;
+    let false_northing = -2_100_000.0;
+
+    let (ll_lat, ll_lon) =
+        inverse_spherical_laea(0.0, -4_400_000.0, lat0, lon0, false_easting, false_northing);
+    let (ul_lat, ul_lon) =
+        inverse_spherical_laea(0.0, 0.0, lat0, lon0, false_easting, false_northing);
+    let (ur_lat, ur_lon) =
+        inverse_spherical_laea(3_800_000.0, 0.0, lat0, lon0, false_easting, false_northing);
+
+    assert!((ll_lat - 31.7462).abs() < 0.05, "{ll_lat}");
+    assert!((ll_lon - -10.4346).abs() < 0.25, "{ll_lon}");
+    assert!((ul_lat - 67.0228).abs() < 0.05, "{ul_lat}");
+    assert!((ul_lon - -39.5358).abs() < 0.25, "{ul_lon}");
+    assert!((ur_lat - 67.6210).abs() < 0.05, "{ur_lat}");
+    assert!((ur_lon - 57.8120).abs() < 0.25, "{ur_lon}");
+}
+
+#[test]
+#[ignore = "network smoke test against live MRMS realtime feed"]
+fn live_mrms_latest_reflectivity_gzip_parses_grib2() {
+    let url = "https://mrms.ncep.noaa.gov/2D/ReflectivityAtLowestAltitude/MRMS_ReflectivityAtLowestAltitude.latest.grib2.gz";
+    let compressed = client()
+        .expect("download client")
+        .get_bytes(url)
+        .expect("MRMS latest reflectivity downloads");
+    let bytes = maybe_decompress_grib_payload(url, compressed).expect("MRMS gzip decompresses");
+    let grib = Grib2File::from_bytes(&bytes).expect("MRMS payload parses as GRIB2");
+    assert_eq!(grib.messages.len(), 1, "MRMS reflectivity is one field");
+    let message = &grib.messages[0];
+    eprintln!(
+        "MRMS latest: discipline={} category={} parameter={} level_type={} level_value={} grid={}x{} template={}",
+        message.discipline,
+        message.product.parameter_category,
+        message.product.parameter_number,
+        message.product.level_type,
+        message.product.level_value,
+        message.grid.nx,
+        message.grid.ny,
+        message.grid.template
+    );
+
+    assert_eq!(message.discipline, 209);
+    assert_eq!(message.product.parameter_category, 3);
+    assert_eq!(message.product.parameter_number, 57);
+}
+
+#[test]
+#[ignore = "network smoke test against live MRMS realtime feed"]
+fn live_mrms_latest_reflectivity_helpers_extract_fields() {
+    let lowest = retry_live(|| extract_mrms_latest_reflectivity_at_lowest_altitude())
+        .expect("MRMS lowest-altitude reflectivity extracts");
+    eprintln!(
+        "MRMS lowest-altitude: {} values on {}x{}",
+        lowest.values.len(),
+        lowest.grid.shape.nx,
+        lowest.grid.shape.ny
+    );
+    assert_eq!(
+        lowest.selector,
+        FieldSelector::altitude_msl(CanonicalField::RadarReflectivity, 500)
+    );
+
+    let composite_bytes = retry_live(|| fetch_mrms_latest_product("MergedReflectivityQCComposite"))
+        .expect("MRMS composite reflectivity downloads");
+    let composite_grib =
+        Grib2File::from_bytes(&composite_bytes).expect("MRMS composite parses as GRIB2");
+    let composite_message = &composite_grib.messages[0];
+    eprintln!(
+        "MRMS composite metadata: discipline={} category={} parameter={} level_type={} level_value={} grid={}x{} template={}",
+        composite_message.discipline,
+        composite_message.product.parameter_category,
+        composite_message.product.parameter_number,
+        composite_message.product.level_type,
+        composite_message.product.level_value,
+        composite_message.grid.nx,
+        composite_message.grid.ny,
+        composite_message.grid.template
+    );
+
+    let composite = retry_live(|| extract_mrms_latest_composite_reflectivity())
+        .expect("MRMS composite reflectivity extracts");
+    eprintln!(
+        "MRMS composite: {} values on {}x{}",
+        composite.values.len(),
+        composite.grid.shape.nx,
+        composite.grid.shape.ny
+    );
+    assert_eq!(
+        composite.selector,
+        FieldSelector::altitude_msl(CanonicalField::CompositeReflectivity, 500)
+    );
+}
+
+#[test]
+#[ignore = "network smoke test against live EUMETNET OPERA ODIM HDF5 feed"]
+fn live_eumetnet_opera_latest_dbzh_helpers_extract_field() {
+    let now = chrono::Utc::now();
+    let start = now - chrono::Duration::minutes(45);
+    let end = now - chrono::Duration::minutes(5);
+    let range = format!(
+        "{}/{}",
+        start.format("%Y-%m-%dT%H:%MZ"),
+        end.format("%Y-%m-%dT%H:%MZ")
+    );
+    let coverage =
+        retry_live(|| fetch_eumetnet_opera_dbzh_coverage(&range)).expect("OPERA coverage resolves");
+    let link = coverage
+        .latest_odim_link()
+        .expect("OPERA coverage has ODIM HDF5 link");
+    eprintln!("OPERA latest link: {}", link.href);
+    let bytes =
+        retry_live(|| fetch_eumetnet_opera_odim_h5(&link.href)).expect("OPERA HDF5 downloads");
+    let field = extract_eumetnet_opera_dbzh_from_odim_h5(&bytes).expect("OPERA HDF5 extracts");
+    eprintln!(
+        "OPERA DBZH: {} values on {}x{}",
+        field.values.len(),
+        field.grid.shape.nx,
+        field.grid.shape.ny
+    );
+    assert_eq!(
+        field.selector,
+        FieldSelector::entire_atmosphere(CanonicalField::CompositeReflectivity)
+    );
+    assert_eq!(field.units, "dBZ");
+    assert_eq!(field.grid.shape.nx, 3800);
+    assert_eq!(field.grid.shape.ny, 4400);
+    assert!(field.values.iter().any(|value| value.is_finite()));
+}
+
+fn retry_live<T>(mut f: impl FnMut() -> Result<T, IoError>) -> Result<T, IoError> {
+    let mut last = None;
+    for attempt in 1..=3 {
+        match f() {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                eprintln!("live attempt {attempt} failed: {err}");
+                last = Some(err);
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+    Err(last.expect("retry loop ran at least once"))
+}
+
+#[test]
 fn alternating_i_scan_rows_are_normalized_to_row_major_order() {
     let mut values = vec![
         1.0, 2.0, 3.0, 4.0, //

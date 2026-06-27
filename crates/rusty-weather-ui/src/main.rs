@@ -571,8 +571,86 @@ impl Args {
 fn cadence_hint(model: rustwx_core::ModelId, _cycle: u8) -> &'static str {
     use rustwx_core::ModelId;
     match model {
-        ModelId::Gfs => "hourly ≤120, 3-hourly 123-384",
+        ModelId::Gfs => "hourly <=120, 3-hourly 123-384",
+        ModelId::Gefs => "3-hourly <=240, 6-hourly 246-384",
+        ModelId::Aigfs | ModelId::Aigefs => "6-hourly 000-384",
+        ModelId::Hgefs => "6-hourly 000-240",
+        ModelId::EcmwfOpenData => {
+            "00/12z: 3-hourly <=144 then 6-hourly <=360; 06/18z: 3-hourly <=144"
+        }
+        ModelId::Rap => "f000-f021 most cycles, f000-f051 at 03/09/15/21z",
+        ModelId::Nam => "hourly <=36, 3-hourly 39-84",
         _ => "",
+    }
+}
+
+fn normalize_download_spec(mut spec: DownloadSpec) -> DownloadSpec {
+    let Ok(model) = spec.model.parse::<rustwx_core::ModelId>() else {
+        return spec;
+    };
+    if let Some(hours) = normalize_hour_spec_for_model(model, spec.cycle, &spec.hours) {
+        spec.hours = hours;
+    }
+    spec
+}
+
+fn normalize_hour_spec_for_model(
+    model: rustwx_core::ModelId,
+    cycle: u8,
+    hour_spec: &str,
+) -> Option<String> {
+    let supported = supported_forecast_hours(model, cycle);
+    if supported.is_empty() {
+        return None;
+    }
+    let requested = rw_ingest::parse_hours(hour_spec).ok()?;
+    if requested.iter().all(|hour| supported.contains(hour)) {
+        return None;
+    }
+
+    let mut normalized = Vec::new();
+    for token in hour_spec
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        if let Some((start, end)) = token.split_once('-') {
+            let start: u16 = start.trim().parse().ok()?;
+            let end: u16 = end.trim().parse().ok()?;
+            if start > end {
+                return None;
+            }
+            let before = normalized.len();
+            normalized.extend(
+                supported
+                    .iter()
+                    .copied()
+                    .filter(|hour| *hour >= start && *hour <= end),
+            );
+            if normalized.len() == before {
+                return None;
+            }
+        } else {
+            let hour: u16 = token.parse().ok()?;
+            if !supported.contains(&hour) {
+                return None;
+            }
+            normalized.push(hour);
+        }
+    }
+
+    normalized.sort_unstable();
+    normalized.dedup();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(
+            normalized
+                .iter()
+                .map(|hour| hour.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
     }
 }
 
@@ -714,6 +792,7 @@ impl App {
             }
             _ => {}
         }
+        spec = normalize_download_spec(spec);
         let mut download = DownloadPanel::new(spec.clone());
         download.set_model_options(model_options());
         Self::sync_run_pickers(&mut download, &spec);
@@ -800,6 +879,14 @@ impl App {
         }
     }
 
+    fn apply_normalized_download_spec(&mut self, spec: DownloadSpec) -> DownloadSpec {
+        let normalized = normalize_download_spec(spec);
+        if self.download.spec() != &normalized {
+            self.download.set_spec(normalized.clone());
+        }
+        normalized
+    }
+
     fn select_hour(&mut self, key: HourKey) {
         self.worker.send(StoreRequest::LoadHour(key));
     }
@@ -877,6 +964,7 @@ impl App {
                 IngestResponse::Latest { date, cycle } => {
                     self.download.set_latest(date, cycle);
                     let spec = self.download.spec().clone();
+                    let spec = self.apply_normalized_download_spec(spec);
                     Self::sync_run_pickers(&mut self.download, &spec);
                     self.ingest.send(IngestRequest::Estimate(spec));
                 }
@@ -1025,16 +1113,23 @@ impl App {
         for event in events {
             match event {
                 DownloadEvent::SpecChanged(spec) => {
+                    let spec = self.apply_normalized_download_spec(spec);
                     Self::sync_run_pickers(&mut self.download, &spec);
                     self.ingest.send(IngestRequest::Estimate(spec));
                 }
                 DownloadEvent::CheckAvailability(spec) => {
+                    let spec = self.apply_normalized_download_spec(spec);
+                    Self::sync_run_pickers(&mut self.download, &spec);
                     self.ingest.send(IngestRequest::Probe(spec));
                 }
                 DownloadEvent::LatestRequested(spec) => {
+                    let spec = self.apply_normalized_download_spec(spec);
+                    Self::sync_run_pickers(&mut self.download, &spec);
                     self.ingest.send(IngestRequest::Latest(spec));
                 }
                 DownloadEvent::StartRequested(spec) => {
+                    let spec = self.apply_normalized_download_spec(spec);
+                    Self::sync_run_pickers(&mut self.download, &spec);
                     self.ingest.send(IngestRequest::Start(spec));
                 }
                 DownloadEvent::CancelRequested => {
@@ -1486,21 +1581,36 @@ mod tests {
     /// enabled entry — the download picker un-greys it without any hardcoded
     /// special case.
     #[test]
-    fn gfs_model_option_is_enabled() {
+    fn ingest_supported_model_options_are_enabled() {
         let options = model_options();
-        let gfs = options
-            .iter()
-            .find(|o| o.slug == "gfs")
-            .expect("GFS must appear in model options");
-        assert!(
-            gfs.enabled,
-            "GFS must be enabled (ingest_supported is true)"
-        );
-        assert!(
-            gfs.note.is_empty(),
-            "enabled entries have no disabled note, got: {:?}",
-            gfs.note
-        );
+        for slug in [
+            "hrrr",
+            "hrrr-ak",
+            "rap",
+            "gfs",
+            "gdas",
+            "gefs",
+            "aigfs",
+            "aigefs",
+            "hgefs",
+            "ecmwf-open-data",
+            "nam",
+            "rrfs-a",
+        ] {
+            let option = options
+                .iter()
+                .find(|o| o.slug == slug)
+                .unwrap_or_else(|| panic!("{slug} must appear in model options"));
+            assert!(
+                option.enabled,
+                "{slug} must be enabled (ingest_supported is true)"
+            );
+            assert!(
+                option.note.is_empty(),
+                "enabled entries have no disabled note, got: {:?}",
+                option.note
+            );
+        }
     }
 
     /// GFS cycle options from the model summary are exactly [0, 6, 12, 18].
@@ -1531,6 +1641,61 @@ mod tests {
 
     /// Non-GFS models (e.g. HRRR) get an empty cadence hint — the hint is
     /// only appended when non-empty, so HRRR's hours row stays clean.
+    #[test]
+    fn regional_hours_hints_include_non_uniform_cadence_notes() {
+        let gefs = cadence_hint(rustwx_core::ModelId::Gefs, 0);
+        assert!(
+            gefs.contains("240") && gefs.contains("246-384"),
+            "GEFS cadence note must mention the high-hour split, got: {gefs}"
+        );
+
+        let aigfs = cadence_hint(rustwx_core::ModelId::Aigfs, 0);
+        assert!(
+            aigfs.contains("6-hourly") && aigfs.contains("384"),
+            "AI-GFS cadence note must mention 6-hourly range, got: {aigfs}"
+        );
+
+        let ecmwf = cadence_hint(rustwx_core::ModelId::EcmwfOpenData, 12);
+        assert!(
+            ecmwf.contains("00/12z") && ecmwf.contains("360"),
+            "ECMWF cadence note must mention 00/12z longer horizon, got: {ecmwf}"
+        );
+
+        let rap = cadence_hint(rustwx_core::ModelId::Rap, 3);
+        assert!(
+            rap.contains("f051") && rap.contains("03/09/15/21"),
+            "RAP cadence note must mention extended cycles, got: {rap}"
+        );
+
+        let nam = cadence_hint(rustwx_core::ModelId::Nam, 0);
+        assert!(
+            nam.contains("36") && nam.contains("39-84"),
+            "NAM cadence note must mention the hourly/3-hourly split, got: {nam}"
+        );
+    }
+
+    #[test]
+    fn default_hour_range_normalizes_to_model_cadence() {
+        assert_eq!(
+            normalize_hour_spec_for_model(rustwx_core::ModelId::Aigefs, 0, "0-6"),
+            Some("0,6".to_string())
+        );
+        assert_eq!(
+            normalize_hour_spec_for_model(rustwx_core::ModelId::Gefs, 0, "0-6"),
+            Some("0,3,6".to_string())
+        );
+        assert_eq!(
+            normalize_hour_spec_for_model(rustwx_core::ModelId::Gfs, 0, "0-6"),
+            None,
+            "GFS accepts every hour in the default 0-6 range"
+        );
+        assert_eq!(
+            normalize_hour_spec_for_model(rustwx_core::ModelId::Aigefs, 0, "1"),
+            None,
+            "a direct invalid hour should stay invalid and surface validation"
+        );
+    }
+
     #[test]
     fn hrrr_cadence_hint_is_empty() {
         let hint = cadence_hint(rustwx_core::ModelId::Hrrr, 0);
