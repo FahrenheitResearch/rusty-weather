@@ -22,14 +22,9 @@ use rustwx_sounding::{NativeSounding, SoundingColumn, SoundingMetadata};
 use crate::worker::{ProfileVar, SoundingData};
 
 /// 3D store variables the skew-T needs, in the units the ingest writes
-/// (K, K, m/s, m/s, gpm).
-const PROFILE_VARS: [&str; 5] = [
-    "temperature_iso",
-    "dewpoint_iso",
-    "u_iso",
-    "v_iso",
-    "height_iso",
-];
+/// (K, m/s, m/s, gpm). Moisture can be stored either directly as
+/// `dewpoint_iso` or as `rh_iso`, which is converted to dewpoint on read.
+const PROFILE_VARS: [&str; 4] = ["temperature_iso", "u_iso", "v_iso", "height_iso"];
 
 /// Surface samples the skew-T needs (K, K, m/s, m/s, Pa, gpm).
 const SURFACE_VARS: [&str; 6] = [
@@ -54,10 +49,11 @@ pub fn build_native_sounding(data: &SoundingData) -> Result<NativeSounding, Stri
     NativeSounding::from_column(&column).map_err(|err| err.to_string())
 }
 
-/// Render `native` to an RGBA [`ColorImage`] via the bridge's PNG renderer.
+/// Render `native` to an RGBA [`ColorImage`] via the bridge's classic
+/// SHARPpy-layout PNG renderer.
 pub fn render_sounding_image(native: &NativeSounding) -> Result<ColorImage, String> {
     crate::profile_scope!("skewt_render_image");
-    png_to_color_image(&native.render_full_png())
+    png_to_color_image(&native.render_sharppy_png())
 }
 
 /// Assemble the `SoundingColumn` (the `rustwx-sounding` bridge input
@@ -65,10 +61,13 @@ pub fn render_sounding_image(native: &NativeSounding) -> Result<ColorImage, Stri
 /// from store-native profile + surface data. See the module docs for the
 /// below-ground convention.
 pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, String> {
+    let has_dewpoint = data.vars.iter().any(|var| var.name == "dewpoint_iso");
+    let has_rh = data.vars.iter().any(|var| var.name == "rh_iso");
     let missing: Vec<&str> = PROFILE_VARS
         .iter()
         .copied()
         .filter(|name| !data.vars.iter().any(|var| var.name == *name))
+        .chain((!has_dewpoint && !has_rh).then_some("dewpoint_iso or rh_iso"))
         .chain(
             SURFACE_VARS
                 .iter()
@@ -104,7 +103,8 @@ pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, Stri
 
     let profile = |name: &str| data.vars.iter().find(|var| var.name == name).unwrap();
     let temperature = profile("temperature_iso");
-    let dewpoint = profile("dewpoint_iso");
+    let dewpoint = data.vars.iter().find(|var| var.name == "dewpoint_iso");
+    let rh = data.vars.iter().find(|var| var.name == "rh_iso");
     let u_wind = profile("u_iso");
     let v_wind = profile("v_iso");
     let height = profile("height_iso");
@@ -129,7 +129,7 @@ pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, Stri
         let Some(t_c) = level_value(temperature, level_hpa) else {
             continue;
         };
-        let Some(td_c) = level_value(dewpoint, level_hpa) else {
+        let Some(td_c) = level_dewpoint_c(dewpoint, rh, t_c, level_hpa) else {
             continue;
         };
         let Some(u_ms) = level_value(u_wind, level_hpa) else {
@@ -157,6 +157,31 @@ pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, Stri
     }
     column.validate().map_err(|err| err.to_string())?;
     Ok(column)
+}
+
+fn level_dewpoint_c(
+    dewpoint: Option<&ProfileVar>,
+    rh: Option<&ProfileVar>,
+    temperature_c: f64,
+    level_hpa: u16,
+) -> Option<f64> {
+    if let Some(dewpoint) = dewpoint
+        && let Some(td_c) = level_value(dewpoint, level_hpa)
+    {
+        return Some(td_c);
+    }
+    let rh_percent = level_value(rh?, level_hpa)?;
+    Some(dewpoint_c_from_rh(temperature_c, rh_percent))
+}
+
+/// Bolton-style RH inversion. Used for GFS-style stores that carry
+/// relative humidity instead of explicit isobaric dewpoint.
+pub(crate) fn dewpoint_c_from_rh(temperature_c: f64, rh_percent: f64) -> f64 {
+    let rh = rh_percent.clamp(1.0, 100.0) / 100.0;
+    let a = 17.67;
+    let b = 243.5;
+    let gamma = (a * temperature_c) / (b + temperature_c) + rh.ln();
+    (b * gamma) / (a - gamma)
 }
 
 /// One profile value, converted to bridge units; `None` for absent levels
@@ -369,6 +394,33 @@ mod tests {
         data.surface[1].value = data.surface[0].value + 1.0;
         let column = build_sounding_column(&data).expect("clamped column should build");
         assert_eq!(column.dewpoint_c[0], column.temperature_c[0]);
+    }
+
+    #[test]
+    fn rh_iso_can_supply_isobaric_dewpoint() {
+        let mut data = sample_data();
+        let levels = data.vars[0].levels_hpa.clone();
+        data.vars.retain(|var| var.name != "dewpoint_iso");
+        data.vars.push(ProfileVar {
+            name: "rh_iso".to_string(),
+            units: "%".to_string(),
+            levels_hpa: levels,
+            values: vec![98.0, 89.0, 70.9, 72.8, 84.2, 95.8, 96.2, 100.0, 100.0],
+        });
+
+        let column = build_sounding_column(&data).expect("RH fallback should build a column");
+        let p950 = column
+            .pressure_hpa
+            .iter()
+            .position(|&pressure| (pressure - 950.0).abs() < 0.1)
+            .expect("950 hPa level retained");
+        let expected = dewpoint_c_from_rh(26.0, 70.9);
+        assert!(
+            (column.dewpoint_c[p950] - expected).abs() < 0.05,
+            "got {}, expected {expected}",
+            column.dewpoint_c[p950]
+        );
+        build_native_sounding(&data).expect("native sounding should build from rh_iso");
     }
 
     #[test]

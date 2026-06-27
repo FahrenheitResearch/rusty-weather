@@ -4490,6 +4490,7 @@ dependencies = [
  "rustwx-render",
  "rustwx-sounding",
  "rw-store",
+ "serde",
  "serde_json",
 ]
 

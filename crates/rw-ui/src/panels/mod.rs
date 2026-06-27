@@ -21,4 +21,4 @@ pub use satellite::{
     SatDiskUsage, SatFollowSpec, SatFollowState, SatLayerOption, SatSatelliteOption,
     SatSectorOption, SatelliteEvent, SatellitePanel,
 };
-pub use sounding::SoundingPanel;
+pub use sounding::{SoundingPanel, SoundingViewState};

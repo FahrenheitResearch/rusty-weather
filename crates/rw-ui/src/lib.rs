@@ -41,8 +41,8 @@ pub use panels::{
     EstimateView, FieldViewerEvent, FieldViewerPanel, HourDoneView, ModelOption, RunBrowserPanel,
     SatDiskUsage, SatFollowSpec, SatFollowState, SatFrameImage, SatLayerOption, SatPlayerEvent,
     SatPlayerPanel, SatRunKey, SatRunListing, SatSatelliteOption, SatSectorOption, SatelliteEvent,
-    SatellitePanel, SoundingPanel, StageState, format_bytes, shift_date_yyyymmdd,
-    today_yyyymmdd_utc,
+    SatellitePanel, SoundingPanel, SoundingViewState, StageState, format_bytes,
+    shift_date_yyyymmdd, today_yyyymmdd_utc,
 };
 pub use store_view::{HourEntry, ModelEntry, RunEntry, StoreTree, StoreView};
 pub use worker::{

@@ -66,10 +66,10 @@ const INSET_H: u32 = UPPER_H - HODO_H; // 520
 // Colour palette
 // =========================================================================
 
-const COL_BG: [u8; 4] = [10, 10, 22, 255];
-const COL_TITLE_BG: [u8; 4] = [30, 30, 50, 255];
+const COL_BG: [u8; 4] = [0, 0, 0, 255];
+const COL_TITLE_BG: [u8; 4] = [0, 0, 0, 255];
 const COL_WHITE: [u8; 4] = [230, 230, 230, 255];
-const COL_BORDER: [u8; 4] = [50, 50, 70, 255];
+const COL_BORDER: [u8; 4] = [215, 215, 215, 255];
 
 // =========================================================================
 // ComputedParams — all pre-computed values needed by every panel
@@ -1045,7 +1045,7 @@ pub fn render_full_sounding(profile: &Profile, params: &ComputedParams) -> Vec<u
     // ===================================================================
     // 2. Skew-T diagram (left region, includes omega + barbs internally)
     // ===================================================================
-    let skewt_rgba = super::skewt::render_skewt(profile, LEFT_W, UPPER_H);
+    let skewt_rgba = super::skewt::render_skewt_only(profile, LEFT_W, UPPER_H);
     blit_raw_rgba(&mut img, &skewt_rgba, LEFT_W, UPPER_H, 0, TITLE_H as i32);
 
     // ===================================================================

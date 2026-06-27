@@ -216,6 +216,16 @@ impl NativeSounding {
         .unwrap_or(base)
     }
 
+    /// Render the vendored SHARPpy-style compositor directly.
+    ///
+    /// This keeps the classic SHARPpy panel arrangement intact instead of
+    /// replacing the title/table and adding the rustwx location/summary
+    /// column. It is still a raster PNG, but it is the best current bridge
+    /// target for app-side zoom/hover work and for a future egui-native scene.
+    pub fn render_sharppy_png(&self) -> Vec<u8> {
+        render_full_sounding(&self.profile, &self.params)
+    }
+
     pub fn render_full_png_with_ecape(
         &self,
         ecape: &ExternalEcapeSummary,
@@ -227,6 +237,11 @@ impl NativeSounding {
 
     pub fn write_full_png<P: AsRef<Path>>(&self, path: P) -> Result<(), SoundingBridgeError> {
         std::fs::write(path, self.render_full_png())?;
+        Ok(())
+    }
+
+    pub fn write_sharppy_png<P: AsRef<Path>>(&self, path: P) -> Result<(), SoundingBridgeError> {
+        std::fs::write(path, self.render_sharppy_png())?;
         Ok(())
     }
 
@@ -489,6 +504,12 @@ pub fn render_full_sounding_png(column: &SoundingColumn) -> Result<Vec<u8>, Soun
     Ok(NativeSounding::from_column(column)?.render_full_png())
 }
 
+pub fn render_sharppy_sounding_png(
+    column: &SoundingColumn,
+) -> Result<Vec<u8>, SoundingBridgeError> {
+    Ok(NativeSounding::from_column(column)?.render_sharppy_png())
+}
+
 pub fn render_full_sounding_with_ecape_png(
     column: &SoundingColumn,
     ecape: &ExternalEcapeSummary,
@@ -501,6 +522,13 @@ pub fn write_full_sounding_png<P: AsRef<Path>>(
     path: P,
 ) -> Result<(), SoundingBridgeError> {
     NativeSounding::from_column(column)?.write_full_png(path)
+}
+
+pub fn write_sharppy_sounding_png<P: AsRef<Path>>(
+    column: &SoundingColumn,
+    path: P,
+) -> Result<(), SoundingBridgeError> {
+    NativeSounding::from_column(column)?.write_sharppy_png(path)
 }
 
 pub fn write_full_sounding_with_ecape_png<P: AsRef<Path>>(
