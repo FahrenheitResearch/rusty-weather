@@ -18,9 +18,10 @@
 //!                    [--download-hours SPEC] [--download-profile NAME]
 //!                    [--satellite]
 //!
-//! `--store-root` defaults to `store`. `--cache-dir` presets the Download
-//! panel's raw GRIB cache directory (default `out/cache`; point it at an
-//! existing cache to ingest without network). The `--download-*` flags
+//! `--store-root` defaults to an existing nearby rw-store when one is found,
+//! otherwise the per-user app data directory. `--cache-dir` presets the
+//! Download panel's raw GRIB cache directory (default per-user cache dir;
+//! point it at an existing cache to ingest without network). The `--download-*` flags
 //! preset the Download panel's pickers (handy for scripted/offline runs).
 //! `--satellite` opens the Satellite window on launch. `--synthetic`
 //! writes a tiny synthetic store to a temp directory and opens that
@@ -29,8 +30,8 @@
 //! Storage paths (`--store-root`, `--cache-dir`) are configurable in the
 //! app via the "Storage" collapsible section in the left browser panel;
 //! values are persisted across launches via eframe's built-in storage.
-//! Precedence: CLI arg > persisted setting > built-in default ("store" /
-//! "out/cache"). Relative paths resolve against the working directory.
+//! Precedence: CLI arg > persisted setting > automatic default. Relative paths
+//! are resolved through the launch context and saved as absolute paths.
 //!
 //! Profiling: build with `--features profiling` for puffin scopes, a
 //! puffin_http server on 127.0.0.1:8585 (external `puffin_viewer`), and
@@ -43,7 +44,7 @@ mod ingest_worker;
 mod profiler;
 mod sat_worker;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -68,10 +69,12 @@ const STORAGE_KEY: &str = "rw.storage_paths";
 /// eframe Storage key for user-saved native plot domains.
 const DOMAIN_STORAGE_KEY: &str = "rw.custom_domains";
 
-/// Default store root when neither CLI nor persisted settings provide one.
+/// Legacy/default store leaf when neither CLI nor persisted settings provide one.
 const DEFAULT_STORE_ROOT: &str = "store";
-/// Default download cache dir when neither CLI nor persisted settings provide one.
+/// Legacy/default download cache path when neither CLI nor persisted settings provide one.
 const DEFAULT_CACHE_DIR: &str = "out/cache";
+/// Stable app-data folder name used for installed/default storage.
+const APP_DATA_DIR_NAME: &str = "rusty-weather";
 
 /// Where a resolved storage path came from — shown in the Settings UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,27 +150,28 @@ fn deserialize_custom_domains(s: &str) -> Vec<CustomDomain> {
 ///
 /// Precedence (highest first): CLI arg → persisted saved value → built-in default.
 ///
-/// Relative paths are accepted as-is; they resolve against the process's
-/// working directory (documented in the storage settings UI).
+/// Relative paths are resolved against the launch context so double-clicking
+/// the executable from different folders does not silently point at a
+/// different empty store.
 fn resolve_storage_paths(
     cli_store: Option<&str>,
     cli_cache: Option<&str>,
     saved: Option<&PersistedPaths>,
 ) -> StoragePaths {
     let (store_root, store_root_source) = if let Some(v) = cli_store {
-        (PathBuf::from(v), PathSource::Cli)
+        (resolve_store_path_input(v), PathSource::Cli)
     } else if let Some(v) = saved.and_then(|s| s.store_root.as_deref()) {
-        (PathBuf::from(v), PathSource::Saved)
+        (resolve_store_path_input(v), PathSource::Saved)
     } else {
-        (PathBuf::from(DEFAULT_STORE_ROOT), PathSource::Default)
+        (default_store_root(), PathSource::Default)
     };
 
     let (cache_dir, cache_dir_source) = if let Some(v) = cli_cache {
-        (PathBuf::from(v), PathSource::Cli)
+        (resolve_cache_path_input(v), PathSource::Cli)
     } else if let Some(v) = saved.and_then(|s| s.cache_dir.as_deref()) {
-        (PathBuf::from(v), PathSource::Saved)
+        (resolve_cache_path_input(v), PathSource::Saved)
     } else {
-        (PathBuf::from(DEFAULT_CACHE_DIR), PathSource::Default)
+        (default_cache_dir(), PathSource::Default)
     };
 
     StoragePaths {
@@ -175,6 +179,192 @@ fn resolve_storage_paths(
         store_root_source,
         cache_dir,
         cache_dir_source,
+    }
+}
+
+fn resolve_store_path_input(value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return path;
+    }
+    if path == Path::new(DEFAULT_STORE_ROOT) {
+        if let Some(discovered) = discover_existing_store_root() {
+            return discovered;
+        }
+    }
+    absolutize_from_current_dir(path)
+}
+
+fn resolve_cache_path_input(value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return path;
+    }
+    if let Some(discovered) = discover_existing_relative_path(&path) {
+        return discovered;
+    }
+    absolutize_from_current_dir(path)
+}
+
+fn absolutize_from_current_dir(path: PathBuf) -> PathBuf {
+    std::env::current_dir()
+        .map(|cwd| cwd.join(&path))
+        .unwrap_or(path)
+}
+
+fn default_store_root() -> PathBuf {
+    discover_existing_store_root()
+        .or_else(|| app_data_dir().map(|dir| dir.join(DEFAULT_STORE_ROOT)))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_STORE_ROOT))
+}
+
+fn default_cache_dir() -> PathBuf {
+    discover_existing_relative_path(Path::new(DEFAULT_CACHE_DIR))
+        .or_else(app_cache_dir)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CACHE_DIR))
+}
+
+fn discover_existing_store_root() -> Option<PathBuf> {
+    discover_existing_store_root_from(launch_search_roots())
+}
+
+fn discover_existing_store_root_from<I>(starts: I) -> Option<PathBuf>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    for start in starts {
+        for ancestor in start.ancestors().take(8) {
+            let candidate = ancestor.join(DEFAULT_STORE_ROOT);
+            if looks_like_rw_store_root(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn discover_existing_relative_path(relative: &Path) -> Option<PathBuf> {
+    for start in launch_search_roots() {
+        for ancestor in start.ancestors().take(8) {
+            let candidate = ancestor.join(relative);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn launch_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            roots.push(dir.to_path_buf());
+        }
+    }
+    roots
+}
+
+fn looks_like_rw_store_root(path: &Path) -> bool {
+    let Ok(models) = std::fs::read_dir(path) else {
+        return false;
+    };
+
+    for model in models.flatten() {
+        let model_path = model.path();
+        if !model_path.is_dir() {
+            continue;
+        }
+        let Ok(runs) = std::fs::read_dir(&model_path) else {
+            continue;
+        };
+        for run in runs.flatten() {
+            let run_path = run.path();
+            if run_path.join("run.json").is_file()
+                || run_path.join("grid.rwg").is_file()
+                || contains_rws_file(&run_path)
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn contains_rws_file(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .path()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("rws"))
+    })
+}
+
+fn app_data_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("USERPROFILE")
+                    .map(PathBuf::from)
+                    .map(|home| home.join("AppData").join("Roaming"))
+            })
+            .map(|dir| dir.join(APP_DATA_DIR_NAME))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME").map(PathBuf::from).map(|home| {
+            home.join("Library")
+                .join("Application Support")
+                .join(APP_DATA_DIR_NAME)
+        })
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".local").join("share"))
+            })
+            .map(|dir| dir.join(APP_DATA_DIR_NAME))
+    }
+}
+
+fn app_cache_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
+            .map(|dir| dir.join(APP_DATA_DIR_NAME).join("cache"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join("Library").join("Caches").join(APP_DATA_DIR_NAME))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".cache"))
+            })
+            .map(|dir| dir.join(APP_DATA_DIR_NAME))
     }
 }
 
@@ -373,15 +563,17 @@ impl StorageSettingsUi {
                     {
                         // Validate: try create_dir_all for any path not
                         // overridden by CLI (editable fields only).
+                        let resolved_store = resolve_store_path_input(&self.store_root_edit);
+                        let resolved_cache = resolve_cache_path_input(&self.cache_dir_edit);
                         let store_ok = if self.store_root_source != PathSource::Cli {
-                            let p = PathBuf::from(&self.store_root_edit);
-                            std::fs::create_dir_all(&p).map_err(|e| format!("store root: {e}"))
+                            std::fs::create_dir_all(&resolved_store)
+                                .map_err(|e| format!("store root: {e}"))
                         } else {
                             Ok(())
                         };
                         let cache_ok = if self.cache_dir_source != PathSource::Cli {
-                            let p = PathBuf::from(&self.cache_dir_edit);
-                            std::fs::create_dir_all(&p).map_err(|e| format!("cache dir: {e}"))
+                            std::fs::create_dir_all(&resolved_cache)
+                                .map_err(|e| format!("cache dir: {e}"))
                         } else {
                             Ok(())
                         };
@@ -392,10 +584,10 @@ impl StorageSettingsUi {
                             }
                             (Ok(()), Ok(())) => {
                                 // Refresh disk sizes after Apply
-                                let new_store = PathBuf::from(&self.store_root_edit);
-                                let new_cache = PathBuf::from(&self.cache_dir_edit);
-                                self.store_size = dir_size_bytes(&new_store);
-                                self.cache_size = dir_size_bytes(&new_cache);
+                                self.store_root_edit = resolved_store.display().to_string();
+                                self.cache_dir_edit = resolved_cache.display().to_string();
+                                self.store_size = dir_size_bytes(&resolved_store);
+                                self.cache_size = dir_size_bytes(&resolved_cache);
                                 self.apply_error = None;
                                 self.apply_status =
                                     Some("Saved — restart to apply to live workers".to_string());
@@ -430,7 +622,7 @@ impl StorageSettingsUi {
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(
-                        "Relative paths resolve against the working directory. \
+                        "Relative paths are saved as absolute paths. \
                          Changes take effect on the next launch (workers hold the \
                          old paths until restart).",
                     )
@@ -1458,6 +1650,10 @@ impl eframe::App for App {
 mod tests {
     use super::*;
 
+    fn test_abs_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("rw-ui-{name}"))
+    }
+
     // ------------------------------------------------------------------
     // resolve_storage_paths: precedence unit tests
     // ------------------------------------------------------------------
@@ -1466,22 +1662,52 @@ mod tests {
     #[test]
     fn resolve_defaults_when_nothing_provided() {
         let paths = resolve_storage_paths(None, None, None);
-        assert_eq!(paths.store_root, PathBuf::from(DEFAULT_STORE_ROOT));
-        assert_eq!(paths.cache_dir, PathBuf::from(DEFAULT_CACHE_DIR));
+        assert!(paths.store_root.ends_with(DEFAULT_STORE_ROOT));
+        assert!(paths.cache_dir.ends_with("cache"));
         assert_eq!(paths.store_root_source, PathSource::Default);
         assert_eq!(paths.cache_dir_source, PathSource::Default);
+    }
+
+    #[test]
+    fn store_discovery_finds_ancestor_store_from_release_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "rw-store-discovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let release_dir = root.join("target").join("release-fast");
+        let run_dir = root.join("store").join("hrrr").join("20260629_05z");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("run.json"), "{}").unwrap();
+
+        let discovered = discover_existing_store_root_from([release_dir]).unwrap();
+        assert_eq!(discovered, root.join("store"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// CLI arg wins over both saved and default.
     #[test]
     fn cli_wins_over_saved_and_default() {
+        let cli_store = test_abs_path("cli-store");
+        let cli_cache = test_abs_path("cli-cache");
+        let saved_store = test_abs_path("saved-store");
+        let saved_cache = test_abs_path("saved-cache");
         let saved = PersistedPaths {
-            store_root: Some("/saved/store".to_string()),
-            cache_dir: Some("/saved/cache".to_string()),
+            store_root: Some(saved_store.display().to_string()),
+            cache_dir: Some(saved_cache.display().to_string()),
         };
-        let paths = resolve_storage_paths(Some("/cli/store"), Some("/cli/cache"), Some(&saved));
-        assert_eq!(paths.store_root, PathBuf::from("/cli/store"));
-        assert_eq!(paths.cache_dir, PathBuf::from("/cli/cache"));
+        let paths = resolve_storage_paths(
+            Some(&cli_store.display().to_string()),
+            Some(&cli_cache.display().to_string()),
+            Some(&saved),
+        );
+        assert_eq!(paths.store_root, cli_store);
+        assert_eq!(paths.cache_dir, cli_cache);
         assert_eq!(paths.store_root_source, PathSource::Cli);
         assert_eq!(paths.cache_dir_source, PathSource::Cli);
     }
@@ -1489,13 +1715,15 @@ mod tests {
     /// Saved value wins over default when no CLI arg.
     #[test]
     fn saved_wins_over_default() {
+        let saved_store = test_abs_path("saved-store");
+        let saved_cache = test_abs_path("saved-cache");
         let saved = PersistedPaths {
-            store_root: Some("/saved/store".to_string()),
-            cache_dir: Some("/saved/cache".to_string()),
+            store_root: Some(saved_store.display().to_string()),
+            cache_dir: Some(saved_cache.display().to_string()),
         };
         let paths = resolve_storage_paths(None, None, Some(&saved));
-        assert_eq!(paths.store_root, PathBuf::from("/saved/store"));
-        assert_eq!(paths.cache_dir, PathBuf::from("/saved/cache"));
+        assert_eq!(paths.store_root, saved_store);
+        assert_eq!(paths.cache_dir, saved_cache);
         assert_eq!(paths.store_root_source, PathSource::Saved);
         assert_eq!(paths.cache_dir_source, PathSource::Saved);
     }
@@ -1503,28 +1731,33 @@ mod tests {
     /// CLI wins for store_root; saved wins for cache_dir (independent fields).
     #[test]
     fn cli_and_saved_can_mix_per_field() {
+        let cli_store = test_abs_path("cli-store");
+        let saved_store = test_abs_path("saved-store");
+        let saved_cache = test_abs_path("saved-cache");
         let saved = PersistedPaths {
-            store_root: Some("/saved/store".to_string()),
-            cache_dir: Some("/saved/cache".to_string()),
+            store_root: Some(saved_store.display().to_string()),
+            cache_dir: Some(saved_cache.display().to_string()),
         };
-        let paths = resolve_storage_paths(Some("/cli/store"), None, Some(&saved));
-        assert_eq!(paths.store_root, PathBuf::from("/cli/store"));
+        let paths =
+            resolve_storage_paths(Some(&cli_store.display().to_string()), None, Some(&saved));
+        assert_eq!(paths.store_root, cli_store);
         assert_eq!(paths.store_root_source, PathSource::Cli);
-        assert_eq!(paths.cache_dir, PathBuf::from("/saved/cache"));
+        assert_eq!(paths.cache_dir, saved_cache);
         assert_eq!(paths.cache_dir_source, PathSource::Saved);
     }
 
     /// Saved with `None` fields falls through to default for those fields.
     #[test]
     fn saved_none_fields_fall_through_to_default() {
+        let saved_cache = test_abs_path("saved-cache");
         let saved = PersistedPaths {
             store_root: None,
-            cache_dir: Some("/saved/cache".to_string()),
+            cache_dir: Some(saved_cache.display().to_string()),
         };
         let paths = resolve_storage_paths(None, None, Some(&saved));
-        assert_eq!(paths.store_root, PathBuf::from(DEFAULT_STORE_ROOT));
+        assert!(paths.store_root.ends_with(DEFAULT_STORE_ROOT));
         assert_eq!(paths.store_root_source, PathSource::Default);
-        assert_eq!(paths.cache_dir, PathBuf::from("/saved/cache"));
+        assert_eq!(paths.cache_dir, saved_cache);
         assert_eq!(paths.cache_dir_source, PathSource::Saved);
     }
 
