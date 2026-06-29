@@ -57,3 +57,10 @@ hdf5-reader = { path = "vendor/netcrust/vendor/hdf5-reader" }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+debug = 1

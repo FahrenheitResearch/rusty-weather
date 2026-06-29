@@ -1210,6 +1210,8 @@ impl eframe::App for App {
         egui::Panel::left("rw-browser")
             .resizable(true)
             .default_size(260.0)
+            .min_size(220.0)
+            .max_size(420.0)
             .show_inside(ui, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {

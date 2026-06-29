@@ -1,0 +1,5 @@
+[alias]
+build-ui-fast = "build --profile release-fast -p rusty-weather-ui"
+ui-fast = "run --profile release-fast -p rusty-weather-ui"
+build-ui-release = "build --release -p rusty-weather-ui"
+ui-release = "run --release -p rusty-weather-ui"
