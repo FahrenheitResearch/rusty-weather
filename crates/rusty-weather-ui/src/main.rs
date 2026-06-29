@@ -1134,11 +1134,13 @@ impl App {
                 DownloadEvent::CheckAvailability(spec) => {
                     let spec = self.apply_normalized_download_spec(spec);
                     Self::sync_run_pickers(&mut self.download, &spec);
+                    self.download.set_probing();
                     self.ingest.send(IngestRequest::Probe(spec));
                 }
                 DownloadEvent::LatestRequested(spec) => {
                     let spec = self.apply_normalized_download_spec(spec);
                     Self::sync_run_pickers(&mut self.download, &spec);
+                    self.download.set_probing();
                     self.ingest.send(IngestRequest::Latest(spec));
                 }
                 DownloadEvent::StartRequested(spec) => {

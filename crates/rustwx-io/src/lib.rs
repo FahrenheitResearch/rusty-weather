@@ -166,11 +166,31 @@ pub fn available_forecast_hours(
     product: &str,
     source_override: Option<SourceId>,
 ) -> Result<Vec<u16>, IoError> {
-    let client = client()?;
     let candidates = candidate_hours(model, hour_utc);
+    available_forecast_hours_for_candidates(
+        model,
+        date_yyyymmdd,
+        hour_utc,
+        product,
+        source_override,
+        &candidates,
+    )
+}
+
+pub fn available_forecast_hours_for_candidates(
+    model: ModelId,
+    date_yyyymmdd: &str,
+    hour_utc: u8,
+    product: &str,
+    source_override: Option<SourceId>,
+    candidates: &[u16],
+) -> Result<Vec<u16>, IoError> {
+    let client = client()?;
     let summary = model_summary(model);
 
-    let available = if should_parallelize_hour_availability_probes(source_override, summary) {
+    let parallelize = candidates.len() <= 48
+        || should_parallelize_hour_availability_probes(source_override, summary);
+    let available = if parallelize {
         candidates
             .par_iter()
             .filter_map(|&forecast_hour| {

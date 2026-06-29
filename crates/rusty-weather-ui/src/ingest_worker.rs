@@ -23,7 +23,7 @@ use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::thread::JoinHandle;
 
 use rustwx_core::{CycleSpec, ModelId, SourceId};
-use rustwx_models::{supported_forecast_hours, supported_models};
+use rustwx_models::supported_models;
 use rw_ingest::ingest_profile::IngestProfile;
 use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate};
 use rw_ingest::{
@@ -374,6 +374,14 @@ fn intersect_hours(mut left: Vec<u16>, right: &[u16]) -> Vec<u16> {
     left
 }
 
+fn fast_probe_source(model: ModelId) -> Option<SourceId> {
+    rustwx_models::model_summary(model)
+        .sources
+        .iter()
+        .find(|source| source.id != SourceId::Nomads)
+        .map(|source| source.id)
+}
+
 /// Prefer f006 for latest-run probing. Some feeds can publish product
 /// metadata unevenly at f000, while f006 is supported across every
 /// currently ingest-enabled model and matches the UI's short default range.
@@ -391,10 +399,9 @@ fn latest_probe_hour(model: ModelId) -> u16 {
     0
 }
 
-/// Probe the run's hours via AWS idx HEADs (parallel on the background
-/// pool; HRRR's catalog order would otherwise probe NOMADS serially —
-/// 49 round trips). The actual fetch still tries every source in catalog
-/// order, so a freshest-hour lag on AWS only affects the chips.
+/// Probe the requested hours for this run. Probing the full model horizon
+/// can take minutes for global models and blocks queued downloads behind
+/// the availability request.
 fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> AvailabilityView {
     let mut view = AvailabilityView {
         model: spec.model.clone(),
@@ -404,14 +411,14 @@ fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> Availabil
         available: Vec::new(),
         note: None,
     };
-    let (model, profile) = match resolve_spec(spec) {
-        Ok((model, profile, _, _)) => (model, profile),
+    let (model, profile, hours) = match resolve_spec(spec) {
+        Ok((model, profile, hours, _)) => (model, profile, hours),
         Err(message) => {
             view.note = Some(message);
             return view;
         }
     };
-    view.candidates = supported_forecast_hours(model, spec.cycle);
+    view.candidates = hours;
     let source = match source_override(spec) {
         Ok(source) => source,
         Err(message) => {
@@ -419,6 +426,7 @@ fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> Availabil
             return view;
         }
     };
+    let probe_source = source.or_else(|| fast_probe_source(model));
     let products = match required_products_for_profile(model, &profile) {
         Ok(products) => products,
         Err(message) => {
@@ -428,8 +436,17 @@ fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> Availabil
     };
     let date = spec.date.clone();
     let cycle = spec.cycle;
-    let probe =
-        |product: &str| rustwx_io::available_forecast_hours(model, &date, cycle, product, source);
+    let candidates = view.candidates.clone();
+    let probe = |product: &str| {
+        rustwx_io::available_forecast_hours_for_candidates(
+            model,
+            &date,
+            cycle,
+            product,
+            probe_source,
+            &candidates,
+        )
+    };
     let result = state.pool().install(|| {
         let mut iter = products.iter();
         let Some(first) = iter.next() else {
@@ -446,7 +463,7 @@ fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> Availabil
         Ok(available) => {
             view.available = available;
             let products = products.join(", ");
-            let source = source
+            let source = probe_source
                 .map(|source| source.to_string())
                 .unwrap_or_else(|| "auto catalog".to_string());
             view.note = Some(format!("probed {products} via {source}"));
@@ -986,6 +1003,52 @@ mod tests {
                 assert_eq!(view.hour_count, 3);
             }
             other => panic!("expected Estimate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fast_probe_source_prefers_non_nomads_when_available() {
+        assert_eq!(fast_probe_source(ModelId::Hrrr), Some(SourceId::Aws));
+        assert_eq!(fast_probe_source(ModelId::Gfs), Some(SourceId::Aws));
+        assert_eq!(fast_probe_source(ModelId::Aigfs), None);
+    }
+
+    #[test]
+    #[ignore = "network smoke test against live model feeds"]
+    fn live_probe_round_trips_through_the_worker() {
+        let today = chrono::Utc::now().format("%Y%m%d").to_string();
+        let products = all_ingest_products(ModelId::Hrrr).expect("HRRR products");
+        let latest = rustwx_models::latest_available_run_for_products_at_forecast_hour(
+            ModelId::Hrrr,
+            None,
+            &today,
+            &products,
+            6,
+        )
+        .expect("latest HRRR run");
+
+        let worker = IngestWorker::spawn(PathBuf::from("missing-store"), || {});
+        worker.send(IngestRequest::Probe(DownloadSpec {
+            model: "hrrr".to_string(),
+            date: latest.cycle.date_yyyymmdd,
+            cycle: latest.cycle.hour_utc,
+            hours: "0-6".to_string(),
+            ..DownloadSpec::default()
+        }));
+        let response = worker
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(90))
+            .expect("worker responds");
+        match response {
+            IngestResponse::Availability(view) => {
+                assert!(
+                    view.available.contains(&6),
+                    "latest HRRR f006 should be available, got {:?}; note={:?}",
+                    view.available,
+                    view.note
+                );
+            }
+            other => panic!("expected Availability, got {other:?}"),
         }
     }
 }
