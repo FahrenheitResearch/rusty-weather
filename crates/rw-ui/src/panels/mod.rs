@@ -4,6 +4,7 @@
 
 mod download;
 mod field_viewer;
+mod plot_viewer;
 mod run_browser;
 mod sat_player;
 mod satellite;
@@ -15,10 +16,11 @@ pub use download::{
     today_yyyymmdd_utc,
 };
 pub use field_viewer::{FieldViewerEvent, FieldViewerPanel};
+pub use plot_viewer::PlotViewerPanel;
 pub use run_browser::RunBrowserPanel;
 pub use sat_player::{SatFrameImage, SatPlayerEvent, SatPlayerPanel, SatRunKey, SatRunListing};
 pub use satellite::{
     SatDiskUsage, SatFollowSpec, SatFollowState, SatLayerOption, SatSatelliteOption,
     SatSectorOption, SatelliteEvent, SatellitePanel,
 };
-pub use sounding::SoundingPanel;
+pub use sounding::{SoundingPanel, SoundingViewState};

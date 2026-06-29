@@ -162,10 +162,7 @@ pub fn band_hour_prefix(
 
 /// Whether a parsed filename product matches the requested one (a bare
 /// `...M` request accepts both mesoscale sectors).
-pub fn abi_filename_product_matches_request(
-    actual_product: &str,
-    requested_product: &str,
-) -> bool {
+pub fn abi_filename_product_matches_request(actual_product: &str, requested_product: &str) -> bool {
     let actual = actual_product.trim().to_ascii_uppercase();
     let requested = requested_product.trim().to_ascii_uppercase();
     actual == requested
@@ -538,10 +535,7 @@ mod tests {
 
     #[test]
     fn cache_prune_removes_stale_objects_and_empty_dirs() {
-        let dir = std::env::temp_dir().join(format!(
-            "rw-sat-cache-prune-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("rw-sat-cache-prune-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let bucket = "noaa-goes19";
         let old_key = "ABI-L2-CMIPC/2026/161/18/OR_ABI-L2-CMIPC-M6C13_G19_s20261611851176_e20261611853549_c20261611854020.nc";
@@ -568,7 +562,10 @@ mod tests {
         assert!(cached_object_path(&dir, bucket, new_key).is_file());
 
         // Second pass is a no-op; a missing cache root never errors.
-        assert_eq!(prune_object_cache(&dir, bucket, cutoff), CachePruneReport::default());
+        assert_eq!(
+            prune_object_cache(&dir, bucket, cutoff),
+            CachePruneReport::default()
+        );
         assert_eq!(
             prune_object_cache(&dir.join("absent"), bucket, cutoff),
             CachePruneReport::default()
@@ -578,10 +575,8 @@ mod tests {
 
     #[test]
     fn cache_prune_falls_back_to_mtime_for_unparseable_names() {
-        let dir = std::env::temp_dir().join(format!(
-            "rw-sat-cache-prune-mtime-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rw-sat-cache-prune-mtime-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let bucket = "noaa-goes19";
         let path = cached_object_path(&dir, bucket, "leftover.partial");

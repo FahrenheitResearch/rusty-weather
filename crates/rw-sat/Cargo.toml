@@ -8,6 +8,8 @@ rust-version.workspace = true
 description = "Continuous GOES ABI ingest: live S3 follow -> NetCDF decode -> rw-store rolling time-window frames"
 
 [dependencies]
+base64 = "0.22"
+bzip2 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -18,11 +20,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
+zip = { version = "6.0.0", default-features = false, features = ["deflate"] }
 
 # Pure-Rust NetCDF4/HDF5 reading: the vendored production stack from the old
-# rustwx satellite pipeline. hdf5-reader resolves to the vendored tree via
-# the workspace-root [patch.crates-io] pin.
-hdf5-reader = "0.3"
+# rustwx satellite pipeline. Use a repo-relative path so downstream git
+# consumers (BowEcho) do not need machine-local root patches.
+hdf5-reader = { path = "../../vendor/netcrust/vendor/hdf5-reader" }
 netcrust = { path = "../../vendor/netcrust" }
 
 rustwx-core = { path = "../rustwx-core" }

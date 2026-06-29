@@ -27,7 +27,7 @@ use rustwx_models::{supported_forecast_hours, supported_models};
 use rw_ingest::ingest_profile::IngestProfile;
 use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate};
 use rw_ingest::{
-    IngestConfig, IngestError, IngestEvent, IngestStage, parse_hours, throttle,
+    IngestConfig, IngestError, IngestEvent, IngestStage, fetch_plan, parse_hours, throttle,
     validate_forecast_hours,
 };
 use rw_ui::{AvailabilityView, DownloadSpec, DownloadStage, EstimateView, HourDoneView};
@@ -336,6 +336,61 @@ fn format_duration_secs(secs: u64) -> String {
     }
 }
 
+/// Product tokens required by a profile. The availability path intentionally
+/// reuses the ingest fetch plan so new models do not need a second, drifting
+/// `prs`/`sfc` probe table.
+fn required_products_for_profile(
+    model: ModelId,
+    profile: &IngestProfile,
+) -> Result<Vec<&'static str>, String> {
+    let mut products = Vec::new();
+    for entry in fetch_plan(model).map_err(|err| err.to_string())? {
+        let needed = entry.surface_source || (profile.needs_prs() && entry.pressure_source);
+        if needed && !products.iter().any(|seen| seen == &entry.product) {
+            products.push(entry.product);
+        }
+    }
+    if products.is_empty() {
+        return Err(format!("model '{model}' has no probeable ingest products"));
+    }
+    Ok(products)
+}
+
+fn all_ingest_products(model: ModelId) -> Result<Vec<&'static str>, String> {
+    let mut products = Vec::new();
+    for entry in fetch_plan(model).map_err(|err| err.to_string())? {
+        if !products.iter().any(|seen| seen == &entry.product) {
+            products.push(entry.product);
+        }
+    }
+    if products.is_empty() {
+        return Err(format!("model '{model}' has no probeable ingest products"));
+    }
+    Ok(products)
+}
+
+fn intersect_hours(mut left: Vec<u16>, right: &[u16]) -> Vec<u16> {
+    left.retain(|hour| right.contains(hour));
+    left
+}
+
+/// Prefer f006 for latest-run probing. Some feeds can publish product
+/// metadata unevenly at f000, while f006 is supported across every
+/// currently ingest-enabled model and matches the UI's short default range.
+fn latest_probe_hour(model: ModelId) -> u16 {
+    let summary = rustwx_models::model_summary(model);
+    for candidate in [6, 0, 3, 1] {
+        if summary
+            .cycle_hours_utc
+            .iter()
+            .any(|&cycle| rustwx_models::forecast_hour_supported(model, cycle, candidate))
+        {
+            return candidate;
+        }
+    }
+    0
+}
+
 /// Probe the run's hours via AWS idx HEADs (parallel on the background
 /// pool; HRRR's catalog order would otherwise probe NOMADS serially —
 /// 49 round trips). The actual fetch still tries every source in catalog
@@ -357,25 +412,44 @@ fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> Availabil
         }
     };
     view.candidates = supported_forecast_hours(model, spec.cycle);
+    let source = match source_override(spec) {
+        Ok(source) => source,
+        Err(message) => {
+            view.note = Some(message);
+            return view;
+        }
+    };
+    let products = match required_products_for_profile(model, &profile) {
+        Ok(products) => products,
+        Err(message) => {
+            view.note = Some(message);
+            return view;
+        }
+    };
     let date = spec.date.clone();
     let cycle = spec.cycle;
-    let probe = |product: &str| {
-        rustwx_io::available_forecast_hours(model, &date, cycle, product, Some(SourceId::Aws))
-    };
+    let probe =
+        |product: &str| rustwx_io::available_forecast_hours(model, &date, cycle, product, source);
     let result = state.pool().install(|| {
-        let sfc = probe("sfc")?;
-        if !profile.needs_prs() {
-            return Ok(sfc);
+        let mut iter = products.iter();
+        let Some(first) = iter.next() else {
+            return Ok(Vec::new());
+        };
+        let mut available = probe(first)?;
+        for product in iter {
+            let product_hours = probe(product)?;
+            available = intersect_hours(available, &product_hours);
         }
-        let prs = probe("prs")?;
-        Ok::<Vec<u16>, rustwx_io::IoError>(
-            sfc.into_iter().filter(|hour| prs.contains(hour)).collect(),
-        )
+        Ok::<Vec<u16>, rustwx_io::IoError>(available)
     });
     match result {
         Ok(available) => {
             view.available = available;
-            view.note = Some("probed via AWS idx".to_string());
+            let products = products.join(", ");
+            let source = source
+                .map(|source| source.to_string())
+                .unwrap_or_else(|| "auto catalog".to_string());
+            view.note = Some(format!("probed {products} via {source}"));
         }
         Err(err) => view.note = Some(format!("availability probe failed: {err}")),
     }
@@ -383,14 +457,22 @@ fn probe_availability(state: &mut WorkerState, spec: &DownloadSpec) -> Availabil
 }
 
 /// Newest available run for the spec's model, walking back from the spec's
-/// date (AWS-pinned probes for speed).
+/// date and requiring every product the ingest plan needs.
 fn find_latest(spec: &DownloadSpec) -> Result<(String, u8), String> {
     let model: ModelId = spec
         .model
         .parse()
         .map_err(|_| format!("unknown model '{}'", spec.model))?;
-    let latest = rustwx_models::latest_available_run(model, Some(SourceId::Aws), &spec.date)
-        .map_err(|err| format!("latest-run probe failed: {err}"))?;
+    let source = source_override(spec)?;
+    let products = all_ingest_products(model)?;
+    let latest = rustwx_models::latest_available_run_for_products_at_forecast_hour(
+        model,
+        source,
+        &spec.date,
+        &products,
+        latest_probe_hour(model),
+    )
+    .map_err(|err| format!("latest-run probe failed: {err}"))?;
     Ok((latest.cycle.date_yyyymmdd, latest.cycle.hour_utc))
 }
 
@@ -614,19 +696,60 @@ mod tests {
         let message = resolve_spec(&bad).expect_err("unsupported model");
         assert!(message.contains("not ingest-supported"), "got: {message}");
         // The supported list is derived, so it names the models that DO have
-        // a fetch plan (HRRR and now GFS) rather than a hardcoded "HRRR only".
+        // a fetch plan rather than a hardcoded "HRRR only".
         assert!(
             message.contains("GFS"),
             "supported list must include GFS: {message}"
         );
+        assert!(
+            message.contains("RAP") && message.contains("NAM"),
+            "supported list must include newly enabled regional models: {message}"
+        );
+        assert!(
+            message.contains("GEFS")
+                && message.contains("AIGFS")
+                && message.contains("ECMWF-OPEN-DATA"),
+            "supported list must include newly enabled global models: {message}"
+        );
 
-        // GFS now resolves through the model gate (its fetch plan landed); a
-        // GFS sounding spec validates end-to-end.
-        let mut gfs = spec();
-        gfs.model = "gfs".to_string();
-        let (model, _, hours, _) = resolve_spec(&gfs).expect("GFS spec now resolves");
-        assert_eq!(model, ModelId::Gfs);
-        assert_eq!(hours, vec![4, 5, 6]);
+        // Newly fetch-planned models resolve through the model gate; a
+        // sounding spec validates end-to-end before any network work starts.
+        for (slug, expected) in [
+            ("hrrr-ak", ModelId::HrrrAk),
+            ("rap", ModelId::Rap),
+            ("gfs", ModelId::Gfs),
+            ("gdas", ModelId::Gdas),
+            ("gefs", ModelId::Gefs),
+            ("aigfs", ModelId::Aigfs),
+            ("aigefs", ModelId::Aigefs),
+            ("hgefs", ModelId::Hgefs),
+            ("ecmwf-open-data", ModelId::EcmwfOpenData),
+            ("nam", ModelId::Nam),
+        ] {
+            let mut spec = spec();
+            spec.model = slug.to_string();
+            spec.cycle = match expected {
+                ModelId::Gdas | ModelId::Nam => 0,
+                ModelId::Gefs
+                | ModelId::Aigfs
+                | ModelId::Aigefs
+                | ModelId::Hgefs
+                | ModelId::EcmwfOpenData => {
+                    spec.hours = "0,6".to_string();
+                    0
+                }
+                _ => spec.cycle,
+            };
+            let (model, _, hours, _) =
+                resolve_spec(&spec).unwrap_or_else(|err| panic!("{slug} spec resolves: {err}"));
+            assert_eq!(model, expected);
+            let expected_hours = if spec.hours == "0,6" {
+                vec![0, 6]
+            } else {
+                vec![4, 5, 6]
+            };
+            assert_eq!(hours, expected_hours);
+        }
 
         let mut bad = spec();
         bad.date = "not-a-date".to_string();
@@ -669,6 +792,19 @@ mod tests {
         let mut bad = spec();
         bad.source = "carrier-pigeon".to_string();
         assert!(source_override(&bad).is_err());
+    }
+
+    #[test]
+    fn availability_products_follow_ingest_fetch_plan() {
+        let aigefs = required_products_for_profile(ModelId::Aigefs, &IngestProfile::sounding())
+            .expect("AI-GEFS has a sounding fetch plan");
+        assert_eq!(aigefs, vec!["pres/avg", "sfc/avg"]);
+
+        let gefs = required_products_for_profile(ModelId::Gefs, &IngestProfile::sounding())
+            .expect("GEFS has a sounding fetch plan");
+        assert_eq!(gefs, vec!["pgrb2ap5/gec00"]);
+
+        assert_eq!(latest_probe_hour(ModelId::Aigefs), 6);
     }
 
     /// The estimate path is fully local (no network): a valid spec prices

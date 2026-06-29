@@ -1,6 +1,6 @@
 //! `rw_glm_follow` — the thin ops CLI for the GLM lightning follow engine.
 //!
-//! Two subcommands:
+//! Three subcommands:
 //!
 //! - `follow`: poll the live GOES GLM-L2-LCFA bucket for `--satellite`,
 //!   ingesting flashes into the rolling `.rwl` store under `--store-root`,
@@ -14,6 +14,12 @@
 //! - `list`: a one-shot listing sanity check — print the first N keys under the
 //!   current (or `--hour-back`) GLM hour prefix for a satellite. Used for the
 //!   G18 cross-check (the follow engine only targets one satellite at a time).
+//!
+//! - `density`: derive a regular lat/lon flash-density grid from the `.rwl`
+//!   store for a recent or explicit time window.
+//!
+//! - `mtg-li-ingest`: ingest an unpacked MTG Lightning Imager L2 flash body
+//!   NetCDF into the same `.rwl` store.
 //!
 //! This is a deliberately thin front end: all behaviour lives in the library
 //! ([`rw_glm::follow_live`], [`rw_glm::read_flashes`],
@@ -32,7 +38,8 @@ use rw_glm::s3::{
     bucket_for_satellite, build_agent, glm_hour_prefix, list_s3_objects, object_filename,
 };
 use rw_glm::{
-    BBox, GlmFollowSpec, ValidateDepth, WindowManifest, follow_live, read_flashes,
+    BBox, BucketWriter, DensityBounds, FlashDensityRequest, FlashRecord, GlmFollowSpec,
+    ValidateDepth, WindowManifest, decode_mtg_li_flashes, flash_density, follow_live, read_flashes,
     validate_bucket_file,
 };
 
@@ -53,6 +60,10 @@ enum Command {
     /// List the first few granule keys under a satellite's current GLM hour
     /// prefix (a one-shot bucket sanity check, e.g. the G18 cross-check).
     List(ListArgs),
+    /// Derive a flash-density grid from an existing `.rwl` store.
+    Density(DensityArgs),
+    /// Ingest unpacked MTG Lightning Imager flash body NetCDF into `.rwl`.
+    MtgLiIngest(MtgLiIngestArgs),
 }
 
 #[derive(Args)]
@@ -95,16 +106,222 @@ struct ListArgs {
     hour_back: i64,
 }
 
+#[derive(Args)]
+struct DensityArgs {
+    /// Satellite store to read (goes19 / goes18 / future MTG LI slug).
+    #[arg(long, default_value = "goes19")]
+    satellite: String,
+    /// Store root; reads `<root>/glm/<satellite>/<YYYYMMDD>/tHHMM.rwl`.
+    #[arg(long, default_value = "out/glm_store")]
+    store_root: PathBuf,
+    /// Window end, Unix milliseconds. Defaults to now.
+    #[arg(long)]
+    end_unix_ms: Option<i64>,
+    /// Window start, Unix milliseconds. Defaults to `end - --minutes`.
+    #[arg(long)]
+    start_unix_ms: Option<i64>,
+    /// Lookback window in minutes when `--start-unix-ms` is omitted.
+    #[arg(long, default_value_t = 60)]
+    minutes: u64,
+    /// Southern latitude bound.
+    #[arg(long, default_value_t = 24.0)]
+    south: f32,
+    /// Northern latitude bound.
+    #[arg(long, default_value_t = 50.0)]
+    north: f32,
+    /// Western longitude bound.
+    #[arg(long, default_value_t = -125.0)]
+    west: f32,
+    /// Eastern longitude bound.
+    #[arg(long, default_value_t = -66.0)]
+    east: f32,
+    /// Grid columns.
+    #[arg(long, default_value_t = 118)]
+    nx: usize,
+    /// Grid rows.
+    #[arg(long, default_value_t = 52)]
+    ny: usize,
+    /// Include flashes marked degraded-quality.
+    #[arg(long, default_value_t = false)]
+    include_degraded: bool,
+    /// Print the whole grid as pretty JSON.
+    #[arg(long, default_value_t = false)]
+    json: bool,
+    /// Write the whole grid as pretty JSON.
+    #[arg(long)]
+    out_json: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct MtgLiIngestArgs {
+    /// Unpacked MTG LI L2 flash body NetCDF path(s), usually `...CHK-BODY...nc`.
+    #[arg(long)]
+    path: Vec<PathBuf>,
+    /// Store root; buckets land under `<root>/glm/<satellite>/<YYYYMMDD>/`.
+    #[arg(long, default_value = "out/glm_store")]
+    store_root: PathBuf,
+    /// Satellite/store slug for MTG LI.
+    #[arg(long, default_value = "mtg-li")]
+    satellite: String,
+    /// Reingest even when the product key is already present in window.json.
+    #[arg(long, default_value_t = false)]
+    force: bool,
+    /// Skip structural validation of written buckets.
+    #[arg(long, default_value_t = false)]
+    no_validate: bool,
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Follow(args) => run_follow(&args),
         Command::List(args) => run_list(&args),
+        Command::Density(args) => run_density(&args),
+        Command::MtgLiIngest(args) => run_mtg_li_ingest(&args),
     };
     if let Err(err) = result {
         eprintln!("rw_glm_follow: {err}");
         std::process::exit(1);
     }
+}
+
+fn run_density(args: &DensityArgs) -> Result<(), Box<dyn Error>> {
+    let end = args.end_unix_ms.unwrap_or_else(now_unix_ms);
+    let start = args
+        .start_unix_ms
+        .unwrap_or_else(|| end.saturating_sub(args.minutes.saturating_mul(60_000) as i64));
+    let mut request = FlashDensityRequest::new(
+        start,
+        end,
+        DensityBounds::new(args.south, args.north, args.west, args.east),
+        args.nx,
+        args.ny,
+    );
+    request.include_degraded = args.include_degraded;
+
+    let grid = flash_density(&args.store_root, &args.satellite, &request)?;
+    if let Some(path) = &args.out_json {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_vec_pretty(&grid)?)?;
+    }
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&grid)?);
+        return Ok(());
+    }
+
+    let hours = (end - start) as f64 / 3_600_000.0;
+    let max = grid.max_cell();
+    println!(
+        "rw_glm_follow density | satellite {} | store {} | window [{start}, {end}) ({hours:.2} h) | grid {}x{} | domain lat {}..{} lon {}..{}",
+        args.satellite,
+        args.store_root.display(),
+        grid.nx,
+        grid.ny,
+        grid.bounds.south,
+        grid.bounds.north,
+        grid.bounds.west,
+        grid.bounds.east,
+    );
+    println!(
+        "flashes counted {} | units {} | degraded included: {}",
+        grid.flash_count, grid.units, args.include_degraded
+    );
+    if let Some(cell) = max {
+        println!(
+            "max cell x={} y={} center=({:.2}, {:.2}) count={} value={:.3}",
+            cell.x, cell.y, cell.lat_center, cell.lon_center, cell.count, cell.value
+        );
+    }
+    if let Some(path) = &args.out_json {
+        println!("wrote {}", path.display());
+    }
+    Ok(())
+}
+
+fn run_mtg_li_ingest(args: &MtgLiIngestArgs) -> Result<(), Box<dyn Error>> {
+    if args.path.is_empty() {
+        return Err("pass at least one --path pointing at an MTG LI body NetCDF".into());
+    }
+
+    let mut writer = BucketWriter::open(&args.store_root, &args.satellite)?;
+    let mut seen = writer.load_manifest().seen_granule_keys;
+    let mut total_products = 0_usize;
+    let mut skipped = 0_usize;
+    let mut total_flashes = 0_usize;
+    let mut affected = Vec::new();
+    let mut time_min = i64::MAX;
+    let mut time_max = i64::MIN;
+
+    for path in &args.path {
+        let decoded = decode_mtg_li_flashes(path)?;
+        if !args.force && seen.iter().any(|key| key == &decoded.product_key) {
+            skipped += 1;
+            println!(
+                "mtg-li-ingest skip {} | already in window.json",
+                decoded.product_key
+            );
+            continue;
+        }
+        let records: Vec<FlashRecord> = decoded
+            .flashes
+            .iter()
+            .map(|flash| FlashRecord {
+                time_unix_ms: flash.time_unix_ms,
+                lat: flash.lat,
+                lon: flash.lon,
+                energy: flash.energy,
+                area: flash.area,
+                flash_id: flash.flash_id,
+                flags: flash.flags,
+                duration_ms: flash.duration_ms,
+            })
+            .collect();
+        for record in &records {
+            time_min = time_min.min(record.time_unix_ms);
+            time_max = time_max.max(record.time_unix_ms);
+        }
+        affected.extend(writer.affected_bucket_paths(&records));
+        writer.insert_flashes(&records, 1)?;
+        writer.record_seen_granule(&decoded.product_key)?;
+        seen.push(decoded.product_key.clone());
+        total_products += 1;
+        total_flashes += records.len();
+        println!(
+            "mtg-li-ingest {} | {} flash(es) | coverage {:?}..{:?}",
+            path.display(),
+            records.len(),
+            decoded.time_coverage_start,
+            decoded.time_coverage_end
+        );
+    }
+
+    affected.sort();
+    affected.dedup();
+    if !args.no_validate {
+        for path in &affected {
+            let report = validate_bucket_file(path, ValidateDepth::Structural)?;
+            if !report.errors.is_empty() {
+                return Err(
+                    format!("{} failed validation: {:?}", path.display(), report.errors).into(),
+                );
+            }
+        }
+    }
+
+    println!(
+        "mtg-li-ingest summary | satellite {} | store {} | products {} skipped {} | flashes {} | buckets {} | time [{}..{}]",
+        args.satellite,
+        args.store_root.display(),
+        total_products,
+        skipped,
+        total_flashes,
+        affected.len(),
+        if time_min == i64::MAX { 0 } else { time_min },
+        if time_max == i64::MIN { 0 } else { time_max },
+    );
+    Ok(())
 }
 
 fn now_unix_ms() -> i64 {
@@ -493,6 +710,31 @@ mod tests {
                 assert_eq!(a.hour_back, 0);
             }
             _ => panic!("expected list"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "rw_glm_follow",
+            "density",
+            "--satellite",
+            "goes19",
+            "--minutes",
+            "30",
+            "--nx",
+            "20",
+            "--ny",
+            "10",
+            "--json",
+        ])
+        .expect("density args parse");
+        match cli.command {
+            Command::Density(a) => {
+                assert_eq!(a.satellite, "goes19");
+                assert_eq!(a.minutes, 30);
+                assert_eq!(a.nx, 20);
+                assert_eq!(a.ny, 10);
+                assert!(a.json);
+            }
+            _ => panic!("expected density"),
         }
     }
 

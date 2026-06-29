@@ -157,6 +157,10 @@ impl FieldViewerPanel {
         self.last_texture_ms
     }
 
+    pub fn current_field(&self) -> Option<&FieldData> {
+        self.field.as_ref()
+    }
+
     /// Render the variable picker + field image. Returns at most one event.
     pub fn ui(&mut self, ui: &mut Ui) -> Option<FieldViewerEvent> {
         let mut event = None;
@@ -299,7 +303,7 @@ impl FieldViewerPanel {
                 "rw-ui-field",
                 image,
                 TextureOptions {
-                    magnification: TextureFilter::Nearest,
+                    magnification: TextureFilter::Linear,
                     minification: TextureFilter::Linear,
                     ..Default::default()
                 },

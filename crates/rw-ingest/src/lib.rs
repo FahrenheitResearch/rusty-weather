@@ -73,8 +73,8 @@ pub struct ProductFetch {
 /// The per-model fetch plan: which product file(s) one hour downloads and
 /// which extraction roles each serves. HRRR keeps its historical two-file
 /// pair (pressure = `prs`, surface = `sfc`) in that exact order so its
-/// fetch URLs and extraction sequence stay byte-identical; GFS fetches its
-/// single `pgrb2.0p25` file once and serves both roles from it.
+/// fetch URLs and extraction sequence stay byte-identical; single-file
+/// analysis products fetch once and serve both roles from the same bytes.
 ///
 /// Models that are not ingest-supported (see [`ingest_supported`]) return an
 /// error rather than a plan — callers gate on `ingest_supported` first, so
@@ -82,7 +82,7 @@ pub struct ProductFetch {
 pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, IngestError> {
     use rustwx_core::ModelId;
     match model {
-        ModelId::Hrrr => Ok(vec![
+        ModelId::Hrrr | ModelId::HrrrAk => Ok(vec![
             ProductFetch {
                 product: "prs",
                 surface_source: false,
@@ -96,8 +96,76 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
                 idx_patterns: &[],
             },
         ]),
-        ModelId::Gfs => Ok(vec![ProductFetch {
+        ModelId::Gfs | ModelId::Gdas => Ok(vec![ProductFetch {
             product: "pgrb2.0p25",
+            surface_source: true,
+            pressure_source: true,
+            idx_patterns: &[],
+        }]),
+        ModelId::Gefs => Ok(vec![ProductFetch {
+            product: "pgrb2ap5/gec00",
+            surface_source: true,
+            pressure_source: true,
+            idx_patterns: &[],
+        }]),
+        ModelId::Aigfs => Ok(vec![
+            ProductFetch {
+                product: "pres",
+                surface_source: false,
+                pressure_source: true,
+                idx_patterns: &[],
+            },
+            ProductFetch {
+                product: "sfc",
+                surface_source: true,
+                pressure_source: false,
+                idx_patterns: &[],
+            },
+        ]),
+        ModelId::Aigefs => Ok(vec![
+            ProductFetch {
+                product: "pres/avg",
+                surface_source: false,
+                pressure_source: true,
+                idx_patterns: &[],
+            },
+            ProductFetch {
+                product: "sfc/avg",
+                surface_source: true,
+                pressure_source: false,
+                idx_patterns: &[],
+            },
+        ]),
+        ModelId::Hgefs => Ok(vec![
+            ProductFetch {
+                product: "pres/avg",
+                surface_source: false,
+                pressure_source: true,
+                idx_patterns: &[],
+            },
+            ProductFetch {
+                product: "sfc/avg",
+                surface_source: true,
+                pressure_source: false,
+                idx_patterns: &[],
+            },
+        ]),
+        ModelId::EcmwfOpenData => Ok(vec![ProductFetch {
+            product: "oper",
+            surface_source: true,
+            pressure_source: true,
+            idx_patterns: &[],
+        }]),
+        ModelId::Rap => Ok(vec![ProductFetch {
+            product: "awp130pgrb",
+            surface_source: true,
+            pressure_source: true,
+            // Keep RAP whole-file for now: the shared gridded fetch path
+            // documents old subset attempts missing pressure-level winds.
+            idx_patterns: &[],
+        }]),
+        ModelId::Nam => Ok(vec![ProductFetch {
+            product: "awip3d",
             surface_source: true,
             pressure_source: true,
             idx_patterns: &[],
@@ -263,14 +331,31 @@ mod tests {
     }
 
     #[test]
-    fn hrrr_gfs_and_rrfs_a_are_ingest_supported() {
+    fn fetch_plan_models_are_ingest_supported() {
         use rustwx_core::ModelId;
-        assert!(ingest_supported(ModelId::Hrrr));
-        assert!(ingest_supported(ModelId::Gfs));
-        assert!(ingest_supported(ModelId::RrfsA));
-        // Every other catalog model stays gated until its fetch plan lands.
+        let enabled = [
+            ModelId::Hrrr,
+            ModelId::HrrrAk,
+            ModelId::Rap,
+            ModelId::Gfs,
+            ModelId::Gdas,
+            ModelId::Gefs,
+            ModelId::Aigfs,
+            ModelId::Aigefs,
+            ModelId::Hgefs,
+            ModelId::EcmwfOpenData,
+            ModelId::Nam,
+            ModelId::RrfsA,
+        ];
+        for model in enabled {
+            assert!(
+                ingest_supported(model),
+                "{model} should be ingest-supported"
+            );
+        }
+        // Every other user-facing model stays gated until its fetch plan lands.
         for model in rustwx_models::supported_models() {
-            if !matches!(model, ModelId::Hrrr | ModelId::Gfs | ModelId::RrfsA) {
+            if !enabled.contains(&model) {
                 assert!(
                     !ingest_supported(model),
                     "{model} must stay gated until its fetch plan exists"
@@ -284,9 +369,20 @@ mod tests {
     #[test]
     fn whole_file_models_carry_no_idx_patterns() {
         use rustwx_core::ModelId;
-        // HRRR + GFS must keep their historical whole-file fetch (empty
-        // patterns) so their fetch URLs and bytes stay byte-identical.
-        for model in [ModelId::Hrrr, ModelId::Gfs] {
+        // These plans intentionally keep whole-file fetches (empty patterns).
+        for model in [
+            ModelId::Hrrr,
+            ModelId::HrrrAk,
+            ModelId::Rap,
+            ModelId::Gfs,
+            ModelId::Gdas,
+            ModelId::Gefs,
+            ModelId::Aigfs,
+            ModelId::Aigefs,
+            ModelId::Hgefs,
+            ModelId::EcmwfOpenData,
+            ModelId::Nam,
+        ] {
             for entry in fetch_plan(model).expect("plan") {
                 assert!(
                     entry.idx_patterns.is_empty(),
@@ -295,9 +391,13 @@ mod tests {
                 );
             }
         }
-        // HRRR/GFS have no crop box (native grid IS the store grid).
+        // Whole-file first-wave models have no crop box.
         assert!(model_crop_box(ModelId::Hrrr).is_none());
+        assert!(model_crop_box(ModelId::HrrrAk).is_none());
+        assert!(model_crop_box(ModelId::Rap).is_none());
         assert!(model_crop_box(ModelId::Gfs).is_none());
+        assert!(model_crop_box(ModelId::Gdas).is_none());
+        assert!(model_crop_box(ModelId::Nam).is_none());
     }
 
     #[test]
@@ -442,26 +542,56 @@ mod tests {
     #[test]
     fn fetch_plan_hrrr_is_the_historical_two_file_pair() {
         use rustwx_core::ModelId;
-        let plan = fetch_plan(ModelId::Hrrr).expect("HRRR plan");
-        assert_eq!(plan.len(), 2, "HRRR fetches prs + sfc");
-        // Order is load-bearing: pressure (prs) first, surface (sfc) second,
-        // matching the historical fetch sequence.
-        assert_eq!(plan[0].product, "prs");
-        assert!(plan[0].pressure_source && !plan[0].surface_source);
-        assert_eq!(plan[1].product, "sfc");
-        assert!(plan[1].surface_source && !plan[1].pressure_source);
+        for (model, pressure, surface) in [
+            (ModelId::Hrrr, "prs", "sfc"),
+            (ModelId::HrrrAk, "prs", "sfc"),
+            (ModelId::Aigfs, "pres", "sfc"),
+            (ModelId::Aigefs, "pres/avg", "sfc/avg"),
+            (ModelId::Hgefs, "pres/avg", "sfc/avg"),
+        ] {
+            let plan = fetch_plan(model).expect("split pressure/surface plan");
+            assert_eq!(plan.len(), 2, "{model} fetches pressure + surface");
+            // Order is load-bearing: pressure (prs) first, surface (sfc) second,
+            // matching the historical fetch sequence.
+            assert_eq!(plan[0].product, pressure);
+            assert!(plan[0].pressure_source && !plan[0].surface_source);
+            assert_eq!(plan[1].product, surface);
+            assert!(plan[1].surface_source && !plan[1].pressure_source);
+        }
     }
 
     #[test]
-    fn fetch_plan_gfs_is_one_file_serving_both_roles() {
+    fn fetch_plan_single_file_models_serve_both_roles() {
         use rustwx_core::ModelId;
-        let plan = fetch_plan(ModelId::Gfs).expect("GFS plan");
-        assert_eq!(plan.len(), 1, "GFS fetches a single pgrb2.0p25 file");
-        assert_eq!(plan[0].product, "pgrb2.0p25");
+        for (model, product) in [
+            (ModelId::Rap, "awp130pgrb"),
+            (ModelId::Gfs, "pgrb2.0p25"),
+            (ModelId::Gdas, "pgrb2.0p25"),
+            (ModelId::Gefs, "pgrb2ap5/gec00"),
+            (ModelId::EcmwfOpenData, "oper"),
+            (ModelId::Nam, "awip3d"),
+        ] {
+            let plan = fetch_plan(model).expect("single-file plan");
+            assert_eq!(plan.len(), 1, "{model} fetches one product file");
+            assert_eq!(plan[0].product, product);
+            assert!(
+                plan[0].surface_source && plan[0].pressure_source,
+                "the one {model} file serves both the surface and pressure roles"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_plan_rap_is_one_file_serving_both_roles() {
+        use rustwx_core::ModelId;
+        let plan = fetch_plan(ModelId::Rap).expect("RAP plan");
+        assert_eq!(plan.len(), 1, "RAP fetches a single awp130pgrb file");
+        assert_eq!(plan[0].product, "awp130pgrb");
         assert!(
             plan[0].surface_source && plan[0].pressure_source,
-            "the one GFS file serves both the surface and pressure roles"
+            "the one RAP file serves both the surface and pressure roles"
         );
+        assert!(plan[0].idx_patterns.is_empty());
     }
 
     #[test]
@@ -495,5 +625,86 @@ mod tests {
             aws.grib_url,
             "https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.20260414/18/atmos/gfs.t18z.pgrb2.0p25.f012"
         );
+    }
+
+    #[test]
+    fn added_fetch_plan_tokens_resolve_well_formed_urls() {
+        use rustwx_core::{CycleSpec, ModelId, ModelRunRequest, SourceId};
+        let cycle = CycleSpec::new("20260414", 18).expect("valid cycle");
+        let cases = [
+            (
+                ModelId::HrrrAk,
+                6,
+                "prs",
+                SourceId::Aws,
+                "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.20260414/alaska/hrrr.t18z.wrfprsf06.ak.grib2",
+            ),
+            (
+                ModelId::Rap,
+                6,
+                "awp130pgrb",
+                SourceId::Aws,
+                "https://noaa-rap-pds.s3.amazonaws.com/rap.20260414/rap.t18z.awp130pgrbf06.grib2",
+            ),
+            (
+                ModelId::Gdas,
+                3,
+                "pgrb2.0p25",
+                SourceId::Aws,
+                "https://noaa-gfs-bdp-pds.s3.amazonaws.com/gdas.20260414/18/atmos/gdas.t18z.pgrb2.0p25.f003",
+            ),
+            (
+                ModelId::Gefs,
+                6,
+                "pgrb2ap5/gec00",
+                SourceId::Aws,
+                "https://noaa-gefs-pds.s3.amazonaws.com/gefs.20260414/18/atmos/pgrb2ap5/gec00.t18z.pgrb2a.0p50.f006",
+            ),
+            (
+                ModelId::Aigfs,
+                6,
+                "pres",
+                SourceId::Nomads,
+                "https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigfs/prod/aigfs.20260414/18/model/atmos/grib2/aigfs.t18z.pres.f006.grib2",
+            ),
+            (
+                ModelId::Aigefs,
+                6,
+                "sfc/avg",
+                SourceId::Nomads,
+                "https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigefs/prod/aigefs.20260414/18/ensstat/products/atmos/grib2/aigefs.t18z.sfc.avg.f006.grib2",
+            ),
+            (
+                ModelId::Hgefs,
+                6,
+                "pres/avg",
+                SourceId::Nomads,
+                "https://nomads.ncep.noaa.gov/pub/data/nccf/com/hgefs/prod/hgefs.20260414/18/ensstat/products/atmos/grib2/hgefs.t18z.pres.avg.f006.grib2",
+            ),
+            (
+                ModelId::EcmwfOpenData,
+                6,
+                "oper",
+                SourceId::Ecmwf,
+                "https://data.ecmwf.int/forecasts/20260414/18z/ifs/0p25/oper/20260414180000-6h-oper-fc.grib2",
+            ),
+            (
+                ModelId::Nam,
+                6,
+                "awip3d",
+                SourceId::Aws,
+                "https://noaa-nam-pds.s3.amazonaws.com/nam.20260414/nam.t18z.awip3d06.tm00.grib2",
+            ),
+        ];
+        for (model, hour, product, source, expected) in cases {
+            let request =
+                ModelRunRequest::new(model, cycle.clone(), hour, product).expect("request");
+            let urls = rustwx_models::resolve_urls(&request).expect("urls resolve");
+            let resolved = urls
+                .iter()
+                .find(|url| url.source == source)
+                .unwrap_or_else(|| panic!("{model} {source:?} URL missing"));
+            assert_eq!(resolved.grib_url, expected);
+        }
     }
 }

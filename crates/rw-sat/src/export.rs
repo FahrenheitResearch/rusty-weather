@@ -10,7 +10,7 @@ use image::RgbaImage;
 
 use crate::composite::{GoesAbiRgbCompositeStyle, Rgba, compose_rgb_pixels};
 use crate::palette::band_color;
-use crate::store::read_frame;
+use crate::store::{read_frame, selector_band};
 
 /// False-color one band plane. Rows are stored north-first (GOES y scan
 /// axes descend), so row 0 is already the top of the image.
@@ -48,14 +48,11 @@ pub fn export_frame_png(
     out_path: &Path,
 ) -> Result<PathBuf, Box<dyn Error>> {
     let frame = read_frame(store_root, model, run, hhmm)?;
-    let band = frame.selector["goes"]["band"]
-        .as_u64()
-        .and_then(|value| u8::try_from(value).ok())
-        .ok_or_else(|| {
-            boxed_error(format!(
-                "frame {model}/{run}/t{hhmm:04} selector carries no band"
-            ))
-        })?;
+    let band = selector_band(&frame.selector, &frame.variable).ok_or_else(|| {
+        boxed_error(format!(
+            "frame {model}/{run}/t{hhmm:04} selector carries no band"
+        ))
+    })?;
     let image = render_band_image(&frame.values, frame.nx, frame.ny, band);
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -88,10 +85,8 @@ mod tests {
 
     #[test]
     fn stored_frame_exports_to_png() {
-        let dir = std::env::temp_dir().join(format!(
-            "rw-sat-export-{}-stored-frame",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rw-sat-export-{}-stored-frame", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 

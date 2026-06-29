@@ -7,7 +7,7 @@ use rustwx_sounding::{
     EcapeIntegrationStatus, ExternalEcapeSummary, ExternalEcapeValue, NativeParcelContext,
     NativeSounding, ParcelFlavor, PendingEcapeRequest, SoundingColumn, SoundingMetadata,
     ecape_status, render_full_sounding_png, render_full_sounding_with_ecape_png,
-    require_future_ecape_bridge,
+    render_sharppy_sounding_png, require_future_ecape_bridge,
 };
 
 fn sample_column() -> SoundingColumn {
@@ -201,6 +201,20 @@ fn renders_full_sounding_png_bytes() {
 
     assert!(png.len() > 1000, "png too small: {}", png.len());
     assert_eq!(&png[..4], &[0x89, 0x50, 0x4e, 0x47]);
+}
+
+#[test]
+fn renders_classic_sharppy_layout_png_bytes() {
+    let classic =
+        render_sharppy_sounding_png(&sample_column()).expect("classic render should succeed");
+    let full = render_full_sounding_png(&sample_column()).expect("full render should succeed");
+
+    assert!(classic.len() > 1000, "png too small: {}", classic.len());
+    assert_eq!(&classic[..4], &[0x89, 0x50, 0x4e, 0x47]);
+    assert_ne!(
+        classic, full,
+        "classic SHARPpy layout should not include the rustwx replacement table"
+    );
 }
 
 #[test]

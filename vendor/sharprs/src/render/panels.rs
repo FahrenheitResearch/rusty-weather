@@ -23,9 +23,9 @@ use crate::watch_type::WatchType;
 
 /// Main background color (used when clearing sub-panels).
 #[allow(dead_code)]
-const COL_BG: [u8; 4] = [10, 10, 22, 255];
-const COL_PANEL_BG: [u8; 4] = [18, 18, 32, 255];
-const COL_PANEL_BORDER: [u8; 4] = [60, 60, 85, 255];
+const COL_BG: [u8; 4] = [0, 0, 0, 255];
+const COL_PANEL_BG: [u8; 4] = [0, 0, 0, 255];
+const COL_PANEL_BORDER: [u8; 4] = [215, 215, 215, 255];
 const COL_TEXT: [u8; 4] = [230, 230, 230, 255];
 const COL_TEXT_DIM: [u8; 4] = [140, 140, 150, 255];
 const COL_WHITE: [u8; 4] = [255, 255, 255, 255];

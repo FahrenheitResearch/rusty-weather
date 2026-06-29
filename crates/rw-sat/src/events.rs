@@ -12,12 +12,22 @@ use chrono::{DateTime, Utc};
 #[derive(Debug, Clone)]
 pub enum SatEvent {
     /// One poll cycle started for a band watcher.
-    PollStarted { band: u8, prefixes: Vec<String> },
+    PollStarted {
+        band: u8,
+        prefixes: Vec<String>,
+    },
     /// One poll cycle finished; `new_keys` is the number of previously
     /// unseen objects discovered across the polled prefixes.
-    PollDone { band: u8, new_keys: usize, ms: u128 },
+    PollDone {
+        band: u8,
+        new_keys: usize,
+        ms: u128,
+    },
     /// An object download began (`bytes` is the listed S3 size).
-    DownloadStarted { key: String, bytes: u64 },
+    DownloadStarted {
+        key: String,
+        bytes: u64,
+    },
     DownloadDone {
         key: String,
         bytes: u64,
@@ -42,9 +52,15 @@ pub enum SatEvent {
     },
     /// The next poll was delayed (jitter/backoff included), for UIs that
     /// show a countdown.
-    Sleeping { ms: u64 },
-    Info { message: String },
-    Warning { message: String },
+    Sleeping {
+        ms: u64,
+    },
+    Info {
+        message: String,
+    },
+    Warning {
+        message: String,
+    },
 }
 
 /// The bins' sink: human-readable lines, `Info`/frame/download events to

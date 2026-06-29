@@ -12,6 +12,8 @@
 //! so the in-flight stage (possibly a multi-hundred-MB file fetch)
 //! completes first; the store write is atomic, so no partial files.
 
+use std::time::{Duration, Instant};
+
 use egui::{Color32, ComboBox, RichText, ScrollArea, TextEdit, Ui};
 
 /// What the user wants downloaded — plain data only, host-interpretable.
@@ -228,6 +230,7 @@ pub struct DownloadPanel {
     spec_error: Option<String>,
     availability: Option<AvailabilityView>,
     probing: bool,
+    probe_started_at: Option<Instant>,
     /// A failed probe / latest lookup (transient, cleared on the next
     /// probe or spec change).
     probe_error: Option<String>,
@@ -240,6 +243,7 @@ pub struct DownloadPanel {
 
 /// Cap on retained note lines.
 const MAX_NOTES: usize = 50;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl DownloadPanel {
     pub fn new(spec: DownloadSpec) -> Self {
@@ -253,6 +257,7 @@ impl DownloadPanel {
             spec_error: None,
             availability: None,
             probing: false,
+            probe_started_at: None,
             probe_error: None,
             run_state: DownloadRunState::Idle,
             progress: Vec::new(),
@@ -263,6 +268,15 @@ impl DownloadPanel {
 
     pub fn spec(&self) -> &DownloadSpec {
         &self.spec
+    }
+
+    pub fn set_spec(&mut self, spec: DownloadSpec) {
+        self.spec = spec;
+        self.availability = None;
+        self.probing = false;
+        self.probe_started_at = None;
+        self.probe_error = None;
+        self.spec_error = None;
     }
 
     pub fn set_model_options(&mut self, options: Vec<ModelOption>) {
@@ -290,30 +304,36 @@ impl DownloadPanel {
     /// A spec problem from the host (validation failed); clears the
     /// estimate and disables Start until a valid spec lands.
     pub fn set_spec_error(&mut self, message: String) {
+        self.probing = false;
+        self.probe_started_at = None;
         self.spec_error = Some(message);
         self.estimate = None;
     }
 
     pub fn set_availability(&mut self, availability: AvailabilityView) {
         self.probing = false;
+        self.probe_started_at = None;
         self.probe_error = None;
         self.availability = Some(availability);
     }
 
     pub fn set_probing(&mut self) {
         self.probing = true;
+        self.probe_started_at = Some(Instant::now());
     }
 
     /// A probe / latest lookup failed (shown by the hours row until the
     /// next probe or spec change).
     pub fn set_probing_failed(&mut self, message: String) {
         self.probing = false;
+        self.probe_started_at = None;
         self.probe_error = Some(message);
     }
 
     /// Snap date + cycle to a host-resolved latest run.
     pub fn set_latest(&mut self, date: String, cycle: u8) {
         self.probing = false;
+        self.probe_started_at = None;
         self.probe_error = None;
         self.spec.date = date;
         self.spec.cycle = cycle;
@@ -416,6 +436,7 @@ impl DownloadPanel {
 
     /// Render the panel. Returns the events the host should act on.
     pub fn ui(&mut self, ui: &mut Ui) -> Vec<DownloadEvent> {
+        self.expire_stale_probe();
         let mut events = Vec::new();
         let running = self.is_running();
         let before = self.spec.clone();
@@ -426,6 +447,8 @@ impl DownloadPanel {
 
         if self.spec != before {
             self.availability = None;
+            self.probing = false;
+            self.probe_started_at = None;
             self.probe_error = None;
             events.push(DownloadEvent::SpecChanged(self.spec.clone()));
         }
@@ -498,7 +521,7 @@ impl DownloadPanel {
                 .on_hover_text("probe for the newest available run and snap to it")
                 .clicked()
             {
-                self.probing = true;
+                self.set_probing();
                 events.push(DownloadEvent::LatestRequested(self.spec.clone()));
             }
         });
@@ -519,11 +542,12 @@ impl DownloadPanel {
                 .on_hover_text("probe which hours of this run exist upstream (one HEAD per hour)")
                 .clicked()
             {
-                self.probing = true;
+                self.set_probing();
                 events.push(DownloadEvent::CheckAvailability(self.spec.clone()));
             }
             if self.probing {
                 ui.spinner();
+                ui.ctx().request_repaint_after(Duration::from_millis(250));
             }
         });
         if let Some(message) = &self.probe_error {
@@ -739,6 +763,20 @@ impl DownloadPanel {
                             }
                         });
                 });
+        }
+    }
+
+    fn expire_stale_probe(&mut self) {
+        if self.probing
+            && self
+                .probe_started_at
+                .is_some_and(|started| started.elapsed() >= PROBE_TIMEOUT)
+        {
+            self.probing = false;
+            self.probe_started_at = None;
+            self.probe_error = Some(
+                "availability/latest probe timed out; Download is still available if the run settings are valid".to_owned(),
+            );
         }
     }
 }

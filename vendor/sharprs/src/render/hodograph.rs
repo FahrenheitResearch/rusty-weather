@@ -21,17 +21,17 @@ use crate::render::canvas::{Canvas, FONT_H};
 // Colour palette (SHARPpy dark-background style)
 // =========================================================================
 
-const COL_BG: [u8; 4] = [10, 10, 22, 255];
-const COL_PANEL_BG: [u8; 4] = [18, 18, 32, 255];
-const COL_PANEL_BORDER: [u8; 4] = [50, 50, 70, 255];
+const COL_BG: [u8; 4] = [0, 0, 0, 255];
+const COL_PANEL_BG: [u8; 4] = [0, 0, 0, 255];
+const COL_PANEL_BORDER: [u8; 4] = [215, 215, 215, 255];
 const COL_RING: [u8; 4] = [40, 40, 52, 255]; // subtle gray rings — don't compete with data
-const COL_AXIS: [u8; 4] = [55, 55, 70, 255];
+const COL_AXIS: [u8; 4] = [70, 70, 70, 255];
 const COL_RING_LABEL: [u8; 4] = [130, 130, 155, 255];
 const COL_TEXT: [u8; 4] = [240, 240, 240, 255];
 const COL_TEXT_DIM: [u8; 4] = [150, 150, 165, 255];
 const COL_TEXT_HEADER: [u8; 4] = [100, 190, 255, 255];
 const COL_TEXT_WARN: [u8; 4] = [255, 210, 80, 255];
-const COL_LABEL_BG: [u8; 4] = [10, 10, 22, 180]; // semi-transparent dark box behind labels
+const COL_LABEL_BG: [u8; 4] = [0, 0, 0, 180]; // semi-transparent dark box behind labels
 const COL_DOT_BG: [u8; 4] = [255, 255, 255, 255]; // white dot background for height markers
 const COL_DOT_FG: [u8; 4] = [10, 10, 22, 255]; // dark text inside height dots
 

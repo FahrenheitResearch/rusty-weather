@@ -5730,14 +5730,22 @@ pub fn built_in_models() -> &'static [ModelSummary] {
 /// [`built_in_models`] remains linked (`ModelId` match arms thread through
 /// rustwx-products), but every user-facing enumeration must go through this
 /// list.
-pub fn supported_models() -> [ModelId; 6] {
+pub fn supported_models() -> [ModelId; 14] {
     [
         ModelId::Hrrr,
+        ModelId::HrrrAk,
+        ModelId::Rap,
         ModelId::Gfs,
+        ModelId::Gdas,
+        ModelId::Gefs,
+        ModelId::Aigfs,
+        ModelId::Aigefs,
+        ModelId::Hgefs,
+        ModelId::EcmwfOpenData,
+        ModelId::Nam,
         ModelId::RrfsA,
         ModelId::Refs,
         ModelId::Nbm,
-        ModelId::Rap,
     ]
 }
 

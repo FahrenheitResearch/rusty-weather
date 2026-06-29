@@ -69,6 +69,104 @@ the entire warm sounding is 0.19 ms.
     ds = xr.open_dataset("f000_subset.nc")   # scipy backend reads NetCDF3 natively
     print(ds["temperature_2m"].sel(y=500, x=900).values)
 
+## Satellite imagery (rw-sat)
+
+`rw-sat` ingests live GOES ABI imagery from the NOAA open S3 buckets into the
+same rolling `rw-store` frame layout the native app plays back. It also includes
+public EUMETSAT MTG discovery for Meteosat-12 FCI and Lightning Imager products,
+plus public Himawari-9 AHI segment discovery:
+
+    cargo run --release -p rw-sat --bin rw_sat -- mtg-list \
+        --collection fci-l1c --minutes 360 --count 5
+    cargo run --release -p rw-sat --bin rw_sat -- mtg-list \
+        --collection li-flashes --minutes 360 --count 5
+    cargo run --release -p rw-sat --bin rw_sat -- mtg-download \
+        --collection li-flashes --minutes 360 --dry-run
+    cargo run --release -p rw-sat --bin rw_sat -- himawari-list \
+        --satellite h9 --band 13 --minutes 180 --count 10
+    cargo run --release -p rw-sat --bin rw_sat -- himawari-download \
+        --satellite h9 --band 13 --minutes 180 --cache cache \
+        --manifest-dir out/himawari
+    cargo run --release -p rw-sat --bin rw_sat -- himawari-stage \
+        --manifest out/himawari/<download-manifest>.json \
+        --out-dir out/himawari/raw
+    cargo run --release -p rw-sat --bin rw_sat -- himawari-inspect \
+        --stage-manifest out/himawari/raw/himawari_stage_manifest.json \
+        --out-json out/himawari/raw/himawari_headers.json
+    cargo run --release -p rw-sat --bin rw_sat -- himawari-ingest \
+        --stage-manifest out/himawari/raw/himawari_stage_manifest.json \
+        --store store --value brightness-temp --downsample 2
+    cargo run --release -p rw-sat --bin rw_sat -- mtg-fci-ingest \
+        --path out/mtg/unpacked/<FCI-CHK-BODY>.nc \
+        --channel ir_105 --value brightness-temp \
+        --store store --downsample 8 --png-out out/mtg_fci_ir105.png
+
+Run the combined live-access smoke checker when you want one native executable
+to prove the whole satellite stack on a machine:
+
+    $env:EUMETSAT_CONSUMER_KEY="..."
+    $env:EUMETSAT_CONSUMER_SECRET="..."
+    cargo run --release -p rw-sat-check --bin rusty_sat_check -- \
+        --out-dir out/sat_check --store-root out/sat_check/store \
+        --fci-sample out/mtg/unpacked/<FCI-CHK-BODY>.nc
+
+By default `rusty_sat_check` verifies GOES ABI public listing, Himawari AHI
+download/stage/`rw-store` ingest, MTG FCI discovery, optional FCI
+decode/write/PNG export from `--fci-sample`, and MTG LI download/unpack/`.rwl`
+ingest/density. Add `--download-fci` only when you want to pull the larger FCI
+image package too.
+
+`mtg-list` uses the public EUMETSAT OpenSearch endpoint to list current product
+IDs and construct the collection-aware Data Store download URL. The product byte
+download itself requires EUMETSAT API credentials. Supply them either as
+`--consumer-key`/`--consumer-secret` or environment variables:
+
+    $env:EUMETSAT_CONSUMER_KEY="..."
+    $env:EUMETSAT_CONSUMER_SECRET="..."
+    cargo run --release -p rw-sat --bin rw_sat -- mtg-download \
+        --collection li-flashes --minutes 360 --out-dir out/mtg
+    cargo run --release -p rw-sat --bin rw_sat -- mtg-unpack \
+        --product out/mtg/<downloaded-product>.zip \
+        --out-dir out/mtg/unpacked
+    cargo run --release -p rw-glm --bin rw_glm_follow -- mtg-li-ingest \
+        --path out/mtg/unpacked/<LI-CHK-BODY>.nc \
+        --store-root out/glm_store --satellite mtg-li
+    cargo run --release -p rw-glm --bin rw_glm_follow -- density \
+        --satellite mtg-li --store-root out/glm_store \
+        --start-unix-ms <start> --end-unix-ms <end> \
+        --south=-60 --north=70 --west=-80 --east=80 \
+        --nx 160 --ny 130 --out-json out/mtg_li_density.json
+
+The same collection IDs (`EO:EUM:DAT:0662` for FCI normal-res,
+`EO:EUM:DAT:0691` for LI flashes, plus the other LI collections in
+`rw_sat::mtg`) are the credentialed downloader's inputs. Today this lands the
+official ZIP/SIP product bytes. `mtg-unpack` inspects the package safely,
+extracts decoder-ready NetCDF members by default, and writes a JSON manifest
+with FCI/LI member counts. `rw_glm_follow mtg-li-ingest` reads the unpacked LI
+flash body NetCDF, writes flashes into the same `.rwl` bucket layout as GOES
+GLM under a store slug such as `mtg-li`, and then the existing density command
+can derive `flashes per 1000 km^2 per hour` grids. `rw_sat mtg-fci-ingest`
+reads unpacked FCI L1c body NetCDF chunks, calibrates packed effective
+radiance to radiance, brightness temperature, reflectance, or count, assembles
+contiguous chunks, and writes normal `rw-store` satellite frames.
+
+`himawari-list` uses NOAA's public `noaa-himawari9` bucket to locate the newest
+JMA Himawari AHI full-disk `DAT.bz2` scan segments. That gives Rust-native live
+inventory and URLs for west-Pacific imagery today. `himawari-download` fetches
+the latest complete matching band by default, validates byte counts through the
+same S3 cache path as GOES, and writes a JSON segment manifest for the future
+AHI decoder. Add `--allow-partial` only when a low-latency consumer can handle
+an upload-in-progress scan. `himawari-stage` reads that manifest, validates the
+cached compressed byte counts, and decompresses the Rust-native `bzip2` payloads
+to raw `.DAT` files plus a stage manifest. `himawari-inspect` parses the staged
+Himawari Standard Data headers natively, including byte order, band calibration,
+projection, segment numbering, pixel dimensions, compression flag, and declared
+header/data lengths. `himawari-ingest` assembles contiguous staged segments,
+converts IR bands to brightness temperature by default, and writes the result
+through the generic satellite `rw-store` frame path. A full 10-segment band
+writes a full-disk run; a contiguous subset writes an explicit partial run such
+as `fulldisk_s01_02of10_c13_<date>`.
+
 ## GLM lightning (rw-glm)
 
 Format spec: docs/FORMAT.md §10 ("The `.rwl` flash file")
@@ -105,11 +203,22 @@ Read the store from any consumer (the layer/render side):
 
     let flashes = rw_glm::read_flashes(&root, "goes19", t0, t1, Some(bbox))?; // [t0, t1)
 
-**FOOTGUN — the same `[patch.crates-io] hdf5-reader` pin applies.** `rw-glm`'s
-granule decode goes through the vendored `netcrust` → `hdf5-reader` stack, so a
-project depending on `rw-glm` must add the same patch shown above for `rw-sat`
-(`[patch]` sections do not propagate to dependent workspaces). Without it the
-crates.io `hdf5-reader` fails GOES NetCDF4 reads.
+Derive observed flash density directly from stored satellite events:
+
+    cargo run --release -p rw-glm --bin rw_glm_follow -- density \
+        --satellite goes19 --store-root out/glm_store \
+        --minutes 60 --south 24 --north 50 --west -125 --east -66 \
+        --nx 118 --ny 52 --out-json out/glm_density_conus.json
+
+The density API (`rw_glm::flash_density`) returns both raw counts and normalized
+values in `flashes per 1000 km^2 per hour`. That keeps this product separate
+from model-only lightning proxies: GLM today and MTG Lightning Imager later can
+share the same `.rwl` point-event store and density derivation.
+
+`rw-glm`'s granule decode goes through the vendored `netcrust` -> `hdf5-reader`
+stack. The satellite crates use repo-relative vendored paths, so downstream git
+consumers such as BowEcho can pin a rusty-weather commit without adding their
+own machine-local `[patch.crates-io]` override.
 
 Measured (live G19 follow, 2026-06-11 ~10:00–10:30 UTC, very active CONUS/Gulf
 convection): ~110–145 flashes per ~20 s granule (~250–350 KB each), order

@@ -818,10 +818,9 @@ pub fn estimate(
     // rule so callers can still get a rough estimate.
     let per_hour_download_bytes = match fetch_plan(model).ok().as_deref() {
         Some([_single]) => {
-            // One file covers both roles: the single pgrb2 download.
-            // calibration.prs_file_bytes carries the measured pgrb2 size;
-            // calibration.sfc_file_bytes is 0 for the GFS builtin.
-            calibration.prs_file_bytes + calibration.sfc_file_bytes
+            // One physical file covers both roles. The calibration's
+            // prs_file_bytes slot carries that single-product download size.
+            calibration.prs_file_bytes
         }
         _ => {
             // Two-entry (prs + sfc) or unknown plan: legacy HRRR logic.

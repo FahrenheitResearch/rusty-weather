@@ -68,10 +68,10 @@ const LABELED_PRESSURES: &[f64] = &[1000.0, 850.0, 700.0, 500.0, 300.0, 200.0, 1
 // Color palette (SHARPpy-inspired dark background) — BRIGHTER
 // =========================================================================
 
-const COL_BG: [u8; 4] = [10, 10, 22, 255];
+const COL_BG: [u8; 4] = [0, 0, 0, 255];
 const COL_GRID: [u8; 4] = [38, 42, 52, 175];
 const COL_GRID_ZERO: [u8; 4] = [90, 135, 230, 210];
-const COL_ISOBAR: [u8; 4] = [58, 62, 76, 215];
+const COL_ISOBAR: [u8; 4] = [105, 105, 105, 225];
 const COL_DRY_AD: [u8; 4] = [120, 90, 55, 70];
 const COL_MOIST_AD: [u8; 4] = [35, 120, 70, 62];
 const COL_MIX_RATIO: [u8; 4] = [35, 110, 65, 55];
@@ -89,15 +89,15 @@ const COL_LABEL_LARGE: [u8; 4] = [220, 220, 230, 255]; // for large axis labels
 const COL_TEXT: [u8; 4] = [230, 230, 230, 255];
 const COL_TEXT_DIM: [u8; 4] = [140, 140, 150, 255];
 const COL_TEXT_HEADER: [u8; 4] = [100, 180, 255, 255];
-const COL_PANEL_BG: [u8; 4] = [18, 18, 32, 255];
-const COL_PANEL_BORDER: [u8; 4] = [50, 50, 70, 255];
+const COL_PANEL_BG: [u8; 4] = [0, 0, 0, 255];
+const COL_PANEL_BORDER: [u8; 4] = [215, 215, 215, 255];
 const COL_HEIGHT_MARK: [u8; 4] = [0, 220, 220, 255]; // cyan
 const COL_EFF_INFLOW: [u8; 4] = [0, 220, 220, 220]; // cyan, more opaque
 const COL_OMEGA: [u8; 4] = [40, 200, 40, 200]; // green
 const COL_LCL_LABEL: [u8; 4] = [0, 255, 0, 255]; // brighter green
 const COL_LFC_LABEL: [u8; 4] = [255, 255, 0, 255]; // yellow
 const COL_EL_LABEL: [u8; 4] = [255, 100, 255, 255]; // brighter magenta
-const COL_LABEL_BG: [u8; 4] = [10, 10, 22, 200]; // dark background box
+const COL_LABEL_BG: [u8; 4] = [0, 0, 0, 215]; // dark background box
 
 // Hodograph colors
 const COL_HODO_0_3: [u8; 4] = [255, 60, 60, 255];
@@ -500,12 +500,30 @@ fn draw_text_with_bg_2x(
 ///
 /// Returns `Vec<u8>` of length `width * height * 4`.
 pub fn render_skewt(prof: &Profile, width: u32, height: u32) -> Vec<u8> {
+    render_skewt_impl(prof, width, height, true)
+}
+
+/// Render only the Skew-T plotting region and its in-plot diagnostics.
+pub fn render_skewt_only(prof: &Profile, width: u32, height: u32) -> Vec<u8> {
+    render_skewt_impl(prof, width, height, false)
+}
+
+fn render_skewt_impl(
+    prof: &Profile,
+    width: u32,
+    height: u32,
+    include_side_panels: bool,
+) -> Vec<u8> {
     let mut c = Canvas::new(width, height, COL_BG);
 
     let cape_prof = make_cape_profile(prof);
     let params = compute_skewt_params(prof, &cape_prof);
 
-    let skewt_w = (width as f64 * SKEWT_FRAC) as u32;
+    let skewt_w = if include_side_panels {
+        (width as f64 * SKEWT_FRAC) as u32
+    } else {
+        width
+    };
     let right_x = skewt_w as i32;
     let right_w = width - skewt_w;
 
@@ -568,18 +586,20 @@ pub fn render_skewt(prof: &Profile, width: u32, height: u32) -> Vec<u8> {
 
     // ── Title ───────────────────────────────────────────────────────
     // ── Right panel: hodograph ──────────────────────────────────────
-    let hodo_h = (height as i32) / 2;
-    draw_hodograph(&mut c, prof, &params, right_x, 0, right_w as i32, hodo_h);
+    if include_side_panels && right_w > 0 {
+        let hodo_h = (height as i32) / 2;
+        draw_hodograph(&mut c, prof, &params, right_x, 0, right_w as i32, hodo_h);
 
-    // ── Right panel: text indices ───────────────────────────────────
-    draw_text_panel(
-        &mut c,
-        &params,
-        right_x,
-        hodo_h,
-        right_w as i32,
-        height as i32 - hodo_h,
-    );
+        // ── Right panel: text indices ───────────────────────────────────
+        draw_text_panel(
+            &mut c,
+            &params,
+            right_x,
+            hodo_h,
+            right_w as i32,
+            height as i32 - hodo_h,
+        );
+    }
 
     c.pixels
 }
@@ -618,13 +638,13 @@ fn draw_isobars(c: &mut Canvas, plot_w: f64, plot_h: f64, skewt_w: u32) {
 }
 
 fn draw_pressure_labels(c: &mut Canvas, plot_w: f64, plot_h: f64) {
-    // Draw large labels for the key pressure levels
+    // SHARPpy keeps pressure labels compact so they do not compete with traces.
     for &p in LABELED_PRESSURES {
         let (_, y) = tp_to_screen(0.0, p, plot_w, plot_h);
         let label = format!("{}", p as i32);
-        let tw = text_width_2x(&label);
+        let tw = Canvas::text_width(&label);
         let lx = MARGIN_LEFT as i32 - tw - 4;
-        draw_text_2x(c, &label, lx.max(2), y as i32 - FONT_H, COL_LABEL_LARGE);
+        c.draw_text(&label, lx.max(2), y as i32 - FONT_H / 2, COL_LABEL_LARGE);
     }
     // Draw smaller labels for the remaining standard levels
     for &p in STD_PRESSURES {
@@ -658,9 +678,9 @@ fn draw_temp_labels(c: &mut Canvas, plot_w: f64, plot_h: f64) {
     // Label every 10 degrees from -30 to 40
     for t in (-30..=40).step_by(10) {
         let (x, _) = tp_to_screen(t as f64, P_BOT, plot_w, plot_h);
-        let label = format!("{}C", t);
-        let tw = text_width_2x(&label);
-        draw_text_2x(c, &label, x as i32 - tw / 2, y_bot, COL_LABEL_LARGE);
+        let label = format!("{}", t);
+        let tw = Canvas::text_width(&label);
+        c.draw_text(&label, x as i32 - tw / 2, y_bot, COL_LABEL_LARGE);
     }
 }
 
@@ -1073,7 +1093,10 @@ fn draw_level_labels(
         None => return,
     };
 
-    let label_x = MARGIN_LEFT as i32 + 14;
+    let plot_right = MARGIN_LEFT + plot_w;
+    let label_x = plot_right as i32 - 66;
+    let dash_x0 = plot_right - 78.0;
+    let dash_x1 = plot_right - 12.0;
 
     // LCL — with dark background box, 2x scale
     if sb_pcl.lclpres.is_finite() && sb_pcl.lclpres > P_TOP && sb_pcl.lclpres < P_BOT {
@@ -1088,14 +1111,7 @@ fn draw_level_labels(
             3,
         );
         // Horizontal dash at the level
-        c.draw_thick_line_aa(
-            MARGIN_LEFT + 2.0,
-            y,
-            MARGIN_LEFT + 12.0,
-            y,
-            COL_LCL_LABEL,
-            2,
-        );
+        c.draw_thick_line_aa(dash_x0, y, dash_x1, y, COL_LCL_LABEL, 2);
     }
 
     // LFC — with dark background box, 2x scale
@@ -1110,14 +1126,7 @@ fn draw_level_labels(
             COL_LABEL_BG,
             3,
         );
-        c.draw_thick_line_aa(
-            MARGIN_LEFT + 2.0,
-            y,
-            MARGIN_LEFT + 12.0,
-            y,
-            COL_LFC_LABEL,
-            2,
-        );
+        c.draw_thick_line_aa(dash_x0, y, dash_x1, y, COL_LFC_LABEL, 2);
     }
 
     // EL — with dark background box, 2x scale
@@ -1132,7 +1141,7 @@ fn draw_level_labels(
             COL_LABEL_BG,
             3,
         );
-        c.draw_thick_line_aa(MARGIN_LEFT + 2.0, y, MARGIN_LEFT + 12.0, y, COL_EL_LABEL, 2);
+        c.draw_thick_line_aa(dash_x0, y, dash_x1, y, COL_EL_LABEL, 2);
     }
 }
 

@@ -581,7 +581,6 @@ impl FractalHeap {
         }
         rows
     }
-
 }
 
 /// Decode the offset and length from a managed-object heap ID.

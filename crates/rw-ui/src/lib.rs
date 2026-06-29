@@ -9,8 +9,8 @@
 //!   `run.json`) and open hour/grid files.
 //! - [`StoreWorker`]: a background IO thread so the UI never blocks on file
 //!   reads; plain-data requests/responses over channels.
-//! - [`RunBrowserPanel`], [`FieldViewerPanel`], [`SoundingPanel`],
-//!   [`DownloadPanel`], [`SatellitePanel`], [`SatPlayerPanel`]: the panels
+//! - [`RunBrowserPanel`], [`FieldViewerPanel`], [`PlotViewerPanel`],
+//!   [`SoundingPanel`], [`DownloadPanel`], [`SatellitePanel`], [`SatPlayerPanel`]: the panels
 //!   themselves — pure widgets over host-pushed data (the download and
 //!   satellite panels never touch the network; the host owns the workers
 //!   that resolve their events).
@@ -38,11 +38,11 @@ mod worker;
 
 pub use panels::{
     AvailabilityView, DownloadEvent, DownloadPanel, DownloadRunState, DownloadSpec, DownloadStage,
-    EstimateView, FieldViewerEvent, FieldViewerPanel, HourDoneView, ModelOption, RunBrowserPanel,
-    SatDiskUsage, SatFollowSpec, SatFollowState, SatFrameImage, SatLayerOption, SatPlayerEvent,
-    SatPlayerPanel, SatRunKey, SatRunListing, SatSatelliteOption, SatSectorOption, SatelliteEvent,
-    SatellitePanel, SoundingPanel, StageState, format_bytes, shift_date_yyyymmdd,
-    today_yyyymmdd_utc,
+    EstimateView, FieldViewerEvent, FieldViewerPanel, HourDoneView, ModelOption, PlotViewerPanel,
+    RunBrowserPanel, SatDiskUsage, SatFollowSpec, SatFollowState, SatFrameImage, SatLayerOption,
+    SatPlayerEvent, SatPlayerPanel, SatRunKey, SatRunListing, SatSatelliteOption, SatSectorOption,
+    SatelliteEvent, SatellitePanel, SoundingPanel, SoundingViewState, StageState, format_bytes,
+    shift_date_yyyymmdd, today_yyyymmdd_utc,
 };
 pub use store_view::{HourEntry, ModelEntry, RunEntry, StoreTree, StoreView};
 pub use worker::{

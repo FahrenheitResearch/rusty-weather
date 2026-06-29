@@ -28,7 +28,7 @@ use rw_sat::follow::FollowConfig;
 use rw_sat::goes::{GoesSatellite, parse_goes_abi_filename};
 use rw_sat::palette::{anchor_color, band_anchors};
 use rw_sat::s3::{Sector, bucket_for_satellite, object_filename};
-use rw_sat::store::{frame_file_name, run_day};
+use rw_sat::store::{frame_file_name, run_day, selector_band};
 use rw_sat::window::WindowConfig;
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
@@ -462,15 +462,7 @@ fn load_frame(
         .iter()
         .find(|var| var.kind == "surface2d")
         .ok_or_else(|| format!("{key}/t{hhmm:04} holds no 2D variable"))?;
-    let band = variable.selector["goes"]["band"]
-        .as_u64()
-        .and_then(|value| u8::try_from(value).ok())
-        .or_else(|| {
-            variable
-                .name
-                .strip_prefix("cmi_c")
-                .and_then(|raw| raw.parse::<u8>().ok())
-        })
+    let band = selector_band(&variable.selector, &variable.name)
         .ok_or_else(|| format!("{key}/t{hhmm:04} selector carries no band"))?;
 
     let grid_key = (key.model.clone(), key.run.clone());

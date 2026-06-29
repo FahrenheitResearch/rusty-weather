@@ -47,14 +47,22 @@ fn built_in_models_are_real() {
 }
 
 #[test]
-fn catalog_exposes_exactly_the_six_supported_models() {
+fn catalog_exposes_the_user_facing_supported_models() {
     let expected = [
         ModelId::Hrrr,
+        ModelId::HrrrAk,
+        ModelId::Rap,
         ModelId::Gfs,
+        ModelId::Gdas,
+        ModelId::Gefs,
+        ModelId::Aigfs,
+        ModelId::Aigefs,
+        ModelId::Hgefs,
+        ModelId::EcmwfOpenData,
+        ModelId::Nam,
         ModelId::RrfsA,
         ModelId::Refs,
         ModelId::Nbm,
-        ModelId::Rap,
     ];
     assert_eq!(supported_models(), expected);
 
@@ -884,6 +892,12 @@ fn easy_ncep_model_urls_use_current_operational_layouts() {
     assert_eq!(
         build_grib_url(SourceId::Nomads, &nam).unwrap(),
         "https://nomads.ncep.noaa.gov/pub/data/nccf/com/nam/prod/nam.20260502/nam.t00z.awip1224.tm00.grib2"
+    );
+
+    let nam_3d = ModelRunRequest::new(ModelId::Nam, cycle.clone(), 24, "awip3d").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::Aws, &nam_3d).unwrap(),
+        "https://noaa-nam-pds.s3.amazonaws.com/nam.20260502/nam.t00z.awip3d24.tm00.grib2"
     );
 
     let hiresw =
