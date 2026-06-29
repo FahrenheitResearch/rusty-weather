@@ -110,6 +110,43 @@ pub fn build_natural_projected_map_with_projection(
     bounds: (f64, f64, f64, f64),
     target_ratio: f64,
 ) -> Result<ProjectedMap, Box<dyn std::error::Error>> {
+    build_natural_projected_map_with_projection_inner(
+        lat_deg,
+        lon_deg,
+        projection,
+        bounds,
+        target_ratio,
+        None,
+    )
+}
+
+pub fn build_natural_projected_map_with_projection_and_basemap_padding(
+    lat_deg: &[f32],
+    lon_deg: &[f32],
+    projection: Option<&GridProjection>,
+    bounds: (f64, f64, f64, f64),
+    target_ratio: f64,
+    line_pad_fraction: f64,
+    polygon_pad_fraction: f64,
+) -> Result<ProjectedMap, Box<dyn std::error::Error>> {
+    build_natural_projected_map_with_projection_inner(
+        lat_deg,
+        lon_deg,
+        projection,
+        bounds,
+        target_ratio,
+        Some((line_pad_fraction, polygon_pad_fraction)),
+    )
+}
+
+fn build_natural_projected_map_with_projection_inner(
+    lat_deg: &[f32],
+    lon_deg: &[f32],
+    projection: Option<&GridProjection>,
+    bounds: (f64, f64, f64, f64),
+    target_ratio: f64,
+    basemap_padding: Option<(f64, f64)>,
+) -> Result<ProjectedMap, Box<dyn std::error::Error>> {
     let variant = projection_presentation_variant();
     let presentation_projection = presentation_projection_for_bounds(projection, bounds, variant);
     let frame_bounds = bounds;
@@ -125,6 +162,9 @@ pub fn build_natural_projected_map_with_projection(
         }
     }
     options = options.with_basemap_detail(basemap_detail_for_bounds(frame_bounds));
+    if let Some((line_pad_fraction, polygon_pad_fraction)) = basemap_padding {
+        options = options.with_basemap_padding(line_pad_fraction, polygon_pad_fraction);
+    }
     options.domain.pad_fraction = presentation_pad_fraction_for_bounds(frame_bounds);
     let mut projected =
         rustwx_render::build_projected_map_with_options(lat_deg, lon_deg, &options)?;

@@ -71,6 +71,8 @@ pub struct FieldViewerPanel {
     domain_rotate: Option<DomainRotate>,
     /// Last completed custom-domain selection in grid coordinates.
     domain_selection: Option<DomainSelection>,
+    /// Display viewport in full-grid edge coordinates. None means full field.
+    view: Option<GridViewport>,
     colormap: Colormap,
     /// The production colormap for the loaded field (None = generic ramp).
     cmap: Option<LeveledColormap>,
@@ -101,6 +103,102 @@ struct DomainSelection {
     fx1: f64,
     fy1: f64,
     rotation_deg: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GridViewport {
+    x0: f64,
+    x1: f64,
+    y0: f64,
+    y1: f64,
+}
+
+impl GridViewport {
+    fn full(nx: usize, ny: usize) -> Self {
+        Self {
+            x0: 0.0,
+            x1: nx.max(1) as f64,
+            y0: 0.0,
+            y1: ny.max(1) as f64,
+        }
+    }
+
+    fn from_selection(selection: DomainSelection, nx: usize, ny: usize) -> Option<Self> {
+        if nx == 0 || ny == 0 {
+            return None;
+        }
+        let nx_f = nx as f64;
+        let ny_f = ny as f64;
+        let x0 = (selection.fx0.min(selection.fx1).floor()).clamp(0.0, nx_f - 1.0);
+        let x1 = (selection.fx0.max(selection.fx1).ceil() + 1.0).clamp(1.0, nx_f);
+        let y0 = (selection.fy0.min(selection.fy1).floor()).clamp(0.0, ny_f - 1.0);
+        let y1 = (selection.fy0.max(selection.fy1).ceil() + 1.0).clamp(1.0, ny_f);
+        (x1 - x0 >= 2.0 && y1 - y0 >= 2.0).then_some(Self { x0, x1, y0, y1 })
+    }
+
+    fn padded(self, fraction: f64, nx: usize, ny: usize) -> Self {
+        let pad_x = (self.width_cells() * fraction).max(1.0);
+        let pad_y = (self.height_cells() * fraction).max(1.0);
+        Self {
+            x0: (self.x0 - pad_x).max(0.0),
+            x1: (self.x1 + pad_x).min(nx.max(1) as f64),
+            y0: (self.y0 - pad_y).max(0.0),
+            y1: (self.y1 + pad_y).min(ny.max(1) as f64),
+        }
+    }
+
+    fn width_cells(self) -> f64 {
+        (self.x1 - self.x0).max(1.0)
+    }
+
+    fn height_cells(self) -> f64 {
+        (self.y1 - self.y0).max(1.0)
+    }
+
+    fn texture_uv_rect(self, nx: usize, ny: usize, flip_y: bool) -> Rect {
+        let nx = nx.max(1) as f64;
+        let ny = ny.max(1) as f64;
+        let left = (self.x0 / nx) as f32;
+        let right = (self.x1 / nx) as f32;
+        let (top, bottom) = if flip_y {
+            ((1.0 - self.y1 / ny) as f32, (1.0 - self.y0 / ny) as f32)
+        } else {
+            ((self.y0 / ny) as f32, (self.y1 / ny) as f32)
+        };
+        Rect::from_min_max(pos2(left, top), pos2(right, bottom))
+    }
+
+    fn image_uv_to_grid(self, u: f64, v: f64, nx: usize, ny: usize, flip_y: bool) -> (f64, f64) {
+        let u = u.clamp(0.0, 1.0);
+        let v = v.clamp(0.0, 1.0);
+        let row_edge = if flip_y {
+            self.y1 - v * self.height_cells()
+        } else {
+            self.y0 + v * self.height_cells()
+        };
+        let fx = (self.x0 + u * self.width_cells() - 0.5).clamp(0.0, (nx - 1) as f64);
+        let fy = (row_edge - 0.5).clamp(0.0, (ny - 1) as f64);
+        (fx, fy)
+    }
+
+    fn grid_to_image_uv(
+        self,
+        fx: f64,
+        fy: f64,
+        _nx: usize,
+        _ny: usize,
+        flip_y: bool,
+    ) -> (f64, f64) {
+        let u = ((fx + 0.5 - self.x0) / self.width_cells()).clamp(0.0, 1.0);
+        let row_edge = fy + 0.5;
+        let v = if flip_y {
+            (self.y1 - row_edge) / self.height_cells()
+        } else {
+            (row_edge - self.y0) / self.height_cells()
+        }
+        .clamp(0.0, 1.0);
+        (u, v)
+    }
 }
 
 impl FieldViewerPanel {
@@ -140,6 +238,7 @@ impl FieldViewerPanel {
         self.domain_drag = None;
         self.domain_rotate = None;
         self.domain_selection = None;
+        self.view = None;
         self.cmap = None;
         self.legend_texture = None;
         self.state = LoadState::Idle;
@@ -177,6 +276,17 @@ impl FieldViewerPanel {
     pub fn set_field(&mut self, data: FieldData) {
         if Some(&data.key) != self.wanted_field().as_ref() {
             return;
+        }
+        let dimensions_changed = self
+            .field
+            .as_ref()
+            .is_some_and(|field| field.nx != data.nx || field.ny != data.ny);
+        if dimensions_changed {
+            self.view = None;
+            self.clicked = None;
+            self.domain_selection = None;
+            self.domain_drag = None;
+            self.domain_rotate = None;
         }
         self.field = Some(data);
         self.texture_dirty = true;
@@ -231,6 +341,7 @@ impl FieldViewerPanel {
                 self.domain_drag = None;
                 self.domain_rotate = None;
                 self.domain_selection = None;
+                self.view = None;
                 self.cmap = None;
                 self.legend_texture = None;
                 event = Some(FieldViewerEvent::VarSelected(current));
@@ -242,6 +353,16 @@ impl FieldViewerPanel {
                     None => "all values missing".to_string(),
                 };
                 ui.label(RichText::new(range).small().weak());
+            }
+            if self.view.is_some() {
+                if ui
+                    .button("Reset zoom")
+                    .on_hover_text("return the raw data preview to the full grid")
+                    .clicked()
+                {
+                    self.view = None;
+                }
+                ui.label(RichText::new("zoomed").small().weak());
             }
         });
         match self.field.as_ref().and_then(|field| field.style.as_ref()) {
@@ -344,7 +465,7 @@ impl FieldViewerPanel {
                 "rw-ui-field",
                 image,
                 TextureOptions {
-                    magnification: TextureFilter::Linear,
+                    magnification: TextureFilter::Nearest,
                     minification: TextureFilter::Linear,
                     ..Default::default()
                 },
@@ -358,6 +479,9 @@ impl FieldViewerPanel {
 
         // Fit the grid into the remaining space, preserving aspect; mapped
         // fields reserve a strip on the right for the production legend.
+        let view = self
+            .view
+            .unwrap_or_else(|| GridViewport::full(field.nx, field.ny));
         let legend_width = if self.cmap.is_some() {
             LEGEND_WIDTH
         } else {
@@ -365,12 +489,13 @@ impl FieldViewerPanel {
         };
         let mut avail = ui.available_size();
         avail.x = (avail.x - legend_width).max(1.0);
-        let scale = (avail.x / field.nx as f32)
-            .min(avail.y / field.ny as f32)
-            .max(0.01);
-        let size = Vec2::new(field.nx as f32 * scale, field.ny as f32 * scale);
+        let view_width = view.width_cells() as f32;
+        let view_height = view.height_cells() as f32;
+        let scale = (avail.x / view_width).min(avail.y / view_height).max(0.01);
+        let size = Vec2::new(view_width * scale, view_height * scale);
         let response = ui.add(
             Image::new(texture)
+                .uv(view.texture_uv_rect(field.nx, field.ny, flip_y))
                 .fit_to_exact_size(size)
                 .sense(Sense::click_and_drag()),
         );
@@ -383,7 +508,7 @@ impl FieldViewerPanel {
         let to_grid = |pos: egui::Pos2| -> (f64, f64) {
             let u = ((pos.x - rect.left()) / rect.width()) as f64;
             let v = ((pos.y - rect.top()) / rect.height()) as f64;
-            image_uv_to_grid(u, v, field.nx, field.ny, flip_y)
+            view.image_uv_to_grid(u, v, field.nx, field.ny, flip_y)
         };
 
         if response.clicked() {
@@ -401,7 +526,7 @@ impl FieldViewerPanel {
                 let mut started_rotation = false;
                 if let Some(selection) = self.domain_selection {
                     if let Some((center, corners)) =
-                        domain_selection_geometry(rect, field.nx, field.ny, flip_y, selection)
+                        domain_selection_geometry(rect, field.nx, field.ny, flip_y, view, selection)
                     {
                         if pointer_near_selection_corner(pos, corners) {
                             self.domain_rotate = Some(DomainRotate {
@@ -469,6 +594,10 @@ impl FieldViewerPanel {
                         fy1,
                         rotation_deg: 0.0,
                     };
+                    if let Some(view) = GridViewport::from_selection(selection, field.nx, field.ny)
+                    {
+                        self.view = Some(view.padded(0.12, field.nx, field.ny));
+                    }
                     if let Some(grid) = field.grid.as_ref() {
                         if let Some(bounds) = domain_bounds_from_grid_selection(
                             &grid.lat, &grid.lon, grid.nx, grid.ny, selection,
@@ -485,7 +614,7 @@ impl FieldViewerPanel {
 
         // Marker on the last clicked point (forward display transform).
         if let Some((fx, fy)) = self.clicked {
-            let (u, v) = grid_to_image_uv(fx, fy, field.nx, field.ny, flip_y);
+            let (u, v) = view.grid_to_image_uv(fx, fy, field.nx, field.ny, flip_y);
             let px = rect.left() + u as f32 * rect.width();
             let py = rect.top() + v as f32 * rect.height();
             let painter = ui.painter_at(rect);
@@ -493,7 +622,7 @@ impl FieldViewerPanel {
             painter.circle_stroke(pos2(px, py), 6.5, Stroke::new(1.0, Color32::BLACK));
         }
         if let Some(selection) = self.domain_selection {
-            draw_domain_selection(ui, rect, field.nx, field.ny, flip_y, selection);
+            draw_domain_selection(ui, rect, field.nx, field.ny, flip_y, view, selection);
         }
         if let Some(drag) = self.domain_drag {
             draw_screen_domain_drag(ui, rect, drag);
@@ -632,6 +761,7 @@ fn legend_bar_image(cmap: &LeveledColormap, mode: rustwx_render::LegendMode) -> 
 /// integer coords. `flip_y` must be the SAME flag the texture build used —
 /// this is the inverse of the display transform, so clicks and hovers sample
 /// the grid point actually under the pointer.
+#[cfg(test)]
 fn image_uv_to_grid(u: f64, v: f64, nx: usize, ny: usize, flip_y: bool) -> (f64, f64) {
     let row = if flip_y { 1.0 - v } else { v };
     let fx = (u * nx as f64 - 0.5).clamp(0.0, (nx - 1) as f64);
@@ -641,6 +771,7 @@ fn image_uv_to_grid(u: f64, v: f64, nx: usize, ny: usize, flip_y: bool) -> (f64,
 
 /// Fractional grid coords -> normalized image coords; exact inverse of
 /// [`image_uv_to_grid`] away from the clamped border (marker overlay).
+#[cfg(test)]
 fn grid_to_image_uv(fx: f64, fy: f64, nx: usize, ny: usize, flip_y: bool) -> (f64, f64) {
     let u = (fx + 0.5) / nx as f64;
     let row = (fy + 0.5) / ny as f64;
@@ -669,9 +800,11 @@ fn draw_domain_selection(
     nx: usize,
     ny: usize,
     flip_y: bool,
+    view: GridViewport,
     selection: DomainSelection,
 ) {
-    let Some((_center, corners)) = domain_selection_geometry(image_rect, nx, ny, flip_y, selection)
+    let Some((_center, corners)) =
+        domain_selection_geometry(image_rect, nx, ny, flip_y, view, selection)
     else {
         return;
     };
@@ -683,10 +816,11 @@ fn domain_selection_geometry(
     nx: usize,
     ny: usize,
     flip_y: bool,
+    view: GridViewport,
     selection: DomainSelection,
 ) -> Option<(Pos2, [Pos2; 4])> {
-    let (u0, v0) = grid_to_image_uv(selection.fx0, selection.fy0, nx, ny, flip_y);
-    let (u1, v1) = grid_to_image_uv(selection.fx1, selection.fy1, nx, ny, flip_y);
+    let (u0, v0) = view.grid_to_image_uv(selection.fx0, selection.fy0, nx, ny, flip_y);
+    let (u1, v1) = view.grid_to_image_uv(selection.fx1, selection.fy1, nx, ny, flip_y);
     let p0 = pos2(
         image_rect.left() + u0 as f32 * image_rect.width(),
         image_rect.top() + v0 as f32 * image_rect.height(),
@@ -981,6 +1115,48 @@ mod tests {
     }
 
     #[test]
+    fn viewport_mapping_round_trips_inside_zoomed_region() {
+        let view = GridViewport {
+            x0: 2.0,
+            x1: 6.0,
+            y0: 1.0,
+            y1: 5.0,
+        };
+        for flip_y in [false, true] {
+            for &(u, v) in &[(0.25, 0.25), (0.5, 0.5), (0.8, 0.4)] {
+                let (fx, fy) = view.image_uv_to_grid(u, v, NX, NY, flip_y);
+                let (u2, v2) = view.grid_to_image_uv(fx, fy, NX, NY, flip_y);
+                assert!(
+                    (u2 - u).abs() < 1e-12 && (v2 - v).abs() < 1e-12,
+                    "zoom round trip (flip_y={flip_y}): ({u}, {v}) -> ({fx}, {fy}) -> ({u2}, {v2})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn viewport_uv_rect_uses_grid_edges() {
+        let view = GridViewport {
+            x0: 2.0,
+            x1: 6.0,
+            y0: 1.0,
+            y1: 5.0,
+        };
+        let rect = view.texture_uv_rect(NX, NY, false);
+        assert!((rect.left() - 0.25).abs() < 1.0e-6, "{rect:?}");
+        assert!((rect.right() - 0.75).abs() < 1.0e-6, "{rect:?}");
+        assert!((rect.top() - (1.0 / 6.0)).abs() < 1.0e-6, "{rect:?}");
+        assert!((rect.bottom() - (5.0 / 6.0)).abs() < 1.0e-6, "{rect:?}");
+
+        let flipped = view.texture_uv_rect(NX, NY, true);
+        assert!((flipped.top() - (1.0 / 6.0)).abs() < 1.0e-6, "{flipped:?}");
+        assert!(
+            (flipped.bottom() - (5.0 / 6.0)).abs() < 1.0e-6,
+            "{flipped:?}"
+        );
+    }
+
+    #[test]
     fn uv_mapping_clamps_to_the_grid() {
         for flip_y in [false, true] {
             for &(u, v) in &[(-0.2, -0.2), (1.2, 1.2), (0.0, 1.0), (1.0, 0.0)] {
@@ -1038,6 +1214,7 @@ mod tests {
             10,
             10,
             false,
+            GridViewport::full(10, 10),
             DomainSelection {
                 fx0: 1.0,
                 fy0: 1.0,

@@ -155,6 +155,7 @@ jobs:
           foreach ($bin in $env:TOOL_BINS -split ' ') {
             Copy-Item "target\release\$bin.exe" "package\tools\$bin.exe"
           }
+          Copy-Item assets package\assets -Recurse
           Copy-Item README.md package\README.md
           Copy-Item LICENSE package\LICENSE
           Compress-Archive -Path package\* -DestinationPath "dist\${{ matrix.artifact_name }}.zip" -Force
@@ -169,6 +170,8 @@ jobs:
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
           cp "target/release/${GUI_BIN}" "$app/Contents/MacOS/${GUI_BIN}"
           chmod +x "$app/Contents/MacOS/${GUI_BIN}"
+          cp -R assets "bundle/${APP_NAME}/assets"
+          cp -R assets "$app/Contents/Resources/assets"
           for bin in ${TOOL_BINS}; do
             cp "target/release/${bin}" "bundle/${APP_NAME}/tools/${bin}"
             chmod +x "bundle/${APP_NAME}/tools/${bin}"
@@ -277,6 +280,7 @@ jobs:
             cp "target/release/${bin}" "package/${PACKAGE_NAME}/tools/${bin}"
             chmod +x "package/${PACKAGE_NAME}/tools/${bin}"
           done
+          cp -R assets "package/${PACKAGE_NAME}/assets"
           cp README.md "package/${PACKAGE_NAME}/README.md"
           cp LICENSE "package/${PACKAGE_NAME}/LICENSE"
           tar -C package -czf "dist/${{ matrix.artifact_name }}.tar.gz" "${PACKAGE_NAME}"

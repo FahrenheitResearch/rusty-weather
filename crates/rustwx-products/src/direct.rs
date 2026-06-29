@@ -73,7 +73,8 @@ use projection::{
     reference_latitude_for_projection_variant,
 };
 pub use projection::{
-    build_natural_projected_map_with_projection, build_projected_map,
+    build_natural_projected_map_with_projection,
+    build_natural_projected_map_with_projection_and_basemap_padding, build_projected_map,
     build_projected_map_with_projection, build_requested_projected_map_with_projection,
     model_data_domain_frame_for_projection,
 };

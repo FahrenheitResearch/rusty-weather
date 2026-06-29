@@ -384,6 +384,18 @@ impl ProjectedMapBuildOptions {
         self.basemap = Some(basemap);
         self
     }
+
+    pub fn with_basemap_padding(
+        mut self,
+        line_pad_fraction: f64,
+        polygon_pad_fraction: f64,
+    ) -> Self {
+        let mut basemap = self.basemap.unwrap_or_default();
+        basemap.line_pad_fraction = line_pad_fraction.max(0.0);
+        basemap.polygon_pad_fraction = polygon_pad_fraction.max(0.0);
+        self.basemap = Some(basemap);
+        self
+    }
 }
 
 pub fn build_projected_domain(

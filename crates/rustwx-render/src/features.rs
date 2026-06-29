@@ -77,32 +77,58 @@ pub fn checked_in_us_counties_5m_root() -> Option<PathBuf> {
 }
 
 fn workspace_basemap_subdir(name: &str) -> Option<PathBuf> {
-    for env_name in ["RUSTWX_BASEMAP_DIR", "RUSTWX_ASSETS_DIR"] {
-        if let Some(root) = std::env::var_os(env_name).map(PathBuf::from) {
-            let candidate = if env_name == "RUSTWX_ASSETS_DIR" {
-                root.join("basemap").join(name)
-            } else {
-                root.join(name)
-            };
-            if candidate.exists() {
-                return Some(candidate);
+    basemap_root_candidates()
+        .into_iter()
+        .map(|root| root.join(name))
+        .find(|path| path.exists())
+}
+
+fn basemap_root_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !candidates.iter().any(|existing| existing == &path) {
+            candidates.push(path);
+        }
+    };
+
+    if let Some(root) = std::env::var_os("RUSTWX_BASEMAP_DIR").map(PathBuf::from) {
+        push(root);
+    }
+    if let Some(root) = std::env::var_os("RUSTWX_ASSETS_DIR").map(PathBuf::from) {
+        push(root.join("basemap"));
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for ancestor in parent.ancestors().take(8) {
+                push(ancestor.join("assets").join("basemap"));
+                push(ancestor.join("Resources").join("assets").join("basemap"));
             }
+        }
+    }
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        for ancestor in current_dir.ancestors().take(6) {
+            push(ancestor.join("assets").join("basemap"));
+            push(ancestor.join("basemap"));
         }
     }
 
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .and_then(|path| path.parent())?
-        .to_path_buf();
-    let candidates = [
-        workspace_root.join("assets").join("basemap").join(name),
-        workspace_root
-            .join("rustbox-fresh")
-            .join("assets")
-            .join("basemap")
-            .join(name),
-    ];
-    candidates.into_iter().find(|path| path.exists())
+        .and_then(|path| path.parent())
+        .map(Path::to_path_buf);
+    if let Some(workspace_root) = workspace_root {
+        push(workspace_root.join("assets").join("basemap"));
+        push(
+            workspace_root
+                .join("rustbox-fresh")
+                .join("assets")
+                .join("basemap"),
+        );
+    }
+
+    candidates
 }
 
 /// Load US county boundary line segments (from the 5m TIGER cartographic

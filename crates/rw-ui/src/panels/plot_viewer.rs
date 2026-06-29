@@ -84,6 +84,7 @@ pub struct PlotViewerPanel {
     error: Option<String>,
     last_render_ms: Option<f32>,
     last_upload_ms: Option<f32>,
+    quality_scale: f32,
     active_domain: Option<CustomDomain>,
     saved_domains: Vec<CustomDomain>,
     domain_name_edit: String,
@@ -92,7 +93,10 @@ pub struct PlotViewerPanel {
 
 impl PlotViewerPanel {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            quality_scale: 1.5,
+            ..Self::default()
+        }
     }
 
     pub fn clear(&mut self) {
@@ -162,7 +166,12 @@ impl PlotViewerPanel {
                 .as_ref()
                 .map(|domain| domain_plot_aspect(domain.bounds, domain.rotation_deg))
                 .unwrap_or(16.0 / 9.0);
-            let (width, height) = quantized_plot_size(available, target_aspect);
+            let (display_width, display_height) = quantized_plot_size(available, target_aspect);
+            let (width, height) = render_plot_size(
+                display_width,
+                display_height,
+                self.effective_quality_scale(),
+            );
             let key = PlotCacheKey {
                 field: field.key.clone(),
                 width,
@@ -184,12 +193,15 @@ impl PlotViewerPanel {
                 return;
             };
 
-            ui.add(Image::new(texture).fit_to_exact_size(Vec2::new(width as f32, height as f32)));
+            ui.add(
+                Image::new(texture)
+                    .fit_to_exact_size(Vec2::new(display_width as f32, display_height as f32)),
+            );
             if let Some((render_ms, upload_ms)) = self.last_timings() {
                 ui.label(
                     RichText::new(format!(
-                        "native plot render {:.0} ms / upload {:.0} ms",
-                        render_ms, upload_ms
+                        "native plot render {:.0} ms / upload {:.0} ms / {}x{}",
+                        render_ms, upload_ms, width, height
                     ))
                     .small()
                     .weak(),
@@ -303,7 +315,27 @@ impl PlotViewerPanel {
             } else {
                 ui.label(RichText::new("full model grid").small().weak());
             }
+            ui.separator();
+            ui.label(RichText::new("Resolution").small().strong());
+            for (label, scale) in [("1x", 1.0), ("1.5x", 1.5), ("2x", 2.0), ("3x", 3.0)] {
+                if ui
+                    .selectable_label((self.effective_quality_scale() - scale).abs() < 0.01, label)
+                    .on_hover_text("native plot render scale")
+                    .clicked()
+                {
+                    self.quality_scale = scale;
+                    self.clear();
+                }
+            }
         });
+    }
+
+    fn effective_quality_scale(&self) -> f32 {
+        if self.quality_scale.is_finite() && self.quality_scale >= 0.95 {
+            self.quality_scale.clamp(1.0, 3.0)
+        } else {
+            1.5
+        }
     }
 
     fn save_active_domain(&mut self) {
@@ -421,14 +453,26 @@ fn render_field_plot(
     let bounds = geographic_bounds(&grid_file.lat, &grid_file.lon)
         .ok_or_else(|| "grid has no finite lat/lon bounds".to_string())?;
     let render_bounds = domain.map(|domain| domain.bounds).unwrap_or(bounds);
-    let projected = if domain.is_some() {
-        rustwx_products::direct::build_natural_projected_map_with_projection(
-            &grid_file.lat,
-            &grid_file.lon,
-            grid_file.projection.as_ref(),
-            render_bounds,
-            width as f64 / height as f64,
-        )
+    let projected = if let Some(domain) = domain {
+        if rotated_domain_needs_basemap_padding(domain.rotation_deg) {
+            rustwx_products::direct::build_natural_projected_map_with_projection_and_basemap_padding(
+                &grid_file.lat,
+                &grid_file.lon,
+                grid_file.projection.as_ref(),
+                render_bounds,
+                width as f64 / height as f64,
+                1.35,
+                1.10,
+            )
+        } else {
+            rustwx_products::direct::build_natural_projected_map_with_projection(
+                &grid_file.lat,
+                &grid_file.lon,
+                grid_file.projection.as_ref(),
+                render_bounds,
+                width as f64 / height as f64,
+            )
+        }
     } else {
         rustwx_products::direct::build_projected_map_with_projection(
             &grid_file.lat,
@@ -526,6 +570,13 @@ fn quantized_plot_size(available: Vec2, aspect: f32) -> (u32, u32) {
     )
 }
 
+fn render_plot_size(display_width: u32, display_height: u32, scale: f32) -> (u32, u32) {
+    (
+        quantized_dimension(display_width as f32 * scale, display_width, 4800),
+        quantized_dimension(display_height as f32 * scale, display_height, 3200),
+    )
+}
+
 fn domain_plot_aspect(bounds: (f64, f64, f64, f64), rotation_deg: f64) -> f32 {
     let lat_span = (bounds.3 - bounds.2).abs().max(0.01);
     let center_lat = ((bounds.2 + bounds.3) * 0.5).to_radians();
@@ -536,6 +587,10 @@ fn domain_plot_aspect(bounds: (f64, f64, f64, f64), rotation_deg: f64) -> f32 {
     let rotated_width = width * rotation.cos().abs() + height * rotation.sin().abs();
     let rotated_height = width * rotation.sin().abs() + height * rotation.cos().abs();
     (rotated_width / rotated_height.max(0.01)) as f32
+}
+
+fn rotated_domain_needs_basemap_padding(rotation_deg: f64) -> bool {
+    normalize_rotation(rotation_deg).abs() >= 0.05
 }
 
 fn rgba_to_color_image(image: &RgbaImage) -> ColorImage {
@@ -640,6 +695,13 @@ mod tests {
         assert_eq!(quantized_dimension(10.0, 640, 2200), 640);
         assert_eq!(quantized_dimension(657.0, 640, 2200), 672);
         assert_eq!(quantized_dimension(5000.0, 640, 2200), 2200);
+    }
+
+    #[test]
+    fn render_plot_size_scales_preview_without_unbounded_textures() {
+        assert_eq!(render_plot_size(960, 540, 1.0), (960, 544));
+        assert_eq!(render_plot_size(960, 540, 2.0), (1920, 1088));
+        assert_eq!(render_plot_size(2200, 1400, 3.0), (4800, 3200));
     }
 
     #[test]

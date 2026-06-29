@@ -26,14 +26,13 @@ use crate::worker::{ProfileVar, SoundingData};
 /// `dewpoint_iso` or as `rh_iso`, which is converted to dewpoint on read.
 const PROFILE_VARS: [&str; 4] = ["temperature_iso", "u_iso", "v_iso", "height_iso"];
 
-/// Surface samples the skew-T needs (K, K, m/s, m/s, Pa, gpm).
-const SURFACE_VARS: [&str; 6] = [
+/// Surface samples the skew-T needs directly (K, K, m/s, m/s, Pa).
+const REQUIRED_SURFACE_VARS: [&str; 5] = [
     "temperature_2m",
     "dewpoint_2m",
     "u_10m",
     "v_10m",
     "surface_pressure",
-    "orography",
 ];
 
 /// Below-ground pruning epsilons — same values as the production
@@ -69,7 +68,7 @@ pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, Stri
         .filter(|name| !data.vars.iter().any(|var| var.name == *name))
         .chain((!has_dewpoint && !has_rh).then_some("dewpoint_iso or rh_iso"))
         .chain(
-            SURFACE_VARS
+            REQUIRED_SURFACE_VARS
                 .iter()
                 .copied()
                 .filter(|name| data.surface_value(name).is_none()),
@@ -82,24 +81,29 @@ pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, Stri
         ));
     }
 
-    let surface_value = |name: &str| -> Result<f64, String> {
-        let sample = data.surface_value(name).expect("checked above");
+    let surface_value_optional = |name: &str| -> Result<Option<f64>, String> {
+        let Some(sample) = data.surface_value(name) else {
+            return Ok(None);
+        };
         let value = f64::from(sample.value);
         if !value.is_finite() {
             return Err(format!("surface sample {name} is missing at this point"));
         }
-        Ok(match (name, sample.units.as_str()) {
+        Ok(Some(match (name, sample.units.as_str()) {
             (_, "K") => value - 273.15,
             ("surface_pressure", "Pa") => value / 100.0,
             _ => value,
-        })
+        }))
+    };
+    let surface_value = |name: &str| -> Result<f64, String> {
+        surface_value_optional(name)?
+            .ok_or_else(|| format!("store hour lacks skew-T inputs: {name}"))
     };
     let t2_c = surface_value("temperature_2m")?;
     let td2_c = surface_value("dewpoint_2m")?;
     let u10_ms = surface_value("u_10m")?;
     let v10_ms = surface_value("v_10m")?;
     let psfc_hpa = surface_value("surface_pressure")?;
-    let orog_m = surface_value("orography")?;
 
     let profile = |name: &str| data.vars.iter().find(|var| var.name == name).unwrap();
     let temperature = profile("temperature_iso");
@@ -108,6 +112,9 @@ pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, Stri
     let u_wind = profile("u_iso");
     let v_wind = profile("v_iso");
     let height = profile("height_iso");
+    let orog_m = surface_value_optional("orography")?
+        .or_else(|| estimate_orography_from_profile(psfc_hpa, height))
+        .unwrap_or(0.0);
 
     let mut column = SoundingColumn {
         pressure_hpa: Vec::new(),
@@ -157,6 +164,32 @@ pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, Stri
     }
     column.validate().map_err(|err| err.to_string())?;
     Ok(column)
+}
+
+fn estimate_orography_from_profile(psfc_hpa: f64, height: &ProfileVar) -> Option<f64> {
+    if !psfc_hpa.is_finite() || psfc_hpa <= 0.0 {
+        return None;
+    }
+    height
+        .levels_hpa
+        .iter()
+        .zip(height.values.iter())
+        .filter_map(|(&level_hpa, &height_m)| {
+            let level_hpa = f64::from(level_hpa);
+            let height_m = f64::from(height_m);
+            (level_hpa.is_finite()
+                && level_hpa > 0.0
+                && height_m.is_finite()
+                && level_hpa <= psfc_hpa + PRESSURE_EPSILON_HPA)
+                .then_some((level_hpa, height_m))
+        })
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(level_hpa, height_m)| {
+            // Hypsometric back-extrapolation with a standard-atmosphere scale
+            // height. This is only a surface anchor fallback for global
+            // products that lack an explicit terrain/orography plane.
+            (height_m - 8000.0 * (psfc_hpa / level_hpa).ln()).clamp(-500.0, 9000.0)
+        })
 }
 
 fn level_dewpoint_c(
@@ -385,6 +418,25 @@ mod tests {
 
         // And the bridge accepts it.
         build_native_sounding(&sample_data()).expect("native sounding should build");
+    }
+
+    #[test]
+    fn missing_orography_uses_pressure_height_surface_estimate() {
+        let mut data = sample_data();
+        data.surface.retain(|sample| sample.name != "orography");
+
+        let column = build_sounding_column(&data).expect("column should build without orography");
+
+        assert!(
+            column
+                .metadata
+                .elevation_m
+                .is_some_and(|height| height > 0.0),
+            "expected estimated surface height, got {:?}",
+            column.metadata.elevation_m
+        );
+        assert_eq!(column.pressure_hpa[0], 962.0);
+        build_native_sounding(&data).expect("native sounding should build without orography");
     }
 
     #[test]
