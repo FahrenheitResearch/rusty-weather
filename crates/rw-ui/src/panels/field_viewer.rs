@@ -9,14 +9,25 @@
 //! The texture is cached and re-uploaded only when the loaded field changes;
 //! per-frame work is just drawing the cached textures.
 
+use std::{
+    sync::{
+        Arc,
+        mpsc::{Receiver, TryRecvError, channel},
+    },
+    time::Duration,
+};
+
 use egui::{
     Align2, Color32, ColorImage, ComboBox, FontId, Image, PointerButton, Pos2, Rect, RichText,
-    Sense, Stroke, StrokeKind, TextureFilter, TextureHandle, TextureOptions, Ui, Vec2, pos2,
+    Sense, Slider, Stroke, StrokeKind, TextureFilter, TextureHandle, TextureOptions, Ui, Vec2,
+    pos2,
 };
 use rustwx_render::{
-    LeveledColormap, build_colormap, colorbar_ticks, format_tick, legend_color_at_rel,
-    legend_tick_rel,
+    BasemapDetail, BasemapStyle, LeveledColormap, LineworkRole, Rgba, build_colormap,
+    colorbar_ticks, format_tick, legend_color_at_rel, legend_tick_rel,
+    load_styled_basemap_features_for_detail,
 };
+use rw_store::grid::{GridFile, GridLocator};
 
 use crate::colormap::{Colormap, VIRIDIS, field_to_color_image, field_to_production_color_image};
 use crate::profile_scope;
@@ -29,6 +40,9 @@ const LEGEND_WIDTH: f32 = 78.0;
 /// Vertical resolution of the legend bar texture (one production colorbar
 /// sample per row, matching `draw_vertical_colorbar`'s per-pixel sampling).
 const LEGEND_BAR_RESOLUTION: usize = 512;
+const RAW_BASEMAP_DEFAULT_OPACITY: f32 = 0.9;
+const RAW_BASEMAP_DEFAULT_WIDTH_SCALE: f32 = 1.0;
+const RAW_BASEMAP_GEO_PAD_DEG: f64 = 2.5;
 
 /// What the user did this frame; the host turns these into worker requests.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,9 +66,170 @@ enum LoadState {
     Ready,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum FieldSamplingMode {
+    PixelExact,
+    #[default]
+    Smooth,
+}
+
+impl FieldSamplingMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PixelExact => "Pixel exact",
+            Self::Smooth => "Smooth",
+        }
+    }
+
+    fn texture_options(self) -> TextureOptions {
+        match self {
+            Self::PixelExact => TextureOptions {
+                magnification: TextureFilter::Nearest,
+                minification: TextureFilter::Nearest,
+                ..Default::default()
+            },
+            Self::Smooth => TextureOptions {
+                magnification: TextureFilter::Linear,
+                minification: TextureFilter::Linear,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RawBasemapMode {
+    Off,
+    Global,
+    #[default]
+    Broad,
+    Regional,
+    Counties,
+}
+
+impl RawBasemapMode {
+    const ALL: [Self; 5] = [
+        Self::Off,
+        Self::Global,
+        Self::Broad,
+        Self::Regional,
+        Self::Counties,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Global => "Global",
+            Self::Broad => "Broad",
+            Self::Regional => "Regional",
+            Self::Counties => "Counties",
+        }
+    }
+
+    fn detail(self) -> Option<BasemapDetail> {
+        match self {
+            Self::Off => None,
+            Self::Global => Some(BasemapDetail::Global),
+            Self::Broad => Some(BasemapDetail::Broad),
+            Self::Regional | Self::Counties => Some(BasemapDetail::Regional),
+        }
+    }
+
+    fn includes_role(self, role: LineworkRole) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Global => !matches!(role, LineworkRole::County | LineworkRole::State),
+            Self::Broad | Self::Regional => !matches!(role, LineworkRole::County),
+            Self::Counties => true,
+        }
+    }
+
+    fn max_segment_deg(self, role: LineworkRole) -> f64 {
+        match (self, role) {
+            (Self::Counties, LineworkRole::County) => 0.25,
+            (Self::Regional | Self::Counties, _) => 0.20,
+            (Self::Broad, _) => 0.45,
+            (Self::Global, _) => 0.9,
+            (Self::Off, _) => 1.0,
+        }
+    }
+
+    fn max_located_points(self, role: LineworkRole) -> usize {
+        match (self, role) {
+            (Self::Counties, LineworkRole::County) => 180_000,
+            (Self::Regional | Self::Counties, _) => 120_000,
+            (Self::Broad, _) => 90_000,
+            (Self::Global, _) => 70_000,
+            (Self::Off, _) => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RawBasemapTone {
+    Subtle,
+    #[default]
+    Normal,
+    Strong,
+}
+
+impl RawBasemapTone {
+    const ALL: [Self; 3] = [Self::Subtle, Self::Normal, Self::Strong];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Subtle => "Subtle",
+            Self::Normal => "Normal",
+            Self::Strong => "Strong",
+        }
+    }
+
+    fn alpha_multiplier(self) -> f32 {
+        match self {
+            Self::Subtle => 0.62,
+            Self::Normal => 1.0,
+            Self::Strong => 1.22,
+        }
+    }
+
+    fn rgb_multiplier(self) -> f32 {
+        match self {
+            Self::Subtle => 1.08,
+            Self::Normal => 0.86,
+            Self::Strong => 0.55,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawBasemapCacheKey {
+    grid_hash: String,
+    mode: RawBasemapMode,
+}
+
+struct RawBasemapBuild {
+    key: RawBasemapCacheKey,
+    rx: Receiver<RawBasemapCache>,
+}
+
+#[derive(Debug, Clone)]
+struct RawBasemapCache {
+    key: RawBasemapCacheKey,
+    layers: Vec<RawBasemapLayer>,
+    build_ms: f32,
+    point_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RawBasemapLayer {
+    lines: Vec<Vec<(f64, f64)>>,
+    color: Rgba,
+    width: u32,
+    role: LineworkRole,
+}
+
 /// False-color 2D field inspector. Pure widget over host-pushed data:
 /// `set_hour` -> `set_loading` -> `set_field`/`set_error`, render with `ui`.
-#[derive(Default)]
 pub struct FieldViewerPanel {
     hour: Option<HourKey>,
     vars: Vec<VarInfo>,
@@ -65,9 +240,9 @@ pub struct FieldViewerPanel {
     state: LoadState,
     /// Last clicked point in fractional grid coords (marker overlay).
     clicked: Option<(f64, f64)>,
-    /// In-progress shift + secondary-button custom-domain selection.
+    /// In-progress shift + pointer-button custom-domain selection.
     domain_drag: Option<DomainDrag>,
-    /// In-progress shift + secondary-button corner rotation.
+    /// In-progress shift + pointer-button corner rotation.
     domain_rotate: Option<DomainRotate>,
     /// Last completed custom-domain selection in grid coordinates.
     domain_selection: Option<DomainSelection>,
@@ -77,20 +252,59 @@ pub struct FieldViewerPanel {
     /// The production colormap for the loaded field (None = generic ramp).
     cmap: Option<LeveledColormap>,
     legend_texture: Option<TextureHandle>,
+    sampling_mode: FieldSamplingMode,
+    basemap_mode: RawBasemapMode,
+    basemap_tone: RawBasemapTone,
+    basemap_opacity: f32,
+    basemap_width_scale: f32,
+    basemap_cache: Option<RawBasemapCache>,
+    basemap_pending: Option<RawBasemapBuild>,
     /// Wall time of the last colormap + texture-upload pass, for the
     /// always-on stats strip.
     last_texture_ms: Option<f32>,
+}
+
+impl Default for FieldViewerPanel {
+    fn default() -> Self {
+        Self {
+            hour: None,
+            vars: Vec::new(),
+            selected_var: None,
+            field: None,
+            texture: None,
+            texture_dirty: false,
+            state: LoadState::Idle,
+            clicked: None,
+            domain_drag: None,
+            domain_rotate: None,
+            domain_selection: None,
+            view: None,
+            colormap: VIRIDIS,
+            cmap: None,
+            legend_texture: None,
+            sampling_mode: FieldSamplingMode::default(),
+            basemap_mode: RawBasemapMode::default(),
+            basemap_tone: RawBasemapTone::default(),
+            basemap_opacity: RAW_BASEMAP_DEFAULT_OPACITY,
+            basemap_width_scale: RAW_BASEMAP_DEFAULT_WIDTH_SCALE,
+            basemap_cache: None,
+            basemap_pending: None,
+            last_texture_ms: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct DomainDrag {
     start: Pos2,
     current: Pos2,
+    button: PointerButton,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct DomainRotate {
     center: Pos2,
+    button: PointerButton,
     start_pointer_angle_deg: f64,
     start_rotation_deg: f64,
     current_rotation_deg: f64,
@@ -123,36 +337,69 @@ impl GridViewport {
         }
     }
 
-    fn from_selection(selection: DomainSelection, nx: usize, ny: usize) -> Option<Self> {
-        if nx == 0 || ny == 0 {
-            return None;
-        }
-        let nx_f = nx as f64;
-        let ny_f = ny as f64;
-        let x0 = (selection.fx0.min(selection.fx1).floor()).clamp(0.0, nx_f - 1.0);
-        let x1 = (selection.fx0.max(selection.fx1).ceil() + 1.0).clamp(1.0, nx_f);
-        let y0 = (selection.fy0.min(selection.fy1).floor()).clamp(0.0, ny_f - 1.0);
-        let y1 = (selection.fy0.max(selection.fy1).ceil() + 1.0).clamp(1.0, ny_f);
-        (x1 - x0 >= 2.0 && y1 - y0 >= 2.0).then_some(Self { x0, x1, y0, y1 })
-    }
-
-    fn padded(self, fraction: f64, nx: usize, ny: usize) -> Self {
-        let pad_x = (self.width_cells() * fraction).max(1.0);
-        let pad_y = (self.height_cells() * fraction).max(1.0);
-        Self {
-            x0: (self.x0 - pad_x).max(0.0),
-            x1: (self.x1 + pad_x).min(nx.max(1) as f64),
-            y0: (self.y0 - pad_y).max(0.0),
-            y1: (self.y1 + pad_y).min(ny.max(1) as f64),
-        }
-    }
-
     fn width_cells(self) -> f64 {
         (self.x1 - self.x0).max(1.0)
     }
 
     fn height_cells(self) -> f64 {
         (self.y1 - self.y0).max(1.0)
+    }
+
+    fn is_full(self, nx: usize, ny: usize) -> bool {
+        self.x0 <= 1.0e-6
+            && self.y0 <= 1.0e-6
+            && (self.x1 - nx.max(1) as f64).abs() <= 1.0e-6
+            && (self.y1 - ny.max(1) as f64).abs() <= 1.0e-6
+    }
+
+    fn clamped(self, nx: usize, ny: usize) -> Self {
+        let full_w = nx.max(1) as f64;
+        let full_h = ny.max(1) as f64;
+        let width = self.width_cells().min(full_w);
+        let height = self.height_cells().min(full_h);
+        let x0 = self.x0.clamp(0.0, (full_w - width).max(0.0));
+        let y0 = self.y0.clamp(0.0, (full_h - height).max(0.0));
+        Self {
+            x0,
+            x1: x0 + width,
+            y0,
+            y1: y0 + height,
+        }
+    }
+
+    fn translated(self, dx: f64, dy: f64, nx: usize, ny: usize) -> Self {
+        Self {
+            x0: self.x0 + dx,
+            x1: self.x1 + dx,
+            y0: self.y0 + dy,
+            y1: self.y1 + dy,
+        }
+        .clamped(nx, ny)
+    }
+
+    fn zoomed_at(self, anchor_fx: f64, anchor_fy: f64, factor: f64, nx: usize, ny: usize) -> Self {
+        let full_w = nx.max(1) as f64;
+        let full_h = ny.max(1) as f64;
+        let min_w = full_w.min(8.0);
+        let min_h = full_h.min(8.0);
+        let factor = factor.clamp(0.2, 5.0);
+        let old_w = self.width_cells();
+        let old_h = self.height_cells();
+        let new_w = (old_w / factor).clamp(min_w, full_w);
+        let new_h = (old_h / factor).clamp(min_h, full_h);
+        let anchor_x = (anchor_fx + 0.5).clamp(0.0, full_w);
+        let anchor_y = (anchor_fy + 0.5).clamp(0.0, full_h);
+        let rel_x = ((anchor_x - self.x0) / old_w).clamp(0.0, 1.0);
+        let rel_y = ((anchor_y - self.y0) / old_h).clamp(0.0, 1.0);
+        let x0 = anchor_x - rel_x * new_w;
+        let y0 = anchor_y - rel_y * new_h;
+        Self {
+            x0,
+            x1: x0 + new_w,
+            y0,
+            y1: y0 + new_h,
+        }
+        .clamped(nx, ny)
     }
 
     fn texture_uv_rect(self, nx: usize, ny: usize, flip_y: bool) -> Rect {
@@ -199,12 +446,28 @@ impl GridViewport {
         .clamp(0.0, 1.0);
         (u, v)
     }
+
+    fn grid_to_image_uv_unclamped(self, fx: f64, fy: f64, flip_y: bool) -> (f64, f64) {
+        let u = (fx + 0.5 - self.x0) / self.width_cells();
+        let row_edge = fy + 0.5;
+        let v = if flip_y {
+            (self.y1 - row_edge) / self.height_cells()
+        } else {
+            (row_edge - self.y0) / self.height_cells()
+        };
+        (u, v)
+    }
 }
 
 impl FieldViewerPanel {
     pub fn new() -> Self {
         Self {
             colormap: VIRIDIS,
+            sampling_mode: FieldSamplingMode::default(),
+            basemap_mode: RawBasemapMode::default(),
+            basemap_tone: RawBasemapTone::default(),
+            basemap_opacity: RAW_BASEMAP_DEFAULT_OPACITY,
+            basemap_width_scale: RAW_BASEMAP_DEFAULT_WIDTH_SCALE,
             ..Self::default()
         }
     }
@@ -241,6 +504,7 @@ impl FieldViewerPanel {
         self.view = None;
         self.cmap = None;
         self.legend_texture = None;
+        self.basemap_pending = None;
         self.state = LoadState::Idle;
     }
 
@@ -287,6 +551,7 @@ impl FieldViewerPanel {
             self.domain_selection = None;
             self.domain_drag = None;
             self.domain_rotate = None;
+            self.basemap_pending = None;
         }
         self.field = Some(data);
         self.texture_dirty = true;
@@ -296,6 +561,13 @@ impl FieldViewerPanel {
     pub fn clear(&mut self) {
         *self = Self {
             colormap: self.colormap,
+            sampling_mode: self.sampling_mode,
+            basemap_mode: self.basemap_mode,
+            basemap_tone: self.basemap_tone,
+            basemap_opacity: self.basemap_opacity,
+            basemap_width_scale: self.basemap_width_scale,
+            basemap_cache: self.basemap_cache.clone(),
+            basemap_pending: None,
             ..Self::default()
         };
     }
@@ -312,6 +584,7 @@ impl FieldViewerPanel {
     /// Render the variable picker + field image. Returns at most one event.
     pub fn ui(&mut self, ui: &mut Ui) -> Option<FieldViewerEvent> {
         let mut event = None;
+        self.poll_raw_basemap_build(ui);
 
         ui.horizontal_wrapped(|ui| {
             let previous = self.selected_var.clone();
@@ -344,6 +617,7 @@ impl FieldViewerPanel {
                 self.view = None;
                 self.cmap = None;
                 self.legend_texture = None;
+                self.basemap_pending = None;
                 event = Some(FieldViewerEvent::VarSelected(current));
             }
 
@@ -386,6 +660,7 @@ impl FieldViewerPanel {
                 );
             }
         }
+        self.draw_display_controls(ui);
         ui.separator();
 
         match &self.state {
@@ -464,11 +739,7 @@ impl FieldViewerPanel {
             self.texture = Some(ui.ctx().load_texture(
                 "rw-ui-field",
                 image,
-                TextureOptions {
-                    magnification: TextureFilter::Nearest,
-                    minification: TextureFilter::Linear,
-                    ..Default::default()
-                },
+                self.sampling_mode.texture_options(),
             ));
             self.last_texture_ms = Some(texture_started.elapsed().as_secs_f32() * 1000.0);
             self.texture_dirty = false;
@@ -501,6 +772,42 @@ impl FieldViewerPanel {
         );
         let rect = response.rect;
 
+        let basemap_request = field.grid.as_ref().and_then(|grid| {
+            raw_basemap_cache_key(grid, self.basemap_mode).map(|key| (Arc::clone(grid), key))
+        });
+        if let Some((grid, key)) = basemap_request.as_ref() {
+            let cache_ready = self
+                .basemap_cache
+                .as_ref()
+                .is_some_and(|cache| cache.key == *key);
+            let pending_ready = self
+                .basemap_pending
+                .as_ref()
+                .is_some_and(|pending| pending.key == *key);
+            if !cache_ready && !pending_ready {
+                self.basemap_pending = spawn_raw_basemap_build(Arc::clone(grid), key.clone());
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            }
+        }
+        if let (Some(cache), Some((_, key))) =
+            (self.basemap_cache.as_ref(), basemap_request.as_ref())
+        {
+            if cache.key == *key {
+                draw_raw_basemap(
+                    ui,
+                    rect,
+                    field.nx,
+                    field.ny,
+                    flip_y,
+                    view,
+                    cache,
+                    self.basemap_tone,
+                    self.basemap_opacity,
+                    self.basemap_width_scale,
+                );
+            }
+        }
+
         // Pointer position -> fractional grid coordinates (texel centers at
         // integer coords). MUST invert the exact display transform above:
         // same `flip_y`, or clicks/hovers would sample a north/south-mirrored
@@ -511,7 +818,61 @@ impl FieldViewerPanel {
             view.image_uv_to_grid(u, v, field.nx, field.ny, flip_y)
         };
 
-        if response.clicked() {
+        let shift_down = ui.input(|input| input.modifiers.shift);
+        let alt_down = ui.input(|input| input.modifiers.alt);
+
+        if response.hovered() {
+            let scroll_delta = ui.input(|input| input.smooth_scroll_delta().y);
+            let zoom_delta = ui.input(|input| input.zoom_delta());
+            if scroll_delta.abs() > 0.01 || (zoom_delta - 1.0).abs() > 0.001 {
+                let factor = if (zoom_delta - 1.0).abs() > 0.001 {
+                    f64::from(zoom_delta)
+                } else {
+                    f64::from(scroll_delta * 0.004).exp()
+                };
+                if let Some(pos) = response.hover_pos() {
+                    let (fx, fy) = to_grid(pos);
+                    self.view = viewport_option(
+                        view.zoomed_at(fx, fy, factor, field.nx, field.ny),
+                        field.nx,
+                        field.ny,
+                    );
+                    ui.input_mut(|input| input.smooth_scroll_delta = Vec2::ZERO);
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+
+        if response.dragged_by(PointerButton::Primary)
+            && !shift_down
+            && !alt_down
+            && self.domain_drag.is_none()
+            && self.domain_rotate.is_none()
+        {
+            let delta = ui.input(|input| input.pointer.delta());
+            if delta != Vec2::ZERO {
+                let dx =
+                    -f64::from(delta.x) / f64::from(rect.width().max(1.0)) * view.width_cells();
+                let dy = if flip_y {
+                    f64::from(delta.y) / f64::from(rect.height().max(1.0)) * view.height_cells()
+                } else {
+                    -f64::from(delta.y) / f64::from(rect.height().max(1.0)) * view.height_cells()
+                };
+                self.view = viewport_option(
+                    view.translated(dx, dy, field.nx, field.ny),
+                    field.nx,
+                    field.ny,
+                );
+                ui.ctx().request_repaint();
+            }
+        }
+
+        if response.double_clicked_by(PointerButton::Primary) && !shift_down && !alt_down {
+            self.view = None;
+            ui.ctx().request_repaint();
+        }
+
+        if response.clicked_by(PointerButton::Primary) && alt_down {
             if let Some(pos) = response.interact_pointer_pos() {
                 let (fx, fy) = to_grid(pos);
                 self.clicked = Some((fx, fy));
@@ -519,8 +880,14 @@ impl FieldViewerPanel {
             }
         }
 
-        let shift_down = ui.input(|input| input.modifiers.shift);
-        if response.drag_started_by(PointerButton::Secondary) && shift_down {
+        let domain_button = if shift_down && response.drag_started_by(PointerButton::Primary) {
+            Some(PointerButton::Primary)
+        } else if shift_down && response.drag_started_by(PointerButton::Secondary) {
+            Some(PointerButton::Secondary)
+        } else {
+            None
+        };
+        if let Some(button) = domain_button {
             if let Some(pos) = response.interact_pointer_pos() {
                 let pos = clamp_pos_to_rect(pos, rect);
                 let mut started_rotation = false;
@@ -531,6 +898,7 @@ impl FieldViewerPanel {
                         if pointer_near_selection_corner(pos, corners) {
                             self.domain_rotate = Some(DomainRotate {
                                 center,
+                                button,
                                 start_pointer_angle_deg: pointer_angle_deg(center, pos),
                                 start_rotation_deg: selection.rotation_deg,
                                 current_rotation_deg: selection.rotation_deg,
@@ -544,6 +912,7 @@ impl FieldViewerPanel {
                     self.domain_drag = Some(DomainDrag {
                         start: pos,
                         current: pos,
+                        button,
                     });
                     self.domain_rotate = None;
                 }
@@ -551,7 +920,7 @@ impl FieldViewerPanel {
         }
         let mut finished_rotation = None;
         if let Some(rotate) = self.domain_rotate.as_mut() {
-            if response.dragged_by(PointerButton::Secondary) {
+            if response.dragged_by(rotate.button) {
                 if let Some(pos) = response.interact_pointer_pos() {
                     let rotation_deg = normalize_rotation(
                         rotate.start_rotation_deg + pointer_angle_deg(rotate.center, pos)
@@ -563,7 +932,7 @@ impl FieldViewerPanel {
                     }
                 }
             }
-            if response.drag_stopped_by(PointerButton::Secondary) {
+            if response.drag_stopped_by(rotate.button) {
                 finished_rotation = Some(rotate.current_rotation_deg);
             }
         }
@@ -575,12 +944,12 @@ impl FieldViewerPanel {
             event = Some(FieldViewerEvent::DomainRotationChanged { rotation_deg });
         }
         if let Some(drag) = self.domain_drag.as_mut() {
-            if response.dragged_by(PointerButton::Secondary) {
+            if response.dragged_by(drag.button) {
                 if let Some(pos) = response.interact_pointer_pos() {
                     drag.current = clamp_pos_to_rect(pos, rect);
                 }
             }
-            if response.drag_stopped_by(PointerButton::Secondary) {
+            if response.drag_stopped_by(drag.button) {
                 let start = drag.start;
                 let current = drag.current;
                 self.domain_drag = None;
@@ -594,10 +963,6 @@ impl FieldViewerPanel {
                         fy1,
                         rotation_deg: 0.0,
                     };
-                    if let Some(view) = GridViewport::from_selection(selection, field.nx, field.ny)
-                    {
-                        self.view = Some(view.padded(0.12, field.nx, field.ny));
-                    }
                     if let Some(grid) = field.grid.as_ref() {
                         if let Some(bounds) = domain_bounds_from_grid_selection(
                             &grid.lat, &grid.lon, grid.nx, grid.ny, selection,
@@ -665,6 +1030,109 @@ impl FieldViewerPanel {
         }
 
         event
+    }
+
+    fn poll_raw_basemap_build(&mut self, ui: &Ui) {
+        let Some(pending) = self.basemap_pending.take() else {
+            return;
+        };
+        match pending.rx.try_recv() {
+            Ok(cache) => {
+                if cache.key == pending.key {
+                    self.basemap_cache = Some(cache);
+                }
+                ui.ctx().request_repaint();
+            }
+            Err(TryRecvError::Empty) => {
+                self.basemap_pending = Some(pending);
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            }
+            Err(TryRecvError::Disconnected) => {
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+
+    fn draw_display_controls(&mut self, ui: &mut Ui) {
+        let previous_sampling = self.sampling_mode;
+        let previous_basemap = self.basemap_mode;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Display").small().strong());
+
+            ComboBox::from_id_salt("rw-ui-field-sampling")
+                .selected_text(self.sampling_mode.label())
+                .width(112.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.sampling_mode,
+                        FieldSamplingMode::Smooth,
+                        FieldSamplingMode::Smooth.label(),
+                    );
+                    ui.selectable_value(
+                        &mut self.sampling_mode,
+                        FieldSamplingMode::PixelExact,
+                        FieldSamplingMode::PixelExact.label(),
+                    );
+                });
+
+            ComboBox::from_id_salt("rw-ui-field-basemap")
+                .selected_text(self.basemap_mode.label())
+                .width(104.0)
+                .show_ui(ui, |ui| {
+                    for mode in RawBasemapMode::ALL {
+                        ui.selectable_value(&mut self.basemap_mode, mode, mode.label());
+                    }
+                });
+
+            ComboBox::from_id_salt("rw-ui-field-basemap-tone")
+                .selected_text(self.basemap_tone.label())
+                .width(90.0)
+                .show_ui(ui, |ui| {
+                    for tone in RawBasemapTone::ALL {
+                        ui.selectable_value(&mut self.basemap_tone, tone, tone.label());
+                    }
+                });
+
+            ui.add(
+                Slider::new(&mut self.basemap_opacity, 0.05..=1.0)
+                    .text("Opacity")
+                    .fixed_decimals(2),
+            );
+            ui.add(
+                Slider::new(&mut self.basemap_width_scale, 0.5..=2.5)
+                    .text("Line")
+                    .fixed_decimals(2),
+            );
+
+            if let Some(pending) = &self.basemap_pending {
+                ui.label(
+                    RichText::new(format!("basemap {} building", pending.key.mode.label()))
+                        .small()
+                        .weak(),
+                );
+            } else if let Some(cache) = &self.basemap_cache {
+                ui.label(
+                    RichText::new(format!(
+                        "basemap {:.0} ms · {} pts",
+                        cache.build_ms, cache.point_count
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+        });
+
+        self.basemap_opacity = self.basemap_opacity.clamp(0.05, 1.0);
+        self.basemap_width_scale = self.basemap_width_scale.clamp(0.5, 2.5);
+        if self.sampling_mode != previous_sampling {
+            self.texture = None;
+            self.texture_dirty = self.field.is_some();
+        }
+        if self.basemap_mode != previous_basemap {
+            self.basemap_cache = None;
+            self.basemap_pending = None;
+        }
     }
 
     /// Draw the vertical production colorbar to the right of `image_rect`:
@@ -756,6 +1224,342 @@ fn legend_bar_image(cmap: &LeveledColormap, mode: rustwx_render::LegendMode) -> 
     ColorImage::new([1, LEGEND_BAR_RESOLUTION], pixels)
 }
 
+fn raw_basemap_cache_key(grid: &GridFile, mode: RawBasemapMode) -> Option<RawBasemapCacheKey> {
+    if mode == RawBasemapMode::Off
+        || grid.nx == 0
+        || grid.ny == 0
+        || grid.lat.len() != grid.nx * grid.ny
+        || grid.lon.len() != grid.nx * grid.ny
+    {
+        return None;
+    }
+    Some(RawBasemapCacheKey {
+        grid_hash: grid.hash.clone(),
+        mode,
+    })
+}
+
+fn spawn_raw_basemap_build(
+    grid: Arc<GridFile>,
+    key: RawBasemapCacheKey,
+) -> Option<RawBasemapBuild> {
+    let (tx, rx) = channel();
+    let worker_key = key.clone();
+    std::thread::Builder::new()
+        .name("rw-ui-raw-basemap".to_string())
+        .spawn(move || {
+            let cache = build_raw_basemap_cache(&grid, worker_key);
+            let _ = tx.send(cache);
+        })
+        .ok()?;
+    Some(RawBasemapBuild { key, rx })
+}
+
+fn build_raw_basemap_cache(grid: &GridFile, key: RawBasemapCacheKey) -> RawBasemapCache {
+    let started = std::time::Instant::now();
+    let Some(detail) = key.mode.detail() else {
+        return RawBasemapCache {
+            key,
+            layers: Vec::new(),
+            build_ms: 0.0,
+            point_count: 0,
+        };
+    };
+    let Some(bounds) = GridGeoBounds::from_grid(grid) else {
+        return RawBasemapCache {
+            key,
+            layers: Vec::new(),
+            build_ms: started.elapsed().as_secs_f32() * 1000.0,
+            point_count: 0,
+        };
+    };
+
+    let locator = GridLocator::build(grid);
+    let mut layers = Vec::new();
+    let mut point_count = 0usize;
+    for layer in load_styled_basemap_features_for_detail(BasemapStyle::Filled, detail) {
+        if !key.mode.includes_role(layer.role) {
+            continue;
+        }
+        let (lines, points) =
+            locate_raw_basemap_lines(&layer.lines, &locator, bounds, key.mode, layer.role, grid);
+        point_count += points;
+        if !lines.is_empty() {
+            layers.push(RawBasemapLayer {
+                lines,
+                color: layer.color,
+                width: layer.width,
+                role: layer.role,
+            });
+        }
+    }
+
+    RawBasemapCache {
+        key,
+        layers,
+        build_ms: started.elapsed().as_secs_f32() * 1000.0,
+        point_count,
+    }
+}
+
+fn locate_raw_basemap_lines(
+    lines: &[Vec<(f64, f64)>],
+    locator: &GridLocator,
+    bounds: GridGeoBounds,
+    mode: RawBasemapMode,
+    role: LineworkRole,
+    grid: &GridFile,
+) -> (Vec<Vec<(f64, f64)>>, usize) {
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+    let mut point_count = 0usize;
+    let max_points = mode.max_located_points(role);
+    let max_segment_deg = mode.max_segment_deg(role);
+    let min_step2 = min_raw_basemap_step_cells2(mode, role);
+    let split_distance = (grid.nx.max(grid.ny) as f64 * 0.35).max(96.0);
+
+    'lines: for line in lines {
+        finish_raw_basemap_line(&mut out, &mut current);
+        if line.len() < 2 {
+            continue;
+        }
+
+        for segment in line.windows(2) {
+            let (lon0, lat0) = segment[0];
+            let (lon1, lat1) = segment[1];
+            if ![lon0, lat0, lon1, lat1]
+                .iter()
+                .all(|value| value.is_finite())
+            {
+                finish_raw_basemap_line(&mut out, &mut current);
+                continue;
+            }
+
+            let dlon = shortest_lon_delta(lon0, lon1);
+            let dlat = lat1 - lat0;
+            let steps =
+                ((dlat.abs().max(dlon.abs()) / max_segment_deg).ceil() as usize).clamp(1, 96);
+            for step in 0..=steps {
+                if step == 0 && !current.is_empty() {
+                    continue;
+                }
+                let t = step as f64 / steps as f64;
+                let lat = lat0 + dlat * t;
+                let lon = normalize_lon(lon0 + dlon * t);
+                if !bounds.contains(lat, lon, RAW_BASEMAP_GEO_PAD_DEG) {
+                    finish_raw_basemap_line(&mut out, &mut current);
+                    continue;
+                }
+                let Some((fx, fy)) = locator.locate(lat, lon) else {
+                    finish_raw_basemap_line(&mut out, &mut current);
+                    continue;
+                };
+                if current.last().is_some_and(|(last_x, last_y)| {
+                    (fx - last_x).abs().max((fy - last_y).abs()) > split_distance
+                }) {
+                    finish_raw_basemap_line(&mut out, &mut current);
+                }
+                if current.last().is_none_or(|(last_x, last_y)| {
+                    let dx = fx - last_x;
+                    let dy = fy - last_y;
+                    dx * dx + dy * dy >= min_step2
+                }) {
+                    current.push((fx, fy));
+                    point_count += 1;
+                }
+                if point_count >= max_points {
+                    finish_raw_basemap_line(&mut out, &mut current);
+                    break 'lines;
+                }
+            }
+        }
+    }
+    finish_raw_basemap_line(&mut out, &mut current);
+    (out, point_count)
+}
+
+fn finish_raw_basemap_line(out: &mut Vec<Vec<(f64, f64)>>, current: &mut Vec<(f64, f64)>) {
+    if current.len() >= 2 {
+        out.push(std::mem::take(current));
+    } else {
+        current.clear();
+    }
+}
+
+fn min_raw_basemap_step_cells2(mode: RawBasemapMode, role: LineworkRole) -> f64 {
+    let step: f64 = match (mode, role) {
+        (RawBasemapMode::Counties, LineworkRole::County) => 0.55,
+        (RawBasemapMode::Regional | RawBasemapMode::Counties, _) => 0.30,
+        (RawBasemapMode::Broad, _) => 0.22,
+        (RawBasemapMode::Global, _) => 0.18,
+        (RawBasemapMode::Off, _) => 1.0,
+    };
+    step * step
+}
+
+fn draw_raw_basemap(
+    ui: &Ui,
+    image_rect: Rect,
+    _nx: usize,
+    _ny: usize,
+    flip_y: bool,
+    view: GridViewport,
+    cache: &RawBasemapCache,
+    tone: RawBasemapTone,
+    opacity: f32,
+    width_scale: f32,
+) {
+    if cache.layers.is_empty() || opacity <= 0.0 || width_scale <= 0.0 {
+        return;
+    }
+    let painter = ui.painter_at(image_rect);
+    let cull_rect = image_rect.expand(24.0);
+    for layer in &cache.layers {
+        let color = raw_basemap_color(layer.color, layer.role, tone, opacity);
+        if color.a() == 0 {
+            continue;
+        }
+        let stroke = Stroke::new(
+            raw_basemap_width(layer.width, layer.role, width_scale),
+            color,
+        );
+        for line in &layer.lines {
+            for segment in line.windows(2) {
+                let p0 = raw_grid_point_to_screen(segment[0], image_rect, view, flip_y);
+                let p1 = raw_grid_point_to_screen(segment[1], image_rect, view, flip_y);
+                if segment_might_intersect_rect(p0, p1, cull_rect) {
+                    painter.line_segment([p0, p1], stroke);
+                }
+            }
+        }
+    }
+}
+
+fn raw_grid_point_to_screen(
+    point: (f64, f64),
+    image_rect: Rect,
+    view: GridViewport,
+    flip_y: bool,
+) -> Pos2 {
+    let (u, v) = view.grid_to_image_uv_unclamped(point.0, point.1, flip_y);
+    pos2(
+        image_rect.left() + u as f32 * image_rect.width(),
+        image_rect.top() + v as f32 * image_rect.height(),
+    )
+}
+
+fn segment_might_intersect_rect(a: Pos2, b: Pos2, rect: Rect) -> bool {
+    a.x.min(b.x) <= rect.right()
+        && a.x.max(b.x) >= rect.left()
+        && a.y.min(b.y) <= rect.bottom()
+        && a.y.max(b.y) >= rect.top()
+}
+
+fn raw_basemap_color(
+    color: Rgba,
+    role: LineworkRole,
+    tone: RawBasemapTone,
+    opacity: f32,
+) -> Color32 {
+    let county_alpha = if matches!(role, LineworkRole::County) {
+        0.78
+    } else {
+        1.0
+    };
+    let alpha = (color.a as f32 * opacity * tone.alpha_multiplier() * county_alpha)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    let rgb_mul = tone.rgb_multiplier();
+    Color32::from_rgba_unmultiplied(
+        (color.r as f32 * rgb_mul).round().clamp(0.0, 255.0) as u8,
+        (color.g as f32 * rgb_mul).round().clamp(0.0, 255.0) as u8,
+        (color.b as f32 * rgb_mul).round().clamp(0.0, 255.0) as u8,
+        alpha,
+    )
+}
+
+fn raw_basemap_width(width: u32, role: LineworkRole, scale: f32) -> f32 {
+    let role_scale = match role {
+        LineworkRole::Coast | LineworkRole::State => 1.1,
+        LineworkRole::International | LineworkRole::Lake => 0.95,
+        LineworkRole::County => 0.7,
+        LineworkRole::Generic => 1.0,
+    };
+    ((width.max(1) as f32) * role_scale * scale).clamp(0.35, 5.0)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GridGeoBounds {
+    south: f64,
+    north: f64,
+    west: f64,
+    east: f64,
+}
+
+impl GridGeoBounds {
+    fn from_grid(grid: &GridFile) -> Option<Self> {
+        let mut south = f64::INFINITY;
+        let mut north = f64::NEG_INFINITY;
+        let mut longitudes = Vec::new();
+        let stride = ((grid.nx.max(grid.ny) as f64 / 240.0).ceil() as usize).max(1);
+        for y in sample_axis_indices(grid.ny, stride) {
+            for x in sample_axis_indices(grid.nx, stride) {
+                let idx = y * grid.nx + x;
+                let lat = f64::from(grid.lat[idx]);
+                let lon = normalize_lon(f64::from(grid.lon[idx]));
+                if lat.is_finite() && lon.is_finite() {
+                    south = south.min(lat);
+                    north = north.max(lat);
+                    longitudes.push(lon);
+                }
+            }
+        }
+        if !south.is_finite() || !north.is_finite() {
+            return None;
+        }
+        let (west, east) = shortest_longitude_interval(&longitudes)?;
+        Some(Self {
+            south,
+            north,
+            west,
+            east,
+        })
+    }
+
+    fn contains(self, lat: f64, lon: f64, pad_deg: f64) -> bool {
+        lat >= self.south - pad_deg
+            && lat <= self.north + pad_deg
+            && longitude_in_interval(lon, self.west, self.east, pad_deg)
+    }
+}
+
+fn sample_axis_indices(n: usize, stride: usize) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..n).step_by(stride.max(1)).collect();
+    if n > 0 && indices.last().copied() != Some(n - 1) {
+        indices.push(n - 1);
+    }
+    indices
+}
+
+fn longitude_in_interval(lon: f64, west: f64, east: f64, pad_deg: f64) -> bool {
+    let span = longitude_span(west, east);
+    if span + pad_deg * 2.0 >= 359.0 {
+        return true;
+    }
+    let lon = normalize_lon(lon);
+    let west = normalize_lon(west - pad_deg);
+    let east = normalize_lon(east + pad_deg);
+    if west <= east {
+        lon >= west && lon <= east
+    } else {
+        lon >= west || lon <= east
+    }
+}
+
+fn shortest_lon_delta(from_lon: f64, to_lon: f64) -> f64 {
+    normalize_lon(to_lon - from_lon)
+}
+
 /// Normalized image coords (`u` rightward, `v` DOWNWARD from the image top,
 /// both in `[0, 1]`) -> fractional grid coords, with texel centers at
 /// integer coords. `flip_y` must be the SAME flag the texture build used —
@@ -783,6 +1587,11 @@ fn clamp_pos_to_rect(pos: Pos2, rect: Rect) -> Pos2 {
         pos.x.clamp(rect.left(), rect.right()),
         pos.y.clamp(rect.top(), rect.bottom()),
     )
+}
+
+fn viewport_option(view: GridViewport, nx: usize, ny: usize) -> Option<GridViewport> {
+    let view = view.clamped(nx, ny);
+    (!view.is_full(nx, ny)).then_some(view)
 }
 
 fn screen_drag_is_large_enough(a: Pos2, b: Pos2) -> bool {
@@ -1154,6 +1963,35 @@ mod tests {
             (flipped.bottom() - (5.0 / 6.0)).abs() < 1.0e-6,
             "{flipped:?}"
         );
+    }
+
+    #[test]
+    fn viewport_zoom_keeps_cursor_anchor_stable() {
+        let nx = 80;
+        let ny = 60;
+        let view = GridViewport::full(nx, ny);
+        let (u, v) = view.grid_to_image_uv(30.0, 20.0, nx, ny, false);
+        let zoomed = view.zoomed_at(30.0, 20.0, 2.0, nx, ny);
+        let (u2, v2) = zoomed.grid_to_image_uv(30.0, 20.0, nx, ny, false);
+
+        assert!(zoomed.width_cells() < view.width_cells(), "{zoomed:?}");
+        assert!((u2 - u).abs() < 1e-12, "{u} -> {u2}");
+        assert!((v2 - v).abs() < 1e-12, "{v} -> {v2}");
+    }
+
+    #[test]
+    fn viewport_pan_clamps_to_grid_edges() {
+        let view = GridViewport {
+            x0: 2.0,
+            x1: 6.0,
+            y0: 1.0,
+            y1: 5.0,
+        };
+        let panned = view.translated(100.0, -100.0, NX, NY);
+        assert_eq!(panned.x1, NX as f64);
+        assert_eq!(panned.y0, 0.0);
+        assert_eq!(panned.width_cells(), view.width_cells());
+        assert_eq!(panned.height_cells(), view.height_cells());
     }
 
     #[test]

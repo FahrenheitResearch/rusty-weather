@@ -30,8 +30,8 @@ pub fn print_cuda_rasterize_phase_timing_if_enabled() {}
 pub use features::{
     BasemapDetail, BasemapStyle, StyledLonLatLayer, StyledLonLatPolygonLayer,
     checked_in_natural_earth_110m_root, load_styled_basemap_features,
-    load_styled_basemap_features_for, load_styled_basemap_polygons,
-    load_styled_basemap_polygons_for, load_styled_conus_features_for,
+    load_styled_basemap_features_for, load_styled_basemap_features_for_detail,
+    load_styled_basemap_polygons, load_styled_basemap_polygons_for, load_styled_conus_features_for,
     load_styled_conus_polygons_for,
 };
 pub use image::RgbaImage;
