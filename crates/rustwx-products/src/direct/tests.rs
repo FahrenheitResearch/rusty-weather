@@ -629,6 +629,77 @@ fn adaptive_geographic_regions_use_presentation_projections() {
 }
 
 #[test]
+fn adaptive_native_lambert_straightens_western_coast_domains() {
+    let native = GridProjection::LambertConformal {
+        standard_parallel_1_deg: 38.5,
+        standard_parallel_2_deg: 38.5,
+        central_meridian_deg: -97.5,
+    };
+
+    let california = presentation_projection_for_bounds(
+        Some(&native),
+        (-124.9, -113.8, 31.9, 42.5),
+        ProjectionPresentationVariant::Adaptive,
+    )
+    .unwrap();
+    assert!(matches!(
+        california,
+        rustwx_render::ProjectionSpec::Mercator {
+            central_meridian_deg,
+            ..
+        } if (central_meridian_deg + 119.35).abs() < 1.0e-6
+    ));
+
+    let west_coast = presentation_projection_for_bounds(
+        Some(&native),
+        (-126.5, -108.0, 30.0, 50.5),
+        ProjectionPresentationVariant::Adaptive,
+    )
+    .unwrap();
+    assert!(matches!(
+        west_coast,
+        rustwx_render::ProjectionSpec::Mercator {
+            central_meridian_deg,
+            ..
+        } if (central_meridian_deg + 117.25).abs() < 1.0e-6
+    ));
+}
+
+#[test]
+fn adaptive_native_lambert_keeps_rockies_on_native_projection() {
+    let native = GridProjection::LambertConformal {
+        standard_parallel_1_deg: 38.5,
+        standard_parallel_2_deg: 38.5,
+        central_meridian_deg: -97.5,
+    };
+
+    let projection = presentation_projection_for_bounds(
+        Some(&native),
+        (-112.0, -96.0, 37.0, 49.5),
+        ProjectionPresentationVariant::Adaptive,
+    )
+    .unwrap();
+    assert_eq!(projection, native.into());
+}
+
+#[test]
+fn explicit_rectangular_variant_overrides_native_lambert() {
+    let native = GridProjection::LambertConformal {
+        standard_parallel_1_deg: 38.5,
+        standard_parallel_2_deg: 38.5,
+        central_meridian_deg: -97.5,
+    };
+
+    let projection = presentation_projection_for_bounds(
+        Some(&native),
+        (-124.9, -113.8, 31.9, 42.5),
+        ProjectionPresentationVariant::RectangularGeographic,
+    )
+    .unwrap();
+    assert_eq!(projection, rustwx_render::ProjectionSpec::Geographic);
+}
+
+#[test]
 fn rectangular_variant_expands_tall_bounds_to_target_aspect() {
     let bounds = (110.0, 180.0, -50.0, 0.0);
     let expanded = presentation_frame_bounds_for_grid(

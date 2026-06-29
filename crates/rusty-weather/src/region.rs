@@ -22,6 +22,8 @@ pub enum RegionPreset {
     CaliforniaSquare,
     RenoSquare,
     PacificNorthwest,
+    WestCoast,
+    SierraNevada,
     CaliforniaSouthwest,
     FireWeatherWest,
     RockiesHighPlains,
@@ -123,6 +125,8 @@ impl RegionPreset {
             Self::CaliforniaSquare => (-124.9, -113.7, 31.8, 42.7),
             Self::RenoSquare => (-123.1, -116.1, 36.1, 43.1),
             Self::PacificNorthwest => (-125.0, -110.0, 41.0, 49.5),
+            Self::WestCoast => (-125.7, -110.5, 30.5, 49.0),
+            Self::SierraNevada => (-122.4, -117.7, 35.0, 40.7),
             Self::CaliforniaSouthwest => (-125.0, -108.0, 31.0, 41.5),
             Self::FireWeatherWest => (-126.5, -101.0, 28.0, 50.5),
             Self::RockiesHighPlains => (-112.0, -96.0, 37.0, 49.5),
@@ -155,6 +159,8 @@ impl RegionPreset {
             Self::CaliforniaSquare => "california_square",
             Self::RenoSquare => "reno_square",
             Self::PacificNorthwest => "pacific_northwest",
+            Self::WestCoast => "west_coast",
+            Self::SierraNevada => "sierra_nevada",
             Self::CaliforniaSouthwest => "california_southwest",
             Self::FireWeatherWest => "fire_weather_west",
             Self::RockiesHighPlains => "rockies_high_plains",
@@ -166,6 +172,21 @@ impl RegionPreset {
             Self::Northeast => "northeast",
             Self::GreatLakes => "great_lakes",
         }
+    }
+
+    pub fn from_slug_or_name(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Ok(preset) = Self::from_str(trimmed, true) {
+            return Some(preset);
+        }
+        let slug = trimmed.to_ascii_lowercase().replace(['-', ' '], "_");
+        Self::value_variants()
+            .iter()
+            .copied()
+            .find(|preset| preset.slug() == slug)
     }
 }
 
@@ -205,6 +226,20 @@ mod tests {
         let center_lat = (south + north) / 2.0;
         assert!((center_lon + 119.8).abs() < 0.5);
         assert!((center_lat - 39.5).abs() < 0.5);
+    }
+
+    #[test]
+    fn western_api_regions_have_stable_slugs() {
+        assert_eq!(RegionPreset::WestCoast.slug(), "west_coast");
+        assert_eq!(RegionPreset::SierraNevada.slug(), "sierra_nevada");
+        assert_eq!(
+            RegionPreset::from_slug_or_name("pacific-northwest"),
+            Some(RegionPreset::PacificNorthwest)
+        );
+        assert_eq!(
+            RegionPreset::from_slug_or_name("sierra_nevada"),
+            Some(RegionPreset::SierraNevada)
+        );
     }
 
     #[test]

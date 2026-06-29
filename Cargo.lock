@@ -4359,6 +4359,7 @@ name = "rusty-weather"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "image",
  "libmimalloc-sys",
  "mimalloc",
  "rayon",
@@ -4370,6 +4371,7 @@ dependencies = [
  "rustwx-render",
  "rw-ingest",
  "rw-store",
+ "serde",
  "serde_json",
  "windows-sys 0.61.2",
 ]

@@ -51,10 +51,10 @@ use eframe::egui;
 use ingest_worker::{IngestRequest, IngestResponse, IngestWorker};
 use rustwx_models::{model_summary, supported_forecast_hours, supported_models};
 use rw_ui::{
-    DownloadEvent, DownloadPanel, DownloadSpec, FieldViewerEvent, FieldViewerPanel, HourKey,
-    ModelOption, PlotViewerPanel, RunBrowserPanel, SatFollowSpec, SatPlayerEvent, SatPlayerPanel,
-    SatelliteEvent, SatellitePanel, SoundingPanel, StoreRequest, StoreResponse, StoreTree,
-    StoreView, StoreWorker,
+    CustomDomain, DownloadEvent, DownloadPanel, DownloadSpec, FieldViewerEvent, FieldViewerPanel,
+    HourKey, ModelOption, PlotViewerPanel, RunBrowserPanel, SatFollowSpec, SatPlayerEvent,
+    SatPlayerPanel, SatelliteEvent, SatellitePanel, SoundingPanel, StoreRequest, StoreResponse,
+    StoreTree, StoreView, StoreWorker,
 };
 use sat_worker::{SatRequest, SatResponse, SatWorker};
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,8 @@ use serde::{Deserialize, Serialize};
 
 /// eframe Storage key for the serialized [`PersistedPaths`].
 const STORAGE_KEY: &str = "rw.storage_paths";
+/// eframe Storage key for user-saved native plot domains.
+const DOMAIN_STORAGE_KEY: &str = "rw.custom_domains";
 
 /// Default store root when neither CLI nor persisted settings provide one.
 const DEFAULT_STORE_ROOT: &str = "store";
@@ -129,6 +131,14 @@ fn serialize_persisted(p: &PersistedPaths) -> String {
 /// Returns a value with `None` fields on any parse error so that garbled or
 /// stale storage data degrades gracefully to built-in defaults.
 fn deserialize_persisted(s: &str) -> PersistedPaths {
+    serde_json::from_str(s).unwrap_or_default()
+}
+
+fn serialize_custom_domains(domains: &[CustomDomain]) -> String {
+    serde_json::to_string(domains).unwrap_or_default()
+}
+
+fn deserialize_custom_domains(s: &str) -> Vec<CustomDomain> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
@@ -712,6 +722,8 @@ struct App {
     /// Set by `StorageSettingsUi` when the user clicks Apply; drained in
     /// `App::save` which eframe calls after every frame (and on exit).
     pending_persist: Option<String>,
+    /// Pending saved-domain JSON written by the native plot panel.
+    pending_domain_persist: Option<String>,
     #[cfg(feature = "profiling")]
     profiler: profiler::ProfilerPanel,
     #[cfg(feature = "profiling")]
@@ -822,6 +834,16 @@ impl App {
         puffin::set_scopes_on(true);
 
         let storage_ui = StorageSettingsUi::new(&paths);
+        let saved_domains = cc
+            .storage
+            .and_then(|storage| {
+                storage
+                    .get_string(DOMAIN_STORAGE_KEY)
+                    .map(|value| deserialize_custom_domains(&value))
+            })
+            .unwrap_or_default();
+        let mut plot_viewer = PlotViewerPanel::new();
+        plot_viewer.set_saved_domains(saved_domains);
 
         Self {
             worker,
@@ -831,7 +853,7 @@ impl App {
             tree: None,
             browser: RunBrowserPanel::new(),
             viewer: FieldViewerPanel::new(),
-            plot_viewer: PlotViewerPanel::new(),
+            plot_viewer,
             show_plot_viewer: true,
             sounding: SoundingPanel::new(),
             download,
@@ -847,6 +869,7 @@ impl App {
             recorded_sat_texture_ms: None,
             storage_ui,
             pending_persist: None,
+            pending_domain_persist: None,
             #[cfg(feature = "profiling")]
             profiler: profiler::ProfilerPanel::default(),
             #[cfg(feature = "profiling")]
@@ -1167,6 +1190,9 @@ impl eframe::App for App {
         if let Some(json) = self.pending_persist.take() {
             storage.set_string(STORAGE_KEY, json);
         }
+        if let Some(json) = self.pending_domain_persist.take() {
+            storage.set_string(DOMAIN_STORAGE_KEY, json);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1306,6 +1332,10 @@ impl eframe::App for App {
 
             if self.show_plot_viewer {
                 self.plot_viewer.ui(ui, self.viewer.current_field());
+                if self.plot_viewer.take_saved_domains_changed() {
+                    self.pending_domain_persist =
+                        Some(serialize_custom_domains(self.plot_viewer.saved_domains()));
+                }
                 if let Some((render_ms, upload_ms)) = self.plot_viewer.last_timings() {
                     let timings = (render_ms, upload_ms);
                     if self.recorded_plot_timings != Some(timings) {
@@ -1332,6 +1362,16 @@ impl eframe::App for App {
                         self.worker
                             .send(StoreRequest::LoadSounding { hour, fx, fy });
                     }
+                }
+                Some(FieldViewerEvent::DomainSelected(domain)) => {
+                    self.show_plot_viewer = true;
+                    self.plot_viewer.set_active_domain(domain);
+                    self.recorded_plot_timings = None;
+                }
+                Some(FieldViewerEvent::DomainRotationChanged { rotation_deg }) => {
+                    self.show_plot_viewer = true;
+                    self.plot_viewer.set_active_domain_rotation(rotation_deg);
+                    self.recorded_plot_timings = None;
                 }
                 None => {}
             }

@@ -58,6 +58,90 @@ impl ProjectedMap {
         };
         (domain, basemap)
     }
+
+    pub fn rotated_degrees(mut self, degrees: f64) -> Self {
+        if !degrees.is_finite() || degrees.abs() < 1.0e-9 {
+            return self;
+        }
+        let radians = degrees.to_radians();
+        let sin = radians.sin();
+        let cos = radians.cos();
+        let center = (
+            (self.extent.x_min + self.extent.x_max) * 0.5,
+            (self.extent.y_min + self.extent.y_max) * 0.5,
+        );
+
+        rotate_parallel_points(
+            &mut self.projected_x,
+            &mut self.projected_y,
+            center,
+            sin,
+            cos,
+        );
+        for line in &mut self.lines {
+            rotate_points(&mut line.points, center, sin, cos);
+        }
+        for polygon in &mut self.polygons {
+            for ring in &mut polygon.rings {
+                rotate_points(ring, center, sin, cos);
+            }
+        }
+        self.extent = rotated_extent(self.extent, center, sin, cos);
+        self.inverse_raster_projection = None;
+        self
+    }
+}
+
+fn rotate_parallel_points(xs: &mut [f64], ys: &mut [f64], center: (f64, f64), sin: f64, cos: f64) {
+    for (x, y) in xs.iter_mut().zip(ys.iter_mut()) {
+        (*x, *y) = rotate_point((*x, *y), center, sin, cos);
+    }
+}
+
+fn rotate_points(points: &mut [(f64, f64)], center: (f64, f64), sin: f64, cos: f64) {
+    for point in points {
+        *point = rotate_point(*point, center, sin, cos);
+    }
+}
+
+fn rotate_point(point: (f64, f64), center: (f64, f64), sin: f64, cos: f64) -> (f64, f64) {
+    let dx = point.0 - center.0;
+    let dy = point.1 - center.1;
+    (
+        center.0 + dx * cos - dy * sin,
+        center.1 + dx * sin + dy * cos,
+    )
+}
+
+fn rotated_extent(
+    extent: ProjectedExtent,
+    center: (f64, f64),
+    sin: f64,
+    cos: f64,
+) -> ProjectedExtent {
+    let corners = [
+        (extent.x_min, extent.y_min),
+        (extent.x_max, extent.y_min),
+        (extent.x_max, extent.y_max),
+        (extent.x_min, extent.y_max),
+    ];
+    let mut x_min = f64::INFINITY;
+    let mut x_max = f64::NEG_INFINITY;
+    let mut y_min = f64::INFINITY;
+    let mut y_max = f64::NEG_INFINITY;
+    for point in corners {
+        let (x, y) = rotate_point(point, center, sin, cos);
+        x_min = x_min.min(x);
+        x_max = x_max.max(x);
+        y_min = y_min.min(y);
+        y_max = y_max.max(y);
+    }
+    ProjectedExtent {
+        x_min,
+        x_max,
+        y_min,
+        y_max,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -136,13 +220,25 @@ impl From<(f64, f64, f64, f64)> for GeographicBounds {
 pub enum ProjectedFrameSource {
     FullDomain,
     GeographicBounds(GeographicBounds),
+    GeographicGridIntersection(GeographicBounds),
 }
 
 impl ProjectedFrameSource {
     fn matches(self, lat_deg: f64, lon_deg: f64) -> bool {
         match self {
             Self::FullDomain => true,
-            Self::GeographicBounds(bounds) => bounds.contains(lat_deg, lon_deg),
+            Self::GeographicBounds(bounds) | Self::GeographicGridIntersection(bounds) => {
+                bounds.contains(lat_deg, lon_deg)
+            }
+        }
+    }
+
+    fn geographic_bounds(self) -> Option<GeographicBounds> {
+        match self {
+            Self::FullDomain => None,
+            Self::GeographicBounds(bounds) | Self::GeographicGridIntersection(bounds) => {
+                Some(bounds)
+            }
         }
     }
 }
@@ -156,6 +252,7 @@ pub struct ProjectedDomainBuildOptions {
     pub reference_latitude_deg: Option<f64>,
     pub frame_source: ProjectedFrameSource,
     pub target_aspect_ratio: f64,
+    pub fit_to_target_aspect: bool,
     pub pad_fraction: f64,
 }
 
@@ -166,6 +263,7 @@ impl ProjectedDomainBuildOptions {
             reference_latitude_deg: None,
             frame_source: ProjectedFrameSource::GeographicBounds(bounds.into()),
             target_aspect_ratio,
+            fit_to_target_aspect: true,
             pad_fraction: 0.0,
         }
     }
@@ -176,6 +274,7 @@ impl ProjectedDomainBuildOptions {
             reference_latitude_deg: None,
             frame_source: ProjectedFrameSource::FullDomain,
             target_aspect_ratio,
+            fit_to_target_aspect: true,
             pad_fraction: 0.0,
         }
     }
@@ -187,6 +286,19 @@ impl ProjectedDomainBuildOptions {
 
     pub fn with_reference_latitude(mut self, reference_latitude_deg: f64) -> Self {
         self.reference_latitude_deg = Some(reference_latitude_deg);
+        self
+    }
+
+    pub fn with_geographic_grid_intersection_frame(
+        mut self,
+        bounds: impl Into<GeographicBounds>,
+    ) -> Self {
+        self.frame_source = ProjectedFrameSource::GeographicGridIntersection(bounds.into());
+        self
+    }
+
+    pub fn with_natural_frame_aspect(mut self) -> Self {
+        self.fit_to_target_aspect = false;
         self
     }
 
@@ -241,6 +353,19 @@ impl ProjectedMapBuildOptions {
         self
     }
 
+    pub fn with_geographic_grid_intersection_frame(
+        mut self,
+        bounds: impl Into<GeographicBounds>,
+    ) -> Self {
+        self.domain = self.domain.with_geographic_grid_intersection_frame(bounds);
+        self
+    }
+
+    pub fn with_natural_frame_aspect(mut self) -> Self {
+        self.domain = self.domain.with_natural_frame_aspect();
+        self
+    }
+
     pub fn without_basemap(mut self) -> Self {
         self.basemap = None;
         self
@@ -275,6 +400,7 @@ pub fn build_projected_domain(
         options.frame_source,
         options.pad_fraction,
         options.target_aspect_ratio,
+        options.fit_to_target_aspect,
     )?;
 
     Ok(ProjectedDomain {
@@ -298,6 +424,7 @@ pub fn build_projected_map_with_options(
         options.domain.frame_source,
         options.domain.pad_fraction,
         options.domain.target_aspect_ratio,
+        options.domain.fit_to_target_aspect,
     )?;
 
     let basemap = options
@@ -343,9 +470,9 @@ fn resolved_projector(
         .or_else(|| ProjectionSpec::infer_from_latlon_grid(lat_deg, lon_deg))
         .ok_or("projected map builder requires at least one finite lat/lon point")?;
     let reference_longitude_deg = match (&projection, options.frame_source) {
-        (ProjectionSpec::Geographic, ProjectedFrameSource::GeographicBounds(bounds)) => {
-            Some(bounds.center_longitude())
-        }
+        (ProjectionSpec::Geographic, source) => source
+            .geographic_bounds()
+            .map(GeographicBounds::center_longitude),
         _ => None,
     };
     projection
@@ -375,6 +502,7 @@ fn project_domain(
     frame_source: ProjectedFrameSource,
     pad_fraction: f64,
     target_aspect_ratio: f64,
+    fit_to_target_aspect: bool,
 ) -> Result<(Vec<f64>, Vec<f64>, ProjectedExtent), Box<dyn Error>> {
     let mut projected_x = Vec::with_capacity(lat_deg.len());
     let mut projected_y = Vec::with_capacity(lat_deg.len());
@@ -396,30 +524,47 @@ fn project_domain(
         }
     }
 
-    let bounds = if let ProjectedFrameSource::GeographicBounds(bounds) = frame_source {
-        if !framed_bounds.is_valid() {
-            return Err(
-                "requested geographic bounds crop does not intersect the model grid".into(),
-            );
+    let bounds = match frame_source {
+        ProjectedFrameSource::GeographicBounds(bounds) => {
+            if !framed_bounds.is_valid() {
+                return Err(
+                    "requested geographic bounds crop does not intersect the model grid".into(),
+                );
+            }
+            projected_geographic_frame_bounds(projector, bounds).unwrap_or(framed_bounds)
         }
-        projected_geographic_frame_bounds(projector, bounds).unwrap_or(framed_bounds)
-    } else if framed_bounds.is_valid() {
-        framed_bounds
-    } else {
-        full_bounds
+        ProjectedFrameSource::GeographicGridIntersection(_) => {
+            if !framed_bounds.is_valid() {
+                return Err(
+                    "requested geographic bounds crop does not intersect the model grid".into(),
+                );
+            }
+            framed_bounds
+        }
+        ProjectedFrameSource::FullDomain if framed_bounds.is_valid() => framed_bounds,
+        ProjectedFrameSource::FullDomain => full_bounds,
     };
     if !bounds.is_valid() {
         return Err("projected extent produced no finite coordinates".into());
     }
 
     let padded = bounds.expanded(pad_fraction.max(0.0));
-    let extent = MapExtent::from_bounds(
-        padded.min_x,
-        padded.max_x,
-        padded.min_y,
-        padded.max_y,
-        target_aspect_ratio,
-    );
+    let extent = if fit_to_target_aspect {
+        MapExtent::from_bounds(
+            padded.min_x,
+            padded.max_x,
+            padded.min_y,
+            padded.max_y,
+            target_aspect_ratio,
+        )
+    } else {
+        MapExtent {
+            x_min: padded.min_x,
+            x_max: padded.max_x,
+            y_min: padded.min_y,
+            y_max: padded.max_y,
+        }
+    };
 
     Ok((
         projected_x,
@@ -506,12 +651,7 @@ fn build_projected_basemap(
 ) -> Result<ProjectedBasemap, Box<dyn Error>> {
     let line_bbox = expanded_bbox(extent, options.line_pad_fraction.max(0.0));
     let polygon_bbox = expanded_bbox(extent, options.polygon_pad_fraction.max(0.0));
-    let geographic_clip = match frame_source {
-        ProjectedFrameSource::GeographicBounds(bounds) if bounds.longitude_span_deg() < 359.0 => {
-            Some(bounds)
-        }
-        _ => None,
-    };
+    let geographic_clip = basemap_geographic_clip(frame_source);
 
     let mut lines = Vec::new();
     if subtle_graticule_enabled(options.detail) {
@@ -531,6 +671,7 @@ fn build_projected_basemap(
         for line in layer.lines {
             let mut current = Vec::<(f64, f64)>::with_capacity(line.len());
             let mut previous_lonlat: Option<(f64, f64)> = None;
+            let mut previous_projected: Option<(f64, f64)> = None;
             for (lon, lat) in line {
                 if let Some((prev_lon, prev_lat)) = previous_lonlat {
                     let steps = densified_lonlat_segment_steps(
@@ -547,6 +688,7 @@ fn build_projected_basemap(
                         push_projected_line_point(
                             &mut lines,
                             &mut current,
+                            &mut previous_projected,
                             projector,
                             geographic_clip,
                             line_bbox,
@@ -562,6 +704,7 @@ fn build_projected_basemap(
                     push_projected_line_point(
                         &mut lines,
                         &mut current,
+                        &mut previous_projected,
                         projector,
                         geographic_clip,
                         line_bbox,
@@ -614,6 +757,11 @@ fn build_projected_basemap(
     Ok(ProjectedBasemap { lines, polygons })
 }
 
+fn basemap_geographic_clip(frame_source: ProjectedFrameSource) -> Option<GeographicBounds> {
+    let _ = frame_source;
+    None
+}
+
 fn subtle_graticule_enabled(detail: BasemapDetail) -> bool {
     if matches!(detail, BasemapDetail::Regional) {
         return false;
@@ -657,11 +805,13 @@ fn append_graticule_lines(
     };
     for &lat in latitude_lines {
         let mut current = Vec::new();
+        let mut previous_projected = None;
         let mut lon = -180.0;
         while lon <= 180.0 {
             push_projected_line_point(
                 lines,
                 &mut current,
+                &mut previous_projected,
                 projector,
                 geographic_clip,
                 bbox,
@@ -684,11 +834,13 @@ fn append_graticule_lines(
     };
     for lon in (-180..=180).step_by(lon_step) {
         let mut current = Vec::new();
+        let mut previous_projected = None;
         let mut lat = -80.0;
         while lat <= 80.0 {
             push_projected_line_point(
                 lines,
                 &mut current,
+                &mut previous_projected,
                 projector,
                 geographic_clip,
                 bbox,
@@ -767,6 +919,7 @@ fn interpolate_longitude(lon0: f64, lon1: f64, t: f64) -> f64 {
 fn push_projected_line_point(
     lines: &mut Vec<ProjectedLineOverlay>,
     current: &mut Vec<(f64, f64)>,
+    previous_projected: &mut Option<(f64, f64)>,
     projector: ProjectionProjector,
     geographic_clip: Option<GeographicBounds>,
     bbox: (f64, f64, f64, f64),
@@ -779,21 +932,34 @@ fn push_projected_line_point(
 ) {
     if geographic_clip.is_some_and(|bounds| !bounds.contains(lat, lon)) {
         flush_projected_line(lines, current, color, width, role);
+        *previous_projected = None;
         return;
     }
     let point = projector.project(lat, lon);
-    if !point.0.is_finite() || !point.1.is_finite() || !point_in_bbox(point, bbox) {
+    if !point.0.is_finite() || !point.1.is_finite() {
         flush_projected_line(lines, current, color, width, role);
+        *previous_projected = None;
         return;
     }
 
-    if current
-        .last()
-        .is_some_and(|&previous| projected_distance(previous, point) > max_projected_step)
-    {
+    if let Some(previous) = *previous_projected {
+        if projected_distance(previous, point) > max_projected_step {
+            flush_projected_line(lines, current, color, width, role);
+            if point_in_bbox(point, bbox) {
+                current.push(point);
+            }
+            *previous_projected = Some(point);
+            return;
+        }
+        append_clipped_projected_segment(lines, current, previous, point, bbox, color, width, role);
+    } else if point_in_bbox(point, bbox) {
+        current.push(point);
+    }
+
+    if !point_in_bbox(point, bbox) {
         flush_projected_line(lines, current, color, width, role);
     }
-    current.push(point);
+    *previous_projected = Some(point);
 }
 
 fn flush_projected_line(
@@ -813,6 +979,95 @@ fn flush_projected_line(
     } else {
         current.clear();
     }
+}
+
+fn append_clipped_projected_segment(
+    lines: &mut Vec<ProjectedLineOverlay>,
+    current: &mut Vec<(f64, f64)>,
+    previous: (f64, f64),
+    point: (f64, f64),
+    bbox: (f64, f64, f64, f64),
+    color: Color,
+    width: u32,
+    role: LineworkRole,
+) {
+    let Some((start, end)) = clip_projected_segment_to_bbox(previous, point, bbox) else {
+        if !point_in_bbox(point, bbox) {
+            flush_projected_line(lines, current, color, width, role);
+        }
+        return;
+    };
+
+    if current.is_empty() {
+        current.push(start);
+    } else if current
+        .last()
+        .is_some_and(|&last| !projected_points_close(last, start))
+    {
+        flush_projected_line(lines, current, color, width, role);
+        current.push(start);
+    }
+    if current
+        .last()
+        .is_none_or(|&last| !projected_points_close(last, end))
+    {
+        current.push(end);
+    }
+}
+
+fn clip_projected_segment_to_bbox(
+    p0: (f64, f64),
+    p1: (f64, f64),
+    bbox: (f64, f64, f64, f64),
+) -> Option<((f64, f64), (f64, f64))> {
+    let (x_min, x_max, y_min, y_max) = bbox;
+    if x_min > x_max || y_min > y_max {
+        return None;
+    }
+
+    let dx = p1.0 - p0.0;
+    let dy = p1.1 - p0.1;
+    let mut t0 = 0.0;
+    let mut t1 = 1.0;
+
+    for (p, q) in [
+        (-dx, p0.0 - x_min),
+        (dx, x_max - p0.0),
+        (-dy, p0.1 - y_min),
+        (dy, y_max - p0.1),
+    ] {
+        if p.abs() <= f64::EPSILON {
+            if q < 0.0 {
+                return None;
+            }
+            continue;
+        }
+        let r = q / p;
+        if p < 0.0 {
+            if r > t1 {
+                return None;
+            }
+            if r > t0 {
+                t0 = r;
+            }
+        } else {
+            if r < t0 {
+                return None;
+            }
+            if r < t1 {
+                t1 = r;
+            }
+        }
+    }
+
+    Some((
+        (p0.0 + dx * t0, p0.1 + dy * t0),
+        (p0.0 + dx * t1, p0.1 + dy * t1),
+    ))
+}
+
+fn projected_points_close(a: (f64, f64), b: (f64, f64)) -> bool {
+    projected_distance(a, b) <= 1.0e-6
 }
 
 fn projected_distance(a: (f64, f64), b: (f64, f64)) -> f64 {
@@ -993,6 +1248,64 @@ mod tests {
     }
 
     #[test]
+    fn grid_intersection_frame_uses_model_cells_not_requested_rectangle() {
+        let lat = vec![0.0, 0.0, 1.0, 1.0];
+        let lon = vec![0.0, 1.0, 0.2, 0.8];
+        let rectangle = build_projected_domain(
+            &lat,
+            &lon,
+            &ProjectedDomainBuildOptions::from_bounds((0.1, 0.9, 0.0, 1.0), 1.0)
+                .with_projection(ProjectionSpec::Geographic),
+        )
+        .expect("rectangle frame");
+        let grid_intersection = build_projected_domain(
+            &lat,
+            &lon,
+            &ProjectedDomainBuildOptions::from_bounds((0.1, 0.9, 0.0, 1.0), 1.0)
+                .with_projection(ProjectionSpec::Geographic)
+                .with_geographic_grid_intersection_frame((0.1, 0.9, 0.0, 1.0)),
+        )
+        .expect("grid intersection frame");
+
+        assert!(
+            grid_intersection.extent.x_max - grid_intersection.extent.x_min
+                < rectangle.extent.x_max - rectangle.extent.x_min
+        );
+    }
+
+    #[test]
+    fn projected_frames_do_not_geographically_clip_basemap_linework() {
+        let bounds = GeographicBounds::new(-125.0, -110.0, 30.0, 49.0);
+
+        assert!(basemap_geographic_clip(ProjectedFrameSource::GeographicBounds(bounds)).is_none());
+        assert!(
+            basemap_geographic_clip(ProjectedFrameSource::GeographicGridIntersection(bounds))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn projected_segments_clip_to_bbox_edges() {
+        let bbox = (0.0, 10.0, 0.0, 10.0);
+
+        let clipped = clip_projected_segment_to_bbox((-5.0, 5.0), (5.0, 5.0), bbox)
+            .expect("segment should enter bbox");
+        assert!((clipped.0.0 - 0.0).abs() < 1.0e-9);
+        assert!((clipped.0.1 - 5.0).abs() < 1.0e-9);
+        assert!((clipped.1.0 - 5.0).abs() < 1.0e-9);
+        assert!((clipped.1.1 - 5.0).abs() < 1.0e-9);
+
+        let clipped = clip_projected_segment_to_bbox((5.0, 5.0), (15.0, 5.0), bbox)
+            .expect("segment should exit bbox");
+        assert!((clipped.0.0 - 5.0).abs() < 1.0e-9);
+        assert!((clipped.0.1 - 5.0).abs() < 1.0e-9);
+        assert!((clipped.1.0 - 10.0).abs() < 1.0e-9);
+        assert!((clipped.1.1 - 5.0).abs() < 1.0e-9);
+
+        assert!(clip_projected_segment_to_bbox((-5.0, -5.0), (-1.0, -1.0), bbox).is_none());
+    }
+
+    #[test]
     fn geographic_crop_bounds_can_cross_antimeridian() {
         let lat = vec![-20.0, -18.0, -20.0, -18.0, 0.0, 0.0, 40.0, -40.0];
         let lon = vec![176.0, 178.0, -179.0, -178.0, -60.0, 30.0, 120.0, -100.0];
@@ -1138,6 +1451,44 @@ mod tests {
 
         assert!(projected.lines.is_empty());
         assert!(projected.polygons.is_empty());
+    }
+
+    #[test]
+    fn projected_map_rotation_transforms_domain_and_basemap_together() {
+        let projected = ProjectedMap {
+            projected_x: vec![0.0, 2.0],
+            projected_y: vec![0.0, 0.0],
+            extent: ProjectedExtent {
+                x_min: 0.0,
+                x_max: 2.0,
+                y_min: 0.0,
+                y_max: 2.0,
+            },
+            lines: vec![ProjectedLineOverlay {
+                points: vec![(0.0, 1.0), (2.0, 1.0)],
+                color: Color::BLACK,
+                width: 1,
+                role: crate::presentation::LineworkRole::Generic,
+            }],
+            polygons: vec![ProjectedPolygonFill {
+                rings: vec![vec![(1.0, 0.0), (2.0, 1.0)]],
+                color: Color::WHITE,
+                role: crate::presentation::PolygonRole::Generic,
+            }],
+            inverse_raster_projection: None,
+        }
+        .rotated_degrees(90.0);
+
+        assert!((projected.projected_x[0] - 2.0).abs() < 1.0e-9);
+        assert!((projected.projected_y[0] - 0.0).abs() < 1.0e-9);
+        assert!((projected.projected_x[1] - 2.0).abs() < 1.0e-9);
+        assert!((projected.projected_y[1] - 2.0).abs() < 1.0e-9);
+        assert!((projected.lines[0].points[0].0 - 1.0).abs() < 1.0e-9);
+        assert!((projected.lines[0].points[1].0 - 1.0).abs() < 1.0e-9);
+        assert!((projected.extent.x_min - 0.0).abs() < 1.0e-9);
+        assert!((projected.extent.x_max - 2.0).abs() < 1.0e-9);
+        assert!((projected.extent.y_min - 0.0).abs() < 1.0e-9);
+        assert!((projected.extent.y_max - 2.0).abs() < 1.0e-9);
     }
 
     #[test]

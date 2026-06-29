@@ -562,9 +562,9 @@ fn build_global_polygons(style: BasemapStyle) -> Vec<StyledLonLatPolygonLayer> {
 }
 
 fn build_broad_features(style: BasemapStyle) -> Vec<StyledLonLatLayer> {
-    let Some((root, tag)) = checked_in_natural_earth_110m_root()
-        .map(|root| (root, "110m"))
-        .or_else(|| checked_in_natural_earth_10m_root().map(|root| (root, "10m")))
+    let Some((root, tag)) = checked_in_natural_earth_10m_root()
+        .map(|root| (root, "10m"))
+        .or_else(|| checked_in_natural_earth_110m_root().map(|root| (root, "110m")))
     else {
         return build_conus_features(style)
             .into_iter()
@@ -601,7 +601,7 @@ fn build_broad_features(style: BasemapStyle) -> Vec<StyledLonLatLayer> {
         layers.push(StyledLonLatLayer {
             lines: state,
             color: Rgba::with_alpha(colors.state.r, colors.state.g, colors.state.b, 210),
-            width: 2,
+            width: 1,
             role: LineworkRole::State,
         });
     }
@@ -609,7 +609,7 @@ fn build_broad_features(style: BasemapStyle) -> Vec<StyledLonLatLayer> {
         layers.push(StyledLonLatLayer {
             lines: nat,
             color: Rgba::with_alpha(colors.nat.r, colors.nat.g, colors.nat.b, 155),
-            width: 2,
+            width: 1,
             role: LineworkRole::International,
         });
     }
@@ -617,7 +617,7 @@ fn build_broad_features(style: BasemapStyle) -> Vec<StyledLonLatLayer> {
         layers.push(StyledLonLatLayer {
             lines: coast,
             color: Rgba::with_alpha(colors.coast.r, colors.coast.g, colors.coast.b, 180),
-            width: 2,
+            width: 1,
             role: LineworkRole::Coast,
         });
     }
@@ -666,7 +666,7 @@ fn build_global_features(style: BasemapStyle) -> Vec<StyledLonLatLayer> {
         layers.push(StyledLonLatLayer {
             lines: nat,
             color: Rgba::with_alpha(colors.nat.r, colors.nat.g, colors.nat.b, 90),
-            width: 2,
+            width: 1,
             role: LineworkRole::International,
         });
     }
@@ -674,7 +674,7 @@ fn build_global_features(style: BasemapStyle) -> Vec<StyledLonLatLayer> {
         layers.push(StyledLonLatLayer {
             lines: coast,
             color: Rgba::with_alpha(colors.coast.r, colors.coast.g, colors.coast.b, 115),
-            width: 2,
+            width: 1,
             role: LineworkRole::Coast,
         });
     }
@@ -704,7 +704,7 @@ fn feature_colors(style: BasemapStyle) -> FeatureColors {
             lake: Rgba::with_alpha(118, 136, 154, 220),
             nat: BASEMAP_NAT_CORE,
             state: BASEMAP_STATE_CORE,
-            county: BASEMAP_STATE_CORE, // unused in Filled
+            county: BASEMAP_COUNTY_CORE,
         },
         BasemapStyle::White => FeatureColors {
             coast: WHITE_COAST_CORE,
@@ -771,7 +771,13 @@ const BASEMAP_STATE_CORE: Rgba = Rgba {
     b: 30,
     a: 255,
 };
-const BASEMAP_COAST_WIDTH: u32 = 2;
+const BASEMAP_COUNTY_CORE: Rgba = Rgba {
+    r: 108,
+    g: 116,
+    b: 128,
+    a: 170,
+};
+const BASEMAP_COAST_WIDTH: u32 = 1;
 const BASEMAP_NAT_WIDTH: u32 = 1;
 const BASEMAP_STATE_WIDTH: u32 = 1;
 

@@ -10,8 +10,8 @@
 //! per-frame work is just drawing the cached textures.
 
 use egui::{
-    Align2, Color32, ColorImage, ComboBox, FontId, Image, Rect, RichText, Sense, Stroke,
-    StrokeKind, TextureFilter, TextureHandle, TextureOptions, Ui, Vec2, pos2,
+    Align2, Color32, ColorImage, ComboBox, FontId, Image, PointerButton, Pos2, Rect, RichText,
+    Sense, Stroke, StrokeKind, TextureFilter, TextureHandle, TextureOptions, Ui, Vec2, pos2,
 };
 use rustwx_render::{
     LeveledColormap, build_colormap, colorbar_ticks, format_tick, legend_color_at_rel,
@@ -21,6 +21,8 @@ use rustwx_render::{
 use crate::colormap::{Colormap, VIRIDIS, field_to_color_image, field_to_production_color_image};
 use crate::profile_scope;
 use crate::worker::{FieldData, FieldKey, HourKey, VarInfo, VarKind};
+
+use super::plot_viewer::CustomDomain;
 
 /// Horizontal room reserved for the production legend (bar + ticks + labels).
 const LEGEND_WIDTH: f32 = 78.0;
@@ -35,6 +37,10 @@ pub enum FieldViewerEvent {
     VarSelected(String),
     /// The field was clicked at fractional grid coordinates.
     PointClicked { fx: f64, fy: f64 },
+    /// A custom render domain was box-selected from the displayed field.
+    DomainSelected(CustomDomain),
+    /// The selected custom render domain was rotated on the displayed field.
+    DomainRotationChanged { rotation_deg: f64 },
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -59,6 +65,12 @@ pub struct FieldViewerPanel {
     state: LoadState,
     /// Last clicked point in fractional grid coords (marker overlay).
     clicked: Option<(f64, f64)>,
+    /// In-progress shift + secondary-button custom-domain selection.
+    domain_drag: Option<DomainDrag>,
+    /// In-progress shift + secondary-button corner rotation.
+    domain_rotate: Option<DomainRotate>,
+    /// Last completed custom-domain selection in grid coordinates.
+    domain_selection: Option<DomainSelection>,
     colormap: Colormap,
     /// The production colormap for the loaded field (None = generic ramp).
     cmap: Option<LeveledColormap>,
@@ -66,6 +78,29 @@ pub struct FieldViewerPanel {
     /// Wall time of the last colormap + texture-upload pass, for the
     /// always-on stats strip.
     last_texture_ms: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DomainDrag {
+    start: Pos2,
+    current: Pos2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DomainRotate {
+    center: Pos2,
+    start_pointer_angle_deg: f64,
+    start_rotation_deg: f64,
+    current_rotation_deg: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DomainSelection {
+    fx0: f64,
+    fy0: f64,
+    fx1: f64,
+    fy1: f64,
+    rotation_deg: f64,
 }
 
 impl FieldViewerPanel {
@@ -102,6 +137,9 @@ impl FieldViewerPanel {
         self.texture = None;
         self.texture_dirty = false;
         self.clicked = None;
+        self.domain_drag = None;
+        self.domain_rotate = None;
+        self.domain_selection = None;
         self.cmap = None;
         self.legend_texture = None;
         self.state = LoadState::Idle;
@@ -190,6 +228,9 @@ impl FieldViewerPanel {
                 self.texture = None;
                 self.texture_dirty = false;
                 self.clicked = None;
+                self.domain_drag = None;
+                self.domain_rotate = None;
+                self.domain_selection = None;
                 self.cmap = None;
                 self.legend_texture = None;
                 event = Some(FieldViewerEvent::VarSelected(current));
@@ -331,7 +372,7 @@ impl FieldViewerPanel {
         let response = ui.add(
             Image::new(texture)
                 .fit_to_exact_size(size)
-                .sense(Sense::click()),
+                .sense(Sense::click_and_drag()),
         );
         let rect = response.rect;
 
@@ -353,6 +394,95 @@ impl FieldViewerPanel {
             }
         }
 
+        let shift_down = ui.input(|input| input.modifiers.shift);
+        if response.drag_started_by(PointerButton::Secondary) && shift_down {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let pos = clamp_pos_to_rect(pos, rect);
+                let mut started_rotation = false;
+                if let Some(selection) = self.domain_selection {
+                    if let Some((center, corners)) =
+                        domain_selection_geometry(rect, field.nx, field.ny, flip_y, selection)
+                    {
+                        if pointer_near_selection_corner(pos, corners) {
+                            self.domain_rotate = Some(DomainRotate {
+                                center,
+                                start_pointer_angle_deg: pointer_angle_deg(center, pos),
+                                start_rotation_deg: selection.rotation_deg,
+                                current_rotation_deg: selection.rotation_deg,
+                            });
+                            self.domain_drag = None;
+                            started_rotation = true;
+                        }
+                    }
+                }
+                if !started_rotation {
+                    self.domain_drag = Some(DomainDrag {
+                        start: pos,
+                        current: pos,
+                    });
+                    self.domain_rotate = None;
+                }
+            }
+        }
+        let mut finished_rotation = None;
+        if let Some(rotate) = self.domain_rotate.as_mut() {
+            if response.dragged_by(PointerButton::Secondary) {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let rotation_deg = normalize_rotation(
+                        rotate.start_rotation_deg + pointer_angle_deg(rotate.center, pos)
+                            - rotate.start_pointer_angle_deg,
+                    );
+                    rotate.current_rotation_deg = rotation_deg;
+                    if let Some(selection) = self.domain_selection.as_mut() {
+                        selection.rotation_deg = rotation_deg;
+                    }
+                }
+            }
+            if response.drag_stopped_by(PointerButton::Secondary) {
+                finished_rotation = Some(rotate.current_rotation_deg);
+            }
+        }
+        if let Some(rotation_deg) = finished_rotation {
+            self.domain_rotate = None;
+            if let Some(selection) = self.domain_selection.as_mut() {
+                selection.rotation_deg = rotation_deg;
+            }
+            event = Some(FieldViewerEvent::DomainRotationChanged { rotation_deg });
+        }
+        if let Some(drag) = self.domain_drag.as_mut() {
+            if response.dragged_by(PointerButton::Secondary) {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    drag.current = clamp_pos_to_rect(pos, rect);
+                }
+            }
+            if response.drag_stopped_by(PointerButton::Secondary) {
+                let start = drag.start;
+                let current = drag.current;
+                self.domain_drag = None;
+                if screen_drag_is_large_enough(start, current) {
+                    let (fx0, fy0) = to_grid(start);
+                    let (fx1, fy1) = to_grid(current);
+                    let selection = DomainSelection {
+                        fx0,
+                        fy0,
+                        fx1,
+                        fy1,
+                        rotation_deg: 0.0,
+                    };
+                    if let Some(grid) = field.grid.as_ref() {
+                        if let Some(bounds) = domain_bounds_from_grid_selection(
+                            &grid.lat, &grid.lon, grid.nx, grid.ny, selection,
+                        ) {
+                            let domain = CustomDomain::generated(bounds)
+                                .with_rotation(selection.rotation_deg);
+                            self.domain_selection = Some(selection);
+                            event = Some(FieldViewerEvent::DomainSelected(domain));
+                        }
+                    }
+                }
+            }
+        }
+
         // Marker on the last clicked point (forward display transform).
         if let Some((fx, fy)) = self.clicked {
             let (u, v) = grid_to_image_uv(fx, fy, field.nx, field.ny, flip_y);
@@ -361,6 +491,12 @@ impl FieldViewerPanel {
             let painter = ui.painter_at(rect);
             painter.circle_stroke(pos2(px, py), 5.0, Stroke::new(2.0, Color32::WHITE));
             painter.circle_stroke(pos2(px, py), 6.5, Stroke::new(1.0, Color32::BLACK));
+        }
+        if let Some(selection) = self.domain_selection {
+            draw_domain_selection(ui, rect, field.nx, field.ny, flip_y, selection);
+        }
+        if let Some(drag) = self.domain_drag {
+            draw_screen_domain_drag(ui, rect, drag);
         }
         ui.painter_at(rect.expand(1.0)).rect_stroke(
             Rect::from_min_max(rect.min, rect.max),
@@ -511,6 +647,260 @@ fn grid_to_image_uv(fx: f64, fy: f64, nx: usize, ny: usize, flip_y: bool) -> (f6
     (u, if flip_y { 1.0 - row } else { row })
 }
 
+fn clamp_pos_to_rect(pos: Pos2, rect: Rect) -> Pos2 {
+    pos2(
+        pos.x.clamp(rect.left(), rect.right()),
+        pos.y.clamp(rect.top(), rect.bottom()),
+    )
+}
+
+fn screen_drag_is_large_enough(a: Pos2, b: Pos2) -> bool {
+    (a.x - b.x).abs() >= 8.0 && (a.y - b.y).abs() >= 8.0
+}
+
+fn draw_screen_domain_drag(ui: &Ui, image_rect: Rect, drag: DomainDrag) {
+    let rect = Rect::from_two_pos(drag.start, drag.current).intersect(image_rect);
+    draw_domain_rect(ui, rect);
+}
+
+fn draw_domain_selection(
+    ui: &Ui,
+    image_rect: Rect,
+    nx: usize,
+    ny: usize,
+    flip_y: bool,
+    selection: DomainSelection,
+) {
+    let Some((_center, corners)) = domain_selection_geometry(image_rect, nx, ny, flip_y, selection)
+    else {
+        return;
+    };
+    draw_domain_polygon(ui, image_rect, corners);
+}
+
+fn domain_selection_geometry(
+    image_rect: Rect,
+    nx: usize,
+    ny: usize,
+    flip_y: bool,
+    selection: DomainSelection,
+) -> Option<(Pos2, [Pos2; 4])> {
+    let (u0, v0) = grid_to_image_uv(selection.fx0, selection.fy0, nx, ny, flip_y);
+    let (u1, v1) = grid_to_image_uv(selection.fx1, selection.fy1, nx, ny, flip_y);
+    let p0 = pos2(
+        image_rect.left() + u0 as f32 * image_rect.width(),
+        image_rect.top() + v0 as f32 * image_rect.height(),
+    );
+    let p1 = pos2(
+        image_rect.left() + u1 as f32 * image_rect.width(),
+        image_rect.top() + v1 as f32 * image_rect.height(),
+    );
+    let rect = Rect::from_two_pos(p0, p1).intersect(image_rect);
+    if rect.width() < 2.0 || rect.height() < 2.0 {
+        return None;
+    }
+    let center = rect.center();
+    let corners = [
+        rotate_pos(rect.left_top(), center, selection.rotation_deg),
+        rotate_pos(rect.right_top(), center, selection.rotation_deg),
+        rotate_pos(rect.right_bottom(), center, selection.rotation_deg),
+        rotate_pos(rect.left_bottom(), center, selection.rotation_deg),
+    ];
+    Some((center, corners))
+}
+
+fn draw_domain_polygon(ui: &Ui, image_rect: Rect, corners: [Pos2; 4]) {
+    let painter = ui.painter_at(image_rect.expand(24.0));
+    painter.add(egui::Shape::convex_polygon(
+        corners.to_vec(),
+        Color32::from_rgba_unmultiplied(0, 160, 255, 20),
+        Stroke::new(0.0, Color32::TRANSPARENT),
+    ));
+    let outline = Stroke::new(2.0, Color32::from_rgb(0, 185, 255));
+    let shadow = Stroke::new(1.0, Color32::BLACK);
+    for index in 0..4 {
+        let a = corners[index];
+        let b = corners[(index + 1) % 4];
+        painter.line_segment([a, b], Stroke::new(outline.width + 2.0, Color32::BLACK));
+        painter.line_segment([a, b], outline);
+    }
+    for corner in corners {
+        painter.circle_filled(corner, 4.5, Color32::from_rgb(0, 185, 255));
+        painter.circle_stroke(corner, 5.5, shadow);
+    }
+}
+
+fn pointer_near_selection_corner(pos: Pos2, corners: [Pos2; 4]) -> bool {
+    corners.iter().any(|corner| corner.distance(pos) <= 18.0)
+}
+
+fn pointer_angle_deg(center: Pos2, pos: Pos2) -> f64 {
+    f64::from(pos.y - center.y)
+        .atan2(f64::from(pos.x - center.x))
+        .to_degrees()
+}
+
+fn rotate_pos(pos: Pos2, center: Pos2, rotation_deg: f64) -> Pos2 {
+    let radians = rotation_deg.to_radians();
+    let sin = radians.sin() as f32;
+    let cos = radians.cos() as f32;
+    let dx = pos.x - center.x;
+    let dy = pos.y - center.y;
+    pos2(
+        center.x + dx * cos - dy * sin,
+        center.y + dx * sin + dy * cos,
+    )
+}
+
+fn normalize_rotation(rotation_deg: f64) -> f64 {
+    if !rotation_deg.is_finite() {
+        return 0.0;
+    }
+    let normalized = ((rotation_deg + 180.0).rem_euclid(360.0)) - 180.0;
+    if (normalized + 180.0).abs() < 1.0e-9 {
+        180.0
+    } else {
+        normalized
+    }
+}
+
+fn draw_domain_rect(ui: &Ui, rect: Rect) {
+    if rect.width() < 2.0 || rect.height() < 2.0 {
+        return;
+    }
+    let painter = ui.painter_at(rect.expand(2.0));
+    painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0, 160, 255, 20));
+    painter.rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(2.0, Color32::from_rgb(0, 185, 255)),
+        StrokeKind::Outside,
+    );
+    painter.rect_stroke(
+        rect.expand(1.0),
+        0.0,
+        Stroke::new(1.0, Color32::BLACK),
+        StrokeKind::Outside,
+    );
+}
+
+fn domain_bounds_from_grid_selection(
+    lat: &[f32],
+    lon: &[f32],
+    nx: usize,
+    ny: usize,
+    selection: DomainSelection,
+) -> Option<(f64, f64, f64, f64)> {
+    if lat.len() != nx * ny || lon.len() != nx * ny || nx == 0 || ny == 0 {
+        return None;
+    }
+    let x0 = selection.fx0.min(selection.fx1).floor().max(0.0) as usize;
+    let x1 = selection.fx0.max(selection.fx1).ceil().min((nx - 1) as f64) as usize;
+    let y0 = selection.fy0.min(selection.fy1).floor().max(0.0) as usize;
+    let y1 = selection.fy0.max(selection.fy1).ceil().min((ny - 1) as f64) as usize;
+    if x0 > x1 || y0 > y1 {
+        return None;
+    }
+
+    let mut south = f64::INFINITY;
+    let mut north = f64::NEG_INFINITY;
+    let mut longitudes = Vec::new();
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let idx = y * nx + x;
+            let lat = f64::from(lat[idx]);
+            let lon = normalize_lon(f64::from(lon[idx]));
+            if !lat.is_finite() || !lon.is_finite() {
+                continue;
+            }
+            south = south.min(lat);
+            north = north.max(lat);
+            longitudes.push(lon);
+        }
+    }
+    let (west, east) = shortest_longitude_interval(&longitudes)?;
+    if !south.is_finite() || !north.is_finite() {
+        return None;
+    }
+    Some(expand_tiny_bounds((west, east, south, north)))
+}
+
+fn shortest_longitude_interval(longitudes: &[f64]) -> Option<(f64, f64)> {
+    let mut values: Vec<f64> = longitudes
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .map(|value| normalize_lon(value).rem_euclid(360.0))
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    values.dedup_by(|a, b| (*a - *b).abs() < 1.0e-9);
+    if values.len() == 1 {
+        let lon = normalize_lon(values[0]);
+        return Some((lon, lon));
+    }
+
+    let mut largest_gap = f64::NEG_INFINITY;
+    let mut largest_gap_index = 0usize;
+    for i in 0..values.len() {
+        let a = values[i];
+        let b = if i + 1 == values.len() {
+            values[0] + 360.0
+        } else {
+            values[i + 1]
+        };
+        let gap = b - a;
+        if gap > largest_gap {
+            largest_gap = gap;
+            largest_gap_index = i;
+        }
+    }
+
+    let west = values[(largest_gap_index + 1) % values.len()];
+    let east = values[largest_gap_index];
+    Some((normalize_lon(west), normalize_lon(east)))
+}
+
+fn expand_tiny_bounds(bounds: (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
+    let (mut west, mut east, mut south, mut north) = bounds;
+    if longitude_span(west, east) < 0.05 {
+        let center = midpoint_longitude(west, east);
+        west = normalize_lon(center - 0.025);
+        east = normalize_lon(center + 0.025);
+    }
+    if north - south < 0.05 {
+        let center = (north + south) * 0.5;
+        south = (center - 0.025).clamp(-89.5, 89.5);
+        north = (center + 0.025).clamp(-89.5, 89.5);
+    }
+    (west, east, south, north)
+}
+
+fn longitude_span(west: f64, east: f64) -> f64 {
+    let west = normalize_lon(west);
+    let east = normalize_lon(east);
+    if west <= east {
+        east - west
+    } else {
+        east + 360.0 - west
+    }
+}
+
+fn midpoint_longitude(west: f64, east: f64) -> f64 {
+    let west = normalize_lon(west);
+    let mut east = normalize_lon(east);
+    if east < west {
+        east += 360.0;
+    }
+    normalize_lon((west + east) * 0.5)
+}
+
+fn normalize_lon(lon: f64) -> f64 {
+    ((lon + 180.0).rem_euclid(360.0)) - 180.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,5 +989,75 @@ mod tests {
                 assert!((0.0..=(NY - 1) as f64).contains(&fy), "fy {fy} in range");
             }
         }
+    }
+
+    #[test]
+    fn domain_selection_scans_curvilinear_grid_bounds() {
+        let nx = 4;
+        let ny = 3;
+        let lat = vec![
+            30.0, 30.2, 30.4, 30.6, 31.0, 31.2, 31.4, 31.6, 32.0, 32.2, 32.4, 32.6,
+        ];
+        let lon = vec![
+            -105.0, -104.8, -104.6, -104.4, -104.5, -104.3, -104.1, -103.9, -104.0, -103.8, -103.6,
+            -103.4,
+        ];
+        let bounds = domain_bounds_from_grid_selection(
+            &lat,
+            &lon,
+            nx,
+            ny,
+            DomainSelection {
+                fx0: 1.0,
+                fy0: 0.0,
+                fx1: 3.0,
+                fy1: 1.0,
+                rotation_deg: 0.0,
+            },
+        )
+        .expect("bounds");
+        assert!((bounds.0 + 104.8).abs() < 1.0e-5, "{bounds:?}");
+        assert!((bounds.1 + 103.9).abs() < 1.0e-5, "{bounds:?}");
+        assert!((bounds.2 - 30.2).abs() < 1.0e-6, "{bounds:?}");
+        assert!((bounds.3 - 31.6).abs() < 1.0e-6, "{bounds:?}");
+    }
+
+    #[test]
+    fn domain_selection_handles_antimeridian() {
+        let bounds = shortest_longitude_interval(&[178.0, 179.0, -179.5, -178.5]).unwrap();
+        assert!(bounds.0 > 170.0, "{bounds:?}");
+        assert!(bounds.1 < -170.0, "{bounds:?}");
+        assert!(longitude_span(bounds.0, bounds.1) < 5.0, "{bounds:?}");
+    }
+
+    #[test]
+    fn domain_selection_geometry_rotates_around_screen_center() {
+        let image_rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 100.0));
+        let (_center, corners) = domain_selection_geometry(
+            image_rect,
+            10,
+            10,
+            false,
+            DomainSelection {
+                fx0: 1.0,
+                fy0: 1.0,
+                fx1: 8.0,
+                fy1: 8.0,
+                rotation_deg: 90.0,
+            },
+        )
+        .expect("geometry");
+
+        assert!((corners[0].x - 85.0).abs() < 1.0e-4, "{corners:?}");
+        assert!((corners[0].y - 15.0).abs() < 1.0e-4, "{corners:?}");
+        assert!((corners[1].x - 85.0).abs() < 1.0e-4, "{corners:?}");
+        assert!((corners[1].y - 85.0).abs() < 1.0e-4, "{corners:?}");
+    }
+
+    #[test]
+    fn rotation_normalizes_to_signed_half_turns() {
+        assert!((normalize_rotation(370.0) - 10.0).abs() < 1.0e-9);
+        assert!((normalize_rotation(-190.0) - 170.0).abs() < 1.0e-9);
+        assert_eq!(normalize_rotation(f64::NAN), 0.0);
     }
 }

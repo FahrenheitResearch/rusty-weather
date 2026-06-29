@@ -73,8 +73,9 @@ use projection::{
     reference_latitude_for_projection_variant,
 };
 pub use projection::{
-    build_projected_map, build_projected_map_with_projection,
-    build_requested_projected_map_with_projection, model_data_domain_frame_for_projection,
+    build_natural_projected_map_with_projection, build_projected_map,
+    build_projected_map_with_projection, build_requested_projected_map_with_projection,
+    model_data_domain_frame_for_projection,
 };
 pub(crate) use query::{load_direct_sampled_fields_from_latest, required_direct_fetch_products};
 #[cfg(test)]

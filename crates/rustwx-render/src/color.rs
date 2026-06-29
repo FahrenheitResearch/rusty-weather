@@ -76,11 +76,32 @@ pub fn lerp_rgba(anchors: &[Rgba], n: usize) -> Vec<Rgba> {
         let f = t - lo as f64;
         let a = &anchors[lo];
         let b = &anchors[hi];
-        result.push(Rgba::new(
+        result.push(Rgba::with_alpha(
             (a.r as f64 + f * (b.r as f64 - a.r as f64)).round() as u8,
             (a.g as f64 + f * (b.g as f64 - a.g as f64)).round() as u8,
             (a.b as f64 + f * (b.b as f64 - a.b as f64)).round() as u8,
+            (a.a as f64 + f * (b.a as f64 - a.a as f64)).round() as u8,
         ));
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgba_interpolation_preserves_alpha() {
+        let colors = lerp_rgba(
+            &[
+                Rgba::with_alpha(0, 0, 0, 0),
+                Rgba::with_alpha(10, 20, 30, 200),
+            ],
+            3,
+        );
+
+        assert_eq!(colors[0].a, 0);
+        assert_eq!(colors[1].a, 100);
+        assert_eq!(colors[2].a, 200);
+    }
 }

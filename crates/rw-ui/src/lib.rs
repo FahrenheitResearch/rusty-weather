@@ -37,12 +37,12 @@ pub mod synthetic;
 mod worker;
 
 pub use panels::{
-    AvailabilityView, DownloadEvent, DownloadPanel, DownloadRunState, DownloadSpec, DownloadStage,
-    EstimateView, FieldViewerEvent, FieldViewerPanel, HourDoneView, ModelOption, PlotViewerPanel,
-    RunBrowserPanel, SatDiskUsage, SatFollowSpec, SatFollowState, SatFrameImage, SatLayerOption,
-    SatPlayerEvent, SatPlayerPanel, SatRunKey, SatRunListing, SatSatelliteOption, SatSectorOption,
-    SatelliteEvent, SatellitePanel, SoundingPanel, SoundingViewState, StageState, format_bytes,
-    shift_date_yyyymmdd, today_yyyymmdd_utc,
+    AvailabilityView, CustomDomain, DownloadEvent, DownloadPanel, DownloadRunState, DownloadSpec,
+    DownloadStage, EstimateView, FieldViewerEvent, FieldViewerPanel, HourDoneView, ModelOption,
+    PlotViewerPanel, RunBrowserPanel, SatDiskUsage, SatFollowSpec, SatFollowState, SatFrameImage,
+    SatLayerOption, SatPlayerEvent, SatPlayerPanel, SatRunKey, SatRunListing, SatSatelliteOption,
+    SatSectorOption, SatelliteEvent, SatellitePanel, SoundingPanel, SoundingViewState, StageState,
+    format_bytes, shift_date_yyyymmdd, today_yyyymmdd_utc,
 };
 pub use store_view::{HourEntry, ModelEntry, RunEntry, StoreTree, StoreView};
 pub use worker::{

@@ -1,5 +1,6 @@
 use super::*;
 use crate::colormap::{ColormapBuildOptions, Extend, LevelDensity};
+use crate::presentation::StaticPlotStyle;
 
 fn sample_cmap() -> LeveledColormap {
     LeveledColormap::from_palette(
@@ -65,6 +66,35 @@ fn sample_projected_opts() -> RenderOpts {
         streamlines: Vec::new(),
         presentation: RenderPresentation::for_mode(ProductVisualMode::FilledMeteorology),
     }
+}
+
+#[test]
+fn vertical_colorbar_follows_domain_frame_horizontally() {
+    let presentation = RenderPresentation::for_mode_with_style(
+        ProductVisualMode::FilledMeteorology,
+        StaticPlotStyle::OperationalBudget30s,
+    );
+    let layout = compute_layout(2400, 1600, true, true, presentation, ChromeScale::default());
+    let frame = DomainFrame::map_viewport_default();
+    let rect = LocalRect {
+        min_x: 0,
+        max_x: layout.map_w.saturating_sub(160),
+        min_y: 0,
+        max_y: layout.map_h.saturating_sub(1),
+    };
+
+    let (x, y, w) = colorbar_anchor_rect(
+        &layout,
+        ColorbarOrientation::VerticalRight,
+        Some(frame),
+        Some(rect),
+    );
+    let frame_gap = (2u32.saturating_mul(layout.text_scale.max(1))).clamp(4, 8);
+
+    assert_eq!(x, layout.map_x + rect.max_x + frame_gap);
+    assert!(x < layout.cbar_x);
+    assert_eq!(y, layout.cbar_y);
+    assert_eq!(w, layout.cbar_w);
 }
 
 fn sample_place_label() -> ProjectedPlaceLabelOverlay {
@@ -912,6 +942,22 @@ fn center_horizontal_canvas_content_balances_outer_margins() {
     let right_margin = centered.width().saturating_sub(max_x).saturating_sub(1);
 
     assert!(left_margin.abs_diff(right_margin) <= 1);
+}
+
+#[test]
+fn crop_canvas_whitespace_removes_blank_border() {
+    let bg = RenderPresentation::for_mode(ProductVisualMode::FilledMeteorology).canvas_background;
+    let mut img = RgbaImage::from_pixel(12, 10, bg.to_image_rgba());
+    for y in 3..7 {
+        for x in 4..9 {
+            img.put_pixel(x, y, Rgba::BLACK.to_image_rgba());
+        }
+    }
+
+    let cropped = crop_canvas_whitespace(&img, bg, 1);
+
+    assert_eq!(cropped.width(), 7);
+    assert_eq!(cropped.height(), 6);
 }
 
 #[test]

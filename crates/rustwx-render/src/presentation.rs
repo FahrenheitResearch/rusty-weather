@@ -31,6 +31,7 @@ pub enum StaticPlotStyle {
     Operational,
     OperationalFast,
     OperationalQuality2x,
+    OperationalBudget30s,
 }
 
 impl StaticPlotStyle {
@@ -72,6 +73,15 @@ impl StaticPlotStyle {
             | "ops_quality"
             | "weathermodels_quality"
             | "pivotal_quality" => Some(Self::OperationalQuality2x),
+            "operational_budget_30s"
+            | "operational_budget"
+            | "ops_budget"
+            | "budget_30s"
+            | "quality_budget"
+            | "operational_best"
+            | "ops_best"
+            | "weathermodels_best"
+            | "max_quality" => Some(Self::OperationalBudget30s),
             _ => None,
         }
     }
@@ -86,13 +96,17 @@ impl StaticPlotStyle {
                 | Self::Operational
                 | Self::OperationalFast
                 | Self::OperationalQuality2x
+                | Self::OperationalBudget30s
         )
     }
 
     pub fn uses_operational_presentation(self) -> bool {
         matches!(
             self,
-            Self::Operational | Self::OperationalFast | Self::OperationalQuality2x
+            Self::Operational
+                | Self::OperationalFast
+                | Self::OperationalQuality2x
+                | Self::OperationalBudget30s
         )
     }
 
@@ -104,6 +118,7 @@ impl StaticPlotStyle {
                 | Self::CleanAtlasCombined
                 | Self::OperationalFast
                 | Self::OperationalQuality2x
+                | Self::OperationalBudget30s
         ) {
             return requested;
         }
@@ -119,6 +134,7 @@ impl StaticPlotStyle {
 
     pub fn supersample_factor(self, requested: u32) -> u32 {
         match self {
+            Self::OperationalBudget30s => requested.max(3),
             Self::CleanAtlasQuality2x | Self::CleanAtlasCombined | Self::OperationalQuality2x => {
                 requested.max(2)
             }
@@ -129,7 +145,7 @@ impl StaticPlotStyle {
     pub fn supersample_sharpen(self, requested: bool) -> bool {
         match self {
             Self::CleanAtlasQuality2x | Self::OperationalQuality2x => false,
-            Self::CleanAtlasCombined => true,
+            Self::CleanAtlasCombined | Self::OperationalBudget30s => true,
             _ => requested,
         }
     }
@@ -297,6 +313,8 @@ impl RenderPresentation {
 
     fn apply_operational_plot_style(&mut self) {
         self.colorbar = operational_colorbar();
+        self.layout.colorbar_gap = self.layout.colorbar_gap.min(6);
+        self.layout.colorbar_margin_x = self.layout.colorbar_margin_x.min(72);
         if matches!(
             self.mode,
             ProductVisualMode::PanelMember | ProductVisualMode::ComparisonPanel
@@ -553,6 +571,14 @@ mod tests {
             Some(StaticPlotStyle::CleanAtlasCombined)
         );
         assert_eq!(
+            StaticPlotStyle::parse("operational_budget_30s"),
+            Some(StaticPlotStyle::OperationalBudget30s)
+        );
+        assert_eq!(
+            StaticPlotStyle::parse("max_quality"),
+            Some(StaticPlotStyle::OperationalBudget30s)
+        );
+        assert_eq!(
             StaticPlotStyle::parse("default"),
             Some(StaticPlotStyle::Default)
         );
@@ -598,12 +624,17 @@ mod tests {
             2
         );
         assert_eq!(StaticPlotStyle::CleanAtlasCombined.supersample_factor(1), 2);
+        assert_eq!(
+            StaticPlotStyle::OperationalBudget30s.supersample_factor(1),
+            3
+        );
         assert!(!StaticPlotStyle::CleanAtlasQuality2x.supersample_sharpen(true));
         assert!(StaticPlotStyle::CleanAtlasCombined.supersample_sharpen(false));
+        assert!(StaticPlotStyle::OperationalBudget30s.supersample_sharpen(false));
     }
 
     #[test]
-    fn clean_atlas_respects_broad_basemap_line_widths() {
+    fn clean_atlas_uses_sleek_basemap_line_widths() {
         let style = RenderPresentation::for_mode_with_style(
             ProductVisualMode::FilledMeteorology,
             StaticPlotStyle::CleanAtlas,
@@ -611,7 +642,7 @@ mod tests {
         .linework_style(LineworkRole::Coast, Rgba::BLACK, 1);
 
         assert!(style.visible);
-        assert_eq!(style.width, 2);
+        assert_eq!(style.width, 1);
     }
 
     #[test]
@@ -633,8 +664,8 @@ mod tests {
             ColorbarOrientation::VerticalRight
         );
         assert_eq!(presentation.colorbar.frame_color, Rgba::BLACK);
-        assert_eq!(coast.width, 2);
-        assert_eq!(coast.color, Rgba::with_alpha(18, 22, 28, 190));
+        assert_eq!(coast.width, 1);
+        assert_eq!(coast.color, Rgba::with_alpha(18, 22, 28, 227));
         assert!(land.visible);
         assert_eq!(land.color, Rgba::new(250, 250, 246));
     }
@@ -649,10 +680,23 @@ mod tests {
             presentation.linework_style(LineworkRole::International, Rgba::BLACK, 1);
         let state = presentation.linework_style(LineworkRole::State, Rgba::BLACK, 1);
 
-        assert_eq!(international.width, 2);
-        assert_eq!(international.color, Rgba::with_alpha(20, 24, 30, 184));
-        assert_eq!(state.width, 2);
-        assert_eq!(state.color, Rgba::with_alpha(12, 14, 18, 210));
+        assert_eq!(international.width, 1);
+        assert_eq!(international.color, Rgba::with_alpha(30, 36, 44, 209));
+        assert_eq!(state.width, 1);
+        assert_eq!(state.color, Rgba::with_alpha(18, 22, 28, 220));
+    }
+
+    #[test]
+    fn operational_filled_maps_show_faint_county_linework() {
+        let presentation = RenderPresentation::for_mode_with_style(
+            ProductVisualMode::FilledMeteorology,
+            StaticPlotStyle::OperationalFast,
+        );
+        let county = presentation.linework_style(LineworkRole::County, Rgba::BLACK, 1);
+
+        assert!(county.visible);
+        assert_eq!(county.width, 1);
+        assert_eq!(county.color, Rgba::with_alpha(92, 100, 112, 55));
     }
 
     #[test]
@@ -665,9 +709,9 @@ mod tests {
         let state = presentation.linework_style(LineworkRole::State, Rgba::BLACK, 2);
 
         assert!(!county.visible);
-        assert_eq!(county.color, Rgba::with_alpha(46, 52, 62, 76));
+        assert_eq!(county.color, Rgba::with_alpha(92, 100, 112, 55));
         assert_eq!(state.width, 2);
-        assert_eq!(state.color, Rgba::with_alpha(12, 14, 18, 210));
+        assert_eq!(state.color, Rgba::with_alpha(18, 22, 28, 220));
     }
 
     #[test]
@@ -709,7 +753,7 @@ mod tests {
         .linework_style(LineworkRole::Lake, Rgba::BLACK, 1);
 
         assert!(style.visible);
-        assert_eq!(style.color, Rgba::with_alpha(54, 60, 68, 132));
+        assert_eq!(style.color, Rgba::with_alpha(64, 70, 78, 125));
     }
 }
 
@@ -892,15 +936,15 @@ fn clean_atlas_polygon_style(
 }
 
 fn clean_atlas_linework_style(
-    _mode: ProductVisualMode,
+    mode: ProductVisualMode,
     role: LineworkRole,
     fallback: Rgba,
     fallback_width: u32,
 ) -> LineworkStyle {
     let fallback_width = fallback_width.max(1);
-    let major_width = fallback_width.clamp(1, 3);
-    let minor_width = fallback_width.clamp(1, 3);
-    let county_visible = false;
+    let major_width = fallback_width.clamp(1, 2);
+    let minor_width = fallback_width.clamp(1, 2);
+    let county_visible = clean_atlas_county_linework_visible(mode);
     let width_boost = static_linework_width_boost();
     let alpha_scale = static_linework_alpha_scale();
     let boost_width = |width: u32| width.saturating_add(width_boost).clamp(1, 8);
@@ -910,28 +954,28 @@ fn clean_atlas_linework_style(
     };
     let (color, width, visible) = match role {
         LineworkRole::Coast => (
-            Rgba::with_alpha(18, 22, 28, alpha(190)),
-            boost_width(major_width.max(2)),
+            Rgba::with_alpha(18, 22, 28, alpha(227)),
+            boost_width(major_width),
             true,
         ),
         LineworkRole::Lake => (
-            Rgba::with_alpha(54, 60, 68, alpha(132)),
+            Rgba::with_alpha(64, 70, 78, alpha(125)),
             boost_width(minor_width),
             true,
         ),
         LineworkRole::International => (
-            Rgba::with_alpha(20, 24, 30, alpha(184)),
-            boost_width(minor_width.max(2)),
+            Rgba::with_alpha(30, 36, 44, alpha(209)),
+            boost_width(minor_width),
             true,
         ),
         LineworkRole::State => (
-            Rgba::with_alpha(12, 14, 18, alpha(210)),
-            boost_width(minor_width.max(2)),
+            Rgba::with_alpha(18, 22, 28, alpha(220)),
+            boost_width(minor_width),
             true,
         ),
         LineworkRole::County => (
-            Rgba::with_alpha(46, 52, 62, alpha(76)),
-            boost_width(1),
+            Rgba::with_alpha(92, 100, 112, alpha(55)),
+            boost_width(minor_width),
             county_visible,
         ),
         LineworkRole::Generic => (fallback, boost_width(fallback_width), true),
@@ -942,6 +986,26 @@ fn clean_atlas_linework_style(
         color,
         width,
     }
+}
+
+fn clean_atlas_county_linework_visible(mode: ProductVisualMode) -> bool {
+    std::env::var("RUSTWX_COUNTY_LINEWORK")
+        .ok()
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => false,
+            "1" | "true" | "on" | "yes" => true,
+            _ => default_clean_atlas_county_linework_visible(mode),
+        })
+        .unwrap_or_else(|| default_clean_atlas_county_linework_visible(mode))
+}
+
+fn default_clean_atlas_county_linework_visible(mode: ProductVisualMode) -> bool {
+    matches!(
+        mode,
+        ProductVisualMode::FilledMeteorology
+            | ProductVisualMode::PanelMember
+            | ProductVisualMode::ComparisonPanel
+    )
 }
 
 fn static_linework_width_boost() -> u32 {

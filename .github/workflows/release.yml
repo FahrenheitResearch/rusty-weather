@@ -1,0 +1,269 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  GUI_BIN: rusty-weather-ui
+  APP_NAME: Rusty Weather
+  PACKAGE_NAME: rusty-weather
+  TOOL_BINS: rw_ingest rw_batch rw_render rw_render_bench rw_bench rw_store_diff rws rw_sat rw_glm_follow rusty_sat_check
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+
+jobs:
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists."
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Rusty Weather ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
+
+  build:
+    needs: create-release
+    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: rusty-weather-windows-x64
+            package: windows
+          - os: windows-11-arm
+            artifact_name: rusty-weather-windows-arm64
+            package: windows
+          - os: ubuntu-24.04
+            artifact_name: rusty-weather-linux-x64
+            package: linux
+          - os: ubuntu-24.04-arm
+            artifact_name: rusty-weather-linux-arm64
+            package: linux
+          - os: macos-15-intel
+            artifact_name: rusty-weather-macos-intel
+            package: macos
+          - os: macos-15
+            artifact_name: rusty-weather-macos-apple-silicon
+            package: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxi-dev \
+            libxkbcommon-dev
+
+      - name: Use stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build release binaries
+        run: >
+          cargo build --release
+          -p rusty-weather-ui --bin rusty-weather-ui
+          -p rusty-weather --bin rw_ingest --bin rw_batch --bin rw_render --bin rw_render_bench --bin rw_bench --bin rw_store_diff --bin rws
+          -p rw-sat --bin rw_sat
+          -p rw-glm --bin rw_glm_follow
+          -p rw-sat-check --bin rusty_sat_check
+
+      # Signs every packaged Windows executable via Azure Trusted Signing
+      # when the BowEcho/Rusty Weather signing secrets exist.
+      - name: Sign Windows binaries (Azure Trusted Signing)
+        if: runner.os == 'Windows' && env.AZURE_TENANT_ID != ''
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
+          files-folder: target/release
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Package Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          New-Item -ItemType Directory -Force package\tools | Out-Null
+          Copy-Item target\release\${env:GUI_BIN}.exe package\${env:GUI_BIN}.exe
+          foreach ($bin in $env:TOOL_BINS -split ' ') {
+            Copy-Item "target\release\$bin.exe" "package\tools\$bin.exe"
+          }
+          Copy-Item README.md package\README.md
+          Copy-Item LICENSE package\LICENSE
+          Compress-Archive -Path package\* -DestinationPath "dist\${{ matrix.artifact_name }}.zip" -Force
+
+      - name: Prepare macOS bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist "bundle/${APP_NAME}/tools"
+          app="bundle/${APP_NAME}/${APP_NAME}.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp "target/release/${GUI_BIN}" "$app/Contents/MacOS/${GUI_BIN}"
+          chmod +x "$app/Contents/MacOS/${GUI_BIN}"
+          for bin in ${TOOL_BINS}; do
+            cp "target/release/${bin}" "bundle/${APP_NAME}/tools/${bin}"
+            chmod +x "bundle/${APP_NAME}/tools/${bin}"
+          done
+          cp README.md "bundle/${APP_NAME}/README.md"
+          cp LICENSE "bundle/${APP_NAME}/LICENSE"
+          if [[ "${GITHUB_REF_NAME:-}" =~ ^v[0-9] ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="$(awk -F '"' '/^version =/ { print $2; exit }' crates/rusty-weather-ui/Cargo.toml)"
+          fi
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key>
+            <string>en</string>
+            <key>CFBundleDisplayName</key>
+            <string>Rusty Weather</string>
+            <key>CFBundleExecutable</key>
+            <string>rusty-weather-ui</string>
+            <key>CFBundleIdentifier</key>
+            <string>research.fahrenheit.rusty-weather</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleName</key>
+            <string>Rusty Weather</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${version}</string>
+            <key>CFBundleVersion</key>
+            <string>${version}</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>12.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+      # Signs + notarizes the app bundle when the Apple Developer ID /
+      # App Store Connect secrets exist. The CLI tools are signed too; the
+      # app is stapled so the common double-click path is Gatekeeper-clean.
+      - name: Sign and notarize macOS bundle
+        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE_BASE64 != ''
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          ASC_API_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          app="bundle/${APP_NAME}/${APP_NAME}.app"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -base64 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 1800 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          echo "$MACOS_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | awk -F '"' '/Developer ID Application/ {print $2; exit}')"
+          if [ -z "$identity" ]; then
+            echo "No Developer ID Application identity found in certificate" >&2
+            exit 1
+          fi
+          echo "Signing with: $identity"
+          for bin in "bundle/${APP_NAME}/tools/"*; do
+            codesign --force --options runtime --timestamp --sign "$identity" "$bin"
+          done
+          codesign --force --deep --options runtime --timestamp --sign "$identity" "$app"
+          codesign --verify --deep --strict "$app"
+          echo "$ASC_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k --sequesterRsrc --keepParent "bundle/${APP_NAME}" "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$ASC_KEY_ID" \
+            --issuer "$ASC_ISSUER_ID" --wait
+          xcrun stapler staple "$app"
+          spctl --assess --type execute --verbose "$app" || true
+          security delete-keychain "$keychain"
+
+      - name: Zip macOS bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ditto -c -k --sequesterRsrc --keepParent "bundle/${APP_NAME}" "dist/${{ matrix.artifact_name }}.zip"
+
+      - name: Package Linux binaries
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist" "package/${PACKAGE_NAME}/tools"
+          cp "target/release/${GUI_BIN}" "package/${PACKAGE_NAME}/${GUI_BIN}"
+          chmod +x "package/${PACKAGE_NAME}/${GUI_BIN}"
+          for bin in ${TOOL_BINS}; do
+            cp "target/release/${bin}" "package/${PACKAGE_NAME}/tools/${bin}"
+            chmod +x "package/${PACKAGE_NAME}/tools/${bin}"
+          done
+          cp README.md "package/${PACKAGE_NAME}/README.md"
+          cp LICENSE "package/${PACKAGE_NAME}/LICENSE"
+          tar -C package -czf "dist/${{ matrix.artifact_name }}.tar.gz" "${PACKAGE_NAME}"
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in *; do
+            sha256sum "$f" > "$f.sha256"
+          done
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Upload release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"

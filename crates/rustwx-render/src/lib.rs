@@ -85,8 +85,9 @@ use crate::overlay::{
     ProjectedPolygon, ProjectedPolyline,
 };
 use crate::render::{
-    RenderOpts, center_horizontal_canvas_content, encode_rgba_png_profile_with_options,
-    render_to_image as native_render_to_image, render_to_png, trim_vertical_canvas_whitespace,
+    RenderOpts, center_horizontal_canvas_content, crop_canvas_whitespace,
+    encode_rgba_png_profile_with_options, render_to_image as native_render_to_image, render_to_png,
+    trim_vertical_canvas_whitespace,
 };
 pub use crate::text::format_tick;
 use serde::{Deserialize, Serialize};
@@ -301,10 +302,15 @@ impl RustRenderer {
             with_render_state_profile_with_style(request, plot_style, |data, ny, nx, opts| {
                 let (image, mut image_timing) = render_to_image_profile(data, ny, nx, opts);
                 let trim_start = Instant::now();
-                let image = if opts.domain_frame.is_some() {
-                    center_horizontal_canvas_content(&image, opts.presentation.canvas_background)
-                } else {
-                    image
+                let image = match opts.domain_frame {
+                    Some(frame) if matches!(frame.source, DomainFrameSource::MapViewport) => {
+                        crop_canvas_whitespace(&image, opts.presentation.canvas_background, 8)
+                    }
+                    Some(_) => center_horizontal_canvas_content(
+                        &image,
+                        opts.presentation.canvas_background,
+                    ),
+                    None => image,
                 };
                 let trimmed = if trim_vertical_canvas_whitespace_enabled() {
                     trim_vertical_canvas_whitespace(&image, opts.presentation.canvas_background)

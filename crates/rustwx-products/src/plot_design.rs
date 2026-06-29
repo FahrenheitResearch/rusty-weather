@@ -59,8 +59,19 @@ pub fn is_global_scale_domain(bounds: (f64, f64, f64, f64)) -> bool {
 pub fn static_domain_frame_for_bounds(bounds: (f64, f64, f64, f64)) -> Option<DomainFrame> {
     if is_global_scale_domain(bounds) {
         None
+    } else if straight_western_domain_frame_enabled(bounds) {
+        Some(static_map_viewport_domain_frame())
     } else {
         Some(static_model_data_domain_frame())
+    }
+}
+
+fn static_map_viewport_domain_frame() -> DomainFrame {
+    DomainFrame {
+        inset_px: 2,
+        outline_width: 2,
+        source: DomainFrameSource::MapViewport,
+        ..DomainFrame::map_viewport_default()
     }
 }
 
@@ -71,6 +82,37 @@ fn static_model_data_domain_frame() -> DomainFrame {
         source: DomainFrameSource::ProjectedGrid,
         ..DomainFrame::map_viewport_default()
     }
+}
+
+fn straight_western_domain_frame_enabled(bounds: (f64, f64, f64, f64)) -> bool {
+    let default = is_straight_western_domain_frame_candidate(bounds);
+    std::env::var("RUSTWX_STRAIGHT_WEST_PROJECTION")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "mercator" | "straight" | "northup"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn is_straight_western_domain_frame_candidate(bounds: (f64, f64, f64, f64)) -> bool {
+    let west = normalize_longitude_for_bounds(bounds.0);
+    let east = normalize_longitude_for_bounds(bounds.1);
+    if west > east {
+        return false;
+    }
+    let lat_span = (bounds.3 - bounds.2).abs();
+    let lon_span = longitude_bounds_span_deg(bounds);
+    bounds.2 >= 25.0
+        && bounds.3 <= 55.0
+        && west >= -130.0
+        && west <= -115.0
+        && east >= -123.0
+        && east <= -104.0
+        && lat_span >= 4.0
+        && lon_span <= 28.0
 }
 
 pub fn apply_static_map_design(
@@ -115,18 +157,18 @@ pub fn operational_fill_scale_for_recipe(
 
     if filled_selector.field == CanonicalField::SmokeMassDensity {
         return ColorScale::Discrete(DiscreteColorScale {
-            levels: vec![0.0, 5.0, 10.0, 20.0, 35.0, 55.0, 100.0, 150.0, 250.0, 500.0],
+            levels: vec![10.0, 20.0, 35.0, 55.0, 100.0, 150.0, 250.0, 500.0],
             colors: smoke_scale_colors(),
             extend: ExtendMode::Max,
-            mask_below: Some(1.0),
+            mask_below: Some(10.0),
         });
     }
     if filled_selector.field == CanonicalField::ColumnIntegratedSmoke {
         return ColorScale::Discrete(DiscreteColorScale {
-            levels: vec![0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0],
+            levels: vec![20.0, 40.0, 80.0, 160.0, 320.0],
             colors: smoke_scale_colors(),
             extend: ExtendMode::Max,
-            mask_below: Some(0.5),
+            mask_below: Some(20.0),
         });
     }
 
@@ -568,16 +610,16 @@ fn precipitable_water_inches_scale() -> DiscreteColorScale {
 
 fn smoke_scale_colors() -> Vec<Color> {
     vec![
-        Color::rgba(230, 243, 255, 255),
-        Color::rgba(135, 206, 235, 255),
-        Color::rgba(144, 238, 144, 255),
-        Color::rgba(255, 255, 0, 255),
-        Color::rgba(255, 165, 0, 255),
-        Color::rgba(255, 69, 0, 255),
-        Color::rgba(255, 0, 0, 255),
-        Color::rgba(128, 0, 128, 255),
-        Color::rgba(92, 0, 168, 255),
-        Color::rgba(64, 0, 128, 255),
+        Color::rgba(82, 185, 226, 42),
+        Color::rgba(84, 210, 238, 78),
+        Color::rgba(116, 230, 140, 116),
+        Color::rgba(247, 232, 65, 160),
+        Color::rgba(255, 169, 42, 200),
+        Color::rgba(244, 76, 31, 226),
+        Color::rgba(218, 10, 36, 238),
+        Color::rgba(135, 0, 150, 246),
+        Color::rgba(78, 0, 138, 252),
+        Color::rgba(48, 0, 112, 255),
     ]
 }
 
@@ -637,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn regional_static_design_uses_viewport_frame_and_stepped_legend() {
+    fn regional_static_design_uses_projected_grid_frame_and_smooth_legend() {
         let mut request = sample_request();
 
         StaticPlotDesign::new(
@@ -647,10 +689,56 @@ mod tests {
         .apply_to_request(&mut request);
 
         assert_eq!(request.visual_mode, ProductVisualMode::FilledMeteorology);
-        assert!(request.domain_frame.is_some());
+        assert_eq!(
+            request.domain_frame.map(|frame| frame.source),
+            Some(DomainFrameSource::ProjectedGrid)
+        );
         assert_eq!(request.legend.mode, LegendMode::SmoothRamp);
         assert_eq!(request.render_density.fill, high_detail_fill_density());
         assert_eq!(request.render_density.palette_multiplier, 4);
+    }
+
+    #[test]
+    fn straight_west_static_design_uses_viewport_frame() {
+        let mut request = sample_request();
+
+        StaticPlotDesign::new(
+            (-124.9, -113.8, 31.9, 42.5),
+            ProductVisualMode::FilledMeteorology,
+        )
+        .apply_to_request(&mut request);
+
+        assert_eq!(
+            request.domain_frame.map(|frame| frame.source),
+            Some(DomainFrameSource::MapViewport)
+        );
+
+        let mut west_request = sample_request();
+        StaticPlotDesign::new(
+            (-125.7, -110.5, 30.5, 49.0),
+            ProductVisualMode::FilledMeteorology,
+        )
+        .apply_to_request(&mut west_request);
+        assert_eq!(
+            west_request.domain_frame.map(|frame| frame.source),
+            Some(DomainFrameSource::MapViewport)
+        );
+    }
+
+    #[test]
+    fn rockies_static_design_keeps_projected_grid_frame() {
+        let mut request = sample_request();
+
+        StaticPlotDesign::new(
+            (-112.0, -96.0, 37.0, 49.5),
+            ProductVisualMode::FilledMeteorology,
+        )
+        .apply_to_request(&mut request);
+
+        assert_eq!(
+            request.domain_frame.map(|frame| frame.source),
+            Some(DomainFrameSource::ProjectedGrid)
+        );
     }
 
     #[test]
@@ -776,5 +864,27 @@ mod tests {
         };
         assert_eq!(categorical_scale.extend, ExtendMode::Neither);
         assert_eq!(categorical_scale.mask_below, Some(0.5));
+
+        let surface_smoke = rustwx_models::plot_recipe("smoke_pm25_native").unwrap();
+        let ColorScale::Discrete(surface_smoke_scale) = operational_fill_scale_for_recipe(
+            surface_smoke,
+            FieldSelector::height_agl(CanonicalField::SmokeMassDensity, 8),
+        ) else {
+            panic!("expected surface smoke discrete scale");
+        };
+        assert_eq!(surface_smoke_scale.levels.first().copied(), Some(10.0));
+        assert_eq!(surface_smoke_scale.mask_below, Some(10.0));
+        assert!(surface_smoke_scale.colors[0].a < 80);
+
+        let column_smoke = rustwx_models::plot_recipe("smoke_column").unwrap();
+        let ColorScale::Discrete(column_smoke_scale) = operational_fill_scale_for_recipe(
+            column_smoke,
+            FieldSelector::entire_atmosphere(CanonicalField::ColumnIntegratedSmoke),
+        ) else {
+            panic!("expected column smoke discrete scale");
+        };
+        assert_eq!(column_smoke_scale.levels.first().copied(), Some(20.0));
+        assert_eq!(column_smoke_scale.mask_below, Some(20.0));
+        assert!(column_smoke_scale.colors[0].a < 80);
     }
 }

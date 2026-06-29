@@ -479,6 +479,71 @@ fn compute_effective_layout(
     layout
 }
 
+fn fit_map_viewport_layout_to_extent(
+    layout: &mut Layout,
+    total_w: u32,
+    has_cbar: bool,
+    colorbar_orientation: ColorbarOrientation,
+    domain_frame: Option<DomainFrame>,
+    extent: Option<&MapExtent>,
+) {
+    if !matches!(domain_frame, Some(frame) if matches!(frame.source, DomainFrameSource::MapViewport))
+    {
+        return;
+    }
+    let Some(extent) = extent else {
+        return;
+    };
+    let dx = extent.x_max - extent.x_min;
+    let dy = extent.y_max - extent.y_min;
+    if !dx.is_finite() || !dy.is_finite() || dx <= 0.0 || dy <= 0.0 {
+        return;
+    }
+
+    let target_aspect = dx / dy;
+    let current_aspect = layout.map_w as f64 / layout.map_h.max(1) as f64;
+    if target_aspect >= current_aspect * 0.98 {
+        return;
+    }
+
+    let old_map_w = layout.map_w;
+    let new_map_w = ((layout.map_h as f64) * target_aspect)
+        .round()
+        .clamp(1.0, old_map_w as f64) as u32;
+    if new_map_w >= old_map_w {
+        return;
+    }
+
+    let old_cbar_x = layout.cbar_x;
+    let cbar_gap = if has_cbar && matches!(colorbar_orientation, ColorbarOrientation::VerticalRight)
+    {
+        old_cbar_x.saturating_sub(layout.map_x.saturating_add(old_map_w))
+    } else {
+        0
+    };
+    let right_span =
+        if has_cbar && matches!(colorbar_orientation, ColorbarOrientation::VerticalRight) {
+            total_w.saturating_sub(old_cbar_x)
+        } else {
+            0
+        };
+    let group_w = new_map_w
+        .saturating_add(cbar_gap)
+        .saturating_add(right_span)
+        .min(total_w);
+    let centered_x = total_w.saturating_sub(group_w) / 2;
+
+    layout.map_x = centered_x.max(1);
+    layout.map_w = new_map_w.max(1);
+    if has_cbar && matches!(colorbar_orientation, ColorbarOrientation::VerticalRight) {
+        layout.cbar_x = layout
+            .map_x
+            .saturating_add(layout.map_w)
+            .saturating_add(cbar_gap)
+            .min(total_w.saturating_sub(1));
+    }
+}
+
 fn reserve_domain_frame_legend_space(
     layout: &mut Layout,
     has_cbar: bool,
@@ -2197,6 +2262,16 @@ fn colorbar_anchor_rect(
     let mut cbar_w = layout.cbar_w;
 
     if matches!(orientation, ColorbarOrientation::VerticalRight) {
+        if matches!(frame, Some(frame) if frame.legend_follows_frame) {
+            if let Some(rect) = frame_rect {
+                let domain_right = layout.map_x.saturating_add(rect.max_x);
+                let frame_gap = (2u32.saturating_mul(layout.text_scale.max(1))).clamp(4, 8);
+                let anchored_x = domain_right.saturating_add(frame_gap);
+                if anchored_x < cbar_x {
+                    cbar_x = anchored_x;
+                }
+            }
+        }
         return (cbar_x, cbar_y, cbar_w);
     }
 
@@ -3943,12 +4018,13 @@ fn barb_glyph_margin_px(length_px: f64, width: u32) -> f64 {
 fn effective_domain_frame_rect(
     opts: &RenderOpts,
     map_img: &RgbaImage,
+    raster_frame_mask: Option<&RgbaImage>,
     projected_domain_frame_rect: Option<LocalRect>,
     overlay_padding_px: u32,
 ) -> Option<LocalRect> {
     match opts.domain_frame {
         Some(frame) if matches!(frame.source, DomainFrameSource::RasterAlpha) => {
-            raster_alpha_bounds(map_img)
+            raster_alpha_bounds(raster_frame_mask.unwrap_or(map_img))
                 .map(LocalRect::from_bounds)
                 .and_then(|rect| inset_rect(rect, frame.inset_px))
                 .map(|rect| {
@@ -4041,11 +4117,37 @@ fn draw_variable_layers(
         } else {
             None
         };
-    let effective_domain_frame_rect =
-        effective_domain_frame_rect(opts, &map_img, domain_frame_rect, overlay_padding_px);
+    let raster_frame_clip_mask = if matches!(
+        opts.domain_frame,
+        Some(frame) if frame.clear_outside && matches!(frame.source, DomainFrameSource::RasterAlpha)
+    ) {
+        match (opts.projected_grid.as_ref(), projected_pixels) {
+            (Some(grid), Some(pixel_points)) => Some(rasterize::rasterize_projected_coverage_mask(
+                grid.ny,
+                grid.nx,
+                pixel_points,
+                layout.map_w,
+                layout.map_h,
+            )),
+            _ => build_alpha_clip_mask(&map_img),
+        }
+    } else {
+        None
+    };
+    let effective_domain_frame_rect = effective_domain_frame_rect(
+        opts,
+        &map_img,
+        raster_frame_clip_mask.as_ref(),
+        domain_frame_rect,
+        overlay_padding_px,
+    );
 
     let frame_clip_rect = match opts.domain_frame {
-        Some(frame) if frame.clear_outside => effective_domain_frame_rect,
+        Some(frame)
+            if frame.clear_outside && !matches!(frame.source, DomainFrameSource::RasterAlpha) =>
+        {
+            effective_domain_frame_rect
+        }
         _ => None,
     };
     let domain_clip_rect = frame_clip_rect.or_else(|| {
@@ -4064,15 +4166,18 @@ fn draw_variable_layers(
                     .and_then(|bounds| inset_rect(bounds, inset))
             })
     });
-    let domain_clip_mask =
+    let rect_domain_clip_mask =
         domain_clip_rect.map(|rect| build_rect_clip_mask(layout.map_w, layout.map_h, rect));
-    let combined_clip_mask = match (domain_clip_mask.as_ref(), projection_clip_mask.as_ref()) {
+    let domain_clip_mask = raster_frame_clip_mask
+        .as_ref()
+        .or(rect_domain_clip_mask.as_ref());
+    let combined_clip_mask = match (domain_clip_mask, projection_clip_mask.as_ref()) {
         (Some(domain), Some(projection)) => Some(intersect_alpha_clip_masks(domain, projection)),
         _ => None,
     };
     let draw_clip_mask = combined_clip_mask
         .as_ref()
-        .or(domain_clip_mask.as_ref())
+        .or(domain_clip_mask)
         .or(projection_clip_mask.as_ref());
 
     let raster_blit_start = Instant::now();
@@ -4183,18 +4288,14 @@ fn draw_variable_layers(
     let outside_frame_clear_start = Instant::now();
     if let Some(mask) = combined_clip_mask.as_ref() {
         clear_map_outside_local_mask(img, layout, mask, canvas_background);
-        if let Some(frame) = opts.presentation.chrome.frame_color {
-            draw_local_mask_outline(img, layout, mask, frame, 1);
-        }
+        draw_domain_clip_mask_outline(img, layout, mask, opts);
     } else if let (Some(frame), Some(rect)) = (opts.domain_frame, effective_domain_frame_rect) {
         if frame.clear_outside {
             clear_map_outside_local_rect(img, layout, rect, canvas_background);
         }
     } else if let Some(mask) = projection_clip_mask.as_ref() {
         clear_map_outside_local_mask(img, layout, mask, canvas_background);
-        if let Some(frame) = opts.presentation.chrome.frame_color {
-            draw_local_mask_outline(img, layout, mask, frame, 1);
-        }
+        draw_domain_clip_mask_outline(img, layout, mask, opts);
     }
     let outside_frame_clear_ms = outside_frame_clear_start.elapsed().as_millis();
 
@@ -4211,6 +4312,24 @@ fn draw_variable_layers(
         domain_frame_rect: effective_domain_frame_rect,
         domain_clip_rect,
         projection_clip_mask_present: projection_clip_mask.is_some(),
+    }
+}
+
+fn draw_domain_clip_mask_outline(
+    img: &mut RgbaImage,
+    layout: &Layout,
+    mask: &RgbaImage,
+    opts: &RenderOpts,
+) {
+    if let Some(frame) = opts.domain_frame {
+        let frame_style = opts
+            .presentation
+            .domain_frame_style(frame.outline_color.into(), frame.outline_width);
+        if frame_style.visible {
+            draw_local_mask_outline(img, layout, mask, frame_style.color, frame_style.width);
+        }
+    } else if let Some(frame) = opts.presentation.chrome.frame_color {
+        draw_local_mask_outline(img, layout, mask, frame, 1);
     }
 }
 
@@ -4374,11 +4493,19 @@ fn draw_chrome_and_colorbar(
 
     if let Some(frame) = opts.domain_frame {
         if let Some(rect) = domain_frame_rect {
-            let frame_style = opts
-                .presentation
-                .domain_frame_style(frame.outline_color.into(), frame.outline_width);
-            if frame_style.visible {
-                draw_local_rect_outline(img, layout, rect, frame_style.color, frame_style.width);
+            if !matches!(frame.source, DomainFrameSource::RasterAlpha) {
+                let frame_style = opts
+                    .presentation
+                    .domain_frame_style(frame.outline_color.into(), frame.outline_width);
+                if frame_style.visible {
+                    draw_local_rect_outline(
+                        img,
+                        layout,
+                        rect,
+                        frame_style.color,
+                        frame_style.width,
+                    );
+                }
             }
         }
     }
@@ -4563,7 +4690,7 @@ fn render_to_image_profile_inner(
         || opts.subtitle_left.is_some()
         || opts.subtitle_center.is_some()
         || opts.subtitle_right.is_some();
-    let layout = compute_effective_layout(
+    let mut layout = compute_effective_layout(
         opts.width,
         opts.height,
         opts.colorbar,
@@ -4571,6 +4698,14 @@ fn render_to_image_profile_inner(
         opts.presentation,
         opts.chrome_scale,
         opts.domain_frame.is_some(),
+    );
+    fit_map_viewport_layout_to_extent(
+        &mut layout,
+        opts.width,
+        opts.colorbar,
+        opts.presentation.colorbar.orientation,
+        opts.domain_frame,
+        opts.map_extent.as_ref(),
     );
     let layout_ms = layout_start.elapsed().as_millis();
 
@@ -4796,6 +4931,45 @@ pub(crate) fn trim_vertical_canvas_whitespace(img: &RgbaImage, background: Rgba)
     }
 
     crop_imm(img, 0, crop_top, img.width(), crop_h).to_image()
+}
+
+pub(crate) fn crop_canvas_whitespace(img: &RgbaImage, background: Rgba, pad: u32) -> RgbaImage {
+    if img.width() <= 2 || img.height() <= 2 {
+        return img.clone();
+    }
+
+    let mut min_x = img.width();
+    let mut max_x = 0;
+    let mut min_y = img.height();
+    let mut max_y = 0;
+    for y in 0..img.height() {
+        for x in 0..img.width() {
+            if !pixel_matches_background(*img.get_pixel(x, y), background) {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+
+    if min_x > max_x || min_y > max_y {
+        return img.clone();
+    }
+
+    let crop_x = min_x.saturating_sub(pad);
+    let crop_y = min_y.saturating_sub(pad);
+    let crop_right = max_x.saturating_add(pad).min(img.width().saturating_sub(1));
+    let crop_bottom = max_y
+        .saturating_add(pad)
+        .min(img.height().saturating_sub(1));
+    let crop_w = crop_right.saturating_sub(crop_x).saturating_add(1);
+    let crop_h = crop_bottom.saturating_sub(crop_y).saturating_add(1);
+    if crop_x == 0 && crop_y == 0 && crop_w == img.width() && crop_h == img.height() {
+        return img.clone();
+    }
+
+    crop_imm(img, crop_x, crop_y, crop_w, crop_h).to_image()
 }
 
 fn pixel_matches_background(px: image::Rgba<u8>, background: Rgba) -> bool {

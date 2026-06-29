@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
 use rustwx_render::map_frame_aspect_ratio;
 
 use crate::gridded::{
@@ -103,13 +104,14 @@ pub fn render_derived_recipes_from_store_grids(
         request.domain.bounds,
         map_frame_aspect_ratio(request.output_width, request.output_height, true, true),
     )?;
+    let projected_crop_pad_cells = store_render_projected_crop_pad_cells(request.domain.bounds);
     let (grid, projected, crop) = match classify_projected_grid_intersection(
         full_grid.shape.nx,
         full_grid.shape.ny,
         &full_projected.projected_x,
         &full_projected.projected_y,
         &full_projected.extent,
-        2,
+        projected_crop_pad_cells,
     )? {
         ProjectedGridIntersection::Empty => {
             return Err(format!(
@@ -157,16 +159,15 @@ pub fn render_derived_recipes_from_store_grids(
         computed.surface_v10_ms = Some(crop_plane(v10));
     }
 
-    let mut rendered = Vec::with_capacity(recipes.len());
-    for recipe in &recipes {
+    let render_one = |recipe: &DerivedRecipe| -> Result<DerivedRenderedRecipe, String> {
         if recipe.is_heavy() {
             let store_grid = by_slug[recipe.slug()];
             let field = WeatherPanelField::new(
-                weather_product_for_heavy_recipe(*recipe)?,
+                weather_product_for_heavy_recipe(*recipe).map_err(|err| err.to_string())?,
                 store_grid.units.clone(),
                 crop_plane(&store_grid.values),
             );
-            rendered.push(render_derived_heavy_recipe(
+            render_derived_heavy_recipe(
                 request,
                 *recipe,
                 &field,
@@ -180,9 +181,10 @@ pub fn render_derived_recipes_from_store_grids(
                 request.model,
                 input_fetch_keys.clone(),
                 DerivedRenderOverrides::default(),
-            )?);
+            )
+            .map_err(|err| err.to_string())
         } else {
-            rendered.push(render_derived_output_recipe(
+            render_derived_output_recipe(
                 request,
                 *recipe,
                 &grid,
@@ -196,10 +198,106 @@ pub fn render_derived_recipes_from_store_grids(
                 &computed,
                 input_fetch_keys.clone(),
                 DerivedRenderOverrides::default(),
-            )?);
+            )
+            .map_err(|err| err.to_string())
         }
+    };
+
+    let worker_count = derived_render_worker_count(recipes.len());
+    let rendered = if worker_count <= 1 {
+        recipes
+            .iter()
+            .map(render_one)
+            .collect::<Result<Vec<_>, _>>()
+    } else {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(worker_count)
+            .thread_name(|index| format!("rustwx-derived-render-{index}"))
+            .build()
+            .map_err(|err| err.to_string())?
+            .install(|| {
+                recipes
+                    .par_iter()
+                    .map(render_one)
+                    .collect::<Result<Vec<_>, _>>()
+            })
     }
+    .map_err(std::io::Error::other)?;
     Ok(rendered)
+}
+
+fn store_render_projected_crop_pad_cells(bounds: (f64, f64, f64, f64)) -> usize {
+    std::env::var("RUSTWX_STORE_RENDER_PROJECTED_CROP_PAD_CELLS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or_else(|| {
+            if is_straight_western_store_render_domain(bounds) {
+                192
+            } else {
+                2
+            }
+        })
+}
+
+fn is_straight_western_store_render_domain(bounds: (f64, f64, f64, f64)) -> bool {
+    let west = normalize_longitude_for_store_bounds(bounds.0);
+    let east = normalize_longitude_for_store_bounds(bounds.1);
+    if west > east {
+        return false;
+    }
+    let lat_span = (bounds.3 - bounds.2).abs();
+    let lon_span = longitude_store_bounds_span_deg(bounds);
+    bounds.2 >= 25.0
+        && bounds.3 <= 55.0
+        && west >= -130.0
+        && west <= -115.0
+        && east >= -123.0
+        && east <= -104.0
+        && lat_span >= 4.0
+        && lon_span <= 28.0
+}
+
+fn longitude_store_bounds_span_deg(bounds: (f64, f64, f64, f64)) -> f64 {
+    let raw_span = (bounds.1 - bounds.0).abs();
+    if raw_span >= 359.0 {
+        return raw_span.min(360.0);
+    }
+
+    let west = normalize_longitude_for_store_bounds(bounds.0);
+    let east = normalize_longitude_for_store_bounds(bounds.1);
+    if west <= east {
+        east - west
+    } else {
+        east + 360.0 - west
+    }
+}
+
+fn normalize_longitude_for_store_bounds(lon: f64) -> f64 {
+    let mut lon = lon % 360.0;
+    if lon > 180.0 {
+        lon -= 360.0;
+    } else if lon <= -180.0 {
+        lon += 360.0;
+    }
+    lon
+}
+
+fn derived_render_worker_count(recipe_count: usize) -> usize {
+    if recipe_count <= 1 {
+        return 1;
+    }
+
+    let override_threads = std::env::var("RUSTWX_DERIVED_RENDER_THREADS")
+        .ok()
+        .or_else(|| std::env::var("RUSTWX_RENDER_THREADS").ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0);
+
+    std::thread::available_parallelism()
+        .map(|count| override_threads.unwrap_or((count.get() / 2).max(1)))
+        .unwrap_or(1)
+        .min(recipe_count)
 }
 
 /// Place one store-read plane into the computed-fields slot the render

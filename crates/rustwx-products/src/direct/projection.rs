@@ -44,6 +44,11 @@ pub fn build_projected_map_with_projection(
         target_ratio,
     );
     let mut options = ProjectedMapBuildOptions::from_bounds(frame_bounds, target_ratio);
+    if straight_western_projection_enabled(bounds) {
+        options = options
+            .with_geographic_grid_intersection_frame(frame_bounds)
+            .with_natural_frame_aspect();
+    }
     if let Some(presentation_projection) = presentation_projection {
         let reference_latitude =
             reference_latitude_for_projection_variant(variant, projection, frame_bounds);
@@ -76,6 +81,41 @@ pub fn build_requested_projected_map_with_projection(
         target_ratio,
     );
     let mut options = ProjectedMapBuildOptions::from_bounds(frame_bounds, target_ratio);
+    if straight_western_projection_enabled(bounds) {
+        options = options
+            .with_geographic_grid_intersection_frame(frame_bounds)
+            .with_natural_frame_aspect();
+    }
+    if let Some(presentation_projection) = presentation_projection {
+        let reference_latitude =
+            reference_latitude_for_projection_variant(variant, projection, frame_bounds);
+        options = options.with_projection(presentation_projection);
+        if let Some(reference_latitude) = reference_latitude {
+            options.domain.reference_latitude_deg = Some(reference_latitude);
+        }
+    }
+    options = options.with_basemap_detail(basemap_detail_for_bounds(frame_bounds));
+    options.domain.pad_fraction = presentation_pad_fraction_for_bounds(frame_bounds);
+    let mut projected =
+        rustwx_render::build_projected_map_with_options(lat_deg, lon_deg, &options)?;
+    projected.inverse_raster_projection =
+        inverse_raster_projection_for_latlon_mesh(projection, frame_bounds, lat_deg, lon_deg);
+    Ok(projected)
+}
+
+pub fn build_natural_projected_map_with_projection(
+    lat_deg: &[f32],
+    lon_deg: &[f32],
+    projection: Option<&GridProjection>,
+    bounds: (f64, f64, f64, f64),
+    target_ratio: f64,
+) -> Result<ProjectedMap, Box<dyn std::error::Error>> {
+    let variant = projection_presentation_variant();
+    let presentation_projection = presentation_projection_for_bounds(projection, bounds, variant);
+    let frame_bounds = bounds;
+    let mut options = ProjectedMapBuildOptions::from_bounds(frame_bounds, target_ratio)
+        .with_geographic_grid_intersection_frame(frame_bounds)
+        .with_natural_frame_aspect();
     if let Some(presentation_projection) = presentation_projection {
         let reference_latitude =
             reference_latitude_for_projection_variant(variant, projection, frame_bounds);
@@ -326,7 +366,7 @@ fn basemap_detail_for_bounds(bounds: (f64, f64, f64, f64)) -> BasemapDetail {
     let lon_span = longitude_bounds_span_deg(bounds);
     if is_global_scale_domain(bounds) {
         BasemapDetail::Global
-    } else if lat_span >= 45.0 || lon_span >= 65.0 {
+    } else if lat_span >= 60.0 || lon_span >= 120.0 {
         BasemapDetail::Broad
     } else {
         BasemapDetail::Regional
@@ -378,7 +418,10 @@ pub(super) fn projection_presentation_variant() -> ProjectionPresentationVariant
                 "rectangular" | "geographic" | "platecarree" | "crop" => {
                     ProjectionPresentationVariant::RectangularGeographic
                 }
-                "mercator" | "webmap" | "webmercator" => ProjectionPresentationVariant::Mercator,
+                "mercator" | "webmap" | "webmercator" | "straight" | "northup"
+                | "northupmercator" | "weststraight" | "straightwest" | "westernstraight" => {
+                    ProjectionPresentationVariant::Mercator
+                }
                 "pivotallambert" | "pivotal" => ProjectionPresentationVariant::PivotalLambert,
                 "robinson" | "atlas" => ProjectionPresentationVariant::Robinson,
                 _ => ProjectionPresentationVariant::Adaptive,
@@ -400,6 +443,14 @@ pub(super) fn presentation_projection_for_bounds(
         return Some(rustwx_render::ProjectionSpec::Robinson {
             central_meridian_deg: center_longitude_for_bounds(bounds),
         });
+    }
+
+    if !matches!(variant, ProjectionPresentationVariant::Adaptive) {
+        return Some(regional_latlon_presentation_projection(bounds, variant));
+    }
+
+    if straight_western_projection_enabled(bounds) {
+        return Some(straight_western_presentation_projection(bounds));
     }
 
     match native_projection {
@@ -667,5 +718,59 @@ fn stabilize_presentation_parallel(lat_deg: f64) -> f64 {
         10.0_f64.copysign(if lat < 0.0 { -1.0 } else { 1.0 })
     } else {
         lat
+    }
+}
+
+fn straight_western_projection_enabled(bounds: (f64, f64, f64, f64)) -> bool {
+    let default = is_straight_western_projection_candidate(bounds);
+    env_flag_enabled("RUSTWX_STRAIGHT_WEST_PROJECTION", default)
+}
+
+fn is_straight_western_projection_candidate(bounds: (f64, f64, f64, f64)) -> bool {
+    let west = normalize_longitude_for_bounds(bounds.0);
+    let east = normalize_longitude_for_bounds(bounds.1);
+    if west > east {
+        return false;
+    }
+    let lat_span = (bounds.3 - bounds.2).abs();
+    let lon_span = longitude_bounds_span_deg(bounds);
+    bounds.2 >= 25.0
+        && bounds.3 <= 55.0
+        && west >= -130.0
+        && west <= -115.0
+        && east >= -123.0
+        && east <= -104.0
+        && lat_span >= 4.0
+        && lon_span <= 28.0
+}
+
+fn straight_western_presentation_projection(
+    bounds: (f64, f64, f64, f64),
+) -> rustwx_render::ProjectionSpec {
+    regional_mercator_presentation_projection(bounds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conus_sized_domains_keep_regional_basemap_detail() {
+        assert_eq!(
+            basemap_detail_for_bounds((-127.0, -66.0, 23.0, 51.5)),
+            BasemapDetail::Regional
+        );
+        assert_eq!(
+            basemap_detail_for_bounds((-134.0, -60.0, 21.0, 54.0)),
+            BasemapDetail::Regional
+        );
+    }
+
+    #[test]
+    fn continent_sized_domains_use_broad_basemap_detail() {
+        assert_eq!(
+            basemap_detail_for_bounds((-170.0, -50.0, 5.0, 84.0)),
+            BasemapDetail::Broad
+        );
     }
 }
