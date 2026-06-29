@@ -41,7 +41,6 @@ jobs:
           fi
           missing=0
           for name in \
-            AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_TS_ENDPOINT AZURE_TS_ACCOUNT AZURE_TS_PROFILE \
             MACOS_CERTIFICATE_BASE64 MACOS_CERTIFICATE_PWD ASC_API_KEY_BASE64 ASC_KEY_ID ASC_ISSUER_ID
           do
             if [[ -z "${!name:-}" ]]; then
@@ -50,10 +49,10 @@ jobs:
             fi
           done
           if [[ "${missing}" -ne 0 ]]; then
-            echo "Refusing to create a public release with unsigned Windows/macOS artifacts."
+            echo "Refusing to create a public release without signed/notarized macOS artifacts."
             exit 1
           fi
-          echo "Signing secrets are present; release may proceed."
+          echo "macOS signing secrets are present; release may proceed. Windows signing remains optional."
 
   create-release:
     needs: preflight-signing
