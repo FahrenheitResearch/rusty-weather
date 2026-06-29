@@ -954,8 +954,11 @@ impl App {
                 StoreResponse::Sounding(_, Ok(data)) => {
                     self.worker.stats().record("sounding.read", data.read_ms);
                     self.sounding.set_data(data);
-                    if let Some((_, render_ms)) = self.sounding.last_timings() {
-                        self.worker.stats().record("skewt.render", render_ms);
+                    if let Some((read_ms, scene_ms)) = self.sounding.last_timings() {
+                        self.worker.stats().record("sounding.scene", scene_ms);
+                        self.worker
+                            .stats()
+                            .record("sounding.native_total", read_ms + scene_ms);
                     }
                 }
                 StoreResponse::Sounding(_, Err(message)) => {

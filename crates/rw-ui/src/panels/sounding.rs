@@ -1037,6 +1037,7 @@ fn draw_sounding_scene(
     overlays: &SoundingOverlaySettings,
     edit_layout: bool,
 ) {
+    profile_scope!("sounding_draw_scene");
     let painter = ui.painter_at(screen);
     painter.rect_filled(screen, 0.0, Color32::BLACK);
 
@@ -1170,6 +1171,7 @@ fn draw_skewt_panel(
     view: PanelViewport,
     overlays: &SoundingOverlaySettings,
 ) {
+    profile_scope!("sounding_draw_skewt");
     let plot_left = SKEWT_MARGIN_LEFT;
     let plot_top = TITLE_H + SKEWT_MARGIN_TOP;
     let plot_w = SKEWT_LEFT_W * SKEWT_FRAC - SKEWT_MARGIN_LEFT - SKEWT_MARGIN_RIGHT;
@@ -1369,6 +1371,7 @@ fn draw_hodograph_panel(
     view: PanelViewport,
     overlays: &SoundingOverlaySettings,
 ) {
+    profile_scope!("sounding_draw_hodograph");
     draw_rect_outline_base(
         painter,
         rect,
@@ -1518,6 +1521,7 @@ fn draw_slinky_panel(
     view: PanelViewport,
     overlays: &SoundingOverlaySettings,
 ) {
+    profile_scope!("sounding_draw_slinky");
     draw_rect_outline_base(
         painter,
         rect,
@@ -1659,6 +1663,7 @@ fn draw_native_tables(
     scene: &SoundingScene,
     data: &SoundingData,
 ) {
+    profile_scope!("sounding_draw_tables");
     let top = TITLE_H + SKEWT_UPPER_H;
     let p = &scene.native.params;
     let ecape = &scene.native.verified_ecape;
