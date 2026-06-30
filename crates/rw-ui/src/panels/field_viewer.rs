@@ -234,6 +234,7 @@ pub struct FieldViewerPanel {
     hour: Option<HourKey>,
     vars: Vec<VarInfo>,
     selected_var: Option<String>,
+    var_filter: String,
     field: Option<FieldData>,
     texture: Option<TextureHandle>,
     texture_dirty: bool,
@@ -270,6 +271,7 @@ impl Default for FieldViewerPanel {
             hour: None,
             vars: Vec::new(),
             selected_var: None,
+            var_filter: String::new(),
             field: None,
             texture: None,
             texture_dirty: false,
@@ -494,6 +496,7 @@ impl FieldViewerPanel {
             });
         self.hour = Some(hour);
         self.vars = vars;
+        self.var_filter.clear();
         self.field = None;
         self.texture = None;
         self.texture_dirty = false;
@@ -589,6 +592,32 @@ impl FieldViewerPanel {
         ui.horizontal_wrapped(|ui| {
             let previous = self.selected_var.clone();
             let mut current = previous.clone().unwrap_or_default();
+            let surface_total = self
+                .vars
+                .iter()
+                .filter(|v| v.kind == VarKind::Surface2D)
+                .count();
+            ui.add(
+                egui::TextEdit::singleline(&mut self.var_filter)
+                    .desired_width(130.0)
+                    .hint_text("filter variables"),
+            );
+            if !self.var_filter.is_empty() && ui.button("x").on_hover_text("clear filter").clicked()
+            {
+                self.var_filter.clear();
+            }
+            let filter = self.var_filter.trim().to_ascii_lowercase();
+            let matching_vars = self
+                .vars
+                .iter()
+                .filter(|v| v.kind == VarKind::Surface2D)
+                .filter(|v| {
+                    filter.is_empty()
+                        || v.name.to_ascii_lowercase().contains(&filter)
+                        || v.units.to_ascii_lowercase().contains(&filter)
+                })
+                .map(|v| (v.name.clone(), v.units.clone()))
+                .collect::<Vec<_>>();
             ComboBox::from_id_salt("rw-ui-field-var")
                 .selected_text(if current.is_empty() {
                     "pick a variable"
@@ -597,14 +626,22 @@ impl FieldViewerPanel {
                 })
                 .width(220.0)
                 .show_ui(ui, |ui| {
-                    for var in self.vars.iter().filter(|v| v.kind == VarKind::Surface2D) {
+                    if matching_vars.is_empty() {
+                        ui.label(RichText::new("No variables match").small().weak());
+                    }
+                    for (name, units) in &matching_vars {
                         ui.selectable_value(
                             &mut current,
-                            var.name.clone(),
-                            format!("{} ({})", var.name, var.units),
+                            name.clone(),
+                            format!("{} ({})", name, units),
                         );
                     }
                 });
+            ui.label(
+                RichText::new(format!("{} of {} vars", matching_vars.len(), surface_total))
+                    .small()
+                    .weak(),
+            );
             if !current.is_empty() && Some(&current) != previous.as_ref() {
                 self.selected_var = Some(current.clone());
                 self.field = None;

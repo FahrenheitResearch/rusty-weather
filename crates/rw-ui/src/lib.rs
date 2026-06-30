@@ -33,18 +33,24 @@ mod panels;
 pub mod skewt;
 pub mod stats;
 mod store_view;
+pub mod style_overrides;
 pub mod synthetic;
 mod worker;
 
 pub use panels::{
-    AvailabilityView, CustomDomain, DownloadEvent, DownloadPanel, DownloadRunState, DownloadSpec,
-    DownloadStage, EstimateView, FieldViewerEvent, FieldViewerPanel, HourDoneView, ModelOption,
-    PlotViewerPanel, RunBrowserPanel, SatDiskUsage, SatFollowSpec, SatFollowState, SatFrameImage,
-    SatLayerOption, SatPlayerEvent, SatPlayerPanel, SatRunKey, SatRunListing, SatSatelliteOption,
-    SatSectorOption, SatelliteEvent, SatellitePanel, SoundingPanel, SoundingViewState, StageState,
-    format_bytes, shift_date_yyyymmdd, today_yyyymmdd_utc,
+    AvailabilityView, ColorTableEditorPanel, CustomDomain, DownloadEvent, DownloadPanel,
+    DownloadRunState, DownloadSpec, DownloadStage, EstimateView, FieldViewerEvent,
+    FieldViewerPanel, HourDoneView, ModelOption, PlotViewerPanel, RunBrowserPanel, SatDiskUsage,
+    SatFollowSpec, SatFollowState, SatFrameImage, SatLayerOption, SatPlayerEvent, SatPlayerPanel,
+    SatRunKey, SatRunListing, SatSatelliteOption, SatSectorOption, SatelliteEvent, SatellitePanel,
+    SoundingPanel, SoundingViewState, StageState, format_bytes, shift_date_yyyymmdd,
+    today_yyyymmdd_utc,
 };
 pub use store_view::{HourEntry, ModelEntry, RunEntry, StoreTree, StoreView};
+pub use style_overrides::{
+    ProductStyleBinding, StyleOverrideSettings, UserColorTable, UserExtendMode, UserLegendMode,
+    UserUnitConvert, normalize_product_key,
+};
 pub use worker::{
     FieldData, FieldKey, HourKey, ProfileVar, SoundingData, StoreRequest, StoreResponse,
     StoreWorker, SurfaceSample, VarInfo, VarKind,

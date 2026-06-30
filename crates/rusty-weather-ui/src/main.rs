@@ -40,25 +40,30 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ingest_worker;
+mod local_import;
 #[cfg(feature = "profiling")]
 mod profiler;
 mod sat_worker;
+mod wrf_process;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::sync::mpsc::TryRecvError;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use ingest_worker::{IngestRequest, IngestResponse, IngestWorker};
+use local_import::{LocalImportSummary, LocalImportTask};
 use rustwx_models::{model_summary, supported_forecast_hours, supported_models};
 use rw_ui::{
-    CustomDomain, DownloadEvent, DownloadPanel, DownloadSpec, FieldViewerEvent, FieldViewerPanel,
-    HourKey, ModelOption, PlotViewerPanel, RunBrowserPanel, SatFollowSpec, SatPlayerEvent,
-    SatPlayerPanel, SatelliteEvent, SatellitePanel, SoundingPanel, StoreRequest, StoreResponse,
-    StoreTree, StoreView, StoreWorker,
+    ColorTableEditorPanel, CustomDomain, DownloadEvent, DownloadPanel, DownloadSpec,
+    FieldViewerEvent, FieldViewerPanel, HourKey, ModelOption, PlotViewerPanel, RunBrowserPanel,
+    SatFollowSpec, SatPlayerEvent, SatPlayerPanel, SatelliteEvent, SatellitePanel, SoundingPanel,
+    StoreRequest, StoreResponse, StoreTree, StoreView, StoreWorker, StyleOverrideSettings,
 };
 use sat_worker::{SatRequest, SatResponse, SatWorker};
 use serde::{Deserialize, Serialize};
+use wrf_process::{WrfProcessMessage, WrfProcessOptions, WrfProcessSummary, WrfProcessTask};
 
 // ---------------------------------------------------------------------------
 // Storage path resolution
@@ -68,6 +73,10 @@ use serde::{Deserialize, Serialize};
 const STORAGE_KEY: &str = "rw.storage_paths";
 /// eframe Storage key for user-saved native plot domains.
 const DOMAIN_STORAGE_KEY: &str = "rw.custom_domains";
+/// eframe Storage key for user color tables and product -> table bindings.
+const STYLE_STORAGE_KEY: &str = "rw.style_overrides";
+/// eframe Storage key for local WRF processing options.
+const WRF_PROCESS_STORAGE_KEY: &str = "rw.wrf_process_options";
 
 /// Legacy/default store leaf when neither CLI nor persisted settings provide one.
 const DEFAULT_STORE_ROOT: &str = "store";
@@ -143,6 +152,26 @@ fn serialize_custom_domains(domains: &[CustomDomain]) -> String {
 
 fn deserialize_custom_domains(s: &str) -> Vec<CustomDomain> {
     serde_json::from_str(s).unwrap_or_default()
+}
+
+fn serialize_style_settings(settings: &StyleOverrideSettings) -> String {
+    serde_json::to_string(settings).unwrap_or_default()
+}
+
+fn deserialize_style_settings(s: &str) -> StyleOverrideSettings {
+    serde_json::from_str::<StyleOverrideSettings>(s)
+        .unwrap_or_default()
+        .normalized()
+}
+
+fn serialize_wrf_process_options(options: &WrfProcessOptions) -> String {
+    serde_json::to_string(options).unwrap_or_default()
+}
+
+fn deserialize_wrf_process_options(s: &str) -> WrfProcessOptions {
+    serde_json::from_str::<WrfProcessOptions>(s)
+        .unwrap_or_default()
+        .normalized()
 }
 
 /// Pure resolution function: merges CLI overrides + persisted settings +
@@ -636,6 +665,124 @@ impl StorageSettingsUi {
 }
 
 // ---------------------------------------------------------------------------
+// WRF processing settings UI (app-shell only)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct WrfProcessSettingsUi {
+    only_edit: String,
+    skip_edit: String,
+}
+
+impl WrfProcessSettingsUi {
+    fn new(options: &WrfProcessOptions) -> Self {
+        Self {
+            only_edit: format_product_filter_tokens(&options.only),
+            skip_edit: format_product_filter_tokens(&options.skip),
+        }
+    }
+
+    fn set_from_options(&mut self, options: &WrfProcessOptions) {
+        self.only_edit = format_product_filter_tokens(&options.only);
+        self.skip_edit = format_product_filter_tokens(&options.skip);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, options: &mut WrfProcessOptions) -> bool {
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Fast core").clicked() {
+                *options = WrfProcessOptions {
+                    core_fields: true,
+                    diagnostics: false,
+                    heavy_ecape: false,
+                    raw_extras: false,
+                    only: Vec::new(),
+                    skip: Vec::new(),
+                };
+                self.set_from_options(options);
+                changed = true;
+            }
+            if ui.button("WRF default").clicked() {
+                *options = WrfProcessOptions::default();
+                self.set_from_options(options);
+                changed = true;
+            }
+            if ui.button("Everything").clicked() {
+                *options = WrfProcessOptions {
+                    core_fields: true,
+                    diagnostics: true,
+                    heavy_ecape: true,
+                    raw_extras: true,
+                    only: Vec::new(),
+                    skip: Vec::new(),
+                };
+                self.set_from_options(options);
+                changed = true;
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            changed |= ui
+                .checkbox(&mut options.core_fields, "Core fields")
+                .changed();
+            changed |= ui
+                .checkbox(&mut options.diagnostics, "Diagnostics")
+                .changed();
+            changed |= ui
+                .checkbox(&mut options.heavy_ecape, "ECAPE/heavy")
+                .changed();
+            changed |= ui.checkbox(&mut options.raw_extras, "Raw extras").changed();
+        });
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Only products").small().strong());
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut self.only_edit)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("blank = any selected group"),
+            )
+            .changed()
+        {
+            options.only = parse_product_filter_tokens(&self.only_edit);
+            changed = true;
+        }
+        ui.label(egui::RichText::new("Skip products").small().strong());
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut self.skip_edit)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("ecape, hail, graupel, ..."),
+            )
+            .changed()
+        {
+            options.skip = parse_product_filter_tokens(&self.skip_edit);
+            changed = true;
+        }
+        ui.label(
+            egui::RichText::new(
+                "Filters match WRF names, store product names, and stripped wrf_ aliases.",
+            )
+            .small()
+            .weak(),
+        );
+        changed
+    }
+}
+
+fn parse_product_filter_tokens(value: &str) -> Vec<String> {
+    value
+        .split([',', ';', '\n', '\r', '\t'])
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn format_product_filter_tokens(tokens: &[String]) -> String {
+    tokens.join(", ")
+}
+
+// ---------------------------------------------------------------------------
 // main + CLI parsing
 // ---------------------------------------------------------------------------
 
@@ -889,6 +1036,8 @@ struct App {
     viewer: FieldViewerPanel,
     plot_viewer: PlotViewerPanel,
     show_plot_viewer: bool,
+    color_tables: ColorTableEditorPanel,
+    show_color_tables: bool,
     sounding: SoundingPanel,
     download: DownloadPanel,
     show_download: bool,
@@ -907,6 +1056,22 @@ struct App {
     recorded_plot_timings: Option<(f32, f32)>,
     /// Same dedup for the sat player's texture uploads.
     recorded_sat_texture_ms: Option<f32>,
+    /// Background local file/folder import, currently focused on WRF NetCDF.
+    local_import: Option<LocalImportTask>,
+    /// Short file/open/import status shown in the toolbar.
+    local_import_status: Option<String>,
+    /// WRF files staged by File -> Open before explicit product processing.
+    pending_wrf_paths: Vec<PathBuf>,
+    /// Background WRF diagnostic/product processing.
+    wrf_process: Option<WrfProcessTask>,
+    /// Short WRF open/process status shown in the toolbar.
+    wrf_process_status: Option<String>,
+    /// Persistent local WRF product-processing profile.
+    wrf_options: WrfProcessOptions,
+    /// Edit buffers for WRF product filters.
+    wrf_options_ui: WrfProcessSettingsUi,
+    /// Toggle for the WRF processing settings window.
+    show_wrf_options: bool,
     /// State for the collapsible Storage settings section.
     storage_ui: StorageSettingsUi,
     /// Pending JSON to write via `App::save` on the next eframe save tick.
@@ -916,6 +1081,10 @@ struct App {
     pending_persist: Option<String>,
     /// Pending saved-domain JSON written by the native plot panel.
     pending_domain_persist: Option<String>,
+    /// Pending color table/product binding JSON.
+    pending_style_persist: Option<String>,
+    /// Pending WRF processing options JSON.
+    pending_wrf_options_persist: Option<String>,
     #[cfg(feature = "profiling")]
     profiler: profiler::ProfilerPanel,
     #[cfg(feature = "profiling")]
@@ -951,6 +1120,18 @@ impl App {
         let worker = StoreWorker::spawn(StoreView::new(&store_root), move || {
             ctx.request_repaint();
         });
+        let style_settings = cc
+            .storage
+            .and_then(|storage| {
+                storage
+                    .get_string(STYLE_STORAGE_KEY)
+                    .map(|value| deserialize_style_settings(&value))
+            })
+            .unwrap_or_default()
+            .normalized();
+        let mut color_tables = ColorTableEditorPanel::new();
+        color_tables.set_settings(style_settings.clone());
+        worker.send(StoreRequest::SetStyleOverrides(style_settings));
         worker.send(StoreRequest::Enumerate);
 
         let ctx = cc.egui_ctx.clone();
@@ -1036,6 +1217,16 @@ impl App {
             .unwrap_or_default();
         let mut plot_viewer = PlotViewerPanel::new();
         plot_viewer.set_saved_domains(saved_domains);
+        let wrf_options = cc
+            .storage
+            .and_then(|storage| {
+                storage
+                    .get_string(WRF_PROCESS_STORAGE_KEY)
+                    .map(|value| deserialize_wrf_process_options(&value))
+            })
+            .unwrap_or_default()
+            .normalized();
+        let wrf_options_ui = WrfProcessSettingsUi::new(&wrf_options);
 
         Self {
             worker,
@@ -1047,6 +1238,8 @@ impl App {
             viewer: FieldViewerPanel::new(),
             plot_viewer,
             show_plot_viewer: true,
+            color_tables,
+            show_color_tables: false,
             sounding: SoundingPanel::new(),
             download,
             show_download: false,
@@ -1059,9 +1252,19 @@ impl App {
             recorded_texture_ms: None,
             recorded_plot_timings: None,
             recorded_sat_texture_ms: None,
+            local_import: None,
+            local_import_status: None,
+            pending_wrf_paths: Vec::new(),
+            wrf_process: None,
+            wrf_process_status: None,
+            wrf_options,
+            wrf_options_ui,
+            show_wrf_options: false,
             storage_ui,
             pending_persist: None,
             pending_domain_persist: None,
+            pending_style_persist: None,
+            pending_wrf_options_persist: None,
             #[cfg(feature = "profiling")]
             profiler: profiler::ProfilerPanel::default(),
             #[cfg(feature = "profiling")]
@@ -1069,6 +1272,357 @@ impl App {
             #[cfg(feature = "profiling")]
             _puffin_server: puffin_server,
         }
+    }
+
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("File", |ui| {
+            if ui.button("Open File(s)...").clicked() {
+                if let Some(paths) = rfd::FileDialog::new()
+                    .set_title("Open WRF file(s)")
+                    .pick_files()
+                {
+                    let supported = paths
+                        .into_iter()
+                        .filter(|path| wrf_process::is_supported_wrf_file(path))
+                        .collect::<Vec<_>>();
+                    self.stage_wrf_paths(supported);
+                }
+                ui.close();
+            }
+
+            if ui
+                .add_enabled(
+                    !self.pending_wrf_paths.is_empty() && self.wrf_process.is_none(),
+                    egui::Button::new("Process Open WRF File(s)"),
+                )
+                .clicked()
+            {
+                self.start_wrf_process();
+                ui.close();
+            }
+
+            if ui.button("WRF Processing Settings...").clicked() {
+                self.show_wrf_options = true;
+                ui.close();
+            }
+
+            if ui.button("Open Folder...").clicked() {
+                if let Some(folder) = rfd::FileDialog::new()
+                    .set_title("Open store or WRF folder")
+                    .pick_folder()
+                {
+                    if looks_like_rw_store_root(&folder) {
+                        self.switch_store_root(folder, ui.ctx());
+                    } else {
+                        let files = wrf_process::wrf_files_in_folder(&folder);
+                        if files.is_empty() {
+                            self.wrf_process_status = Some(format!(
+                                "No supported WRF files found in {}",
+                                folder.display()
+                            ));
+                        } else {
+                            self.stage_wrf_paths(files);
+                        }
+                    }
+                }
+                ui.close();
+            }
+
+            ui.separator();
+
+            if ui.button("Color Tables...").clicked() {
+                self.show_color_tables = true;
+                ui.close();
+            }
+
+            ui.separator();
+
+            if ui.button("Import Raw NetCDF/WRF File(s)...").clicked() {
+                if let Some(paths) = rfd::FileDialog::new()
+                    .set_title("Import raw NetCDF/WRF file(s)")
+                    .pick_files()
+                {
+                    let supported = paths
+                        .into_iter()
+                        .filter(|path| local_import::is_supported_model_file(path))
+                        .collect::<Vec<_>>();
+                    if supported.is_empty() {
+                        self.local_import_status =
+                            Some("No supported WRF/NetCDF files selected".to_string());
+                    } else {
+                        self.start_local_import(supported);
+                    }
+                }
+                ui.close();
+            }
+
+            if ui.button("Import Raw NetCDF/WRF Folder...").clicked() {
+                if let Some(folder) = rfd::FileDialog::new()
+                    .set_title("Import raw NetCDF/WRF folder")
+                    .pick_folder()
+                {
+                    let files = local_import::supported_files_in_folder(&folder);
+                    if files.is_empty() {
+                        self.local_import_status = Some(format!(
+                            "No supported WRF/NetCDF files found in {}",
+                            folder.display()
+                        ));
+                    } else {
+                        self.start_local_import(files);
+                    }
+                }
+                ui.close();
+            }
+        });
+    }
+
+    fn switch_store_root(&mut self, store_root: PathBuf, ctx: &egui::Context) {
+        if let Err(err) = std::fs::create_dir_all(&store_root) {
+            self.local_import_status = Some(format!("Open folder failed: {err}"));
+            return;
+        }
+
+        let repaint = ctx.clone();
+        self.worker = StoreWorker::spawn(StoreView::new(&store_root), move || {
+            repaint.request_repaint();
+        });
+        self.worker.send(StoreRequest::SetStyleOverrides(
+            self.color_tables.settings().clone(),
+        ));
+        self.worker.send(StoreRequest::Enumerate);
+
+        let repaint = ctx.clone();
+        self.ingest = IngestWorker::spawn(store_root.clone(), move || {
+            repaint.request_repaint();
+        });
+
+        self.sat.stop_follow();
+        let repaint = ctx.clone();
+        self.sat = SatWorker::spawn(store_root.join("sat"), move || {
+            repaint.request_repaint();
+        });
+        self.sat.send(SatRequest::Scan);
+
+        self.store_root = store_root.clone();
+        self.tree = None;
+        self.browser = RunBrowserPanel::new();
+        self.viewer.clear();
+        self.plot_viewer.clear();
+        self.sounding.clear();
+        self.sat_player = SatPlayerPanel::new();
+        self.sat_initialized = false;
+        self.recorded_texture_ms = None;
+        self.recorded_plot_timings = None;
+        self.recorded_sat_texture_ms = None;
+        self.pending_wrf_paths.clear();
+        self.wrf_process = None;
+        self.wrf_process_status = None;
+
+        self.storage_ui.store_root_edit = store_root.display().to_string();
+        self.storage_ui.store_root_source = PathSource::Saved;
+        self.storage_ui.store_size = dir_size_bytes(&store_root);
+        self.storage_ui.sizes_computed = true;
+        self.storage_ui.apply_error = None;
+        self.storage_ui.apply_status = Some("Opened for this session".to_string());
+
+        self.pending_persist = Some(serialize_persisted(&PersistedPaths {
+            store_root: Some(store_root.display().to_string()),
+            cache_dir: Some(self.cache_dir.display().to_string()),
+        }));
+        self.local_import_status = Some(format!("Opened {}", store_root.display()));
+    }
+
+    fn stage_wrf_paths(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            self.wrf_process_status = Some("No supported WRF files selected".to_string());
+            return;
+        }
+        let count = paths.len();
+        let first = paths
+            .first()
+            .and_then(|path| path.file_name())
+            .and_then(|value| value.to_str())
+            .unwrap_or("WRF file")
+            .to_string();
+        self.pending_wrf_paths = paths;
+        self.wrf_process_status = if count == 1 {
+            Some(format!("Ready to process {first}"))
+        } else {
+            Some(format!(
+                "Ready to process {count} WRF files starting with {first}"
+            ))
+        };
+    }
+
+    fn start_wrf_process(&mut self) {
+        if self.wrf_process.is_some() {
+            self.wrf_process_status = Some("WRF processing is already running".to_string());
+            return;
+        }
+        if self.pending_wrf_paths.is_empty() {
+            self.wrf_process_status = Some("Open WRF file(s) first".to_string());
+            return;
+        }
+        let task = wrf_process::spawn_process_paths(
+            self.pending_wrf_paths.clone(),
+            self.store_root.clone(),
+            self.wrf_options.clone(),
+        );
+        self.wrf_process_status = Some(task.label.clone());
+        self.wrf_process = Some(task);
+    }
+
+    fn apply_color_table_changes(&mut self) {
+        let settings = self.color_tables.settings().clone().normalized();
+        self.worker
+            .send(StoreRequest::SetStyleOverrides(settings.clone()));
+        self.pending_style_persist = Some(serialize_style_settings(&settings));
+        self.plot_viewer.clear();
+        self.recorded_plot_timings = None;
+        if let Some(field) = self.viewer.wanted_field() {
+            self.viewer.set_loading(&field.var);
+            self.worker.send(StoreRequest::LoadField(field));
+        }
+    }
+
+    fn persist_wrf_process_options(&mut self) {
+        self.wrf_options = self.wrf_options.clone().normalized();
+        self.wrf_options_ui.set_from_options(&self.wrf_options);
+        self.pending_wrf_options_persist = Some(serialize_wrf_process_options(&self.wrf_options));
+    }
+
+    fn start_local_import(&mut self, paths: Vec<PathBuf>) {
+        if self.local_import.is_some() {
+            self.local_import_status = Some("A local import is already running".to_string());
+            return;
+        }
+        let task = local_import::spawn_import_paths(paths, self.store_root.clone());
+        self.local_import_status = Some(task.label.clone());
+        self.local_import = Some(task);
+    }
+
+    fn handle_local_import_response(&mut self, ctx: &egui::Context) {
+        let Some(task) = self.local_import.take() else {
+            return;
+        };
+
+        match task.rx.try_recv() {
+            Ok(Ok(summary)) => {
+                self.local_import_status = Some(Self::local_import_summary_text(&summary));
+                self.worker.send(StoreRequest::Enumerate);
+            }
+            Ok(Err(message)) => {
+                self.local_import_status = Some(format!("Import failed: {message}"));
+            }
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(250));
+                self.local_import = Some(task);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.local_import_status = Some("Import worker stopped".to_string());
+            }
+        }
+    }
+
+    fn handle_wrf_process_response(&mut self, ctx: &egui::Context) {
+        let Some(task) = self.wrf_process.take() else {
+            return;
+        };
+
+        let mut finished = false;
+        loop {
+            match task.rx.try_recv() {
+                Ok(WrfProcessMessage::Progress(message)) => {
+                    self.wrf_process_status = Some(message);
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                }
+                Ok(WrfProcessMessage::Done(Ok(summary))) => {
+                    self.wrf_process_status = Some(Self::wrf_process_summary_text(&summary));
+                    self.pending_wrf_paths.clear();
+                    self.worker.send(StoreRequest::Enumerate);
+                    finished = true;
+                    break;
+                }
+                Ok(WrfProcessMessage::Done(Err(message))) => {
+                    self.wrf_process_status = Some(format!("WRF process failed: {message}"));
+                    finished = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.wrf_process_status = Some("WRF processor stopped".to_string());
+                    finished = true;
+                    break;
+                }
+            }
+        }
+
+        if !finished {
+            self.wrf_process = Some(task);
+        }
+    }
+
+    fn local_import_summary_text(summary: &LocalImportSummary) -> String {
+        let shown = summary
+            .variables
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let extra = summary.variables.len().saturating_sub(6);
+        let suffix = if extra == 0 {
+            String::new()
+        } else {
+            format!(", +{extra} more")
+        };
+        format!(
+            "Imported {}/{} local files into {}/{} under {} ({} vars: {}{})",
+            summary.hours_written,
+            summary.files_seen,
+            summary.model,
+            summary.run,
+            summary.store_root.display(),
+            summary.variables.len(),
+            shown,
+            suffix
+        )
+    }
+
+    fn wrf_process_summary_text(summary: &WrfProcessSummary) -> String {
+        let shown = summary
+            .variables
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let extra = summary.variables.len().saturating_sub(6);
+        let suffix = if extra == 0 {
+            String::new()
+        } else {
+            format!(", +{extra} more")
+        };
+        let note_suffix = if summary.notes.is_empty() {
+            String::new()
+        } else {
+            format!("; {} skipped/unavailable", summary.notes.len())
+        };
+        format!(
+            "Processed {} WRF hour(s) from {} file(s) into {}/{} under {} ({} vars: {}{}{})",
+            summary.hours_written,
+            summary.files_seen,
+            summary.model,
+            summary.run,
+            summary.store_root.display(),
+            summary.variables.len(),
+            shown,
+            suffix,
+            note_suffix
+        )
     }
 
     /// Cycle list, source list, and hours hint follow the spec's model +
@@ -1140,6 +1694,7 @@ impl App {
                     }
                     self.tree = Some(tree);
                 }
+                StoreResponse::StyleOverridesApplied => {}
                 StoreResponse::HourVars(key, Ok(vars)) => {
                     if self.browser.selected() == Some(&key) {
                         self.plot_viewer.clear();
@@ -1385,6 +1940,12 @@ impl eframe::App for App {
         if let Some(json) = self.pending_domain_persist.take() {
             storage.set_string(DOMAIN_STORAGE_KEY, json);
         }
+        if let Some(json) = self.pending_style_persist.take() {
+            storage.set_string(STYLE_STORAGE_KEY, json);
+        }
+        if let Some(json) = self.pending_wrf_options_persist.take() {
+            storage.set_string(WRF_PROCESS_STORAGE_KEY, json);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1395,6 +1956,8 @@ impl eframe::App for App {
         self.handle_responses();
         self.handle_ingest_responses();
         self.handle_sat_responses();
+        self.handle_wrf_process_response(ui.ctx());
+        self.handle_local_import_response(ui.ctx());
 
         // Smooth progress while a download runs, even through long silent
         // stages (a 60 s heavy stage emits nothing between its events).
@@ -1411,8 +1974,20 @@ impl eframe::App for App {
 
         egui::Panel::top("rw-toolbar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
+                self.file_menu(ui);
+                ui.separator();
+                if !self.pending_wrf_paths.is_empty() && self.wrf_process.is_none() {
+                    if ui
+                        .button(format!("Process WRF ({})", self.pending_wrf_paths.len()))
+                        .clicked()
+                    {
+                        self.start_wrf_process();
+                    }
+                }
                 ui.toggle_value(&mut self.show_download, "⬇ Download");
                 ui.toggle_value(&mut self.show_satellite, "🛰 Satellite");
+                ui.toggle_value(&mut self.show_wrf_options, "WRF products");
+                ui.toggle_value(&mut self.show_color_tables, "Color tables");
                 #[cfg(feature = "profiling")]
                 ui.toggle_value(&mut self.show_profiler, "🔍 Profiler");
                 #[cfg(not(feature = "profiling"))]
@@ -1421,6 +1996,17 @@ impl eframe::App for App {
                         .small()
                         .weak(),
                 );
+                if let Some(task) = &self.wrf_process {
+                    ui.spinner();
+                    ui.label(egui::RichText::new(&task.label).small().weak());
+                } else if let Some(status) = &self.wrf_process_status {
+                    ui.label(egui::RichText::new(status).small().weak());
+                } else if let Some(task) = &self.local_import {
+                    ui.spinner();
+                    ui.label(egui::RichText::new(&task.label).small().weak());
+                } else if let Some(status) = &self.local_import_status {
+                    ui.label(egui::RichText::new(status).small().weak());
+                }
             });
         });
 
@@ -1626,6 +2212,43 @@ impl eframe::App for App {
                     self.worker.stats().record("sat.texture", ms);
                     self.recorded_sat_texture_ms = Some(ms);
                 }
+            }
+        }
+
+        if self.show_color_tables {
+            let mut open = self.show_color_tables;
+            egui::Window::new("Color Tables")
+                .open(&mut open)
+                .default_width(760.0)
+                .default_height(680.0)
+                .resizable(true)
+                .show(ui.ctx(), |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("rw-color-tables-window-scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.color_tables.ui(ui, self.viewer.current_field());
+                        });
+                });
+            self.show_color_tables = open;
+            if self.color_tables.take_changed() {
+                self.apply_color_table_changes();
+            }
+        }
+
+        if self.show_wrf_options {
+            let mut open = self.show_wrf_options;
+            let mut changed = false;
+            egui::Window::new("WRF Products")
+                .open(&mut open)
+                .default_width(520.0)
+                .resizable(true)
+                .show(ui.ctx(), |ui| {
+                    changed = self.wrf_options_ui.ui(ui, &mut self.wrf_options);
+                });
+            self.show_wrf_options = open;
+            if changed {
+                self.persist_wrf_process_options();
             }
         }
 

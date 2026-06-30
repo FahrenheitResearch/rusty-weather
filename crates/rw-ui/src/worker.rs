@@ -12,7 +12,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use rustwx_products::viewer::{StoreVariableStyle, operational_style_for_store_variable};
+use rustwx_products::viewer::StoreVariableStyle;
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
 
@@ -20,6 +20,7 @@ use crate::colormap::finite_min_max;
 use crate::profile_scope;
 use crate::stats::StatsRegistry;
 use crate::store_view::{StoreTree, StoreView};
+use crate::style_overrides::StyleOverrideSettings;
 
 /// One forecast hour of one model run.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -151,6 +152,8 @@ impl SoundingData {
 pub enum StoreRequest {
     /// Re-scan the store root.
     Enumerate,
+    /// Replace the user-editable color table/product binding layer.
+    SetStyleOverrides(StyleOverrideSettings),
     /// Open an hour and report its variables.
     LoadHour(HourKey),
     /// Read a full 2D field.
@@ -164,6 +167,7 @@ pub enum StoreRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StoreResponse {
     Tree(StoreTree),
+    StyleOverridesApplied,
     HourVars(HourKey, Result<Vec<VarInfo>, String>),
     /// Boxed: [`FieldData`] carries the inline production style (color
     /// scale levels, title, ...) and would otherwise dwarf the other
@@ -232,6 +236,7 @@ struct WorkerState {
     view: StoreView,
     hour: Option<(HourKey, HourReader)>,
     grid: Option<((String, String), Arc<GridFile>)>,
+    style_overrides: StyleOverrideSettings,
 }
 
 fn worker_loop(
@@ -245,6 +250,7 @@ fn worker_loop(
         view,
         hour: None,
         grid: None,
+        style_overrides: StyleOverrideSettings::default(),
     };
     loop {
         // Block for the next request, then drain the queue and coalesce:
@@ -279,6 +285,7 @@ fn worker_loop(
 fn request_stat_name(request: &StoreRequest) -> &'static str {
     match request {
         StoreRequest::Enumerate => "store.enumerate",
+        StoreRequest::SetStyleOverrides(_) => "store.style",
         StoreRequest::LoadHour(_) => "store.hour",
         StoreRequest::LoadField(_) => "store.field",
         StoreRequest::LoadSounding { .. } => "store.sounding",
@@ -289,18 +296,20 @@ fn request_stat_name(request: &StoreRequest) -> &'static str {
 /// (enumerate, hour, field, sounding) so dependent loads stay sequenced.
 fn coalesce(batch: Vec<StoreRequest>) -> Vec<StoreRequest> {
     let mut enumerate = None;
+    let mut style = None;
     let mut hour = None;
     let mut field = None;
     let mut sounding = None;
     for request in batch {
         match request {
             StoreRequest::Enumerate => enumerate = Some(request),
+            StoreRequest::SetStyleOverrides(_) => style = Some(request),
             StoreRequest::LoadHour(_) => hour = Some(request),
             StoreRequest::LoadField(_) => field = Some(request),
             StoreRequest::LoadSounding { .. } => sounding = Some(request),
         }
     }
-    [enumerate, hour, field, sounding]
+    [enumerate, style, hour, field, sounding]
         .into_iter()
         .flatten()
         .collect()
@@ -315,6 +324,10 @@ fn handle(state: &mut WorkerState, request: StoreRequest) -> StoreResponse {
             state.hour = None;
             profile_scope!("store_enumerate");
             StoreResponse::Tree(state.view.enumerate())
+        }
+        StoreRequest::SetStyleOverrides(settings) => {
+            state.style_overrides = settings.normalized();
+            StoreResponse::StyleOverridesApplied
         }
         StoreRequest::LoadHour(key) => {
             profile_scope!("store_load_hour");
@@ -383,6 +396,7 @@ fn grid_for(state: &mut WorkerState, key: &HourKey) -> Option<Arc<GridFile>> {
 fn load_field(state: &mut WorkerState, key: &FieldKey) -> rw_store::RwResult<FieldData> {
     // Grid first (separate borrow scope from the hour reader).
     let grid = grid_for(state, &key.hour);
+    let style_overrides = state.style_overrides.clone();
     let reader = reader_for(state, &key.hour)?;
     let meta = reader.meta();
     let (nx, ny) = (meta.nx, meta.ny);
@@ -395,14 +409,14 @@ fn load_field(state: &mut WorkerState, key: &FieldKey) -> rw_store::RwResult<Fie
     // Resolve the variable's production plot styling from its stored
     // selector JSON. Unknown models (e.g. the synthetic test store) and
     // unmapped variables resolve to `None` -> the generic ramp.
-    let style = meta
-        .model
-        .parse::<rustwx_core::ModelId>()
-        .ok()
-        .and_then(|model| {
-            let var = reader.variable(&key.var)?;
-            operational_style_for_store_variable(&var.name, &var.selector, &var.units, model)
-        });
+    let style = reader.variable(&key.var).and_then(|var| {
+        style_overrides.style_for_store_variable(
+            &var.name,
+            &var.selector,
+            &var.units,
+            meta.model.parse::<rustwx_core::ModelId>().ok(),
+        )
+    });
     let stored_units = reader
         .variable(&key.var)
         .map(|var| var.units.clone())
