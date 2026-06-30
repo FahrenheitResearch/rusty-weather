@@ -19,6 +19,7 @@ pub enum RegionPreset {
     Hawaii,
     PuertoRico,
     California,
+    CafireCalifornia,
     CaliforniaSquare,
     RenoSquare,
     PacificNorthwest,
@@ -26,6 +27,7 @@ pub enum RegionPreset {
     SierraNevada,
     CaliforniaSouthwest,
     FireWeatherWest,
+    CafireWideWest,
     RockiesHighPlains,
     Southeast,
     SouthernPlains,
@@ -122,6 +124,7 @@ impl RegionPreset {
             Self::Hawaii => (-161.5, -154.0, 18.0, 23.5),
             Self::PuertoRico => (-68.5, -63.5, 17.0, 20.0),
             Self::California => (-124.9, -113.8, 31.9, 42.5),
+            Self::CafireCalifornia => (-126.0, -113.8, 31.9, 42.5),
             Self::CaliforniaSquare => (-124.9, -113.7, 31.8, 42.7),
             Self::RenoSquare => (-123.1, -116.1, 36.1, 43.1),
             Self::PacificNorthwest => (-125.0, -110.0, 41.0, 49.5),
@@ -129,6 +132,7 @@ impl RegionPreset {
             Self::SierraNevada => (-122.4, -117.7, 35.0, 40.7),
             Self::CaliforniaSouthwest => (-125.0, -108.0, 31.0, 41.5),
             Self::FireWeatherWest => (-126.5, -101.0, 28.0, 50.5),
+            Self::CafireWideWest => (-125.7, -103.8, 31.9, 46.5),
             Self::RockiesHighPlains => (-112.0, -96.0, 37.0, 49.5),
             Self::Southeast => (-96.0, -72.0, 24.0, 38.5),
             Self::SouthernPlains => (-109.0, -90.0, 25.0, 40.5),
@@ -156,6 +160,7 @@ impl RegionPreset {
             Self::Hawaii => "hawaii",
             Self::PuertoRico => "puerto_rico",
             Self::California => "california",
+            Self::CafireCalifornia => "cafire_california",
             Self::CaliforniaSquare => "california_square",
             Self::RenoSquare => "reno_square",
             Self::PacificNorthwest => "pacific_northwest",
@@ -163,6 +168,7 @@ impl RegionPreset {
             Self::SierraNevada => "sierra_nevada",
             Self::CaliforniaSouthwest => "california_southwest",
             Self::FireWeatherWest => "fire_weather_west",
+            Self::CafireWideWest => "cafire_wide_west",
             Self::RockiesHighPlains => "rockies_high_plains",
             Self::Southeast => "southeast",
             Self::SouthernPlains => "southern_plains",
@@ -217,6 +223,20 @@ mod tests {
     #[test]
     fn california_square_slug_is_stable() {
         assert_eq!(RegionPreset::CaliforniaSquare.slug(), "california_square");
+    }
+
+    #[test]
+    fn cafire_region_presets_match_operational_bounds() {
+        assert_eq!(
+            RegionPreset::CafireCalifornia.bounds(),
+            (-126.0, -113.8, 31.9, 42.5)
+        );
+        assert_eq!(
+            RegionPreset::CafireWideWest.bounds(),
+            (-125.7, -103.8, 31.9, 46.5)
+        );
+        assert_eq!(RegionPreset::CafireCalifornia.slug(), "cafire_california");
+        assert_eq!(RegionPreset::CafireWideWest.slug(), "cafire_wide_west");
     }
 
     #[test]

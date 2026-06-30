@@ -569,6 +569,49 @@ fn rectangular_variant_uses_geographic_regionally_and_robinson_globally() {
 }
 
 #[test]
+fn explicit_projection_variant_overrides_native_lambert_regionally() {
+    let hrrr_native = GridProjection::LambertConformal {
+        standard_parallel_1_deg: 38.5,
+        standard_parallel_2_deg: 38.5,
+        central_meridian_deg: -97.5,
+    };
+    let cafire_bounds = (-126.0, -113.8, 31.9, 42.5);
+
+    let mercator_projection = presentation_projection_for_bounds(
+        Some(&hrrr_native),
+        cafire_bounds,
+        ProjectionPresentationVariant::Mercator,
+    )
+    .expect("explicit mercator should override HRRR native Lambert");
+    assert!(matches!(
+        mercator_projection,
+        rustwx_render::ProjectionSpec::Mercator { .. }
+    ));
+
+    let rectangular_projection = presentation_projection_for_bounds(
+        Some(&hrrr_native),
+        cafire_bounds,
+        ProjectionPresentationVariant::RectangularGeographic,
+    )
+    .expect("explicit rectangular should override HRRR native Lambert");
+    assert_eq!(
+        rectangular_projection,
+        rustwx_render::ProjectionSpec::Geographic
+    );
+
+    let adaptive_projection = presentation_projection_for_bounds(
+        Some(&hrrr_native),
+        cafire_bounds,
+        ProjectionPresentationVariant::Adaptive,
+    )
+    .expect("adaptive western fire-weather domains should use a straight/north-up projection");
+    assert!(matches!(
+        adaptive_projection,
+        rustwx_render::ProjectionSpec::Mercator { .. }
+    ));
+}
+
+#[test]
 fn adaptive_geographic_regions_use_presentation_projections() {
     assert!(matches!(
         presentation_projection_for_bounds(

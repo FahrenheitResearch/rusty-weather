@@ -319,6 +319,7 @@ pub(super) fn assign_store_values(
         DerivedRecipe::Dcape => &mut computed.dcape_jkg,
         DerivedRecipe::ThetaE2m10mWinds => &mut computed.theta_e_2m_k,
         DerivedRecipe::Vpd2m => &mut computed.vpd_2m_hpa,
+        DerivedRecipe::Hdw => &mut computed.hdw_hpa_ms,
         DerivedRecipe::DewpointDepression2m => &mut computed.dewpoint_depression_2m_c,
         DerivedRecipe::Wetbulb2m => &mut computed.wetbulb_2m_c,
         DerivedRecipe::FireWeatherComposite => &mut computed.fire_weather_composite,

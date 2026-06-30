@@ -265,7 +265,8 @@ impl PointVariable {
             Self::WindDirection10mDeg => "degrees",
             Self::PrecipAccumMm | Self::PrecipHourlyMm => "mm",
             Self::MslpHpa | Self::Vpd2mHpa => "hPa",
-            Self::Hdw | Self::FireWeatherComposite => "unitless",
+            Self::Hdw => "hPa*m/s",
+            Self::FireWeatherComposite => "unitless",
         }
     }
 
@@ -936,9 +937,7 @@ fn build_report_hour(
             PointVariable::HighCloudPct => derived.high_cloud_pct(),
             PointVariable::MslpHpa => derived.mslp_hpa(),
             PointVariable::Vpd2mHpa => derived.surface_thermo().map(|thermo| thermo.vpd_hpa),
-            PointVariable::Hdw => derived
-                .surface_thermo()
-                .and_then(|thermo| derived.wind_speed_ms().map(|wind| thermo.vpd_hpa * wind)),
+            PointVariable::Hdw => derived.surface_thermo().map(|thermo| thermo.hdw_hpa_ms),
             PointVariable::FireWeatherComposite => derived
                 .surface_thermo()
                 .map(|thermo| thermo.fire_weather_composite),
@@ -962,6 +961,7 @@ fn build_report_hour(
 struct SurfaceThermoPoint {
     wetbulb_c: f64,
     vpd_hpa: f64,
+    hdw_hpa_ms: f64,
     fire_weather_composite: f64,
 }
 
@@ -1121,6 +1121,7 @@ impl<'a> DerivedPointState<'a> {
         Some(SurfaceThermoPoint {
             wetbulb_c: thermo.wetbulb_2m_c[0],
             vpd_hpa: thermo.vpd_2m_hpa[0],
+            hdw_hpa_ms: thermo.hdw_hpa_ms[0],
             fire_weather_composite: thermo.fire_weather_composite[0],
         })
     }

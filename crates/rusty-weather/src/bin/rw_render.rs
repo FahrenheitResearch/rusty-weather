@@ -94,13 +94,25 @@ struct Args {
     #[arg(
         long,
         default_value = "all",
-        help = "all | direct | derived | heavy | windowed | comma-separated product slugs \
-                (windowed products span the run's stored hours, anchored at the max hour; \
-                'all' includes them only when more than one hour is stored)"
+        help = "all | none | direct | derived | heavy | windowed | cafire-core | cafire-all | \
+                cafire-expanded | comma-separated product slugs (windowed products span the \
+                run's stored hours, anchored at the max hour; 'all' includes them only when \
+                more than one hour is stored)"
     )]
     products: String,
     #[arg(long, value_enum, default_value_t = RegionPreset::Midwest)]
     region: RegionPreset,
+    #[arg(
+        long,
+        help = "Custom render domain bounds as west,east,south,north; overrides --region/--regions"
+    )]
+    domain_bounds: Option<String>,
+    #[arg(
+        long,
+        default_value = "custom",
+        help = "Slug/name for --domain-bounds output paths and manifest entries"
+    )]
+    domain_slug: String,
     #[arg(
         long,
         help = "Comma-separated region presets for one-pass domain batching; accepts slugs like california,pacific_northwest,west-coast"
@@ -209,6 +221,62 @@ fn selected_regions(args: &Args) -> Result<Vec<RegionPreset>, Box<dyn std::error
         return Ok(western_api_domain_presets());
     }
     Ok(vec![args.region])
+}
+
+fn selected_domains(args: &Args) -> Result<Vec<DomainSpec>, Box<dyn std::error::Error>> {
+    if let Some(bounds) = &args.domain_bounds {
+        return Ok(vec![DomainSpec::new(
+            sanitize_domain_slug(&args.domain_slug),
+            parse_domain_bounds(bounds)?,
+        )]);
+    }
+    selected_regions(args).map(|regions| {
+        regions
+            .into_iter()
+            .map(|region| DomainSpec::new(region.slug(), region.bounds()))
+            .collect()
+    })
+}
+
+fn parse_domain_bounds(spec: &str) -> Result<(f64, f64, f64, f64), Box<dyn std::error::Error>> {
+    let parts = spec
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::parse::<f64>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("--domain-bounds must be west,east,south,north: {err}"))?;
+    let [west, east, south, north]: [f64; 4] = parts
+        .try_into()
+        .map_err(|_| "--domain-bounds must contain exactly four comma-separated numbers")?;
+    if !west.is_finite() || !east.is_finite() || !south.is_finite() || !north.is_finite() {
+        return Err("--domain-bounds values must be finite".into());
+    }
+    if west < -360.0 || east > 360.0 || south < -90.0 || north > 90.0 || south >= north {
+        return Err(format!(
+            "--domain-bounds out of range: west/east must be within +/-360, south < north within +/-90; got {west},{east},{south},{north}"
+        )
+        .into());
+    }
+    Ok((west, east, south, north))
+}
+
+fn sanitize_domain_slug(value: &str) -> String {
+    let slug = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if slug.is_empty() {
+        "custom".to_string()
+    } else {
+        slug
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -413,8 +481,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let total_started = Instant::now();
     let (date, cycle) = parse_run_slug(&args.run)?;
     let request = render_all::partition_products(&args.products, args.model)?;
-    let regions = selected_regions(args)?;
-    let multi_domain = regions.len() > 1;
+    let domains = selected_domains(args)?;
+    let multi_domain = domains.len() > 1;
     let model_slug = args.model.as_str().replace('-', "_");
     let source = args
         .source
@@ -433,7 +501,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         request.direct.len(),
         request.derived.len(),
         request.windowed.len(),
-        regions.len(),
+        domains.len(),
         args.output_format,
         open_ms,
     );
@@ -442,11 +510,10 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut skipped: Vec<(String, StoreRenderSkip)> = Vec::new();
     let mut api_domains: Vec<ApiDomainManifest> = Vec::new();
 
-    for region in &regions {
-        let domain_slug = region.slug();
+    for domain in &domains {
+        let domain_slug = domain.slug.as_str();
         let domain_started = Instant::now();
-        let bounds = region.bounds();
-        let domain = DomainSpec::new(domain_slug, bounds);
+        let bounds = domain.bounds;
         let out_dir = if multi_domain {
             args.out_dir.join(domain_slug)
         } else {
@@ -666,6 +733,29 @@ mod tests {
             regions,
             vec![RegionPreset::California, RegionPreset::WestCoast]
         );
+    }
+
+    #[test]
+    fn domain_bounds_parse_for_web_drawn_boxes() {
+        assert_eq!(
+            parse_domain_bounds("-123.5,-120.25,37.0,39.5").unwrap(),
+            (-123.5, -120.25, 37.0, 39.5)
+        );
+    }
+
+    #[test]
+    fn domain_bounds_reject_wrong_shape_and_inverted_latitude() {
+        assert!(parse_domain_bounds("-123,-120,37").is_err());
+        assert!(parse_domain_bounds("-123,-120,40,37").is_err());
+    }
+
+    #[test]
+    fn custom_domain_slugs_are_path_safe() {
+        assert_eq!(
+            sanitize_domain_slug("CAFire Box 12 / Napa"),
+            "cafire_box_12_napa"
+        );
+        assert_eq!(sanitize_domain_slug(" "), "custom");
     }
 
     #[test]

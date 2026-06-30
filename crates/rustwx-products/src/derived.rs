@@ -1817,6 +1817,16 @@ fn build_render_artifact_with_contour_mode(
             ExtendMode::Max,
             Some(4.0),
         )?,
+        DerivedRecipe::Hdw => custom_scale_request(
+            recipe,
+            grid,
+            "hPa*m/s",
+            required_values(&computed.hdw_hpa_ms, recipe, "hdw_hpa_ms")?.clone(),
+            hdw_scale_levels(),
+            hdw_scale_colors(),
+            ExtendMode::Max,
+            Some(100.0),
+        )?,
         DerivedRecipe::DewpointDepression2m => custom_scale_request(
             recipe,
             grid,
@@ -2052,7 +2062,7 @@ fn build_render_artifact_with_contour_mode(
         cycle_utc,
         forecast_hour,
     ));
-    request.subtitle_right = Some(source_subtitle(source));
+    request.subtitle_right = Some(derived_subtitle_right(recipe, source));
     request.projected_domain = Some(ProjectedDomain {
         x: projected.projected_x.clone(),
         y: projected.projected_y.clone(),
@@ -2185,6 +2195,16 @@ fn build_render_artifact_with_contour_mode_profiled(
             ExtendMode::Max,
             Some(2.0),
         )?,
+        DerivedRecipe::Hdw => custom_scale_request(
+            recipe,
+            grid,
+            "hPa*m/s",
+            required_values(&computed.hdw_hpa_ms, recipe, "hdw_hpa_ms")?.clone(),
+            hdw_scale_levels(),
+            hdw_scale_colors(),
+            ExtendMode::Max,
+            Some(100.0),
+        )?,
         DerivedRecipe::DewpointDepression2m => custom_scale_request(
             recipe,
             grid,
@@ -2420,7 +2440,7 @@ fn build_render_artifact_with_contour_mode_profiled(
         cycle_utc,
         forecast_hour,
     ));
-    request.subtitle_right = Some(source_subtitle(source));
+    request.subtitle_right = Some(derived_subtitle_right(recipe, source));
     request.projected_domain = Some(ProjectedDomain {
         x: projected.projected_x.clone(),
         y: projected.projected_y.clone(),
@@ -2748,6 +2768,18 @@ fn heavy_ecape_subtitle_right(recipe: DerivedRecipe, source: SourceId) -> String
     }
 }
 
+fn derived_subtitle_right(recipe: DerivedRecipe, source: SourceId) -> String {
+    let source_label = source_subtitle(source);
+    if matches!(
+        recipe,
+        DerivedRecipe::Hdw | DerivedRecipe::FireWeatherComposite
+    ) {
+        format!("{source_label} - weather only; fuels not included")
+    } else {
+        source_label
+    }
+}
+
 fn render_derived_heavy_recipe(
     request: &DerivedBatchRequest,
     recipe: DerivedRecipe,
@@ -2969,6 +3001,7 @@ fn crop_computed_fields(
         dcape_jkg: crop_optional_values(&computed.dcape_jkg, source_nx, crop),
         theta_e_2m_k: crop_optional_values(&computed.theta_e_2m_k, source_nx, crop),
         vpd_2m_hpa: crop_optional_values(&computed.vpd_2m_hpa, source_nx, crop),
+        hdw_hpa_ms: crop_optional_values(&computed.hdw_hpa_ms, source_nx, crop),
         dewpoint_depression_2m_c: crop_optional_values(
             &computed.dewpoint_depression_2m_c,
             source_nx,
@@ -3303,6 +3336,28 @@ fn vpd_scale_colors() -> Vec<Color> {
         Color::rgba(184, 74, 61, 255),
         Color::rgba(157, 53, 60, 255),
         Color::rgba(128, 37, 63, 255),
+    ]
+}
+
+fn hdw_scale_levels() -> Vec<f64> {
+    vec![
+        0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 150.0, 200.0, 300.0, 400.0, 600.0, 800.0,
+    ]
+}
+
+fn hdw_scale_colors() -> Vec<Color> {
+    vec![
+        Color::rgba(248, 250, 247, 255),
+        Color::rgba(223, 234, 212, 255),
+        Color::rgba(169, 220, 139, 255),
+        Color::rgba(234, 223, 99, 255),
+        Color::rgba(250, 196, 67, 255),
+        Color::rgba(247, 148, 45, 255),
+        Color::rgba(232, 76, 41, 255),
+        Color::rgba(184, 28, 38, 255),
+        Color::rgba(119, 18, 35, 255),
+        Color::rgba(83, 17, 61, 255),
+        Color::rgba(44, 11, 50, 255),
     ]
 }
 

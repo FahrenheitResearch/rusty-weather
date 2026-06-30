@@ -28,6 +28,7 @@ pub(crate) enum DerivedRecipe {
     EcapeStp,
     ThetaE2m10mWinds,
     Vpd2m,
+    Hdw,
     DewpointDepression2m,
     Wetbulb2m,
     FireWeatherComposite,
@@ -95,6 +96,7 @@ impl DerivedRecipe {
             "vpd_2m" | "2m_vpd" | "vapor_pressure_deficit_2m" | "2m_vapor_pressure_deficit" => {
                 Ok(Self::Vpd2m)
             }
+            "hdw" | "hot_dry_windy" | "hot_dry_windy_index" => Ok(Self::Hdw),
             "dewpoint_depression_2m" | "2m_dewpoint_depression" => {
                 Ok(Self::DewpointDepression2m)
             }
@@ -160,6 +162,7 @@ impl DerivedRecipe {
             Self::EcapeStp => "ecape_stp",
             Self::ThetaE2m10mWinds => "theta_e_2m_10m_winds",
             Self::Vpd2m => "vpd_2m",
+            Self::Hdw => "hdw",
             Self::DewpointDepression2m => "dewpoint_depression_2m",
             Self::Wetbulb2m => "wetbulb_2m",
             Self::FireWeatherComposite => "fire_weather_composite",
@@ -210,6 +213,7 @@ impl DerivedRecipe {
             Self::EcapeStp => "ECAPE STP (EXP)",
             Self::ThetaE2m10mWinds => "2 m Theta-e, 10 m Wind",
             Self::Vpd2m => "2 m Vapor Pressure Deficit",
+            Self::Hdw => "Hot-Dry-Windy Index",
             Self::DewpointDepression2m => "2 m Dewpoint Depression",
             Self::Wetbulb2m => "2 m Wet-Bulb Temperature",
             Self::FireWeatherComposite => "Fire Weather Composite",
@@ -315,6 +319,7 @@ impl DerivedRequirements {
                     requirements.surface_winds = true;
                 }
                 DerivedRecipe::Vpd2m
+                | DerivedRecipe::Hdw
                 | DerivedRecipe::DewpointDepression2m
                 | DerivedRecipe::Wetbulb2m
                 | DerivedRecipe::FireWeatherComposite

@@ -39,6 +39,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod fire_weather_worker;
 mod ingest_worker;
 #[cfg(feature = "profiling")]
 mod profiler;
@@ -49,6 +50,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use eframe::egui;
+use fire_weather_worker::{FireWeatherRenderRequest, FireWeatherRenderResponse, FireWeatherWorker};
 use ingest_worker::{IngestRequest, IngestResponse, IngestWorker};
 use rustwx_models::{model_summary, supported_forecast_hours, supported_models};
 use rw_ui::{
@@ -878,9 +880,64 @@ fn model_options() -> Vec<ModelOption> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FireWeatherDomainMode {
+    California,
+    WideWest,
+    CurrentBox,
+}
+
+impl FireWeatherDomainMode {
+    const ALL: [Self; 3] = [Self::California, Self::WideWest, Self::CurrentBox];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::California => "CAFire California",
+            Self::WideWest => "CAFire Wide West",
+            Self::CurrentBox => "Current Box",
+        }
+    }
+
+    fn preset(self) -> Option<(&'static str, (f64, f64, f64, f64), (u32, u32))> {
+        match self {
+            Self::California => Some((
+                "cafire_california",
+                (-126.0, -113.8, 31.9, 42.5),
+                (1400, 1696),
+            )),
+            Self::WideWest => Some((
+                "cafire_wide_west",
+                (-125.7, -103.8, 31.9, 46.5),
+                (1800, 1200),
+            )),
+            Self::CurrentBox => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FireWeatherUiState {
+    products: String,
+    domain_mode: FireWeatherDomainMode,
+    running: bool,
+    status: Option<String>,
+}
+
+impl Default for FireWeatherUiState {
+    fn default() -> Self {
+        Self {
+            products: "cafire-all".to_string(),
+            domain_mode: FireWeatherDomainMode::California,
+            running: false,
+            status: None,
+        }
+    }
+}
+
 struct App {
     worker: StoreWorker,
     ingest: IngestWorker,
+    fire_weather: FireWeatherWorker,
     store_root: PathBuf,
     cache_dir: PathBuf,
     /// `None` until the first scan lands.
@@ -892,6 +949,8 @@ struct App {
     sounding: SoundingPanel,
     download: DownloadPanel,
     show_download: bool,
+    fire_weather_ui: FireWeatherUiState,
+    show_fire_weather: bool,
     sat: SatWorker,
     sat_panel: SatellitePanel,
     sat_player: SatPlayerPanel,
@@ -955,6 +1014,11 @@ impl App {
 
         let ctx = cc.egui_ctx.clone();
         let ingest = IngestWorker::spawn(store_root.clone(), move || {
+            ctx.request_repaint();
+        });
+
+        let ctx = cc.egui_ctx.clone();
+        let fire_weather = FireWeatherWorker::spawn(move || {
             ctx.request_repaint();
         });
 
@@ -1040,6 +1104,7 @@ impl App {
         Self {
             worker,
             ingest,
+            fire_weather,
             store_root,
             cache_dir,
             tree: None,
@@ -1050,6 +1115,8 @@ impl App {
             sounding: SoundingPanel::new(),
             download,
             show_download: false,
+            fire_weather_ui: FireWeatherUiState::default(),
+            show_fire_weather: false,
             sat,
             sat_panel,
             sat_player: SatPlayerPanel::new(),
@@ -1244,6 +1311,53 @@ impl App {
         }
     }
 
+    fn handle_fire_weather_responses(&mut self) {
+        while let Some(response) = self.fire_weather.try_recv() {
+            match response {
+                FireWeatherRenderResponse::Started(request) => {
+                    self.fire_weather_ui.running = true;
+                    self.fire_weather_ui.status = Some(format!(
+                        "rendering {} f{:03} {} -> {}",
+                        request.run,
+                        request.hour,
+                        request.domain_slug,
+                        request.out_dir.display()
+                    ));
+                }
+                FireWeatherRenderResponse::Finished {
+                    request,
+                    stdout_tail,
+                    stderr_tail,
+                } => {
+                    self.fire_weather_ui.running = false;
+                    let mut status = format!(
+                        "done: {} f{:03} {} -> {}",
+                        request.run,
+                        request.hour,
+                        request.domain_slug,
+                        request.out_dir.display()
+                    );
+                    append_render_tail(&mut status, &stdout_tail, &stderr_tail);
+                    self.fire_weather_ui.status = Some(status);
+                }
+                FireWeatherRenderResponse::Failed {
+                    request,
+                    message,
+                    stdout_tail,
+                    stderr_tail,
+                } => {
+                    self.fire_weather_ui.running = false;
+                    let mut status = format!(
+                        "failed: {} f{:03} {}: {}",
+                        request.run, request.hour, request.domain_slug, message
+                    );
+                    append_render_tail(&mut status, &stdout_tail, &stderr_tail);
+                    self.fire_weather_ui.status = Some(status);
+                }
+            }
+        }
+    }
+
     /// Drain sat-worker responses into the satellite panels (and record
     /// the sat-path timings into the always-on stats registry).
     fn handle_sat_responses(&mut self) {
@@ -1372,6 +1486,183 @@ impl App {
             }
         }
     }
+
+    fn selected_hour_key(&self) -> Option<HourKey> {
+        self.viewer
+            .hour()
+            .cloned()
+            .or_else(|| self.browser.selected().cloned())
+    }
+
+    fn fire_weather_domain(
+        &self,
+        mode: FireWeatherDomainMode,
+    ) -> Option<(String, (f64, f64, f64, f64), (u32, u32))> {
+        if let Some((slug, bounds, size)) = mode.preset() {
+            return Some((slug.to_string(), bounds, size));
+        }
+        let domain = self.plot_viewer.active_domain()?;
+        Some((
+            path_safe_slug(&domain.name),
+            domain.bounds,
+            output_size_for_bounds(domain.bounds),
+        ))
+    }
+
+    fn fire_weather_out_dir(&self, key: &HourKey, domain_slug: &str) -> PathBuf {
+        let root = self
+            .store_root
+            .parent()
+            .map(|parent| parent.join("fire_weather_exports"))
+            .unwrap_or_else(|| self.store_root.join("_fire_weather_exports"));
+        root.join(&key.model)
+            .join(&key.run)
+            .join(format!("f{:03}", key.hour))
+            .join(domain_slug)
+    }
+
+    fn start_fire_weather_render(&mut self) {
+        if self.fire_weather_ui.running {
+            return;
+        }
+        let Some(key) = self.selected_hour_key() else {
+            self.fire_weather_ui.status = Some("select a stored forecast hour first".to_string());
+            return;
+        };
+        let Some((domain_slug, bounds, (output_width, output_height))) =
+            self.fire_weather_domain(self.fire_weather_ui.domain_mode)
+        else {
+            self.fire_weather_ui.status =
+                Some("draw or select a native-plot box first".to_string());
+            return;
+        };
+        let out_dir = self.fire_weather_out_dir(&key, &domain_slug);
+        let request = FireWeatherRenderRequest {
+            model: key.model,
+            run: key.run,
+            hour: key.hour,
+            store_root: self.store_root.clone(),
+            out_dir,
+            products: self.fire_weather_ui.products.clone(),
+            domain_slug,
+            bounds,
+            output_width,
+            output_height,
+        };
+        self.fire_weather.send(request);
+    }
+
+    fn fire_weather_window_ui(&mut self, ui: &mut egui::Ui) {
+        let selected = self.selected_hour_key();
+        ui.horizontal(|ui| {
+            ui.label("Hour");
+            match &selected {
+                Some(key) => ui.label(key.to_string()),
+                None => ui.label(egui::RichText::new("none").weak()),
+            };
+        });
+        ui.horizontal(|ui| {
+            ui.label("Products");
+            egui::ComboBox::from_id_salt("rw-fire-weather-products")
+                .selected_text(&self.fire_weather_ui.products)
+                .show_ui(ui, |ui| {
+                    for preset in ["cafire-all", "cafire-expanded", "cafire-core"] {
+                        ui.selectable_value(
+                            &mut self.fire_weather_ui.products,
+                            preset.to_string(),
+                            preset,
+                        );
+                    }
+                });
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Domain");
+            for mode in FireWeatherDomainMode::ALL {
+                let enabled = mode != FireWeatherDomainMode::CurrentBox
+                    || self.plot_viewer.active_domain().is_some();
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.selectable_value(&mut self.fire_weather_ui.domain_mode, mode, mode.label());
+                });
+            }
+        });
+        if let Some((slug, bounds, (width, height))) =
+            self.fire_weather_domain(self.fire_weather_ui.domain_mode)
+        {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} [{:.2}, {:.2}, {:.2}, {:.2}] {}x{}",
+                    slug, bounds.0, bounds.1, bounds.2, bounds.3, width, height
+                ))
+                .small()
+                .weak(),
+            );
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            let can_render = selected.is_some() && !self.fire_weather_ui.running;
+            if ui
+                .add_enabled(can_render, egui::Button::new("Render Fire Weather Maps"))
+                .clicked()
+            {
+                self.start_fire_weather_render();
+            }
+            if self.fire_weather_ui.running {
+                ui.spinner();
+            }
+        });
+        if let Some(status) = &self.fire_weather_ui.status {
+            egui::ScrollArea::vertical()
+                .id_salt("rw-fire-weather-status")
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new(status).small().monospace());
+                });
+        }
+    }
+}
+
+fn append_render_tail(status: &mut String, stdout_tail: &str, stderr_tail: &str) {
+    if !stdout_tail.trim().is_empty() {
+        status.push_str("\n\nstdout:\n");
+        status.push_str(stdout_tail.trim());
+    }
+    if !stderr_tail.trim().is_empty() {
+        status.push_str("\n\nstderr:\n");
+        status.push_str(stderr_tail.trim());
+    }
+}
+
+fn path_safe_slug(value: &str) -> String {
+    let slug = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if slug.is_empty() {
+        "custom_box".to_string()
+    } else {
+        slug
+    }
+}
+
+fn output_size_for_bounds(bounds: (f64, f64, f64, f64)) -> (u32, u32) {
+    let lon_span = (bounds.1 - bounds.0).abs().max(0.1);
+    let lat_span = (bounds.3 - bounds.2).abs().max(0.1);
+    let aspect = (lon_span / lat_span).clamp(0.45, 2.2);
+    if aspect >= 1.0 {
+        let width = 1600u32;
+        let height = (f64::from(width) / aspect).round().clamp(900.0, 1600.0) as u32;
+        (width, height)
+    } else {
+        let height = 1500u32;
+        let width = (f64::from(height) * aspect).round().clamp(900.0, 1600.0) as u32;
+        (width, height)
+    }
 }
 
 impl eframe::App for App {
@@ -1394,11 +1685,16 @@ impl eframe::App for App {
 
         self.handle_responses();
         self.handle_ingest_responses();
+        self.handle_fire_weather_responses();
         self.handle_sat_responses();
 
         // Smooth progress while a download runs, even through long silent
         // stages (a 60 s heavy stage emits nothing between its events).
         if self.download.is_running() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        if self.fire_weather_ui.running {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(250));
         }
@@ -1412,6 +1708,7 @@ impl eframe::App for App {
         egui::Panel::top("rw-toolbar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.toggle_value(&mut self.show_download, "⬇ Download");
+                ui.toggle_value(&mut self.show_fire_weather, "Fire Weather");
                 ui.toggle_value(&mut self.show_satellite, "🛰 Satellite");
                 #[cfg(feature = "profiling")]
                 ui.toggle_value(&mut self.show_profiler, "🔍 Profiler");
@@ -1589,6 +1886,18 @@ impl eframe::App for App {
                 });
             self.show_download = open;
             self.handle_download_events(events);
+        }
+
+        if self.show_fire_weather {
+            let mut open = self.show_fire_weather;
+            egui::Window::new("Fire Weather")
+                .open(&mut open)
+                .default_width(560.0)
+                .resizable(true)
+                .show(ui.ctx(), |ui| {
+                    self.fire_weather_window_ui(ui);
+                });
+            self.show_fire_weather = open;
         }
 
         if self.show_satellite {
@@ -1885,6 +2194,20 @@ mod tests {
         assert_eq!(format_bytes(1024), "1.0 KB");
         assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    #[test]
+    fn fire_weather_custom_box_slug_is_path_safe() {
+        assert_eq!(path_safe_slug("Napa Box / 01"), "napa_box_01");
+        assert_eq!(path_safe_slug(" "), "custom_box");
+    }
+
+    #[test]
+    fn fire_weather_custom_box_size_tracks_domain_aspect() {
+        let wide = output_size_for_bounds((-124.0, -114.0, 35.0, 40.0));
+        assert!(wide.0 > wide.1);
+        let tall = output_size_for_bounds((-123.0, -121.0, 34.0, 42.0));
+        assert!(tall.1 > tall.0);
     }
 
     // ------------------------------------------------------------------

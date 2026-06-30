@@ -663,7 +663,12 @@ fn build_projected_basemap(
 ) -> Result<ProjectedBasemap, Box<dyn Error>> {
     let line_bbox = expanded_bbox(extent, options.line_pad_fraction.max(0.0));
     let polygon_bbox = expanded_bbox(extent, options.polygon_pad_fraction.max(0.0));
-    let geographic_clip = basemap_geographic_clip(frame_source);
+    // The projected extent may be aspect-expanded beyond the requested
+    // geographic crop. Linework should fill that visible context; otherwise
+    // state/province borders appear to stop inside the map. The projected
+    // bbox still clips the actual drawing to the viewport.
+    let line_geographic_clip = basemap_line_geographic_clip(frame_source);
+    let polygon_geographic_clip = basemap_polygon_geographic_clip(frame_source);
 
     let mut lines = Vec::new();
     if subtle_graticule_enabled(options.detail) {
@@ -671,7 +676,7 @@ fn build_projected_basemap(
             &mut lines,
             projector,
             line_bbox,
-            geographic_clip,
+            line_geographic_clip,
             options.detail,
         );
     }
@@ -702,7 +707,7 @@ fn build_projected_basemap(
                             &mut current,
                             &mut previous_projected,
                             projector,
-                            geographic_clip,
+                            line_geographic_clip,
                             line_bbox,
                             max_projected_step,
                             point_lon,
@@ -718,7 +723,7 @@ fn build_projected_basemap(
                         &mut current,
                         &mut previous_projected,
                         projector,
-                        geographic_clip,
+                        line_geographic_clip,
                         line_bbox,
                         max_projected_step,
                         lon,
@@ -749,7 +754,7 @@ fn build_projected_basemap(
             let rings: Vec<Vec<(f64, f64)>> = polygon
                 .into_iter()
                 .filter(|ring| {
-                    geographic_clip
+                    polygon_geographic_clip
                         .map(|bounds| ring.iter().any(|&(lon, lat)| bounds.contains(lat, lon)))
                         .unwrap_or(true)
                 })
@@ -769,9 +774,17 @@ fn build_projected_basemap(
     Ok(ProjectedBasemap { lines, polygons })
 }
 
-fn basemap_geographic_clip(frame_source: ProjectedFrameSource) -> Option<GeographicBounds> {
-    let _ = frame_source;
+fn basemap_line_geographic_clip(_frame_source: ProjectedFrameSource) -> Option<GeographicBounds> {
     None
+}
+
+fn basemap_polygon_geographic_clip(frame_source: ProjectedFrameSource) -> Option<GeographicBounds> {
+    match frame_source {
+        ProjectedFrameSource::GeographicBounds(bounds) if bounds.longitude_span_deg() < 359.0 => {
+            Some(bounds)
+        }
+        _ => None,
+    }
 }
 
 fn subtle_graticule_enabled(detail: BasemapDetail) -> bool {
@@ -1289,9 +1302,11 @@ mod tests {
     fn projected_frames_do_not_geographically_clip_basemap_linework() {
         let bounds = GeographicBounds::new(-125.0, -110.0, 30.0, 49.0);
 
-        assert!(basemap_geographic_clip(ProjectedFrameSource::GeographicBounds(bounds)).is_none());
         assert!(
-            basemap_geographic_clip(ProjectedFrameSource::GeographicGridIntersection(bounds))
+            basemap_line_geographic_clip(ProjectedFrameSource::GeographicBounds(bounds)).is_none()
+        );
+        assert!(
+            basemap_line_geographic_clip(ProjectedFrameSource::GeographicGridIntersection(bounds))
                 .is_none()
         );
     }
@@ -1501,6 +1516,18 @@ mod tests {
         assert!((projected.extent.x_max - 2.0).abs() < 1.0e-9);
         assert!((projected.extent.y_min - 0.0).abs() < 1.0e-9);
         assert!((projected.extent.y_max - 2.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn basemap_linework_uses_projected_viewport_not_unexpanded_geo_clip() {
+        let requested = GeographicBounds::new(-126.0, -113.8, 31.9, 42.5);
+        let frame_source = ProjectedFrameSource::GeographicBounds(requested);
+
+        assert_eq!(basemap_line_geographic_clip(frame_source), None);
+        assert_eq!(
+            basemap_polygon_geographic_clip(frame_source),
+            Some(requested)
+        );
     }
 
     #[test]

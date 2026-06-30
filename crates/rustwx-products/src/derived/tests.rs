@@ -73,6 +73,9 @@ fn sample_domain_bounds() -> (f64, f64, f64, f64) {
 fn sample_fire_weather_computed_fields() -> DerivedComputedFields {
     DerivedComputedFields {
         vpd_2m_hpa: Some(vec![0.5, 1.5, 3.0, 2.0, 4.0, 6.0, 5.0, 8.0, 10.0]),
+        hdw_hpa_ms: Some(vec![
+            10.0, 30.0, 60.0, 40.0, 90.0, 150.0, 120.0, 260.0, 420.0,
+        ]),
         dewpoint_depression_2m_c: Some(vec![1.0, 3.0, 6.0, 4.0, 8.0, 12.0, 10.0, 16.0, 20.0]),
         wetbulb_2m_c: Some(vec![-6.0, -3.0, 0.0, 2.0, 5.0, 8.0, 11.0, 15.0, 19.0]),
         fire_weather_composite: Some(vec![8.0, 15.0, 25.0, 20.0, 35.0, 55.0, 50.0, 75.0, 92.0]),
@@ -101,6 +104,11 @@ fn canonical_depth_ehi_slugs_are_supported_and_legacy_aliases_canonicalize() {
     assert_eq!(
         DerivedRecipe::parse("vapor_pressure_deficit_2m").unwrap(),
         DerivedRecipe::Vpd2m
+    );
+    assert_eq!(DerivedRecipe::parse("hdw").unwrap(), DerivedRecipe::Hdw);
+    assert_eq!(
+        DerivedRecipe::parse("hot_dry_windy_index").unwrap(),
+        DerivedRecipe::Hdw
     );
     assert_eq!(
         DerivedRecipe::parse("2m_dewpoint_depression").unwrap(),
@@ -209,6 +217,7 @@ fn apparent_temperature_is_supported_surface_only_inventory_entry() {
 fn fire_weather_family_is_supported_surface_only_inventory() {
     let expected = [
         ("vpd_2m", "2 m Vapor Pressure Deficit", DerivedRecipe::Vpd2m),
+        ("hdw", "Hot-Dry-Windy Index", DerivedRecipe::Hdw),
         (
             "dewpoint_depression_2m",
             "2 m Dewpoint Depression",
@@ -239,6 +248,7 @@ fn fire_weather_family_is_supported_surface_only_inventory() {
 
     let requirements = DerivedRequirements::from_recipes(&[
         DerivedRecipe::Vpd2m,
+        DerivedRecipe::Hdw,
         DerivedRecipe::DewpointDepression2m,
         DerivedRecipe::Wetbulb2m,
         DerivedRecipe::FireWeatherComposite,
@@ -588,6 +598,7 @@ fn fire_weather_family_render_artifacts_build_and_stay_rasterized() {
 
     for recipe in [
         DerivedRecipe::Vpd2m,
+        DerivedRecipe::Hdw,
         DerivedRecipe::DewpointDepression2m,
         DerivedRecipe::Wetbulb2m,
         DerivedRecipe::FireWeatherComposite,

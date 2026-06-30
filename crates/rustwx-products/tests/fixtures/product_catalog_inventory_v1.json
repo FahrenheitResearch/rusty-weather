@@ -1,12 +1,12 @@
 {
   "schema": "rustwx-products.catalog_inventory.v1",
   "summary": {
-    "total_entries": 324,
+    "total_entries": 325,
     "direct_entries": 226,
-    "derived_entries": 48,
+    "derived_entries": 49,
     "heavy_entries": 1,
     "windowed_entries": 49,
-    "supported_entries": 95,
+    "supported_entries": 96,
     "partial_entries": 225,
     "blocked_entries": 4,
     "experimental_entries": 11,
@@ -255,6 +255,7 @@
       "ehi_0_1km",
       "ehi_0_3km",
       "fire_weather_composite",
+      "hdw",
       "heat_index_2m",
       "lapse_rate_0_3km",
       "lapse_rate_700_500",

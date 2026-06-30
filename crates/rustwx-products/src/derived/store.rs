@@ -528,14 +528,14 @@ mod tests {
 
     /// The phased store compute (wind kernels first, winds freed or handed
     /// back before the parcel pass) must be bit-identical to the generic
-    /// single-join path, in BOTH wind modes, across all 29 recipes — this
+    /// single-join path, in BOTH wind modes, across all 30 recipes — this
     /// is the determinism contract behind the early wind free.
     #[test]
     fn phased_store_derived_compute_matches_generic_path() {
         let (surface, pressure) = synthetic_pair();
         let legacy = compute_store_derived_grids(&surface, &pressure)
             .expect("generic-path store compute succeeds");
-        assert_eq!(legacy.len(), 29, "all 29 non-heavy recipes realize");
+        assert_eq!(legacy.len(), 30, "all 30 non-heavy recipes realize");
 
         let mut keep = prepare_store_compute_inputs(surface.clone(), pressure.clone());
         let kept_grids =

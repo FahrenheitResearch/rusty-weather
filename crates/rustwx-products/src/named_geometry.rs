@@ -715,6 +715,22 @@ const BUILT_IN_ALL_REGION_PRESETS: &[BuiltInBoundsPreset] = &[
         bounds: NamedGeoBounds::new(-124.9, -113.8, 31.9, 42.5),
     },
     BuiltInBoundsPreset {
+        slug: "cafire_california",
+        label: "CAFire California",
+        kind: NamedGeometryKind::Region,
+        groups: GROUPS_US_REGION,
+        tags: TAG_US_REGION,
+        bounds: NamedGeoBounds::new(-126.0, -113.8, 31.9, 42.5),
+    },
+    BuiltInBoundsPreset {
+        slug: "cafire_wide_west",
+        label: "CAFire Wide West",
+        kind: NamedGeometryKind::Region,
+        groups: GROUPS_US_REGION,
+        tags: TAG_US_REGION,
+        bounds: NamedGeoBounds::new(-125.7, -103.8, 31.9, 46.5),
+    },
+    BuiltInBoundsPreset {
         slug: "california_square",
         label: "California Square",
         kind: NamedGeometryKind::Region,
@@ -826,6 +842,26 @@ mod tests {
                 asset.slug
             );
         }
+    }
+
+    #[test]
+    fn built_in_catalog_contains_cafire_domains() {
+        let catalog = NamedGeometryCatalog::built_in();
+        let cafire_ca = catalog
+            .find("cafire_california")
+            .expect("CAFire California preset");
+        assert_eq!(
+            cafire_ca.bounds_geometry().map(NamedGeoBounds::as_tuple),
+            Some((-126.0, -113.8, 31.9, 42.5))
+        );
+
+        let cafire_west = catalog
+            .find("cafire_wide_west")
+            .expect("CAFire Wide West preset");
+        assert_eq!(
+            cafire_west.bounds_geometry().map(NamedGeoBounds::as_tuple),
+            Some((-125.7, -103.8, 31.9, 46.5))
+        );
     }
 
     #[test]

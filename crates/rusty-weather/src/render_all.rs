@@ -35,6 +35,26 @@ pub mod windowed_store;
 
 pub use store_render::{StoreFieldSource, StoreRenderSkip};
 
+pub const CAFIRE_CORE_HOUR_PRODUCTS: &[&str] = &["vpd_2m", "hdw", "fire_weather_composite"];
+pub const CAFIRE_CORE_WINDOWED_PRODUCTS: &[&str] = &["10m_wind_1h_max", "10m_wind_run_max"];
+pub const CAFIRE_DIRECT_PRODUCTS: &[&str] = &[
+    "2m_temperature_10m_winds",
+    "2m_relative_humidity_10m_winds",
+    "2m_dewpoint_10m_winds",
+    "10m_wind_gusts",
+    "visibility",
+    "smoke_pm25_native",
+    "smoke_column",
+];
+pub const CAFIRE_WINDOWED_PRODUCTS: &[&str] = &[
+    "qpf_1h",
+    "10m_wind_1h_max",
+    "10m_wind_run_max",
+    "2m_temp_0_24h_range",
+    "2m_temp_24_48h_range",
+    "2m_temp_0_48h_range",
+];
+
 /// Which products were asked for, and whether unresolvable ones fail the
 /// run (only explicit slug lists are strict; the catalog keywords render
 /// what exists and report the rest).
@@ -66,6 +86,33 @@ impl ProductRequest {
     }
 }
 
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|item| (*item).to_string()).collect()
+}
+
+fn cafire_hour_products() -> Vec<String> {
+    CAFIRE_DIRECT_PRODUCTS
+        .iter()
+        .chain(CAFIRE_CORE_HOUR_PRODUCTS)
+        .map(|item| (*item).to_string())
+        .collect()
+}
+
+fn product_request(
+    direct: Vec<String>,
+    derived: Vec<String>,
+    windowed: Vec<String>,
+    windowed_auto: bool,
+) -> Result<ProductRequest, Box<dyn std::error::Error>> {
+    Ok(ProductRequest {
+        direct,
+        derived,
+        windowed,
+        windowed_auto,
+        strict: false,
+    })
+}
+
 pub fn partition_products(
     spec: &str,
     model: ModelId,
@@ -89,6 +136,54 @@ pub fn partition_products(
             .collect::<Vec<_>>()
     };
     match spec.trim() {
+        "none" | "store-only" | "ingest-only" => {
+            product_request(Vec::new(), Vec::new(), Vec::new(), false)
+        }
+        "cafire-core" => product_request(
+            Vec::new(),
+            strings(CAFIRE_CORE_HOUR_PRODUCTS),
+            strings(CAFIRE_CORE_WINDOWED_PRODUCTS),
+            false,
+        ),
+        "cafire-core-hour" => product_request(
+            Vec::new(),
+            strings(CAFIRE_CORE_HOUR_PRODUCTS),
+            Vec::new(),
+            false,
+        ),
+        "cafire-core-windowed" => product_request(
+            Vec::new(),
+            Vec::new(),
+            strings(CAFIRE_CORE_WINDOWED_PRODUCTS),
+            false,
+        ),
+        "cafire-hour" => product_request(
+            strings(CAFIRE_DIRECT_PRODUCTS),
+            strings(CAFIRE_CORE_HOUR_PRODUCTS),
+            Vec::new(),
+            false,
+        ),
+        "cafire-windowed" => product_request(
+            Vec::new(),
+            Vec::new(),
+            strings(CAFIRE_WINDOWED_PRODUCTS),
+            false,
+        ),
+        "cafire-windowed-expanded" => {
+            product_request(Vec::new(), Vec::new(), windowed_catalog(), false)
+        }
+        "cafire-all" | "cafire-current" | "cafire-ops" => product_request(
+            strings(CAFIRE_DIRECT_PRODUCTS),
+            strings(CAFIRE_CORE_HOUR_PRODUCTS),
+            strings(CAFIRE_WINDOWED_PRODUCTS),
+            false,
+        ),
+        "cafire-expanded" | "cafire-store-all" => product_request(
+            strings(CAFIRE_DIRECT_PRODUCTS),
+            strings(CAFIRE_CORE_HOUR_PRODUCTS),
+            windowed_catalog(),
+            false,
+        ),
         "all" => Ok(ProductRequest {
             direct: supported_direct_recipe_slugs(model),
             derived: derived_catalog()
@@ -437,6 +532,83 @@ mod tests {
             "explicit 'windowed' keyword must render even single-hour stores"
         );
         assert!(!windowed.strict);
+    }
+
+    #[test]
+    fn none_keyword_builds_store_without_render_requests() {
+        for keyword in ["none", "store-only", "ingest-only"] {
+            let request = partition_products(keyword, ModelId::Hrrr).unwrap();
+            assert!(request.direct.is_empty(), "{keyword} direct");
+            assert!(request.derived.is_empty(), "{keyword} derived");
+            assert!(request.windowed.is_empty(), "{keyword} windowed");
+            assert!(!request.strict);
+            assert!(!request.windowed_auto);
+        }
+    }
+
+    #[test]
+    fn cafire_all_matches_current_store_backed_product_table() {
+        let request = partition_products("cafire-all", ModelId::Hrrr).unwrap();
+        assert!(!request.strict);
+        assert_eq!(request.direct, strings(CAFIRE_DIRECT_PRODUCTS));
+        assert_eq!(request.derived, strings(CAFIRE_CORE_HOUR_PRODUCTS));
+        assert_eq!(request.windowed, strings(CAFIRE_WINDOWED_PRODUCTS));
+        for slug in [
+            "2m_temperature_10m_winds",
+            "2m_relative_humidity_10m_winds",
+            "2m_dewpoint_10m_winds",
+            "10m_wind_gusts",
+            "visibility",
+            "smoke_pm25_native",
+            "smoke_column",
+            "vpd_2m",
+            "hdw",
+            "fire_weather_composite",
+            "qpf_1h",
+            "10m_wind_1h_max",
+            "10m_wind_run_max",
+            "2m_temp_0_24h_range",
+            "2m_temp_24_48h_range",
+            "2m_temp_0_48h_range",
+        ] {
+            assert!(
+                request.direct.iter().any(|item| item == slug)
+                    || request.derived.iter().any(|item| item == slug)
+                    || request.windowed.iter().any(|item| item == slug),
+                "missing {slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn cafire_expanded_adds_every_current_windowed_store_product() {
+        let request = partition_products("cafire-expanded", ModelId::Hrrr).unwrap();
+        assert_eq!(request.direct, strings(CAFIRE_DIRECT_PRODUCTS));
+        assert_eq!(request.derived, strings(CAFIRE_CORE_HOUR_PRODUCTS));
+        assert_eq!(
+            request.windowed.len(),
+            HrrrWindowedProduct::supported_products().len()
+        );
+        assert!(
+            request
+                .windowed
+                .iter()
+                .any(|slug| slug == "2m_rh_0_24h_min")
+        );
+        assert!(
+            request
+                .windowed
+                .iter()
+                .any(|slug| slug == "2m_vpd_0_48h_max")
+        );
+        assert!(request.windowed.iter().any(|slug| slug == "qpf_24h"));
+        assert!(
+            request
+                .windowed
+                .iter()
+                .any(|slug| slug == "10m_wind_0_48h_max")
+        );
+        assert!(!request.strict);
     }
 
     #[test]

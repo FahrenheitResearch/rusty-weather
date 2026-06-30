@@ -266,7 +266,8 @@ struct Args {
     #[arg(
         long,
         default_value = "all",
-        help = "all | direct | derived | heavy | windowed | comma-separated product slugs"
+        help = "all | none | direct | derived | heavy | windowed | cafire-core | cafire-all | \
+                cafire-expanded | comma-separated product slugs"
     )]
     products: String,
     #[arg(long, value_enum, default_value_t = RegionPreset::Midwest)]
@@ -440,8 +441,15 @@ struct HourReport {
     open_ms: u128,
     render_ms: u128,
     render_cpu_ms: u128,
-    rendered: Vec<(String, u128)>,
+    rendered: Vec<RenderedReport>,
     skipped: Vec<StoreRenderSkip>,
+}
+
+/// Manifest-facing product record for one rendered PNG.
+struct RenderedReport {
+    slug: String,
+    ms: u128,
+    output_path: PathBuf,
 }
 
 fn ms_distribution(timings: &[u128]) -> (u128, u128, u128) {
@@ -768,7 +776,11 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     rendered: outcome
                         .rendered
                         .into_iter()
-                        .map(|product| (product.slug, product.total_ms))
+                        .map(|product| RenderedReport {
+                            slug: product.slug,
+                            ms: product.total_ms,
+                            output_path: product.output_path,
+                        })
                         .collect(),
                     skipped: outcome.skipped,
                 });
@@ -835,6 +847,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     "rendered": outcome.rendered.iter().map(|product| serde_json::json!({
                         "slug": product.slug,
                         "ms": product.total_ms,
+                        "path": product.output_path.display().to_string(),
                     })).collect::<Vec<_>>(),
                     "blocked": outcome.blocked.iter().map(|skip| serde_json::json!({
                         "slug": skip.slug,
@@ -915,7 +928,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         "per_hour": reports.iter().map(|report| {
             let ingested = &report.ingested;
             let per_product: Vec<u128> =
-                report.rendered.iter().map(|(_, ms)| *ms).collect();
+                report.rendered.iter().map(|product| product.ms).collect();
             let (min_ms, median_ms, max_ms) = ms_distribution(&per_product);
             serde_json::json!({
                 "hour": ingested.hour,
@@ -968,6 +981,11 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     "cpu_ms": report.render_cpu_ms,
                     "open_ms": report.open_ms,
                     "rendered": report.rendered.len(),
+                    "rendered_products": report.rendered.iter().map(|product| serde_json::json!({
+                        "slug": product.slug,
+                        "ms": product.ms,
+                        "path": product.output_path.display().to_string(),
+                    })).collect::<Vec<_>>(),
                     "skipped": report.skipped.iter().map(|skip| serde_json::json!({
                         "slug": skip.slug,
                         "reason": skip.reason,
