@@ -12,11 +12,15 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+
+const MIN_RENDER_WIDTH: u32 = 1200;
+const MIN_RENDER_HEIGHT: u32 = 900;
+const MAX_RENDER_DIMENSION: u32 = 2400;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,6 +38,12 @@ struct Args {
     out_root: PathBuf,
     #[arg(long, help = "Path to rw_render; default is sibling executable")]
     rw_render: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value_t = 2,
+        help = "Maximum simultaneous rw_render child processes"
+    )]
+    max_render_jobs: usize,
 }
 
 #[derive(Clone)]
@@ -43,6 +53,61 @@ struct AppState {
     rw_render: PathBuf,
     jobs: Arc<Mutex<HashMap<String, Job>>>,
     counter: Arc<AtomicU64>,
+    render_gate: Arc<RenderGate>,
+}
+
+struct RenderGate {
+    max_active: usize,
+    state: Mutex<RenderGateState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct RenderGateState {
+    active: usize,
+    waiting: usize,
+}
+
+struct RenderPermit {
+    gate: Arc<RenderGate>,
+}
+
+impl RenderGate {
+    fn new(max_active: usize) -> Self {
+        Self {
+            max_active: max_active.max(1),
+            state: Mutex::new(RenderGateState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> RenderPermit {
+        let mut state = self.state.lock().expect("render gate mutex");
+        state.waiting += 1;
+        while state.active >= self.max_active {
+            state = self.changed.wait(state).expect("render gate mutex");
+        }
+        state.waiting -= 1;
+        state.active += 1;
+        RenderPermit { gate: self.clone() }
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        let state = self.state.lock().expect("render gate mutex");
+        serde_json::json!({
+            "max_active": self.max_active,
+            "active": state.active,
+            "waiting": state.waiting,
+        })
+    }
+}
+
+impl Drop for RenderPermit {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().expect("render gate mutex");
+        state.active = state.active.saturating_sub(1);
+        self.gate.changed.notify_one();
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +172,9 @@ struct HttpRequest {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if args.max_render_jobs == 0 {
+        return Err("--max-render-jobs must be at least 1".into());
+    }
     fs::create_dir_all(&args.out_root)?;
     let rw_render = args.rw_render.unwrap_or_else(sibling_rw_render_path);
     let state = AppState {
@@ -115,6 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rw_render,
         jobs: Arc::new(Mutex::new(HashMap::new())),
         counter: Arc::new(AtomicU64::new(1)),
+        render_gate: Arc::new(RenderGate::new(args.max_render_jobs)),
     };
     let addr = format!("{}:{}", args.host, args.port);
     let listener = TcpListener::bind(&addr)?;
@@ -122,6 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("store_root: {}", state.store_root.display());
     println!("out_root: {}", state.out_root.display());
     println!("rw_render: {}", state.rw_render.display());
+    println!("max_render_jobs: {}", state.render_gate.max_active);
 
     for stream in listener.incoming() {
         match stream {
@@ -155,6 +225,7 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
             "store_root": state.store_root.display().to_string(),
             "out_root": state.out_root.display().to_string(),
             "rw_render": state.rw_render.display().to_string(),
+            "render_gate": state.render_gate.snapshot(),
         })),
         ("POST", "/api/render") => start_render_job(request.body, state),
         ("OPTIONS", _) => empty_response(204),
@@ -252,11 +323,15 @@ fn output_file_response(path: &str, state: &AppState) -> Vec<u8> {
 
 fn run_job(state: AppState, id: String, request: RenderJobRequest, output_dir: PathBuf) {
     update_job(&state, &id, |job| {
+        job.message = "waiting for render slot".to_string();
+    });
+    let _permit = state.render_gate.acquire();
+    let started = Instant::now();
+    update_job(&state, &id, |job| {
         job.state = JobState::Running;
         job.message = "running rw_render".to_string();
         job.started_unix_ms = Some(unix_ms_now());
     });
-    let started = Instant::now();
     let result = run_rw_render(&state, &request, &output_dir, &id);
     let wall_ms = started.elapsed().as_millis();
     update_job(&state, &id, |job| {
@@ -582,16 +657,26 @@ fn output_size(request: &RenderJobRequest) -> (u32, u32) {
     let [west, east, south, north] = request.bounds;
     let aspect = ((east - west).abs().max(0.1) / (north - south).abs().max(0.1)).clamp(0.45, 2.2);
     match (
-        request.output_width.map(|width| width.clamp(480, 2400)),
-        request.output_height.map(|height| height.clamp(480, 2400)),
+        request
+            .output_width
+            .map(|width| width.clamp(MIN_RENDER_WIDTH, MAX_RENDER_DIMENSION)),
+        request
+            .output_height
+            .map(|height| height.clamp(MIN_RENDER_HEIGHT, MAX_RENDER_DIMENSION)),
     ) {
         (Some(width), Some(height)) => return (width, height),
         (Some(width), None) => {
-            let height = (f64::from(width) / aspect).round().clamp(480.0, 2400.0) as u32;
+            let height = (f64::from(width) / aspect).round().clamp(
+                f64::from(MIN_RENDER_HEIGHT),
+                f64::from(MAX_RENDER_DIMENSION),
+            ) as u32;
             return (width, height);
         }
         (None, Some(height)) => {
-            let width = (f64::from(height) * aspect).round().clamp(480.0, 2400.0) as u32;
+            let width = (f64::from(height) * aspect)
+                .round()
+                .clamp(f64::from(MIN_RENDER_WIDTH), f64::from(MAX_RENDER_DIMENSION))
+                as u32;
             return (width, height);
         }
         (None, None) => {}
@@ -633,7 +718,7 @@ fn default_hour() -> u16 {
 }
 
 fn default_products() -> String {
-    "cafire-core".to_string()
+    "cafire-with-fuels".to_string()
 }
 
 fn default_output_format() -> String {
@@ -684,14 +769,19 @@ const DEMO_HTML: &str = r#"<!doctype html>
     </div>
     <div class="row">
       <label>Hour <input id="hour" type="number" min="0" max="384" value="3"></label>
-      <label>Preview width <input id="outputWidth" type="number" min="480" max="2400" value="800"></label>
+      <label>Preview width <input id="outputWidth" type="number" min="1200" max="2400" value="1400"></label>
     </div>
     <div class="row">
       <label>Products
         <select id="products">
+          <option value="cafire-with-fuels" selected>cafire-with-fuels</option>
+          <option value="cafire-expanded-with-fuels">cafire-expanded-with-fuels</option>
           <option value="cafire-core">cafire-core</option>
           <option value="cafire-all">cafire-all</option>
           <option value="cafire-expanded">cafire-expanded</option>
+          <option value="cafire-fuels">cafire-fuels</option>
+          <option value="cafire-fuel-layers">cafire-fuel-layers</option>
+          <option value="cafire-fuel-composites">cafire-fuel-composites</option>
         </select>
       </label>
       <label>Format
@@ -934,7 +1024,7 @@ mod tests {
             output_width: Some(1000),
             output_height: None,
         };
-        assert_eq!(output_size(&request), (1000, 1133));
+        assert_eq!(output_size(&request), (1200, 1359));
     }
 
     #[test]
@@ -950,6 +1040,16 @@ mod tests {
             output_width: Some(1000),
             output_height: Some(700),
         };
-        assert_eq!(output_size(&request), (1000, 700));
+        assert_eq!(output_size(&request), (1200, 900));
+    }
+
+    #[test]
+    fn render_gate_tracks_active_permits() {
+        let gate = Arc::new(RenderGate::new(1));
+        assert_eq!(gate.snapshot()["active"], 0);
+        let permit = gate.acquire();
+        assert_eq!(gate.snapshot()["active"], 1);
+        drop(permit);
+        assert_eq!(gate.snapshot()["active"], 0);
     }
 }

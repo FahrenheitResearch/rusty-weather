@@ -266,8 +266,9 @@ struct Args {
     #[arg(
         long,
         default_value = "all",
-        help = "all | none | direct | derived | heavy | windowed | cafire-core | cafire-all | \
-                cafire-expanded | comma-separated product slugs"
+        help = "all | none | direct | derived | heavy | windowed | fuels | cafire-core | \
+                cafire-all | cafire-expanded | cafire-with-fuels | cafire-fuels | \
+                comma-separated product slugs"
     )]
     products: String,
     #[arg(long, value_enum, default_value_t = RegionPreset::Midwest)]
@@ -516,9 +517,10 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         args.out_dir.display(),
     );
     println!(
-        "products: {} direct, {} derived/heavy, {} windowed requested",
+        "products: {} direct, {} derived/heavy, {} fuel, {} windowed requested",
         request.direct.len(),
         request.derived.len(),
+        request.fuel.len(),
         request.windowed.len(),
     );
 
@@ -733,6 +735,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     hour,
                     &request.direct,
                     &request.derived,
+                    &request.fuel,
                     Some(&chunk_gate),
                 )
                 .map_err(|err| format!("f{hour:03}: render: {err}"))?;

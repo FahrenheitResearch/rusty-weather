@@ -2774,7 +2774,7 @@ fn derived_subtitle_right(recipe: DerivedRecipe, source: SourceId) -> String {
         recipe,
         DerivedRecipe::Hdw | DerivedRecipe::FireWeatherComposite
     ) {
-        format!("{source_label} - weather only; fuels not included")
+        format!("{source_label} | wx-only")
     } else {
         source_label
     }

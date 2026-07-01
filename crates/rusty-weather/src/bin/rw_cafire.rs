@@ -34,6 +34,12 @@ enum CafireDomainArg {
     WideWest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum FuelProviderArg {
+    Gridmet,
+}
+
 impl CafireDomainArg {
     fn slug(self) -> &'static str {
         match self {
@@ -136,7 +142,7 @@ struct Args {
     #[arg(
         long,
         default_value = DEFAULT_PRODUCTS,
-        help = "Product preset or slug list. CAFire presets: cafire-core, cafire-all, cafire-expanded"
+        help = "Product preset or slug list. CAFire presets: cafire-core, cafire-all, cafire-expanded, cafire-with-fuels, cafire-fuels"
     )]
     products: String,
     #[arg(
@@ -159,6 +165,43 @@ struct Args {
     full_throttle: bool,
     #[arg(long, default_value_t = false)]
     list_products: bool,
+    #[arg(
+        long = "fuel-layer",
+        help = "Import fuel layer before render: slug=path.nc:variable; repeat for KBDI/ERC/LANDFIRE/etc."
+    )]
+    fuel_layers: Vec<String>,
+    #[arg(
+        long = "fuel-provider",
+        value_enum,
+        help = "Fetch/process public fuel data before render. Currently supported: gridmet"
+    )]
+    fuel_provider: Option<FuelProviderArg>,
+    #[arg(
+        long = "fuel-date",
+        help = "Fuel valid date as YYYY-MM-DD; default is the model run date"
+    )]
+    fuel_date: Option<String>,
+    #[arg(
+        long = "fuel-cache-dir",
+        help = "Fuel data cache root; default is <cache-dir>/fuel or cache/fuel"
+    )]
+    fuel_cache_dir: Option<PathBuf>,
+    #[arg(long = "fuel-kbdi", default_value_t = true)]
+    fuel_kbdi: bool,
+    #[arg(long = "fuel-kbdi-spinup-days", default_value_t = 180)]
+    fuel_kbdi_spinup_days: usize,
+    #[arg(long = "fuel-kbdi-annual-rain-in", default_value_t = 20.0)]
+    fuel_kbdi_annual_rain_in: f32,
+    #[arg(long = "fuel-lat-var")]
+    fuel_lat_var: Option<String>,
+    #[arg(long = "fuel-lon-var")]
+    fuel_lon_var: Option<String>,
+    #[arg(long = "fuel-time-index", default_value_t = 0)]
+    fuel_time_index: usize,
+    #[arg(long = "fuel-method", default_value = "bilinear")]
+    fuel_method: String,
+    #[arg(long = "fuel-overwrite", default_value_t = false)]
+    fuel_overwrite: bool,
     #[arg(
         long,
         default_value_t = false,
@@ -209,8 +252,11 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let product_slugs = product_groups.expanded_slugs();
     let batch_exe = sibling_rw_batch_path();
     let render_exe = sibling_rw_render_path();
+    let fuel_fetch_exe = sibling_rw_fuel_fetch_path();
+    let fuel_import_exe = sibling_rw_fuel_import_path();
     let ingest_out_dir = args.out_dir.join("ingest");
     let ingest_domain = args.domains[0];
+    let mut fuel_manifest_path = serde_json::Value::Null;
     let mut domain_summaries = Vec::new();
 
     println!(
@@ -251,6 +297,98 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         if !status.success() {
             return Err(format!("rw_batch ingest failed with status {status}").into());
         }
+    }
+
+    if product_slugs
+        .iter()
+        .any(|slug| render_all::fuel_products::FuelProduct::parse(slug).is_some())
+        && args.fuel_layers.is_empty()
+        && args.fuel_provider.is_none()
+    {
+        eprintln!(
+            "warning: fuel-aware products requested but no --fuel-provider/--fuel-layer inputs were supplied; \
+             fuel products will skip unless the stores already contain fuel grids"
+        );
+    }
+
+    if let Some(provider) = args.fuel_provider {
+        match provider {
+            FuelProviderArg::Gridmet => {
+                let manifest = args.out_dir.join("fuel_fetch_manifest.json");
+                let fuel_args = build_fuel_fetch_args(args, &run, &manifest)?;
+                if args.dry_run {
+                    println!(
+                        "dry-run: {}",
+                        command_preview(&fuel_fetch_exe, &fuel_args, Vec::new())
+                    );
+                } else {
+                    println!(
+                        "rw_cafire: fetch/process gridMET fuels for {} into {} {:02}z hours {}",
+                        fuel_date_for_run(args, &run)?,
+                        run.date_yyyymmdd,
+                        run.cycle_utc,
+                        args.hours
+                    );
+                    let status = if fuel_fetch_exe.exists() {
+                        Command::new(&fuel_fetch_exe).args(&fuel_args).status()
+                    } else {
+                        let mut cargo_args = vec![
+                            "run".to_string(),
+                            "-p".to_string(),
+                            "rusty-weather".to_string(),
+                            "--bin".to_string(),
+                            "rw_fuel_fetch".to_string(),
+                            "--".to_string(),
+                        ];
+                        cargo_args.extend(fuel_args.clone());
+                        Command::new("cargo").args(cargo_args).status()
+                    }
+                    .map_err(|err| format!("launch rw_fuel_fetch: {err}"))?;
+                    if !status.success() {
+                        return Err(format!("rw_fuel_fetch failed with status {status}").into());
+                    }
+                }
+                fuel_manifest_path = manifest.display().to_string().into();
+            }
+        }
+    }
+
+    if !args.fuel_layers.is_empty() {
+        let manifest = args.out_dir.join("fuel_import_manifest.json");
+        let fuel_args = build_fuel_import_args(args, &run, &manifest);
+        if args.dry_run {
+            println!(
+                "dry-run: {}",
+                command_preview(&fuel_import_exe, &fuel_args, Vec::new())
+            );
+        } else {
+            println!(
+                "rw_cafire: import {} fuel layer(s) into {} {:02}z hours {}",
+                args.fuel_layers.len(),
+                run.date_yyyymmdd,
+                run.cycle_utc,
+                args.hours
+            );
+            let status = if fuel_import_exe.exists() {
+                Command::new(&fuel_import_exe).args(&fuel_args).status()
+            } else {
+                let mut cargo_args = vec![
+                    "run".to_string(),
+                    "-p".to_string(),
+                    "rusty-weather".to_string(),
+                    "--bin".to_string(),
+                    "rw_fuel_import".to_string(),
+                    "--".to_string(),
+                ];
+                cargo_args.extend(fuel_args.clone());
+                Command::new("cargo").args(cargo_args).status()
+            }
+            .map_err(|err| format!("launch rw_fuel_import: {err}"))?;
+            if !status.success() {
+                return Err(format!("rw_fuel_import failed with status {status}").into());
+            }
+        }
+        fuel_manifest_path = manifest.display().to_string().into();
     }
 
     let batch_manifest_path = ingest_out_dir.join("batch_manifest.json");
@@ -339,6 +477,15 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             "out_dir": ingest_out_dir.display().to_string(),
             "batch_manifest": batch_manifest,
         },
+        "fuel_import": {
+            "enabled": args.fuel_provider.is_some() || !args.fuel_layers.is_empty(),
+            "provider": args.fuel_provider.map(|provider| match provider {
+                FuelProviderArg::Gridmet => "gridmet",
+            }),
+            "fuel_date": args.fuel_date.clone().unwrap_or_else(|| run_date_as_fuel_date(&run.date_yyyymmdd)),
+            "layers": args.fuel_layers,
+            "manifest": fuel_manifest_path,
+        },
         "rendering": {
             "engine": "rustwx-render/rustwx-products",
             "style_note": "RustWX-style static map chrome, scales, labels, basemap overlays, colorbars, and wind/windowed products are rendered from .rws-backed Rusty Weather stores.",
@@ -372,6 +519,7 @@ fn product_groups(args: &Args) -> Result<ProductGroups, Box<dyn std::error::Erro
         .direct
         .into_iter()
         .chain(request.derived)
+        .chain(request.fuel)
         .collect::<Vec<_>>();
     let (hour_render_spec, windowed_render_spec) =
         split_render_specs(args.products.trim(), &hour, &request.windowed);
@@ -402,7 +550,19 @@ fn split_render_specs(
             Some("cafire-hour".to_string()),
             Some("cafire-windowed-expanded".to_string()),
         ),
+        "cafire-with-fuels" | "cafire-all-fuels" => (
+            Some("cafire-hour-with-fuels".to_string()),
+            Some("cafire-windowed".to_string()),
+        ),
+        "cafire-expanded-with-fuels" | "cafire-store-all-fuels" => (
+            Some("cafire-hour-with-fuels".to_string()),
+            Some("cafire-windowed-expanded".to_string()),
+        ),
+        "cafire-fuels" | "cafire-fuel" => (Some("cafire-fuels".to_string()), None),
+        "cafire-fuel-layers" => (Some("cafire-fuel-layers".to_string()), None),
+        "cafire-fuel-composites" => (Some("cafire-fuel-composites".to_string()), None),
         "cafire-hour" => (Some("cafire-hour".to_string()), None),
+        "cafire-hour-with-fuels" => (Some("cafire-hour-with-fuels".to_string()), None),
         "cafire-windowed" => (None, Some("cafire-windowed".to_string())),
         "cafire-windowed-expanded" => (None, Some("cafire-windowed-expanded".to_string())),
         "cafire-core-hour" => (Some("cafire-core-hour".to_string()), None),
@@ -707,10 +867,125 @@ fn build_batch_args(
     batch_args
 }
 
+fn build_fuel_import_args(
+    args: &Args,
+    run: &ResolvedRun,
+    manifest_out: &std::path::Path,
+) -> Vec<String> {
+    let run_slug = format!("{}_{:02}z", run.date_yyyymmdd, run.cycle_utc);
+    let mut fuel_args = vec![
+        "--model".to_string(),
+        args.model.as_str().to_string(),
+        "--run".to_string(),
+        run_slug,
+        "--hours".to_string(),
+        args.hours.clone(),
+        "--store-root".to_string(),
+        args.store_root.display().to_string(),
+        "--method".to_string(),
+        args.fuel_method.clone(),
+        "--time-index".to_string(),
+        args.fuel_time_index.to_string(),
+        "--manifest-out".to_string(),
+        manifest_out.display().to_string(),
+    ];
+    for layer in &args.fuel_layers {
+        fuel_args.push("--layer".to_string());
+        fuel_args.push(layer.clone());
+    }
+    if let Some(lat_var) = &args.fuel_lat_var {
+        fuel_args.push("--lat-var".to_string());
+        fuel_args.push(lat_var.clone());
+    }
+    if let Some(lon_var) = &args.fuel_lon_var {
+        fuel_args.push("--lon-var".to_string());
+        fuel_args.push(lon_var.clone());
+    }
+    if args.fuel_overwrite {
+        fuel_args.push("--overwrite".to_string());
+    }
+    fuel_args
+}
+
+fn build_fuel_fetch_args(
+    args: &Args,
+    run: &ResolvedRun,
+    manifest_out: &std::path::Path,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let run_slug = format!("{}_{:02}z", run.date_yyyymmdd, run.cycle_utc);
+    let fuel_cache_dir = args
+        .fuel_cache_dir
+        .clone()
+        .or_else(|| args.cache_dir.as_ref().map(|path| path.join("fuel")))
+        .unwrap_or_else(|| PathBuf::from("cache").join("fuel"));
+    let mut fuel_args = vec![
+        "--model".to_string(),
+        args.model.as_str().to_string(),
+        "--run".to_string(),
+        run_slug,
+        "--hours".to_string(),
+        args.hours.clone(),
+        "--store-root".to_string(),
+        args.store_root.display().to_string(),
+        "--date".to_string(),
+        fuel_date_for_run(args, run)?,
+        "--cache-dir".to_string(),
+        fuel_cache_dir.display().to_string(),
+        "--method".to_string(),
+        args.fuel_method.clone(),
+        "--kbdi-spinup-days".to_string(),
+        args.fuel_kbdi_spinup_days.to_string(),
+        "--kbdi-annual-rain-in".to_string(),
+        args.fuel_kbdi_annual_rain_in.to_string(),
+        "--manifest-out".to_string(),
+        manifest_out.display().to_string(),
+    ];
+    if args.fuel_kbdi {
+        fuel_args.push("--kbdi".to_string());
+    }
+    Ok(fuel_args)
+}
+
+fn fuel_date_for_run(args: &Args, run: &ResolvedRun) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(date) = &args.fuel_date {
+        return Ok(date.clone());
+    }
+    Ok(run_date_as_fuel_date(&run.date_yyyymmdd))
+}
+
+fn run_date_as_fuel_date(date_yyyymmdd: &str) -> String {
+    if date_yyyymmdd.len() == 8 {
+        format!(
+            "{}-{}-{}",
+            &date_yyyymmdd[0..4],
+            &date_yyyymmdd[4..6],
+            &date_yyyymmdd[6..8]
+        )
+    } else {
+        date_yyyymmdd.to_string()
+    }
+}
+
 fn sibling_rw_batch_path() -> PathBuf {
     let mut path = std::env::current_exe()
         .unwrap_or_else(|_| PathBuf::from(format!("rw_batch{}", std::env::consts::EXE_SUFFIX)));
     path.set_file_name(format!("rw_batch{}", std::env::consts::EXE_SUFFIX));
+    path
+}
+
+fn sibling_rw_fuel_fetch_path() -> PathBuf {
+    let mut path = std::env::current_exe().unwrap_or_else(|_| {
+        PathBuf::from(format!("rw_fuel_fetch{}", std::env::consts::EXE_SUFFIX))
+    });
+    path.set_file_name(format!("rw_fuel_fetch{}", std::env::consts::EXE_SUFFIX));
+    path
+}
+
+fn sibling_rw_fuel_import_path() -> PathBuf {
+    let mut path = std::env::current_exe().unwrap_or_else(|_| {
+        PathBuf::from(format!("rw_fuel_import{}", std::env::consts::EXE_SUFFIX))
+    });
+    path.set_file_name(format!("rw_fuel_import{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -898,6 +1173,107 @@ mod tests {
     }
 
     #[test]
+    fn fuel_import_args_forward_layers_and_regrid_options() {
+        let args = Args::try_parse_from([
+            "rw-cafire",
+            "--date",
+            "20260608",
+            "--cycle",
+            "18",
+            "--hours",
+            "1-3",
+            "--products",
+            "cafire-with-fuels",
+            "--fuel-layer",
+            r"kbdi=C:\fuel\gridmet.nc:kbdi",
+            "--fuel-layer",
+            r"erc=C:\fuel\nfdrs.nc:erc",
+            "--fuel-lat-var",
+            "lat",
+            "--fuel-lon-var",
+            "lon",
+            "--fuel-time-index",
+            "2",
+            "--fuel-method",
+            "nearest",
+            "--fuel-overwrite",
+        ])
+        .expect("fuel args parse");
+        let run = ResolvedRun {
+            date_yyyymmdd: "20260608".to_string(),
+            cycle_utc: 18,
+            source: None,
+            auto_resolved: false,
+        };
+        let fuel_args = build_fuel_import_args(&args, &run, std::path::Path::new("out/fuel.json"));
+        for pair in [
+            ["--run", "20260608_18z"],
+            ["--hours", "1-3"],
+            ["--method", "nearest"],
+            ["--time-index", "2"],
+            ["--lat-var", "lat"],
+            ["--lon-var", "lon"],
+            ["--manifest-out", "out/fuel.json"],
+        ] {
+            assert!(fuel_args.windows(2).any(|have| have == pair));
+        }
+        assert!(fuel_args.iter().any(|arg| arg == "--overwrite"));
+        assert_eq!(
+            fuel_args
+                .windows(2)
+                .filter(|pair| pair[0] == "--layer")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn fuel_fetch_args_use_gridmet_date_and_cache() {
+        let args = Args::try_parse_from([
+            "rw-cafire",
+            "--date",
+            "20260629",
+            "--cycle",
+            "3",
+            "--hours",
+            "1-3",
+            "--products",
+            "cafire-with-fuels",
+            "--fuel-provider",
+            "gridmet",
+            "--fuel-cache-dir",
+            r"C:\fuel-cache",
+            "--fuel-kbdi-spinup-days",
+            "90",
+            "--fuel-kbdi-annual-rain-in",
+            "24",
+        ])
+        .expect("fuel fetch args parse");
+        let run = ResolvedRun {
+            date_yyyymmdd: "20260629".to_string(),
+            cycle_utc: 3,
+            source: None,
+            auto_resolved: false,
+        };
+        let fuel_args =
+            build_fuel_fetch_args(&args, &run, std::path::Path::new("out/fuel_fetch.json"))
+                .expect("fuel fetch args");
+        for pair in [
+            ["--run", "20260629_03z"],
+            ["--hours", "1-3"],
+            ["--date", "2026-06-29"],
+            ["--cache-dir", r"C:\fuel-cache"],
+            ["--method", "bilinear"],
+            ["--kbdi-spinup-days", "90"],
+            ["--kbdi-annual-rain-in", "24"],
+            ["--manifest-out", "out/fuel_fetch.json"],
+        ] {
+            assert!(fuel_args.windows(2).any(|have| have == pair));
+        }
+        assert!(fuel_args.iter().any(|arg| arg == "--kbdi"));
+    }
+
+    #[test]
     fn product_groups_split_hour_and_windowed_products() {
         let args = pinned_args();
         let groups = product_groups(&args).expect("default product groups");
@@ -936,6 +1312,44 @@ mod tests {
             groups.windowed_render_spec.as_deref(),
             Some("cafire-windowed")
         );
+    }
+
+    #[test]
+    fn product_groups_keep_fuels_in_hour_render_lane() {
+        let args = Args::try_parse_from([
+            "rw-cafire",
+            "--date",
+            "20260608",
+            "--cycle",
+            "18",
+            "--hours",
+            "1-3",
+            "--products",
+            "cafire-with-fuels",
+        ])
+        .expect("fuel args parse");
+        let groups = product_groups(&args).expect("fuel product groups");
+        assert_eq!(
+            groups.hour_render_spec.as_deref(),
+            Some("cafire-hour-with-fuels")
+        );
+        assert_eq!(
+            groups.windowed_render_spec.as_deref(),
+            Some("cafire-windowed")
+        );
+        for slug in [
+            "kbdi",
+            "erc",
+            "dead_fuel_moisture_1000h",
+            "fuel_receptiveness",
+            "fire_potential_composite",
+            "erc_hdw_composite",
+        ] {
+            assert!(
+                groups.hour.iter().any(|item| item == slug),
+                "missing {slug}"
+            );
+        }
     }
 
     #[test]

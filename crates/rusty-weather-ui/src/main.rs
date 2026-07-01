@@ -1566,7 +1566,16 @@ impl App {
             egui::ComboBox::from_id_salt("rw-fire-weather-products")
                 .selected_text(&self.fire_weather_ui.products)
                 .show_ui(ui, |ui| {
-                    for preset in ["cafire-all", "cafire-expanded", "cafire-core"] {
+                    for preset in [
+                        "cafire-all",
+                        "cafire-expanded",
+                        "cafire-core",
+                        "cafire-with-fuels",
+                        "cafire-expanded-with-fuels",
+                        "cafire-fuels",
+                        "cafire-fuel-layers",
+                        "cafire-fuel-composites",
+                    ] {
                         ui.selectable_value(
                             &mut self.fire_weather_ui.products,
                             preset.to_string(),

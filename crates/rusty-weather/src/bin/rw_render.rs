@@ -94,8 +94,9 @@ struct Args {
     #[arg(
         long,
         default_value = "all",
-        help = "all | none | direct | derived | heavy | windowed | cafire-core | cafire-all | \
-                cafire-expanded | comma-separated product slugs (windowed products span the \
+        help = "all | none | direct | derived | heavy | windowed | fuels | cafire-core | \
+                cafire-all | cafire-expanded | cafire-with-fuels | cafire-fuels | \
+                comma-separated product slugs (windowed products span the \
                 run's stored hours, anchored at the max hour; 'all' includes them only when \
                 more than one hour is stored)"
     )]
@@ -494,12 +495,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let store = StoreFieldSource::open(&args.store_root, &model_slug, &args.run, args.hour)?;
     let open_ms = open_started.elapsed().as_millis();
     println!(
-        "rw_render build {} | store {} | {} products requested ({} direct, {} derived/heavy, {} windowed) | {} domain(s) | output {:?} | open {} ms",
+        "rw_render build {} | store {} | {} products requested ({} direct, {} derived/heavy, {} fuel, {} windowed) | {} domain(s) | output {:?} | open {} ms",
         env!("RW_BUILD_SHA"),
         store.hour_path().display(),
-        request.direct.len() + request.derived.len() + request.windowed.len(),
+        request.direct.len() + request.derived.len() + request.fuel.len() + request.windowed.len(),
         request.direct.len(),
         request.derived.len(),
+        request.fuel.len(),
         request.windowed.len(),
         domains.len(),
         args.output_format,
@@ -553,6 +555,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             args.hour,
             &request.direct,
             &request.derived,
+            &request.fuel,
             // Solo render: nothing else competes for memory, no chunk gate.
             None,
         )?;

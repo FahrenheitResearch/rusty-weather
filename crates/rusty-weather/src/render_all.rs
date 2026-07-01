@@ -28,6 +28,8 @@ use rustwx_products::windowed::{
 };
 use rustwx_render::PngCompressionMode;
 
+#[path = "fuel_products.rs"]
+pub mod fuel_products;
 #[path = "store_render.rs"]
 pub mod store_render;
 #[path = "windowed_store.rs"]
@@ -61,6 +63,7 @@ pub const CAFIRE_WINDOWED_PRODUCTS: &[&str] = &[
 pub struct ProductRequest {
     pub direct: Vec<String>,
     pub derived: Vec<String>,
+    pub fuel: Vec<String>,
     pub windowed: Vec<String>,
     /// The windowed list came from the "all" keyword: render it only when
     /// the run has more than one stored hour (a single hour realizes only
@@ -104,9 +107,20 @@ fn product_request(
     windowed: Vec<String>,
     windowed_auto: bool,
 ) -> Result<ProductRequest, Box<dyn std::error::Error>> {
+    product_request_with_fuel(direct, derived, Vec::new(), windowed, windowed_auto)
+}
+
+fn product_request_with_fuel(
+    direct: Vec<String>,
+    derived: Vec<String>,
+    fuel: Vec<String>,
+    windowed: Vec<String>,
+    windowed_auto: bool,
+) -> Result<ProductRequest, Box<dyn std::error::Error>> {
     Ok(ProductRequest {
         direct,
         derived,
+        fuel,
         windowed,
         windowed_auto,
         strict: false,
@@ -135,6 +149,7 @@ pub fn partition_products(
             .map(|product| product.slug().to_string())
             .collect::<Vec<_>>()
     };
+    let fuel_catalog = fuel_products::supported_fuel_product_slugs;
     match spec.trim() {
         "none" | "store-only" | "ingest-only" => {
             product_request(Vec::new(), Vec::new(), Vec::new(), false)
@@ -184,12 +199,51 @@ pub fn partition_products(
             windowed_catalog(),
             false,
         ),
+        "cafire-with-fuels" | "cafire-all-fuels" => product_request_with_fuel(
+            strings(CAFIRE_DIRECT_PRODUCTS),
+            strings(CAFIRE_CORE_HOUR_PRODUCTS),
+            fuel_catalog(),
+            strings(CAFIRE_WINDOWED_PRODUCTS),
+            false,
+        ),
+        "cafire-expanded-with-fuels" | "cafire-store-all-fuels" => product_request_with_fuel(
+            strings(CAFIRE_DIRECT_PRODUCTS),
+            strings(CAFIRE_CORE_HOUR_PRODUCTS),
+            fuel_catalog(),
+            windowed_catalog(),
+            false,
+        ),
+        "cafire-hour-with-fuels" => product_request_with_fuel(
+            strings(CAFIRE_DIRECT_PRODUCTS),
+            strings(CAFIRE_CORE_HOUR_PRODUCTS),
+            fuel_catalog(),
+            Vec::new(),
+            false,
+        ),
+        "cafire-fuels" | "cafire-fuel" => {
+            product_request_with_fuel(Vec::new(), Vec::new(), fuel_catalog(), Vec::new(), false)
+        }
+        "cafire-fuel-layers" => product_request_with_fuel(
+            Vec::new(),
+            Vec::new(),
+            strings(fuel_products::CAFIRE_FUEL_PRODUCTS),
+            Vec::new(),
+            false,
+        ),
+        "cafire-fuel-composites" => product_request_with_fuel(
+            Vec::new(),
+            Vec::new(),
+            strings(fuel_products::CAFIRE_FUEL_COMPOSITE_PRODUCTS),
+            Vec::new(),
+            false,
+        ),
         "all" => Ok(ProductRequest {
             direct: supported_direct_recipe_slugs(model),
             derived: derived_catalog()
                 .into_iter()
                 .chain(heavy_catalog())
                 .collect(),
+            fuel: fuel_catalog(),
             windowed: windowed_catalog(),
             windowed_auto: true,
             strict: false,
@@ -197,6 +251,7 @@ pub fn partition_products(
         "direct" => Ok(ProductRequest {
             direct: supported_direct_recipe_slugs(model),
             derived: Vec::new(),
+            fuel: Vec::new(),
             windowed: Vec::new(),
             windowed_auto: false,
             strict: false,
@@ -204,6 +259,7 @@ pub fn partition_products(
         "derived" => Ok(ProductRequest {
             direct: Vec::new(),
             derived: derived_catalog(),
+            fuel: Vec::new(),
             windowed: Vec::new(),
             windowed_auto: false,
             strict: false,
@@ -211,6 +267,7 @@ pub fn partition_products(
         "heavy" => Ok(ProductRequest {
             direct: Vec::new(),
             derived: heavy_catalog(),
+            fuel: Vec::new(),
             windowed: Vec::new(),
             windowed_auto: false,
             strict: false,
@@ -218,13 +275,23 @@ pub fn partition_products(
         "windowed" => Ok(ProductRequest {
             direct: Vec::new(),
             derived: Vec::new(),
+            fuel: Vec::new(),
             windowed: windowed_catalog(),
+            windowed_auto: false,
+            strict: false,
+        }),
+        "fuel" | "fuels" => Ok(ProductRequest {
+            direct: Vec::new(),
+            derived: Vec::new(),
+            fuel: fuel_catalog(),
+            windowed: Vec::new(),
             windowed_auto: false,
             strict: false,
         }),
         list => {
             let mut direct = Vec::new();
             let mut derived = Vec::new();
+            let mut fuel = Vec::new();
             let mut windowed = Vec::new();
             for slug in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 let is_derived = store_derived_recipe_slugs().contains(&slug)
@@ -234,22 +301,26 @@ pub fn partition_products(
                     windowed.push(slug.to_string());
                 } else if is_derived {
                     derived.push(slug.to_string());
+                } else if fuel_products::FuelProduct::parse(slug).is_some() {
+                    fuel.push(slug.to_string());
                 } else if plot_recipe(slug).is_some() {
                     direct.push(slug.to_string());
                 } else {
                     return Err(format!(
                         "unknown product '{slug}': neither a direct plot recipe, a \
-                         derived/heavy recipe slug, nor a windowed product slug"
+                         derived/heavy recipe slug, a fuel product slug, nor a windowed \
+                         product slug"
                     )
                     .into());
                 }
             }
-            if direct.is_empty() && derived.is_empty() && windowed.is_empty() {
+            if direct.is_empty() && derived.is_empty() && fuel.is_empty() && windowed.is_empty() {
                 return Err("pass at least one product slug via --products".into());
             }
             Ok(ProductRequest {
                 direct,
                 derived,
+                fuel,
                 windowed,
                 windowed_auto: false,
                 strict: true,
@@ -310,6 +381,7 @@ pub fn render_hour_products(
     hour: u16,
     direct_slugs: &[String],
     derived_slugs: &[String],
+    fuel_slugs: &[String],
     // Optional pacing hook for the direct lane's chunked render: called
     // before each chunk loads its fields. `rw_batch` passes its memory
     // gate (defer chunks inside high-memory ingest windows); `rw_render`
@@ -397,6 +469,16 @@ pub fn render_hour_products(
             total_ms: recipe.timing.total_ms,
             output_path: recipe.output_path,
         }));
+        skipped.extend(outcome.skipped);
+    }
+
+    if !fuel_slugs.is_empty() {
+        if let Some(gate) = direct_chunk_gate {
+            gate();
+        }
+        let outcome =
+            fuel_products::render_fuel_products_from_store(config, store, hour, fuel_slugs)?;
+        rendered.extend(outcome.rendered);
         skipped.extend(outcome.skipped);
     }
 
@@ -508,6 +590,10 @@ mod tests {
             store_derived_recipe_slugs().len() + store_heavy_recipe_slugs().len()
         );
         assert_eq!(
+            all.fuel.len(),
+            fuel_products::supported_fuel_product_slugs().len()
+        );
+        assert_eq!(
             all.windowed.len(),
             HrrrWindowedProduct::supported_products().len()
         );
@@ -519,10 +605,12 @@ mod tests {
         let heavy = partition_products("heavy", ModelId::Hrrr).unwrap();
         assert!(heavy.direct.is_empty());
         assert_eq!(heavy.derived.len(), store_heavy_recipe_slugs().len());
+        assert!(heavy.fuel.is_empty());
         assert!(heavy.windowed.is_empty());
 
         let windowed = partition_products("windowed", ModelId::Hrrr).unwrap();
         assert!(windowed.direct.is_empty() && windowed.derived.is_empty());
+        assert!(windowed.fuel.is_empty());
         assert_eq!(
             windowed.windowed.len(),
             HrrrWindowedProduct::supported_products().len()
@@ -540,6 +628,7 @@ mod tests {
             let request = partition_products(keyword, ModelId::Hrrr).unwrap();
             assert!(request.direct.is_empty(), "{keyword} direct");
             assert!(request.derived.is_empty(), "{keyword} derived");
+            assert!(request.fuel.is_empty(), "{keyword} fuel");
             assert!(request.windowed.is_empty(), "{keyword} windowed");
             assert!(!request.strict);
             assert!(!request.windowed_auto);
@@ -552,6 +641,7 @@ mod tests {
         assert!(!request.strict);
         assert_eq!(request.direct, strings(CAFIRE_DIRECT_PRODUCTS));
         assert_eq!(request.derived, strings(CAFIRE_CORE_HOUR_PRODUCTS));
+        assert!(request.fuel.is_empty());
         assert_eq!(request.windowed, strings(CAFIRE_WINDOWED_PRODUCTS));
         for slug in [
             "2m_temperature_10m_winds",
@@ -574,6 +664,7 @@ mod tests {
             assert!(
                 request.direct.iter().any(|item| item == slug)
                     || request.derived.iter().any(|item| item == slug)
+                    || request.fuel.iter().any(|item| item == slug)
                     || request.windowed.iter().any(|item| item == slug),
                 "missing {slug}"
             );
@@ -585,6 +676,7 @@ mod tests {
         let request = partition_products("cafire-expanded", ModelId::Hrrr).unwrap();
         assert_eq!(request.direct, strings(CAFIRE_DIRECT_PRODUCTS));
         assert_eq!(request.derived, strings(CAFIRE_CORE_HOUR_PRODUCTS));
+        assert!(request.fuel.is_empty());
         assert_eq!(
             request.windowed.len(),
             HrrrWindowedProduct::supported_products().len()
@@ -612,9 +704,25 @@ mod tests {
     }
 
     #[test]
+    fn cafire_fuel_presets_are_native_hour_products() {
+        let request = partition_products("cafire-with-fuels", ModelId::Hrrr).unwrap();
+        assert_eq!(request.direct, strings(CAFIRE_DIRECT_PRODUCTS));
+        assert_eq!(request.derived, strings(CAFIRE_CORE_HOUR_PRODUCTS));
+        assert_eq!(request.fuel, fuel_products::supported_fuel_product_slugs());
+        assert_eq!(request.windowed, strings(CAFIRE_WINDOWED_PRODUCTS));
+        assert!(!request.strict);
+
+        let fuels = partition_products("cafire-fuels", ModelId::Hrrr).unwrap();
+        assert!(fuels.direct.is_empty());
+        assert!(fuels.derived.is_empty());
+        assert_eq!(fuels.fuel, fuel_products::supported_fuel_product_slugs());
+        assert!(fuels.windowed.is_empty());
+    }
+
+    #[test]
     fn product_lists_classify_into_lanes_and_are_strict() {
         let picked = partition_products(
-            "2m_temperature,sbcape,ecape_stp,qpf_6h,uh_2to5km_run_max",
+            "2m_temperature,sbcape,ecape_stp,kbdi,fire_potential_composite,qpf_6h,uh_2to5km_run_max",
             ModelId::Hrrr,
         )
         .unwrap();
@@ -623,6 +731,10 @@ mod tests {
         assert_eq!(
             picked.derived,
             vec!["sbcape".to_string(), "ecape_stp".to_string()]
+        );
+        assert_eq!(
+            picked.fuel,
+            vec!["kbdi".to_string(), "fire_potential_composite".to_string()]
         );
         assert_eq!(
             picked.windowed,

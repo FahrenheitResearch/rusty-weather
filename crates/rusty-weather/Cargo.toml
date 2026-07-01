@@ -28,9 +28,13 @@ rustwx-core = { path = "../rustwx-core" }
 rustwx-io = { path = "../rustwx-io" }
 rustwx-models = { path = "../rustwx-models" }
 rustwx-products = { path = "../rustwx-products" }
+rustwx-regrid = { path = "../rustwx-regrid" }
 rustwx-render = { path = "../rustwx-render" }
 rw-ingest = { path = "../rw-ingest" }
+rw-sat = { path = "../rw-sat" }
 rw-store = { path = "../rw-store" }
+netcrust = { path = "../../vendor/netcrust" }
+ureq.workspace = true
 
 # Polite-mode priority drop (src/throttle.rs): windows-sys is already in
 # the tree transitively (clap's anstyle stack pulls 0.61), so this adds one
