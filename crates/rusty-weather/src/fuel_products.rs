@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use rayon::prelude::*;
 use rustwx_core::{ModelId, SourceId};
 use rustwx_products::places;
 use rustwx_products::plot_design::StaticPlotDesign;
@@ -18,7 +19,7 @@ use rustwx_products::shared_context::{DomainSpec, model_time_subtitle, source_su
 use rustwx_render::{
     ChromeScale, Color, ColorScale, DiscreteColorScale, ExtendMode, Field2D, GridShape, LatLonGrid,
     MapRenderRequest, PngWriteOptions, ProductKey, ProductVisualMode, ProjectedDomain,
-    map_frame_aspect_ratio, save_png_profile_with_options,
+    ProjectedMap, map_frame_aspect_ratio, save_png_profile_with_options,
 };
 use rw_store::error::RwStoreError;
 
@@ -278,13 +279,28 @@ struct FuelPlane {
     values: Vec<f32>,
 }
 
+struct PreparedFuelProduct {
+    product: FuelProduct,
+    plane: FuelPlane,
+    resolve_ms: u128,
+}
+
+struct FuelRenderContext {
+    nx: usize,
+    ny: usize,
+    lat_deg: Vec<f32>,
+    lon_deg: Vec<f32>,
+    projection: Option<rustwx_core::GridProjection>,
+    projected: ProjectedMap,
+}
+
 pub fn render_fuel_products_from_store(
     config: &StoreRenderConfig,
     store: &StoreFieldSource,
     hour: u16,
     requested: &[String],
 ) -> Result<FuelRenderOutcome, Box<dyn std::error::Error>> {
-    let mut rendered = Vec::new();
+    let mut prepared = Vec::new();
     let mut skipped = Vec::new();
     for slug in requested {
         let Some(product) = FuelProduct::parse(slug) else {
@@ -296,20 +312,38 @@ pub fn render_fuel_products_from_store(
         };
         let started = Instant::now();
         match resolve_fuel_product(product, store) {
-            Ok(plane) => {
-                let output_path = render_one_fuel_product(config, store, hour, product, plane)?;
-                rendered.push(RenderedProduct {
-                    slug: product.slug().to_string(),
-                    total_ms: started.elapsed().as_millis(),
-                    output_path,
-                });
-            }
+            Ok(plane) => prepared.push(PreparedFuelProduct {
+                product,
+                plane,
+                resolve_ms: started.elapsed().as_millis(),
+            }),
             Err(reason) => skipped.push(StoreRenderSkip {
                 slug: product.slug().to_string(),
                 reason,
             }),
         }
     }
+    if prepared.is_empty() {
+        return Ok(FuelRenderOutcome {
+            rendered: Vec::new(),
+            skipped,
+        });
+    }
+    let context = build_fuel_render_context(config, store)?;
+    let rendered = prepared
+        .into_par_iter()
+        .map(|prepared| {
+            let started = Instant::now();
+            render_one_fuel_product(config, &context, hour, prepared.product, prepared.plane)
+                .map(|output_path| RenderedProduct {
+                    slug: prepared.product.slug().to_string(),
+                    total_ms: prepared.resolve_ms + started.elapsed().as_millis(),
+                    output_path,
+                })
+                .map_err(|err| err.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
     Ok(FuelRenderOutcome { rendered, skipped })
 }
 
@@ -539,19 +573,40 @@ fn combine_normalized(a: &[f32], b: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-fn render_one_fuel_product(
+fn build_fuel_render_context(
     config: &StoreRenderConfig,
     store: &StoreFieldSource,
+) -> Result<FuelRenderContext, Box<dyn std::error::Error>> {
+    let full_grid = store.full_grid();
+    let projected = rustwx_products::direct::build_projected_map_with_projection(
+        &full_grid.lat_deg,
+        &full_grid.lon_deg,
+        store.projection(),
+        config.domain.bounds,
+        map_frame_aspect_ratio(config.output_width, config.output_height, true, true),
+    )?;
+    Ok(FuelRenderContext {
+        nx: full_grid.shape.nx,
+        ny: full_grid.shape.ny,
+        lat_deg: full_grid.lat_deg,
+        lon_deg: full_grid.lon_deg,
+        projection: store.projection().cloned(),
+        projected,
+    })
+}
+
+fn render_one_fuel_product(
+    config: &StoreRenderConfig,
+    context: &FuelRenderContext,
     hour: u16,
     product: FuelProduct,
     plane: FuelPlane,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&config.out_dir)?;
-    let full_grid = store.full_grid();
     let render_grid = LatLonGrid::new(
-        GridShape::new(full_grid.shape.nx, full_grid.shape.ny)?,
-        full_grid.lat_deg,
-        full_grid.lon_deg,
+        GridShape::new(context.nx, context.ny)?,
+        context.lat_deg.clone(),
+        context.lon_deg.clone(),
     )?;
     let field = Field2D::new(
         ProductKey::named(product.slug()),
@@ -576,31 +631,22 @@ fn render_one_fuel_product(
     request.supersample_sharpen = static_supersample_sharpen();
     StaticPlotDesign::new(config.domain.bounds, ProductVisualMode::SevereDiagnostic)
         .apply_to_request(&mut request);
-    let label_lat_deg = request.field.grid.lat_deg.clone();
-    let label_lon_deg = request.field.grid.lon_deg.clone();
-    let projected = rustwx_products::direct::build_projected_map_with_projection(
-        &label_lat_deg,
-        &label_lon_deg,
-        store.projection(),
-        config.domain.bounds,
-        map_frame_aspect_ratio(config.output_width, config.output_height, true, true),
-    )?;
     request.projected_domain = Some(ProjectedDomain {
-        x: projected.projected_x,
-        y: projected.projected_y,
-        extent: projected.extent,
+        x: context.projected.projected_x.clone(),
+        y: context.projected.projected_y.clone(),
+        extent: context.projected.extent.clone(),
     });
-    request.projected_lines = projected.lines;
-    request.projected_polygons = projected.polygons;
-    request.inverse_raster_projection = projected.inverse_raster_projection;
+    request.projected_lines = context.projected.lines.clone();
+    request.projected_polygons = context.projected.polygons.clone();
+    request.inverse_raster_projection = context.projected.inverse_raster_projection.clone();
     if let Some(overlay) = config.place_label_overlay.as_ref() {
         places::apply_place_label_overlay(
             &mut request,
             overlay,
             &config.domain,
-            &label_lat_deg,
-            &label_lon_deg,
-            store.projection(),
+            &context.lat_deg,
+            &context.lon_deg,
+            context.projection.as_ref(),
         )?;
     }
     let output_path = config.out_dir.join(fuel_output_filename(
