@@ -55,6 +55,7 @@ fn sample_projected_opts() -> RenderOpts {
         }),
         projected_grid: Some(sample_projected_grid()),
         inverse_projected_grid: None,
+        terrain_rgba_grid: None,
         rgba_grid: None,
         projected_polygons: Vec::new(),
         projected_data_polygons: Vec::new(),

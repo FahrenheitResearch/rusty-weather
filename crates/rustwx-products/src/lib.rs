@@ -28,6 +28,7 @@ pub mod shared_context;
 pub mod source;
 pub mod spec;
 pub mod thermo_native;
+pub mod topo;
 pub mod viewer;
 pub mod windowed;
 pub mod windowed_decoder;
@@ -104,6 +105,13 @@ fn style_added_place_labels_for_density(
                     rustwx_render::ProjectedPlaceLabelPriority::Auxiliary
                 } else {
                     rustwx_render::ProjectedPlaceLabelPriority::Micro
+                }
+            }
+            crate::places::PlaceLabelDensityTier::MaxLocal => {
+                if is_auxiliary_catalog_place {
+                    rustwx_render::ProjectedPlaceLabelPriority::Auxiliary
+                } else {
+                    rustwx_render::ProjectedPlaceLabelPriority::Primary
                 }
             }
         };

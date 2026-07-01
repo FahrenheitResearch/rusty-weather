@@ -19,9 +19,11 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 use rustwx_render::map_frame_aspect_ratio;
 
+use rustwx_core::SelectedField2D;
+
 use crate::gridded::{
-    ProjectedGridIntersection, classify_projected_grid_intersection, crop_latlon_grid,
-    crop_values_f64,
+    GridCrop, ProjectedGridIntersection, classify_projected_grid_intersection, crop_latlon_grid,
+    crop_values_f32, crop_values_f64,
 };
 use crate::shared_context::WeatherPanelField;
 
@@ -138,6 +140,11 @@ pub fn render_derived_recipes_from_store_grids(
         Some(crop) => crop_values_f64(values, full_grid.shape.nx, crop),
         None => values.to_vec(),
     };
+    let mut request = request.clone();
+    request.topo_orography = request
+        .topo_orography
+        .as_ref()
+        .and_then(|orography| crop_topo_orography(orography, full_grid.shape.nx, &grid, crop));
 
     let mut computed = DerivedComputedFields::default();
     for recipe in recipes.iter().filter(|recipe| !recipe.is_heavy()) {
@@ -168,7 +175,7 @@ pub fn render_derived_recipes_from_store_grids(
                 crop_plane(&store_grid.values),
             );
             render_derived_heavy_recipe(
-                request,
+                &request,
                 *recipe,
                 &field,
                 &grid,
@@ -185,7 +192,7 @@ pub fn render_derived_recipes_from_store_grids(
             .map_err(|err| err.to_string())
         } else {
             render_derived_output_recipe(
-                request,
+                &request,
                 *recipe,
                 &grid,
                 projection,
@@ -224,6 +231,28 @@ pub fn render_derived_recipes_from_store_grids(
     }
     .map_err(std::io::Error::other)?;
     Ok(rendered)
+}
+
+fn crop_topo_orography(
+    orography: &SelectedField2D,
+    full_nx: usize,
+    grid: &rustwx_core::LatLonGrid,
+    crop: Option<GridCrop>,
+) -> Option<SelectedField2D> {
+    if orography.grid.shape.len() == 0 {
+        return None;
+    }
+    let values = match crop {
+        Some(crop) => crop_values_f32(&orography.values, full_nx, crop),
+        None => orography.values.clone(),
+    };
+    SelectedField2D::new(
+        orography.selector,
+        orography.units.clone(),
+        grid.clone(),
+        values,
+    )
+    .ok()
 }
 
 fn store_render_projected_crop_pad_cells(bounds: (f64, f64, f64, f64)) -> usize {

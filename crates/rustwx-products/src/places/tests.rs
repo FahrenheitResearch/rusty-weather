@@ -457,6 +457,33 @@ fn dense_overlay_can_label_arbitrary_drawn_box_with_micro_places() {
 }
 
 #[test]
+fn max_local_overlay_labels_reno_sierra_drawn_box_with_many_towns() {
+    let domain = DomainSpec::new("drawn_box", (-121.73, -116.61, 38.35, 41.53));
+    let overlay = default_place_label_overlay_for_domain(&domain, PlaceLabelDensityTier::MaxLocal)
+        .expect("custom drawn boxes should get a label plan");
+    let selected = overlay.selected_places_for_domain(&domain);
+    let slugs = place_slugs(&selected);
+
+    assert!(
+        selected.len() >= 10,
+        "max local labels should select many local places; selected={slugs:?}"
+    );
+    for expected in [
+        "nv_reno",
+        "nv_sparks",
+        "nv_carson_city",
+        "nv_fallon",
+        "nv_fernley",
+        "ca_truckee",
+    ] {
+        assert!(
+            slugs.contains(&expected),
+            "expected {expected} in Reno/Sierra local labels; selected={slugs:?}"
+        );
+    }
+}
+
+#[test]
 fn zero_density_disables_arbitrary_drawn_box_labels() {
     let domain = DomainSpec::new("drawn_box", (-123.5, -120.25, 37.0, 39.5));
     let overlay = default_place_label_overlay_for_domain(&domain, PlaceLabelDensityTier::None)

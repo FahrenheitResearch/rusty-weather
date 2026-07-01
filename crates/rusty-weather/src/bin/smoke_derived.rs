@@ -94,7 +94,7 @@ struct Args {
     native_fill_level_multiplier: usize,
     #[arg(long = "png-compression", value_enum, default_value_t = PngCompressionArg::Fast)]
     png_compression: PngCompressionArg,
-    #[arg(long = "place-label-density", default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=3))]
+    #[arg(long = "place-label-density", default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
     place_label_density: u8,
 }
 
@@ -191,6 +191,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             &domain,
             PlaceLabelDensityTier::from_numeric(args.place_label_density),
         ),
+        topo_orography: None,
     };
     let report = run_derived_batch(&request)?;
 

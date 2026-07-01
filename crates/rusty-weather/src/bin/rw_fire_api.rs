@@ -169,6 +169,8 @@ struct RenderJobRequest {
     county_linework: bool,
     #[serde(default = "default_place_label_density")]
     place_label_density: u8,
+    #[serde(default = "default_place_label_size")]
+    place_label_size: u8,
     #[serde(default = "default_domain_slug")]
     domain_slug: String,
     bounds: [f64; 4],
@@ -461,6 +463,8 @@ fn run_rw_render(
     })?;
     let (width, height) = output_size(request);
     let place_label_density = request.place_label_density.to_string();
+    let (place_label_size_factor, place_label_alpha_factor) =
+        place_label_render_env(request.place_label_size);
     let mut command = Command::new(&state.rw_render);
     command.args([
         "--model",
@@ -506,6 +510,8 @@ fn run_rw_render(
     );
     command.env("RUSTWX_STATIC_OUTPUT_WIDTH", width.to_string());
     command.env("RUSTWX_STATIC_OUTPUT_HEIGHT", height.to_string());
+    command.env("RUSTWX_PLACE_LABEL_SIZE_FACTOR", place_label_size_factor);
+    command.env("RUSTWX_PLACE_LABEL_ALPHA_FACTOR", place_label_alpha_factor);
 
     let output = command.output().map_err(|err| {
         (
@@ -590,8 +596,11 @@ fn validate_render_request(mut request: RenderJobRequest) -> Result<RenderJobReq
     if !matches!(request.output_format.as_str(), "png" | "webp" | "png-webp") {
         return Err("output_format must be png, webp, or png-webp".to_string());
     }
-    if request.place_label_density > 3 {
-        return Err("place_label_density must be 0, 1, 2, or 3".to_string());
+    if request.place_label_density > 4 {
+        return Err("place_label_density must be 0, 1, 2, 3, or 4".to_string());
+    }
+    if request.place_label_size > 3 {
+        return Err("place_label_size must be 0, 1, 2, or 3".to_string());
     }
     let [west, east, south, north] = request.bounds;
     if !west.is_finite() || !east.is_finite() || !south.is_finite() || !north.is_finite() {
@@ -678,7 +687,12 @@ fn json_status_response(status: u16, value: &impl Serialize) -> Vec<u8> {
 }
 
 fn html_response(body: &str) -> Vec<u8> {
-    response(200, "text/html; charset=utf-8", body.as_bytes().to_vec())
+    response_with_extra_headers(
+        200,
+        "text/html; charset=utf-8",
+        body.as_bytes().to_vec(),
+        "Cache-Control: no-store\r\n",
+    )
 }
 
 fn text_response(status: u16, body: &str) -> Vec<u8> {
@@ -698,6 +712,15 @@ fn empty_response(status: u16) -> Vec<u8> {
 }
 
 fn response(status: u16, content_type: &str, body: Vec<u8>) -> Vec<u8> {
+    response_with_extra_headers(status, content_type, body, "")
+}
+
+fn response_with_extra_headers(
+    status: u16,
+    content_type: &str,
+    body: Vec<u8>,
+    extra_headers: &str,
+) -> Vec<u8> {
     let status_text = match status {
         200 => "OK",
         202 => "Accepted",
@@ -707,7 +730,7 @@ fn response(status: u16, content_type: &str, body: Vec<u8>) -> Vec<u8> {
         _ => "OK",
     };
     let mut out = format!(
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: content-type\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\n{extra_headers}Connection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
@@ -808,7 +831,7 @@ fn output_size(request: &RenderJobRequest) -> (u32, u32) {
 fn render_cache_key(request: &RenderJobRequest) -> String {
     let (width, height) = output_size(request);
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
         request.model,
         request.run,
         request.hour,
@@ -818,6 +841,7 @@ fn render_cache_key(request: &RenderJobRequest) -> String {
         request.basemap_style,
         request.county_linework,
         request.place_label_density,
+        request.place_label_size,
         request.domain_slug,
         format_bounds(request.bounds),
         width,
@@ -863,7 +887,7 @@ fn default_plot_style() -> String {
 }
 
 fn default_basemap_style() -> String {
-    "filled".to_string()
+    "topo".to_string()
 }
 
 fn default_county_linework() -> bool {
@@ -871,7 +895,11 @@ fn default_county_linework() -> bool {
 }
 
 fn default_place_label_density() -> u8 {
-    1
+    4
+}
+
+fn default_place_label_size() -> u8 {
+    2
 }
 
 fn default_domain_slug() -> String {
@@ -938,6 +966,15 @@ fn normalize_basemap_style(value: &str) -> Result<String, String> {
         }
     };
     Ok(canonical.to_string())
+}
+
+fn place_label_render_env(size: u8) -> (&'static str, &'static str) {
+    match size {
+        0 => ("0.90", "1.00"),
+        1 => ("1.00", "1.05"),
+        2 => ("1.28", "1.18"),
+        _ => ("1.55", "1.30"),
+    }
 }
 
 const DEMO_HTML: &str = r#"<!doctype html>
@@ -1017,9 +1054,9 @@ const DEMO_HTML: &str = r#"<!doctype html>
       </label>
       <label>Map fill
         <select id="basemapStyle">
-          <option value="filled" selected>filled land/ocean</option>
+          <option value="topo" selected>topo terrain tint</option>
+          <option value="filled">filled land/ocean</option>
           <option value="white">white / NWS-style</option>
-          <option value="topo">topo terrain tint</option>
         </select>
       </label>
     </div>
@@ -1029,11 +1066,20 @@ const DEMO_HTML: &str = r#"<!doctype html>
           <option value="0">off</option>
           <option value="1">major cities</option>
           <option value="2">major + regional cities</option>
-          <option value="3" selected>dense local / tiny places</option>
+          <option value="3">dense local / tiny places</option>
+          <option value="4" selected>max tiny towns</option>
         </select>
       </label>
-      <label class="check"><input id="countyLinework" type="checkbox" checked> Show county lines</label>
+      <label>Label size
+        <select id="placeLabelSize">
+          <option value="0">small</option>
+          <option value="1">normal</option>
+          <option value="2" selected>large</option>
+          <option value="3">huge</option>
+        </select>
+      </label>
     </div>
+    <label class="check"><input id="countyLinework" type="checkbox" checked> Show county lines</label>
     <label>Domain name <input id="domainSlug" value="drawn_box"></label>
     <div class="row">
       <label>West <input id="west" type="number" step="0.01" value="-123.50"></label>
@@ -1155,6 +1201,7 @@ document.getElementById('render').onclick = async () => {
     basemap_style: input('basemapStyle').value,
     county_linework: input('countyLinework').checked,
     place_label_density: Number(input('placeLabelDensity').value),
+    place_label_size: Number(input('placeLabelSize').value),
     domain_slug: input('domainSlug').value,
     bounds: [b.west, b.east, b.south, b.north]
   };
@@ -1237,6 +1284,7 @@ mod tests {
             basemap_style: default_basemap_style(),
             county_linework: default_county_linework(),
             place_label_density: default_place_label_density(),
+            place_label_size: default_place_label_size(),
             domain_slug: "bad".to_string(),
             bounds: [-123.0, -120.0, 40.0, 37.0],
             output_width: None,
@@ -1257,6 +1305,7 @@ mod tests {
             basemap_style: default_basemap_style(),
             county_linework: default_county_linework(),
             place_label_density: default_place_label_density(),
+            place_label_size: default_place_label_size(),
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(800),
@@ -1277,6 +1326,7 @@ mod tests {
             basemap_style: default_basemap_style(),
             county_linework: default_county_linework(),
             place_label_density: default_place_label_density(),
+            place_label_size: default_place_label_size(),
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1000),
@@ -1297,6 +1347,7 @@ mod tests {
             basemap_style: default_basemap_style(),
             county_linework: default_county_linework(),
             place_label_density: default_place_label_density(),
+            place_label_size: default_place_label_size(),
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1000),
@@ -1317,6 +1368,7 @@ mod tests {
             basemap_style: default_basemap_style(),
             county_linework: default_county_linework(),
             place_label_density: default_place_label_density(),
+            place_label_size: default_place_label_size(),
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(800),
@@ -1341,6 +1393,7 @@ mod tests {
             basemap_style: "NWS".to_string(),
             county_linework: false,
             place_label_density: 3,
+            place_label_size: 3,
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1400),
@@ -1351,6 +1404,7 @@ mod tests {
         assert_eq!(validated.basemap_style, "white");
         assert!(!validated.county_linework);
         assert_eq!(validated.place_label_density, 3);
+        assert_eq!(validated.place_label_size, 3);
     }
 
     #[test]
@@ -1365,6 +1419,7 @@ mod tests {
             basemap_style: "terrain".to_string(),
             county_linework: default_county_linework(),
             place_label_density: default_place_label_density(),
+            place_label_size: default_place_label_size(),
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1400),
@@ -1386,6 +1441,7 @@ mod tests {
             basemap_style: "filled".to_string(),
             county_linework: true,
             place_label_density: 1,
+            place_label_size: 1,
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1200),
@@ -1407,10 +1463,15 @@ mod tests {
             place_label_density: 3,
             ..base.clone()
         };
+        let huge_places = RenderJobRequest {
+            place_label_size: 3,
+            ..base.clone()
+        };
         assert_ne!(render_cache_key(&base), render_cache_key(&clean));
         assert_ne!(render_cache_key(&base), render_cache_key(&white));
         assert_ne!(render_cache_key(&base), render_cache_key(&no_counties));
         assert_ne!(render_cache_key(&base), render_cache_key(&dense_places));
+        assert_ne!(render_cache_key(&base), render_cache_key(&huge_places));
     }
 
     #[test]
@@ -1424,7 +1485,8 @@ mod tests {
             plot_style: default_plot_style(),
             basemap_style: default_basemap_style(),
             county_linework: default_county_linework(),
-            place_label_density: 4,
+            place_label_density: 5,
+            place_label_size: default_place_label_size(),
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1400),

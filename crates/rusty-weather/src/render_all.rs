@@ -392,6 +392,11 @@ pub fn render_hour_products(
     let mut skipped = Vec::new();
 
     if !direct_slugs.is_empty() {
+        let topo_orography = if rustwx_products::topo::basemap_style_env_is_topo() {
+            store.fetch_variable("orography").ok()
+        } else {
+            None
+        };
         let direct_request = DirectBatchRequest {
             model: config.model,
             date_yyyymmdd: config.date_yyyymmdd.clone(),
@@ -413,6 +418,7 @@ pub fn render_hour_products(
             output_suffix: None,
             subtitle_left_override: None,
             subtitle_right_override: None,
+            topo_orography,
         };
         let outcome = store_render::render_direct_recipes_from_store(
             store,
@@ -457,6 +463,11 @@ pub fn render_hour_products(
             output_height: config.output_height,
             png_compression: config.png_compression,
             place_label_overlay: config.place_label_overlay.clone(),
+            topo_orography: if rustwx_products::topo::basemap_style_env_is_topo() {
+                store.fetch_variable("orography").ok()
+            } else {
+                None
+            },
         };
         let outcome = store_render::render_derived_recipes_from_store(
             store,
@@ -536,6 +547,11 @@ pub fn render_windowed_products(
         output_height: config.output_height,
         png_compression: config.png_compression,
         place_label_overlay: config.place_label_overlay.clone(),
+        topo_orography: if rustwx_products::topo::basemap_style_env_is_topo() {
+            store.fetch_variable("orography").ok()
+        } else {
+            None
+        },
     };
     let grids: Vec<StoreWindowedGrid> = outcome
         .grids

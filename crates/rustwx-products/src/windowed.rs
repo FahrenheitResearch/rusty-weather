@@ -21,7 +21,9 @@ use crate::windowed_decoder::{
     compute_wind10m_product, load_or_decode_apcp, load_or_decode_surface_snapshot,
     load_or_decode_uh25, load_or_decode_wind10m_max, qpf_fallback_hours_if_direct_missing,
 };
-use rustwx_core::{BundleRequirement, CanonicalBundleDescriptor, Field2D, ModelId, SourceId};
+use rustwx_core::{
+    BundleRequirement, CanonicalBundleDescriptor, Field2D, ModelId, SelectedField2D, SourceId,
+};
 use rustwx_models::{LatestRun, resolve_canonical_bundle_product};
 use rustwx_render::map_frame_aspect_ratio;
 use rustwx_render::{
@@ -426,6 +428,8 @@ pub struct HrrrWindowedBatchRequest {
     pub png_compression: PngCompressionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub place_label_overlay: Option<PlaceLabelOverlay>,
+    #[serde(skip)]
+    pub topo_orography: Option<SelectedField2D>,
 }
 
 impl HrrrWindowedBatchRequest {
@@ -1100,6 +1104,7 @@ fn sampling_windowed_request(
         output_height: OUTPUT_HEIGHT,
         png_compression: PngCompressionMode::Default,
         place_label_overlay: None,
+        topo_orography: None,
     }
 }
 
@@ -1528,6 +1533,11 @@ fn run_hrrr_windowed_batch_from_prepared_with_total_start(
     let projection = prepared.projection.as_ref();
     let domain_grid = &domain_grid;
     let prepared_products = &prepared.products;
+    let topo_orography = request
+        .topo_orography
+        .as_ref()
+        .and_then(|orography| crop_windowed_topo_orography(orography, domain_grid, crop));
+    let topo_orography = &topo_orography;
     let mut outcomes = thread::scope(|scope| -> Result<Vec<WindowedProductOutcome>, io::Error> {
         let mut done = Vec::with_capacity(prepared_products.len());
         let mut pending = std::collections::VecDeque::new();
@@ -1563,6 +1573,10 @@ fn run_hrrr_windowed_batch_from_prepared_with_total_start(
                         model,
                         source,
                     );
+                    if let Some(orography) = topo_orography.as_ref() {
+                        crate::topo::apply_orography_topo_overlay(&mut render_request, orography)
+                            .map_err(thread_windowed_error)?;
+                    }
                     if let Some(overlay) = request.place_label_overlay.as_ref() {
                         crate::apply_place_label_overlay_with_density_styling(
                             &mut render_request,
@@ -1692,6 +1706,24 @@ fn crop_for_domain_grid(
     } else {
         Ok(Some(crop))
     }
+}
+
+fn crop_windowed_topo_orography(
+    orography: &SelectedField2D,
+    domain_grid: &rustwx_core::LatLonGrid,
+    crop: Option<GridCrop>,
+) -> Option<SelectedField2D> {
+    let values = match crop {
+        Some(crop) => crop_values_f32(&orography.values, orography.grid.shape.nx, crop),
+        None => orography.values.clone(),
+    };
+    SelectedField2D::new(
+        orography.selector,
+        orography.units.clone(),
+        domain_grid.clone(),
+        values,
+    )
+    .ok()
 }
 
 fn cropped_windowed_field_for_domain(

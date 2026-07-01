@@ -55,6 +55,7 @@ pub struct RenderOpts {
     pub map_extent: Option<MapExtent>,
     pub projected_grid: Option<ProjectedGrid>,
     pub(crate) inverse_projected_grid: Option<InverseProjectedGrid>,
+    pub terrain_rgba_grid: Option<Vec<Rgba>>,
     pub rgba_grid: Option<Vec<Rgba>>,
     /// Filled polygons (lat/lon-derived). Drawn BEFORE the data raster so the
     /// data overlays on top; ordering within the list is bottom-to-top.
@@ -175,6 +176,7 @@ impl Default for RenderOpts {
             map_extent: None,
             projected_grid: None,
             inverse_projected_grid: None,
+            terrain_rgba_grid: None,
             rgba_grid: None,
             projected_polygons: vec![],
             projected_data_polygons: vec![],
@@ -1240,7 +1242,7 @@ struct PlaceLabelRenderAdjustments {
 fn place_label_render_adjustments(
     priority: ProjectedPlaceLabelPriority,
 ) -> PlaceLabelRenderAdjustments {
-    match priority {
+    let mut adjustments = match priority {
         ProjectedPlaceLabelPriority::Primary => PlaceLabelRenderAdjustments {
             text_size_factor: 1.0,
             text_alpha_factor: 1.0,
@@ -1271,7 +1273,36 @@ fn place_label_render_adjustments(
             halo_width_factor: 0.50,
             offset_factor: 0.85,
         },
-    }
+    };
+    let size_factor = place_label_size_factor();
+    let alpha_factor = place_label_alpha_factor();
+    adjustments.text_size_factor *= size_factor;
+    adjustments.marker_scale_factor *= size_factor;
+    adjustments.outline_width_factor *= size_factor;
+    adjustments.halo_width_factor *= size_factor;
+    adjustments.offset_factor *= size_factor;
+    adjustments.text_alpha_factor *= alpha_factor;
+    adjustments.halo_alpha_factor *= alpha_factor;
+    adjustments.marker_alpha_factor *= alpha_factor;
+    adjustments
+}
+
+fn place_label_size_factor() -> f32 {
+    std::env::var("RUSTWX_PLACE_LABEL_SIZE_FACTOR")
+        .ok()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(1.0)
+        .clamp(0.75, 2.25)
+}
+
+fn place_label_alpha_factor() -> f32 {
+    std::env::var("RUSTWX_PLACE_LABEL_ALPHA_FACTOR")
+        .ok()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(1.0)
+        .clamp(0.50, 1.75)
 }
 
 fn scale_alpha(color: Rgba, factor: f32) -> Rgba {
@@ -1279,7 +1310,9 @@ fn scale_alpha(color: Rgba, factor: f32) -> Rgba {
         color.r,
         color.g,
         color.b,
-        ((color.a as f32) * factor.clamp(0.0, 1.0)).round() as u8,
+        ((color.a as f32) * factor.clamp(0.0, 2.0))
+            .round()
+            .clamp(0.0, 255.0) as u8,
     )
 }
 
@@ -4057,6 +4090,41 @@ fn draw_variable_layers(
             opts.presentation,
             Some(polygon_clip_rect),
         );
+    }
+
+    if let Some(terrain_grid) = opts.terrain_rgba_grid.as_deref() {
+        let terrain_img = if let Some(pixel_points) = projected_pixels {
+            rasterize::rasterize_projected_rgba_grid(
+                terrain_grid,
+                ny,
+                nx,
+                pixel_points,
+                layout.map_w,
+                layout.map_h,
+            )
+        } else {
+            rasterize::rasterize_rgba_grid(terrain_grid, ny, nx, layout.map_w, layout.map_h)
+        };
+        for py in 0..layout.map_h {
+            for px in 0..layout.map_w {
+                let src = terrain_img.get_pixel(px, py);
+                let a = src.0[3];
+                if a == 0 {
+                    continue;
+                }
+                draw::blend_pixel(
+                    img,
+                    (layout.map_x + px) as i32,
+                    (layout.map_y + py) as i32,
+                    Rgba {
+                        r: src.0[0],
+                        g: src.0[1],
+                        b: src.0[2],
+                        a,
+                    },
+                );
+            }
+        }
     }
 
     let rasterize_start = Instant::now();

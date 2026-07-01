@@ -146,7 +146,7 @@ struct Args {
         help = "png keeps existing output, webp emits lossless API WebP only, png-webp keeps both"
     )]
     output_format: ImageOutputFormatArg,
-    #[arg(long = "place-label-density", default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=3))]
+    #[arg(long = "place-label-density", default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=4))]
     place_label_density: u8,
     #[arg(
         long,

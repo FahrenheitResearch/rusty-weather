@@ -165,6 +165,11 @@ pub(super) fn build_render_request(
         )?;
         timing.contour_prepare_ms += contour_fill_start.elapsed().as_millis();
     }
+    if crate::topo::basemap_style_env_is_topo() {
+        if let Some(orography) = crate::topo::selected_orography_field(extracted) {
+            crate::topo::apply_orography_topo_overlay(&mut request, orography)?;
+        }
+    }
     Ok((request, timing))
 }
 

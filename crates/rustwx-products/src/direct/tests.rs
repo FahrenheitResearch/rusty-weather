@@ -175,6 +175,7 @@ fn sample_direct_request(model: ModelId) -> DirectBatchRequest {
         output_suffix: None,
         subtitle_left_override: None,
         subtitle_right_override: None,
+        topo_orography: None,
     }
 }
 

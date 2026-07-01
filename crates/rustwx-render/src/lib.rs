@@ -540,6 +540,18 @@ fn with_render_state_profile_with_style<T>(
                 })
                 .collect::<Vec<_>>()
         });
+        let terrain_rgba_grid = request.terrain_rgba_grid.as_ref().map(|field| {
+            field
+                .pixels
+                .iter()
+                .map(|pixel| Rgba {
+                    r: pixel.r,
+                    g: pixel.g,
+                    b: pixel.b,
+                    a: pixel.a,
+                })
+                .collect::<Vec<_>>()
+        });
 
         let projected_lines_start = Instant::now();
         let mut projected_lines = Vec::with_capacity(request.projected_lines.len());
@@ -700,6 +712,7 @@ fn with_render_state_profile_with_style<T>(
             }),
             projected_grid,
             inverse_projected_grid,
+            terrain_rgba_grid,
             rgba_grid,
             projected_polygons,
             projected_data_polygons,
@@ -784,6 +797,15 @@ fn validate_request(request: &MapRenderRequest) -> Result<(), RustwxRenderError>
         if rgba_grid.grid.shape != request.field.grid.shape || rgba_grid.pixels.len() != expected {
             return Err(RustwxRenderError::LayerShapeMismatch {
                 layer: "rgba_grid",
+                expected,
+                actual: rgba_grid.pixels.len(),
+            });
+        }
+    }
+    if let Some(rgba_grid) = &request.terrain_rgba_grid {
+        if rgba_grid.grid.shape != request.field.grid.shape || rgba_grid.pixels.len() != expected {
+            return Err(RustwxRenderError::LayerShapeMismatch {
+                layer: "terrain_rgba_grid",
                 expected,
                 actual: rgba_grid.pixels.len(),
             });

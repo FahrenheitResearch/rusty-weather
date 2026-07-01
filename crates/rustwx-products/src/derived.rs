@@ -213,6 +213,7 @@ impl DerivedBatchRequest {
             output_height: request.output_height,
             png_compression: request.png_compression,
             place_label_overlay: request.place_label_overlay.clone(),
+            topo_orography: None,
         }
     }
 
@@ -2831,6 +2832,9 @@ fn render_derived_heavy_recipe(
         request.contour_mode,
         request.native_fill_level_multiplier,
     )?;
+    if let Some(orography) = request.topo_orography.as_ref() {
+        crate::topo::apply_orography_topo_overlay(&mut render_request, orography)?;
+    }
     if let Some(overlay) = request.place_label_overlay.as_ref() {
         crate::apply_place_label_overlay_with_density_styling(
             &mut render_request,
@@ -3490,6 +3494,10 @@ fn render_derived_output_recipe(
     }
     if let Some(subtitle_right) = render_overrides.subtitle_right {
         render_request.subtitle_right = Some(subtitle_right.to_string());
+    }
+    if let Some(orography) = request.topo_orography.as_ref() {
+        crate::topo::apply_orography_topo_overlay(&mut render_request, orography)
+            .map_err(thread_render_error)?;
     }
     if let Some(overlay) = request.place_label_overlay.as_ref() {
         crate::apply_place_label_overlay_with_density_styling(

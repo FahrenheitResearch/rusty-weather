@@ -72,6 +72,8 @@ pub struct DirectBatchRequest {
     pub subtitle_left_override: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle_right_override: Option<String>,
+    #[serde(skip)]
+    pub topo_orography: Option<SelectedField2D>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

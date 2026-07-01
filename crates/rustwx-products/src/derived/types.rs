@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use rustwx_core::{ModelId, SourceId};
+use rustwx_core::{ModelId, SelectedField2D, SourceId};
 use rustwx_render::{PngCompressionMode, RenderImageTiming, RenderStateTiming};
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +71,8 @@ pub struct DerivedBatchRequest {
     pub png_compression: PngCompressionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub place_label_overlay: Option<PlaceLabelOverlay>,
+    #[serde(skip)]
+    pub topo_orography: Option<SelectedField2D>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

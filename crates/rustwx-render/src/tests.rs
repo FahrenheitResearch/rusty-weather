@@ -49,6 +49,7 @@ fn render_png_emits_valid_nonempty_image() {
     let request = MapRenderRequest {
         field: sample_field("sbecape"),
         rgba_grid: None,
+        terrain_rgba_grid: None,
         product_metadata: None,
         width: 320,
         height: 240,
@@ -115,6 +116,7 @@ fn render_image_emits_rgba_canvas_without_png_decode_in_callers() {
     let request = MapRenderRequest {
         field: sample_field("mucape"),
         rgba_grid: None,
+        terrain_rgba_grid: None,
         product_metadata: None,
         width: 320,
         height: 240,

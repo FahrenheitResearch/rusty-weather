@@ -183,6 +183,7 @@ pub enum PlaceLabelDensityTier {
     Major,
     MajorAndAux,
     Dense,
+    MaxLocal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,7 +200,8 @@ impl PlaceLabelDensityTier {
             0 => Self::None,
             1 => Self::Major,
             2 => Self::MajorAndAux,
-            _ => Self::Dense,
+            3 => Self::Dense,
+            _ => Self::MaxLocal,
         }
     }
 
@@ -209,6 +211,7 @@ impl PlaceLabelDensityTier {
             Self::Major => 1,
             Self::MajorAndAux => 2,
             Self::Dense => 3,
+            Self::MaxLocal => 4,
         }
     }
 
@@ -287,7 +290,7 @@ impl PlaceLabelOverlay {
                 .copied()
                 .filter(|preset| self.includes_place(preset.slug))
                 .collect(),
-            PlaceLabelDensityTier::Dense => MAJOR_US_CITY_PRESETS
+            PlaceLabelDensityTier::Dense | PlaceLabelDensityTier::MaxLocal => MAJOR_US_CITY_PRESETS
                 .iter()
                 .chain(AUX_US_CITY_PRESETS.iter())
                 .chain(MICRO_US_PLACE_PRESETS.iter())
@@ -523,12 +526,26 @@ pub const MICRO_US_PLACE_PRESETS: &[PlacePreset] = &[
     place("ca_arcata", "Arcata, CA", -124.09, 40.87),
     place("ca_chico", "Chico, CA", -121.84, 39.73),
     place("ca_eureka", "Eureka, CA", -124.16, 40.80),
+    place("ca_auburn", "Auburn, CA", -121.08, 38.90),
+    place("ca_grass_valley", "Grass Valley, CA", -121.06, 39.22),
+    place("ca_nevada_city", "Nevada City, CA", -121.02, 39.26),
     place("ca_napa", "Napa, CA", -122.29, 38.30),
     place("ca_oxnard", "Oxnard, CA", -119.18, 34.20),
+    place("ca_placerville", "Placerville, CA", -120.80, 38.73),
+    place("ca_portola", "Portola, CA", -120.47, 39.81),
+    place("ca_quincy", "Quincy, CA", -120.95, 39.94),
     place("ca_santa_cruz", "Santa Cruz, CA", -122.03, 36.97),
+    place(
+        "ca_south_lake_tahoe",
+        "South Lake Tahoe, CA",
+        -119.98,
+        38.94,
+    ),
+    place("ca_tahoe_city", "Tahoe City, CA", -120.14, 39.17),
     place("ca_truckee", "Truckee, CA", -120.18, 39.33),
     place("ca_ukiah", "Ukiah, CA", -123.21, 39.15),
     place("ca_ventura", "Ventura, CA", -119.29, 34.27),
+    place("ca_yreka", "Yreka, CA", -122.64, 41.74),
     place("co_durango", "Durango, CO", -107.88, 37.27),
     place(
         "co_steamboat_springs",
@@ -552,7 +569,18 @@ pub const MICRO_US_PLACE_PRESETS: &[PlacePreset] = &[
     place("mo_joplin", "Joplin, MO", -94.51, 37.08),
     place("mt_kalispell", "Kalispell, MT", -114.32, 48.20),
     place("nc_boone", "Boone, NC", -81.67, 36.22),
+    place("nv_carson_city", "Carson City, NV", -119.77, 39.16),
+    place("nv_fallon", "Fallon, NV", -118.78, 39.47),
+    place("nv_fernley", "Fernley, NV", -119.25, 39.61),
+    place("nv_gardnerville", "Gardnerville, NV", -119.75, 38.94),
+    place("nv_hawthorne", "Hawthorne, NV", -118.63, 38.52),
+    place("nv_incline_village", "Incline Village, NV", -119.95, 39.25),
+    place("nv_lovelock", "Lovelock, NV", -118.47, 40.18),
+    place("nv_minden", "Minden, NV", -119.77, 38.95),
+    place("nv_sparks", "Sparks, NV", -119.75, 39.53),
+    place("nv_virginia_city", "Virginia City, NV", -119.65, 39.31),
     place("nv_winnemucca", "Winnemucca, NV", -117.74, 40.97),
+    place("nv_yerington", "Yerington, NV", -119.16, 38.99),
     place("nm_farmington", "Farmington, NM", -108.22, 36.73),
     place("ny_lake_placid", "Lake Placid, NY", -73.98, 44.28),
     place("ny_watertown", "Watertown, NY", -75.91, 43.97),
@@ -1012,6 +1040,11 @@ fn tuned_place_label_plan(
             } else {
                 (plan.max_crop_overlap_fraction + 0.40).min(0.97)
             };
+        }
+        PlaceLabelDensityTier::MaxLocal => {
+            plan.max_count = plan.max_count.saturating_mul(8).max(12);
+            plan.min_center_spacing_km = 0.0;
+            plan.max_crop_overlap_fraction = 1.0;
         }
     }
     Some(plan)

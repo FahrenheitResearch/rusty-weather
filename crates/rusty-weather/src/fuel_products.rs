@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use rayon::prelude::*;
-use rustwx_core::{ModelId, SourceId};
+use rustwx_core::{ModelId, SelectedField2D, SourceId};
 use rustwx_products::places;
 use rustwx_products::plot_design::StaticPlotDesign;
 use rustwx_products::shared_context::{DomainSpec, model_time_subtitle, source_subtitle};
@@ -292,6 +292,7 @@ struct FuelRenderContext {
     lon_deg: Vec<f32>,
     projection: Option<rustwx_core::GridProjection>,
     projected: ProjectedMap,
+    orography: Option<SelectedField2D>,
 }
 
 pub fn render_fuel_products_from_store(
@@ -592,6 +593,11 @@ fn build_fuel_render_context(
         lon_deg: full_grid.lon_deg,
         projection: store.projection().cloned(),
         projected,
+        orography: if rustwx_products::topo::basemap_style_env_is_topo() {
+            store.fetch_variable("orography").ok()
+        } else {
+            None
+        },
     })
 }
 
@@ -639,6 +645,9 @@ fn render_one_fuel_product(
     request.projected_lines = context.projected.lines.clone();
     request.projected_polygons = context.projected.polygons.clone();
     request.inverse_raster_projection = context.projected.inverse_raster_projection.clone();
+    if let Some(orography) = context.orography.as_ref() {
+        rustwx_products::topo::apply_orography_topo_overlay(&mut request, orography)?;
+    }
     if let Some(overlay) = config.place_label_overlay.as_ref() {
         places::apply_place_label_overlay(
             &mut request,

@@ -151,6 +151,7 @@ impl DirectBatchRequest {
             output_suffix: None,
             subtitle_left_override: None,
             subtitle_right_override: None,
+            topo_orography: None,
         }
     }
 
@@ -199,6 +200,7 @@ fn sampling_direct_request(
         output_suffix: None,
         subtitle_left_override: None,
         subtitle_right_override: None,
+        topo_orography: None,
     }
 }
 
@@ -381,6 +383,11 @@ pub fn render_direct_recipes_chunked_from_loader(
                 }
             }
         }
+        if let Some(orography) = request.topo_orography.as_ref() {
+            extracted
+                .entry(orography.selector)
+                .or_insert_with(|| orography.clone());
+        }
         let domain_extracted = crop_direct_fields_for_domain(&extracted, crop_bounds)?;
         // The full-grid inputs leave RAM before any rendering starts; the
         // render workers only ever see the domain-cropped fields.
@@ -462,8 +469,18 @@ fn render_direct_recipes(
         return Ok(Vec::new());
     }
 
-    let crop_bounds = crop_bounds_for_direct_request(request, planned, extracted);
-    let domain_extracted = crop_direct_fields_for_domain(extracted, crop_bounds)?;
+    let mut augmented_extracted;
+    let extracted_for_crop = if let Some(orography) = request.topo_orography.as_ref() {
+        augmented_extracted = extracted.clone();
+        augmented_extracted
+            .entry(orography.selector)
+            .or_insert_with(|| orography.clone());
+        &augmented_extracted
+    } else {
+        extracted
+    };
+    let crop_bounds = crop_bounds_for_direct_request(request, planned, extracted_for_crop);
+    let domain_extracted = crop_direct_fields_for_domain(extracted_for_crop, crop_bounds)?;
     let extracted = &domain_extracted;
     let shared = DirectSharedRenderCaches::default();
     let prepared_projected_maps = build_prepared_projected_maps(request, planned, extracted)?;

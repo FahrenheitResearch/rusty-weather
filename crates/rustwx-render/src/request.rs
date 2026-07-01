@@ -799,6 +799,8 @@ pub struct MapRenderRequest {
     pub field: Field2D,
     #[serde(default)]
     pub rgba_grid: Option<RgbaGridField>,
+    #[serde(default)]
+    pub terrain_rgba_grid: Option<RgbaGridField>,
     pub product_metadata: Option<core::ProductKeyMetadata>,
     pub width: u32,
     pub height: u32,
@@ -861,6 +863,7 @@ impl MapRenderRequest {
         Self {
             field,
             rgba_grid: None,
+            terrain_rgba_grid: None,
             product_metadata: None,
             width: 1100,
             height: 850,
@@ -1005,6 +1008,16 @@ impl MapRenderRequest {
 
     pub fn with_rgba_grid(mut self, rgba_grid: RgbaGridField) -> Self {
         self.rgba_grid = Some(rgba_grid);
+        self
+    }
+
+    pub fn set_terrain_rgba_grid(&mut self, rgba_grid: RgbaGridField) -> &mut Self {
+        self.terrain_rgba_grid = Some(rgba_grid);
+        self
+    }
+
+    pub fn with_terrain_rgba_grid(mut self, rgba_grid: RgbaGridField) -> Self {
+        self.terrain_rgba_grid = Some(rgba_grid);
         self
     }
 

@@ -503,6 +503,7 @@ fn prepare_non_ecape_hour(
             output_suffix: None,
             subtitle_left_override: None,
             subtitle_right_override: None,
+            topo_orography: None,
         };
         crate::direct::plan_direct_fetch_groups(&direct_request)?
     };
@@ -543,6 +544,7 @@ fn prepare_non_ecape_hour(
         output_height: request.output_height,
         png_compression: request.png_compression,
         place_label_overlay: request.place_label_overlay.clone(),
+        topo_orography: None,
     });
 
     let mut shared_load_decode_ms = 0u128;
@@ -708,6 +710,7 @@ fn prepare_non_ecape_hour(
                 output_suffix: None,
                 subtitle_left_override: None,
                 subtitle_right_override: None,
+                topo_orography: None,
             };
             Some(Arc::new(prepare_direct_batch_from_loaded(
                 &direct_request,
@@ -752,6 +755,7 @@ fn prepare_non_ecape_hour(
                 output_height: request.output_height,
                 png_compression: request.png_compression,
                 place_label_overlay: None,
+                topo_orography: None,
             };
             Some(Arc::new(prepare_hrrr_windowed_batch_with_context(
                 &windowed_request,
@@ -982,6 +986,7 @@ fn run_prepared_non_ecape_domain(
             output_suffix: None,
             subtitle_left_override: None,
             subtitle_right_override: None,
+            topo_orography: None,
         });
 
     let derived_request = (!prepared.normalized.derived_recipe_slugs.is_empty()).then(|| {
@@ -1007,6 +1012,7 @@ fn run_prepared_non_ecape_domain(
                 output_height: request.output_height,
                 png_compression: request.png_compression,
                 place_label_overlay: request.place_label_overlay.clone(),
+                topo_orography: None,
             },
             prepared.derived_recipes.clone(),
         )
@@ -1031,6 +1037,7 @@ fn run_prepared_non_ecape_domain(
             output_height: request.output_height,
             png_compression: request.png_compression,
             place_label_overlay: request.place_label_overlay.clone(),
+            topo_orography: None,
         });
 
     let lane_result = run_fanout3(

@@ -137,6 +137,13 @@ impl StoreFieldSource {
         Ok(read_field_2d(&self.reader, &self.grid, name)?)
     }
 
+    pub fn fetch_variable(
+        &self,
+        name: &str,
+    ) -> Result<SelectedField2D, Box<dyn std::error::Error>> {
+        Ok(read_field_2d(&self.reader, &self.grid, name)?)
+    }
+
     /// Derived/heavy recipe slugs stored in this hour, in store order.
     pub fn derived_slugs(&self) -> &[String] {
         &self.derived_slugs

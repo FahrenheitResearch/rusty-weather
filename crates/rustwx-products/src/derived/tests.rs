@@ -908,6 +908,7 @@ fn cycle_pinned_fastest_native_only_run_skips_pair_resolution() {
         output_height: OUTPUT_HEIGHT,
         png_compression: PngCompressionMode::Default,
         place_label_overlay: None,
+        topo_orography: None,
     };
     let planned = plan_native_thermo_routes_with_surface_product(
         request.model,
