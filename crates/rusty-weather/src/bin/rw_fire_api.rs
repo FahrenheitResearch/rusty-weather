@@ -44,6 +44,17 @@ struct Args {
         help = "Maximum simultaneous rw_render child processes"
     )]
     max_render_jobs: usize,
+    #[arg(
+        long,
+        help = "Thread count forwarded to rw_render; tune with --max-render-jobs to avoid oversubscription"
+    )]
+    render_threads: Option<usize>,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Forward --full-throttle to rw_render for dedicated server nodes"
+    )]
+    full_throttle_render: bool,
 }
 
 #[derive(Clone)]
@@ -51,6 +62,8 @@ struct AppState {
     store_root: PathBuf,
     out_root: PathBuf,
     rw_render: PathBuf,
+    render_threads: Option<usize>,
+    full_throttle_render: bool,
     jobs: Arc<Mutex<HashMap<String, Job>>>,
     render_cache: Arc<Mutex<HashMap<String, String>>>,
     counter: Arc<AtomicU64>,
@@ -182,6 +195,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         store_root: args.store_root,
         out_root: args.out_root,
         rw_render,
+        render_threads: args.render_threads,
+        full_throttle_render: args.full_throttle_render,
         jobs: Arc::new(Mutex::new(HashMap::new())),
         render_cache: Arc::new(Mutex::new(HashMap::new())),
         counter: Arc::new(AtomicU64::new(1)),
@@ -194,6 +209,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("out_root: {}", state.out_root.display());
     println!("rw_render: {}", state.rw_render.display());
     println!("max_render_jobs: {}", state.render_gate.max_active);
+    if let Some(threads) = state.render_threads {
+        println!("render_threads: {threads}");
+    }
+    println!("full_throttle_render: {}", state.full_throttle_render);
 
     for stream in listener.incoming() {
         match stream {
@@ -227,6 +246,8 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
             "store_root": state.store_root.display().to_string(),
             "out_root": state.out_root.display().to_string(),
             "rw_render": state.rw_render.display().to_string(),
+            "render_threads": state.render_threads,
+            "full_throttle_render": state.full_throttle_render,
             "render_gate": state.render_gate.snapshot(),
             "render_cache_entries": state.render_cache.lock().expect("render cache mutex").len(),
         })),
@@ -455,6 +476,13 @@ fn run_rw_render(
         "--place-label-density",
         "1",
     ]);
+    if let Some(threads) = state.render_threads {
+        let threads = threads.to_string();
+        command.args(["--threads", &threads]);
+    }
+    if state.full_throttle_render {
+        command.arg("--full-throttle");
+    }
     command.env("RUSTWX_PROJECTED_FRAME_SOURCE", "requested");
     command.env("RUSTWX_PROJECTION_VARIANT", "mercator");
     command.env("RUSTWX_PLOT_STYLE", "operational-fast");
