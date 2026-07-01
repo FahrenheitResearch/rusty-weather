@@ -1,7 +1,7 @@
 use rustwx_core::GridProjection;
 use rustwx_render::{
-    BasemapDetail, DomainFrame, DomainFrameSource, GeographicClipBounds, InverseRasterProjection,
-    ProductVisualMode, ProjectedMap, ProjectedMapBuildOptions,
+    BasemapDetail, BasemapStyle, DomainFrame, DomainFrameSource, GeographicClipBounds,
+    InverseRasterProjection, ProductVisualMode, ProjectedMap, ProjectedMapBuildOptions,
 };
 
 use crate::shared_context::static_chrome_scale;
@@ -58,6 +58,7 @@ pub fn build_projected_map_with_projection(
         }
     }
     options = options.with_basemap_detail(basemap_detail_for_bounds(frame_bounds));
+    options = apply_basemap_style_from_env(options);
     options.domain.pad_fraction = presentation_pad_fraction_for_bounds(frame_bounds);
     let mut projected =
         rustwx_render::build_projected_map_with_options(lat_deg, lon_deg, &options)?;
@@ -95,6 +96,7 @@ pub fn build_requested_projected_map_with_projection(
         }
     }
     options = options.with_basemap_detail(basemap_detail_for_bounds(frame_bounds));
+    options = apply_basemap_style_from_env(options);
     options.domain.pad_fraction = presentation_pad_fraction_for_bounds(frame_bounds);
     let mut projected =
         rustwx_render::build_projected_map_with_options(lat_deg, lon_deg, &options)?;
@@ -162,6 +164,7 @@ fn build_natural_projected_map_with_projection_inner(
         }
     }
     options = options.with_basemap_detail(basemap_detail_for_bounds(frame_bounds));
+    options = apply_basemap_style_from_env(options);
     if let Some((line_pad_fraction, polygon_pad_fraction)) = basemap_padding {
         options = options.with_basemap_padding(line_pad_fraction, polygon_pad_fraction);
     }
@@ -186,6 +189,7 @@ fn build_full_domain_projected_map_with_projection(
     }
     let basemap_bounds = latlon_mesh_bounds(lat_deg, lon_deg).unwrap_or(bounds);
     options = options.with_basemap_detail(basemap_detail_for_bounds(basemap_bounds));
+    options = apply_basemap_style_from_env(options);
     options.domain.pad_fraction = full_domain_projected_frame_pad_fraction();
     let mut projected =
         rustwx_render::build_projected_map_with_options(lat_deg, lon_deg, &options)?;
@@ -227,6 +231,24 @@ fn full_domain_projected_frame_pad_fraction() -> f64 {
         .filter(|value| value.is_finite() && *value >= 0.0)
         .unwrap_or(0.02)
         .clamp(0.0, 0.25)
+}
+
+fn apply_basemap_style_from_env(options: ProjectedMapBuildOptions) -> ProjectedMapBuildOptions {
+    match basemap_style_from_env() {
+        Some(style) => options.with_basemap_style(style),
+        None => options,
+    }
+}
+
+fn basemap_style_from_env() -> Option<BasemapStyle> {
+    let value = std::env::var("RUSTWX_BASEMAP_STYLE").ok()?;
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "" | "default" => None,
+        "filled" | "fill" | "color" | "colored" | "land-ocean" | "rusty-weather"
+        | "clean-atlas" => Some(BasemapStyle::Filled),
+        "white" | "nws" | "plain" | "outline" => Some(BasemapStyle::White),
+        _ => None,
+    }
 }
 
 fn latlon_mesh_bounds(lat_deg: &[f32], lon_deg: &[f32]) -> Option<(f64, f64, f64, f64)> {

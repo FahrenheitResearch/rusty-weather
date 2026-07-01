@@ -161,6 +161,12 @@ struct RenderJobRequest {
     products: String,
     #[serde(default = "default_output_format")]
     output_format: String,
+    #[serde(default = "default_plot_style")]
+    plot_style: String,
+    #[serde(default = "default_basemap_style")]
+    basemap_style: String,
+    #[serde(default = "default_county_linework")]
+    county_linework: bool,
     #[serde(default = "default_domain_slug")]
     domain_slug: String,
     bounds: [f64; 4],
@@ -485,7 +491,16 @@ fn run_rw_render(
     }
     command.env("RUSTWX_PROJECTED_FRAME_SOURCE", "requested");
     command.env("RUSTWX_PROJECTION_VARIANT", "mercator");
-    command.env("RUSTWX_PLOT_STYLE", "operational-fast");
+    command.env("RUSTWX_PLOT_STYLE", &request.plot_style);
+    command.env("RUSTWX_BASEMAP_STYLE", &request.basemap_style);
+    command.env(
+        "RUSTWX_COUNTY_LINEWORK",
+        if request.county_linework {
+            "true"
+        } else {
+            "false"
+        },
+    );
     command.env("RUSTWX_STATIC_OUTPUT_WIDTH", width.to_string());
     command.env("RUSTWX_STATIC_OUTPUT_HEIGHT", height.to_string());
 
@@ -557,6 +572,8 @@ fn update_job(state: &AppState, id: &str, f: impl FnOnce(&mut Job)) {
 fn validate_render_request(mut request: RenderJobRequest) -> Result<RenderJobRequest, String> {
     request.model = safe_model_slug(&request.model);
     request.output_format = request.output_format.trim().to_ascii_lowercase();
+    request.plot_style = normalize_plot_style(&request.plot_style)?;
+    request.basemap_style = normalize_basemap_style(&request.basemap_style)?;
     request.domain_slug = safe_slug(&request.domain_slug);
     if request.model.is_empty() {
         return Err("model is required".to_string());
@@ -785,12 +802,15 @@ fn output_size(request: &RenderJobRequest) -> (u32, u32) {
 fn render_cache_key(request: &RenderJobRequest) -> String {
     let (width, height) = output_size(request);
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}x{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
         request.model,
         request.run,
         request.hour,
         request.products.trim(),
         request.output_format,
+        request.plot_style,
+        request.basemap_style,
+        request.county_linework,
         request.domain_slug,
         format_bounds(request.bounds),
         width,
@@ -831,8 +851,81 @@ fn default_output_format() -> String {
     "png".to_string()
 }
 
+fn default_plot_style() -> String {
+    "operational-fast".to_string()
+}
+
+fn default_basemap_style() -> String {
+    "filled".to_string()
+}
+
+fn default_county_linework() -> bool {
+    true
+}
+
 fn default_domain_slug() -> String {
     "drawn_box".to_string()
+}
+
+fn normalize_plot_style(value: &str) -> Result<String, String> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    let canonical = match normalized.as_str() {
+        "" | "default" | "operational-fast" | "ops-fast" | "weathermodels-fast"
+        | "pivotal-fast" => "operational-fast",
+        "operational" | "ops" | "weathermodels" | "reference" => "operational",
+        "operational-quality"
+        | "operational-quality-2x"
+        | "ops-quality"
+        | "weathermodels-quality"
+        | "pivotal-quality" => "operational-quality-2x",
+        "operational-budget-30s"
+        | "operational-budget"
+        | "ops-budget"
+        | "budget-30s"
+        | "quality-budget"
+        | "operational-best"
+        | "ops-best"
+        | "weathermodels-best"
+        | "max-quality" => "operational-budget-30s",
+        "clean" | "atlas" | "clean-atlas" | "pivotal" => "clean-atlas",
+        "fast" | "clean-fast" | "atlas-fast" | "clean-atlas-fast" | "production"
+        | "rusty-weather" | "rusty-weather-fast" => "clean-atlas-fast",
+        "quality"
+        | "quality-2x"
+        | "beauty"
+        | "export"
+        | "clean-quality"
+        | "clean-quality-2x"
+        | "clean-atlas-quality"
+        | "clean-atlas-quality-2x" => "clean-atlas-quality-2x",
+        "combined"
+        | "clean-combined"
+        | "atlas-combined"
+        | "clean-atlas-combined"
+        | "presentation"
+        | "best" => "clean-atlas-combined",
+        other => {
+            return Err(format!(
+                "plot_style must be operational-fast, clean-atlas-fast, clean-atlas, clean-atlas-combined, or another supported static plot style; got {other}"
+            ));
+        }
+    };
+    Ok(canonical.to_string())
+}
+
+fn normalize_basemap_style(value: &str) -> Result<String, String> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    let canonical = match normalized.as_str() {
+        "" | "default" | "filled" | "fill" | "color" | "colored" | "land-ocean"
+        | "rusty-weather" | "clean-atlas" => "filled",
+        "white" | "nws" | "plain" | "outline" => "white",
+        other => {
+            return Err(format!(
+                "basemap_style must be filled or white; got {other}"
+            ));
+        }
+    };
+    Ok(canonical.to_string())
 }
 
 const DEMO_HTML: &str = r#"<!doctype html>
@@ -851,6 +944,8 @@ const DEMO_HTML: &str = r#"<!doctype html>
   label { display: grid; gap: 4px; margin: 9px 0; font-size: 13px; font-weight: 650; }
   input, select, button { font: inherit; }
   input, select { padding: 8px; border: 1px solid #c7cec4; border-radius: 6px; }
+  label.check { display: flex; align-items: center; gap: 8px; }
+  label.check input { width: 18px; height: 18px; }
   button { border: 0; border-radius: 6px; padding: 9px 11px; background: #ba2430; color: white; font-weight: 700; cursor: pointer; }
   button.secondary { background: #315b6f; }
   button:disabled { background: #a9b0a6; cursor: wait; }
@@ -898,6 +993,24 @@ const DEMO_HTML: &str = r#"<!doctype html>
         </select>
       </label>
     </div>
+    <div class="row">
+      <label>Basemap / plot style
+        <select id="plotStyle">
+          <option value="operational-fast" selected>CAFire operational fast</option>
+          <option value="clean-atlas-fast">Rusty Weather clean atlas fast</option>
+          <option value="clean-atlas">Rusty Weather clean atlas</option>
+          <option value="clean-atlas-combined">Rusty Weather clean atlas best</option>
+          <option value="operational-quality-2x">CAFire operational quality 2x</option>
+        </select>
+      </label>
+      <label>Map fill
+        <select id="basemapStyle">
+          <option value="filled" selected>filled land/ocean</option>
+          <option value="white">white / NWS-style</option>
+        </select>
+      </label>
+    </div>
+    <label class="check"><input id="countyLinework" type="checkbox" checked> Show county lines</label>
     <label>Domain name <input id="domainSlug" value="drawn_box"></label>
     <div class="row">
       <label>West <input id="west" type="number" step="0.01" value="-123.50"></label>
@@ -1015,6 +1128,9 @@ document.getElementById('render').onclick = async () => {
     hour: Number(input('hour').value),
     products: input('products').value,
     output_format: input('outputFormat').value,
+    plot_style: input('plotStyle').value,
+    basemap_style: input('basemapStyle').value,
+    county_linework: input('countyLinework').checked,
     domain_slug: input('domainSlug').value,
     bounds: [b.west, b.east, b.south, b.north]
   };
@@ -1093,6 +1209,9 @@ mod tests {
             hour: 3,
             products: "cafire-core".to_string(),
             output_format: "webp".to_string(),
+            plot_style: default_plot_style(),
+            basemap_style: default_basemap_style(),
+            county_linework: default_county_linework(),
             domain_slug: "bad".to_string(),
             bounds: [-123.0, -120.0, 40.0, 37.0],
             output_width: None,
@@ -1109,6 +1228,9 @@ mod tests {
             hour: 3,
             products: "cafire-core".to_string(),
             output_format: "jpeg".to_string(),
+            plot_style: default_plot_style(),
+            basemap_style: default_basemap_style(),
+            county_linework: default_county_linework(),
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(800),
@@ -1125,6 +1247,9 @@ mod tests {
             hour: 3,
             products: "cafire-core".to_string(),
             output_format: "webp".to_string(),
+            plot_style: default_plot_style(),
+            basemap_style: default_basemap_style(),
+            county_linework: default_county_linework(),
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1000),
@@ -1141,6 +1266,9 @@ mod tests {
             hour: 3,
             products: "cafire-core".to_string(),
             output_format: "webp".to_string(),
+            plot_style: default_plot_style(),
+            basemap_style: default_basemap_style(),
+            county_linework: default_county_linework(),
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1000),
@@ -1157,6 +1285,9 @@ mod tests {
             hour: 3,
             products: "cafire-with-fuels".to_string(),
             output_format: "webp".to_string(),
+            plot_style: default_plot_style(),
+            basemap_style: default_basemap_style(),
+            county_linework: default_county_linework(),
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(800),
@@ -1167,6 +1298,61 @@ mod tests {
             ..small.clone()
         };
         assert_eq!(render_cache_key(&small), render_cache_key(&clamped));
+    }
+
+    #[test]
+    fn request_validation_normalizes_map_style_options() {
+        let request = RenderJobRequest {
+            model: "hrrr".to_string(),
+            run: "20260629_03z".to_string(),
+            hour: 3,
+            products: "cafire-core".to_string(),
+            output_format: "webp".to_string(),
+            plot_style: "rusty_weather".to_string(),
+            basemap_style: "NWS".to_string(),
+            county_linework: false,
+            domain_slug: "box".to_string(),
+            bounds: [-123.21, -119.67, 37.13, 41.14],
+            output_width: Some(1400),
+            output_height: None,
+        };
+        let validated = validate_render_request(request).expect("request should validate");
+        assert_eq!(validated.plot_style, "clean-atlas-fast");
+        assert_eq!(validated.basemap_style, "white");
+        assert!(!validated.county_linework);
+    }
+
+    #[test]
+    fn render_cache_key_changes_for_map_style_options() {
+        let base = RenderJobRequest {
+            model: "hrrr".to_string(),
+            run: "20260629_03z".to_string(),
+            hour: 3,
+            products: "cafire-with-fuels".to_string(),
+            output_format: "webp".to_string(),
+            plot_style: "operational-fast".to_string(),
+            basemap_style: "filled".to_string(),
+            county_linework: true,
+            domain_slug: "box".to_string(),
+            bounds: [-123.21, -119.67, 37.13, 41.14],
+            output_width: Some(1200),
+            output_height: None,
+        };
+        let clean = RenderJobRequest {
+            plot_style: "clean-atlas-fast".to_string(),
+            ..base.clone()
+        };
+        let white = RenderJobRequest {
+            basemap_style: "white".to_string(),
+            ..base.clone()
+        };
+        let no_counties = RenderJobRequest {
+            county_linework: false,
+            ..base.clone()
+        };
+        assert_ne!(render_cache_key(&base), render_cache_key(&clean));
+        assert_ne!(render_cache_key(&base), render_cache_key(&white));
+        assert_ne!(render_cache_key(&base), render_cache_key(&no_counties));
     }
 
     #[test]
