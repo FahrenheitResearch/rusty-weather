@@ -1,8 +1,8 @@
 use crate::shared_context::DomainSpec;
 use rustwx_core::GridProjection;
 use rustwx_render::{
-    Color, MapRenderRequest, ProjectedDomainBuildOptions, ProjectedLabelPlacement,
-    ProjectedPlaceLabel, ProjectedPlaceLabelStyle, ProjectionSpec, build_projected_domain,
+    Color, MapRenderRequest, ProjectedDomain, ProjectedLabelPlacement, ProjectedPlaceLabel,
+    ProjectedPlaceLabelStyle,
 };
 use serde::{Deserialize, Serialize};
 
@@ -616,7 +616,7 @@ pub fn apply_place_label_overlay(
     domain: &DomainSpec,
     grid_lat_deg: &[f32],
     grid_lon_deg: &[f32],
-    projection: Option<&GridProjection>,
+    _projection: Option<&GridProjection>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if request.projected_domain.is_none() {
         return Ok(());
@@ -635,8 +635,16 @@ pub fn apply_place_label_overlay(
         .iter()
         .map(|place| (place.center_lat, place.center_lon))
         .collect::<Vec<_>>();
-    let projected =
-        project_geographic_points(&geographic_points, grid_lat_deg, grid_lon_deg, projection)?;
+    let projected_domain = request
+        .projected_domain
+        .as_ref()
+        .ok_or("place-label projection requires a projected map domain")?;
+    let projected = project_geographic_points(
+        &geographic_points,
+        grid_lat_deg,
+        grid_lon_deg,
+        projected_domain,
+    )?;
     let center_lon = (domain.bounds.0 + domain.bounds.1) * 0.5;
     let center_lat = (domain.bounds.2 + domain.bounds.3) * 0.5;
 
@@ -863,8 +871,10 @@ fn place_label_plan_for_domain(domain: &DomainSpec) -> Option<PlaceLabelPlan> {
         });
     }
 
-    major_us_city_places()
+    MAJOR_US_CITY_PRESETS
         .iter()
+        .chain(AUX_US_CITY_PRESETS.iter())
+        .chain(MICRO_US_PLACE_PRESETS.iter())
         .find(|preset| preset.slug == domain.slug.as_str())
         .map(|preset| PlaceLabelPlan {
             kind: PlaceLabelDomainKind::CityCrop,
@@ -873,6 +883,46 @@ fn place_label_plan_for_domain(domain: &DomainSpec) -> Option<PlaceLabelPlan> {
             max_crop_overlap_fraction: 0.80,
             anchor_slug: Some(preset.slug),
         })
+        .or_else(|| custom_domain_place_label_plan(domain))
+}
+
+fn custom_domain_place_label_plan(domain: &DomainSpec) -> Option<PlaceLabelPlan> {
+    let (west, east, south, north) = domain.bounds;
+    if !west.is_finite()
+        || !east.is_finite()
+        || !south.is_finite()
+        || !north.is_finite()
+        || south >= north
+    {
+        return None;
+    }
+
+    let lon_span = (east - west).abs();
+    let lat_span = (north - south).abs();
+    if lon_span <= 0.0 || lat_span <= 0.0 || lon_span > 80.0 || lat_span > 50.0 {
+        return None;
+    }
+
+    let diagonal_km = haversine_km(south, west, north, east).max(1.0);
+    let (max_count, min_center_spacing_km, max_crop_overlap_fraction) = if diagonal_km <= 90.0 {
+        (4, 22.0, 1.0)
+    } else if diagonal_km <= 180.0 {
+        (6, 35.0, 1.0)
+    } else if diagonal_km <= 450.0 {
+        (8, 70.0, 1.0)
+    } else if diagonal_km <= 900.0 {
+        (10, 120.0, 0.75)
+    } else {
+        (12, 180.0, 0.55)
+    };
+
+    Some(PlaceLabelPlan {
+        kind: PlaceLabelDomainKind::Region,
+        max_count,
+        min_center_spacing_km,
+        max_crop_overlap_fraction,
+        anchor_slug: None,
+    })
 }
 
 fn select_places_for_label_plan(
@@ -948,12 +998,20 @@ fn tuned_place_label_plan(
         PlaceLabelDensityTier::MajorAndAux => {
             plan.max_count = plan.max_count.saturating_mul(2);
             plan.min_center_spacing_km = (plan.min_center_spacing_km * 0.70).max(35.0);
-            plan.max_crop_overlap_fraction = (plan.max_crop_overlap_fraction + 0.18).min(0.90);
+            plan.max_crop_overlap_fraction = if plan.max_crop_overlap_fraction >= 1.0 {
+                1.0
+            } else {
+                (plan.max_crop_overlap_fraction + 0.18).min(0.90)
+            };
         }
         PlaceLabelDensityTier::Dense => {
             plan.max_count = plan.max_count.saturating_mul(4);
             plan.min_center_spacing_km = (plan.min_center_spacing_km * 0.45).max(20.0);
-            plan.max_crop_overlap_fraction = (plan.max_crop_overlap_fraction + 0.40).min(0.97);
+            plan.max_crop_overlap_fraction = if plan.max_crop_overlap_fraction >= 1.0 {
+                1.0
+            } else {
+                (plan.max_crop_overlap_fraction + 0.40).min(0.97)
+            };
         }
     }
     Some(plan)
@@ -1288,58 +1346,68 @@ fn project_geographic_points(
     geographic_points: &[(f64, f64)],
     grid_lat_deg: &[f32],
     grid_lon_deg: &[f32],
-    projection: Option<&GridProjection>,
+    projected_domain: &ProjectedDomain,
 ) -> Result<Vec<(f64, f64)>, Box<dyn std::error::Error>> {
     if geographic_points.is_empty() {
         return Ok(Vec::new());
     }
-    let lat = geographic_points
-        .iter()
-        .map(|&(lat_deg, _)| lat_deg as f32)
-        .collect::<Vec<_>>();
-    let lon = geographic_points
-        .iter()
-        .map(|&(_, lon_deg)| lon_deg as f32)
-        .collect::<Vec<_>>();
+    if grid_lat_deg.len() != grid_lon_deg.len()
+        || grid_lat_deg.len() != projected_domain.x.len()
+        || grid_lat_deg.len() != projected_domain.y.len()
+    {
+        return Err("place-label projection grid size mismatch".into());
+    }
 
-    let mut options = ProjectedDomainBuildOptions::full_domain(1.0);
-    if let Some(reference_latitude_deg) = latitude_midpoint_deg(grid_lat_deg) {
-        options = options.with_reference_latitude(reference_latitude_deg);
+    let mut projected_points = Vec::with_capacity(geographic_points.len());
+    for &(lat, lon) in geographic_points {
+        let Some(index) = nearest_grid_index(grid_lat_deg, grid_lon_deg, lat, lon) else {
+            continue;
+        };
+        let x = projected_domain.x[index];
+        let y = projected_domain.y[index];
+        if x.is_finite() && y.is_finite() {
+            projected_points.push((x, y));
+        }
     }
-    if let Some(projection_spec) = resolve_projection_spec(grid_lat_deg, grid_lon_deg, projection) {
-        options = options.with_projection(projection_spec);
-    }
-    let projected = build_projected_domain(&lat, &lon, &options)?;
-    Ok(projected.x.into_iter().zip(projected.y).collect())
+    Ok(projected_points)
 }
 
-fn resolve_projection_spec(
+fn nearest_grid_index(
     grid_lat_deg: &[f32],
     grid_lon_deg: &[f32],
-    projection: Option<&GridProjection>,
-) -> Option<ProjectionSpec> {
-    projection
-        .cloned()
-        .map(Into::into)
-        .or_else(|| ProjectionSpec::infer_from_latlon_grid(grid_lat_deg, grid_lon_deg))
-}
-
-fn latitude_midpoint_deg(values: &[f32]) -> Option<f64> {
-    let mut min_lat = f64::INFINITY;
-    let mut max_lat = f64::NEG_INFINITY;
-    for &value in values {
-        let value = value as f64;
-        if !value.is_finite() {
+    lat: f64,
+    lon: f64,
+) -> Option<usize> {
+    let cos_lat = lat.to_radians().cos().abs().max(0.25);
+    let mut best_index = None;
+    let mut best_score = f64::INFINITY;
+    for (index, (&grid_lat, &grid_lon)) in grid_lat_deg.iter().zip(grid_lon_deg.iter()).enumerate()
+    {
+        let grid_lat = grid_lat as f64;
+        let grid_lon = grid_lon as f64;
+        if !grid_lat.is_finite() || !grid_lon.is_finite() {
             continue;
         }
-        min_lat = min_lat.min(value);
-        max_lat = max_lat.max(value);
+        let dlat = grid_lat - lat;
+        let dlon = longitude_delta_deg(grid_lon, lon) * cos_lat;
+        let score = dlat * dlat + dlon * dlon;
+        if score < best_score {
+            best_score = score;
+            best_index = Some(index);
+        }
     }
-    if min_lat.is_finite() && max_lat.is_finite() {
-        Some((min_lat + max_lat) * 0.5)
-    } else {
-        None
+    best_index
+}
+
+fn longitude_delta_deg(a: f64, b: f64) -> f64 {
+    let mut delta = a - b;
+    while delta > 180.0 {
+        delta -= 360.0;
     }
+    while delta < -180.0 {
+        delta += 360.0;
+    }
+    delta
 }
 
 #[cfg(test)]

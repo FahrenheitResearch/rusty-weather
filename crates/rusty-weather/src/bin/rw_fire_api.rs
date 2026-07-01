@@ -167,6 +167,8 @@ struct RenderJobRequest {
     basemap_style: String,
     #[serde(default = "default_county_linework")]
     county_linework: bool,
+    #[serde(default = "default_place_label_density")]
+    place_label_density: u8,
     #[serde(default = "default_domain_slug")]
     domain_slug: String,
     bounds: [f64; 4],
@@ -458,6 +460,7 @@ fn run_rw_render(
         )
     })?;
     let (width, height) = output_size(request);
+    let place_label_density = request.place_label_density.to_string();
     let mut command = Command::new(&state.rw_render);
     command.args([
         "--model",
@@ -480,7 +483,7 @@ fn run_rw_render(
         "--png-compression",
         "fastest",
         "--place-label-density",
-        "1",
+        &place_label_density,
     ]);
     if let Some(threads) = state.render_threads {
         let threads = threads.to_string();
@@ -586,6 +589,9 @@ fn validate_render_request(mut request: RenderJobRequest) -> Result<RenderJobReq
     }
     if !matches!(request.output_format.as_str(), "png" | "webp" | "png-webp") {
         return Err("output_format must be png, webp, or png-webp".to_string());
+    }
+    if request.place_label_density > 3 {
+        return Err("place_label_density must be 0, 1, 2, or 3".to_string());
     }
     let [west, east, south, north] = request.bounds;
     if !west.is_finite() || !east.is_finite() || !south.is_finite() || !north.is_finite() {
@@ -802,7 +808,7 @@ fn output_size(request: &RenderJobRequest) -> (u32, u32) {
 fn render_cache_key(request: &RenderJobRequest) -> String {
     let (width, height) = output_size(request);
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
         request.model,
         request.run,
         request.hour,
@@ -811,6 +817,7 @@ fn render_cache_key(request: &RenderJobRequest) -> String {
         request.plot_style,
         request.basemap_style,
         request.county_linework,
+        request.place_label_density,
         request.domain_slug,
         format_bounds(request.bounds),
         width,
@@ -861,6 +868,10 @@ fn default_basemap_style() -> String {
 
 fn default_county_linework() -> bool {
     true
+}
+
+fn default_place_label_density() -> u8 {
+    1
 }
 
 fn default_domain_slug() -> String {
@@ -1010,7 +1021,17 @@ const DEMO_HTML: &str = r#"<!doctype html>
         </select>
       </label>
     </div>
-    <label class="check"><input id="countyLinework" type="checkbox" checked> Show county lines</label>
+    <div class="row">
+      <label>Place labels
+        <select id="placeLabelDensity">
+          <option value="0">off</option>
+          <option value="1">major cities</option>
+          <option value="2">major + regional cities</option>
+          <option value="3" selected>dense local / tiny places</option>
+        </select>
+      </label>
+      <label class="check"><input id="countyLinework" type="checkbox" checked> Show county lines</label>
+    </div>
     <label>Domain name <input id="domainSlug" value="drawn_box"></label>
     <div class="row">
       <label>West <input id="west" type="number" step="0.01" value="-123.50"></label>
@@ -1131,6 +1152,7 @@ document.getElementById('render').onclick = async () => {
     plot_style: input('plotStyle').value,
     basemap_style: input('basemapStyle').value,
     county_linework: input('countyLinework').checked,
+    place_label_density: Number(input('placeLabelDensity').value),
     domain_slug: input('domainSlug').value,
     bounds: [b.west, b.east, b.south, b.north]
   };
@@ -1212,6 +1234,7 @@ mod tests {
             plot_style: default_plot_style(),
             basemap_style: default_basemap_style(),
             county_linework: default_county_linework(),
+            place_label_density: default_place_label_density(),
             domain_slug: "bad".to_string(),
             bounds: [-123.0, -120.0, 40.0, 37.0],
             output_width: None,
@@ -1231,6 +1254,7 @@ mod tests {
             plot_style: default_plot_style(),
             basemap_style: default_basemap_style(),
             county_linework: default_county_linework(),
+            place_label_density: default_place_label_density(),
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(800),
@@ -1250,6 +1274,7 @@ mod tests {
             plot_style: default_plot_style(),
             basemap_style: default_basemap_style(),
             county_linework: default_county_linework(),
+            place_label_density: default_place_label_density(),
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1000),
@@ -1269,6 +1294,7 @@ mod tests {
             plot_style: default_plot_style(),
             basemap_style: default_basemap_style(),
             county_linework: default_county_linework(),
+            place_label_density: default_place_label_density(),
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1000),
@@ -1288,6 +1314,7 @@ mod tests {
             plot_style: default_plot_style(),
             basemap_style: default_basemap_style(),
             county_linework: default_county_linework(),
+            place_label_density: default_place_label_density(),
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(800),
@@ -1311,6 +1338,7 @@ mod tests {
             plot_style: "rusty_weather".to_string(),
             basemap_style: "NWS".to_string(),
             county_linework: false,
+            place_label_density: 3,
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1400),
@@ -1320,6 +1348,7 @@ mod tests {
         assert_eq!(validated.plot_style, "clean-atlas-fast");
         assert_eq!(validated.basemap_style, "white");
         assert!(!validated.county_linework);
+        assert_eq!(validated.place_label_density, 3);
     }
 
     #[test]
@@ -1333,6 +1362,7 @@ mod tests {
             plot_style: "operational-fast".to_string(),
             basemap_style: "filled".to_string(),
             county_linework: true,
+            place_label_density: 1,
             domain_slug: "box".to_string(),
             bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1200),
@@ -1350,9 +1380,34 @@ mod tests {
             county_linework: false,
             ..base.clone()
         };
+        let dense_places = RenderJobRequest {
+            place_label_density: 3,
+            ..base.clone()
+        };
         assert_ne!(render_cache_key(&base), render_cache_key(&clean));
         assert_ne!(render_cache_key(&base), render_cache_key(&white));
         assert_ne!(render_cache_key(&base), render_cache_key(&no_counties));
+        assert_ne!(render_cache_key(&base), render_cache_key(&dense_places));
+    }
+
+    #[test]
+    fn request_validation_rejects_unknown_place_label_density() {
+        let request = RenderJobRequest {
+            model: "hrrr".to_string(),
+            run: "20260629_03z".to_string(),
+            hour: 3,
+            products: "cafire-core".to_string(),
+            output_format: "webp".to_string(),
+            plot_style: default_plot_style(),
+            basemap_style: default_basemap_style(),
+            county_linework: default_county_linework(),
+            place_label_density: 4,
+            domain_slug: "box".to_string(),
+            bounds: [-123.21, -119.67, 37.13, 41.14],
+            output_width: Some(1400),
+            output_height: None,
+        };
+        assert!(validate_render_request(request).is_err());
     }
 
     #[test]

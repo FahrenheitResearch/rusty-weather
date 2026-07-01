@@ -441,6 +441,30 @@ fn dense_overlay_can_pull_micro_places_into_california_square() {
 }
 
 #[test]
+fn dense_overlay_can_label_arbitrary_drawn_box_with_micro_places() {
+    let domain = DomainSpec::new("drawn_box", (-123.5, -120.25, 37.0, 39.5));
+    let overlay = default_place_label_overlay_for_domain(&domain, PlaceLabelDensityTier::Dense)
+        .expect("custom drawn boxes should get a label plan");
+    let selected = overlay.selected_places_for_domain(&domain);
+    let slugs = place_slugs(&selected);
+
+    assert!(
+        selected
+            .iter()
+            .any(|place| place_catalog_tier_for_slug(&place.slug) == PlaceCatalogTier::Micro),
+        "dense drawn-box labels should include micro places; selected={slugs:?}"
+    );
+}
+
+#[test]
+fn zero_density_disables_arbitrary_drawn_box_labels() {
+    let domain = DomainSpec::new("drawn_box", (-123.5, -120.25, 37.0, 39.5));
+    let overlay = default_place_label_overlay_for_domain(&domain, PlaceLabelDensityTier::None)
+        .expect("custom drawn boxes should still produce an overlay config");
+    assert!(overlay.selected_places_for_domain(&domain).is_empty());
+}
+
+#[test]
 fn dense_overlay_can_select_micro_only_places_beyond_major_and_aux() {
     let domain = MAJOR_US_CITY_PRESETS
         .iter()
