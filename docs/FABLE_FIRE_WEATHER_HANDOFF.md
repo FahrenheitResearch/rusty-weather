@@ -20,6 +20,12 @@ service where CAFire.org users can choose California, Wide West, or arbitrary
 drawn domains, eventually including domains derived from fire perimeters, and
 receive polished RustWX-quality static plots from `.rws` model and fuel data.
 
+The largest remaining production hurdle is the operational refresh pattern:
+when HRRR/model cycles arrive, when smoke/fuel data updates, and when RTMA or
+RTMA-derived anomaly products are due, the system must ingest, derive, prewarm,
+publish, and recover cleanly so users see fresh complete data instead of stale
+or half-built output.
+
 Current local demo:
 
 - API: `http://127.0.0.1:8788/`
@@ -376,6 +382,89 @@ Principle:
 - On a dedicated Hetzner render node, test `--full-throttle-render` and tuned
   `--render-threads`; on shared/dev boxes keep throttling conservative.
 
+## Operational Processing Pattern
+
+This is the biggest next system problem. The project cannot only be an
+on-demand renderer. CAFire needs an operational data machine that continuously
+gets fresh products ready as upstream sources refresh, especially around HRRR
+release times and big fire days when many users arrive at once.
+
+Target behavior:
+
+- Detect/poll source availability by source cadence.
+- Ingest newly available data into staging `.rws` stores.
+- Derive required weather, smoke, fuel, and anomaly grids.
+- Render/prewarm common products and domains before users ask for them.
+- Atomically publish manifests only when a run/hour/product set is complete.
+- Keep the previous good public manifest active if the new run partially fails.
+- Expose freshness, lag, queue depth, failures, and latest-complete status.
+- Support resumable backfill/replay without corrupting live output.
+
+Source cadence model:
+
+- HRRR forecast cycles: process each cycle progressively as forecast hours
+  become available. Do not require all 48 hours before publishing useful early
+  hours, but never mark an hour complete until its required grids and products
+  are actually available.
+- HRRR-Smoke: handle as a separate source/cadence where smoke fields may arrive
+  differently from core HRRR. Missing smoke should not block core weather.
+- Daily fuel products: process gridMET/NFDRS-style daily fuel grids when the
+  daily source is released, then import/regrid into the relevant `.rws` stores
+  or a sidecar store strategy if that becomes cleaner.
+- LANDFIRE/static fuels: treat as versioned static layers with explicit import
+  manifests. They refresh rarely, but the active version must be visible in
+  output provenance.
+- RTMA analyses: process hourly analyses as observations, separate from HRRR
+  forecast cycles.
+- RTMA anomaly/percentile products: run only when the needed RTMA analysis and
+  baseline/climatology inputs are available. Daily/windowed products such as
+  overnight RH recovery should run on their natural completed window rather than
+  on every HRRR hour.
+
+Recommended pipeline shape:
+
+```text
+source watcher
+  -> availability manifest / file completeness check
+  -> ingest job into staging .rws
+  -> derived-grid jobs
+  -> scheduled render/prewarm jobs
+  -> validation/proof checks
+  -> atomic public manifest update
+  -> API serves latest complete data + on-demand cached renders
+```
+
+Operational queues should have priorities:
+
+1. Source ingest and store integrity.
+2. Required derived grids for latest public products.
+3. Scheduled prewarms for California, Wide West, and active incidents.
+4. Urgent fire/perimeter products.
+5. Ad hoc user-drawn domains.
+6. Backfill and research products.
+
+Publishing rules:
+
+- Build in staging paths, then publish by writing/versioning a manifest.
+- Never serve a directory just because files exist.
+- Use idempotent job keys: source/model/run/hour/product/domain/options.
+- Use per-run/hour locks so duplicate pollers do not race.
+- Keep "latest complete" separate from "latest detected".
+- Preserve enough metadata to explain a product: source, run, valid time,
+  fuel date/version, RTMA baseline version, render build, and processing times.
+
+Metrics to capture:
+
+- Upstream release/detection time.
+- Download time, decode time, `.rws` write time.
+- Derived-grid compute time.
+- Render/prewarm time by product/domain.
+- Public manifest publish time.
+- End-to-end lag from source release to user-visible product.
+- Queue depth and wait time by priority.
+- Cache hit/miss rate.
+- Failures by source/product and last successful public version.
+
 ## Hetzner Production Target
 
 Known from this repo: Hetzner is the performance/deployment target. Exact
@@ -545,6 +634,10 @@ GeoJSON gets the domain/render UX working without external dependency risk.
 - Fuel-aware products correctly skip when required fuel grids are absent. That
   is good behavior, but production should surface the missing grids cleanly in
   the web UI.
+- The operational scheduler/processor is not complete yet. The current system
+  can ingest/render, but it still needs a robust source-watcher, staging,
+  atomic publish, latest-complete manifests, queue priorities, and freshness
+  telemetry.
 - Exact Hetzner specs are unknown from this repo.
 - RTMA anomaly/percentile work is conceptually planned but not fully native in
   this CAFire branch yet.
@@ -605,12 +698,15 @@ Recommended next actions:
 1. Read this file and `docs/CAFire_Fuel_Production.md`.
 2. Confirm the worktree is clean except generated `outputs/`.
 3. Run the existing local API and one known proof render.
-4. Implement perimeter-to-bounds with tests.
-5. Thread perimeter overlay through all render lanes.
-6. Generate a proof perimeter plot using topo, counties, max local labels, and
+4. Design the operational refresh pipeline for HRRR, smoke, fuel, RTMA, and
+   anomaly products: source watchers, staging, atomic manifests, priority
+   queues, prewarming, and freshness telemetry.
+5. Implement perimeter-to-bounds with tests.
+6. Thread perimeter overlay through all render lanes.
+7. Generate a proof perimeter plot using topo, counties, max local labels, and
    `cafire-with-fuels`.
-7. Run a small load test for drawn boxes and perimeter-derived boxes.
-8. Write down Hetzner deployment assumptions but do not touch the server until
+8. Run a small load test for drawn boxes and perimeter-derived boxes.
+9. Write down Hetzner deployment assumptions but do not touch the server until
    the user explicitly says to.
 
 The best next proof would be:
@@ -643,6 +739,8 @@ This project is now close enough to be useful:
 - Drawn local domains already work.
 - Fuel-aware product rendering exists when fuel grids are present.
 - WebP previews and caching make website-style use plausible.
-- The next leap is not a new rendering engine. It is production polish:
+- The next leap is not a new rendering engine. It is the operational processor:
+  source refresh detection, staged `.rws` writes, derived/anomaly timing,
+  fuel-data refreshes, atomic publish manifests, prewarmed fire products,
   perimeter domains, overlay support, queue/cache hardening, Hetzner load tests,
   and UI paths that expose all the controls without confusing users.

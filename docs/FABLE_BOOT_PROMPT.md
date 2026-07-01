@@ -20,12 +20,19 @@ Project truth:
   fuel products, and no cut-off text.
 - Fuel-aware products must use real ingested fuel grids such as gridMET,
   LANDFIRE, NFDRS/public fuel layers. Do not fake fuels with weather-only data.
+- The end state is not just on-demand plotting. It is an operational processing
+  pattern that keeps fresh HRRR, fuel, smoke, and RTMA/anomaly products ready for
+  users as each source refreshes.
 - Do not touch the Hetzner server until the user explicitly approves it.
 
 Core pain:
 - The old RustWX codebase became too huge for fast iteration.
 - We need to process data extremely efficiently and robustly around HRRR/model
   release times and big fire days, when traffic arrives in bursts.
+- The biggest remaining hurdle is orchestration: when HRRR cycles arrive, fuel
+  data updates, smoke data appears, and RTMA/analysis fields become available,
+  the system must ingest, derive, render/prewarm, atomically publish manifests,
+  and recover from partial failures without users seeing stale/half-built data.
 - On-demand website renders must survive many users drawing small domains, fire
   perimeter buffers, and wide-area CAFire domains without queue explosions,
   memory blowups, or ugly degraded plots.
@@ -42,6 +49,8 @@ For perimeter plots, compute a domain around the perimeter with 25/50/100 km
 padding, optional one-sided extension toward spread/wind direction, aspect-ratio
 fit, min/max size safeguards, and a visible perimeter overlay. Render products
 from existing .rws stores with topo/counties/town controls and cache the result.
+Behind that, build/plan the operational refresh pipeline that gets data to users
+when HRRR, fuel, smoke, and RTMA-derived anomaly products update.
 
 Performance target:
 - Pre-ingest/latest-run data should be ready before users hit the site.
@@ -54,6 +63,20 @@ Performance target:
 - Optimize without lowering plot quality first: prefer caching, prewarming,
   process/thread tuning, reusable geometry/basemap/topo work, WebP previews,
   output sizing, and queue/backpressure.
+
+Operational processing target:
+- Poll/detect source availability by cadence: HRRR forecast cycles and forecast
+  hours, smoke products when available, daily fuel grids, static LANDFIRE-style
+  layers, hourly RTMA analyses, and RTMA-derived daily/windowed products.
+- Ingest into staging .rws paths, derive needed products, render/prewarm common
+  CA/Wide West and incident products, write manifests, then publish atomically.
+- Never serve half-processed runs. Use idempotent jobs, per-run/hour locks,
+  resumable backfill, clear failure states, and "latest complete" manifests.
+- Separate queues/priorities: source ingest, required derived grids, scheduled
+  prewarms, urgent perimeter/fire products, then ad hoc user renders.
+- Track freshness and lag: source release time, ingest completion, derived
+  completion, render completion, cache hit rate, queue depth, failures, and
+  current public latest run.
 
 Products that matter:
 - Weather core: vpd_2m, hdw, fire_weather_composite, 10m_wind_1h_max,
@@ -71,13 +94,15 @@ Products that matter:
 
 Immediate best work:
 1. Confirm repo state and run current tests/checks.
-2. Add perimeter-to-domain support with robust kilometer padding/extension math.
-3. Thread perimeter overlays through direct, derived, windowed, and fuel renders.
-4. Improve label decluttering for max local/tiny-town density without removing
+2. Design the operational refresh pipeline and identify what exists vs what must
+   be added for HRRR, fuel, smoke, and RTMA/anomaly processing.
+3. Add perimeter-to-domain support with robust kilometer padding/extension math.
+4. Thread perimeter overlays through direct, derived, windowed, and fuel renders.
+5. Improve label decluttering for max local/tiny-town density without removing
    the dense option.
-5. Improve topo/basemap visual quality while keeping performance profiled.
-6. Run local proof renders and load tests that simulate bursty website users.
-7. Produce concrete Hetzner deployment recommendations, but do not deploy until
+6. Improve topo/basemap visual quality while keeping performance profiled.
+7. Run local proof renders and load tests that simulate bursty website users.
+8. Produce concrete Hetzner deployment recommendations, but do not deploy until
    the user says so.
 
 Operating rules:
@@ -89,4 +114,3 @@ Operating rules:
 - Be decisive: implement, measure, inspect images, iterate until the result is
   genuinely production-shaped.
 ```
-
