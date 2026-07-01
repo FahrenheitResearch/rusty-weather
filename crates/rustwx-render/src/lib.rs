@@ -6,6 +6,7 @@ mod contour_fill;
 mod draw;
 mod error;
 mod features;
+mod geo_overlay;
 mod overlay;
 mod panel;
 mod presentation;
@@ -33,6 +34,10 @@ pub use features::{
     load_styled_basemap_features_for, load_styled_basemap_features_for_detail,
     load_styled_basemap_polygons, load_styled_basemap_polygons_for, load_styled_conus_features_for,
     load_styled_conus_polygons_for,
+};
+pub use geo_overlay::{
+    GeoPolylineOverlaySpec, OVERLAY_POLYLINE_FILE_ENV, load_overlay_polyline_spec_from_env,
+    load_overlay_polyline_spec_from_path, parse_overlay_polyline_spec,
 };
 pub use image::RgbaImage;
 pub use panel::{PanelGridLayout, PanelPadding, compose_panel_images, render_panel_grid};

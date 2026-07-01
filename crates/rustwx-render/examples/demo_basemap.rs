@@ -161,6 +161,7 @@ fn main() {
         request.title = Some(match style {
             BasemapStyle::Filled => "SBECAPE — filled basemap".to_string(),
             BasemapStyle::White => "SBECAPE — white basemap (NWS-style)".to_string(),
+            BasemapStyle::Topo => "SBECAPE — topo terrain basemap".to_string(),
         });
         request.subtitle_left = Some("Synthetic field · Lambert Conformal CONUS".to_string());
         request.subtitle_right = Some("rustwx-render native engine".to_string());

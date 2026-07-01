@@ -439,7 +439,7 @@ pub fn build_projected_map_with_options(
         options.domain.fit_to_target_aspect,
     )?;
 
-    let basemap = options
+    let mut basemap = options
         .basemap
         .as_ref()
         .map(|basemap| {
@@ -447,6 +447,16 @@ pub fn build_projected_map_with_options(
         })
         .transpose()?
         .unwrap_or_default();
+
+    // Geographic overlays (fire perimeters) ride the same linework pass as
+    // the basemap so every product lane draws them without new plumbing.
+    if let Some(spec) = crate::geo_overlay::load_overlay_polyline_spec_from_env()? {
+        basemap.lines.extend(crate::geo_overlay::projected_overlay_lines(
+            &spec,
+            |lon, lat| projector.project(lat, lon),
+            crate::geo_overlay::OVERLAY_DENSIFY_STEP_DEG,
+        ));
+    }
 
     Ok(ProjectedMap {
         projected_x,

@@ -4338,6 +4338,7 @@ dependencies = [
  "rustwx-contour",
  "rustwx-core",
  "serde",
+ "serde_json",
  "shapefile",
  "thiserror 2.0.18",
 ]

@@ -18,9 +18,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
+#[path = "../perimeter.rs"]
+mod perimeter;
+
 const MIN_RENDER_WIDTH: u32 = 1200;
 const MIN_RENDER_HEIGHT: u32 = 900;
 const MAX_RENDER_DIMENSION: u32 = 2400;
+/// Request bodies above this are rejected before buffering; large enough
+/// for multi-thousand-point perimeter GeoJSON, far below memory-pressure
+/// territory on burst days.
+const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -55,6 +62,12 @@ struct Args {
         help = "Forward --full-throttle to rw_render for dedicated server nodes"
     )]
     full_throttle_render: bool,
+    #[arg(
+        long,
+        default_value_t = 300,
+        help = "Kill rw_render children that run longer than this many seconds"
+    )]
+    render_timeout_secs: u64,
 }
 
 #[derive(Clone)]
@@ -64,6 +77,7 @@ struct AppState {
     rw_render: PathBuf,
     render_threads: Option<usize>,
     full_throttle_render: bool,
+    render_timeout: Duration,
     jobs: Arc<Mutex<HashMap<String, Job>>>,
     render_cache: Arc<Mutex<HashMap<String, String>>>,
     counter: Arc<AtomicU64>,
@@ -173,11 +187,45 @@ struct RenderJobRequest {
     place_label_size: u8,
     #[serde(default = "default_domain_slug")]
     domain_slug: String,
-    bounds: [f64; 4],
+    /// Render bounds; either given directly (draw-a-box) or computed by
+    /// validation from `perimeter`. Always `Some` after validation.
+    #[serde(default)]
+    bounds: Option<[f64; 4]>,
+    /// Fire perimeter ring as `[lon, lat]` pairs. When present, bounds are
+    /// computed around it and the ring is overlaid on the rendered maps.
+    #[serde(default)]
+    perimeter: Option<Vec<[f64; 2]>>,
+    /// Kilometers of padding around the perimeter (default 50).
+    #[serde(default)]
+    padding_km: Option<f64>,
+    /// One-sided extension toward an expected spread bearing.
+    #[serde(default)]
+    extend: Option<ExtendRequest>,
+    /// Draw the perimeter ring on the maps (default true).
+    #[serde(default)]
+    overlay_perimeter: Option<bool>,
     #[serde(default)]
     output_width: Option<u32>,
     #[serde(default)]
     output_height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct ExtendRequest {
+    direction_deg: f64,
+    distance_km: f64,
+}
+
+impl RenderJobRequest {
+    /// Bounds after successful validation.
+    fn resolved_bounds(&self) -> [f64; 4] {
+        self.bounds
+            .expect("request was validated: bounds are resolved")
+    }
+
+    fn overlay_perimeter_enabled(&self) -> bool {
+        self.perimeter.is_some() && self.overlay_perimeter.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -207,6 +255,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rw_render,
         render_threads: args.render_threads,
         full_throttle_render: args.full_throttle_render,
+        render_timeout: Duration::from_secs(args.render_timeout_secs.max(1)),
         jobs: Arc::new(Mutex::new(HashMap::new())),
         render_cache: Arc::new(Mutex::new(HashMap::new())),
         counter: Arc::new(AtomicU64::new(1)),
@@ -258,6 +307,7 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
             "rw_render": state.rw_render.display().to_string(),
             "render_threads": state.render_threads,
             "full_throttle_render": state.full_throttle_render,
+            "render_timeout_secs": state.render_timeout.as_secs(),
             "render_gate": state.render_gate.snapshot(),
             "render_cache_entries": state.render_cache.lock().expect("render cache mutex").len(),
         })),
@@ -481,7 +531,7 @@ fn run_rw_render(
         &request.products,
         "--output-format",
         &request.output_format,
-        &format!("--domain-bounds={}", format_bounds(request.bounds)),
+        &format!("--domain-bounds={}", format_bounds(request.resolved_bounds())),
         "--domain-slug",
         &safe_slug(&request.domain_slug),
         "--png-compression",
@@ -512,21 +562,52 @@ fn run_rw_render(
     command.env("RUSTWX_STATIC_OUTPUT_HEIGHT", height.to_string());
     command.env("RUSTWX_PLACE_LABEL_SIZE_FACTOR", place_label_size_factor);
     command.env("RUSTWX_PLACE_LABEL_ALPHA_FACTOR", place_label_alpha_factor);
+    if request.overlay_perimeter_enabled() {
+        let overlay_path = output_dir.join("perimeter_overlay.json");
+        write_perimeter_overlay_spec(&overlay_path, request).map_err(|err| {
+            (
+                format!("write {}: {err}", overlay_path.display()),
+                String::new(),
+                String::new(),
+            )
+        })?;
+        command.env(
+            "RUSTWX_OVERLAY_POLYLINE_FILE",
+            overlay_path.display().to_string(),
+        );
+    }
 
-    let output = command.output().map_err(|err| {
+    // Child output goes to per-job log files instead of in-memory pipes so
+    // the deadline loop below never deadlocks on a full pipe and the API
+    // never buffers unbounded child output.
+    let stdout_path = output_dir.join("render_stdout.log");
+    let stderr_path = output_dir.join("render_stderr.log");
+    for (stream, path) in [("stdout", &stdout_path), ("stderr", &stderr_path)] {
+        let file = fs::File::create(path).map_err(|err| {
+            (
+                format!("create {stream} log {}: {err}", path.display()),
+                String::new(),
+                String::new(),
+            )
+        })?;
+        if stream == "stdout" {
+            command.stdout(file);
+        } else {
+            command.stderr(file);
+        }
+    }
+    let status = run_command_with_deadline(&mut command, state.render_timeout).map_err(|err| {
         (
-            format!("launch {}: {err}", state.rw_render.display()),
-            String::new(),
-            String::new(),
+            format!("rw_render {err}"),
+            read_log_tail(&stdout_path),
+            read_log_tail(&stderr_path),
         )
     })?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    let stdout_tail = tail_lines(&stdout, 24);
-    let stderr_tail = tail_lines(&stderr, 24);
-    if !output.status.success() {
+    let stdout_tail = read_log_tail(&stdout_path);
+    let stderr_tail = read_log_tail(&stderr_path);
+    if !status.success() {
         return Err((
-            format!("rw_render exited with {}", output.status),
+            format!("rw_render exited with {status}"),
             stdout_tail,
             stderr_tail,
         ));
@@ -539,6 +620,19 @@ fn run_rw_render(
         )
     })?;
     Ok((files, stdout_tail, stderr_tail))
+}
+
+/// Write the render-side overlay spec (`{"rings": [[[lon, lat], ...]]}`)
+/// consumed through `RUSTWX_OVERLAY_POLYLINE_FILE`.
+fn write_perimeter_overlay_spec(
+    path: &Path,
+    request: &RenderJobRequest,
+) -> std::io::Result<()> {
+    let Some(points) = &request.perimeter else {
+        return Ok(());
+    };
+    let spec = serde_json::json!({ "rings": [points] });
+    fs::write(path, serde_json::to_vec(&spec)?)
 }
 
 fn collect_rendered_files(output_dir: &Path, job_id: &str) -> std::io::Result<Vec<RenderedFile>> {
@@ -602,11 +696,37 @@ fn validate_render_request(mut request: RenderJobRequest) -> Result<RenderJobReq
     if request.place_label_size > 3 {
         return Err("place_label_size must be 0, 1, 2, or 3".to_string());
     }
-    let [west, east, south, north] = request.bounds;
+    if let Some(points) = &request.perimeter {
+        let ring: Vec<(f64, f64)> = points.iter().map(|point| (point[0], point[1])).collect();
+        let options = perimeter::PerimeterDomainOptions {
+            padding_km: request.padding_km.unwrap_or(50.0),
+            extend: request.extend.map(|extend| perimeter::PerimeterExtension {
+                direction_deg: extend.direction_deg,
+                distance_km: extend.distance_km,
+            }),
+            // Only an explicit width x height request pins the aspect; a
+            // width-only preview keeps the natural padded box and derives
+            // its height from the computed bounds in output_size.
+            aspect: match (request.output_width, request.output_height) {
+                (Some(width), Some(height)) if width > 0 && height > 0 => {
+                    Some(f64::from(width.clamp(MIN_RENDER_WIDTH, MAX_RENDER_DIMENSION))
+                        / f64::from(height.clamp(MIN_RENDER_HEIGHT, MAX_RENDER_DIMENSION)))
+                }
+                _ => None,
+            },
+            ..perimeter::PerimeterDomainOptions::default()
+        };
+        request.bounds = Some(perimeter::perimeter_domain_bounds(&ring, &options)?);
+    }
+    let Some([west, east, south, north]) = request.bounds else {
+        return Err("provide bounds [west,east,south,north] or a perimeter".to_string());
+    };
     if !west.is_finite() || !east.is_finite() || !south.is_finite() || !north.is_finite() {
         return Err("bounds must be finite west,east,south,north values".to_string());
     }
-    if west < -360.0 || east > 360.0 || south < -90.0 || north > 90.0 || south >= north {
+    if west < -360.0 || east > 360.0 || south < -90.0 || north > 90.0 || west >= east
+        || south >= north
+    {
         return Err(format!(
             "bounds out of range: got [{west},{east},{south},{north}]"
         ));
@@ -653,7 +773,7 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.trim().parse::<usize>().unwrap_or(0);
+                content_length = checked_content_length(value)?;
             }
         }
     }
@@ -790,7 +910,7 @@ fn safe_model_slug(value: &str) -> String {
 }
 
 fn output_size(request: &RenderJobRequest) -> (u32, u32) {
-    let [west, east, south, north] = request.bounds;
+    let [west, east, south, north] = request.resolved_bounds();
     let aspect = ((east - west).abs().max(0.1) / (north - south).abs().max(0.1)).clamp(0.45, 2.2);
     match (
         request
@@ -830,8 +950,25 @@ fn output_size(request: &RenderJobRequest) -> (u32, u32) {
 
 fn render_cache_key(request: &RenderJobRequest) -> String {
     let (width, height) = output_size(request);
+    let perimeter_part = match &request.perimeter {
+        Some(points) => {
+            let ring: Vec<(f64, f64)> = points.iter().map(|point| (point[0], point[1])).collect();
+            let extend_part = request
+                .extend
+                .map(|extend| format!("{:.2}@{:.2}", extend.distance_km, extend.direction_deg))
+                .unwrap_or_else(|| "-".to_string());
+            format!(
+                "{}+{:.2}+{}+{}",
+                perimeter::perimeter_hash(&ring),
+                request.padding_km.unwrap_or(50.0),
+                extend_part,
+                request.overlay_perimeter_enabled(),
+            )
+        }
+        None => "-".to_string(),
+    };
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
         request.model,
         request.run,
         request.hour,
@@ -843,7 +980,8 @@ fn render_cache_key(request: &RenderJobRequest) -> String {
         request.place_label_density,
         request.place_label_size,
         request.domain_slug,
-        format_bounds(request.bounds),
+        format_bounds(request.resolved_bounds()),
+        perimeter_part,
         width,
         height,
     )
@@ -854,6 +992,61 @@ fn format_bounds(bounds: [f64; 4]) -> String {
         "{:.6},{:.6},{:.6},{:.6}",
         bounds[0], bounds[1], bounds[2], bounds[3]
     )
+}
+
+/// Parse a Content-Length header value, rejecting bodies the service must
+/// not buffer (the render API's biggest legitimate body is perimeter
+/// GeoJSON, well under [`MAX_REQUEST_BODY_BYTES`]).
+fn checked_content_length(value: &str) -> Result<usize, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+    let length = trimmed
+        .parse::<usize>()
+        .map_err(|_| format!("invalid content-length '{trimmed}'"))?;
+    if length > MAX_REQUEST_BODY_BYTES {
+        return Err(format!(
+            "request body of {length} bytes exceeds the {MAX_REQUEST_BODY_BYTES} byte limit"
+        ));
+    }
+    Ok(length)
+}
+
+/// Run a child process with a hard deadline: a child that outlives it is
+/// killed so a hung renderer can never pin a render permit forever.
+fn run_command_with_deadline(
+    command: &mut Command,
+    deadline: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("spawn failed: {err}"))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if started.elapsed() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "timed out after {:.0}s and was killed",
+                        deadline.as_secs_f64()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => return Err(format!("wait failed: {err}")),
+        }
+    }
+}
+
+/// Last lines of a child log file, for job status reporting.
+fn read_log_tail(path: &Path) -> String {
+    fs::read_to_string(path)
+        .map(|content| tail_lines(&content, 24))
+        .unwrap_or_default()
 }
 
 fn tail_lines(value: &str, max_lines: usize) -> String {
@@ -1253,6 +1446,40 @@ draw();
 mod tests {
     use super::*;
 
+    /// A validating draw-a-box request; tests override what they probe.
+    fn base_request() -> RenderJobRequest {
+        RenderJobRequest {
+            model: "hrrr".to_string(),
+            run: "20260629_03z".to_string(),
+            hour: 3,
+            products: "cafire-core".to_string(),
+            output_format: "webp".to_string(),
+            plot_style: default_plot_style(),
+            basemap_style: default_basemap_style(),
+            county_linework: default_county_linework(),
+            place_label_density: default_place_label_density(),
+            place_label_size: default_place_label_size(),
+            domain_slug: "box".to_string(),
+            bounds: Some([-123.21, -119.67, 37.13, 41.14]),
+            perimeter: None,
+            padding_km: None,
+            extend: None,
+            overlay_perimeter: None,
+            output_width: None,
+            output_height: None,
+        }
+    }
+
+    /// A ~20 km wide synthetic fire perimeter near Paradise, CA.
+    fn sample_perimeter() -> Vec<[f64; 2]> {
+        vec![
+            [-121.7, 39.6],
+            [-121.5, 39.7],
+            [-121.4, 39.5],
+            [-121.6, 39.4],
+        ]
+    }
+
     #[test]
     fn safe_slug_removes_path_punctuation() {
         assert_eq!(safe_slug("Napa Box / 01"), "napa_box_01");
@@ -1275,20 +1502,18 @@ mod tests {
     #[test]
     fn request_validation_rejects_inverted_boxes() {
         let request = RenderJobRequest {
-            model: "hrrr".to_string(),
-            run: "20260629_03z".to_string(),
-            hour: 3,
-            products: "cafire-core".to_string(),
-            output_format: "webp".to_string(),
-            plot_style: default_plot_style(),
-            basemap_style: default_basemap_style(),
-            county_linework: default_county_linework(),
-            place_label_density: default_place_label_density(),
-            place_label_size: default_place_label_size(),
             domain_slug: "bad".to_string(),
-            bounds: [-123.0, -120.0, 40.0, 37.0],
-            output_width: None,
-            output_height: None,
+            bounds: Some([-123.0, -120.0, 40.0, 37.0]),
+            ..base_request()
+        };
+        assert!(validate_render_request(request).is_err());
+    }
+
+    #[test]
+    fn request_validation_rejects_reversed_west_east() {
+        let request = RenderJobRequest {
+            bounds: Some([-119.67, -123.21, 37.13, 41.14]),
+            ..base_request()
         };
         assert!(validate_render_request(request).is_err());
     }
@@ -1296,41 +1521,116 @@ mod tests {
     #[test]
     fn request_validation_rejects_unknown_output_format() {
         let request = RenderJobRequest {
-            model: "hrrr".to_string(),
-            run: "20260629_03z".to_string(),
-            hour: 3,
-            products: "cafire-core".to_string(),
             output_format: "jpeg".to_string(),
-            plot_style: default_plot_style(),
-            basemap_style: default_basemap_style(),
-            county_linework: default_county_linework(),
-            place_label_density: default_place_label_density(),
-            place_label_size: default_place_label_size(),
-            domain_slug: "box".to_string(),
-            bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(800),
-            output_height: None,
+            ..base_request()
         };
         assert!(validate_render_request(request).is_err());
     }
 
     #[test]
+    fn request_validation_requires_bounds_or_perimeter() {
+        let request = RenderJobRequest {
+            bounds: None,
+            ..base_request()
+        };
+        let message = validate_render_request(request).unwrap_err();
+        assert!(message.contains("bounds"), "unexpected error: {message}");
+        assert!(message.contains("perimeter"), "unexpected error: {message}");
+    }
+
+    #[test]
+    fn perimeter_requests_compute_padded_bounds() {
+        let request = RenderJobRequest {
+            bounds: None,
+            perimeter: Some(sample_perimeter()),
+            padding_km: Some(50.0),
+            ..base_request()
+        };
+        let validated = validate_render_request(request).expect("perimeter request validates");
+        let [west, east, south, north] = validated.resolved_bounds();
+        for point in sample_perimeter() {
+            assert!(point[0] > west && point[0] < east, "lon {}", point[0]);
+            assert!(point[1] > south && point[1] < north, "lat {}", point[1]);
+        }
+        // 50 km padding is roughly 0.45 degrees latitude beyond the ring.
+        assert!(north - 39.7 > 0.40, "north edge too close: {north}");
+        assert!(39.4 - south > 0.40, "south edge too close: {south}");
+    }
+
+    #[test]
+    fn perimeter_requests_reject_bad_rings() {
+        let request = RenderJobRequest {
+            bounds: None,
+            perimeter: Some(vec![[-121.7, 39.6], [-121.5, 39.7]]),
+            ..base_request()
+        };
+        assert!(validate_render_request(request).is_err());
+        let request = RenderJobRequest {
+            bounds: None,
+            perimeter: Some(sample_perimeter()),
+            padding_km: Some(9000.0),
+            ..base_request()
+        };
+        assert!(validate_render_request(request).is_err());
+    }
+
+    #[test]
+    fn perimeter_overlay_defaults_on_and_can_be_disabled() {
+        let on = RenderJobRequest {
+            bounds: None,
+            perimeter: Some(sample_perimeter()),
+            ..base_request()
+        };
+        assert!(on.overlay_perimeter_enabled());
+        let off = RenderJobRequest {
+            overlay_perimeter: Some(false),
+            ..on.clone()
+        };
+        assert!(!off.overlay_perimeter_enabled());
+        let boxed = base_request();
+        assert!(!boxed.overlay_perimeter_enabled());
+    }
+
+    #[test]
+    fn perimeter_options_change_the_cache_key() {
+        let base = validate_render_request(RenderJobRequest {
+            bounds: None,
+            perimeter: Some(sample_perimeter()),
+            padding_km: Some(50.0),
+            ..base_request()
+        })
+        .unwrap();
+        let padded = validate_render_request(RenderJobRequest {
+            padding_km: Some(100.0),
+            ..base.clone()
+        })
+        .unwrap();
+        let extended = validate_render_request(RenderJobRequest {
+            extend: Some(ExtendRequest {
+                direction_deg: 65.0,
+                distance_km: 80.0,
+            }),
+            ..base.clone()
+        })
+        .unwrap();
+        let no_overlay = validate_render_request(RenderJobRequest {
+            overlay_perimeter: Some(false),
+            ..base.clone()
+        })
+        .unwrap();
+        let same = validate_render_request(base.clone()).unwrap();
+        assert_eq!(render_cache_key(&base), render_cache_key(&same));
+        assert_ne!(render_cache_key(&base), render_cache_key(&padded));
+        assert_ne!(render_cache_key(&base), render_cache_key(&extended));
+        assert_ne!(render_cache_key(&base), render_cache_key(&no_overlay));
+    }
+
+    #[test]
     fn output_size_derives_height_from_width_only_preview() {
         let request = RenderJobRequest {
-            model: "hrrr".to_string(),
-            run: "20260629_03z".to_string(),
-            hour: 3,
-            products: "cafire-core".to_string(),
-            output_format: "webp".to_string(),
-            plot_style: default_plot_style(),
-            basemap_style: default_basemap_style(),
-            county_linework: default_county_linework(),
-            place_label_density: default_place_label_density(),
-            place_label_size: default_place_label_size(),
-            domain_slug: "box".to_string(),
-            bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1000),
-            output_height: None,
+            ..base_request()
         };
         assert_eq!(output_size(&request), (1200, 1359));
     }
@@ -1338,20 +1638,9 @@ mod tests {
     #[test]
     fn output_size_keeps_explicit_dimensions() {
         let request = RenderJobRequest {
-            model: "hrrr".to_string(),
-            run: "20260629_03z".to_string(),
-            hour: 3,
-            products: "cafire-core".to_string(),
-            output_format: "webp".to_string(),
-            plot_style: default_plot_style(),
-            basemap_style: default_basemap_style(),
-            county_linework: default_county_linework(),
-            place_label_density: default_place_label_density(),
-            place_label_size: default_place_label_size(),
-            domain_slug: "box".to_string(),
-            bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1000),
             output_height: Some(700),
+            ..base_request()
         };
         assert_eq!(output_size(&request), (1200, 900));
     }
@@ -1359,20 +1648,9 @@ mod tests {
     #[test]
     fn render_cache_key_uses_clamped_output_size() {
         let small = RenderJobRequest {
-            model: "hrrr".to_string(),
-            run: "20260629_03z".to_string(),
-            hour: 3,
             products: "cafire-with-fuels".to_string(),
-            output_format: "webp".to_string(),
-            plot_style: default_plot_style(),
-            basemap_style: default_basemap_style(),
-            county_linework: default_county_linework(),
-            place_label_density: default_place_label_density(),
-            place_label_size: default_place_label_size(),
-            domain_slug: "box".to_string(),
-            bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(800),
-            output_height: None,
+            ..base_request()
         };
         let clamped = RenderJobRequest {
             output_width: Some(1200),
@@ -1384,20 +1662,13 @@ mod tests {
     #[test]
     fn request_validation_normalizes_map_style_options() {
         let request = RenderJobRequest {
-            model: "hrrr".to_string(),
-            run: "20260629_03z".to_string(),
-            hour: 3,
-            products: "cafire-core".to_string(),
-            output_format: "webp".to_string(),
             plot_style: "rusty_weather".to_string(),
             basemap_style: "NWS".to_string(),
             county_linework: false,
             place_label_density: 3,
             place_label_size: 3,
-            domain_slug: "box".to_string(),
-            bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1400),
-            output_height: None,
+            ..base_request()
         };
         let validated = validate_render_request(request).expect("request should validate");
         assert_eq!(validated.plot_style, "clean-atlas-fast");
@@ -1410,20 +1681,9 @@ mod tests {
     #[test]
     fn request_validation_normalizes_topo_basemap_aliases() {
         let request = RenderJobRequest {
-            model: "hrrr".to_string(),
-            run: "20260629_03z".to_string(),
-            hour: 3,
-            products: "cafire-core".to_string(),
-            output_format: "webp".to_string(),
-            plot_style: default_plot_style(),
             basemap_style: "terrain".to_string(),
-            county_linework: default_county_linework(),
-            place_label_density: default_place_label_density(),
-            place_label_size: default_place_label_size(),
-            domain_slug: "box".to_string(),
-            bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1400),
-            output_height: None,
+            ..base_request()
         };
         let validated = validate_render_request(request).expect("request should validate");
         assert_eq!(validated.basemap_style, "topo");
@@ -1432,20 +1692,13 @@ mod tests {
     #[test]
     fn render_cache_key_changes_for_map_style_options() {
         let base = RenderJobRequest {
-            model: "hrrr".to_string(),
-            run: "20260629_03z".to_string(),
-            hour: 3,
             products: "cafire-with-fuels".to_string(),
-            output_format: "webp".to_string(),
             plot_style: "operational-fast".to_string(),
             basemap_style: "filled".to_string(),
-            county_linework: true,
             place_label_density: 1,
             place_label_size: 1,
-            domain_slug: "box".to_string(),
-            bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1200),
-            output_height: None,
+            ..base_request()
         };
         let clean = RenderJobRequest {
             plot_style: "clean-atlas-fast".to_string(),
@@ -1477,20 +1730,9 @@ mod tests {
     #[test]
     fn request_validation_rejects_unknown_place_label_density() {
         let request = RenderJobRequest {
-            model: "hrrr".to_string(),
-            run: "20260629_03z".to_string(),
-            hour: 3,
-            products: "cafire-core".to_string(),
-            output_format: "webp".to_string(),
-            plot_style: default_plot_style(),
-            basemap_style: default_basemap_style(),
-            county_linework: default_county_linework(),
             place_label_density: 5,
-            place_label_size: default_place_label_size(),
-            domain_slug: "box".to_string(),
-            bounds: [-123.21, -119.67, 37.13, 41.14],
             output_width: Some(1400),
-            output_height: None,
+            ..base_request()
         };
         assert!(validate_render_request(request).is_err());
     }
@@ -1503,5 +1745,48 @@ mod tests {
         assert_eq!(gate.snapshot()["active"], 1);
         drop(permit);
         assert_eq!(gate.snapshot()["active"], 0);
+    }
+
+    #[test]
+    fn content_length_is_capped_before_buffering() {
+        assert_eq!(checked_content_length("128"), Ok(128));
+        assert_eq!(checked_content_length(" 128 "), Ok(128));
+        assert_eq!(checked_content_length(""), Ok(0));
+        assert_eq!(
+            checked_content_length(&MAX_REQUEST_BODY_BYTES.to_string()),
+            Ok(MAX_REQUEST_BODY_BYTES)
+        );
+        assert!(checked_content_length(&(MAX_REQUEST_BODY_BYTES + 1).to_string()).is_err());
+        assert!(checked_content_length("8000000000").is_err());
+        assert!(checked_content_length("not-a-number").is_err());
+        assert!(checked_content_length("-5").is_err());
+    }
+
+    #[test]
+    fn fast_children_finish_within_the_deadline() {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "exit", "0"]);
+        let status = run_command_with_deadline(&mut command, Duration::from_secs(30))
+            .expect("fast child should complete");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn hung_children_are_killed_at_the_deadline() {
+        // `ping -n 60` idles for ~59 seconds; the 500 ms deadline must kill it.
+        let mut command = Command::new("cmd");
+        command.args(["/C", "ping -n 60 127.0.0.1 > NUL"]);
+        let started = Instant::now();
+        let result = run_command_with_deadline(&mut command, Duration::from_millis(500));
+        let waited = started.elapsed();
+        let message = result.expect_err("hung child must be killed, not awaited");
+        assert!(
+            message.contains("timed out"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            waited < Duration::from_secs(10),
+            "kill took too long: {waited:?}"
+        );
     }
 }
