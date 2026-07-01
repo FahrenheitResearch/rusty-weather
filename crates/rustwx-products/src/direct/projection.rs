@@ -247,6 +247,7 @@ fn basemap_style_from_env() -> Option<BasemapStyle> {
         "filled" | "fill" | "color" | "colored" | "land-ocean" | "rusty-weather"
         | "clean-atlas" => Some(BasemapStyle::Filled),
         "white" | "nws" | "plain" | "outline" => Some(BasemapStyle::White),
+        "topo" | "topographic" | "terrain" | "terrain-tint" | "relief" => Some(BasemapStyle::Topo),
         _ => None,
     }
 }

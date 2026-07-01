@@ -13,10 +13,12 @@ pub type LonLatLine = Vec<(f64, f64)>;
 /// - `Filled`: cool-beige land + pale-blue ocean (weathermodels.com look).
 /// - `White`: NWS-style white land + white ocean with US county lines drawn on
 ///   top; heavier state borders make the political grid read well.
+/// - `Topo`: terrain-tinted land + cool water and slightly stronger linework.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum BasemapStyle {
     Filled,
     White,
+    Topo,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -253,9 +255,11 @@ pub fn load_styled_basemap_polygons() -> Vec<StyledLonLatPolygonLayer> {
 pub fn load_styled_conus_polygons_for(style: BasemapStyle) -> Vec<StyledLonLatPolygonLayer> {
     static FILLED: OnceLock<Vec<StyledLonLatPolygonLayer>> = OnceLock::new();
     static WHITE: OnceLock<Vec<StyledLonLatPolygonLayer>> = OnceLock::new();
+    static TOPO: OnceLock<Vec<StyledLonLatPolygonLayer>> = OnceLock::new();
     let cache = match style {
         BasemapStyle::Filled => &FILLED,
         BasemapStyle::White => &WHITE,
+        BasemapStyle::Topo => &TOPO,
     };
     cache.get_or_init(|| build_conus_polygons(style)).clone()
 }
@@ -278,9 +282,11 @@ pub fn load_styled_basemap_polygons_for_detail(
 fn load_styled_broad_polygons_for(style: BasemapStyle) -> Vec<StyledLonLatPolygonLayer> {
     static FILLED: OnceLock<Vec<StyledLonLatPolygonLayer>> = OnceLock::new();
     static WHITE: OnceLock<Vec<StyledLonLatPolygonLayer>> = OnceLock::new();
+    static TOPO: OnceLock<Vec<StyledLonLatPolygonLayer>> = OnceLock::new();
     let cache = match style {
         BasemapStyle::Filled => &FILLED,
         BasemapStyle::White => &WHITE,
+        BasemapStyle::Topo => &TOPO,
     };
     cache.get_or_init(|| build_broad_polygons(style)).clone()
 }
@@ -288,9 +294,11 @@ fn load_styled_broad_polygons_for(style: BasemapStyle) -> Vec<StyledLonLatPolygo
 fn load_styled_global_polygons_for(style: BasemapStyle) -> Vec<StyledLonLatPolygonLayer> {
     static FILLED: OnceLock<Vec<StyledLonLatPolygonLayer>> = OnceLock::new();
     static WHITE: OnceLock<Vec<StyledLonLatPolygonLayer>> = OnceLock::new();
+    static TOPO: OnceLock<Vec<StyledLonLatPolygonLayer>> = OnceLock::new();
     let cache = match style {
         BasemapStyle::Filled => &FILLED,
         BasemapStyle::White => &WHITE,
+        BasemapStyle::Topo => &TOPO,
     };
     cache.get_or_init(|| build_global_polygons(style)).clone()
 }
@@ -310,6 +318,7 @@ fn build_conus_polygons(style: BasemapStyle) -> Vec<StyledLonLatPolygonLayer> {
     let (land_fill, ocean_fill, lakes_fill) = match style {
         BasemapStyle::Filled => (BASEMAP_LAND_FILL, BASEMAP_OCEAN_FILL, BASEMAP_OCEAN_FILL),
         BasemapStyle::White => (WHITE_LAND_FILL, WHITE_OCEAN_FILL, WHITE_LAKES_FILL),
+        BasemapStyle::Topo => (TOPO_LAND_FILL, TOPO_OCEAN_FILL, TOPO_LAKES_FILL),
     };
 
     for (root, tag) in candidates {
@@ -365,9 +374,11 @@ pub fn load_styled_basemap_features() -> Vec<StyledLonLatLayer> {
 pub fn load_styled_conus_features_for(style: BasemapStyle) -> Vec<StyledLonLatLayer> {
     static FILLED: OnceLock<Vec<StyledLonLatLayer>> = OnceLock::new();
     static WHITE: OnceLock<Vec<StyledLonLatLayer>> = OnceLock::new();
+    static TOPO: OnceLock<Vec<StyledLonLatLayer>> = OnceLock::new();
     let cache = match style {
         BasemapStyle::Filled => &FILLED,
         BasemapStyle::White => &WHITE,
+        BasemapStyle::Topo => &TOPO,
     };
     cache.get_or_init(|| build_conus_features(style)).clone()
 }
@@ -390,9 +401,11 @@ pub fn load_styled_basemap_features_for_detail(
 fn load_styled_broad_features_for(style: BasemapStyle) -> Vec<StyledLonLatLayer> {
     static FILLED: OnceLock<Vec<StyledLonLatLayer>> = OnceLock::new();
     static WHITE: OnceLock<Vec<StyledLonLatLayer>> = OnceLock::new();
+    static TOPO: OnceLock<Vec<StyledLonLatLayer>> = OnceLock::new();
     let cache = match style {
         BasemapStyle::Filled => &FILLED,
         BasemapStyle::White => &WHITE,
+        BasemapStyle::Topo => &TOPO,
     };
     cache.get_or_init(|| build_broad_features(style)).clone()
 }
@@ -504,6 +517,7 @@ fn build_broad_polygons(style: BasemapStyle) -> Vec<StyledLonLatPolygonLayer> {
     let (land_fill, ocean_fill, lakes_fill) = match style {
         BasemapStyle::Filled => (BASEMAP_LAND_FILL, BASEMAP_OCEAN_FILL, BASEMAP_OCEAN_FILL),
         BasemapStyle::White => (WHITE_LAND_FILL, WHITE_OCEAN_FILL, WHITE_LAKES_FILL),
+        BasemapStyle::Topo => (TOPO_LAND_FILL, TOPO_OCEAN_FILL, TOPO_LAKES_FILL),
     };
 
     if let Some(root) = checked_in_natural_earth_10m_root() {
@@ -570,6 +584,7 @@ fn build_global_polygons(style: BasemapStyle) -> Vec<StyledLonLatPolygonLayer> {
     let (land_fill, _, _) = match style {
         BasemapStyle::Filled => (BASEMAP_LAND_FILL, BASEMAP_OCEAN_FILL, BASEMAP_OCEAN_FILL),
         BasemapStyle::White => (WHITE_LAND_FILL, WHITE_OCEAN_FILL, WHITE_LAKES_FILL),
+        BasemapStyle::Topo => (TOPO_LAND_FILL, TOPO_OCEAN_FILL, TOPO_LAKES_FILL),
     };
 
     if let Some(root) = checked_in_natural_earth_110m_root() {
@@ -653,9 +668,11 @@ fn build_broad_features(style: BasemapStyle) -> Vec<StyledLonLatLayer> {
 fn load_styled_global_features_for(style: BasemapStyle) -> Vec<StyledLonLatLayer> {
     static FILLED: OnceLock<Vec<StyledLonLatLayer>> = OnceLock::new();
     static WHITE: OnceLock<Vec<StyledLonLatLayer>> = OnceLock::new();
+    static TOPO: OnceLock<Vec<StyledLonLatLayer>> = OnceLock::new();
     let cache = match style {
         BasemapStyle::Filled => &FILLED,
         BasemapStyle::White => &WHITE,
+        BasemapStyle::Topo => &TOPO,
     };
     cache.get_or_init(|| build_global_features(style)).clone()
 }
@@ -739,6 +756,13 @@ fn feature_colors(style: BasemapStyle) -> FeatureColors {
             state: WHITE_STATE_CORE,
             county: WHITE_COUNTY_CORE,
         },
+        BasemapStyle::Topo => FeatureColors {
+            coast: TOPO_COAST_CORE,
+            lake: TOPO_LAKE_CORE,
+            nat: TOPO_NAT_CORE,
+            state: TOPO_STATE_CORE,
+            county: TOPO_COUNTY_CORE,
+        },
     }
 }
 
@@ -756,6 +780,13 @@ fn feature_widths(style: BasemapStyle) -> FeatureWidths {
             lake: 1,
             nat: 2,
             state: 2,
+            county: 1,
+        },
+        BasemapStyle::Topo => FeatureWidths {
+            coast: 2,
+            lake: 1,
+            nat: 1,
+            state: 1,
             county: 1,
         },
     }
@@ -858,6 +889,60 @@ const WHITE_COUNTY_CORE: Rgba = Rgba {
     a: 220,
 };
 
+// ---- Topo-style palette -----------------------------------------------------
+//
+// This is intentionally a lightweight static-map topo pass, not a DEM-backed
+// hillshade. It gives terrain products a warmer land/water base and clearer
+// physical linework while keeping data rasters dominant.
+pub const TOPO_LAND_FILL: Rgba = Rgba {
+    r: 224,
+    g: 215,
+    b: 184,
+    a: 255,
+};
+pub const TOPO_OCEAN_FILL: Rgba = Rgba {
+    r: 196,
+    g: 218,
+    b: 228,
+    a: 255,
+};
+const TOPO_LAKES_FILL: Rgba = Rgba {
+    r: 190,
+    g: 214,
+    b: 224,
+    a: 255,
+};
+const TOPO_COAST_CORE: Rgba = Rgba {
+    r: 42,
+    g: 52,
+    b: 46,
+    a: 255,
+};
+const TOPO_LAKE_CORE: Rgba = Rgba {
+    r: 66,
+    g: 104,
+    b: 124,
+    a: 240,
+};
+const TOPO_NAT_CORE: Rgba = Rgba {
+    r: 74,
+    g: 70,
+    b: 56,
+    a: 245,
+};
+const TOPO_STATE_CORE: Rgba = Rgba {
+    r: 58,
+    g: 56,
+    b: 45,
+    a: 245,
+};
+const TOPO_COUNTY_CORE: Rgba = Rgba {
+    r: 118,
+    g: 112,
+    b: 90,
+    a: 205,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,5 +982,21 @@ mod tests {
         if let (Some(lake), Some(coast)) = (lake, coast) {
             assert!(lake < coast);
         }
+    }
+
+    #[test]
+    fn topo_palette_uses_terrain_tinted_land_and_cool_water() {
+        let polygons = build_conus_polygons(BasemapStyle::Topo);
+        let land = polygons
+            .iter()
+            .find(|layer| layer.role == PolygonRole::Land)
+            .expect("topo basemap should include land polygons");
+        let ocean = polygons
+            .iter()
+            .find(|layer| layer.role == PolygonRole::Ocean)
+            .expect("topo basemap should include ocean polygons");
+
+        assert_eq!(land.color, TOPO_LAND_FILL);
+        assert_eq!(ocean.color, TOPO_OCEAN_FILL);
     }
 }

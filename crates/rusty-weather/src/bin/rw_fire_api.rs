@@ -930,9 +930,10 @@ fn normalize_basemap_style(value: &str) -> Result<String, String> {
         "" | "default" | "filled" | "fill" | "color" | "colored" | "land-ocean"
         | "rusty-weather" | "clean-atlas" => "filled",
         "white" | "nws" | "plain" | "outline" => "white",
+        "topo" | "topographic" | "terrain" | "terrain-tint" | "relief" => "topo",
         other => {
             return Err(format!(
-                "basemap_style must be filled or white; got {other}"
+                "basemap_style must be filled, white, or topo; got {other}"
             ));
         }
     };
@@ -1018,6 +1019,7 @@ const DEMO_HTML: &str = r#"<!doctype html>
         <select id="basemapStyle">
           <option value="filled" selected>filled land/ocean</option>
           <option value="white">white / NWS-style</option>
+          <option value="topo">topo terrain tint</option>
         </select>
       </label>
     </div>
@@ -1349,6 +1351,27 @@ mod tests {
         assert_eq!(validated.basemap_style, "white");
         assert!(!validated.county_linework);
         assert_eq!(validated.place_label_density, 3);
+    }
+
+    #[test]
+    fn request_validation_normalizes_topo_basemap_aliases() {
+        let request = RenderJobRequest {
+            model: "hrrr".to_string(),
+            run: "20260629_03z".to_string(),
+            hour: 3,
+            products: "cafire-core".to_string(),
+            output_format: "webp".to_string(),
+            plot_style: default_plot_style(),
+            basemap_style: "terrain".to_string(),
+            county_linework: default_county_linework(),
+            place_label_density: default_place_label_density(),
+            domain_slug: "box".to_string(),
+            bounds: [-123.21, -119.67, 37.13, 41.14],
+            output_width: Some(1400),
+            output_height: None,
+        };
+        let validated = validate_render_request(request).expect("request should validate");
+        assert_eq!(validated.basemap_style, "topo");
     }
 
     #[test]
