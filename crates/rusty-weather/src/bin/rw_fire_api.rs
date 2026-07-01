@@ -52,6 +52,7 @@ struct AppState {
     out_root: PathBuf,
     rw_render: PathBuf,
     jobs: Arc<Mutex<HashMap<String, Job>>>,
+    render_cache: Arc<Mutex<HashMap<String, String>>>,
     counter: Arc<AtomicU64>,
     render_gate: Arc<RenderGate>,
 }
@@ -182,6 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         out_root: args.out_root,
         rw_render,
         jobs: Arc::new(Mutex::new(HashMap::new())),
+        render_cache: Arc::new(Mutex::new(HashMap::new())),
         counter: Arc::new(AtomicU64::new(1)),
         render_gate: Arc::new(RenderGate::new(args.max_render_jobs)),
     };
@@ -226,6 +228,7 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
             "out_root": state.out_root.display().to_string(),
             "rw_render": state.rw_render.display().to_string(),
             "render_gate": state.render_gate.snapshot(),
+            "render_cache_entries": state.render_cache.lock().expect("render cache mutex").len(),
         })),
         ("POST", "/api/render") => start_render_job(request.body, state),
         ("OPTIONS", _) => empty_response(204),
@@ -250,6 +253,23 @@ fn start_render_job(body: Vec<u8>, state: AppState) -> Vec<u8> {
     };
 
     let id = next_job_id(&state);
+    let cache_key = render_cache_key(&request);
+    if let Some(cached_id) = cached_render_job_id(&state, &cache_key) {
+        return json_status_response(
+            202,
+            &serde_json::json!({
+                "id": cached_id,
+                "status_url": format!("/api/jobs/{cached_id}"),
+                "cache": "hit",
+            }),
+        );
+    }
+
+    state
+        .render_cache
+        .lock()
+        .expect("render cache mutex")
+        .insert(cache_key.clone(), id.clone());
     let output_dir = state.out_root.join(&id);
     let job = Job {
         id: id.clone(),
@@ -273,15 +293,46 @@ fn start_render_job(body: Vec<u8>, state: AppState) -> Vec<u8> {
 
     let worker_state = state.clone();
     let worker_id = id.clone();
-    std::thread::spawn(move || run_job(worker_state, worker_id, request, output_dir));
+    std::thread::spawn(move || run_job(worker_state, worker_id, request, output_dir, cache_key));
 
     json_status_response(
         202,
         &serde_json::json!({
             "id": id,
             "status_url": format!("/api/jobs/{id}"),
+            "cache": "miss",
         }),
     )
+}
+
+fn cached_render_job_id(state: &AppState, cache_key: &str) -> Option<String> {
+    let cached_id = state
+        .render_cache
+        .lock()
+        .expect("render cache mutex")
+        .get(cache_key)
+        .cloned()?;
+    let usable = {
+        let jobs = state.jobs.lock().expect("job mutex");
+        match jobs.get(&cached_id) {
+            Some(job) if matches!(job.state, JobState::Queued | JobState::Running) => true,
+            Some(job) if job.state == JobState::Succeeded => job
+                .files
+                .iter()
+                .all(|file| state.out_root.join(&cached_id).join(&file.name).is_file()),
+            _ => false,
+        }
+    };
+    if usable {
+        Some(cached_id)
+    } else {
+        state
+            .render_cache
+            .lock()
+            .expect("render cache mutex")
+            .remove(cache_key);
+        None
+    }
 }
 
 fn job_response(id: &str, state: &AppState) -> Vec<u8> {
@@ -321,7 +372,13 @@ fn output_file_response(path: &str, state: &AppState) -> Vec<u8> {
     }
 }
 
-fn run_job(state: AppState, id: String, request: RenderJobRequest, output_dir: PathBuf) {
+fn run_job(
+    state: AppState,
+    id: String,
+    request: RenderJobRequest,
+    output_dir: PathBuf,
+    cache_key: String,
+) {
     update_job(&state, &id, |job| {
         job.message = "waiting for render slot".to_string();
     });
@@ -350,6 +407,11 @@ fn run_job(state: AppState, id: String, request: RenderJobRequest, output_dir: P
                 job.message = message;
                 job.stdout_tail = stdout_tail;
                 job.stderr_tail = stderr_tail;
+                state
+                    .render_cache
+                    .lock()
+                    .expect("render cache mutex")
+                    .remove(&cache_key);
             }
         }
     });
@@ -690,6 +752,22 @@ fn output_size(request: &RenderJobRequest) -> (u32, u32) {
         let width = (f64::from(height) * aspect).round().clamp(900.0, 1600.0) as u32;
         (width, height)
     }
+}
+
+fn render_cache_key(request: &RenderJobRequest) -> String {
+    let (width, height) = output_size(request);
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}x{}",
+        request.model,
+        request.run,
+        request.hour,
+        request.products.trim(),
+        request.output_format,
+        request.domain_slug,
+        format_bounds(request.bounds),
+        width,
+        height,
+    )
 }
 
 fn format_bounds(bounds: [f64; 4]) -> String {
@@ -1041,6 +1119,26 @@ mod tests {
             output_height: Some(700),
         };
         assert_eq!(output_size(&request), (1200, 900));
+    }
+
+    #[test]
+    fn render_cache_key_uses_clamped_output_size() {
+        let small = RenderJobRequest {
+            model: "hrrr".to_string(),
+            run: "20260629_03z".to_string(),
+            hour: 3,
+            products: "cafire-with-fuels".to_string(),
+            output_format: "webp".to_string(),
+            domain_slug: "box".to_string(),
+            bounds: [-123.21, -119.67, 37.13, 41.14],
+            output_width: Some(800),
+            output_height: None,
+        };
+        let clamped = RenderJobRequest {
+            output_width: Some(1200),
+            ..small.clone()
+        };
+        assert_eq!(render_cache_key(&small), render_cache_key(&clamped));
     }
 
     #[test]
