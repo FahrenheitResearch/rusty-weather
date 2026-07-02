@@ -893,6 +893,11 @@ fn daily_response(query: &str, state: &AppState) -> Vec<u8> {
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| (-14.0..=14.0).contains(v))
             .unwrap_or(-7.0),
+        // step=day (default) | 1 | 3 | 6 — hourly/bucketed columns.
+        step_hours: query
+            .get("step")
+            .and_then(|v| v.parse::<u16>().ok())
+            .filter(|v| matches!(v, 1 | 3 | 6 | 12)),
     };
     match meteogram::render_daily_svg(&state.store_root, model, &run, &date, cycle, &request) {
         Ok(svg) => response_with_extra_headers(

@@ -941,6 +941,9 @@ pub struct DailyRequest {
     pub var: String,
     pub title: Option<String>,
     pub utc_offset_hours: f64,
+    /// Column bucket: None = local calendar days (the classic card);
+    /// Some(1/3/6) = fixed-hour buckets (the HRRR-friendly hourly strip).
+    pub step_hours: Option<u16>,
 }
 
 struct DayAgg {
@@ -948,6 +951,12 @@ struct DayAgg {
     label_dow: &'static str,
     hi: f64,
     lo: f64,
+    /// Bucket-mean wind components (m/s) for the direction arrow and
+    /// bucket-max sustained speed (mph), when wind is stored.
+    wind_dir_from_deg: Option<f64>,
+    wind_max_mph: Option<f64>,
+    /// Bucket precipitation (inches), from run-total differences.
+    precip_in: Option<f64>,
 }
 
 /// Classic absolute temperature (°F) cell color.
@@ -1017,6 +1026,9 @@ pub fn render_daily_svg(
     let run_days = days_from_civil(year, month, day);
     let mut units = String::new();
     let mut per_day: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
+    // Default context rows: wind (u,v) and precip run-total per bucket.
+    let mut per_day_wind: BTreeMap<i64, Vec<(f64, f64)>> = BTreeMap::new();
+    let mut per_day_apcp: BTreeMap<i64, (f64, f64)> = BTreeMap::new(); // (min,max) run-total
     for &hour in &hours {
         let Ok(reader) = HourReader::open(&run_dir.join(format!("f{hour:03}.rws"))) else {
             continue;
@@ -1028,16 +1040,27 @@ pub fn render_daily_svg(
         if units.is_empty() {
             units = var.units.clone();
         }
-        let Ok(window) = reader.read_window_2d(&request.var, cx, cy, cx + 1, cy + 1) else {
-            continue;
+        let point = |name: &str| -> Option<f64> {
+            let window = reader.read_window_2d(name, cx, cy, cx + 1, cy + 1).ok()?;
+            let value = f64::from(window.values[0]);
+            value.is_finite().then_some(value)
         };
-        let raw = f64::from(window.values[0]);
-        if !raw.is_finite() {
-            continue;
-        }
+        let Some(raw) = point(&request.var) else { continue };
         let local_hours =
             run_days * 24 + i64::from(cycle_utc) + i64::from(hour) + request.utc_offset_hours as i64;
-        per_day.entry(local_hours.div_euclid(24)).or_default().push(raw);
+        let bucket = match request.step_hours {
+            Some(step) => local_hours.div_euclid(i64::from(step.max(1))),
+            None => local_hours.div_euclid(24),
+        };
+        per_day.entry(bucket).or_default().push(raw);
+        if let (Some(u), Some(v)) = (point("u_10m"), point("v_10m")) {
+            per_day_wind.entry(bucket).or_default().push((u, v));
+        }
+        if let Some(total) = point("apcp_run_total") {
+            let entry = per_day_apcp.entry(bucket).or_insert((total, total));
+            entry.0 = entry.0.min(total);
+            entry.1 = entry.1.max(total);
+        }
     }
     if per_day.is_empty() {
         return Err(format!("variable '{}' has no data in this run", request.var));
@@ -1059,36 +1082,72 @@ pub fn render_daily_svg(
         units.clone()
     };
 
-    // Drop partial days: require ~3/4 of the samples a full local day
-    // would carry at this model's cadence (HRRR 24/day, GFS 4/day) —
-    // otherwise an evening-only stub masquerades as the day's HI.
+    // Drop partial buckets: require ~3/4 of the samples a full bucket
+    // would carry at this model's cadence — otherwise an evening-only
+    // stub masquerades as the day's HI.
     let cadence = hours
         .windows(2)
         .map(|pair| pair[1] - pair[0])
         .min()
         .unwrap_or(1)
         .max(1);
-    let expected = (24 / cadence as usize).max(1);
-    let min_samples = ((expected * 3) / 4).max(2);
+    let bucket_hours = i64::from(request.step_hours.unwrap_or(24).max(1));
+    let expected = (bucket_hours as usize / cadence as usize).max(1);
+    let min_samples = ((expected * 3) / 4).max(1);
+    // A bucket no finer than the model cadence holds one value: single-
+    // value mode (one strip row, no inner LO bar).
+    let single = bucket_hours <= i64::from(cadence);
+    let mut last_day: i64 = i64::MIN;
     let days: Vec<DayAgg> = per_day
         .iter()
         .filter(|(_, values)| values.len() >= min_samples)
-        .map(|(&local_day, values)| {
+        .map(|(&bucket, values)| {
+            let start_hours = bucket * bucket_hours;
+            let local_day = start_hours.div_euclid(24);
             let (y, m, d) = civil_from_days(local_day);
             let _ = y;
             let dow = WEEKDAYS[(local_day + 4).rem_euclid(7) as usize];
             let hi = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let lo = values.iter().copied().fold(f64::INFINITY, f64::min);
+            let (label_date, label_dow) = if request.step_hours.is_some() {
+                // Hourly strip: hour-of-day on top, date only at day breaks.
+                let hod = start_hours.rem_euclid(24);
+                let day_label: &'static str = if local_day != last_day { dow } else { "" };
+                last_day = local_day;
+                (format!("{hod:02}"), day_label)
+            } else {
+                last_day = local_day;
+                (
+                    format!("{}.{:02}", MONTH_ABBREV[m as usize - 1].to_uppercase(), d),
+                    dow,
+                )
+            };
+            let wind = per_day_wind.get(&bucket).filter(|w| !w.is_empty()).map(|w| {
+                let (su, sv) = w.iter().fold((0.0, 0.0), |(a, b), (u, v)| (a + u, b + v));
+                let (mu, mv) = (su / w.len() as f64, sv / w.len() as f64);
+                let dir_from = (-mu).atan2(-mv).to_degrees().rem_euclid(360.0);
+                let max_mph = w
+                    .iter()
+                    .map(|(u, v)| (u * u + v * v).sqrt() * MS_TO_MPH)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                (dir_from, max_mph)
+            });
+            let precip_in = per_day_apcp
+                .get(&bucket)
+                .map(|(min_total, max_total)| ((max_total - min_total).max(0.0)) / 25.4);
             DayAgg {
-                label_date: format!("{}.{:02}", MONTH_ABBREV[m as usize - 1].to_uppercase(), d),
-                label_dow: dow,
+                label_date,
+                label_dow,
                 hi: convert(hi),
                 lo: convert(lo),
+                wind_dir_from_deg: wind.map(|(d, _)| d),
+                wind_max_mph: wind.map(|(_, s)| s),
+                precip_in,
             }
         })
         .collect();
     if days.is_empty() {
-        return Err("no local day has enough samples".to_string());
+        return Err("no bucket has enough samples".to_string());
     }
 
     // ---- layout ----
@@ -1098,7 +1157,10 @@ pub fn render_daily_svg(
     // Wide enough that the heading never collides with the place name.
     let width = (ml + col_w * n as f64 + 28.0).max(880.0);
     let strip_h = 46.0;
-    let chart_top = 208.0;
+    let n_strips: f64 = if single { 1.0 } else { 2.0 };
+    let wind_row_h = 46.0;
+    let pcpn_row_h = 38.0;
+    let chart_top = 86.0 + n_strips * (strip_h + 6.0) + wind_row_h + pcpn_row_h + 14.0;
     let chart_h = 320.0;
     let height = chart_top + chart_h + 74.0;
     let is_temp = is_kelvin || display_units == "°F" || lower_units.contains("degf");
@@ -1120,10 +1182,15 @@ pub fn render_daily_svg(
     };
 
     let var_pretty = request.var.replace('_', " ");
+    let span_word = match request.step_hours {
+        None => "Daily HI/LO".to_string(),
+        Some(step) if i64::from(step) <= i64::from(cadence) => "Hourly".to_string(),
+        Some(step) => format!("{step}-h HI/LO"),
+    };
     let heading = if is_temp && request.var.starts_with("temperature") {
-        format!("Daily HI/LO Temperature [{display_units}]")
+        format!("{span_word} Temperature [{display_units}]")
     } else {
-        format!("Daily HI/LO {var_pretty} [{display_units}]")
+        format!("{span_word} {var_pretty} [{display_units}]")
     };
     let place = request
         .title
@@ -1160,17 +1227,18 @@ pub fn render_daily_svg(
         width - 26.0
     ));
 
-    // HI / LO strips.
-    for (row, is_hi) in [(0usize, true), (1usize, false)] {
+    // Value strips: HI/LO pair, or one row for single-value buckets.
+    let strip_rows: &[(&str, bool)] = if single { &[("VAL", true)] } else { &[("HI", true), ("LO", false)] };
+    let value_font = if col_w < 100.0 { 19.0 } else { 26.0 };
+    for (row, (label, is_hi)) in strip_rows.iter().enumerate() {
         let y = 86.0 + row as f64 * (strip_h + 6.0);
         svg.push_str(&format!(
-            r##"<text x="{:.0}" y="{:.0}" fill="#9ea6a5" font-size="13" font-weight="700" text-anchor="end">{}</text>"##,
+            r##"<text x="{:.0}" y="{:.0}" fill="#9ea6a5" font-size="13" font-weight="700" text-anchor="end">{label}</text>"##,
             ml - 10.0,
             y + strip_h / 2.0 + 5.0,
-            if is_hi { "HI" } else { "LO" }
         ));
         for (index, day) in days.iter().enumerate() {
-            let v = if is_hi { day.hi } else { day.lo };
+            let v = if *is_hi { day.hi } else { day.lo };
             let color = cell_color(v);
             let x = ml + index as f64 * col_w;
             svg.push_str(&format!(
@@ -1178,13 +1246,70 @@ pub fn render_daily_svg(
                 col_w
             ));
             svg.push_str(&format!(
-                r##"<text x="{:.0}" y="{:.0}" fill="{}" font-size="26" font-weight="800" text-anchor="middle">{}</text>"##,
+                r##"<text x="{:.0}" y="{:.0}" fill="{}" font-size="{value_font}" font-weight="800" text-anchor="middle">{}</text>"##,
                 x + col_w / 2.0,
-                y + strip_h / 2.0 + 9.0,
+                y + strip_h / 2.0 + 8.0,
                 text_on(color),
                 fmt_val(v)
             ));
         }
+    }
+
+    // WIND row: direction arrow (pointing downwind) + bucket-max speed.
+    let wind_y = 86.0 + n_strips * (strip_h + 6.0);
+    svg.push_str(&format!(
+        r##"<text x="{:.0}" y="{:.0}" fill="#9ea6a5" font-size="13" font-weight="700" text-anchor="end">WIND</text>"##,
+        ml - 10.0,
+        wind_y + wind_row_h / 2.0 + 5.0,
+    ));
+    for (index, day) in days.iter().enumerate() {
+        let x_center = ml + index as f64 * col_w + col_w / 2.0;
+        match (day.wind_dir_from_deg, day.wind_max_mph) {
+            (Some(dir), Some(speed)) => {
+                let speed_color = if speed >= 30.0 { "#ff5b24" } else if speed >= 15.0 { "#f5b53c" } else { "#9ea6a5" };
+                svg.push_str(&format!(
+                    r##"<g transform="translate({x_center:.1},{:.1}) rotate({dir:.0})"><line x1="0" y1="-8" x2="0" y2="8" stroke="{speed_color}" stroke-width="2"/><path d="M0,8 L-3.6,2.6 M0,8 L3.6,2.6" stroke="{speed_color}" stroke-width="2" fill="none"/></g>"##,
+                    wind_y + 15.0
+                ));
+                svg.push_str(&format!(
+                    r##"<text x="{x_center:.1}" y="{:.1}" fill="{speed_color}" font-size="13" font-weight="700" text-anchor="middle">{}</text>"##,
+                    wind_y + wind_row_h - 4.0,
+                    speed.round() as i64
+                ));
+            }
+            _ => svg.push_str(&format!(
+                r##"<text x="{x_center:.1}" y="{:.1}" fill="#4a4f50" font-size="13" text-anchor="middle">—</text>"##,
+                wind_y + wind_row_h / 2.0 + 4.0
+            )),
+        }
+    }
+
+    // PCPN row: bucket precipitation in inches, blue-scaled.
+    let pcpn_y = wind_y + wind_row_h + 4.0;
+    svg.push_str(&format!(
+        r##"<text x="{:.0}" y="{:.0}" fill="#9ea6a5" font-size="13" font-weight="700" text-anchor="end">PCPN</text>"##,
+        ml - 10.0,
+        pcpn_y + pcpn_row_h / 2.0 + 5.0,
+    ));
+    for (index, day) in days.iter().enumerate() {
+        let x = ml + index as f64 * col_w;
+        let (cell, text, text_color) = match day.precip_in {
+            Some(p) if p >= 0.005 => {
+                let cell = if p >= 1.0 { "#b3e0ff" } else if p >= 0.5 { "#7cc0e8" } else if p >= 0.25 { "#4fa3d1" } else if p >= 0.1 { "#3b82b8" } else { "#2b5f7e" };
+                (cell, format!("{p:.2}"), text_on(cell))
+            }
+            Some(_) => ("#161c1d", "0".to_string(), "#4a4f50"),
+            None => ("#161c1d", "—".to_string(), "#4a4f50"),
+        };
+        svg.push_str(&format!(
+            r##"<rect x="{x:.0}" y="{pcpn_y:.0}" width="{:.0}" height="{pcpn_row_h}" fill="{cell}" stroke="#0d1112" stroke-width="2"/>"##,
+            col_w
+        ));
+        svg.push_str(&format!(
+            r##"<text x="{:.0}" y="{:.0}" fill="{text_color}" font-size="14" font-weight="700" text-anchor="middle">{text}</text>"##,
+            x + col_w / 2.0,
+            pcpn_y + pcpn_row_h / 2.0 + 5.0,
+        ));
     }
 
     // Chart area + gridlines.
@@ -1221,24 +1346,27 @@ pub fn render_daily_svg(
             (base - hi_y).max(1.0),
             cell_color(day.hi)
         ));
-        let lo_w = bar_w * 0.52;
-        let lo_x = x + (col_w - lo_w) / 2.0;
-        let lo_y = y_of(day.lo);
+        if !single {
+            let lo_w = bar_w * 0.52;
+            let lo_x = x + (col_w - lo_w) / 2.0;
+            let lo_y = y_of(day.lo);
+            svg.push_str(&format!(
+                r##"<rect x="{lo_x:.1}" y="{lo_y:.1}" width="{lo_w:.1}" height="{:.1}" fill="#39b58c" rx="3" stroke="#0d1112" stroke-width="1.5"/>"##,
+                (base - lo_y).max(1.0)
+            ));
+            svg.push_str(&format!(
+                r##"<text x="{:.1}" y="{:.1}" fill="#0d1112" font-size="14" font-weight="800" text-anchor="middle">{}</text>"##,
+                x + col_w / 2.0,
+                (lo_y + 17.0).min(base - 6.0),
+                fmt_val(day.lo)
+            ));
+        }
         svg.push_str(&format!(
-            r##"<rect x="{lo_x:.1}" y="{lo_y:.1}" width="{lo_w:.1}" height="{:.1}" fill="#39b58c" rx="3" stroke="#0d1112" stroke-width="1.5"/>"##,
-            (base - lo_y).max(1.0)
-        ));
-        svg.push_str(&format!(
-            r##"<text x="{:.1}" y="{:.1}" fill="#f6f5f1" font-size="17" font-weight="800" text-anchor="middle">{}</text>"##,
+            r##"<text x="{:.1}" y="{:.1}" fill="#f6f5f1" font-size="{}" font-weight="800" text-anchor="middle">{}</text>"##,
             x + col_w / 2.0,
             hi_y - 8.0,
+            if col_w < 100.0 { 13.5 } else { 17.0 },
             fmt_val(day.hi)
-        ));
-        svg.push_str(&format!(
-            r##"<text x="{:.1}" y="{:.1}" fill="#0d1112" font-size="14" font-weight="800" text-anchor="middle">{}</text>"##,
-            x + col_w / 2.0,
-            (lo_y + 17.0).min(base - 6.0),
-            fmt_val(day.lo)
         ));
         // Day labels.
         svg.push_str(&format!(
