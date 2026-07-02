@@ -1017,10 +1017,28 @@ fn runs_response(query: &str, state: &AppState) -> Vec<u8> {
         .collect();
     runs.sort();
     runs.reverse();
+    // Per-run stored hours so clients can build honest hour ladders for
+    // EXPLICIT run picks (the latest manifest only covers the alias).
+    let mut hours_by_run = serde_json::Map::new();
+    for run in &runs {
+        let mut hours: Vec<u16> = std::fs::read_dir(model_dir.join(run))
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.strip_prefix('f')?.strip_suffix(".rws")?.parse::<u16>().ok()
+            })
+            .collect();
+        hours.sort_unstable();
+        hours_by_run.insert(run.clone(), serde_json::json!(hours));
+    }
     let latest: Option<serde_json::Value> = std::fs::read_to_string(model_dir.join("latest.json"))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok());
-    json_response(&serde_json::json!({ "model": model, "runs": runs, "latest": latest }))
+    json_response(
+        &serde_json::json!({ "model": model, "runs": runs, "hours": hours_by_run, "latest": latest }),
+    )
 }
 
 /// Resolve the `latest` / `latest-day` run aliases via the daemon's atomic

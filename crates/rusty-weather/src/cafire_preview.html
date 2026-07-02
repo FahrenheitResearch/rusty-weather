@@ -115,7 +115,7 @@ button { color: inherit; cursor: pointer; }
 .hour-nav button { background: var(--panel-3); border: 1px solid var(--line-strong); border-radius: 9px; padding: 6px 12px; font-size: 13px; color: var(--text); }
 .hour-nav button:hover { border-color: rgba(255,91,36,0.5); }
 .hour-nav button:disabled { opacity: 0.35; cursor: default; }
-.hour-nav .hour-label { min-width: 58px; text-align: center; font-size: 13.5px; font-weight: 650; color: var(--orange-bright); font-variant-numeric: tabular-nums; }
+.hour-nav .hour-label { min-width: 118px; text-align: center; font-size: 13.5px; font-weight: 650; color: var(--orange-bright); font-variant-numeric: tabular-nums; background: var(--panel-2, #161c1d); border: 1px solid var(--line, #2a3233); border-radius: 9px; padding: 4px 8px; cursor: pointer; }
 .hour-nav .play.on { background: var(--orange-soft); color: var(--orange-bright); border-color: rgba(255,91,36,0.5); }
 .viewport { position: relative; background: #0c0f10; height: clamp(480px, calc(100vh - 250px), 940px); display: grid; place-items: center; overflow: hidden; }
 .viewport img { max-width: 100%; max-height: 100%; display: block; background: #f4f1ea; cursor: zoom-in; }
@@ -306,7 +306,7 @@ button { color: inherit; cursor: pointer; }
         <span class="prov" id="viewProv"></span>
         <div class="hour-nav" id="hourNav">
           <button id="hPrev" title="Earlier hour (←)">◀</button>
-          <span class="hour-label" id="hLabel">—</span>
+          <select class="hour-label" id="hourSelect" title="Jump to any forecast hour"></select>
           <button id="hNext" title="Later hour (→)">▶</button>
           <button class="play" id="hPlay" title="Animate the run">▶ loop</button>
         </div>
@@ -554,6 +554,7 @@ function runAge(unix) {
   return mins < 90 ? `${Math.round(mins)} min ago` : `${(mins / 60).toFixed(1)} h ago`;
 }
 let runsBase = "";
+let runsHours = {};
 async function loadRuns() {
   try {
     // Node-backed families list the compute node's own run inventory —
@@ -562,6 +563,7 @@ async function loadRuns() {
     runsBase = apiBase();
     const data = await fetch(runsBase + "/api/runs").then(r => r.json());
     latestManifest = data.latest || null;
+    runsHours = data.hours || {};
     const select = $("runSelect");
     const keep = select.value;
     select.innerHTML = "";
@@ -590,15 +592,51 @@ loadRuns(); setInterval(loadRuns, 60_000);
 $("runSelect").addEventListener("change", () => { computeHours(); renderCurrent(); });
 
 function computeHours() {
-  // Hour ladder for the selected run: manifest hours for `latest`, else a
-  // sane default; clamp current hour into range.
+  // Hour ladder for the selected run: the API's per-run hour lists cover
+  // explicit picks; `latest` prefers the run it actually resolves to
+  // (complete_run), falling back to the manifest's in-progress hours.
+  const sel = $("runSelect").value;
   let hours = null;
-  if ($("runSelect").value === "latest" && latestManifest && Array.isArray(latestManifest.stored_hours)) {
-    hours = latestManifest.stored_hours;
+  if (sel === "latest") {
+    const resolved = latestManifest && (latestManifest.complete_run || latestManifest.run);
+    if (resolved && Array.isArray(runsHours[resolved]) && runsHours[resolved].length) {
+      hours = runsHours[resolved];
+    } else if (latestManifest && Array.isArray(latestManifest.stored_hours)) {
+      hours = latestManifest.stored_hours;
+    }
+  } else if (Array.isArray(runsHours[sel]) && runsHours[sel].length) {
+    hours = runsHours[sel];
   }
   state.hours = hours && hours.length ? hours : Array.from({ length: 19 }, (_, i) => i);
   if (!state.hours.includes(state.hour)) state.hour = state.hours[Math.min(6, state.hours.length - 1)];
-  updateHourLabel();
+  rebuildHourSelect();
+}
+
+function hourOptionLabel(hour) {
+  const sel = $("runSelect").value;
+  const runSlug = sel === "latest"
+    ? (latestManifest && (latestManifest.complete_run || latestManifest.run)) || null
+    : sel;
+  const fh = "F" + String(hour).padStart(3, "0");
+  const m = runSlug && runSlug.match(/^(\d{4})(\d{2})(\d{2})_(\d{2})z$/);
+  if (!m) return fh;
+  const valid = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] + hour));
+  const local = valid.toLocaleString("en-US", {
+    weekday: "short", hour: "numeric", timeZone: "America/Los_Angeles",
+  });
+  return `${fh} · ${local}`;
+}
+
+function rebuildHourSelect() {
+  const select = $("hourSelect");
+  select.innerHTML = "";
+  state.hours.forEach(h => {
+    const opt = document.createElement("option");
+    opt.value = String(h);
+    opt.textContent = hourOptionLabel(h);
+    select.appendChild(opt);
+  });
+  select.value = String(state.hour);
 }
 
 /* ---------- family + product lists ---------- */
@@ -666,10 +704,14 @@ function markProduct() {
 function updateHourNav() {
   const hourly = FAMS[state.fam].hourly;
   $("hourNav").style.opacity = hourly ? 1 : 0.3;
-  $("hPrev").disabled = $("hNext").disabled = $("hPlay").disabled = !hourly;
+  $("hPrev").disabled = $("hNext").disabled = $("hPlay").disabled = $("hourSelect").disabled = !hourly;
   if (!hourly) stopPlay();
 }
-function updateHourLabel() { $("hLabel").textContent = "F" + String(state.hour).padStart(2, "0"); }
+function updateHourLabel() { $("hourSelect").value = String(state.hour); }
+$("hourSelect").addEventListener("change", () => {
+  const hour = parseInt($("hourSelect").value, 10);
+  if (Number.isFinite(hour)) { state.hour = hour; renderCurrent(); }
+});
 function stepHour(direction) {
   const index = state.hours.indexOf(state.hour);
   const next = state.hours[index + direction];
