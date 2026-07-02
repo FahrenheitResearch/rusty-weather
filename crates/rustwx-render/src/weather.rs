@@ -5,6 +5,7 @@ use crate::request::{Color, DiscreteColorScale, ExtendMode, ProductSemantics};
 pub enum WeatherPalette {
     Cape,
     Ecape,
+    Pft,
     ThreeCape,
     Ncape,
     Cin,
@@ -792,14 +793,12 @@ impl WeatherPreset {
                 // Fine steps through the 0-500 GW band every published
                 // pyroCb case lives in, coarser above (the colorbar is
                 // value-proportional, so pure log2 bins would collapse
-                // the dangerous end into one sliver). LOW PFT is the
-                // dangerous end: reversed CAPE-family ramp puts hot
-                // colors on small values.
-                let mut colors = weather_palette(WeatherPalette::Cape);
-                colors.reverse();
+                // the dangerous end into one sliver). Dedicated
+                // diverging ramp: deep red = attainable threshold,
+                // blue = implausible.
                 DiscreteColorScale {
                     levels: concat_ranges(&[(0.0, 500.0, 25.0), (500.0, 2049.0, 100.0)]),
-                    colors,
+                    colors: weather_palette(WeatherPalette::Pft),
                     extend: ExtendMode::Max,
                     mask_below,
                 }
@@ -883,6 +882,7 @@ pub fn weather_palette(palette: WeatherPalette) -> Vec<Color> {
     let colors = match palette {
         WeatherPalette::Cape => colormaps::cape(),
         WeatherPalette::Ecape => ecape_palette(),
+        WeatherPalette::Pft => pft_palette(),
         WeatherPalette::ThreeCape => colormaps::three_cape(),
         WeatherPalette::Ncape => ncape_palette(),
         WeatherPalette::Cin => cin_palette(),
@@ -1034,6 +1034,17 @@ fn ecape_palette() -> Vec<crate::color::Rgba> {
     palette_from_hex(&[
         "#f7fbff", "#deebf7", "#c6dbef", "#9ecae1", "#6baed6", "#31a354", "#fdd049", "#fdae61",
         "#f46d43", "#d73027", "#7f0000", "#4d004b",
+    ])
+}
+
+/// PFT diverging ramp: LOW thresholds are the dangerous end (a modest
+/// fire can reach free convection) — deep red through warm to cool blue
+/// as the required firepower becomes implausible. Stops interpolate
+/// smoothly across the fill bins.
+fn pft_palette() -> Vec<crate::color::Rgba> {
+    palette_from_hex(&[
+        "#67001f", "#b2182b", "#d6604d", "#f4a582", "#fddbc7", "#fee9c9", "#ffffbf", "#e0f3f8",
+        "#abd9e9", "#74add1", "#4575b4", "#313695",
     ])
 }
 
