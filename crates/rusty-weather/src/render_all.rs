@@ -637,6 +637,67 @@ pub fn render_windowed_products(
 mod tests {
     use super::*;
 
+    /// The public preview site must expose every renderable product as an
+    /// option. Compares the site's HTML against the live catalogs so a new
+    /// recipe slug fails this test until it is either added to the page or
+    /// pinned in the exclusion list with a reason.
+    #[test]
+    fn preview_site_exposes_the_full_catalog() {
+        let html = include_str!("cafire_preview.html");
+        // Intentionally not on the preview site (reason pinned):
+        let excluded: &[(&str, &str)] = &[
+            ("total_qpf", "alias of qpf_total"),
+            ("10m_wind_1h_max", "trailing 1h window; run-max + 0-24h cover the use"),
+            ("uh_2to5km_1h_max", "trailing 1h window; run-max covers the use"),
+            ("uh_2to5km_3h_max", "trailing 3h window; run-max covers the use"),
+            ("sblcl", "sounding-adjacent; meteogram territory"),
+            ("mucin", "CIN pair covered by mlcin"),
+            ("sbcin", "CIN pair covered by mlcin"),
+            ("ehi_0_1km", "0-3km EHI shown; 0-1km niche"),
+            ("scp_mu_0_3km_0_6km_proxy", "proxy composite; STP shown"),
+            ("2m_temperature", "barbless duplicate of 2m_temperature_10m_winds"),
+            ("2m_dewpoint", "barbless duplicate of 2m_dewpoint_10m_winds"),
+            ("2m_relative_humidity", "barbless duplicate of RH + winds"),
+            ("low_cloud_cover", "cloud_cover_levels panel shows all three"),
+            ("middle_cloud_cover", "cloud_cover_levels panel shows all three"),
+            ("high_cloud_cover", "cloud_cover_levels panel shows all three"),
+        ];
+        let is_excluded = |slug: &str| {
+            excluded.iter().any(|(excluded_slug, _)| *excluded_slug == slug)
+                // The ECAPE/heavy lane stays off the operational site by
+                // Drew's directive (view-profile stores don't carry it).
+                || store_heavy_recipe_slugs().contains(&slug)
+        };
+        let mut missing: Vec<String> = Vec::new();
+        let mut check = |slug: &str| {
+            if !is_excluded(slug) && !html.contains(&format!("\"{slug}\"")) {
+                missing.push(slug.to_string());
+            }
+        };
+        for slug in supported_direct_recipe_slugs(ModelId::Hrrr) {
+            check(&slug);
+        }
+        for slug in store_derived_recipe_slugs() {
+            check(slug);
+        }
+        for product in HrrrWindowedProduct::supported_products() {
+            check(product.slug());
+        }
+        for slug in fuel_products::supported_fuel_product_slugs() {
+            check(&slug);
+        }
+        // Anomaly slugs appear literally; the _vs_record twins are derived
+        // in page JS from the same array, so the base list is the contract.
+        for slug in climo_products::CLIMO_PRODUCTS {
+            check(slug);
+        }
+        assert!(
+            missing.is_empty(),
+            "preview site is missing {} product option(s): {missing:#?}",
+            missing.len()
+        );
+    }
+
     #[test]
     fn products_keywords_pull_the_catalogs() {
         let all = partition_products("all", ModelId::Hrrr).unwrap();

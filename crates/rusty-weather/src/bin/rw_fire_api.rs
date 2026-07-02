@@ -715,7 +715,9 @@ fn update_job(state: &AppState, id: &str, f: impl FnOnce(&mut Job)) {
 /// Live active-fire perimeters from the public WFIGS ArcGIS feed (key-free),
 /// simplified for the perimeter-domain API and the site's fire picker.
 /// Served from a 10-minute in-memory cache so testers never hammer NIFC.
-const WFIGS_URL: &str = "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query?where=poly_GISAcres%3E100+AND+attr_POOState+IN+('US-CA','US-NV','US-OR','US-AZ','US-ID','US-UT')&outFields=poly_IncidentName,poly_GISAcres,attr_POOState,poly_DateCurrent&orderByFields=poly_GISAcres+DESC&resultRecordCount=40&geometryPrecision=4&outSR=4326&f=geojson";
+// National, ordered by size (HRRR covers all of CONUS; the picker labels
+// carry the state). No state filter — a big Colorado fire matters too.
+const WFIGS_URL: &str = "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query?where=poly_GISAcres%3E300&outFields=poly_IncidentName,poly_GISAcres,attr_POOState,poly_DateCurrent&orderByFields=poly_GISAcres+DESC&resultRecordCount=60&geometryPrecision=4&outSR=4326&f=geojson";
 const FIRES_CACHE_SECS: u64 = 600;
 const FIRE_RING_MAX_POINTS: usize = 240;
 
