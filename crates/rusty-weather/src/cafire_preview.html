@@ -117,10 +117,8 @@ button { color: inherit; cursor: pointer; }
 .hour-nav button:disabled { opacity: 0.35; cursor: default; }
 .hour-nav .hour-label { min-width: 58px; text-align: center; font-size: 13.5px; font-weight: 650; color: var(--orange-bright); font-variant-numeric: tabular-nums; }
 .hour-nav .play.on { background: var(--orange-soft); color: var(--orange-bright); border-color: rgba(255,91,36,0.5); }
-.viewport { position: relative; background: #0c0f10; min-height: 420px; display: grid; place-items: center; overflow: hidden; }
-.viewport img { max-width: 100%; max-height: calc(100vh - 210px); display: block; background: #f4f1ea; transform-origin: 0 0; }
-.viewport img.zoomed { max-width: none; max-height: none; cursor: grab; position: absolute; top: 0; left: 0; }
-.viewport img.zoomed.grabbing { cursor: grabbing; }
+.viewport { position: relative; background: #0c0f10; height: clamp(480px, calc(100vh - 250px), 940px); display: grid; place-items: center; overflow: hidden; }
+.viewport img { max-width: 100%; max-height: 100%; display: block; background: #f4f1ea; cursor: zoom-in; }
 .viewport .placeholder { color: var(--muted-2); text-align: center; padding: 90px 20px; font-size: 14px; }
 .viewport .placeholder .flame { font-size: 30px; color: var(--orange); opacity: 0.6; margin-bottom: 10px; }
 .spin { position: absolute; top: 12px; right: 14px; z-index: 5; display: none; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); background: rgba(9,11,12,0.85); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; }
@@ -237,6 +235,23 @@ button { color: inherit; cursor: pointer; }
     </div>
 
     <div>
+      <span class="field-label">Basemap</span>
+      <div class="segmented" id="basemapSeg">
+        <button class="selected" type="button" data-basemap="topo">Topo</button>
+        <button type="button" data-basemap="filled">Filled</button>
+        <button type="button" data-basemap="white">White</button>
+      </div>
+    </div>
+
+    <div>
+      <span class="field-label">Counties</span>
+      <div class="segmented" id="countySeg">
+        <button class="selected" type="button" data-counties="true">On</button>
+        <button type="button" data-counties="false">Off</button>
+      </div>
+    </div>
+
+    <div>
       <span class="field-label">Map labels</span>
       <div class="segmented" id="quality">
         <button type="button" data-density="2">Regional</button>
@@ -262,13 +277,13 @@ button { color: inherit; cursor: pointer; }
       </div>
       <div class="viewport" id="viewport">
         <div class="spin" id="spin"><span id="spinText">rendering…</span></div>
-        <div class="placeholder" id="placeholder"><div class="flame">▲▲▲</div>Pick a product on the left — it renders right here.<br>← / → step hours · wheel zooms · drag pans when zoomed.</div>
+        <div class="placeholder" id="placeholder"><div class="flame">▲▲▲</div>Pick a product on the left — it renders right here.<br>← / → step hours · click any map for full resolution.</div>
         <img id="viewImg" alt="" style="display:none">
       </div>
       <div class="viewer-foot">
         <span id="footNote">HRRR × RTMA climatology 2019–2026 · rendered on demand</span>
         <a id="dlLink" href="#" download style="display:none; color: var(--muted)">download</a>
-        <span class="zoom-hint">wheel to zoom · double-click resets</span>
+        <span class="zoom-hint">click the map to open full resolution</span>
       </div>
     </div>
 
@@ -390,6 +405,7 @@ const RIBBONS = {
 };
 let state = {
   fam: "anomaly", product: ANOMALY[0][0], hour: 6, density: 3,
+  basemap: "topo", counties: true,
   preset: "california", drawn: null, stat: "p95",
   hours: [], playTimer: null, seq: 0,
 };
@@ -554,14 +570,19 @@ $("hPlay").onclick = () => {
   }, 900);
 };
 
-/* ---------- quality ---------- */
-$("quality").addEventListener("click", ev => {
-  const btn = ev.target.closest("button"); if (!btn) return;
-  [...$("quality").children].forEach(b => b.classList.remove("selected"));
-  btn.classList.add("selected");
-  state.density = Number(btn.dataset.density);
-  renderCurrent();
-});
+/* ---------- render options (the tech-demo knobs) ---------- */
+function wireSegment(id, apply) {
+  $(id).addEventListener("click", ev => {
+    const btn = ev.target.closest("button"); if (!btn) return;
+    [...$(id).children].forEach(b => b.classList.remove("selected"));
+    btn.classList.add("selected");
+    apply(btn.dataset);
+    renderCurrent();
+  });
+}
+wireSegment("quality", d => { state.density = Number(d.density); });
+wireSegment("basemapSeg", d => { state.basemap = d.basemap; });
+wireSegment("countySeg", d => { state.counties = d.counties === "true"; });
 
 /* ---------- Leaflet map ---------- */
 const map = L.map("map", { zoomControl: true }).setView([37.6, -119.5], 5);
@@ -674,8 +695,8 @@ function productLabel() {
 async function requestPlot(productSlug, hour, quiet) {
   const payload = {
     run: currentRun(), hour, products: productSlug,
-    output_format: "webp", plot_style: "operational", basemap_style: "topo",
-    county_linework: true, place_label_density: state.density, place_label_size: 2,
+    output_format: "webp", plot_style: "operational", basemap_style: state.basemap,
+    county_linework: state.counties, place_label_density: state.density, place_label_size: 2,
     output_width: 1800, ...domainPayload(),
   };
   const started = await fetch("/api/render", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }).then(r => r.json());
@@ -748,55 +769,19 @@ function prefetchNeighbors(slug, hour) {
   const targets = [index + 1, index - 1, index + 2, index + 3]
     .map(i => state.hours[i]).filter(h => h !== undefined);
   targets.forEach(h => {
-    const key = `${currentRun()}|${slug}|${h}|${JSON.stringify(domainPayload())}|${state.density}`;
+    const key = `${currentRun()}|${slug}|${h}|${JSON.stringify(domainPayload())}|${state.density}|${state.basemap}|${state.counties}`;
     if (prefetched.has(key)) return;
     prefetched.add(key);
     requestPlot(slug, h, true).catch(() => prefetched.delete(key));
   });
 }
 
-/* ---------- in-viewer zoom (no overlay, no z-index fights) ---------- */
-let zoom = { s: 1, x: 0, y: 0 }, panFrom = null;
-const viewport = $("viewport"), viewImg = $("viewImg");
-function resetZoom() {
-  zoom = { s: 1, x: 0, y: 0 };
-  viewImg.classList.remove("zoomed");
-  viewImg.style.transform = "";
-}
-function applyZoom() { viewImg.style.transform = `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.s})`; }
-viewport.addEventListener("wheel", ev => {
-  if (viewImg.style.display === "none") return;
-  ev.preventDefault();
-  const rect = viewport.getBoundingClientRect();
-  const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
-  if (!viewImg.classList.contains("zoomed")) {
-    // Enter zoom mode at the image's current displayed scale/position.
-    const ir = viewImg.getBoundingClientRect();
-    zoom.s = ir.width / viewImg.naturalWidth;
-    zoom.x = ir.left - rect.left; zoom.y = ir.top - rect.top;
-    viewImg.classList.add("zoomed");
-  }
-  const factor = ev.deltaY < 0 ? 1.16 : 1 / 1.16;
-  const ns = Math.min(Math.max(zoom.s * factor, 0.05), 10);
-  zoom.x = mx - (mx - zoom.x) * (ns / zoom.s);
-  zoom.y = my - (my - zoom.y) * (ns / zoom.s);
-  zoom.s = ns;
-  applyZoom();
-}, { passive: false });
-viewImg.addEventListener("pointerdown", ev => {
-  if (!viewImg.classList.contains("zoomed")) return;
-  ev.preventDefault();
-  panFrom = [ev.clientX - zoom.x, ev.clientY - zoom.y];
-  viewImg.classList.add("grabbing");
-  viewImg.setPointerCapture(ev.pointerId);
+/* ---------- full-size view: browser-native, zero custom zoom ---------- */
+const viewImg = $("viewImg");
+function resetZoom() { /* no in-viewer zoom state anymore */ }
+viewImg.addEventListener("click", () => {
+  if (viewImg.src) window.open(viewImg.src, "_blank");
 });
-viewImg.addEventListener("pointermove", ev => {
-  if (!panFrom) return;
-  zoom.x = ev.clientX - panFrom[0]; zoom.y = ev.clientY - panFrom[1];
-  applyZoom();
-});
-viewImg.addEventListener("pointerup", () => { panFrom = null; viewImg.classList.remove("grabbing"); });
-viewport.addEventListener("dblclick", resetZoom);
 
 /* ---------- boot ---------- */
 buildFams();
