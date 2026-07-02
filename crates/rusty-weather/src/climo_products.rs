@@ -21,7 +21,6 @@ use std::time::Instant;
 
 use rustwx_products::places;
 use rustwx_products::plot_design::StaticPlotDesign;
-use rustwx_products::shared_context::model_time_subtitle;
 use rustwx_render::{
     ChromeScale, Color, ColorScale, DiscreteColorScale, ExtendMode, Field2D, GridShape,
     LatLonGrid, MapRenderRequest, PngWriteOptions, ProductKey, ProductVisualMode,
@@ -1356,12 +1355,29 @@ fn render_rank_map(
     )?;
     let mut request = MapRenderRequest::new(field, ColorScale::Discrete(product.scale()));
     request.title = Some(baseline_title(product, baseline));
-    request.subtitle_left = Some(model_time_subtitle(
-        config.model,
-        &config.date_yyyymmdd,
+    // Day-window products have no single valid hour: the left subtitle
+    // names the folded window, not the run's anchor hour.
+    let (month, day) = doy_to_month_day(doy);
+    let month = MONTH_ABBREV[month as usize - 1];
+    let window_text = match product.window() {
+        ClimoWindow::UtcDay => format!("{month} {day} 00-23Z"),
+        ClimoWindow::Utc1206NextDay => {
+            let (next_month, next_day) = doy_to_month_day(if doy >= 365 { 1 } else { doy + 1 });
+            format!(
+                "{month} {day} 12Z-{} {next_day} 06Z",
+                MONTH_ABBREV[next_month as usize - 1]
+            )
+        }
+    };
+    request.subtitle_left = Some(format!(
+        "Init {}/{} {:02}Z {} | {window_text}",
+        &config.date_yyyymmdd[4..6],
+        &config.date_yyyymmdd[6..8],
         config.cycle_utc,
-        anchor_hour,
+        config.model.as_str().to_uppercase(),
     ));
+    // Percentile bins are uneven: label the actual edges.
+    request.cbar_ticks = Some(vec![0.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0]);
     let n_label = if sample_n.is_finite() {
         format!(" | n~{}", sample_n.round() as i64)
     } else {
@@ -1372,9 +1388,9 @@ fn render_rank_map(
         Baseline::AllPeriod => "all days 19-26".to_string(),
     };
     request.subtitle_right = Some(format!(
-        "{climo_label}{n_label} | {}h {}",
+        "{climo_label}{n_label} | {}/{} h",
         fold.hours_used.len(),
-        product.window().store_name().replace("utc_", "").replace("_next_day", "z+"),
+        product.window().full_hours(),
     ));
     request.cbar_tick_step = None;
     request.width = config.output_width;

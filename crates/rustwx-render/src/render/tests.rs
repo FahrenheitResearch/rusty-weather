@@ -41,6 +41,7 @@ fn sample_projected_opts() -> RenderOpts {
         subtitle_center: None,
         subtitle_right: None,
         cbar_tick_step: None,
+        cbar_ticks: None,
         colorbar_mode: crate::colormap::LegendMode::Stepped,
         chrome_scale: ChromeScale::default(),
         supersample_factor: 1,

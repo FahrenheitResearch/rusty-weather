@@ -703,6 +703,7 @@ fn with_render_state_profile_with_style<T>(
             subtitle_center: request.subtitle_center.clone(),
             subtitle_right: request.subtitle_right.clone(),
             cbar_tick_step: request.cbar_tick_step,
+            cbar_ticks: request.cbar_ticks.clone(),
             colorbar_mode: request.legend.mode,
             chrome_scale: request.chrome_scale,
             supersample_factor: plot_style.supersample_factor(request.supersample_factor),

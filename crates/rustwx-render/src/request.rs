@@ -812,6 +812,10 @@ pub struct MapRenderRequest {
     pub subtitle_center: Option<String>,
     pub subtitle_right: Option<String>,
     pub cbar_tick_step: Option<f64>,
+    /// Explicit colorbar tick values (discrete bin edges); overrides
+    /// `cbar_tick_step` and the automatic picker.
+    #[serde(default)]
+    pub cbar_ticks: Option<Vec<f64>>,
     #[serde(default)]
     pub render_density: RenderDensity,
     #[serde(default)]
@@ -875,6 +879,7 @@ impl MapRenderRequest {
             subtitle_center: None,
             subtitle_right: None,
             cbar_tick_step: None,
+            cbar_ticks: None,
             render_density: RenderDensity::default(),
             legend: LegendControls::default(),
             chrome_scale: ChromeScale::default(),

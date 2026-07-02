@@ -46,6 +46,9 @@ pub struct RenderOpts {
     pub subtitle_center: Option<String>,
     pub subtitle_right: Option<String>,
     pub cbar_tick_step: Option<f64>,
+    /// Explicit colorbar tick values (e.g. discrete bin edges); overrides
+    /// `cbar_tick_step` and the automatic picker.
+    pub cbar_ticks: Option<Vec<f64>>,
     pub colorbar_mode: crate::colormap::LegendMode,
     pub chrome_scale: ChromeScale,
     pub supersample_factor: u32,
@@ -167,6 +170,7 @@ impl Default for RenderOpts {
             subtitle_center: None,
             subtitle_right: None,
             cbar_tick_step: None,
+            cbar_ticks: None,
             colorbar_mode: crate::colormap::LegendMode::Stepped,
             chrome_scale: ChromeScale::default(),
             supersample_factor: 1,
@@ -4631,7 +4635,10 @@ fn draw_chrome_and_colorbar(
             domain_frame_rect,
         );
         let levels = colorbar_levels_for_ticks(&opts.cmap);
-        let ticks = pick_ticks(levels, opts.cbar_tick_step);
+        let ticks = match &opts.cbar_ticks {
+            Some(explicit) => explicit.clone(),
+            None => pick_ticks(levels, opts.cbar_tick_step),
+        };
         match colorbar_orientation {
             ColorbarOrientation::HorizontalBottom => {
                 colorbar::draw_colorbar(
