@@ -698,7 +698,7 @@ pub fn render_climo_reference_maps(
             },
         ));
         render_request.subtitle_left =
-            Some("RTMA 2.5 km analysis climatology | FireWxAtlas 2019-2026".to_string());
+            Some("RTMA 2.5 km analysis climatology | 2019-2026 archive".to_string());
         render_request.subtitle_right = Some(match request.target {
             ClimoRefTarget::Doy(doy) => format!("DOY {doy} | +/-7d window | n~105"),
             ClimoRefTarget::Record => "all analyzed days | n~2695".to_string(),
