@@ -111,7 +111,21 @@ fn read_f32bin(path: &Path, expected: usize) -> Result<Vec<f32>, String> {
         .collect())
 }
 
-/// Decode one pack slice (doy index within the task file) to f32.
+/// Read exactly one slice's bytes from a pack task file (ranged read: the
+/// full-year files are ~500 MB and must never be read whole per slice).
+fn read_slice_bytes(path: &Path, slice_index: usize, plane: usize) -> Result<Vec<u8>, String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file =
+        fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
+    file.seek(SeekFrom::Start((slice_index * plane * 2) as u64))
+        .map_err(|err| format!("seek {}: {err}", path.display()))?;
+    let mut buffer = vec![0u8; plane * 2];
+    file.read_exact(&mut buffer)
+        .map_err(|err| format!("read slice {slice_index} of {}: {err}", path.display()))?;
+    Ok(buffer)
+}
+
+/// Decode one pack slice (raw slice bytes) to f32.
 fn decode_slice(
     file_bytes: &[u8],
     slice_index: usize,
@@ -141,11 +155,42 @@ fn decode_slice(
 
 // ------------------------------------------------- curvilinear resampler
 
-/// Precomputed source->target map: for each target cell, up to four source
-/// indices with inverse-distance weights (already normalized), or empty
-/// when the target sits farther than the distance cap from the source mesh.
+/// Precomputed source->target map in compact CSR form: for each target
+/// cell, up to four source indices with normalized inverse-distance
+/// weights; an empty row means the target sits beyond the distance cap.
+/// Contiguous u32/f32 arrays keep the map small (~8 MB) and cheap to
+/// re-checksum, so silent memory corruption during a long import run is
+/// detected instead of producing garbage indexes.
 struct ResampleMap {
-    entries: Vec<Vec<(usize, f64)>>,
+    row_offsets: Vec<u32>,
+    source_indices: Vec<u32>,
+    weights: Vec<f32>,
+}
+
+impl ResampleMap {
+    fn checksum(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut mix = |value: u64| {
+            hash ^= value;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        for &offset in &self.row_offsets {
+            mix(u64::from(offset));
+        }
+        for (&index, &weight) in self.source_indices.iter().zip(&self.weights) {
+            mix(u64::from(index));
+            mix(u64::from(weight.to_bits()));
+        }
+        hash
+    }
+
+    fn mapped_rows(&self) -> usize {
+        self.row_offsets.windows(2).filter(|w| w[1] > w[0]).count()
+    }
+
+    fn rows(&self) -> usize {
+        self.row_offsets.len() - 1
+    }
 }
 
 fn haversine_km(lat_a: f64, lon_a: f64, lat_b: f64, lon_b: f64) -> f64 {
@@ -262,23 +307,45 @@ fn build_resample_map(
             row_entries
         })
         .collect();
+    let mut row_offsets = Vec::with_capacity(tgt_ny * tgt_nx + 1);
+    let mut source_indices = Vec::new();
+    let mut weights = Vec::new();
+    row_offsets.push(0u32);
+    for entry in rows.into_iter().flatten() {
+        for (source_index, weight) in entry {
+            source_indices.push(source_index as u32);
+            weights.push(weight as f32);
+        }
+        row_offsets.push(source_indices.len() as u32);
+    }
     ResampleMap {
-        entries: rows.into_iter().flatten().collect(),
+        row_offsets,
+        source_indices,
+        weights,
     }
 }
 
 impl ResampleMap {
     /// Apply to one source slice; NaN contributors renormalize, all-NaN or
-    /// unmapped targets become NaN.
-    fn apply(&self, source: &[f32], out: &mut [f32]) {
-        for (target_index, entry) in self.entries.iter().enumerate() {
+    /// unmapped targets become NaN. Returns Err on an out-of-range index
+    /// (map corruption) rather than panicking or masking it.
+    fn apply(&self, source: &[f32], out: &mut [f32]) -> Result<(), String> {
+        for target_index in 0..self.rows() {
+            let start = self.row_offsets[target_index] as usize;
+            let end = self.row_offsets[target_index + 1] as usize;
             let mut sum = 0.0f64;
             let mut weight_sum = 0.0f64;
-            for &(source_index, weight) in entry {
-                let v = source[source_index];
+            for slot in start..end {
+                let source_index = self.source_indices[slot] as usize;
+                let v = *source.get(source_index).ok_or_else(|| {
+                    format!(
+                        "resample map corruption: source index {source_index} (plane {}) at target {target_index}",
+                        source.len()
+                    )
+                })?;
                 if v.is_finite() {
-                    sum += f64::from(v) * weight;
-                    weight_sum += weight;
+                    sum += f64::from(v) * f64::from(self.weights[slot]);
+                    weight_sum += f64::from(self.weights[slot]);
                 }
             }
             out[target_index] = if weight_sum > 0.0 {
@@ -287,6 +354,7 @@ impl ResampleMap {
                 f32::NAN
             };
         }
+        Ok(())
     }
 }
 
@@ -389,7 +457,7 @@ fn main() -> Result<(), String> {
         tgt_nx,
         args.max_distance_km,
     );
-    let mapped = map.entries.iter().filter(|entry| !entry.is_empty()).count();
+    let mapped = map.mapped_rows();
     println!(
         "resample map built in {:.1}s: {mapped}/{} targets mapped ({:.2}%)",
         map_started.elapsed().as_secs_f64(),
@@ -403,8 +471,8 @@ fn main() -> Result<(), String> {
         return Err("resample map covers under 90% of the target subgrid".to_string());
     }
     let mut unmapped_edge = [0usize; 4]; // W, E, S, N halves
-    for (index, entry) in map.entries.iter().enumerate() {
-        if entry.is_empty() {
+    for index in 0..map.rows() {
+        if map.row_offsets[index] == map.row_offsets[index + 1] {
             let (row, col) = (index / tgt_nx, index % tgt_nx);
             if col < tgt_nx / 2 { unmapped_edge[0] += 1 } else { unmapped_edge[1] += 1 }
             if row < tgt_ny / 2 { unmapped_edge[2] += 1 } else { unmapped_edge[3] += 1 }
@@ -440,31 +508,17 @@ fn main() -> Result<(), String> {
         }
     }
 
-    // Load pack files once (memory: full v1 pack is ~45 GB, dev packs are
-    // small; stream per task instead of loading everything when large).
-    let mut task_bytes: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
-    let load_lazily = fs::metadata(&args.pack)
-        .map(|_| {
-            manifest
-                .tasks
-                .iter()
-                .map(|task| {
-                    fs::metadata(args.pack.join(&task.file))
-                        .map(|meta| meta.len())
-                        .unwrap_or(0)
-                })
-                .sum::<u64>()
-        })
-        .unwrap_or(0)
-        > 8 * 1024 * 1024 * 1024;
-    if !load_lazily {
-        for task in &manifest.tasks {
-            task_bytes.insert(
-                task.file.as_str(),
-                fs::read(args.pack.join(&task.file)).map_err(|err| err.to_string())?,
-            );
+    // Validate the resample map once, then guard it with a checksum that
+    // is re-verified before every DOY batch: silent memory corruption on
+    // long imports must abort loudly, never write garbage.
+    for &index in &map.source_indices {
+        if (index as usize) >= src_plane {
+            return Err(format!(
+                "resample map is corrupt after build: index {index} (plane {src_plane})"
+            ));
         }
     }
+    let map_checksum = map.checksum();
 
     let written_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -474,6 +528,11 @@ fn main() -> Result<(), String> {
     let mut hours_written = 0usize;
     let mut vars_written = 0usize;
     for (&doy, slices) in &by_doy {
+        if map.checksum() != map_checksum {
+            return Err(format!(
+                "resample map checksum changed before DOY {doy}: memory corruption detected; aborting import"
+            ));
+        }
         let mut writer = HourIngestWriter::begin(
             &args.store_root,
             &args.climo_model,
@@ -489,15 +548,14 @@ fn main() -> Result<(), String> {
             .par_iter()
             .map(|slice| -> Result<_, String> {
                 let is_count = slice.task.stat == "sample_count";
-                let source = if let Some(bytes) = task_bytes.get(slice.task.file.as_str()) {
-                    decode_slice(bytes, slice.slice_index, src_plane, slice.meta, is_count)?
-                } else {
-                    let bytes =
-                        fs::read(args.pack.join(&slice.task.file)).map_err(|err| err.to_string())?;
-                    decode_slice(&bytes, slice.slice_index, src_plane, slice.meta, is_count)?
-                };
+                let bytes = read_slice_bytes(
+                    &args.pack.join(&slice.task.file),
+                    slice.slice_index,
+                    src_plane,
+                )?;
+                let source = decode_slice(&bytes, 0, src_plane, slice.meta, is_count)?;
                 let mut out = vec![f32::NAN; tgt_ny * tgt_nx];
-                map.apply(&source, &mut out);
+                map.apply(&source, &mut out)?;
                 let name = format!(
                     "climo__{}__{}__{}",
                     slice.task.window, slice.task.product, slice.task.stat
@@ -567,10 +625,14 @@ fn main() -> Result<(), String> {
             let slices = &by_doy[&doy];
             let slice = &slices[(next() % slices.len() as u64) as usize];
             let is_count = slice.task.stat == "sample_count";
-            let bytes = fs::read(args.pack.join(&slice.task.file)).map_err(|err| err.to_string())?;
-            let source = decode_slice(&bytes, slice.slice_index, src_plane, slice.meta, is_count)?;
+            let bytes = read_slice_bytes(
+                &args.pack.join(&slice.task.file),
+                slice.slice_index,
+                src_plane,
+            )?;
+            let source = decode_slice(&bytes, 0, src_plane, slice.meta, is_count)?;
             let mut expected = vec![f32::NAN; tgt_ny * tgt_nx];
-            map.apply(&source, &mut expected);
+            map.apply(&source, &mut expected)?;
             let reader = rw_store::reader::HourReader::open(
                 &run_dir.join(format!("f{doy:03}.rws")),
             )
@@ -663,7 +725,7 @@ mod tests {
             .map(|(&la, &lo)| 3.0 * la + 2.0 * lo)
             .collect();
         let mut out = vec![f32::NAN; tgt_lat.len()];
-        map.apply(&field, &mut out);
+        map.apply(&field, &mut out).unwrap();
         for (index, value) in out.iter().enumerate() {
             let expected = 3.0 * tgt_lat[index] + 2.0 * tgt_lon[index];
             assert!(
@@ -682,7 +744,7 @@ mod tests {
         let mut field: Vec<f32> = vec![5.0; 40 * 40];
         field[21 * 40 + 21] = f32::NAN;
         let mut out = vec![0.0f32; 2];
-        map.apply(&field, &mut out);
+        map.apply(&field, &mut out).unwrap();
         assert!((out[0] - 5.0).abs() < 1e-4, "renormalized value {}", out[0]);
         assert!(out[1].is_nan(), "far-away target must be NaN");
     }
