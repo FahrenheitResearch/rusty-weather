@@ -62,6 +62,8 @@ pub enum WeatherPreset {
     PftDtheta,
     /// PFT mixed-layer mean wind (m/s).
     PftWind,
+    /// PFT free-convection height (m AGL).
+    PftHeight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -371,7 +373,7 @@ impl WeatherProduct {
             }
             Self::Uh => WeatherPreset::Uh,
             Self::PftGw => WeatherPreset::PftGw,
-            Self::PftZfc => WeatherPreset::Lfc,
+            Self::PftZfc => WeatherPreset::PftHeight,
             Self::PftDthetaFc => WeatherPreset::PftDtheta,
             Self::PftUml => WeatherPreset::PftWind,
         }
@@ -398,6 +400,7 @@ impl WeatherProduct {
             WeatherPreset::PftGw => Some(250.0),
             WeatherPreset::PftDtheta => Some(2.0),
             WeatherPreset::PftWind => Some(5.0),
+            WeatherPreset::PftHeight => Some(1000.0),
         }
     }
 
@@ -638,6 +641,9 @@ impl WeatherPreset {
                 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0,
             ]),
             Self::PftWind => Some(vec![0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0]),
+            Self::PftHeight => Some(vec![
+                0.0, 1000.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0, 8000.0,
+            ]),
         }
     }
 
@@ -673,6 +679,7 @@ impl WeatherPreset {
             Self::PftGw => Some(250.0),
             Self::PftDtheta => Some(2.0),
             Self::PftWind => Some(5.0),
+            Self::PftHeight => Some(1000.0),
         }
     }
 
@@ -804,14 +811,21 @@ impl WeatherPreset {
                 }
             }
             Self::PftDtheta => DiscreteColorScale {
-                levels: range_step(0.0, 20.1, 1.0),
-                colors: weather_palette(WeatherPalette::LapseRate),
+                // Family ramp: low required warming = attainable = red.
+                levels: range_step(0.0, 20.1, 0.5),
+                colors: weather_palette(WeatherPalette::Pft),
                 extend: ExtendMode::Max,
                 mask_below,
             },
             Self::PftWind => DiscreteColorScale {
-                levels: range_step(0.0, 30.1, 2.0),
-                colors: weather_palette(WeatherPalette::Srh),
+                levels: range_step(0.0, 30.1, 1.0),
+                colors: weather_palette(WeatherPalette::Pft),
+                extend: ExtendMode::Max,
+                mask_below,
+            },
+            Self::PftHeight => DiscreteColorScale {
+                levels: range_step(0.0, 8000.1, 250.0),
+                colors: weather_palette(WeatherPalette::Pft),
                 extend: ExtendMode::Max,
                 mask_below,
             },
