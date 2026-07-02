@@ -244,6 +244,55 @@ struct ClimoGridMeta {
     doy_end: u16,
 }
 
+/// Sidecar schema written by `rw_land_mask` (HRRR `LAND:surface` cropped to
+/// the climatology subgrid): `land_mask.bin` is one byte per cell, row-major,
+/// 1 = land, 0 = water.
+const LAND_MASK_SCHEMA: &str = "cafire.rtma_climo_land_mask.v1";
+
+/// Load the optional ocean-mask sidecar. Fire weather is a land/fuels
+/// problem and RTMA is weakly observation-constrained over water, so every
+/// climatology/anomaly product renders water as basemap no-data when the
+/// mask is present. Absent or invalid sidecars render unmasked — a
+/// misaligned mask must never silently hide real land signal.
+fn load_land_mask(climo_dir: &Path, ny: usize, nx: usize) -> Option<Vec<u8>> {
+    let header = std::fs::read_to_string(climo_dir.join("land_mask.json")).ok()?;
+    let header: serde_json::Value = serde_json::from_str(&header).ok()?;
+    if header.get("schema").and_then(|v| v.as_str()) != Some(LAND_MASK_SCHEMA) {
+        eprintln!("land_mask.json: unsupported schema; rendering unmasked");
+        return None;
+    }
+    let h_ny = header.get("ny").and_then(|v| v.as_u64())? as usize;
+    let h_nx = header.get("nx").and_then(|v| v.as_u64())? as usize;
+    if (h_ny, h_nx) != (ny, nx) {
+        eprintln!(
+            "land_mask is {h_ny}x{h_nx} but climo grid is {ny}x{nx}; rendering unmasked"
+        );
+        return None;
+    }
+    let bytes = std::fs::read(climo_dir.join("land_mask.bin")).ok()?;
+    if bytes.len() != ny * nx {
+        eprintln!(
+            "land_mask.bin carries {} cells, grid has {}; rendering unmasked",
+            bytes.len(),
+            ny * nx
+        );
+        return None;
+    }
+    eprintln!(
+        "land_mask active: {} water cells masked",
+        bytes.iter().filter(|&&cell| cell == 0).count()
+    );
+    Some(bytes)
+}
+
+fn apply_land_mask(ranks: &mut [f32], mask: &[u8]) {
+    for (rank, &land) in ranks.iter_mut().zip(mask) {
+        if land == 0 {
+            *rank = f32::NAN;
+        }
+    }
+}
+
 pub struct ClimoRenderOutcome {
     pub rendered: Vec<RenderedProduct>,
     pub skipped: Vec<StoreRenderSkip>,
@@ -612,6 +661,7 @@ pub fn render_climo_products_from_store(
     }
 
     // Shared render context on the climatology subgrid.
+    let land_mask = load_land_mask(&climo_dir, meta.ny, meta.nx);
     let subgrid = climo.full_grid();
     let (ny, nx) = (subgrid.shape.ny, subgrid.shape.nx);
     if (ny, nx) != (meta.ny, meta.nx) {
@@ -674,7 +724,10 @@ pub fn render_climo_products_from_store(
 
         if product == ClimoProduct::SurfacePotential {
             match compute_surface_potential(&climo, fold, ny * nx) {
-                Ok(ranks) => {
+                Ok(mut ranks) => {
+                    if let Some(mask) = &land_mask {
+                        apply_land_mask(&mut ranks, mask);
+                    }
                     let output_path = render_rank_map(
                         config, &subgrid, &projected, climo.projection().cloned(),
                         product, ranks, anchor_hour, fold, doy, f32::NAN,
@@ -720,6 +773,9 @@ pub fn render_climo_products_from_store(
             } else {
                 percentile_rank(value, &anchor_values)
             };
+        }
+        if let Some(mask) = &land_mask {
+            apply_land_mask(&mut ranks, mask);
         }
 
         let output_path = render_rank_map(
@@ -1009,6 +1065,46 @@ mod tests {
         );
         assert_eq!(hours.first(), Some(&12));
         assert_eq!(hours.last(), Some(&30));
+    }
+
+    #[test]
+    fn land_mask_nans_water_cells_only() {
+        let mut ranks = vec![95.0, 42.0, f32::NAN, 10.0];
+        apply_land_mask(&mut ranks, &[1, 0, 1, 0]);
+        assert_eq!(ranks[0], 95.0, "land cells keep their rank");
+        assert!(ranks[1].is_nan(), "water cell must go no-data");
+        assert!(ranks[2].is_nan(), "NaN land cell stays NaN");
+        assert!(ranks[3].is_nan(), "water cell must go no-data");
+    }
+
+    #[test]
+    fn land_mask_loader_round_trips_and_validates() {
+        let dir = std::env::temp_dir().join(format!("rw_land_mask_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Missing sidecar: render unmasked, no error.
+        assert!(load_land_mask(&dir, 2, 2).is_none());
+        let mask = [1u8, 0, 0, 1];
+        std::fs::write(dir.join("land_mask.bin"), mask).unwrap();
+        std::fs::write(
+            dir.join("land_mask.json"),
+            serde_json::json!({
+                "schema": "cafire.rtma_climo_land_mask.v1",
+                "ny": 2,
+                "nx": 2,
+                "land_cells": 2,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(load_land_mask(&dir, 2, 2).as_deref(), Some(&mask[..]));
+        // Dims disagreeing with the store meta: refuse the mask — a
+        // misaligned mask silently hides real land signal.
+        assert!(load_land_mask(&dir, 2, 3).is_none());
+        // Truncated payload: refuse.
+        std::fs::write(dir.join("land_mask.bin"), [1u8, 0]).unwrap();
+        assert!(load_land_mask(&dir, 2, 2).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
