@@ -553,9 +553,14 @@ function runAge(unix) {
   const mins = Math.max(0, (Date.now() / 1000 - unix) / 60);
   return mins < 90 ? `${Math.round(mins)} min ago` : `${(mins / 60).toFixed(1)} h ago`;
 }
+let runsBase = "";
 async function loadRuns() {
   try {
-    const data = await fetch("/api/runs").then(r => r.json());
+    // Node-backed families list the compute node's own run inventory —
+    // its store is independent of the main server's (and can be ahead
+    // or behind it).
+    runsBase = apiBase();
+    const data = await fetch(runsBase + "/api/runs").then(r => r.json());
     latestManifest = data.latest || null;
     const select = $("runSelect");
     const keep = select.value;
@@ -610,6 +615,7 @@ function buildFams() {
 }
 function selectFam(key) {
   state.fam = key;
+  if (apiBase() !== runsBase) loadRuns();
   [...$("fams").children].forEach((b, i) => b.classList.toggle("on", Object.keys(FAMS)[i] === key));
   $("productBox").classList.toggle("show", FAMS[key].products.length > 0);
   $("climoBox").classList.toggle("show", key === "climoref");
