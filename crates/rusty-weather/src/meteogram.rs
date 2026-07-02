@@ -119,6 +119,9 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_ABBREV: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 /// No-leap DOY (Feb 29 folds onto 59) for a (month, day).
 fn no_leap_doy(month: u32, day: u32) -> u16 {
@@ -923,6 +926,341 @@ pub fn render_meteogram_svg(
         hours: samples.len(),
         data,
     })
+}
+
+// ===================== daily outlook card =====================
+// The weathermodels.com-style shareable graphic: one column per local
+// calendar day, HI/LO colored number strips, grouped bars, weekday labels.
+// Works for any stored 2D variable on any model (temperature gets the
+// classic absolute color scale; everything else auto-normalizes).
+
+#[derive(Debug, Clone)]
+pub struct DailyRequest {
+    pub lat: f64,
+    pub lon: f64,
+    pub var: String,
+    pub title: Option<String>,
+    pub utc_offset_hours: f64,
+}
+
+struct DayAgg {
+    label_date: String,
+    label_dow: &'static str,
+    hi: f64,
+    lo: f64,
+}
+
+/// Classic absolute temperature (°F) cell color.
+fn temp_color(f: f64) -> &'static str {
+    match f {
+        f if f < 0.0 => "#b7a6f0",
+        f if f < 15.0 => "#8f9fe8",
+        f if f < 32.0 => "#6f9bd1",
+        f if f < 45.0 => "#7fc4d8",
+        f if f < 55.0 => "#9cd6a4",
+        f if f < 65.0 => "#d3e07f",
+        f if f < 72.0 => "#f5e05c",
+        f if f < 80.0 => "#f5b53c",
+        f if f < 88.0 => "#ef8633",
+        f if f < 95.0 => "#e0512e",
+        f if f < 103.0 => "#b31f1f",
+        f if f < 110.0 => "#7a2f1d",
+        _ => "#8b3a94",
+    }
+}
+
+/// Generic ramp for non-temperature variables, normalized over the card.
+fn ramp_color(t: f64) -> &'static str {
+    const RAMP: [&str; 8] = [
+        "#6f9bd1", "#7fc4d8", "#9cd6a4", "#d3e07f", "#f5e05c", "#f5b53c", "#ef8633", "#e0512e",
+    ];
+    RAMP[((t.clamp(0.0, 1.0)) * (RAMP.len() as f64 - 1.0)).round() as usize]
+}
+
+/// Black or white text for a hex cell background.
+fn text_on(hex: &str) -> &'static str {
+    let parse = |s: &str| u32::from_str_radix(s, 16).unwrap_or(128) as f64;
+    let (r, g, b) = (parse(&hex[1..3]), parse(&hex[3..5]), parse(&hex[5..7]));
+    if 0.299 * r + 0.587 * g + 0.114 * b > 150.0 { "#141414" } else { "#ffffff" }
+}
+
+pub fn render_daily_svg(
+    store_root: &Path,
+    model_slug: &str,
+    run_slug: &str,
+    date_yyyymmdd: &str,
+    cycle_utc: u8,
+    request: &DailyRequest,
+) -> Result<String, String> {
+    let run_dir = store_root.join(model_slug).join(run_slug);
+    let grid = GridFile::open(&run_dir.join("grid.rwg")).map_err(|err| format!("open grid: {err}"))?;
+    let (cell, d2) = nearest_cell(&grid.lat, &grid.lon, request.lat, request.lon);
+    if d2.sqrt() > 0.5 {
+        return Err("point is outside the model grid".to_string());
+    }
+    let (cx, cy) = (cell % grid.nx, cell / grid.nx);
+
+    let mut hours: Vec<u16> = std::fs::read_dir(&run_dir)
+        .map_err(|err| format!("read run dir: {err}"))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.strip_prefix('f')?.strip_suffix(".rws")?.parse::<u16>().ok()
+        })
+        .collect();
+    hours.sort_unstable();
+
+    // Sample + group by LOCAL calendar day.
+    let year: i64 = date_yyyymmdd[0..4].parse().unwrap_or(2000);
+    let month: u32 = date_yyyymmdd[4..6].parse().unwrap_or(1);
+    let day: u32 = date_yyyymmdd[6..8].parse().unwrap_or(1);
+    let run_days = days_from_civil(year, month, day);
+    let mut units = String::new();
+    let mut per_day: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
+    for &hour in &hours {
+        let Ok(reader) = HourReader::open(&run_dir.join(format!("f{hour:03}.rws"))) else {
+            continue;
+        };
+        if reader.meta().grid_hash != grid.hash {
+            continue;
+        }
+        let Some(var) = reader.variable(&request.var) else { continue };
+        if units.is_empty() {
+            units = var.units.clone();
+        }
+        let Ok(window) = reader.read_window_2d(&request.var, cx, cy, cx + 1, cy + 1) else {
+            continue;
+        };
+        let raw = f64::from(window.values[0]);
+        if !raw.is_finite() {
+            continue;
+        }
+        let local_hours =
+            run_days * 24 + i64::from(cycle_utc) + i64::from(hour) + request.utc_offset_hours as i64;
+        per_day.entry(local_hours.div_euclid(24)).or_default().push(raw);
+    }
+    if per_day.is_empty() {
+        return Err(format!("variable '{}' has no data in this run", request.var));
+    }
+
+    // Unit conversions for readability.
+    let lower_units = units.to_ascii_lowercase();
+    let is_kelvin = lower_units == "k" || lower_units.contains("kelvin");
+    let to_mph = lower_units.contains("m/s")
+        && (request.var.contains("wind") || request.var.contains("gust"));
+    let convert = |v: f64| {
+        if is_kelvin { c_to_f(v - 273.15) } else if to_mph { v * MS_TO_MPH } else { v }
+    };
+    let display_units = if is_kelvin {
+        "°F".to_string()
+    } else if to_mph {
+        "mph".to_string()
+    } else {
+        units.clone()
+    };
+
+    // Drop partial days: require ~3/4 of the samples a full local day
+    // would carry at this model's cadence (HRRR 24/day, GFS 4/day) —
+    // otherwise an evening-only stub masquerades as the day's HI.
+    let cadence = hours
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .min()
+        .unwrap_or(1)
+        .max(1);
+    let expected = (24 / cadence as usize).max(1);
+    let min_samples = ((expected * 3) / 4).max(2);
+    let days: Vec<DayAgg> = per_day
+        .iter()
+        .filter(|(_, values)| values.len() >= min_samples)
+        .map(|(&local_day, values)| {
+            let (y, m, d) = civil_from_days(local_day);
+            let _ = y;
+            let dow = WEEKDAYS[(local_day + 4).rem_euclid(7) as usize];
+            let hi = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let lo = values.iter().copied().fold(f64::INFINITY, f64::min);
+            DayAgg {
+                label_date: format!("{}.{:02}", MONTH_ABBREV[m as usize - 1].to_uppercase(), d),
+                label_dow: dow,
+                hi: convert(hi),
+                lo: convert(lo),
+            }
+        })
+        .collect();
+    if days.is_empty() {
+        return Err("no local day has enough samples".to_string());
+    }
+
+    // ---- layout ----
+    let n = days.len();
+    let col_w = if n <= 4 { 150.0 } else { (1080.0 / n as f64).clamp(84.0, 150.0) };
+    let ml = 64.0;
+    // Wide enough that the heading never collides with the place name.
+    let width = (ml + col_w * n as f64 + 28.0).max(880.0);
+    let strip_h = 46.0;
+    let chart_top = 208.0;
+    let chart_h = 320.0;
+    let height = chart_top + chart_h + 74.0;
+    let is_temp = is_kelvin || display_units == "°F" || lower_units.contains("degf");
+
+    let all_hi = days.iter().map(|d| d.hi).fold(f64::NEG_INFINITY, f64::max);
+    let all_lo = days.iter().map(|d| d.lo).fold(f64::INFINITY, f64::min);
+    let span = (all_hi - all_lo).max(1e-6);
+    let cell_color = |v: f64| if is_temp { temp_color(v) } else { ramp_color((v - all_lo) / span) };
+    // Bar axis: pad below the min and above the max to nice steps.
+    let axis_lo = if is_temp { (all_lo / 5.0).floor() * 5.0 - 5.0 } else { all_lo - span * 0.15 };
+    let axis_hi = if is_temp { (all_hi / 5.0).ceil() * 5.0 + 5.0 } else { all_hi + span * 0.15 };
+    let y_of = |v: f64| chart_top + chart_h - (v - axis_lo) / (axis_hi - axis_lo) * chart_h;
+    let fmt_val = |v: f64| {
+        if (axis_hi - axis_lo) > 20.0 || v.abs() >= 100.0 {
+            format!("{}", v.round() as i64)
+        } else {
+            format!("{v:.1}")
+        }
+    };
+
+    let var_pretty = request.var.replace('_', " ");
+    let heading = if is_temp && request.var.starts_with("temperature") {
+        format!("Daily HI/LO Temperature [{display_units}]")
+    } else {
+        format!("Daily HI/LO {var_pretty} [{display_units}]")
+    };
+    let place = request
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("{:.3}, {:.3}", request.lat, request.lon));
+
+    let mut svg = String::with_capacity(32 * 1024);
+    svg.push_str(&format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" font-family="Inter,'Segoe UI',Helvetica,Arial,sans-serif">"##
+    ));
+    svg.push_str(&format!(r##"<rect width="{width}" height="{height}" fill="#0d1112"/>"##));
+    svg.push_str(&format!(
+        r##"<rect x="0" y="0" width="{width}" height="4" fill="#ff5b24"/>"##
+    ));
+    // Header.
+    svg.push_str(&format!(
+        r##"<text x="24" y="40" fill="#f6f5f1" font-size="21" font-weight="800">CWT | {}</text>"##,
+        xml_escape(&heading)
+    ));
+    svg.push_str(&format!(
+        r##"<text x="24" y="64" fill="#9ea6a5" font-size="13">{} {} {:02}Z | {}</text>"##,
+        model_slug.to_uppercase(),
+        date_yyyymmdd,
+        cycle_utc,
+        xml_escape(&format!("{:.2}°, {:.2}°", request.lat, request.lon)),
+    ));
+    svg.push_str(&format!(
+        r##"<text x="{:.0}" y="44" fill="#ff6a36" font-size="24" font-weight="800" text-anchor="end">{}</text>"##,
+        width - 26.0,
+        xml_escape(&place.to_uppercase())
+    ));
+    svg.push_str(&format!(
+        r##"<text x="{:.0}" y="64" fill="#9ea6a5" font-size="12" text-anchor="end">cafire.wxsection.com/lab</text>"##,
+        width - 26.0
+    ));
+
+    // HI / LO strips.
+    for (row, is_hi) in [(0usize, true), (1usize, false)] {
+        let y = 86.0 + row as f64 * (strip_h + 6.0);
+        svg.push_str(&format!(
+            r##"<text x="{:.0}" y="{:.0}" fill="#9ea6a5" font-size="13" font-weight="700" text-anchor="end">{}</text>"##,
+            ml - 10.0,
+            y + strip_h / 2.0 + 5.0,
+            if is_hi { "HI" } else { "LO" }
+        ));
+        for (index, day) in days.iter().enumerate() {
+            let v = if is_hi { day.hi } else { day.lo };
+            let color = cell_color(v);
+            let x = ml + index as f64 * col_w;
+            svg.push_str(&format!(
+                r##"<rect x="{x:.0}" y="{y:.0}" width="{:.0}" height="{strip_h}" fill="{color}" stroke="#0d1112" stroke-width="2"/>"##,
+                col_w
+            ));
+            svg.push_str(&format!(
+                r##"<text x="{:.0}" y="{:.0}" fill="{}" font-size="26" font-weight="800" text-anchor="middle">{}</text>"##,
+                x + col_w / 2.0,
+                y + strip_h / 2.0 + 9.0,
+                text_on(color),
+                fmt_val(v)
+            ));
+        }
+    }
+
+    // Chart area + gridlines.
+    svg.push_str(&format!(
+        r##"<rect x="{ml:.0}" y="{chart_top:.0}" width="{:.0}" height="{chart_h:.0}" fill="#111617" stroke="#2a2f30"/>"##,
+        col_w * n as f64
+    ));
+    let step = nice_step(axis_hi - axis_lo, 7);
+    let mut tick = (axis_lo / step).ceil() * step;
+    while tick <= axis_hi {
+        let y = y_of(tick);
+        svg.push_str(&format!(
+            r##"<line x1="{ml:.0}" y1="{y:.1}" x2="{:.1}" y2="{y:.1}" stroke="#22282a" stroke-width="1" stroke-dasharray="4,5"/>"##,
+            ml + col_w * n as f64
+        ));
+        svg.push_str(&format!(
+            r##"<text x="{:.0}" y="{:.1}" fill="#737c7b" font-size="12" text-anchor="end">{}</text>"##,
+            ml - 8.0,
+            y + 4.0,
+            fmt_val(tick)
+        ));
+        tick += step;
+    }
+
+    // Bars: wide HI bar (orange-graded), inner LO bar (teal), labels.
+    for (index, day) in days.iter().enumerate() {
+        let x = ml + index as f64 * col_w;
+        let bar_w = col_w * 0.62;
+        let bar_x = x + (col_w - bar_w) / 2.0;
+        let hi_y = y_of(day.hi);
+        let base = chart_top + chart_h;
+        svg.push_str(&format!(
+            r##"<rect x="{bar_x:.1}" y="{hi_y:.1}" width="{bar_w:.1}" height="{:.1}" fill="{}" rx="3"/>"##,
+            (base - hi_y).max(1.0),
+            cell_color(day.hi)
+        ));
+        let lo_w = bar_w * 0.52;
+        let lo_x = x + (col_w - lo_w) / 2.0;
+        let lo_y = y_of(day.lo);
+        svg.push_str(&format!(
+            r##"<rect x="{lo_x:.1}" y="{lo_y:.1}" width="{lo_w:.1}" height="{:.1}" fill="#39b58c" rx="3" stroke="#0d1112" stroke-width="1.5"/>"##,
+            (base - lo_y).max(1.0)
+        ));
+        svg.push_str(&format!(
+            r##"<text x="{:.1}" y="{:.1}" fill="#f6f5f1" font-size="17" font-weight="800" text-anchor="middle">{}</text>"##,
+            x + col_w / 2.0,
+            hi_y - 8.0,
+            fmt_val(day.hi)
+        ));
+        svg.push_str(&format!(
+            r##"<text x="{:.1}" y="{:.1}" fill="#0d1112" font-size="14" font-weight="800" text-anchor="middle">{}</text>"##,
+            x + col_w / 2.0,
+            (lo_y + 17.0).min(base - 6.0),
+            fmt_val(day.lo)
+        ));
+        // Day labels.
+        svg.push_str(&format!(
+            r##"<text x="{:.1}" y="{:.1}" fill="#f6f5f1" font-size="13.5" font-weight="700" text-anchor="middle">{}</text>"##,
+            x + col_w / 2.0,
+            chart_top + chart_h + 24.0,
+            day.label_date
+        ));
+        svg.push_str(&format!(
+            r##"<text x="{:.1}" y="{:.1}" fill="#9ea6a5" font-size="12.5" text-anchor="middle">{}</text>"##,
+            x + col_w / 2.0,
+            chart_top + chart_h + 42.0,
+            day.label_dow
+        ));
+    }
+    svg.push_str(&format!(
+        r##"<text x="24" y="{:.0}" fill="#737c7b" font-size="11">local days (UTC{:+.0}) | HI/LO over each calendar day | California Wildfire Tracking — Weather Lab</text>"##,
+        height - 14.0,
+        request.utc_offset_hours
+    ));
+    svg.push_str("</svg>");
+    Ok(svg)
 }
 
 #[cfg(test)]

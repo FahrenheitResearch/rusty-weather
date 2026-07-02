@@ -337,6 +337,9 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
         _ if request.method == "GET" && request.path.starts_with("/api/vars") => {
             vars_response(&request.query, &state)
         }
+        _ if request.method == "GET" && request.path.starts_with("/api/daily") => {
+            daily_response(&request.query, &state)
+        }
         _ if request.method == "GET" && request.path.starts_with("/api/jobs/") => {
             let id = request.path.trim_start_matches("/api/jobs/");
             job_response(id, &state)
@@ -836,6 +839,66 @@ fn fires_response(state: &AppState) -> Vec<u8> {
             }
             json_status_response(502, &serde_json::json!({ "error": message }))
         }
+    }
+}
+
+/// GET /api/daily?lat&lon&var=temperature_2m[&model][&run][&title][&utc_offset]
+/// — the shareable daily HI/LO outlook card (weathermodels-style) for any
+/// stored variable, one column per local calendar day.
+fn daily_response(query: &str, state: &AppState) -> Vec<u8> {
+    let query = parse_query(query);
+    let bad = |message: &str| json_status_response(400, &serde_json::json!({ "error": message }));
+    let Some(lat) = query.get("lat").and_then(|v| v.parse::<f64>().ok()) else {
+        return bad("lat is required");
+    };
+    let Some(lon) = query.get("lon").and_then(|v| v.parse::<f64>().ok()) else {
+        return bad("lon is required");
+    };
+    let Some(var) = query.get("var").cloned().filter(|v| {
+        !v.is_empty() && v.len() <= 48 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }) else {
+        return bad("var is required (see /api/vars)");
+    };
+    let model = query.get("model").map(String::as_str).unwrap_or("hrrr");
+    if model.len() > 24 || model.contains(['/', '\\', '.']) {
+        return bad("model slug is not valid");
+    }
+    let mut run = query.get("run").cloned().unwrap_or_else(|| "latest".to_string());
+    let alias = run.to_ascii_lowercase();
+    if alias == "latest" || alias == "latest-day" {
+        run = match resolve_latest_run(&state.store_root, model, alias == "latest-day") {
+            Ok(resolved) => resolved,
+            Err(message) => return json_status_response(422, &serde_json::json!({ "error": message })),
+        };
+    }
+    if run.len() > 40 || run.contains(['/', '\\', '.']) {
+        return bad("run slug is not valid");
+    }
+    let Some((date, cycle)) = run.split_once('_').and_then(|(date, cycle)| {
+        let hour: u8 = cycle.strip_suffix('z')?.parse().ok()?;
+        (date.len() == 8 && hour <= 23).then(|| (date.to_string(), hour))
+    }) else {
+        return bad("run must look like 20260702_00z");
+    };
+    let request = meteogram::DailyRequest {
+        lat,
+        lon,
+        var,
+        title: query.get("title").cloned().filter(|t| !t.trim().is_empty()),
+        utc_offset_hours: query
+            .get("utc_offset")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| (-14.0..=14.0).contains(v))
+            .unwrap_or(-7.0),
+    };
+    match meteogram::render_daily_svg(&state.store_root, model, &run, &date, cycle, &request) {
+        Ok(svg) => response_with_extra_headers(
+            200,
+            "image/svg+xml; charset=utf-8",
+            svg.into_bytes(),
+            "Cache-Control: no-store\r\n",
+        ),
+        Err(message) => json_status_response(422, &serde_json::json!({ "error": message })),
     }
 }
 
