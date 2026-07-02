@@ -124,6 +124,13 @@ all), `title=Sacramento`, `utc_offset=-7` (local-time axis row),
 `format=json` (raw sampled series + units instead of SVG).
 Errors: 400/422 JSON `{"error": ...}`.
 
+**Chart anything:** `&vars=composite_reflectivity,pwat,erc` (up to 8)
+replaces the curated panels with one auto-scaled panel per stored
+variable — any of the ~100 variables in the store works. Discover them
+via `GET {BASE}/api/vars[?model=hrrr][&run=latest]` →
+`{"vars": [{"name": "...", "units": "..."}]}`. These chart URLs are
+stable and shareable — embed or link them directly.
+
 ## 5. Domain presets used by the reference console
 
 `cafire_california` `[-126.0,-113.8,31.9,42.5]` ·
