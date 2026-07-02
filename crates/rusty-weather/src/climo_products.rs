@@ -1384,8 +1384,8 @@ fn render_rank_map(
         String::new()
     };
     let climo_label = match baseline {
-        Baseline::Seasonal => format!("+/-7d climo 19-26 | DOY {doy}"),
-        Baseline::AllPeriod => "all days 19-26".to_string(),
+        Baseline::Seasonal => format!("+/-7d climo 2019-2026 | DOY {doy}"),
+        Baseline::AllPeriod => "all days 2019-2026".to_string(),
     };
     request.subtitle_right = Some(format!(
         "{climo_label}{n_label} | {}/{} h",
