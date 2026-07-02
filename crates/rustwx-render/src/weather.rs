@@ -685,8 +685,10 @@ impl WeatherPreset {
                 mask_below,
             },
             Self::Ecape => DiscreteColorScale {
+                // Same ramp family as CAPE (Drew: ECAPE maps should read
+                // like their CAPE siblings), scaled to the ECAPE range.
                 levels: range_step(0.0, 5000.1, 50.0),
-                colors: weather_palette(WeatherPalette::Ecape),
+                colors: weather_palette(WeatherPalette::Cape),
                 extend: ExtendMode::Max,
                 mask_below,
             },
@@ -791,9 +793,9 @@ impl WeatherPreset {
                 // pyroCb case lives in, coarser above (the colorbar is
                 // value-proportional, so pure log2 bins would collapse
                 // the dangerous end into one sliver). LOW PFT is the
-                // dangerous end: reversed palette puts hot colors on
-                // small values.
-                let mut colors = weather_palette(WeatherPalette::Ecape);
+                // dangerous end: reversed CAPE-family ramp puts hot
+                // colors on small values.
+                let mut colors = weather_palette(WeatherPalette::Cape);
                 colors.reverse();
                 DiscreteColorScale {
                     levels: concat_ranges(&[(0.0, 500.0, 25.0), (500.0, 2049.0, 100.0)]),
@@ -1413,8 +1415,15 @@ mod tests {
 
     #[test]
     fn renderer_weather_presets_do_not_borrow_generic_severe_palettes() {
+        // ECAPE deliberately SHARES the CAPE ramp (2026-07-02, Drew:
+        // ECAPE maps should read like their CAPE siblings) — it is
+        // exempt from the borrow guard below.
+        assert_eq!(
+            WeatherPreset::Ecape.scale().colors,
+            weather_palette(WeatherPalette::Cape),
+            "Ecape intentionally shares the CAPE family ramp"
+        );
         for preset in [
-            WeatherPreset::Ecape,
             WeatherPreset::Cin,
             WeatherPreset::Ncape,
             WeatherPreset::Lcl,

@@ -561,7 +561,12 @@ async function loadRuns() {
     // its store is independent of the main server's (and can be ahead
     // or behind it).
     runsBase = apiBase();
-    const data = await fetch(runsBase + "/api/runs").then(r => r.json());
+    // Heavy store products exist only on hours ingested after their
+    // lane deployed — ask the API for the hours that actually carry the
+    // selected product so nothing in the ladder can error.
+    const probe = state.fam === "ecape" && state.product
+      ? `?var=${encodeURIComponent(state.product)}` : "";
+    const data = await fetch(runsBase + "/api/runs" + probe).then(r => r.json());
     latestManifest = data.latest || null;
     runsHours = data.hours || {};
     const select = $("runSelect");
@@ -653,7 +658,6 @@ function buildFams() {
 }
 function selectFam(key) {
   state.fam = key;
-  if (apiBase() !== runsBase) loadRuns();
   [...$("fams").children].forEach((b, i) => b.classList.toggle("on", Object.keys(FAMS)[i] === key));
   $("productBox").classList.toggle("show", FAMS[key].products.length > 0);
   $("climoBox").classList.toggle("show", key === "climoref");
@@ -666,11 +670,24 @@ function selectFam(key) {
   ribbon.classList.toggle("show", key in RIBBONS);
   if (key in RIBBONS) ribbon.innerHTML = RIBBONS[key];
   buildProducts();
-  if (key === "meteogram" || key === "custom" || key === "daily") { setMapMode("point"); renderCurrent(); }
-  else {
+  // Crossing the main-server/compute-node boundary needs a fresh run
+  // inventory (and, for the node family, a product-aware hour probe —
+  // so reload AFTER the family's product is set).
+  const needsRuns = apiBase() !== runsBase;
+  if (key === "meteogram" || key === "custom" || key === "daily") {
+    if (needsRuns) loadRuns();
+    setMapMode("point"); renderCurrent();
+  } else {
     if (mapMode === "point") setMapMode("view");
-    if (FAMS[key].products.length) { state.product = FAMS[key].products[0][0]; markProduct(); renderCurrent(); }
-    else if (key === "climoref") renderCurrent();
+    if (FAMS[key].products.length) {
+      state.product = FAMS[key].products[0][0]; markProduct();
+      if (needsRuns) { loadRuns().then(renderCurrent); } else { renderCurrent(); }
+    } else if (key === "climoref") {
+      if (needsRuns) loadRuns();
+      renderCurrent();
+    } else if (needsRuns) {
+      loadRuns();
+    }
   }
   updateHourNav();
 }
@@ -682,7 +699,11 @@ function buildProducts() {
     b.className = "product-item" + (slug === state.product ? " on" : "");
     b.dataset.slug = slug;
     b.innerHTML = `<span>${name}</span>`;
-    b.onclick = () => { state.product = slug; markProduct(); renderCurrent(); };
+    b.onclick = () => {
+      state.product = slug; markProduct();
+      // Node-family products differ in which hours carry them: re-probe.
+      if (state.fam === "ecape") { loadRuns().then(renderCurrent); } else { renderCurrent(); }
+    };
     list.appendChild(b);
   });
   const stats = $("statList");

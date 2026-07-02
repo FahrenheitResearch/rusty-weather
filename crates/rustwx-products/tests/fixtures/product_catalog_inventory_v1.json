@@ -6,10 +6,10 @@
     "derived_entries": 53,
     "heavy_entries": 1,
     "windowed_entries": 49,
-    "supported_entries": 96,
+    "supported_entries": 100,
     "partial_entries": 225,
     "blocked_entries": 4,
-    "experimental_entries": 11,
+    "experimental_entries": 15,
     "proof_entries": 1,
     "proxy_entries": 2
   },

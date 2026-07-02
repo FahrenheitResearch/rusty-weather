@@ -129,6 +129,28 @@ fn sample_listed_palette(palette: &[Rgba], t: f64) -> Rgba {
     palette[idx.min(palette.len() - 1)]
 }
 
+/// Gradient sample for palettes with FEWER stops than fill bins:
+/// interpolate between adjacent stops instead of snapping to the
+/// nearest one (nearest-snap posterizes a 12-stop ramp stretched over
+/// 100 bins into a handful of hard-edged bands).
+fn sample_stretched_palette(palette: &[Rgba], t: f64) -> Rgba {
+    if palette.is_empty() {
+        return Rgba::TRANSPARENT;
+    }
+    if palette.len() == 1 || !t.is_finite() || t <= 0.0 {
+        return palette[0];
+    }
+    if t >= 1.0 {
+        return palette[palette.len() - 1];
+    }
+    let pos = t * (palette.len() - 1) as f64;
+    let lo = (pos.floor() as usize).min(palette.len() - 2);
+    let f = pos - lo as f64;
+    let (a, b) = (palette[lo], palette[lo + 1]);
+    let mix = |x: u8, y: u8| (x as f64 + f * (y as f64 - x as f64)).round().clamp(0.0, 255.0) as u8;
+    Rgba::with_alpha(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b), mix(a.a, b.a))
+}
+
 fn sample_palette_for_levels(palette: &[Rgba], levels: &[f64]) -> Vec<Rgba> {
     if palette.is_empty() || levels.len() < 2 {
         return vec![];
@@ -137,6 +159,10 @@ fn sample_palette_for_levels(palette: &[Rgba], levels: &[f64]) -> Vec<Rgba> {
     let min_level = levels[0];
     let max_level = levels[levels.len() - 1];
     let level_span = max_level - min_level;
+    // Palettes designed bin-for-bin (>= one stop per bin, e.g. the
+    // percentile scales) keep their exact listed colors; smaller
+    // palettes are being stretched and get smooth in-betweens.
+    let stretched = palette.len() < levels.len() - 1;
 
     levels[..levels.len() - 1]
         .iter()
@@ -146,7 +172,11 @@ fn sample_palette_for_levels(palette: &[Rgba], levels: &[f64]) -> Vec<Rgba> {
             } else {
                 (*level - min_level) / level_span
             };
-            sample_listed_palette(palette, t)
+            if stretched {
+                sample_stretched_palette(palette, t)
+            } else {
+                sample_listed_palette(palette, t)
+            }
         })
         .collect()
 }

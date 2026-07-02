@@ -1019,6 +1019,18 @@ fn runs_response(query: &str, state: &AppState) -> Vec<u8> {
     runs.reverse();
     // Per-run stored hours so clients can build honest hour ladders for
     // EXPLICIT run picks (the latest manifest only covers the alias).
+    // Optional ?var=<store variable> narrows each list to hours whose
+    // file actually carries that variable — so a client can offer only
+    // renderable hours for store-grid products (e.g. PFT exists only on
+    // hours ingested after its lane deployed).
+    let want_var = query
+        .get("var")
+        .map(String::as_str)
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= 64
+                && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        });
     let mut hours_by_run = serde_json::Map::new();
     for run in &runs {
         let mut hours: Vec<u16> = std::fs::read_dir(model_dir.join(run))
@@ -1027,7 +1039,13 @@ fn runs_response(query: &str, state: &AppState) -> Vec<u8> {
             .filter_map(|entry| entry.ok())
             .filter_map(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                name.strip_prefix('f')?.strip_suffix(".rws")?.parse::<u16>().ok()
+                let hour = name.strip_prefix('f')?.strip_suffix(".rws")?.parse::<u16>().ok()?;
+                if let Some(var) = want_var {
+                    let reader =
+                        rw_store::reader::HourReader::open(&entry.path()).ok()?;
+                    reader.variable(var)?;
+                }
+                Some(hour)
             })
             .collect();
         hours.sort_unstable();
