@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CAFire Weather Ops — Fire Weather Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #14110e;
+    --bg-deep: #0e0c09;
+    --panel: #1d1915;
+    --panel-2: #241f19;
+    --line: #342c22;
+    --line-soft: #2a231b;
+    --text: #ece3d3;
+    --muted: #97897a;
+    --faint: #6a5f52;
+    --fire: #ff6a2b;
+    --fire-deep: #d84e15;
+    --amber: #ffb52e;
+    --ok: #8fc966;
+    --danger: #e5484d;
+    --mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+    --sans: "IBM Plex Sans", system-ui, sans-serif;
+    --disp: "Barlow Condensed", "Arial Narrow", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background:
+      radial-gradient(1200px 500px at 85% -10%, rgba(255,106,43,0.07), transparent 60%),
+      repeating-linear-gradient(115deg, transparent 0 34px, rgba(255,255,255,0.012) 34px 35px),
+      var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+
+  /* ---------- top system bar ---------- */
+  header {
+    display: flex; align-items: center; gap: 18px;
+    padding: 0 18px; height: 54px;
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border-bottom: 1px solid var(--line);
+    box-shadow: 0 1px 0 rgba(0,0,0,0.5);
+    position: sticky; top: 0; z-index: 40;
+  }
+  header::after {
+    content: ""; position: absolute; left: 0; right: 0; top: 54px; height: 2px;
+    background: linear-gradient(90deg, var(--fire) 0%, var(--amber) 30%, transparent 75%);
+    opacity: 0.85; pointer-events: none;
+  }
+  .wordmark { display: flex; align-items: baseline; gap: 8px; }
+  .wordmark .flame { color: var(--fire); font-size: 20px; transform: translateY(1px); }
+  .wordmark b {
+    font-family: var(--disp); font-weight: 700; font-size: 26px; letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .wordmark span { font-family: var(--disp); font-weight: 500; font-size: 18px; color: var(--muted); letter-spacing: 0.14em; text-transform: uppercase; }
+  .sysread { margin-left: auto; display: flex; gap: 22px; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+  .sysread b { color: var(--text); font-weight: 500; }
+  .sysread .dot { color: var(--ok); }
+  .sysread .dot.bad { color: var(--danger); }
+
+  /* ---------- shell ---------- */
+  main { display: grid; grid-template-columns: 318px 1fr; min-height: calc(100vh - 56px); }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+
+  /* ---------- control rail ---------- */
+  #rail {
+    border-right: 1px solid var(--line);
+    background: linear-gradient(180deg, var(--panel) 0%, var(--bg-deep) 100%);
+    padding: 16px 14px 40px;
+  }
+  .blocklabel {
+    font-family: var(--disp); font-weight: 600; font-size: 15px; letter-spacing: 0.18em;
+    text-transform: uppercase; color: var(--faint);
+    display: flex; align-items: center; gap: 8px; margin: 20px 2px 8px;
+  }
+  .blocklabel::after { content: ""; flex: 1; height: 1px; background: var(--line-soft); }
+  .blocklabel:first-child { margin-top: 2px; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-family: var(--disp); font-weight: 600; font-size: 15px; letter-spacing: 0.05em;
+    text-transform: uppercase;
+    padding: 6px 11px 5px; border: 1px solid var(--line); border-radius: 3px;
+    background: var(--panel-2); color: var(--muted); cursor: pointer;
+    transition: border-color .15s, color .15s, box-shadow .15s;
+  }
+  .chip:hover { border-color: var(--fire-deep); color: var(--text); }
+  .chip.on {
+    border-color: var(--fire); color: var(--text);
+    box-shadow: inset 0 0 0 1px var(--fire), 0 0 14px rgba(255,106,43,0.18);
+    background: linear-gradient(180deg, rgba(255,106,43,0.14), rgba(255,106,43,0.05));
+  }
+
+  .fam { display: grid; gap: 6px; }
+  .fam .chip { display: flex; justify-content: space-between; align-items: baseline; padding: 8px 11px 7px; }
+  .fam .chip small { font-family: var(--mono); font-size: 10px; letter-spacing: 0; text-transform: none; color: var(--faint); }
+  .fam .chip.on small { color: var(--amber); }
+
+  .hours { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+  .hourbtn {
+    font-family: var(--mono); font-size: 11.5px; padding: 6px 0; text-align: center;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 3px;
+    color: var(--muted); cursor: pointer;
+  }
+  .hourbtn:hover { color: var(--text); border-color: var(--fire-deep); }
+  .hourbtn.on { color: var(--bg-deep); background: var(--amber); border-color: var(--amber); font-weight: 500; }
+
+  .kv { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .kv label { display: grid; gap: 3px; font-family: var(--mono); font-size: 10px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.08em; }
+  .kv input, .kv select, #perimBox textarea {
+    font-family: var(--mono); font-size: 12.5px; color: var(--text);
+    background: var(--bg-deep); border: 1px solid var(--line); border-radius: 3px; padding: 7px 8px;
+  }
+  .kv input:focus, .kv select:focus { outline: 1px solid var(--fire-deep); }
+
+  #drawWrap { margin-top: 8px; display: none; }
+  #drawWrap.show { display: block; }
+  #sketch { width: 100%; aspect-ratio: 1.42; background: var(--bg-deep); border: 1px solid var(--line); border-radius: 3px; touch-action: none; cursor: crosshair; }
+  .sketchnote { font-family: var(--mono); font-size: 10px; color: var(--faint); margin-top: 4px; }
+
+  #perimBox { margin-top: 8px; display: none; }
+  #perimBox.show { display: block; }
+  #perimBox textarea { width: 100%; height: 64px; resize: vertical; }
+  .padrow { display: flex; gap: 6px; margin-top: 6px; }
+  .padrow .chip { flex: 1; text-align: center; }
+
+  #renderBtn {
+    margin-top: 18px; width: 100%; padding: 13px 0 11px;
+    font-family: var(--disp); font-weight: 700; font-size: 21px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: #fff; background: linear-gradient(180deg, var(--fire), var(--fire-deep));
+    border: 0; border-radius: 4px; cursor: pointer;
+    box-shadow: 0 2px 14px rgba(255,106,43,0.35), inset 0 1px 0 rgba(255,255,255,0.25);
+    transition: filter .15s, transform .05s;
+  }
+  #renderBtn:hover { filter: brightness(1.08); }
+  #renderBtn:active { transform: translateY(1px); }
+  #renderBtn:disabled { filter: grayscale(0.7) brightness(0.7); cursor: wait; }
+
+  #console {
+    margin-top: 14px; background: var(--bg-deep); border: 1px solid var(--line-soft); border-radius: 3px;
+    font-family: var(--mono); font-size: 11px; line-height: 1.55; color: var(--muted);
+    padding: 9px 10px; height: 128px; overflow-y: auto; white-space: pre-wrap;
+  }
+  #console .t { color: var(--faint); }
+  #console .ok { color: var(--ok); }
+  #console .warn { color: var(--amber); }
+  #console .err { color: var(--danger); }
+
+  /* ---------- stage ---------- */
+  #stage { padding: 18px 22px 60px; min-width: 0; }
+  #contextbar { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 4px; }
+  #contextbar h1 { font-family: var(--disp); font-weight: 700; font-size: 34px; letter-spacing: 0.03em; text-transform: uppercase; margin: 0; }
+  #contextbar .prov { font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+  #anomalyRibbon {
+    display: none; margin: 10px 0 14px; padding: 10px 14px;
+    border: 1px solid rgba(255,181,46,0.4); border-left: 4px solid var(--amber); border-radius: 3px;
+    background: linear-gradient(90deg, rgba(255,181,46,0.10), transparent 70%);
+    font-size: 13px;
+  }
+  #anomalyRibbon b { color: var(--amber); font-family: var(--disp); font-size: 16px; letter-spacing: 0.08em; text-transform: uppercase; }
+  #anomalyRibbon .mono { font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+  #anomalyRibbon.show { display: block; }
+
+  #gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(430px, 1fr)); gap: 16px; margin-top: 12px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 4px; overflow: hidden;
+    opacity: 0; transform: translateY(10px); animation: rise .45s cubic-bezier(.2,.7,.3,1) forwards;
+  }
+  @keyframes rise { to { opacity: 1; transform: none; } }
+  .card img { display: block; width: 100%; cursor: zoom-in; background: #fff; }
+  .card .cap {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 8px 11px; border-top: 1px solid var(--line-soft);
+  }
+  .card .cap b { font-family: var(--disp); font-weight: 600; font-size: 16px; letter-spacing: 0.06em; text-transform: uppercase; }
+  .card .cap span { font-family: var(--mono); font-size: 10.5px; color: var(--faint); }
+  #empty {
+    margin-top: 60px; text-align: center; color: var(--faint);
+  }
+  #empty .glyph { font-size: 44px; color: var(--fire-deep); opacity: 0.6; }
+  #empty p { font-family: var(--disp); font-size: 20px; letter-spacing: 0.1em; text-transform: uppercase; }
+
+  /* ---------- lightbox ---------- */
+  #box {
+    position: fixed; inset: 0; z-index: 90; display: none;
+    background: rgba(10,8,6,0.93); backdrop-filter: blur(3px);
+  }
+  #box.show { display: block; }
+  #boxImg { position: absolute; transform-origin: 0 0; cursor: grab; user-select: none; background: #fff; box-shadow: 0 8px 60px rgba(0,0,0,0.8); }
+  #boxImg.grabbing { cursor: grabbing; }
+  #boxBar {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 92;
+    display: flex; gap: 18px; align-items: center; justify-content: center;
+    padding: 12px; font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+    background: linear-gradient(0deg, rgba(10,8,6,0.9), transparent);
+  }
+  #boxBar b { color: var(--text); }
+  .boxbtn { font-family: var(--mono); background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 3px; padding: 4px 12px; cursor: pointer; }
+  .boxbtn:hover { border-color: var(--fire); }
+</style>
+</head>
+<body>
+<header>
+  <div class="wordmark"><span class="flame">▲</span><b>CAFire</b><span>Weather Ops</span></div>
+  <div class="sysread">
+    <div><span class="dot" id="sysDot">●</span> <b id="sysState">CONNECTING</b></div>
+    <div>QUEUE <b id="sysQueue">-</b></div>
+    <div>CACHE <b id="sysCache">-</b></div>
+    <div>RENDER SLOTS <b id="sysSlots">-</b></div>
+  </div>
+</header>
+<main>
+  <aside id="rail">
+    <div class="blocklabel">Domain</div>
+    <div class="chips" id="domains">
+      <button class="chip on" data-dom="california">California</button>
+      <button class="chip" data-dom="wide_west">Wide West</button>
+      <button class="chip" data-dom="sierra">Sierra Front</button>
+      <button class="chip" data-dom="draw">Draw Box</button>
+      <button class="chip" data-dom="perimeter">Fire Perimeter</button>
+    </div>
+    <div id="drawWrap"><canvas id="sketch" width="880" height="620"></canvas>
+      <div class="sketchnote" id="drawNote">drag to draw · W/E/S/N appears here</div>
+    </div>
+    <div id="perimBox">
+      <textarea id="perimText" spellcheck="false">[[-121.7,39.6],[-121.4,39.7],[-121.3,39.4],[-121.6,39.3]]</textarea>
+      <div class="padrow">
+        <button class="chip on" data-pad="25">25 km</button>
+        <button class="chip" data-pad="50">50 km</button>
+        <button class="chip" data-pad="100">100 km</button>
+      </div>
+      <div class="kv" style="margin-top:6px">
+        <label>extend bearing° <input id="extDir" type="number" placeholder="none" min="0" max="360"></label>
+        <label>extend km <input id="extKm" type="number" placeholder="0" min="0" max="500"></label>
+      </div>
+    </div>
+
+    <div class="blocklabel">Products</div>
+    <div class="fam" id="fams">
+      <button class="chip on" data-fam="anomaly">Anomaly vs Climo <small>RTMA ±7d 2019–26</small></button>
+      <button class="chip" data-fam="core">Fire Weather Core <small>VPD·HDW·wind·RH</small></button>
+      <button class="chip" data-fam="fuels">Fuels <small>gridMET·NFDRS</small></button>
+      <button class="chip" data-fam="smoke">Smoke <small>HRRR-Smoke</small></button>
+      <button class="chip" data-fam="window">Day Windows <small>24 h max/min</small></button>
+    </div>
+
+    <div class="blocklabel">Valid Hour</div>
+    <div class="hours" id="hours"></div>
+
+    <div class="blocklabel">Run</div>
+    <div class="kv">
+      <label>model run <input id="run" value="20260701_00z"></label>
+      <label>basemap
+        <select id="basemap"><option value="topo" selected>topo</option><option value="filled">filled</option><option value="white">white</option></select>
+      </label>
+      <label>towns
+        <select id="density"><option value="2">regional</option><option value="3" selected>dense</option><option value="4">max</option></select>
+      </label>
+      <label>counties
+        <select id="counties"><option value="true" selected>on</option><option value="false">off</option></select>
+      </label>
+    </div>
+
+    <button id="renderBtn">Render</button>
+    <div id="console"></div>
+  </aside>
+
+  <section id="stage">
+    <div id="contextbar">
+      <h1 id="stageTitle">Anomaly vs Climatology</h1>
+      <span class="prov" id="stageProv"></span>
+    </div>
+    <div id="anomalyRibbon">
+      <b>Percentile vs this date</b> — ranked against the RTMA 2.5 km ±7-day day-of-year climatology,
+      2019–2026, <span class="mono">n≈105 samples/cell · p05–p99 anchors · Feb 29 folded</span>.
+      Reading: <span class="mono">99 = at/beyond the most extreme observed for this calendar window</span>.
+    </div>
+    <div id="gallery"></div>
+    <div id="empty">
+      <div class="glyph">▲▲▲</div>
+      <p>Select domain &amp; products, then render</p>
+    </div>
+  </section>
+</main>
+
+<div id="box">
+  <img id="boxImg" alt="">
+  <div id="boxBar">
+    <b id="boxName"></b>
+    <span>wheel zoom · drag pan · dbl-click reset · ←/→ cycle · esc close</span>
+    <button class="boxbtn" id="boxPrev">←</button>
+    <button class="boxbtn" id="boxNext">→</button>
+    <button class="boxbtn" id="boxClose">✕</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const DOMAINS = {
+  california: { slug: "cafire_california", bounds: [-126.0, -113.8, 31.9, 42.5], label: "California" },
+  wide_west:  { slug: "cafire_wide_west",  bounds: [-125.7, -103.8, 31.9, 46.5], label: "Wide West" },
+  sierra:     { slug: "sierra_front",      bounds: [-121.9, -117.6, 37.2, 41.2], label: "Sierra Front" },
+};
+const FAMS = {
+  anomaly: { title: "Anomaly vs Climatology", products: "cafire-anomaly" },
+  core:    { title: "Fire Weather Core", products: "vpd_2m,hdw,fire_weather_composite,10m_wind_gusts,2m_relative_humidity_10m_winds" },
+  fuels:   { title: "Fuels", products: "erc,kbdi,dead_fuel_moisture_10h,vpd_fuel_receptive,fire_potential_composite" },
+  smoke:   { title: "Smoke", products: "smoke_pm25_native,smoke_column,visibility" },
+  window:  { title: "Day Windows", products: "2m_vpd_0_24h_max,2m_rh_0_24h_min,10m_wind_0_24h_max,qpf_24h" },
+};
+let state = { dom: "california", fam: "anomaly", hour: 12, pad: 25, drawn: null };
+
+/* ---- hour strip ---- */
+const hourWrap = $("hours");
+[0,3,6,9,12,15,18,21,24,30,36,42,48,1,2].slice(0,14).forEach(h => {
+  const b = document.createElement("button");
+  b.className = "hourbtn" + (h === state.hour ? " on" : "");
+  b.textContent = "F" + String(h).padStart(2, "0");
+  b.onclick = () => { state.hour = h; [...hourWrap.children].forEach(x => x.classList.remove("on")); b.classList.add("on"); };
+  hourWrap.appendChild(b);
+});
+
+/* ---- chip groups ---- */
+function wireChips(wrapId, attr, fn) {
+  $(wrapId).addEventListener("click", ev => {
+    const chip = ev.target.closest(".chip"); if (!chip) return;
+    [...$(wrapId).querySelectorAll(".chip")].forEach(c => c.classList.remove("on"));
+    chip.classList.add("on"); fn(chip.dataset[attr]);
+  });
+}
+wireChips("domains", "dom", v => {
+  state.dom = v;
+  $("drawWrap").classList.toggle("show", v === "draw");
+  $("perimBox").classList.toggle("show", v === "perimeter");
+  if (v === "draw") drawSketch();
+});
+wireChips("fams", "fam", v => {
+  state.fam = v;
+  $("stageTitle").textContent = FAMS[v].title;
+  $("anomalyRibbon").classList.toggle("show", v === "anomaly");
+});
+$("anomalyRibbon").classList.add("show");
+$("perimBox").addEventListener("click", ev => {
+  const chip = ev.target.closest(".chip[data-pad]"); if (!chip) return;
+  [...$("perimBox").querySelectorAll(".chip[data-pad]")].forEach(c => c.classList.remove("on"));
+  chip.classList.add("on"); state.pad = Number(chip.dataset.pad);
+});
+
+/* ---- draw-a-box sketch ---- */
+const sk = $("sketch"), skx = sk.getContext("2d");
+const world = { west: -126.5, east: -103.5, south: 31.0, north: 47.0 };
+const X = lon => (lon - world.west) / (world.east - world.west) * sk.width;
+const Y = lat => (world.north - lat) / (world.north - world.south) * sk.height;
+const LON = x => world.west + x / sk.width * (world.east - world.west);
+const LAT = y => world.north - y / sk.height * (world.north - world.south);
+function drawSketch() {
+  skx.clearRect(0, 0, sk.width, sk.height);
+  skx.strokeStyle = "#2a231b"; skx.lineWidth = 1;
+  for (let lon = -126; lon <= -104; lon += 2) { skx.beginPath(); skx.moveTo(X(lon), 0); skx.lineTo(X(lon), sk.height); skx.stroke(); }
+  for (let lat = 32; lat <= 46; lat += 2) { skx.beginPath(); skx.moveTo(0, Y(lat)); skx.lineTo(sk.width, Y(lat)); skx.stroke(); }
+  skx.strokeStyle = "#6a5f52"; skx.lineWidth = 2;
+  [[[-124.4,42],[-123.7,40.5],[-122.7,38.8],[-122.4,37.8],[-121.9,36.7],[-121.2,35.6],[-120.4,34.6],[-118.6,34.0],[-117.1,32.7]],
+   [[-120.0,42.0],[-119.8,40],[-119.9,38.5],[-119.5,36.8],[-118.5,35.2],[-117.3,34.2],[-114.7,32.7]]].forEach(line => {
+    skx.beginPath(); line.forEach(([lo,la],i) => i ? skx.lineTo(X(lo),Y(la)) : skx.moveTo(X(lo),Y(la))); skx.stroke();
+  });
+  if (state.drawn) {
+    const [w,e,s,n] = state.drawn;
+    skx.fillStyle = "rgba(255,106,43,0.15)"; skx.strokeStyle = "#ff6a2b"; skx.lineWidth = 2;
+    skx.fillRect(X(w), Y(n), X(e)-X(w), Y(s)-Y(n)); skx.strokeRect(X(w), Y(n), X(e)-X(w), Y(s)-Y(n));
+  }
+}
+let dragA = null;
+sk.addEventListener("pointerdown", ev => { const r = sk.getBoundingClientRect(); dragA = [(ev.clientX-r.left)*sk.width/r.width, (ev.clientY-r.top)*sk.height/r.height]; sk.setPointerCapture(ev.pointerId); });
+sk.addEventListener("pointermove", ev => {
+  if (!dragA) return;
+  const r = sk.getBoundingClientRect();
+  const bx = (ev.clientX-r.left)*sk.width/r.width, by = (ev.clientY-r.top)*sk.height/r.height;
+  state.drawn = [Math.min(LON(dragA[0]),LON(bx)), Math.max(LON(dragA[0]),LON(bx)), Math.min(LAT(dragA[1]),LAT(by)), Math.max(LAT(dragA[1]),LAT(by))];
+  $("drawNote").textContent = state.drawn.map(v => v.toFixed(2)).join(" / ");
+  drawSketch();
+});
+sk.addEventListener("pointerup", () => dragA = null);
+
+/* ---- console ---- */
+function log(line, cls) {
+  const el = $("console");
+  const t = new Date().toISOString().slice(11, 19);
+  el.insertAdjacentHTML("beforeend", `<div><span class="t">${t}</span> <span class="${cls||""}">${line}</span></div>`);
+  el.scrollTop = el.scrollHeight;
+}
+
+/* ---- health poll ---- */
+async function health() {
+  try {
+    const h = await fetch("/api/health").then(r => r.json());
+    $("sysDot").classList.remove("bad"); $("sysState").textContent = "ONLINE";
+    $("sysQueue").textContent = `${h.render_gate.active} run / ${h.render_gate.waiting} wait`;
+    $("sysCache").textContent = h.render_cache_entries;
+    $("sysSlots").textContent = h.render_gate.max_active;
+  } catch {
+    $("sysDot").classList.add("bad"); $("sysState").textContent = "OFFLINE";
+  }
+}
+health(); setInterval(health, 5000);
+
+/* ---- render flow ---- */
+$("renderBtn").onclick = async () => {
+  const btn = $("renderBtn"); btn.disabled = true; btn.textContent = "Rendering…";
+  try {
+    const payload = {
+      run: $("run").value.trim(),
+      hour: state.hour,
+      products: FAMS[state.fam].products,
+      output_format: "webp",
+      plot_style: "operational-fast",
+      basemap_style: $("basemap").value,
+      county_linework: $("counties").value === "true",
+      place_label_density: Number($("density").value),
+      place_label_size: 1,
+      output_width: 1600,
+    };
+    if (state.dom === "draw") {
+      if (!state.drawn) throw new Error("draw a box first");
+      payload.domain_slug = "drawn_box"; payload.bounds = state.drawn;
+    } else if (state.dom === "perimeter") {
+      payload.domain_slug = "incident"; payload.perimeter = JSON.parse($("perimText").value);
+      payload.padding_km = state.pad;
+      const dir = Number($("extDir").value), km = Number($("extKm").value);
+      if (km > 0 && Number.isFinite(dir)) payload.extend = { direction_deg: dir, distance_km: km };
+    } else {
+      const d = DOMAINS[state.dom]; payload.domain_slug = d.slug; payload.bounds = d.bounds;
+    }
+    log(`submit ${state.fam} · ${payload.domain_slug} · F${String(state.hour).padStart(2,"0")}`);
+    const started = await fetch("/api/render", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }).then(r => r.json());
+    if (started.error) throw new Error(started.error);
+    log(`job ${started.id} (${started.cache})`, started.cache === "hit" ? "ok" : "");
+    const t0 = performance.now();
+    let job;
+    for (;;) {
+      job = await fetch(started.status_url).then(r => r.json());
+      if (job.state === "succeeded" || job.state === "failed") break;
+      await new Promise(r => setTimeout(r, 700));
+    }
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    if (job.state === "failed") { log(`failed: ${job.message}`, "err"); if (job.stderr_tail) log(job.stderr_tail.split("\n").slice(-3).join(" · "), "err"); }
+    else log(`done · ${job.files.length} plot(s) · ${secs}s`, "ok");
+    $("stageProv").textContent = `${payload.run} · ${payload.domain_slug} · rendered in ${secs}s`;
+    showFiles(job.files || []);
+  } catch (err) { log(String(err.message || err), "err"); }
+  finally { btn.disabled = false; btn.textContent = "Render"; }
+};
+
+let shots = [];
+function showFiles(files) {
+  const g = $("gallery"); g.innerHTML = ""; shots = files;
+  $("empty").style.display = files.length ? "none" : "";
+  files.forEach((f, i) => {
+    const name = f.name.replace(/^rustwx_[^_]*_\d+_\d+z_f\d+_[a-z0-9_]+?_/, "").replace(/\.(webp|png)$/, "");
+    const card = document.createElement("div");
+    card.className = "card"; card.style.animationDelay = (i * 70) + "ms";
+    card.innerHTML = `<img src="${f.url}" loading="lazy" alt="${name}"><div class="cap"><b>${name.replace(/_/g," ")}</b><span>${(f.bytes/1024|0)} KB</span></div>`;
+    card.querySelector("img").onclick = () => openBox(i);
+    g.appendChild(card);
+  });
+}
+
+/* ---- lightbox with pan/zoom ---- */
+let boxIndex = 0, view = { s: 1, x: 0, y: 0 };
+const box = $("box"), boxImg = $("boxImg");
+function openBox(index) {
+  boxIndex = index;
+  const f = shots[index];
+  boxImg.src = f.url; $("boxName").textContent = f.name;
+  box.classList.add("show");
+  boxImg.onload = fitBox;
+}
+function fitBox() {
+  const iw = boxImg.naturalWidth, ih = boxImg.naturalHeight;
+  const s = Math.min(innerWidth / iw, (innerHeight - 60) / ih) * 0.96;
+  view = { s, x: (innerWidth - iw * s) / 2, y: (innerHeight - 60 - ih * s) / 2 };
+  applyView();
+}
+function applyView() { boxImg.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.s})`; }
+box.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  const factor = ev.deltaY < 0 ? 1.18 : 1 / 1.18;
+  const ns = Math.min(Math.max(view.s * factor, 0.05), 12);
+  view.x = ev.clientX - (ev.clientX - view.x) * (ns / view.s);
+  view.y = ev.clientY - (ev.clientY - view.y) * (ns / view.s);
+  view.s = ns; applyView();
+}, { passive: false });
+let panA = null;
+boxImg.addEventListener("pointerdown", ev => { ev.preventDefault(); panA = [ev.clientX - view.x, ev.clientY - view.y]; boxImg.classList.add("grabbing"); boxImg.setPointerCapture(ev.pointerId); });
+boxImg.addEventListener("pointermove", ev => { if (!panA) return; view.x = ev.clientX - panA[0]; view.y = ev.clientY - panA[1]; applyView(); });
+boxImg.addEventListener("pointerup", () => { panA = null; boxImg.classList.remove("grabbing"); });
+boxImg.addEventListener("dblclick", fitBox);
+function cycle(direction) { if (!shots.length) return; boxIndex = (boxIndex + direction + shots.length) % shots.length; openBox(boxIndex); }
+$("boxPrev").onclick = () => cycle(-1);
+$("boxNext").onclick = () => cycle(1);
+$("boxClose").onclick = () => box.classList.remove("show");
+addEventListener("keydown", ev => {
+  if (!box.classList.contains("show")) return;
+  if (ev.key === "Escape") box.classList.remove("show");
+  if (ev.key === "ArrowLeft") cycle(-1);
+  if (ev.key === "ArrowRight") cycle(1);
+});
+
+log("CAFire Weather Ops console ready", "ok");
+log("flagship: Anomaly vs Climo — HRRR forecast ranked against 7 years of RTMA analyses");
+</script>
+</body>
+</html>
