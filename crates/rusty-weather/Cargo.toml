@@ -35,6 +35,10 @@ rw-sat = { path = "../rw-sat" }
 rw-store = { path = "../rw-store" }
 netcrust = { path = "../../vendor/netcrust" }
 ureq.workspace = true
+# rw_pipeline probes AWS idx URLs over HTTPS: same pure-Rust TLS stack as
+# rw-sat/rw-glm (no SDK, no credentials).
+rustls.workspace = true
+rustls-rustcrypto.workspace = true
 
 # Polite-mode priority drop (src/throttle.rs): windows-sys is already in
 # the tree transitively (clap's anstyle stack pulls 0.61), so this adds one

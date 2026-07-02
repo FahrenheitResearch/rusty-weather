@@ -133,12 +133,25 @@ Errors: 400/422 JSON `{"error": ...}`.
 `GET {BASE}/` serves a complete working console (single-file HTML/JS) that
 exercises every endpoint above — read its source for canonical usage.
 
-## 7. Stable vs. coming
+## 7. Run discovery
 
-**Stable now:** everything above — schemas, slugs, presets, file URL
-shape, cache semantics.
-**Coming with production:** the production base URL; a `latest` run alias
-plus a small "available runs" endpoint (until then, compute the likely
-run slug from the clock: HRRR cycle `HH` on `YYYYMMDD`, allow ~2 h
-ingest lag, fall back one cycle if the render job reports the run
-missing); automated hourly refresh (no client change).
+Pass `"run": "latest"` (render body) or `run=latest` (meteogram query) —
+the server resolves it to the newest ingested run via the refresh
+daemon's manifest. For explicit control:
+
+`GET {BASE}/api/runs[?model=hrrr]` → 200
+```json
+{ "model": "hrrr", "runs": ["20260702_04z", "20260701_00z"],
+  "latest": { "run": "20260702_04z", "stored_hours": [0,1,...],
+              "target_max_hour": 18, "complete": true, "updated_unix": 0 } }
+```
+`latest` is `null` until the daemon has published a manifest — fall back
+to `runs[0]`. A 422 from `run=latest` means the same thing.
+
+## 8. Stable vs. coming
+
+**Stable now:** everything above — schemas, slugs, presets, the `latest`
+alias, `/api/runs`, file URL shape, cache semantics.
+**Coming with production:** the production base URL (build against a
+config value); automated hourly refresh keeps `latest` fresh with no
+client change.

@@ -322,6 +322,9 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
         _ if request.method == "GET" && request.path.starts_with("/api/meteogram") => {
             meteogram_response(&request.query, &state)
         }
+        _ if request.method == "GET" && request.path.starts_with("/api/runs") => {
+            runs_response(&request.query, &state)
+        }
         _ if request.method == "GET" && request.path.starts_with("/api/jobs/") => {
             let id = request.path.trim_start_matches("/api/jobs/");
             job_response(id, &state)
@@ -337,10 +340,20 @@ fn start_render_job(body: Vec<u8>, state: AppState) -> Vec<u8> {
     let parsed = serde_json::from_slice::<RenderJobRequest>(&body)
         .map_err(|err| format!("invalid JSON body: {err}"))
         .and_then(validate_render_request);
-    let request = match parsed {
+    let mut request = match parsed {
         Ok(request) => request,
         Err(message) => return json_status_response(400, &serde_json::json!({ "error": message })),
     };
+    // Resolve `latest` BEFORE the cache key: alias entries must never
+    // outlive the run they pointed at.
+    if request.run.trim().eq_ignore_ascii_case("latest") {
+        request.run = match resolve_latest_run(&state.store_root, &request.model) {
+            Ok(run) => run,
+            Err(message) => {
+                return json_status_response(422, &serde_json::json!({ "error": message }));
+            }
+        };
+    }
 
     let id = next_job_id(&state);
     let cache_key = render_cache_key(&request);
@@ -692,6 +705,51 @@ fn update_job(state: &AppState, id: &str, f: impl FnOnce(&mut Job)) {
     }
 }
 
+/// GET /api/runs[?model=hrrr] — stored runs plus the daemon's latest manifest.
+fn runs_response(query: &str, state: &AppState) -> Vec<u8> {
+    let query = parse_query(query);
+    let model = query
+        .get("model")
+        .map(String::as_str)
+        .unwrap_or("hrrr")
+        .to_string();
+    if model.len() > 24 || model.contains(['/', '\\', '.']) {
+        return json_status_response(400, &serde_json::json!({ "error": "model slug is not valid" }));
+    }
+    let model_dir = state.store_root.join(&model);
+    let mut runs: Vec<String> = std::fs::read_dir(&model_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains('_') && name.ends_with('z'))
+        .collect();
+    runs.sort();
+    runs.reverse();
+    let latest: Option<serde_json::Value> = std::fs::read_to_string(model_dir.join("latest.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
+    json_response(&serde_json::json!({ "model": model, "runs": runs, "latest": latest }))
+}
+
+/// Resolve the `latest` run alias via the daemon's atomic manifest.
+fn resolve_latest_run(store_root: &Path, model: &str) -> Result<String, String> {
+    let path = store_root.join(model).join("latest.json");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|_| format!("no latest-run manifest for model '{model}' (daemon not running?)"))?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(&text).map_err(|err| format!("latest.json: {err}"))?;
+    let run = manifest
+        .get("run")
+        .and_then(|value| value.as_str())
+        .ok_or("latest.json has no run field")?;
+    if run.len() > 40 || run.contains(['/', '\\', '.']) {
+        return Err("latest.json run slug is not valid".to_string());
+    }
+    Ok(run.to_string())
+}
+
 fn validate_render_request(mut request: RenderJobRequest) -> Result<RenderJobRequest, String> {
     request.model = safe_model_slug(&request.model);
     request.output_format = request.output_format.trim().to_ascii_lowercase();
@@ -876,7 +934,7 @@ fn meteogram_response(path: &str, state: &AppState) -> Vec<u8> {
         return bad("lon is required");
     };
     let Some(run) = query.get("run").map(String::as_str) else {
-        return bad("run is required (e.g. 20260701_00z)");
+        return bad("run is required (e.g. 20260701_00z or latest)");
     };
     if run.len() > 40 || run.contains(['/', '\\', '.']) {
         return bad("run slug is not valid");
@@ -885,6 +943,18 @@ fn meteogram_response(path: &str, state: &AppState) -> Vec<u8> {
     if model.len() > 24 || model.contains(['/', '\\', '.']) {
         return bad("model slug is not valid");
     }
+    let resolved_run;
+    let run = if run.eq_ignore_ascii_case("latest") {
+        match resolve_latest_run(&state.store_root, model) {
+            Ok(resolved) => {
+                resolved_run = resolved;
+                resolved_run.as_str()
+            }
+            Err(message) => return json_status_response(422, &serde_json::json!({ "error": message })),
+        }
+    } else {
+        run
+    };
     let Some((date, cycle)) = run.split_once('_').and_then(|(date, cycle)| {
         let hour: u8 = cycle.strip_suffix('z').or_else(|| cycle.strip_suffix('Z'))?.parse().ok()?;
         (date.len() == 8 && date.chars().all(|c| c.is_ascii_digit()) && hour <= 23)
