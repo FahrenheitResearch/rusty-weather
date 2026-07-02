@@ -216,6 +216,13 @@ button { color: inherit; cursor: pointer; }
       <div class="product-list" id="statList"></div>
     </div>
 
+    <div class="side-box" id="customBox">
+      <span class="field-label">Variables (up to 8)</span>
+      <div class="product-list" id="varList" style="max-height:260px"></div>
+      <button class="tool-btn" id="customGo" style="align-self:start">↻ update chart</button>
+      <button class="tool-btn" id="shareBtn" style="align-self:start">🔗 copy share link</button>
+    </div>
+
     <div class="side-box" id="meteoBox">
       <div class="mini-grid">
         <label>lat <input id="mgLat" type="number" step="0.0001" value="38.5816"></label>
@@ -437,6 +444,7 @@ const FAMS = {
   ]},
   climoref: { label: "Climatology", hourly: false, products: [] },
   meteogram: { label: "Meteogram", hourly: false, products: [] },
+  custom: { label: "Custom Chart", hourly: false, products: [] },
 };
 const STATS = [
   ["p50", "P50 — typical day"], ["p75", "P75"], ["p90", "P90 — big day"],
@@ -451,6 +459,9 @@ const RIBBONS = {
   climoref: `<b>The normals themselves</b> — climatology grids in real units. Pick a product, date, and statistic.`,
   meteogram: `<b>Point meteogram</b> — every stored hour at one spot with night shading, local time, wind
     direction, fuels, and dashed “what's normal here today” climatology lines.`,
+  custom: `<b>Chart anything</b> — pick up to 8 of the ~95 variables in the store and get a time-series
+    chart for any point on the map. The URL <em>is</em> the share link: copy it and anyone sees the
+    same live chart.`,
 };
 let state = {
   fam: "anomaly", product: ANOMALY[0][0], hour: 6, density: 3,
@@ -543,12 +554,14 @@ function selectFam(key) {
   [...$("fams").children].forEach((b, i) => b.classList.toggle("on", Object.keys(FAMS)[i] === key));
   $("productBox").classList.toggle("show", FAMS[key].products.length > 0);
   $("climoBox").classList.toggle("show", key === "climoref");
-  $("meteoBox").classList.toggle("show", key === "meteogram");
+  $("meteoBox").classList.toggle("show", key === "meteogram" || key === "custom");
+  $("customBox").classList.toggle("show", key === "custom");
+  if (key === "custom" && !varsLoaded) loadVars();
   const ribbon = $("ribbon");
   ribbon.classList.toggle("show", key in RIBBONS);
   if (key in RIBBONS) ribbon.innerHTML = RIBBONS[key];
   buildProducts();
-  if (key === "meteogram") { setMapMode("point"); renderCurrent(); }
+  if (key === "meteogram" || key === "custom") { setMapMode("point"); renderCurrent(); }
   else {
     if (mapMode === "point") setMapMode("view");
     if (FAMS[key].products.length) { state.product = FAMS[key].products[0][0]; markProduct(); renderCurrent(); }
@@ -700,7 +713,7 @@ map.on("click", ev => {
   pointMarker = L.circleMarker([lat, lng], { radius: 7, color: "#ffd456", weight: 2, fillColor: "#ff5b24", fillOpacity: 0.9 }).addTo(map);
   $("mgLat").value = lat.toFixed(4); $("mgLon").value = lng.toFixed(4);
   $("mapReadout").textContent = `point: ${lat.toFixed(4)}, ${lng.toFixed(4)}`;
-  if (state.fam !== "meteogram") selectFam("meteogram");
+  if (state.fam !== "meteogram" && state.fam !== "custom") selectFam("meteogram");
   else renderCurrent();
 });
 showPreset("california");
@@ -768,6 +781,41 @@ function climoSlug() {
   return `climo_ref:${base}:${state.stat}:doy${doy}`;
 }
 
+/* ---------- custom chart: any stored variable ---------- */
+let varsLoaded = false;
+const defaultVars = new Set(["temperature_2m", "wind_gust_10m", "rh_2m"]);
+async function loadVars() {
+  try {
+    const data = await fetch("/api/vars?run=latest").then(r => r.json());
+    const list = $("varList");
+    list.innerHTML = "";
+    (data.vars || []).forEach(v => {
+      const item = document.createElement("label");
+      item.className = "product-item";
+      item.style.cursor = "pointer";
+      item.innerHTML = `<span style="display:flex;align-items:center;gap:7px"><input type="checkbox" value="${v.name}" ${defaultVars.has(v.name) ? "checked" : ""}> ${v.name.replace(/_/g, " ")}</span><small>${v.units}</small>`;
+      list.appendChild(item);
+    });
+    varsLoaded = true;
+  } catch { /* list stays empty */ }
+}
+function selectedVars() {
+  return [...$("varList").querySelectorAll("input:checked")].slice(0, 8).map(c => c.value);
+}
+$("customGo").onclick = () => renderCurrent();
+$("varList").addEventListener("change", () => {
+  const checked = $("varList").querySelectorAll("input:checked");
+  if (checked.length > 8) checked[checked.length - 1].checked = false;
+});
+let lastShareUrl = "";
+$("shareBtn").onclick = async () => {
+  if (!lastShareUrl) { log("render a chart first", "err"); return; }
+  try {
+    await navigator.clipboard.writeText(location.origin + lastShareUrl);
+    log("share link copied", "ok");
+  } catch { log(location.origin + lastShareUrl); }
+};
+
 /* ---------- the render core ---------- */
 const dayFams = new Set(["anomaly", "record", "climoref", "window"]);
 function currentRun() {
@@ -825,18 +873,28 @@ async function renderCurrent() {
   const seq = ++state.seq;
   const spin = $("spin");
   try {
-    if (state.fam === "meteogram") {
+    if (state.fam === "meteogram" || state.fam === "custom") {
       spin.classList.add("show"); $("spinText").textContent = "sampling point…";
       const lat = Number($("mgLat").value), lon = Number($("mgLon").value);
-      const panels = [...$("mgPanels").querySelectorAll("input:checked")].map(c => c.value).join(",");
       let run = $("runSelect").value; if (run === "latest") run = "latest-day";
       const title = `${lat.toFixed(3)}, ${lon.toFixed(3)}`;
-      const resp = await fetch(`/api/meteogram?lat=${lat}&lon=${lon}&run=${encodeURIComponent(run)}&panels=${encodeURIComponent(panels)}&title=${encodeURIComponent(title)}`);
+      let url = `/api/meteogram?lat=${lat}&lon=${lon}&run=${encodeURIComponent(run)}&title=${encodeURIComponent(title)}`;
+      if (state.fam === "custom") {
+        const vars = selectedVars();
+        if (!vars.length) throw new Error("pick at least one variable");
+        url += `&vars=${encodeURIComponent(vars.join(","))}`;
+      } else {
+        const panels = [...$("mgPanels").querySelectorAll("input:checked")].map(c => c.value).join(",");
+        url += `&panels=${encodeURIComponent(panels)}`;
+      }
+      lastShareUrl = url;
+      const resp = await fetch(url);
       if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || `HTTP ${resp.status}`);
       const svg = await resp.text();
       if (seq !== state.seq) return;
-      showImage(URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" })), `Meteogram — ${title}`, run, null);
-      log("meteogram ready", "ok");
+      const label = state.fam === "custom" ? `Custom chart — ${title}` : `Meteogram — ${title}`;
+      showImage(URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" })), label, run, null);
+      log(`${state.fam === "custom" ? "custom chart" : "meteogram"} ready`, "ok");
       return;
     }
     const slug = state.fam === "climoref" ? climoSlug() : state.product;

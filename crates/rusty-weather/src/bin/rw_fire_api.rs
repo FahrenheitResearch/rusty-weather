@@ -334,6 +334,9 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
             runs_response(&request.query, &state)
         }
         ("GET", "/api/fires") => fires_response(&state),
+        _ if request.method == "GET" && request.path.starts_with("/api/vars") => {
+            vars_response(&request.query, &state)
+        }
         _ if request.method == "GET" && request.path.starts_with("/api/jobs/") => {
             let id = request.path.trim_start_matches("/api/jobs/");
             job_response(id, &state)
@@ -836,6 +839,56 @@ fn fires_response(state: &AppState) -> Vec<u8> {
     }
 }
 
+/// GET /api/vars[?model=hrrr][&run=latest] — every 2D variable stored in the
+/// run's newest hour (name + units): the catalog behind the chart-anything
+/// custom meteogram mode.
+fn vars_response(query: &str, state: &AppState) -> Vec<u8> {
+    let query = parse_query(query);
+    let model = query.get("model").map(String::as_str).unwrap_or("hrrr").to_string();
+    if model.len() > 24 || model.contains(['/', '\\', '.']) {
+        return json_status_response(400, &serde_json::json!({ "error": "model slug is not valid" }));
+    }
+    let mut run = query.get("run").cloned().unwrap_or_else(|| "latest".to_string());
+    if run.eq_ignore_ascii_case("latest") || run.eq_ignore_ascii_case("latest-day") {
+        run = match resolve_latest_run(&state.store_root, &model, run.eq_ignore_ascii_case("latest-day")) {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                return json_status_response(422, &serde_json::json!({ "error": message }));
+            }
+        };
+    }
+    if run.len() > 40 || run.contains(['/', '\\', '.']) {
+        return json_status_response(400, &serde_json::json!({ "error": "run slug is not valid" }));
+    }
+    let run_dir = state.store_root.join(&model).join(&run);
+    let newest = std::fs::read_dir(&run_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let hour: u16 = name.strip_prefix('f')?.strip_suffix(".rws")?.parse().ok()?;
+            Some((hour, entry.path()))
+        })
+        .max_by_key(|(hour, _)| *hour);
+    let Some((hour, path)) = newest else {
+        return json_status_response(404, &serde_json::json!({ "error": "run has no stored hours" }));
+    };
+    match rw_store::reader::HourReader::open(&path) {
+        Ok(reader) => {
+            let vars: Vec<serde_json::Value> = reader
+                .meta()
+                .variables
+                .iter()
+                .filter(|var| var.kind == "surface2d")
+                .map(|var| serde_json::json!({ "name": var.name, "units": var.units }))
+                .collect();
+            json_response(&serde_json::json!({ "model": model, "run": run, "hour": hour, "vars": vars }))
+        }
+        Err(err) => json_status_response(500, &serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
 /// GET /api/runs[?model=hrrr] — stored runs plus the daemon's latest manifest.
 fn runs_response(query: &str, state: &AppState) -> Vec<u8> {
     let query = parse_query(query);
@@ -1121,10 +1174,23 @@ fn meteogram_response(path: &str, state: &AppState) -> Vec<u8> {
                 .collect()
         })
         .unwrap_or_default();
+    let vars: Vec<String> = query
+        .get("vars")
+        .map(|list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty() && v.len() <= 48)
+                .filter(|v| v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+                .take(8)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let request = meteogram::MeteogramRequest {
         lat,
         lon,
         panels,
+        vars,
         title: query.get("title").cloned().filter(|t| !t.trim().is_empty()),
         utc_offset_hours: query
             .get("utc_offset")

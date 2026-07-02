@@ -29,6 +29,10 @@ pub struct MeteogramRequest {
     pub lat: f64,
     pub lon: f64,
     pub panels: Vec<String>,
+    /// Arbitrary stored variables, one auto-scaled panel each (overrides
+    /// `panels` when non-empty) — the "chart anything" mode. Any 2D
+    /// variable in the run's store works.
+    pub vars: Vec<String>,
     pub title: Option<String>,
     /// Hours to add to UTC for the local-time axis row (PDT = -7).
     pub utc_offset_hours: f64,
@@ -36,7 +40,7 @@ pub struct MeteogramRequest {
 
 struct HourSample {
     hour: u16,
-    values: BTreeMap<&'static str, f64>,
+    values: BTreeMap<String, f64>,
 }
 
 const SAMPLED_VARS: &[&str] = &[
@@ -263,13 +267,36 @@ fn xml_escape(text: &str) -> String {
 }
 
 /// One data series drawn in a panel.
-struct Series<'a> {
-    key: &'a str,
-    label: &'a str,
-    color: &'a str,
+#[derive(Clone)]
+struct Series {
+    key: String,
+    label: String,
+    color: &'static str,
     dashed: bool,
     right_axis: bool,
 }
+
+fn series(key: &str, label: &str, color: &'static str, dashed: bool, right_axis: bool) -> Series {
+    Series {
+        key: key.to_string(),
+        label: label.to_string(),
+        color,
+        dashed,
+        right_axis,
+    }
+}
+
+/// A renderable panel: identity kind (drives rh lines / wind arrows /
+/// climo refs), display title, series list.
+struct PanelDef {
+    kind: String,
+    title: String,
+    series: Vec<Series>,
+}
+
+const CUSTOM_PALETTE: [&str; 8] = [
+    "#ffb454", "#7fb8e6", "#58c98f", "#c77dff", "#ff6d4d", "#ffd456", "#4fa3d1", "#e05545",
+];
 
 pub struct MeteogramOutput {
     pub svg: String,
@@ -322,6 +349,11 @@ pub fn render_meteogram_svg(
         return Err(format!("run has {} stored hours; need at least 2", hours.len()));
     }
 
+    // Custom mode: chart any stored 2D variables, one panel each.
+    let custom_mode = !request.vars.is_empty();
+    let custom_vars: Vec<String> = request.vars.iter().take(8).cloned().collect();
+    let mut var_units: BTreeMap<String, String> = BTreeMap::new();
+
     // Sample the cell across hours: one tile decompress per var-hour.
     let mut samples: Vec<HourSample> = Vec::with_capacity(hours.len());
     let mut elevation_ft: Option<f64> = None;
@@ -335,7 +367,12 @@ pub fn render_meteogram_svg(
             continue;
         }
         let mut values = BTreeMap::new();
-        for &name in SAMPLED_VARS {
+        let names: Vec<String> = if custom_mode {
+            custom_vars.clone()
+        } else {
+            SAMPLED_VARS.iter().map(|s| s.to_string()).collect()
+        };
+        for name in &names {
             let Some(var) = reader.variable(name) else { continue };
             let units = var.units.clone();
             let Ok(window) = reader.read_window_2d(name, cx, cy, cx + 1, cy + 1) else {
@@ -345,12 +382,22 @@ pub fn render_meteogram_svg(
             if !raw.is_finite() {
                 continue;
             }
-            let value = match name {
-                "temperature_2m" | "dewpoint_2m" => c_to_f(to_c(raw, &units)),
-                "u_10m" | "v_10m" | "wind_gust_10m" => raw * MS_TO_MPH,
-                _ => raw,
+            let is_kelvin = units.trim().eq_ignore_ascii_case("k")
+                || units.to_ascii_lowercase().contains("kelvin");
+            let value = if custom_mode {
+                // Generic: Kelvin reads as °F, everything else native.
+                if is_kelvin { c_to_f(raw - 273.15) } else { raw }
+            } else {
+                match name.as_str() {
+                    "temperature_2m" | "dewpoint_2m" => c_to_f(to_c(raw, &units)),
+                    "u_10m" | "v_10m" | "wind_gust_10m" => raw * MS_TO_MPH,
+                    _ => raw,
+                }
             };
-            values.insert(name, value);
+            var_units
+                .entry(name.clone())
+                .or_insert_with(|| if is_kelvin { "F".to_string() } else { units });
+            values.insert(name.clone(), value);
         }
         if elevation_ft.is_none() {
             if let Some(_var) = reader.variable("orography") {
@@ -367,14 +414,14 @@ pub fn render_meteogram_svg(
         {
             let (t_c, td_c) = ((t_f - 32.0) * 5.0 / 9.0, (td_f - 32.0) * 5.0 / 9.0);
             let vpd = vpd_kpa(t_c, td_c);
-            values.insert("vpd", vpd);
+            values.insert("vpd".to_string(), vpd);
             if let (Some(&u), Some(&v)) = (values.get("u_10m"), values.get("v_10m")) {
                 let wind_mph = (u * u + v * v).sqrt();
-                values.insert("wind", wind_mph);
-                values.insert("hdw_wind", vpd * wind_mph / MS_TO_MPH);
+                values.insert("wind".to_string(), wind_mph);
+                values.insert("hdw_wind".to_string(), vpd * wind_mph / MS_TO_MPH);
             }
             if let Some(&gust) = values.get("wind_gust_10m") {
-                values.insert("hdw_gust", vpd * gust / MS_TO_MPH);
+                values.insert("hdw_gust".to_string(), vpd * gust / MS_TO_MPH);
             }
         }
         samples.push(HourSample { hour, values });
@@ -392,7 +439,7 @@ pub fn render_meteogram_svg(
         if let (Some(prev), Some(now)) = (totals[index - 1], totals[index]) {
             samples[index]
                 .values
-                .insert("precip_in", ((now - prev).max(0.0)) / 25.4);
+                .insert("precip_in".to_string(), ((now - prev).max(0.0)) / 25.4);
         }
     }
 
@@ -438,12 +485,13 @@ pub fn render_meteogram_svg(
             .filter(|panel| request.panels.iter().any(|p| p == panel))
             .collect()
     };
-    if panels.is_empty() {
+    if panels.is_empty() && !custom_mode {
         return Err(format!(
             "no valid panels requested; choose from {}",
             METEOGRAM_PANELS.join(",")
         ));
     }
+    let panel_count = if custom_mode { custom_vars.len().max(1) } else { panels.len() };
 
     const W: f64 = 1180.0;
     const ML: f64 = 58.0;
@@ -456,7 +504,7 @@ pub fn render_meteogram_svg(
     const PANEL_UNIT: f64 = PANEL_BAND + PANEL_H + PANEL_GAP;
     const AXIS_H: f64 = 54.0;
     let plot_w = W - ML - MR;
-    let total_h = HEADER + panels.len() as f64 * PANEL_UNIT - PANEL_GAP + AXIS_H;
+    let total_h = HEADER + panel_count as f64 * PANEL_UNIT - PANEL_GAP + AXIS_H;
 
     let h0 = f64::from(samples.first().expect("nonempty").hour);
     let h1 = f64::from(samples.last().expect("nonempty").hour);
@@ -500,59 +548,60 @@ pub fn render_meteogram_svg(
         f1 = samples.last().expect("nonempty").hour,
     ));
 
-    // Panel definitions.
-    let panel_series: BTreeMap<&str, (&str, Vec<Series>)> = BTreeMap::from([
-        (
-            "temp",
-            ("Temperature / Dewpoint (F)", vec![
-                Series { key: "temperature_2m", label: "T", color: "#ff6d4d", dashed: false, right_axis: false },
-                Series { key: "dewpoint_2m", label: "Td", color: "#58c98f", dashed: false, right_axis: false },
+    // Panel definitions: fixed catalog for the curated mode, or one
+    // auto-scaled panel per requested variable in custom mode.
+    let panel_defs: Vec<PanelDef> = if custom_mode {
+        custom_vars
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let units = var_units.get(name).cloned().unwrap_or_default();
+                let pretty = name.replace('_', " ");
+                PanelDef {
+                    kind: "custom".to_string(),
+                    title: if units.is_empty() { pretty.clone() } else { format!("{pretty} ({units})") },
+                    series: vec![series(name, &pretty, CUSTOM_PALETTE[index % CUSTOM_PALETTE.len()], false, false)],
+                }
+            })
+            .collect()
+    } else {
+        let catalog: Vec<(&str, &str, Vec<Series>)> = vec![
+            ("temp", "Temperature / Dewpoint (F)", vec![
+                series("temperature_2m", "T", "#ff6d4d", false, false),
+                series("dewpoint_2m", "Td", "#58c98f", false, false),
             ]),
-        ),
-        (
-            "rh",
-            ("Relative Humidity (%)", vec![Series {
-                key: "rh_2m", label: "RH", color: "#58c98f", dashed: false, right_axis: false,
-            }]),
-        ),
-        (
-            "vpd",
-            ("VPD (kPa) / Surface HDW", vec![
-                Series { key: "vpd", label: "VPD", color: "#ffb454", dashed: false, right_axis: false },
-                Series { key: "hdw_wind", label: "HDW-w", color: "#c77dff", dashed: true, right_axis: true },
-                Series { key: "hdw_gust", label: "HDW-g", color: "#8a5fd0", dashed: true, right_axis: true },
+            ("rh", "Relative Humidity (%)", vec![series("rh_2m", "RH", "#58c98f", false, false)]),
+            ("vpd", "VPD (kPa) / Surface HDW", vec![
+                series("vpd", "VPD", "#ffb454", false, false),
+                series("hdw_wind", "HDW-w", "#c77dff", true, true),
+                series("hdw_gust", "HDW-g", "#8a5fd0", true, true),
             ]),
-        ),
-        (
-            "wind",
-            ("Wind / Gust (mph)", vec![
-                Series { key: "wind", label: "sustained", color: "#7fb8e6", dashed: false, right_axis: false },
-                Series { key: "wind_gust_10m", label: "gust", color: "#ff8a00", dashed: false, right_axis: false },
+            ("wind", "Wind / Gust (mph)", vec![
+                series("wind", "sustained", "#7fb8e6", false, false),
+                series("wind_gust_10m", "gust", "#ff8a00", false, false),
             ]),
-        ),
-        (
-            "precip",
-            ("Hourly Precip (in)", vec![Series {
-                key: "precip_in", label: "precip", color: "#4fa3d1", dashed: false, right_axis: false,
-            }]),
-        ),
-        (
-            "fuels",
-            ("ERC / 10-h Fuel Moisture (%)", vec![
-                Series { key: "erc", label: "ERC", color: "#e05545", dashed: false, right_axis: false },
-                Series { key: "dead_fuel_moisture_10h", label: "10-h FM", color: "#58c98f", dashed: false, right_axis: true },
+            ("precip", "Hourly Precip (in)", vec![series("precip_in", "precip", "#4fa3d1", false, false)]),
+            ("fuels", "ERC / 10-h Fuel Moisture (%)", vec![
+                series("erc", "ERC", "#e05545", false, false),
+                series("dead_fuel_moisture_10h", "10-h FM", "#58c98f", false, true),
             ]),
-        ),
-        (
-            "smoke",
-            ("Near-Surface Smoke (ug/m3)", vec![Series {
-                key: "smoke_8m", label: "smoke 8m", color: "#b0a695", dashed: false, right_axis: false,
-            }]),
-        ),
-    ]);
+            ("smoke", "Near-Surface Smoke (ug/m3)", vec![series("smoke_8m", "smoke 8m", "#b0a695", false, false)]),
+        ];
+        catalog
+            .into_iter()
+            .filter(|(kind, _, _)| panels.iter().any(|p| p == kind))
+            .map(|(kind, title, series)| PanelDef {
+                kind: kind.to_string(),
+                title: title.to_string(),
+                series,
+            })
+            .collect()
+    };
 
-    for (panel_index, panel) in panels.iter().enumerate() {
-        let Some((panel_title, series_list)) = panel_series.get(panel) else { continue };
+    for (panel_index, def) in panel_defs.iter().enumerate() {
+        let panel_title = &def.title;
+        let series_list = &def.series;
+        let panel: &str = &def.kind;
         let band_top = HEADER + panel_index as f64 * PANEL_UNIT;
         let top = band_top + PANEL_BAND;
         // Title strip with an accent underline in the lead series color.
@@ -610,20 +659,20 @@ pub fn render_meteogram_svg(
         // always land inside the axis.
         let panel_refs: &[(f64, String, &'static str)] = climo_refs
             .as_ref()
-            .and_then(|refs| refs.refs.get(*panel).map(Vec::as_slice))
+            .and_then(|refs| refs.refs.get(panel).map(Vec::as_slice))
             .unwrap_or(&[]);
         let mut left_values: Vec<f64> = series_list
             .iter()
             .filter(|s| !s.right_axis)
-            .flat_map(|s| get(s.key))
+            .flat_map(|s| get(&s.key))
             .collect();
         left_values.extend(panel_refs.iter().map(|(value, _, _)| *value));
         let right_values: Vec<f64> = series_list
             .iter()
             .filter(|s| s.right_axis)
-            .flat_map(|s| get(s.key))
+            .flat_map(|s| get(&s.key))
             .collect();
-        let left_bounds = if *panel == "precip" {
+        let left_bounds = if panel == "precip" {
             // Bars hang from zero; keep a sane minimum top for dry runs.
             axis_bounds(&left_values).map(|(_, hi)| (0.0, hi.max(0.10)))
         } else {
@@ -655,7 +704,7 @@ pub fn render_meteogram_svg(
                 tick += step;
             }
             // RH critical reference lines.
-            if *panel == "rh" {
+            if panel == "rh" {
                 for (threshold, color) in [(20.0, "#f8823c"), (15.0, "#dc1f1f")] {
                     if threshold > lo && threshold < hi {
                         let y = top + PANEL_H - (threshold - lo) / (hi - lo) * PANEL_H;
@@ -710,7 +759,7 @@ pub fn render_meteogram_svg(
             let bounds = if series.right_axis { right_bounds } else { left_bounds };
             let Some(bounds) = bounds else { continue };
             let (lo, hi) = pad_bounds(bounds);
-            let values = get(series.key);
+            let values = get(&series.key);
             if series.key == "precip_in" {
                 let bar_half = (plot_w / samples.len() as f64 * 0.36).clamp(2.0, 14.0);
                 let y0 = top + PANEL_H - (0.0 - lo) / (hi - lo) * PANEL_H;
@@ -754,7 +803,7 @@ pub fn render_meteogram_svg(
 
         // Wind-direction arrows along the top of the wind panel (arrow
         // points downwind; met convention "from" drives the rotation).
-        if *panel == "wind" {
+        if panel == "wind" {
             let stride = (samples.len() / 26).max(1);
             for (index, sample) in samples.iter().enumerate() {
                 if index % stride != 0 {
@@ -798,7 +847,7 @@ pub fn render_meteogram_svg(
     }
 
     // Time axis: UTC row, local-time row, date labels at 00Z boundaries.
-    let axis_y = HEADER + panels.len() as f64 * PANEL_UNIT - PANEL_GAP;
+    let axis_y = HEADER + panel_count as f64 * PANEL_UNIT - PANEL_GAP;
     let offset = request.utc_offset_hours;
     for sample in &samples {
         let (hod, day_label) = valid_label(date_yyyymmdd, cycle_utc, sample.hour);
@@ -829,17 +878,17 @@ pub fn render_meteogram_svg(
 
     svg.push_str("</svg>");
 
-    let mut series_keys: Vec<&'static str> = Vec::new();
+    let mut series_keys: Vec<String> = Vec::new();
     for sample in &samples {
-        for &key in sample.values.keys() {
-            if !series_keys.contains(&key) {
-                series_keys.push(key);
+        for key in sample.values.keys() {
+            if !series_keys.contains(key) {
+                series_keys.push(key.clone());
             }
         }
     }
     let series: serde_json::Map<String, serde_json::Value> = series_keys
         .iter()
-        .map(|&key| {
+        .map(|key| {
             let values: Vec<serde_json::Value> = samples
                 .iter()
                 .map(|s| match s.values.get(key) {
