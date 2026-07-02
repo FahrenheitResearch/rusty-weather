@@ -340,6 +340,9 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
         _ if request.method == "GET" && request.path.starts_with("/api/daily") => {
             daily_response(&request.query, &state)
         }
+        _ if request.method == "GET" && request.path.starts_with("/api/ecape/") => {
+            ecape_file_response(&request.path, &state)
+        }
         _ if request.method == "GET" && request.path.starts_with("/api/jobs/") => {
             let id = request.path.trim_start_matches("/api/jobs/");
             job_response(id, &state)
@@ -949,6 +952,41 @@ fn vars_response(query: &str, state: &AppState) -> Vec<u8> {
             json_response(&serde_json::json!({ "model": model, "run": run, "hour": hour, "vars": vars }))
         }
         Err(err) => json_status_response(500, &serde_json::json!({ "error": err.to_string() })),
+    }
+}
+
+/// GET /api/ecape/<run>/<file> or /api/ecape/latest.json — static products
+/// pushed up by the ECAPE compute node (outbound-only rsync into
+/// out_root/ecape/). Path segments are strictly sanitized.
+fn ecape_file_response(path: &str, state: &AppState) -> Vec<u8> {
+    let rel = path.trim_start_matches("/api/ecape/");
+    let safe = !rel.is_empty()
+        && rel.len() < 160
+        && rel
+            .split('/')
+            .all(|part| {
+                !part.is_empty()
+                    && part != ".."
+                    && part.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            });
+    if !safe {
+        return json_status_response(400, &serde_json::json!({ "error": "bad path" }));
+    }
+    let full = state.out_root.join("ecape").join(rel);
+    match std::fs::read(&full) {
+        Ok(bytes) => {
+            let content_type = if rel.ends_with(".json") {
+                "application/json; charset=utf-8"
+            } else if rel.ends_with(".webp") {
+                "image/webp"
+            } else if rel.ends_with(".png") {
+                "image/png"
+            } else {
+                "application/octet-stream"
+            };
+            response(200, content_type, bytes)
+        }
+        Err(_) => json_status_response(404, &serde_json::json!({ "error": "not found" })),
     }
 }
 
