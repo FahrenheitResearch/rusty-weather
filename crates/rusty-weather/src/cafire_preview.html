@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0c0c">
+<meta name="description" content="CWT fire weather lab — HRRR forecasts ranked against 7 years of RTMA analyses.">
+<link rel="icon" href="data:,">
+<title>Weather Lab | CWT</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #090b0c;
+  --bg-soft: #0d1112;
+  --panel: #111617;
+  --panel-2: #161c1d;
+  --panel-3: #1b2223;
+  --line: rgba(255, 255, 255, 0.09);
+  --line-strong: rgba(255, 255, 255, 0.16);
+  --text: #f6f5f1;
+  --muted: #9ea6a5;
+  --muted-2: #737c7b;
+  --orange: #ff5b24;
+  --orange-bright: #ff6a36;
+  --orange-soft: rgba(255, 91, 36, 0.14);
+  --red: #ff3e3e;
+  --green: #70e1a5;
+  --blue: #63b7ff;
+  --yellow: #ffd456;
+  --radius: 18px;
+  --radius-sm: 11px;
+  --shadow: 0 28px 70px rgba(0, 0, 0, 0.34);
+  --font: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0; min-width: 320px; color: var(--text);
+  background:
+    radial-gradient(circle at 50% -8%, rgba(255, 91, 36, 0.09), transparent 31rem),
+    linear-gradient(180deg, #0b0e0f 0%, var(--bg) 42rem);
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+}
+button, input, select { font: inherit; }
+a { color: inherit; }
+button { color: inherit; cursor: pointer; }
+
+/* ---------- header (CWT chrome) ---------- */
+.site-header { position: sticky; top: 0; z-index: 60; backdrop-filter: blur(14px); background: rgba(9, 11, 12, 0.82); border-bottom: 1px solid var(--line); }
+.header-inner { max-width: 1460px; margin: 0 auto; padding: 12px 22px; display: flex; align-items: center; gap: 22px; }
+.brand { display: flex; align-items: center; gap: 12px; text-decoration: none; }
+.brand-mark { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px; background: var(--orange-soft); }
+.brand-mark svg { width: 26px; height: 26px; stroke: var(--orange-bright); }
+.brand-mark svg .brand-mark-cut { stroke: var(--yellow); }
+.brand-copy { display: flex; flex-direction: column; line-height: 1.12; }
+.brand-copy strong { font-size: 16px; letter-spacing: 0.02em; }
+.brand-copy span { font-size: 11.5px; color: var(--muted); }
+.primary-nav { display: flex; gap: 4px; margin-left: 8px; flex-wrap: wrap; }
+.primary-nav a { padding: 8px 13px; border-radius: 999px; font-size: 13.5px; color: var(--muted); text-decoration: none; }
+.primary-nav a:hover { color: var(--text); background: var(--panel-2); }
+.primary-nav a.active { color: var(--text); background: var(--orange-soft); box-shadow: inset 0 0 0 1px rgba(255, 91, 36, 0.35); }
+.header-status { margin-left: auto; display: flex; align-items: center; gap: 9px; font-size: 12.5px; color: var(--muted); padding: 7px 13px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px var(--green); }
+.dot.bad { background: var(--red); box-shadow: 0 0 10px var(--red); }
+
+/* ---------- intro ---------- */
+.page-intro { max-width: 1460px; margin: 26px auto 4px; padding: 0 22px; display: flex; align-items: end; justify-content: space-between; gap: 18px; flex-wrap: wrap; }
+.eyebrow { display: flex; align-items: center; gap: 9px; font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
+.eyebrow span { width: 22px; height: 2px; background: var(--orange); display: inline-block; }
+.page-intro h1 { margin: 8px 0 6px; font-size: clamp(26px, 3.4vw, 38px); letter-spacing: -0.01em; }
+.page-intro p { margin: 0; color: var(--muted); max-width: 62ch; font-size: 14.5px; }
+.preview-tag { font-size: 11.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--yellow); border: 1px solid rgba(255, 212, 86, 0.35); background: rgba(255, 212, 86, 0.08); padding: 6px 12px; border-radius: 999px; white-space: nowrap; }
+
+/* ---------- workspace ---------- */
+.workspace { max-width: 1460px; margin: 18px auto 60px; padding: 0 22px; display: grid; grid-template-columns: 384px 1fr; gap: 18px; align-items: start; }
+@media (max-width: 1020px) { .workspace { grid-template-columns: 1fr; } }
+.panel { background: linear-gradient(180deg, var(--panel-2), var(--panel)); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+.control-panel { padding: 18px; display: flex; flex-direction: column; gap: 16px; position: sticky; top: 76px; max-height: calc(100vh - 96px); overflow: auto; }
+.panel-heading { display: flex; justify-content: space-between; align-items: start; }
+.section-kicker { font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--orange-bright); }
+.panel-heading h2 { margin: 3px 0 0; font-size: 18px; }
+.field-label { display: block; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 7px; }
+.select-wrap { position: relative; }
+.select-wrap select { width: 100%; appearance: none; background: var(--panel-3); color: var(--text); border: 1px solid var(--line-strong); border-radius: var(--radius-sm); padding: 10px 34px 10px 12px; font-size: 14px; }
+.select-wrap svg { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; stroke: var(--muted); pointer-events: none; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.run-note { font-size: 12px; color: var(--muted-2); margin-top: 6px; }
+
+.fam-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.fam-chip { text-align: left; background: var(--panel-3); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 9px 11px; display: flex; flex-direction: column; gap: 2px; }
+.fam-chip strong { font-size: 13px; font-weight: 600; }
+.fam-chip small { font-size: 11px; color: var(--muted-2); }
+.fam-chip:hover { border-color: var(--line-strong); }
+.fam-chip.on { background: var(--orange-soft); border-color: rgba(255, 91, 36, 0.45); }
+.fam-chip.on strong { color: var(--orange-bright); }
+
+.segmented { display: flex; background: var(--panel-3); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 3px; gap: 3px; }
+.segmented button { flex: 1; border: 0; background: transparent; border-radius: 8px; padding: 7px 4px; font-size: 12.5px; color: var(--muted); }
+.segmented button.selected { background: var(--panel); color: var(--text); box-shadow: 0 1px 6px rgba(0,0,0,0.4); }
+
+.hours { display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; }
+.hourbtn { background: var(--panel-3); border: 1px solid var(--line); border-radius: 8px; padding: 6px 0; font-size: 11.5px; color: var(--muted); }
+.hourbtn.on { background: var(--orange-soft); border-color: rgba(255, 91, 36, 0.45); color: var(--orange-bright); font-weight: 600; }
+.hours.dim { opacity: 0.35; pointer-events: none; }
+.hours-note { font-size: 11.5px; color: var(--muted-2); margin-top: 6px; }
+
+.mg-box, .climo-box { display: none; flex-direction: column; gap: 9px; }
+.mg-box.show, .climo-box.show { display: flex; }
+.mini-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.mini-grid label, .mg-panels label { font-size: 12.5px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+.mini-grid input, .mini-grid select { background: var(--panel-3); border: 1px solid var(--line-strong); color: var(--text); border-radius: 9px; padding: 8px 10px; font-size: 13.5px; width: 100%; }
+.mg-panels { display: flex; flex-wrap: wrap; gap: 5px 12px; }
+.mg-panels label { flex-direction: row; align-items: center; gap: 6px; font-size: 12.5px; }
+.hint { font-size: 12px; color: var(--muted-2); line-height: 1.45; }
+
+.render-btn { border: 0; border-radius: var(--radius-sm); padding: 13px; font-size: 15px; font-weight: 650; letter-spacing: 0.02em; background: linear-gradient(180deg, var(--orange-bright), var(--orange)); color: #160904; box-shadow: 0 10px 30px rgba(255, 91, 36, 0.28); }
+.render-btn:hover { filter: brightness(1.07); }
+.render-btn:disabled { filter: grayscale(0.6) brightness(0.75); cursor: wait; }
+.console { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 11.5px; color: var(--muted-2); background: var(--bg-soft); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px 12px; max-height: 120px; overflow: auto; display: flex; flex-direction: column-reverse; gap: 3px; }
+.console .ok { color: var(--green); } .console .err { color: var(--red); }
+
+/* ---------- stage ---------- */
+.stage { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.map-card { padding: 0; overflow: hidden; }
+.map-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.map-head h2 { margin: 0; font-size: 15.5px; }
+.map-head .tools { display: flex; gap: 6px; flex-wrap: wrap; }
+.tool-btn { background: var(--panel-3); border: 1px solid var(--line); border-radius: 999px; padding: 7px 13px; font-size: 12.5px; color: var(--muted); }
+.tool-btn.on { background: var(--orange-soft); color: var(--orange-bright); border-color: rgba(255,91,36,0.45); }
+#map { height: 340px; background: #0c0f10; cursor: crosshair; }
+.map-foot { padding: 9px 16px; font-size: 12px; color: var(--muted-2); border-top: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.leaflet-container { font-family: var(--font); }
+.leaflet-control-attribution { background: rgba(9,11,12,0.7) !important; color: var(--muted-2) !important; }
+.leaflet-control-attribution a { color: var(--muted) !important; }
+
+.ribbon { display: none; background: linear-gradient(180deg, rgba(255,91,36,0.10), rgba(255,91,36,0.04)); border: 1px solid rgba(255, 91, 36, 0.25); border-radius: var(--radius); padding: 13px 17px; font-size: 13px; color: var(--muted); line-height: 1.55; }
+.ribbon.show { display: block; }
+.ribbon b { color: var(--orange-bright); }
+.ribbon code { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--text); }
+
+.gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); animation: rise 0.45s both; }
+@keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+.card img { display: block; width: 100%; cursor: zoom-in; background: #f4f1ea; }
+.card .cap { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 9px 13px; font-size: 12.5px; }
+.card .cap b { font-weight: 600; text-transform: capitalize; }
+.card .cap span { color: var(--muted-2); font-size: 11.5px; white-space: nowrap; }
+.empty { border: 1px dashed var(--line-strong); border-radius: var(--radius); padding: 70px 20px; text-align: center; color: var(--muted-2); }
+.empty .flame { font-size: 30px; color: var(--orange); opacity: 0.6; margin-bottom: 10px; }
+
+/* ---------- lightbox ---------- */
+.box { position: fixed; inset: 0; z-index: 100; display: none; background: rgba(5, 6, 7, 0.94); }
+.box.show { display: block; }
+.box img { position: absolute; top: 0; left: 0; transform-origin: 0 0; cursor: grab; user-select: none; max-width: none; background: #f4f1ea; }
+.box img.grabbing { cursor: grabbing; }
+.box-bar { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 14px; padding: 12px 18px; background: rgba(9, 11, 12, 0.9); border-top: 1px solid var(--line); font-size: 12.5px; color: var(--muted); z-index: 5; }
+.box-bar b { color: var(--text); font-weight: 600; }
+.box-btn { background: var(--panel-3); border: 1px solid var(--line-strong); color: var(--text); border-radius: 8px; padding: 6px 12px; font-size: 12.5px; }
+</style>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="header-inner">
+    <a class="brand" href="https://www.cafire.org/dashboard" aria-label="CWT dashboard">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 44 44" role="img">
+          <path d="M25.7 4.6c.9 7.3-5.4 8.6-3.4 15.2 1.4-2.8 3.8-4.2 5.7-6.7 4.8 4.3 7.5 9.2 6.4 14.5-1.2 6-6 10.7-12.7 10.7-7.1 0-12.4-4.9-12.4-11.7 0-5.7 3.5-9.2 7.7-13.1.2 4.3 1.9 6.9 4 8.5-.4-6.4 1-11.1 4.7-17.4Z"/>
+          <path class="brand-mark-cut" d="M21.8 25.1c3.6 2.5 4.7 5.3 3.3 8.5-1 2.3-4.3 3.5-6.9 1.8-3.4-2.2-3.1-6.5.4-10.7.2 2.3 1.1 3.6 2.2 4.4-.1-1.6.2-2.9 1-4Z"/>
+        </svg>
+      </span>
+      <span class="brand-copy"><strong>CWT</strong><span>California Wildfire Tracking</span></span>
+    </a>
+    <nav class="primary-nav" aria-label="Primary navigation">
+      <a href="https://www.cafire.org/dashboard">Dashboard</a>
+      <a href="https://www.cafire.org/fire-details">Fire Details</a>
+      <a href="https://www.cafire.org/alerts">Alerts</a>
+      <a class="active" href="#" aria-current="page">Weather Lab</a>
+      <a href="https://www.cafire.org/preparedness">Preparedness</a>
+    </nav>
+    <div class="header-status"><span class="dot" id="sysDot"></span><span id="sysState">connecting…</span></div>
+  </div>
+</header>
+
+<main>
+  <section class="page-intro">
+    <div>
+      <div class="eyebrow"><span></span> Weather</div>
+      <h1>Fire Weather Lab</h1>
+      <p>HRRR forecasts ranked against seven years of RTMA analyses — anomaly percentiles, all-time records,
+        fuels, and point meteograms. Rendered on demand for any domain you draw.</p>
+    </div>
+    <div class="preview-tag">Preview — feedback welcome</div>
+  </section>
+
+  <section class="workspace">
+    <aside class="control-panel panel" aria-label="Product controls">
+      <div class="panel-heading">
+        <div><span class="section-kicker">Controls</span><h2>Build a view</h2></div>
+      </div>
+
+      <div>
+        <span class="field-label">Model run</span>
+        <div class="select-wrap">
+          <select id="runSelect"><option value="latest">Latest complete run</option></select>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 10 4 4 4-4"/></svg>
+        </div>
+        <div class="run-note" id="runNote">checking runs…</div>
+      </div>
+
+      <div>
+        <span class="field-label">Product family</span>
+        <div class="fam-grid" id="fams">
+          <button class="fam-chip on" data-fam="anomaly"><strong>Anomaly vs Climo</strong><small>vs this date, ±7d</small></button>
+          <button class="fam-chip" data-fam="record"><strong>vs All-Time Record</strong><small>vs every day 2019–26</small></button>
+          <button class="fam-chip" data-fam="core"><strong>Fire Wx Core</strong><small>VPD · HDW · wind · RH</small></button>
+          <button class="fam-chip" data-fam="fuels"><strong>Fuels</strong><small>ERC · moisture · KBDI</small></button>
+          <button class="fam-chip" data-fam="smoke"><strong>Smoke</strong><small>HRRR-Smoke</small></button>
+          <button class="fam-chip" data-fam="window"><strong>Day Windows</strong><small>24 h max / min</small></button>
+          <button class="fam-chip" data-fam="climoref"><strong>Climatology</strong><small>browse the normals</small></button>
+          <button class="fam-chip" data-fam="meteogram"><strong>Meteogram</strong><small>point · wx + fuels</small></button>
+        </div>
+      </div>
+
+      <div class="climo-box" id="climoBox">
+        <div class="mini-grid">
+          <label>product
+            <select id="refProduct">
+              <option value="vpd_day_max" selected>day-max VPD</option>
+              <option value="min_rh_day">day-min RH</option>
+              <option value="wind_day_max">day-max wind</option>
+              <option value="gust_day_max">day-max gust</option>
+              <option value="hdw_wind_day">HDW (wind)</option>
+              <option value="hdw_gust_day">HDW (gust)</option>
+              <option value="hours_rh15_gust25">hrs RH≤15 &amp; gust≥25</option>
+              <option value="hours_rh20_gust25">hrs RH≤20 &amp; gust≥25</option>
+              <option value="hours_rh20_wind20">hrs RH≤20 &amp; wind≥20</option>
+              <option value="overnight_rh_recovery">overnight min RH</option>
+            </select>
+          </label>
+          <label>date <input id="refDate" type="date"></label>
+        </div>
+        <div class="hint">Renders the P50→P99 ladder for that date plus the all-time P99 and record max.</div>
+      </div>
+
+      <div class="mg-box" id="meteoBox">
+        <div class="mini-grid">
+          <label>lat <input id="mgLat" type="number" step="0.0001" value="38.5816"></label>
+          <label>lon <input id="mgLon" type="number" step="0.0001" value="-121.4944"></label>
+        </div>
+        <div class="mg-panels" id="mgPanels">
+          <label><input type="checkbox" value="temp" checked> T/Td</label>
+          <label><input type="checkbox" value="rh" checked> RH</label>
+          <label><input type="checkbox" value="vpd" checked> VPD·HDW</label>
+          <label><input type="checkbox" value="wind" checked> wind</label>
+          <label><input type="checkbox" value="precip"> precip</label>
+          <label><input type="checkbox" value="fuels" checked> fuels</label>
+          <label><input type="checkbox" value="smoke"> smoke</label>
+        </div>
+        <div class="hint">Tip: switch the map to <b>point</b> mode and click anywhere — the pin fills these in.</div>
+      </div>
+
+      <div id="hoursBlock">
+        <span class="field-label">Valid hour</span>
+        <div class="hours" id="hours"></div>
+        <div class="hours-note" id="hoursNote"></div>
+      </div>
+
+      <div>
+        <span class="field-label">Map quality</span>
+        <div class="segmented" id="quality">
+          <button type="button" data-density="2">Regional labels</button>
+          <button class="selected" type="button" data-density="3">Dense labels</button>
+          <button type="button" data-density="4">Max labels</button>
+        </div>
+      </div>
+
+      <button class="render-btn" id="renderBtn">Render</button>
+      <div class="console" id="console"></div>
+    </aside>
+
+    <section class="stage">
+      <div class="panel map-card">
+        <div class="map-head">
+          <h2 id="mapTitle">Domain — drag a box or pick a preset</h2>
+          <div class="tools">
+            <button class="tool-btn on" data-preset="california">California</button>
+            <button class="tool-btn" data-preset="wide_west">Wide West</button>
+            <button class="tool-btn" data-preset="sierra">Sierra Front</button>
+            <button class="tool-btn" id="drawBtn">✏ draw box</button>
+            <button class="tool-btn" id="pointBtn">📍 point</button>
+          </div>
+        </div>
+        <div id="map"></div>
+        <div class="map-foot">
+          <span id="mapReadout">preset: California</span>
+          <span>drag with <b>draw box</b> on · click with <b>point</b> on for meteograms</span>
+        </div>
+      </div>
+
+      <div class="ribbon show" id="ribbon"></div>
+      <div class="gallery" id="gallery"></div>
+      <div class="empty" id="empty"><div class="flame">▲▲▲</div>Pick a family and hit Render — plots land here.</div>
+    </section>
+  </section>
+</main>
+
+<div class="box" id="box">
+  <img id="boxImg" alt="">
+  <div class="box-bar">
+    <b id="boxName"></b>
+    <span>wheel zoom · drag pan · double-click reset · ←/→ cycle · esc close</span>
+    <span style="margin-left:auto"></span>
+    <button class="box-btn" id="boxPrev">←</button>
+    <button class="box-btn" id="boxNext">→</button>
+    <button class="box-btn" id="boxClose">✕</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+/* ---------- state ---------- */
+const DOMAINS = {
+  california: { slug: "cafire_california", bounds: [-126.0, -113.8, 31.9, 42.5], label: "California" },
+  wide_west:  { slug: "cafire_wide_west",  bounds: [-125.7, -103.8, 31.9, 46.5], label: "Wide West" },
+  sierra:     { slug: "sierra_front",      bounds: [-121.9, -117.6, 37.2, 41.2], label: "Sierra Front" },
+};
+const FAMS = {
+  anomaly: { title: "Anomaly vs Climatology", products: "cafire-anomaly" },
+  record:  { title: "vs All-Time Record", products: "cafire-record" },
+  core:    { title: "Fire Weather Core", products: "vpd_2m,hdw,fire_weather_composite,10m_wind_gusts,2m_relative_humidity_10m_winds" },
+  fuels:   { title: "Fuels", products: "erc,kbdi,dead_fuel_moisture_10h,vpd_fuel_receptive,fire_potential_composite" },
+  smoke:   { title: "Smoke", products: "smoke_pm25_native,smoke_column,visibility" },
+  window:  { title: "Day Windows", products: "2m_vpd_0_24h_max,2m_rh_0_24h_min,10m_wind_0_24h_max,qpf_24h" },
+  climoref:{ title: "Climatology Maps", products: "" },
+  meteogram:{ title: "Point Meteogram", products: "" },
+};
+const RIBBONS = {
+  anomaly: `<b>Percentile vs this date</b> — today's HRRR forecast ranked against the RTMA 2.5 km ±7-day
+    day-of-year climatology, 2019–2026 (<code>n≈105 days/cell</code>).
+    Reading: <code>99 = at or beyond the most extreme ever observed for this calendar window</code>.`,
+  record: `<b>Percentile vs every day on record</b> — the same forecast ranked against all
+    <code>≈2,695 analyzed days 2019–2026</code>. The seasonal tab reads “unusual for the date”;
+    this tab reads “severe in absolute terms”. Purple here is genuinely rare air.`,
+  climoref: `<b>The normals themselves</b> — browsable climatology grids in real units.
+    Pick a product and a date to see its P50→P99 ladder plus the all-time record.`,
+  meteogram: `<b>Point meteogram</b> — every stored hour at one spot: T/Td, RH, VPD + HDW, wind with
+    direction arrows, fuels. Night shading, local time, and dashed “what's normal here today” lines
+    from the climatology.`,
+};
+let state = { fam: "anomaly", hour: 12, density: 3, preset: "california", drawn: null, runsLoaded: false };
+const dayFams = new Set(["anomaly", "record", "climoref", "meteogram", "window"]);
+
+/* ---------- console ---------- */
+function log(message, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = `${new Date().toLocaleTimeString([], {hour12:false})}  ${message}`;
+  const box = $("console"); box.prepend(line);
+  while (box.children.length > 40) box.lastChild.remove();
+}
+
+/* ---------- health + runs ---------- */
+async function health() {
+  try {
+    const h = await fetch("/api/health").then(r => r.json());
+    $("sysDot").classList.remove("bad");
+    $("sysState").textContent = `render engine live · ${h.render_gate.active} active`;
+  } catch { $("sysDot").classList.add("bad"); $("sysState").textContent = "offline"; }
+}
+health(); setInterval(health, 6000);
+
+function runAge(unix) {
+  const mins = Math.max(0, (Date.now() / 1000 - unix) / 60);
+  return mins < 90 ? `${Math.round(mins)} min ago` : `${(mins / 60).toFixed(1)} h ago`;
+}
+async function loadRuns() {
+  try {
+    const data = await fetch("/api/runs").then(r => r.json());
+    const select = $("runSelect");
+    select.innerHTML = "";
+    const latest = data.latest;
+    const optLatest = document.createElement("option");
+    optLatest.value = "latest";
+    optLatest.textContent = latest && latest.complete_run
+      ? `Latest — ${latest.complete_run.replace("_", " ").toUpperCase()}`
+      : "Latest complete run";
+    select.appendChild(optLatest);
+    (data.runs || []).forEach(slug => {
+      const opt = document.createElement("option");
+      opt.value = slug;
+      opt.textContent = slug.replace("_", " · ").toUpperCase();
+      select.appendChild(opt);
+    });
+    if (latest) {
+      const bits = [`ingesting ${latest.run.replace("_"," ")}`];
+      if (latest.updated_unix) bits.push(`updated ${runAge(latest.updated_unix)}`);
+      if (latest.day_run) bits.push(`day products from ${latest.day_run.replace("_"," ")}`);
+      $("runNote").textContent = bits.join(" · ");
+    } else {
+      $("runNote").textContent = "no refresh daemon manifest — pick a run explicitly";
+    }
+    state.runsLoaded = true;
+  } catch { $("runNote").textContent = "run list unavailable"; }
+}
+loadRuns(); setInterval(loadRuns, 60_000);
+
+/* ---------- family chips ---------- */
+$("fams").addEventListener("click", ev => {
+  const chip = ev.target.closest(".fam-chip"); if (!chip) return;
+  [...$("fams").children].forEach(c => c.classList.remove("on"));
+  chip.classList.add("on");
+  state.fam = chip.dataset.fam;
+  const ribbon = $("ribbon");
+  ribbon.classList.toggle("show", state.fam in RIBBONS);
+  if (state.fam in RIBBONS) ribbon.innerHTML = RIBBONS[state.fam];
+  $("climoBox").classList.toggle("show", state.fam === "climoref");
+  $("meteoBox").classList.toggle("show", state.fam === "meteogram");
+  $("hours").classList.toggle("dim", dayFams.has(state.fam));
+  $("hoursNote").textContent = dayFams.has(state.fam)
+    ? (state.fam === "meteogram" ? "meteograms span every stored hour" : "day-window products fold whole UTC days — the hour pick is inert")
+    : "";
+  if (state.fam === "meteogram" && mapMode !== "point") setMapMode("point");
+  if (state.fam !== "meteogram" && mapMode === "point") setMapMode("view");
+});
+$("ribbon").innerHTML = RIBBONS.anomaly;
+$("hours").classList.add("dim");
+$("hoursNote").textContent = "day-window products fold whole UTC days — the hour pick is inert";
+
+/* ---------- hour strip ---------- */
+[0,2,4,6,8,10,12,14,16,18,24,30,36,48].forEach(h => {
+  const b = document.createElement("button");
+  b.className = "hourbtn" + (h === state.hour ? " on" : "");
+  b.textContent = "F" + String(h).padStart(2, "0");
+  b.onclick = () => { state.hour = h; [...$("hours").children].forEach(x => x.classList.remove("on")); b.classList.add("on"); };
+  $("hours").appendChild(b);
+});
+
+/* ---------- quality ---------- */
+$("quality").addEventListener("click", ev => {
+  const btn = ev.target.closest("button"); if (!btn) return;
+  [...$("quality").children].forEach(b => b.classList.remove("selected"));
+  btn.classList.add("selected");
+  state.density = Number(btn.dataset.density);
+});
+
+/* ---------- map (Leaflet domain + point picker) ---------- */
+const map = L.map("map", { zoomControl: true, attributionControl: true }).setView([37.6, -119.5], 5);
+L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
+  subdomains: "abcd", maxZoom: 12,
+}).addTo(map);
+
+let mapMode = "view"; // view | draw | point
+let presetRect = null, drawnRect = null, pointMarker = null, drawStart = null;
+
+function boundsToLeaflet(b) { return [[b[2], b[0]], [b[3], b[1]]]; } // [w,e,s,n] -> [[s,w],[n,e]]
+function showPreset(name) {
+  state.preset = name; state.drawn = null;
+  if (drawnRect) { map.removeLayer(drawnRect); drawnRect = null; }
+  if (presetRect) map.removeLayer(presetRect);
+  presetRect = L.rectangle(boundsToLeaflet(DOMAINS[name].bounds), { color: "#ff5b24", weight: 2, fill: false, dashArray: "6 5" }).addTo(map);
+  map.fitBounds(presetRect.getBounds().pad(0.12));
+  $("mapReadout").textContent = `preset: ${DOMAINS[name].label}`;
+  [...document.querySelectorAll(".tool-btn[data-preset]")].forEach(b => b.classList.toggle("on", b.dataset.preset === name));
+}
+function setMapMode(mode) {
+  mapMode = mode;
+  $("drawBtn").classList.toggle("on", mode === "draw");
+  $("pointBtn").classList.toggle("on", mode === "point");
+  $("map").style.cursor = mode === "view" ? "grab" : "crosshair";
+  if (mode === "draw") map.dragging.disable(); else map.dragging.enable();
+  $("mapTitle").textContent = mode === "draw" ? "Drag to draw your render domain"
+    : mode === "point" ? "Click the map to drop a meteogram point"
+    : "Domain — drag a box or pick a preset";
+}
+document.querySelectorAll(".tool-btn[data-preset]").forEach(btn => {
+  btn.onclick = () => { setMapMode("view"); showPreset(btn.dataset.preset); };
+});
+$("drawBtn").onclick = () => setMapMode(mapMode === "draw" ? "view" : "draw");
+$("pointBtn").onclick = () => setMapMode(mapMode === "point" ? "view" : "point");
+
+map.on("mousedown", ev => {
+  if (mapMode !== "draw") return;
+  drawStart = ev.latlng;
+  if (drawnRect) { map.removeLayer(drawnRect); drawnRect = null; }
+});
+map.on("mousemove", ev => {
+  if (mapMode !== "draw" || !drawStart) return;
+  const b = L.latLngBounds(drawStart, ev.latlng);
+  if (!drawnRect) drawnRect = L.rectangle(b, { color: "#ffd456", weight: 2, fill: true, fillOpacity: 0.06 }).addTo(map);
+  else drawnRect.setBounds(b);
+});
+map.on("mouseup", ev => {
+  if (mapMode !== "draw" || !drawStart) return;
+  const b = L.latLngBounds(drawStart, ev.latlng);
+  drawStart = null;
+  if (b.getSouth() === b.getNorth() || b.getWest() === b.getEast()) return;
+  state.drawn = [b.getWest(), b.getEast(), b.getSouth(), b.getNorth()].map(v => Math.round(v * 100) / 100);
+  state.preset = null;
+  [...document.querySelectorAll(".tool-btn[data-preset]")].forEach(x => x.classList.remove("on"));
+  $("mapReadout").textContent = `drawn: ${state.drawn.map(v => v.toFixed(2)).join(", ")} (W,E,S,N)`;
+  log(`domain drawn ${state.drawn.join(",")}`);
+  setMapMode("view");
+});
+map.on("click", ev => {
+  if (mapMode !== "point") return;
+  const { lat, lng } = ev.latlng;
+  if (pointMarker) map.removeLayer(pointMarker);
+  pointMarker = L.circleMarker([lat, lng], { radius: 7, color: "#ffd456", weight: 2, fillColor: "#ff5b24", fillOpacity: 0.9 }).addTo(map);
+  $("mgLat").value = lat.toFixed(4); $("mgLon").value = lng.toFixed(4);
+  $("mapReadout").textContent = `point: ${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+  if (state.fam !== "meteogram") {
+    document.querySelector('.fam-chip[data-fam="meteogram"]').click();
+  }
+});
+showPreset("california");
+
+/* ---------- products ---------- */
+function noLeapDoy(dateStr) {
+  const parts = (dateStr || "2026-07-15").split("-").map(Number);
+  const cum = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+  const day = (parts[1] === 2 && parts[2] === 29) ? 28 : parts[2];
+  return cum[parts[1] - 1] + day;
+}
+function buildProducts() {
+  if (state.fam !== "climoref") return FAMS[state.fam].products;
+  const base = $("refProduct").value;
+  const doy = noLeapDoy($("refDate").value);
+  const ladder = ["p50", "p75", "p90", "p95", "p99"].map(s => `climo_ref:${base}:${s}:doy${doy}`);
+  ladder.push(`climo_ref:${base}:p99:record`, `climo_ref:${base}:max:record`);
+  return ladder.join(",");
+}
+(function initDate() {
+  const now = new Date();
+  $("refDate").value = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+})();
+
+/* ---------- render flow ---------- */
+async function renderMeteogram() {
+  const lat = Number($("mgLat").value), lon = Number($("mgLon").value);
+  const panels = [...$("mgPanels").querySelectorAll("input:checked")].map(c => c.value).join(",");
+  let run = $("runSelect").value;
+  if (run === "latest") run = "latest-day";
+  const title = `${lat.toFixed(3)}, ${lon.toFixed(3)}`;
+  const url = `/api/meteogram?lat=${lat}&lon=${lon}&run=${encodeURIComponent(run)}&panels=${encodeURIComponent(panels)}&title=${encodeURIComponent(title)}`;
+  const t0 = performance.now();
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
+    throw new Error(err.error || `HTTP ${resp.status}`);
+  }
+  const svg = await resp.text();
+  const blobUrl = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
+  log(`meteogram ready · ${((performance.now() - t0) / 1000).toFixed(2)}s`, "ok");
+  showFiles([{ name: `meteogram — ${title}`, url: blobUrl, bytes: svg.length }]);
+}
+
+$("renderBtn").onclick = async () => {
+  const btn = $("renderBtn"); btn.disabled = true; btn.textContent = "Rendering…";
+  try {
+    if (state.fam === "meteogram") { await renderMeteogram(); return; }
+    let run = $("runSelect").value;
+    // Day-window families (incl. 0-24h windowed maps) need a run whose
+    // hours span a full UTC day; short off-cycle runs can't provide it.
+    if (run === "latest" && dayFams.has(state.fam)) run = "latest-day";
+    const payload = {
+      run,
+      hour: state.hour,
+      products: buildProducts(),
+      output_format: "webp",
+      plot_style: "operational",
+      basemap_style: "topo",
+      county_linework: true,
+      place_label_density: state.density,
+      place_label_size: 2,
+      output_width: 1800,
+    };
+    if (state.drawn) { payload.domain_slug = "drawn_box"; payload.bounds = state.drawn; }
+    else { const d = DOMAINS[state.preset || "california"]; payload.domain_slug = d.slug; payload.bounds = d.bounds; }
+    log(`render ${state.fam} · ${payload.domain_slug} · ${run}`);
+    const started = await fetch("/api/render", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }).then(r => r.json());
+    if (started.error) throw new Error(started.error);
+    log(`job ${started.id} (${started.cache})`, started.cache === "hit" ? "ok" : "");
+    const t0 = performance.now();
+    let job;
+    for (;;) {
+      job = await fetch(started.status_url).then(r => r.json());
+      if (job.state === "succeeded" || job.state === "failed") break;
+      await new Promise(r => setTimeout(r, 700));
+    }
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    if (job.state === "failed") {
+      log(`failed: ${job.message}`, "err");
+      if (job.stderr_tail) log(job.stderr_tail.split("\n").slice(-2).join(" · "), "err");
+    } else log(`done · ${job.files.length} plot(s) · ${secs}s`, "ok");
+    showFiles(job.files || []);
+  } catch (err) { log(String(err.message || err), "err"); }
+  finally { btn.disabled = false; btn.textContent = "Render"; }
+};
+
+/* ---------- gallery + lightbox ---------- */
+let shots = [];
+function showFiles(files) {
+  const g = $("gallery"); g.innerHTML = ""; shots = files;
+  $("empty").style.display = files.length ? "none" : "";
+  files.forEach((f, i) => {
+    const name = f.name.replace(/^rustwx_[^_]*_\d+_\d+z(_f\d+)?_[a-z0-9_]+?_/, "").replace(/\.(webp|png|svg)$/, "");
+    const card = document.createElement("div");
+    card.className = "card"; card.style.animationDelay = (i * 60) + "ms";
+    card.innerHTML = `<img src="${f.url}" loading="lazy" alt="${name}"><div class="cap"><b>${name.replace(/_/g, " ")}</b><span>${(f.bytes / 1024 | 0)} KB</span></div>`;
+    card.querySelector("img").onclick = () => openBox(i);
+    g.appendChild(card);
+  });
+}
+let boxIndex = 0, view = { s: 1, x: 0, y: 0 };
+const box = $("box"), boxImg = $("boxImg");
+function openBox(index) {
+  boxIndex = index;
+  const f = shots[index];
+  boxImg.src = f.url; $("boxName").textContent = f.name;
+  box.classList.add("show");
+  boxImg.onload = fitBox;
+}
+function fitBox() {
+  const iw = boxImg.naturalWidth || 1180, ih = boxImg.naturalHeight || 900;
+  const s = Math.min(innerWidth / iw, (innerHeight - 60) / ih) * 0.96;
+  view = { s, x: (innerWidth - iw * s) / 2, y: (innerHeight - 60 - ih * s) / 2 };
+  applyView();
+}
+function applyView() { boxImg.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.s})`; }
+box.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  const factor = ev.deltaY < 0 ? 1.18 : 1 / 1.18;
+  const ns = Math.min(Math.max(view.s * factor, 0.05), 12);
+  view.x = ev.clientX - (ev.clientX - view.x) * (ns / view.s);
+  view.y = ev.clientY - (ev.clientY - view.y) * (ns / view.s);
+  view.s = ns; applyView();
+}, { passive: false });
+let panA = null;
+boxImg.addEventListener("pointerdown", ev => { ev.preventDefault(); panA = [ev.clientX - view.x, ev.clientY - view.y]; boxImg.classList.add("grabbing"); boxImg.setPointerCapture(ev.pointerId); });
+boxImg.addEventListener("pointermove", ev => { if (!panA) return; view.x = ev.clientX - panA[0]; view.y = ev.clientY - panA[1]; applyView(); });
+boxImg.addEventListener("pointerup", () => { panA = null; boxImg.classList.remove("grabbing"); });
+boxImg.addEventListener("dblclick", fitBox);
+function cycle(direction) { if (!shots.length) return; boxIndex = (boxIndex + direction + shots.length) % shots.length; openBox(boxIndex); }
+$("boxPrev").onclick = () => cycle(-1);
+$("boxNext").onclick = () => cycle(1);
+$("boxClose").onclick = () => box.classList.remove("show");
+addEventListener("keydown", ev => {
+  if (!box.classList.contains("show")) return;
+  if (ev.key === "Escape") box.classList.remove("show");
+  if (ev.key === "ArrowLeft") cycle(-1);
+  if (ev.key === "ArrowRight") cycle(1);
+});
+
+log("CWT Fire Weather Lab preview — HRRR × 7-year RTMA climatology");
+</script>
+</body>
+</html>

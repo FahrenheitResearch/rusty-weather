@@ -303,7 +303,8 @@ fn handle_stream(mut stream: TcpStream, state: AppState) -> Result<(), Box<dyn s
 
 fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") => html_response(SITE_HTML),
+        ("GET", "/") => html_response(PREVIEW_HTML),
+        ("GET", "/ops") => html_response(SITE_HTML),
         ("GET", "/legacy") => html_response(DEMO_HTML),
         ("GET", "/api/health") => json_response(&serde_json::json!({
             "ok": true,
@@ -1380,6 +1381,8 @@ fn place_label_render_env(size: u8) -> (&'static str, &'static str) {
 
 /// The CAFire Weather Ops console — the upgraded weather page.
 const SITE_HTML: &str = include_str!("../fire_site.html");
+/// CAFire-styled public preview page (tester-facing, served at `/`).
+const PREVIEW_HTML: &str = include_str!("../cafire_preview.html");
 
 const DEMO_HTML: &str = r#"<!doctype html>
 <html lang="en">
