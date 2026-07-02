@@ -475,7 +475,11 @@ const FAMS = {
   meteogram: { label: "Meteogram", hourly: false, products: [] },
   custom: { label: "Custom Chart", hourly: false, products: [] },
   daily: { label: "Outlook Cards", hourly: false, products: [] },
-  ecape: { label: "ECAPE · heavy node", hourly: true, products: [
+  ecape: { label: "PyroCb / ECAPE · heavy node", hourly: true, products: [
+    ["pft_gw", "PFT — pyroCb firepower threshold"],
+    ["pft_zfc", "PFT free-convection height"],
+    ["pft_dtheta_fc", "PFT required plume warming"],
+    ["pft_uml", "PFT mixed-layer wind"],
     ["muecape", "MUECAPE (most-unstable)"],
     ["mlecape", "MLECAPE (mixed-layer)"],
     ["sbecape", "SBECAPE (surface-based)"],

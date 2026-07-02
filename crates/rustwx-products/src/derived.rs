@@ -1,4 +1,4 @@
-use crate::direct::{
+﻿use crate::direct::{
     build_projected_map, build_projected_map_with_projection,
     build_requested_projected_map_with_projection, inverse_raster_projection_for_grid,
 };
@@ -2040,7 +2040,11 @@ fn build_render_artifact_with_contour_mode(
         | DerivedRecipe::EcapeScp
         | DerivedRecipe::EcapeEhi01km
         | DerivedRecipe::EcapeEhi03km
-        | DerivedRecipe::EcapeStp => {
+        | DerivedRecipe::EcapeStp
+        | DerivedRecipe::PftGw
+        | DerivedRecipe::PftZfc
+        | DerivedRecipe::PftDthetaFc
+        | DerivedRecipe::PftUml => {
             return Err(format!(
                 "heavy derived recipe '{}' must render through the cropped ECAPE path",
                 recipe.slug()
@@ -2418,7 +2422,11 @@ fn build_render_artifact_with_contour_mode_profiled(
         | DerivedRecipe::EcapeScp
         | DerivedRecipe::EcapeEhi01km
         | DerivedRecipe::EcapeEhi03km
-        | DerivedRecipe::EcapeStp => {
+        | DerivedRecipe::EcapeStp
+        | DerivedRecipe::PftGw
+        | DerivedRecipe::PftZfc
+        | DerivedRecipe::PftDthetaFc
+        | DerivedRecipe::PftUml => {
             return Err(format!(
                 "heavy derived recipe '{}' must render through the cropped ECAPE path",
                 recipe.slug()
@@ -3591,9 +3599,9 @@ pub(crate) struct DerivedLaneStyle {
 
 /// Resolve the production render styling for one derived/heavy store slug
 /// by building a REAL render request over a tiny probe grid through the
-/// exact builders the render lanes run — non-heavy recipes through
+/// exact builders the render lanes run â€” non-heavy recipes through
 /// [`build_render_artifact_with_contour_mode`] (raster mode, the default),
-/// heavy recipes through [`build_weather_map_request`] — and reading the
+/// heavy recipes through [`build_weather_map_request`] â€” and reading the
 /// styling off the request. Identity with the plot output is therefore by
 /// construction, not by a hand-maintained scale table.
 pub(crate) fn derived_store_variable_style(
