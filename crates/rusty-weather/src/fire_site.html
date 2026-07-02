@@ -541,8 +541,12 @@ $("renderBtn").onclick = async () => {
       await renderMeteogram();
       return;
     }
+    // Day-window families need a run covering a full UTC day.
+    const dayFam = state.fam === "anomaly" || state.fam === "record";
+    let runValue = $("run").value.trim();
+    if (dayFam && runValue.toLowerCase() === "latest") runValue = "latest-day";
     const payload = {
-      run: $("run").value.trim(),
+      run: runValue,
       hour: state.hour,
       products: buildProducts(),
       output_format: "webp",

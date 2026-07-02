@@ -34,7 +34,7 @@ struct Args {
     once: bool,
     #[arg(long, help = "Local render API base for cache prewarm, e.g. http://127.0.0.1:8788")]
     api_url: Option<String>,
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 3)]
     keep_recent: usize,
     #[arg(long, default_value_t = 30)]
     long_hours: u16,
@@ -151,12 +151,76 @@ fn run_command(label: &str, command: &mut Command) -> bool {
     }
 }
 
+/// Newest run in the store whose stored hours reach its cycle's target —
+/// the run day-window and anomaly products can actually fold.
+fn newest_complete_run(model_dir: &Path) -> Option<String> {
+    let mut runs: Vec<String> = std::fs::read_dir(model_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    runs.sort();
+    runs.reverse();
+    runs.into_iter().find(|slug| {
+        let Some((_, cycle)) = slug
+            .split_once('_')
+            .and_then(|(date, cycle)| {
+                let hour: u8 = cycle.strip_suffix('z')?.parse().ok()?;
+                (date.len() == 8).then_some((date, hour))
+            })
+        else {
+            return false;
+        };
+        let stored = stored_hours(&model_dir.join(slug));
+        stored.iter().copied().max().unwrap_or(0) >= target_max_hour(cycle)
+    })
+}
+
+/// Hours of any single UTC day covered by `stored` forecast hours of a
+/// `cycle`Z run — day-window (anomaly) products need >= 20.
+fn best_day_coverage(cycle: u8, stored: &[u16]) -> usize {
+    let mut per_day = std::collections::BTreeMap::new();
+    for &hour in stored {
+        let day = (u32::from(cycle) + u32::from(hour)) / 24;
+        *per_day.entry(day).or_insert(0usize) += 1;
+    }
+    per_day.values().copied().max().unwrap_or(0)
+}
+
+/// Newest run whose stored hours cover a full-enough UTC day for the
+/// anomaly/day-window lanes.
+fn newest_day_covering_run(model_dir: &Path) -> Option<String> {
+    let mut runs: Vec<String> = std::fs::read_dir(model_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    runs.sort();
+    runs.reverse();
+    runs.into_iter().find(|slug| {
+        let Some(cycle) = slug
+            .split_once('_')
+            .and_then(|(_, cycle)| cycle.strip_suffix('z')?.parse::<u8>().ok())
+        else {
+            return false;
+        };
+        best_day_coverage(cycle, &stored_hours(&model_dir.join(slug))) >= 20
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_latest(
     model_dir: &Path,
     model: &str,
     run_slug: &str,
     stored: &[u16],
     target_max: u16,
+    complete_run: Option<&str>,
+    day_run: Option<&str>,
 ) -> Result<(), String> {
     let latest = serde_json::json!({
         "schema": "cafire.latest_run.v1",
@@ -165,6 +229,12 @@ fn write_latest(
         "stored_hours": stored,
         "target_max_hour": target_max,
         "complete": stored.iter().copied().max().unwrap_or(0) >= target_max,
+        // Newest fully-stored run: what `latest` resolves to.
+        "complete_run": complete_run,
+        // Newest run covering >=20 h of a UTC day: what `latest-day`
+        // resolves to (anomaly/day-window lanes; off-cycle 18 h runs
+        // never cover a full day).
+        "day_run": day_run,
         "updated_unix": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
     });
     let tmp = model_dir.join("latest.json.tmp");
@@ -174,7 +244,7 @@ fn write_latest(
     std::fs::rename(&tmp, &path).map_err(|err| format!("publish {}: {err}", path.display()))
 }
 
-fn prewarm(agent: &ureq::Agent, api: &str, run_slug: &str) {
+fn prewarm(agent: &ureq::Agent, api: &str, complete_run: &str, day_run: Option<&str>) {
     let domains = [
         ("cafire_california", [-126.0, -113.8, 31.9, 42.5]),
         ("cafire_wide_west", [-125.7, -103.8, 31.9, 46.5]),
@@ -182,6 +252,16 @@ fn prewarm(agent: &ureq::Agent, api: &str, run_slug: &str) {
     let presets = ["cafire-anomaly", "cafire-record", "cafire-core", "fuels"];
     for (slug, bounds) in domains {
         for preset in presets {
+            // Day-window anomaly folds need a day-covering run; hourly
+            // families warm on the newest complete run.
+            let run_slug = if preset.contains("anomaly") || preset.contains("record") {
+                match day_run {
+                    Some(day_run) => day_run,
+                    None => continue,
+                }
+            } else {
+                complete_run
+            };
             let body = serde_json::json!({
                 "model": "hrrr",
                 "run": run_slug,
@@ -305,31 +385,47 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
     if stored.is_empty() {
         return;
     }
-    if let Err(err) = write_latest(&model_dir, &args.model, &run_slug, &stored, target_max) {
+
+    // Fuels + prewarm target the newest COMPLETE run — a brand-new cycle
+    // with two hours stored must not steal them from the run users see.
+    let complete_run = newest_complete_run(&model_dir);
+    let day_run = newest_day_covering_run(&model_dir);
+    if let Err(err) = write_latest(
+        &model_dir,
+        &args.model,
+        &run_slug,
+        &stored,
+        target_max,
+        complete_run.as_deref(),
+        day_run.as_deref(),
+    ) {
         eprintln!("[pipeline] latest.json: {err}");
     }
 
-    // Fuels: once per run, only after every target hour is stored — the
-    // fuel step rewrites hour files, so late-arriving hours must not miss
-    // their fuel grids.
-    let complete = stored.iter().copied().max().unwrap_or(0) >= target_max;
-    let fuel_flag = run_dir.join(".fuels-imported");
-    if !fuel_flag.exists() && complete {
-        // gridMET publishes with a 1-2 day lag; walk back until a day lands.
-        for days_back in 1..=3 {
-            let mut command = Command::new(bin_dir.join(exe("rw_fuel_fetch")));
-            command
-                .arg("--store-root").arg(&args.store_root)
-                .arg("--model").arg(&args.model)
-                .arg("--run").arg(&run_slug)
-                .arg("--hours").arg(hour_span(&stored))
-                .arg("--date").arg(fuel_date_for(&date, days_back));
-            if let Some(cache) = &args.cache_dir {
-                command.arg("--cache-dir").arg(cache.join("fuel"));
-            }
-            if run_command(&format!("fuels (day -{days_back})"), &mut command) {
-                let _ = std::fs::write(&fuel_flag, b"ok");
-                break;
+    if let Some(target_run) = &complete_run {
+        let target_dir = model_dir.join(target_run);
+        let target_hours = stored_hours(&target_dir);
+        let target_date = target_run.split('_').next().unwrap_or(target_run).to_string();
+        // Once per run; the fuel step rewrites hour files, so it only runs
+        // after every target hour is stored.
+        let fuel_flag = target_dir.join(".fuels-imported");
+        if !fuel_flag.exists() {
+            // gridMET publishes with a 1-2 day lag; walk back until a day lands.
+            for days_back in 1..=3 {
+                let mut command = Command::new(bin_dir.join(exe("rw_fuel_fetch")));
+                command
+                    .arg("--store-root").arg(&args.store_root)
+                    .arg("--model").arg(&args.model)
+                    .arg("--run").arg(target_run)
+                    .arg("--hours").arg(hour_span(&target_hours))
+                    .arg("--date").arg(fuel_date_for(&target_date, days_back));
+                if let Some(cache) = &args.cache_dir {
+                    command.arg("--cache-dir").arg(cache.join("fuel"));
+                }
+                if run_command(&format!("fuels (day -{days_back})"), &mut command) {
+                    let _ = std::fs::write(&fuel_flag, b"ok");
+                    break;
+                }
             }
         }
     }
@@ -346,12 +442,15 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
     }
     run_command("prune", &mut command);
 
-    // Prewarm once per run, when the target is fully stored + fuels done.
-    let warm_flag = run_dir.join(".prewarmed");
-    if complete && !warm_flag.exists() && fuel_flag.exists() {
-        if let Some(api) = &args.api_url {
-            prewarm(agent, api.trim_end_matches('/'), &run_slug);
-            let _ = std::fs::write(&warm_flag, b"ok");
+    // Prewarm once per complete run, after its fuels landed.
+    if let Some(target_run) = &complete_run {
+        let target_dir = model_dir.join(target_run);
+        let warm_flag = target_dir.join(".prewarmed");
+        if !warm_flag.exists() && target_dir.join(".fuels-imported").exists() {
+            if let Some(api) = &args.api_url {
+                prewarm(agent, api.trim_end_matches('/'), target_run, day_run.as_deref());
+                let _ = std::fs::write(&warm_flag, b"ok");
+            }
         }
     }
 }
@@ -439,6 +538,20 @@ mod tests {
         assert_eq!(fuel_date_for("20260701", 1), "2026-06-30");
         assert_eq!(fuel_date_for("20260101", 1), "2025-12-31");
         assert_eq!(fuel_date_for("20260702", 2), "2026-06-30");
+    }
+
+    #[test]
+    fn day_coverage_counts_hours_within_one_utc_day() {
+        // 00z F0-F23 covers the full first day.
+        let hours: Vec<u16> = (0..=23).collect();
+        assert_eq!(best_day_coverage(0, &hours), 24);
+        // 04z F0-F18 covers at most 20 hours of day 1 (04-23Z)... only F0-F18
+        // reaches 22Z: 19 hours — below the fold threshold.
+        let hours: Vec<u16> = (0..=18).collect();
+        assert_eq!(best_day_coverage(4, &hours), 19);
+        // 06z 48 h run: day 2 (F18-F41) is fully covered.
+        let hours: Vec<u16> = (0..=48).collect();
+        assert_eq!(best_day_coverage(6, &hours), 24);
     }
 
     #[test]

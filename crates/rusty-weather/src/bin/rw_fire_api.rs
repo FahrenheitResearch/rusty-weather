@@ -346,13 +346,15 @@ fn start_render_job(body: Vec<u8>, state: AppState) -> Vec<u8> {
     };
     // Resolve `latest` BEFORE the cache key: alias entries must never
     // outlive the run they pointed at.
-    if request.run.trim().eq_ignore_ascii_case("latest") {
-        request.run = match resolve_latest_run(&state.store_root, &request.model) {
-            Ok(run) => run,
-            Err(message) => {
-                return json_status_response(422, &serde_json::json!({ "error": message }));
-            }
-        };
+    let alias = request.run.trim().to_ascii_lowercase();
+    if alias == "latest" || alias == "latest-day" {
+        request.run =
+            match resolve_latest_run(&state.store_root, &request.model, alias == "latest-day") {
+                Ok(run) => run,
+                Err(message) => {
+                    return json_status_response(422, &serde_json::json!({ "error": message }));
+                }
+            };
     }
 
     let id = next_job_id(&state);
@@ -733,17 +735,22 @@ fn runs_response(query: &str, state: &AppState) -> Vec<u8> {
     json_response(&serde_json::json!({ "model": model, "runs": runs, "latest": latest }))
 }
 
-/// Resolve the `latest` run alias via the daemon's atomic manifest.
-fn resolve_latest_run(store_root: &Path, model: &str) -> Result<String, String> {
+/// Resolve the `latest` / `latest-day` run aliases via the daemon's atomic
+/// manifest. `latest` = newest fully-stored run; `latest-day` = newest run
+/// covering a full UTC day (what the anomaly/day-window lanes need).
+fn resolve_latest_run(store_root: &Path, model: &str, day: bool) -> Result<String, String> {
     let path = store_root.join(model).join("latest.json");
     let text = std::fs::read_to_string(&path)
         .map_err(|_| format!("no latest-run manifest for model '{model}' (daemon not running?)"))?;
     let manifest: serde_json::Value =
         serde_json::from_str(&text).map_err(|err| format!("latest.json: {err}"))?;
-    let run = manifest
-        .get("run")
-        .and_then(|value| value.as_str())
-        .ok_or("latest.json has no run field")?;
+    let field = |name: &str| manifest.get(name).and_then(|value| value.as_str());
+    let run = if day {
+        field("day_run").or_else(|| field("complete_run")).or_else(|| field("run"))
+    } else {
+        field("complete_run").or_else(|| field("run"))
+    }
+    .ok_or("latest.json has no run field")?;
     if run.len() > 40 || run.contains(['/', '\\', '.']) {
         return Err("latest.json run slug is not valid".to_string());
     }
@@ -944,8 +951,9 @@ fn meteogram_response(path: &str, state: &AppState) -> Vec<u8> {
         return bad("model slug is not valid");
     }
     let resolved_run;
-    let run = if run.eq_ignore_ascii_case("latest") {
-        match resolve_latest_run(&state.store_root, model) {
+    let alias = run.to_ascii_lowercase();
+    let run = if alias == "latest" || alias == "latest-day" {
+        match resolve_latest_run(&state.store_root, model, alias == "latest-day") {
             Ok(resolved) => {
                 resolved_run = resolved;
                 resolved_run.as_str()
