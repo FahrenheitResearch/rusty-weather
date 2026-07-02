@@ -421,12 +421,12 @@ $("renderBtn").onclick = async () => {
       hour: state.hour,
       products: FAMS[state.fam].products,
       output_format: "webp",
-      plot_style: "operational-fast",
+      plot_style: "operational",
       basemap_style: $("basemap").value,
       county_linework: $("counties").value === "true",
       place_label_density: Number($("density").value),
-      place_label_size: 1,
-      output_width: 1600,
+      place_label_size: 2,
+      output_width: 1800,
     };
     if (state.dom === "draw") {
       if (!state.drawn) throw new Error("draw a box first");

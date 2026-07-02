@@ -104,6 +104,11 @@ pub enum ClimoProduct {
     HoursRh20Gust25,
     HoursRh20Wind20,
     OvernightRhRecovery,
+    /// Weighted blend of six ingredient severity percentiles
+    /// (surface_fire_weather_potential_v1: RH .22, VPD .22, wind .16,
+    /// gust .16, HDW-wind .12, HDW-gust .12; needs >=4 ingredients and
+    /// >=0.70 weight fraction). Weather-only by contract.
+    SurfacePotential,
 }
 
 pub const CLIMO_PRODUCTS: &[&str] = &[
@@ -117,9 +122,10 @@ pub const CLIMO_PRODUCTS: &[&str] = &[
     "hours_rh20_gust25_percentile",
     "hours_rh20_wind20_percentile",
     "overnight_rh_recovery_percentile",
+    "surface_fire_weather_potential",
 ];
 
-const ALL_PRODUCTS: [ClimoProduct; 10] = [
+const ALL_PRODUCTS: [ClimoProduct; 11] = [
     ClimoProduct::VpdDayMax,
     ClimoProduct::MinRhDay,
     ClimoProduct::WindDayMax,
@@ -130,6 +136,7 @@ const ALL_PRODUCTS: [ClimoProduct; 10] = [
     ClimoProduct::HoursRh20Gust25,
     ClimoProduct::HoursRh20Wind20,
     ClimoProduct::OvernightRhRecovery,
+    ClimoProduct::SurfacePotential,
 ];
 
 impl ClimoProduct {
@@ -152,6 +159,7 @@ impl ClimoProduct {
             Self::HoursRh20Gust25 => "hours_rh20_gust25_percentile",
             Self::HoursRh20Wind20 => "hours_rh20_wind20_percentile",
             Self::OvernightRhRecovery => "overnight_rh_recovery_percentile",
+            Self::SurfacePotential => "surface_fire_weather_potential",
         }
     }
 
@@ -167,6 +175,7 @@ impl ClimoProduct {
             Self::HoursRh20Gust25 => "Hours RH<=20% & Gust>=25mph Percentile vs Climatology",
             Self::HoursRh20Wind20 => "Hours RH<=20% & Wind>=20mph Percentile vs Climatology",
             Self::OvernightRhRecovery => "Overnight RH Recovery Percentile (12Z-06Z) vs Climatology",
+            Self::SurfacePotential => "Surface Fire Weather Potential (Weather-Only, 0-100)",
         }
     }
 
@@ -189,6 +198,7 @@ impl ClimoProduct {
             Self::HoursRh15Gust25 => "hours_joint_rh15_gust25",
             Self::HoursRh20Gust25 => "hours_joint_rh20_gust25",
             Self::HoursRh20Wind20 => "hours_joint_rh20_wind20",
+            Self::SurfacePotential => "max_vpd_2m_kpa",
         }
     }
 
@@ -197,12 +207,22 @@ impl ClimoProduct {
         matches!(self, Self::MinRhDay | Self::OvernightRhRecovery)
     }
 
+    /// Threshold-hours products: zero hours where zero is also the
+    /// climatological norm renders as no-data, not a mid-rank fill.
+    fn hours_product(self) -> bool {
+        matches!(
+            self,
+            Self::HoursRh15Gust25 | Self::HoursRh20Gust25 | Self::HoursRh20Wind20
+        )
+    }
+
     fn scale(self) -> DiscreteColorScale {
+        // Few, operationally-meaningful bins: quiet blues below median, pale
+        // neutrals through p75, then thick hot bins where IMETs look.
         DiscreteColorScale {
-            levels: vec![0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0, 100.5],
+            levels: vec![0.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0, 100.5],
             colors: hex_colors(&[
-                "#2c7bb6", "#74add1", "#c6dbef", "#edf2f7", "#fdf6c3", "#fdcc8a", "#fc8d59",
-                "#e31a1c", "#7a0177",
+                "#5b93c3", "#c8d9e4", "#f2ede0", "#fdd08a", "#f8823c", "#dc1f1f", "#7a0177",
             ]),
             extend: ExtendMode::Neither,
             mask_below: None,
@@ -265,6 +285,7 @@ impl DayFold {
             ClimoProduct::HoursRh15Gust25 => &self.hours_rh15_gust25,
             ClimoProduct::HoursRh20Gust25 => &self.hours_rh20_gust25,
             ClimoProduct::HoursRh20Wind20 => &self.hours_rh20_wind20,
+            ClimoProduct::SurfacePotential => &self.max_vpd,
         }
     }
 }
@@ -651,11 +672,37 @@ pub fn render_climo_products_from_store(
             .map(|stored| median_finite(&stored.values))
             .unwrap_or(f32::NAN);
 
+        if product == ClimoProduct::SurfacePotential {
+            match compute_surface_potential(&climo, fold, ny * nx) {
+                Ok(ranks) => {
+                    let output_path = render_rank_map(
+                        config, &subgrid, &projected, climo.projection().cloned(),
+                        product, ranks, anchor_hour, fold, doy, f32::NAN,
+                    )?;
+                    rendered.push(RenderedProduct {
+                        slug: product.slug().to_string(),
+                        total_ms: started.elapsed().as_millis(),
+                        output_path,
+                    });
+                }
+                Err(reason) => skipped.push(StoreRenderSkip {
+                    slug: product.slug().to_string(),
+                    reason,
+                }),
+            }
+            continue;
+        }
         let source_values = fold.values_for(product);
         let mut ranks = vec![f32::NAN; ny * nx];
         for cell in 0..ny * nx {
             let value = source_values[cell];
             if !value.is_finite() {
+                continue;
+            }
+            // Joint-hours: no critical hours forecast where none are
+            // climatologically expected (p75 == 0) is "no signal", not a
+            // mid-percentile fill — leave the basemap visible.
+            if product.hours_product() && value <= 0.0 && anchors[4][cell] <= 0.0 {
                 continue;
             }
             let anchor_values = [
@@ -790,6 +837,66 @@ fn render_rank_map(
     Ok(output_path)
 }
 
+/// surface_fire_weather_potential_v1: weighted severity-percentile blend.
+fn compute_surface_potential(
+    climo: &StoreFieldSource,
+    fold: &DayFold,
+    plane: usize,
+) -> Result<Vec<f32>, String> {
+    // (fold values, climo product, weight, dryness orientation)
+    let ingredients: [(&[f32], &str, f64, bool); 6] = [
+        (&fold.min_rh, "min_rh_2m_pct", 0.22, true),
+        (&fold.max_vpd, "max_vpd_2m_kpa", 0.22, false),
+        (&fold.max_wind, "max_wind_10m_ms", 0.16, false),
+        (&fold.max_gust, "max_gust_10m_ms", 0.16, false),
+        (&fold.max_hdw_wind, "max_surface_hdw_wind", 0.12, false),
+        (&fold.max_hdw_gust, "max_surface_hdw_gust", 0.12, false),
+    ];
+    let mut anchor_sets = Vec::with_capacity(6);
+    for (_, name, _, _) in &ingredients {
+        let mut set = Vec::with_capacity(ANCHOR_STATS.len());
+        for stat in ANCHOR_STATS {
+            let full = format!("climo__utc_00_23__{name}__{stat}");
+            match climo.derived_grid(&full) {
+                Ok(stored) => set.push(stored.values),
+                Err(err) => return Err(format!("potential ingredient {full}: {err}")),
+            }
+        }
+        anchor_sets.push(set);
+    }
+    let mut out = vec![f32::NAN; plane];
+    for cell in 0..plane {
+        let mut weighted = 0.0f64;
+        let mut weight_sum = 0.0f64;
+        let mut count = 0usize;
+        for (index, (values, _, weight, dryness)) in ingredients.iter().enumerate() {
+            let value = values[cell];
+            if !value.is_finite() {
+                continue;
+            }
+            let set = &anchor_sets[index];
+            let anchors = [
+                set[0][cell], set[1][cell], set[2][cell], set[3][cell],
+                set[4][cell], set[5][cell], set[6][cell], set[7][cell],
+            ];
+            let rank = if *dryness {
+                dryness_rank(value, &anchors)
+            } else {
+                percentile_rank(value, &anchors)
+            };
+            if rank.is_finite() {
+                weighted += f64::from(rank) * weight;
+                weight_sum += weight;
+                count += 1;
+            }
+        }
+        if count >= 4 && weight_sum >= 0.70 {
+            out[cell] = (weighted / weight_sum) as f32;
+        }
+    }
+    Ok(out)
+}
+
 fn median_finite(values: &[f32]) -> f32 {
     let mut finite: Vec<f32> = values.iter().copied().filter(|v| v.is_finite()).collect();
     if finite.is_empty() {
@@ -862,7 +969,7 @@ mod tests {
 
     #[test]
     fn slugs_round_trip_for_all_ten_products() {
-        assert_eq!(CLIMO_PRODUCTS.len(), 10);
+        assert_eq!(CLIMO_PRODUCTS.len(), 11);
         for slug in CLIMO_PRODUCTS {
             let product = ClimoProduct::parse(slug).expect(slug);
             assert_eq!(product.slug(), *slug);
