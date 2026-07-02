@@ -244,6 +244,65 @@ fn write_latest(
     std::fs::rename(&tmp, &path).map_err(|err| format!("publish {}: {err}", path.display()))
 }
 
+/// Submit one render request and poll it to completion (~4 min cap) so
+/// prewarm never floods the render gate.
+fn warm_one(agent: &ureq::Agent, api: &str, label: &str, body: serde_json::Value) {
+    let started = agent
+        .post(&format!("{api}/api/render"))
+        .header("content-type", "application/json")
+        .send(body.to_string());
+    let mut started = match started {
+        Ok(resp) => resp,
+        Err(err) => {
+            eprintln!("[pipeline] prewarm {label} submit failed: {err}");
+            return;
+        }
+    };
+    let Some(job) = started
+        .body_mut()
+        .read_to_string()
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    else {
+        return;
+    };
+    let Some(status_url) = job.get("status_url").and_then(|v| v.as_str()) else {
+        return;
+    };
+    for _ in 0..240 {
+        std::thread::sleep(Duration::from_secs(1));
+        let Some(state) = get_json(agent, &format!("{api}{status_url}")) else { break };
+        match state.get("state").and_then(|v| v.as_str()) {
+            Some("succeeded") => {
+                println!("[pipeline] prewarm {label} done");
+                break;
+            }
+            Some("failed") => {
+                eprintln!(
+                    "[pipeline] prewarm {label} failed: {}",
+                    state.get("message").and_then(|v| v.as_str()).unwrap_or("?")
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn base_render_body(run_slug: &str, preset: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": "hrrr",
+        "run": run_slug,
+        "hour": 12,
+        "products": preset,
+        "output_format": "webp",
+        "plot_style": "operational",
+        "place_label_density": 3,
+        "place_label_size": 2,
+        "output_width": 1800,
+    })
+}
+
 fn prewarm(agent: &ureq::Agent, api: &str, complete_run: &str, day_run: Option<&str>) {
     let domains = [
         ("cafire_california", [-126.0, -113.8, 31.9, 42.5]),
@@ -262,62 +321,41 @@ fn prewarm(agent: &ureq::Agent, api: &str, complete_run: &str, day_run: Option<&
             } else {
                 complete_run
             };
-            let body = serde_json::json!({
-                "model": "hrrr",
-                "run": run_slug,
-                "hour": 12,
-                "products": preset,
-                "output_format": "webp",
-                "plot_style": "operational",
-                "place_label_density": 3,
-                "place_label_size": 2,
-                "output_width": 1800,
-                "domain_slug": slug,
-                "bounds": bounds,
-            });
-            let started = agent
-                .post(&format!("{api}/api/render"))
-                .header("content-type", "application/json")
-                .send(body.to_string());
-            let mut started = match started {
-                Ok(resp) => resp,
-                Err(err) => {
-                    eprintln!("[pipeline] prewarm {slug}/{preset} submit failed: {err}");
-                    continue;
-                }
-            };
-            let Some(job) = started
-                .body_mut()
-                .read_to_string()
-                .ok()
-                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            else {
-                continue;
-            };
-            let Some(status_url) = job.get("status_url").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            // Poll to completion so the gate isn't flooded; ~4 min cap.
-            for _ in 0..240 {
-                std::thread::sleep(Duration::from_secs(1));
-                let Some(state) = get_json(agent, &format!("{api}{status_url}")) else {
-                    break;
-                };
-                match state.get("state").and_then(|v| v.as_str()) {
-                    Some("succeeded") => {
-                        println!("[pipeline] prewarm {slug}/{preset} done");
-                        break;
-                    }
-                    Some("failed") => {
-                        eprintln!(
-                            "[pipeline] prewarm {slug}/{preset} failed: {}",
-                            state.get("message").and_then(|v| v.as_str()).unwrap_or("?")
-                        );
-                        break;
-                    }
-                    _ => {}
-                }
-            }
+            let mut body = base_render_body(run_slug, preset);
+            body["domain_slug"] = serde_json::json!(slug);
+            body["bounds"] = serde_json::json!(bounds);
+            warm_one(agent, api, &format!("{slug}/{preset}"), body);
+        }
+    }
+
+    // Per-incident pregen: auto-framed domains for the largest active
+    // perimeters (the API's cached WFIGS feed) so the site's fire picker
+    // is a cache hit for everyone.
+    let Some(fires) = get_json(agent, &format!("{api}/api/fires")) else { return };
+    let fires = fires
+        .get("fires")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for fire in fires.iter().take(4) {
+        let Some(ring) = fire.get("ring") else { continue };
+        let name = fire.get("name").and_then(|value| value.as_str()).unwrap_or("incident");
+        let slug: String = name
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let slug = format!("{}_fire", slug.trim_matches('_').chars().take(24).collect::<String>());
+        for (preset, run_slug) in
+            [("cafire-core", Some(complete_run)), ("cafire-anomaly", day_run)]
+        {
+            let Some(run_slug) = run_slug else { continue };
+            let mut body = base_render_body(run_slug, preset);
+            body["domain_slug"] = serde_json::json!(slug);
+            body["perimeter"] = ring.clone();
+            body["padding_km"] = serde_json::json!(50);
+            body["overlay_perimeter"] = serde_json::json!(true);
+            warm_one(agent, api, &format!("{name}/{preset}"), body);
         }
     }
 }

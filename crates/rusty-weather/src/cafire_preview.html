@@ -298,6 +298,14 @@ button { color: inherit; cursor: pointer; }
           <button class="tool-btn" data-preset="sierra">Sierra Front</button>
           <button class="tool-btn" id="drawBtn">✏ draw box</button>
           <button class="tool-btn" id="pointBtn">📍 point</button>
+          <select id="fireSel" class="tool-btn" style="max-width:200px">
+            <option value="">🔥 active fires…</option>
+          </select>
+          <select id="firePad" class="tool-btn" title="perimeter padding">
+            <option value="25">+25 km</option>
+            <option value="50" selected>+50 km</option>
+            <option value="100">+100 km</option>
+          </select>
         </div>
       </div>
       <div id="map"></div>
@@ -406,7 +414,7 @@ const RIBBONS = {
 let state = {
   fam: "anomaly", product: ANOMALY[0][0], hour: 6, density: 3,
   basemap: "topo", counties: true,
-  preset: "california", drawn: null, stat: "p95",
+  preset: "california", drawn: null, fire: null, stat: "p95",
   hours: [], playTimer: null, seq: 0,
 };
 
@@ -592,8 +600,15 @@ L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
 }).addTo(map);
 let mapMode = "view", presetRect = null, drawnRect = null, pointMarker = null, drawStart = null;
 function boundsToLeaflet(b) { return [[b[2], b[0]], [b[3], b[1]]]; }
+let firePoly = null;
+function clearFire() {
+  state.fire = null;
+  if (firePoly) { map.removeLayer(firePoly); firePoly = null; }
+  $("fireSel").value = "";
+}
 function showPreset(name) {
   state.preset = name; state.drawn = null;
+  clearFire();
   if (drawnRect) { map.removeLayer(drawnRect); drawnRect = null; }
   if (presetRect) map.removeLayer(presetRect);
   presetRect = L.rectangle(boundsToLeaflet(DOMAINS[name].bounds), { color: "#ff5b24", weight: 2, fill: false, dashArray: "6 5" }).addTo(map);
@@ -631,6 +646,7 @@ map.on("mouseup", ev => {
   if (b.getSouth() === b.getNorth() || b.getWest() === b.getEast()) return;
   state.drawn = [b.getWest(), b.getEast(), b.getSouth(), b.getNorth()].map(v => Math.round(v * 100) / 100);
   state.preset = null;
+  clearFire();
   [...document.querySelectorAll(".tool-btn[data-preset]")].forEach(x => x.classList.remove("on"));
   $("mapReadout").textContent = `drawn: ${state.drawn.map(v => v.toFixed(2)).join(", ")} (W,E,S,N)`;
   setMapMode("view");
@@ -647,6 +663,46 @@ map.on("click", ev => {
   else renderCurrent();
 });
 showPreset("california");
+
+/* ---------- active fires (WFIGS via /api/fires) ---------- */
+let firesList = [];
+async function loadFires() {
+  try {
+    const data = await fetch("/api/fires").then(r => r.json());
+    firesList = data.fires || [];
+    const select = $("fireSel");
+    const keep = select.value;
+    select.innerHTML = `<option value="">🔥 active fires (${firesList.length})…</option>`;
+    firesList.forEach((fire, index) => {
+      const opt = document.createElement("option");
+      opt.value = String(index);
+      opt.textContent = `${fire.name} — ${Number(fire.acres).toLocaleString()} ac (${String(fire.state).replace("US-", "")})`;
+      select.appendChild(opt);
+    });
+    if ([...select.options].some(o => o.value === keep)) select.value = keep;
+  } catch { /* picker stays empty; presets still work */ }
+}
+loadFires(); setInterval(loadFires, 10 * 60_000);
+function fireSlug(name) {
+  return (name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 24) || "incident") + "_fire";
+}
+$("fireSel").addEventListener("change", () => {
+  const fire = firesList[Number($("fireSel").value)];
+  if (!fire) { clearFire(); showPreset("california"); renderCurrent(); return; }
+  state.fire = fire; state.drawn = null; state.preset = null;
+  if (drawnRect) { map.removeLayer(drawnRect); drawnRect = null; }
+  if (presetRect) { map.removeLayer(presetRect); presetRect = null; }
+  [...document.querySelectorAll(".tool-btn[data-preset]")].forEach(x => x.classList.remove("on"));
+  if (firePoly) map.removeLayer(firePoly);
+  firePoly = L.polygon(fire.ring.map(p => [p[1], p[0]]), {
+    color: "#ff5b24", weight: 2, fillColor: "#ff5b24", fillOpacity: 0.15,
+  }).addTo(map);
+  map.fitBounds(firePoly.getBounds().pad(0.8));
+  $("mapReadout").textContent = `fire: ${fire.name} · auto-framed +${$("firePad").value} km`;
+  log(`fire domain: ${fire.name} (${Number(fire.acres).toLocaleString()} ac)`);
+  renderCurrent();
+});
+$("firePad").addEventListener("change", () => { if (state.fire) renderCurrent(); });
 
 /* ---------- climoref helpers ---------- */
 function noLeapDoy(dateStr) {
@@ -679,9 +735,22 @@ function currentRun() {
   return run;
 }
 function domainPayload() {
+  if (state.fire) {
+    return {
+      domain_slug: fireSlug(state.fire.name),
+      perimeter: state.fire.ring,
+      padding_km: Number($("firePad").value),
+      overlay_perimeter: true,
+    };
+  }
   if (state.drawn) return { domain_slug: "drawn_box", bounds: state.drawn };
   const d = DOMAINS[state.preset || "california"];
   return { domain_slug: d.slug, bounds: d.bounds };
+}
+function domainLabel() {
+  if (state.fire) return `${state.fire.name} fire · +${$("firePad").value} km`;
+  if (state.drawn) return "custom domain";
+  return DOMAINS[state.preset || "california"].label;
 }
 function productLabel() {
   if (state.fam === "climoref") {
@@ -754,7 +823,7 @@ function showImage(url, title, run, file) {
   img.style.display = "block";
   $("placeholder").style.display = "none";
   $("viewTitle").textContent = title;
-  $("viewProv").textContent = `${String(run).replace("_", " ")} · ${state.drawn ? "custom domain" : DOMAINS[state.preset || "california"].label}`;
+  $("viewProv").textContent = `${String(run).replace("_", " ")} · ${domainLabel()}`;
   const dl = $("dlLink");
   if (file) { dl.href = url; dl.download = file.name; dl.style.display = ""; }
   else { dl.style.display = "none"; }

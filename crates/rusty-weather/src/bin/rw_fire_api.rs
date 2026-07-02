@@ -85,6 +85,8 @@ struct AppState {
     render_cache: Arc<Mutex<HashMap<String, String>>>,
     counter: Arc<AtomicU64>,
     render_gate: Arc<RenderGate>,
+    /// Cached /api/fires response body and when it was fetched.
+    fires_cache: Arc<Mutex<Option<(Instant, Vec<u8>)>>>,
 }
 
 struct RenderGate {
@@ -265,6 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         render_cache: Arc::new(Mutex::new(HashMap::new())),
         counter: Arc::new(AtomicU64::new(1)),
         render_gate: Arc::new(RenderGate::new(args.max_render_jobs)),
+        fires_cache: Arc::new(Mutex::new(None)),
     };
     let addr = format!("{}:{}", args.host, args.port);
     let listener = TcpListener::bind(&addr)?;
@@ -326,6 +329,7 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
         _ if request.method == "GET" && request.path.starts_with("/api/runs") => {
             runs_response(&request.query, &state)
         }
+        ("GET", "/api/fires") => fires_response(&state),
         _ if request.method == "GET" && request.path.starts_with("/api/jobs/") => {
             let id = request.path.trim_start_matches("/api/jobs/");
             job_response(id, &state)
@@ -705,6 +709,120 @@ fn is_served_image_extension(path: &Path) -> bool {
 fn update_job(state: &AppState, id: &str, f: impl FnOnce(&mut Job)) {
     if let Some(job) = state.jobs.lock().expect("job mutex").get_mut(id) {
         f(job);
+    }
+}
+
+/// Live active-fire perimeters from the public WFIGS ArcGIS feed (key-free),
+/// simplified for the perimeter-domain API and the site's fire picker.
+/// Served from a 10-minute in-memory cache so testers never hammer NIFC.
+const WFIGS_URL: &str = "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query?where=poly_GISAcres%3E100+AND+attr_POOState+IN+('US-CA','US-NV','US-OR','US-AZ','US-ID','US-UT')&outFields=poly_IncidentName,poly_GISAcres,attr_POOState,poly_DateCurrent&orderByFields=poly_GISAcres+DESC&resultRecordCount=40&geometryPrecision=4&outSR=4326&f=geojson";
+const FIRES_CACHE_SECS: u64 = 600;
+const FIRE_RING_MAX_POINTS: usize = 240;
+
+fn fires_agent() -> ureq::Agent {
+    static CRYPTO_PROVIDER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    CRYPTO_PROVIDER.get_or_init(|| {
+        rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider()).ok();
+    });
+    let crypto = std::sync::Arc::new(rustls_rustcrypto::provider());
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_recv_response(Some(Duration::from_secs(30)))
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::Rustls)
+                .root_certs(ureq::tls::RootCerts::WebPki)
+                .unversioned_rustls_crypto_provider(crypto)
+                .build(),
+        )
+        .build()
+        .new_agent()
+}
+
+/// Largest outer ring of a Polygon/MultiPolygon, decimated to a point cap —
+/// plenty for domain framing and the drawn overlay.
+fn largest_ring(geometry: &serde_json::Value) -> Option<Vec<[f64; 2]>> {
+    let coords = geometry.get("coordinates")?;
+    let outer_rings: Vec<&serde_json::Value> = match geometry.get("type")?.as_str()? {
+        "Polygon" => coords.as_array()?.first().into_iter().collect(),
+        "MultiPolygon" => coords
+            .as_array()?
+            .iter()
+            .filter_map(|poly| poly.as_array()?.first())
+            .collect(),
+        _ => return None,
+    };
+    let ring = outer_rings
+        .into_iter()
+        .filter_map(|ring| ring.as_array())
+        .max_by_key(|ring| ring.len())?;
+    let step = (ring.len() / FIRE_RING_MAX_POINTS).max(1);
+    let points: Vec<[f64; 2]> = ring
+        .iter()
+        .step_by(step)
+        .filter_map(|point| {
+            let pair = point.as_array()?;
+            Some([pair.first()?.as_f64()?, pair.get(1)?.as_f64()?])
+        })
+        .collect();
+    (points.len() >= 4).then_some(points)
+}
+
+fn fetch_fires() -> Result<Vec<u8>, String> {
+    let mut response = fires_agent()
+        .get(WFIGS_URL)
+        .call()
+        .map_err(|err| format!("WFIGS fetch: {err}"))?;
+    let text = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|err| format!("WFIGS body: {err}"))?;
+    let geojson: serde_json::Value =
+        serde_json::from_str(&text).map_err(|err| format!("WFIGS parse: {err}"))?;
+    let fires: Vec<serde_json::Value> = geojson
+        .get("features")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|feature| {
+            let props = feature.get("properties")?;
+            let ring = largest_ring(feature.get("geometry")?)?;
+            Some(serde_json::json!({
+                "name": props.get("poly_IncidentName").and_then(|v| v.as_str()).unwrap_or("unnamed").trim(),
+                "acres": props.get("poly_GISAcres").and_then(|v| v.as_f64()).unwrap_or(0.0).round(),
+                "state": props.get("attr_POOState").and_then(|v| v.as_str()).unwrap_or(""),
+                "updated_ms": props.get("poly_DateCurrent").and_then(|v| v.as_i64()),
+                "ring": ring,
+            }))
+        })
+        .collect();
+    serde_json::to_vec(&serde_json::json!({ "source": "WFIGS current perimeters", "fires": fires }))
+        .map_err(|err| err.to_string())
+}
+
+fn fires_response(state: &AppState) -> Vec<u8> {
+    {
+        let cache = state.fires_cache.lock().expect("fires cache mutex");
+        if let Some((fetched, body)) = cache.as_ref() {
+            if fetched.elapsed().as_secs() < FIRES_CACHE_SECS {
+                return response(200, "application/json; charset=utf-8", body.clone());
+            }
+        }
+    }
+    match fetch_fires() {
+        Ok(body) => {
+            *state.fires_cache.lock().expect("fires cache mutex") =
+                Some((Instant::now(), body.clone()));
+            response(200, "application/json; charset=utf-8", body)
+        }
+        Err(message) => {
+            // Serve stale data over an error when the upstream hiccups.
+            let cache = state.fires_cache.lock().expect("fires cache mutex");
+            if let Some((_, body)) = cache.as_ref() {
+                return response(200, "application/json; charset=utf-8", body.clone());
+            }
+            json_status_response(502, &serde_json::json!({ "error": message }))
+        }
     }
 }
 
