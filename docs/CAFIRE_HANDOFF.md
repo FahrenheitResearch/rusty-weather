@@ -259,6 +259,12 @@ There is additionally a static per-run feed of prerendered California
 frames (`GET {BASE}/api/ecape/latest.json` → files under
 `/api/ecape/{run}/`) if you just want cheap embeds without job polling.
 
+**Availability note:** everything else in this document is served
+entirely from the datacenter; the ECAPE suite alone depends on the
+off-site compute node and its tunnel. If `/node/api/health` is down,
+degrade the ECAPE section gracefully (the static `/api/ecape/` feed may
+still have the last pushed run) — nothing else is affected.
+
 **Honesty note on "pyroCb":** ECAPE is the pyroCb-*relevant* instability
 signal (how much CAPE survives entrainment — plume-driven convection
 cares deeply). Dedicated pyroCb products — PFT (Pyrocumulonimbus
