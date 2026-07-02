@@ -22,6 +22,61 @@ use rw_store::reader::HourReader;
 
 const MS_TO_MPH: f64 = 2.236_936;
 
+/// True meteorological wind barb as an SVG group centered at (x, y):
+/// the staff points toward the wind SOURCE (rotate by the from-degrees),
+/// feathers on the right side per NH convention — half barb = 5 kt,
+/// full barb = 10 kt, pennant = 50 kt (speed converted from mph and
+/// rounded to 5 kt). Calm (< ~3 mph) draws the station circle.
+fn wind_barb_svg(x: f64, y: f64, dir_from_deg: f64, speed_mph: f64, color: &str) -> String {
+    let kt = (speed_mph * 0.868_976 / 5.0).round() as i64 * 5;
+    if kt < 3 {
+        return format!(
+            r##"<circle cx="{x:.1}" cy="{y:.1}" r="3.4" fill="none" stroke="{color}" stroke-width="1.6"/>"##
+        );
+    }
+    const STAFF: f64 = 19.0; // px, tip at local (0, -STAFF/2)
+    const FEATHER: f64 = 7.5;
+    const SPACING: f64 = 3.4;
+    let tip = -STAFF / 2.0;
+    let base = STAFF / 2.0;
+    let mut parts = format!(
+        r##"<line x1="0" y1="{tip:.1}" x2="0" y2="{base:.1}" stroke="{color}" stroke-width="1.7"/>"##
+    );
+    let mut remaining = kt;
+    let mut yi = tip;
+    while remaining >= 50 {
+        parts.push_str(&format!(
+            r##"<path d="M0,{yi:.1} L{FEATHER:.1},{:.1} L0,{:.1} Z" fill="{color}"/>"##,
+            yi + 1.4,
+            yi + 3.4,
+        ));
+        yi += SPACING + 1.6;
+        remaining -= 50;
+    }
+    while remaining >= 10 {
+        parts.push_str(&format!(
+            r##"<line x1="0" y1="{yi:.1}" x2="{FEATHER:.1}" y2="{:.1}" stroke="{color}" stroke-width="1.7"/>"##,
+            yi - 2.6
+        ));
+        yi += SPACING;
+        remaining -= 10;
+    }
+    if remaining >= 5 {
+        // A lone half barb sits one spacing down from the tip.
+        if (yi - tip).abs() < 0.1 {
+            yi += SPACING;
+        }
+        parts.push_str(&format!(
+            r##"<line x1="0" y1="{yi:.1}" x2="{:.1}" y2="{:.1}" stroke="{color}" stroke-width="1.7"/>"##,
+            FEATHER * 0.5,
+            yi - 1.3
+        ));
+    }
+    format!(
+        r##"<g transform="translate({x:.1},{y:.1}) rotate({dir_from_deg:.0})">{parts}</g>"##
+    )
+}
+
 /// Human headline form of a store variable name: underscores to spaces,
 /// words capitalized, known acronyms uppercased ("rh_2m" → "RH 2m").
 fn prettify_var_name(var: &str) -> String {
@@ -646,7 +701,7 @@ pub fn render_meteogram_svg(
     ));
     // Branding parity with the outlook card.
     svg.push_str(&format!(
-        r##"<text x="{:.1}" y="30" fill="#8d8171" font-size="11" text-anchor="end">cafire.wxsection.com/lab</text>"##,
+        r##"<text x="{:.1}" y="30" fill="#8d8171" font-size="11" text-anchor="end">cafire.org/weather</text>"##,
         W - MR
     ));
     svg.push_str(&format!(
@@ -1463,7 +1518,7 @@ pub fn render_daily_svg(
         xml_escape(&place.to_uppercase())
     ));
     svg.push_str(&format!(
-        r##"<text x="{:.0}" y="64" fill="#9ea6a5" font-size="12" text-anchor="end">cafire.wxsection.com/lab</text>"##,
+        r##"<text x="{:.0}" y="64" fill="#9ea6a5" font-size="12" text-anchor="end">cafire.org/weather</text>"##,
         width - 26.0
     ));
 
@@ -1495,7 +1550,9 @@ pub fn render_daily_svg(
         }
     }
 
-    // WIND row: direction arrow (pointing downwind) + bucket-max speed.
+    // WIND row: true meteorological barb (staff points toward the wind
+    // source; half = 5 kt, full = 10 kt, pennant = 50 kt) + bucket-max
+    // speed in mph below.
     let wind_y = 86.0 + n_strips * (strip_h + 6.0);
     svg.push_str(&format!(
         r##"<text x="{:.0}" y="{:.0}" fill="#9ea6a5" font-size="13" font-weight="700" text-anchor="end">WIND</text>"##,
@@ -1507,10 +1564,7 @@ pub fn render_daily_svg(
         match (day.wind_dir_from_deg, day.wind_max_mph) {
             (Some(dir), Some(speed)) => {
                 let speed_color = if speed >= 30.0 { "#ff5b24" } else if speed >= 15.0 { "#f5b53c" } else { "#9ea6a5" };
-                svg.push_str(&format!(
-                    r##"<g transform="translate({x_center:.1},{:.1}) rotate({dir:.0})"><line x1="0" y1="-8" x2="0" y2="8" stroke="{speed_color}" stroke-width="2"/><path d="M0,8 L-3.6,2.6 M0,8 L3.6,2.6" stroke="{speed_color}" stroke-width="2" fill="none"/></g>"##,
-                    wind_y + 15.0
-                ));
+                svg.push_str(&wind_barb_svg(x_center, wind_y + 16.0, dir, speed, speed_color));
                 svg.push_str(&format!(
                     r##"<text x="{x_center:.1}" y="{:.1}" fill="{speed_color}" font-size="13" font-weight="700" text-anchor="middle">{}</text>"##,
                     wind_y + wind_row_h - 4.0,

@@ -210,6 +210,10 @@ struct Layout {
     subtitle_y: u32,
     text_scale: u32,
     label_gap: u32,
+    /// Croppable branding strip ABOVE all plot content: slicing off the
+    /// top `banner_h` pixels leaves a complete plot (title, subtitles,
+    /// map, colorbar). Deliberate — attribution people can remove.
+    banner_h: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,17 +369,23 @@ fn compute_layout(
     let header_top_pad = scale_u32(5, chrome_scale);
     let header_bottom_pad = scale_u32(5, chrome_scale);
     let map_x = metrics.margin_x.min(total_w.saturating_sub(1));
-    let title_h = if has_title {
-        metrics.title_h.max(
-            header_top_pad
-                .saturating_add(title_line_h)
-                .saturating_add(header_row_gap)
-                .saturating_add(subtitle_line_h)
-                .saturating_add(header_bottom_pad),
-        )
-    } else {
-        0
-    };
+    // Branding strip: one small text row above everything else, sized so
+    // cropping it off leaves the full plot intact.
+    let banner_h = scale_u32(3, chrome_scale)
+        .saturating_mul(2)
+        .saturating_add(subtitle_line_h);
+    let title_h = banner_h
+        .saturating_add(if has_title {
+            metrics.title_h.max(
+                header_top_pad
+                    .saturating_add(title_line_h)
+                    .saturating_add(header_row_gap)
+                    .saturating_add(subtitle_line_h)
+                    .saturating_add(header_bottom_pad),
+            )
+        } else {
+            0
+        });
     let footer_h = if has_cbar && !vertical_colorbar {
         metrics
             .footer_h
@@ -446,16 +456,22 @@ fn compute_layout(
         cbar_y,
         cbar_w,
         cbar_h,
-        title_y: if has_title { header_top_pad } else { 0 },
+        title_y: if has_title {
+            banner_h.saturating_add(header_top_pad)
+        } else {
+            banner_h
+        },
         subtitle_y: if has_title {
-            header_top_pad
+            banner_h
+                .saturating_add(header_top_pad)
                 .saturating_add(title_line_h)
                 .saturating_add(header_row_gap)
         } else {
-            0
+            banner_h
         },
         text_scale,
         label_gap,
+        banner_h,
     }
 }
 
@@ -4422,6 +4438,29 @@ fn draw_chrome_and_colorbar(
     let title_color = opts.presentation.chrome.title_color;
     let subtitle_color = opts.presentation.chrome.subtitle_color;
     let row_width = chrome_right.saturating_sub(chrome_left).max(1);
+    if opts.presentation.plot_style.uses_operational_presentation() && layout.banner_h > 0 {
+        // Croppable branding strip: pinned to the very top so trimming
+        // `banner_h` rows leaves a complete, fully-labeled plot.
+        let banner_text_y =
+            (layout.banner_h.saturating_sub(text::regular_line_height(layout.text_scale)) / 2)
+                as i32;
+        text::draw_text_bold(
+            img,
+            "CALIFORNIA WILDFIRE TRACKING",
+            chrome_left as i32,
+            banner_text_y,
+            subtitle_color,
+            layout.text_scale,
+        );
+        text::draw_text_right(
+            img,
+            "cafire.org/weather",
+            chrome_right as i32,
+            banner_text_y,
+            subtitle_color,
+            layout.text_scale,
+        );
+    }
     if opts.presentation.plot_style.uses_operational_presentation() {
         if let Some(title) = opts
             .title

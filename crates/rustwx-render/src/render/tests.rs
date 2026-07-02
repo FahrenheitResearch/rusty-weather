@@ -136,6 +136,7 @@ fn contour_test_layout() -> Layout {
         subtitle_y: 0,
         text_scale: 1,
         label_gap: 14,
+        banner_h: 0,
     }
 }
 
@@ -880,6 +881,7 @@ fn projected_alpha_mask_clears_linework_outside_mask() {
         subtitle_y: 0,
         text_scale: 1,
         label_gap: 1,
+        banner_h: 0,
     };
     let bg = Rgba::new(244, 246, 248);
     let mut img = RgbaImage::from_pixel(6, 6, Rgba::BLACK.to_image_rgba());
@@ -1304,8 +1306,11 @@ fn filled_layout_keeps_header_and_legend_tight_to_map() {
         ChromeScale::Fixed(1.0),
     );
 
-    assert_eq!(layout.map_y, 64);
-    assert_eq!(layout.title_y, 5);
+    // The croppable branding strip sits above the header: everything
+    // below it keeps the original tight spacing.
+    assert!(layout.banner_h > 0);
+    assert_eq!(layout.map_y, 64 + layout.banner_h);
+    assert_eq!(layout.title_y, layout.banner_h + 5);
     assert!(layout.subtitle_y > layout.title_y);
     assert_eq!(layout.cbar_y + layout.cbar_h, 892);
 }
