@@ -907,14 +907,25 @@ fn meteogram_response(path: &str, state: &AppState) -> Vec<u8> {
         lon,
         panels,
         title: query.get("title").cloned().filter(|t| !t.trim().is_empty()),
+        utc_offset_hours: query
+            .get("utc_offset")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| (-14.0..=14.0).contains(v))
+            .unwrap_or(-7.0),
     };
     match meteogram::render_meteogram_svg(&state.store_root, model, run, &date, cycle, &request) {
-        Ok(output) => response_with_extra_headers(
-            200,
-            "image/svg+xml; charset=utf-8",
-            output.svg.into_bytes(),
-            "Cache-Control: no-store\r\n",
-        ),
+        Ok(output) => {
+            if query.get("format").map(String::as_str) == Some("json") {
+                json_response(&output.data)
+            } else {
+                response_with_extra_headers(
+                    200,
+                    "image/svg+xml; charset=utf-8",
+                    output.svg.into_bytes(),
+                    "Cache-Control: no-store\r\n",
+                )
+            }
+        }
         Err(message) => json_status_response(422, &serde_json::json!({ "error": message })),
     }
 }

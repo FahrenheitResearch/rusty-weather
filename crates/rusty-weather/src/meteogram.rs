@@ -21,7 +21,8 @@ use rw_store::reader::HourReader;
 
 const MS_TO_MPH: f64 = 2.236_936;
 
-pub const METEOGRAM_PANELS: &[&str] = &["temp", "rh", "vpd", "wind", "fuels", "smoke"];
+pub const METEOGRAM_PANELS: &[&str] =
+    &["temp", "rh", "vpd", "wind", "precip", "fuels", "smoke"];
 
 #[derive(Debug, Clone)]
 pub struct MeteogramRequest {
@@ -29,6 +30,8 @@ pub struct MeteogramRequest {
     pub lon: f64,
     pub panels: Vec<String>,
     pub title: Option<String>,
+    /// Hours to add to UTC for the local-time axis row (PDT = -7).
+    pub utc_offset_hours: f64,
 }
 
 struct HourSample {
@@ -47,6 +50,7 @@ const SAMPLED_VARS: &[&str] = &[
     "dead_fuel_moisture_10h",
     "kbdi",
     "smoke_8m",
+    "apcp_run_total",
 ];
 
 /// Nearest grid cell by squared equirectangular distance.
@@ -111,6 +115,95 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/// No-leap DOY (Feb 29 folds onto 59) for a (month, day).
+fn no_leap_doy(month: u32, day: u32) -> u16 {
+    const CUM: [u16; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let day = if month == 2 && day == 29 { 28 } else { day };
+    CUM[(month as usize - 1).min(11)] + day as u16
+}
+
+/// NOAA sunrise/sunset in UTC hours for a lat/lon and no-leap DOY.
+/// None above/below the polar circles when the sun never crosses.
+fn sunrise_sunset_utc(lat: f64, lon: f64, doy: u16) -> Option<(f64, f64)> {
+    let gamma = 2.0 * std::f64::consts::PI / 365.0 * (f64::from(doy) - 1.0 + 0.5);
+    let eqtime = 229.18
+        * (0.000075 + 0.001868 * gamma.cos()
+            - 0.032077 * gamma.sin()
+            - 0.014615 * (2.0 * gamma).cos()
+            - 0.040849 * (2.0 * gamma).sin());
+    let decl = 0.006918 - 0.399912 * gamma.cos() + 0.070257 * gamma.sin()
+        - 0.006758 * (2.0 * gamma).cos()
+        + 0.000907 * (2.0 * gamma).sin()
+        - 0.002697 * (3.0 * gamma).cos()
+        + 0.00148 * (3.0 * gamma).sin();
+    let lat_rad = lat.to_radians();
+    let cos_ha = (90.833f64.to_radians().cos() / (lat_rad.cos() * decl.cos()))
+        - lat_rad.tan() * decl.tan();
+    if !(-1.0..=1.0).contains(&cos_ha) {
+        return None;
+    }
+    let ha_deg = cos_ha.acos().to_degrees();
+    let sunrise = (720.0 - 4.0 * (lon + ha_deg) - eqtime) / 60.0;
+    let sunset = (720.0 - 4.0 * (lon - ha_deg) - eqtime) / 60.0;
+    Some((sunrise.rem_euclid(24.0), sunset.rem_euclid(24.0)))
+}
+
+/// Climatological day-window reference values for this cell (from the
+/// seasonal RTMA store, when present): dashed "what's normal" lines.
+struct ClimoDayRefs {
+    /// (value in display units, short label, color) per panel key.
+    refs: BTreeMap<&'static str, Vec<(f64, String, &'static str)>>,
+}
+
+fn climo_day_refs(
+    store_root: &Path,
+    forecast_grid_hash: &str,
+    cx: usize,
+    cy: usize,
+    doy: u16,
+) -> Option<ClimoDayRefs> {
+    let climo_dir = store_root.join("rtma_climo").join("seasonal_v2026_05_24");
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(climo_dir.join("climo_grid_meta.json")).ok()?)
+            .ok()?;
+    if meta.get("hrrr_grid_hash")?.as_str()? != forecast_grid_hash {
+        return None;
+    }
+    let row0 = meta.get("hrrr_row0")?.as_u64()? as usize;
+    let col0 = meta.get("hrrr_col0")?.as_u64()? as usize;
+    let ny = meta.get("ny")?.as_u64()? as usize;
+    let nx = meta.get("nx")?.as_u64()? as usize;
+    let (sx, sy) = (cx.checked_sub(col0)?, cy.checked_sub(row0)?);
+    if sx >= nx || sy >= ny {
+        return None;
+    }
+    let reader = HourReader::open(&climo_dir.join(format!("f{doy:03}.rws"))).ok()?;
+    let read = |name: &str| -> Option<f64> {
+        let window = reader.read_window_2d(name, sx, sy, sx + 1, sy + 1).ok()?;
+        let value = f64::from(window.values[0]);
+        value.is_finite().then_some(value)
+    };
+    let mut refs: BTreeMap<&'static str, Vec<(f64, String, &'static str)>> = BTreeMap::new();
+    let mut push = |panel: &'static str, value: Option<f64>, label: &str, color: &'static str| {
+        if let Some(value) = value {
+            refs.entry(panel).or_default().push((value, label.to_string(), color));
+        }
+    };
+    let vpd = |stat: &str| read(&format!("climo__utc_00_23__max_vpd_2m_kpa__{stat}"));
+    push("vpd", vpd("p50"), "climo p50", "#6f6455");
+    push("vpd", vpd("p90"), "climo p90", "#b0763d");
+    push("vpd", vpd("p99"), "climo p99", "#c24a3d");
+    let gust = |stat: &str| {
+        read(&format!("climo__utc_00_23__max_gust_10m_ms__{stat}")).map(|v| v * MS_TO_MPH)
+    };
+    push("wind", gust("p90"), "gust p90", "#b0763d");
+    push("wind", gust("p99"), "gust p99", "#c24a3d");
+    let rh = |stat: &str| read(&format!("climo__utc_00_23__min_rh_2m_pct__{stat}"));
+    push("rh", rh("p50"), "min-RH p50", "#6f6455");
+    push("rh", rh("p10"), "min-RH p10", "#b0763d");
+    Some(ClimoDayRefs { refs })
+}
 
 /// (utc-hour-of-day, "Wed 7/2") for run date + cycle + forecast hour.
 fn valid_label(date_yyyymmdd: &str, cycle_utc: u8, forecast_hour: u16) -> (u32, String) {
@@ -183,6 +276,9 @@ pub struct MeteogramOutput {
     pub cell_lat: f64,
     pub cell_lon: f64,
     pub hours: usize,
+    /// The sampled data (`format=json` on the API): hour list, per-series
+    /// values in display units, critical-hour flags, cell metadata.
+    pub data: serde_json::Value,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -287,6 +383,40 @@ pub fn render_meteogram_svg(
         return Err("fewer than 2 hours sampled".to_string());
     }
 
+    // Hourly precip (inches) from the run-total accumulation differences.
+    let totals: Vec<Option<f64>> = samples
+        .iter()
+        .map(|s| s.values.get("apcp_run_total").copied())
+        .collect();
+    for index in 1..samples.len() {
+        if let (Some(prev), Some(now)) = (totals[index - 1], totals[index]) {
+            samples[index]
+                .values
+                .insert("precip_in", ((now - prev).max(0.0)) / 25.4);
+        }
+    }
+
+    // Run-date DOY drives the climatology reference lines; night bands come
+    // from NOAA sunrise/sunset at the cell.
+    let run_month: u32 = date_yyyymmdd[4..6].parse().unwrap_or(1);
+    let run_day: u32 = date_yyyymmdd[6..8].parse().unwrap_or(1);
+    let doy = no_leap_doy(run_month, run_day);
+    let climo_refs = climo_day_refs(store_root, &grid.hash, cx, cy, doy);
+    // Night spans in forecast-hour coordinates, covering the run span.
+    let last_hour = samples.last().expect("nonempty").hour;
+    let mut night_spans: Vec<(f64, f64)> = Vec::new();
+    if let Some((sunrise, sunset)) = sunrise_sunset_utc(cell_lat, cell_lon, doy) {
+        // Day offsets relative to the run date, generously covering the span.
+        let span_days = (i64::from(last_hour) + i64::from(cycle_utc)) / 24 + 1;
+        for day in -1..=span_days {
+            let set_fh = day as f64 * 24.0 + sunset - f64::from(cycle_utc);
+            let rise_fh = (day + 1) as f64 * 24.0 + sunrise - f64::from(cycle_utc);
+            if rise_fh > set_fh {
+                night_spans.push((set_fh, rise_fh));
+            }
+        }
+    }
+
     // Critical joint-threshold hours (atlas thresholds, mph).
     let critical: Vec<bool> = samples
         .iter()
@@ -320,10 +450,13 @@ pub fn render_meteogram_svg(
     const MR: f64 = 58.0;
     const HEADER: f64 = 66.0;
     const PANEL_H: f64 = 148.0;
-    const PANEL_GAP: f64 = 10.0;
-    const AXIS_H: f64 = 40.0;
+    /// Dedicated title strip above each plot area.
+    const PANEL_BAND: f64 = 24.0;
+    const PANEL_GAP: f64 = 18.0;
+    const PANEL_UNIT: f64 = PANEL_BAND + PANEL_H + PANEL_GAP;
+    const AXIS_H: f64 = 54.0;
     let plot_w = W - ML - MR;
-    let total_h = HEADER + panels.len() as f64 * (PANEL_H + PANEL_GAP) + AXIS_H;
+    let total_h = HEADER + panels.len() as f64 * PANEL_UNIT - PANEL_GAP + AXIS_H;
 
     let h0 = f64::from(samples.first().expect("nonempty").hour);
     let h1 = f64::from(samples.last().expect("nonempty").hour);
@@ -398,6 +531,12 @@ pub fn render_meteogram_svg(
             ]),
         ),
         (
+            "precip",
+            ("Hourly Precip (in)", vec![Series {
+                key: "precip_in", label: "precip", color: "#4fa3d1", dashed: false, right_axis: false,
+            }]),
+        ),
+        (
             "fuels",
             ("ERC / 10-h Fuel Moisture (%)", vec![
                 Series { key: "erc", label: "ERC", color: "#e05545", dashed: false, right_axis: false },
@@ -414,10 +553,44 @@ pub fn render_meteogram_svg(
 
     for (panel_index, panel) in panels.iter().enumerate() {
         let Some((panel_title, series_list)) = panel_series.get(panel) else { continue };
-        let top = HEADER + panel_index as f64 * (PANEL_H + PANEL_GAP);
+        let band_top = HEADER + panel_index as f64 * PANEL_UNIT;
+        let top = band_top + PANEL_BAND;
+        // Title strip with an accent underline in the lead series color.
+        let accent = series_list.first().map(|s| s.color).unwrap_or("#8d8171");
         svg.push_str(&format!(
-            r##"<rect x="{ML}" y="{top}" width="{plot_w}" height="{PANEL_H}" fill="#1b1611" stroke="#2a231b"/>"##
+            r##"<rect x="{ML}" y="{band_top}" width="{plot_w}" height="{PANEL_BAND}" fill="#241c13"/>"##
         ));
+        svg.push_str(&format!(
+            r##"<rect x="{ML}" y="{:.1}" width="{plot_w}" height="2" fill="{accent}" fill-opacity="0.55"/>"##,
+            band_top + PANEL_BAND - 2.0
+        ));
+        svg.push_str(&format!(
+            r##"<rect x="{ML}" y="{top}" width="{plot_w}" height="{PANEL_H}" fill="#1b1611" stroke="#3a3128"/>"##
+        ));
+        // Night shading (sunset -> sunrise) under everything.
+        for &(start, end) in &night_spans {
+            let lo = start.max(h0);
+            let hi = end.min(h1);
+            if hi <= lo {
+                continue;
+            }
+            let x_lo = x_for(lo);
+            svg.push_str(&format!(
+                r##"<rect x="{x_lo:.1}" y="{top}" width="{:.1}" height="{PANEL_H}" fill="#000000" fill-opacity="0.30"/>"##,
+                x_for(hi) - x_lo
+            ));
+        }
+        // 00Z day boundaries inside the plot area.
+        for sample in &samples {
+            let (hod, _) = valid_label(date_yyyymmdd, cycle_utc, sample.hour);
+            if hod == 0 {
+                let x = x_for(f64::from(sample.hour));
+                svg.push_str(&format!(
+                    r##"<line x1="{x:.1}" y1="{top}" x2="{x:.1}" y2="{:.1}" stroke="#4a4034" stroke-width="1.2"/>"##,
+                    top + PANEL_H
+                ));
+            }
+        }
         // Critical-hour shading.
         for (index, sample) in samples.iter().enumerate() {
             if !critical[index] {
@@ -433,17 +606,29 @@ pub fn render_meteogram_svg(
         }
 
         // Axis scaling: left axis from non-right series, right from the rest.
-        let left_values: Vec<f64> = series_list
+        // Climatology reference values are folded in so their dashed lines
+        // always land inside the axis.
+        let panel_refs: &[(f64, String, &'static str)] = climo_refs
+            .as_ref()
+            .and_then(|refs| refs.refs.get(*panel).map(Vec::as_slice))
+            .unwrap_or(&[]);
+        let mut left_values: Vec<f64> = series_list
             .iter()
             .filter(|s| !s.right_axis)
             .flat_map(|s| get(s.key))
             .collect();
+        left_values.extend(panel_refs.iter().map(|(value, _, _)| *value));
         let right_values: Vec<f64> = series_list
             .iter()
             .filter(|s| s.right_axis)
             .flat_map(|s| get(s.key))
             .collect();
-        let left_bounds = axis_bounds(&left_values);
+        let left_bounds = if *panel == "precip" {
+            // Bars hang from zero; keep a sane minimum top for dry runs.
+            axis_bounds(&left_values).map(|(_, hi)| (0.0, hi.max(0.10)))
+        } else {
+            axis_bounds(&left_values)
+        };
         let right_bounds = axis_bounds(&right_values);
         let pad_bounds = |bounds: (f64, f64)| {
             let pad = (bounds.1 - bounds.0) * 0.12;
@@ -481,6 +666,28 @@ pub fn render_meteogram_svg(
                     }
                 }
             }
+            // Climatology day-window references ("what's normal here today").
+            // Labels stagger left/right so near-equal values stay readable.
+            for (ref_index, (value, label, color)) in panel_refs.iter().enumerate() {
+                if *value <= lo || *value >= hi {
+                    continue;
+                }
+                let y = top + PANEL_H - (value - lo) / (hi - lo) * PANEL_H;
+                svg.push_str(&format!(
+                    r##"<line x1="{ML}" y1="{y:.1}" x2="{:.1}" y2="{y:.1}" stroke="{color}" stroke-width="1" stroke-dasharray="2,4" stroke-opacity="0.9"/>"##,
+                    ML + plot_w
+                ));
+                let label_x = if ref_index % 2 == 0 {
+                    ML + plot_w - 4.0
+                } else {
+                    ML + plot_w - 80.0
+                };
+                svg.push_str(&format!(
+                    r##"<text x="{label_x:.1}" y="{:.1}" fill="{color}" font-size="9" text-anchor="end">{}</text>"##,
+                    y - 3.0,
+                    xml_escape(label)
+                ));
+            }
         }
         if let Some(bounds) = right_bounds {
             let (lo, hi) = pad_bounds(bounds);
@@ -498,12 +705,31 @@ pub fn render_meteogram_svg(
             }
         }
 
-        // Series polylines (NaN breaks the path).
+        // Series polylines (NaN breaks the path); precip draws as bars.
         for series in series_list {
             let bounds = if series.right_axis { right_bounds } else { left_bounds };
             let Some(bounds) = bounds else { continue };
             let (lo, hi) = pad_bounds(bounds);
             let values = get(series.key);
+            if series.key == "precip_in" {
+                let bar_half = (plot_w / samples.len() as f64 * 0.36).clamp(2.0, 14.0);
+                let y0 = top + PANEL_H - (0.0 - lo) / (hi - lo) * PANEL_H;
+                for (sample, &value) in samples.iter().zip(values.iter()) {
+                    if !value.is_finite() || value <= 0.0 {
+                        continue;
+                    }
+                    let x = x_for(f64::from(sample.hour));
+                    let y = top + PANEL_H - (value - lo) / (hi - lo) * PANEL_H;
+                    svg.push_str(&format!(
+                        r##"<rect x="{:.1}" y="{y:.1}" width="{:.1}" height="{:.1}" fill="{}" fill-opacity="0.85"/>"##,
+                        x - bar_half,
+                        bar_half * 2.0,
+                        (y0 - y).max(0.5),
+                        series.color
+                    ));
+                }
+                continue;
+            }
             let mut segments: Vec<Vec<(f64, f64)>> = vec![Vec::new()];
             for (sample, &value) in samples.iter().zip(values.iter()) {
                 if value.is_finite() {
@@ -526,11 +752,36 @@ pub fn render_meteogram_svg(
             }
         }
 
-        // Panel title + legend.
+        // Wind-direction arrows along the top of the wind panel (arrow
+        // points downwind; met convention "from" drives the rotation).
+        if *panel == "wind" {
+            let stride = (samples.len() / 26).max(1);
+            for (index, sample) in samples.iter().enumerate() {
+                if index % stride != 0 {
+                    continue;
+                }
+                let (Some(&u), Some(&v)) =
+                    (sample.values.get("u_10m"), sample.values.get("v_10m"))
+                else {
+                    continue;
+                };
+                if u * u + v * v < 1.0 {
+                    continue; // calm: no meaningful direction
+                }
+                let from_deg = (-u).atan2(-v).to_degrees().rem_euclid(360.0);
+                let x = x_for(f64::from(sample.hour));
+                svg.push_str(&format!(
+                    r##"<g transform="translate({x:.1},{:.1}) rotate({from_deg:.0})"><line x1="0" y1="-5.5" x2="0" y2="5.5" stroke="#9fb6c9" stroke-width="1.3"/><path d="M0,5.5 L-2.6,1.8 M0,5.5 L2.6,1.8" stroke="#9fb6c9" stroke-width="1.3" fill="none"/></g>"##,
+                    top + 13.0
+                ));
+            }
+        }
+
+        // Panel title + legend live in the title strip.
         svg.push_str(&format!(
-            r##"<text x="{:.1}" y="{:.1}" fill="#d8cdbd" font-size="12" font-weight="700">{}</text>"##,
+            r##"<text x="{:.1}" y="{:.1}" fill="#e8ddc9" font-size="12" font-weight="700">{}</text>"##,
             ML + 8.0,
-            top + 16.0,
+            band_top + 16.0,
             xml_escape(panel_title)
         ));
         let mut legend_x = ML + plot_w - 8.0;
@@ -539,44 +790,89 @@ pub fn render_meteogram_svg(
             legend_x -= 7.0 * label.len() as f64 + 12.0;
             svg.push_str(&format!(
                 r##"<text x="{legend_x:.1}" y="{:.1}" fill="{}" font-size="11">{}</text>"##,
-                top + 16.0,
+                band_top + 16.0,
                 series.color,
                 xml_escape(&label)
             ));
         }
     }
 
-    // Time axis: tick every 3 stored hours, heavier at 00Z with date label.
-    let axis_y = HEADER + panels.len() as f64 * (PANEL_H + PANEL_GAP);
+    // Time axis: UTC row, local-time row, date labels at 00Z boundaries.
+    let axis_y = HEADER + panels.len() as f64 * PANEL_UNIT - PANEL_GAP;
+    let offset = request.utc_offset_hours;
     for sample in &samples {
         let (hod, day_label) = valid_label(date_yyyymmdd, cycle_utc, sample.hour);
         let x = x_for(f64::from(sample.hour));
-        let is_midnight = hod == 0;
-        if is_midnight {
-            svg.push_str(&format!(
-                r##"<line x1="{x:.1}" y1="{HEADER}" x2="{x:.1}" y2="{axis_y:.1}" stroke="#40372c" stroke-width="1.2"/>"##
-            ));
-        }
         if hod % 3 == 0 {
             svg.push_str(&format!(
                 r##"<text x="{x:.1}" y="{:.1}" fill="#a99c88" font-size="10" text-anchor="middle">{hod:02}Z</text>"##,
                 axis_y + 14.0
             ));
+            let local = (f64::from(hod) + offset).rem_euclid(24.0) as u32;
+            svg.push_str(&format!(
+                r##"<text x="{x:.1}" y="{:.1}" fill="#7a8f6f" font-size="10" text-anchor="middle">{local:02}</text>"##,
+                axis_y + 27.0
+            ));
         }
-        if is_midnight || sample.hour == samples[0].hour {
+        if hod == 0 || sample.hour == samples[0].hour {
             svg.push_str(&format!(
                 r##"<text x="{x:.1}" y="{:.1}" fill="#8d8171" font-size="10" text-anchor="middle">{day_label}</text>"##,
-                axis_y + 28.0
+                axis_y + 41.0
             ));
         }
     }
+    svg.push_str(&format!(
+        r##"<text x="{:.1}" y="{:.1}" fill="#6f6455" font-size="9" text-anchor="end">UTC / local (UTC{offset:+.0}) | dashed = climo day refs | dark = night</text>"##,
+        ML + plot_w,
+        axis_y + 52.0
+    ));
 
     svg.push_str("</svg>");
+
+    let mut series_keys: Vec<&'static str> = Vec::new();
+    for sample in &samples {
+        for &key in sample.values.keys() {
+            if !series_keys.contains(&key) {
+                series_keys.push(key);
+            }
+        }
+    }
+    let series: serde_json::Map<String, serde_json::Value> = series_keys
+        .iter()
+        .map(|&key| {
+            let values: Vec<serde_json::Value> = samples
+                .iter()
+                .map(|s| match s.values.get(key) {
+                    Some(&v) if v.is_finite() => serde_json::json!(v),
+                    _ => serde_json::Value::Null,
+                })
+                .collect();
+            (key.to_string(), serde_json::Value::Array(values))
+        })
+        .collect();
+    let data = serde_json::json!({
+        "model": model_slug,
+        "run": run_slug,
+        "point": { "lat": request.lat, "lon": request.lon },
+        "cell": { "lat": cell_lat, "lon": cell_lon, "elevation_ft": elevation_ft },
+        "units": {
+            "temperature_2m": "F", "dewpoint_2m": "F", "rh_2m": "%",
+            "u_10m": "mph", "v_10m": "mph", "wind": "mph", "wind_gust_10m": "mph",
+            "vpd": "kPa", "hdw_wind": "kPa*m/s", "hdw_gust": "kPa*m/s",
+            "precip_in": "in", "erc": "index", "dead_fuel_moisture_10h": "%",
+            "kbdi": "index", "smoke_8m": "ug/m3", "apcp_run_total": "mm",
+        },
+        "forecast_hours": samples.iter().map(|s| s.hour).collect::<Vec<u16>>(),
+        "critical": critical,
+        "series": series,
+    });
+
     Ok(MeteogramOutput {
         svg,
         cell_lat,
         cell_lon,
         hours: samples.len(),
+        data,
     })
 }
 
@@ -611,6 +907,16 @@ mod tests {
         assert_eq!(nice_step(10.0, 5), 2.0);
         assert_eq!(nice_step(100.0, 4), 25.0);
         assert!((nice_step(3.7, 4) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sunrise_sunset_bracket_sacramento_summer() {
+        // Sacramento, July 1 (DOY 182): sunrise ~12:45 UTC, sunset ~03:34 UTC.
+        let (sunrise, sunset) = sunrise_sunset_utc(38.58, -121.49, 182).expect("sun crosses");
+        assert!((sunrise - 12.75).abs() < 0.35, "sunrise {sunrise}");
+        assert!((sunset - 3.55).abs() < 0.35, "sunset {sunset}");
+        assert_eq!(no_leap_doy(7, 1), 182);
+        assert_eq!(no_leap_doy(2, 29), 59, "leap day folds");
     }
 
     #[test]
