@@ -42,6 +42,12 @@ struct Args {
     bin_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 8, help = "How many cycles back to search for the newest run")]
     max_cycle_lag_hours: i64,
+    #[arg(
+        long,
+        default_value = "view",
+        help = "Ingest profile passed to rw_batch: view (2D, serving nodes) or full (volumes + heavy/ECAPE, compute nodes)"
+    )]
+    profile: String,
 }
 
 // ---- civil-date math (Hinnant), UTC clock helpers ----
@@ -452,7 +458,7 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
             .arg("--cycle").arg(cycle.to_string())
             .arg("--hours").arg(hours_arg)
             .arg("--products").arg("none")
-            .arg("--profile").arg("view")
+            .arg("--profile").arg(&args.profile)
             .arg("--store-root").arg(&args.store_root);
         if let Some(cache) = &args.cache_dir {
             command.arg("--cache-dir").arg(cache);
