@@ -116,6 +116,7 @@ button { color: inherit; cursor: pointer; }
 .hour-nav button:hover { border-color: rgba(255,91,36,0.5); }
 .hour-nav button:disabled { opacity: 0.35; cursor: default; }
 .hour-nav .hour-label { min-width: 118px; text-align: center; font-size: 13.5px; font-weight: 650; color: var(--orange-bright); font-variant-numeric: tabular-nums; background: var(--panel-2, #161c1d); border: 1px solid var(--line, #2a3233); border-radius: 9px; padding: 4px 8px; cursor: pointer; }
+.prod-note { margin: 8px 0 2px; padding: 9px 12px; font-size: 12.5px; line-height: 1.5; color: var(--muted, #9ea6a5); background: var(--panel-2, #14191a); border: 1px solid var(--line, #232b2c); border-left: 3px solid var(--orange, #ff5b24); border-radius: 9px; }
 .hour-nav .play.on { background: var(--orange-soft); color: var(--orange-bright); border-color: rgba(255,91,36,0.5); }
 .viewport { position: relative; background: #0c0f10; height: clamp(480px, calc(100vh - 250px), 940px); display: grid; place-items: center; overflow: hidden; }
 .viewport img { max-width: 100%; max-height: 100%; display: block; background: #f4f1ea; cursor: zoom-in; }
@@ -319,6 +320,7 @@ button { color: inherit; cursor: pointer; }
           <button class="play" id="hPlay" title="Animate the run">▶ loop</button>
         </div>
       </div>
+      <div class="prod-note" id="productNote" style="display:none"></div>
       <div class="viewport" id="viewport">
         <div class="spin" id="spin"><span id="spinText">rendering…</span></div>
         <div class="placeholder" id="placeholder"><div class="flame">▲▲▲</div>Pick a product on the left — it renders right here.<br>← / → step hours · click any map for full resolution.</div>
@@ -510,6 +512,75 @@ const STATS = [
   ["p50", "P50 — typical day"], ["p75", "P75"], ["p90", "P90 — big day"],
   ["p95", "P95"], ["p99", "P99 — extreme"], ["record_p99", "All-time P99"], ["record_max", "All-time record max"],
 ];
+/* Hand-written product notes shown under the viewer bar. Keyed by
+   product slug; FAM_NOTES is the per-family fallback. PFT wording
+   follows docs/PFT_SPEC.md honesty requirements. */
+const FAM_NOTES = {
+  anomaly: "Each map ranks today's forecast against seven years of analyzed reality (RTMA 2.5 km, 2019–2026) for this exact time of year (±7 days around today's date). 95th percentile = drier/windier than ~95% of same-season days at that spot.",
+  record: "Same ranking, but against every analyzed day 2019–2026 regardless of season — “is this near the all-time record for this spot,” not just unusual for the date.",
+  climoref: "Not a forecast — these render the climatology itself: what the chosen percentile of VPD, RH, wind, or gust looks like on a given date. Use them to calibrate what “normal” and “extreme” mean for a place.",
+  ecape: "Advanced instability diagnostics computed on a dedicated node from full HRRR volumes. Experimental — read individual product notes.",
+  windows: "Each map folds a fixed window of forecast hours (e.g. 0–24 h) into one value per cell — a day's max/min/total at a glance rather than one instant.",
+};
+const PRODUCT_NOTES = {
+  pft_gw: "PyroCb Firepower Threshold (Tory & Kepert 2021): the minimum fire intensity, in gigawatts, that this atmosphere requires before a fire's plume can reach deep, storm-forming convection. LOWER is more dangerous — deep red means a modest fire could do it; blue means it's implausible for any realistic fire. Reference: an intense pyroCb day (Sir Ivan 2017) computed ~300 GW; confirmed events span ~10–1000 GW. This describes the ATMOSPHERE only — it says nothing about whether a fire capable of exceeding the threshold exists. Experimental; trends and relative values are more reliable than exact numbers.",
+  pft_zfc: "The height a fire plume must reach for free moist convection in the PFT calculation. Taller = the atmosphere demands a deeper plume = generally harder. One of the three ingredients of the PFT (with required warming and mixed-layer wind).",
+  pft_dtheta_fc: "How much warmer than the environment a fire plume must arrive at its condensation level to keep rising freely (Kelvin). Small values (deep red) mean the atmosphere is nearly ready to convect on its own — a fire only needs to add a nudge.",
+  pft_uml: "The mean wind through the plume's rise layer, used by the PFT. Stronger wind bends and dilutes the plume, demanding more firepower — so unlike most fire-weather fields, LOW wind here contributes to pyroCb risk.",
+  muecape: "Most-unstable parcel ECAPE: CAPE recomputed with entrainment — how much buoyant energy actually survives the mixing of dry environmental air into a rising plume. Plume-driven (fire) convection cares about this far more than textbook CAPE.",
+  mlecape: "Mixed-layer parcel ECAPE — entrainment-adjusted buoyant energy for a parcel representing the lowest ~90 mb. The “average air feeding a storm” view.",
+  sbecape: "Surface-based parcel ECAPE — entrainment-adjusted buoyant energy for air lifted from the ground. Most relevant when the boundary layer is deeply mixed (peak burn period).",
+  mlecin: "Entrainment-adjusted convective inhibition for the mixed-layer parcel — the energy barrier a plume must punch through before free convection.",
+  sbecin: "Entrainment-adjusted convective inhibition for surface air.",
+  sbncape: "Normalized surface-based ECAPE — buoyancy per meter of climb rather than the column total; high values mean violent acceleration in the updraft.",
+  mu_ecape_native_cape_ratio: "What fraction of the model's own most-unstable CAPE survives entrainment (0–1). Low ratios mean big CAPE numbers are mostly an illusion for real, diluted plumes.",
+  ml_ecape_native_cape_ratio: "Fraction of the model's mixed-layer CAPE surviving entrainment.",
+  sb_ecape_native_cape_ratio: "Fraction of the model's surface-based CAPE surviving entrainment.",
+  mu_ecape_derived_cape_ratio: "Same survival ratio, but against CAPE recomputed from the same profile our ECAPE uses (apples-to-apples, experimental).",
+  ml_ecape_derived_cape_ratio: "Entrainment survival ratio for the mixed-layer parcel (derived-CAPE denominator, experimental).",
+  sb_ecape_derived_cape_ratio: "Entrainment survival ratio for the surface parcel (derived-CAPE denominator, experimental).",
+  ecape_scp: "Supercell Composite recomputed with ECAPE in place of CAPE — organized-storm potential when entrainment is accounted for. Experimental.",
+  ecape_stp: "Significant Tornado Parameter recomputed with ECAPE inputs. Experimental — use alongside, not instead of, the standard STP.",
+  ecape_ehi_0_1km: "Energy-Helicity Index (0–1 km) with ECAPE — low-level rotation potential weighted by entrainment-surviving energy. Experimental.",
+  ecape_ehi_0_3km: "Energy-Helicity Index (0–3 km) with ECAPE. Experimental.",
+  vpd_day_max_percentile: "Today's forecast peak vapor-pressure deficit, ranked against seven years of same-season days. VPD is the atmosphere's raw drying power — the single best one-number predictor of dead-fuel drying and fire growth potential.",
+  min_rh_day_percentile: "Today's forecast minimum relative humidity, ranked as a DRYNESS percentile (95th = drier than ~95% of same-season days).",
+  wind_day_max_percentile: "Today's peak sustained wind vs the seasonal record. High percentiles flag genuinely unusual wind events for that terrain, not just “windy for the mountains.”",
+  gust_day_max_percentile: "Today's peak gust vs the seasonal record.",
+  hdw_wind_day_percentile: "Hot-Dry-Windy index (VPD × sustained wind) day-max percentile — the combination of drying power and wind, ranked seasonally. HDW spikes have verified against many historic blow-up days.",
+  hdw_gust_day_percentile: "Hot-Dry-Windy using gusts instead of sustained wind — more sensitive to frontal passages and downslope surges.",
+  hours_rh15_gust25_percentile: "How many hours today combine RH ≤ 15% with gusts ≥ 25 mph, ranked seasonally — duration of critical fire weather, not just its peak.",
+  hours_rh20_gust25_percentile: "Hours combining RH ≤ 20% with gusts ≥ 25 mph, ranked seasonally.",
+  hours_rh20_wind20_percentile: "Hours combining RH ≤ 20% with sustained wind ≥ 20 mph — the classic red-flag pairing — ranked seasonally.",
+  overnight_rh_recovery_percentile: "Tonight's overnight humidity recovery (12Z–06Z window) ranked against season norms — POOR recovery (high percentile of dryness) means fuels never rewet and tomorrow starts pre-dried.",
+  surface_fire_weather_potential: "A weighted composite of the whole anomaly suite — one map answering “where is today most unusual, fire-weather-wise, for this time of year?” Use it as the index page; drill into the component maps for the why.",
+  hdw: "Hot-Dry-Windy index: vapor-pressure deficit multiplied by wind speed. No thresholds, no fuel assumptions — just the atmosphere's capacity to dry fuel and push fire. Compare against the same location's typical values (see the anomaly suite) rather than absolute numbers.",
+  fire_weather_composite: "Blended surface fire-weather stress (temperature, humidity, wind terms) — a quick-look screening layer, not an operational index.",
+  vpd_2m: "Vapor-pressure deficit: how much more moisture the air could hold. Directly drives dead-fuel drying; ~3 kPa is a very dry afternoon in most of the West.",
+  erc: "Energy Release Component (NFDRS): potential fire intensity from the accumulated dryness of large dead fuels. Moves slowly — think of it as the season's stored energy, updated daily.",
+  kbdi: "Keetch–Byram Drought Index (0–800): cumulative soil/duff moisture deficit. High KBDI means deep fuels and duff are available to burn and mop-up will be ugly.",
+  burning_index: "NFDRS Burning Index: expected flame length class combining spread and energy components. Daily cadence.",
+  dead_fuel_moisture_1h: "Moisture of the finest dead fuels (grass, litter) — responds within the hour to humidity. The ignition-and-spread fuel.",
+  dead_fuel_moisture_10h: "Moisture of pencil-sized dead fuels — the standard carrier of surface fire. Below ~6% is critically receptive.",
+  dead_fuel_moisture_100h: "Moisture of 1–3 inch dead fuels — sustained-burning and resistance-to-control indicator.",
+  dead_fuel_moisture_1000h: "Moisture of the largest dead fuels (3–8 inch): the seasonal drought signal in the fuel bed itself.",
+  fuel_receptiveness: "Composite of dead-fuel moistures and dryness: how ready the fuel bed is to accept and carry fire today.",
+  fire_potential_composite: "Fuels × weather composite — where a receptive fuel bed and stressing weather overlap.",
+  hdw_fuel_receptive: "Hot-Dry-Windy masked to areas whose fuels are actually receptive — removes the false alarms over green or wet fuel beds.",
+  vpd_fuel_receptive: "VPD masked to receptive fuel beds.",
+  erc_hdw_composite: "Season-scale stored energy (ERC) combined with today's atmospheric stress (HDW) — the “primed AND pushed” overlap.",
+  daily_precip_fuel_context: "Recent precipitation in fuel terms — how much rewetting the fuel bed actually received.",
+  landfire_fuel_model: "LANDFIRE surface fuel model classes — what kind of fuel is on the ground (static layer).",
+  landfire_fuel_loading: "LANDFIRE fuel loading — how much burnable material per acre (static layer).",
+  smoke_pm25_native: "HRRR-Smoke near-surface PM2.5 — what people breathe. Driven by the model's own satellite-detected fire sources.",
+  smoke_column: "Vertically integrated smoke — the haze you see, including elevated plumes that never touch the surface.",
+};
+function updateProductNote() {
+  const note = PRODUCT_NOTES[state.product] || FAM_NOTES[state.fam] || "";
+  const el = $("productNote");
+  el.textContent = note;
+  el.style.display = note ? "" : "none";
+}
 const RIBBONS = {
   anomaly: `<b>Percentile vs this date</b> — today's HRRR forecast ranked against the RTMA 2.5 km ±7-day
     day-of-year climatology, 2019–2026 (<code>n≈105 days/cell</code>).
@@ -698,6 +769,7 @@ function selectFam(key) {
     }
   }
   updateHourNav();
+  updateProductNote();
 }
 function buildProducts() {
   const list = $("productList");
@@ -727,6 +799,7 @@ function buildProducts() {
 }
 function markProduct() {
   [...$("productList").children].forEach(b => b.classList.toggle("on", b.dataset.slug === state.product));
+  updateProductNote();
 }
 
 /* ---------- hour nav ---------- */
