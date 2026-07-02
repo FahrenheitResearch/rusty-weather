@@ -65,6 +65,13 @@ struct Args {
     products: String,
     #[arg(long, default_value = "p05,p10,p25,p50,p75,p90,p95,p99,sample_count")]
     stats: String,
+    #[arg(
+        long,
+        default_value = "seasonal",
+        help = "'seasonal' = per-DOY +/-7d arrays; 'exact' = the all-period \
+                climatology (no DOY level, one slice per stat, doy recorded as 0)"
+    )]
+    source: String,
     #[arg(long, default_value_t = 1)]
     doy_start: u16,
     #[arg(long, default_value_t = 365)]
@@ -324,19 +331,41 @@ fn dequantize(q: i16, meta: &SliceMeta, is_count: bool) -> f32 {
     (meta.offset + f64::from(q) * meta.scale) as f32
 }
 
-fn seasonal_root(atlas_root: &Path) -> PathBuf {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceKind {
+    /// Per-DOY ±7-day arrays under `seasonal_15day/<w>/<p>/doy_XXX/<stat>.zarr`.
+    Seasonal,
+    /// All-period arrays under `exact/<w>/<p>/<stat>.zarr` — one slice per
+    /// stat, recorded in the pack as DOY 0.
+    Exact,
+}
+
+fn climatology_root(atlas_root: &Path, source: SourceKind) -> PathBuf {
     atlas_root
         .join("zarr")
         .join("rtma2p5")
         .join("climatology")
-        .join("seasonal_15day")
+        .join(match source {
+            SourceKind::Seasonal => "seasonal_15day",
+            SourceKind::Exact => "exact",
+        })
 }
 
-fn stat_array_dir(root: &Path, window: &str, product: &str, doy: u16, stat: &str) -> PathBuf {
-    root.join(window)
-        .join(product)
-        .join(format!("doy_{doy:03}"))
-        .join(format!("{stat}.zarr"))
+fn stat_array_dir(
+    root: &Path,
+    source: SourceKind,
+    window: &str,
+    product: &str,
+    doy: u16,
+    stat: &str,
+) -> PathBuf {
+    let product_dir = root.join(window).join(product);
+    match source {
+        SourceKind::Seasonal => product_dir
+            .join(format!("doy_{doy:03}"))
+            .join(format!("{stat}.zarr")),
+        SourceKind::Exact => product_dir.join(format!("{stat}.zarr")),
+    }
 }
 
 fn write_f32(path: &Path, values: &[f32]) -> Result<(), String> {
@@ -356,7 +385,12 @@ fn main() -> Result<(), String> {
             .map_err(|err| err.to_string())?;
     }
     let started = Instant::now();
-    let seasonal = seasonal_root(&args.atlas_root);
+    let source = match args.source.trim() {
+        "seasonal" => SourceKind::Seasonal,
+        "exact" => SourceKind::Exact,
+        other => return Err(format!("--source must be seasonal|exact, got '{other}'")),
+    };
+    let climo_root = climatology_root(&args.atlas_root, source);
     let static_dir = args
         .atlas_root
         .join("firewxatlas_rtma_final")
@@ -441,7 +475,11 @@ fn main() -> Result<(), String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
-    let doys: Vec<u16> = (args.doy_start..=args.doy_end).collect();
+    let doys: Vec<u16> = match source {
+        SourceKind::Seasonal => (args.doy_start..=args.doy_end).collect(),
+        // The all-period climatology has no DOY axis: one slice, DOY 0.
+        SourceKind::Exact => vec![0],
+    };
 
     fs::create_dir_all(&args.out).map_err(|err| err.to_string())?;
     write_f32(&args.out.join("latitude_deg.f32bin"), &crop.slice(&lat, nx_full))?;
@@ -486,7 +524,8 @@ fn main() -> Result<(), String> {
             let mut slices = Vec::with_capacity(doys.len());
             for &doy in &doys {
                 let array = ZarrArray::open(&stat_array_dir(
-                    &seasonal,
+                    &climo_root,
+                    source,
                     &task.window,
                     &task.product,
                     doy,
@@ -555,13 +594,19 @@ fn main() -> Result<(), String> {
             .unwrap_or_default()
             .as_secs(),
         source_root: args.atlas_root.display().to_string(),
-        source_dataset: "firewxatlas_rtma_seasonal_15day",
-        window_days: 15,
+        source_dataset: match source {
+            SourceKind::Seasonal => "firewxatlas_rtma_seasonal_15day",
+            SourceKind::Exact => "firewxatlas_rtma_exact",
+        },
+        window_days: match source {
+            SourceKind::Seasonal => 15,
+            SourceKind::Exact => 0,
+        },
         bounds_requested: [args.west, args.east, args.south, args.north],
         source_grid_shape: [ny_full, nx_full],
         crop: &crop,
-        doy_start: args.doy_start,
-        doy_end: args.doy_end,
+        doy_start: *doys.first().unwrap_or(&0),
+        doy_end: *doys.last().unwrap_or(&0),
         nan_sentinel: NAN_SENTINEL,
         latitude_file: "latitude_deg.f32bin",
         longitude_file: "longitude_deg.f32bin",
@@ -591,7 +636,8 @@ fn main() -> Result<(), String> {
             let meta = &task.slices[slice_index];
             let is_count = task.stat == "sample_count";
             let array = ZarrArray::open(&stat_array_dir(
-                &seasonal,
+                &climo_root,
+                source,
                 &task.window,
                 &task.product,
                 meta.doy,

@@ -252,6 +252,15 @@ pub fn partition_products(
             windowed_auto: false,
             strict: false,
         }),
+        "cafire-record" | "cafire-vs-record" => Ok(ProductRequest {
+            direct: Vec::new(),
+            derived: Vec::new(),
+            fuel: Vec::new(),
+            climo: strings(climo_products::CLIMO_RECORD_PRODUCTS),
+            windowed: Vec::new(),
+            windowed_auto: false,
+            strict: false,
+        }),
         "all" => Ok(ProductRequest {
             direct: supported_direct_recipe_slugs(model),
             derived: derived_catalog()
@@ -325,7 +334,7 @@ pub fn partition_products(
                     derived.push(slug.to_string());
                 } else if fuel_products::FuelProduct::parse(slug).is_some() {
                     fuel.push(slug.to_string());
-                } else if climo_products::ClimoProduct::parse(slug).is_some() {
+                } else if climo_products::parse_climo_request(slug).is_some() {
                     climo.push(slug.to_string());
                 } else if plot_recipe(slug).is_some() {
                     direct.push(slug.to_string());

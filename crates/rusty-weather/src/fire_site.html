@@ -168,6 +168,7 @@
   #anomalyRibbon b { color: var(--amber); font-family: var(--disp); font-size: 16px; letter-spacing: 0.08em; text-transform: uppercase; }
   #anomalyRibbon .mono { font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
   #anomalyRibbon.show { display: block; }
+  .hours.dim { opacity: 0.35; pointer-events: none; }
 
   #gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(430px, 1fr)); gap: 16px; margin-top: 12px; }
   .card {
@@ -246,6 +247,7 @@
     <div class="blocklabel">Products</div>
     <div class="fam" id="fams">
       <button class="chip on" data-fam="anomaly">Anomaly vs Climo <small>RTMA ±7d 2019–26</small></button>
+      <button class="chip" data-fam="record">vs All-Time Record <small>RTMA all days 2019–26</small></button>
       <button class="chip" data-fam="core">Fire Weather Core <small>VPD·HDW·wind·RH</small></button>
       <button class="chip" data-fam="fuels">Fuels <small>gridMET·NFDRS</small></button>
       <button class="chip" data-fam="smoke">Smoke <small>HRRR-Smoke</small></button>
@@ -312,6 +314,7 @@ const DOMAINS = {
 };
 const FAMS = {
   anomaly: { title: "Anomaly vs Climatology", products: "cafire-anomaly" },
+  record:  { title: "vs All-Time Record", products: "cafire-record" },
   core:    { title: "Fire Weather Core", products: "vpd_2m,hdw,fire_weather_composite,10m_wind_gusts,2m_relative_humidity_10m_winds" },
   fuels:   { title: "Fuels", products: "erc,kbdi,dead_fuel_moisture_10h,vpd_fuel_receptive,fire_potential_composite" },
   smoke:   { title: "Smoke", products: "smoke_pm25_native,smoke_column,visibility" },
@@ -343,12 +346,25 @@ wireChips("domains", "dom", v => {
   $("perimBox").classList.toggle("show", v === "perimeter");
   if (v === "draw") drawSketch();
 });
+const RIBBONS = {
+  anomaly: `<b>Percentile vs this date</b> — ranked against the RTMA 2.5 km ±7-day day-of-year climatology,
+      2019–2026, <span class="mono">n≈105 samples/cell · p05–p99 anchors · Feb 29 folded</span>.
+      Reading: <span class="mono">99 = at/beyond the most extreme observed for this calendar window</span>.`,
+  record: `<b>Percentile vs every day on record</b> — the same forecast fold ranked against the exact
+      all-period RTMA climatology, <span class="mono">2019–2026 · n≈2,695 days/cell · p05–p99 anchors</span>.
+      Reading: <span class="mono">seasonal tab = unusual for the date; this tab = severe in absolute terms</span>.`,
+};
 wireChips("fams", "fam", v => {
   state.fam = v;
   $("stageTitle").textContent = FAMS[v].title;
-  $("anomalyRibbon").classList.toggle("show", v === "anomaly");
+  const ribbon = $("anomalyRibbon");
+  ribbon.classList.toggle("show", v in RIBBONS);
+  if (v in RIBBONS) ribbon.innerHTML = RIBBONS[v];
+  // Anomaly families fold whole UTC-day windows; the valid-hour pick is inert there.
+  $("hours").classList.toggle("dim", v === "anomaly" || v === "record");
 });
 $("anomalyRibbon").classList.add("show");
+$("hours").classList.add("dim");
 $("perimBox").addEventListener("click", ev => {
   const chip = ev.target.closest(".chip[data-pad]"); if (!chip) return;
   [...$("perimBox").querySelectorAll(".chip[data-pad]")].forEach(c => c.classList.remove("on"));

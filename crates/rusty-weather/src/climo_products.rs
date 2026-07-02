@@ -19,10 +19,9 @@
 use std::path::Path;
 use std::time::Instant;
 
-use rustwx_core::ModelId;
 use rustwx_products::places;
 use rustwx_products::plot_design::StaticPlotDesign;
-use rustwx_products::shared_context::{DomainSpec, model_time_subtitle};
+use rustwx_products::shared_context::model_time_subtitle;
 use rustwx_render::{
     ChromeScale, Color, ColorScale, DiscreteColorScale, ExtendMode, Field2D, GridShape,
     LatLonGrid, MapRenderRequest, PngWriteOptions, ProductKey, ProductVisualMode,
@@ -38,6 +37,8 @@ use super::{RenderedProduct, StoreFieldSource, StoreRenderConfig, StoreRenderSki
 pub const CLIMO_MODEL: &str = "rtma_climo";
 const CLIMO_RUN_ENV: &str = "RUSTWX_CLIMO_RUN";
 const DEFAULT_CLIMO_RUN: &str = "seasonal_v2026_05_24";
+const CLIMO_EXACT_RUN_ENV: &str = "RUSTWX_CLIMO_EXACT_RUN";
+const DEFAULT_CLIMO_EXACT_RUN: &str = "exact_v2026_05_24";
 const ANCHOR_STATS: [&str; 8] = ["p05", "p10", "p25", "p50", "p75", "p90", "p95", "p99"];
 const MPH_TO_MS: f32 = 0.447_04;
 /// Minimum hourly samples for a usable day window (of 24) and overnight
@@ -124,6 +125,67 @@ pub const CLIMO_PRODUCTS: &[&str] = &[
     "overnight_rh_recovery_percentile",
     "surface_fire_weather_potential",
 ];
+
+/// `_vs_record` siblings of every anomaly product: the same forecast fold
+/// ranked against the exact all-period (2019-2026, every day) climatology
+/// instead of the ±7-day seasonal one — "is this extreme vs everything
+/// we've ever analyzed", not "vs this time of year".
+pub const CLIMO_RECORD_PRODUCTS: &[&str] = &[
+    "vpd_day_max_percentile_vs_record",
+    "min_rh_day_percentile_vs_record",
+    "wind_day_max_percentile_vs_record",
+    "gust_day_max_percentile_vs_record",
+    "hdw_wind_day_percentile_vs_record",
+    "hdw_gust_day_percentile_vs_record",
+    "hours_rh15_gust25_percentile_vs_record",
+    "hours_rh20_gust25_percentile_vs_record",
+    "hours_rh20_wind20_percentile_vs_record",
+    "overnight_rh_recovery_percentile_vs_record",
+    "surface_fire_weather_potential_vs_record",
+];
+
+const RECORD_SLUG_SUFFIX: &str = "_vs_record";
+
+/// Which climatology distribution a request ranks against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Baseline {
+    /// ±7-day DOY seasonal climatology (the default anomaly lane).
+    Seasonal,
+    /// Exact all-period climatology — every analyzed day 2019-2026.
+    AllPeriod,
+}
+
+/// Parse a climo request slug into its product and baseline.
+pub fn parse_climo_request(slug: &str) -> Option<(ClimoProduct, Baseline)> {
+    match slug.strip_suffix(RECORD_SLUG_SUFFIX) {
+        Some(base) => ClimoProduct::parse(base).map(|p| (p, Baseline::AllPeriod)),
+        None => ClimoProduct::parse(slug).map(|p| (p, Baseline::Seasonal)),
+    }
+}
+
+/// The output slug for a (product, baseline) request.
+fn request_slug(product: ClimoProduct, baseline: Baseline) -> String {
+    match baseline {
+        Baseline::Seasonal => product.slug().to_string(),
+        Baseline::AllPeriod => format!("{}{RECORD_SLUG_SUFFIX}", product.slug()),
+    }
+}
+
+/// Plot title for a (product, baseline) request.
+fn baseline_title(product: ClimoProduct, baseline: Baseline) -> String {
+    match baseline {
+        Baseline::Seasonal => product.title().to_string(),
+        Baseline::AllPeriod => {
+            // Swap the seasonal-climatology framing for the all-period one.
+            let base = product
+                .title()
+                .replace(" vs 2019-2026 Climatology", "")
+                .replace(" vs Climatology", "")
+                .replace(" (Weather-Only, 0-100)", "");
+            format!("{base} vs 2019-2026 All Days")
+        }
+    }
+}
 
 const ALL_PRODUCTS: [ClimoProduct; 11] = [
     ClimoProduct::VpdDayMax,
@@ -308,6 +370,14 @@ fn climo_run_slug() -> String {
         .unwrap_or_else(|| DEFAULT_CLIMO_RUN.to_string())
 }
 
+fn climo_exact_run_slug() -> String {
+    std::env::var(CLIMO_EXACT_RUN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_CLIMO_EXACT_RUN.to_string())
+}
+
 /// Everything one UTC-day fold produces, on the climatology subgrid.
 struct DayFold {
     min_rh: Vec<f32>,
@@ -423,7 +493,7 @@ fn fold_window(
     for &hour in hours {
         let source = StoreFieldSource::open(store_root, model_slug, run_slug, hour)
             .map_err(|err| format!("open hour {hour}: {err}"))?;
-        let mut fetch = |name: &str| -> Result<(Vec<f32>, String), String> {
+        let fetch = |name: &str| -> Result<(Vec<f32>, String), String> {
             let field = source
                 .fetch_variable(name)
                 .map_err(|err| format!("hour {hour} variable {name}: {err}"))?;
@@ -491,10 +561,10 @@ pub fn render_climo_products_from_store(
     requested: &[String],
 ) -> Result<ClimoRenderOutcome, Box<dyn std::error::Error>> {
     let mut skipped = Vec::new();
-    let mut products = Vec::new();
+    let mut products: Vec<(ClimoProduct, Baseline)> = Vec::new();
     for slug in requested {
-        match ClimoProduct::parse(slug) {
-            Some(product) => products.push(product),
+        match parse_climo_request(slug) {
+            Some(request) => products.push(request),
             None => skipped.push(StoreRenderSkip {
                 slug: slug.clone(),
                 reason: "unknown climo product".to_string(),
@@ -532,8 +602,8 @@ pub fn render_climo_products_from_store(
             rendered: Vec::new(),
             skipped: products
                 .iter()
-                .map(|product| StoreRenderSkip {
-                    slug: product.slug().to_string(),
+                .map(|&(product, baseline)| StoreRenderSkip {
+                    slug: request_slug(product, baseline),
                     reason: format!(
                         "no UTC day has >= {MIN_DAY_HOURS} stored hours (run has {} hours)",
                         stored_hours.len()
@@ -549,14 +619,14 @@ pub fn render_climo_products_from_store(
 
     let climo_run = climo_run_slug();
     let climo_dir = store_root.join(CLIMO_MODEL).join(&climo_run);
-    let block_all = |products: &[ClimoProduct],
+    let block_all = |products: &[(ClimoProduct, Baseline)],
                      skipped: Vec<StoreRenderSkip>,
                      reason: String| ClimoRenderOutcome {
         rendered: Vec::new(),
         skipped: products
             .iter()
-            .map(|product| StoreRenderSkip {
-                slug: product.slug().to_string(),
+            .map(|&(product, baseline)| StoreRenderSkip {
+                slug: request_slug(product, baseline),
                 reason: reason.clone(),
             })
             .chain(skipped)
@@ -602,14 +672,29 @@ pub fn render_climo_products_from_store(
         ));
     }
     if doy < meta.doy_start || doy > meta.doy_end {
-        return Ok(block_all(
-            &products,
-            skipped,
-            format!(
-                "DOY {doy} outside imported climatology range {}..{}",
-                meta.doy_start, meta.doy_end
-            ),
-        ));
+        // Only the seasonal baseline has a DOY axis; all-period requests
+        // rank against a single distribution and stay renderable.
+        let reason = format!(
+            "DOY {doy} outside imported climatology range {}..{}",
+            meta.doy_start, meta.doy_end
+        );
+        for &(product, baseline) in &products {
+            if baseline == Baseline::Seasonal {
+                skipped.push(StoreRenderSkip {
+                    slug: request_slug(product, baseline),
+                    reason: reason.clone(),
+                });
+            }
+        }
+        products.retain(|&(_, baseline)| baseline != Baseline::Seasonal);
+        if products.is_empty() {
+            return Ok(ClimoRenderOutcome {
+                rendered: Vec::new(),
+                skipped,
+                anchor_hour,
+                doy,
+            });
+        }
     }
     let climo = match StoreFieldSource::open(store_root, CLIMO_MODEL, &climo_run, doy) {
         Ok(source) => source,
@@ -618,11 +703,47 @@ pub fn render_climo_products_from_store(
         }
     };
 
+    // All-period ("vs record") anchors live in their own store run, aligned
+    // to the same HRRR subgrid; a missing/misaligned exact store blocks only
+    // the record requests.
+    let mut exact: Option<StoreFieldSource> = None;
+    if products.iter().any(|&(_, baseline)| baseline == Baseline::AllPeriod) {
+        let exact_run = climo_exact_run_slug();
+        let exact_dir = store_root.join(CLIMO_MODEL).join(&exact_run);
+        let open_exact = || -> Result<StoreFieldSource, String> {
+            let text = std::fs::read_to_string(exact_dir.join("climo_grid_meta.json"))
+                .map_err(|err| format!("exact climatology not available: {err}"))?;
+            let exact_meta: ClimoGridMeta = serde_json::from_str(&text)
+                .map_err(|err| format!("exact climo_grid_meta.json: {err}"))?;
+            if exact_meta.hrrr_grid_hash != meta.hrrr_grid_hash
+                || (exact_meta.ny, exact_meta.nx) != (meta.ny, meta.nx)
+            {
+                return Err("exact climatology grid disagrees with seasonal import".to_string());
+            }
+            StoreFieldSource::open(store_root, CLIMO_MODEL, &exact_run, 0)
+                .map_err(|err| format!("open exact climatology: {err}"))
+        };
+        match open_exact() {
+            Ok(source) => exact = Some(source),
+            Err(reason) => {
+                for &(product, baseline) in &products {
+                    if baseline == Baseline::AllPeriod {
+                        skipped.push(StoreRenderSkip {
+                            slug: request_slug(product, baseline),
+                            reason: reason.clone(),
+                        });
+                    }
+                }
+                products.retain(|&(_, baseline)| baseline != Baseline::AllPeriod);
+            }
+        }
+    }
+
     // Fold each needed window once.
     let mut day_fold: Option<DayFold> = None;
     let mut night_fold: Option<DayFold> = None;
     for window in [ClimoWindow::UtcDay, ClimoWindow::Utc1206NextDay] {
-        if !products.iter().any(|product| product.window() == window) {
+        if !products.iter().any(|&(product, _)| product.window() == window) {
             continue;
         }
         let hours = window_hours(
@@ -639,18 +760,16 @@ pub fn render_climo_products_from_store(
                 hours.len(),
                 window.full_hours()
             );
-            let blocked: Vec<ClimoProduct> = products
+            for &(product, baseline) in products
                 .iter()
-                .copied()
-                .filter(|product| product.window() == window)
-                .collect();
-            for product in &blocked {
+                .filter(|&&(product, _)| product.window() == window)
+            {
                 skipped.push(StoreRenderSkip {
-                    slug: product.slug().to_string(),
+                    slug: request_slug(product, baseline),
                     reason: reason.clone(),
                 });
             }
-            products.retain(|product| product.window() != window);
+            products.retain(|&(product, _)| product.window() != window);
             continue;
         }
         let fold = fold_window(store_root, model_slug, run_slug, &hours, &meta, hrrr_grid.nx)?;
@@ -680,13 +799,18 @@ pub fn render_climo_products_from_store(
     )?;
 
     let mut rendered = Vec::new();
-    for product in products {
+    for (product, baseline) in products {
         let started = Instant::now();
         let fold = match product.window() {
             ClimoWindow::UtcDay => day_fold.as_ref(),
             ClimoWindow::Utc1206NextDay => night_fold.as_ref(),
         };
         let Some(fold) = fold else { continue };
+        let anchors_source = match baseline {
+            Baseline::Seasonal => &climo,
+            // Guarded above: AllPeriod requests were dropped if open failed.
+            Baseline::AllPeriod => exact.as_ref().expect("exact source open"),
+        };
 
         let mut anchors = Vec::with_capacity(ANCHOR_STATS.len());
         let mut anchor_error = None;
@@ -696,7 +820,7 @@ pub fn render_climo_products_from_store(
                 product.window().store_name(),
                 product.climo_product()
             );
-            match climo.derived_grid(&name) {
+            match anchors_source.derived_grid(&name) {
                 Ok(stored) => anchors.push(stored.values),
                 Err(RwStoreError::UnknownVariable(_)) => {
                     anchor_error = Some(format!("climatology grid '{name}' not stored"));
@@ -707,12 +831,12 @@ pub fn render_climo_products_from_store(
         }
         if let Some(reason) = anchor_error {
             skipped.push(StoreRenderSkip {
-                slug: product.slug().to_string(),
+                slug: request_slug(product, baseline),
                 reason,
             });
             continue;
         }
-        let sample_n = climo
+        let sample_n = anchors_source
             .derived_grid(&format!(
                 "climo__{}__{}__sample_count",
                 product.window().store_name(),
@@ -723,23 +847,23 @@ pub fn render_climo_products_from_store(
             .unwrap_or(f32::NAN);
 
         if product == ClimoProduct::SurfacePotential {
-            match compute_surface_potential(&climo, fold, ny * nx) {
+            match compute_surface_potential(anchors_source, fold, ny * nx) {
                 Ok(mut ranks) => {
                     if let Some(mask) = &land_mask {
                         apply_land_mask(&mut ranks, mask);
                     }
                     let output_path = render_rank_map(
                         config, &subgrid, &projected, climo.projection().cloned(),
-                        product, ranks, anchor_hour, fold, doy, f32::NAN,
+                        product, baseline, ranks, anchor_hour, fold, doy, f32::NAN,
                     )?;
                     rendered.push(RenderedProduct {
-                        slug: product.slug().to_string(),
+                        slug: request_slug(product, baseline),
                         total_ms: started.elapsed().as_millis(),
                         output_path,
                     });
                 }
                 Err(reason) => skipped.push(StoreRenderSkip {
-                    slug: product.slug().to_string(),
+                    slug: request_slug(product, baseline),
                     reason,
                 }),
             }
@@ -784,6 +908,7 @@ pub fn render_climo_products_from_store(
             &projected,
             climo.projection().cloned(),
             product,
+            baseline,
             ranks,
             anchor_hour,
             fold,
@@ -791,7 +916,7 @@ pub fn render_climo_products_from_store(
             sample_n,
         )?;
         rendered.push(RenderedProduct {
-            slug: product.slug().to_string(),
+            slug: request_slug(product, baseline),
             total_ms: started.elapsed().as_millis(),
             output_path,
         });
@@ -812,6 +937,7 @@ fn render_rank_map(
     projected: &rustwx_render::ProjectedMap,
     projection: Option<rustwx_core::GridProjection>,
     product: ClimoProduct,
+    baseline: Baseline,
     ranks: Vec<f32>,
     anchor_hour: u16,
     fold: &DayFold,
@@ -819,19 +945,20 @@ fn render_rank_map(
     sample_n: f32,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&config.out_dir)?;
+    let slug = request_slug(product, baseline);
     let render_grid = LatLonGrid::new(
         GridShape::new(subgrid.shape.nx, subgrid.shape.ny)?,
         subgrid.lat_deg.clone(),
         subgrid.lon_deg.clone(),
     )?;
     let field = Field2D::new(
-        ProductKey::named(product.slug()),
+        ProductKey::named(slug.clone()),
         "percentile".to_string(),
         render_grid,
         ranks,
     )?;
     let mut request = MapRenderRequest::new(field, ColorScale::Discrete(product.scale()));
-    request.title = Some(product.title().to_string());
+    request.title = Some(baseline_title(product, baseline));
     request.subtitle_left = Some(model_time_subtitle(
         config.model,
         &config.date_yyyymmdd,
@@ -843,8 +970,12 @@ fn render_rank_map(
     } else {
         String::new()
     };
+    let climo_label = match baseline {
+        Baseline::Seasonal => format!("+/-7d climo 19-26 | DOY {doy}"),
+        Baseline::AllPeriod => "all days 19-26".to_string(),
+    };
     request.subtitle_right = Some(format!(
-        "+/-7d climo 19-26 | DOY {doy}{n_label} | {}h {}",
+        "{climo_label}{n_label} | {}h {}",
         fold.hours_used.len(),
         product.window().store_name().replace("utc_", "").replace("_next_day", "z+"),
     ));
@@ -881,7 +1012,7 @@ fn render_rank_map(
         config.cycle_utc,
         anchor_hour,
         config.domain.slug,
-        product.slug(),
+        slug,
     ));
     save_png_profile_with_options(
         &request,
@@ -1065,6 +1196,31 @@ mod tests {
         );
         assert_eq!(hours.first(), Some(&12));
         assert_eq!(hours.last(), Some(&30));
+    }
+
+    #[test]
+    fn record_slugs_parse_to_all_period_baseline() {
+        assert_eq!(CLIMO_RECORD_PRODUCTS.len(), CLIMO_PRODUCTS.len());
+        for slug in CLIMO_RECORD_PRODUCTS {
+            let (product, baseline) = parse_climo_request(slug).expect(slug);
+            assert_eq!(baseline, Baseline::AllPeriod, "{slug}");
+            assert_eq!(request_slug(product, baseline), *slug);
+        }
+        for slug in CLIMO_PRODUCTS {
+            let (product, baseline) = parse_climo_request(slug).expect(slug);
+            assert_eq!(baseline, Baseline::Seasonal, "{slug}");
+            assert_eq!(request_slug(product, baseline), *slug);
+        }
+        assert!(parse_climo_request("nope_vs_record").is_none());
+        assert!(parse_climo_request("nope").is_none());
+    }
+
+    #[test]
+    fn record_titles_name_the_all_period_baseline() {
+        let title = baseline_title(ClimoProduct::VpdDayMax, Baseline::AllPeriod);
+        assert!(title.contains("All Days"), "{title}");
+        let title = baseline_title(ClimoProduct::VpdDayMax, Baseline::Seasonal);
+        assert_eq!(title, ClimoProduct::VpdDayMax.title());
     }
 
     #[test]
