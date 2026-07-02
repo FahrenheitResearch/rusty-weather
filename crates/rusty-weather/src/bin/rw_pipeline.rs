@@ -93,6 +93,24 @@ fn target_max_hour(cycle: u8) -> u16 {
     if cycle % 6 == 0 { 48 } else { 18 }
 }
 
+/// The forecast hours a model's cycle should ingest. HRRR: hourly to
+/// 18/48. GFS: 6-hourly to F192 (the daily-outlook span) on synoptic
+/// cycles only.
+fn target_hours(model: &str, cycle: u8) -> Vec<u16> {
+    match model {
+        "gfs" => (0..=192u16).step_by(6).collect(),
+        _ => (0..=target_max_hour(cycle)).collect(),
+    }
+}
+
+/// Whether this model publishes the given cycle at all.
+fn model_has_cycle(model: &str, cycle: u8) -> bool {
+    match model {
+        "gfs" => cycle % 6 == 0,
+        _ => true,
+    }
+}
+
 fn hour_span(hours: &[u16]) -> String {
     match (hours.first(), hours.last()) {
         (Some(first), Some(last)) if first != last => format!("{first}-{last}"),
@@ -101,10 +119,15 @@ fn hour_span(hours: &[u16]) -> String {
     }
 }
 
-fn idx_url(date: &str, cycle: u8, hour: u16) -> String {
-    format!(
-        "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.{date}/conus/hrrr.t{cycle:02}z.wrfsfcf{hour:02}.grib2.idx"
-    )
+fn idx_url(model: &str, date: &str, cycle: u8, hour: u16) -> String {
+    match model {
+        "gfs" => format!(
+            "https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.{date}/{cycle:02}/atmos/gfs.t{cycle:02}z.pgrb2.0p25.f{hour:03}.idx"
+        ),
+        _ => format!(
+            "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.{date}/conus/hrrr.t{cycle:02}z.wrfsfcf{hour:02}.grib2.idx"
+        ),
+    }
 }
 
 fn probe(agent: &ureq::Agent, url: &str) -> bool {
@@ -153,7 +176,7 @@ fn run_command(label: &str, command: &mut Command) -> bool {
 
 /// Newest run in the store whose stored hours reach its cycle's target —
 /// the run day-window and anomaly products can actually fold.
-fn newest_complete_run(model_dir: &Path) -> Option<String> {
+fn newest_complete_run(model: &str, model_dir: &Path) -> Option<String> {
     let mut runs: Vec<String> = std::fs::read_dir(model_dir)
         .into_iter()
         .flatten()
@@ -174,7 +197,8 @@ fn newest_complete_run(model_dir: &Path) -> Option<String> {
             return false;
         };
         let stored = stored_hours(&model_dir.join(slug));
-        stored.iter().copied().max().unwrap_or(0) >= target_max_hour(cycle)
+        let target = target_hours(model, cycle).last().copied().unwrap_or(0);
+        stored.iter().copied().max().unwrap_or(0) >= target
     })
 }
 
@@ -368,36 +392,46 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
         .as_secs() as i64;
 
     // Newest cycle whose first file exists (HRRR appears ~50-90 min after
-    // cycle time, so start one hour back).
+    // cycle time; GFS synoptic cycles lag ~3.5-5 h, so search further back).
     let mut found: Option<(String, u8)> = None;
-    for lag in 1..=args.max_cycle_lag_hours {
+    let max_lag = if args.model == "gfs" { args.max_cycle_lag_hours.max(12) } else { args.max_cycle_lag_hours };
+    for lag in 1..=max_lag {
         let (date, cycle) = cycle_at(now_unix, lag);
-        if probe(agent, &idx_url(&date, cycle, 1)) {
+        if !model_has_cycle(&args.model, cycle) {
+            continue;
+        }
+        if probe(agent, &idx_url(&args.model, &date, cycle, 1)) {
             found = Some((date, cycle));
             break;
         }
     }
     let Some((date, cycle)) = found else {
-        eprintln!("[pipeline] no available HRRR cycle found in the last {} h", args.max_cycle_lag_hours);
+        eprintln!(
+            "[pipeline] no available {} cycle found in the last {max_lag} h",
+            args.model
+        );
         return;
     };
     let run_slug = format!("{date}_{cycle:02}z");
-    let target_max = target_max_hour(cycle);
+    let targets = target_hours(&args.model, cycle);
+    let target_max = targets.last().copied().unwrap_or(0);
     let model_dir = args.store_root.join(&args.model);
     let run_dir = model_dir.join(&run_slug);
     let stored = stored_hours(&run_dir);
 
-    // Highest hour published upstream so far (probe down from target).
+    // Highest target hour published upstream so far (probe down).
     let mut available_max = None;
-    for hour in (1..=target_max).rev() {
-        if probe(agent, &idx_url(&date, cycle, hour)) {
+    for &hour in targets.iter().rev() {
+        if probe(agent, &idx_url(&args.model, &date, cycle, hour)) {
             available_max = Some(hour);
             break;
         }
     }
     let Some(available_max) = available_max else { return };
-    let missing: Vec<u16> = (0..=available_max)
-        .filter(|hour| !stored.contains(hour))
+    let missing: Vec<u16> = targets
+        .iter()
+        .copied()
+        .filter(|hour| *hour <= available_max && !stored.contains(hour))
         .collect();
 
     println!(
@@ -406,11 +440,17 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
     );
 
     if !missing.is_empty() {
+        let hours_arg = missing
+            .iter()
+            .map(|hour| hour.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let mut command = Command::new(bin_dir.join(exe("rw_batch")));
         command
+            .arg("--model").arg(&args.model)
             .arg("--date").arg(&date)
             .arg("--cycle").arg(cycle.to_string())
-            .arg("--hours").arg(hour_span(&missing))
+            .arg("--hours").arg(hours_arg)
             .arg("--products").arg("none")
             .arg("--profile").arg("view")
             .arg("--store-root").arg(&args.store_root);
@@ -427,7 +467,7 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
 
     // Fuels + prewarm target the newest COMPLETE run — a brand-new cycle
     // with two hours stored must not steal them from the run users see.
-    let complete_run = newest_complete_run(&model_dir);
+    let complete_run = newest_complete_run(&args.model, &model_dir);
     let day_run = newest_day_covering_run(&model_dir);
     if let Err(err) = write_latest(
         &model_dir,
@@ -441,7 +481,9 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
         eprintln!("[pipeline] latest.json: {err}");
     }
 
-    if let Some(target_run) = &complete_run {
+    // Fuels + prewarm are HRRR-lane concerns (fuel grids + anomaly presets
+    // live on the HRRR grid); other models just ingest + publish.
+    if let Some(target_run) = complete_run.as_ref().filter(|_| args.model == "hrrr") {
         let target_dir = model_dir.join(target_run);
         let target_hours = stored_hours(&target_dir);
         let target_date = target_run.split('_').next().unwrap_or(target_run).to_string();
@@ -482,7 +524,7 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
     run_command("prune", &mut command);
 
     // Prewarm once per complete run, after its fuels landed.
-    if let Some(target_run) = &complete_run {
+    if let Some(target_run) = complete_run.as_ref().filter(|_| args.model == "hrrr") {
         let target_dir = model_dir.join(target_run);
         let warm_flag = target_dir.join(".prewarmed");
         if !warm_flag.exists() && target_dir.join(".fuels-imported").exists() {
@@ -529,7 +571,7 @@ fn main() {
     });
 
     // Singleton guard: refuse to start if another daemon holds the lock.
-    let lock_path = args.store_root.join(".rw-pipeline-lock");
+    let lock_path = args.store_root.join(format!(".rw-pipeline-lock-{}", args.model));
     match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
         Ok(_) => {}
         Err(_) => {
@@ -570,6 +612,18 @@ mod tests {
         assert_eq!(target_max_hour(6), 48);
         assert_eq!(target_max_hour(3), 18);
         assert_eq!(target_max_hour(23), 18);
+    }
+
+    #[test]
+    fn gfs_targets_six_hourly_to_f192_on_synoptic_cycles_only() {
+        let hours = target_hours("gfs", 12);
+        assert_eq!(hours.first(), Some(&0));
+        assert_eq!(hours.last(), Some(&192));
+        assert!(hours.windows(2).all(|pair| pair[1] - pair[0] == 6));
+        assert!(model_has_cycle("gfs", 6));
+        assert!(!model_has_cycle("gfs", 7));
+        assert!(model_has_cycle("hrrr", 7));
+        assert!(idx_url("gfs", "20260702", 6, 96).contains("atmos/gfs.t06z.pgrb2.0p25.f096.idx"));
     }
 
     #[test]
