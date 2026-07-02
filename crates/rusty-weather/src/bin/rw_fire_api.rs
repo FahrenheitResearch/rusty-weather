@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 #[path = "../perimeter.rs"]
 mod perimeter;
 
+#[path = "../meteogram.rs"]
+mod meteogram;
+
 const MIN_RENDER_WIDTH: u32 = 1200;
 const MIN_RENDER_HEIGHT: u32 = 900;
 const MAX_RENDER_DIMENSION: u32 = 2400;
@@ -239,6 +242,8 @@ struct RenderedFile {
 struct HttpRequest {
     method: String,
     path: String,
+    /// Raw query string (after '?'), empty when absent.
+    query: String,
     body: Vec<u8>,
 }
 
@@ -314,6 +319,9 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
         })),
         ("POST", "/api/render") => start_render_job(request.body, state),
         ("OPTIONS", _) => empty_response(204),
+        _ if request.method == "GET" && request.path.starts_with("/api/meteogram") => {
+            meteogram_response(&request.query, &state)
+        }
         _ if request.method == "GET" && request.path.starts_with("/api/jobs/") => {
             let id = request.path.trim_start_matches("/api/jobs/");
             job_response(id, &state)
@@ -780,7 +788,10 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let mut request_parts = request_line.split_whitespace();
     let method = request_parts.next().unwrap_or_default().to_string();
     let raw_path = request_parts.next().unwrap_or("/").to_string();
-    let path = raw_path.split('?').next().unwrap_or("/").to_string();
+    let (path, query) = match raw_path.split_once('?') {
+        Some((path, query)) => (path.to_string(), query.to_string()),
+        None => (raw_path, String::new()),
+    };
     let mut content_length = 0usize;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
@@ -801,7 +812,12 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         .get(body_start..body_start + content_length)
         .unwrap_or_default()
         .to_vec();
-    Ok(HttpRequest { method, path, body })
+    Ok(HttpRequest {
+        method,
+        path,
+        query,
+        body,
+    })
 }
 
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
@@ -810,6 +826,97 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
 
 fn json_response(value: &impl Serialize) -> Vec<u8> {
     json_status_response(200, value)
+}
+
+/// Minimal query-string parse for the meteogram GET (handles %XX and '+').
+fn parse_query(query: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        out.insert(url_decode(key), url_decode(value));
+    }
+    out
+}
+
+fn url_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => out.push(b' '),
+            b'%' => {
+                if let Some(decoded) = bytes
+                    .get(index + 1..index + 3)
+                    .and_then(|hex| std::str::from_utf8(hex).ok())
+                    .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                {
+                    out.push(decoded);
+                    index += 2;
+                } else {
+                    out.push(b'%');
+                }
+            }
+            other => out.push(other),
+        }
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// GET /api/meteogram?lat=..&lon=..&run=20260701_00z[&model=hrrr]
+/// [&panels=temp,rh,vpd,wind,fuels,smoke][&title=...] -> inline SVG.
+fn meteogram_response(path: &str, state: &AppState) -> Vec<u8> {
+    let query = parse_query(path);
+    let bad = |message: &str| json_status_response(400, &serde_json::json!({ "error": message }));
+    let Some(lat) = query.get("lat").and_then(|v| v.parse::<f64>().ok()) else {
+        return bad("lat is required");
+    };
+    let Some(lon) = query.get("lon").and_then(|v| v.parse::<f64>().ok()) else {
+        return bad("lon is required");
+    };
+    let Some(run) = query.get("run").map(String::as_str) else {
+        return bad("run is required (e.g. 20260701_00z)");
+    };
+    if run.len() > 40 || run.contains(['/', '\\', '.']) {
+        return bad("run slug is not valid");
+    }
+    let model = query.get("model").map(String::as_str).unwrap_or("hrrr");
+    if model.len() > 24 || model.contains(['/', '\\', '.']) {
+        return bad("model slug is not valid");
+    }
+    let Some((date, cycle)) = run.split_once('_').and_then(|(date, cycle)| {
+        let hour: u8 = cycle.strip_suffix('z').or_else(|| cycle.strip_suffix('Z'))?.parse().ok()?;
+        (date.len() == 8 && date.chars().all(|c| c.is_ascii_digit()) && hour <= 23)
+            .then(|| (date.to_string(), hour))
+    }) else {
+        return bad("run must look like 20260701_00z");
+    };
+    let panels: Vec<String> = query
+        .get("panels")
+        .map(|list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let request = meteogram::MeteogramRequest {
+        lat,
+        lon,
+        panels,
+        title: query.get("title").cloned().filter(|t| !t.trim().is_empty()),
+    };
+    match meteogram::render_meteogram_svg(&state.store_root, model, run, &date, cycle, &request) {
+        Ok(output) => response_with_extra_headers(
+            200,
+            "image/svg+xml; charset=utf-8",
+            output.svg.into_bytes(),
+            "Cache-Control: no-store\r\n",
+        ),
+        Err(message) => json_status_response(422, &serde_json::json!({ "error": message })),
+    }
 }
 
 fn json_status_response(status: u16, value: &impl Serialize) -> Vec<u8> {

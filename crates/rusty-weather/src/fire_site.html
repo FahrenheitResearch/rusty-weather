@@ -249,6 +249,7 @@
       <button class="chip on" data-fam="anomaly">Anomaly vs Climo <small>RTMA ±7d 2019–26</small></button>
       <button class="chip" data-fam="record">vs All-Time Record <small>RTMA all days 2019–26</small></button>
       <button class="chip" data-fam="climoref">Climatology Maps <small>browse the normals</small></button>
+      <button class="chip" data-fam="meteogram">Meteogram <small>point · wx+fuels</small></button>
       <button class="chip" data-fam="core">Fire Weather Core <small>VPD·HDW·wind·RH</small></button>
       <button class="chip" data-fam="fuels">Fuels <small>gridMET·NFDRS</small></button>
       <button class="chip" data-fam="smoke">Smoke <small>HRRR-Smoke</small></button>
@@ -275,6 +276,31 @@
       </div>
       <div style="font-family:var(--mono); font-size:10.5px; color:var(--muted); margin-top:4px">
         renders the P50→P99 ladder for that date, plus all-time P99 &amp; max
+      </div>
+    </div>
+
+    <div id="meteoBox" style="display:none; margin-top:6px">
+      <div class="kv">
+        <label>site
+          <select id="mgSite">
+            <option value="38.5816,-121.4944" selected>Sacramento</option>
+            <option value="40.5865,-122.3917">Redding</option>
+            <option value="39.5296,-119.8138">Reno</option>
+            <option value="37.3614,-118.3997">Bishop</option>
+            <option value="34.4208,-119.6982">Santa Barbara</option>
+            <option value="custom">custom lat,lon</option>
+          </select>
+        </label>
+        <label>lat <input id="mgLat" type="number" step="0.0001" value="38.5816"></label>
+        <label>lon <input id="mgLon" type="number" step="0.0001" value="-121.4944"></label>
+      </div>
+      <div class="kv" style="margin-top:4px" id="mgPanels">
+        <label><input type="checkbox" value="temp" checked> T/Td</label>
+        <label><input type="checkbox" value="rh" checked> RH</label>
+        <label><input type="checkbox" value="vpd" checked> VPD·HDW</label>
+        <label><input type="checkbox" value="wind" checked> wind</label>
+        <label><input type="checkbox" value="fuels" checked> fuels</label>
+        <label><input type="checkbox" value="smoke"> smoke</label>
       </div>
     </div>
 
@@ -340,6 +366,7 @@ const FAMS = {
   anomaly: { title: "Anomaly vs Climatology", products: "cafire-anomaly" },
   record:  { title: "vs All-Time Record", products: "cafire-record" },
   climoref:{ title: "Climatology Maps", products: "" }, // built from the pickers
+  meteogram:{ title: "Point Meteogram", products: "" }, // GET /api/meteogram
 
   core:    { title: "Fire Weather Core", products: "vpd_2m,hdw,fire_weather_composite,10m_wind_gusts,2m_relative_humidity_10m_winds" },
   fuels:   { title: "Fuels", products: "erc,kbdi,dead_fuel_moisture_10h,vpd_fuel_receptive,fire_potential_composite" },
@@ -387,9 +414,19 @@ wireChips("fams", "fam", v => {
   ribbon.classList.toggle("show", v in RIBBONS);
   if (v in RIBBONS) ribbon.innerHTML = RIBBONS[v];
   $("climoBox").style.display = v === "climoref" ? "block" : "none";
+  $("meteoBox").style.display = v === "meteogram" ? "block" : "none";
   // Anomaly/climatology families fold whole UTC-day windows or ignore the
-  // forecast entirely; the valid-hour pick is inert there.
-  $("hours").classList.toggle("dim", v === "anomaly" || v === "record" || v === "climoref");
+  // forecast entirely; meteograms span every stored hour.
+  $("hours").classList.toggle(
+    "dim",
+    v === "anomaly" || v === "record" || v === "climoref" || v === "meteogram"
+  );
+});
+$("mgSite").addEventListener("change", () => {
+  const v = $("mgSite").value;
+  if (v === "custom") return;
+  const [lat, lon] = v.split(",");
+  $("mgLat").value = lat; $("mgLon").value = lon;
 });
 $("anomalyRibbon").classList.add("show");
 $("hours").classList.add("dim");
@@ -471,9 +508,38 @@ function buildProducts() {
   ladder.push(`climo_ref:${base}:p99:record`, `climo_ref:${base}:max:record`);
   return ladder.join(",");
 }
+async function renderMeteogram() {
+  const lat = Number($("mgLat").value), lon = Number($("mgLon").value);
+  const panels = [...$("mgPanels").querySelectorAll("input:checked")].map(c => c.value).join(",");
+  const siteSel = $("mgSite");
+  const siteName = siteSel.value === "custom"
+    ? `${lat.toFixed(3)}, ${lon.toFixed(3)}`
+    : siteSel.options[siteSel.selectedIndex].text;
+  const run = $("run").value.trim();
+  const url = `/api/meteogram?lat=${lat}&lon=${lon}&run=${encodeURIComponent(run)}` +
+    `&panels=${encodeURIComponent(panels)}&title=${encodeURIComponent(siteName)}`;
+  log(`meteogram ${siteName} · ${run} · ${panels}`);
+  const t0 = performance.now();
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
+    throw new Error(err.error || `HTTP ${resp.status}`);
+  }
+  const svg = await resp.text();
+  const blobUrl = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
+  const secs = ((performance.now() - t0) / 1000).toFixed(2);
+  log(`meteogram ready · ${secs}s`, "ok");
+  $("stageProv").textContent = `${run} · ${siteName} · ${secs}s`;
+  showFiles([{ name: `meteogram — ${siteName}`, url: blobUrl, bytes: svg.length }]);
+}
+
 $("renderBtn").onclick = async () => {
   const btn = $("renderBtn"); btn.disabled = true; btn.textContent = "Rendering…";
   try {
+    if (state.fam === "meteogram") {
+      await renderMeteogram();
+      return;
+    }
     const payload = {
       run: $("run").value.trim(),
       hour: state.hour,
