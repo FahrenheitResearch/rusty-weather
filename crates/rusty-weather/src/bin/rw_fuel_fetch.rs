@@ -304,7 +304,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             required.push(KBDI_PR);
         }
     }
-    let files = fetch_gridmet_files(&args, date.year, &required)?;
+    let mut files = fetch_gridmet_files(&args, date.year, &required)?;
+    ensure_gridmet_day_coverage(&mut files, &required, date.day_index)?;
     if args.download_only {
         let manifest_path =
             default_manifest_path(&args, &model_slug(&args), "fuel_fetch_manifest.json");
@@ -484,6 +485,68 @@ fn fetch_gridmet_files(
         });
     }
     Ok(manifests)
+}
+
+/// A cached gridMET annual file only covers the days published when it was
+/// downloaded. When the requested day index is beyond the cached time
+/// dimension, refresh the file once and re-check; fail with a clear message
+/// only if the freshly downloaded file still lacks the day (gridMET
+/// publishes with roughly a 1-2 day lag).
+fn ensure_gridmet_day_coverage(
+    files: &mut [DownloadManifest],
+    defs: &[GridmetLayerDef],
+    day_index: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let agent = rw_sat::s3::build_agent();
+    for manifest in files.iter_mut() {
+        let Some(def) = defs.iter().find(|def| def.file_stem == manifest.file_stem) else {
+            continue;
+        };
+        let path = PathBuf::from(&manifest.path);
+        let days = gridmet_time_len(&path, def.variable)?;
+        if days > day_index {
+            continue;
+        }
+        if !manifest.cache_hit {
+            return Err(format!(
+                "gridMET {} covers {days} day(s); day index {day_index} is not published yet",
+                manifest.file_stem
+            )
+            .into());
+        }
+        println!(
+            "gridMET {:<8} cached file covers {days} day(s), need index {day_index}; refreshing",
+            manifest.file_stem
+        );
+        fs::remove_file(&path)?;
+        let started = Instant::now();
+        let (_, bytes) = download_if_needed(&agent, &manifest.url, &path)?;
+        manifest.cache_hit = false;
+        manifest.bytes = bytes;
+        manifest.download_ms = started.elapsed().as_millis();
+        let refreshed = gridmet_time_len(&path, def.variable)?;
+        if refreshed <= day_index {
+            return Err(format!(
+                "gridMET {} still covers only {refreshed} day(s) after refresh; day index \
+                 {day_index} is not published yet (gridMET lags ~1-2 days)",
+                manifest.file_stem
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn gridmet_time_len(path: &Path, variable: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let file = open_goes_netcdf_lossy(path)?;
+    let Some(var) = file.variable(variable) else {
+        return Err(format!("variable not found: {variable} in {}", path.display()).into());
+    };
+    let shape = var.shape().to_vec();
+    match shape.as_slice() {
+        [nt, _, _] => Ok(*nt),
+        other => Err(format!("{variable} is not 3D [time,lat,lon]: {other:?}").into()),
+    }
 }
 
 fn download_if_needed(

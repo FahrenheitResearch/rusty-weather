@@ -17,7 +17,7 @@ use std::time::Instant;
 use rustwx_core::ModelId;
 use rustwx_products::places;
 use rustwx_products::plot_design::StaticPlotDesign;
-use rustwx_products::shared_context::{DomainSpec, model_time_subtitle, source_subtitle};
+use rustwx_products::shared_context::{DomainSpec, model_time_subtitle};
 use rustwx_render::{
     ChromeScale, Color, ColorScale, DiscreteColorScale, ExtendMode, Field2D, GridShape,
     LatLonGrid, MapRenderRequest, PngWriteOptions, ProductKey, ProductVisualMode,
@@ -438,11 +438,11 @@ fn render_rank_map(
     )?;
     let mut request = MapRenderRequest::new(field, ColorScale::Discrete(product.scale()));
     request.title = Some(product.title().to_string());
-    request.subtitle_left = Some(format!(
-        "{} | window F{:03}-F{:03}",
-        model_time_subtitle(config.model, &config.date_yyyymmdd, config.cycle_utc, anchor_hour),
-        source_grid.hours_used.first().copied().unwrap_or(0),
-        source_grid.hours_used.last().copied().unwrap_or(anchor_hour),
+    request.subtitle_left = Some(model_time_subtitle(
+        config.model,
+        &config.date_yyyymmdd,
+        config.cycle_utc,
+        anchor_hour,
     ));
     let n_label = if sample_n.is_finite() {
         format!(" | n~{}", sample_n.round() as i64)
@@ -450,8 +450,9 @@ fn render_rank_map(
         String::new()
     };
     request.subtitle_right = Some(format!(
-        "{} | RTMA +/-7d climo 2019-2026 | DOY {doy}{n_label}",
-        source_subtitle(config.source),
+        "+/-7d climo 19-26 | DOY {doy}{n_label} | F{:02}-F{:02}",
+        source_grid.hours_used.first().copied().unwrap_or(0),
+        source_grid.hours_used.last().copied().unwrap_or(anchor_hour),
     ));
     request.cbar_tick_step = None;
     request.width = config.output_width;

@@ -620,6 +620,17 @@ fn run_rw_render(
             stderr_tail.clone(),
         )
     })?;
+    if files.is_empty() {
+        // Exit 0 with zero outputs means every requested product was
+        // blocked/skipped (e.g. windowed sources not yet ingested). Caching
+        // that as a success would poison the request key forever.
+        return Err((
+            "rw_render produced no output files (all requested products were blocked or skipped)"
+                .to_string(),
+            stdout_tail,
+            stderr_tail,
+        ));
+    }
     Ok((files, stdout_tail, stderr_tail))
 }
 
