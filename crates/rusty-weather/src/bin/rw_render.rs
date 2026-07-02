@@ -623,12 +623,55 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if !request.climo.is_empty() {
+            // Reference-map requests (climo_ref:...) render stored anchor
+            // grids directly and don't need the forecast fold.
+            let (ref_slugs, anomaly_slugs): (Vec<String>, Vec<String>) = request
+                .climo
+                .iter()
+                .cloned()
+                .partition(|slug| render_all::climo_products::parse_climo_ref(slug).is_some());
+            if !ref_slugs.is_empty() {
+                let requests: Vec<_> = ref_slugs
+                    .iter()
+                    .filter_map(|slug| render_all::climo_products::parse_climo_ref(slug))
+                    .collect();
+                let (ref_rendered, ref_skipped) =
+                    render_all::climo_products::render_climo_reference_maps(
+                        &config,
+                        &args.store_root,
+                        &model_slug,
+                        &args.run,
+                        &requests,
+                    )?;
+                println!(
+                    "climo-ref {:<14} {} rendered, {} blocked",
+                    domain_slug,
+                    ref_rendered.len(),
+                    ref_skipped.len(),
+                );
+                for product in &ref_rendered {
+                    println!(
+                        "{:>8} ms  {:<20} {}  {}",
+                        product.total_ms,
+                        domain_slug,
+                        product.slug,
+                        product.output_path.display()
+                    );
+                    timings.push((format!("{domain_slug}/{}", product.slug), product.total_ms));
+                }
+                skipped.extend(
+                    ref_skipped
+                        .into_iter()
+                        .map(|skip| (domain_slug.to_string(), skip)),
+                );
+                domain_rendered.extend(ref_rendered);
+            }
             let outcome = render_all::climo_products::render_climo_products_from_store(
                 &config,
                 &args.store_root,
                 &model_slug,
                 &args.run,
-                &request.climo,
+                &anomaly_slugs,
             )?;
             println!(
                 "climo {:<18} {} rendered, {} blocked | DOY {:03} anchored F{:03}",

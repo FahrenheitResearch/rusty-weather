@@ -187,6 +187,98 @@ fn baseline_title(product: ClimoProduct, baseline: Baseline) -> String {
     }
 }
 
+/// Browsable climatology reference maps: a stored anchor grid rendered
+/// directly in product units ("what does p95 VPD normally look like on
+/// July 15"). Slug grammar: `climo_ref:<base>:<stat>:<doyNNN|record>`
+/// where `<base>` is the anomaly slug minus `_percentile`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClimoRefRequest {
+    product: ClimoProduct,
+    stat: String,
+    target: ClimoRefTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClimoRefTarget {
+    Doy(u16),
+    Record,
+}
+
+const CLIMO_REF_PREFIX: &str = "climo_ref:";
+const CLIMO_REF_STATS: [&str; 9] =
+    ["p05", "p10", "p25", "p50", "p75", "p90", "p95", "p99", "max"];
+
+pub fn parse_climo_ref(slug: &str) -> Option<ClimoRefRequest> {
+    let rest = slug.strip_prefix(CLIMO_REF_PREFIX)?;
+    let mut parts = rest.split(':');
+    let base = parts.next()?;
+    let stat = parts.next()?;
+    let target = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let product = ALL_PRODUCTS.iter().copied().find(|p| {
+        p.slug().strip_suffix("_percentile").unwrap_or(p.slug()) == base
+    })?;
+    // The potential composite is computed, not stored — no reference grid.
+    if product == ClimoProduct::SurfacePotential {
+        return None;
+    }
+    if !CLIMO_REF_STATS.contains(&stat) {
+        return None;
+    }
+    let target = if target == "record" {
+        ClimoRefTarget::Record
+    } else {
+        let doy: u16 = target.strip_prefix("doy")?.parse().ok()?;
+        if !(1..=365).contains(&doy) {
+            return None;
+        }
+        ClimoRefTarget::Doy(doy)
+    };
+    // The seasonal pack carries no 'max' stat; all-time max is record-only.
+    if stat == "max" && matches!(target, ClimoRefTarget::Doy(_)) {
+        return None;
+    }
+    Some(ClimoRefRequest {
+        product,
+        stat: stat.to_string(),
+        target,
+    })
+}
+
+impl ClimoRefRequest {
+    /// Windows-filename-safe output slug.
+    fn file_slug(&self) -> String {
+        let base = self
+            .product
+            .slug()
+            .strip_suffix("_percentile")
+            .unwrap_or(self.product.slug());
+        match self.target {
+            ClimoRefTarget::Doy(doy) => format!("climo_ref_{base}_{}_doy{doy}", self.stat),
+            ClimoRefTarget::Record => format!("climo_ref_{base}_{}_record", self.stat),
+        }
+    }
+}
+
+/// No-leap DOY back to (month, day) — inverse of `no_leap_doy`.
+fn doy_to_month_day(doy: u16) -> (u32, u32) {
+    const MONTH_DAYS: [u16; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut remaining = doy;
+    for (index, &days) in MONTH_DAYS.iter().enumerate() {
+        if remaining <= days {
+            return (index as u32 + 1, u32::from(remaining));
+        }
+        remaining -= days;
+    }
+    (12, 31)
+}
+
+const MONTH_ABBREV: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
 const ALL_PRODUCTS: [ClimoProduct; 11] = [
     ClimoProduct::VpdDayMax,
     ClimoProduct::MinRhDay,
@@ -353,6 +445,311 @@ fn apply_land_mask(ranks: &mut [f32], mask: &[u8]) {
             *rank = f32::NAN;
         }
     }
+}
+
+const MS_TO_MPH: f32 = 2.236_936;
+
+/// Display styling for a reference map: color scale, display units, a
+/// multiplier from stored units to display units, and the product noun.
+fn ref_style(product: ClimoProduct) -> (DiscreteColorScale, &'static str, f32, &'static str) {
+    let scale = |levels: &[f64], colors: &[&str]| DiscreteColorScale {
+        levels: levels.to_vec(),
+        colors: hex_colors(colors),
+        extend: ExtendMode::Neither,
+        mask_below: None,
+    };
+    let dry_ramp = [
+        "#7a0177", "#dc1f1f", "#f8823c", "#fdd08a", "#f7ecc8", "#dcebd2", "#b5d9c3", "#8cc3cf",
+        "#5b93c3",
+    ];
+    let hot_ramp = [
+        "#5b93c3", "#8cb8d8", "#c8d9e4", "#f2ede0", "#fdd08a", "#f8a25c", "#f8823c", "#dc1f1f",
+        "#7a0177",
+    ];
+    match product {
+        ClimoProduct::MinRhDay | ClimoProduct::OvernightRhRecovery => (
+            scale(&[0.0, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 55.0, 75.0, 100.0], &dry_ramp),
+            "%",
+            1.0,
+            match product {
+                ClimoProduct::OvernightRhRecovery => "Overnight Min RH (12Z-06Z)",
+                _ => "Day-Min RH",
+            },
+        ),
+        ClimoProduct::VpdDayMax => (
+            scale(&[0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.5, 10.0], &hot_ramp),
+            "kPa",
+            1.0,
+            "Day-Max VPD",
+        ),
+        ClimoProduct::WindDayMax => (
+            scale(&[0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 55.0, 90.0], &hot_ramp),
+            "mph",
+            MS_TO_MPH,
+            "Day-Max Sustained Wind",
+        ),
+        ClimoProduct::GustDayMax => (
+            scale(&[0.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0, 65.0, 110.0], &hot_ramp),
+            "mph",
+            MS_TO_MPH,
+            "Day-Max Gust",
+        ),
+        ClimoProduct::HdwWindDay => (
+            scale(&[0.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 80.0, 110.0, 200.0], &hot_ramp),
+            "kPa*m/s",
+            1.0,
+            "Day-Max Surface HDW (Wind)",
+        ),
+        ClimoProduct::HdwGustDay => (
+            scale(&[0.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 80.0, 110.0, 200.0], &hot_ramp),
+            "kPa*m/s",
+            1.0,
+            "Day-Max Surface HDW (Gust)",
+        ),
+        ClimoProduct::HoursRh15Gust25 => (
+            scale(&[0.0, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 18.0, 24.0], &hot_ramp),
+            "h",
+            1.0,
+            "Hours RH<=15% & Gust>=25mph",
+        ),
+        ClimoProduct::HoursRh20Gust25 => (
+            scale(&[0.0, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 18.0, 24.0], &hot_ramp),
+            "h",
+            1.0,
+            "Hours RH<=20% & Gust>=25mph",
+        ),
+        ClimoProduct::HoursRh20Wind20 => (
+            scale(&[0.0, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 18.0, 24.0], &hot_ramp),
+            "h",
+            1.0,
+            "Hours RH<=20% & Wind>=20mph",
+        ),
+        // Excluded by parse_climo_ref; unreachable in practice.
+        ClimoProduct::SurfacePotential => (
+            scale(&[0.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0, 100.5], &hot_ramp[..7]),
+            "percentile",
+            1.0,
+            "Surface Fire Weather Potential",
+        ),
+    }
+}
+
+fn ref_stat_label(stat: &str) -> String {
+    match stat {
+        "max" => "All-Time Max".to_string(),
+        other => other.to_uppercase(),
+    }
+}
+
+/// Render stored climatology anchor grids directly as browsable reference
+/// maps. Self-contained: validates the store meta/grid, applies the ocean
+/// mask, and renders in product display units.
+pub fn render_climo_reference_maps(
+    config: &StoreRenderConfig,
+    store_root: &Path,
+    model_slug: &str,
+    run_slug: &str,
+    requests: &[ClimoRefRequest],
+) -> Result<(Vec<RenderedProduct>, Vec<StoreRenderSkip>), Box<dyn std::error::Error>> {
+    let mut rendered = Vec::new();
+    let mut skipped = Vec::new();
+    if requests.is_empty() {
+        return Ok((rendered, skipped));
+    }
+
+    let climo_run = climo_run_slug();
+    let climo_dir = store_root.join(CLIMO_MODEL).join(&climo_run);
+    let block_all = |skipped: &mut Vec<StoreRenderSkip>, reason: String| {
+        skipped.extend(requests.iter().map(|request| StoreRenderSkip {
+            slug: request.file_slug(),
+            reason: reason.clone(),
+        }));
+    };
+    let meta: ClimoGridMeta = match std::fs::read_to_string(climo_dir.join("climo_grid_meta.json"))
+        .map_err(|err| format!("climatology store not available: {err}"))
+        .and_then(|text| {
+            serde_json::from_str(&text).map_err(|err| format!("climo_grid_meta.json: {err}"))
+        }) {
+        Ok(meta) => meta,
+        Err(reason) => {
+            block_all(&mut skipped, reason);
+            return Ok((rendered, skipped));
+        }
+    };
+    let hrrr_grid = rw_store::grid::GridFile::open(
+        &store_root.join(model_slug).join(run_slug).join("grid.rwg"),
+    )?;
+    if meta.schema != "cafire.rtma_climo_grid_meta.v1" || hrrr_grid.hash != meta.hrrr_grid_hash {
+        block_all(
+            &mut skipped,
+            "climatology store does not match this run's HRRR grid".to_string(),
+        );
+        return Ok((rendered, skipped));
+    }
+    let land_mask = load_land_mask(&climo_dir, meta.ny, meta.nx);
+
+    // Sources cache: one open per (run, hour) actually used.
+    let mut open_source: Option<(ClimoRefTarget, StoreFieldSource)> = None;
+    let mut projected_ctx: Option<rustwx_render::ProjectedMap> = None;
+    for request in requests {
+        let started = Instant::now();
+        if let ClimoRefTarget::Doy(doy) = request.target {
+            if doy < meta.doy_start || doy > meta.doy_end {
+                skipped.push(StoreRenderSkip {
+                    slug: request.file_slug(),
+                    reason: format!(
+                        "DOY {doy} outside imported climatology range {}..{}",
+                        meta.doy_start, meta.doy_end
+                    ),
+                });
+                continue;
+            }
+        }
+        if open_source.as_ref().map(|(key, _)| *key) != Some(request.target) {
+            let opened = match request.target {
+                ClimoRefTarget::Doy(doy) => {
+                    StoreFieldSource::open(store_root, CLIMO_MODEL, &climo_run, doy)
+                }
+                ClimoRefTarget::Record => {
+                    StoreFieldSource::open(store_root, CLIMO_MODEL, &climo_exact_run_slug(), 0)
+                }
+            };
+            match opened {
+                Ok(source) => open_source = Some((request.target, source)),
+                Err(err) => {
+                    skipped.push(StoreRenderSkip {
+                        slug: request.file_slug(),
+                        reason: format!("open climatology source: {err}"),
+                    });
+                    continue;
+                }
+            }
+        }
+        let source = &open_source.as_ref().expect("source cached").1;
+        let subgrid = source.full_grid();
+        if (subgrid.shape.ny, subgrid.shape.nx) != (meta.ny, meta.nx) {
+            skipped.push(StoreRenderSkip {
+                slug: request.file_slug(),
+                reason: "climatology grid disagrees with its meta sidecar".to_string(),
+            });
+            continue;
+        }
+        if projected_ctx.is_none() {
+            projected_ctx = Some(rustwx_products::direct::build_projected_map_with_projection(
+                &subgrid.lat_deg,
+                &subgrid.lon_deg,
+                source.projection(),
+                config.domain.bounds,
+                map_frame_aspect_ratio(config.output_width, config.output_height, true, true),
+            )?);
+        }
+        let projected = projected_ctx.as_ref().expect("projected map");
+
+        let name = format!(
+            "climo__{}__{}__{}",
+            request.product.window().store_name(),
+            request.product.climo_product(),
+            request.stat
+        );
+        let mut values = match source.derived_grid(&name) {
+            Ok(stored) => stored.values,
+            Err(RwStoreError::UnknownVariable(_)) => {
+                skipped.push(StoreRenderSkip {
+                    slug: request.file_slug(),
+                    reason: format!("climatology grid '{name}' not stored"),
+                });
+                continue;
+            }
+            Err(err) => return Err(format!("read {name}: {err}").into()),
+        };
+        let (scale, units, multiplier, noun) = ref_style(request.product);
+        if multiplier != 1.0 {
+            for value in values.iter_mut() {
+                *value *= multiplier;
+            }
+        }
+        if let Some(mask) = &land_mask {
+            apply_land_mask(&mut values, mask);
+        }
+
+        std::fs::create_dir_all(&config.out_dir)?;
+        let render_grid = LatLonGrid::new(
+            GridShape::new(subgrid.shape.nx, subgrid.shape.ny)?,
+            subgrid.lat_deg.clone(),
+            subgrid.lon_deg.clone(),
+        )?;
+        let field = Field2D::new(
+            ProductKey::named(request.file_slug()),
+            units.to_string(),
+            render_grid,
+            values,
+        )?;
+        let mut render_request = MapRenderRequest::new(field, ColorScale::Discrete(scale));
+        let stat_label = ref_stat_label(&request.stat);
+        render_request.title = Some(match request.target {
+            ClimoRefTarget::Doy(doy) => {
+                let (month, day) = doy_to_month_day(doy);
+                format!(
+                    "{stat_label} {noun} — {} {day} Climatology",
+                    MONTH_ABBREV[month as usize - 1]
+                )
+            }
+            ClimoRefTarget::Record => format!("{stat_label} {noun} — All Days 2019-2026"),
+        });
+        render_request.subtitle_left =
+            Some("RTMA 2.5 km analysis climatology | FireWxAtlas 2019-2026".to_string());
+        render_request.subtitle_right = Some(match request.target {
+            ClimoRefTarget::Doy(doy) => format!("DOY {doy} | +/-7d window | n~105"),
+            ClimoRefTarget::Record => "all analyzed days | n~2695".to_string(),
+        });
+        render_request.cbar_tick_step = None;
+        render_request.width = config.output_width;
+        render_request.height = config.output_height;
+        render_request.chrome_scale = static_chrome_scale();
+        render_request.supersample_factor = static_supersample_factor();
+        render_request.supersample_sharpen = static_supersample_sharpen();
+        StaticPlotDesign::new(config.domain.bounds, ProductVisualMode::SevereDiagnostic)
+            .apply_to_request(&mut render_request);
+        render_request.projected_domain = Some(ProjectedDomain {
+            x: projected.projected_x.clone(),
+            y: projected.projected_y.clone(),
+            extent: projected.extent.clone(),
+        });
+        render_request.projected_lines = projected.lines.clone();
+        render_request.projected_polygons = projected.polygons.clone();
+        render_request.inverse_raster_projection = projected.inverse_raster_projection.clone();
+        if let Some(overlay) = config.place_label_overlay.as_ref() {
+            places::apply_place_label_overlay(
+                &mut render_request,
+                overlay,
+                &config.domain,
+                &subgrid.lat_deg,
+                &subgrid.lon_deg,
+                source.projection(),
+            )?;
+        }
+        let output_path = config.out_dir.join(format!(
+            "rustwx_{}_{}_{}z_{}_{}.png",
+            config.model.as_str().replace('-', "_"),
+            config.date_yyyymmdd,
+            config.cycle_utc,
+            config.domain.slug,
+            request.file_slug(),
+        ));
+        save_png_profile_with_options(
+            &render_request,
+            &output_path,
+            &PngWriteOptions {
+                compression: config.png_compression,
+            },
+        )?;
+        rendered.push(RenderedProduct {
+            slug: request.file_slug(),
+            total_ms: started.elapsed().as_millis(),
+            output_path,
+        });
+    }
+    Ok((rendered, skipped))
 }
 
 pub struct ClimoRenderOutcome {
@@ -1213,6 +1610,38 @@ mod tests {
         }
         assert!(parse_climo_request("nope_vs_record").is_none());
         assert!(parse_climo_request("nope").is_none());
+    }
+
+    #[test]
+    fn climo_ref_slugs_parse_and_round_trip() {
+        let request = parse_climo_ref("climo_ref:vpd_day_max:p95:doy196").expect("vpd ref");
+        assert_eq!(request.product, ClimoProduct::VpdDayMax);
+        assert_eq!(request.stat, "p95");
+        assert_eq!(request.target, ClimoRefTarget::Doy(196));
+        assert_eq!(request.file_slug(), "climo_ref_vpd_day_max_p95_doy196");
+
+        let request = parse_climo_ref("climo_ref:min_rh_day:max:record").expect("record max");
+        assert_eq!(request.target, ClimoRefTarget::Record);
+        assert_eq!(request.file_slug(), "climo_ref_min_rh_day_max_record");
+
+        let overnight = parse_climo_ref("climo_ref:overnight_rh_recovery:p50:doy10").unwrap();
+        assert_eq!(overnight.product, ClimoProduct::OvernightRhRecovery);
+
+        // The seasonal pack carries no 'max' stat; record-only.
+        assert!(parse_climo_ref("climo_ref:vpd_day_max:max:doy196").is_none());
+        assert!(parse_climo_ref("climo_ref:vpd_day_max:p97:doy196").is_none(), "unknown stat");
+        assert!(parse_climo_ref("climo_ref:vpd_day_max:p95:doy366").is_none(), "DOY range");
+        assert!(parse_climo_ref("climo_ref:surface_fire_weather_potential:p95:doy10").is_none());
+        assert!(parse_climo_ref("vpd_day_max_percentile").is_none());
+    }
+
+    #[test]
+    fn doy_maps_back_to_no_leap_calendar_dates() {
+        assert_eq!(doy_to_month_day(1), (1, 1));
+        assert_eq!(doy_to_month_day(59), (2, 28));
+        assert_eq!(doy_to_month_day(60), (3, 1));
+        assert_eq!(doy_to_month_day(196), (7, 15));
+        assert_eq!(doy_to_month_day(365), (12, 31));
     }
 
     #[test]

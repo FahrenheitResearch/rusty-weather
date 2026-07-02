@@ -248,10 +248,34 @@
     <div class="fam" id="fams">
       <button class="chip on" data-fam="anomaly">Anomaly vs Climo <small>RTMA ±7d 2019–26</small></button>
       <button class="chip" data-fam="record">vs All-Time Record <small>RTMA all days 2019–26</small></button>
+      <button class="chip" data-fam="climoref">Climatology Maps <small>browse the normals</small></button>
       <button class="chip" data-fam="core">Fire Weather Core <small>VPD·HDW·wind·RH</small></button>
       <button class="chip" data-fam="fuels">Fuels <small>gridMET·NFDRS</small></button>
       <button class="chip" data-fam="smoke">Smoke <small>HRRR-Smoke</small></button>
       <button class="chip" data-fam="window">Day Windows <small>24 h max/min</small></button>
+    </div>
+
+    <div id="climoBox" style="display:none; margin-top:6px">
+      <div class="kv">
+        <label>product
+          <select id="refProduct">
+            <option value="vpd_day_max" selected>day-max VPD</option>
+            <option value="min_rh_day">day-min RH</option>
+            <option value="wind_day_max">day-max wind</option>
+            <option value="gust_day_max">day-max gust</option>
+            <option value="hdw_wind_day">HDW (wind)</option>
+            <option value="hdw_gust_day">HDW (gust)</option>
+            <option value="hours_rh15_gust25">hrs RH≤15 & gust≥25</option>
+            <option value="hours_rh20_gust25">hrs RH≤20 & gust≥25</option>
+            <option value="hours_rh20_wind20">hrs RH≤20 & wind≥20</option>
+            <option value="overnight_rh_recovery">overnight min RH</option>
+          </select>
+        </label>
+        <label>date <input id="refDate" type="date" value="2026-07-15"></label>
+      </div>
+      <div style="font-family:var(--mono); font-size:10.5px; color:var(--muted); margin-top:4px">
+        renders the P50→P99 ladder for that date, plus all-time P99 &amp; max
+      </div>
     </div>
 
     <div class="blocklabel">Valid Hour</div>
@@ -315,6 +339,8 @@ const DOMAINS = {
 const FAMS = {
   anomaly: { title: "Anomaly vs Climatology", products: "cafire-anomaly" },
   record:  { title: "vs All-Time Record", products: "cafire-record" },
+  climoref:{ title: "Climatology Maps", products: "" }, // built from the pickers
+
   core:    { title: "Fire Weather Core", products: "vpd_2m,hdw,fire_weather_composite,10m_wind_gusts,2m_relative_humidity_10m_winds" },
   fuels:   { title: "Fuels", products: "erc,kbdi,dead_fuel_moisture_10h,vpd_fuel_receptive,fire_potential_composite" },
   smoke:   { title: "Smoke", products: "smoke_pm25_native,smoke_column,visibility" },
@@ -360,8 +386,10 @@ wireChips("fams", "fam", v => {
   const ribbon = $("anomalyRibbon");
   ribbon.classList.toggle("show", v in RIBBONS);
   if (v in RIBBONS) ribbon.innerHTML = RIBBONS[v];
-  // Anomaly families fold whole UTC-day windows; the valid-hour pick is inert there.
-  $("hours").classList.toggle("dim", v === "anomaly" || v === "record");
+  $("climoBox").style.display = v === "climoref" ? "block" : "none";
+  // Anomaly/climatology families fold whole UTC-day windows or ignore the
+  // forecast entirely; the valid-hour pick is inert there.
+  $("hours").classList.toggle("dim", v === "anomaly" || v === "record" || v === "climoref");
 });
 $("anomalyRibbon").classList.add("show");
 $("hours").classList.add("dim");
@@ -429,13 +457,27 @@ async function health() {
 health(); setInterval(health, 5000);
 
 /* ---- render flow ---- */
+function noLeapDoy(dateStr) {
+  const parts = (dateStr || "2026-07-15").split("-").map(Number);
+  const cum = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+  const day = (parts[1] === 2 && parts[2] === 29) ? 28 : parts[2];
+  return cum[parts[1] - 1] + day;
+}
+function buildProducts() {
+  if (state.fam !== "climoref") return FAMS[state.fam].products;
+  const base = $("refProduct").value;
+  const doy = noLeapDoy($("refDate").value);
+  const ladder = ["p50", "p75", "p90", "p95", "p99"].map(s => `climo_ref:${base}:${s}:doy${doy}`);
+  ladder.push(`climo_ref:${base}:p99:record`, `climo_ref:${base}:max:record`);
+  return ladder.join(",");
+}
 $("renderBtn").onclick = async () => {
   const btn = $("renderBtn"); btn.disabled = true; btn.textContent = "Rendering…";
   try {
     const payload = {
       run: $("run").value.trim(),
       hour: state.hour,
-      products: FAMS[state.fam].products,
+      products: buildProducts(),
       output_format: "webp",
       plot_style: "operational",
       basemap_style: $("basemap").value,

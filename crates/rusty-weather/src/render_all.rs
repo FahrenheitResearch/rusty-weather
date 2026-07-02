@@ -334,7 +334,9 @@ pub fn partition_products(
                     derived.push(slug.to_string());
                 } else if fuel_products::FuelProduct::parse(slug).is_some() {
                     fuel.push(slug.to_string());
-                } else if climo_products::parse_climo_request(slug).is_some() {
+                } else if climo_products::parse_climo_request(slug).is_some()
+                    || climo_products::parse_climo_ref(slug).is_some()
+                {
                     climo.push(slug.to_string());
                 } else if plot_recipe(slug).is_some() {
                     direct.push(slug.to_string());
