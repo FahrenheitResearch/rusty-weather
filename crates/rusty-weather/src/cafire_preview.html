@@ -288,6 +288,14 @@ button { color: inherit; cursor: pointer; }
     </div>
 
     <div>
+      <span class="field-label">Temp units</span>
+      <div class="segmented" id="tempUnitSeg">
+        <button class="selected" type="button" data-tempunits="f">°F</button>
+        <button type="button" data-tempunits="c">°C</button>
+      </div>
+    </div>
+
+    <div>
       <span class="field-label">Map labels</span>
       <div class="segmented" id="quality">
         <button type="button" data-density="2">Regional</button>
@@ -524,7 +532,7 @@ const RIBBONS = {
 };
 let state = {
   fam: "anomaly", product: ANOMALY[0][0], hour: 6, density: 3,
-  basemap: "topo", counties: true,
+  basemap: "topo", counties: true, tempUnits: "f",
   preset: "california", drawn: null, fire: null, stat: "p95",
   hours: [], playTimer: null, seq: 0,
 };
@@ -775,6 +783,7 @@ function wireSegment(id, apply) {
 wireSegment("quality", d => { state.density = Number(d.density); });
 wireSegment("basemapSeg", d => { state.basemap = d.basemap; });
 wireSegment("countySeg", d => { state.counties = d.counties === "true"; });
+wireSegment("tempUnitSeg", d => { state.tempUnits = d.tempunits; });
 
 /* ---------- Leaflet map ---------- */
 const map = L.map("map", { zoomControl: true }).setView([37.6, -119.5], 5);
@@ -1025,6 +1034,9 @@ async function requestPlot(productSlug, hour, quiet) {
     output_width: 1800, ...domainPayload(),
   };
   if (state.fire) payload.title_note = `${state.fire.name} Fire`;
+  // °F is the server default: omit the field so °F requests share the
+  // prewarm/pipeline cache key, send it only for the °C opt-out.
+  if (state.tempUnits === "c") payload.temp_units = "c";
   const started = await fetch(apiBase() + "/api/render", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }).then(r => r.json());
   if (started.error) throw new Error(started.error);
   if (!quiet) log(`job ${started.id} (${started.cache})`, started.cache === "hit" ? "ok" : "");
@@ -1125,7 +1137,7 @@ function prefetchNeighbors(slug, hour) {
   const targets = [index + 1, index - 1, index + 2, index + 3]
     .map(i => state.hours[i]).filter(h => h !== undefined);
   targets.forEach(h => {
-    const key = `${currentRun()}|${slug}|${h}|${JSON.stringify(domainPayload())}|${state.density}|${state.basemap}|${state.counties}`;
+    const key = `${currentRun()}|${slug}|${h}|${JSON.stringify(domainPayload())}|${state.density}|${state.basemap}|${state.counties}|${state.tempUnits}`;
     if (prefetched.has(key)) return;
     prefetched.add(key);
     requestPlot(slug, h, true).catch(() => prefetched.delete(key));

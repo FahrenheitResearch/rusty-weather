@@ -104,6 +104,9 @@ Poll for a status dot. Non-200 = down.
   ignore it (they fold whole windows); hourly products honor it.
 - `basemap_style`: `topo` | `filled` | `white`. `place_label_density`
   0–4. `output_width` up to ~2400.
+- `temp_units`: `"c"` for Celsius; surface temperature maps (2 m temp/
+  dewpoint, wet-bulb, heat index, ...) default to °F (`"f"`). Upper-air
+  (pressure-level) temperature maps always render °C.
 
 Response `202`:
 ```json

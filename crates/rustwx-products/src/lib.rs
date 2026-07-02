@@ -27,6 +27,7 @@ pub mod severe;
 pub mod shared_context;
 pub mod source;
 pub mod spec;
+pub mod temp_display;
 pub mod thermo_native;
 pub mod topo;
 pub mod viewer;

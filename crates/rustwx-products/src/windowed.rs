@@ -1833,6 +1833,9 @@ fn build_windowed_render_request(
     ) {
         render_request.legend.mode = LegendMode::Stepped;
     }
+    if let Some(temp_display) = windowed_temp_display(product) {
+        crate::temp_display::apply_temp_units_display(&mut render_request, temp_display);
+    }
     render_request.projected_domain = Some(rustwx_render::ProjectedDomain {
         x: projected.projected_x.clone(),
         y: projected.projected_y.clone(),
@@ -1841,6 +1844,28 @@ fn build_windowed_render_request(
     render_request.projected_lines = projected.lines.clone();
     render_request.projected_polygons = projected.polygons.clone();
     render_request
+}
+
+/// How a windowed product's fill currently expresses temperature, for the
+/// °F-default display transform (`crate::temp_display`). The 2 m
+/// temperature/dewpoint snapshot windows store °C: max/min windows are
+/// absolute temperatures; range windows are temperature *differences*
+/// (Δ°F = Δ°C × 9/5, no offset).
+fn windowed_temp_display(
+    product: HrrrWindowedProduct,
+) -> Option<crate::temp_display::TempDisplay> {
+    use HrrrWindowedProduct::*;
+    match product {
+        Temp2m0to24hMax | Temp2m24to48hMax | Temp2m0to48hMax | Temp2m0to24hMin
+        | Temp2m24to48hMin | Temp2m0to48hMin | Dewpoint2m0to24hMax | Dewpoint2m24to48hMax
+        | Dewpoint2m0to48hMax | Dewpoint2m0to24hMin | Dewpoint2m24to48hMin
+        | Dewpoint2m0to48hMin => Some(crate::temp_display::TempDisplay::AbsoluteCelsius),
+        Temp2m0to24hRange | Temp2m24to48hRange | Temp2m0to48hRange | Dewpoint2m0to24hRange
+        | Dewpoint2m24to48hRange | Dewpoint2m0to48hRange => {
+            Some(crate::temp_display::TempDisplay::DeltaCelsius)
+        }
+        _ => None,
+    }
 }
 
 fn windowed_display_hour_label(

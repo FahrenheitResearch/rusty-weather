@@ -37,6 +37,7 @@ const PRODUCT_MODULE_SURFACE: &[(&str, ProductModuleSurfaceKind)] = &[
     ("shared_context", StablePublic),
     ("source", CompatibilityPublic),
     ("spec", CompatibilityPublic),
+    ("temp_display", OperationalPublic),
     ("thermo_native", ProofResearchPublic),
     ("topo", OperationalPublic),
     ("viewer", StablePublic),

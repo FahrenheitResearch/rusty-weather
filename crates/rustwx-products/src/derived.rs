@@ -1722,6 +1722,25 @@ fn build_render_artifact(
     )
 }
 
+/// How a derived recipe's fill currently expresses temperature, for the
+/// °F-default display transform (`crate::temp_display`). Only the surface
+/// temperature family converts: wet-bulb/apparent/heat-index/wind-chill
+/// are absolute °C values and dewpoint depression is a °C *difference*.
+/// Lifted index stays °C (a 500 mb stability index, kept by meteorological
+/// convention) and the `degC/hr` advection tendencies never match.
+fn derived_temp_display(recipe: DerivedRecipe) -> Option<crate::temp_display::TempDisplay> {
+    match recipe {
+        DerivedRecipe::Wetbulb2m
+        | DerivedRecipe::ApparentTemperature2m
+        | DerivedRecipe::HeatIndex2m
+        | DerivedRecipe::WindChill2m => Some(crate::temp_display::TempDisplay::AbsoluteCelsius),
+        DerivedRecipe::DewpointDepression2m => {
+            Some(crate::temp_display::TempDisplay::DeltaCelsius)
+        }
+        _ => None,
+    }
+}
+
 fn build_render_artifact_with_contour_mode(
     recipe: DerivedRecipe,
     grid: &rustwx_core::LatLonGrid,
@@ -2076,6 +2095,9 @@ fn build_render_artifact_with_contour_mode(
     request.projected_lines = projected.lines.clone();
     request.projected_polygons = projected.polygons.clone();
     apply_source_raster_policy(source, &mut request);
+    if let Some(temp_display) = derived_temp_display(recipe) {
+        crate::temp_display::apply_temp_units_display(&mut request, temp_display);
+    }
     maybe_apply_native_contour_fill_for_mode(
         recipe,
         &mut request,
@@ -2458,6 +2480,9 @@ fn build_render_artifact_with_contour_mode_profiled(
     request.projected_lines = projected.lines.clone();
     request.projected_polygons = projected.polygons.clone();
     apply_source_raster_policy(source, &mut request);
+    if let Some(temp_display) = derived_temp_display(recipe) {
+        crate::temp_display::apply_temp_units_display(&mut request, temp_display);
+    }
     let request_base_build_ms = request_base_build_start.elapsed().as_millis();
 
     let native_contour_timing = maybe_apply_native_contour_fill_for_mode_profiled(

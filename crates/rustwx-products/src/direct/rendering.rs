@@ -115,6 +115,16 @@ pub(super) fn build_render_request(
         .overlay_only(overlay_only)
         .apply_to_request(&mut request);
     apply_direct_recipe_render_controls(recipe, filled.selector, &mut request);
+    // °F is this lane's native display for the 2 m temperature family
+    // (see `direct_fill_unit_conversion`); `RUSTWX_TEMP_UNITS=c` converts
+    // that display back to Celsius. Upper-air temperature fills are
+    // "degC" and intentionally never match (they stay °C by convention).
+    if request.field.units == "degF" {
+        crate::temp_display::apply_temp_units_display(
+            &mut request,
+            crate::temp_display::TempDisplay::AbsoluteFahrenheit,
+        );
+    }
     request.title = Some(static_title_with_suffix(recipe.title));
     request.width = output_width;
     request.height = output_height;

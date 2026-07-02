@@ -213,6 +213,13 @@ struct RenderJobRequest {
     /// e.g. "Aspen Acres Fire". Sanitized and capped at validation.
     #[serde(default)]
     title_note: Option<String>,
+    /// Temperature display units for the surface temperature family
+    /// (2 m temperature/dewpoint, wet-bulb, heat index, ...): "f"
+    /// (default) or "c". Upper-air temperature maps always render °C.
+    /// Normalized at validation so an omitted field and an explicit "f"
+    /// share one cache key.
+    #[serde(default = "default_temp_units")]
+    temp_units: String,
     #[serde(default)]
     output_width: Option<u32>,
     #[serde(default)]
@@ -622,6 +629,9 @@ fn run_rw_render(
         // Every render lane appends this to its plot title as " (note)".
         command.env("RUSTWX_TITLE_SUFFIX", note);
     }
+    // Surface temperature family display units ("f" default | "c"); every
+    // map lane reads this at request-finalization time.
+    command.env("RUSTWX_TEMP_UNITS", &request.temp_units);
 
     // Child output goes to per-job log files instead of in-memory pipes so
     // the deadline loop below never deadlocks on a full pipe and the API
@@ -1098,6 +1108,7 @@ fn validate_render_request(mut request: RenderJobRequest) -> Result<RenderJobReq
     request.output_format = request.output_format.trim().to_ascii_lowercase();
     request.plot_style = normalize_plot_style(&request.plot_style)?;
     request.basemap_style = normalize_basemap_style(&request.basemap_style)?;
+    request.temp_units = normalize_temp_units(&request.temp_units)?;
     request.domain_slug = safe_slug(&request.domain_slug);
     if request.model.is_empty() {
         return Err("model is required".to_string());
@@ -1525,7 +1536,7 @@ fn render_cache_key(request: &RenderJobRequest) -> String {
         None => "-".to_string(),
     };
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
         request.model,
         request.run,
         request.hour,
@@ -1533,6 +1544,7 @@ fn render_cache_key(request: &RenderJobRequest) -> String {
         request.output_format,
         request.plot_style,
         request.basemap_style,
+        request.temp_units,
         request.county_linework,
         request.place_label_density,
         request.place_label_size,
@@ -1655,6 +1667,23 @@ fn default_place_label_size() -> u8 {
 
 fn default_domain_slug() -> String {
     "drawn_box".to_string()
+}
+
+fn default_temp_units() -> String {
+    "f".to_string()
+}
+
+/// Normalize the surface temperature display units to the canonical "f" /
+/// "c" the cache key and the render child use: an omitted field, "f", and
+/// "fahrenheit" must all produce the SAME cache key.
+fn normalize_temp_units(value: &str) -> Result<String, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "f" | "degf" | "fahrenheit" => Ok("f".to_string()),
+        "c" | "degc" | "celsius" => Ok("c".to_string()),
+        other => Err(format!(
+            "temp_units must be 'f' (Fahrenheit, default) or 'c' (Celsius), got '{other}'"
+        )),
+    }
 }
 
 fn normalize_plot_style(value: &str) -> Result<String, String> {
@@ -2029,6 +2058,7 @@ mod tests {
             extend: None,
             overlay_perimeter: None,
             title_note: None,
+            temp_units: default_temp_units(),
             output_width: None,
             output_height: None,
         }
@@ -2289,6 +2319,43 @@ mod tests {
         assert_ne!(render_cache_key(&base), render_cache_key(&no_counties));
         assert_ne!(render_cache_key(&base), render_cache_key(&dense_places));
         assert_ne!(render_cache_key(&base), render_cache_key(&huge_places));
+    }
+
+    #[test]
+    fn temp_units_normalize_and_default_fahrenheit_shares_the_cache_key() {
+        // Omitted field (serde default), explicit "f", and "Fahrenheit"
+        // must all normalize to the same cache key; "c" must differ.
+        let omitted = validate_render_request(base_request()).unwrap();
+        assert_eq!(omitted.temp_units, "f");
+        let explicit_f = validate_render_request(RenderJobRequest {
+            temp_units: "f".to_string(),
+            ..base_request()
+        })
+        .unwrap();
+        let spelled_out = validate_render_request(RenderJobRequest {
+            temp_units: " Fahrenheit ".to_string(),
+            ..base_request()
+        })
+        .unwrap();
+        let celsius = validate_render_request(RenderJobRequest {
+            temp_units: "C".to_string(),
+            ..base_request()
+        })
+        .unwrap();
+        assert_eq!(celsius.temp_units, "c");
+        assert_eq!(render_cache_key(&omitted), render_cache_key(&explicit_f));
+        assert_eq!(render_cache_key(&omitted), render_cache_key(&spelled_out));
+        assert_ne!(render_cache_key(&omitted), render_cache_key(&celsius));
+    }
+
+    #[test]
+    fn temp_units_reject_unknown_values() {
+        let request = RenderJobRequest {
+            temp_units: "kelvin".to_string(),
+            ..base_request()
+        };
+        let message = validate_render_request(request).unwrap_err();
+        assert!(message.contains("temp_units"), "unexpected error: {message}");
     }
 
     #[test]

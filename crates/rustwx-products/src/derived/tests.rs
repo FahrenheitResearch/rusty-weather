@@ -362,15 +362,31 @@ fn wetbulb_uses_raster_temperature_scale_without_contour_promotion() {
             .iter()
             .any(|value| value.is_finite())
     );
+    // The °C raster temperature scale ships in the °F display default:
+    // the SAME transform hits values and level edges (colors unchanged),
+    // so -50..50.5 by 0.5 °C reads -58..122.9 by 0.9 °F.
+    assert_eq!(artifact.request.field.units, "degF");
+    assert!(
+        (f64::from(artifact.request.field.values[0]) - 21.2).abs() < 1.0e-4,
+        "-6 degC wet-bulb should display as 21.2 degF, got {}",
+        artifact.request.field.values[0]
+    );
     let ColorScale::Discrete(scale) = artifact.request.scale else {
         panic!("wet-bulb scale should be discrete");
     };
     assert_eq!(scale.extend, ExtendMode::Both);
-    assert_eq!(scale.levels[0], -50.0);
-    assert_eq!(scale.levels[1] - scale.levels[0], 0.5);
-    assert!(scale.levels.contains(&0.0));
-    assert!(scale.levels.contains(&40.0));
-    assert_ne!(scale.levels[1] - scale.levels[0], 5.0);
+    assert!((scale.levels[0] - -58.0).abs() < 1.0e-9);
+    assert!((scale.levels[1] - scale.levels[0] - 0.9).abs() < 1.0e-9);
+    assert!(scale.levels.iter().any(|level| (level - 32.0).abs() < 1.0e-6)); // 0 degC edge
+    assert!(scale.levels.iter().any(|level| (level - 104.0).abs() < 1.0e-6)); // 40 degC edge
+    // Ticks re-anchor on round 10 degF multiples instead of 9 degF steps.
+    let ticks = artifact
+        .request
+        .cbar_ticks
+        .as_ref()
+        .expect("wet-bulb ticks re-anchored in degF");
+    assert!((ticks[0] - -50.0).abs() < 1.0e-9);
+    assert!((ticks[1] - ticks[0] - 10.0).abs() < 1.0e-9);
 }
 
 #[test]
