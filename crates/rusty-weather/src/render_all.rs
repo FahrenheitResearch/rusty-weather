@@ -28,6 +28,10 @@ use rustwx_products::windowed::{
 };
 use rustwx_render::PngCompressionMode;
 
+#[path = "climo_products.rs"]
+pub mod climo_products;
+#[path = "climo_rank.rs"]
+pub mod climo_rank;
 #[path = "fuel_products.rs"]
 pub mod fuel_products;
 #[path = "store_render.rs"]
@@ -64,6 +68,7 @@ pub struct ProductRequest {
     pub direct: Vec<String>,
     pub derived: Vec<String>,
     pub fuel: Vec<String>,
+    pub climo: Vec<String>,
     pub windowed: Vec<String>,
     /// The windowed list came from the "all" keyword: render it only when
     /// the run has more than one stored hour (a single hour realizes only
@@ -121,6 +126,7 @@ fn product_request_with_fuel(
         direct,
         derived,
         fuel,
+        climo: Vec::new(),
         windowed,
         windowed_auto,
         strict: false,
@@ -237,6 +243,15 @@ pub fn partition_products(
             Vec::new(),
             false,
         ),
+        "cafire-anomaly" | "cafire-climo" => Ok(ProductRequest {
+            direct: Vec::new(),
+            derived: Vec::new(),
+            fuel: Vec::new(),
+            climo: strings(climo_products::CLIMO_PRODUCTS),
+            windowed: Vec::new(),
+            windowed_auto: false,
+            strict: false,
+        }),
         "all" => Ok(ProductRequest {
             direct: supported_direct_recipe_slugs(model),
             derived: derived_catalog()
@@ -244,6 +259,7 @@ pub fn partition_products(
                 .chain(heavy_catalog())
                 .collect(),
             fuel: fuel_catalog(),
+            climo: Vec::new(),
             windowed: windowed_catalog(),
             windowed_auto: true,
             strict: false,
@@ -252,6 +268,7 @@ pub fn partition_products(
             direct: supported_direct_recipe_slugs(model),
             derived: Vec::new(),
             fuel: Vec::new(),
+            climo: Vec::new(),
             windowed: Vec::new(),
             windowed_auto: false,
             strict: false,
@@ -260,6 +277,7 @@ pub fn partition_products(
             direct: Vec::new(),
             derived: derived_catalog(),
             fuel: Vec::new(),
+            climo: Vec::new(),
             windowed: Vec::new(),
             windowed_auto: false,
             strict: false,
@@ -268,6 +286,7 @@ pub fn partition_products(
             direct: Vec::new(),
             derived: heavy_catalog(),
             fuel: Vec::new(),
+            climo: Vec::new(),
             windowed: Vec::new(),
             windowed_auto: false,
             strict: false,
@@ -276,6 +295,7 @@ pub fn partition_products(
             direct: Vec::new(),
             derived: Vec::new(),
             fuel: Vec::new(),
+            climo: Vec::new(),
             windowed: windowed_catalog(),
             windowed_auto: false,
             strict: false,
@@ -284,6 +304,7 @@ pub fn partition_products(
             direct: Vec::new(),
             derived: Vec::new(),
             fuel: fuel_catalog(),
+            climo: Vec::new(),
             windowed: Vec::new(),
             windowed_auto: false,
             strict: false,
@@ -292,6 +313,7 @@ pub fn partition_products(
             let mut direct = Vec::new();
             let mut derived = Vec::new();
             let mut fuel = Vec::new();
+            let mut climo = Vec::new();
             let mut windowed = Vec::new();
             for slug in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 let is_derived = store_derived_recipe_slugs().contains(&slug)
@@ -303,24 +325,32 @@ pub fn partition_products(
                     derived.push(slug.to_string());
                 } else if fuel_products::FuelProduct::parse(slug).is_some() {
                     fuel.push(slug.to_string());
+                } else if climo_products::ClimoProduct::parse(slug).is_some() {
+                    climo.push(slug.to_string());
                 } else if plot_recipe(slug).is_some() {
                     direct.push(slug.to_string());
                 } else {
                     return Err(format!(
                         "unknown product '{slug}': neither a direct plot recipe, a \
-                         derived/heavy recipe slug, a fuel product slug, nor a windowed \
-                         product slug"
+                         derived/heavy recipe slug, a fuel product slug, a climo anomaly \
+                         slug, nor a windowed product slug"
                     )
                     .into());
                 }
             }
-            if direct.is_empty() && derived.is_empty() && fuel.is_empty() && windowed.is_empty() {
+            if direct.is_empty()
+                && derived.is_empty()
+                && fuel.is_empty()
+                && climo.is_empty()
+                && windowed.is_empty()
+            {
                 return Err("pass at least one product slug via --products".into());
             }
             Ok(ProductRequest {
                 direct,
                 derived,
                 fuel,
+                climo,
                 windowed,
                 windowed_auto: false,
                 strict: true,

@@ -622,6 +622,41 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        if !request.climo.is_empty() {
+            let outcome = render_all::climo_products::render_climo_products_from_store(
+                &config,
+                &args.store_root,
+                &model_slug,
+                &args.run,
+                &request.climo,
+            )?;
+            println!(
+                "climo {:<18} {} rendered, {} blocked | DOY {:03} anchored F{:03}",
+                domain_slug,
+                outcome.rendered.len(),
+                outcome.skipped.len(),
+                outcome.doy,
+                outcome.anchor_hour,
+            );
+            for product in &outcome.rendered {
+                println!(
+                    "{:>8} ms  {:<20} {}  {}",
+                    product.total_ms,
+                    domain_slug,
+                    product.slug,
+                    product.output_path.display()
+                );
+                timings.push((format!("{domain_slug}/{}", product.slug), product.total_ms));
+            }
+            skipped.extend(
+                outcome
+                    .skipped
+                    .into_iter()
+                    .map(|skip| (domain_slug.to_string(), skip)),
+            );
+            domain_rendered.extend(outcome.rendered);
+        }
+
         let published = publish_webp_outputs(&domain_rendered, args.output_format)?;
         print_webp_summary(domain_slug, &published);
         if !published.is_empty() {
