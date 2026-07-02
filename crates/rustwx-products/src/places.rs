@@ -613,6 +613,73 @@ pub fn micro_us_place_presets() -> &'static [PlacePreset] {
     MICRO_US_PLACE_PRESETS
 }
 
+/// Nearest catalog town to a point, searched across every tier (major,
+/// aux, micro). The catalog is curated for map-label density, not a
+/// gazetteer, so rural hits can sit tens of miles out — `describe()`
+/// carries the distance and bearing to keep that honest.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NearestPlace {
+    pub label: &'static str,
+    pub distance_km: f64,
+    /// Initial great-circle bearing from the town to the point.
+    pub bearing_deg: f64,
+}
+
+impl NearestPlace {
+    pub fn distance_mi(&self) -> f64 {
+        self.distance_km / 1.609_344
+    }
+
+    pub fn compass(&self) -> &'static str {
+        const POINTS: [&str; 16] = [
+            "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W",
+            "WNW", "NW", "NNW",
+        ];
+        POINTS[((self.bearing_deg.rem_euclid(360.0) + 11.25) / 22.5) as usize % 16]
+    }
+
+    /// "12 mi NE of Ukiah, CA" — or "near Ukiah, CA" inside two miles.
+    pub fn describe(&self) -> String {
+        let miles = self.distance_mi();
+        if miles < 2.0 {
+            format!("near {}", self.label)
+        } else {
+            format!("{} mi {} of {}", miles.round() as i64, self.compass(), self.label)
+        }
+    }
+}
+
+pub fn nearest_place(lat: f64, lon: f64) -> Option<NearestPlace> {
+    if !(lat.is_finite() && lon.is_finite()) {
+        return None;
+    }
+    let tiers = [
+        MAJOR_US_CITY_PRESETS,
+        AUX_US_CITY_PRESETS,
+        MICRO_US_PLACE_PRESETS,
+    ];
+    let mut best: Option<NearestPlace> = None;
+    for preset in tiers.into_iter().flatten() {
+        let distance_km = haversine_km(preset.center_lat, preset.center_lon, lat, lon);
+        if best.is_none_or(|b| distance_km < b.distance_km) {
+            best = Some(NearestPlace {
+                label: preset.label,
+                distance_km,
+                bearing_deg: initial_bearing_deg(preset.center_lat, preset.center_lon, lat, lon),
+            });
+        }
+    }
+    best
+}
+
+fn initial_bearing_deg(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let (phi1, phi2) = (lat1.to_radians(), lat2.to_radians());
+    let dlambda = (lon2 - lon1).to_radians();
+    let y = dlambda.sin() * phi2.cos();
+    let x = phi1.cos() * phi2.sin() - phi1.sin() * phi2.cos() * dlambda.cos();
+    y.atan2(x).to_degrees().rem_euclid(360.0)
+}
+
 pub fn major_us_city_domains() -> Vec<DomainSpec> {
     MAJOR_US_CITY_PRESETS
         .iter()

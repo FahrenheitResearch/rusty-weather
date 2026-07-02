@@ -625,3 +625,49 @@ fn region_and_city_labels_use_compact_names() {
         "Phoenix, AZ"
     );
 }
+
+#[test]
+fn nearest_place_finds_the_hosting_town() {
+    // Downtown Sacramento sits on the catalog's Sacramento center.
+    let near = nearest_place(38.58, -121.49).expect("catalog is nonempty");
+    assert_eq!(near.label, "Sacramento, CA");
+    assert!(near.distance_km < 2.0, "distance {}", near.distance_km);
+    assert_eq!(near.describe(), "near Sacramento, CA");
+}
+
+#[test]
+fn nearest_place_reports_distance_and_bearing() {
+    // Half a degree due north of Reno's catalog center (~34.6 mi).
+    let near = nearest_place(40.03, -119.81).expect("catalog is nonempty");
+    assert_eq!(near.label, "Reno, NV");
+    assert_eq!(near.compass(), "N");
+    assert!(
+        (near.distance_mi() - 34.6).abs() < 1.0,
+        "miles {}",
+        near.distance_mi()
+    );
+    assert_eq!(near.describe(), "35 mi N of Reno, NV");
+}
+
+#[test]
+fn nearest_place_rejects_non_finite_points() {
+    assert_eq!(nearest_place(f64::NAN, -120.0), None);
+    assert_eq!(nearest_place(39.0, f64::INFINITY), None);
+}
+
+#[test]
+fn compass_sectors_wrap_correctly() {
+    let at = |bearing_deg: f64| NearestPlace {
+        label: "x",
+        distance_km: 10.0,
+        bearing_deg,
+    };
+    assert_eq!(at(0.0).compass(), "N");
+    assert_eq!(at(22.5).compass(), "NNE");
+    assert_eq!(at(45.0).compass(), "NE");
+    assert_eq!(at(90.0).compass(), "E");
+    assert_eq!(at(180.0).compass(), "S");
+    assert_eq!(at(270.0).compass(), "W");
+    assert_eq!(at(355.0).compass(), "N");
+    assert_eq!(at(-10.0).compass(), "N");
+}

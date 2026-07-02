@@ -16,10 +16,49 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use rustwx_products::places::{nearest_place, NearestPlace};
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
 
 const MS_TO_MPH: f64 = 2.236_936;
+
+/// Client-sent titles that are just coordinates (the Lab sends
+/// "39.150, -123.210" for map picks) get the nearest-town treatment as
+/// if no title were given.
+fn title_is_bare_coords(title: &str) -> bool {
+    let trimmed = title.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().any(|c| c.is_ascii_digit())
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | '-' | '+' | ' ' | '°'))
+}
+
+/// Display title for a point product: absent/bare-coords titles become
+/// "<coords> · 12 mi NE of Town, ST"; custom titles keep their text and
+/// gain the town phrase only when it is non-redundant and fits.
+fn point_title(
+    title: Option<&str>,
+    fallback_coords: &str,
+    near: Option<&NearestPlace>,
+    max_chars: usize,
+) -> String {
+    let custom = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !title_is_bare_coords(t));
+    let mut composed = custom.map_or_else(|| fallback_coords.to_string(), str::to_string);
+    if let Some(near) = near {
+        let town = near.label.split(',').next().unwrap_or(near.label);
+        let redundant = composed
+            .to_ascii_lowercase()
+            .contains(&town.to_ascii_lowercase());
+        let phrase = near.describe();
+        if !redundant && composed.chars().count() + phrase.chars().count() + 3 <= max_chars {
+            composed.push_str(&format!(" · {phrase}"));
+        }
+    }
+    composed
+}
 
 pub const METEOGRAM_PANELS: &[&str] =
     &["temp", "rh", "vpd", "wind", "precip", "fuels", "smoke"];
@@ -529,10 +568,13 @@ pub fn render_meteogram_svg(
     ));
 
     // Header.
-    let title = request
-        .title
-        .clone()
-        .unwrap_or_else(|| format!("{:.4}, {:.4}", request.lat, request.lon));
+    let near = nearest_place(request.lat, request.lon);
+    let title = point_title(
+        request.title.as_deref(),
+        &format!("{:.4}, {:.4}", request.lat, request.lon),
+        near.as_ref(),
+        75,
+    );
     let elev = elevation_ft
         .map(|ft| format!(" | {} ft", ft.round() as i64))
         .unwrap_or_default();
@@ -906,6 +948,12 @@ pub fn render_meteogram_svg(
         "model": model_slug,
         "run": run_slug,
         "point": { "lat": request.lat, "lon": request.lon },
+        "nearest_place": near.map_or(serde_json::Value::Null, |n| serde_json::json!({
+            "label": n.label,
+            "distance_mi": (n.distance_mi() * 10.0).round() / 10.0,
+            "bearing": n.compass(),
+            "description": n.describe(),
+        })),
         "cell": { "lat": cell_lat, "lon": cell_lon, "elevation_ft": elevation_ft },
         "units": {
             "temperature_2m": "F", "dewpoint_2m": "F", "rh_2m": "%",
@@ -1192,10 +1240,31 @@ pub fn render_daily_svg(
     } else {
         format!("{span_word} {var_pretty} [{display_units}]")
     };
-    let place = request
+    let near = nearest_place(request.lat, request.lon);
+    let custom_title = request
         .title
-        .clone()
-        .unwrap_or_else(|| format!("{:.3}, {:.3}", request.lat, request.lon));
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !title_is_bare_coords(t));
+    // Big orange slot: custom titles verbatim; map picks become the town.
+    let place = match (custom_title, &near) {
+        (Some(t), _) => t.to_string(),
+        (None, Some(n)) if n.distance_mi() < 2.0 => n.label.to_string(),
+        (None, Some(n)) => format!("near {}", n.label),
+        (None, None) => format!("{:.3}, {:.3}", request.lat, request.lon),
+    };
+    // Coord readout keeps the precise town offset (skipped only when a
+    // custom title already names the town).
+    let mut point_line = format!("{:.2}°, {:.2}°", request.lat, request.lon);
+    if let Some(n) = &near {
+        let town = n.label.split(',').next().unwrap_or(n.label);
+        let redundant = custom_title
+            .map(|t| t.to_ascii_lowercase().contains(&town.to_ascii_lowercase()))
+            .unwrap_or(false);
+        if !redundant {
+            point_line.push_str(&format!(" · {}", n.describe()));
+        }
+    }
 
     let mut svg = String::with_capacity(32 * 1024);
     svg.push_str(&format!(
@@ -1215,7 +1284,7 @@ pub fn render_daily_svg(
         model_slug.to_uppercase(),
         date_yyyymmdd,
         cycle_utc,
-        xml_escape(&format!("{:.2}°, {:.2}°", request.lat, request.lon)),
+        xml_escape(&point_line),
     ));
     svg.push_str(&format!(
         r##"<text x="{:.0}" y="44" fill="#ff6a36" font-size="24" font-weight="800" text-anchor="end">{}</text>"##,
@@ -1382,8 +1451,19 @@ pub fn render_daily_svg(
             day.label_dow
         ));
     }
+    let window_note = match request.step_hours {
+        None => "HI/LO over each calendar day".to_string(),
+        Some(1) => "hourly values".to_string(),
+        Some(step) if single => format!("one value per {step}-h step"),
+        Some(step) => format!("HI/LO over each {step}-h bucket"),
+    };
+    let axis_note = if request.step_hours.is_none() {
+        "local days"
+    } else {
+        "local time"
+    };
     svg.push_str(&format!(
-        r##"<text x="24" y="{:.0}" fill="#737c7b" font-size="11">local days (UTC{:+.0}) | HI/LO over each calendar day | California Wildfire Tracking — Weather Lab</text>"##,
+        r##"<text x="24" y="{:.0}" fill="#737c7b" font-size="11">{axis_note} (UTC{:+.0}) | {window_note} | California Wildfire Tracking — Weather Lab</text>"##,
         height - 14.0,
         request.utc_offset_hours
     ));
@@ -1404,6 +1484,50 @@ mod tests {
         assert_eq!(cell, 5, "closest to (31, -118)");
         let (cell, _) = nearest_cell(&lat, &lon, 30.1, -120.2);
         assert_eq!(cell, 0);
+    }
+
+    #[test]
+    fn bare_coords_titles_are_detected() {
+        assert!(title_is_bare_coords("39.150, -123.210"));
+        assert!(title_is_bare_coords(" 39.15°, -123.21° "));
+        assert!(title_is_bare_coords("38.58,-121.49"));
+        assert!(!title_is_bare_coords("Grapevine Fire"));
+        assert!(!title_is_bare_coords("Station 12"));
+        assert!(!title_is_bare_coords(""));
+        assert!(!title_is_bare_coords("   "));
+        assert!(!title_is_bare_coords("- - -"), "no digits at all");
+    }
+
+    #[test]
+    fn point_titles_get_the_nearest_town() {
+        // ~10 mi east of Sacramento's catalog center.
+        let near = nearest_place(38.60, -121.30).expect("catalog is nonempty");
+        assert_eq!(near.label, "Sacramento, CA");
+
+        // The Lab's bare-coords title becomes coords + town phrase.
+        let title = point_title(
+            Some("38.600, -121.300"),
+            "38.6000, -121.3000",
+            Some(&near),
+            75,
+        );
+        assert!(title.starts_with("38.6000, -121.3000 · "), "{title}");
+        assert!(title.contains("of Sacramento, CA"), "{title}");
+
+        // Custom titles keep their text; a redundant town suffix is skipped.
+        let title = point_title(Some("Sacramento Exec Airport"), "x", Some(&near), 75);
+        assert_eq!(title, "Sacramento Exec Airport");
+
+        // Fire names gain the phrase when it fits.
+        let title = point_title(Some("Grapevine Fire"), "x", Some(&near), 75);
+        assert!(title.starts_with("Grapevine Fire · "), "{title}");
+        // ...but not when the strip would overflow.
+        let title = point_title(Some("Grapevine Fire"), "x", Some(&near), 20);
+        assert_eq!(title, "Grapevine Fire");
+
+        // No catalog hit falls back to plain coords.
+        let title = point_title(None, "38.6000, -121.3000", None, 75);
+        assert_eq!(title, "38.6000, -121.3000");
     }
 
     #[test]

@@ -4365,6 +4365,8 @@ dependencies = [
  "mimalloc",
  "netcrust",
  "rayon",
+ "rustls",
+ "rustls-rustcrypto",
  "rustwx-calc",
  "rustwx-core",
  "rustwx-io",
