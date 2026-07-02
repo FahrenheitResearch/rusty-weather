@@ -217,6 +217,11 @@ button { color: inherit; cursor: pointer; }
     </div>
 
     <div class="side-box" id="customBox">
+      <span class="field-label">Model</span>
+      <div class="segmented" id="chartModel">
+        <button class="selected" type="button" data-model="hrrr">HRRR · hi-res</button>
+        <button type="button" data-model="gfs">GFS · 8-day</button>
+      </div>
       <span class="field-label">Variables (up to 8)</span>
       <div class="product-list" id="varList" style="max-height:260px"></div>
       <button class="tool-btn" id="customGo" style="align-self:start">↻ update chart</button>
@@ -783,10 +788,19 @@ function climoSlug() {
 
 /* ---------- custom chart: any stored variable ---------- */
 let varsLoaded = false;
+let chartModel = "hrrr";
 const defaultVars = new Set(["temperature_2m", "wind_gust_10m", "rh_2m"]);
+$("chartModel").addEventListener("click", ev => {
+  const btn = ev.target.closest("button"); if (!btn) return;
+  [...$("chartModel").children].forEach(b => b.classList.remove("selected"));
+  btn.classList.add("selected");
+  chartModel = btn.dataset.model;
+  varsLoaded = false;
+  loadVars().then(() => renderCurrent());
+});
 async function loadVars() {
   try {
-    const data = await fetch("/api/vars?run=latest").then(r => r.json());
+    const data = await fetch(`/api/vars?model=${chartModel}&run=latest`).then(r => r.json());
     const list = $("varList");
     list.innerHTML = "";
     (data.vars || []).forEach(v => {
@@ -880,6 +894,10 @@ async function renderCurrent() {
       const title = `${lat.toFixed(3)}, ${lon.toFixed(3)}`;
       let url = `/api/meteogram?lat=${lat}&lon=${lon}&run=${encodeURIComponent(run)}&title=${encodeURIComponent(title)}`;
       if (state.fam === "custom") {
+        // Custom charts pick their own model; GFS runs have no day-run.
+        if (chartModel !== "hrrr") {
+          url = url.replace(/run=[^&]+/, "run=latest") + `&model=${chartModel}`;
+        }
         const vars = selectedVars();
         if (!vars.length) throw new Error("pick at least one variable");
         url += `&vars=${encodeURIComponent(vars.join(","))}`;
