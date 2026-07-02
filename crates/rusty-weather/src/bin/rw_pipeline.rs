@@ -78,12 +78,13 @@ fn cycle_at(now_unix: i64, hours_back: i64) -> (String, u8) {
     (format!("{y:04}{m:02}{d:02}"), hour)
 }
 
-/// Fuel valid date: run date minus one day (gridMET lags realtime).
-fn fuel_date_for(date_yyyymmdd: &str) -> String {
+/// Fuel valid date candidate: run date minus `days_back` (gridMET lags
+/// realtime by 1-2 days; callers try 1 then 2 then 3).
+fn fuel_date_for(date_yyyymmdd: &str, days_back: i64) -> String {
     let y: i64 = date_yyyymmdd[0..4].parse().unwrap_or(2000);
     let m: u32 = date_yyyymmdd[4..6].parse().unwrap_or(1);
     let d: u32 = date_yyyymmdd[6..8].parse().unwrap_or(1);
-    let (y, m, d) = civil_from_days(days_from_civil(y, m, d) - 1);
+    let (y, m, d) = civil_from_days(days_from_civil(y, m, d) - days_back);
     format!("{y:04}-{m:02}-{d:02}")
 }
 
@@ -308,21 +309,28 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
         eprintln!("[pipeline] latest.json: {err}");
     }
 
-    // Fuels: once per run, only after the day window is present.
+    // Fuels: once per run, only after every target hour is stored — the
+    // fuel step rewrites hour files, so late-arriving hours must not miss
+    // their fuel grids.
+    let complete = stored.iter().copied().max().unwrap_or(0) >= target_max;
     let fuel_flag = run_dir.join(".fuels-imported");
-    if !fuel_flag.exists() && stored.iter().any(|&hour| hour >= 23) {
-        let mut command = Command::new(bin_dir.join(exe("rw_fuel_fetch")));
-        command
-            .arg("--store-root").arg(&args.store_root)
-            .arg("--model").arg(&args.model)
-            .arg("--run").arg(&run_slug)
-            .arg("--hours").arg(hour_span(&stored))
-            .arg("--date").arg(fuel_date_for(&date));
-        if let Some(cache) = &args.cache_dir {
-            command.arg("--cache-dir").arg(cache.join("fuel"));
-        }
-        if run_command("fuels", &mut command) {
-            let _ = std::fs::write(&fuel_flag, b"ok");
+    if !fuel_flag.exists() && complete {
+        // gridMET publishes with a 1-2 day lag; walk back until a day lands.
+        for days_back in 1..=3 {
+            let mut command = Command::new(bin_dir.join(exe("rw_fuel_fetch")));
+            command
+                .arg("--store-root").arg(&args.store_root)
+                .arg("--model").arg(&args.model)
+                .arg("--run").arg(&run_slug)
+                .arg("--hours").arg(hour_span(&stored))
+                .arg("--date").arg(fuel_date_for(&date, days_back));
+            if let Some(cache) = &args.cache_dir {
+                command.arg("--cache-dir").arg(cache.join("fuel"));
+            }
+            if run_command(&format!("fuels (day -{days_back})"), &mut command) {
+                let _ = std::fs::write(&fuel_flag, b"ok");
+                break;
+            }
         }
     }
 
@@ -340,7 +348,6 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
 
     // Prewarm once per run, when the target is fully stored + fuels done.
     let warm_flag = run_dir.join(".prewarmed");
-    let complete = stored.iter().copied().max().unwrap_or(0) >= target_max;
     if complete && !warm_flag.exists() && fuel_flag.exists() {
         if let Some(api) = &args.api_url {
             prewarm(agent, api.trim_end_matches('/'), &run_slug);
@@ -428,9 +435,10 @@ mod tests {
     }
 
     #[test]
-    fn fuel_date_is_previous_day_dashed() {
-        assert_eq!(fuel_date_for("20260701"), "2026-06-30");
-        assert_eq!(fuel_date_for("20260101"), "2025-12-31");
+    fn fuel_date_walks_back_dashed() {
+        assert_eq!(fuel_date_for("20260701", 1), "2026-06-30");
+        assert_eq!(fuel_date_for("20260101", 1), "2025-12-31");
+        assert_eq!(fuel_date_for("20260702", 2), "2026-06-30");
     }
 
     #[test]
