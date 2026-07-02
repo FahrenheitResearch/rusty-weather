@@ -32,8 +32,11 @@ struct Args {
     min_age_hours: u64,
     #[arg(long, help = "Also prune files in this fetch-cache dir")]
     fetch_cache: Option<PathBuf>,
-    #[arg(long, default_value_t = 3)]
-    cache_max_age_days: u64,
+    /// Raw fetches are dead weight once their hour is ingested; at
+    /// HRRR+GFS+NBM volume a days-scale cap fills the disk (2026-07-02
+    /// outage: 179 GB of raw GRIBs in half a day starved the pipeline).
+    #[arg(long, default_value_t = 6)]
+    cache_max_age_hours: u64,
     #[arg(long)]
     dry_run: bool,
 }
@@ -146,7 +149,7 @@ fn main() -> Result<(), String> {
     }
 
     if let Some(cache) = &args.fetch_cache {
-        let cutoff = Duration::from_secs(args.cache_max_age_days * 86_400);
+        let cutoff = Duration::from_secs(args.cache_max_age_hours * 3_600);
         let (cache_files, cache_bytes) = prune_cache(cache, cutoff, args.dry_run)?;
         println!(
             "cache: {} {} file(s), {:.2} GB",
