@@ -394,7 +394,7 @@ impl WeatherProduct {
             WeatherPreset::EcapeCapeRatio => Some(0.25),
             WeatherPreset::Uh => Some(20.0),
             WeatherPreset::LapseRate => Some(1.0),
-            WeatherPreset::PftGw => None,
+            WeatherPreset::PftGw => Some(250.0),
             WeatherPreset::PftDtheta => Some(2.0),
             WeatherPreset::PftWind => Some(5.0),
         }
@@ -631,7 +631,7 @@ impl WeatherPreset {
             ]),
             Self::LapseRate => Some(vec![4.0, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0]),
             Self::PftGw => Some(vec![
-                0.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
+                0.0, 50.0, 100.0, 200.0, 300.0, 500.0, 1000.0, 1500.0, 2000.0,
             ]),
             Self::PftDtheta => Some(vec![
                 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0,
@@ -669,7 +669,7 @@ impl WeatherPreset {
             Self::EcapeCapeRatio => Some(0.25),
             Self::Uh => Some(20.0),
             Self::LapseRate => Some(1.0),
-            Self::PftGw => None,
+            Self::PftGw => Some(250.0),
             Self::PftDtheta => Some(2.0),
             Self::PftWind => Some(5.0),
         }
@@ -787,15 +787,16 @@ impl WeatherPreset {
                 mask_below,
             },
             Self::PftGw => {
-                // Log2 operational bins (BoM trial style). LOW PFT is
-                // the dangerous end: reversed palette puts hot colors
-                // on small values.
+                // Fine steps through the 0-500 GW band every published
+                // pyroCb case lives in, coarser above (the colorbar is
+                // value-proportional, so pure log2 bins would collapse
+                // the dangerous end into one sliver). LOW PFT is the
+                // dangerous end: reversed palette puts hot colors on
+                // small values.
                 let mut colors = weather_palette(WeatherPalette::Ecape);
                 colors.reverse();
                 DiscreteColorScale {
-                    levels: vec![
-                        0.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
-                    ],
+                    levels: concat_ranges(&[(0.0, 500.0, 25.0), (500.0, 2049.0, 100.0)]),
                     colors,
                     extend: ExtendMode::Max,
                     mask_below,
