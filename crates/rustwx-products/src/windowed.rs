@@ -1794,11 +1794,18 @@ fn build_windowed_render_request(
     render_request.height = request.output_height;
     render_request.title = Some(static_title_with_suffix(computed.title.clone()));
     let hour_label = windowed_display_hour_label(product, &computed.metadata, forecast_hour);
+    // Fixed-window snapshot products (0-24 h, 24-48 h, 0-48 h) end at their
+    // window's last hour, not at the run's anchor hour — the stamped valid
+    // time must match the window end. Trailing windows (qpf_24h etc.) do
+    // end at the anchor, so they keep `forecast_hour`.
+    let valid_hour = surface_snapshot_window_hours(product)
+        .map(|(_, end_hour, _)| end_hour)
+        .unwrap_or(forecast_hour);
     render_request.subtitle_left = Some(model_time_subtitle_with_lead_label(
         model,
         date_yyyymmdd,
         cycle_utc,
-        forecast_hour,
+        valid_hour,
         hour_label,
     ));
     render_request.subtitle_right = Some(source_subtitle(source));
