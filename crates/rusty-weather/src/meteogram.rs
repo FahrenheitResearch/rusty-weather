@@ -22,6 +22,27 @@ use rw_store::reader::HourReader;
 
 const MS_TO_MPH: f64 = 2.236_936;
 
+/// Human headline form of a store variable name: underscores to spaces,
+/// words capitalized, known acronyms uppercased ("rh_2m" → "RH 2m").
+fn prettify_var_name(var: &str) -> String {
+    var.split('_')
+        .map(|word| match word {
+            "rh" | "vpd" | "hdw" | "erc" | "kbdi" | "mslp" | "pwat" | "apcp" | "qpf" | "uh" => {
+                word.to_uppercase()
+            }
+            _ if word.chars().next().is_some_and(|c| c.is_ascii_digit()) => word.to_string(),
+            _ => {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Client-sent titles that are just coordinates (the Lab sends
 /// "39.150, -123.210" for map picks) get the nearest-town treatment as
 /// if no title were given.
@@ -48,7 +69,7 @@ fn point_title(
         .filter(|t| !t.is_empty() && !title_is_bare_coords(t));
     let mut composed = custom.map_or_else(|| fallback_coords.to_string(), str::to_string);
     if let Some(near) = near {
-        let town = near.label.split(',').next().unwrap_or(near.label);
+        let town = near.label.split(',').next().unwrap_or(&near.label);
         let redundant = composed
             .to_ascii_lowercase()
             .contains(&town.to_ascii_lowercase());
@@ -304,8 +325,51 @@ fn fmt(v: f64) -> String {
     }
 }
 
+/// Step-aware tick label: prints enough digits that adjacent ticks
+/// always differ (tiny-range panels like raw smoke or vorticity would
+/// otherwise print "0 0 0 0"). Sub-1e-4 steps switch to compact
+/// exponent form ("2.5e-7") instead of a wall of zeros.
+fn fmt_tick(v: f64, step: f64) -> String {
+    if step >= 1.0 {
+        return fmt(v);
+    }
+    if step < 1e-4 {
+        return if v == 0.0 {
+            "0".to_string()
+        } else {
+            format!("{v:.1e}")
+        };
+    }
+    let decimals = ((-step.log10().floor()) as usize).clamp(1, 6);
+    let s = format!("{v:.decimals$}");
+    // IEEE -0.0 (and small negatives that round to it) print as 0.
+    if s.trim_start_matches('-').chars().all(|c| c == '0' || c == '.') {
+        s.trim_start_matches('-').to_string()
+    } else {
+        s
+    }
+}
+
 fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Sunset→next-sunrise night bands in forecast-hour coordinates. In UTC
+/// hours-of-day the night stays inside one UTC day when sunrise > sunset
+/// (the Americas); it straddles the day boundary otherwise (Europe-like
+/// longitudes) — pairing the wrong sunrise makes every night ~33 h long
+/// and shades the whole plot.
+fn night_spans_fh(sunrise: f64, sunset: f64, cycle_utc: u8, span_days: i64) -> Vec<(f64, f64)> {
+    let mut spans = Vec::new();
+    for day in -1..=span_days {
+        let set_fh = day as f64 * 24.0 + sunset - f64::from(cycle_utc);
+        let rise_day = if sunrise > sunset { day } else { day + 1 };
+        let rise_fh = rise_day as f64 * 24.0 + sunrise - f64::from(cycle_utc);
+        if rise_fh > set_fh {
+            spans.push((set_fh, rise_fh));
+        }
+    }
+    spans
 }
 
 /// One data series drawn in a panel.
@@ -433,6 +497,8 @@ pub fn render_meteogram_svg(
                 match name.as_str() {
                     "temperature_2m" | "dewpoint_2m" => c_to_f(to_c(raw, &units)),
                     "u_10m" | "v_10m" | "wind_gust_10m" => raw * MS_TO_MPH,
+                    // Store carries kg/m^3; the curated panel is ug/m3.
+                    "smoke_8m" => raw * 1.0e9,
                     _ => raw,
                 }
             };
@@ -493,18 +559,14 @@ pub fn render_meteogram_svg(
     let climo_refs = climo_day_refs(store_root, &grid.hash, cx, cy, doy);
     // Night spans in forecast-hour coordinates, covering the run span.
     let last_hour = samples.last().expect("nonempty").hour;
-    let mut night_spans: Vec<(f64, f64)> = Vec::new();
-    if let Some((sunrise, sunset)) = sunrise_sunset_utc(cell_lat, cell_lon, doy) {
-        // Day offsets relative to the run date, generously covering the span.
-        let span_days = (i64::from(last_hour) + i64::from(cycle_utc)) / 24 + 1;
-        for day in -1..=span_days {
-            let set_fh = day as f64 * 24.0 + sunset - f64::from(cycle_utc);
-            let rise_fh = (day + 1) as f64 * 24.0 + sunrise - f64::from(cycle_utc);
-            if rise_fh > set_fh {
-                night_spans.push((set_fh, rise_fh));
-            }
-        }
-    }
+    let night_spans: Vec<(f64, f64)> =
+        if let Some((sunrise, sunset)) = sunrise_sunset_utc(cell_lat, cell_lon, doy) {
+            // Day offsets relative to the run date, generously covering the span.
+            let span_days = (i64::from(last_hour) + i64::from(cycle_utc)) / 24 + 1;
+            night_spans_fh(sunrise, sunset, cycle_utc, span_days)
+        } else {
+            Vec::new()
+        };
 
     // Critical joint-threshold hours (atlas thresholds, mph).
     let critical: Vec<bool> = samples
@@ -582,6 +644,11 @@ pub fn render_meteogram_svg(
         r##"<text x="{ML}" y="30" fill="#f2e7d5" font-size="19" font-weight="700">POINT METEOGRAM — {}</text>"##,
         xml_escape(&title)
     ));
+    // Branding parity with the outlook card.
+    svg.push_str(&format!(
+        r##"<text x="{:.1}" y="30" fill="#8d8171" font-size="11" text-anchor="end">cafire.wxsection.com/lab</text>"##,
+        W - MR
+    ));
     svg.push_str(&format!(
         r##"<text x="{ML}" y="50" fill="#8d8171" font-size="12">{model} {date} {cycle:02}Z | grid cell {clat:.4}, {clon:.4}{elev} | F{f0:03}-F{f1:03} | RTMA-formula VPD/HDW | shaded = RH&lt;=20% &amp; wind&gt;=20mph (or RH&lt;=15 &amp; gust&gt;=25)</text>"##,
         model = model_slug.to_uppercase(),
@@ -610,8 +677,22 @@ pub fn render_meteogram_svg(
             })
             .collect()
     } else {
+        // Model cadence from the actual stored spacing (1 h HRRR, 6 h
+        // GFS/NBM) — the precip panel shows per-step totals, so its
+        // title must name the step.
+        let sample_gap_h = samples
+            .windows(2)
+            .map(|w| w[1].hour - w[0].hour)
+            .min()
+            .unwrap_or(1)
+            .max(1);
+        let precip_title = if sample_gap_h == 1 {
+            "Hourly Precip (in)".to_string()
+        } else {
+            format!("{sample_gap_h}-h Precip (in)")
+        };
         let catalog: Vec<(&str, &str, Vec<Series>)> = vec![
-            ("temp", "Temperature / Dewpoint (F)", vec![
+            ("temp", "Temperature / Dewpoint (°F)", vec![
                 series("temperature_2m", "T", "#ff6d4d", false, false),
                 series("dewpoint_2m", "Td", "#58c98f", false, false),
             ]),
@@ -625,7 +706,7 @@ pub fn render_meteogram_svg(
                 series("wind", "sustained", "#7fb8e6", false, false),
                 series("wind_gust_10m", "gust", "#ff8a00", false, false),
             ]),
-            ("precip", "Hourly Precip (in)", vec![series("precip_in", "precip", "#4fa3d1", false, false)]),
+            ("precip", precip_title.as_str(), vec![series("precip_in", "precip", "#4fa3d1", false, false)]),
             ("fuels", "ERC / 10-h Fuel Moisture (%)", vec![
                 series("erc", "ERC", "#e05545", false, false),
                 series("dead_fuel_moisture_10h", "10-h FM", "#58c98f", false, true),
@@ -729,6 +810,20 @@ pub fn render_meteogram_svg(
             (bounds.0 - pad, bounds.1 + pad)
         };
 
+        // A panel with no plottable data names its missing variables
+        // instead of rendering a silent blank box (typos self-diagnose;
+        // NBM has no fuels/smoke, short runs may lack ERC).
+        let panel_empty = left_bounds.is_none() && right_bounds.is_none();
+        if panel_empty {
+            let missing: Vec<&str> = series_list.iter().map(|s| s.key.as_str()).collect();
+            svg.push_str(&format!(
+                r##"<text x="{:.1}" y="{:.1}" fill="#8d8171" font-size="12" text-anchor="middle">no data for '{}' in this run</text>"##,
+                ML + plot_w / 2.0,
+                top + PANEL_H / 2.0 + 4.0,
+                xml_escape(&missing.join("', '"))
+            ));
+        }
+
         // Gridlines + left ticks.
         if let Some(bounds) = left_bounds {
             let (lo, hi) = pad_bounds(bounds);
@@ -744,7 +839,7 @@ pub fn render_meteogram_svg(
                     r##"<text x="{:.1}" y="{:.1}" fill="#8d8171" font-size="10" text-anchor="end">{}</text>"##,
                     ML - 6.0,
                     y + 3.0,
-                    fmt(tick)
+                    fmt_tick(tick, step)
                 ));
                 tick += step;
             }
@@ -776,9 +871,11 @@ pub fn render_meteogram_svg(
                 } else {
                     ML + plot_w - 80.0
                 };
+                // Near the panel top the usual above-the-line spot collides
+                // with the wind-arrow row — drop below the line instead.
+                let label_y = if y - top < 26.0 { y + 10.0 } else { y - 3.0 };
                 svg.push_str(&format!(
-                    r##"<text x="{label_x:.1}" y="{:.1}" fill="{color}" font-size="9" text-anchor="end">{}</text>"##,
-                    y - 3.0,
+                    r##"<text x="{label_x:.1}" y="{label_y:.1}" fill="{color}" font-size="9" text-anchor="end">{}</text>"##,
                     xml_escape(label)
                 ));
             }
@@ -793,7 +890,7 @@ pub fn render_meteogram_svg(
                     r##"<text x="{:.1}" y="{:.1}" fill="#6f6455" font-size="10">{}</text>"##,
                     ML + plot_w + 6.0,
                     y + 3.0,
-                    fmt(tick)
+                    fmt_tick(tick, step)
                 ));
                 tick += step;
             }
@@ -814,10 +911,12 @@ pub fn render_meteogram_svg(
                     }
                     let x = x_for(f64::from(sample.hour));
                     let y = top + PANEL_H - (value - lo) / (hi - lo) * PANEL_H;
+                    // Edge samples: keep the bar inside the plot frame.
+                    let x_lo = (x - bar_half).max(ML);
+                    let x_hi = (x + bar_half).min(ML + plot_w);
                     svg.push_str(&format!(
-                        r##"<rect x="{:.1}" y="{y:.1}" width="{:.1}" height="{:.1}" fill="{}" fill-opacity="0.85"/>"##,
-                        x - bar_half,
-                        bar_half * 2.0,
+                        r##"<rect x="{x_lo:.1}" y="{y:.1}" width="{:.1}" height="{:.1}" fill="{}" fill-opacity="0.85"/>"##,
+                        (x_hi - x_lo).max(0.5),
                         (y0 - y).max(0.5),
                         series.color
                     ));
@@ -863,7 +962,8 @@ pub fn render_meteogram_svg(
                     continue; // calm: no meaningful direction
                 }
                 let from_deg = (-u).atan2(-v).to_degrees().rem_euclid(360.0);
-                let x = x_for(f64::from(sample.hour));
+                // Edge samples: keep the rotated glyph inside the frame.
+                let x = x_for(f64::from(sample.hour)).clamp(ML + 6.0, ML + plot_w - 6.0);
                 svg.push_str(&format!(
                     r##"<g transform="translate({x:.1},{:.1}) rotate({from_deg:.0})"><line x1="0" y1="-5.5" x2="0" y2="5.5" stroke="#9fb6c9" stroke-width="1.3"/><path d="M0,5.5 L-2.6,1.8 M0,5.5 L2.6,1.8" stroke="#9fb6c9" stroke-width="1.3" fill="none"/></g>"##,
                     top + 13.0
@@ -878,16 +978,20 @@ pub fn render_meteogram_svg(
             band_top + 16.0,
             xml_escape(panel_title)
         ));
-        let mut legend_x = ML + plot_w - 8.0;
-        for series in series_list.iter().rev() {
-            let label = format!("{} —", series.label);
-            legend_x -= 7.0 * label.len() as f64 + 12.0;
-            svg.push_str(&format!(
-                r##"<text x="{legend_x:.1}" y="{:.1}" fill="{}" font-size="11">{}</text>"##,
-                band_top + 16.0,
-                series.color,
-                xml_escape(&label)
-            ));
+        // No legend swatches over an empty panel — the in-panel note
+        // already names what's missing.
+        if !panel_empty {
+            let mut legend_x = ML + plot_w - 8.0;
+            for series in series_list.iter().rev() {
+                let label = format!("{} —", series.label);
+                legend_x -= 7.0 * label.len() as f64 + 12.0;
+                svg.push_str(&format!(
+                    r##"<text x="{legend_x:.1}" y="{:.1}" fill="{}" font-size="11">{}</text>"##,
+                    band_top + 16.0,
+                    series.color,
+                    xml_escape(&label)
+                ));
+            }
         }
     }
 
@@ -1076,7 +1180,10 @@ pub fn render_daily_svg(
     let mut per_day: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
     // Default context rows: wind (u,v) and precip run-total per bucket.
     let mut per_day_wind: BTreeMap<i64, Vec<(f64, f64)>> = BTreeMap::new();
-    let mut per_day_apcp: BTreeMap<i64, (f64, f64)> = BTreeMap::new(); // (min,max) run-total
+    let mut per_day_apcp: BTreeMap<i64, (f64, f64)> = BTreeMap::new(); // (first,last) run-total
+    // First sampled local-hour per bucket: single-value columns are
+    // labeled with the sample's actual valid hour, not the bucket start.
+    let mut per_day_first_lh: BTreeMap<i64, i64> = BTreeMap::new();
     for &hour in &hours {
         let Ok(reader) = HourReader::open(&run_dir.join(format!("f{hour:03}.rws"))) else {
             continue;
@@ -1101,17 +1208,31 @@ pub fn render_daily_svg(
             None => local_hours.div_euclid(24),
         };
         per_day.entry(bucket).or_default().push(raw);
+        per_day_first_lh.entry(bucket).or_insert(local_hours);
         if let (Some(u), Some(v)) = (point("u_10m"), point("v_10m")) {
             per_day_wind.entry(bucket).or_default().push((u, v));
         }
         if let Some(total) = point("apcp_run_total") {
+            // Hours iterate ascending: keep the first total, overwrite
+            // the last.
             let entry = per_day_apcp.entry(bucket).or_insert((total, total));
-            entry.0 = entry.0.min(total);
-            entry.1 = entry.1.max(total);
+            entry.1 = total;
         }
     }
     if per_day.is_empty() {
         return Err(format!("variable '{}' has no data in this run", request.var));
+    }
+
+    // Chain run-total diffs ACROSS buckets so accumulation between the
+    // last sample of one bucket and the first of the next isn't dropped
+    // (an hourly bucket holds one sample — its in-bucket spread is zero
+    // by construction, which zeroed the whole PCPN row on hourly cards).
+    let mut per_day_precip: BTreeMap<i64, f64> = BTreeMap::new();
+    let mut prev_total: Option<f64> = None;
+    for (&bucket, &(first, last)) in &per_day_apcp {
+        let base = prev_total.unwrap_or(first);
+        per_day_precip.insert(bucket, (last - base).max(0.0));
+        prev_total = Some(last);
     }
 
     // Unit conversions for readability.
@@ -1158,8 +1279,17 @@ pub fn render_daily_svg(
             let hi = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let lo = values.iter().copied().fold(f64::INFINITY, f64::min);
             let (label_date, label_dow) = if request.step_hours.is_some() {
-                // Hourly strip: hour-of-day on top, date only at day breaks.
-                let hod = start_hours.rem_euclid(24);
+                // Hourly strip: hour-of-day on top, date only at day
+                // breaks. Single-value columns label the sample's actual
+                // valid hour — the bucket start can sit hours earlier.
+                let hod = if single {
+                    per_day_first_lh
+                        .get(&bucket)
+                        .map_or(start_hours, |lh| *lh)
+                        .rem_euclid(24)
+                } else {
+                    start_hours.rem_euclid(24)
+                };
                 let day_label: &'static str = if local_day != last_day { dow } else { "" };
                 last_day = local_day;
                 (format!("{hod:02}"), day_label)
@@ -1180,9 +1310,7 @@ pub fn render_daily_svg(
                     .fold(f64::NEG_INFINITY, f64::max);
                 (dir_from, max_mph)
             });
-            let precip_in = per_day_apcp
-                .get(&bucket)
-                .map(|(min_total, max_total)| ((max_total - min_total).max(0.0)) / 25.4);
+            let precip_in = per_day_precip.get(&bucket).map(|mm| mm / 25.4);
             DayAgg {
                 label_date,
                 label_dow,
@@ -1198,41 +1326,22 @@ pub fn render_daily_svg(
         return Err("no bucket has enough samples".to_string());
     }
 
-    // ---- layout ----
-    let n = days.len();
-    let col_w = if n <= 4 { 150.0 } else { (1080.0 / n as f64).clamp(84.0, 150.0) };
-    let ml = 64.0;
-    // Wide enough that the heading never collides with the place name.
-    let width = (ml + col_w * n as f64 + 28.0).max(880.0);
-    let strip_h = 46.0;
-    let n_strips: f64 = if single { 1.0 } else { 2.0 };
-    let wind_row_h = 46.0;
-    let pcpn_row_h = 38.0;
-    let chart_top = 86.0 + n_strips * (strip_h + 6.0) + wind_row_h + pcpn_row_h + 14.0;
-    let chart_h = 320.0;
-    let height = chart_top + chart_h + 74.0;
     let is_temp = is_kelvin || display_units == "°F" || lower_units.contains("degf");
 
-    let all_hi = days.iter().map(|d| d.hi).fold(f64::NEG_INFINITY, f64::max);
-    let all_lo = days.iter().map(|d| d.lo).fold(f64::INFINITY, f64::min);
-    let span = (all_hi - all_lo).max(1e-6);
-    let cell_color = |v: f64| if is_temp { temp_color(v) } else { ramp_color((v - all_lo) / span) };
-    // Bar axis: pad below the min and above the max to nice steps.
-    let axis_lo = if is_temp { (all_lo / 5.0).floor() * 5.0 - 5.0 } else { all_lo - span * 0.15 };
-    let axis_hi = if is_temp { (all_hi / 5.0).ceil() * 5.0 + 5.0 } else { all_hi + span * 0.15 };
-    let y_of = |v: f64| chart_top + chart_h - (v - axis_lo) / (axis_hi - axis_lo) * chart_h;
-    let fmt_val = |v: f64| {
-        if (axis_hi - axis_lo) > 20.0 || v.abs() >= 100.0 {
-            format!("{}", v.round() as i64)
-        } else {
-            format!("{v:.1}")
-        }
-    };
-
-    let var_pretty = request.var.replace('_', " ");
+    // Header text first: the canvas widens to fit it, so it must exist
+    // before layout.
+    let var_pretty = prettify_var_name(&request.var);
     let span_word = match request.step_hours {
         None => "Daily HI/LO".to_string(),
-        Some(step) if i64::from(step) <= i64::from(cadence) => "Hourly".to_string(),
+        Some(step) if i64::from(step) <= i64::from(cadence) => {
+            // Single-value mode: surviving columns land on the model
+            // cadence, not the requested step — say what's rendered.
+            if cadence == 1 {
+                "Hourly".to_string()
+            } else {
+                format!("{cadence}-h")
+            }
+        }
         Some(step) => format!("{step}-h HI/LO"),
     };
     let heading = if is_temp && request.var.starts_with("temperature") {
@@ -1246,18 +1355,26 @@ pub fn render_daily_svg(
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty() && !title_is_bare_coords(t));
-    // Big orange slot: custom titles verbatim; map picks become the town.
+    // Big orange slot: custom titles verbatim; map picks become the
+    // community, distance-honest ("near" only genuinely nearby, the
+    // full offset beyond that).
     let place = match (custom_title, &near) {
         (Some(t), _) => t.to_string(),
-        (None, Some(n)) if n.distance_mi() < 2.0 => n.label.to_string(),
-        (None, Some(n)) => format!("near {}", n.label),
+        (None, Some(n)) if n.distance_mi() < 3.0 => n.label.clone(),
+        (None, Some(n)) if n.distance_mi() <= 12.0 => format!("near {}", n.label),
+        (None, Some(n)) => format!(
+            "{} mi {} of {}",
+            n.distance_mi().round() as i64,
+            n.compass(),
+            n.label
+        ),
         (None, None) => format!("{:.3}, {:.3}", request.lat, request.lon),
     };
     // Coord readout keeps the precise town offset (skipped only when a
     // custom title already names the town).
     let mut point_line = format!("{:.2}°, {:.2}°", request.lat, request.lon);
     if let Some(n) = &near {
-        let town = n.label.split(',').next().unwrap_or(n.label);
+        let town = n.label.split(',').next().unwrap_or(&n.label);
         let redundant = custom_title
             .map(|t| t.to_ascii_lowercase().contains(&town.to_ascii_lowercase()))
             .unwrap_or(false);
@@ -1265,6 +1382,60 @@ pub fn render_daily_svg(
             point_line.push_str(&format!(" · {}", n.describe()));
         }
     }
+
+    // ---- layout ----
+    let n = days.len();
+    let mut ml = 64.0;
+    let base_col = if n <= 4 { 150.0 } else { (1080.0 / n as f64).clamp(84.0, 150.0) };
+    // Width: room for the columns, the 880px header floor, AND the
+    // actual header text — a long fire title must never overlap the
+    // heading (both are anchored to opposite edges).
+    let place_chars = place.chars().count();
+    let place_font: f64 = if place_chars > 30 { 19.0 } else { 24.0 };
+    let heading_w = (6 + heading.chars().count()) as f64 * 21.0 * 0.60;
+    let place_w = place_chars as f64 * place_font * 0.68;
+    let text_need = 24.0 + heading_w + 24.0 + place_w + 26.0;
+    let width = (ml + base_col * n as f64 + 28.0)
+        .max(880.0)
+        .max(text_need.ceil());
+    // Stretch columns into the floored width (capped so a 1-day bar
+    // doesn't balloon) and center the block in the leftover slack.
+    let col_w = ((width - ml - 28.0) / n as f64)
+        .clamp(84.0, if n <= 4 { 240.0 } else { 150.0 });
+    ml += ((width - 28.0 - ml) - col_w * n as f64) / 2.0;
+    let strip_h = 46.0;
+    let n_strips: f64 = if single { 1.0 } else { 2.0 };
+    let wind_row_h = 46.0;
+    let pcpn_row_h = 38.0;
+    let chart_top = 86.0 + n_strips * (strip_h + 6.0) + wind_row_h + pcpn_row_h + 14.0;
+    let chart_h = 320.0;
+    let height = chart_top + chart_h + 74.0;
+
+    let all_hi = days.iter().map(|d| d.hi).fold(f64::NEG_INFINITY, f64::max);
+    let all_lo = days.iter().map(|d| d.lo).fold(f64::INFINITY, f64::min);
+    let (all_lo, all_hi) = if !is_temp && all_hi - all_lo < 1e-9 {
+        // Constant field (zero precip, per-run fuels): widen so the axis
+        // is real instead of ±1e-7 noise. Non-negative data sits at the
+        // axis floor, not mid-chart.
+        let lo = if all_lo >= 0.0 { (all_lo - 1.0).max(0.0) } else { all_lo - 1.0 };
+        (lo, all_hi + 1.0)
+    } else {
+        (all_lo, all_hi)
+    };
+    let span = (all_hi - all_lo).max(1e-6);
+    let cell_color = |v: f64| if is_temp { temp_color(v) } else { ramp_color((v - all_lo) / span) };
+    // Bar axis: pad below the min and above the max to nice steps.
+    let axis_lo = if is_temp { (all_lo / 5.0).floor() * 5.0 - 5.0 } else { all_lo - span * 0.15 };
+    let axis_hi = if is_temp { (all_hi / 5.0).ceil() * 5.0 + 5.0 } else { all_hi + span * 0.15 };
+    let y_of = |v: f64| chart_top + chart_h - (v - axis_lo) / (axis_hi - axis_lo) * chart_h;
+    let fmt_val = |v: f64| {
+        if (axis_hi - axis_lo) > 20.0 || v.abs() >= 100.0 {
+            format!("{}", v.round() as i64)
+        } else {
+            let s = format!("{v:.1}");
+            if s == "-0.0" { "0.0".to_string() } else { s }
+        }
+    };
 
     let mut svg = String::with_capacity(32 * 1024);
     svg.push_str(&format!(
@@ -1287,7 +1458,7 @@ pub fn render_daily_svg(
         xml_escape(&point_line),
     ));
     svg.push_str(&format!(
-        r##"<text x="{:.0}" y="44" fill="#ff6a36" font-size="24" font-weight="800" text-anchor="end">{}</text>"##,
+        r##"<text x="{:.0}" y="44" fill="#ff6a36" font-size="{place_font:.0}" font-weight="800" text-anchor="end">{}</text>"##,
         width - 26.0,
         xml_escape(&place.to_uppercase())
     ));
@@ -1403,7 +1574,7 @@ pub fn render_daily_svg(
         tick += step;
     }
 
-    // Bars: wide HI bar (orange-graded), inner LO bar (teal), labels.
+    // Bars: wide HI bar + inner LO bar, both on the strip color scale.
     for (index, day) in days.iter().enumerate() {
         let x = ml + index as f64 * col_w;
         let bar_w = col_w * 0.62;
@@ -1420,8 +1591,9 @@ pub fn render_daily_svg(
             let lo_x = x + (col_w - lo_w) / 2.0;
             let lo_y = y_of(day.lo);
             svg.push_str(&format!(
-                r##"<rect x="{lo_x:.1}" y="{lo_y:.1}" width="{lo_w:.1}" height="{:.1}" fill="#39b58c" rx="3" stroke="#0d1112" stroke-width="1.5"/>"##,
-                (base - lo_y).max(1.0)
+                r##"<rect x="{lo_x:.1}" y="{lo_y:.1}" width="{lo_w:.1}" height="{:.1}" fill="{}" rx="3" stroke="#0d1112" stroke-width="1.5"/>"##,
+                (base - lo_y).max(1.0),
+                cell_color(day.lo)
             ));
             svg.push_str(&format!(
                 r##"<text x="{:.1}" y="{:.1}" fill="#0d1112" font-size="14" font-weight="800" text-anchor="middle">{}</text>"##,
@@ -1453,8 +1625,9 @@ pub fn render_daily_svg(
     }
     let window_note = match request.step_hours {
         None => "HI/LO over each calendar day".to_string(),
-        Some(1) => "hourly values".to_string(),
-        Some(step) if single => format!("one value per {step}-h step"),
+        // Single-value mode: columns land on the model cadence.
+        Some(_) if single && cadence == 1 => "hourly values".to_string(),
+        Some(_) if single => format!("one value per {cadence}-h step"),
         Some(step) => format!("HI/LO over each {step}-h bucket"),
     };
     let axis_note = if request.step_hours.is_none() {
@@ -1500,19 +1673,19 @@ mod tests {
 
     #[test]
     fn point_titles_get_the_nearest_town() {
-        // ~10 mi east of Sacramento's catalog center.
-        let near = nearest_place(38.60, -121.30).expect("catalog is nonempty");
+        // On Sacramento's Census internal point.
+        let near = nearest_place(38.5677, -121.4682).expect("gazetteer is nonempty");
         assert_eq!(near.label, "Sacramento, CA");
 
         // The Lab's bare-coords title becomes coords + town phrase.
         let title = point_title(
-            Some("38.600, -121.300"),
-            "38.6000, -121.3000",
+            Some("38.568, -121.468"),
+            "38.5677, -121.4682",
             Some(&near),
             75,
         );
-        assert!(title.starts_with("38.6000, -121.3000 · "), "{title}");
-        assert!(title.contains("of Sacramento, CA"), "{title}");
+        assert!(title.starts_with("38.5677, -121.4682 · "), "{title}");
+        assert!(title.contains("Sacramento, CA"), "{title}");
 
         // Custom titles keep their text; a redundant town suffix is skipped.
         let title = point_title(Some("Sacramento Exec Airport"), "x", Some(&near), 75);
@@ -1525,7 +1698,7 @@ mod tests {
         let title = point_title(Some("Grapevine Fire"), "x", Some(&near), 20);
         assert_eq!(title, "Grapevine Fire");
 
-        // No catalog hit falls back to plain coords.
+        // No gazetteer hit falls back to plain coords.
         let title = point_title(None, "38.6000, -121.3000", None, 75);
         assert_eq!(title, "38.6000, -121.3000");
     }
@@ -1546,6 +1719,29 @@ mod tests {
         assert_eq!(nice_step(10.0, 5), 2.0);
         assert_eq!(nice_step(100.0, 4), 25.0);
         assert!((nice_step(3.7, 4) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn night_spans_pair_sunset_with_next_sunrise() {
+        // Sacramento July (UTC): sunset 03:34, sunrise 12:45 — the night
+        // stays inside ONE UTC day. Every span must be shorter than 24 h
+        // and consecutive spans must not overlap (the old pairing made
+        // 33-h overlapping spans that shaded the entire plot).
+        let spans = night_spans_fh(12.75, 3.55, 0, 2);
+        assert!(!spans.is_empty());
+        for (start, end) in &spans {
+            assert!(end - start < 24.0, "span {start}..{end} too long");
+            assert!((end - start - 9.2).abs() < 0.5, "span {start}..{end}");
+        }
+        for pair in spans.windows(2) {
+            assert!(pair[1].0 >= pair[0].1, "spans overlap: {pair:?}");
+        }
+        // Europe-like longitudes (sunset 20:00, sunrise 04:00 UTC):
+        // night straddles the day boundary; behavior unchanged.
+        let spans = night_spans_fh(4.0, 20.0, 0, 2);
+        for (start, end) in &spans {
+            assert!((end - start - 8.0).abs() < 1e-9, "span {start}..{end}");
+        }
     }
 
     #[test]

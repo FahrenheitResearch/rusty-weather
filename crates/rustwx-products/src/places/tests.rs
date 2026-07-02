@@ -628,25 +628,59 @@ fn region_and_city_labels_use_compact_names() {
 
 #[test]
 fn nearest_place_finds_the_hosting_town() {
-    // Downtown Sacramento sits on the catalog's Sacramento center.
-    let near = nearest_place(38.58, -121.49).expect("catalog is nonempty");
+    // The Census internal point of Sacramento city.
+    let near = nearest_place(38.5677, -121.4682).expect("gazetteer is nonempty");
     assert_eq!(near.label, "Sacramento, CA");
-    assert!(near.distance_km < 2.0, "distance {}", near.distance_km);
+    assert!(near.distance_km < 1.0, "distance {}", near.distance_km);
     assert_eq!(near.describe(), "near Sacramento, CA");
+
+    // Ukiah, CA — and the gazetteer also knows Ukiah, OR as a distinct place.
+    let near = nearest_place(39.15, -123.21).expect("gazetteer is nonempty");
+    assert_eq!(near.label, "Ukiah, CA");
 }
 
 #[test]
-fn nearest_place_reports_distance_and_bearing() {
-    // Half a degree due north of Reno's catalog center (~34.6 mi).
-    let near = nearest_place(40.03, -119.81).expect("catalog is nonempty");
-    assert_eq!(near.label, "Reno, NV");
-    assert_eq!(near.compass(), "N");
+fn remote_points_resolve_to_local_communities_not_metros() {
+    // ~100 mi east of Portland, OR (Columbia River near Boardman):
+    // must resolve to a nearby community, never the distant metro.
+    let near = nearest_place(45.84, -119.70).expect("gazetteer is nonempty");
     assert!(
-        (near.distance_mi() - 34.6).abs() < 1.0,
-        "miles {}",
+        !near.label.contains("Portland"),
+        "resolved to {}",
+        near.label
+    );
+    assert!(
+        near.distance_mi() < 25.0,
+        "{} is {:.0} mi away",
+        near.label,
         near.distance_mi()
     );
-    assert_eq!(near.describe(), "35 mi N of Reno, NV");
+
+    // Deep rural Nevada (Highway 50): whatever comes back must be a
+    // genuinely nearby community, not a city 100+ miles off.
+    let near = nearest_place(39.5, -117.1).expect("gazetteer is nonempty");
+    assert!(
+        near.distance_mi() < 60.0,
+        "{} is {:.0} mi away",
+        near.label,
+        near.distance_mi()
+    );
+}
+
+#[test]
+fn describe_shapes_are_wellformed() {
+    // On a town: the sub-two-mile "near" form.
+    let near = nearest_place(38.5677, -121.4682).expect("gazetteer is nonempty");
+    assert_eq!(near.describe(), "near Sacramento, CA");
+
+    // Between towns: either form, but always naming the resolved label.
+    let off = nearest_place(38.75, -121.47).expect("gazetteer is nonempty");
+    let described = off.describe();
+    assert!(
+        described == format!("near {}", off.label)
+            || described.ends_with(&format!("of {}", off.label)),
+        "{described}"
+    );
 }
 
 #[test]
@@ -658,7 +692,7 @@ fn nearest_place_rejects_non_finite_points() {
 #[test]
 fn compass_sectors_wrap_correctly() {
     let at = |bearing_deg: f64| NearestPlace {
-        label: "x",
+        label: "x".to_string(),
         distance_km: 10.0,
         bearing_deg,
     };

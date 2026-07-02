@@ -613,13 +613,47 @@ pub fn micro_us_place_presets() -> &'static [PlacePreset] {
     MICRO_US_PLACE_PRESETS
 }
 
-/// Nearest catalog town to a point, searched across every tier (major,
-/// aux, micro). The catalog is curated for map-label density, not a
-/// gazetteer, so rural hits can sit tens of miles out — `describe()`
-/// carries the distance and bearing to keep that honest.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Dense nearest-community gazetteer: the US Census national places
+/// file (every incorporated place + census designated place, 50 states
+/// + DC, ~32k entries, public domain) baked in as a TSV asset — see the
+/// asset header for provenance and regeneration steps. This backs the
+/// point-product "nearest town" readouts; the curated preset tiers
+/// above remain the map-label catalog (label density, not coverage).
+const GAZETTEER_TSV: &str = include_str!("places/us_places_gazetteer.tsv");
+
+struct GazetteerPlace {
+    name: &'static str,
+    state: &'static str,
+    lat: f32,
+    lon: f32,
+}
+
+fn gazetteer() -> &'static [GazetteerPlace] {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Vec<GazetteerPlace>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        GAZETTEER_TSV
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| {
+                let mut fields = line.split('\t');
+                Some(GazetteerPlace {
+                    name: fields.next()?,
+                    state: fields.next()?,
+                    lat: fields.next()?.parse().ok()?,
+                    lon: fields.next()?.parse().ok()?,
+                })
+            })
+            .collect()
+    })
+}
+
+/// Nearest gazetteer community to a point. `describe()` carries the
+/// distance and bearing so remote points stay honest ("23 mi NE of ...").
+#[derive(Debug, Clone, PartialEq)]
 pub struct NearestPlace {
-    pub label: &'static str,
+    /// "Ukiah, CA"
+    pub label: String,
     pub distance_km: f64,
     /// Initial great-circle bearing from the town to the point.
     pub bearing_deg: f64,
@@ -653,23 +687,27 @@ pub fn nearest_place(lat: f64, lon: f64) -> Option<NearestPlace> {
     if !(lat.is_finite() && lon.is_finite()) {
         return None;
     }
-    let tiers = [
-        MAJOR_US_CITY_PRESETS,
-        AUX_US_CITY_PRESETS,
-        MICRO_US_PLACE_PRESETS,
-    ];
-    let mut best: Option<NearestPlace> = None;
-    for preset in tiers.into_iter().flatten() {
-        let distance_km = haversine_km(preset.center_lat, preset.center_lon, lat, lon);
-        if best.is_none_or(|b| distance_km < b.distance_km) {
-            best = Some(NearestPlace {
-                label: preset.label,
-                distance_km,
-                bearing_deg: initial_bearing_deg(preset.center_lat, preset.center_lon, lat, lon),
-            });
-        }
-    }
-    best
+    // Argmin over ~32k entries with a cheap equirectangular metric
+    // (monotone with true distance at these scales), then exact
+    // haversine + bearing for the winner only.
+    let coslat = lat.to_radians().cos().max(0.05);
+    let best = gazetteer().iter().min_by(|a, b| {
+        let da = equirect_d2(a, lat, lon, coslat);
+        let db = equirect_d2(b, lat, lon, coslat);
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    })?;
+    let (place_lat, place_lon) = (f64::from(best.lat), f64::from(best.lon));
+    Some(NearestPlace {
+        label: format!("{}, {}", best.name, best.state),
+        distance_km: haversine_km(place_lat, place_lon, lat, lon),
+        bearing_deg: initial_bearing_deg(place_lat, place_lon, lat, lon),
+    })
+}
+
+fn equirect_d2(place: &GazetteerPlace, lat: f64, lon: f64, coslat: f64) -> f64 {
+    let dlat = f64::from(place.lat) - lat;
+    let dlon = (f64::from(place.lon) - lon) * coslat;
+    dlat * dlat + dlon * dlon
 }
 
 fn initial_bearing_deg(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {

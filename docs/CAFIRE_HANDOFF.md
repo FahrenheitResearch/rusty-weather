@@ -13,7 +13,7 @@ value changes.
 
 **Reference implementation:** `{BASE}/lab` is a complete single-file
 web client that exercises every endpoint below — product maps, fire
-framing, meteograms, custom charts, outlook cards, the ECAPE feed. It is
+framing, meteograms, custom charts, outlook cards. It is
 our opinion of *what works best given the shape of this service*: treat
 it as canonical usage (view source; there is no build step), not as a
 constraint. Anything it does, your site can do with plain `fetch`.
@@ -35,8 +35,7 @@ constraint. Anything it does, your site can do with plain `fetch`.
 | Shareable outlook cards (daily/hourly) | **Live** | HI/LO strips + wind + precip rows |
 | GFS lane (8 days, 6-hourly) | **Live** | Charts/cards/meteograms; maps not tuned |
 | NBM lane (official blend, 10+ days) | **Live** | 9 surface variables, 6-hourly |
-| ECAPE suite (heavy compute) | **Live, full-featured** | Rendered on the compute node via `{BASE}/node/*` |
-| Dedicated pyroCb products (PFT etc.) | **Not built** | Next compute-node lane |
+| Advanced instability / pyroCb suite | **In development** | Not part of this integration surface yet |
 | Render cache + prewarming | **Live** | Common requests return in ~100 ms |
 | Authentication / rate limiting | **Not built** | Open in v1; handle 429 if it appears |
 | NDFD proper | **Not built** | NBM covers the "official blend" need |
@@ -53,9 +52,7 @@ store fresh (HRRR every 5 min, GFS every 15, NBM every 20), a pruner
 bounds the disk, and after each completed HRRR run the server pre-renders
 the common domain × product combinations plus the four largest active
 fires — so the requests a public site is likely to make are usually
-**cache hits**. A separate 24-core compute node runs the expensive
-ECAPE/pyroCb physics and pushes finished images to the server (outbound
-only). Practical consequences for you: (a) prefer the canonical presets
+**cache hits**. Practical consequences for you: (a) prefer the canonical presets
 and `latest`/`latest-day` aliases, because those paths are prewarmed;
 (b) identical requests are free — don't be shy about re-requesting;
 (c) everything is stateless HTTP + JSON/WebP/SVG — no SDK, no keys.
@@ -169,6 +166,14 @@ Params: `panels=temp,rh,vpd,wind,precip,fuels,smoke` (default all),
 `title=Sacramento`, `utc_offset=-7`, `model=hrrr|gfs|nbm` (default
 hrrr), `format=json` (raw series + units). Errors: 400/422 JSON.
 
+**Nearest community, automatic:** if `title` is omitted — or is just a
+coordinates string like `"39.250, -123.100"` — the graphic titles
+itself with the point's nearest community and offset, e.g.
+`39.2500, -123.1000 · 9 mi NE of Ukiah, CA`. A real `title` (fire name,
+station) is kept verbatim and gains the community phrase when it fits.
+`format=json` includes the same lookup as
+`nearest_place: {label, distance_mi, bearing, description}`.
+
 **Chart anything:** `&vars=composite_reflectivity,pwat,erc` (≤8 names,
 `[a-z0-9_]`) replaces the panels with one auto-scaled panel per stored
 variable — Kelvin auto-converts to °F. Discover names via:
@@ -197,6 +202,10 @@ arrow + max speed), a **PCPN** row (bucket inches), and grouped bars.
 - `utc_offset` (default −7) controls the local-day bucketing.
 - Partial edge buckets are dropped automatically (no fake daily highs
   from an evening-only stub).
+- Nearest-community labeling works exactly as on meteograms: omit
+  `title` (or send bare coordinates) and the card's headline becomes the
+  nearest community, with the precise offset ("10 mi E of Sacramento,
+  CA") next to the coordinates in the header line.
 
 The URL **is** the share link: it always re-renders from the named run
 (`latest` stays current). For a frozen snapshot, save the SVG.
@@ -235,44 +244,7 @@ Feed a `ring` straight into `/api/render`'s `perimeter` with
 `padding_km` + `overlay_perimeter` + `title_note` for a labeled,
 auto-framed incident map. The top four fires are prewarmed each run.
 
-## 9. ECAPE suite (heavy-compute node)
-
-The entrainment-CAPE physics needs full HRRR volumes — too heavy for
-the serving box — so it runs on a dedicated 24-core compute node. That
-node is reachable through the server at the **`/node` prefix**, which
-exposes the *same render API* as §3 with the same request shape:
-
-- `POST {BASE}/node/api/render` — identical body; `products` takes the
-  heavy slugs below (or `"heavy"` for all 16). Any bounds, any
-  perimeter, any stored hour, any basemap — full feature parity.
-- `GET {BASE}/node{status_url}` to poll; fetch images from
-  `{BASE}/node{files[i].url}`.
-- `GET {BASE}/node/api/runs` for the node's own run inventory
-  (it tracks the same HRRR cycles, refreshed every 10 min).
-
-16 product slugs: `sbecape`, `mlecape`, `muecape`, `sbecin`, `mlecin`,
-`sbncape`, `{sb,ml,mu}_ecape_native_cape_ratio`,
-`{sb,ml,mu}_ecape_derived_cape_ratio`, `ecape_scp`, `ecape_stp`,
-`ecape_ehi_0_1km`, `ecape_ehi_0_3km`.
-
-There is additionally a static per-run feed of prerendered California
-frames (`GET {BASE}/api/ecape/latest.json` → files under
-`/api/ecape/{run}/`) if you just want cheap embeds without job polling.
-
-**Availability note:** everything else in this document is served
-entirely from the datacenter; the ECAPE suite alone depends on the
-off-site compute node and its tunnel. If `/node/api/health` is down,
-degrade the ECAPE section gracefully (the static `/api/ecape/` feed may
-still have the last pushed run) — nothing else is affected.
-
-**Honesty note on "pyroCb":** ECAPE is the pyroCb-*relevant* instability
-signal (how much CAPE survives entrainment — plume-driven convection
-cares deeply). Dedicated pyroCb products — PFT (Pyrocumulonimbus
-Firepower Threshold), fire-modified parcel profiles — are **not built
-yet**; they are the next lane planned for this compute node. Don't
-label the current suite "pyroCb prediction" on the site.
-
-## 10. Integration recipes (what we'd build in your shoes)
+## 9. Integration recipes (what we'd build in your shoes)
 
 - **Incident page:** `GET /api/fires` → user picks fire → one
   `POST /api/render` with `perimeter`, `padding_km: 50`,
@@ -295,7 +267,7 @@ Style/system notes: everything visual is our house style (dark,
 CWT-branded, Cloudflare-cacheable). If you need your own branding on
 cards/charts, that's a parameter away — ask.
 
-## 11. Not operational / known limits (read before promising features)
+## 10. Not operational / known limits (read before promising features)
 
 - **No auth, no rate limiting** yet. The render gate allows 3 concurrent
   jobs; heavy bursts queue. If you expect real public traffic spikes,
@@ -307,7 +279,10 @@ cards/charts, that's a parameter away — ask.
   tuned for HRRR; use GFS/NBM for charts, cards, and meteograms today.
 - **NBM carries 9 surface variables** (T/Td/RH/u/v/gust/precip/PWAT/
   visibility) — no smoke, no fuels, no severe fields.
-- **ECAPE** is push-based and fixed-form (see §9).
+- **Advanced instability / pyroCb products** (entrainment CAPE, PFT,
+  fire-modified parcels) are in development on dedicated compute and
+  intentionally excluded from this surface for now — don't promise them
+  on the site yet; they'll arrive as a documented addition.
 - **RRFS / HREF** deliberately deferred.
 - **Satellite & lightning** remain on your existing legacy service
   (`/api/v1/*`) — this service does not replace them yet.
@@ -318,9 +293,9 @@ cards/charts, that's a parameter away — ask.
   — re-request instead (cache makes it free). Card/chart URLs with
   `run=latest` are permanent by construction.
 
-## 12. Stability contract
+## 11. Stability contract
 
-Everything in §§2–9 — schemas, slugs, presets, aliases, URL shapes,
+Everything in §§2–8 — schemas, slugs, presets, aliases, URL shapes,
 cache semantics — is what production runs today, and we treat it as
 frozen: additions will be backward-compatible; breaking changes get a
 versioned path. Build against `{BASE}` as config and you will not need
