@@ -588,11 +588,12 @@ mod tests {
         );
     }
 
-    /// The heavy store inventory is the 16 ECAPE-class recipes, in
-    /// inventory order, and every slug maps 1:1 onto a heavy-lane panel
-    /// artifact slug (the mapping `compute_store_heavy_grids` relies on).
+    /// The heavy store inventory is the 16 ECAPE-class recipes plus the
+    /// 4 PFT (pyroCb) recipes, in inventory order, and every slug maps
+    /// 1:1 onto a heavy-lane panel artifact slug (the mapping
+    /// `compute_store_heavy_grids` relies on).
     #[test]
-    fn heavy_store_slugs_pin_the_sixteen_ecape_recipes() {
+    fn heavy_store_slugs_pin_the_twenty_heavy_recipes() {
         assert_eq!(
             store_heavy_recipe_slugs(),
             vec![
@@ -612,6 +613,10 @@ mod tests {
                 "ecape_ehi_0_1km",
                 "ecape_ehi_0_3km",
                 "ecape_stp",
+                "pft_gw",
+                "pft_zfc",
+                "pft_dtheta_fc",
+                "pft_uml",
             ]
         );
     }

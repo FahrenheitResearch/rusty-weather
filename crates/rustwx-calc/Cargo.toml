@@ -12,3 +12,4 @@ rayon.workspace = true
 serde.workspace = true
 rustwx-core = { path = "../rustwx-core" }
 metrust = { path = "../../vendor/metrust" }
+wx-math = { path = "../../vendor/wx-math" }

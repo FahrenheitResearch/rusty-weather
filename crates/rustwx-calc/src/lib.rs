@@ -2,6 +2,7 @@ mod derived;
 mod ecape;
 mod error;
 mod mesoanalysis;
+mod pft;
 mod severe;
 mod windowed;
 
@@ -28,6 +29,10 @@ pub use ecape::{
     compute_ecape_with_failure_mask, compute_ecape_with_failure_mask_from_parts,
 };
 pub use error::CalcError;
+pub use pft::{
+    NO_PYROCB_SENTINEL_GW, PftFields, PftOptions, PftOutcome, PftSolution, compute_pft_grid,
+    manual_pft_gw,
+};
 pub use mesoanalysis::{
     MesoObservation, MesoanalysisConfig, MesoanalysisCovarianceKernel, MesoanalysisFields,
     MesoanalysisMethod, MesoanalysisVariableDiagnostics, SurfaceMesoBackground,

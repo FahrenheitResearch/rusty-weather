@@ -26,6 +26,10 @@ pub(crate) enum DerivedRecipe {
     EcapeEhi01km,
     EcapeEhi03km,
     EcapeStp,
+    PftGw,
+    PftZfc,
+    PftDthetaFc,
+    PftUml,
     ThetaE2m10mWinds,
     Vpd2m,
     Hdw,
@@ -90,6 +94,10 @@ impl DerivedRecipe {
             "ecape_ehi" | "ecape_ehi_0_1km" | "ecape_ehi_01km" => Ok(Self::EcapeEhi01km),
             "ecape_ehi_0_3km" | "ecape_ehi_03km" => Ok(Self::EcapeEhi03km),
             "ecape_stp" => Ok(Self::EcapeStp),
+            "pft_gw" | "pft" | "pyrocb_firepower_threshold" => Ok(Self::PftGw),
+            "pft_zfc" | "pft_free_convection_height" => Ok(Self::PftZfc),
+            "pft_dtheta_fc" | "pft_dtheta" => Ok(Self::PftDthetaFc),
+            "pft_uml" | "pft_wind" => Ok(Self::PftUml),
             "theta_e_2m_10m_winds" | "2m_theta_e_10m_winds" => {
                 Ok(Self::ThetaE2m10mWinds)
             }
@@ -160,6 +168,10 @@ impl DerivedRecipe {
             Self::EcapeEhi01km => "ecape_ehi_0_1km",
             Self::EcapeEhi03km => "ecape_ehi_0_3km",
             Self::EcapeStp => "ecape_stp",
+            Self::PftGw => "pft_gw",
+            Self::PftZfc => "pft_zfc",
+            Self::PftDthetaFc => "pft_dtheta_fc",
+            Self::PftUml => "pft_uml",
             Self::ThetaE2m10mWinds => "theta_e_2m_10m_winds",
             Self::Vpd2m => "vpd_2m",
             Self::Hdw => "hdw",
@@ -211,6 +223,10 @@ impl DerivedRecipe {
             Self::EcapeEhi01km => "ECAPE EHI 0-1 km (EXP)",
             Self::EcapeEhi03km => "ECAPE EHI 0-3 km (EXP)",
             Self::EcapeStp => "ECAPE STP (EXP)",
+            Self::PftGw => "PyroCb Firepower Threshold (EXP)",
+            Self::PftZfc => "PFT Free-Convection Height (EXP)",
+            Self::PftDthetaFc => "PFT Required Plume Warming (EXP)",
+            Self::PftUml => "PFT Mixed-Layer Wind (EXP)",
             Self::ThetaE2m10mWinds => "2 m Theta-e, 10 m Wind",
             Self::Vpd2m => "2 m Vapor Pressure Deficit",
             Self::Hdw => "Hot-Dry-Windy Index",
@@ -270,6 +286,10 @@ impl DerivedRecipe {
                 | Self::EcapeEhi01km
                 | Self::EcapeEhi03km
                 | Self::EcapeStp
+                | Self::PftGw
+                | Self::PftZfc
+                | Self::PftDthetaFc
+                | Self::PftUml
         )
     }
 }
@@ -392,7 +412,11 @@ impl DerivedRequirements {
                 | DerivedRecipe::EcapeScp
                 | DerivedRecipe::EcapeEhi01km
                 | DerivedRecipe::EcapeEhi03km
-                | DerivedRecipe::EcapeStp => {}
+                | DerivedRecipe::EcapeStp
+                | DerivedRecipe::PftGw
+                | DerivedRecipe::PftZfc
+                | DerivedRecipe::PftDthetaFc
+                | DerivedRecipe::PftUml => {}
             }
         }
         requirements

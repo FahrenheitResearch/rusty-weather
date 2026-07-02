@@ -383,7 +383,11 @@ pub(super) fn assign_store_values(
         | DerivedRecipe::EcapeScp
         | DerivedRecipe::EcapeEhi01km
         | DerivedRecipe::EcapeEhi03km
-        | DerivedRecipe::EcapeStp => {
+        | DerivedRecipe::EcapeStp
+        | DerivedRecipe::PftGw
+        | DerivedRecipe::PftZfc
+        | DerivedRecipe::PftDthetaFc
+        | DerivedRecipe::PftUml => {
             return Err(format!(
                 "heavy recipe '{}' renders from a WeatherPanelField, not the computed slots",
                 recipe.slug()
@@ -419,6 +423,10 @@ pub(super) fn weather_product_for_heavy_recipe(
         DerivedRecipe::EcapeEhi01km => WeatherProduct::EcapeEhi01kmExperimental,
         DerivedRecipe::EcapeEhi03km => WeatherProduct::EcapeEhi03kmExperimental,
         DerivedRecipe::EcapeStp => WeatherProduct::EcapeStpExperimental,
+        DerivedRecipe::PftGw => WeatherProduct::PftGw,
+        DerivedRecipe::PftZfc => WeatherProduct::PftZfc,
+        DerivedRecipe::PftDthetaFc => WeatherProduct::PftDthetaFc,
+        DerivedRecipe::PftUml => WeatherProduct::PftUml,
         other => {
             return Err(format!(
                 "recipe '{}' is not a heavy ECAPE-class recipe",

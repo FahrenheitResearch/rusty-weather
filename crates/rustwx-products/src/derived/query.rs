@@ -268,7 +268,11 @@ fn computed_recipe_slot<'a>(
         | DerivedRecipe::EcapeScp
         | DerivedRecipe::EcapeEhi01km
         | DerivedRecipe::EcapeEhi03km
-        | DerivedRecipe::EcapeStp => unreachable!("heavy recipes are blocked above"),
+        | DerivedRecipe::EcapeStp
+        | DerivedRecipe::PftGw
+        | DerivedRecipe::PftZfc
+        | DerivedRecipe::PftDthetaFc
+        | DerivedRecipe::PftUml => unreachable!("heavy recipes are blocked above"),
     }
 }
 

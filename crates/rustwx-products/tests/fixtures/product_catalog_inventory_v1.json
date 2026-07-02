@@ -1,9 +1,9 @@
 {
   "schema": "rustwx-products.catalog_inventory.v1",
   "summary": {
-    "total_entries": 325,
+    "total_entries": 329,
     "direct_entries": 226,
-    "derived_entries": 49,
+    "derived_entries": 53,
     "heavy_entries": 1,
     "windowed_entries": 49,
     "supported_entries": 96,
@@ -271,6 +271,10 @@
       "mucape",
       "mucin",
       "muecape",
+      "pft_dtheta_fc",
+      "pft_gw",
+      "pft_uml",
+      "pft_zfc",
       "sb_ecape_derived_cape_ratio",
       "sb_ecape_native_cape_ratio",
       "sbcape",

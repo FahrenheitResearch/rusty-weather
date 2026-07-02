@@ -161,6 +161,30 @@ const SUPPORTED_DERIVED_RECIPE_INVENTORY: &[DerivedRecipeInventoryEntry] = &[
         heavy: true,
     },
     DerivedRecipeInventoryEntry {
+        slug: "pft_gw",
+        title: "PyroCb Firepower Threshold (EXP)",
+        experimental: true,
+        heavy: true,
+    },
+    DerivedRecipeInventoryEntry {
+        slug: "pft_zfc",
+        title: "PFT Free-Convection Height (EXP)",
+        experimental: true,
+        heavy: true,
+    },
+    DerivedRecipeInventoryEntry {
+        slug: "pft_dtheta_fc",
+        title: "PFT Required Plume Warming (EXP)",
+        experimental: true,
+        heavy: true,
+    },
+    DerivedRecipeInventoryEntry {
+        slug: "pft_uml",
+        title: "PFT Mixed-Layer Wind (EXP)",
+        experimental: true,
+        heavy: true,
+    },
+    DerivedRecipeInventoryEntry {
         slug: "theta_e_2m_10m_winds",
         title: "2 m Theta-e, 10 m Wind Barbs",
         experimental: false,

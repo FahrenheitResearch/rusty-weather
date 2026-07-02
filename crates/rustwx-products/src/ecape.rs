@@ -16,9 +16,10 @@ use crate::shared_context::{
     DomainSpec, ProjectedMap, WeatherPanelField, build_weather_map_request,
 };
 use rustwx_calc::{
-    EcapeTripletOptions, EcapeVolumeInputs, EffectiveStpInputs, ScpEhiInputs, SurfaceInputs,
-    WindGridInputs, compute_ecape_triplet_with_failure_mask_from_parts, compute_ehi,
-    compute_mlcape_cin, compute_scp_ehi, compute_stp_effective, compute_wind_diagnostics_bundle,
+    EcapeTripletOptions, EcapeVolumeInputs, EffectiveStpInputs, PftOptions, ScpEhiInputs,
+    SurfaceInputs, WindGridInputs, compute_ecape_triplet_with_failure_mask_from_parts, compute_ehi,
+    compute_mlcape_cin, compute_pft_grid, compute_scp_ehi, compute_stp_effective,
+    compute_wind_diagnostics_bundle,
 };
 use rustwx_core::{ModelId, SourceId};
 use rustwx_render::{
@@ -543,6 +544,9 @@ pub struct EcapeMapFieldsTiming {
     pub ml_classic_ms: u128,
     /// Elementwise composites + ratios (SCP/EHI/STP, derived/native ratios).
     pub composites_ms: u128,
+    /// The PFT (pyroCb firepower threshold) column solves.
+    #[serde(default)]
+    pub pft_ms: u128,
 }
 
 pub fn compute_ecape_map_fields_with_prepared_volume(
@@ -718,6 +722,51 @@ pub fn compute_ecape_map_fields_with_prepared_volume_timed(
         ));
     }
     timing.composites_ms += tail_start.elapsed().as_millis();
+
+    // PyroCb Firepower Threshold suite (Tory & Kepert 2021) — same
+    // column inputs as the ECAPE triplet; see docs/PFT_SPEC.md.
+    let pft_start = Instant::now();
+    let pft = compute_pft_grid(
+        prepared.grid,
+        EcapeVolumeInputs {
+            pressure_pa: prepared
+                .pressure_3d_pa
+                .as_deref()
+                .unwrap_or(&prepared.pressure_levels_pa),
+            temperature_c: &pressure.temperature_c_3d,
+            qvapor_kgkg: &pressure.qvapor_kgkg_3d,
+            height_agl_m: &prepared.height_agl_3d,
+            u_ms: &pressure.u_ms_3d,
+            v_ms: &pressure.v_ms_3d,
+            nz: prepared.shape.nz,
+        },
+        SurfaceInputs {
+            psfc_pa: &surface.psfc_pa,
+            t2_k: &surface.t2_k,
+            q2_kgkg: &surface.q2_kgkg,
+            u10_ms: &surface.u10_ms,
+            v10_ms: &surface.v10_ms,
+        },
+        PftOptions::default(),
+    )?;
+    timing.pft_ms = pft_start.elapsed().as_millis();
+    fields.push(WeatherPanelField::new(
+        WeatherProduct::PftGw,
+        "GW",
+        pft.pft_gw,
+    ));
+    fields.push(WeatherPanelField::new(WeatherProduct::PftZfc, "m", pft.z_fc_m));
+    fields.push(WeatherPanelField::new(
+        WeatherProduct::PftDthetaFc,
+        "K",
+        pft.dtheta_fc_k,
+    ));
+    fields.push(WeatherPanelField::new(
+        WeatherProduct::PftUml,
+        "m/s",
+        pft.u_ml_ms,
+    ));
+
     Ok((fields, failure_count, timing))
 }
 

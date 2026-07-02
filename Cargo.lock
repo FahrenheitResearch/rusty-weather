@@ -4254,6 +4254,7 @@ dependencies = [
  "rustwx-core",
  "serde",
  "thiserror 2.0.18",
+ "wx-math",
 ]
 
 [[package]]

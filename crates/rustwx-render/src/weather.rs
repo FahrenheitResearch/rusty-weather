@@ -54,6 +54,13 @@ pub enum WeatherPreset {
     EcapeCapeRatio,
     Uh,
     LapseRate,
+    /// PyroCb Firepower Threshold (GW), log2-style operational scale —
+    /// LOW values are the dangerous end (inverted palette).
+    PftGw,
+    /// Required plume excess potential temperature at free convection (K).
+    PftDtheta,
+    /// PFT mixed-layer mean wind (m/s).
+    PftWind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -121,6 +128,10 @@ pub enum WeatherProduct {
     EcapeEhi01kmExperimental,
     EcapeEhi03kmExperimental,
     EcapeStpExperimental,
+    PftGw,
+    PftZfc,
+    PftDthetaFc,
+    PftUml,
 }
 
 pub const SEVERE_CLASSIC_PANEL_PRODUCTS: [WeatherProduct; 8] = [
@@ -213,6 +224,10 @@ impl WeatherProduct {
             }
             "ecape_ehi_0_3km" | "ecape_ehi_03km" => Some(Self::EcapeEhi03kmExperimental),
             "ecape_stp" => Some(Self::EcapeStpExperimental),
+            "pft_gw" | "pft" | "pyrocb_firepower_threshold" => Some(Self::PftGw),
+            "pft_zfc" | "pft_free_convection_height" => Some(Self::PftZfc),
+            "pft_dtheta_fc" | "pft_dtheta" => Some(Self::PftDthetaFc),
+            "pft_uml" | "pft_wind" => Some(Self::PftUml),
             _ => None,
         }
     }
@@ -262,6 +277,10 @@ impl WeatherProduct {
             Self::EcapeEhi01kmExperimental => "ecape_ehi_0_1km",
             Self::EcapeEhi03kmExperimental => "ecape_ehi_0_3km",
             Self::EcapeStpExperimental => "ecape_stp",
+            Self::PftGw => "pft_gw",
+            Self::PftZfc => "pft_zfc",
+            Self::PftDthetaFc => "pft_dtheta_fc",
+            Self::PftUml => "pft_uml",
         }
     }
 
@@ -310,6 +329,10 @@ impl WeatherProduct {
             Self::EcapeEhi01kmExperimental => "ECAPE EHI 0-1 KM (EXP)",
             Self::EcapeEhi03kmExperimental => "ECAPE EHI 0-3 KM (EXP)",
             Self::EcapeStpExperimental => "ECAPE STP (EXP)",
+            Self::PftGw => "PYROCB FIREPOWER THRESHOLD (EXP)",
+            Self::PftZfc => "PFT FREE-CONVECTION HEIGHT (EXP)",
+            Self::PftDthetaFc => "PFT REQUIRED PLUME WARMING (EXP)",
+            Self::PftUml => "PFT MIXED-LAYER WIND (EXP)",
         }
     }
 
@@ -346,6 +369,10 @@ impl WeatherProduct {
                 WeatherPreset::Ehi
             }
             Self::Uh => WeatherPreset::Uh,
+            Self::PftGw => WeatherPreset::PftGw,
+            Self::PftZfc => WeatherPreset::Lfc,
+            Self::PftDthetaFc => WeatherPreset::PftDtheta,
+            Self::PftUml => WeatherPreset::PftWind,
         }
     }
 
@@ -367,6 +394,9 @@ impl WeatherProduct {
             WeatherPreset::EcapeCapeRatio => Some(0.25),
             WeatherPreset::Uh => Some(20.0),
             WeatherPreset::LapseRate => Some(1.0),
+            WeatherPreset::PftGw => None,
+            WeatherPreset::PftDtheta => Some(2.0),
+            WeatherPreset::PftWind => Some(5.0),
         }
     }
 
@@ -399,6 +429,10 @@ impl WeatherProduct {
                 | Self::EcapeEhi01kmExperimental
                 | Self::EcapeEhi03kmExperimental
                 | Self::EcapeStpExperimental
+                | Self::PftGw
+                | Self::PftZfc
+                | Self::PftDthetaFc
+                | Self::PftUml
         )
     }
 }
@@ -596,6 +630,13 @@ impl WeatherPreset {
                 25.0, 50.0, 75.0, 100.0, 150.0, 200.0, 250.0, 300.0, 400.0,
             ]),
             Self::LapseRate => Some(vec![4.0, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0]),
+            Self::PftGw => Some(vec![
+                0.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
+            ]),
+            Self::PftDtheta => Some(vec![
+                0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0,
+            ]),
+            Self::PftWind => Some(vec![0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0]),
         }
     }
 
@@ -628,6 +669,9 @@ impl WeatherPreset {
             Self::EcapeCapeRatio => Some(0.25),
             Self::Uh => Some(20.0),
             Self::LapseRate => Some(1.0),
+            Self::PftGw => None,
+            Self::PftDtheta => Some(2.0),
+            Self::PftWind => Some(5.0),
         }
     }
 
@@ -740,6 +784,33 @@ impl WeatherPreset {
                 levels: range_step(2.0, 10.1, 0.1),
                 colors: weather_palette(WeatherPalette::LapseRate),
                 extend: ExtendMode::Both,
+                mask_below,
+            },
+            Self::PftGw => {
+                // Log2 operational bins (BoM trial style). LOW PFT is
+                // the dangerous end: reversed palette puts hot colors
+                // on small values.
+                let mut colors = weather_palette(WeatherPalette::Ecape);
+                colors.reverse();
+                DiscreteColorScale {
+                    levels: vec![
+                        0.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
+                    ],
+                    colors,
+                    extend: ExtendMode::Max,
+                    mask_below,
+                }
+            }
+            Self::PftDtheta => DiscreteColorScale {
+                levels: range_step(0.0, 20.1, 1.0),
+                colors: weather_palette(WeatherPalette::LapseRate),
+                extend: ExtendMode::Max,
+                mask_below,
+            },
+            Self::PftWind => DiscreteColorScale {
+                levels: range_step(0.0, 30.1, 2.0),
+                colors: weather_palette(WeatherPalette::Srh),
+                extend: ExtendMode::Max,
                 mask_below,
             },
         }
