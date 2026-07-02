@@ -235,7 +235,7 @@ pub(crate) fn static_chrome_scale() -> ChromeScale {
     ChromeScale::Fixed(scale)
 }
 
-pub(crate) fn static_title_with_suffix(title: impl Into<String>) -> String {
+pub fn static_title_with_suffix(title: impl Into<String>) -> String {
     let mut title = title.into();
     let Some(suffix) = std::env::var("RUSTWX_TITLE_SUFFIX")
         .ok()

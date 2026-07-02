@@ -809,6 +809,7 @@ async function requestPlot(productSlug, hour, quiet) {
     county_linework: state.counties, place_label_density: state.density, place_label_size: 2,
     output_width: 1800, ...domainPayload(),
   };
+  if (state.fire) payload.title_note = `${state.fire.name} Fire`;
   const started = await fetch("/api/render", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }).then(r => r.json());
   if (started.error) throw new Error(started.error);
   if (!quiet) log(`job ${started.id} (${started.cache})`, started.cache === "hit" ? "ok" : "");

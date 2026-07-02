@@ -53,6 +53,8 @@ Poll this for a status dot. Anything non-200 = service down.
   - optional `"overlay_perimeter": true` to draw the perimeter on the map.
 - `hour` is the forecast hour. Day-window / anomaly / climatology products
   ignore it (they fold whole windows); hourly products honor it.
+- Optional `"title_note": "Aspen Acres Fire"` — appended to every plot
+  title as " (Aspen Acres Fire)". Free text, sanitized, max 60 chars.
 - `basemap_style`: `topo` | `filled` | `white`. `place_label_density`:
   0–4. `output_width`: up to ~2400.
 

@@ -685,16 +685,18 @@ pub fn render_climo_reference_maps(
         )?;
         let mut render_request = MapRenderRequest::new(field, ColorScale::Discrete(scale));
         let stat_label = ref_stat_label(&request.stat);
-        render_request.title = Some(match request.target {
-            ClimoRefTarget::Doy(doy) => {
-                let (month, day) = doy_to_month_day(doy);
-                format!(
-                    "{stat_label} {noun} — {} {day} Climatology",
-                    MONTH_ABBREV[month as usize - 1]
-                )
-            }
-            ClimoRefTarget::Record => format!("{stat_label} {noun} — All Days 2019-2026"),
-        });
+        render_request.title = Some(rustwx_products::shared_context::static_title_with_suffix(
+            match request.target {
+                ClimoRefTarget::Doy(doy) => {
+                    let (month, day) = doy_to_month_day(doy);
+                    format!(
+                        "{stat_label} {noun} — {} {day} Climatology",
+                        MONTH_ABBREV[month as usize - 1]
+                    )
+                }
+                ClimoRefTarget::Record => format!("{stat_label} {noun} — All Days 2019-2026"),
+            },
+        ));
         render_request.subtitle_left =
             Some("RTMA 2.5 km analysis climatology | FireWxAtlas 2019-2026".to_string());
         render_request.subtitle_right = Some(match request.target {
@@ -1354,7 +1356,9 @@ fn render_rank_map(
         ranks,
     )?;
     let mut request = MapRenderRequest::new(field, ColorScale::Discrete(product.scale()));
-    request.title = Some(baseline_title(product, baseline));
+    request.title = Some(rustwx_products::shared_context::static_title_with_suffix(
+        baseline_title(product, baseline),
+    ));
     // Day-window products have no single valid hour: the left subtitle
     // names the folded window, not the run's anchor hour.
     let (month, day) = doy_to_month_day(doy);

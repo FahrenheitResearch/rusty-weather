@@ -209,6 +209,10 @@ struct RenderJobRequest {
     /// Draw the perimeter ring on the maps (default true).
     #[serde(default)]
     overlay_perimeter: Option<bool>,
+    /// Free-text context appended to every plot title as " (note)" —
+    /// e.g. "Aspen Acres Fire". Sanitized and capped at validation.
+    #[serde(default)]
+    title_note: Option<String>,
     #[serde(default)]
     output_width: Option<u32>,
     #[serde(default)]
@@ -605,6 +609,10 @@ fn run_rw_render(
             overlay_path.display().to_string(),
         );
     }
+    if let Some(note) = &request.title_note {
+        // Every render lane appends this to its plot title as " (note)".
+        command.env("RUSTWX_TITLE_SUFFIX", note);
+    }
 
     // Child output goes to per-job log files instead of in-memory pipes so
     // the deadline loop below never deadlocks on a full pipe and the API
@@ -880,6 +888,18 @@ fn resolve_latest_run(store_root: &Path, model: &str, day: bool) -> Result<Strin
 
 fn validate_render_request(mut request: RenderJobRequest) -> Result<RenderJobRequest, String> {
     request.model = safe_model_slug(&request.model);
+    // Title note: printable text only, capped — it lands verbatim in the
+    // plot chrome via RUSTWX_TITLE_SUFFIX.
+    request.title_note = request.title_note.take().and_then(|note| {
+        let cleaned: String = note
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(60)
+            .collect::<String>()
+            .trim()
+            .to_string();
+        (!cleaned.is_empty()).then_some(cleaned)
+    });
     request.output_format = request.output_format.trim().to_ascii_lowercase();
     request.plot_style = normalize_plot_style(&request.plot_style)?;
     request.basemap_style = normalize_basemap_style(&request.basemap_style)?;
@@ -1297,7 +1317,7 @@ fn render_cache_key(request: &RenderJobRequest) -> String {
         None => "-".to_string(),
     };
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
         request.model,
         request.run,
         request.hour,
@@ -1311,6 +1331,7 @@ fn render_cache_key(request: &RenderJobRequest) -> String {
         request.domain_slug,
         format_bounds(request.resolved_bounds()),
         perimeter_part,
+        request.title_note.as_deref().unwrap_or("-"),
         width,
         height,
     )
@@ -1799,6 +1820,7 @@ mod tests {
             padding_km: None,
             extend: None,
             overlay_perimeter: None,
+            title_note: None,
             output_width: None,
             output_height: None,
         }

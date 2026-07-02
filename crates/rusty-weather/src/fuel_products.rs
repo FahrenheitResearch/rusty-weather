@@ -621,7 +621,9 @@ fn render_one_fuel_product(
         plane.values,
     )?;
     let mut request = MapRenderRequest::new(field, ColorScale::Discrete(product.scale()));
-    request.title = Some(product.title().to_string());
+    request.title = Some(rustwx_products::shared_context::static_title_with_suffix(
+        product.title(),
+    ));
     request.subtitle_left = Some(model_time_subtitle(
         config.model,
         &config.date_yyyymmdd,

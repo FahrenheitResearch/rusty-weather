@@ -355,6 +355,7 @@ fn prewarm(agent: &ureq::Agent, api: &str, complete_run: &str, day_run: Option<&
             body["perimeter"] = ring.clone();
             body["padding_km"] = serde_json::json!(50);
             body["overlay_perimeter"] = serde_json::json!(true);
+            body["title_note"] = serde_json::json!(format!("{name} Fire"));
             warm_one(agent, api, &format!("{name}/{preset}"), body);
         }
     }
