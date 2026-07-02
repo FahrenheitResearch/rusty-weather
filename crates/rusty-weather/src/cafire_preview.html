@@ -219,8 +219,9 @@ button { color: inherit; cursor: pointer; }
     <div class="side-box" id="customBox">
       <span class="field-label">Model</span>
       <div class="segmented" id="chartModel">
-        <button class="selected" type="button" data-model="hrrr">HRRR · hi-res</button>
-        <button type="button" data-model="gfs">GFS · 8-day</button>
+        <button class="selected" type="button" data-model="hrrr">HRRR</button>
+        <button type="button" data-model="gfs">GFS</button>
+        <button type="button" data-model="nbm">NBM</button>
       </div>
       <span class="field-label">Variables (up to 8)</span>
       <div class="product-list" id="varList" style="max-height:260px"></div>
@@ -231,8 +232,9 @@ button { color: inherit; cursor: pointer; }
     <div class="side-box" id="dailyBox">
       <span class="field-label">Model</span>
       <div class="segmented" id="dailyModelSeg">
-        <button type="button" data-model="hrrr">HRRR · 2-day</button>
-        <button class="selected" type="button" data-model="gfs">GFS · 8-day</button>
+        <button type="button" data-model="hrrr">HRRR · 2d</button>
+        <button type="button" data-model="gfs">GFS · 8d</button>
+        <button class="selected" type="button" data-model="nbm">NBM · 10d</button>
       </div>
       <span class="field-label">Variable</span>
       <div class="select-wrap">
@@ -810,7 +812,7 @@ function climoSlug() {
 
 /* ---------- custom chart: any stored variable ---------- */
 let varsLoaded = false;
-let chartModel = "gfs";
+let chartModel = "nbm";
 const defaultVars = new Set(["temperature_2m", "wind_gust_10m", "rh_2m"]);
 function syncModelSegs() {
   for (const id of ["chartModel", "dailyModelSeg"]) {

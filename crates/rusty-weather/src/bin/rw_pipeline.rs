@@ -105,6 +105,8 @@ fn target_max_hour(cycle: u8) -> u16 {
 fn target_hours(model: &str, cycle: u8) -> Vec<u16> {
     match model {
         "gfs" => (0..=192u16).step_by(6).collect(),
+        // NBM: 6-hourly through day 11 — the official-blend outlook span.
+        "nbm" => (6..=264u16).step_by(6).collect(),
         _ => (0..=target_max_hour(cycle)).collect(),
     }
 }
@@ -112,7 +114,7 @@ fn target_hours(model: &str, cycle: u8) -> Vec<u16> {
 /// Whether this model publishes the given cycle at all.
 fn model_has_cycle(model: &str, cycle: u8) -> bool {
     match model {
-        "gfs" => cycle % 6 == 0,
+        "gfs" | "nbm" => cycle % 6 == 0,
         _ => true,
     }
 }
@@ -129,6 +131,9 @@ fn idx_url(model: &str, date: &str, cycle: u8, hour: u16) -> String {
     match model {
         "gfs" => format!(
             "https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.{date}/{cycle:02}/atmos/gfs.t{cycle:02}z.pgrb2.0p25.f{hour:03}.idx"
+        ),
+        "nbm" => format!(
+            "https://noaa-nbm-grib2-pds.s3.amazonaws.com/blend.{date}/{cycle:02}/core/blend.t{cycle:02}z.core.f{hour:03}.co.grib2.idx"
         ),
         _ => format!(
             "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.{date}/conus/hrrr.t{cycle:02}z.wrfsfcf{hour:02}.grib2.idx"
@@ -400,7 +405,11 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
     // Newest cycle whose first file exists (HRRR appears ~50-90 min after
     // cycle time; GFS synoptic cycles lag ~3.5-5 h, so search further back).
     let mut found: Option<(String, u8)> = None;
-    let max_lag = if args.model == "gfs" { args.max_cycle_lag_hours.max(12) } else { args.max_cycle_lag_hours };
+    let max_lag = if matches!(args.model.as_str(), "gfs" | "nbm") {
+        args.max_cycle_lag_hours.max(12)
+    } else {
+        args.max_cycle_lag_hours
+    };
     for lag in 1..=max_lag {
         let (date, cycle) = cycle_at(now_unix, lag);
         if !model_has_cycle(&args.model, cycle) {

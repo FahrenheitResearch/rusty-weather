@@ -164,6 +164,15 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
             // documents old subset attempts missing pressure-level winds.
             idx_patterns: &[],
         }]),
+        // NBM core CONUS blend: the official forecast out to F264, one
+        // 2.5 km surface file per hour serving both extraction roles
+        // (NBM has no isobaric volumes worth ingesting).
+        ModelId::Nbm => Ok(vec![ProductFetch {
+            product: "core/co",
+            surface_source: true,
+            pressure_source: true,
+            idx_patterns: &[],
+        }]),
         ModelId::Nam => Ok(vec![ProductFetch {
             product: "awip3d",
             surface_source: true,
@@ -346,6 +355,7 @@ mod tests {
             ModelId::EcmwfOpenData,
             ModelId::Nam,
             ModelId::RrfsA,
+            ModelId::Nbm,
         ];
         for model in enabled {
             assert!(
@@ -362,8 +372,6 @@ mod tests {
                 );
             }
         }
-        // A model with no plan (e.g. NBM) is explicitly unsupported.
-        assert!(!ingest_supported(ModelId::Nbm));
     }
 
     #[test]
@@ -597,7 +605,7 @@ mod tests {
     #[test]
     fn fetch_plan_rejects_unsupported_model() {
         use rustwx_core::ModelId;
-        let err = fetch_plan(ModelId::Nbm).expect_err("NBM has no fetch plan");
+        let err = fetch_plan(ModelId::Rtma).expect_err("RTMA has no ingest fetch plan");
         assert!(!err.is_cancelled());
         assert!(
             err.to_string().contains("no ingest fetch plan"),
