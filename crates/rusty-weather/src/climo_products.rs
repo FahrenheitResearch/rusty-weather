@@ -4,12 +4,17 @@
 //! against the FireWxAtlas ±7-day day-of-year percentile store
 //! (`rtma_climo` model, imported by `rw_climo_import`).
 //!
-//! Each product folds the run's stored hours into a day window (via the
-//! existing windowed lane), crops onto the climatology subgrid using the
-//! importer's recorded HRRR offsets, ranks every cell against the eight
-//! stored percentile anchors, and renders a [5..99] percentile-rank map.
-//! Missing climatology (wrong grid hash, absent DOY, absent store) blocks
-//! the product with a reason — never a silent weather-only substitute.
+//! Formula parity is BY CONSTRUCTION with the atlas's frozen
+//! `rtma_surface_formula_manifest_v2026_05_24`: hourly RH/VPD are computed
+//! from stored 2 m T/Td with the same Magnus/Bolton saturation vapor
+//! pressure, wind is `sqrt(u^2+v^2)`, the surface-HDW proxies are
+//! `vpd_kpa * wind` and `vpd_kpa * gust`, and the joint threshold-hours
+//! products count hours meeting RH<=15/20 % with gust>=25 mph or
+//! wind>=20 mph. Windows are true UTC calendar windows (`utc_00_23` and
+//! `utc_12_06_next_day`, the latter assigned to the 12Z start date), then
+//! each cell is ranked against the eight stored percentile anchors for
+//! that day-of-year. Missing climatology or insufficient window coverage
+//! blocks the product with a reason — never a weather-only substitute.
 
 use std::path::Path;
 use std::time::Instant;
@@ -26,10 +31,7 @@ use rustwx_render::{
 use rw_store::error::RwStoreError;
 use serde::Deserialize;
 
-use super::climo_rank::{
-    ANCHOR_LEVELS, dryness_rank, no_leap_doy, percentile_rank, valid_civil_date,
-};
-use super::windowed_store;
+use super::climo_rank::{dryness_rank, no_leap_doy, percentile_rank, valid_civil_date};
 use super::{RenderedProduct, StoreFieldSource, StoreRenderConfig, StoreRenderSkip};
 
 /// Store model the importer writes and this lane reads.
@@ -37,86 +39,162 @@ pub const CLIMO_MODEL: &str = "rtma_climo";
 const CLIMO_RUN_ENV: &str = "RUSTWX_CLIMO_RUN";
 const DEFAULT_CLIMO_RUN: &str = "seasonal_v2026_05_24";
 const ANCHOR_STATS: [&str; 8] = ["p05", "p10", "p25", "p50", "p75", "p90", "p95", "p99"];
+const MPH_TO_MS: f32 = 0.447_04;
+/// Minimum hourly samples for a usable day window (of 24) and overnight
+/// window (of 19) — mirrors the atlas's n_valid_hours tolerance.
+const MIN_DAY_HOURS: usize = 20;
+const MIN_OVERNIGHT_HOURS: usize = 16;
+
+/// Magnus/Bolton saturation vapor pressure in hPa (thermo_v1).
+fn saturation_vapor_pressure_hpa(t_c: f32) -> f32 {
+    6.112 * ((17.67 * t_c) / (t_c + 243.5)).exp()
+}
+
+/// RH % from T/Td, clipped to 0..100 (thermo_v1).
+fn relative_humidity_pct(t_c: f32, td_c: f32) -> f32 {
+    (100.0 * saturation_vapor_pressure_hpa(td_c) / saturation_vapor_pressure_hpa(t_c))
+        .clamp(0.0, 100.0)
+}
+
+/// VPD kPa from T/Td (thermo_v1).
+fn vapor_pressure_deficit_kpa(t_c: f32, td_c: f32) -> f32 {
+    ((saturation_vapor_pressure_hpa(t_c) - saturation_vapor_pressure_hpa(td_c)).max(0.0)) * 0.1
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClimoWindow {
+    /// 00-23Z of the target UTC date.
+    UtcDay,
+    /// 12Z target date through 06Z the next date, assigned to the start date.
+    Utc1206NextDay,
+}
+
+impl ClimoWindow {
+    fn store_name(self) -> &'static str {
+        match self {
+            Self::UtcDay => "utc_00_23",
+            Self::Utc1206NextDay => "utc_12_06_next_day",
+        }
+    }
+
+    fn min_hours(self) -> usize {
+        match self {
+            Self::UtcDay => MIN_DAY_HOURS,
+            Self::Utc1206NextDay => MIN_OVERNIGHT_HOURS,
+        }
+    }
+
+    fn full_hours(self) -> usize {
+        match self {
+            Self::UtcDay => 24,
+            Self::Utc1206NextDay => 19,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClimoProduct {
-    /// Day-max 2 m VPD vs `utc_00_23/max_vpd_2m_kpa`.
-    VpdDayMaxPercentile,
-    /// Day-min 2 m RH vs `utc_00_23/min_rh_2m_pct` (dryness rank: 99 = driest).
-    MinRhDayPercentile,
-    /// Day-max 10 m wind vs `utc_00_23/max_wind_10m_ms`.
-    WindDayMaxPercentile,
+    VpdDayMax,
+    MinRhDay,
+    WindDayMax,
+    GustDayMax,
+    HdwWindDay,
+    HdwGustDay,
+    HoursRh15Gust25,
+    HoursRh20Gust25,
+    HoursRh20Wind20,
+    OvernightRhRecovery,
 }
 
 pub const CLIMO_PRODUCTS: &[&str] = &[
     "vpd_day_max_percentile",
     "min_rh_day_percentile",
     "wind_day_max_percentile",
+    "gust_day_max_percentile",
+    "hdw_wind_day_percentile",
+    "hdw_gust_day_percentile",
+    "hours_rh15_gust25_percentile",
+    "hours_rh20_gust25_percentile",
+    "hours_rh20_wind20_percentile",
+    "overnight_rh_recovery_percentile",
+];
+
+const ALL_PRODUCTS: [ClimoProduct; 10] = [
+    ClimoProduct::VpdDayMax,
+    ClimoProduct::MinRhDay,
+    ClimoProduct::WindDayMax,
+    ClimoProduct::GustDayMax,
+    ClimoProduct::HdwWindDay,
+    ClimoProduct::HdwGustDay,
+    ClimoProduct::HoursRh15Gust25,
+    ClimoProduct::HoursRh20Gust25,
+    ClimoProduct::HoursRh20Wind20,
+    ClimoProduct::OvernightRhRecovery,
 ];
 
 impl ClimoProduct {
     pub fn parse(slug: &str) -> Option<Self> {
-        match slug {
-            "vpd_day_max_percentile" => Some(Self::VpdDayMaxPercentile),
-            "min_rh_day_percentile" => Some(Self::MinRhDayPercentile),
-            "wind_day_max_percentile" => Some(Self::WindDayMaxPercentile),
-            _ => None,
-        }
+        ALL_PRODUCTS
+            .iter()
+            .copied()
+            .find(|product| product.slug() == slug)
     }
 
     pub fn slug(self) -> &'static str {
         match self {
-            Self::VpdDayMaxPercentile => "vpd_day_max_percentile",
-            Self::MinRhDayPercentile => "min_rh_day_percentile",
-            Self::WindDayMaxPercentile => "wind_day_max_percentile",
+            Self::VpdDayMax => "vpd_day_max_percentile",
+            Self::MinRhDay => "min_rh_day_percentile",
+            Self::WindDayMax => "wind_day_max_percentile",
+            Self::GustDayMax => "gust_day_max_percentile",
+            Self::HdwWindDay => "hdw_wind_day_percentile",
+            Self::HdwGustDay => "hdw_gust_day_percentile",
+            Self::HoursRh15Gust25 => "hours_rh15_gust25_percentile",
+            Self::HoursRh20Gust25 => "hours_rh20_gust25_percentile",
+            Self::HoursRh20Wind20 => "hours_rh20_wind20_percentile",
+            Self::OvernightRhRecovery => "overnight_rh_recovery_percentile",
         }
     }
 
     pub fn title(self) -> &'static str {
         match self {
-            Self::VpdDayMaxPercentile => "Day-Max VPD Percentile vs 2019-2026 Climatology",
-            Self::MinRhDayPercentile => "Day-Min RH Dryness Percentile vs 2019-2026 Climatology",
-            Self::WindDayMaxPercentile => "Day-Max Wind Percentile vs 2019-2026 Climatology",
+            Self::VpdDayMax => "Day-Max VPD Percentile vs 2019-2026 Climatology",
+            Self::MinRhDay => "Day-Min RH Dryness Percentile vs 2019-2026 Climatology",
+            Self::WindDayMax => "Day-Max Wind Percentile vs 2019-2026 Climatology",
+            Self::GustDayMax => "Day-Max Gust Percentile vs 2019-2026 Climatology",
+            Self::HdwWindDay => "Day-Max Surface HDW (Wind) Percentile vs Climatology",
+            Self::HdwGustDay => "Day-Max Surface HDW (Gust) Percentile vs Climatology",
+            Self::HoursRh15Gust25 => "Hours RH<=15% & Gust>=25mph Percentile vs Climatology",
+            Self::HoursRh20Gust25 => "Hours RH<=20% & Gust>=25mph Percentile vs Climatology",
+            Self::HoursRh20Wind20 => "Hours RH<=20% & Wind>=20mph Percentile vs Climatology",
+            Self::OvernightRhRecovery => "Overnight RH Recovery Percentile (12Z-06Z) vs Climatology",
         }
     }
 
-    /// Windowed HRRR source slug feeding the rank.
-    fn windowed_slug(self) -> &'static str {
+    fn window(self) -> ClimoWindow {
         match self {
-            Self::VpdDayMaxPercentile => "2m_vpd_0_24h_max",
-            Self::MinRhDayPercentile => "2m_rh_0_24h_min",
-            Self::WindDayMaxPercentile => "10m_wind_0_24h_max",
+            Self::OvernightRhRecovery => ClimoWindow::Utc1206NextDay,
+            _ => ClimoWindow::UtcDay,
         }
     }
 
-    /// Climatology store product name (window fixed at utc_00_23 for v1).
+    /// Climatology store product name inside the window group.
     fn climo_product(self) -> &'static str {
         match self {
-            Self::VpdDayMaxPercentile => "max_vpd_2m_kpa",
-            Self::MinRhDayPercentile => "min_rh_2m_pct",
-            Self::WindDayMaxPercentile => "max_wind_10m_ms",
+            Self::VpdDayMax => "max_vpd_2m_kpa",
+            Self::MinRhDay | Self::OvernightRhRecovery => "min_rh_2m_pct",
+            Self::WindDayMax => "max_wind_10m_ms",
+            Self::GustDayMax => "max_gust_10m_ms",
+            Self::HdwWindDay => "max_surface_hdw_wind",
+            Self::HdwGustDay => "max_surface_hdw_gust",
+            Self::HoursRh15Gust25 => "hours_joint_rh15_gust25",
+            Self::HoursRh20Gust25 => "hours_joint_rh20_gust25",
+            Self::HoursRh20Wind20 => "hours_joint_rh20_wind20",
         }
     }
 
-    /// Low tail is the dangerous tail (minimum RH).
+    /// Low tail is the dangerous tail (minimum RH products).
     fn dryness(self) -> bool {
-        matches!(self, Self::MinRhDayPercentile)
-    }
-
-    /// Convert the windowed lane's display units to climatology units.
-    fn normalize(self, units: &str, value: f64) -> Result<f64, String> {
-        match (self, units) {
-            (Self::VpdDayMaxPercentile, "kPa") => Ok(value),
-            (Self::VpdDayMaxPercentile, "hPa") => Ok(value / 10.0),
-            (Self::MinRhDayPercentile, "%") => Ok(value),
-            (Self::WindDayMaxPercentile, "m/s") => Ok(value),
-            (Self::WindDayMaxPercentile, "kt" | "kts" | "knots") => Ok(value * 0.514_444),
-            (Self::WindDayMaxPercentile, "mph") => Ok(value * 0.447_04),
-            _ => Err(format!(
-                "windowed source units '{units}' are not convertible for {}",
-                self.slug()
-            )),
-        }
+        matches!(self, Self::MinRhDay | Self::OvernightRhRecovery)
     }
 
     fn scale(self) -> DiscreteColorScale {
@@ -161,8 +239,180 @@ fn climo_run_slug() -> String {
         .unwrap_or_else(|| DEFAULT_CLIMO_RUN.to_string())
 }
 
-/// Render the requested climatology-anomaly products for one run. `store`
-/// is the already-open HRRR hour (grid + projection provenance only).
+/// Everything one UTC-day fold produces, on the climatology subgrid.
+struct DayFold {
+    min_rh: Vec<f32>,
+    max_vpd: Vec<f32>,
+    max_wind: Vec<f32>,
+    max_gust: Vec<f32>,
+    max_hdw_wind: Vec<f32>,
+    max_hdw_gust: Vec<f32>,
+    hours_rh15_gust25: Vec<f32>,
+    hours_rh20_gust25: Vec<f32>,
+    hours_rh20_wind20: Vec<f32>,
+    hours_used: Vec<u16>,
+}
+
+impl DayFold {
+    fn values_for(&self, product: ClimoProduct) -> &[f32] {
+        match product {
+            ClimoProduct::VpdDayMax => &self.max_vpd,
+            ClimoProduct::MinRhDay | ClimoProduct::OvernightRhRecovery => &self.min_rh,
+            ClimoProduct::WindDayMax => &self.max_wind,
+            ClimoProduct::GustDayMax => &self.max_gust,
+            ClimoProduct::HdwWindDay => &self.max_hdw_wind,
+            ClimoProduct::HdwGustDay => &self.max_hdw_gust,
+            ClimoProduct::HoursRh15Gust25 => &self.hours_rh15_gust25,
+            ClimoProduct::HoursRh20Gust25 => &self.hours_rh20_gust25,
+            ClimoProduct::HoursRh20Wind20 => &self.hours_rh20_wind20,
+        }
+    }
+}
+
+/// Temperatures stored in Kelvin convert to Celsius; Celsius passes through.
+fn to_celsius(units: &str, values: &mut [f32]) {
+    let is_kelvin = units.trim().eq_ignore_ascii_case("k")
+        || units.to_ascii_lowercase().contains("kelvin");
+    if is_kelvin {
+        for value in values.iter_mut() {
+            *value -= 273.15;
+        }
+    }
+}
+
+/// The forecast hours of `stored_hours` whose valid times fall inside the
+/// window anchored at UTC date `(year, month, day)`.
+fn window_hours(
+    stored_hours: &[u16],
+    date_yyyymmdd: &str,
+    cycle_utc: u8,
+    target: (i32, u32, u32),
+    window: ClimoWindow,
+) -> Vec<u16> {
+    let mut hours = Vec::new();
+    for &hour in stored_hours {
+        let Ok(valid_date) = valid_civil_date(date_yyyymmdd, cycle_utc, hour) else {
+            continue;
+        };
+        let hod = (u32::from(cycle_utc) + u32::from(hour)) % 24;
+        let is_member = match window {
+            ClimoWindow::UtcDay => valid_date == target,
+            ClimoWindow::Utc1206NextDay => {
+                let next = next_civil_date(target);
+                (valid_date == target && hod >= 12) || (valid_date == next && hod <= 6)
+            }
+        };
+        if is_member {
+            hours.push(hour);
+        }
+    }
+    hours.sort_unstable();
+    hours
+}
+
+fn next_civil_date(date: (i32, u32, u32)) -> (i32, u32, u32) {
+    // Reuse the run-relative hour arithmetic: date + 24 hours.
+    let stamp = format!("{:04}{:02}{:02}", date.0, date.1, date.2);
+    valid_civil_date(&stamp, 0, 24).unwrap_or(date)
+}
+
+/// Fold one window's hourly fields (cropped to the subgrid) into the
+/// atlas-formula day products.
+#[allow(clippy::too_many_arguments)]
+fn fold_window(
+    store_root: &Path,
+    model_slug: &str,
+    run_slug: &str,
+    hours: &[u16],
+    meta: &ClimoGridMeta,
+    hrrr_nx: usize,
+) -> Result<DayFold, String> {
+    let plane = meta.ny * meta.nx;
+    let gust25 = 25.0 * MPH_TO_MS;
+    let wind20 = 20.0 * MPH_TO_MS;
+    let mut fold = DayFold {
+        min_rh: vec![f32::NAN; plane],
+        max_vpd: vec![f32::NAN; plane],
+        max_wind: vec![f32::NAN; plane],
+        max_gust: vec![f32::NAN; plane],
+        max_hdw_wind: vec![f32::NAN; plane],
+        max_hdw_gust: vec![f32::NAN; plane],
+        hours_rh15_gust25: vec![0.0; plane],
+        hours_rh20_gust25: vec![0.0; plane],
+        hours_rh20_wind20: vec![0.0; plane],
+        hours_used: Vec::new(),
+    };
+    let crop = |field: &rustwx_core::SelectedField2D| -> Vec<f32> {
+        let mut out = Vec::with_capacity(plane);
+        for row in 0..meta.ny {
+            let base = (meta.hrrr_row0 + row) * hrrr_nx + meta.hrrr_col0;
+            out.extend_from_slice(&field.values[base..base + meta.nx]);
+        }
+        out
+    };
+    for &hour in hours {
+        let source = StoreFieldSource::open(store_root, model_slug, run_slug, hour)
+            .map_err(|err| format!("open hour {hour}: {err}"))?;
+        let mut fetch = |name: &str| -> Result<(Vec<f32>, String), String> {
+            let field = source
+                .fetch_variable(name)
+                .map_err(|err| format!("hour {hour} variable {name}: {err}"))?;
+            Ok((crop(&field), field.units))
+        };
+        let (mut t, t_units) = fetch("temperature_2m")?;
+        let (mut td, td_units) = fetch("dewpoint_2m")?;
+        let (u, _) = fetch("u_10m")?;
+        let (v, _) = fetch("v_10m")?;
+        let (gust, _) = fetch("wind_gust_10m")?;
+        to_celsius(&t_units, &mut t);
+        to_celsius(&td_units, &mut td);
+        for cell in 0..plane {
+            let (t_c, td_c) = (t[cell], td[cell]);
+            if !t_c.is_finite() || !td_c.is_finite() {
+                continue;
+            }
+            let rh = relative_humidity_pct(t_c, td_c);
+            let vpd = vapor_pressure_deficit_kpa(t_c, td_c);
+            let wind = (u[cell] * u[cell] + v[cell] * v[cell]).sqrt();
+            let gust_ms = gust[cell];
+            let update_max = |slot: &mut f32, value: f32| {
+                if value.is_finite() && (!slot.is_finite() || value > *slot) {
+                    *slot = value;
+                }
+            };
+            let update_min = |slot: &mut f32, value: f32| {
+                if value.is_finite() && (!slot.is_finite() || value < *slot) {
+                    *slot = value;
+                }
+            };
+            update_min(&mut fold.min_rh[cell], rh);
+            update_max(&mut fold.max_vpd[cell], vpd);
+            update_max(&mut fold.max_wind[cell], wind);
+            update_max(&mut fold.max_gust[cell], gust_ms);
+            if wind.is_finite() {
+                update_max(&mut fold.max_hdw_wind[cell], vpd * wind);
+            }
+            if gust_ms.is_finite() {
+                update_max(&mut fold.max_hdw_gust[cell], vpd * gust_ms);
+            }
+            if gust_ms.is_finite() && gust_ms >= gust25 {
+                if rh <= 15.0 {
+                    fold.hours_rh15_gust25[cell] += 1.0;
+                }
+                if rh <= 20.0 {
+                    fold.hours_rh20_gust25[cell] += 1.0;
+                }
+            }
+            if wind.is_finite() && wind >= wind20 && rh <= 20.0 {
+                fold.hours_rh20_wind20[cell] += 1.0;
+            }
+        }
+        fold.hours_used.push(hour);
+    }
+    Ok(fold)
+}
+
+/// Render the requested climatology-anomaly products for one run.
 pub fn render_climo_products_from_store(
     config: &StoreRenderConfig,
     store_root: &Path,
@@ -182,17 +432,56 @@ pub fn render_climo_products_from_store(
         }
     }
 
-    // Window fold across the run's stored hours (anchored at the max hour).
-    let stored_hours = windowed_store::stored_run_hours(store_root, model_slug, run_slug)?;
+    let stored_hours =
+        super::windowed_store::stored_run_hours(store_root, model_slug, run_slug)?;
     let anchor_hour = stored_hours.iter().copied().max().unwrap_or(0);
-    let (year, month, day) =
-        valid_civil_date(&config.date_yyyymmdd, config.cycle_utc, anchor_hour)
-            .map_err(|err| format!("valid date: {err}"))?;
-    let doy = no_leap_doy(year, month, day);
+
+    // Target day: the latest UTC date with a usable 00-23Z window.
+    let mut target: Option<(i32, u32, u32)> = None;
+    let mut candidates: Vec<(i32, u32, u32)> = stored_hours
+        .iter()
+        .filter_map(|&hour| valid_civil_date(&config.date_yyyymmdd, config.cycle_utc, hour).ok())
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    for &candidate in candidates.iter().rev() {
+        let hours = window_hours(
+            &stored_hours,
+            &config.date_yyyymmdd,
+            config.cycle_utc,
+            candidate,
+            ClimoWindow::UtcDay,
+        );
+        if hours.len() >= MIN_DAY_HOURS {
+            target = Some(candidate);
+            break;
+        }
+    }
+    let Some(target) = target else {
+        return Ok(ClimoRenderOutcome {
+            rendered: Vec::new(),
+            skipped: products
+                .iter()
+                .map(|product| StoreRenderSkip {
+                    slug: product.slug().to_string(),
+                    reason: format!(
+                        "no UTC day has >= {MIN_DAY_HOURS} stored hours (run has {} hours)",
+                        stored_hours.len()
+                    ),
+                })
+                .chain(skipped)
+                .collect(),
+            anchor_hour,
+            doy: 0,
+        });
+    };
+    let doy = no_leap_doy(target.0, target.1, target.2);
 
     let climo_run = climo_run_slug();
     let climo_dir = store_root.join(CLIMO_MODEL).join(&climo_run);
-    let block_all = |products: &[ClimoProduct], reason: String| ClimoRenderOutcome {
+    let block_all = |products: &[ClimoProduct],
+                     skipped: Vec<StoreRenderSkip>,
+                     reason: String| ClimoRenderOutcome {
         rendered: Vec::new(),
         skipped: products
             .iter()
@@ -200,23 +489,26 @@ pub fn render_climo_products_from_store(
                 slug: product.slug().to_string(),
                 reason: reason.clone(),
             })
-            .chain(skipped.iter().cloned())
+            .chain(skipped)
             .collect(),
         anchor_hour,
         doy,
     };
     if products.is_empty() {
-        return Ok(block_all(&[], String::new()));
+        return Ok(ClimoRenderOutcome {
+            rendered: Vec::new(),
+            skipped,
+            anchor_hour,
+            doy,
+        });
     }
     let meta_text = match std::fs::read_to_string(climo_dir.join("climo_grid_meta.json")) {
         Ok(text) => text,
         Err(err) => {
             return Ok(block_all(
                 &products,
-                format!(
-                    "climatology store not available at {}: {err}",
-                    climo_dir.display()
-                ),
+                skipped,
+                format!("climatology store not available at {}: {err}", climo_dir.display()),
             ));
         }
     };
@@ -225,6 +517,7 @@ pub fn render_climo_products_from_store(
     if meta.schema != "cafire.rtma_climo_grid_meta.v1" {
         return Ok(block_all(
             &products,
+            skipped,
             format!("unsupported climo grid meta schema {}", meta.schema),
         ));
     }
@@ -234,12 +527,14 @@ pub fn render_climo_products_from_store(
     if hrrr_grid.hash != meta.hrrr_grid_hash {
         return Ok(block_all(
             &products,
+            skipped,
             "climatology was imported against a different HRRR grid".to_string(),
         ));
     }
     if doy < meta.doy_start || doy > meta.doy_end {
         return Ok(block_all(
             &products,
+            skipped,
             format!(
                 "DOY {doy} outside imported climatology range {}..{}",
                 meta.doy_start, meta.doy_end
@@ -248,21 +543,52 @@ pub fn render_climo_products_from_store(
     }
     let climo = match StoreFieldSource::open(store_root, CLIMO_MODEL, &climo_run, doy) {
         Ok(source) => source,
-        Err(err) => return Ok(block_all(&products, format!("open climo DOY {doy}: {err}"))),
+        Err(err) => {
+            return Ok(block_all(&products, skipped, format!("open climo DOY {doy}: {err}")));
+        }
     };
 
-    let requested_windowed: Vec<String> = products
-        .iter()
-        .map(|product| product.windowed_slug().to_string())
-        .collect();
-    let outcome = windowed_store::compute_windowed_products(
-        store_root,
-        model_slug,
-        run_slug,
-        &stored_hours,
-        &requested_windowed,
-    )?;
-    let blockers: Vec<(String, String)> = outcome.blockers;
+    // Fold each needed window once.
+    let mut day_fold: Option<DayFold> = None;
+    let mut night_fold: Option<DayFold> = None;
+    for window in [ClimoWindow::UtcDay, ClimoWindow::Utc1206NextDay] {
+        if !products.iter().any(|product| product.window() == window) {
+            continue;
+        }
+        let hours = window_hours(
+            &stored_hours,
+            &config.date_yyyymmdd,
+            config.cycle_utc,
+            target,
+            window,
+        );
+        if hours.len() < window.min_hours() {
+            let reason = format!(
+                "{} window has {}/{} stored hours",
+                window.store_name(),
+                hours.len(),
+                window.full_hours()
+            );
+            let blocked: Vec<ClimoProduct> = products
+                .iter()
+                .copied()
+                .filter(|product| product.window() == window)
+                .collect();
+            for product in &blocked {
+                skipped.push(StoreRenderSkip {
+                    slug: product.slug().to_string(),
+                    reason: reason.clone(),
+                });
+            }
+            products.retain(|product| product.window() != window);
+            continue;
+        }
+        let fold = fold_window(store_root, model_slug, run_slug, &hours, &meta, hrrr_grid.nx)?;
+        match window {
+            ClimoWindow::UtcDay => day_fold = Some(fold),
+            ClimoWindow::Utc1206NextDay => night_fold = Some(fold),
+        }
+    }
 
     // Shared render context on the climatology subgrid.
     let subgrid = climo.full_grid();
@@ -281,38 +607,24 @@ pub fn render_climo_products_from_store(
         config.domain.bounds,
         map_frame_aspect_ratio(config.output_width, config.output_height, true, true),
     )?;
-    let hrrr_nx = hrrr_grid.nx;
 
     let mut rendered = Vec::new();
     for product in products {
         let started = Instant::now();
-        let source_grid = match outcome
-            .grids
-            .iter()
-            .find(|grid| grid.slug == product.windowed_slug())
-        {
-            Some(grid) => grid,
-            None => {
-                let reason = blockers
-                    .iter()
-                    .find(|(slug, _)| slug == product.windowed_slug())
-                    .map(|(_, reason)| reason.clone())
-                    .unwrap_or_else(|| {
-                        format!("windowed source {} unavailable", product.windowed_slug())
-                    });
-                skipped.push(StoreRenderSkip {
-                    slug: product.slug().to_string(),
-                    reason,
-                });
-                continue;
-            }
+        let fold = match product.window() {
+            ClimoWindow::UtcDay => day_fold.as_ref(),
+            ClimoWindow::Utc1206NextDay => night_fold.as_ref(),
         };
+        let Some(fold) = fold else { continue };
 
-        // Anchor grids + sample count from the climatology hour.
         let mut anchors = Vec::with_capacity(ANCHOR_STATS.len());
         let mut anchor_error = None;
         for stat in ANCHOR_STATS {
-            let name = format!("climo__utc_00_23__{}__{stat}", product.climo_product());
+            let name = format!(
+                "climo__{}__{}__{stat}",
+                product.window().store_name(),
+                product.climo_product()
+            );
             match climo.derived_grid(&name) {
                 Ok(stored) => anchors.push(stored.values),
                 Err(RwStoreError::UnknownVariable(_)) => {
@@ -331,57 +643,36 @@ pub fn render_climo_products_from_store(
         }
         let sample_n = climo
             .derived_grid(&format!(
-                "climo__utc_00_23__{}__sample_count",
+                "climo__{}__{}__sample_count",
+                product.window().store_name(),
                 product.climo_product()
             ))
             .ok()
             .map(|stored| median_finite(&stored.values))
             .unwrap_or(f32::NAN);
 
-        // Crop the full-grid windowed values onto the subgrid and rank.
+        let source_values = fold.values_for(product);
         let mut ranks = vec![f32::NAN; ny * nx];
-        let mut unit_error = None;
-        for row in 0..ny {
-            let hrrr_base = (meta.hrrr_row0 + row) * hrrr_nx + meta.hrrr_col0;
-            for col in 0..nx {
-                let value = source_grid.values[hrrr_base + col];
-                if !value.is_finite() {
-                    continue;
-                }
-                let value = match product.normalize(&source_grid.units, value) {
-                    Ok(value) => value as f32,
-                    Err(err) => {
-                        unit_error = Some(err);
-                        break;
-                    }
-                };
-                let cell = row * nx + col;
-                let anchor_values = [
-                    anchors[0][cell],
-                    anchors[1][cell],
-                    anchors[2][cell],
-                    anchors[3][cell],
-                    anchors[4][cell],
-                    anchors[5][cell],
-                    anchors[6][cell],
-                    anchors[7][cell],
-                ];
-                ranks[cell] = if product.dryness() {
-                    dryness_rank(value, &anchor_values)
-                } else {
-                    percentile_rank(value, &anchor_values)
-                };
+        for cell in 0..ny * nx {
+            let value = source_values[cell];
+            if !value.is_finite() {
+                continue;
             }
-            if unit_error.is_some() {
-                break;
-            }
-        }
-        if let Some(reason) = unit_error {
-            skipped.push(StoreRenderSkip {
-                slug: product.slug().to_string(),
-                reason,
-            });
-            continue;
+            let anchor_values = [
+                anchors[0][cell],
+                anchors[1][cell],
+                anchors[2][cell],
+                anchors[3][cell],
+                anchors[4][cell],
+                anchors[5][cell],
+                anchors[6][cell],
+                anchors[7][cell],
+            ];
+            ranks[cell] = if product.dryness() {
+                dryness_rank(value, &anchor_values)
+            } else {
+                percentile_rank(value, &anchor_values)
+            };
         }
 
         let output_path = render_rank_map(
@@ -392,7 +683,7 @@ pub fn render_climo_products_from_store(
             product,
             ranks,
             anchor_hour,
-            source_grid,
+            fold,
             doy,
             sample_n,
         )?;
@@ -420,7 +711,7 @@ fn render_rank_map(
     product: ClimoProduct,
     ranks: Vec<f32>,
     anchor_hour: u16,
-    source_grid: &windowed_store::WindowedGrid,
+    fold: &DayFold,
     doy: u16,
     sample_n: f32,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
@@ -450,9 +741,9 @@ fn render_rank_map(
         String::new()
     };
     request.subtitle_right = Some(format!(
-        "+/-7d climo 19-26 | DOY {doy}{n_label} | F{:02}-F{:02}",
-        source_grid.hours_used.first().copied().unwrap_or(0),
-        source_grid.hours_used.last().copied().unwrap_or(anchor_hour),
+        "+/-7d climo 19-26 | DOY {doy}{n_label} | {}h {}",
+        fold.hours_used.len(),
+        product.window().store_name().replace("utc_", "").replace("_next_day", "z+"),
     ));
     request.cbar_tick_step = None;
     request.width = config.output_width;
@@ -480,13 +771,14 @@ fn render_rank_map(
             projection.as_ref(),
         )?;
     }
-    let output_path = config.out_dir.join(climo_output_filename(
-        config.model,
-        &config.date_yyyymmdd,
+    let output_path = config.out_dir.join(format!(
+        "rustwx_{}_{}_{}z_f{:03}_{}_{}.png",
+        config.model.as_str().replace('-', "_"),
+        config.date_yyyymmdd,
         config.cycle_utc,
         anchor_hour,
-        &config.domain,
-        product,
+        config.domain.slug,
+        product.slug(),
     ));
     save_png_profile_with_options(
         &request,
@@ -496,25 +788,6 @@ fn render_rank_map(
         },
     )?;
     Ok(output_path)
-}
-
-fn climo_output_filename(
-    model: ModelId,
-    date_yyyymmdd: &str,
-    cycle_utc: u8,
-    hour: u16,
-    domain: &DomainSpec,
-    product: ClimoProduct,
-) -> String {
-    format!(
-        "rustwx_{}_{}_{}z_f{:03}_{}_{}.png",
-        model.as_str().replace('-', "_"),
-        date_yyyymmdd,
-        cycle_utc,
-        hour,
-        domain.slug,
-        product.slug(),
-    )
 }
 
 fn median_finite(values: &[f32]) -> f32 {
@@ -572,7 +845,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slugs_round_trip() {
+    fn thermo_matches_the_frozen_atlas_formulas() {
+        // Magnus/Bolton spot values, hand-computed.
+        assert!((saturation_vapor_pressure_hpa(20.0) - 23.37).abs() < 0.05);
+        assert!((saturation_vapor_pressure_hpa(0.0) - 6.112).abs() < 1e-3);
+        // T=30C, Td=10C: e_s=42.4x hPa, e_d=12.27 hPa -> VPD ~3.02 kPa.
+        let vpd = vapor_pressure_deficit_kpa(30.0, 10.0);
+        assert!((vpd - 3.02).abs() < 0.02, "vpd {vpd}");
+        let rh = relative_humidity_pct(30.0, 10.0);
+        assert!((rh - 28.9).abs() < 0.5, "rh {rh}");
+        // Saturated inputs sit at ~100 (f32 rounding); supersaturated clip exactly.
+        assert!(relative_humidity_pct(10.0, 10.0) > 99.99);
+        assert_eq!(relative_humidity_pct(10.0, 12.0), 100.0);
+        assert_eq!(vapor_pressure_deficit_kpa(10.0, 12.0), 0.0);
+    }
+
+    #[test]
+    fn slugs_round_trip_for_all_ten_products() {
+        assert_eq!(CLIMO_PRODUCTS.len(), 10);
         for slug in CLIMO_PRODUCTS {
             let product = ClimoProduct::parse(slug).expect(slug);
             assert_eq!(product.slug(), *slug);
@@ -581,29 +871,52 @@ mod tests {
     }
 
     #[test]
-    fn unit_normalization_covers_the_windowed_display_units() {
-        let vpd = ClimoProduct::VpdDayMaxPercentile;
-        assert_eq!(vpd.normalize("kPa", 2.0).unwrap(), 2.0);
-        assert!((vpd.normalize("hPa", 20.0).unwrap() - 2.0).abs() < 1e-12);
-        assert!(vpd.normalize("%", 20.0).is_err());
-        let wind = ClimoProduct::WindDayMaxPercentile;
-        assert!((wind.normalize("kt", 10.0).unwrap() - 5.14444).abs() < 1e-4);
-        assert_eq!(wind.normalize("m/s", 12.0).unwrap(), 12.0);
-        let rh = ClimoProduct::MinRhDayPercentile;
-        assert_eq!(rh.normalize("%", 15.0).unwrap(), 15.0);
+    fn day_window_selects_the_utc_calendar_day() {
+        let stored: Vec<u16> = (0..=30).collect();
+        // 00z run on 2026-07-01: the Jul 1 day window is F00..F23.
+        let hours = window_hours(&stored, "20260701", 0, (2026, 7, 1), ClimoWindow::UtcDay);
+        assert_eq!(hours, (0..=23).collect::<Vec<u16>>());
+        // 12z run: Jul 1 window is F00..F11 (12Z-23Z of Jul 1).
+        let hours = window_hours(&stored, "20260701", 12, (2026, 7, 1), ClimoWindow::UtcDay);
+        assert_eq!(hours, (0..=11).collect::<Vec<u16>>());
     }
 
     #[test]
-    fn percentile_scale_bins_cover_the_full_rank_range() {
-        for product in [
-            ClimoProduct::VpdDayMaxPercentile,
-            ClimoProduct::MinRhDayPercentile,
-            ClimoProduct::WindDayMaxPercentile,
-        ] {
-            let scale = product.scale();
-            assert_eq!(scale.levels.len(), scale.colors.len() + 1);
-            assert!(scale.levels.first().copied().unwrap() <= ANCHOR_LEVELS[0] as f64);
-            assert!(scale.levels.last().copied().unwrap() > ANCHOR_LEVELS[7] as f64);
-        }
+    fn overnight_window_spans_12z_to_06z_next_day() {
+        let stored: Vec<u16> = (0..=30).collect();
+        let hours = window_hours(
+            &stored,
+            "20260701",
+            0,
+            (2026, 7, 1),
+            ClimoWindow::Utc1206NextDay,
+        );
+        assert_eq!(hours, (12..=30).collect::<Vec<u16>>(), "F12..F30 = 12Z Jul1 .. 06Z Jul2");
+        // Month rollover: overnight window anchored on Jul 31.
+        let hours = window_hours(
+            &(0..=48).collect::<Vec<u16>>(),
+            "20260731",
+            0,
+            (2026, 7, 31),
+            ClimoWindow::Utc1206NextDay,
+        );
+        assert_eq!(hours.first(), Some(&12));
+        assert_eq!(hours.last(), Some(&30));
+    }
+
+    #[test]
+    fn kelvin_fields_convert_to_celsius() {
+        let mut values = vec![300.15, f32::NAN];
+        to_celsius("K", &mut values);
+        assert!((values[0] - 27.0).abs() < 1e-3);
+        let mut celsius = vec![27.0];
+        to_celsius("degC", &mut celsius);
+        assert_eq!(celsius[0], 27.0);
+    }
+
+    #[test]
+    fn joint_thresholds_use_mph_converted_to_ms() {
+        assert!((25.0 * MPH_TO_MS - 11.176).abs() < 1e-3);
+        assert!((20.0 * MPH_TO_MS - 8.9408).abs() < 1e-3);
     }
 }
