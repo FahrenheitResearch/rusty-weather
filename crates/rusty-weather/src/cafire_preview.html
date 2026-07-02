@@ -475,7 +475,24 @@ const FAMS = {
   meteogram: { label: "Meteogram", hourly: false, products: [] },
   custom: { label: "Custom Chart", hourly: false, products: [] },
   daily: { label: "Outlook Cards", hourly: false, products: [] },
-  ecape: { label: "PyroCb / ECAPE", hourly: false, products: [] },
+  ecape: { label: "ECAPE · heavy node", hourly: true, products: [
+    ["muecape", "MUECAPE (most-unstable)"],
+    ["mlecape", "MLECAPE (mixed-layer)"],
+    ["sbecape", "SBECAPE (surface-based)"],
+    ["mlecin", "MLECIN"],
+    ["sbecin", "SBECIN"],
+    ["sbncape", "SB NCAPE"],
+    ["mu_ecape_native_cape_ratio", "MU entrainment ratio"],
+    ["ml_ecape_native_cape_ratio", "ML entrainment ratio"],
+    ["sb_ecape_native_cape_ratio", "SB entrainment ratio"],
+    ["mu_ecape_derived_cape_ratio", "MU ratio (derived CAPE)"],
+    ["ml_ecape_derived_cape_ratio", "ML ratio (derived CAPE)"],
+    ["sb_ecape_derived_cape_ratio", "SB ratio (derived CAPE)"],
+    ["ecape_scp", "ECAPE-weighted SCP"],
+    ["ecape_stp", "ECAPE-weighted STP"],
+    ["ecape_ehi_0_1km", "ECAPE-EHI 0–1 km"],
+    ["ecape_ehi_0_3km", "ECAPE-EHI 0–3 km"],
+  ] },
 };
 const STATS = [
   ["p50", "P50 — typical day"], ["p75", "P75"], ["p90", "P90 — big day"],
@@ -496,9 +513,10 @@ const RIBBONS = {
   daily: `<b>Shareable outlook cards</b> — colored number strips, wind + precip rows, bars. Daily
     columns for NBM/GFS (8–10 days) or hourly/3-h/6-h columns for HRRR. Any variable, any point —
     copy the link or save the image and post it.`,
-  ecape: `<b>Entrainment CAPE suite</b> — computed on the CWT heavy-compute node (full HRRR volumes +
-    the ECAPE kernels are too expensive for the serving box) and pushed here each run. The
-    pyroCb-relevant signal: how much CAPE survives entrainment.`,
+  ecape: `<b>Entrainment CAPE suite</b> — rendered live on the CWT 24-core compute node (full HRRR
+    volumes; too heavy for the serving box) through a secure tunnel. Full features: any hour, any
+    domain, draw-a-box, fire framing. The pyroCb-relevant signal is how much CAPE survives
+    entrainment — dedicated pyroCb products (PFT, fire-modified parcels) are the next lane.`,
 };
 let state = {
   fam: "anomaly", product: ANOMALY[0][0], hour: 6, density: 3,
@@ -600,7 +618,6 @@ function selectFam(key) {
   ribbon.classList.toggle("show", key in RIBBONS);
   if (key in RIBBONS) ribbon.innerHTML = RIBBONS[key];
   buildProducts();
-  if (key === "ecape") { loadEcape(); updateHourNav(); return; }
   if (key === "meteogram" || key === "custom" || key === "daily") { setMapMode("point"); renderCurrent(); }
   else {
     if (mapMode === "point") setMapMode("view");
@@ -823,31 +840,9 @@ $("dailyStep").addEventListener("click", ev => {
   renderCurrent();
 });
 
-/* ---------- ECAPE gallery (node-pushed) ---------- */
-let ecapeManifest = null;
-async function loadEcape() {
-  try {
-    ecapeManifest = await fetch("/api/ecape/latest.json").then(r => r.json());
-    const list = $("productList");
-    list.innerHTML = "";
-    (ecapeManifest.files || []).forEach(file => {
-      const name = file.replace(/^rustwx_[a-z]+_[0-9_z]+_f\d+_[a-z0-9_]+?_((sb|ml|mu)?ecape.*|.*)\.webp$/, "$1")
-        .replace(/^rustwx.*_california_/, "").replace(/\.webp$/, "");
-      const hour = (file.match(/_f(\d+)_/) || [])[1] || "";
-      const b = document.createElement("button");
-      b.className = "product-item";
-      b.dataset.slug = file;
-      b.innerHTML = `<span>${name.replace(/_/g, " ")}</span><small>F${hour}</small>`;
-      b.onclick = () => {
-        [...list.children].forEach(x => x.classList.toggle("on", x === b));
-        showImage(`/api/ecape/${ecapeManifest.run}/${file}`, name.replace(/_/g, " "), ecapeManifest.run, null);
-      };
-      list.appendChild(b);
-    });
-    $("productBox").classList.add("show");
-    if (list.firstChild) list.firstChild.click();
-  } catch { log("ECAPE feed unavailable", "err"); }
-}
+/* ECAPE renders route to the heavy-compute node through /node (reverse
+   tunnel) — same request shape, different backend. */
+function apiBase() { return state.fam === "ecape" ? "/node" : ""; }
 
 function climoSlug() {
   const base = $("refProduct").value;
@@ -957,11 +952,11 @@ async function requestPlot(productSlug, hour, quiet) {
     output_width: 1800, ...domainPayload(),
   };
   if (state.fire) payload.title_note = `${state.fire.name} Fire`;
-  const started = await fetch("/api/render", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }).then(r => r.json());
+  const started = await fetch(apiBase() + "/api/render", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }).then(r => r.json());
   if (started.error) throw new Error(started.error);
   if (!quiet) log(`job ${started.id} (${started.cache})`, started.cache === "hit" ? "ok" : "");
   for (;;) {
-    const job = await fetch(started.status_url).then(r => r.json());
+    const job = await fetch(apiBase() + started.status_url).then(r => r.json());
     if (job.state === "succeeded") return job;
     if (job.state === "failed") throw new Error(job.message || "render failed");
     await new Promise(r => setTimeout(r, 550));
@@ -1025,7 +1020,7 @@ async function renderCurrent() {
     const file = (job.files || [])[0];
     if (!file) throw new Error("no output file");
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
-    showImage(file.url, productLabel(), currentRun(), file);
+    showImage(apiBase() + file.url, productLabel(), currentRun(), file);
     log(`${productLabel()} · ${secs}s`, "ok");
     prefetchNeighbors(slug, hour);
   } catch (err) {
