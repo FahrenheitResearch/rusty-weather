@@ -48,12 +48,12 @@ button, input, select { font: inherit; }
 a { color: inherit; }
 button { color: inherit; cursor: pointer; }
 
-/* ---------- header (CWT chrome) ---------- */
-.site-header { position: sticky; top: 0; z-index: 60; backdrop-filter: blur(14px); background: rgba(9, 11, 12, 0.82); border-bottom: 1px solid var(--line); }
-.header-inner { max-width: 1460px; margin: 0 auto; padding: 12px 22px; display: flex; align-items: center; gap: 22px; }
+/* ---------- header ---------- */
+.site-header { position: sticky; top: 0; z-index: 1200; backdrop-filter: blur(14px); background: rgba(9, 11, 12, 0.82); border-bottom: 1px solid var(--line); }
+.header-inner { max-width: 1560px; margin: 0 auto; padding: 12px 22px; display: flex; align-items: center; gap: 22px; }
 .brand { display: flex; align-items: center; gap: 12px; text-decoration: none; }
 .brand-mark { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px; background: var(--orange-soft); }
-.brand-mark svg { width: 26px; height: 26px; stroke: var(--orange-bright); }
+.brand-mark svg { width: 26px; height: 26px; stroke: var(--orange-bright); fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .brand-mark svg .brand-mark-cut { stroke: var(--yellow); }
 .brand-copy { display: flex; flex-direction: column; line-height: 1.12; }
 .brand-copy strong { font-size: 16px; letter-spacing: 0.02em; }
@@ -66,98 +66,87 @@ button { color: inherit; cursor: pointer; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px var(--green); }
 .dot.bad { background: var(--red); box-shadow: 0 0 10px var(--red); }
 
-/* ---------- intro ---------- */
-.page-intro { max-width: 1460px; margin: 26px auto 4px; padding: 0 22px; display: flex; align-items: end; justify-content: space-between; gap: 18px; flex-wrap: wrap; }
-.eyebrow { display: flex; align-items: center; gap: 9px; font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
-.eyebrow span { width: 22px; height: 2px; background: var(--orange); display: inline-block; }
-.page-intro h1 { margin: 8px 0 6px; font-size: clamp(26px, 3.4vw, 38px); letter-spacing: -0.01em; }
-.page-intro p { margin: 0; color: var(--muted); max-width: 62ch; font-size: 14.5px; }
-.preview-tag { font-size: 11.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--yellow); border: 1px solid rgba(255, 212, 86, 0.35); background: rgba(255, 212, 86, 0.08); padding: 6px 12px; border-radius: 999px; white-space: nowrap; }
-
-/* ---------- workspace ---------- */
-.workspace { max-width: 1460px; margin: 18px auto 60px; padding: 0 22px; display: grid; grid-template-columns: 384px 1fr; gap: 18px; align-items: start; }
+/* ---------- layout ---------- */
+.workspace { max-width: 1560px; margin: 16px auto 60px; padding: 0 22px; display: grid; grid-template-columns: 318px 1fr; gap: 16px; align-items: start; }
 @media (max-width: 1020px) { .workspace { grid-template-columns: 1fr; } }
 .panel { background: linear-gradient(180deg, var(--panel-2), var(--panel)); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
-.control-panel { padding: 18px; display: flex; flex-direction: column; gap: 16px; position: sticky; top: 76px; max-height: calc(100vh - 96px); overflow: auto; }
-.panel-heading { display: flex; justify-content: space-between; align-items: start; }
+.sidebar { padding: 16px; display: flex; flex-direction: column; gap: 14px; position: sticky; top: 72px; max-height: calc(100vh - 90px); overflow: auto; }
 .section-kicker { font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--orange-bright); }
-.panel-heading h2 { margin: 3px 0 0; font-size: 18px; }
-.field-label { display: block; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 7px; }
+.sidebar h2 { margin: 3px 0 0; font-size: 17px; }
+.field-label { display: block; font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
 .select-wrap { position: relative; }
-.select-wrap select { width: 100%; appearance: none; background: var(--panel-3); color: var(--text); border: 1px solid var(--line-strong); border-radius: var(--radius-sm); padding: 10px 34px 10px 12px; font-size: 14px; }
-.select-wrap svg { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; stroke: var(--muted); pointer-events: none; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.run-note { font-size: 12px; color: var(--muted-2); margin-top: 6px; }
+.select-wrap select { width: 100%; appearance: none; background: var(--panel-3); color: var(--text); border: 1px solid var(--line-strong); border-radius: var(--radius-sm); padding: 9px 32px 9px 11px; font-size: 13.5px; }
+.select-wrap svg { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); width: 15px; height: 15px; stroke: var(--muted); pointer-events: none; fill: none; stroke-width: 1.8; stroke-linecap: round; }
+.run-note { font-size: 11.5px; color: var(--muted-2); margin-top: 5px; line-height: 1.4; }
 
-.fam-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
-.fam-chip { text-align: left; background: var(--panel-3); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 9px 11px; display: flex; flex-direction: column; gap: 2px; }
-.fam-chip strong { font-size: 13px; font-weight: 600; }
-.fam-chip small { font-size: 11px; color: var(--muted-2); }
-.fam-chip:hover { border-color: var(--line-strong); }
-.fam-chip.on { background: var(--orange-soft); border-color: rgba(255, 91, 36, 0.45); }
-.fam-chip.on strong { color: var(--orange-bright); }
+.fam-tabs { display: flex; flex-wrap: wrap; gap: 5px; }
+.fam-tab { background: var(--panel-3); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; font-size: 12.5px; color: var(--muted); }
+.fam-tab.on { background: var(--orange-soft); border-color: rgba(255, 91, 36, 0.45); color: var(--orange-bright); font-weight: 600; }
+
+.product-list { display: flex; flex-direction: column; gap: 3px; max-height: 340px; overflow: auto; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--bg-soft); padding: 5px; }
+.product-item { text-align: left; border: 0; background: transparent; border-radius: 8px; padding: 7px 10px; font-size: 13px; color: var(--muted); display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+.product-item:hover { background: var(--panel-3); color: var(--text); }
+.product-item.on { background: var(--orange-soft); color: var(--orange-bright); font-weight: 600; }
+.product-item small { color: var(--muted-2); font-size: 10.5px; }
+
+.mini-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.mini-grid label { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
+.mini-grid input, .mini-grid select { background: var(--panel-3); border: 1px solid var(--line-strong); color: var(--text); border-radius: 9px; padding: 7px 9px; font-size: 13px; width: 100%; }
+.mg-panels { display: flex; flex-wrap: wrap; gap: 4px 11px; }
+.mg-panels label { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
+.hint { font-size: 11.5px; color: var(--muted-2); line-height: 1.45; }
+.side-box { display: none; flex-direction: column; gap: 8px; }
+.side-box.show { display: flex; }
 
 .segmented { display: flex; background: var(--panel-3); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 3px; gap: 3px; }
-.segmented button { flex: 1; border: 0; background: transparent; border-radius: 8px; padding: 7px 4px; font-size: 12.5px; color: var(--muted); }
+.segmented button { flex: 1; border: 0; background: transparent; border-radius: 8px; padding: 6px 4px; font-size: 12px; color: var(--muted); }
 .segmented button.selected { background: var(--panel); color: var(--text); box-shadow: 0 1px 6px rgba(0,0,0,0.4); }
 
-.hours { display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; }
-.hourbtn { background: var(--panel-3); border: 1px solid var(--line); border-radius: 8px; padding: 6px 0; font-size: 11.5px; color: var(--muted); }
-.hourbtn.on { background: var(--orange-soft); border-color: rgba(255, 91, 36, 0.45); color: var(--orange-bright); font-weight: 600; }
-.hours.dim { opacity: 0.35; pointer-events: none; }
-.hours-note { font-size: 11.5px; color: var(--muted-2); margin-top: 6px; }
-
-.mg-box, .climo-box { display: none; flex-direction: column; gap: 9px; }
-.mg-box.show, .climo-box.show { display: flex; }
-.mini-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
-.mini-grid label, .mg-panels label { font-size: 12.5px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; }
-.mini-grid input, .mini-grid select { background: var(--panel-3); border: 1px solid var(--line-strong); color: var(--text); border-radius: 9px; padding: 8px 10px; font-size: 13.5px; width: 100%; }
-.mg-panels { display: flex; flex-wrap: wrap; gap: 5px 12px; }
-.mg-panels label { flex-direction: row; align-items: center; gap: 6px; font-size: 12.5px; }
-.hint { font-size: 12px; color: var(--muted-2); line-height: 1.45; }
-
-.render-btn { border: 0; border-radius: var(--radius-sm); padding: 13px; font-size: 15px; font-weight: 650; letter-spacing: 0.02em; background: linear-gradient(180deg, var(--orange-bright), var(--orange)); color: #160904; box-shadow: 0 10px 30px rgba(255, 91, 36, 0.28); }
-.render-btn:hover { filter: brightness(1.07); }
-.render-btn:disabled { filter: grayscale(0.6) brightness(0.75); cursor: wait; }
-.console { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 11.5px; color: var(--muted-2); background: var(--bg-soft); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px 12px; max-height: 120px; overflow: auto; display: flex; flex-direction: column-reverse; gap: 3px; }
+.console { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 11px; color: var(--muted-2); background: var(--bg-soft); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 9px 11px; max-height: 104px; overflow: auto; display: flex; flex-direction: column-reverse; gap: 3px; }
 .console .ok { color: var(--green); } .console .err { color: var(--red); }
 
-/* ---------- stage ---------- */
-.stage { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
-.map-card { padding: 0; overflow: hidden; }
-.map-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
-.map-head h2 { margin: 0; font-size: 15.5px; }
+/* ---------- viewer ---------- */
+.main-col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.viewer-card { padding: 0; overflow: hidden; }
+.viewer-bar { display: flex; align-items: center; gap: 12px; padding: 11px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.viewer-bar h2 { margin: 0; font-size: 15px; font-weight: 650; }
+.viewer-bar .prov { font-size: 12px; color: var(--muted-2); }
+.hour-nav { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+.hour-nav button { background: var(--panel-3); border: 1px solid var(--line-strong); border-radius: 9px; padding: 6px 12px; font-size: 13px; color: var(--text); }
+.hour-nav button:hover { border-color: rgba(255,91,36,0.5); }
+.hour-nav button:disabled { opacity: 0.35; cursor: default; }
+.hour-nav .hour-label { min-width: 58px; text-align: center; font-size: 13.5px; font-weight: 650; color: var(--orange-bright); font-variant-numeric: tabular-nums; }
+.hour-nav .play.on { background: var(--orange-soft); color: var(--orange-bright); border-color: rgba(255,91,36,0.5); }
+.viewport { position: relative; background: #0c0f10; min-height: 420px; display: grid; place-items: center; overflow: hidden; }
+.viewport img { max-width: 100%; max-height: calc(100vh - 210px); display: block; background: #f4f1ea; transform-origin: 0 0; }
+.viewport img.zoomed { max-width: none; max-height: none; cursor: grab; position: absolute; top: 0; left: 0; }
+.viewport img.zoomed.grabbing { cursor: grabbing; }
+.viewport .placeholder { color: var(--muted-2); text-align: center; padding: 90px 20px; font-size: 14px; }
+.viewport .placeholder .flame { font-size: 30px; color: var(--orange); opacity: 0.6; margin-bottom: 10px; }
+.spin { position: absolute; top: 12px; right: 14px; z-index: 5; display: none; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); background: rgba(9,11,12,0.85); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; }
+.spin.show { display: flex; }
+.spin::before { content: ""; width: 11px; height: 11px; border-radius: 50%; border: 2px solid var(--orange); border-top-color: transparent; animation: whirl 0.8s linear infinite; }
+@keyframes whirl { to { transform: rotate(360deg); } }
+.viewer-foot { display: flex; align-items: center; gap: 14px; padding: 8px 16px; border-top: 1px solid var(--line); font-size: 11.5px; color: var(--muted-2); flex-wrap: wrap; }
+.viewer-foot .zoom-hint { margin-left: auto; }
+
+.ribbon { display: none; background: linear-gradient(180deg, rgba(255,91,36,0.10), rgba(255,91,36,0.04)); border: 1px solid rgba(255, 91, 36, 0.25); border-radius: var(--radius); padding: 12px 16px; font-size: 12.5px; color: var(--muted); line-height: 1.55; }
+.ribbon.show { display: block; }
+.ribbon b { color: var(--orange-bright); }
+.ribbon code { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; color: var(--text); }
+
+/* ---------- map card ---------- */
+.map-card { padding: 0; overflow: hidden; position: relative; z-index: 0; }
+.map-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.map-head h2 { margin: 0; font-size: 14.5px; }
 .map-head .tools { display: flex; gap: 6px; flex-wrap: wrap; }
-.tool-btn { background: var(--panel-3); border: 1px solid var(--line); border-radius: 999px; padding: 7px 13px; font-size: 12.5px; color: var(--muted); }
+.tool-btn { background: var(--panel-3); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; font-size: 12px; color: var(--muted); }
 .tool-btn.on { background: var(--orange-soft); color: var(--orange-bright); border-color: rgba(255,91,36,0.45); }
-#map { height: 340px; background: #0c0f10; cursor: crosshair; }
-.map-foot { padding: 9px 16px; font-size: 12px; color: var(--muted-2); border-top: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+#map { height: 300px; background: #0c0f10; position: relative; z-index: 0; }
+.map-foot { padding: 8px 16px; font-size: 11.5px; color: var(--muted-2); border-top: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .leaflet-container { font-family: var(--font); }
 .leaflet-control-attribution { background: rgba(9,11,12,0.7) !important; color: var(--muted-2) !important; }
 .leaflet-control-attribution a { color: var(--muted) !important; }
-
-.ribbon { display: none; background: linear-gradient(180deg, rgba(255,91,36,0.10), rgba(255,91,36,0.04)); border: 1px solid rgba(255, 91, 36, 0.25); border-radius: var(--radius); padding: 13px 17px; font-size: 13px; color: var(--muted); line-height: 1.55; }
-.ribbon.show { display: block; }
-.ribbon b { color: var(--orange-bright); }
-.ribbon code { font-family: ui-monospace, Consolas, monospace; font-size: 12px; color: var(--text); }
-
-.gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); animation: rise 0.45s both; }
-@keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
-.card img { display: block; width: 100%; cursor: zoom-in; background: #f4f1ea; }
-.card .cap { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 9px 13px; font-size: 12.5px; }
-.card .cap b { font-weight: 600; text-transform: capitalize; }
-.card .cap span { color: var(--muted-2); font-size: 11.5px; white-space: nowrap; }
-.empty { border: 1px dashed var(--line-strong); border-radius: var(--radius); padding: 70px 20px; text-align: center; color: var(--muted-2); }
-.empty .flame { font-size: 30px; color: var(--orange); opacity: 0.6; margin-bottom: 10px; }
-
-/* ---------- lightbox ---------- */
-.box { position: fixed; inset: 0; z-index: 100; display: none; background: rgba(5, 6, 7, 0.94); }
-.box.show { display: block; }
-.box img { position: absolute; top: 0; left: 0; transform-origin: 0 0; cursor: grab; user-select: none; max-width: none; background: #f4f1ea; }
-.box img.grabbing { cursor: grabbing; }
-.box-bar { position: absolute; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 14px; padding: 12px 18px; background: rgba(9, 11, 12, 0.9); border-top: 1px solid var(--line); font-size: 12.5px; color: var(--muted); z-index: 5; }
-.box-bar b { color: var(--text); font-weight: 600; }
-.box-btn { background: var(--panel-3); border: 1px solid var(--line-strong); color: var(--text); border-radius: 8px; padding: 6px 12px; font-size: 12.5px; }
 </style>
 </head>
 <body>
@@ -184,182 +173,232 @@ button { color: inherit; cursor: pointer; }
   </div>
 </header>
 
-<main>
-  <section class="page-intro">
+<main class="workspace">
+  <aside class="sidebar panel" aria-label="Product controls">
+    <div><span class="section-kicker">Fire Weather Lab</span><h2>Products</h2></div>
+
     <div>
-      <div class="eyebrow"><span></span> Weather</div>
-      <h1>Fire Weather Lab</h1>
-      <p>HRRR forecasts ranked against seven years of RTMA analyses — anomaly percentiles, all-time records,
-        fuels, and point meteograms. Rendered on demand for any domain you draw.</p>
+      <span class="field-label">Model run</span>
+      <div class="select-wrap">
+        <select id="runSelect"><option value="latest">Latest complete run</option></select>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 10 4 4 4-4"/></svg>
+      </div>
+      <div class="run-note" id="runNote">checking runs…</div>
     </div>
-    <div class="preview-tag">Preview — feedback welcome</div>
-  </section>
 
-  <section class="workspace">
-    <aside class="control-panel panel" aria-label="Product controls">
-      <div class="panel-heading">
-        <div><span class="section-kicker">Controls</span><h2>Build a view</h2></div>
+    <div>
+      <span class="field-label">Family</span>
+      <div class="fam-tabs" id="fams"></div>
+    </div>
+
+    <div class="side-box show" id="productBox">
+      <span class="field-label">Product</span>
+      <div class="product-list" id="productList"></div>
+    </div>
+
+    <div class="side-box" id="climoBox">
+      <div class="mini-grid">
+        <label>product
+          <select id="refProduct">
+            <option value="vpd_day_max" selected>day-max VPD</option>
+            <option value="min_rh_day">day-min RH</option>
+            <option value="wind_day_max">day-max wind</option>
+            <option value="gust_day_max">day-max gust</option>
+            <option value="hdw_wind_day">HDW (wind)</option>
+            <option value="hdw_gust_day">HDW (gust)</option>
+            <option value="hours_rh15_gust25">hrs RH≤15 &amp; gust≥25</option>
+            <option value="hours_rh20_gust25">hrs RH≤20 &amp; gust≥25</option>
+            <option value="hours_rh20_wind20">hrs RH≤20 &amp; wind≥20</option>
+            <option value="overnight_rh_recovery">overnight min RH</option>
+          </select>
+        </label>
+        <label>date <input id="refDate" type="date"></label>
       </div>
+      <span class="field-label">Statistic</span>
+      <div class="product-list" id="statList"></div>
+    </div>
 
-      <div>
-        <span class="field-label">Model run</span>
-        <div class="select-wrap">
-          <select id="runSelect"><option value="latest">Latest complete run</option></select>
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 10 4 4 4-4"/></svg>
-        </div>
-        <div class="run-note" id="runNote">checking runs…</div>
+    <div class="side-box" id="meteoBox">
+      <div class="mini-grid">
+        <label>lat <input id="mgLat" type="number" step="0.0001" value="38.5816"></label>
+        <label>lon <input id="mgLon" type="number" step="0.0001" value="-121.4944"></label>
       </div>
-
-      <div>
-        <span class="field-label">Product family</span>
-        <div class="fam-grid" id="fams">
-          <button class="fam-chip on" data-fam="anomaly"><strong>Anomaly vs Climo</strong><small>vs this date, ±7d</small></button>
-          <button class="fam-chip" data-fam="record"><strong>vs All-Time Record</strong><small>vs every day 2019–26</small></button>
-          <button class="fam-chip" data-fam="core"><strong>Fire Wx Core</strong><small>VPD · HDW · wind · RH</small></button>
-          <button class="fam-chip" data-fam="fuels"><strong>Fuels</strong><small>ERC · moisture · KBDI</small></button>
-          <button class="fam-chip" data-fam="smoke"><strong>Smoke</strong><small>HRRR-Smoke</small></button>
-          <button class="fam-chip" data-fam="window"><strong>Day Windows</strong><small>24 h max / min</small></button>
-          <button class="fam-chip" data-fam="climoref"><strong>Climatology</strong><small>browse the normals</small></button>
-          <button class="fam-chip" data-fam="meteogram"><strong>Meteogram</strong><small>point · wx + fuels</small></button>
-        </div>
+      <div class="mg-panels" id="mgPanels">
+        <label><input type="checkbox" value="temp" checked> T/Td</label>
+        <label><input type="checkbox" value="rh" checked> RH</label>
+        <label><input type="checkbox" value="vpd" checked> VPD·HDW</label>
+        <label><input type="checkbox" value="wind" checked> wind</label>
+        <label><input type="checkbox" value="precip"> precip</label>
+        <label><input type="checkbox" value="fuels" checked> fuels</label>
+        <label><input type="checkbox" value="smoke"> smoke</label>
       </div>
+      <button class="tool-btn" id="mgGo" style="align-self:start">↻ update meteogram</button>
+      <div class="hint">Switch the map to <b>point</b> mode and click anywhere — the pin re-renders this view.</div>
+    </div>
 
-      <div class="climo-box" id="climoBox">
-        <div class="mini-grid">
-          <label>product
-            <select id="refProduct">
-              <option value="vpd_day_max" selected>day-max VPD</option>
-              <option value="min_rh_day">day-min RH</option>
-              <option value="wind_day_max">day-max wind</option>
-              <option value="gust_day_max">day-max gust</option>
-              <option value="hdw_wind_day">HDW (wind)</option>
-              <option value="hdw_gust_day">HDW (gust)</option>
-              <option value="hours_rh15_gust25">hrs RH≤15 &amp; gust≥25</option>
-              <option value="hours_rh20_gust25">hrs RH≤20 &amp; gust≥25</option>
-              <option value="hours_rh20_wind20">hrs RH≤20 &amp; wind≥20</option>
-              <option value="overnight_rh_recovery">overnight min RH</option>
-            </select>
-          </label>
-          <label>date <input id="refDate" type="date"></label>
-        </div>
-        <div class="hint">Renders the P50→P99 ladder for that date plus the all-time P99 and record max.</div>
+    <div>
+      <span class="field-label">Map labels</span>
+      <div class="segmented" id="quality">
+        <button type="button" data-density="2">Regional</button>
+        <button class="selected" type="button" data-density="3">Dense</button>
+        <button type="button" data-density="4">Max</button>
       </div>
+    </div>
 
-      <div class="mg-box" id="meteoBox">
-        <div class="mini-grid">
-          <label>lat <input id="mgLat" type="number" step="0.0001" value="38.5816"></label>
-          <label>lon <input id="mgLon" type="number" step="0.0001" value="-121.4944"></label>
-        </div>
-        <div class="mg-panels" id="mgPanels">
-          <label><input type="checkbox" value="temp" checked> T/Td</label>
-          <label><input type="checkbox" value="rh" checked> RH</label>
-          <label><input type="checkbox" value="vpd" checked> VPD·HDW</label>
-          <label><input type="checkbox" value="wind" checked> wind</label>
-          <label><input type="checkbox" value="precip"> precip</label>
-          <label><input type="checkbox" value="fuels" checked> fuels</label>
-          <label><input type="checkbox" value="smoke"> smoke</label>
-        </div>
-        <div class="hint">Tip: switch the map to <b>point</b> mode and click anywhere — the pin fills these in.</div>
-      </div>
+    <div class="console" id="console"></div>
+  </aside>
 
-      <div id="hoursBlock">
-        <span class="field-label">Valid hour</span>
-        <div class="hours" id="hours"></div>
-        <div class="hours-note" id="hoursNote"></div>
-      </div>
-
-      <div>
-        <span class="field-label">Map quality</span>
-        <div class="segmented" id="quality">
-          <button type="button" data-density="2">Regional labels</button>
-          <button class="selected" type="button" data-density="3">Dense labels</button>
-          <button type="button" data-density="4">Max labels</button>
+  <section class="main-col">
+    <div class="panel viewer-card">
+      <div class="viewer-bar">
+        <h2 id="viewTitle">Pick a product</h2>
+        <span class="prov" id="viewProv"></span>
+        <div class="hour-nav" id="hourNav">
+          <button id="hPrev" title="Earlier hour (←)">◀</button>
+          <span class="hour-label" id="hLabel">—</span>
+          <button id="hNext" title="Later hour (→)">▶</button>
+          <button class="play" id="hPlay" title="Animate the run">▶ loop</button>
         </div>
       </div>
+      <div class="viewport" id="viewport">
+        <div class="spin" id="spin"><span id="spinText">rendering…</span></div>
+        <div class="placeholder" id="placeholder"><div class="flame">▲▲▲</div>Pick a product on the left — it renders right here.<br>← / → step hours · wheel zooms · drag pans when zoomed.</div>
+        <img id="viewImg" alt="" style="display:none">
+      </div>
+      <div class="viewer-foot">
+        <span id="footNote">HRRR × RTMA climatology 2019–2026 · rendered on demand</span>
+        <a id="dlLink" href="#" download style="display:none; color: var(--muted)">download</a>
+        <span class="zoom-hint">wheel to zoom · double-click resets</span>
+      </div>
+    </div>
 
-      <button class="render-btn" id="renderBtn">Render</button>
-      <div class="console" id="console"></div>
-    </aside>
+    <div class="ribbon show" id="ribbon"></div>
 
-    <section class="stage">
-      <div class="panel map-card">
-        <div class="map-head">
-          <h2 id="mapTitle">Domain — drag a box or pick a preset</h2>
-          <div class="tools">
-            <button class="tool-btn on" data-preset="california">California</button>
-            <button class="tool-btn" data-preset="wide_west">Wide West</button>
-            <button class="tool-btn" data-preset="sierra">Sierra Front</button>
-            <button class="tool-btn" id="drawBtn">✏ draw box</button>
-            <button class="tool-btn" id="pointBtn">📍 point</button>
-          </div>
-        </div>
-        <div id="map"></div>
-        <div class="map-foot">
-          <span id="mapReadout">preset: California</span>
-          <span>drag with <b>draw box</b> on · click with <b>point</b> on for meteograms</span>
+    <div class="panel map-card">
+      <div class="map-head">
+        <h2>Domain &amp; point picker</h2>
+        <div class="tools">
+          <button class="tool-btn on" data-preset="california">California</button>
+          <button class="tool-btn" data-preset="wide_west">Wide West</button>
+          <button class="tool-btn" data-preset="sierra">Sierra Front</button>
+          <button class="tool-btn" id="drawBtn">✏ draw box</button>
+          <button class="tool-btn" id="pointBtn">📍 point</button>
         </div>
       </div>
-
-      <div class="ribbon show" id="ribbon"></div>
-      <div class="gallery" id="gallery"></div>
-      <div class="empty" id="empty"><div class="flame">▲▲▲</div>Pick a family and hit Render — plots land here.</div>
-    </section>
+      <div id="map"></div>
+      <div class="map-foot">
+        <span id="mapReadout">preset: California</span>
+        <span>changing the domain re-renders the current product</span>
+      </div>
+    </div>
   </section>
 </main>
-
-<div class="box" id="box">
-  <img id="boxImg" alt="">
-  <div class="box-bar">
-    <b id="boxName"></b>
-    <span>wheel zoom · drag pan · double-click reset · ←/→ cycle · esc close</span>
-    <span style="margin-left:auto"></span>
-    <button class="box-btn" id="boxPrev">←</button>
-    <button class="box-btn" id="boxNext">→</button>
-    <button class="box-btn" id="boxClose">✕</button>
-  </div>
-</div>
 
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
 
-/* ---------- state ---------- */
+/* ---------- catalogs ---------- */
 const DOMAINS = {
   california: { slug: "cafire_california", bounds: [-126.0, -113.8, 31.9, 42.5], label: "California" },
   wide_west:  { slug: "cafire_wide_west",  bounds: [-125.7, -103.8, 31.9, 46.5], label: "Wide West" },
   sierra:     { slug: "sierra_front",      bounds: [-121.9, -117.6, 37.2, 41.2], label: "Sierra Front" },
 };
+const ANOMALY = [
+  ["vpd_day_max_percentile", "Day-max VPD"],
+  ["min_rh_day_percentile", "Day-min RH"],
+  ["wind_day_max_percentile", "Day-max wind"],
+  ["gust_day_max_percentile", "Day-max gust"],
+  ["hdw_wind_day_percentile", "HDW (wind)"],
+  ["hdw_gust_day_percentile", "HDW (gust)"],
+  ["hours_rh15_gust25_percentile", "Hrs RH≤15 & gust≥25"],
+  ["hours_rh20_gust25_percentile", "Hrs RH≤20 & gust≥25"],
+  ["hours_rh20_wind20_percentile", "Hrs RH≤20 & wind≥20"],
+  ["overnight_rh_recovery_percentile", "Overnight RH recovery"],
+  ["surface_fire_weather_potential", "Fire Wx Potential ★"],
+];
 const FAMS = {
-  anomaly: { title: "Anomaly vs Climatology", products: "cafire-anomaly" },
-  record:  { title: "vs All-Time Record", products: "cafire-record" },
-  core:    { title: "Fire Weather Core", products: "vpd_2m,hdw,fire_weather_composite,10m_wind_gusts,2m_relative_humidity_10m_winds" },
-  fuels:   { title: "Fuels", products: "erc,kbdi,dead_fuel_moisture_10h,vpd_fuel_receptive,fire_potential_composite" },
-  smoke:   { title: "Smoke", products: "smoke_pm25_native,smoke_column,visibility" },
-  window:  { title: "Day Windows", products: "2m_vpd_0_24h_max,2m_rh_0_24h_min,10m_wind_0_24h_max,qpf_24h" },
-  climoref:{ title: "Climatology Maps", products: "" },
-  meteogram:{ title: "Point Meteogram", products: "" },
+  anomaly: { label: "Anomaly", hourly: false, products: ANOMALY },
+  record:  { label: "vs Record", hourly: false, products: ANOMALY.map(([slug, name]) => [slug + "_vs_record", name]) },
+  core: { label: "Fire Wx", hourly: true, products: [
+    ["vpd_2m", "VPD"], ["hdw", "HDW"], ["fire_weather_composite", "Fire Wx composite"],
+    ["10m_wind_gusts", "Wind gusts"], ["2m_relative_humidity_10m_winds", "RH + wind"],
+    ["2m_temperature_10m_winds", "Temperature + wind"], ["2m_dewpoint_10m_winds", "Dewpoint + wind"],
+    ["visibility", "Visibility"],
+  ]},
+  weather: { label: "Weather", hourly: true, products: [
+    ["2m_temperature_10m_winds", "Temperature + wind"], ["2m_dewpoint_10m_winds", "Dewpoint + wind"],
+    ["2m_relative_humidity_10m_winds", "RH + wind"], ["apparent_temperature_2m", "Apparent temp"],
+    ["heat_index_2m", "Heat index"], ["wetbulb_2m", "Wet-bulb"], ["wind_chill_2m", "Wind chill"],
+    ["dewpoint_depression_2m", "Dewpoint depression"], ["theta_e_2m_10m_winds", "Theta-e + wind"],
+    ["mslp_10m_winds", "MSLP + wind"], ["10m_wind_gusts", "Wind gusts"],
+    ["cloud_cover", "Cloud cover"], ["cloud_cover_levels", "Clouds by level"],
+    ["visibility", "Visibility"], ["precipitable_water", "Precipitable water"],
+  ]},
+  radar: { label: "Radar & Precip", hourly: true, products: [
+    ["composite_reflectivity", "Composite reflectivity"], ["1km_reflectivity", "1 km reflectivity"],
+    ["composite_reflectivity_uh", "Reflectivity + UH"], ["simulated_ir_satellite", "Simulated IR"],
+    ["precipitation_type", "Precip type"], ["qpf_1h", "1-h precip"], ["qpf_6h", "6-h precip"],
+    ["qpf_12h", "12-h precip"], ["qpf_total", "Run-total precip"],
+  ]},
+  upper: { label: "Upper Air", hourly: true, products: [
+    ["850mb_temperature_height_winds", "850 mb temp"], ["850mb_dewpoint_height_winds", "850 mb dewpoint"],
+    ["700mb_temperature_height_winds", "700 mb temp"], ["700mb_rh_height_winds", "700 mb RH"],
+    ["500mb_height_winds", "500 mb heights"], ["500mb_absolute_vorticity_height_winds", "500 mb vorticity"],
+    ["300mb_height_winds", "300 mb jet"], ["250mb_height_winds", "250 mb jet"],
+    ["temperature_advection_850mb", "850 mb temp advection"], ["temperature_advection_700mb", "700 mb temp advection"],
+  ]},
+  severe: { label: "Severe", hourly: true, products: [
+    ["sbcape", "SBCAPE"], ["mlcape", "MLCAPE"], ["mucape", "MUCAPE"], ["mlcin", "MLCIN"],
+    ["dcape", "DCAPE"], ["srh_0_1km", "SRH 0-1 km"], ["srh_0_3km", "SRH 0-3 km"],
+    ["bulk_shear_0_6km", "Shear 0-6 km"], ["bulk_shear_0_1km", "Shear 0-1 km"],
+    ["stp_fixed", "Sig-tor parameter"], ["ehi_0_3km", "EHI 0-3 km"],
+    ["lifted_index", "Lifted index"], ["lapse_rate_700_500", "Lapse rate 700-500"],
+    ["lapse_rate_0_3km", "Lapse rate 0-3 km"], ["uh_2to5km_run_max", "UH run-max"],
+  ]},
+  fuels: { label: "Fuels", hourly: false, products: [
+    ["fire_potential_composite", "Fire potential ★"], ["erc", "ERC"], ["burning_index", "Burning index"],
+    ["kbdi", "KBDI"], ["dead_fuel_moisture_1h", "1-h fuel moisture"], ["dead_fuel_moisture_10h", "10-h fuel moisture"],
+    ["dead_fuel_moisture_100h", "100-h fuel moisture"], ["fuel_receptiveness", "Fuel receptiveness"],
+    ["hdw_fuel_receptive", "HDW × receptive fuels"], ["vpd_fuel_receptive", "VPD × receptive fuels"],
+    ["erc_hdw_composite", "ERC × HDW"],
+  ]},
+  smoke: { label: "Smoke", hourly: true, products: [
+    ["smoke_pm25_native", "Near-surface smoke"], ["smoke_column", "Column smoke"], ["visibility", "Visibility"],
+  ]},
+  window: { label: "Day Windows", hourly: false, products: [
+    ["2m_vpd_0_24h_max", "VPD 24-h max"], ["2m_rh_0_24h_min", "RH 24-h min"],
+    ["10m_wind_0_24h_max", "Wind 24-h max"], ["2m_temp_0_24h_max", "Temp 24-h max"],
+    ["2m_temp_0_24h_min", "Temp 24-h min"], ["qpf_24h", "24-h precip"], ["10m_wind_run_max", "Wind run-max"],
+  ]},
+  climoref: { label: "Climatology", hourly: false, products: [] },
+  meteogram: { label: "Meteogram", hourly: false, products: [] },
 };
+const STATS = [
+  ["p50", "P50 — typical day"], ["p75", "P75"], ["p90", "P90 — big day"],
+  ["p95", "P95"], ["p99", "P99 — extreme"], ["record_p99", "All-time P99"], ["record_max", "All-time record max"],
+];
 const RIBBONS = {
   anomaly: `<b>Percentile vs this date</b> — today's HRRR forecast ranked against the RTMA 2.5 km ±7-day
     day-of-year climatology, 2019–2026 (<code>n≈105 days/cell</code>).
-    Reading: <code>99 = at or beyond the most extreme ever observed for this calendar window</code>.`,
-  record: `<b>Percentile vs every day on record</b> — the same forecast ranked against all
-    <code>≈2,695 analyzed days 2019–2026</code>. The seasonal tab reads “unusual for the date”;
-    this tab reads “severe in absolute terms”. Purple here is genuinely rare air.`,
-  climoref: `<b>The normals themselves</b> — browsable climatology grids in real units.
-    Pick a product and a date to see its P50→P99 ladder plus the all-time record.`,
-  meteogram: `<b>Point meteogram</b> — every stored hour at one spot: T/Td, RH, VPD + HDW, wind with
-    direction arrows, fuels. Night shading, local time, and dashed “what's normal here today” lines
-    from the climatology.`,
+    <code>99 = at or beyond the most extreme ever observed for this calendar window</code>.`,
+  record: `<b>Percentile vs every day on record</b> — ranked against all <code>≈2,695 analyzed days 2019–2026</code>.
+    The Anomaly tab reads “unusual for the date”; this one reads “severe in absolute terms”.`,
+  climoref: `<b>The normals themselves</b> — climatology grids in real units. Pick a product, date, and statistic.`,
+  meteogram: `<b>Point meteogram</b> — every stored hour at one spot with night shading, local time, wind
+    direction, fuels, and dashed “what's normal here today” climatology lines.`,
 };
-let state = { fam: "anomaly", hour: 12, density: 3, preset: "california", drawn: null, runsLoaded: false };
-const dayFams = new Set(["anomaly", "record", "climoref", "meteogram", "window"]);
+let state = {
+  fam: "anomaly", product: ANOMALY[0][0], hour: 6, density: 3,
+  preset: "california", drawn: null, stat: "p95",
+  hours: [], playTimer: null, seq: 0,
+};
 
-/* ---------- console ---------- */
+/* ---------- console/log ---------- */
 function log(message, cls) {
   const line = document.createElement("div");
   if (cls) line.className = cls;
-  line.textContent = `${new Date().toLocaleTimeString([], {hour12:false})}  ${message}`;
+  line.textContent = `${new Date().toLocaleTimeString([], { hour12: false })}  ${message}`;
   const box = $("console"); box.prepend(line);
   while (box.children.length > 40) box.lastChild.remove();
 }
@@ -374,6 +413,7 @@ async function health() {
 }
 health(); setInterval(health, 6000);
 
+let latestManifest = null;
 function runAge(unix) {
   const mins = Math.max(0, (Date.now() / 1000 - unix) / 60);
   return mins < 90 ? `${Math.round(mins)} min ago` : `${(mins / 60).toFixed(1)} h ago`;
@@ -381,13 +421,14 @@ function runAge(unix) {
 async function loadRuns() {
   try {
     const data = await fetch("/api/runs").then(r => r.json());
+    latestManifest = data.latest || null;
     const select = $("runSelect");
+    const keep = select.value;
     select.innerHTML = "";
-    const latest = data.latest;
     const optLatest = document.createElement("option");
     optLatest.value = "latest";
-    optLatest.textContent = latest && latest.complete_run
-      ? `Latest — ${latest.complete_run.replace("_", " ").toUpperCase()}`
+    optLatest.textContent = latestManifest && latestManifest.complete_run
+      ? `Latest — ${latestManifest.complete_run.replace("_", " ").toUpperCase()}`
       : "Latest complete run";
     select.appendChild(optLatest);
     (data.runs || []).forEach(slug => {
@@ -396,49 +437,122 @@ async function loadRuns() {
       opt.textContent = slug.replace("_", " · ").toUpperCase();
       select.appendChild(opt);
     });
-    if (latest) {
-      const bits = [`ingesting ${latest.run.replace("_"," ")}`];
-      if (latest.updated_unix) bits.push(`updated ${runAge(latest.updated_unix)}`);
-      if (latest.day_run) bits.push(`day products from ${latest.day_run.replace("_"," ")}`);
+    if ([...select.options].some(o => o.value === keep)) select.value = keep;
+    if (latestManifest) {
+      const bits = [`ingesting ${latestManifest.run.replace("_", " ")}`];
+      if (latestManifest.updated_unix) bits.push(`updated ${runAge(latestManifest.updated_unix)}`);
       $("runNote").textContent = bits.join(" · ");
-    } else {
-      $("runNote").textContent = "no refresh daemon manifest — pick a run explicitly";
-    }
-    state.runsLoaded = true;
+    } else $("runNote").textContent = "no refresh manifest — pick a run explicitly";
+    computeHours();
   } catch { $("runNote").textContent = "run list unavailable"; }
 }
 loadRuns(); setInterval(loadRuns, 60_000);
+$("runSelect").addEventListener("change", () => { computeHours(); renderCurrent(); });
 
-/* ---------- family chips ---------- */
-$("fams").addEventListener("click", ev => {
-  const chip = ev.target.closest(".fam-chip"); if (!chip) return;
-  [...$("fams").children].forEach(c => c.classList.remove("on"));
-  chip.classList.add("on");
-  state.fam = chip.dataset.fam;
+function computeHours() {
+  // Hour ladder for the selected run: manifest hours for `latest`, else a
+  // sane default; clamp current hour into range.
+  let hours = null;
+  if ($("runSelect").value === "latest" && latestManifest && Array.isArray(latestManifest.stored_hours)) {
+    hours = latestManifest.stored_hours;
+  }
+  state.hours = hours && hours.length ? hours : Array.from({ length: 19 }, (_, i) => i);
+  if (!state.hours.includes(state.hour)) state.hour = state.hours[Math.min(6, state.hours.length - 1)];
+  updateHourLabel();
+}
+
+/* ---------- family + product lists ---------- */
+function buildFams() {
+  const wrap = $("fams");
+  wrap.innerHTML = "";
+  Object.entries(FAMS).forEach(([key, fam]) => {
+    const b = document.createElement("button");
+    b.className = "fam-tab" + (key === state.fam ? " on" : "");
+    b.textContent = fam.label;
+    b.onclick = () => selectFam(key);
+    wrap.appendChild(b);
+  });
+}
+function selectFam(key) {
+  state.fam = key;
+  [...$("fams").children].forEach((b, i) => b.classList.toggle("on", Object.keys(FAMS)[i] === key));
+  $("productBox").classList.toggle("show", FAMS[key].products.length > 0);
+  $("climoBox").classList.toggle("show", key === "climoref");
+  $("meteoBox").classList.toggle("show", key === "meteogram");
   const ribbon = $("ribbon");
-  ribbon.classList.toggle("show", state.fam in RIBBONS);
-  if (state.fam in RIBBONS) ribbon.innerHTML = RIBBONS[state.fam];
-  $("climoBox").classList.toggle("show", state.fam === "climoref");
-  $("meteoBox").classList.toggle("show", state.fam === "meteogram");
-  $("hours").classList.toggle("dim", dayFams.has(state.fam));
-  $("hoursNote").textContent = dayFams.has(state.fam)
-    ? (state.fam === "meteogram" ? "meteograms span every stored hour" : "day-window products fold whole UTC days — the hour pick is inert")
-    : "";
-  if (state.fam === "meteogram" && mapMode !== "point") setMapMode("point");
-  if (state.fam !== "meteogram" && mapMode === "point") setMapMode("view");
-});
-$("ribbon").innerHTML = RIBBONS.anomaly;
-$("hours").classList.add("dim");
-$("hoursNote").textContent = "day-window products fold whole UTC days — the hour pick is inert";
+  ribbon.classList.toggle("show", key in RIBBONS);
+  if (key in RIBBONS) ribbon.innerHTML = RIBBONS[key];
+  buildProducts();
+  if (key === "meteogram") { setMapMode("point"); renderCurrent(); }
+  else {
+    if (mapMode === "point") setMapMode("view");
+    if (FAMS[key].products.length) { state.product = FAMS[key].products[0][0]; markProduct(); renderCurrent(); }
+    else if (key === "climoref") renderCurrent();
+  }
+  updateHourNav();
+}
+function buildProducts() {
+  const list = $("productList");
+  list.innerHTML = "";
+  FAMS[state.fam].products.forEach(([slug, name]) => {
+    const b = document.createElement("button");
+    b.className = "product-item" + (slug === state.product ? " on" : "");
+    b.dataset.slug = slug;
+    b.innerHTML = `<span>${name}</span>`;
+    b.onclick = () => { state.product = slug; markProduct(); renderCurrent(); };
+    list.appendChild(b);
+  });
+  const stats = $("statList");
+  stats.innerHTML = "";
+  STATS.forEach(([key, name]) => {
+    const b = document.createElement("button");
+    b.className = "product-item" + (key === state.stat ? " on" : "");
+    b.dataset.stat = key;
+    b.innerHTML = `<span>${name}</span>`;
+    b.onclick = () => { state.stat = key; [...stats.children].forEach(x => x.classList.toggle("on", x.dataset.stat === key)); renderCurrent(); };
+    stats.appendChild(b);
+  });
+}
+function markProduct() {
+  [...$("productList").children].forEach(b => b.classList.toggle("on", b.dataset.slug === state.product));
+}
 
-/* ---------- hour strip ---------- */
-[0,2,4,6,8,10,12,14,16,18,24,30,36,48].forEach(h => {
-  const b = document.createElement("button");
-  b.className = "hourbtn" + (h === state.hour ? " on" : "");
-  b.textContent = "F" + String(h).padStart(2, "0");
-  b.onclick = () => { state.hour = h; [...$("hours").children].forEach(x => x.classList.remove("on")); b.classList.add("on"); };
-  $("hours").appendChild(b);
+/* ---------- hour nav ---------- */
+function updateHourNav() {
+  const hourly = FAMS[state.fam].hourly;
+  $("hourNav").style.opacity = hourly ? 1 : 0.3;
+  $("hPrev").disabled = $("hNext").disabled = $("hPlay").disabled = !hourly;
+  if (!hourly) stopPlay();
+}
+function updateHourLabel() { $("hLabel").textContent = "F" + String(state.hour).padStart(2, "0"); }
+function stepHour(direction) {
+  const index = state.hours.indexOf(state.hour);
+  const next = state.hours[index + direction];
+  if (next === undefined) return;
+  state.hour = next;
+  updateHourLabel();
+  renderCurrent();
+}
+$("hPrev").onclick = () => stepHour(-1);
+$("hNext").onclick = () => stepHour(1);
+addEventListener("keydown", ev => {
+  if (ev.target.tagName === "INPUT" || ev.target.tagName === "SELECT") return;
+  if (ev.key === "ArrowLeft") stepHour(-1);
+  if (ev.key === "ArrowRight") stepHour(1);
 });
+function stopPlay() {
+  if (state.playTimer) { clearInterval(state.playTimer); state.playTimer = null; $("hPlay").classList.remove("on"); }
+}
+$("hPlay").onclick = () => {
+  if (state.playTimer) return stopPlay();
+  $("hPlay").classList.add("on");
+  state.playTimer = setInterval(() => {
+    const index = state.hours.indexOf(state.hour);
+    state.hour = state.hours[(index + 1) % state.hours.length];
+    updateHourLabel();
+    renderCurrent();
+  }, 900);
+};
 
 /* ---------- quality ---------- */
 $("quality").addEventListener("click", ev => {
@@ -446,19 +560,17 @@ $("quality").addEventListener("click", ev => {
   [...$("quality").children].forEach(b => b.classList.remove("selected"));
   btn.classList.add("selected");
   state.density = Number(btn.dataset.density);
+  renderCurrent();
 });
 
-/* ---------- map (Leaflet domain + point picker) ---------- */
-const map = L.map("map", { zoomControl: true, attributionControl: true }).setView([37.6, -119.5], 5);
+/* ---------- Leaflet map ---------- */
+const map = L.map("map", { zoomControl: true }).setView([37.6, -119.5], 5);
 L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
   subdomains: "abcd", maxZoom: 12,
 }).addTo(map);
-
-let mapMode = "view"; // view | draw | point
-let presetRect = null, drawnRect = null, pointMarker = null, drawStart = null;
-
-function boundsToLeaflet(b) { return [[b[2], b[0]], [b[3], b[1]]]; } // [w,e,s,n] -> [[s,w],[n,e]]
+let mapMode = "view", presetRect = null, drawnRect = null, pointMarker = null, drawStart = null;
+function boundsToLeaflet(b) { return [[b[2], b[0]], [b[3], b[1]]]; }
 function showPreset(name) {
   state.preset = name; state.drawn = null;
   if (drawnRect) { map.removeLayer(drawnRect); drawnRect = null; }
@@ -474,16 +586,12 @@ function setMapMode(mode) {
   $("pointBtn").classList.toggle("on", mode === "point");
   $("map").style.cursor = mode === "view" ? "grab" : "crosshair";
   if (mode === "draw") map.dragging.disable(); else map.dragging.enable();
-  $("mapTitle").textContent = mode === "draw" ? "Drag to draw your render domain"
-    : mode === "point" ? "Click the map to drop a meteogram point"
-    : "Domain — drag a box or pick a preset";
 }
 document.querySelectorAll(".tool-btn[data-preset]").forEach(btn => {
-  btn.onclick = () => { setMapMode("view"); showPreset(btn.dataset.preset); };
+  btn.onclick = () => { setMapMode("view"); showPreset(btn.dataset.preset); renderCurrent(); };
 });
 $("drawBtn").onclick = () => setMapMode(mapMode === "draw" ? "view" : "draw");
 $("pointBtn").onclick = () => setMapMode(mapMode === "point" ? "view" : "point");
-
 map.on("mousedown", ev => {
   if (mapMode !== "draw") return;
   drawStart = ev.latlng;
@@ -504,8 +612,8 @@ map.on("mouseup", ev => {
   state.preset = null;
   [...document.querySelectorAll(".tool-btn[data-preset]")].forEach(x => x.classList.remove("on"));
   $("mapReadout").textContent = `drawn: ${state.drawn.map(v => v.toFixed(2)).join(", ")} (W,E,S,N)`;
-  log(`domain drawn ${state.drawn.join(",")}`);
   setMapMode("view");
+  renderCurrent();
 });
 map.on("click", ev => {
   if (mapMode !== "point") return;
@@ -514,150 +622,190 @@ map.on("click", ev => {
   pointMarker = L.circleMarker([lat, lng], { radius: 7, color: "#ffd456", weight: 2, fillColor: "#ff5b24", fillOpacity: 0.9 }).addTo(map);
   $("mgLat").value = lat.toFixed(4); $("mgLon").value = lng.toFixed(4);
   $("mapReadout").textContent = `point: ${lat.toFixed(4)}, ${lng.toFixed(4)}`;
-  if (state.fam !== "meteogram") {
-    document.querySelector('.fam-chip[data-fam="meteogram"]').click();
-  }
+  if (state.fam !== "meteogram") selectFam("meteogram");
+  else renderCurrent();
 });
 showPreset("california");
 
-/* ---------- products ---------- */
+/* ---------- climoref helpers ---------- */
 function noLeapDoy(dateStr) {
   const parts = (dateStr || "2026-07-15").split("-").map(Number);
   const cum = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
   const day = (parts[1] === 2 && parts[2] === 29) ? 28 : parts[2];
   return cum[parts[1] - 1] + day;
 }
-function buildProducts() {
-  if (state.fam !== "climoref") return FAMS[state.fam].products;
-  const base = $("refProduct").value;
-  const doy = noLeapDoy($("refDate").value);
-  const ladder = ["p50", "p75", "p90", "p95", "p99"].map(s => `climo_ref:${base}:${s}:doy${doy}`);
-  ladder.push(`climo_ref:${base}:p99:record`, `climo_ref:${base}:max:record`);
-  return ladder.join(",");
-}
 (function initDate() {
   const now = new Date();
   $("refDate").value = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
 })();
+$("refDate").addEventListener("change", renderCurrent);
+$("refProduct").addEventListener("change", renderCurrent);
+$("mgGo").onclick = () => renderCurrent();
 
-/* ---------- render flow ---------- */
-async function renderMeteogram() {
-  const lat = Number($("mgLat").value), lon = Number($("mgLon").value);
-  const panels = [...$("mgPanels").querySelectorAll("input:checked")].map(c => c.value).join(",");
-  let run = $("runSelect").value;
-  if (run === "latest") run = "latest-day";
-  const title = `${lat.toFixed(3)}, ${lon.toFixed(3)}`;
-  const url = `/api/meteogram?lat=${lat}&lon=${lon}&run=${encodeURIComponent(run)}&panels=${encodeURIComponent(panels)}&title=${encodeURIComponent(title)}`;
-  const t0 = performance.now();
-  const resp = await fetch(url);
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }));
-    throw new Error(err.error || `HTTP ${resp.status}`);
-  }
-  const svg = await resp.text();
-  const blobUrl = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
-  log(`meteogram ready · ${((performance.now() - t0) / 1000).toFixed(2)}s`, "ok");
-  showFiles([{ name: `meteogram — ${title}`, url: blobUrl, bytes: svg.length }]);
+function climoSlug() {
+  const base = $("refProduct").value;
+  const doy = noLeapDoy($("refDate").value);
+  if (state.stat === "record_p99") return `climo_ref:${base}:p99:record`;
+  if (state.stat === "record_max") return `climo_ref:${base}:max:record`;
+  return `climo_ref:${base}:${state.stat}:doy${doy}`;
 }
 
-$("renderBtn").onclick = async () => {
-  const btn = $("renderBtn"); btn.disabled = true; btn.textContent = "Rendering…";
-  try {
-    if (state.fam === "meteogram") { await renderMeteogram(); return; }
-    let run = $("runSelect").value;
-    // Day-window families (incl. 0-24h windowed maps) need a run whose
-    // hours span a full UTC day; short off-cycle runs can't provide it.
-    if (run === "latest" && dayFams.has(state.fam)) run = "latest-day";
-    const payload = {
-      run,
-      hour: state.hour,
-      products: buildProducts(),
-      output_format: "webp",
-      plot_style: "operational",
-      basemap_style: "topo",
-      county_linework: true,
-      place_label_density: state.density,
-      place_label_size: 2,
-      output_width: 1800,
-    };
-    if (state.drawn) { payload.domain_slug = "drawn_box"; payload.bounds = state.drawn; }
-    else { const d = DOMAINS[state.preset || "california"]; payload.domain_slug = d.slug; payload.bounds = d.bounds; }
-    log(`render ${state.fam} · ${payload.domain_slug} · ${run}`);
-    const started = await fetch("/api/render", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }).then(r => r.json());
-    if (started.error) throw new Error(started.error);
-    log(`job ${started.id} (${started.cache})`, started.cache === "hit" ? "ok" : "");
-    const t0 = performance.now();
-    let job;
-    for (;;) {
-      job = await fetch(started.status_url).then(r => r.json());
-      if (job.state === "succeeded" || job.state === "failed") break;
-      await new Promise(r => setTimeout(r, 700));
-    }
-    const secs = ((performance.now() - t0) / 1000).toFixed(1);
-    if (job.state === "failed") {
-      log(`failed: ${job.message}`, "err");
-      if (job.stderr_tail) log(job.stderr_tail.split("\n").slice(-2).join(" · "), "err");
-    } else log(`done · ${job.files.length} plot(s) · ${secs}s`, "ok");
-    showFiles(job.files || []);
-  } catch (err) { log(String(err.message || err), "err"); }
-  finally { btn.disabled = false; btn.textContent = "Render"; }
-};
+/* ---------- the render core ---------- */
+const dayFams = new Set(["anomaly", "record", "climoref", "window"]);
+function currentRun() {
+  let run = $("runSelect").value;
+  if (run === "latest" && dayFams.has(state.fam)) run = "latest-day";
+  return run;
+}
+function domainPayload() {
+  if (state.drawn) return { domain_slug: "drawn_box", bounds: state.drawn };
+  const d = DOMAINS[state.preset || "california"];
+  return { domain_slug: d.slug, bounds: d.bounds };
+}
+function productLabel() {
+  if (state.fam === "climoref") {
+    const stat = STATS.find(([k]) => k === state.stat)[1];
+    return `${$("refProduct").selectedOptions[0].text} — ${stat}`;
+  }
+  const hit = FAMS[state.fam].products.find(([slug]) => slug === state.product);
+  return hit ? hit[1] : state.product;
+}
 
-/* ---------- gallery + lightbox ---------- */
-let shots = [];
-function showFiles(files) {
-  const g = $("gallery"); g.innerHTML = ""; shots = files;
-  $("empty").style.display = files.length ? "none" : "";
-  files.forEach((f, i) => {
-    const name = f.name.replace(/^rustwx_[^_]*_\d+_\d+z(_f\d+)?_[a-z0-9_]+?_/, "").replace(/\.(webp|png|svg)$/, "");
-    const card = document.createElement("div");
-    card.className = "card"; card.style.animationDelay = (i * 60) + "ms";
-    card.innerHTML = `<img src="${f.url}" loading="lazy" alt="${name}"><div class="cap"><b>${name.replace(/_/g, " ")}</b><span>${(f.bytes / 1024 | 0)} KB</span></div>`;
-    card.querySelector("img").onclick = () => openBox(i);
-    g.appendChild(card);
+async function requestPlot(productSlug, hour, quiet) {
+  const payload = {
+    run: currentRun(), hour, products: productSlug,
+    output_format: "webp", plot_style: "operational", basemap_style: "topo",
+    county_linework: true, place_label_density: state.density, place_label_size: 2,
+    output_width: 1800, ...domainPayload(),
+  };
+  const started = await fetch("/api/render", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }).then(r => r.json());
+  if (started.error) throw new Error(started.error);
+  if (!quiet) log(`job ${started.id} (${started.cache})`, started.cache === "hit" ? "ok" : "");
+  for (;;) {
+    const job = await fetch(started.status_url).then(r => r.json());
+    if (job.state === "succeeded") return job;
+    if (job.state === "failed") throw new Error(job.message || "render failed");
+    await new Promise(r => setTimeout(r, 550));
+  }
+}
+
+async function renderCurrent() {
+  const seq = ++state.seq;
+  const spin = $("spin");
+  try {
+    if (state.fam === "meteogram") {
+      spin.classList.add("show"); $("spinText").textContent = "sampling point…";
+      const lat = Number($("mgLat").value), lon = Number($("mgLon").value);
+      const panels = [...$("mgPanels").querySelectorAll("input:checked")].map(c => c.value).join(",");
+      let run = $("runSelect").value; if (run === "latest") run = "latest-day";
+      const title = `${lat.toFixed(3)}, ${lon.toFixed(3)}`;
+      const resp = await fetch(`/api/meteogram?lat=${lat}&lon=${lon}&run=${encodeURIComponent(run)}&panels=${encodeURIComponent(panels)}&title=${encodeURIComponent(title)}`);
+      if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || `HTTP ${resp.status}`);
+      const svg = await resp.text();
+      if (seq !== state.seq) return;
+      showImage(URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" })), `Meteogram — ${title}`, run, null);
+      log("meteogram ready", "ok");
+      return;
+    }
+    const slug = state.fam === "climoref" ? climoSlug() : state.product;
+    const hour = FAMS[state.fam].hourly ? state.hour : (state.hours[state.hours.length - 1] ?? 18);
+    spin.classList.add("show"); $("spinText").textContent = "rendering…";
+    const t0 = performance.now();
+    const job = await requestPlot(slug, hour);
+    if (seq !== state.seq) return;
+    const file = (job.files || [])[0];
+    if (!file) throw new Error("no output file");
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    showImage(file.url, productLabel(), currentRun(), file);
+    log(`${productLabel()} · ${secs}s`, "ok");
+    prefetchNeighbors(slug, hour);
+  } catch (err) {
+    if (seq === state.seq) { log(String(err.message || err), "err"); $("spinText").textContent = "failed"; setTimeout(() => spin.classList.remove("show"), 1200); }
+  } finally {
+    if (seq === state.seq && state.fam) spin.classList.remove("show");
+  }
+}
+
+function showImage(url, title, run, file) {
+  const img = $("viewImg");
+  resetZoom();
+  img.src = url;
+  img.style.display = "block";
+  $("placeholder").style.display = "none";
+  $("viewTitle").textContent = title;
+  $("viewProv").textContent = `${String(run).replace("_", " ")} · ${state.drawn ? "custom domain" : DOMAINS[state.preset || "california"].label}`;
+  const dl = $("dlLink");
+  if (file) { dl.href = url; dl.download = file.name; dl.style.display = ""; }
+  else { dl.style.display = "none"; }
+}
+
+/* Speculative neighbor prefetch: warm the shared server cache so hour
+   stepping (and every future visitor) is instant. */
+const prefetched = new Set();
+function prefetchNeighbors(slug, hour) {
+  if (!FAMS[state.fam].hourly) return;
+  const index = state.hours.indexOf(hour);
+  const targets = [index + 1, index - 1, index + 2, index + 3]
+    .map(i => state.hours[i]).filter(h => h !== undefined);
+  targets.forEach(h => {
+    const key = `${currentRun()}|${slug}|${h}|${JSON.stringify(domainPayload())}|${state.density}`;
+    if (prefetched.has(key)) return;
+    prefetched.add(key);
+    requestPlot(slug, h, true).catch(() => prefetched.delete(key));
   });
 }
-let boxIndex = 0, view = { s: 1, x: 0, y: 0 };
-const box = $("box"), boxImg = $("boxImg");
-function openBox(index) {
-  boxIndex = index;
-  const f = shots[index];
-  boxImg.src = f.url; $("boxName").textContent = f.name;
-  box.classList.add("show");
-  boxImg.onload = fitBox;
-}
-function fitBox() {
-  const iw = boxImg.naturalWidth || 1180, ih = boxImg.naturalHeight || 900;
-  const s = Math.min(innerWidth / iw, (innerHeight - 60) / ih) * 0.96;
-  view = { s, x: (innerWidth - iw * s) / 2, y: (innerHeight - 60 - ih * s) / 2 };
-  applyView();
-}
-function applyView() { boxImg.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.s})`; }
-box.addEventListener("wheel", ev => {
-  ev.preventDefault();
-  const factor = ev.deltaY < 0 ? 1.18 : 1 / 1.18;
-  const ns = Math.min(Math.max(view.s * factor, 0.05), 12);
-  view.x = ev.clientX - (ev.clientX - view.x) * (ns / view.s);
-  view.y = ev.clientY - (ev.clientY - view.y) * (ns / view.s);
-  view.s = ns; applyView();
-}, { passive: false });
-let panA = null;
-boxImg.addEventListener("pointerdown", ev => { ev.preventDefault(); panA = [ev.clientX - view.x, ev.clientY - view.y]; boxImg.classList.add("grabbing"); boxImg.setPointerCapture(ev.pointerId); });
-boxImg.addEventListener("pointermove", ev => { if (!panA) return; view.x = ev.clientX - panA[0]; view.y = ev.clientY - panA[1]; applyView(); });
-boxImg.addEventListener("pointerup", () => { panA = null; boxImg.classList.remove("grabbing"); });
-boxImg.addEventListener("dblclick", fitBox);
-function cycle(direction) { if (!shots.length) return; boxIndex = (boxIndex + direction + shots.length) % shots.length; openBox(boxIndex); }
-$("boxPrev").onclick = () => cycle(-1);
-$("boxNext").onclick = () => cycle(1);
-$("boxClose").onclick = () => box.classList.remove("show");
-addEventListener("keydown", ev => {
-  if (!box.classList.contains("show")) return;
-  if (ev.key === "Escape") box.classList.remove("show");
-  if (ev.key === "ArrowLeft") cycle(-1);
-  if (ev.key === "ArrowRight") cycle(1);
-});
 
-log("CWT Fire Weather Lab preview — HRRR × 7-year RTMA climatology");
+/* ---------- in-viewer zoom (no overlay, no z-index fights) ---------- */
+let zoom = { s: 1, x: 0, y: 0 }, panFrom = null;
+const viewport = $("viewport"), viewImg = $("viewImg");
+function resetZoom() {
+  zoom = { s: 1, x: 0, y: 0 };
+  viewImg.classList.remove("zoomed");
+  viewImg.style.transform = "";
+}
+function applyZoom() { viewImg.style.transform = `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.s})`; }
+viewport.addEventListener("wheel", ev => {
+  if (viewImg.style.display === "none") return;
+  ev.preventDefault();
+  const rect = viewport.getBoundingClientRect();
+  const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+  if (!viewImg.classList.contains("zoomed")) {
+    // Enter zoom mode at the image's current displayed scale/position.
+    const ir = viewImg.getBoundingClientRect();
+    zoom.s = ir.width / viewImg.naturalWidth;
+    zoom.x = ir.left - rect.left; zoom.y = ir.top - rect.top;
+    viewImg.classList.add("zoomed");
+  }
+  const factor = ev.deltaY < 0 ? 1.16 : 1 / 1.16;
+  const ns = Math.min(Math.max(zoom.s * factor, 0.05), 10);
+  zoom.x = mx - (mx - zoom.x) * (ns / zoom.s);
+  zoom.y = my - (my - zoom.y) * (ns / zoom.s);
+  zoom.s = ns;
+  applyZoom();
+}, { passive: false });
+viewImg.addEventListener("pointerdown", ev => {
+  if (!viewImg.classList.contains("zoomed")) return;
+  ev.preventDefault();
+  panFrom = [ev.clientX - zoom.x, ev.clientY - zoom.y];
+  viewImg.classList.add("grabbing");
+  viewImg.setPointerCapture(ev.pointerId);
+});
+viewImg.addEventListener("pointermove", ev => {
+  if (!panFrom) return;
+  zoom.x = ev.clientX - panFrom[0]; zoom.y = ev.clientY - panFrom[1];
+  applyZoom();
+});
+viewImg.addEventListener("pointerup", () => { panFrom = null; viewImg.classList.remove("grabbing"); });
+viewport.addEventListener("dblclick", resetZoom);
+
+/* ---------- boot ---------- */
+buildFams();
+buildProducts();
+$("ribbon").innerHTML = RIBBONS.anomaly;
+updateHourNav();
+updateHourLabel();
+log("CWT Fire Weather Lab — HRRR × 7-year RTMA climatology");
+setTimeout(() => renderCurrent(), 400);
 </script>
 </body>
 </html>
