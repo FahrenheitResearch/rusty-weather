@@ -370,10 +370,12 @@ fn compute_layout(
     let header_bottom_pad = scale_u32(5, chrome_scale);
     let map_x = metrics.margin_x.min(total_w.saturating_sub(1));
     // Branding strip: one small text row above everything else, sized so
-    // cropping it off leaves the full plot intact.
-    let banner_h = scale_u32(3, chrome_scale)
+    // cropping it off leaves the full plot intact. Sized by the BOLD
+    // line height (the strip draws bold text) plus real padding so it
+    // cannot kiss the title row below.
+    let banner_h = scale_u32(11, chrome_scale)
         .saturating_mul(2)
-        .saturating_add(subtitle_line_h);
+        .saturating_add(title_line_h);
     let title_h = banner_h
         .saturating_add(if has_title {
             metrics.title_h.max(
@@ -1107,8 +1109,16 @@ fn draw_projected_lines(
     // serializes sync overhead per polyline. Re-enable only when the canvas
     // can stay GPU-resident across multiple draw passes — see the
     // canvas-resident pipeline plan.
+    // Clip strokes to the map panel: edge-hugging boundaries otherwise
+    // paint their anti-aliased width past the frame into the chrome.
+    let map_clip = (
+        layout.map_x as i32,
+        layout.map_y as i32,
+        (layout.map_x + layout.map_w).saturating_sub(1) as i32,
+        (layout.map_y + layout.map_h).saturating_sub(1) as i32,
+    );
     for (points, color, width) in chunks {
-        draw::draw_polyline_aa(img, &points, color, width);
+        draw::draw_polyline_aa_clipped(img, &points, color, width, map_clip);
     }
 }
 
@@ -4441,9 +4451,13 @@ fn draw_chrome_and_colorbar(
     if opts.presentation.plot_style.uses_operational_presentation() && layout.banner_h > 0 {
         // Croppable branding strip: pinned to the very top so trimming
         // `banner_h` rows leaves a complete, fully-labeled plot.
-        let banner_text_y =
-            (layout.banner_h.saturating_sub(text::regular_line_height(layout.text_scale)) / 2)
-                as i32;
+        // Pin to the strip's top: all remaining banner height becomes
+        // the visual gap between the banner and the plot title.
+        let banner_text_y = scale_u32(3, resolve_chrome_scale(
+            img.width(),
+            img.height(),
+            opts.chrome_scale,
+        )) as i32;
         text::draw_text_bold(
             img,
             "CALIFORNIA WILDFIRE TRACKING",

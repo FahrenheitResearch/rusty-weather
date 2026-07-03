@@ -210,6 +210,43 @@ pub fn draw_polyline_aa(img: &mut RgbaImage, points: &[(f64, f64)], color: Rgba,
     }
 }
 
+/// Like [`draw_polyline_aa`] but pixel writes are confined to `clip`
+/// (inclusive rect `(x0, y0, x1, y1)`). Map-panel linework must use this:
+/// the anti-aliased stroke extends ~`width/2 + 1` px past segment ends,
+/// so edge-hugging state/county lines otherwise bleed past the frame.
+pub fn draw_polyline_aa_clipped(
+    img: &mut RgbaImage,
+    points: &[(f64, f64)],
+    color: Rgba,
+    width: u32,
+    clip: (i32, i32, i32, i32),
+) {
+    if points.len() < 2 || clip.2 < clip.0 || clip.3 < clip.1 {
+        return;
+    }
+    for segment in points.windows(2) {
+        let (x0, y0) = segment[0];
+        let (x1, y1) = segment[1];
+        if !x0.is_finite() || !y0.is_finite() || !x1.is_finite() || !y1.is_finite() {
+            continue;
+        }
+        let radius = width.max(1) as f64 * 0.5 + 1.0;
+        let min_x = ((x0.min(x1) - radius).floor() as i32).max(clip.0);
+        let max_x = ((x0.max(x1) + radius).ceil() as i32).min(clip.2);
+        let min_y = ((y0.min(y1) - radius).floor() as i32).max(clip.1);
+        let max_y = ((y0.max(y1) + radius).ceil() as i32).min(clip.3);
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let px = x as f64 + 0.5;
+                let py = y as f64 + 0.5;
+                let coverage =
+                    stroke_coverage(distance_to_segment(px, py, x0, y0, x1, y1), width.max(1));
+                blend_pixel_coverage(img, x, y, color, coverage);
+            }
+        }
+    }
+}
+
 /// Fill a polygon (optionally with holes) using an even-odd scanline rule.
 ///
 /// `rings` is a list of closed rings in pixel coordinates — the first ring is
