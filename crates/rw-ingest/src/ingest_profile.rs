@@ -151,14 +151,29 @@ impl IngestProfile {
         }
     }
 
+    /// The serving-box pack with vertical structure: everything `view`
+    /// stores PLUS the 5 isobaric volumes (cross sections / soundings
+    /// serve from the store), still NO heavy stage — entrainment-CAPE
+    /// class compute stays on the dedicated node.
+    pub fn view_volumes() -> Self {
+        Self {
+            volumes: VolumeChoice::ALL.to_vec(),
+            level_step_hpa: 25,
+            surface_fields: FieldSet::All,
+            derived: true,
+            heavy: false,
+        }
+    }
+
     /// Preset lookup by CLI name.
     pub fn preset(name: &str) -> Result<Self, String> {
         match name {
             "full" => Ok(Self::full()),
             "sounding" => Ok(Self::sounding()),
             "view" => Ok(Self::view()),
+            "view-volumes" | "view_volumes" => Ok(Self::view_volumes()),
             other => Err(format!(
-                "--profile: unknown preset '{other}' (expected full, sounding, or view)"
+                "--profile: unknown preset '{other}' (expected full, sounding, view, or view-volumes)"
             )),
         }
     }
