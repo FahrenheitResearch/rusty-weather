@@ -137,11 +137,26 @@ Details that matter:
   `YYYYMMDD_HHz/` holding `f###.rws` hour files. HRRR runs also carry a
   `.fuels-imported` flag file once fuel grids are merged in.
 - `<model>/latest.json` — the per-model manifest (schema
-  `cafire.latest_run.v1`): `run`, `complete_run` (newest fully-stored
-  run), `day_run` (HRRR only — newest run covering a full UTC day, used
-  by anomaly products via the `latest-day` alias), `stored_hours`.
-  Written atomically by the pipeline; the API resolves the `latest` /
-  `latest-day` aliases from it **before** computing render-cache keys.
+  `cafire.latest_run.v1`). Three run pointers, each feeding a different
+  API alias so every product family resolves to a run that actually has
+  what it needs (a run is promoted to a pointer only once it's *ready*
+  for that family — see the fix below):
+  - `complete_run` → alias **`latest`**: newest fully-ingested run.
+    Advances the instant weather ingest finishes → weather maps always
+    freshest. Never gated on fuels.
+  - `day_run` → alias **`latest-day`**: newest **complete** run covering
+    a full UTC day (anomaly / day-window products). Requires full ingest
+    so 24–48h windows aren't rendered against missing hours; off-cycle
+    F18 runs never qualify, so it rides the extended 00/06/12/18Z runs.
+  - `fuel_run` → alias **`fuel-run`**: newest complete run whose
+    `.fuels-imported` flag is set (HRRR only). Fuel products (ERC etc.)
+    resolve here, so a slow/failed gridMET import never errors a fuel map
+    on `latest` and never freezes the weather pointer.
+  Also carries `run`, `stored_hours`. Written atomically by the pipeline;
+  the API resolves all three aliases **before** computing render-cache
+  keys. (Fix `86a1f4d`, 2026-07-03: before this, pointers advanced before
+  a run was ready — fuels lagged on `latest`, and `day_run` promoted to a
+  still-ingesting extended run — causing recurring `rw_render exit 1`.)
 - `rtma_climo/` (~34 GB) — **precious, not reproducible on this server.**
   Two runs: `seasonal_v2026_05_24` (DOY percentile climatology) and
   `exact_v2026_05_24` (all-time records), each with a `land_mask.bin/json`
