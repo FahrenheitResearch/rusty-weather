@@ -20,14 +20,14 @@ use rustwx_products::places::{nearest_place, NearestPlace};
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
 
-const MS_TO_MPH: f64 = 2.236_936;
+pub(crate) const MS_TO_MPH: f64 = 2.236_936;
 
 /// True meteorological wind barb as an SVG group centered at (x, y):
 /// the staff points toward the wind SOURCE (rotate by the from-degrees),
 /// feathers on the right side per NH convention — half barb = 5 kt,
 /// full barb = 10 kt, pennant = 50 kt (speed converted from mph and
 /// rounded to 5 kt). Calm (< ~3 mph) draws the station circle.
-fn wind_barb_svg(x: f64, y: f64, dir_from_deg: f64, speed_mph: f64, color: &str) -> String {
+pub(crate) fn wind_barb_svg(x: f64, y: f64, dir_from_deg: f64, speed_mph: f64, color: &str) -> String {
     let kt = (speed_mph * 0.868_976 / 5.0).round() as i64 * 5;
     if kt < 3 {
         return format!(
@@ -173,7 +173,7 @@ const SAMPLED_VARS: &[&str] = &[
 ];
 
 /// Nearest grid cell by squared equirectangular distance.
-fn nearest_cell(lat: &[f32], lon: &[f32], point_lat: f64, point_lon: f64) -> (usize, f64) {
+pub(crate) fn nearest_cell(lat: &[f32], lon: &[f32], point_lat: f64, point_lon: f64) -> (usize, f64) {
     let coslat = point_lat.to_radians().cos();
     let mut best = (0usize, f64::INFINITY);
     for (index, (&la, &lo)) in lat.iter().zip(lon.iter()).enumerate() {
@@ -187,7 +187,7 @@ fn nearest_cell(lat: &[f32], lon: &[f32], point_lat: f64, point_lon: f64) -> (us
     best
 }
 
-fn saturation_vapor_pressure_hpa(t_c: f64) -> f64 {
+pub(crate) fn saturation_vapor_pressure_hpa(t_c: f64) -> f64 {
     6.112 * ((17.67 * t_c) / (t_c + 243.5)).exp()
 }
 
@@ -204,7 +204,7 @@ fn to_c(value: f64, units: &str) -> f64 {
     }
 }
 
-fn c_to_f(c: f64) -> f64 {
+pub(crate) fn c_to_f(c: f64) -> f64 {
     c * 9.0 / 5.0 + 32.0
 }
 
@@ -328,7 +328,7 @@ fn climo_day_refs(
 }
 
 /// (utc-hour-of-day, "Wed 7/2") for run date + cycle + forecast hour.
-fn valid_label(date_yyyymmdd: &str, cycle_utc: u8, forecast_hour: u16) -> (u32, String) {
+pub(crate) fn valid_label(date_yyyymmdd: &str, cycle_utc: u8, forecast_hour: u16) -> (u32, String) {
     let year: i64 = date_yyyymmdd[0..4].parse().unwrap_or(2000);
     let month: u32 = date_yyyymmdd[4..6].parse().unwrap_or(1);
     let day: u32 = date_yyyymmdd[6..8].parse().unwrap_or(1);
@@ -341,7 +341,7 @@ fn valid_label(date_yyyymmdd: &str, cycle_utc: u8, forecast_hour: u16) -> (u32, 
 }
 
 /// Round tick step to a 1/2/2.5/5 decade multiple covering the range.
-fn nice_step(range: f64, target: usize) -> f64 {
+pub(crate) fn nice_step(range: f64, target: usize) -> f64 {
     if !(range.is_finite()) || range <= 0.0 {
         return 1.0;
     }
@@ -405,7 +405,7 @@ fn fmt_tick(v: f64, step: f64) -> String {
     }
 }
 
-fn xml_escape(text: &str) -> String {
+pub(crate) fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 

@@ -146,6 +146,8 @@ button { color: inherit; cursor: pointer; }
 .leaflet-container { font-family: var(--font); }
 .leaflet-control-attribution { background: rgba(9,11,12,0.7) !important; color: var(--muted-2) !important; }
 .leaflet-control-attribution a { color: var(--muted) !important; }
+.xsec-tip { background: rgba(9,11,12,0.88); border: 1px solid var(--line-strong); color: var(--text); font-weight: 700; font-size: 11px; padding: 1px 6px; border-radius: 6px; box-shadow: none; }
+.xsec-tip::before { display: none; }
 </style>
 </head>
 <body>
@@ -253,6 +255,17 @@ button { color: inherit; cursor: pointer; }
       <div class="hint">The classic shareable card — click the map to move it anywhere.</div>
     </div>
 
+    <div class="side-box" id="xsectionBox">
+      <span class="field-label">Field</span>
+      <div class="segmented" id="xsecFieldSeg">
+        <button class="selected" type="button" data-field="temperature">Temp</button>
+        <button type="button" data-field="rh">RH</button>
+        <button type="button" data-field="wind">Wind</button>
+      </div>
+      <button class="tool-btn" id="xsecShare" style="align-self:start">🔗 copy share link</button>
+      <div class="hint">Switch the map to <b>line</b> mode and click twice — <b>A</b>, then <b>B</b> — to slice the atmosphere along that line. Click again to start a new line; ← / → steps the forecast hour.</div>
+    </div>
+
     <div class="side-box" id="meteoBox">
       <div class="mini-grid">
         <label>lat <input id="mgLat" type="number" step="0.0001" value="38.5816"></label>
@@ -344,6 +357,7 @@ button { color: inherit; cursor: pointer; }
           <button class="tool-btn" data-preset="sierra">Sierra Front</button>
           <button class="tool-btn" id="drawBtn">✏ draw box</button>
           <button class="tool-btn" id="pointBtn">📍 point</button>
+          <button class="tool-btn" id="lineBtn">📏 line</button>
           <select id="fireSel" class="tool-btn" style="max-width:200px">
             <option value="">🔥 active fires…</option>
           </select>
@@ -485,7 +499,11 @@ const FAMS = {
   meteogram: { label: "Meteogram", hourly: false, products: [] },
   custom: { label: "Custom Chart", hourly: false, products: [] },
   daily: { label: "Outlook Cards", hourly: false, products: [] },
-  ecape: { label: "PyroCb / ECAPE · heavy node", hourly: true, products: [
+  /* probeVar: families whose hours must carry a specific store variable
+     declare it here; loadRuns narrows the hour ladder with /api/runs?var=.
+     Cross sections need the isobaric volumes (view-volumes ingest). */
+  xsection: { label: "Cross Section", hourly: true, products: [], probeVar: () => "temperature_iso" },
+  ecape: { label: "PyroCb / ECAPE · heavy node", hourly: true, probeVar: () => state.product, products: [
     ["pft_gw", "PFT — pyroCb firepower threshold"],
     ["pft_zfc", "PFT free-convection height"],
     ["pft_dtheta_fc", "PFT required plume warming"],
@@ -520,6 +538,7 @@ const FAM_NOTES = {
   record: "Same ranking, but against every analyzed day 2019–2026 regardless of season — “is this near the all-time record for this spot,” not just unusual for the date.",
   climoref: "Not a forecast — these render the climatology itself: what the chosen percentile of VPD, RH, wind, or gust looks like on a given date. Use them to calibrate what “normal” and “extreme” mean for a place.",
   ecape: "Advanced instability diagnostics computed on a dedicated node from full HRRR volumes. Experimental — read individual product notes.",
+  xsection: "A vertical slice through the model atmosphere along the line you draw — the chosen field at every pressure level from the ground to 150 mb, terrain blacked out from model surface pressure, wind barbs in knots. Honest caveat: columns sample a straight lat/lon line (not a true great circle) and grid indices interpolate linearly between the endpoint cells, so the path can drift a cell or two (~3–6 km) mid-line — negligible at this scale. Only hours whose stored file carries the isobaric volumes appear in the hour ladder.",
   windows: "Each map folds a fixed window of forecast hours (e.g. 0–24 h) into one value per cell — a day's max/min/total at a glance rather than one instant.",
 };
 const PRODUCT_NOTES = {
@@ -596,6 +615,10 @@ const RIBBONS = {
   daily: `<b>Shareable outlook cards</b> — colored number strips, wind + precip rows, bars. Daily
     columns for NBM/GFS (8–10 days) or hourly/3-h/6-h columns for HRRR. Any variable, any point —
     copy the link or save the image and post it.`,
+  xsection: `<b>Vertical cross section</b> — the atmosphere sliced along your A→B line from the stored
+    HRRR isobaric volumes (25 hPa steps): fill = temperature / RH / wind speed, dark silhouette =
+    terrain from surface pressure, true wind barbs in knots. Add <code>&amp;format=json</code> to the
+    share link for the raw sampled arrays.`,
   ecape: `<b>Entrainment CAPE suite</b> — rendered live on the CWT 24-core compute node (full HRRR
     volumes; too heavy for the serving box) through a secure tunnel. Full features: any hour, any
     domain, draw-a-box, fire framing. The pyroCb-relevant signal is how much CAPE survives
@@ -606,7 +629,10 @@ let state = {
   basemap: "topo", counties: true, tempUnits: "f",
   preset: "california", drawn: null, fire: null, stat: "p95",
   hours: [], playTimer: null, seq: 0,
+  /* cross-section endpoints, [lat, lon] each */
+  xsecA: null, xsecB: null,
 };
+let xsecField = "temperature";
 
 /* ---------- console/log ---------- */
 function log(message, cls) {
@@ -633,18 +659,24 @@ function runAge(unix) {
   return mins < 90 ? `${Math.round(mins)} min ago` : `${(mins / 60).toFixed(1)} h ago`;
 }
 let runsBase = "";
+let runsProbe = "";
 let runsHours = {};
+function currentProbeVar() {
+  const fam = FAMS[state.fam];
+  return fam && fam.probeVar ? fam.probeVar() : "";
+}
 async function loadRuns() {
   try {
     // Node-backed families list the compute node's own run inventory —
     // its store is independent of the main server's (and can be ahead
     // or behind it).
     runsBase = apiBase();
-    // Heavy store products exist only on hours ingested after their
-    // lane deployed — ask the API for the hours that actually carry the
-    // selected product so nothing in the ladder can error.
-    const probe = state.fam === "ecape" && state.product
-      ? `?var=${encodeURIComponent(state.product)}` : "";
+    // Some products exist only on hours ingested after their lane
+    // deployed (ECAPE on the heavy node, isobaric volumes for cross
+    // sections) — the family's probeVar asks the API for the hours that
+    // actually carry it so nothing in the ladder can error.
+    runsProbe = currentProbeVar();
+    const probe = runsProbe ? `?var=${encodeURIComponent(runsProbe)}` : "";
     const data = await fetch(runsBase + "/api/runs" + probe).then(r => r.json());
     latestManifest = data.latest || null;
     runsHours = data.hours || {};
@@ -743,6 +775,7 @@ function selectFam(key) {
   $("meteoBox").classList.toggle("show", key === "meteogram" || key === "custom" || key === "daily");
   $("customBox").classList.toggle("show", key === "custom");
   $("dailyBox").classList.toggle("show", key === "daily");
+  $("xsectionBox").classList.toggle("show", key === "xsection");
   if ((key === "custom" || key === "daily") && !varsLoaded) loadVars();
   if (key === "custom" || key === "daily") syncModelSegs();
   const ribbon = $("ribbon");
@@ -750,14 +783,19 @@ function selectFam(key) {
   if (key in RIBBONS) ribbon.innerHTML = RIBBONS[key];
   buildProducts();
   // Crossing the main-server/compute-node boundary needs a fresh run
-  // inventory (and, for the node family, a product-aware hour probe —
-  // so reload AFTER the family's product is set).
-  const needsRuns = apiBase() !== runsBase;
+  // inventory, and so does a change of the family's hour-probe variable
+  // (for the node family the probe tracks the product — reload AFTER
+  // the family's product is set).
+  const needsRuns = apiBase() !== runsBase || currentProbeVar() !== runsProbe;
   if (key === "meteogram" || key === "custom" || key === "daily") {
     if (needsRuns) loadRuns();
     setMapMode("point"); renderCurrent();
+  } else if (key === "xsection") {
+    // Hour ladder must reflect volume-carrying hours before rendering.
+    setMapMode("line");
+    if (needsRuns) { loadRuns().then(renderCurrent); } else { renderCurrent(); }
   } else {
-    if (mapMode === "point") setMapMode("view");
+    if (mapMode === "point" || mapMode === "line") setMapMode("view");
     if (FAMS[key].products.length) {
       state.product = FAMS[key].products[0][0]; markProduct();
       if (needsRuns) { loadRuns().then(renderCurrent); } else { renderCurrent(); }
@@ -857,6 +895,8 @@ wireSegment("quality", d => { state.density = Number(d.density); });
 wireSegment("basemapSeg", d => { state.basemap = d.basemap; });
 wireSegment("countySeg", d => { state.counties = d.counties === "true"; });
 wireSegment("tempUnitSeg", d => { state.tempUnits = d.tempunits; });
+wireSegment("xsecFieldSeg", d => { xsecField = d.field; });
+$("xsecShare").onclick = () => $("shareBtn").onclick();
 
 /* ---------- Leaflet map ---------- */
 const map = L.map("map", { zoomControl: true }).setView([37.6, -119.5], 5);
@@ -886,6 +926,7 @@ function setMapMode(mode) {
   mapMode = mode;
   $("drawBtn").classList.toggle("on", mode === "draw");
   $("pointBtn").classList.toggle("on", mode === "point");
+  $("lineBtn").classList.toggle("on", mode === "line");
   $("map").style.cursor = mode === "view" ? "grab" : "crosshair";
   if (mode === "draw") map.dragging.disable(); else map.dragging.enable();
 }
@@ -894,6 +935,7 @@ document.querySelectorAll(".tool-btn[data-preset]").forEach(btn => {
 });
 $("drawBtn").onclick = () => setMapMode(mapMode === "draw" ? "view" : "draw");
 $("pointBtn").onclick = () => setMapMode(mapMode === "point" ? "view" : "point");
+$("lineBtn").onclick = () => setMapMode(mapMode === "line" ? "view" : "line");
 map.on("mousedown", ev => {
   if (mapMode !== "draw") return;
   drawStart = ev.latlng;
@@ -918,9 +960,39 @@ map.on("mouseup", ev => {
   setMapMode("view");
   renderCurrent();
 });
+/* Cross-section line: two clicks set A then B; a third starts over. */
+let xsecLine = null, xsecMarkers = [];
+function clearXsecLine() {
+  state.xsecA = null; state.xsecB = null;
+  if (xsecLine) { map.removeLayer(xsecLine); xsecLine = null; }
+  xsecMarkers.forEach(m => map.removeLayer(m)); xsecMarkers = [];
+}
+function xsecEndpointMarker(latlng, label) {
+  const marker = L.circleMarker(latlng, { radius: 7, color: "#ffd456", weight: 2, fillColor: "#ff5b24", fillOpacity: 0.9 })
+    .bindTooltip(label, { permanent: true, direction: "top", offset: [0, -8], className: "xsec-tip" })
+    .addTo(map);
+  xsecMarkers.push(marker);
+}
 map.on("click", ev => {
-  if (mapMode !== "point") return;
   const { lat, lng } = ev.latlng;
+  if (mapMode === "line") {
+    if (!state.xsecA || state.xsecB) {
+      clearXsecLine();
+      state.xsecA = [lat, lng];
+      xsecEndpointMarker([lat, lng], "A");
+      $("mapReadout").textContent = `cross section A: ${lat.toFixed(3)}, ${lng.toFixed(3)} — click B`;
+      return;
+    }
+    state.xsecB = [lat, lng];
+    xsecEndpointMarker([lat, lng], "B");
+    xsecLine = L.polyline([state.xsecA, state.xsecB], { color: "#ffd456", weight: 2.5, dashArray: "7 5" }).addTo(map);
+    $("mapReadout").textContent =
+      `cross section: ${state.xsecA[0].toFixed(3)}, ${state.xsecA[1].toFixed(3)} → ${lat.toFixed(3)}, ${lng.toFixed(3)}`;
+    if (state.fam !== "xsection") selectFam("xsection");
+    else renderCurrent();
+    return;
+  }
+  if (mapMode !== "point") return;
   if (pointMarker) map.removeLayer(pointMarker);
   pointMarker = L.circleMarker([lat, lng], { radius: 7, color: "#ffd456", weight: 2, fillColor: "#ff5b24", fillOpacity: 0.9 }).addTo(map);
   $("mgLat").value = lat.toFixed(4); $("mgLon").value = lng.toFixed(4);
@@ -1139,6 +1211,30 @@ async function renderCurrent() {
       if (seq !== state.seq) return;
       showImage(URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" })), `Daily outlook — ${variable.replace(/_/g, " ")}`, `${chartModel} latest`, null);
       log("daily card ready", "ok");
+      return;
+    }
+    if (state.fam === "xsection") {
+      if (!state.xsecA || !state.xsecB) {
+        $("viewImg").style.display = "none";
+        $("placeholder").style.display = "";
+        $("placeholder").innerHTML = `<div class="flame">▲▲▲</div>Cross section: click the map twice — <b>A</b>, then <b>B</b> — to slice the atmosphere.`;
+        log("cross section: pick A and B on the map");
+        return;
+      }
+      spin.classList.add("show"); $("spinText").textContent = "slicing atmosphere…";
+      const [lat0, lon0] = state.xsecA, [lat1, lon1] = state.xsecB;
+      const url = `/api/xsection?lat0=${lat0.toFixed(4)}&lon0=${lon0.toFixed(4)}`
+        + `&lat1=${lat1.toFixed(4)}&lon1=${lon1.toFixed(4)}`
+        + `&run=${encodeURIComponent($("runSelect").value)}&hour=${state.hour}&field=${xsecField}`;
+      lastShareUrl = url;
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || `HTTP ${resp.status}`);
+      const svg = await resp.text();
+      if (seq !== state.seq) return;
+      showImage(URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" })),
+        `Cross section — ${xsecField === "rh" ? "relative humidity" : xsecField}`,
+        `${$("runSelect").value} · F${String(state.hour).padStart(3, "0")}`, null);
+      log("cross section ready", "ok");
       return;
     }
     if (state.fam === "meteogram" || state.fam === "custom") {

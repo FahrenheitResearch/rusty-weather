@@ -24,6 +24,9 @@ mod perimeter;
 #[path = "../meteogram.rs"]
 mod meteogram;
 
+#[path = "../xsection.rs"]
+mod xsection;
+
 const MIN_RENDER_WIDTH: u32 = 1200;
 const MIN_RENDER_HEIGHT: u32 = 900;
 const MAX_RENDER_DIMENSION: u32 = 2400;
@@ -336,6 +339,9 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
         ("OPTIONS", _) => empty_response(204),
         _ if request.method == "GET" && request.path.starts_with("/api/meteogram") => {
             meteogram_response(&request.query, &state)
+        }
+        _ if request.method == "GET" && request.path.starts_with("/api/xsection") => {
+            xsection_response(&request.query, &state)
         }
         _ if request.method == "GET" && request.path.starts_with("/api/runs") => {
             runs_response(&request.query, &state)
@@ -1352,6 +1358,105 @@ fn meteogram_response(path: &str, state: &AppState) -> Vec<u8> {
             .unwrap_or(-7.0),
     };
     match meteogram::render_meteogram_svg(&state.store_root, model, run, &date, cycle, &request) {
+        Ok(output) => {
+            if query.get("format").map(String::as_str) == Some("json") {
+                json_response(&output.data)
+            } else {
+                response_with_extra_headers(
+                    200,
+                    "image/svg+xml; charset=utf-8",
+                    output.svg.into_bytes(),
+                    "Cache-Control: no-store\r\n",
+                )
+            }
+        }
+        Err(message) => json_status_response(422, &serde_json::json!({ "error": message })),
+    }
+}
+
+/// GET /api/xsection?lat0=..&lon0=..&lat1=..&lon1=..&run=latest[&model=hrrr]
+/// [&hour=12][&field=temperature|rh|wind][&utc_offset=-7][&format=json]
+/// — a vertical slice through the stored isobaric volumes along the A→B
+/// line, as inline SVG (or the raw sampled arrays with format=json).
+fn xsection_response(path: &str, state: &AppState) -> Vec<u8> {
+    let query = parse_query(path);
+    let bad = |message: &str| json_status_response(400, &serde_json::json!({ "error": message }));
+    let mut coords = [0.0f64; 4];
+    for (slot, key) in coords.iter_mut().zip(["lat0", "lon0", "lat1", "lon1"]) {
+        match query.get(key).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite()) {
+            Some(value) => *slot = value,
+            None => return bad(&format!("{key} is required (endpoint coordinates)")),
+        }
+    }
+    let [lat0, lon0, lat1, lon1] = coords;
+    if !((-90.0..=90.0).contains(&lat0) && (-90.0..=90.0).contains(&lat1)) {
+        return bad("latitudes must be within -90..90");
+    }
+    if !((-360.0..=360.0).contains(&lon0) && (-360.0..=360.0).contains(&lon1)) {
+        return bad("longitudes must be within -360..360");
+    }
+    let Some(run) = query.get("run").map(String::as_str) else {
+        return bad("run is required (e.g. 20260702_22z or latest)");
+    };
+    if run.len() > 40 || run.contains(['/', '\\', '.']) {
+        return bad("run slug is not valid");
+    }
+    let model = query.get("model").map(String::as_str).unwrap_or("hrrr");
+    if model.len() > 24 || model.contains(['/', '\\', '.']) {
+        return bad("model slug is not valid");
+    }
+    let field = query
+        .get("field")
+        .map(String::as_str)
+        .unwrap_or("temperature")
+        .to_ascii_lowercase();
+    if !xsection::XSECTION_FIELDS.contains(&field.as_str()) {
+        return bad(&format!(
+            "field must be one of {}",
+            xsection::XSECTION_FIELDS.join(", ")
+        ));
+    }
+    let hour = match query.get("hour") {
+        None => None,
+        Some(value) => match value.parse::<u16>().ok().filter(|h| *h <= 384) {
+            Some(hour) => Some(hour),
+            None => return bad("hour must be an integer forecast hour (0-384)"),
+        },
+    };
+    let resolved_run;
+    let alias = run.to_ascii_lowercase();
+    let run = if alias == "latest" || alias == "latest-day" {
+        match resolve_latest_run(&state.store_root, model, alias == "latest-day") {
+            Ok(resolved) => {
+                resolved_run = resolved;
+                resolved_run.as_str()
+            }
+            Err(message) => return json_status_response(422, &serde_json::json!({ "error": message })),
+        }
+    } else {
+        run
+    };
+    let Some((date, cycle)) = run.split_once('_').and_then(|(date, cycle)| {
+        let hour: u8 = cycle.strip_suffix('z').or_else(|| cycle.strip_suffix('Z'))?.parse().ok()?;
+        (date.len() == 8 && date.chars().all(|c| c.is_ascii_digit()) && hour <= 23)
+            .then(|| (date.to_string(), hour))
+    }) else {
+        return bad("run must look like 20260702_22z");
+    };
+    let request = xsection::XsectionRequest {
+        lat0,
+        lon0,
+        lat1,
+        lon1,
+        field,
+        hour,
+        utc_offset_hours: query
+            .get("utc_offset")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| (-14.0..=14.0).contains(v))
+            .unwrap_or(-7.0),
+    };
+    match xsection::render_xsection_svg(&state.store_root, model, run, &date, cycle, &request) {
         Ok(output) => {
             if query.get("format").map(String::as_str) == Some("json") {
                 json_response(&output.data)
