@@ -810,6 +810,29 @@ pub fn render_meteogram_svg(
                 x_for(hi) - x_lo
             ));
         }
+        // Extended range (>= ~day 8 / F192): dim it and mark the onset —
+        // deterministic skill is low out there. Only shows when the run
+        // actually reaches past day 8 (HRRR never does).
+        if h1 > 192.0 {
+            let ex_lo = x_for(192.0_f64.max(h0));
+            if x_for(h1) > ex_lo + 1.0 {
+                svg.push_str(&format!(
+                    r##"<rect x="{ex_lo:.1}" y="{top}" width="{:.1}" height="{PANEL_H}" fill="#000000" fill-opacity="0.16"/>"##,
+                    x_for(h1) - ex_lo
+                ));
+                svg.push_str(&format!(
+                    r##"<line x1="{ex_lo:.1}" y1="{top}" x2="{ex_lo:.1}" y2="{:.1}" stroke="#ff6a36" stroke-width="1.2" stroke-dasharray="5 4" opacity="0.6"/>"##,
+                    top + PANEL_H
+                ));
+                if panel_index == 0 {
+                    svg.push_str(&format!(
+                        r##"<text x="{:.1}" y="{:.1}" fill="#ff8a5c" font-size="11" font-weight="700">▸ EXTENDED RANGE · LOWER CONFIDENCE</text>"##,
+                        ex_lo + 6.0,
+                        top + 14.0
+                    ));
+                }
+            }
+        }
         // 00Z day boundaries inside the plot area.
         for sample in &samples {
             let (hod, _) = valid_label(date_yyyymmdd, cycle_utc, sample.hour);
@@ -1164,6 +1187,9 @@ struct DayAgg {
     wind_max_mph: Option<f64>,
     /// Bucket precipitation (inches), from run-total differences.
     precip_in: Option<f64>,
+    /// True once this column is >=8 local days past the run init — the
+    /// extended range where deterministic skill is low (flagged in the UI).
+    extended: bool,
 }
 
 /// Classic absolute temperature (°F) cell color.
@@ -1321,6 +1347,10 @@ pub fn render_daily_svg(
     // A bucket no finer than the model cadence holds one value: single-
     // value mode (one strip row, no inner LO bar).
     let single = bucket_hours <= i64::from(cadence);
+    // A column is "extended range" once it sits >=8 local days after the
+    // run's init day (~F192): deterministic skill is low out there.
+    let init_local_day =
+        (run_days * 24 + i64::from(cycle_utc) + request.utc_offset_hours as i64).div_euclid(24);
     let mut last_day: i64 = i64::MIN;
     let days: Vec<DayAgg> = per_day
         .iter()
@@ -1328,6 +1358,7 @@ pub fn render_daily_svg(
         .map(|(&bucket, values)| {
             let start_hours = bucket * bucket_hours;
             let local_day = start_hours.div_euclid(24);
+            let extended = local_day - init_local_day >= 8;
             let (y, m, d) = civil_from_days(local_day);
             let _ = y;
             let dow = WEEKDAYS[(local_day + 4).rem_euclid(7) as usize];
@@ -1374,6 +1405,7 @@ pub fn render_daily_svg(
                 wind_dir_from_deg: wind.map(|(d, _)| d),
                 wind_max_mph: wind.map(|(_, s)| s),
                 precip_in,
+                extended,
             }
         })
         .collect();
@@ -1694,6 +1726,29 @@ pub fn render_daily_svg(
         height - 14.0,
         request.utc_offset_hours
     ));
+    // Extended range: gently dim and mark the columns >=8 days out, where
+    // deterministic skill is low — so day 14 doesn't read as confident as
+    // day 2. Only appears when the run actually reaches that far.
+    if let Some(first_ext) = days.iter().position(|d| d.extended) {
+        if first_ext > 0 {
+            let bx = ml + first_ext as f64 * col_w;
+            let rx = ml + days.len() as f64 * col_w;
+            let top_y = 80.0;
+            let bot_y = chart_top + chart_h;
+            svg.push_str(&format!(
+                r##"<rect x="{bx:.1}" y="{top_y:.1}" width="{:.1}" height="{:.1}" fill="#0d1112" opacity="0.26"/>"##,
+                rx - bx,
+                bot_y - top_y
+            ));
+            svg.push_str(&format!(
+                r##"<line x1="{bx:.1}" y1="{top_y:.1}" x2="{bx:.1}" y2="{bot_y:.1}" stroke="#ff6a36" stroke-width="1.4" stroke-dasharray="5 4" opacity="0.7"/>"##
+            ));
+            svg.push_str(&format!(
+                r##"<text x="{:.1}" y="78" fill="#ff8a5c" font-size="11" font-weight="700">▸ EXTENDED RANGE · LOWER CONFIDENCE</text>"##,
+                bx + 6.0
+            ));
+        }
+    }
     svg.push_str("</svg>");
     Ok(svg)
 }
