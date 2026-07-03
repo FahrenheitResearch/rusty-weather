@@ -31,9 +31,11 @@ Params:
 - `field` = `temperature` (default, °F) | `rh` (%) | `wind` (mph).
 - `run` / `hour` — same aliases and semantics as everywhere else.
 - `utc_offset` (default −7) for the valid-time label.
-- `format=json` — raw arrays instead of the SVG: `levels_hpa`,
-  per-column `distance_mi`/`lat`/`lon`/`values`, `terrain_hpa`, and a
-  `path_note` stating the sampling approximation.
+- `format=json` — raw arrays instead of the SVG. Top-level keys (as
+  served): `a`, `b` (endpoint metadata), `distance_mi`, `lat`, `lon`,
+  `levels_hpa`, `values` (per column × level), `terrain_psfc_hpa`,
+  `units`, `field`, `model`, `run`, `hour`, `valid`, and `path_note`
+  stating the sampling approximation.
 
 Honesty note (also printed on the plot): the path is a straight
 lat/lon interpolation between the endpoint grid cells — mid-path drift
@@ -55,7 +57,10 @@ carry. It is labeled experimental and deliberately shows "--" for the
 survival ratio when CAPE is too small for the ratio to mean anything.
 
 Params: `lat`, `lon`, `run`, optional `hour`, `utc_offset`,
-`format=json` (profile arrays + all computed indices as a flat object).
+`format=json` — top-level keys as served: `point`, `cell`,
+`nearest_place`, `profile` (level arrays), `indices` (flat object of
+every computed parameter), `ecape_note`, `model`, `run`, `hour`,
+`valid`.
 
 Placement suggestions: fire-detail pages (one sounding at the fire
 point per run) and anywhere you show our meteogram — they're
