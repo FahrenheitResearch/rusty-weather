@@ -66,10 +66,10 @@ const INSET_H: u32 = UPPER_H - HODO_H; // 520
 // Colour palette
 // =========================================================================
 
-const COL_BG: [u8; 4] = [0, 0, 0, 255];
-const COL_TITLE_BG: [u8; 4] = [0, 0, 0, 255];
-const COL_WHITE: [u8; 4] = [230, 230, 230, 255];
-const COL_BORDER: [u8; 4] = [215, 215, 215, 255];
+const COL_BG: [u8; 4] = [13, 17, 18, 255]; // #0d1112 CWT dark
+const COL_TITLE_BG: [u8; 4] = [20, 16, 12, 255]; // #14100c
+const COL_WHITE: [u8; 4] = [242, 231, 213, 255]; // #f2e7d5 cream
+const COL_BORDER: [u8; 4] = [58, 49, 40, 255]; // #3a3128
 
 // =========================================================================
 // ComputedParams — all pre-computed values needed by every panel

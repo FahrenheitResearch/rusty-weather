@@ -266,6 +266,12 @@ button { color: inherit; cursor: pointer; }
       <div class="hint">Switch the map to <b>line</b> mode and click twice — <b>A</b>, then <b>B</b> — to slice the atmosphere along that line. Click again to start a new line; ← / → steps the forecast hour.</div>
     </div>
 
+    <div class="side-box" id="soundingBox">
+      <button class="tool-btn" id="soundingShare" style="align-self:start">🔗 copy share link</button>
+      <div class="hint">Switch the map to <b>point</b> mode and click anywhere — the pin renders a full
+        skew-T for that column; ← / → steps the forecast hour.</div>
+    </div>
+
     <div class="side-box" id="meteoBox">
       <div class="mini-grid">
         <label>lat <input id="mgLat" type="number" step="0.0001" value="38.5816"></label>
@@ -503,6 +509,7 @@ const FAMS = {
      declare it here; loadRuns narrows the hour ladder with /api/runs?var=.
      Cross sections need the isobaric volumes (view-volumes ingest). */
   xsection: { label: "Cross Section", hourly: true, products: [], probeVar: () => "temperature_iso" },
+  sounding: { label: "Sounding", hourly: true, products: [], probeVar: () => "temperature_iso" },
   ecape: { label: "PyroCb / ECAPE · heavy node", hourly: true, probeVar: () => state.product, products: [
     ["pft_gw", "PFT — pyroCb firepower threshold"],
     ["pft_zfc", "PFT free-convection height"],
@@ -539,6 +546,7 @@ const FAM_NOTES = {
   climoref: "Not a forecast — these render the climatology itself: what the chosen percentile of VPD, RH, wind, or gust looks like on a given date. Use them to calibrate what “normal” and “extreme” mean for a place.",
   ecape: "Advanced instability diagnostics computed on a dedicated node from full HRRR volumes. Experimental — read individual product notes.",
   xsection: "A vertical slice through the model atmosphere along the line you draw — the chosen field at every pressure level from the ground to 150 mb, terrain blacked out from model surface pressure, wind barbs in knots. Honest caveat: columns sample a straight lat/lon line (not a true great circle) and grid indices interpolate linearly between the endpoint cells, so the path can drift a cell or two (~3–6 km) mid-line — negligible at this scale. Only hours whose stored file carries the isobaric volumes appear in the hour ladder.",
+  sounding: "A skew-T/log-p sounding of the model atmosphere above the point you click: temperature and dewpoint traces against the dry/moist adiabats and mixing-ratio lines, wind barbs, a hodograph, and the derived parcel/shear/moisture numbers forecasters read. ECAPE values are entrainment-adjusted (experimental).",
   windows: "Each map folds a fixed window of forecast hours (e.g. 0–24 h) into one value per cell — a day's max/min/total at a glance rather than one instant.",
 };
 const PRODUCT_NOTES = {
@@ -619,6 +627,10 @@ const RIBBONS = {
     HRRR isobaric volumes (25 hPa steps): fill = temperature / RH / wind speed, dark silhouette =
     terrain from surface pressure, true wind barbs in knots. Add <code>&amp;format=json</code> to the
     share link for the raw sampled arrays.`,
+  sounding: `<b>Skew-T sounding</b> — the stored HRRR isobaric volumes above one point, drawn as a full
+    skew-T with hodograph, wind barbs, parameter table, and single-column ECAPE (entrainment-adjusted,
+    experimental). Only volume-carrying hours appear in the ladder; add <code>&amp;format=json</code>
+    to the share link for the raw profile + indices.`,
   ecape: `<b>Entrainment CAPE suite</b> — rendered live on the CWT 24-core compute node (full HRRR
     volumes; too heavy for the serving box) through a secure tunnel. Full features: any hour, any
     domain, draw-a-box, fire framing. The pyroCb-relevant signal is how much CAPE survives
@@ -776,6 +788,7 @@ function selectFam(key) {
   $("customBox").classList.toggle("show", key === "custom");
   $("dailyBox").classList.toggle("show", key === "daily");
   $("xsectionBox").classList.toggle("show", key === "xsection");
+  $("soundingBox").classList.toggle("show", key === "sounding");
   if ((key === "custom" || key === "daily") && !varsLoaded) loadVars();
   if (key === "custom" || key === "daily") syncModelSegs();
   const ribbon = $("ribbon");
@@ -793,6 +806,11 @@ function selectFam(key) {
   } else if (key === "xsection") {
     // Hour ladder must reflect volume-carrying hours before rendering.
     setMapMode("line");
+    if (needsRuns) { loadRuns().then(renderCurrent); } else { renderCurrent(); }
+  } else if (key === "sounding") {
+    // Point pick like the meteogram; volume-carrying hour ladder like
+    // the cross section.
+    setMapMode("point");
     if (needsRuns) { loadRuns().then(renderCurrent); } else { renderCurrent(); }
   } else {
     if (mapMode === "point" || mapMode === "line") setMapMode("view");
@@ -897,6 +915,7 @@ wireSegment("countySeg", d => { state.counties = d.counties === "true"; });
 wireSegment("tempUnitSeg", d => { state.tempUnits = d.tempunits; });
 wireSegment("xsecFieldSeg", d => { xsecField = d.field; });
 $("xsecShare").onclick = () => $("shareBtn").onclick();
+$("soundingShare").onclick = () => $("shareBtn").onclick();
 
 /* ---------- Leaflet map ---------- */
 const map = L.map("map", { zoomControl: true }).setView([37.6, -119.5], 5);
@@ -997,7 +1016,7 @@ map.on("click", ev => {
   pointMarker = L.circleMarker([lat, lng], { radius: 7, color: "#ffd456", weight: 2, fillColor: "#ff5b24", fillOpacity: 0.9 }).addTo(map);
   $("mgLat").value = lat.toFixed(4); $("mgLon").value = lng.toFixed(4);
   $("mapReadout").textContent = `point: ${lat.toFixed(4)}, ${lng.toFixed(4)}`;
-  if (state.fam !== "meteogram" && state.fam !== "custom") selectFam("meteogram");
+  if (state.fam !== "meteogram" && state.fam !== "custom" && state.fam !== "sounding") selectFam("meteogram");
   else renderCurrent();
 });
 showPreset("california");
@@ -1235,6 +1254,21 @@ async function renderCurrent() {
         `Cross section — ${xsecField === "rh" ? "relative humidity" : xsecField}`,
         `${$("runSelect").value} · F${String(state.hour).padStart(3, "0")}`, null);
       log("cross section ready", "ok");
+      return;
+    }
+    if (state.fam === "sounding") {
+      spin.classList.add("show"); $("spinText").textContent = "computing sounding…";
+      const lat = Number($("mgLat").value), lon = Number($("mgLon").value);
+      const url = `/api/sounding?lat=${lat.toFixed(4)}&lon=${lon.toFixed(4)}`
+        + `&run=${encodeURIComponent($("runSelect").value)}&hour=${state.hour}`;
+      lastShareUrl = url;
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || `HTTP ${resp.status}`);
+      const blob = await resp.blob();
+      if (seq !== state.seq) return;
+      showImage(URL.createObjectURL(blob), `Sounding — ${lat.toFixed(3)}, ${lon.toFixed(3)}`,
+        `${$("runSelect").value} · F${String(state.hour).padStart(3, "0")}`, null);
+      log("sounding ready", "ok");
       return;
     }
     if (state.fam === "meteogram" || state.fam === "custom") {

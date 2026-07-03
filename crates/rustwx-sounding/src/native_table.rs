@@ -27,54 +27,68 @@ const SAMPLE_BODY_SCALE: u32 = 3;
 const UNIT_SCALE: u32 = 2;
 const TEXT_SIZE_FACTOR: f32 = 1.42;
 
+// CWT house dark palette (cards/meteogram family): warm charcoal panels,
+// cream ink, amber section titles, #ff5b24 accent used sparingly.
 const BG: Color = Color {
-    r: 7,
-    g: 10,
-    b: 16,
+    r: 13,
+    g: 17,
+    b: 18,
     a: 255,
-};
+}; // #0d1112
 const TITLE_BG: Color = Color {
-    r: 18,
-    g: 22,
-    b: 31,
+    r: 20,
+    g: 16,
+    b: 12,
     a: 255,
-};
+}; // #14100c
 const PANEL_BG: Color = Color {
-    r: 10,
-    g: 14,
-    b: 22,
+    r: 20,
+    g: 16,
+    b: 12,
     a: 255,
-};
+}; // #14100c
 const LINE: Color = Color {
     r: 58,
-    g: 66,
-    b: 82,
+    g: 49,
+    b: 40,
     a: 255,
-};
+}; // #3a3128
 const LINE_DIM: Color = Color {
-    r: 34,
-    g: 41,
-    b: 54,
+    r: 42,
+    g: 36,
+    b: 29,
     a: 255,
 };
 const TEXT: Color = Color {
-    r: 231,
-    g: 235,
-    b: 241,
+    r: 242,
+    g: 231,
+    b: 213,
     a: 255,
-};
+}; // #f2e7d5
 const MUTED: Color = Color {
-    r: 145,
-    g: 154,
-    b: 168,
-    a: 255,
-};
-const LABEL: Color = Color {
     r: 141,
-    g: 214,
-    b: 232,
+    g: 129,
+    b: 113,
     a: 255,
-};
+}; // #8d8171
+const LABEL: Color = Color {
+    r: 169,
+    g: 156,
+    b: 136,
+    a: 255,
+}; // #a99c88
+const SECTION: Color = Color {
+    r: 255,
+    g: 180,
+    b: 84,
+    a: 255,
+}; // #ffb454 section titles
+const ACCENT: Color = Color {
+    r: 255,
+    g: 91,
+    b: 36,
+    a: 255,
+}; // #ff5b24 house accent
 const GOOD: Color = Color {
     r: 96,
     g: 220,
@@ -170,14 +184,25 @@ fn draw_title(image: &mut RgbaImage, profile: &SharprsProfile) {
 }
 
 fn draw_locator_map(image: &mut RgbaImage, profile: &SharprsProfile, metadata: &SoundingMetadata) {
+    draw_locator_map_at(
+        image, profile, metadata, LOCATOR_X, LOCATOR_Y, LOCATOR_W, LOCATOR_H,
+    );
+}
+
+/// Draw the gazetteer locator panel into an arbitrary rectangle.
+fn draw_locator_map_at(
+    image: &mut RgbaImage,
+    profile: &SharprsProfile,
+    metadata: &SoundingMetadata,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) {
     let Some((lat, lon)) = sounding_location(profile, metadata) else {
         return;
     };
 
-    let x = LOCATOR_X;
-    let y = LOCATOR_Y;
-    let w = LOCATOR_W;
-    let h = LOCATOR_H;
     let map_x = x + 12;
     let map_y = y + 66;
     let map_w = w - 24;
@@ -196,7 +221,7 @@ fn draw_locator_map(image: &mut RgbaImage, profile: &SharprsProfile, metadata: &
         },
         x + 14,
         y + 14,
-        LABEL,
+        SECTION,
         SECTION_SCALE,
     );
     let coord = format!("{lat:.3}, {lon:.3}");
@@ -232,7 +257,7 @@ fn draw_locator_summary(image: &mut RgbaImage, data: &TableData, metadata: &Soun
         "SOUNDING SUMMARY",
         x + 14,
         y + 14,
-        LABEL,
+        SECTION,
         SECTION_SCALE,
     );
     hline(image, x + 10, x + w - 10, y + 58, LINE_DIM);
@@ -357,7 +382,7 @@ fn draw_sample_info_panel(
 ) {
     fill_rect(image, x, y, w, h, PANEL_BG);
     draw_rect_border(image, x, y, w, h, LINE, 1);
-    draw_text_line(image, "SOURCE", x + 10, y + 10, LABEL, SECTION_SCALE);
+    draw_text_line(image, "SOURCE", x + 10, y + 10, SECTION, SECTION_SCALE);
     draw_right_text_line(
         image,
         "MODEL PROFILE",
@@ -553,16 +578,16 @@ fn draw_locator_basemap(image: &mut RgbaImage, bounds: &MapBounds, x: i32, y: i3
     for layer in load_styled_basemap_features_for(BasemapStyle::White) {
         let color = if layer.width <= 1 {
             Color {
-                r: 72,
-                g: 82,
-                b: 100,
+                r: 90,
+                g: 81,
+                b: 68,
                 a: 255,
             }
         } else {
             Color {
-                r: 128,
-                g: 143,
-                b: 164,
+                r: 158,
+                g: 145,
+                b: 126,
                 a: 255,
             }
         };
@@ -753,18 +778,24 @@ fn outcode(lon: f64, lat: f64, bounds: &MapBounds) -> u8 {
 }
 
 fn draw_table(image: &mut RgbaImage, data: &TableData) {
-    fill_rect(image, 0, TABLE_Y, image.width() as i32, TABLE_H, BG);
-    hline(image, 0, image.width() as i32 - 1, TABLE_Y, LINE);
+    draw_table_at(image, data, TABLE_Y);
+}
+
+/// Draw the full parameter table with its top edge at `table_y` (the CWT
+/// composition places the table lower than the legacy layout does).
+fn draw_table_at(image: &mut RgbaImage, data: &TableData, table_y: i32) {
+    fill_rect(image, 0, table_y, image.width() as i32, TABLE_H, BG);
+    hline(image, 0, image.width() as i32 - 1, table_y, LINE);
 
     let left = 20;
     let mid = 1120;
     let right = 1740;
-    let bottom = TABLE_Y + TABLE_H - 1;
+    let bottom = table_y + TABLE_H - 1;
 
     fill_rect(
         image,
         left - 10,
-        TABLE_Y + 10,
+        table_y + 10,
         mid - left - 10,
         TABLE_H - 20,
         PANEL_BG,
@@ -772,7 +803,7 @@ fn draw_table(image: &mut RgbaImage, data: &TableData) {
     fill_rect(
         image,
         mid + 10,
-        TABLE_Y + 10,
+        table_y + 10,
         right - mid - 20,
         TABLE_H - 20,
         PANEL_BG,
@@ -780,20 +811,20 @@ fn draw_table(image: &mut RgbaImage, data: &TableData) {
     fill_rect(
         image,
         right + 10,
-        TABLE_Y + 10,
+        table_y + 10,
         image.width() as i32 - right - 20,
         TABLE_H - 20,
         PANEL_BG,
     );
-    vline(image, mid - 1, TABLE_Y + 14, bottom - 14, LINE_DIM);
-    vline(image, right - 1, TABLE_Y + 14, bottom - 14, LINE_DIM);
+    vline(image, mid - 1, table_y + 14, bottom - 14, LINE_DIM);
+    vline(image, right - 1, table_y + 14, bottom - 14, LINE_DIM);
 
-    draw_parcels(image, left, TABLE_Y + 20, data);
-    draw_storm_motions(image, left, TABLE_Y + 284, data);
-    draw_lapse_rates(image, left + 430, TABLE_Y + 284, data);
-    draw_shear(image, mid + 24, TABLE_Y + 20, data);
-    draw_indices(image, right + 24, TABLE_Y + 20, data);
-    draw_composites(image, right + 24, TABLE_Y + 378, data);
+    draw_parcels(image, left, table_y + 20, data);
+    draw_storm_motions(image, left, table_y + 284, data);
+    draw_lapse_rates(image, left + 430, table_y + 284, data);
+    draw_shear(image, mid + 24, table_y + 20, data);
+    draw_indices(image, right + 24, table_y + 20, data);
+    draw_composites(image, right + 24, table_y + 378, data);
 }
 
 fn draw_parcels(image: &mut RgbaImage, x: i32, y: i32, data: &TableData) {
@@ -1070,8 +1101,218 @@ fn draw_key_columns(
     }
 }
 
+// =========================================================================
+// CWT composition — the cafire.org/weather store-served sounding
+// =========================================================================
+
+/// Header strings for the CWT-styled sounding. The caller owns gazetteer
+/// lookup and run/valid formatting; this module only draws them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CwtHeader {
+    /// e.g. "SOUNDING — 3 mi NE of Placerville, CA"
+    pub title: String,
+    /// e.g. "HRRR 20260702 22Z | F012 | valid Fri 7/3 10Z (03 local) | ..."
+    pub subtitle: String,
+    /// Right-aligned branding, e.g. "cafire.org/weather".
+    pub brand: String,
+}
+
+const CWT_W: u32 = 2400;
+const CWT_HEADER_H: i32 = 96;
+const CWT_LEFT_W: u32 = 1680;
+const CWT_UPPER_H: u32 = 1120;
+const CWT_RIGHT_W: u32 = CWT_W - CWT_LEFT_W; // 720
+const CWT_HODO_H: u32 = 600;
+const CWT_ECAPE_H: i32 = 300;
+const CWT_TABLE_Y: i32 = CWT_HEADER_H + CWT_UPPER_H as i32; // 1216
+const CWT_H: u32 = (CWT_TABLE_Y + TABLE_H) as u32; // 1852
+
+/// Render the CWT-styled composed sounding: house header, full-width
+/// skew-T (with omega strip and barb stave), hodograph, ECAPE
+/// (entrainment) block, gazetteer locator map, and the full parameter
+/// table. Returns PNG bytes.
+pub(crate) fn render_cwt(
+    profile: &SharprsProfile,
+    params: &ComputedParams,
+    ecape: &VerifiedEcapeParcels,
+    metadata: &SoundingMetadata,
+    header: &CwtHeader,
+) -> Result<Vec<u8>, SoundingBridgeError> {
+    let mut image = RgbaImage::from_pixel(CWT_W, CWT_H, color_to_rgba(BG));
+
+    draw_cwt_header(&mut image, header);
+
+    // Skew-T (left region; omega strip, height marks, level labels and the
+    // wind-barb stave are drawn by the vendored renderer itself).
+    let skewt = sharprs::render::skewt::render_skewt_only(profile, CWT_LEFT_W, CWT_UPPER_H);
+    blit_rgba(&mut image, &skewt, CWT_LEFT_W, CWT_UPPER_H, 0, CWT_HEADER_H);
+
+    // Hodograph (top right).
+    if let Ok(data) = sharprs::render::hodograph_data_from_profile(profile) {
+        let canvas = sharprs::render::render_hodograph(&data, CWT_RIGHT_W, CWT_HODO_H);
+        blit_rgba(
+            &mut image,
+            &canvas.pixels,
+            CWT_RIGHT_W,
+            CWT_HODO_H,
+            CWT_LEFT_W as i32,
+            CWT_HEADER_H,
+        );
+    }
+
+    // Right column below the hodograph: ECAPE (entrainment) block, then
+    // the gazetteer locator map.
+    let right_x = CWT_LEFT_W as i32;
+    let ecape_y = CWT_HEADER_H + CWT_HODO_H as i32;
+    draw_cwt_ecape_panel(
+        &mut image,
+        ecape,
+        right_x,
+        ecape_y,
+        CWT_RIGHT_W as i32,
+        CWT_ECAPE_H,
+    );
+    let locator_y = ecape_y + CWT_ECAPE_H;
+    draw_locator_map_at(
+        &mut image,
+        profile,
+        metadata,
+        right_x,
+        locator_y,
+        CWT_RIGHT_W as i32,
+        CWT_TABLE_Y - locator_y,
+    );
+
+    // Full-width parameter table (carries the ECAPE/NCAPE parcel columns).
+    let data = build_table_data(profile, params, ecape);
+    draw_table_at(&mut image, &data, CWT_TABLE_Y);
+
+    // Panel separators.
+    vline(&mut image, right_x, CWT_HEADER_H, CWT_TABLE_Y - 1, LINE);
+    hline(&mut image, right_x, CWT_W as i32 - 1, ecape_y, LINE);
+
+    encode_png(image).map_err(Into::into)
+}
+
+fn draw_cwt_header(image: &mut RgbaImage, header: &CwtHeader) {
+    let w = image.width() as i32;
+    fill_rect(image, 0, 0, w, CWT_HEADER_H, TITLE_BG);
+    hline(image, 0, w - 1, CWT_HEADER_H - 1, LINE);
+    // House accent, sparingly: one bar on the left edge of the header.
+    fill_rect(image, 0, 0, 10, CWT_HEADER_H, ACCENT);
+    draw_text_line(image, &header.title, 34, 10, TEXT, 4);
+    draw_text_line(image, &header.subtitle, 36, 62, MUTED, 2);
+    draw_right_text_line(image, &header.brand, w - 24, 18, MUTED, 2);
+}
+
+fn draw_cwt_ecape_panel(
+    image: &mut RgbaImage,
+    ecape: &VerifiedEcapeParcels,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) {
+    fill_rect(image, x, y, w, h, PANEL_BG);
+    draw_rect_border(image, x, y, w, h, LINE, 1);
+    draw_text_line(image, "ECAPE (ENTRAINMENT)", x + 14, y + 14, SECTION, SECTION_SCALE);
+    hline(image, x + 10, x + w - 10, y + 58, LINE_DIM);
+
+    let header_y = y + 72;
+    let col_pcl = x + 14;
+    let col_ecape = x + 250;
+    let col_ncape = x + 396;
+    let col_cape = x + 540;
+    let col_kept = x + w - 24;
+
+    draw_text_line(image, "PCL", col_pcl, header_y, LABEL, LABEL_SCALE);
+    for (label, col) in [
+        ("ECAPE", col_ecape),
+        ("NCAPE", col_ncape),
+        ("CAPE", col_cape),
+        ("KEPT", col_kept),
+    ] {
+        draw_right_text_line(image, label, col, header_y, LABEL, LABEL_SCALE);
+    }
+    for (unit, col) in [("J/kg", col_ecape), ("J/kg", col_cape), ("%", col_kept)] {
+        draw_right_text_line(image, unit, col, header_y + 26, MUTED, UNIT_SCALE);
+    }
+    hline(image, x + 14, x + w - 24, header_y + 46, LINE_DIM);
+
+    let rows: [(&str, &VerifiedEcapeParcelParams); 3] = [
+        ("SFC", &ecape.surface_based),
+        ("ML", &ecape.mixed_layer),
+        ("MU", &ecape.most_unstable),
+    ];
+    let mut yy = header_y + 58;
+    for (label, parcel) in rows {
+        draw_text_line(image, label, col_pcl, yy, TEXT, BODY_SCALE);
+        draw_right_text_line(
+            image,
+            &fmt_int(parcel.ecape),
+            col_ecape,
+            yy,
+            cape_color(parcel.ecape),
+            BODY_SCALE,
+        );
+        draw_right_text_line(image, &fmt_2f(parcel.ncape), col_ncape, yy, TEXT, BODY_SCALE);
+        draw_right_text_line(
+            image,
+            &fmt_int(parcel.cape),
+            col_cape,
+            yy,
+            cape_color(parcel.cape),
+            BODY_SCALE,
+        );
+        // The survival ratio is noise below ~100 J/kg of CAPE (two nearly
+        // zero parcel integrals can put "ECAPE" above "CAPE"): suppress it.
+        let kept = if parcel.ecape.is_finite() && parcel.cape.is_finite() && parcel.cape >= 100.0 {
+            format!("{:.0}", (parcel.ecape / parcel.cape * 100.0).clamp(0.0, 999.0))
+        } else {
+            "--".to_string()
+        };
+        draw_right_text_line(image, &kept, col_kept, yy, TEXT, BODY_SCALE);
+        yy += 48;
+    }
+
+    draw_text_line(
+        image,
+        "entrainment-adjusted parcel energy (ecape-rs) - experimental",
+        x + 14,
+        y + h - 34,
+        MUTED,
+        UNIT_SCALE,
+    );
+}
+
+/// Opaque copy of a raw RGBA buffer (Canvas pixels / skew-T output) into
+/// the composition image at (dx, dy).
+fn blit_rgba(dst: &mut RgbaImage, src: &[u8], src_w: u32, src_h: u32, dx: i32, dy: i32) {
+    for sy in 0..src_h as i32 {
+        let ty = dy + sy;
+        if ty < 0 || ty >= dst.height() as i32 {
+            continue;
+        }
+        for sx in 0..src_w as i32 {
+            let tx = dx + sx;
+            if tx < 0 || tx >= dst.width() as i32 {
+                continue;
+            }
+            let si = ((sy as u32 * src_w + sx as u32) * 4) as usize;
+            if si + 3 >= src.len() {
+                continue;
+            }
+            dst.put_pixel(
+                tx as u32,
+                ty as u32,
+                Rgba([src[si], src[si + 1], src[si + 2], 255]),
+            );
+        }
+    }
+}
+
 fn section_title(image: &mut RgbaImage, title: &str, x: i32, y: i32, width: i32) {
-    draw_text_line(image, title, x, y, LABEL, SECTION_SCALE);
+    draw_text_line(image, title, x, y, SECTION, SECTION_SCALE);
     hline(image, x, x + width, y + 44, LINE);
 }
 

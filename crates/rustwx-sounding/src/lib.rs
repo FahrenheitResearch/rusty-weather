@@ -15,5 +15,6 @@ pub use ecape::{
     PendingEcapeRequest, ecape_status, require_future_ecape_bridge, supported_parcels,
 };
 pub use error::SoundingBridgeError;
+pub use native_table::CwtHeader;
 pub use sharprs::Profile as SharprsProfile;
 pub use sharprs::render::ComputedParams as SharprsComputedParams;

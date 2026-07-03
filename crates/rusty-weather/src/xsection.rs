@@ -38,8 +38,9 @@ const BARB_COLUMN_STRIDE: usize = 14;
 const BARB_LEVEL_STRIDE: usize = 3;
 
 /// The honest 422 message when a stored hour has no isobaric volumes
-/// (hours ingested before the `view-volumes` profile deployed).
-const NO_VOLUME_MESSAGE: &str =
+/// (hours ingested before the `view-volumes` profile deployed). Shared
+/// with `/api/sounding`, which reads the same volumes.
+pub(crate) const NO_VOLUME_MESSAGE: &str =
     "this hour predates vertical-volume storage — pick a newer run/hour";
 
 pub const XSECTION_FIELDS: &[&str] = &["temperature", "rh", "wind"];

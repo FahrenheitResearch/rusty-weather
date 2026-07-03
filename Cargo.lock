@@ -4375,6 +4375,7 @@ dependencies = [
  "rustwx-products",
  "rustwx-regrid",
  "rustwx-render",
+ "rustwx-sounding",
  "rw-ingest",
  "rw-sat",
  "rw-store",

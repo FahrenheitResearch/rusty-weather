@@ -30,6 +30,9 @@ rustwx-models = { path = "../rustwx-models" }
 rustwx-products = { path = "../rustwx-products" }
 rustwx-regrid = { path = "../rustwx-regrid" }
 rustwx-render = { path = "../rustwx-render" }
+# /api/sounding: bridges store columns into the vendored sharprs skew-T
+# machinery (parcels, ECAPE via ecape-rs, CWT-styled compositor).
+rustwx-sounding = { path = "../rustwx-sounding" }
 rw-ingest = { path = "../rw-ingest" }
 rw-sat = { path = "../rw-sat" }
 rw-store = { path = "../rw-store" }

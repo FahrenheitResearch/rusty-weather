@@ -27,6 +27,9 @@ mod meteogram;
 #[path = "../xsection.rs"]
 mod xsection;
 
+#[path = "../sounding.rs"]
+mod sounding;
+
 const MIN_RENDER_WIDTH: u32 = 1200;
 const MIN_RENDER_HEIGHT: u32 = 900;
 const MAX_RENDER_DIMENSION: u32 = 2400;
@@ -342,6 +345,9 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
         }
         _ if request.method == "GET" && request.path.starts_with("/api/xsection") => {
             xsection_response(&request.query, &state)
+        }
+        _ if request.method == "GET" && request.path.starts_with("/api/sounding") => {
+            sounding_response(&request.query, &state)
         }
         _ if request.method == "GET" && request.path.starts_with("/api/runs") => {
             runs_response(&request.query, &state)
@@ -1465,6 +1471,92 @@ fn xsection_response(path: &str, state: &AppState) -> Vec<u8> {
                     200,
                     "image/svg+xml; charset=utf-8",
                     output.svg.into_bytes(),
+                    "Cache-Control: no-store\r\n",
+                )
+            }
+        }
+        Err(message) => json_status_response(422, &serde_json::json!({ "error": message })),
+    }
+}
+
+/// GET /api/sounding?lat=..&lon=..&run=latest[&model=hrrr][&hour=12]
+/// [&utc_offset=-7][&format=json] — a CWT-styled skew-T/hodograph/ECAPE
+/// sounding for the nearest grid cell, composed from the stored isobaric
+/// volumes + surface fields, as PNG (or the profile arrays and computed
+/// indices with format=json).
+fn sounding_response(path: &str, state: &AppState) -> Vec<u8> {
+    let query = parse_query(path);
+    let bad = |message: &str| json_status_response(400, &serde_json::json!({ "error": message }));
+    let Some(lat) = query.get("lat").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite())
+    else {
+        return bad("lat is required");
+    };
+    let Some(lon) = query.get("lon").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite())
+    else {
+        return bad("lon is required");
+    };
+    if !(-90.0..=90.0).contains(&lat) {
+        return bad("lat must be within -90..90");
+    }
+    if !(-360.0..=360.0).contains(&lon) {
+        return bad("lon must be within -360..360");
+    }
+    let Some(run) = query.get("run").map(String::as_str) else {
+        return bad("run is required (e.g. 20260702_22z or latest)");
+    };
+    if run.len() > 40 || run.contains(['/', '\\', '.']) {
+        return bad("run slug is not valid");
+    }
+    let model = query.get("model").map(String::as_str).unwrap_or("hrrr");
+    if model.len() > 24 || model.contains(['/', '\\', '.']) {
+        return bad("model slug is not valid");
+    }
+    let hour = match query.get("hour") {
+        None => None,
+        Some(value) => match value.parse::<u16>().ok().filter(|h| *h <= 384) {
+            Some(hour) => Some(hour),
+            None => return bad("hour must be an integer forecast hour (0-384)"),
+        },
+    };
+    let resolved_run;
+    let alias = run.to_ascii_lowercase();
+    let run = if alias == "latest" || alias == "latest-day" {
+        match resolve_latest_run(&state.store_root, model, alias == "latest-day") {
+            Ok(resolved) => {
+                resolved_run = resolved;
+                resolved_run.as_str()
+            }
+            Err(message) => return json_status_response(422, &serde_json::json!({ "error": message })),
+        }
+    } else {
+        run
+    };
+    let Some((date, cycle)) = run.split_once('_').and_then(|(date, cycle)| {
+        let hour: u8 = cycle.strip_suffix('z').or_else(|| cycle.strip_suffix('Z'))?.parse().ok()?;
+        (date.len() == 8 && date.chars().all(|c| c.is_ascii_digit()) && hour <= 23)
+            .then(|| (date.to_string(), hour))
+    }) else {
+        return bad("run must look like 20260702_22z");
+    };
+    let request = sounding::SoundingRequest {
+        lat,
+        lon,
+        hour,
+        utc_offset_hours: query
+            .get("utc_offset")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| (-14.0..=14.0).contains(v))
+            .unwrap_or(-7.0),
+    };
+    match sounding::render_sounding(&state.store_root, model, run, &date, cycle, &request) {
+        Ok(output) => {
+            if query.get("format").map(String::as_str) == Some("json") {
+                json_response(&output.data)
+            } else {
+                response_with_extra_headers(
+                    200,
+                    "image/png",
+                    output.png,
                     "Cache-Control: no-store\r\n",
                 )
             }

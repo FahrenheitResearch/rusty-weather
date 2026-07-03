@@ -65,48 +65,48 @@ const STD_PRESSURES: &[f64] = &[
 const LABELED_PRESSURES: &[f64] = &[1000.0, 850.0, 700.0, 500.0, 300.0, 200.0, 100.0];
 
 // =========================================================================
-// Color palette (SHARPpy-inspired dark background) — BRIGHTER
+// Color palette — CWT house dark (warm charcoal, cream ink, site ramp hues)
 // =========================================================================
 
-const COL_BG: [u8; 4] = [0, 0, 0, 255];
-const COL_GRID: [u8; 4] = [38, 42, 52, 175];
-const COL_GRID_ZERO: [u8; 4] = [90, 135, 230, 210];
-const COL_ISOBAR: [u8; 4] = [105, 105, 105, 225];
+const COL_BG: [u8; 4] = [13, 17, 18, 255]; // #0d1112
+const COL_GRID: [u8; 4] = [58, 49, 40, 175]; // #3a3128 warm grid
+const COL_GRID_ZERO: [u8; 4] = [79, 163, 209, 210]; // #4fa3d1 site blue
+const COL_ISOBAR: [u8; 4] = [116, 106, 91, 225]; // warm gray
 const COL_DRY_AD: [u8; 4] = [120, 90, 55, 70];
 const COL_MOIST_AD: [u8; 4] = [35, 120, 70, 62];
 const COL_MIX_RATIO: [u8; 4] = [35, 110, 65, 55];
-const COL_TEMP: [u8; 4] = [255, 50, 50, 255]; // bright red
-const COL_DEWP: [u8; 4] = [50, 255, 50, 255]; // bright green
-const COL_WETBULB: [u8; 4] = [0, 220, 220, 180];
-const COL_PARCEL_ML: [u8; 4] = [255, 210, 50, 255]; // bright gold
-const COL_PARCEL_MU: [u8; 4] = [255, 165, 0, 230]; // bright orange
-const COL_DCAPE: [u8; 4] = [220, 80, 220, 200]; // magenta
-const COL_CAPE_FILL: [u8; 4] = [255, 60, 40, 70]; // semi-transparent red
-const COL_CIN_FILL: [u8; 4] = [60, 80, 255, 60]; // semi-transparent blue
-const COL_WIND_BARB: [u8; 4] = [0, 220, 220, 255]; // cyan
-const COL_LABEL: [u8; 4] = [200, 200, 210, 255]; // brighter labels
-const COL_LABEL_LARGE: [u8; 4] = [220, 220, 230, 255]; // for large axis labels
-const COL_TEXT: [u8; 4] = [230, 230, 230, 255];
-const COL_TEXT_DIM: [u8; 4] = [140, 140, 150, 255];
-const COL_TEXT_HEADER: [u8; 4] = [100, 180, 255, 255];
-const COL_PANEL_BG: [u8; 4] = [0, 0, 0, 255];
-const COL_PANEL_BORDER: [u8; 4] = [215, 215, 215, 255];
-const COL_HEIGHT_MARK: [u8; 4] = [0, 220, 220, 255]; // cyan
-const COL_EFF_INFLOW: [u8; 4] = [0, 220, 220, 220]; // cyan, more opaque
-const COL_OMEGA: [u8; 4] = [40, 200, 40, 200]; // green
-const COL_LCL_LABEL: [u8; 4] = [0, 255, 0, 255]; // brighter green
-const COL_LFC_LABEL: [u8; 4] = [255, 255, 0, 255]; // yellow
-const COL_EL_LABEL: [u8; 4] = [255, 100, 255, 255]; // brighter magenta
-const COL_LABEL_BG: [u8; 4] = [0, 0, 0, 215]; // dark background box
+const COL_TEMP: [u8; 4] = [255, 109, 77, 255]; // #ff6d4d site red-orange
+const COL_DEWP: [u8; 4] = [88, 201, 143, 255]; // #58c98f site green
+const COL_WETBULB: [u8; 4] = [79, 163, 209, 190]; // #4fa3d1, thin
+const COL_PARCEL_ML: [u8; 4] = [255, 212, 86, 255]; // #ffd456 site yellow
+const COL_PARCEL_MU: [u8; 4] = [255, 180, 84, 230]; // #ffb454 site orange
+const COL_DCAPE: [u8; 4] = [199, 125, 255, 200]; // #c77dff site purple
+const COL_CAPE_FILL: [u8; 4] = [255, 91, 36, 60]; // house accent #ff5b24, translucent
+const COL_CIN_FILL: [u8; 4] = [79, 163, 209, 60]; // translucent site blue
+const COL_WIND_BARB: [u8; 4] = [242, 231, 213, 255]; // #f2e7d5 cream ink
+const COL_LABEL: [u8; 4] = [169, 156, 136, 255]; // #a99c88 minor labels
+const COL_LABEL_LARGE: [u8; 4] = [242, 231, 213, 255]; // cream axis labels
+const COL_TEXT: [u8; 4] = [242, 231, 213, 255];
+const COL_TEXT_DIM: [u8; 4] = [141, 129, 113, 255]; // #8d8171
+const COL_TEXT_HEADER: [u8; 4] = [255, 180, 84, 255]; // #ffb454
+const COL_PANEL_BG: [u8; 4] = [20, 16, 12, 255]; // #14100c
+const COL_PANEL_BORDER: [u8; 4] = [58, 49, 40, 255]; // #3a3128
+const COL_HEIGHT_MARK: [u8; 4] = [127, 184, 230, 255]; // #7fb8e6 site blue
+const COL_EFF_INFLOW: [u8; 4] = [79, 163, 209, 220]; // #4fa3d1
+const COL_OMEGA: [u8; 4] = [88, 201, 143, 200]; // site green
+const COL_LCL_LABEL: [u8; 4] = [88, 201, 143, 255]; // #58c98f
+const COL_LFC_LABEL: [u8; 4] = [255, 212, 86, 255]; // #ffd456
+const COL_EL_LABEL: [u8; 4] = [199, 125, 255, 255]; // #c77dff
+const COL_LABEL_BG: [u8; 4] = [13, 17, 18, 215]; // dark background box
 
 // Hodograph colors
-const COL_HODO_0_3: [u8; 4] = [255, 60, 60, 255];
-const COL_HODO_3_6: [u8; 4] = [60, 220, 60, 255];
-const COL_HODO_6_9: [u8; 4] = [60, 120, 255, 255];
-const COL_HODO_9_12: [u8; 4] = [180, 80, 220, 255];
-const COL_HODO_RING: [u8; 4] = [55, 55, 65, 255];
-const COL_HODO_BUNKERS: [u8; 4] = [255, 200, 60, 255];
-const COL_HODO_MEAN: [u8; 4] = [200, 200, 200, 255];
+const COL_HODO_0_3: [u8; 4] = [255, 109, 77, 255]; // #ff6d4d
+const COL_HODO_3_6: [u8; 4] = [88, 201, 143, 255]; // #58c98f
+const COL_HODO_6_9: [u8; 4] = [127, 184, 230, 255]; // #7fb8e6
+const COL_HODO_9_12: [u8; 4] = [199, 125, 255, 255]; // #c77dff
+const COL_HODO_RING: [u8; 4] = [48, 42, 35, 255];
+const COL_HODO_BUNKERS: [u8; 4] = [255, 212, 86, 255]; // #ffd456
+const COL_HODO_MEAN: [u8; 4] = [200, 193, 179, 255];
 
 // =========================================================================
 // Coordinate transforms
@@ -921,7 +921,7 @@ fn draw_omega_profile(c: &mut Canvas, prof: &Profile, plot_h: f64) {
         y_top,
         omega_x_center as i32,
         y_bot,
-        [35, 35, 45, 200],
+        [48, 42, 35, 200],
     );
 
     for i in 1..prof.num_levels() {

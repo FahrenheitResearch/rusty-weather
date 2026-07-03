@@ -216,6 +216,24 @@ impl NativeSounding {
         .unwrap_or(base)
     }
 
+    /// Render the CWT-styled composed sounding (house dark header, skew-T,
+    /// hodograph, ECAPE entrainment block, locator map, parameter table).
+    ///
+    /// The caller supplies the pre-formatted header strings (title /
+    /// subtitle / brand); gazetteer and run formatting stay upstream.
+    pub fn render_cwt_png(
+        &self,
+        header: &crate::native_table::CwtHeader,
+    ) -> Result<Vec<u8>, SoundingBridgeError> {
+        crate::native_table::render_cwt(
+            &self.profile,
+            &self.params,
+            &self.verified_ecape,
+            &self.metadata,
+            header,
+        )
+    }
+
     /// Render the vendored SHARPpy-style compositor directly.
     ///
     /// This keeps the classic SHARPpy panel arrangement intact instead of

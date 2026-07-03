@@ -21,35 +21,35 @@ use crate::render::canvas::{Canvas, FONT_H};
 // Colour palette (SHARPpy dark-background style)
 // =========================================================================
 
-const COL_BG: [u8; 4] = [0, 0, 0, 255];
-const COL_PANEL_BG: [u8; 4] = [0, 0, 0, 255];
-const COL_PANEL_BORDER: [u8; 4] = [215, 215, 215, 255];
-const COL_RING: [u8; 4] = [40, 40, 52, 255]; // subtle gray rings — don't compete with data
-const COL_AXIS: [u8; 4] = [70, 70, 70, 255];
-const COL_RING_LABEL: [u8; 4] = [130, 130, 155, 255];
-const COL_TEXT: [u8; 4] = [240, 240, 240, 255];
-const COL_TEXT_DIM: [u8; 4] = [150, 150, 165, 255];
-const COL_TEXT_HEADER: [u8; 4] = [100, 190, 255, 255];
-const COL_TEXT_WARN: [u8; 4] = [255, 210, 80, 255];
-const COL_LABEL_BG: [u8; 4] = [0, 0, 0, 180]; // semi-transparent dark box behind labels
-const COL_DOT_BG: [u8; 4] = [255, 255, 255, 255]; // white dot background for height markers
-const COL_DOT_FG: [u8; 4] = [10, 10, 22, 255]; // dark text inside height dots
+const COL_BG: [u8; 4] = [13, 17, 18, 255]; // #0d1112 CWT dark
+const COL_PANEL_BG: [u8; 4] = [20, 16, 12, 255]; // #14100c CWT panel
+const COL_PANEL_BORDER: [u8; 4] = [58, 49, 40, 255]; // #3a3128
+const COL_RING: [u8; 4] = [48, 42, 35, 255]; // subtle warm rings — don't compete with data
+const COL_AXIS: [u8; 4] = [74, 66, 55, 255];
+const COL_RING_LABEL: [u8; 4] = [141, 129, 113, 255]; // #8d8171
+const COL_TEXT: [u8; 4] = [242, 231, 213, 255]; // #f2e7d5 cream
+const COL_TEXT_DIM: [u8; 4] = [141, 129, 113, 255]; // #8d8171
+const COL_TEXT_HEADER: [u8; 4] = [255, 180, 84, 255]; // #ffb454
+const COL_TEXT_WARN: [u8; 4] = [255, 212, 86, 255]; // #ffd456
+const COL_LABEL_BG: [u8; 4] = [13, 17, 18, 180]; // semi-transparent dark box behind labels
+const COL_DOT_BG: [u8; 4] = [242, 231, 213, 255]; // cream dot background for height markers
+const COL_DOT_FG: [u8; 4] = [13, 17, 18, 255]; // dark text inside height dots
 
-// Height-band trace colours — BRIGHT and saturated
-const COL_0_1KM: [u8; 4] = [255, 30, 30, 255]; // Bright red
-const COL_1_3KM: [u8; 4] = [255, 165, 0, 255]; // Bright orange
-const COL_3_6KM: [u8; 4] = [255, 255, 0, 255]; // Bright yellow
-const COL_6_9KM: [u8; 4] = [0, 230, 0, 255]; // Bright green
-const COL_9_12KM: [u8; 4] = [50, 130, 255, 255]; // Bright blue
-const COL_12_PLUS: [u8; 4] = [200, 80, 255, 255]; // Bright purple
+// Height-band trace colours — CWT site ramp hues
+const COL_0_1KM: [u8; 4] = [255, 91, 36, 255]; // #ff5b24 house accent (surface layer)
+const COL_1_3KM: [u8; 4] = [255, 180, 84, 255]; // #ffb454
+const COL_3_6KM: [u8; 4] = [255, 212, 86, 255]; // #ffd456
+const COL_6_9KM: [u8; 4] = [88, 201, 143, 255]; // #58c98f
+const COL_9_12KM: [u8; 4] = [127, 184, 230, 255]; // #7fb8e6
+const COL_12_PLUS: [u8; 4] = [199, 125, 255, 255]; // #c77dff
 
 // Marker colours
-const COL_RM: [u8; 4] = [255, 50, 50, 255]; // Bunkers RM — bright red
-const COL_LM: [u8; 4] = [60, 130, 255, 255]; // Bunkers LM — blue
-const COL_MEAN: [u8; 4] = [210, 210, 210, 255]; // Mean wind — white/grey
-const COL_CORFIDI_UP: [u8; 4] = [255, 180, 60, 255]; // Corfidi upshear — orange
-const COL_CORFIDI_DN: [u8; 4] = [60, 220, 255, 255]; // Corfidi downshear — cyan
-const COL_SR_WIND: [u8; 4] = [180, 255, 180, 200]; // Storm-relative wind
+const COL_RM: [u8; 4] = [224, 85, 69, 255]; // Bunkers RM — #e05545
+const COL_LM: [u8; 4] = [79, 163, 209, 255]; // Bunkers LM — #4fa3d1
+const COL_MEAN: [u8; 4] = [200, 193, 179, 255]; // Mean wind — warm grey
+const COL_CORFIDI_UP: [u8; 4] = [255, 180, 84, 255]; // Corfidi upshear — #ffb454
+const COL_CORFIDI_DN: [u8; 4] = [79, 163, 209, 255]; // Corfidi downshear — #4fa3d1
+const COL_SR_WIND: [u8; 4] = [150, 220, 180, 200]; // Storm-relative wind
 
 // Speed rings (knots)
 const SPEED_RINGS: &[f64] = &[20.0, 40.0, 60.0, 80.0];
