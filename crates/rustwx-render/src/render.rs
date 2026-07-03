@@ -1111,12 +1111,7 @@ fn draw_projected_lines(
     // canvas-resident pipeline plan.
     // Clip strokes to the map panel: edge-hugging boundaries otherwise
     // paint their anti-aliased width past the frame into the chrome.
-    let map_clip = (
-        layout.map_x as i32,
-        layout.map_y as i32,
-        (layout.map_x + layout.map_w).saturating_sub(1) as i32,
-        (layout.map_y + layout.map_h).saturating_sub(1) as i32,
-    );
+    let map_clip = map_panel_clip(layout);
     for (points, color, width) in chunks {
         draw::draw_polyline_aa_clipped(img, &points, color, width, map_clip);
     }
@@ -2814,6 +2809,17 @@ fn contour_level_width(overlay: &ContourOverlay, level_index: usize) -> u32 {
     }
 }
 
+/// Inclusive pixel rect of the map panel — every in-panel stroke must
+/// clip to this or its anti-aliased width bleeds into the chrome.
+fn map_panel_clip(layout: &Layout) -> (i32, i32, i32, i32) {
+    (
+        layout.map_x as i32,
+        layout.map_y as i32,
+        (layout.map_x + layout.map_w).saturating_sub(1) as i32,
+        (layout.map_y + layout.map_h).saturating_sub(1) as i32,
+    )
+}
+
 fn draw_contour_stroke(
     img: &mut RgbaImage,
     x0: f64,
@@ -2823,9 +2829,10 @@ fn draw_contour_stroke(
     color: Rgba,
     width: u32,
     pattern: crate::request::ContourLinePattern,
+    clip: (i32, i32, i32, i32),
 ) {
     if !matches!(pattern, crate::request::ContourLinePattern::Dashed) {
-        draw::draw_line_aa_width(img, x0, y0, x1, y1, color, width);
+        draw::draw_line_aa_width_clipped(img, x0, y0, x1, y1, color, width, clip);
         return;
     }
 
@@ -2841,14 +2848,23 @@ fn draw_contour_stroke(
     let phase = (x0 * dx + y0 * dy).rem_euclid(period);
     let mut offset = if phase < dash {
         let end = (dash - phase).min(len);
-        draw::draw_line_aa_width(img, x0, y0, x0 + dx * end, y0 + dy * end, color, width);
+        draw::draw_line_aa_width_clipped(
+            img,
+            x0,
+            y0,
+            x0 + dx * end,
+            y0 + dy * end,
+            color,
+            width,
+            clip,
+        );
         end + gap
     } else {
         period - phase
     };
     while offset < len {
         let end = (offset + dash).min(len);
-        draw::draw_line_aa_width(
+        draw::draw_line_aa_width_clipped(
             img,
             x0 + dx * offset,
             y0 + dy * offset,
@@ -2856,6 +2872,7 @@ fn draw_contour_stroke(
             y0 + dy * end,
             color,
             width,
+            clip,
         );
         offset += period;
     }
@@ -2890,6 +2907,7 @@ fn draw_contour_segments_unmasked(
             overlay.color,
             contour_level_width(overlay, level_index),
             overlay.pattern,
+            map_panel_clip(layout),
         );
         maybe_place_contour_label(
             layout,
@@ -2939,6 +2957,7 @@ fn draw_contour_segments_masked(
             overlay.color,
             contour_level_width(overlay, level_index),
             overlay.pattern,
+            map_panel_clip(layout),
         );
         maybe_place_contour_label(
             layout,
@@ -3774,7 +3793,7 @@ fn draw_streamline_direction(
         };
 
         if segment_inside_map_and_mask(layout, prev, next, clip_mask) {
-            draw::draw_line_aa_width(
+            draw::draw_line_aa_width_clipped(
                 img,
                 prev.0,
                 prev.1,
@@ -3782,6 +3801,7 @@ fn draw_streamline_direction(
                 next.1,
                 overlay.color,
                 overlay.width,
+                map_panel_clip(layout),
             );
         }
         prev = next;

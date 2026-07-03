@@ -705,6 +705,7 @@ fn contour_stroke_supports_major_width_and_dashes() {
         Rgba::BLACK,
         1,
         crate::request::ContourLinePattern::Solid,
+        (0, 0, 79, 79),
     );
     draw_contour_stroke(
         &mut dashed,
@@ -715,6 +716,7 @@ fn contour_stroke_supports_major_width_and_dashes() {
         Rgba::BLACK,
         1,
         crate::request::ContourLinePattern::Dashed,
+        (0, 0, 79, 79),
     );
     let solid_pixels = solid
         .pixels()
