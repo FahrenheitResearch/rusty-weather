@@ -384,14 +384,13 @@ fn start_render_job(body: Vec<u8>, state: AppState) -> Vec<u8> {
     // Resolve `latest` BEFORE the cache key: alias entries must never
     // outlive the run they pointed at.
     let alias = request.run.trim().to_ascii_lowercase();
-    if alias == "latest" || alias == "latest-day" {
-        request.run =
-            match resolve_latest_run(&state.store_root, &request.model, alias == "latest-day") {
-                Ok(run) => run,
-                Err(message) => {
-                    return json_status_response(422, &serde_json::json!({ "error": message }));
-                }
-            };
+    if alias == "latest" || alias == "latest-day" || alias == "fuel-run" {
+        request.run = match resolve_latest_run(&state.store_root, &request.model, &alias) {
+            Ok(run) => run,
+            Err(message) => {
+                return json_status_response(422, &serde_json::json!({ "error": message }));
+            }
+        };
     }
 
     let id = next_job_id(&state);
@@ -890,8 +889,8 @@ fn daily_response(query: &str, state: &AppState) -> Vec<u8> {
     }
     let mut run = query.get("run").cloned().unwrap_or_else(|| "latest".to_string());
     let alias = run.to_ascii_lowercase();
-    if alias == "latest" || alias == "latest-day" {
-        run = match resolve_latest_run(&state.store_root, model, alias == "latest-day") {
+    if alias == "latest" || alias == "latest-day" || alias == "fuel-run" {
+        run = match resolve_latest_run(&state.store_root, model, &alias) {
             Ok(resolved) => resolved,
             Err(message) => return json_status_response(422, &serde_json::json!({ "error": message })),
         };
@@ -942,8 +941,9 @@ fn vars_response(query: &str, state: &AppState) -> Vec<u8> {
         return json_status_response(400, &serde_json::json!({ "error": "model slug is not valid" }));
     }
     let mut run = query.get("run").cloned().unwrap_or_else(|| "latest".to_string());
-    if run.eq_ignore_ascii_case("latest") || run.eq_ignore_ascii_case("latest-day") {
-        run = match resolve_latest_run(&state.store_root, &model, run.eq_ignore_ascii_case("latest-day")) {
+    let alias = run.to_ascii_lowercase();
+    if alias == "latest" || alias == "latest-day" || alias == "fuel-run" {
+        run = match resolve_latest_run(&state.store_root, &model, &alias) {
             Ok(resolved) => resolved,
             Err(message) => {
                 return json_status_response(422, &serde_json::json!({ "error": message }));
@@ -1081,20 +1081,27 @@ fn runs_response(query: &str, state: &AppState) -> Vec<u8> {
     )
 }
 
-/// Resolve the `latest` / `latest-day` run aliases via the daemon's atomic
-/// manifest. `latest` = newest fully-stored run; `latest-day` = newest run
-/// covering a full UTC day (what the anomaly/day-window lanes need).
-fn resolve_latest_run(store_root: &Path, model: &str, day: bool) -> Result<String, String> {
+/// Resolve the `latest` / `latest-day` / `fuel-run` run aliases via the
+/// daemon's atomic manifest. `latest` = newest fully-stored run (freshest
+/// weather); `latest-day` = newest complete run covering a full UTC day
+/// (anomaly/day-window lanes); `fuel-run` = newest complete run whose fuels
+/// are imported (fuel products, so they never error on `latest` during a
+/// fresh run's gridMET-import lag). Unknown aliases resolve as `latest`.
+fn resolve_latest_run(store_root: &Path, model: &str, alias: &str) -> Result<String, String> {
     let path = store_root.join(model).join("latest.json");
     let text = std::fs::read_to_string(&path)
         .map_err(|_| format!("no latest-run manifest for model '{model}' (daemon not running?)"))?;
     let manifest: serde_json::Value =
         serde_json::from_str(&text).map_err(|err| format!("latest.json: {err}"))?;
     let field = |name: &str| manifest.get(name).and_then(|value| value.as_str());
-    let run = if day {
-        field("day_run").or_else(|| field("complete_run")).or_else(|| field("run"))
-    } else {
-        field("complete_run").or_else(|| field("run"))
+    let run = match alias {
+        "latest-day" => {
+            field("day_run").or_else(|| field("complete_run")).or_else(|| field("run"))
+        }
+        "fuel-run" => {
+            field("fuel_run").or_else(|| field("complete_run")).or_else(|| field("run"))
+        }
+        _ => field("complete_run").or_else(|| field("run")),
     }
     .ok_or("latest.json has no run field")?;
     if run.len() > 40 || run.contains(['/', '\\', '.']) {
@@ -1311,8 +1318,8 @@ fn meteogram_response(path: &str, state: &AppState) -> Vec<u8> {
     }
     let resolved_run;
     let alias = run.to_ascii_lowercase();
-    let run = if alias == "latest" || alias == "latest-day" {
-        match resolve_latest_run(&state.store_root, model, alias == "latest-day") {
+    let run = if alias == "latest" || alias == "latest-day" || alias == "fuel-run" {
+        match resolve_latest_run(&state.store_root, model, &alias) {
             Ok(resolved) => {
                 resolved_run = resolved;
                 resolved_run.as_str()
@@ -1431,8 +1438,8 @@ fn xsection_response(path: &str, state: &AppState) -> Vec<u8> {
     };
     let resolved_run;
     let alias = run.to_ascii_lowercase();
-    let run = if alias == "latest" || alias == "latest-day" {
-        match resolve_latest_run(&state.store_root, model, alias == "latest-day") {
+    let run = if alias == "latest" || alias == "latest-day" || alias == "fuel-run" {
+        match resolve_latest_run(&state.store_root, model, &alias) {
             Ok(resolved) => {
                 resolved_run = resolved;
                 resolved_run.as_str()
@@ -1520,8 +1527,8 @@ fn sounding_response(path: &str, state: &AppState) -> Vec<u8> {
     };
     let resolved_run;
     let alias = run.to_ascii_lowercase();
-    let run = if alias == "latest" || alias == "latest-day" {
-        match resolve_latest_run(&state.store_root, model, alias == "latest-day") {
+    let run = if alias == "latest" || alias == "latest-day" || alias == "fuel-run" {
+        match resolve_latest_run(&state.store_root, model, &alias) {
             Ok(resolved) => {
                 resolved_run = resolved;
                 resolved_run.as_str()

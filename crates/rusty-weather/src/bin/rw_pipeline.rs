@@ -187,7 +187,8 @@ fn run_command(label: &str, command: &mut Command) -> bool {
 
 /// Newest run in the store whose stored hours reach its cycle's target —
 /// the run day-window and anomaly products can actually fold.
-fn newest_complete_run(model: &str, model_dir: &Path) -> Option<String> {
+/// All run-dir slugs under a model dir, newest first.
+fn list_runs_newest_first(model_dir: &Path) -> Vec<String> {
     let mut runs: Vec<String> = std::fs::read_dir(model_dir)
         .into_iter()
         .flatten()
@@ -197,19 +198,40 @@ fn newest_complete_run(model: &str, model_dir: &Path) -> Option<String> {
         .collect();
     runs.sort();
     runs.reverse();
-    runs.into_iter().find(|slug| {
-        let Some((_, cycle)) = slug
-            .split_once('_')
-            .and_then(|(date, cycle)| {
-                let hour: u8 = cycle.strip_suffix('z')?.parse().ok()?;
-                (date.len() == 8).then_some((date, hour))
-            })
-        else {
-            return false;
-        };
-        let stored = stored_hours(&model_dir.join(slug));
-        let target = target_hours(model, cycle).last().copied().unwrap_or(0);
-        stored.iter().copied().max().unwrap_or(0) >= target
+    runs
+}
+
+/// A run is complete once its newest stored hour reaches its cycle's target
+/// forecast length (F18 off-cycle, F48 on 00/06/12/18Z).
+fn run_is_complete(model: &str, model_dir: &Path, slug: &str) -> bool {
+    let Some(cycle) = slug.split_once('_').and_then(|(date, cycle)| {
+        let hour: u8 = cycle.strip_suffix('z')?.parse().ok()?;
+        (date.len() == 8).then_some(hour)
+    }) else {
+        return false;
+    };
+    let stored = stored_hours(&model_dir.join(slug));
+    let target = target_hours(model, cycle).last().copied().unwrap_or(0);
+    stored.iter().copied().max().unwrap_or(0) >= target
+}
+
+fn newest_complete_run(model: &str, model_dir: &Path) -> Option<String> {
+    list_runs_newest_first(model_dir)
+        .into_iter()
+        .find(|slug| run_is_complete(model, model_dir, slug))
+}
+
+/// Newest run that is both complete AND has fuels imported — what fuel
+/// products resolve to (`fuel-run` alias). Decouples fuels from weather so a
+/// slow/failed gridMET import can never make a fuel map error on the run
+/// users see as `latest`, and never freezes the weather pointer. HRRR-only.
+fn newest_fuel_run(model: &str, model_dir: &Path) -> Option<String> {
+    if model != "hrrr" {
+        return None;
+    }
+    list_runs_newest_first(model_dir).into_iter().find(|slug| {
+        run_is_complete(model, model_dir, slug)
+            && model_dir.join(slug).join(".fuels-imported").exists()
     })
 }
 
@@ -225,25 +247,19 @@ fn best_day_coverage(cycle: u8, stored: &[u16]) -> usize {
 }
 
 /// Newest run whose stored hours cover a full-enough UTC day for the
-/// anomaly/day-window lanes.
-fn newest_day_covering_run(model_dir: &Path) -> Option<String> {
-    let mut runs: Vec<String> = std::fs::read_dir(model_dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().is_dir())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
-    runs.sort();
-    runs.reverse();
-    runs.into_iter().find(|slug| {
+/// anomaly/day-window lanes. Must ALSO be complete: a still-ingesting
+/// extended run covers ~20 h of a day well before it reaches F48, and the
+/// 24-48h window products would then render against missing hours.
+fn newest_day_covering_run(model: &str, model_dir: &Path) -> Option<String> {
+    list_runs_newest_first(model_dir).into_iter().find(|slug| {
         let Some(cycle) = slug
             .split_once('_')
             .and_then(|(_, cycle)| cycle.strip_suffix('z')?.parse::<u8>().ok())
         else {
             return false;
         };
-        best_day_coverage(cycle, &stored_hours(&model_dir.join(slug))) >= 20
+        run_is_complete(model, model_dir, slug)
+            && best_day_coverage(cycle, &stored_hours(&model_dir.join(slug))) >= 20
     })
 }
 
@@ -256,6 +272,7 @@ fn write_latest(
     target_max: u16,
     complete_run: Option<&str>,
     day_run: Option<&str>,
+    fuel_run: Option<&str>,
 ) -> Result<(), String> {
     let latest = serde_json::json!({
         "schema": "cafire.latest_run.v1",
@@ -264,12 +281,17 @@ fn write_latest(
         "stored_hours": stored,
         "target_max_hour": target_max,
         "complete": stored.iter().copied().max().unwrap_or(0) >= target_max,
-        // Newest fully-stored run: what `latest` resolves to.
+        // Newest fully-stored run: what `latest` resolves to. Advances the
+        // instant ingest finishes so weather maps are always freshest.
         "complete_run": complete_run,
-        // Newest run covering >=20 h of a UTC day: what `latest-day`
-        // resolves to (anomaly/day-window lanes; off-cycle 18 h runs
-        // never cover a full day).
+        // Newest COMPLETE run covering >=20 h of a UTC day: what `latest-day`
+        // resolves to (anomaly/day-window lanes; off-cycle 18 h runs never
+        // cover a full day).
         "day_run": day_run,
+        // Newest complete run whose fuels are imported: what fuel products
+        // resolve to (`fuel-run`). Lags complete_run only while a fresh run's
+        // gridMET import is pending, so fuel maps never error on `latest`.
+        "fuel_run": fuel_run,
         "updated_unix": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
     });
     let tmp = model_dir.join("latest.json.tmp");
@@ -483,7 +505,8 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
     // Fuels + prewarm target the newest COMPLETE run — a brand-new cycle
     // with two hours stored must not steal them from the run users see.
     let complete_run = newest_complete_run(&args.model, &model_dir);
-    let day_run = newest_day_covering_run(&model_dir);
+    let day_run = newest_day_covering_run(&args.model, &model_dir);
+    let fuel_run = newest_fuel_run(&args.model, &model_dir);
     if let Err(err) = write_latest(
         &model_dir,
         &args.model,
@@ -492,6 +515,7 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
         target_max,
         complete_run.as_deref(),
         day_run.as_deref(),
+        fuel_run.as_deref(),
     ) {
         eprintln!("[pipeline] latest.json: {err}");
     }

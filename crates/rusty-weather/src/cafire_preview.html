@@ -1158,10 +1158,21 @@ $("shareBtn").onclick = async () => {
 
 /* ---------- the render core ---------- */
 const dayFams = new Set(["anomaly", "record", "climoref", "window"]);
+const fuelFams = new Set(["fuels"]);
 function currentRun() {
   let run = $("runSelect").value;
   if (run === "latest" && dayFams.has(state.fam)) run = "latest-day";
+  else if (run === "latest" && fuelFams.has(state.fam)) run = "fuel-run";
   return run;
+}
+// Fuel products resolve to fuel_run, which can lag complete_run (smaller F18
+// vs a fresh F48). Pick the hour from fuel_run's own range so we never
+// request an hour it lacks; hour 0 exists in every run and fuel layers are
+// daily/hour-invariant, so it's a safe floor.
+function fuelHour() {
+  const fr = latestManifest && latestManifest.fuel_run;
+  const hrs = fr && runsHours[fr];
+  return Array.isArray(hrs) && hrs.length ? hrs[hrs.length - 1] : 0;
 }
 function domainPayload() {
   if (state.fire) {
@@ -1300,7 +1311,11 @@ async function renderCurrent() {
       return;
     }
     const slug = state.fam === "climoref" ? climoSlug() : state.product;
-    const hour = FAMS[state.fam].hourly ? state.hour : (state.hours[state.hours.length - 1] ?? 18);
+    const hour = FAMS[state.fam].hourly
+      ? state.hour
+      : fuelFams.has(state.fam)
+        ? fuelHour()
+        : (state.hours[state.hours.length - 1] ?? 18);
     spin.classList.add("show"); $("spinText").textContent = "rendering…";
     const t0 = performance.now();
     const job = await requestPlot(slug, hour);
