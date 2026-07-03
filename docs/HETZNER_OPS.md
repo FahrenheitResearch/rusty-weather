@@ -125,7 +125,7 @@ Details that matter:
 ├── bin/        rw_fire_api  rw_pipeline  rw_render  rw_batch  rw_prune
 │               rw_fuel_fetch  rw_fuel_import  rw_climo_import  rw_land_mask
 ├── store/      the .rws model stores (see below)
-├── cache/      _raw_fetch/ = raw GRIB downloads, ~147 GB steady state
+├── cache/      _raw_fetch/ = raw GRIB downloads (~90-150 GB; capped by hourly cron, see §4)
 ├── out/        render outputs: job-*/ dirs (disposable cache) + ecape/ (KEEP)
 ├── src/        source tree from last deploy (build workspace)
 └── logs/       one-off build/backfill logs (journald has the real logs)
@@ -153,17 +153,21 @@ Details that matter:
 
 | Consumer | Size | Behavior |
 |---|---|---|
-| `cache/_raw_fetch` | ~147 GB | **Steady state — do not panic.** `rw_prune` caps raw GRIBs at 6 h age (`--cache-max-age-hours`, default 6). Raw files are dead weight post-ingest. |
+| `cache/_raw_fetch` | ~90–150 GB | Raw GRIBs, re-fetchable dead weight post-ingest. **Capped by an hourly cron** (`/etc/cron.hourly/rw-rawfetch-cache-cap`, deletes files >6 h) — NOT by the pipeline. ⚠️ The daemon's own `rw_prune` does **not** honor the 6 h cache policy (`rw_pipeline` has no `--cache-max-age-hours` flag to pass through; it leaves 6–24 h GRIBs). Without the cron this balloons past 200 GB and fills the disk (happened 2026-07-03, →94%). If the cron is ever removed, the proper fix is to rebuild the pipeline so its internal prune passes the age flag. |
 | `store/hrrr` | ~57 GB | Pruned to newest runs + newest long (≥F030) run |
 | `store/rtma_climo` | 34 GB | Fixed |
 | legacy `data/` | ~180 GB | Shrinks ~123 GB after the §9 cleanup |
 
-Levers if disk gets tight, in order: (1) confirm `_raw_fetch` isn't
-ballooning past ~150 GB (if it is, a pipeline lane is failing mid-ingest
-and re-fetching); (2) execute §9 if past the soak window; (3) HRRR
-`--keep-recent` 3→2 buys ~15 GB. The July 2 incident (§8) is what
-happens when this is ignored: at 95% full the ingest daemon dies and the
-public site serves stale weather.
+Levers if disk gets tight, in order: (1) confirm the `rw-rawfetch-cache-cap`
+cron exists and is running — if `_raw_fetch` is past ~150 GB the cron is
+missing or broken; reclaim immediately with
+`find /opt/rusty-weather/cache/_raw_fetch -type f -mmin +360 -delete`;
+(2) execute §9 if past the soak window; (3) HRRR `--keep-recent` 3→2 buys
+~15 GB. The July 2 incident (§8) is what happens when this is ignored: at
+95% full the ingest daemon dies and the public site serves stale weather.
+The 2026-07-03 recurrence (disk hit 94%) was this exact cause — the
+daemon's prune silently leaving old GRIBs — and is why the hourly cron now
+exists as a backstop.
 
 ---
 
@@ -276,8 +280,12 @@ capture `ps` output before killing anything there.
 
 **Public data is stale (latest run hours behind).** July 2 incident.
 Triage order:
-1. `df -h /` — at ~95% the ingest daemon crashes mid-run. Free space
-   (check `_raw_fetch`, legacy cache), then restart the pipeline units.
+1. `df -h /` — at ~95% the ingest daemon crashes mid-run. Free space:
+   `find /opt/rusty-weather/cache/_raw_fetch -type f -mmin +360 -delete`
+   (the big, always-safe reclaim), then check the `rw-rawfetch-cache-cap`
+   cron still exists (§4 — the daemon's own prune doesn't cap `_raw_fetch`,
+   so if that cron is gone the cache re-balloons). Then restart the
+   pipeline units.
 2. `systemctl status rusty-wx-pipeline` — crash-looping? Almost always a
    stale `.rw-pipeline-lock-hrrr` surviving a crash. `systemctl restart`
    clears it via ExecStartPre.
