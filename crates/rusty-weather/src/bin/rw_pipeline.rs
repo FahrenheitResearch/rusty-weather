@@ -100,11 +100,13 @@ fn target_max_hour(cycle: u8) -> u16 {
 }
 
 /// The forecast hours a model's cycle should ingest. HRRR: hourly to
-/// 18/48. GFS: 6-hourly to F192 (the daily-outlook span) on synoptic
-/// cycles only.
+/// 18/48. GFS: 6-hourly to F384 (the full 16-day outlook span; GFS 0.25°
+/// is 1-hourly to F120 then 3-hourly to F384, so every 6-hour step exists)
+/// on synoptic cycles only. Note deterministic skill past ~day 7-10 is low
+/// (extended range).
 fn target_hours(model: &str, cycle: u8) -> Vec<u16> {
     match model {
-        "gfs" => (0..=192u16).step_by(6).collect(),
+        "gfs" => (0..=384u16).step_by(6).collect(),
         // NBM: 6-hourly through day 11 — the official-blend outlook span.
         "nbm" => (6..=264u16).step_by(6).collect(),
         _ => (0..=target_max_hour(cycle)).collect(),
@@ -654,10 +656,10 @@ mod tests {
     }
 
     #[test]
-    fn gfs_targets_six_hourly_to_f192_on_synoptic_cycles_only() {
+    fn gfs_targets_six_hourly_to_f384_on_synoptic_cycles_only() {
         let hours = target_hours("gfs", 12);
         assert_eq!(hours.first(), Some(&0));
-        assert_eq!(hours.last(), Some(&192));
+        assert_eq!(hours.last(), Some(&384));
         assert!(hours.windows(2).all(|pair| pair[1] - pair[0] == 6));
         assert!(model_has_cycle("gfs", 6));
         assert!(!model_has_cycle("gfs", 7));
