@@ -508,7 +508,15 @@ fn output_file_response(path: &str, state: &AppState) -> Vec<u8> {
         _ => "image/png",
     };
     match fs::read(&path) {
-        Ok(bytes) => binary_response(200, content_type, bytes),
+        // Rendered outputs are job-id-keyed and never change, so let browsers
+        // and the CDN cache them hard — makes loop/prefetch frame re-loads
+        // instant instead of a fresh fetch each cycle.
+        Ok(bytes) => response_with_extra_headers(
+            200,
+            content_type,
+            bytes,
+            "Cache-Control: public, max-age=31536000, immutable\r\n",
+        ),
         Err(err) => text_response(404, &format!("read {}: {err}", path.display())),
     }
 }

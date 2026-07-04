@@ -157,7 +157,9 @@ pub fn operational_fill_scale_for_recipe(
 
     if filled_selector.field == CanonicalField::SmokeMassDensity {
         return ColorScale::Discrete(DiscreteColorScale {
-            levels: vec![10.0, 20.0, 35.0, 55.0, 100.0, 150.0, 250.0, 500.0],
+            // Fine geometric ramp (was 8 coarse steps) so the 10-stop palette
+            // lerps into a fluid gradient instead of hard bands.
+            levels: geometric_levels(10.0, 1.12, 560.0),
             colors: smoke_scale_colors(),
             extend: ExtendMode::Max,
             mask_below: Some(10.0),
@@ -165,7 +167,9 @@ pub fn operational_fill_scale_for_recipe(
     }
     if filled_selector.field == CanonicalField::ColumnIntegratedSmoke {
         return ColorScale::Discrete(DiscreteColorScale {
-            levels: vec![20.0, 40.0, 80.0, 160.0, 320.0],
+            // Fine geometric ramp (was 5 coarse doublings → blocky) so the
+            // palette lerps smoothly across smoke's heavy-tailed range.
+            levels: geometric_levels(20.0, 1.12, 720.0),
             colors: smoke_scale_colors(),
             extend: ExtendMode::Max,
             mask_below: Some(20.0),
@@ -621,6 +625,19 @@ fn smoke_scale_colors() -> Vec<Color> {
         Color::rgba(78, 0, 138, 252),
         Color::rgba(48, 0, 112, 255),
     ]
+}
+
+/// Geometric (log-spaced) level ladder — fine steps for heavy-tailed fields
+/// like smoke, so the palette lerps into a fluid gradient instead of a few
+/// hard doublings. `factor` ~1.1 gives a smooth ramp.
+fn geometric_levels(start: f64, factor: f64, max: f64) -> Vec<f64> {
+    let mut out = Vec::new();
+    let mut value = start;
+    while value <= max + 1e-6 {
+        out.push((value * 10.0).round() / 10.0);
+        value *= factor;
+    }
+    out
 }
 
 fn range_step(start: f64, stop: f64, step: f64) -> Vec<f64> {
