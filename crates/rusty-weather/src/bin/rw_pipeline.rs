@@ -249,10 +249,13 @@ fn best_day_coverage(cycle: u8, stored: &[u16]) -> usize {
 }
 
 /// Newest run whose stored hours cover a full-enough UTC day for the
-/// anomaly/day-window lanes. Must ALSO be complete: a still-ingesting
-/// extended run covers ~20 h of a day well before it reaches F48, and the
-/// 24-48h window products would then render against missing hours.
-fn newest_day_covering_run(model: &str, model_dir: &Path) -> Option<String> {
+/// anomaly/day-window lanes. Requires >=20 h of a single UTC day — which is
+/// all the anomaly fold needs — but NOT full ingest: extended F48 runs
+/// frequently stall a few hours short (the daemon chases newer cycles), and
+/// gating on full completeness would null this pointer and break the whole
+/// anomaly suite even though the day's data is present. Off-cycle F18 runs
+/// never reach 20 h of one day, so this still rides the extended cycles.
+fn newest_day_covering_run(model_dir: &Path) -> Option<String> {
     list_runs_newest_first(model_dir).into_iter().find(|slug| {
         let Some(cycle) = slug
             .split_once('_')
@@ -260,8 +263,7 @@ fn newest_day_covering_run(model: &str, model_dir: &Path) -> Option<String> {
         else {
             return false;
         };
-        run_is_complete(model, model_dir, slug)
-            && best_day_coverage(cycle, &stored_hours(&model_dir.join(slug))) >= 20
+        best_day_coverage(cycle, &stored_hours(&model_dir.join(slug))) >= 20
     })
 }
 
@@ -507,7 +509,7 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
     // Fuels + prewarm target the newest COMPLETE run — a brand-new cycle
     // with two hours stored must not steal them from the run users see.
     let complete_run = newest_complete_run(&args.model, &model_dir);
-    let day_run = newest_day_covering_run(&args.model, &model_dir);
+    let day_run = newest_day_covering_run(&model_dir);
     let fuel_run = newest_fuel_run(&args.model, &model_dir);
     if let Err(err) = write_latest(
         &model_dir,
