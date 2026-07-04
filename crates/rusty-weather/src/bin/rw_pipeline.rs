@@ -422,6 +422,67 @@ fn prewarm(agent: &ureq::Agent, api: &str, complete_run: &str, day_run: Option<&
     }
 }
 
+/// Ingest every target hour of `date`/`cycle` that is published upstream but
+/// not yet stored. Safe to call repeatedly: probes what's available, fetches
+/// only the missing published hours (empty = no-op).
+fn ingest_available(args: &Args, agent: &ureq::Agent, bin_dir: &Path, date: &str, cycle: u8) {
+    let targets = target_hours(&args.model, cycle);
+    let target_max = targets.last().copied().unwrap_or(0);
+    let run_dir = args.store_root.join(&args.model).join(format!("{date}_{cycle:02}z"));
+    let stored = stored_hours(&run_dir);
+    // Highest target hour published upstream so far (probe down).
+    let mut available_max = None;
+    for &hour in targets.iter().rev() {
+        if probe(agent, &idx_url(&args.model, date, cycle, hour)) {
+            available_max = Some(hour);
+            break;
+        }
+    }
+    let Some(available_max) = available_max else { return };
+    let missing: Vec<u16> = targets
+        .iter()
+        .copied()
+        .filter(|hour| *hour <= available_max && !stored.contains(hour))
+        .collect();
+    println!(
+        "[pipeline] run {date}_{cycle:02}z: stored {} / available F000-F{available_max:03} / target F{target_max:03}",
+        stored.len()
+    );
+    if missing.is_empty() {
+        return;
+    }
+    let hours_arg = missing.iter().map(|h| h.to_string()).collect::<Vec<_>>().join(",");
+    let mut command = Command::new(bin_dir.join(exe("rw_batch")));
+    command
+        .arg("--model").arg(&args.model)
+        .arg("--date").arg(date)
+        .arg("--cycle").arg(cycle.to_string())
+        .arg("--hours").arg(hours_arg)
+        .arg("--products").arg("none")
+        .arg("--profile").arg(&args.profile)
+        .arg("--store-root").arg(&args.store_root);
+    if let Some(cache) = &args.cache_dir {
+        command.arg("--cache-dir").arg(cache);
+    }
+    run_command("ingest", &mut command);
+}
+
+/// Newest available cycle that is a synoptic/extended run (cycle % 6 == 0 —
+/// HRRR's F48 runs, and every GFS/NBM cycle). Probes back far enough to catch
+/// one whose far hours are still publishing.
+fn newest_extended_cycle(args: &Args, agent: &ureq::Agent, now_unix: i64) -> Option<(String, u8)> {
+    for lag in 1..=args.max_cycle_lag_hours.max(9) {
+        let (date, cycle) = cycle_at(now_unix, lag);
+        if cycle % 6 != 0 || !model_has_cycle(&args.model, cycle) {
+            continue;
+        }
+        if probe(agent, &idx_url(&args.model, &date, cycle, 1)) {
+            return Some((date, cycle));
+        }
+    }
+    None
+}
+
 fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -454,51 +515,22 @@ fn tick(args: &Args, agent: &ureq::Agent, bin_dir: &Path) {
         return;
     };
     let run_slug = format!("{date}_{cycle:02}z");
-    let targets = target_hours(&args.model, cycle);
-    let target_max = targets.last().copied().unwrap_or(0);
+    let target_max = target_hours(&args.model, cycle).last().copied().unwrap_or(0);
     let model_dir = args.store_root.join(&args.model);
     let run_dir = model_dir.join(&run_slug);
-    let stored = stored_hours(&run_dir);
 
-    // Highest target hour published upstream so far (probe down).
-    let mut available_max = None;
-    for &hour in targets.iter().rev() {
-        if probe(agent, &idx_url(&args.model, &date, cycle, hour)) {
-            available_max = Some(hour);
-            break;
+    // Ingest the newest cycle first (freshest weather). Then finish the
+    // newest incomplete extended (F48/synoptic) run: HRRR's 00/06/12/18Z
+    // runs publish their far hours ~2 h out and take ~45 min to ingest, but a
+    // new hourly cycle lands every hour — without this the daemon abandons
+    // them and they never reach F48. For GFS/NBM the newest cycle already is
+    // a synoptic run, so the second pass no-ops.
+    ingest_available(args, agent, bin_dir, &date, cycle);
+    if let Some((ext_date, ext_cycle)) = newest_extended_cycle(args, agent, now_unix) {
+        let ext_slug = format!("{ext_date}_{ext_cycle:02}z");
+        if ext_slug != run_slug && !run_is_complete(&args.model, &model_dir, &ext_slug) {
+            ingest_available(args, agent, bin_dir, &ext_date, ext_cycle);
         }
-    }
-    let Some(available_max) = available_max else { return };
-    let missing: Vec<u16> = targets
-        .iter()
-        .copied()
-        .filter(|hour| *hour <= available_max && !stored.contains(hour))
-        .collect();
-
-    println!(
-        "[pipeline] run {run_slug}: stored {} / available F000-F{available_max:03} / target F{target_max:03}",
-        stored.len()
-    );
-
-    if !missing.is_empty() {
-        let hours_arg = missing
-            .iter()
-            .map(|hour| hour.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let mut command = Command::new(bin_dir.join(exe("rw_batch")));
-        command
-            .arg("--model").arg(&args.model)
-            .arg("--date").arg(&date)
-            .arg("--cycle").arg(cycle.to_string())
-            .arg("--hours").arg(hours_arg)
-            .arg("--products").arg("none")
-            .arg("--profile").arg(&args.profile)
-            .arg("--store-root").arg(&args.store_root);
-        if let Some(cache) = &args.cache_dir {
-            command.arg("--cache-dir").arg(cache);
-        }
-        run_command("ingest", &mut command);
     }
 
     let stored = stored_hours(&run_dir);
