@@ -850,10 +850,14 @@ fn fill_missing_surface(fields: &mut ImportedWrfFields, surface: SurfaceFallback
 /// the wrf-core reader needs, and carry no surface fields. Returns the
 /// synthesized surface 2D fields + the isobaric volumes, or `None` if this
 /// isn't a post-processed WRF file (so the caller falls back to the raw path).
-fn try_postprocessed_wrf(
+pub(crate) fn try_postprocessed_wrf(
     path: &Path,
 ) -> Result<Option<(Vec<(String, SelectedField2D)>, Vec<IsoVolume>)>, ImportError> {
-    let nc = netcrust::open(path)?;
+    // If netcrust can't open it at all, it's not our post-processed case —
+    // let the caller's raw-wrfout path try instead of failing here.
+    let Ok(nc) = netcrust::open(path) else {
+        return Ok(None);
+    };
     let is_postprocessed = nc.variable("TK").is_some()
         && nc.variable("Z").is_some()
         && nc.variable("P").is_some()
@@ -1160,7 +1164,7 @@ mod tests {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum ImportError {
+pub(crate) enum ImportError {
     #[error("no files selected")]
     NoFiles,
     #[error("no supported local model files found in selection")]

@@ -223,6 +223,46 @@ fn process_paths(
     let mut all_notes = Vec::<String>::new();
 
     for path in &files {
+        if written.len() > u16::MAX as usize {
+            return Err(format!("Too many WRF times to store: {}", written.len()));
+        }
+        // Post-processed climate wrfout (CONUS-I/II, GDEX: derived TK/Z/P, no
+        // raw T/PB) — wrf-core can't open these, so route them through the
+        // netcrust-based reader before falling through to the raw path.
+        match crate::local_import::try_postprocessed_wrf(path) {
+            Ok(Some((canonical, volumes))) => {
+                let hour = u16::try_from(written.len()).expect("bounded above");
+                let _ = tx.send(WrfProcessMessage::Progress(format!(
+                    "Reading post-processed WRF {} -> f{hour:03}",
+                    display_name(path)
+                )));
+                let refs = canonical
+                    .iter()
+                    .map(|(name, field)| (name.as_str(), field))
+                    .collect::<Vec<_>>();
+                let volume_inputs = volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
+                let result = write_hour_from_fields_with_derived(
+                    store_root,
+                    &model,
+                    &run,
+                    hour,
+                    &refs,
+                    &[],
+                    &volume_inputs,
+                    writer_build(),
+                    now_unix(),
+                )
+                .map_err(|err| format!("Write WRF f{hour:03} failed: {err}"))?;
+                all_vars.extend(result.vars.iter().cloned());
+                written.push(result);
+                continue;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Err(format!("Process WRF {} failed: {err}", path.display()));
+            }
+        }
+
         let _ = tx.send(WrfProcessMessage::Progress(format!(
             "Opening WRF {}",
             display_name(path)
