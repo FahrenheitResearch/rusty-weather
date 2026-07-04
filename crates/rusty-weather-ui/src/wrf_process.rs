@@ -7,6 +7,8 @@ use rustwx_core::{
 };
 use rw_store::{DerivedFieldInput, WrittenHour, write_hour_from_fields_with_derived};
 use serde::{Deserialize, Serialize};
+
+use crate::wrf_volumes::{IsoVolume, build_iso_volumes};
 use wrf_core::variables::{VARS, VarDim};
 use wrf_core::{ComputeOpts, VarOutput, WrfFile, getvar};
 
@@ -110,6 +112,7 @@ pub struct WrfProcessSummary {
 struct WrfHourFields {
     canonical: Vec<(String, SelectedField2D)>,
     derived: Vec<OwnedDerivedField>,
+    volumes: Vec<IsoVolume>,
     notes: Vec<String>,
 }
 
@@ -263,6 +266,11 @@ fn process_paths(
                     values: field.values.as_slice(),
                 })
                 .collect::<Vec<_>>();
+            let volume_inputs = fields
+                .volumes
+                .iter()
+                .map(IsoVolume::as_input)
+                .collect::<Vec<_>>();
             let result = write_hour_from_fields_with_derived(
                 store_root,
                 &model,
@@ -270,7 +278,7 @@ fn process_paths(
                 hour,
                 &refs,
                 &derived_refs,
-                &[],
+                &volume_inputs,
                 writer_build(),
                 now_unix(),
             )
@@ -330,6 +338,7 @@ fn read_wrf_products(
     let mut fields = WrfHourFields {
         canonical: Vec::new(),
         derived: Vec::new(),
+        volumes: Vec::new(),
         notes: Vec::new(),
     };
 
@@ -399,6 +408,26 @@ fn read_wrf_products(
         FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel),
         Some("Pa")
     );
+    // Surface pressure (Pa) — required by the skew-T column builder. WRF PSFC
+    // is a raw field (no `getvar` diagnostic), so push it explicitly with a
+    // forced "Pa" unit rather than through `push_core!`.
+    if options.should_process("PSFC", Some("surface_pressure"), WrfProductGroup::Core) {
+        match compute_var(file, "PSFC", timeidx, Some("Pa")) {
+            Ok(output) => match single_plane(output, shape.len()) {
+                Ok((values, _units)) => push_canonical_values(
+                    &mut fields,
+                    &grid,
+                    projection.clone(),
+                    "surface_pressure",
+                    FieldSelector::surface(CanonicalField::Pressure),
+                    "Pa",
+                    values,
+                ),
+                Err(err) => fields.notes.push(format!("PSFC skipped: {err}")),
+            },
+            Err(err) => fields.notes.push(format!("PSFC unavailable: {err}")),
+        }
+    }
     push_core!(
         "pw",
         "pwat",
@@ -484,6 +513,19 @@ fn read_wrf_products(
         match compute_var(file, raw, timeidx, None) {
             Ok(output) => push_derived_output(&mut fields, raw, output, shape.len()),
             Err(_) => {}
+        }
+    }
+
+    // Isobaric sounding volumes (temperature_iso/dewpoint_iso/u_iso/v_iso/
+    // height_iso) so imported WRF runs produce skew-T soundings like the
+    // downloaded models. Failure here never fails the hour — the 2D fields
+    // still write; only the sounding is unavailable.
+    if options.core_fields {
+        match build_iso_volumes(file, timeidx, shape.len()) {
+            Ok(volumes) => fields.volumes = volumes,
+            Err(err) => fields
+                .notes
+                .push(format!("WRF isobaric sounding volumes unavailable: {err}")),
         }
     }
 
@@ -940,6 +982,97 @@ mod tests {
         );
         assert!(summary.variables.iter().any(|name| name == "sbcape"));
         assert!(summary.variables.iter().any(|name| name == "wrf_wspd10"));
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// End-to-end guard for the sounding fix: a real WRF file must land the
+    /// `*_iso` isobaric volumes (as `pressure3d`) plus `surface_pressure`, and
+    /// an interior column pull must carry real mid-tropospheric data. Gated on
+    /// `RW_WRF_PROCESS_FIXTURE` (a `wrfout_*` path) like the sibling test.
+    #[test]
+    fn real_fixture_writes_isobaric_sounding_volumes() {
+        let Some(path) = std::env::var_os("RW_WRF_PROCESS_FIXTURE") else {
+            return;
+        };
+        let store =
+            std::env::temp_dir().join(format!("rw-wrf-sounding-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let (tx, _rx) = channel();
+        let summary = process_paths(
+            &[PathBuf::from(path)],
+            &store,
+            &WrfProcessOptions::default(),
+            &tx,
+        )
+        .expect("real WRF fixture should process");
+
+        let hour_path = store
+            .join(&summary.model)
+            .join(&summary.run)
+            .join("f000.rws");
+        let reader = rw_store::reader::HourReader::open(&hour_path).expect("open hour file");
+
+        for name in [
+            "temperature_iso",
+            "dewpoint_iso",
+            "u_iso",
+            "v_iso",
+            "height_iso",
+        ] {
+            let var = reader
+                .variable(name)
+                .unwrap_or_else(|| panic!("{name} missing from store"));
+            assert_eq!(var.kind, "pressure3d", "{name} should be a 3D volume");
+            assert!(!var.levels_hpa.is_empty(), "{name} has no isobaric levels");
+        }
+        assert!(
+            reader.variable("surface_pressure").is_some(),
+            "surface_pressure missing — the skew-T column builder needs it"
+        );
+
+        // An interior column pull carries real, physical data: temperatures
+        // in a sane Kelvin band and geopotential height increasing as pressure
+        // decreases (store levels are descending, so 1000 hPa is index 0).
+        // This catches the unit/ordering regressions a finite check misses.
+        let levels = reader
+            .variable("temperature_iso")
+            .expect("temperature_iso")
+            .levels_hpa
+            .clone();
+        let temps = reader
+            .read_profile_3d("temperature_iso", 5.0, 5.0)
+            .expect("read temperature_iso profile");
+        let heights = reader
+            .read_profile_3d("height_iso", 5.0, 5.0)
+            .expect("read height_iso profile");
+        assert_eq!(temps.len(), levels.len());
+        assert_eq!(heights.len(), levels.len());
+
+        let finite_temps = temps.iter().filter(|value| value.is_finite()).count();
+        assert!(
+            finite_temps >= 5,
+            "expected several finite isobaric temperatures, got {finite_temps} of {}",
+            temps.len()
+        );
+        for (level, temp) in levels.iter().zip(&temps) {
+            if temp.is_finite() {
+                assert!(
+                    (180.0..=330.0).contains(temp),
+                    "{level} hPa temperature {temp} K is non-physical (unit bug?)"
+                );
+            }
+        }
+        let mut last_height = f32::NEG_INFINITY;
+        for height in &heights {
+            if height.is_finite() {
+                assert!(
+                    *height > last_height,
+                    "height must increase as pressure decreases, got {height} after {last_height}"
+                );
+                last_height = *height;
+            }
+        }
+
         let _ = std::fs::remove_dir_all(&store);
     }
 

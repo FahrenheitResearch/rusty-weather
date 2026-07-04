@@ -241,6 +241,9 @@ pub struct FieldViewerPanel {
     state: LoadState,
     /// Last clicked point in fractional grid coords (marker overlay).
     clicked: Option<(f64, f64)>,
+    /// Ctrl+Alt smooth-sounding mode: the last grid cell a live sounding was
+    /// fired for, so we only regenerate when the pointer enters a new cell.
+    live_sounding_cell: Option<(usize, usize)>,
     /// In-progress shift + pointer-button custom-domain selection.
     domain_drag: Option<DomainDrag>,
     /// In-progress shift + pointer-button corner rotation.
@@ -277,6 +280,7 @@ impl Default for FieldViewerPanel {
             texture_dirty: false,
             state: LoadState::Idle,
             clicked: None,
+            live_sounding_cell: None,
             domain_drag: None,
             domain_rotate: None,
             domain_selection: None,
@@ -857,6 +861,7 @@ impl FieldViewerPanel {
 
         let shift_down = ui.input(|input| input.modifiers.shift);
         let alt_down = ui.input(|input| input.modifiers.alt);
+        let ctrl_down = ui.input(|input| input.modifiers.ctrl || input.modifiers.mac_cmd);
 
         if response.hovered() {
             let scroll_delta = ui.input(|input| input.smooth_scroll_delta().y);
@@ -909,12 +914,42 @@ impl FieldViewerPanel {
             ui.ctx().request_repaint();
         }
 
-        if response.clicked_by(PointerButton::Primary) && alt_down {
+        if response.clicked_by(PointerButton::Primary) && alt_down && !ctrl_down {
             if let Some(pos) = response.interact_pointer_pos() {
                 let (fx, fy) = to_grid(pos);
                 self.clicked = Some((fx, fy));
                 event = Some(FieldViewerEvent::PointClicked { fx, fy });
             }
+        }
+
+        // Ctrl+Alt held: smooth "scrubbing" soundings. Every time the pointer
+        // moves into a new grid cell over the field, fire a fresh sounding.
+        // The store read is sub-millisecond warm and the worker coalesces to
+        // the latest request; the sounding panel keeps its previous scene
+        // while the next one computes, so scrubbing stays fluid and flicker
+        // free. Gating on the integer grid cell caps regeneration to at most
+        // one sounding per column — all the data resolution supports.
+        if ctrl_down && alt_down && response.hovered() {
+            if let Some(pos) = response.hover_pos() {
+                let (fx, fy) = to_grid(pos);
+                if fx >= 0.0
+                    && fy >= 0.0
+                    && fx.round() < field.nx as f64
+                    && fy.round() < field.ny as f64
+                {
+                    let cell = (fx.round() as usize, fy.round() as usize);
+                    if self.live_sounding_cell != Some(cell) {
+                        self.live_sounding_cell = Some(cell);
+                        self.clicked = Some((fx, fy));
+                        event = Some(FieldViewerEvent::PointClicked { fx, fy });
+                    }
+                }
+            }
+            // Keep frames flowing while the modifier is held so pointer motion
+            // is sampled smoothly.
+            ui.ctx().request_repaint();
+        } else {
+            self.live_sounding_cell = None;
         }
 
         let domain_button = if shift_down && response.drag_started_by(PointerButton::Primary) {
@@ -1058,11 +1093,14 @@ impl FieldViewerPanel {
                 }
                 None => String::new(),
             };
-            let text = if value.is_nan() {
+            let mut text = if value.is_nan() {
                 format!("({ix}, {iy}){place}  missing")
             } else {
                 format!("({ix}, {iy}){place}  {value:.2} {}", field.units)
             };
+            if ctrl_down && alt_down {
+                text.push_str("   ⟳ live sounding");
+            }
             response.on_hover_text_at_pointer(text);
         }
 

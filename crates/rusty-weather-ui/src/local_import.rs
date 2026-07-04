@@ -8,6 +8,9 @@ use rustwx_core::{
     CanonicalField, FieldSelector, GridProjection, GridShape, LatLonGrid, SelectedField2D,
 };
 use rw_store::{DerivedFieldInput, WrittenHour, write_hour_from_fields_with_derived};
+use wrf_core::WrfFile;
+
+use crate::wrf_volumes::{IsoVolume, build_iso_volumes};
 
 const LOCAL_IMPORT_MAX_SCAN_DEPTH: usize = 8;
 const LOCAL_IMPORT_MAX_DISCOVERED_FILES: usize = 10_000;
@@ -137,6 +140,31 @@ fn import_paths(paths: &[PathBuf], store_root: &Path) -> Result<LocalImportSumma
                 values: field.values.as_slice(),
             })
             .collect::<Vec<_>>();
+        // Isobaric sounding volumes, so an imported WRF run makes soundings.
+        // Built through wrf-core (destaggering + WRF physics); a plain-NetCDF
+        // file that wrf-core can't open simply yields no volumes. The 2D grid
+        // comes from netcrust while volumes come from wrf-core; if they ever
+        // disagreed on grid size the store write would reject the hour, so drop
+        // the volumes on mismatch rather than fail an otherwise-good 2D import.
+        let grid_cells = fields
+            .canonical
+            .first()
+            .map(|(_, field)| field.grid.shape.len());
+        let iso_volumes = read_iso_volumes(path);
+        let volumes_match = match grid_cells {
+            Some(cells) => iso_volumes
+                .iter()
+                .all(|volume| volume.levels.iter().all(|(_, plane)| plane.len() == cells)),
+            None => false,
+        };
+        let volume_inputs = if volumes_match {
+            iso_volumes
+                .iter()
+                .map(IsoVolume::as_input)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let result = write_hour_from_fields_with_derived(
             store_root,
             &model,
@@ -144,7 +172,7 @@ fn import_paths(paths: &[PathBuf], store_root: &Path) -> Result<LocalImportSumma
             hour,
             &refs,
             &raw_refs,
-            &[],
+            &volume_inputs,
             writer_build(),
             now_unix(),
         )?;
@@ -720,6 +748,18 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+/// Build isobaric sounding volumes for one WRF file via wrf-core (time index 0,
+/// matching the single-record 2D import). Returns empty for files wrf-core
+/// cannot open (e.g. plain NetCDF) or whose 3D fields are unavailable, so the
+/// 2D import still succeeds.
+fn read_iso_volumes(path: &Path) -> Vec<IsoVolume> {
+    let Ok(file) = WrfFile::open(path) else {
+        return Vec::new();
+    };
+    let cells = file.nx.saturating_mul(file.ny);
+    build_iso_volumes(&file, 0, cells).unwrap_or_default()
 }
 
 #[cfg(test)]

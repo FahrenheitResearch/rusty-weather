@@ -45,6 +45,7 @@ mod local_import;
 mod profiler;
 mod sat_worker;
 mod wrf_process;
+mod wrf_volumes;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
