@@ -8,7 +8,7 @@ use rustwx_core::{
 use rw_store::{DerivedFieldInput, WrittenHour, write_hour_from_fields_with_derived};
 use serde::{Deserialize, Serialize};
 
-use crate::wrf_volumes::{IsoVolume, build_iso_volumes};
+use crate::wrf_volumes::{IsoVolume, SurfaceFallback, build_iso_volumes};
 use wrf_core::variables::{VARS, VarDim};
 use wrf_core::{ComputeOpts, VarOutput, WrfFile, getvar};
 
@@ -522,7 +522,13 @@ fn read_wrf_products(
     // still write; only the sounding is unavailable.
     if options.core_fields {
         match build_iso_volumes(file, timeidx, shape.len()) {
-            Ok(volumes) => fields.volumes = volumes,
+            Ok((volumes, surface)) => {
+                fields.volumes = volumes;
+                // Split wrf3d files (CONUS404 / GDEX CONUS-II) omit PSFC (and
+                // sometimes T2/Td2/winds); synthesize any missing surface field
+                // from the lowest model level so the sounding still builds.
+                fill_missing_surface(&mut fields, &grid, projection.clone(), surface);
+            }
             Err(err) => fields
                 .notes
                 .push(format!("WRF isobaric sounding volumes unavailable: {err}")),
@@ -530,6 +536,55 @@ fn read_wrf_products(
     }
 
     Ok(fields)
+}
+
+/// Add any skew-T surface field the file did not already provide, using the
+/// lowest-model-level [`SurfaceFallback`]. Real 2D fields (T2, U10, V10, …)
+/// already pushed win; only the genuinely-missing ones (chiefly
+/// `surface_pressure`) are synthesized.
+fn fill_missing_surface(
+    fields: &mut WrfHourFields,
+    grid: &LatLonGrid,
+    projection: Option<GridProjection>,
+    surface: SurfaceFallback,
+) {
+    let entries: [(&str, FieldSelector, &str, Vec<f32>); 5] = [
+        (
+            "surface_pressure",
+            FieldSelector::surface(CanonicalField::Pressure),
+            "Pa",
+            surface.surface_pressure_pa,
+        ),
+        (
+            "temperature_2m",
+            FieldSelector::height_agl(CanonicalField::Temperature, 2),
+            "K",
+            surface.temperature_2m_k,
+        ),
+        (
+            "dewpoint_2m",
+            FieldSelector::height_agl(CanonicalField::Dewpoint, 2),
+            "K",
+            surface.dewpoint_2m_k,
+        ),
+        (
+            "u_10m",
+            FieldSelector::height_agl(CanonicalField::UWind, 10),
+            "m/s",
+            surface.u_10m,
+        ),
+        (
+            "v_10m",
+            FieldSelector::height_agl(CanonicalField::VWind, 10),
+            "m/s",
+            surface.v_10m,
+        ),
+    ];
+    for (name, selector, units, values) in entries {
+        if !fields.canonical.iter().any(|(existing, _)| existing == name) {
+            push_canonical_values(fields, grid, projection.clone(), name, selector, units, values);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -998,10 +1053,18 @@ mod tests {
             std::env::temp_dir().join(format!("rw-wrf-sounding-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
         let (tx, _rx) = channel();
+        // Sounding-focused: skip the heavy 2D diagnostics (CAPE/severe) so this
+        // stays fast even on a ~2M-cell CONUS grid; core fields + volumes +
+        // surface fallback are what matter here.
         let summary = process_paths(
             &[PathBuf::from(path)],
             &store,
-            &WrfProcessOptions::default(),
+            &WrfProcessOptions {
+                diagnostics: false,
+                raw_extras: false,
+                heavy_ecape: false,
+                ..WrfProcessOptions::default()
+            },
             &tx,
         )
         .expect("real WRF fixture should process");

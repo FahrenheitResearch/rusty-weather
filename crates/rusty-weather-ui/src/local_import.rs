@@ -10,7 +10,7 @@ use rustwx_core::{
 use rw_store::{DerivedFieldInput, WrittenHour, write_hour_from_fields_with_derived};
 use wrf_core::WrfFile;
 
-use crate::wrf_volumes::{IsoVolume, build_iso_volumes};
+use crate::wrf_volumes::{IsoVolume, SurfaceFallback, build_iso_volumes, interpolate_iso_volumes};
 
 const LOCAL_IMPORT_MAX_SCAN_DEPTH: usize = 8;
 const LOCAL_IMPORT_MAX_DISCOVERED_FILES: usize = 10_000;
@@ -34,6 +34,8 @@ pub struct LocalImportSummary {
 struct ImportedWrfFields {
     canonical: Vec<(String, SelectedField2D)>,
     raw_2d: Vec<RawField2D>,
+    grid: LatLonGrid,
+    projection: Option<GridProjection>,
 }
 
 struct RawField2D {
@@ -122,9 +124,40 @@ fn import_paths(paths: &[PathBuf], store_root: &Path) -> Result<LocalImportSumma
     let mut written = Vec::<WrittenHour>::new();
     for (index, path) in files.iter().enumerate() {
         let hour = u16::try_from(index).expect("bounded above");
-        let fields = read_wrf_2d_fields(path)?;
+        // Post-processed climate wrfout (CONUS-I/II, GDEX: derived TK/Z/P, no
+        // raw T/PB) can't go through the raw-wrfout reader — build it directly.
+        if let Some((canonical, volumes)) = try_postprocessed_wrf(path)? {
+            let refs = canonical
+                .iter()
+                .map(|(name, field)| (name.as_str(), field))
+                .collect::<Vec<_>>();
+            let volume_inputs = volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
+            let result = write_hour_from_fields_with_derived(
+                store_root,
+                &model,
+                &run,
+                hour,
+                &refs,
+                &[],
+                &volume_inputs,
+                writer_build(),
+                now_unix(),
+            )?;
+            all_vars.extend(result.vars.iter().cloned());
+            written.push(result);
+            continue;
+        }
+        let mut fields = read_wrf_2d_fields(path)?;
         if fields.canonical.is_empty() {
             return Err(ImportError::NoFields(path.clone()));
+        }
+        // Isobaric sounding volumes + lowest-model-level surface fallback, so an
+        // imported WRF run makes soundings. Built through wrf-core; a plain
+        // NetCDF wrf-core can't open yields neither. Fill any surface field the
+        // 2D read missed (e.g. PSFC in a split wrf3d file) from the fallback.
+        let (iso_volumes, surface_fallback) = read_iso_volumes(path);
+        if let Some(surface) = surface_fallback {
+            fill_missing_surface(&mut fields, surface);
         }
         let refs = fields
             .canonical
@@ -140,23 +173,12 @@ fn import_paths(paths: &[PathBuf], store_root: &Path) -> Result<LocalImportSumma
                 values: field.values.as_slice(),
             })
             .collect::<Vec<_>>();
-        // Isobaric sounding volumes, so an imported WRF run makes soundings.
-        // Built through wrf-core (destaggering + WRF physics); a plain-NetCDF
-        // file that wrf-core can't open simply yields no volumes. The 2D grid
-        // comes from netcrust while volumes come from wrf-core; if they ever
-        // disagreed on grid size the store write would reject the hour, so drop
-        // the volumes on mismatch rather than fail an otherwise-good 2D import.
-        let grid_cells = fields
-            .canonical
-            .first()
-            .map(|(_, field)| field.grid.shape.len());
-        let iso_volumes = read_iso_volumes(path);
-        let volumes_match = match grid_cells {
-            Some(cells) => iso_volumes
-                .iter()
-                .all(|volume| volume.levels.iter().all(|(_, plane)| plane.len() == cells)),
-            None => false,
-        };
+        // Volume planes come from wrf-core, the 2D grid from netcrust; if they
+        // ever disagree on grid size, drop volumes rather than fail the hour.
+        let grid_cells = fields.grid.shape.len();
+        let volumes_match = iso_volumes
+            .iter()
+            .all(|volume| volume.levels.iter().all(|(_, plane)| plane.len() == grid_cells));
         let volume_inputs = if volumes_match {
             iso_volumes
                 .iter()
@@ -332,7 +354,7 @@ fn read_wrf_2d_fields(path: &Path) -> Result<ImportedWrfFields, ImportError> {
         push_computed(
             &mut canonical,
             &grid,
-            projection,
+            projection.clone(),
             "apcp",
             FieldSelector::surface(CanonicalField::TotalPrecipitation),
             "kg/m^2",
@@ -342,7 +364,12 @@ fn read_wrf_2d_fields(path: &Path) -> Result<ImportedWrfFields, ImportError> {
 
     let raw_2d = read_raw_wrf_mass_grid_fields(&nc, lat.nx, lat.ny)?;
 
-    Ok(ImportedWrfFields { canonical, raw_2d })
+    Ok(ImportedWrfFields {
+        canonical,
+        raw_2d,
+        grid,
+        projection,
+    })
 }
 
 fn push_direct(
@@ -754,12 +781,249 @@ fn now_unix() -> u64 {
 /// matching the single-record 2D import). Returns empty for files wrf-core
 /// cannot open (e.g. plain NetCDF) or whose 3D fields are unavailable, so the
 /// 2D import still succeeds.
-fn read_iso_volumes(path: &Path) -> Vec<IsoVolume> {
+fn read_iso_volumes(path: &Path) -> (Vec<IsoVolume>, Option<SurfaceFallback>) {
     let Ok(file) = WrfFile::open(path) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let cells = file.nx.saturating_mul(file.ny);
-    build_iso_volumes(&file, 0, cells).unwrap_or_default()
+    match build_iso_volumes(&file, 0, cells) {
+        Ok((volumes, surface)) => (volumes, Some(surface)),
+        Err(_) => (Vec::new(), None),
+    }
+}
+
+/// Add any skew-T surface field the netcrust 2D read did not provide, from the
+/// wrf-core lowest-model-level fallback — so a split `wrf3d` file (which omits
+/// `PSFC`) still sounds. Fields already present are kept; planes that don't
+/// match the hour grid are skipped.
+fn fill_missing_surface(fields: &mut ImportedWrfFields, surface: SurfaceFallback) {
+    let cells = fields.grid.shape.len();
+    let entries: [(&str, FieldSelector, &str, Vec<f32>); 5] = [
+        (
+            "surface_pressure",
+            FieldSelector::surface(CanonicalField::Pressure),
+            "Pa",
+            surface.surface_pressure_pa,
+        ),
+        (
+            "temperature_2m",
+            FieldSelector::height_agl(CanonicalField::Temperature, 2),
+            "K",
+            surface.temperature_2m_k,
+        ),
+        (
+            "dewpoint_2m",
+            FieldSelector::height_agl(CanonicalField::Dewpoint, 2),
+            "K",
+            surface.dewpoint_2m_k,
+        ),
+        (
+            "u_10m",
+            FieldSelector::height_agl(CanonicalField::UWind, 10),
+            "m/s",
+            surface.u_10m,
+        ),
+        (
+            "v_10m",
+            FieldSelector::height_agl(CanonicalField::VWind, 10),
+            "m/s",
+            surface.v_10m,
+        ),
+    ];
+    for (name, selector, units, values) in entries {
+        if values.len() != cells || fields.canonical.iter().any(|(existing, _)| existing == name) {
+            continue;
+        }
+        if let Ok(field) = SelectedField2D::new(selector, units, fields.grid.clone(), values) {
+            let field = match &fields.projection {
+                Some(projection) => field.with_projection(projection.clone()),
+                None => field,
+            };
+            fields.canonical.push((name.to_string(), field));
+        }
+    }
+}
+
+/// Build a soundable store hour from a POST-PROCESSED climate wrfout (NCAR
+/// CONUS-I/II, GDEX): these ship derived `TK` (K), `Z` (m MSL), `P` (full
+/// pressure, Pa) and staggered `U`/`V` instead of the raw `T`/`PB`/`PH`/`PHB`
+/// the wrf-core reader needs, and carry no surface fields. Returns the
+/// synthesized surface 2D fields + the isobaric volumes, or `None` if this
+/// isn't a post-processed WRF file (so the caller falls back to the raw path).
+fn try_postprocessed_wrf(
+    path: &Path,
+) -> Result<Option<(Vec<(String, SelectedField2D)>, Vec<IsoVolume>)>, ImportError> {
+    let nc = netcrust::open(path)?;
+    let is_postprocessed = nc.variable("TK").is_some()
+        && nc.variable("Z").is_some()
+        && nc.variable("P").is_some()
+        && nc.variable("PB").is_none();
+    if !is_postprocessed {
+        return Ok(None);
+    }
+
+    let lat = read_first_2d_any(&nc, &["XLAT", "XLAT_M", "lat", "latitude"])?;
+    let lon = read_first_2d_any(&nc, &["XLONG", "XLONG_M", "lon", "longitude"])?;
+    if lat.nx != lon.nx || lat.ny != lon.ny {
+        return Err(ImportError::GridMismatch(path.to_path_buf()));
+    }
+    let (nx, ny) = (lat.nx, lat.ny);
+    let cells = nx
+        .checked_mul(ny)
+        .ok_or_else(|| ImportError::BadShape("grid".to_string(), vec![ny, nx]))?;
+    let shape = GridShape::new(nx, ny)?;
+    let grid = LatLonGrid::new(shape, lat.values, lon.values)?;
+    let projection = wrf_projection(&nc);
+
+    // 3D mass-point state. `read3d` verifies the horizontal shape and returns
+    // the level count.
+    let read3d = |name: &str| -> Result<(Vec<f64>, usize), ImportError> {
+        let array = nc.read_array_f64_first_record_or_all(name)?;
+        let s = array.shape();
+        if s.len() != 3 || s[1] != ny || s[2] != nx {
+            return Err(ImportError::BadShape(name.to_string(), s.to_vec()));
+        }
+        Ok((array.values().to_vec(), s[0]))
+    };
+    let (tk, nz) = read3d("TK")?;
+    let (p_pa, _) = read3d("P")?;
+    let (z_m, _) = read3d("Z")?;
+    let (qv, _) = read3d("QVAPOR")?;
+    let expected = nz.checked_mul(cells).unwrap_or(0);
+    if expected == 0
+        || [tk.len(), p_pa.len(), z_m.len(), qv.len()]
+            .iter()
+            .any(|len| *len != expected)
+    {
+        return Err(ImportError::PlaneMismatch);
+    }
+
+    // Destagger the C-grid winds to mass points.
+    let u_mass = destagger_x(&nc, "U", nz, ny, nx)?;
+    let v_mass = destagger_y(&nc, "V", nz, ny, nx)?;
+
+    let p_hpa: Vec<f64> = p_pa.iter().map(|pa| pa / 100.0).collect();
+    let dewpoint_k: Vec<f64> = qv
+        .iter()
+        .zip(&p_pa)
+        .map(|(&q, &pa)| dewpoint_k_from_q_p(q, pa))
+        .collect();
+
+    let (volumes, surface) =
+        interpolate_iso_volumes(&p_hpa, &tk, &dewpoint_k, &z_m, &u_mass, &v_mass, nz, cells);
+
+    // The 3D file carries no surface fields; synthesize all five from the
+    // lowest model level so the sounding column can anchor at the surface.
+    let mut canonical = Vec::new();
+    let surface_entries: [(&str, FieldSelector, &str, Vec<f32>); 5] = [
+        (
+            "surface_pressure",
+            FieldSelector::surface(CanonicalField::Pressure),
+            "Pa",
+            surface.surface_pressure_pa,
+        ),
+        (
+            "temperature_2m",
+            FieldSelector::height_agl(CanonicalField::Temperature, 2),
+            "K",
+            surface.temperature_2m_k,
+        ),
+        (
+            "dewpoint_2m",
+            FieldSelector::height_agl(CanonicalField::Dewpoint, 2),
+            "K",
+            surface.dewpoint_2m_k,
+        ),
+        (
+            "u_10m",
+            FieldSelector::height_agl(CanonicalField::UWind, 10),
+            "m/s",
+            surface.u_10m,
+        ),
+        (
+            "v_10m",
+            FieldSelector::height_agl(CanonicalField::VWind, 10),
+            "m/s",
+            surface.v_10m,
+        ),
+    ];
+    for (name, selector, units, values) in surface_entries {
+        push_computed(&mut canonical, &grid, projection.clone(), name, selector, units, values)?;
+    }
+
+    Ok(Some((canonical, volumes)))
+}
+
+/// Destagger a `[nz, ny, nx+1]` (west_east_stag) field to `[nz, ny, nx]` mass
+/// points by averaging adjacent x faces.
+fn destagger_x(
+    nc: &NcFile,
+    name: &str,
+    nz: usize,
+    ny: usize,
+    nx: usize,
+) -> Result<Vec<f64>, ImportError> {
+    let array = nc.read_array_f64_first_record_or_all(name)?;
+    let s = array.shape();
+    let nxs = nx + 1;
+    if s.len() != 3 || s[0] != nz || s[1] != ny || s[2] != nxs {
+        return Err(ImportError::BadShape(name.to_string(), s.to_vec()));
+    }
+    let src = array.values();
+    let mut out = vec![0f64; nz * ny * nx];
+    for k in 0..nz {
+        for y in 0..ny {
+            let base_s = (k * ny + y) * nxs;
+            let base_d = (k * ny + y) * nx;
+            for x in 0..nx {
+                out[base_d + x] = 0.5 * (src[base_s + x] + src[base_s + x + 1]);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Destagger a `[nz, ny+1, nx]` (south_north_stag) field to `[nz, ny, nx]` mass
+/// points by averaging adjacent y faces.
+fn destagger_y(
+    nc: &NcFile,
+    name: &str,
+    nz: usize,
+    ny: usize,
+    nx: usize,
+) -> Result<Vec<f64>, ImportError> {
+    let array = nc.read_array_f64_first_record_or_all(name)?;
+    let s = array.shape();
+    let nys = ny + 1;
+    if s.len() != 3 || s[0] != nz || s[1] != nys || s[2] != nx {
+        return Err(ImportError::BadShape(name.to_string(), s.to_vec()));
+    }
+    let src = array.values();
+    let mut out = vec![0f64; nz * ny * nx];
+    for k in 0..nz {
+        for y in 0..ny {
+            let base_lo = (k * nys + y) * nx;
+            let base_hi = (k * nys + y + 1) * nx;
+            let base_d = (k * ny + y) * nx;
+            for x in 0..nx {
+                out[base_d + x] = 0.5 * (src[base_lo + x] + src[base_hi + x]);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Dewpoint (K) from water-vapor mixing ratio (kg/kg) and pressure (Pa), via
+/// vapor pressure and the Bolton inversion — the 3D analog of the 2 m
+/// `dewpoint_from_q_psfc` used above.
+fn dewpoint_k_from_q_p(q: f64, p_pa: f64) -> f64 {
+    if !q.is_finite() || !p_pa.is_finite() || q <= 0.0 || p_pa <= 0.0 {
+        return f64::NAN;
+    }
+    let e = (q * p_pa / (0.622 + q)).max(1.0);
+    let ln = (e / 611.2).ln();
+    let td_c = 243.5 * ln / (17.67 - ln);
+    td_c + 273.15
 }
 
 #[cfg(test)]
@@ -820,6 +1084,76 @@ mod tests {
         assert!(summary.variables.iter().any(|var| var == "dewpoint_2m"));
         assert!(summary.variables.iter().any(|var| var == "wind_speed_10m"));
         assert!(summary.variables.iter().any(|var| var == "apcp"));
+
+        let _ = std::fs::remove_dir_all(store_root);
+    }
+
+    /// End-to-end guard for the post-processed climate-wrfout path (TK/Z/P, no
+    /// raw T/PB, no surface fields): the store must land the `*_iso` volumes +
+    /// a synthesized `surface_pressure`, with physical temps, monotonic height,
+    /// and sane winds. Gated on `RW_POSTPROCESSED_WRF_FIXTURE` (a `wrf3d`-style
+    /// CONUS-I/II / GDEX file).
+    #[test]
+    fn optional_postprocessed_fixture_sounds() {
+        let Ok(fixture) = std::env::var("RW_POSTPROCESSED_WRF_FIXTURE") else {
+            eprintln!("skipping; set RW_POSTPROCESSED_WRF_FIXTURE to a TK/Z/P wrf3d file");
+            return;
+        };
+        let store_root = temp_dir("postproc");
+        let summary = import_paths(&[PathBuf::from(&fixture)], &store_root).unwrap();
+        assert_eq!(summary.model, "wrf");
+        assert_eq!(summary.hours_written, 1);
+
+        let hour = store_root
+            .join(&summary.model)
+            .join(&summary.run)
+            .join("f000.rws");
+        let reader = rw_store::reader::HourReader::open(&hour).expect("open hour");
+        for name in [
+            "temperature_iso",
+            "dewpoint_iso",
+            "u_iso",
+            "v_iso",
+            "height_iso",
+        ] {
+            let var = reader
+                .variable(name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(var.kind, "pressure3d", "{name} should be a volume");
+            assert!(!var.levels_hpa.is_empty(), "{name} has no levels");
+        }
+        assert!(
+            reader.variable("surface_pressure").is_some(),
+            "surface_pressure must be synthesized from the lowest level"
+        );
+
+        let temps = reader.read_profile_3d("temperature_iso", 5.0, 5.0).unwrap();
+        let heights = reader.read_profile_3d("height_iso", 5.0, 5.0).unwrap();
+        let us = reader.read_profile_3d("u_iso", 5.0, 5.0).unwrap();
+        let vs = reader.read_profile_3d("v_iso", 5.0, 5.0).unwrap();
+
+        let finite_t = temps.iter().filter(|value| value.is_finite()).count();
+        assert!(finite_t >= 5, "expected finite temps, got {finite_t}");
+        for temp in &temps {
+            if temp.is_finite() {
+                assert!((180.0..=330.0).contains(temp), "T {temp} K non-physical");
+            }
+        }
+        let mut last = f32::NEG_INFINITY;
+        for height in &heights {
+            if height.is_finite() {
+                assert!(*height > last, "height {height} after {last}");
+                last = *height;
+            }
+        }
+        for (u, v) in us.iter().zip(&vs) {
+            if u.is_finite() {
+                assert!(u.abs() < 150.0, "u {u} m/s implausible");
+            }
+            if v.is_finite() {
+                assert!(v.abs() < 150.0, "v {v} m/s implausible");
+            }
+        }
 
         let _ = std::fs::remove_dir_all(store_root);
     }

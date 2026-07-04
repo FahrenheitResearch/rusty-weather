@@ -47,8 +47,22 @@ impl IsoVolume {
     }
 }
 
+/// Lowest-model-level surface fallbacks, in the units the skew-T expects
+/// (Pa, K, K, m/s, m/s). Used to synthesize the 2D surface fields a split
+/// `wrf3d` file (CONUS404 / GDEX CONUS-II) omits — chiefly `PSFC` — so the
+/// sounding can still start at the surface. Each plane is row-major `ny * nx`.
+pub struct SurfaceFallback {
+    pub surface_pressure_pa: Vec<f32>,
+    pub temperature_2m_k: Vec<f32>,
+    pub dewpoint_2m_k: Vec<f32>,
+    pub u_10m: Vec<f32>,
+    pub v_10m: Vec<f32>,
+}
+
 /// Read WRF 3D fields for `timeidx` and interpolate them to the canonical
-/// isobaric levels, returning the five `*_iso` volumes the skew-T needs.
+/// isobaric levels, returning the five `*_iso` volumes the skew-T needs plus
+/// the lowest-model-level [`SurfaceFallback`] (so callers can fill in any 2D
+/// surface field the file omits).
 ///
 /// `cells` is the horizontal grid size (`ny * nx`) of the hour being written;
 /// every returned plane matches it. Fails (leaving the caller to skip volumes
@@ -57,7 +71,7 @@ pub fn build_iso_volumes(
     file: &WrfFile,
     timeidx: usize,
     cells: usize,
-) -> Result<Vec<IsoVolume>, String> {
+) -> Result<(Vec<IsoVolume>, SurfaceFallback), String> {
     if cells == 0 {
         return Err("WRF grid has zero cells".to_string());
     }
@@ -99,6 +113,36 @@ pub fn build_iso_volumes(
         }
     };
 
+    // Dewpoint arrives in degC from wrf-core's `td`; the shared interpolator
+    // works in Kelvin like every other field.
+    let dewpoint_k: Vec<f64> = td.data.iter().map(|value| value + 273.15).collect();
+    Ok(interpolate_iso_volumes(
+        &pressure.data,
+        &temp.data,
+        &dewpoint_k,
+        &height.data,
+        &u_wind,
+        &v_wind,
+        nz,
+        cells,
+    ))
+}
+
+/// Interpolate pre-read WRF column fields onto the canonical isobaric levels
+/// and derive the lowest-level surface fallback. All inputs are row-major
+/// `[nz, ny, nx]` (index `k * cells + c`) in skew-T units: pressure hPa,
+/// temperature K, dewpoint K, height m, winds m/s. Shared by the raw-wrfout
+/// (`build_iso_volumes`) and post-processed (`TK`/`Z`/`P`) reader paths.
+pub fn interpolate_iso_volumes(
+    pressure_hpa: &[f64],
+    temp_k: &[f64],
+    dewpoint_k: &[f64],
+    height_m: &[f64],
+    u_ms: &[f64],
+    v_ms: &[f64],
+    nz: usize,
+    cells: usize,
+) -> (Vec<IsoVolume>, SurfaceFallback) {
     let levels = standard_levels();
     let mut temp_iso = init_planes(levels.len(), cells);
     let mut dewp_iso = init_planes(levels.len(), cells);
@@ -109,32 +153,44 @@ pub fn build_iso_volumes(
     let mut col_p = vec![0f64; nz];
     for c in 0..cells {
         for k in 0..nz {
-            col_p[k] = pressure.data[k * cells + c];
+            col_p[k] = pressure_hpa[k * cells + c];
         }
         for (li, &lev) in levels.iter().enumerate() {
             let Some((k, t)) = bracket(&col_p, f64::from(lev)) else {
                 continue;
             };
             let (i0, i1) = (k * cells + c, (k + 1) * cells + c);
-            if let Some(value) = lerp(temp.data[i0], temp.data[i1], t) {
+            if let Some(value) = lerp(temp_k[i0], temp_k[i1], t) {
                 temp_iso[li][c] = value as f32;
             }
-            if let Some(value) = lerp(td.data[i0], td.data[i1], t) {
-                dewp_iso[li][c] = (value + 273.15) as f32;
+            if let Some(value) = lerp(dewpoint_k[i0], dewpoint_k[i1], t) {
+                dewp_iso[li][c] = value as f32;
             }
-            if let Some(value) = lerp(u_wind[i0], u_wind[i1], t) {
+            if let Some(value) = lerp(u_ms[i0], u_ms[i1], t) {
                 u_iso[li][c] = value as f32;
             }
-            if let Some(value) = lerp(v_wind[i0], v_wind[i1], t) {
+            if let Some(value) = lerp(v_ms[i0], v_ms[i1], t) {
                 v_iso[li][c] = value as f32;
             }
-            if let Some(value) = lerp(height.data[i0], height.data[i1], t) {
+            if let Some(value) = lerp(height_m[i0], height_m[i1], t) {
                 hgt_iso[li][c] = value as f32;
             }
         }
     }
 
-    Ok(vec![
+    // Lowest model level (k=0) as a surface fallback, in skew-T units. Split
+    // wrf3d files omit PSFC (and sometimes T2/Td2/winds); the k=0 level sits a
+    // few metres above ground, close enough to anchor the sounding surface.
+    let level0 = |data: &[f64]| -> Vec<f32> { (0..cells).map(|c| data[c] as f32).collect() };
+    let surface = SurfaceFallback {
+        surface_pressure_pa: (0..cells).map(|c| (pressure_hpa[c] * 100.0) as f32).collect(),
+        temperature_2m_k: level0(temp_k),
+        dewpoint_2m_k: level0(dewpoint_k),
+        u_10m: level0(u_ms),
+        v_10m: level0(v_ms),
+    };
+
+    let volumes = vec![
         IsoVolume {
             name: "temperature_iso".to_string(),
             units: "K".to_string(),
@@ -160,7 +216,8 @@ pub fn build_iso_volumes(
             units: "gpm".to_string(),
             levels: pack(&levels, hgt_iso),
         },
-    ])
+    ];
+    (volumes, surface)
 }
 
 fn check_len(out: &VarOutput, expected: usize, name: &str) -> Result<(), String> {
