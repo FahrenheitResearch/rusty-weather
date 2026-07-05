@@ -1608,18 +1608,14 @@ pub fn render_daily_svg(
                 let speed_color = if speed >= 30.0 { "#ff5b24" } else if speed >= 15.0 { "#f5b53c" } else { "#9ea6a5" };
                 svg.push_str(&wind_barb_svg(x_center, wind_y + 16.0, dir, speed, speed_color));
                 let sust = speed.round() as i64;
-                let mut value = format!(r##"<tspan fill="{speed_color}">{sust}</tspan>"##);
-                if let Some(gust) = day.wind_gust_max_mph {
-                    if gust.round() as i64 > sust {
-                        let gust_color = if gust >= 30.0 { "#ff5b24" } else { "#e0904a" };
-                        value.push_str(&format!(
-                            r##"<tspan fill="{gust_color}" font-weight="800"> G{}</tspan>"##,
-                            gust.round() as i64
-                        ));
+                let label = match day.wind_gust_max_mph {
+                    Some(gust) if gust.round() as i64 > sust => {
+                        format!("{sust} G{}", gust.round() as i64)
                     }
-                }
+                    _ => format!("{sust}"),
+                };
                 svg.push_str(&format!(
-                    r##"<text x="{x_center:.1}" y="{:.1}" font-size="13" font-weight="700" text-anchor="middle" xml:space="preserve">{value}</text>"##,
+                    r##"<text x="{x_center:.1}" y="{:.1}" fill="{speed_color}" font-size="13" font-weight="700" text-anchor="middle">{label}</text>"##,
                     wind_y + wind_row_h - 4.0,
                 ));
             }
