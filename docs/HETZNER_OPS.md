@@ -171,12 +171,16 @@ Details that matter:
 | `cache/_raw_fetch` | ~90–150 GB | Raw GRIBs, re-fetchable dead weight post-ingest. **Capped by an hourly cron** (`/etc/cron.hourly/rw-rawfetch-cache-cap`, deletes files >6 h) — NOT by the pipeline. ⚠️ The daemon's own `rw_prune` does **not** honor the 6 h cache policy (`rw_pipeline` has no `--cache-max-age-hours` flag to pass through; it leaves 6–24 h GRIBs). Without the cron this balloons past 200 GB and fills the disk (happened 2026-07-03, →94%). If the cron is ever removed, the proper fix is to rebuild the pipeline so its internal prune passes the age flag. |
 | `store/hrrr` | ~57 GB | Pruned to newest runs + newest long (≥F030) run |
 | `store/rtma_climo` | 34 GB | Fixed |
-| legacy `data/` | ~180 GB | Shrinks ~123 GB after the §9 cleanup |
+| `cafire…/data/cache` | ~70 GB | GOES satellite + hrrr raw download cache. **Capped at 36 h** by `/etc/cron.hourly/cafire-cache-cap`. The sat/lightning workers download unbounded otherwise — this grew to **118 GB** by 2026-07-05 (only `artifacts/` had a pruner, not `cache/`). Regenerable; safe to prune. ⚠️ `cache/hrrr` (~34 GB) is written entirely fresh every 36 h even post-cutover — if the `api:8000` container no longer serves HRRR, kill it at the source rather than just capping. |
+| `cafire…/data/artifacts` | ~35 GB | Rendered sat/lightning frames. **Capped at 36 h** by `/etc/cron.hourly/cafire-artifact-retention`. |
 
-Levers if disk gets tight, in order: (1) confirm the `rw-rawfetch-cache-cap`
-cron exists and is running — if `_raw_fetch` is past ~150 GB the cron is
-missing or broken; reclaim immediately with
-`find /opt/rusty-weather/cache/_raw_fetch -type f -mmin +360 -delete`;
+Levers if disk gets tight, in order: (1) confirm the **three retention crons**
+exist and are running — `rw-rawfetch-cache-cap`, `cafire-cache-cap`,
+`cafire-artifact-retention`. If `_raw_fetch` is past ~150 GB or
+`cafire…/data/cache` is past ~80 GB, a cron is missing or broken; reclaim
+immediately with
+`find /opt/rusty-weather/cache/_raw_fetch -type f -mmin +360 -delete` and
+`find /opt/cafire-weather-service/data/cache/{satellite,hrrr} -type f -mmin +2160 -delete`;
 (2) execute §9 if past the soak window; (3) HRRR `--keep-recent` 3→2 buys
 ~15 GB. The July 2 incident (§8) is what happens when this is ignored: at
 95% full the ingest daemon dies and the public site serves stale weather.
