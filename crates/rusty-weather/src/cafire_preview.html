@@ -348,6 +348,7 @@ button { color: inherit; cursor: pointer; }
       <div class="viewer-foot">
         <span id="footNote">HRRR × RTMA climatology 2019–2026 · rendered on demand</span>
         <a id="dlLink" href="#" download style="display:none; color: var(--muted)">download</a>
+        <button id="savePngBtn" type="button" style="display:none; background:transparent; color:var(--muted); border:1px solid var(--muted); border-radius:6px; padding:3px 10px; font:inherit; font-size:12px; cursor:pointer">⬇ Save PNG</button>
         <span class="zoom-hint">click the map to open full resolution</span>
       </div>
     </div>
@@ -1239,7 +1240,7 @@ async function renderCurrent() {
       if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || `HTTP ${resp.status}`);
       const svg = await resp.text();
       if (seq !== state.seq) return;
-      showImage(URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" })), `Daily outlook — ${variable.replace(/_/g, " ")}`, `${chartModel} latest`, null);
+      showImage(URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" })), `Daily outlook — ${variable.replace(/_/g, " ")}`, `${chartModel} latest`, null, url + "&format=png");
       log("daily card ready", "ok");
       return;
     }
@@ -1263,7 +1264,7 @@ async function renderCurrent() {
       if (seq !== state.seq) return;
       showImage(URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" })),
         `Cross section — ${xsecField === "rh" ? "relative humidity" : xsecField}`,
-        `${$("runSelect").value} · F${String(state.hour).padStart(3, "0")}`, null);
+        `${$("runSelect").value} · F${String(state.hour).padStart(3, "0")}`, null, url + "&format=png");
       log("cross section ready", "ok");
       return;
     }
@@ -1278,7 +1279,7 @@ async function renderCurrent() {
       const blob = await resp.blob();
       if (seq !== state.seq) return;
       showImage(URL.createObjectURL(blob), `Sounding — ${lat.toFixed(3)}, ${lon.toFixed(3)}`,
-        `${$("runSelect").value} · F${String(state.hour).padStart(3, "0")}`, null);
+        `${$("runSelect").value} · F${String(state.hour).padStart(3, "0")}`, null, url);
       log("sounding ready", "ok");
       return;
     }
@@ -1306,7 +1307,7 @@ async function renderCurrent() {
       const svg = await resp.text();
       if (seq !== state.seq) return;
       const label = state.fam === "custom" ? `Custom chart — ${title}` : `Meteogram — ${title}`;
-      showImage(URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" })), label, run, null);
+      showImage(URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" })), label, run, null, url + "&format=png");
       log(`${state.fam === "custom" ? "custom chart" : "meteogram"} ready`, "ok");
       return;
     }
@@ -1333,7 +1334,7 @@ async function renderCurrent() {
   }
 }
 
-function showImage(url, title, run, file) {
+function showImage(url, title, run, file, pngUrl) {
   const img = $("viewImg");
   resetZoom();
   img.src = url;
@@ -1344,6 +1345,44 @@ function showImage(url, title, run, file) {
   const dl = $("dlLink");
   if (file) { dl.href = url; dl.download = file.name; dl.style.display = ""; }
   else { dl.style.display = "none"; }
+  // Save PNG: the card is displayed as crisp SVG, but a raw SVG can't be
+  // saved/shared as an image (mobile falls back to a link). This fetches the
+  // rasterized PNG and hands it to the native share sheet (mobile) or a
+  // download (desktop).
+  const sp = $("savePngBtn");
+  if (pngUrl) {
+    sp.style.display = "";
+    const name = `${String(title).replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase() || "card"}.png`;
+    sp.onclick = () => savePng(pngUrl, name, title);
+  } else {
+    sp.style.display = "none";
+    sp.onclick = null;
+  }
+}
+
+async function savePng(pngUrl, filename, title) {
+  let blob;
+  try {
+    const resp = await fetch(pngUrl);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    blob = await resp.blob();
+  } catch (e) {
+    window.open(pngUrl, "_blank");
+    return;
+  }
+  const file = new File([blob], filename, { type: "image/png" });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    // Mobile: native share sheet — "Save Image" drops a real PNG in the
+    // camera roll; Share sends the image file, not a link. A cancel is a no-op.
+    try { await navigator.share({ files: [file], title }); } catch (e) {}
+    return;
+  }
+  // Desktop / no file-share: download the PNG.
+  const obj = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = obj; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(obj), 5000);
 }
 
 /* Speculative neighbor prefetch: warm the shared server cache so hour
