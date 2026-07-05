@@ -30,6 +30,9 @@ mod xsection;
 #[path = "../sounding.rs"]
 mod sounding;
 
+#[path = "../svg_raster.rs"]
+mod svg_raster;
+
 const MIN_RENDER_WIDTH: u32 = 1200;
 const MIN_RENDER_HEIGHT: u32 = 900;
 const MAX_RENDER_DIMENSION: u32 = 2400;
@@ -928,7 +931,23 @@ fn daily_response(query: &str, state: &AppState) -> Vec<u8> {
             .and_then(|v| v.parse::<u16>().ok())
             .filter(|v| matches!(v, 1 | 3 | 6 | 12)),
     };
+    // `?format=png` returns a rasterized copy so the card can be shared /
+    // "open image in new tab" / copied as a picture — a raw SVG document copies
+    // its `<text>` instead of a bitmap. The in-page display stays SVG.
+    let want_png = query
+        .get("format")
+        .map(|f| f.eq_ignore_ascii_case("png"))
+        .unwrap_or(false);
     match meteogram::render_daily_svg(&state.store_root, model, &run, &date, cycle, &request) {
+        Ok(svg) if want_png => match svg_raster::svg_to_png(&svg, 2.0) {
+            Ok(png) => {
+                response_with_extra_headers(200, "image/png", png, "Cache-Control: no-store\r\n")
+            }
+            Err(message) => json_status_response(
+                500,
+                &serde_json::json!({ "error": format!("rasterize: {message}") }),
+            ),
+        },
         Ok(svg) => response_with_extra_headers(
             200,
             "image/svg+xml; charset=utf-8",
