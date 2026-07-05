@@ -281,6 +281,18 @@ systemctl restart rusty-wx-pipeline rusty-wx-pipeline-gfs rusty-wx-pipeline-nbm 
 find /opt/rusty-weather/out -maxdepth 1 -name 'job-*' -exec rm -rf {} +
 ```
 
+**Runtime system dependency — fonts (required, or PNG shares render wrong).**
+`rw_fire_api` rasterizes the SVG cards to PNG for `/api/daily?format=png`
+(the shareable/copyable image) via resvg, which reads fonts from
+`/usr/share/fonts`. The cards name `Inter` (daily) and `IBM Plex Mono`
+(meteograms); `fonts-dejavu-core` is a glyph fallback. If the box is ever
+rebuilt, reinstall these or the shared PNGs fall back to the wrong faces:
+```bash
+apt-get install -y fonts-inter fonts-ibm-plex fonts-dejavu-core
+```
+This is a *runtime* dep of the API, not just a build dep — the SVG endpoint
+(default, no `format`) doesn't need it, but the PNG one does.
+
 6. Verify public: hit `https://cafire.wxsection.com/api/health`, then one
 fresh render through `/lab`. The Lab HTML is compiled into `rw_fire_api`,
 so UI changes deploy with the binary — no separate file copy.
