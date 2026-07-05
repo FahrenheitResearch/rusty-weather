@@ -877,6 +877,32 @@ fn fires_response(state: &AppState) -> Vec<u8> {
     }
 }
 
+/// Serve a rendered SVG card as vector SVG, or rasterized to PNG when the
+/// client passes `?format=png` — a raw SVG document can't be copied/pasted as a
+/// picture (a drag-select grabs its `<text>`), so shares / "open image in new
+/// tab" need a raster. The in-page `<img>` should keep requesting SVG for
+/// crispness.
+fn svg_card_response(svg: String, want_png: bool) -> Vec<u8> {
+    if want_png {
+        match svg_raster::svg_to_png(&svg, 2.0) {
+            Ok(png) => {
+                response_with_extra_headers(200, "image/png", png, "Cache-Control: no-store\r\n")
+            }
+            Err(message) => json_status_response(
+                500,
+                &serde_json::json!({ "error": format!("rasterize: {message}") }),
+            ),
+        }
+    } else {
+        response_with_extra_headers(
+            200,
+            "image/svg+xml; charset=utf-8",
+            svg.into_bytes(),
+            "Cache-Control: no-store\r\n",
+        )
+    }
+}
+
 /// GET /api/daily?lat&lon&var=temperature_2m[&model][&run][&title][&utc_offset]
 /// — the shareable daily HI/LO outlook card (weathermodels-style) for any
 /// stored variable, one column per local calendar day.
@@ -932,28 +958,13 @@ fn daily_response(query: &str, state: &AppState) -> Vec<u8> {
             .filter(|v| matches!(v, 1 | 3 | 6 | 12)),
     };
     // `?format=png` returns a rasterized copy so the card can be shared /
-    // "open image in new tab" / copied as a picture — a raw SVG document copies
-    // its `<text>` instead of a bitmap. The in-page display stays SVG.
+    // "open image in new tab" / copied as a picture. The in-page display stays SVG.
     let want_png = query
         .get("format")
         .map(|f| f.eq_ignore_ascii_case("png"))
         .unwrap_or(false);
     match meteogram::render_daily_svg(&state.store_root, model, &run, &date, cycle, &request) {
-        Ok(svg) if want_png => match svg_raster::svg_to_png(&svg, 2.0) {
-            Ok(png) => {
-                response_with_extra_headers(200, "image/png", png, "Cache-Control: no-store\r\n")
-            }
-            Err(message) => json_status_response(
-                500,
-                &serde_json::json!({ "error": format!("rasterize: {message}") }),
-            ),
-        },
-        Ok(svg) => response_with_extra_headers(
-            200,
-            "image/svg+xml; charset=utf-8",
-            svg.into_bytes(),
-            "Cache-Control: no-store\r\n",
-        ),
+        Ok(svg) => svg_card_response(svg, want_png),
         Err(message) => json_status_response(422, &serde_json::json!({ "error": message })),
     }
 }
@@ -1402,12 +1413,11 @@ fn meteogram_response(path: &str, state: &AppState) -> Vec<u8> {
             if query.get("format").map(String::as_str) == Some("json") {
                 json_response(&output.data)
             } else {
-                response_with_extra_headers(
-                    200,
-                    "image/svg+xml; charset=utf-8",
-                    output.svg.into_bytes(),
-                    "Cache-Control: no-store\r\n",
-                )
+                let want_png = query
+                    .get("format")
+                    .map(|f| f.eq_ignore_ascii_case("png"))
+                    .unwrap_or(false);
+                svg_card_response(output.svg, want_png)
             }
         }
         Err(message) => json_status_response(422, &serde_json::json!({ "error": message })),
@@ -1501,12 +1511,11 @@ fn xsection_response(path: &str, state: &AppState) -> Vec<u8> {
             if query.get("format").map(String::as_str) == Some("json") {
                 json_response(&output.data)
             } else {
-                response_with_extra_headers(
-                    200,
-                    "image/svg+xml; charset=utf-8",
-                    output.svg.into_bytes(),
-                    "Cache-Control: no-store\r\n",
-                )
+                let want_png = query
+                    .get("format")
+                    .map(|f| f.eq_ignore_ascii_case("png"))
+                    .unwrap_or(false);
+                svg_card_response(output.svg, want_png)
             }
         }
         Err(message) => json_status_response(422, &serde_json::json!({ "error": message })),

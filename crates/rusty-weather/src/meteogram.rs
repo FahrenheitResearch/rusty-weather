@@ -1185,6 +1185,9 @@ struct DayAgg {
     /// bucket-max sustained speed (mph), when wind is stored.
     wind_dir_from_deg: Option<f64>,
     wind_max_mph: Option<f64>,
+    /// Bucket-max wind gust (mph), when gust is stored — shown beside the
+    /// sustained value as "12 G18" (METAR gust convention).
+    wind_gust_max_mph: Option<f64>,
     /// Bucket precipitation (inches), from run-total differences.
     precip_in: Option<f64>,
     /// True once this column is >=8 local days past the run init — the
@@ -1261,6 +1264,7 @@ pub fn render_daily_svg(
     let mut per_day: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
     // Default context rows: wind (u,v) and precip run-total per bucket.
     let mut per_day_wind: BTreeMap<i64, Vec<(f64, f64)>> = BTreeMap::new();
+    let mut per_day_gust: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
     let mut per_day_apcp: BTreeMap<i64, (f64, f64)> = BTreeMap::new(); // (first,last) run-total
     // First sampled local-hour per bucket: single-value columns are
     // labeled with the sample's actual valid hour, not the bucket start.
@@ -1292,6 +1296,9 @@ pub fn render_daily_svg(
         per_day_first_lh.entry(bucket).or_insert(local_hours);
         if let (Some(u), Some(v)) = (point("u_10m"), point("v_10m")) {
             per_day_wind.entry(bucket).or_default().push((u, v));
+        }
+        if let Some(gust) = point("wind_gust_10m") {
+            per_day_gust.entry(bucket).or_default().push(gust);
         }
         if let Some(total) = point("apcp_run_total") {
             // Hours iterate ascending: keep the first total, overwrite
@@ -1396,6 +1403,10 @@ pub fn render_daily_svg(
                     .fold(f64::NEG_INFINITY, f64::max);
                 (dir_from, max_mph)
             });
+            let wind_gust_max_mph = per_day_gust
+                .get(&bucket)
+                .filter(|g| !g.is_empty())
+                .map(|g| g.iter().copied().fold(f64::NEG_INFINITY, f64::max) * MS_TO_MPH);
             let precip_in = per_day_precip.get(&bucket).map(|mm| mm / 25.4);
             DayAgg {
                 label_date,
@@ -1404,6 +1415,7 @@ pub fn render_daily_svg(
                 lo: convert(lo),
                 wind_dir_from_deg: wind.map(|(d, _)| d),
                 wind_max_mph: wind.map(|(_, s)| s),
+                wind_gust_max_mph,
                 precip_in,
                 extended,
             }
@@ -1529,9 +1541,6 @@ pub fn render_daily_svg(
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" font-family="Inter,'Segoe UI',Helvetica,Arial,sans-serif">"##
     ));
     svg.push_str(&format!(r##"<rect width="{width}" height="{height}" fill="#0d1112"/>"##));
-    svg.push_str(&format!(
-        r##"<rect x="0" y="0" width="{width}" height="4" fill="#ff5b24"/>"##
-    ));
     // Header.
     svg.push_str(&format!(
         r##"<text x="24" y="40" fill="#f6f5f1" font-size="21" font-weight="800">CWT | {}</text>"##,
@@ -1583,8 +1592,9 @@ pub fn render_daily_svg(
     }
 
     // WIND row: true meteorological barb (staff points toward the wind
-    // source; half = 5 kt, full = 10 kt, pennant = 50 kt) + bucket-max
-    // speed in mph below.
+    // source; half = 5 kt, full = 10 kt, pennant = 50 kt) + the bucket-max
+    // sustained speed and, beside it, the bucket-max gust ("12 G18", METAR
+    // convention) — both in mph. The legend line spells this out.
     let wind_y = 86.0 + n_strips * (strip_h + 6.0);
     svg.push_str(&format!(
         r##"<text x="{:.0}" y="{:.0}" fill="#9ea6a5" font-size="13" font-weight="700" text-anchor="end">WIND</text>"##,
@@ -1597,10 +1607,20 @@ pub fn render_daily_svg(
             (Some(dir), Some(speed)) => {
                 let speed_color = if speed >= 30.0 { "#ff5b24" } else if speed >= 15.0 { "#f5b53c" } else { "#9ea6a5" };
                 svg.push_str(&wind_barb_svg(x_center, wind_y + 16.0, dir, speed, speed_color));
+                let sust = speed.round() as i64;
+                let mut value = format!(r##"<tspan fill="{speed_color}">{sust}</tspan>"##);
+                if let Some(gust) = day.wind_gust_max_mph {
+                    if gust.round() as i64 > sust {
+                        let gust_color = if gust >= 30.0 { "#ff5b24" } else { "#e0904a" };
+                        value.push_str(&format!(
+                            r##"<tspan fill="{gust_color}" font-weight="800"> G{}</tspan>"##,
+                            gust.round() as i64
+                        ));
+                    }
+                }
                 svg.push_str(&format!(
-                    r##"<text x="{x_center:.1}" y="{:.1}" fill="{speed_color}" font-size="13" font-weight="700" text-anchor="middle">{}</text>"##,
+                    r##"<text x="{x_center:.1}" y="{:.1}" font-size="13" font-weight="700" text-anchor="middle" xml:space="preserve">{value}</text>"##,
                     wind_y + wind_row_h - 4.0,
-                    speed.round() as i64
                 ));
             }
             _ => svg.push_str(&format!(
@@ -1722,7 +1742,7 @@ pub fn render_daily_svg(
         "local time"
     };
     svg.push_str(&format!(
-        r##"<text x="24" y="{:.0}" fill="#737c7b" font-size="11">{axis_note} (UTC{:+.0}) | {window_note} | California Wildfire Tracking — Weather Lab</text>"##,
+        r##"<text x="24" y="{:.0}" fill="#737c7b" font-size="11">{axis_note} (UTC{:+.0}) | {window_note} | WIND = max sustained, G = max gust (mph) | California Wildfire Tracking — Weather Lab</text>"##,
         height - 14.0,
         request.utc_offset_hours
     ));
