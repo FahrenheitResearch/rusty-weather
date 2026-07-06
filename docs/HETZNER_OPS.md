@@ -379,21 +379,24 @@ resurrect all five retired services. Always name the service:
 task #10; honors the two-week no-delete promise in the CAFire addendum):
 
 ```bash
-rm -rf /opt/cafire-weather-service/data/cache/hrrr        # ~12 GB (cron already trimmed it from ~80)
+rm -rf /opt/cafire-weather-service/data/cache/hrrr        # (cron caps it at 36 h; ~34 GB of churn)
 rm -rf /opt/cafire-weather-service/data/volume-stores     # ~26 GB
 rm -rf /opt/cafire-weather-service/data/wxstore           # ~17 GB
-rm /etc/cron.hourly/cafire-legacy-cache-cap               # its target dir is gone
+# ⚠️ KEEP /etc/cron.hourly/cafire-cache-cap — it also caps data/cache/satellite
+# (§4). Its two cache/hrrr find lines just become no-ops once the dir is gone.
 # optional tidy: remove the 5 retired services from docker-compose.yml
 ```
 
 ⚠️ Delete `data/cache/`**`hrrr`** ONLY — NOT the whole `data/cache/` folder.
-`data/cache/satellite` (~45 GB) sits right beside it and is **still served**.
-Also do **not** touch `data/artifacts` (~65 GB) or `data/glm` — satellite and
-lightning live there. Net reclaim is **~55 GB** (not the ~123 GB first
-estimated: the hourly cron shrank the legacy HRRR cache from ~80 to ~12 GB).
-Until the cleanup runs, the hourly cron
-`cafire-legacy-cache-cap` keeps the orphaned legacy HRRR cache from
-growing (it caps `data/cache/hrrr` to the 2 newest cycle dirs).
+`data/cache/satellite` sits right beside it and is **still served**.
+Also do **not** touch `data/artifacts` (capped at 36 h, see §4) or `data/glm` —
+satellite and lightning live there. Note the sat/lightning workers keep
+re-downloading into `cache/hrrr` even post-cutover, so it regrows until the
+source is killed; the reclaim only sticks if whatever writes it is stopped too.
+Until the cleanup runs, the hourly cron `cafire-cache-cap` keeps the orphaned
+legacy HRRR cache bounded (36 h mtime cap on `cache/hrrr` alongside
+`cache/satellite` — one shared script, which is why it must survive the
+cleanup).
 
 ---
 
