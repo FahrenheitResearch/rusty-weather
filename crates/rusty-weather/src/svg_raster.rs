@@ -13,10 +13,41 @@
 //! design. `fonts-dejavu-core` is a broad-coverage fallback for stray glyphs
 //! (e.g. the `▸` extended-range marker) the primary faces may lack.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use resvg::tiny_skia;
 use resvg::usvg::{self, fontdb};
+
+/// At most this many rasterizations run at once. Each one holds a scaled
+/// pixmap (the wide GFS meteogram at 2× is ~50 MB of RGBA) and a core for
+/// ~100–300 ms, and the API is thread-per-connection with no other guard on
+/// this path — so a burst of `?format=png` requests (share storm, crawler)
+/// would otherwise multiply that unbounded. Excess requests queue below; a
+/// waiting thread holds only its small SVG string.
+const MAX_CONCURRENT_RASTERS: usize = 4;
+
+static RASTER_ACTIVE: Mutex<usize> = Mutex::new(0);
+static RASTER_DONE: Condvar = Condvar::new();
+
+/// RAII permit — released on drop, including on unwind.
+struct RasterPermit;
+
+fn acquire_raster_permit() -> RasterPermit {
+    let mut active = RASTER_ACTIVE.lock().expect("raster gate mutex");
+    while *active >= MAX_CONCURRENT_RASTERS {
+        active = RASTER_DONE.wait(active).expect("raster gate mutex");
+    }
+    *active += 1;
+    RasterPermit
+}
+
+impl Drop for RasterPermit {
+    fn drop(&mut self) {
+        let mut active = RASTER_ACTIVE.lock().expect("raster gate mutex");
+        *active = active.saturating_sub(1);
+        RASTER_DONE.notify_one();
+    }
+}
 
 /// Loaded once per process. Cloning the returned `Arc` is cheap; each request
 /// reuses the same database rather than re-scanning the font directories.
@@ -40,6 +71,7 @@ fn shared_fontdb() -> Arc<fontdb::Database> {
 /// retina-quality share image without blowing up the byte size (the cards are
 /// mostly flat fills, which PNG compresses well).
 pub fn svg_to_png(svg: &str, scale: f32) -> Result<Vec<u8>, String> {
+    let _permit = acquire_raster_permit();
     let mut opt = usvg::Options::default();
     opt.fontdb = shared_fontdb();
     // Only used if an element ever carries no font-family; our cards always set
