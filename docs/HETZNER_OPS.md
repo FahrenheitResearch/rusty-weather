@@ -171,7 +171,7 @@ Details that matter:
 | `cache/_raw_fetch` | ~90–150 GB | Raw GRIBs, re-fetchable dead weight post-ingest. **Capped by an hourly cron** (`/etc/cron.hourly/rw-rawfetch-cache-cap`, deletes files >6 h) — NOT by the pipeline. ⚠️ The daemon's own `rw_prune` does **not** honor the 6 h cache policy (`rw_pipeline` has no `--cache-max-age-hours` flag to pass through; it leaves 6–24 h GRIBs). Without the cron this balloons past 200 GB and fills the disk (happened 2026-07-03, →94%). If the cron is ever removed, the proper fix is to rebuild the pipeline so its internal prune passes the age flag. |
 | `store/hrrr` | ~57 GB | Pruned to newest runs + newest long (≥F030) run |
 | `store/rtma_climo` | 34 GB | Fixed |
-| `cafire…/data/cache` | ~70 GB | GOES satellite + hrrr raw download cache. **Capped at 36 h** by `/etc/cron.hourly/cafire-cache-cap`. The sat/lightning workers download unbounded otherwise — this grew to **118 GB** by 2026-07-05 (only `artifacts/` had a pruner, not `cache/`). Regenerable; safe to prune. ⚠️ `cache/hrrr` (~34 GB) is written entirely fresh every 36 h even post-cutover — if the `api:8000` container no longer serves HRRR, kill it at the source rather than just capping. |
+| `cafire…/data/cache` | ~70 GB | GOES satellite + hrrr raw download cache. **Capped at 36 h** by `/etc/cron.hourly/cafire-cache-cap`. The sat/lightning workers download unbounded otherwise — this grew to **118 GB** by 2026-07-05 (only `artifacts/` had a pruner, not `cache/`). Regenerable; safe to prune. `cache/hrrr` churn **killed at the source 2026-07-06**: the writer was the api container's fast-meteogram-store thread (full F0–48 NOMADS refetch ~4×/day to warm legacy `/api/v1` meteograms nothing calls since the cutover) — disabled via `FAST_METEOGRAM_STORE_ENABLED=false` in `.env` (backup `.env.bak-20260706-faststore`); the residual ~34 GB ages out through this cron within 36 h. |
 | `cafire…/data/artifacts` | ~35 GB | Rendered sat/lightning frames. **Capped at 36 h** by `/etc/cron.hourly/cafire-artifact-retention`. |
 
 Levers if disk gets tight, in order: (1) confirm the **three retention crons**
@@ -374,6 +374,10 @@ missed: `docker compose start <service>` (takes seconds).
 ⚠️ Never run a bare `docker compose up -d` in that directory — it would
 resurrect all five retired services. Always name the service:
 `docker compose restart caddy`, `docker compose up -d satellite-worker`.
+Recreating `api` needs `--no-deps` too (`docker compose up -d --no-deps api`)
+— it has `depends_on: pressure-volume`, a retired service, which a plain
+named `up -d api` would restart. Note `docker compose restart` does NOT
+reload `.env`; env changes need the `up -d --no-deps` recreate.
 
 **Soak cleanup — after ~2026-07-17, and only with Drew's go** (tracked as
 task #10; honors the two-week no-delete promise in the CAFire addendum):
@@ -385,6 +389,9 @@ rm -rf /opt/cafire-weather-service/data/wxstore           # ~17 GB
 # ⚠️ KEEP /etc/cron.hourly/cafire-cache-cap — it also caps data/cache/satellite
 # (§4). Its two cache/hrrr find lines just become no-ops once the dir is gone.
 # optional tidy: remove the 5 retired services from docker-compose.yml
+# optional tidy: WXSTORE_ENABLED=false in .env, then docker compose up -d
+#   --no-deps api — /health live-probes the retired wxstore container on every
+#   call and has reported ok:false since the cutover (harmless but noisy).
 ```
 
 ⚠️ Delete `data/cache/`**`hrrr`** ONLY — NOT the whole `data/cache/` folder.
