@@ -1182,6 +1182,11 @@ struct DayAgg {
     hi: f64,
     lo: f64,
     /// Bucket-mean wind components (m/s) for the direction arrow and
+    /// Overnight low FOLLOWING this day (evening → next day's dawn), daily
+    /// temperature cards only. Drawn between the day columns so the reader
+    /// knows which night it refers to (meteorologist feedback); None when
+    /// the run lacks dawn coverage for that night.
+    night_lo: Option<f64>,
     /// bucket-max sustained speed (mph), when wind is stored.
     wind_dir_from_deg: Option<f64>,
     wind_max_mph: Option<f64>,
@@ -1229,6 +1234,25 @@ fn text_on(hex: &str) -> &'static str {
     if 0.299 * r + 0.587 * g + 0.114 * b > 150.0 { "#141414" } else { "#ffffff" }
 }
 
+/// Overnight bucketing for the daily temperature card: assigns a sampled
+/// absolute local hour to the night it belongs to, keyed by the local day the
+/// night FOLLOWS (night N spans the evening of day N through the late morning
+/// of day N+1; midday hours 12–14 belong to no night). Returns
+/// `(night_key, counts_as_dawn)` — a night's minimum is only trustworthy once
+/// it has a dawn-window sample (03–11 local of the next day); without one an
+/// evening temperature would masquerade as "the low".
+fn night_key(local_hours: i64) -> Option<(i64, bool)> {
+    let day = local_hours.div_euclid(24);
+    let hour = local_hours.rem_euclid(24);
+    if hour >= 15 {
+        Some((day, false))
+    } else if hour <= 11 {
+        Some((day - 1, hour >= 3))
+    } else {
+        None
+    }
+}
+
 pub fn render_daily_svg(
     store_root: &Path,
     model_slug: &str,
@@ -1266,6 +1290,11 @@ pub fn render_daily_svg(
     let mut per_day_wind: BTreeMap<i64, Vec<(f64, f64)>> = BTreeMap::new();
     let mut per_day_gust: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
     let mut per_day_apcp: BTreeMap<i64, (f64, f64)> = BTreeMap::new(); // (first,last) run-total
+    // Overnight buckets for the daily temperature card (see night_key): the
+    // LO drawn between day N and N+1 must be the min over THAT night, not
+    // the calendar-day min (which is the night before's dawn).
+    let mut per_night: BTreeMap<i64, Vec<f64>> = BTreeMap::new();
+    let mut per_night_dawn: BTreeMap<i64, bool> = BTreeMap::new();
     // First sampled local-hour per bucket: single-value columns are
     // labeled with the sample's actual valid hour, not the bucket start.
     let mut per_day_first_lh: BTreeMap<i64, i64> = BTreeMap::new();
@@ -1294,6 +1323,12 @@ pub fn render_daily_svg(
         };
         per_day.entry(bucket).or_default().push(raw);
         per_day_first_lh.entry(bucket).or_insert(local_hours);
+        if let Some((night, dawn)) = night_key(local_hours) {
+            per_night.entry(night).or_default().push(raw);
+            if dawn {
+                per_night_dawn.insert(night, true);
+            }
+        }
         if let (Some(u), Some(v)) = (point("u_10m"), point("v_10m")) {
             per_day_wind.entry(bucket).or_default().push((u, v));
         }
@@ -1407,12 +1442,28 @@ pub fn render_daily_svg(
                 .get(&bucket)
                 .filter(|g| !g.is_empty())
                 .map(|g| g.iter().copied().fold(f64::NEG_INFINITY, f64::max) * MS_TO_MPH);
+            // Daily temperature cards only: buckets are local days there, so
+            // the per-night key lines up with the bucket key. A night needs a
+            // dawn sample to be trusted (an evening-only stub isn't a low).
+            let night_lo = if request.step_hours.is_none()
+                && request.var.starts_with("temperature")
+            {
+                per_night
+                    .get(&bucket)
+                    .filter(|v| {
+                        v.len() >= 2 && per_night_dawn.get(&bucket).copied().unwrap_or(false)
+                    })
+                    .map(|v| convert(v.iter().copied().fold(f64::INFINITY, f64::min)))
+            } else {
+                None
+            };
             let precip_in = per_day_precip.get(&bucket).map(|mm| mm / 25.4);
             DayAgg {
                 label_date,
                 label_dow,
                 hi: convert(hi),
                 lo: convert(lo),
+                night_lo,
                 wind_dir_from_deg: wind.map(|(d, _)| d),
                 wind_max_mph: wind.map(|(_, s)| s),
                 wind_gust_max_mph,
@@ -1426,6 +1477,12 @@ pub fn render_daily_svg(
     }
 
     let is_temp = is_kelvin || display_units == "°F" || lower_units.contains("degf");
+
+    // Between-days LO layout (daily temperature cards): each low is the
+    // OVERNIGHT min drawn in the gap between the two days its night spans.
+    // Falls back to the classic in-column calendar-day LO when no night
+    // resolved (run too short for any dawn coverage).
+    let night_mode = !single && days.iter().any(|d| d.night_lo.is_some());
 
     // Header text first: the canvas widens to fit it, so it must exist
     // before layout.
@@ -1511,7 +1568,12 @@ pub fn render_daily_svg(
     let height = chart_top + chart_h + 74.0;
 
     let all_hi = days.iter().map(|d| d.hi).fold(f64::NEG_INFINITY, f64::max);
-    let all_lo = days.iter().map(|d| d.lo).fold(f64::INFINITY, f64::min);
+    // Night mode draws the overnight lows, so they set the axis floor.
+    let all_lo = if night_mode {
+        days.iter().filter_map(|d| d.night_lo).fold(f64::INFINITY, f64::min)
+    } else {
+        days.iter().map(|d| d.lo).fold(f64::INFINITY, f64::min)
+    };
     let (all_lo, all_hi) = if !is_temp && all_hi - all_lo < 1e-9 {
         // Constant field (zero precip, per-run fuels): widen so the axis
         // is real instead of ±1e-7 noise. Non-negative data sits at the
@@ -1574,9 +1636,43 @@ pub fn render_daily_svg(
             y + strip_h / 2.0 + 5.0,
         ));
         for (index, day) in days.iter().enumerate() {
+            let x = ml + index as f64 * col_w;
+            if !*is_hi && night_mode {
+                // Overnight cell: straddles the boundary into the next
+                // column so the value reads as "the night between these two
+                // days"; the last night (nothing to its right) gets a half
+                // cell ending at the block edge.
+                let cell_x = x + col_w / 2.0;
+                let cell_w = if index + 1 < days.len() { col_w } else { col_w / 2.0 };
+                match day.night_lo {
+                    Some(v) => {
+                        let color = cell_color(v);
+                        svg.push_str(&format!(
+                            r##"<rect x="{cell_x:.0}" y="{y:.0}" width="{cell_w:.0}" height="{strip_h}" fill="{color}" stroke="#0d1112" stroke-width="2"/>"##
+                        ));
+                        svg.push_str(&format!(
+                            r##"<text x="{:.0}" y="{:.0}" fill="{}" font-size="{value_font}" font-weight="800" text-anchor="middle">{}</text>"##,
+                            cell_x + cell_w / 2.0,
+                            y + strip_h / 2.0 + 8.0,
+                            text_on(color),
+                            fmt_val(v)
+                        ));
+                    }
+                    None => {
+                        svg.push_str(&format!(
+                            r##"<rect x="{cell_x:.0}" y="{y:.0}" width="{cell_w:.0}" height="{strip_h}" fill="#161c1d" stroke="#0d1112" stroke-width="2"/>"##
+                        ));
+                        svg.push_str(&format!(
+                            r##"<text x="{:.0}" y="{:.0}" fill="#4a4f50" font-size="14" text-anchor="middle">—</text>"##,
+                            cell_x + cell_w / 2.0,
+                            y + strip_h / 2.0 + 5.0,
+                        ));
+                    }
+                }
+                continue;
+            }
             let v = if *is_hi { day.hi } else { day.lo };
             let color = cell_color(v);
-            let x = ml + index as f64 * col_w;
             svg.push_str(&format!(
                 r##"<rect x="{x:.0}" y="{y:.0}" width="{:.0}" height="{strip_h}" fill="{color}" stroke="#0d1112" stroke-width="2"/>"##,
                 col_w
@@ -1676,19 +1772,44 @@ pub fn render_daily_svg(
         tick += step;
     }
 
-    // Bars: wide HI bar + inner LO bar, both on the strip color scale.
+    // Bars. Classic: wide HI bar + inner LO bar. Night mode: HI bar on the
+    // column's left and the overnight-LO bar to its right, sitting in the
+    // gap toward the next day's HI — the gap it occupies IS the night it
+    // describes (meteorologist feedback: "so people know which night I am
+    // referring to").
     for (index, day) in days.iter().enumerate() {
         let x = ml + index as f64 * col_w;
-        let bar_w = col_w * 0.62;
-        let bar_x = x + (col_w - bar_w) / 2.0;
-        let hi_y = y_of(day.hi);
         let base = chart_top + chart_h;
+        let hi_y = y_of(day.hi);
+        let (bar_x, bar_w) = if night_mode {
+            (x + col_w * 0.07, col_w * 0.50)
+        } else {
+            (x + col_w * 0.19, col_w * 0.62)
+        };
         svg.push_str(&format!(
             r##"<rect x="{bar_x:.1}" y="{hi_y:.1}" width="{bar_w:.1}" height="{:.1}" fill="{}" rx="3"/>"##,
             (base - hi_y).max(1.0),
             cell_color(day.hi)
         ));
-        if !single {
+        if night_mode {
+            if let Some(lo) = day.night_lo {
+                let lo_w = col_w * 0.30;
+                let lo_x = x + col_w * 0.63;
+                let lo_y = y_of(lo);
+                svg.push_str(&format!(
+                    r##"<rect x="{lo_x:.1}" y="{lo_y:.1}" width="{lo_w:.1}" height="{:.1}" fill="{}" rx="3" stroke="#0d1112" stroke-width="1.5"/>"##,
+                    (base - lo_y).max(1.0),
+                    cell_color(lo)
+                ));
+                svg.push_str(&format!(
+                    r##"<text x="{:.1}" y="{:.1}" fill="#f6f5f1" font-size="{}" font-weight="800" text-anchor="middle">{}</text>"##,
+                    lo_x + lo_w / 2.0,
+                    lo_y - 7.0,
+                    if col_w < 100.0 { 12.0 } else { 14.0 },
+                    fmt_val(lo)
+                ));
+            }
+        } else if !single {
             let lo_w = bar_w * 0.52;
             let lo_x = x + (col_w - lo_w) / 2.0;
             let lo_y = y_of(day.lo);
@@ -1704,28 +1825,29 @@ pub fn render_daily_svg(
                 fmt_val(day.lo)
             ));
         }
+        // HI number and day labels center on the HI bar (which is the whole
+        // column in classic mode).
+        let label_x = bar_x + bar_w / 2.0;
         svg.push_str(&format!(
-            r##"<text x="{:.1}" y="{:.1}" fill="#f6f5f1" font-size="{}" font-weight="800" text-anchor="middle">{}</text>"##,
-            x + col_w / 2.0,
+            r##"<text x="{label_x:.1}" y="{:.1}" fill="#f6f5f1" font-size="{}" font-weight="800" text-anchor="middle">{}</text>"##,
             hi_y - 8.0,
             if col_w < 100.0 { 13.5 } else { 17.0 },
             fmt_val(day.hi)
         ));
         // Day labels.
         svg.push_str(&format!(
-            r##"<text x="{:.1}" y="{:.1}" fill="#f6f5f1" font-size="13.5" font-weight="700" text-anchor="middle">{}</text>"##,
-            x + col_w / 2.0,
+            r##"<text x="{label_x:.1}" y="{:.1}" fill="#f6f5f1" font-size="13.5" font-weight="700" text-anchor="middle">{}</text>"##,
             chart_top + chart_h + 24.0,
             day.label_date
         ));
         svg.push_str(&format!(
-            r##"<text x="{:.1}" y="{:.1}" fill="#9ea6a5" font-size="12.5" text-anchor="middle">{}</text>"##,
-            x + col_w / 2.0,
+            r##"<text x="{label_x:.1}" y="{:.1}" fill="#9ea6a5" font-size="12.5" text-anchor="middle">{}</text>"##,
             chart_top + chart_h + 42.0,
             day.label_dow
         ));
     }
     let window_note = match request.step_hours {
+        None if night_mode => "HI day max, LO overnight low (between days)".to_string(),
         None => "HI/LO over each calendar day".to_string(),
         // Single-value mode: columns land on the model cadence.
         Some(_) if single && cadence == 1 => "hourly values".to_string(),
@@ -1877,6 +1999,22 @@ mod tests {
         assert!((sunset - 3.55).abs() < 0.35, "sunset {sunset}");
         assert_eq!(no_leap_doy(7, 1), 182);
         assert_eq!(no_leap_doy(2, 29), 59, "leap day folds");
+    }
+
+    #[test]
+    fn night_buckets_pair_evening_with_next_dawn() {
+        // Day 100, 17:00 local → the night after day 100; not dawn.
+        assert_eq!(night_key(100 * 24 + 17), Some((100, false)));
+        // Day 101, 05:00 local → still night 100, and dawn-qualifying.
+        assert_eq!(night_key(101 * 24 + 5), Some((100, true)));
+        // Midnight belongs to the previous day's night, before dawn.
+        assert_eq!(night_key(101 * 24), Some((100, false)));
+        // Late morning still counts toward the ending night.
+        assert_eq!(night_key(101 * 24 + 11), Some((100, true)));
+        // Midday belongs to no night.
+        assert_eq!(night_key(100 * 24 + 13), None);
+        // Negative absolute hours (west-of-UTC offsets) stay consistent.
+        assert_eq!(night_key(-24 + 5), Some((-2, true)));
     }
 
     #[test]
