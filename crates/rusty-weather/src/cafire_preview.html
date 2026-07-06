@@ -1371,9 +1371,13 @@ async function savePng(pngUrl, filename, title) {
     return;
   }
   const file = new File([blob], filename, { type: "image/png" });
-  if (navigator.canShare && navigator.canShare({ files: [file] })) {
-    // Mobile: native share sheet — "Save Image" drops a real PNG in the
-    // camera roll; Share sends the image file, not a link. A cancel is a no-op.
+  // Share sheet only where it beats a download: on touch devices "Save Image"
+  // drops a real PNG in the camera roll and Share sends the image file, not a
+  // link. Desktop Chrome/Edge also pass canShare({files}), but their OS share
+  // flyout has no save-to-disk — a plain download serves desktop better.
+  const touchDevice = matchMedia("(pointer: coarse)").matches;
+  if (touchDevice && navigator.canShare && navigator.canShare({ files: [file] })) {
+    // A cancel of the sheet is a no-op.
     try { await navigator.share({ files: [file], title }); } catch (e) {}
     return;
   }
