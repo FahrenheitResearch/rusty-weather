@@ -1,5 +1,11 @@
 # Fable Boot Prompt
 
+> **⚠️ Historical (2026-06-30, pre-deployment).** The system described below
+> has since shipped: the service is live on Hetzner and CAFire cut over on
+> 2026-07-03. For current orientation read **`docs/AGENT_GUIDE.md`** (agent
+> entry point) and **`docs/HETZNER_OPS.md`** (server runbook). Kept for the
+> original framing of goals and constraints, which still hold.
+
 Paste this into Claude Fable before asking it to work in this repo.
 
 ```text

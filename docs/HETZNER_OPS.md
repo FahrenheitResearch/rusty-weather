@@ -422,7 +422,8 @@ if every fuel fetch starts failing in early January, that's why.
 
 ## 11. Orientation for a brand-new agent
 
-1. Read this doc, then skim `docs/CAFIRE_HANDOFF.md` +
+1. Read `docs/AGENT_GUIDE.md` (the agent entry point — project map, hard
+   rules, gotcha ledger) and this doc, then skim `docs/CAFIRE_HANDOFF.md` +
    `CAFIRE_HANDOFF_ADDENDUM_1.md` (the external promises) and
    `docs/FABLE_FIRE_WEATHER_HANDOFF.md` (project deep background).
 2. Run the §2 health check so you know the baseline before changing
