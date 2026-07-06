@@ -965,6 +965,38 @@ fn daily_response(query: &str, state: &AppState) -> Vec<u8> {
         .unwrap_or(false);
     match meteogram::render_daily_svg(&state.store_root, model, &run, &date, cycle, &request) {
         Ok(svg) => svg_card_response(svg, want_png),
+        // `latest` resolves to the newest complete run, but a short hourly run
+        // that initializes mid-local-day (e.g. HRRR 14z–17z = morning PDT,
+        // F0–18) can't put the required ~3/4 of a day's samples in ANY bucket,
+        // so the card 422s purely from cycle timing. The day_run pointer is the
+        // newest extended run and always spans full local days — retry with it
+        // rather than erroring. Explicit run requests still surface the error.
+        Err(message)
+            if alias == "latest" && message.contains("enough samples") =>
+        {
+            let fallback = resolve_latest_run(&state.store_root, model, "latest-day")
+                .ok()
+                .filter(|day_run| *day_run != run)
+                .and_then(|day_run| {
+                    let (date, cycle) = day_run.split_once('_').and_then(|(date, cycle)| {
+                        let hour: u8 = cycle.strip_suffix('z')?.parse().ok()?;
+                        (date.len() == 8 && hour <= 23).then(|| (date.to_string(), hour))
+                    })?;
+                    meteogram::render_daily_svg(
+                        &state.store_root,
+                        model,
+                        &day_run,
+                        &date,
+                        cycle,
+                        &request,
+                    )
+                    .ok()
+                });
+            match fallback {
+                Some(svg) => svg_card_response(svg, want_png),
+                None => json_status_response(422, &serde_json::json!({ "error": message })),
+            }
+        }
         Err(message) => json_status_response(422, &serde_json::json!({ "error": message })),
     }
 }
