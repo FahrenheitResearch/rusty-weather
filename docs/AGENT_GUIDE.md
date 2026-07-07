@@ -170,6 +170,19 @@ host (holds the 201 GB CONUS climo pack; wide-west is what's deployed).
 5. Daily **temperature** cards draw the LO as a true **overnight** min
    (evening→dawn window, `night_key()`), positioned BETWEEN the day
    columns. Other variables and step-bucket cards keep in-column HI/LO.
+6. **Map rendering shells out to the `rw_render` binary** (rw_fire_api spawns
+   it). `store_render.rs` compiles into `rw_render` — rebuild `rw_render`
+   (not just `rw_fire_api`) for any render/store change, or the fix won't
+   take effect.
+7. **GFS/NBM surface weather maps** (Lab Weather + Radar families, 2026-07-06):
+   the render path takes `model=`; HRRR is the default (omit `model` for
+   cache parity). GFS carries the full surface set + MSLP isobars (coarse
+   0.25°); NBM is a 2.5-km surface blend with no MSLP/clouds/reflectivity
+   and no pressure-pair derived, so its temp/RH/dewpoint maps render with
+   the isobar overlay dropped (overlays are optional in `store_render.rs`;
+   the fill is required). Per-model product availability was probed against
+   the store, not assumed — the Lab's `MODEL_PRODUCTS` table holds the
+   verified sets. Reflectivity/IR and hourly-QPF windows are HRRR-only.
 
 ## 7. API quick reference
 
