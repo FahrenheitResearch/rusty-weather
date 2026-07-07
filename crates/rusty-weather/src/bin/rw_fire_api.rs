@@ -1817,7 +1817,7 @@ fn render_cache_key(request: &RenderJobRequest) -> String {
         None => "-".to_string(),
     };
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
         request.model,
         request.run,
         request.hour,
@@ -1829,6 +1829,7 @@ fn render_cache_key(request: &RenderJobRequest) -> String {
         request.county_linework,
         request.place_label_density,
         request.place_label_size,
+        request.value_labels,
         request.domain_slug,
         format_bounds(request.resolved_bounds()),
         perimeter_part,
