@@ -148,6 +148,42 @@ button { color: inherit; cursor: pointer; }
 .leaflet-control-attribution a { color: var(--muted) !important; }
 .xsec-tip { background: rgba(9,11,12,0.88); border: 1px solid var(--line-strong); color: var(--text); font-weight: 700; font-size: 11px; padding: 1px 6px; border-radius: 6px; box-shadow: none; }
 .xsec-tip::before { display: none; }
+
+/* ---------- mobile (phones) ----------
+   The desktop 2-column layout stacks the full control panel ABOVE the viewer,
+   burying the rendered map ~1000px down. On phones we: slim the header, pin
+   the viewer to the top so a tapped product is always visible, and drop the
+   controls + interactive map below it. `display: contents` on .main-col lets
+   the viewer / ribbon / map interleave with the sidebar in one ordered column. */
+@media (max-width: 820px) {
+  .header-inner { padding: 9px 13px; gap: 10px; }
+  .primary-nav { display: none; }
+  .header-status { padding: 6px 10px; font-size: 12px; }
+
+  .workspace { display: flex; flex-direction: column; gap: 11px; margin: 10px auto 44px; padding: 0 11px; }
+  .main-col { display: contents; }
+  /* Viewer pinned under the header: a tapped product updates it live while the
+     controls scroll underneath. 40vh leaves room for the map fully below it. */
+  .viewer-card { order: 1; position: sticky; top: 52px; z-index: 20; box-shadow: 0 10px 26px rgba(0,0,0,0.6); }
+  .sidebar { order: 2; position: static; top: auto; max-height: none; overflow: visible; padding: 13px; }
+  .ribbon { order: 3; }
+  .map-card { order: 4; }
+
+  .viewport { height: clamp(240px, 40vh, 420px); }
+  .viewport .placeholder { padding: 40px 18px; }
+  /* Family chips: one swipeable row instead of ~6 wrapped rows. */
+  .fam-tabs { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 5px; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+  .fam-tabs::-webkit-scrollbar { display: none; }
+  .fam-tab { flex: 0 0 auto; }
+  .product-list { max-height: 46vh; }
+  #map { height: 330px; }
+  .map-head { padding: 10px 13px; }
+  .map-head .tools { gap: 5px; }
+  .viewer-bar { padding: 9px 13px; }
+}
+/* Draw mode must own touch gestures on the map, or the browser pans/scrolls
+   instead of letting us drag a box. */
+#map.drawing { touch-action: none; }
 </style>
 </head>
 <body>
@@ -985,6 +1021,15 @@ L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
   subdomains: "abcd", maxZoom: 12,
 }).addTo(map);
+/* Leaflet caches the container size at init; on mobile the layout reflows
+   after that (fonts, the sticky viewer, address-bar show/hide, rotation),
+   leaving the map gray with mis-placed tiles until a manual reload — the
+   "have to hard refresh" bug. Re-measure whenever the container resizes. */
+let _invT;
+function refreshMapSize() { clearTimeout(_invT); _invT = setTimeout(() => map.invalidateSize(), 140); }
+if (window.ResizeObserver) new ResizeObserver(refreshMapSize).observe(map.getContainer());
+addEventListener("orientationchange", () => setTimeout(() => map.invalidateSize(), 320));
+addEventListener("load", () => setTimeout(() => map.invalidateSize(), 250));
 let mapMode = "view", presetRect = null, drawnRect = null, pointMarker = null, drawStart = null;
 function boundsToLeaflet(b) { return [[b[2], b[0]], [b[3], b[1]]]; }
 let firePoly = null;
@@ -1009,6 +1054,9 @@ function setMapMode(mode) {
   $("pointBtn").classList.toggle("on", mode === "point");
   $("lineBtn").classList.toggle("on", mode === "line");
   $("map").style.cursor = mode === "view" ? "grab" : "crosshair";
+  // `.drawing` sets touch-action:none so a finger-drag draws the box instead
+  // of scrolling the page; Leaflet dragging is off so the map doesn't pan.
+  $("map").classList.toggle("drawing", mode === "draw");
   if (mode === "draw") map.dragging.disable(); else map.dragging.enable();
 }
 document.querySelectorAll(".tool-btn[data-preset]").forEach(btn => {
@@ -1017,22 +1065,31 @@ document.querySelectorAll(".tool-btn[data-preset]").forEach(btn => {
 $("drawBtn").onclick = () => setMapMode(mapMode === "draw" ? "view" : "draw");
 $("pointBtn").onclick = () => setMapMode(mapMode === "point" ? "view" : "point");
 $("lineBtn").onclick = () => setMapMode(mapMode === "line" ? "view" : "line");
-map.on("mousedown", ev => {
+/* Draw-a-box via POINTER events on the map container so it works with a
+   finger as well as a mouse (Leaflet's own mouse events never fire from
+   touch). Pointer capture keeps the drag alive if the finger leaves the map. */
+let drawPointerId = null;
+const mapEl = map.getContainer();
+mapEl.addEventListener("pointerdown", ev => {
   if (mapMode !== "draw") return;
-  drawStart = ev.latlng;
+  drawPointerId = ev.pointerId;
+  drawStart = map.mouseEventToLatLng(ev);
   if (drawnRect) { map.removeLayer(drawnRect); drawnRect = null; }
+  try { mapEl.setPointerCapture(ev.pointerId); } catch (e) {}
+  ev.preventDefault();
 });
-map.on("mousemove", ev => {
-  if (mapMode !== "draw" || !drawStart) return;
-  const b = L.latLngBounds(drawStart, ev.latlng);
+mapEl.addEventListener("pointermove", ev => {
+  if (mapMode !== "draw" || drawStart === null || ev.pointerId !== drawPointerId) return;
+  const b = L.latLngBounds(drawStart, map.mouseEventToLatLng(ev));
   if (!drawnRect) drawnRect = L.rectangle(b, { color: "#ffd456", weight: 2, fill: true, fillOpacity: 0.06 }).addTo(map);
   else drawnRect.setBounds(b);
+  ev.preventDefault();
 });
-map.on("mouseup", ev => {
-  if (mapMode !== "draw" || !drawStart) return;
-  const b = L.latLngBounds(drawStart, ev.latlng);
-  drawStart = null;
-  if (b.getSouth() === b.getNorth() || b.getWest() === b.getEast()) return;
+function finishDraw(ev) {
+  if (mapMode !== "draw" || drawStart === null || ev.pointerId !== drawPointerId) return;
+  const b = L.latLngBounds(drawStart, map.mouseEventToLatLng(ev));
+  drawStart = null; drawPointerId = null;
+  if (b.getSouth() === b.getNorth() || b.getWest() === b.getEast()) { setMapMode("view"); return; }
   state.drawn = [b.getWest(), b.getEast(), b.getSouth(), b.getNorth()].map(v => Math.round(v * 100) / 100);
   state.preset = null;
   clearFire();
@@ -1040,7 +1097,9 @@ map.on("mouseup", ev => {
   $("mapReadout").textContent = `drawn: ${state.drawn.map(v => v.toFixed(2)).join(", ")} (W,E,S,N)`;
   setMapMode("view");
   renderCurrent();
-});
+}
+mapEl.addEventListener("pointerup", finishDraw);
+mapEl.addEventListener("pointercancel", () => { drawStart = null; drawPointerId = null; });
 /* Cross-section line: two clicks set A then B; a third starts over. */
 let xsecLine = null, xsecMarkers = [];
 function clearXsecLine() {
