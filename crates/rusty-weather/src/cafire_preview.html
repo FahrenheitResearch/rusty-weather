@@ -160,8 +160,13 @@ button { color: inherit; cursor: pointer; }
   .primary-nav { display: none; }
   .header-status { padding: 6px 10px; font-size: 12px; }
 
-  .workspace { display: flex; flex-direction: column; gap: 11px; margin: 10px auto 44px; padding: 0 11px; }
+  .workspace { display: flex; flex-direction: column; gap: 11px; margin: 10px auto 44px; padding: 0 11px; max-width: 100%; overflow-x: clip; }
+  /* Flex items default to min-width:auto and refuse to shrink below their
+     content — a nowrap chip row (~1600px) would then stretch the whole page
+     sideways. min-width:0 lets them shrink so inner overflow-x scrolls the
+     STRIP, not the page. */
   .main-col { display: contents; }
+  .sidebar, .viewer-card, .ribbon, .map-card { min-width: 0; max-width: 100%; }
   /* Viewer pinned under the header: a tapped product updates it live while the
      controls scroll underneath. 40vh leaves room for the map fully below it. */
   .viewer-card { order: 1; position: sticky; top: 52px; z-index: 20; box-shadow: 0 10px 26px rgba(0,0,0,0.6); }
@@ -171,8 +176,10 @@ button { color: inherit; cursor: pointer; }
 
   .viewport { height: clamp(240px, 40vh, 420px); }
   .viewport .placeholder { padding: 40px 18px; }
-  /* Family chips: one swipeable row instead of ~6 wrapped rows. */
-  .fam-tabs { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 5px; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+  /* Family chips: one swipeable row instead of ~6 wrapped rows. min-width:0
+     is what keeps the strip's own overflow-x scrolling instead of widening
+     the page. */
+  .fam-tabs { flex-wrap: nowrap; overflow-x: auto; min-width: 0; max-width: 100%; padding-bottom: 5px; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
   .fam-tabs::-webkit-scrollbar { display: none; }
   .fam-tab { flex: 0 0 auto; }
   .product-list { max-height: 46vh; }
