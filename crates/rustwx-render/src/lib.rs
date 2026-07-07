@@ -454,6 +454,52 @@ fn with_render_state_with_style<T>(
     .map(|(result, _, _)| result)
 }
 
+/// Prettify a stored unit string for the min/max readout, matching how the
+/// colorbar presents it (ASCII-safe for the bitmap chrome font).
+fn pretty_extent_units(units: &str) -> String {
+    match units.trim() {
+        "degF" | "F" => "\u{00b0}F".to_string(),
+        "degC" | "C" => "\u{00b0}C".to_string(),
+        "" | "1" | "index" | "categorical" => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// Format one extent value: integers for wide/large ranges, one decimal for
+/// small ranges (mirrors the daily-card number style).
+fn fmt_extent_value(v: f64, span: f64) -> String {
+    if span >= 20.0 || v.abs() >= 100.0 {
+        format!("{}", v.round() as i64)
+    } else {
+        let s = format!("{v:.1}");
+        if s == "-0.0" { "0.0".to_string() } else { s }
+    }
+}
+
+/// "max 110 / min 63 °F" over the domain's finite values — `None` when the
+/// field is empty/all-NaN (nothing to summarize).
+fn data_extent_subtitle(values: &[f32], units: &str) -> Option<String> {
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &value in values {
+        let value = value as f64;
+        if value.is_finite() {
+            lo = lo.min(value);
+            hi = hi.max(value);
+        }
+    }
+    if !lo.is_finite() || !hi.is_finite() {
+        return None;
+    }
+    let span = (hi - lo).abs();
+    let unit = pretty_extent_units(units);
+    let tail = if unit.is_empty() { String::new() } else { format!(" {unit}") };
+    Some(format!(
+        "max {} / min {}{tail}",
+        fmt_extent_value(hi, span),
+        fmt_extent_value(lo, span)
+    ))
+}
+
 fn with_render_state_profile_with_style<T>(
     request: &MapRenderRequest,
     plot_style: StaticPlotStyle,
@@ -700,7 +746,17 @@ fn with_render_state_profile_with_style<T>(
             colorbar: request.colorbar,
             title: request.title.clone().or(default_title),
             subtitle_left: request.subtitle_left.clone(),
-            subtitle_center: request.subtitle_center.clone(),
+            // Domain min/max readout in the header (past the map frame). Only
+            // for filled data maps (skip contour/barb-only overlays), only
+            // when the caller hasn't set a center subtitle, and computed from
+            // the SAME values the colorbar uses so units already match.
+            subtitle_center: request.subtitle_center.clone().or_else(|| {
+                if request.colorbar && !overlay_only {
+                    data_extent_subtitle(&request.field.values, &request.field.units)
+                } else {
+                    None
+                }
+            }),
             subtitle_right: request.subtitle_right.clone(),
             cbar_tick_step: request.cbar_tick_step,
             cbar_ticks: request.cbar_ticks.clone(),
