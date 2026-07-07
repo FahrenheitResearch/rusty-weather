@@ -311,6 +311,14 @@ pub fn render_direct_recipes_chunked_from_loader(
     request: &DirectBatchRequest,
     latest: &LatestRun,
     recipe_slugs: &[String],
+    // Overlay selectors the caller has confirmed are ABSENT from the source
+    // (e.g. an MSLP-isobar overlay on a model that stores no MSLP). They are
+    // skipped at load time rather than fetched; the fill still renders and
+    // the overlay is silently dropped (`build_contour_layers` already returns
+    // nothing when its field is missing). Empty for HRRR and any source that
+    // carries every overlay — an empty set never triggers the skip, so the
+    // load path is byte-identical to before.
+    absent_overlay_selectors: &HashSet<FieldSelector>,
     load_field: &mut dyn FnMut(
         &FieldSelector,
     ) -> Result<SelectedField2D, Box<dyn std::error::Error>>,
@@ -378,6 +386,12 @@ pub fn render_direct_recipes_chunked_from_loader(
         let mut extracted = HashMap::<FieldSelector, SelectedField2D>::new();
         for item in chunk {
             for selector in item.plan.selectors() {
+                // A confirmed-absent overlay (e.g. MSLP on a no-MSLP model)
+                // is skipped: loading it would error, but the fill renders
+                // fine and the overlay layer drops itself downstream.
+                if absent_overlay_selectors.contains(&selector) {
+                    continue;
+                }
                 if !extracted.contains_key(&selector) {
                     extracted.insert(selector, load_field(&selector)?);
                 }

@@ -18,11 +18,11 @@
 //! proven render paths see. Windowed reads stay a later optimization for
 //! when a render lane learns to consume pre-windowed grids.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rustwx_core::{FieldSelector, SelectedField2D};
-use rustwx_models::{LatestRun, plot_recipe_fetch_plan};
+use rustwx_models::{LatestRun, plot_recipe, plot_recipe_fetch_plan};
 use rustwx_products::derived::{
     DerivedBatchRequest, DerivedRenderedRecipe, StoreProductGrid,
     render_derived_recipes_from_store_grids,
@@ -211,6 +211,9 @@ pub fn render_direct_recipes_from_store(
 ) -> Result<DirectStoreOutcome, Box<dyn std::error::Error>> {
     let mut renderable = Vec::new();
     let mut skipped = Vec::new();
+    // Overlay selectors a requested recipe declares but this store hour lacks
+    // — dropped from the load so the fill still renders (see below).
+    let mut absent_overlay_selectors: HashSet<FieldSelector> = HashSet::new();
     for slug in recipe_slugs {
         let plan = match plot_recipe_fetch_plan(slug, request.model) {
             Ok(plan) => plan,
@@ -222,18 +225,39 @@ pub fn render_direct_recipes_from_store(
                 continue;
             }
         };
-        let missing: Vec<String> = plan
+        // The isobar/contour overlay (e.g. MSLP on the weather-style temp
+        // maps) is a secondary layer: if the store lacks it, we still render
+        // the fill and drop the overlay, rather than failing the whole
+        // product. This is what lets a surface-only model (NBM stores no
+        // MSLP) serve its temperature/RH/dewpoint maps. The FILL and wind
+        // barbs stay required — a missing fill is a real blocker.
+        let overlay_selector = plot_recipe(slug)
+            .and_then(|recipe| recipe.contours.as_ref())
+            .and_then(|contours| contours.selector);
+        let missing: Vec<FieldSelector> = plan
             .selectors()
             .iter()
+            .copied()
             .filter(|selector| source.resolve(selector).is_none())
+            .collect();
+        let required_missing: Vec<String> = missing
+            .iter()
+            .filter(|selector| Some(**selector) != overlay_selector)
             .map(|selector| selector.key())
             .collect();
-        if missing.is_empty() {
+        if required_missing.is_empty() {
+            // Any missing selector here is the optional overlay: record it so
+            // the loader skips it instead of erroring on the fetch.
+            for selector in missing {
+                if Some(selector) == overlay_selector {
+                    absent_overlay_selectors.insert(selector);
+                }
+            }
             renderable.push(slug.clone());
         } else {
             skipped.push(StoreRenderSkip {
                 slug: slug.clone(),
-                reason: format!("missing stored selector(s): {}", missing.join(", ")),
+                reason: format!("missing stored selector(s): {}", required_missing.join(", ")),
             });
         }
     }
@@ -249,6 +273,7 @@ pub fn render_direct_recipes_from_store(
         request,
         latest,
         &renderable,
+        &absent_overlay_selectors,
         &mut load_field,
         direct_render_chunk_size(),
         chunk_gate,
