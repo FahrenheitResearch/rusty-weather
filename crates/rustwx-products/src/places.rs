@@ -1510,7 +1510,7 @@ fn project_geographic_points(
     Ok(projected_points)
 }
 
-fn nearest_grid_index(
+pub(crate) fn nearest_grid_index(
     grid_lat_deg: &[f32],
     grid_lon_deg: &[f32],
     lat: f64,

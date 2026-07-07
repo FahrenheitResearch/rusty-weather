@@ -199,6 +199,10 @@ struct RenderJobRequest {
     place_label_density: u8,
     #[serde(default = "default_place_label_size")]
     place_label_size: u8,
+    /// Pivotal-style value labels: stamp the plotted field's value at the
+    /// city label points instead of the city name. Off by default.
+    #[serde(default)]
+    value_labels: bool,
     #[serde(default = "default_domain_slug")]
     domain_slug: String,
     /// Render bounds; either given directly (draw-a-box) or computed by
@@ -654,6 +658,11 @@ fn run_rw_render(
     // Surface temperature family display units ("f" default | "c"); every
     // map lane reads this at request-finalization time.
     command.env("RUSTWX_TEMP_UNITS", &request.temp_units);
+    // Pivotal-style city value labels: the place-label overlay stamps the
+    // plotted value (in display units) at each city instead of its name.
+    if request.value_labels {
+        command.env("RUSTWX_VALUE_LABELS", "1");
+    }
 
     // Child output goes to per-job log files instead of in-memory pipes so
     // the deadline loop below never deadlocks on a full pipe and the API

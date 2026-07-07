@@ -376,6 +376,14 @@ button { color: inherit; cursor: pointer; }
       </div>
     </div>
 
+    <div>
+      <span class="field-label">City labels</span>
+      <div class="segmented" id="valueSeg">
+        <button class="selected" type="button" data-values="off">Names</button>
+        <button type="button" data-values="on">Values</button>
+      </div>
+    </div>
+
     <div class="console" id="console"></div>
   </aside>
 
@@ -691,7 +699,7 @@ const RIBBONS = {
 };
 let state = {
   fam: "anomaly", product: ANOMALY[0][0], hour: 6, density: 3,
-  basemap: "topo", counties: true, tempUnits: "f",
+  basemap: "topo", counties: true, tempUnits: "f", valueLabels: false,
   preset: "california", drawn: null, fire: null, stat: "p95",
   hours: [], playTimer: null, seq: 0,
   /* cross-section endpoints, [lat, lon] each */
@@ -1018,6 +1026,7 @@ wireSegment("quality", d => { state.density = Number(d.density); });
 wireSegment("basemapSeg", d => { state.basemap = d.basemap; });
 wireSegment("countySeg", d => { state.counties = d.counties === "true"; });
 wireSegment("tempUnitSeg", d => { state.tempUnits = d.tempunits; });
+wireSegment("valueSeg", d => { state.valueLabels = d.values === "on"; });
 wireSegment("xsecFieldSeg", d => { xsecField = d.field; });
 $("xsecShare").onclick = () => $("shareBtn").onclick();
 $("soundingShare").onclick = () => $("shareBtn").onclick();
@@ -1357,6 +1366,8 @@ async function requestPlot(productSlug, hour, quiet) {
   // °F is the server default: omit the field so °F requests share the
   // prewarm/pipeline cache key, send it only for the °C opt-out.
   if (state.tempUnits === "c") payload.temp_units = "c";
+  // Pivotal-style value labels: stamp the field value at major cities.
+  if (state.valueLabels) payload.value_labels = true;
   // HRRR is the server default: omit `model` so HRRR requests keep sharing the
   // prewarm/pipeline cache key; send it only for a non-HRRR map family.
   if (activeMapModel() !== "hrrr") payload.model = activeMapModel();
@@ -1545,7 +1556,7 @@ function prefetchNeighbors(slug, hour) {
   const targets = [index + 1, index - 1, index + 2, index + 3]
     .map(i => state.hours[i]).filter(h => h !== undefined);
   targets.forEach(h => {
-    const key = `${currentRun()}|${slug}|${h}|${JSON.stringify(domainPayload())}|${state.density}|${state.basemap}|${state.counties}|${state.tempUnits}`;
+    const key = `${currentRun()}|${slug}|${h}|${JSON.stringify(domainPayload())}|${state.density}|${state.basemap}|${state.counties}|${state.tempUnits}|${state.valueLabels}`;
     if (prefetched.has(key)) return;
     prefetched.add(key);
     requestPlot(slug, h, true).catch(() => prefetched.delete(key));
