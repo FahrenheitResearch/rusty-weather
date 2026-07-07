@@ -193,6 +193,15 @@ button { color: inherit; cursor: pointer; }
     </div>
 
     <div class="side-box show" id="productBox">
+      <div id="mapModelWrap" style="display:none">
+        <span class="field-label">Model</span>
+        <div class="segmented" id="mapModelSeg">
+          <button class="selected" type="button" data-model="hrrr">HRRR · 3km</button>
+          <button type="button" data-model="gfs">GFS · 25km</button>
+          <button type="button" data-model="nbm">NBM · 2.5km</button>
+        </div>
+        <div class="hint" id="mapModelHint" style="margin:4px 0 2px">HRRR: full 48-h detail. GFS: coarse, to 16 days. NBM: crisp surface blend, to 10 days.</div>
+      </div>
       <span class="field-label">Product</span>
       <div class="product-list" id="productList"></div>
     </div>
@@ -644,7 +653,47 @@ let state = {
   hours: [], playTimer: null, seq: 0,
   /* cross-section endpoints, [lat, lon] each */
   xsecA: null, xsecB: null,
+  /* map-family model picker (surface weather maps from GFS/NBM as well as
+     HRRR). Only the families in MULTI_MODEL_FAMS honor it. */
+  mapModel: "hrrr",
 };
+
+/* Which map families offer the HRRR/GFS/NBM picker, and which products each
+   non-HRRR model can actually render — verified empirically against the store,
+   NOT assumed. HRRR renders every product in the family (no entry). A model's
+   `null` for a family means "the whole family"; a Set means "only these
+   slugs"; a missing family means "none". GFS carries the full surface field
+   set + MSLP isobars (coarse 0.25°); NBM is a 2.5-km surface blend with no
+   MSLP / clouds / reflectivity and no pressure-pair derived (wet-bulb etc.),
+   so its combined temp/RH/dewpoint maps render with the isobar overlay
+   dropped. Reflectivity/IR and hourly-QPF windows aren't wired for GFS/NBM. */
+const MULTI_MODEL_FAMS = new Set(["weather", "radar"]);
+const MODEL_PRODUCTS = {
+  gfs: {
+    weather: null,
+    radar: new Set(["precipitation_type", "categorical_rain", "categorical_snow", "qpf_total"]),
+  },
+  nbm: {
+    weather: new Set([
+      "2m_temperature_10m_winds", "2m_dewpoint_10m_winds", "2m_relative_humidity_10m_winds",
+      "10m_wind_gusts", "visibility", "precipitable_water",
+    ]),
+    radar: new Set(["qpf_total"]),
+  },
+};
+/* The model in force for the current family: the picker value for a
+   multi-model map family, else always HRRR. */
+function activeMapModel() { return MULTI_MODEL_FAMS.has(state.fam) ? state.mapModel : "hrrr"; }
+/* The family's product list filtered to what `model` can render. */
+function productsForModel(fam, model) {
+  const all = (FAMS[fam] && FAMS[fam].products) || [];
+  if (model === "hrrr") return all;
+  const perModel = MODEL_PRODUCTS[model];
+  const allow = perModel ? perModel[fam] : undefined;
+  if (allow === undefined) return [];
+  if (allow === null) return all;
+  return all.filter(([slug]) => allow.has(slug));
+}
 let xsecField = "temperature";
 
 /* ---------- console/log ---------- */
@@ -673,6 +722,7 @@ function runAge(unix) {
 }
 let runsBase = "";
 let runsProbe = "";
+let runsModel = "";
 let runsHours = {};
 function currentProbeVar() {
   const fam = FAMS[state.fam];
@@ -689,8 +739,12 @@ async function loadRuns() {
     // sections) — the family's probeVar asks the API for the hours that
     // actually carry it so nothing in the ladder can error.
     runsProbe = currentProbeVar();
-    const probe = runsProbe ? `?var=${encodeURIComponent(runsProbe)}` : "";
-    const data = await fetch(runsBase + "/api/runs" + probe).then(r => r.json());
+    runsModel = activeMapModel();
+    const params = new URLSearchParams();
+    if (runsModel !== "hrrr") params.set("model", runsModel);
+    if (runsProbe) params.set("var", runsProbe);
+    const qs = params.toString();
+    const data = await fetch(runsBase + "/api/runs" + (qs ? `?${qs}` : "")).then(r => r.json());
     latestManifest = data.latest || null;
     runsHours = data.hours || {};
     const select = $("runSelect");
@@ -784,6 +838,9 @@ function selectFam(key) {
   state.fam = key;
   [...$("fams").children].forEach((b, i) => b.classList.toggle("on", Object.keys(FAMS)[i] === key));
   $("productBox").classList.toggle("show", FAMS[key].products.length > 0);
+  // Map-model picker: only the surface-map families offer HRRR/GFS/NBM.
+  $("mapModelWrap").style.display = MULTI_MODEL_FAMS.has(key) ? "" : "none";
+  if (MULTI_MODEL_FAMS.has(key)) syncMapModelSeg();
   $("climoBox").classList.toggle("show", key === "climoref");
   $("meteoBox").classList.toggle("show", key === "meteogram" || key === "custom" || key === "daily");
   $("customBox").classList.toggle("show", key === "custom");
@@ -800,7 +857,7 @@ function selectFam(key) {
   // inventory, and so does a change of the family's hour-probe variable
   // (for the node family the probe tracks the product — reload AFTER
   // the family's product is set).
-  const needsRuns = apiBase() !== runsBase || currentProbeVar() !== runsProbe;
+  const needsRuns = apiBase() !== runsBase || currentProbeVar() !== runsProbe || activeMapModel() !== runsModel;
   if (key === "meteogram" || key === "custom" || key === "daily") {
     if (needsRuns) loadRuns();
     setMapMode("point"); renderCurrent();
@@ -815,8 +872,12 @@ function selectFam(key) {
     if (needsRuns) { loadRuns().then(renderCurrent); } else { renderCurrent(); }
   } else {
     if (mapMode === "point" || mapMode === "line") setMapMode("view");
-    if (FAMS[key].products.length) {
-      state.product = FAMS[key].products[0][0]; markProduct();
+    const avail = productsForModel(key, activeMapModel());
+    if (avail.length) {
+      // Keep the current product if this model still offers it, else fall to
+      // the first available — never leave a product the model can't render.
+      if (!avail.some(([slug]) => slug === state.product)) state.product = avail[0][0];
+      markProduct();
       if (needsRuns) { loadRuns().then(renderCurrent); } else { renderCurrent(); }
     } else if (key === "climoref") {
       if (needsRuns) loadRuns();
@@ -831,7 +892,7 @@ function selectFam(key) {
 function buildProducts() {
   const list = $("productList");
   list.innerHTML = "";
-  FAMS[state.fam].products.forEach(([slug, name]) => {
+  productsForModel(state.fam, activeMapModel()).forEach(([slug, name]) => {
     const b = document.createElement("button");
     b.className = "product-item" + (slug === state.product ? " on" : "");
     b.dataset.slug = slug;
@@ -1117,6 +1178,23 @@ for (const id of ["chartModel", "dailyModelSeg"]) {
     loadVars().then(() => renderCurrent());
   });
 }
+/* Map-family model picker (weather / radar): HRRR / GFS / NBM surface maps. */
+function syncMapModelSeg() {
+  [...$("mapModelSeg").children].forEach(b => b.classList.toggle("selected", b.dataset.model === state.mapModel));
+}
+$("mapModelSeg").addEventListener("click", ev => {
+  const btn = ev.target.closest("button"); if (!btn) return;
+  if (btn.dataset.model === state.mapModel) return;
+  state.mapModel = btn.dataset.model;
+  syncMapModelSeg();
+  buildProducts();
+  // Keep the product if the new model offers it, else fall to the first it does.
+  const avail = productsForModel(state.fam, activeMapModel());
+  if (avail.length && !avail.some(([slug]) => slug === state.product)) state.product = avail[0][0];
+  markProduct();
+  // A different model has a different run inventory: reload runs, then render.
+  loadRuns().then(renderCurrent);
+});
 async function loadVars() {
   try {
     const data = await fetch(`/api/vars?model=${chartModel}&run=latest`).then(r => r.json());
@@ -1213,6 +1291,9 @@ async function requestPlot(productSlug, hour, quiet) {
   // °F is the server default: omit the field so °F requests share the
   // prewarm/pipeline cache key, send it only for the °C opt-out.
   if (state.tempUnits === "c") payload.temp_units = "c";
+  // HRRR is the server default: omit `model` so HRRR requests keep sharing the
+  // prewarm/pipeline cache key; send it only for a non-HRRR map family.
+  if (activeMapModel() !== "hrrr") payload.model = activeMapModel();
   const started = await fetch(apiBase() + "/api/render", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }).then(r => r.json());
   if (started.error) throw new Error(started.error);
   if (!quiet) log(`job ${started.id} (${started.cache})`, started.cache === "hit" ? "ok" : "");
