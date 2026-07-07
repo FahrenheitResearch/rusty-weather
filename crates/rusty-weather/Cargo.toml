@@ -8,6 +8,7 @@ rust-version.workspace = true
 default-run = "rusty-weather"
 
 [dependencies]
+base64 = "0.22"
 clap.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "webp"] }
 # Rasterize the daily-outlook / meteogram SVG cards to PNG for the shareable

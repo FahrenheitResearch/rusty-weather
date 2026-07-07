@@ -4451,6 +4451,44 @@ fn draw_domain_clip_mask_outline(
     }
 }
 
+/// Resolvable branding for the top banner strip. Defaults reproduce CAFire's
+/// banner exactly, so when the `RUSTWX_BRAND_*` env is unset a render is
+/// byte-identical to before. The API sets these per render from the request
+/// `brand` field (mirrors the `RUSTWX_TITLE_SUFFIX` env pattern).
+///
+/// Semantics: an absent env var falls back to the CAFire default; a present
+/// but empty var means "omit this element" (used by the "generic"/"none"
+/// brand presets). The logo, when present, is a decoded PNG.
+struct BrandChrome {
+    title: String,
+    credit: String,
+    logo: Option<RgbaImage>,
+}
+
+impl BrandChrome {
+    fn from_env() -> Self {
+        let title = std::env::var("RUSTWX_BRAND_TITLE")
+            .unwrap_or_else(|_| "CALIFORNIA WILDFIRE TRACKING".to_string());
+        let credit = std::env::var("RUSTWX_BRAND_CREDIT")
+            .unwrap_or_else(|_| "cafire.org/weather".to_string());
+        let logo = std::env::var("RUSTWX_BRAND_LOGO")
+            .ok()
+            .filter(|path| !path.trim().is_empty())
+            .and_then(|path| match image::open(&path) {
+                Ok(decoded) => Some(decoded.to_rgba8()),
+                Err(err) => {
+                    eprintln!("brand logo load failed ({path}): {err}");
+                    None
+                }
+            });
+        Self {
+            title,
+            credit,
+            logo,
+        }
+    }
+}
+
 fn draw_chrome_and_colorbar(
     img: &mut RgbaImage,
     layout: &Layout,
@@ -4478,22 +4516,40 @@ fn draw_chrome_and_colorbar(
             img.height(),
             opts.chrome_scale,
         )) as i32;
-        text::draw_text_bold(
-            img,
-            "CALIFORNIA WILDFIRE TRACKING",
-            chrome_left as i32,
-            banner_text_y,
-            subtitle_color,
-            layout.text_scale,
-        );
-        text::draw_text_right(
-            img,
-            "cafire.org/weather",
-            chrome_right as i32,
-            banner_text_y,
-            subtitle_color,
-            layout.text_scale,
-        );
+        let brand = BrandChrome::from_env();
+        // Optional left-aligned logo, scaled to fit inside the banner strip.
+        // It shifts the title right so the two never overlap.
+        let mut title_x = chrome_left as i32;
+        if let Some(logo) = &brand.logo {
+            let margin = banner_text_y.max(1) as u32;
+            let target_h = layout.banner_h.saturating_sub(margin.saturating_mul(2)).max(1);
+            let target_w = ((u64::from(logo.width()) * u64::from(target_h))
+                / u64::from(logo.height().max(1)))
+            .max(1) as u32;
+            let scaled = resize(logo, target_w, target_h, FilterType::Lanczos3);
+            image::imageops::overlay(img, &scaled, i64::from(chrome_left), i64::from(margin));
+            title_x += scaled.width() as i32 + (6 * layout.text_scale.max(1)) as i32;
+        }
+        if !brand.title.trim().is_empty() {
+            text::draw_text_bold(
+                img,
+                &brand.title,
+                title_x,
+                banner_text_y,
+                subtitle_color,
+                layout.text_scale,
+            );
+        }
+        if !brand.credit.trim().is_empty() {
+            text::draw_text_right(
+                img,
+                &brand.credit,
+                chrome_right as i32,
+                banner_text_y,
+                subtitle_color,
+                layout.text_scale,
+            );
+        }
     }
     if opts.presentation.plot_style.uses_operational_presentation() {
         if let Some(title) = opts

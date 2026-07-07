@@ -203,6 +203,11 @@ struct RenderJobRequest {
     /// city label points instead of the city name. Off by default.
     #[serde(default)]
     value_labels: bool,
+    /// Optional plot-banner branding (title / credit / logo). When absent the
+    /// render keeps the built-in CAFire banner, so existing callers are
+    /// unchanged. See `BrandRequest`.
+    #[serde(default)]
+    brand: Option<BrandRequest>,
     #[serde(default = "default_domain_slug")]
     domain_slug: String,
     /// Render bounds; either given directly (draw-a-box) or computed by
@@ -243,6 +248,103 @@ struct RenderJobRequest {
 struct ExtendRequest {
     direction_deg: f64,
     distance_km: f64,
+}
+
+/// Plot-banner branding. A named `preset` picks a base look; `title`/`credit`
+/// override individual strings; `logo_b64` is a base64 PNG drawn left-aligned
+/// in the banner strip.
+///
+/// Presets:
+/// - `cafire` (or absent) — the built-in CAFire banner (unchanged behavior).
+/// - `generic` — no left title, right credit `wxsection.com`.
+/// - `none` — blank strip (no title/credit; logo still drawn if supplied).
+/// - `custom` — start blank; use `title`/`credit`/`logo_b64` verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BrandRequest {
+    #[serde(default)]
+    preset: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    credit: Option<String>,
+    #[serde(default)]
+    logo_b64: Option<String>,
+}
+
+/// Branding resolved to the env values the render child reads. `None` for a
+/// text field means "leave the render's built-in CAFire default"; `Some("")`
+/// means "omit that element".
+struct ResolvedBrand {
+    title: Option<String>,
+    credit: Option<String>,
+    logo_png: Option<Vec<u8>>,
+}
+
+impl BrandRequest {
+    fn resolve(&self) -> Result<ResolvedBrand, String> {
+        let preset = self
+            .preset
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        // Base strings from the preset. `None` = keep the render default.
+        let (mut title, mut credit) = match preset.as_str() {
+            "" | "cafire" => (None, None),
+            "generic" => (Some(String::new()), Some("wxsection.com".to_string())),
+            "none" => (Some(String::new()), Some(String::new())),
+            "custom" => (Some(String::new()), Some(String::new())),
+            other => return Err(format!("unknown brand preset: {other}")),
+        };
+        // Explicit strings override the preset base.
+        if let Some(explicit) = &self.title {
+            title = Some(sanitize_brand_text(explicit));
+        }
+        if let Some(explicit) = &self.credit {
+            credit = Some(sanitize_brand_text(explicit));
+        }
+        let logo_png = match &self.logo_b64 {
+            Some(encoded) if !encoded.trim().is_empty() => {
+                Some(decode_brand_logo(encoded.trim())?)
+            }
+            _ => None,
+        };
+        Ok(ResolvedBrand {
+            title,
+            credit,
+            logo_png,
+        })
+    }
+}
+
+/// Keep brand strings to a single sane line: no control chars, capped length.
+fn sanitize_brand_text(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| !ch.is_control())
+        .take(80)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Decode a base64 PNG logo, accepting an optional `data:image/...;base64,`
+/// prefix. Caps the decoded size so a caller can't push a huge asset.
+fn decode_brand_logo(encoded: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let payload = encoded
+        .rsplit_once(";base64,")
+        .map(|(_, data)| data)
+        .unwrap_or(encoded);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.trim())
+        .map_err(|err| format!("brand logo is not valid base64: {err}"))?;
+    if bytes.len() > 2 * 1024 * 1024 {
+        return Err("brand logo exceeds 2 MB".to_string());
+    }
+    if bytes.len() < 8 || bytes[..8] != [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a] {
+        return Err("brand logo must be a PNG".to_string());
+    }
+    Ok(bytes)
 }
 
 impl RenderJobRequest {
@@ -333,6 +435,10 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
         ("GET", "/") => html_response(PREVIEW_HTML),
         ("GET", "/ops") => html_response(SITE_HTML),
         ("GET", "/legacy") => html_response(DEMO_HTML),
+        // Public URL is `/lab/generic`: Caddy's `handle_path /lab*` strips the
+        // `/lab` prefix, so it arrives here as `/generic`. `/lab-generic` is
+        // kept for direct access to the API port (bypassing Caddy).
+        ("GET", "/generic") | ("GET", "/lab-generic") => html_response(GENERIC_LAB_HTML),
         ("GET", "/api/health") => json_response(&serde_json::json!({
             "ok": true,
             "service": "rw-fire-api",
@@ -662,6 +768,31 @@ fn run_rw_render(
     // plotted value (in display units) at each city instead of its name.
     if request.value_labels {
         command.env("RUSTWX_VALUE_LABELS", "1");
+    }
+    // Plot-banner branding. Absent env vars => the render keeps its built-in
+    // CAFire banner (unchanged). A present-but-empty title/credit omits that
+    // element; the logo is written to the job dir and passed by path.
+    if let Some(brand) = &request.brand {
+        let resolved = brand
+            .resolve()
+            .map_err(|message| (message, String::new(), String::new()))?;
+        if let Some(title) = resolved.title {
+            command.env("RUSTWX_BRAND_TITLE", title);
+        }
+        if let Some(credit) = resolved.credit {
+            command.env("RUSTWX_BRAND_CREDIT", credit);
+        }
+        if let Some(logo_png) = resolved.logo_png {
+            let logo_path = output_dir.join("brand_logo.png");
+            fs::write(&logo_path, &logo_png).map_err(|err| {
+                (
+                    format!("write {}: {err}", logo_path.display()),
+                    String::new(),
+                    String::new(),
+                )
+            })?;
+            command.env("RUSTWX_BRAND_LOGO", logo_path.display().to_string());
+        }
     }
 
     // Child output goes to per-job log files instead of in-memory pipes so
@@ -1816,8 +1947,22 @@ fn render_cache_key(request: &RenderJobRequest) -> String {
         }
         None => "-".to_string(),
     };
+    // Fingerprint the branding so a re-brand never returns a cached image of a
+    // different brand (the logo is hashed, not embedded, to keep the key small).
+    let brand_part = match &request.brand {
+        None => "-".to_string(),
+        Some(brand) => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            brand.preset.as_deref().unwrap_or("").hash(&mut hasher);
+            brand.title.as_deref().unwrap_or("").hash(&mut hasher);
+            brand.credit.as_deref().unwrap_or("").hash(&mut hasher);
+            brand.logo_b64.as_deref().unwrap_or("").hash(&mut hasher);
+            format!("{:x}", hasher.finish())
+        }
+    };
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}x{}",
         request.model,
         request.run,
         request.hour,
@@ -1834,6 +1979,7 @@ fn render_cache_key(request: &RenderJobRequest) -> String {
         format_bounds(request.resolved_bounds()),
         perimeter_part,
         request.title_note.as_deref().unwrap_or("-"),
+        brand_part,
         width,
         height,
     )
@@ -2043,6 +2189,10 @@ fn place_label_render_env(size: u8) -> (&'static str, &'static str) {
 const SITE_HTML: &str = include_str!("../fire_site.html");
 /// CAFire-styled public preview page (tester-facing, served at `/`).
 const PREVIEW_HTML: &str = include_str!("../cafire_preview.html");
+/// Neutral (unbranded) generic weather-plot lab, served at `/lab-generic`.
+/// Reuses the same render API; adds a branding panel (generic / custom / none)
+/// to exercise the `brand` request field end-to-end.
+const GENERIC_LAB_HTML: &str = include_str!("../generic_lab.html");
 
 const DEMO_HTML: &str = r#"<!doctype html>
 <html lang="en">
@@ -2333,6 +2483,8 @@ mod tests {
             county_linework: default_county_linework(),
             place_label_density: default_place_label_density(),
             place_label_size: default_place_label_size(),
+            value_labels: false,
+            brand: None,
             domain_slug: "box".to_string(),
             bounds: Some([-123.21, -119.67, 37.13, 41.14]),
             perimeter: None,
