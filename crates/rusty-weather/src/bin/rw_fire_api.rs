@@ -783,7 +783,7 @@ fn run_rw_render(
             command.env("RUSTWX_BRAND_CREDIT", credit);
         }
         if let Some(logo_png) = resolved.logo_png {
-            let logo_path = output_dir.join("brand_logo.png");
+            let logo_path = output_dir.join(BRAND_LOGO_FILENAME);
             fs::write(&logo_path, &logo_png).map_err(|err| {
                 (
                     format!("write {}: {err}", logo_path.display()),
@@ -864,6 +864,10 @@ fn write_perimeter_overlay_spec(
     fs::write(path, serde_json::to_vec(&spec)?)
 }
 
+/// Sidecar input written into the job dir for the render child (a PNG logo).
+/// It is NOT a render artifact, so it must be excluded from the served files.
+const BRAND_LOGO_FILENAME: &str = "brand_logo.png";
+
 fn collect_rendered_files(output_dir: &Path, job_id: &str) -> std::io::Result<Vec<RenderedFile>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(output_dir)? {
@@ -875,6 +879,10 @@ fn collect_rendered_files(output_dir: &Path, job_id: &str) -> std::io::Result<Ve
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
+        // The brand logo is an input we wrote, not a rendered output.
+        if name == BRAND_LOGO_FILENAME {
+            continue;
+        }
         let bytes = entry.metadata()?.len();
         files.push(RenderedFile {
             name: name.to_string(),
