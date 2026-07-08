@@ -110,21 +110,36 @@ pub fn stored_run_hours(
 }
 
 /// Compute the requested windowed products from the stored hour files of
-/// `<store_root>/<model_slug>/<run_slug>/`, anchored at the max hour in
-/// `available_hours`. Unknown slugs are an error (the caller validates
-/// requests against `HrrrWindowedProduct::supported_products()`); windows
-/// that do not fit the available hours come back as blockers, never as
-/// silently shortened windows.
+/// `<store_root>/<model_slug>/<run_slug>/`. The accumulation window ends at
+/// `anchor_override` when given (the interactive render path passes the
+/// requested forecast hour so a user can scrub QPF hour-by-hour), otherwise
+/// at the max hour in `available_hours` (the batch/pipeline default). Unknown
+/// slugs are an error (the caller validates requests against
+/// `HrrrWindowedProduct::supported_products()`); windows that do not fit the
+/// available hours come back as blockers, never as silently shortened windows.
 pub fn compute_windowed_products(
     store_root: &Path,
     model_slug: &str,
     run_slug: &str,
     available_hours: &[u16],
     requested: &[String],
+    anchor_override: Option<u16>,
 ) -> Result<WindowedStoreOutcome, Box<dyn std::error::Error>> {
     let available: BTreeSet<u16> = available_hours.iter().copied().collect();
-    let Some(&anchor_hour) = available.iter().next_back() else {
-        return Err("windowed compute needs at least one stored hour".into());
+    let anchor_hour = match anchor_override {
+        Some(hour) => {
+            if !available.contains(&hour) {
+                return Err(format!(
+                    "windowed anchor F{hour:03} is not a stored hour of this run"
+                )
+                .into());
+            }
+            hour
+        }
+        None => match available.iter().next_back() {
+            Some(&hour) => hour,
+            None => return Err("windowed compute needs at least one stored hour".into()),
+        },
     };
     let run_dir = store_root.join(model_slug).join(run_slug);
     let grid_path = run_dir.join("grid.rwg");
@@ -1130,6 +1145,7 @@ mod tests {
             run,
             hours,
             &slugs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            None,
         )
         .unwrap()
     }
@@ -1641,6 +1657,51 @@ mod tests {
     }
 
     #[test]
+    fn anchor_override_ends_window_at_requested_hour() {
+        let dir = test_dir("anchor-override");
+        let hours: Vec<u16> = (1..=12).collect();
+        write_test_run(&dir, "20260608_00z", &hours);
+
+        // Default (batch/pipeline): anchor at the max stored hour.
+        let default = compute(&dir, "20260608_00z", &hours, &["qpf_1h", "qpf_6h"]);
+        assert_eq!(default.anchor_hour, 12);
+        assert_eq!(grid_named(&default, "qpf_1h").hours_used, vec![12]);
+
+        // Interactive: honor the requested anchor hour (the reported bug —
+        // QPF used to always render the max hour regardless of the request).
+        let anchored = compute_windowed_products(
+            &dir,
+            "hrrr",
+            "20260608_00z",
+            &hours,
+            &["qpf_1h".to_string(), "qpf_6h".to_string()],
+            Some(6),
+        )
+        .unwrap();
+        assert_eq!(anchored.anchor_hour, 6);
+        assert_eq!(grid_named(&anchored, "qpf_1h").hours_used, vec![6]);
+        assert_eq!(
+            grid_named(&anchored, "qpf_6h").hours_used,
+            (1..=6).collect::<Vec<u16>>()
+        );
+
+        // An anchor that is not a stored hour errors, never silently snaps.
+        let err = compute_windowed_products(
+            &dir,
+            "hrrr",
+            "20260608_00z",
+            &hours,
+            &["qpf_1h".to_string()],
+            Some(99),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("F099"), "{err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn unknown_slugs_error_and_duplicates_dedupe() {
         let dir = test_dir("slugs");
         write_test_run(&dir, "20260608_00z", &[1]);
@@ -1650,6 +1711,7 @@ mod tests {
             "20260608_00z",
             &[1],
             &["not_a_windowed_product".to_string()],
+            None,
         )
         .unwrap_err()
         .to_string();

@@ -813,6 +813,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             &run_slug,
             &request.windowed,
             request.windowed_auto,
+            // Pipeline batch: anchor at the max stored hour (unchanged).
+            None,
         )? {
             None => println!(
                 "windowed: skipped (single stored hour; 'all' includes windowed products \

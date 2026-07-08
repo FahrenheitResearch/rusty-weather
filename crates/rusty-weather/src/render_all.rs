@@ -559,6 +559,7 @@ pub fn render_windowed_products(
     run_slug: &str,
     requested: &[String],
     auto: bool,
+    anchor_override: Option<u16>,
 ) -> Result<Option<WindowedRenderOutcome>, Box<dyn std::error::Error>> {
     let stored_hours = windowed_store::stored_run_hours(store_root, model_slug, run_slug)?;
     if auto && stored_hours.len() <= 1 {
@@ -571,6 +572,7 @@ pub fn render_windowed_products(
         run_slug,
         &stored_hours,
         requested,
+        anchor_override,
     )?;
     let compute_ms = compute_started.elapsed().as_millis();
     let windowed_request = HrrrWindowedBatchRequest {

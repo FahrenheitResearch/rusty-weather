@@ -586,6 +586,10 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 &args.run,
                 &request.windowed,
                 request.windowed_auto,
+                // Interactive render: anchor the accumulation window at the
+                // requested hour so QPF honors the hour the user picked
+                // (batch/pipeline passes None = anchor at the max stored hour).
+                Some(args.hour),
             )? {
                 None => println!(
                     "windowed {:<15} skipped (single stored hour; 'all' includes windowed products only when more than one hour is stored)",
