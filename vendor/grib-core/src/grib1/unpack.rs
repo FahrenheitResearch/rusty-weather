@@ -106,9 +106,8 @@ pub fn unpack_bds(
         ));
     }
 
-    let declared_length = ((bds_data[0] as usize) << 16)
-        | ((bds_data[1] as usize) << 8)
-        | bds_data[2] as usize;
+    let declared_length =
+        ((bds_data[0] as usize) << 16) | ((bds_data[1] as usize) << 8) | bds_data[2] as usize;
     if declared_length != bds_data.len() {
         return Err(GribError::Unpack(format!(
             "BDS declares {declared_length} bytes but decoder received {}",
@@ -198,12 +197,11 @@ pub fn unpack_bds(
         let bit_pos = i
             .checked_mul(usize::from(nbits))
             .ok_or_else(|| GribError::Unpack("BDS datum bit offset overflows".into()))?;
-        let x = extract_bits(packed_data, bit_pos, nbits)
-            .ok_or_else(|| {
-                GribError::Unpack(format!(
-                    "BDS datum {i} extends beyond the declared packed payload"
-                ))
-            })? as f64;
+        let x = extract_bits(packed_data, bit_pos, nbits).ok_or_else(|| {
+            GribError::Unpack(format!(
+                "BDS datum {i} extends beyond the declared packed payload"
+            ))
+        })? as f64;
         let y = reference + x * binary_factor;
         values.push(y * decimal_factor);
     }

@@ -56,11 +56,7 @@ fn validate_scanning_mode(byte: u8) -> Result<(), GribError> {
     Ok(())
 }
 
-fn validate_latitude_endpoints(
-    la1: f64,
-    la2: f64,
-    j_positive: bool,
-) -> Result<(), GribError> {
+fn validate_latitude_endpoints(la1: f64, la2: f64, j_positive: bool) -> Result<(), GribError> {
     if !la1.is_finite()
         || !la2.is_finite()
         || !(-90.0..=90.0).contains(&la1)
@@ -965,7 +961,10 @@ mod tests {
         assert!((row_lats[0] + row_lats[3]).abs() < 1e-9);
         assert!((row_lats[1] + row_lats[2]).abs() < 1e-9);
         assert_eq!(
-            coords[3..6].iter().map(|point| point.lon).collect::<Vec<_>>(),
+            coords[3..6]
+                .iter()
+                .map(|point| point.lon)
+                .collect::<Vec<_>>(),
             vec![0.0, 120.0, 240.0]
         );
     }

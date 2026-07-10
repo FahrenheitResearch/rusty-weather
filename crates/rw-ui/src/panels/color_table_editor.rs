@@ -454,11 +454,8 @@ impl ColorTableEditorPanel {
             return;
         };
         let source = UserColorTable::from_store_style("built-in colors", &template.style);
-        let name = editable_table_name(
-            &self.settings,
-            product,
-            &format!("{product} custom colors"),
-        );
+        let name =
+            editable_table_name(&self.settings, product, &format!("{product} custom colors"));
         let current = UserColorTable::from_store_style(name.clone(), style);
         let Some(table) = with_resampled_colors(current, &source.colors) else {
             self.status = Some(format!(
@@ -479,14 +476,13 @@ impl ColorTableEditorPanel {
     }
 
     fn fit_selected_table_to_field(&mut self, table_name: &str, field: &FieldData) {
-        if let Err(reason) =
-            fit_scale_availability(&self.settings, Some(table_name), Some(field))
-        {
+        if let Err(reason) = fit_scale_availability(&self.settings, Some(table_name), Some(field)) {
             self.status = Some(format!("Scale was not changed: {}", reason.help()));
             return;
         }
         let Some(mut table) = self.settings.table(table_name).cloned() else {
-            self.status = Some("Scale was not changed: the selected preset is missing.".to_string());
+            self.status =
+                Some("Scale was not changed: the selected preset is missing.".to_string());
             return;
         };
         match fit_table_to_values(&mut table, &field.values) {
@@ -789,8 +785,8 @@ fn fit_scale_availability(
         .as_ref()
         .ok_or(FitScaleUnavailable::NoCurrentStyle)?;
     let expected_convert = rustwx_products::viewer::UnitConvert::from(table.convert);
-    let configured_units_match = table.display_units.trim().is_empty()
-        || table.display_units == style.display_units;
+    let configured_units_match =
+        table.display_units.trim().is_empty() || table.display_units == style.display_units;
     if field.units != style.display_units
         || style.convert != expected_convert
         || !configured_units_match
@@ -1053,11 +1049,7 @@ mod tests {
 
     #[test]
     fn palette_resampling_is_deterministic_and_keeps_endpoints() {
-        let source = [
-            [0, 10, 20, 30],
-            [100, 110, 120, 130],
-            [200, 210, 220, 230],
-        ];
+        let source = [[0, 10, 20, 30], [100, 110, 120, 130], [200, 210, 220, 230]];
         assert_eq!(
             resample_palette_colors(&source, 5),
             Some(vec![
@@ -1079,11 +1071,7 @@ mod tests {
     #[test]
     fn colors_only_preserves_scale_units_conversion_and_legend_controls() {
         let current = sample_table();
-        let palette = [
-            [0, 0, 255, 255],
-            [255, 255, 255, 255],
-            [255, 0, 0, 255],
-        ];
+        let palette = [[0, 0, 255, 255], [255, 255, 255, 255], [255, 0, 0, 255]];
         let recolored = with_resampled_colors(current.clone(), &palette).unwrap();
         let mut expected = current;
         expected.colors = vec![
@@ -1103,8 +1091,7 @@ mod tests {
         temperature_palette.convert = UserUnitConvert::KelvinToFahrenheit;
         temperature_palette.colors = vec![[20, 40, 200, 255], [240, 30, 20, 255]];
 
-        let recolored =
-            with_resampled_colors(wind.clone(), &temperature_palette.colors).unwrap();
+        let recolored = with_resampled_colors(wind.clone(), &temperature_palette.colors).unwrap();
         assert_eq!(recolored.display_units, "m/s");
         assert_eq!(recolored.convert, UserUnitConvert::None);
         assert_eq!(recolored.levels, wind.levels);
@@ -1125,10 +1112,7 @@ mod tests {
         assert_eq!(outcome.source_min, -999.0);
         assert_eq!(outcome.source_max, 999.0);
         assert!(!outcome.constant);
-        assert_eq!(
-            fitted.levels,
-            vec![-999.0, -499.5, 0.0, 499.5, 999.0]
-        );
+        assert_eq!(fitted.levels, vec![-999.0, -499.5, 0.0, 499.5, 999.0]);
         assert_eq!(fitted.colors, before.colors);
         assert_eq!(fitted.name, before.name);
         assert_eq!(fitted.title, before.title);

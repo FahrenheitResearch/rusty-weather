@@ -3155,8 +3155,7 @@ impl eframe::App for App {
                     self.sounding.clear();
                 }
                 let settings = self.color_tables.settings().clone().normalized();
-                self.viewer
-                    .install_generated_field(result.field, &settings);
+                self.viewer.install_generated_field(result.field, &settings);
             } else {
                 self.formula_lab
                     .note_result_discarded("the selected data source changed while it ran");

@@ -837,10 +837,9 @@ fn normalize_longitude_row(row_lons: &[f64]) -> Result<(usize, Vec<f64>), String
         return Err("GRIB1 longitude row is not uniformly rectilinear".to_string());
     }
     let periodic_tolerance = (step * 0.01).max(0.002);
-    let no_duplicate_periodic =
-        (unwrapped.len() as f64 * step - 360.0).abs() <= periodic_tolerance;
-    let duplicate_endpoint_periodic = (((unwrapped.len() - 1) as f64 * step) - 360.0).abs()
-        <= periodic_tolerance;
+    let no_duplicate_periodic = (unwrapped.len() as f64 * step - 360.0).abs() <= periodic_tolerance;
+    let duplicate_endpoint_periodic =
+        (((unwrapped.len() - 1) as f64 * step) - 360.0).abs() <= periodic_tolerance;
     let span = unwrapped.last().unwrap() - unwrapped[0];
     if !no_duplicate_periodic && !duplicate_endpoint_periodic && span >= 360.0 {
         return Err(format!(
@@ -1495,12 +1494,7 @@ mod tests {
         path
     }
 
-    fn synthetic_grid_plan(
-        nx: usize,
-        ny: usize,
-        rotate: usize,
-        i_negative: bool,
-    ) -> GridPlan {
+    fn synthetic_grid_plan(nx: usize, ny: usize, rotate: usize, i_negative: bool) -> GridPlan {
         let shape = GridShape::new(nx, ny).expect("synthetic shape");
         let cells = nx * ny;
         GridPlan {

@@ -24,7 +24,7 @@ use egui::{
 };
 use rustwx_render::{
     BasemapDetail, BasemapStyle, Color, ColorScale, ColormapBuildOptions, DiscreteColorScale,
-    ExtendMode, LegendControls, LegendMode, LeveledColormap, LevelDensity, LineworkRole,
+    ExtendMode, LegendControls, LegendMode, LevelDensity, LeveledColormap, LineworkRole,
     RenderDensity, Rgba, StaticPlotStyle, build_colormap, colorbar_ticks, format_tick,
     legend_color_at_rel, legend_tick_rel, load_styled_basemap_features_for_detail,
 };
@@ -297,9 +297,7 @@ fn generated_field_style(
 /// represented (including outliers); constant fields get display padding only,
 /// and fields with no finite samples get an explicitly labeled placeholder
 /// scale because the native renderer still requires ordered levels.
-fn auto_generated_field_style(
-    raw: &FieldData,
-) -> rustwx_products::viewer::StoreVariableStyle {
+fn auto_generated_field_style(raw: &FieldData) -> rustwx_products::viewer::StoreVariableStyle {
     const COLORS: [[u8; 4]; 9] = [
         [68, 1, 84, 255],
         [72, 40, 120, 255],
@@ -328,9 +326,7 @@ fn auto_generated_field_style(
         _ => ((0.0, 1.0), "no finite values"),
     };
     let levels = (0..=COLORS.len())
-        .map(|index| {
-            range.0 + (range.1 - range.0) * index as f64 / COLORS.len() as f64
-        })
+        .map(|index| range.0 + (range.1 - range.0) * index as f64 / COLORS.len() as f64)
         .collect();
     rustwx_products::viewer::StoreVariableStyle {
         title: format!("{} (Formula Lab auto, {range_note})", raw.key.var),
@@ -346,8 +342,7 @@ fn auto_generated_field_style(
             mask_below: None,
         }),
         colormap_options: ColormapBuildOptions {
-            render_density: StaticPlotStyle::from_env()
-                .render_density(RenderDensity::default()),
+            render_density: StaticPlotStyle::from_env().render_density(RenderDensity::default()),
             legend: LegendControls {
                 density: LevelDensity::default(),
                 mode: LegendMode::SmoothRamp,
@@ -784,8 +779,8 @@ impl FieldViewerPanel {
         generated.restyle(settings);
         let var = generated.raw.key.var.clone();
         let units = generated.display_units().to_string();
-        let displayed = (wanted.as_ref() == Some(&generated.raw.key))
-            .then(|| generated.display_field());
+        let displayed =
+            (wanted.as_ref() == Some(&generated.raw.key)).then(|| generated.display_field());
         if let Some(info) = self.vars.iter_mut().find(|info| info.name == var) {
             info.units = units;
         }
@@ -2353,7 +2348,10 @@ mod tests {
         assert_eq!(panel.current_field().unwrap().values, first);
         assert!(panel.restyle_generated_field(&settings));
         assert_eq!(panel.current_field().unwrap().values, first);
-        assert_eq!(panel.generated_field.as_ref().unwrap().raw.values, raw_values);
+        assert_eq!(
+            panel.generated_field.as_ref().unwrap().raw.values,
+            raw_values
+        );
     }
 
     #[test]

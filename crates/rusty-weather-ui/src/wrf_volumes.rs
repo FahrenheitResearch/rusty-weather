@@ -61,9 +61,7 @@ pub(crate) fn preflight_iso_volume_shape(nz: usize, cells: usize) -> Result<u64,
         return Err("WRF grid has zero cells".to_string());
     }
     let iso_elements = checked_volume_elements(STANDARD_LEVEL_COUNT, cells).map_err(|err| {
-        format!(
-            "canonical {STANDARD_LEVEL_COUNT}-level WRF pressure volume is unsupported: {err}"
-        )
+        format!("canonical {STANDARD_LEVEL_COUNT}-level WRF pressure volume is unsupported: {err}")
     })?;
 
     let native_bytes = checked_byte_product(
@@ -289,14 +287,7 @@ pub(crate) fn try_interpolate_iso_volumes(
     let levels = standard_levels();
     debug_assert_eq!(levels.len(), STANDARD_LEVEL_COUNT);
     let planes = IsoPlanes::try_new(levels.len(), cells)?;
-    let surface = try_surface_fallback(
-        pressure_hpa,
-        temp_k,
-        dewpoint_k,
-        u_ms,
-        v_ms,
-        cells,
-    )?;
+    let surface = try_surface_fallback(pressure_hpa, temp_k, dewpoint_k, u_ms, v_ms, cells)?;
     let mut column_pressure = Vec::new();
     column_pressure
         .try_reserve_exact(nz)
@@ -354,7 +345,6 @@ fn interpolate_iso_volumes_with_allocations(
     mut col_p: Vec<f64>,
     progress: &mut dyn FnMut(String),
 ) -> (Vec<IsoVolume>, SurfaceFallback) {
-
     let progress_step = (cells / 10).max(1);
     for c in 0..cells {
         if c % progress_step == 0 {
@@ -530,18 +520,12 @@ fn try_surface_fallback(
             cells,
             |value| (value * 100.0) as f32,
         )?,
-        temperature_2m_k: try_surface_plane(
-            "approx_temperature_2m",
-            temp_k,
-            cells,
-            |value| value as f32,
-        )?,
-        dewpoint_2m_k: try_surface_plane(
-            "approx_dewpoint_2m",
-            dewpoint_k,
-            cells,
-            |value| value as f32,
-        )?,
+        temperature_2m_k: try_surface_plane("approx_temperature_2m", temp_k, cells, |value| {
+            value as f32
+        })?,
+        dewpoint_2m_k: try_surface_plane("approx_dewpoint_2m", dewpoint_k, cells, |value| {
+            value as f32
+        })?,
         u_10m: try_surface_plane("approx_u_10m", u_ms, cells, |value| value as f32)?,
         v_10m: try_surface_plane("approx_v_10m", v_ms, cells, |value| value as f32)?,
     })
@@ -722,7 +706,10 @@ mod tests {
         };
         let error = check_native_3d_output(&transposed, "temp", 2, 1, 1)
             .expect_err("same-length transposed shape must fail closed");
-        assert!(error.contains("exact native shape"), "unexpected error: {error}");
+        assert!(
+            error.contains("exact native shape"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -733,8 +720,8 @@ mod tests {
             units: "m/s".to_string(),
             description: "earth-relative wind".to_string(),
         };
-        let winds = validate_earth_relative_uvmet(uvmet, 2, 1, 1, 2)
-            .expect("valid uvmet components");
+        let winds =
+            validate_earth_relative_uvmet(uvmet, 2, 1, 1, 2).expect("valid uvmet components");
         let (u, v) = winds.split_at(2);
         assert_eq!(u, &[1.0, 2.0]);
         assert_eq!(v, &[3.0, 4.0]);

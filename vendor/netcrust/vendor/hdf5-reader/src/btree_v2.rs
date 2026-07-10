@@ -511,9 +511,8 @@ fn parse_internal_node(
             ndims,
             heap_id_len,
         )?;
-        node_records.push(
-            record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds).then_some(record),
-        );
+        node_records
+            .push(record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds).then_some(record));
     }
 
     // Read child node pointers (num_records + 1 of them).
@@ -677,9 +676,7 @@ pub fn collect_btree_v2_records(
         )?;
     }
 
-    if chunk_bounds.is_none()
-        && u64::try_from(records.len()).ok() != Some(header.total_records)
-    {
+    if chunk_bounds.is_none() && u64::try_from(records.len()).ok() != Some(header.total_records) {
         return Err(Error::InvalidData(format!(
             "B-tree v2 traversal collected {} records, header declares {}",
             records.len(),
@@ -749,9 +746,7 @@ pub fn collect_btree_v2_records_storage(
         )?;
     }
 
-    if chunk_bounds.is_none()
-        && u64::try_from(records.len()).ok() != Some(header.total_records)
-    {
+    if chunk_bounds.is_none() && u64::try_from(records.len()).ok() != Some(header.total_records) {
         return Err(Error::InvalidData(format!(
             "B-tree v2 traversal collected {} records, header declares {}",
             records.len(),
@@ -861,9 +856,8 @@ fn parse_internal_node_storage(
             ndims,
             heap_id_len,
         )?;
-        node_records.push(
-            record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds).then_some(record),
-        );
+        node_records
+            .push(record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds).then_some(record));
     }
 
     let num_children = usize::from(num_records) + 1;
@@ -1238,8 +1232,7 @@ mod tests {
     #[test]
     fn internal_records_are_collected_in_order_from_buffered_tree() {
         let (data, header) = type5_depth_one_tree();
-        let records =
-            collect_btree_v2_records(&data, &header, 8, 8, None, &[], None).unwrap();
+        let records = collect_btree_v2_records(&data, &header, 8, 8, None, &[], None).unwrap();
 
         assert_eq!(link_hashes(&records), vec![10, 20, 30]);
         assert_eq!(records.len() as u64, header.total_records);
@@ -1263,16 +1256,8 @@ mod tests {
     fn internal_records_are_collected_in_order_from_random_access_tree() {
         let (data, header) = type5_depth_one_tree();
         let storage = crate::storage::BytesStorage::new(data);
-        let records = collect_btree_v2_records_storage(
-            &storage,
-            &header,
-            8,
-            8,
-            None,
-            &[],
-            None,
-        )
-        .unwrap();
+        let records =
+            collect_btree_v2_records_storage(&storage, &header, 8, 8, None, &[], None).unwrap();
 
         assert_eq!(link_hashes(&records), vec![10, 20, 30]);
         assert_eq!(records.len() as u64, header.total_records);
