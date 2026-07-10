@@ -147,7 +147,19 @@ fn worker_round_trip_on_synthetic_store() {
             "dewpoint_2m",
             "wind_gust_10m",
             "temperature_iso",
-            "dewpoint_iso"
+            "dewpoint_iso",
+            "temperature_925",
+            "temperature_850",
+            "temperature_700",
+            "temperature_500",
+            "temperature_300",
+            "temperature_250",
+            "dewpoint_925",
+            "dewpoint_850",
+            "dewpoint_700",
+            "dewpoint_500",
+            "dewpoint_300",
+            "dewpoint_250",
         ]
     );
     assert_eq!(vars[0].kind, VarKind::Surface2D);
