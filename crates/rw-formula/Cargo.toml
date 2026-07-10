@@ -12,5 +12,5 @@ rw-store = { path = "../rw-store" }
 rustwx-core = { path = "../rustwx-core" }
 sha2 = "0.10"
 thiserror = "2"
-wrf-core = { git = "https://github.com/FahrenheitResearch/wrf-rust.git", rev = "96b8fd9d29c3477474da18f1277971bb89a61a9c", package = "wrf-core", default-features = false, features = ["pure-rust-reader"] }
-wrf-formula = { git = "https://github.com/FahrenheitResearch/wrf-rust.git", rev = "96b8fd9d29c3477474da18f1277971bb89a61a9c", package = "wrf-formula", default-features = false, features = ["pure-rust-reader"] }
+wrf-core = { git = "https://github.com/FahrenheitResearch/wrf-rust.git", rev = "f8df4b90da90ee7fbc847c4176dfe5ef0c8aa0fb", package = "wrf-core", default-features = false, features = ["pure-rust-reader"] }
+wrf-formula = { git = "https://github.com/FahrenheitResearch/wrf-rust.git", rev = "f8df4b90da90ee7fbc847c4176dfe5ef0c8aa0fb", package = "wrf-formula", default-features = false, features = ["pure-rust-reader"] }

@@ -6740,7 +6740,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "wrf-core"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=96b8fd9d29c3477474da18f1277971bb89a61a9c#96b8fd9d29c3477474da18f1277971bb89a61a9c"
+source = "git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=f8df4b90da90ee7fbc847c4176dfe5ef0c8aa0fb#f8df4b90da90ee7fbc847c4176dfe5ef0c8aa0fb"
 dependencies = [
  "ecape-rs 0.1.4 (git+https://github.com/FahrenheitResearch/ecape-rs?rev=414cac67ce1ce4bff64c7c74449ed4ccddb3ebc0)",
  "flate2",
@@ -6752,7 +6752,7 @@ dependencies = [
 [[package]]
 name = "wrf-formula"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=96b8fd9d29c3477474da18f1277971bb89a61a9c#96b8fd9d29c3477474da18f1277971bb89a61a9c"
+source = "git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=f8df4b90da90ee7fbc847c4176dfe5ef0c8aa0fb#f8df4b90da90ee7fbc847c4176dfe5ef0c8aa0fb"
 dependencies = [
  "serde",
  "serde_json",
