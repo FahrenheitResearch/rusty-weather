@@ -31,16 +31,16 @@ jobs:
           ref: ${{ env.TARGET_REF }}
           fetch-depth: 0
 
-      - name: Install Rust 1.85 with rustfmt
+      - name: Install Rust 1.92 with rustfmt
         run: |
-          rustup toolchain install 1.85.0 --profile minimal --component rustfmt
-          rustup default 1.85.0
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt
+          rustup default 1.92.0
 
       - name: Regenerate Cargo.lock
-        run: cargo +1.85.0 generate-lockfile --verbose
+        run: cargo +1.92.0 generate-lockfile --verbose
 
       - name: Format Rust sources
-        run: cargo +1.85.0 fmt --all
+        run: cargo +1.92.0 fmt --all
 
       - name: Commit generated files
         shell: bash
@@ -84,17 +84,17 @@ jobs:
             libxi-dev \
             libxkbcommon-dev
 
-      - name: Install Rust 1.85 with rustfmt
+      - name: Install Rust 1.92 with rustfmt
         run: |
-          rustup toolchain install 1.85.0 --profile minimal --component rustfmt
-          rustup default 1.85.0
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt
+          rustup default 1.92.0
 
       - name: Verify formatting
-        run: cargo +1.85.0 fmt --all -- --check
+        run: cargo +1.92.0 fmt --all -- --check
 
       - name: Check full workspace and all targets
-        run: cargo +1.85.0 check --locked --workspace --all-targets
+        run: cargo +1.92.0 check --locked --workspace --all-targets
 
       - name: Run workspace library and integration tests
         if: runner.os == 'Linux'
-        run: cargo +1.85.0 test --locked --workspace --lib --tests
+        run: cargo +1.92.0 test --locked --workspace --lib --tests
