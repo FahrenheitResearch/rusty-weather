@@ -1101,10 +1101,10 @@ fn format_valid_unix(unix: i64) -> String {
 fn explicit_netcdf_reference_time(nc: &NcFile) -> Result<Option<i64>, ImportError> {
     let mut found = None::<(String, i64)>;
     for name in ["START_DATE", "SIMULATION_START_DATE"] {
-        let Some(value) = nc
-            .attribute(name)
-            .and_then(|attribute| attribute.as_string())
-        else {
+        let Some(attribute) = nc.attribute(name) else {
+            continue;
+        };
+        let Some(value) = attribute.as_string() else {
             continue;
         };
         let parsed = parse_utc_timestamp(value).ok_or_else(|| {

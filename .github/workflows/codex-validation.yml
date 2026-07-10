@@ -39,6 +39,17 @@ jobs:
       - name: Regenerate Cargo.lock
         run: cargo +1.92.0 generate-lockfile --verbose
 
+      # gpu-allocator 0.28 accepts several semver-incompatible `windows`
+      # releases. A fresh resolution may select 0.61 for gpu-allocator while
+      # wgpu-hal 29 uses 0.62, making their Direct3D types incompatible.
+      - name: Unify Windows graphics bindings
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -q '"windows 0.61.3"' Cargo.lock; then
+            cargo +1.92.0 update -p windows@0.61.3 --precise 0.62.2
+          fi
+
       - name: Format Rust sources
         run: cargo +1.92.0 fmt --all
 
