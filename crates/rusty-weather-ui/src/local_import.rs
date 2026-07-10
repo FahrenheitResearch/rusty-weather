@@ -80,7 +80,7 @@ struct PublishJournal {
 enum PublishRecoveryAction {
     KeepFinal,
     RestoreBackup,
-    InstallStaged,
+    RollbackInstalled,
     RemoveAbandoned,
 }
 
@@ -88,9 +88,11 @@ enum PublishRecoveryAction {
 /// and use the FINAL model/run identity beneath a unique hidden transaction,
 /// so hour metadata is already truthful. Publication moves the whole complete
 /// run directory into place; an existing run is first moved to a transaction
-/// backup and restored if the second rename fails. Immutable, synced phase
-/// journals let the next publisher for the same target reconcile a process
-/// death at either rename boundary while holding the same per-run lock.
+/// backup and restored if the second rename or its pre-commit durability step
+/// fails. `FinalInstalled` is the commit point; later cleanup is retryable and
+/// cannot turn an installed run into a reported publication failure. Immutable,
+/// synced phase journals let the next publisher for the same target reconcile a
+/// process death at either rename boundary while holding the same per-run lock.
 pub(crate) struct RunStagingPublisher {
     store_root: PathBuf,
     staging_root: PathBuf,
@@ -379,6 +381,10 @@ impl RunStagingPublisher {
             &self.staged_run_dir,
             "staged run before publish",
         )?;
+        let staged_model_dir = staged_run
+            .parent()
+            .ok_or_else(|| "staged run has no model directory".to_string())?
+            .to_path_buf();
         let publish_error = match move_staged(&staged_run, &self.final_run_dir) {
             Err(err) => Some(err.to_string()),
             Ok(()) if staged_run.exists() || !self.final_run_dir.is_dir() => Some(
@@ -411,26 +417,134 @@ impl RunStagingPublisher {
                 )),
             };
         }
-        self.published = true;
-        sync_directory(&final_model_dir)
-            .map_err(|err| format!("sync final model directory after publish: {err}"))?;
-        sync_directory(&self.transaction_root)
-            .map_err(|err| format!("sync transaction directory after publish: {err}"))?;
-        self.write_publish_phase(PublishPhase::FinalInstalled)?;
 
-        if self.backup_active {
-            safe_remove_tree(&self.transaction_root, &self.backup_run_dir)?;
-            self.backup_active = false;
-            sync_directory(&self.transaction_root)
-                .map_err(|err| format!("sync transaction after backup cleanup: {err}"))?;
+        // The staged -> final rename is not the commit point. Both directories
+        // directly changed by the rename must be durable before the immutable
+        // FinalInstalled journal makes the new run authoritative. Any failure
+        // before that marker moves the new run back to staging and restores the
+        // previous backup (or leaves the final path absent when there was none).
+        if let Err(commit_error) = self.persist_final_install(&final_model_dir, &staged_model_dir) {
+            let had_backup = self.backup_active;
+            let rollback = self.rollback_uncommitted_install();
+            if rollback.is_ok() {
+                self.publish_lock.take();
+            }
+            return match rollback {
+                Ok(()) if had_backup => Err(format!(
+                    "publish staged run to {} was not durably committed: {commit_error}; new run returned to staging and previous run restored",
+                    self.final_run_dir.display()
+                )),
+                Ok(()) => Err(format!(
+                    "publish staged run to {} was not durably committed: {commit_error}; new run returned to staging and final path remains absent as before",
+                    self.final_run_dir.display()
+                )),
+                Err(rollback_error) => Err(format!(
+                    "publish staged run to {} was not durably committed: {commit_error}; rollback also failed: {rollback_error}; recovery transaction preserved at {}",
+                    self.final_run_dir.display(),
+                    self.transaction_root.display()
+                )),
+            };
         }
-        safe_remove_tree(&self.staging_root, &self.transaction_root)?;
-        self.cleanup_complete = true;
-        sync_directory(&self.staging_root)
-            .map_err(|err| format!("sync staging root after publish cleanup: {err}"))?;
+        self.published = true;
+
+        // FinalInstalled is durable: from here on, returning an error while the
+        // new final remains installed would lie to the caller. Cleanup is safe
+        // to retry from Drop or the next target-locked recovery pass, so report
+        // it and leave the journal/backup in place when a best-effort step fails.
+        self.finish_committed_cleanup();
         self.publish_lock.take();
         debug_assert!(self.final_run_dir.starts_with(final_model_dir));
         Ok(())
+    }
+
+    fn persist_final_install(
+        &self,
+        final_model_dir: &Path,
+        staged_model_dir: &Path,
+    ) -> Result<(), String> {
+        sync_directory(final_model_dir)
+            .map_err(|err| format!("sync final model directory after publish: {err}"))?;
+        sync_directory(staged_model_dir)
+            .map_err(|err| format!("sync staged model directory after publish: {err}"))?;
+        self.write_publish_phase(PublishPhase::FinalInstalled)
+    }
+
+    fn rollback_uncommitted_install(&mut self) -> Result<(), String> {
+        if !self.final_run_dir.exists() {
+            return Err(format!(
+                "cannot roll back uncommitted install because final path {} is absent",
+                self.final_run_dir.display()
+            ));
+        }
+        if self.staged_run_dir.exists() {
+            return Err(format!(
+                "cannot roll back uncommitted install because staged path {} already exists",
+                self.staged_run_dir.display()
+            ));
+        }
+        let final_model_dir = self
+            .final_run_dir
+            .parent()
+            .ok_or_else(|| "uncommitted final run has no model directory".to_string())?
+            .to_path_buf();
+        let staged_model_dir = self
+            .staged_run_dir
+            .parent()
+            .ok_or_else(|| "uncommitted staged run has no model directory".to_string())?
+            .to_path_buf();
+        checked_rename(
+            &self.store_root,
+            &self.final_run_dir,
+            &self.transaction_root,
+            &self.staged_run_dir,
+            "return uncommitted final run to staging",
+        )?;
+        sync_directory(&final_model_dir)
+            .map_err(|err| format!("sync final model directory after commit rollback: {err}"))?;
+        sync_directory(&staged_model_dir)
+            .map_err(|err| format!("sync staged model directory after commit rollback: {err}"))?;
+        self.rollback_backup()
+    }
+
+    fn finish_committed_cleanup(&mut self) {
+        if self.backup_active {
+            match safe_remove_tree(&self.transaction_root, &self.backup_run_dir) {
+                Ok(()) => {
+                    self.backup_active = false;
+                    if let Err(err) = sync_directory(&self.transaction_root) {
+                        eprintln!(
+                            "published run {}/{}; transaction sync after backup cleanup deferred: {err}",
+                            self.model, self.run
+                        );
+                    }
+                }
+                Err(err) => eprintln!(
+                    "published run {}/{}; backup cleanup deferred in {}: {err}",
+                    self.model,
+                    self.run,
+                    self.transaction_root.display()
+                ),
+            }
+        }
+        if !self.backup_active {
+            match safe_remove_tree(&self.staging_root, &self.transaction_root) {
+                Ok(()) => {
+                    self.cleanup_complete = true;
+                    if let Err(err) = sync_directory(&self.staging_root) {
+                        eprintln!(
+                            "published run {}/{}; staging-root sync after cleanup deferred: {err}",
+                            self.model, self.run
+                        );
+                    }
+                }
+                Err(err) => eprintln!(
+                    "published run {}/{}; transaction cleanup deferred at {}: {err}",
+                    self.model,
+                    self.run,
+                    self.transaction_root.display()
+                ),
+            }
+        }
     }
 
     fn rollback_backup(&mut self) -> Result<(), String> {
@@ -477,13 +591,28 @@ impl Drop for RunStagingPublisher {
                         self.backup_run_dir.display()
                     );
                 }
-            } else if !self.staged_run_dir.exists() || self.published {
+            } else if self.published {
                 if safe_remove_tree(&self.transaction_root, &self.backup_run_dir).is_ok() {
                     self.backup_active = false;
                 }
+            } else {
+                // The new final was installed but FinalInstalled never became
+                // durable. Keep both it and the prior backup for the next
+                // target-locked recovery pass; deleting either here would turn
+                // an interrupted pre-commit publish into an implicit commit.
+                return;
             }
         }
         if !self.backup_active {
+            if !self.published
+                && self.final_run_dir.exists()
+                && !self.staged_run_dir.exists()
+            {
+                // Same pre-commit window for a target that had no prior run.
+                // Its Prepared journal lets recovery move the new final back
+                // under the transaction and restore the original absence.
+                return;
+            }
             let _ = safe_remove_tree(&self.staging_root, &self.transaction_root);
             self.cleanup_complete = true;
         }
@@ -727,23 +856,44 @@ fn publish_recovery_action(
     backup_exists: bool,
     staged_exists: bool,
 ) -> Result<PublishRecoveryAction, String> {
-    match (final_exists, backup_exists, staged_exists) {
-        (true, _, _) => Ok(PublishRecoveryAction::KeepFinal),
-        (false, true, _) => Ok(PublishRecoveryAction::RestoreBackup),
-        (false, false, true) if phase == PublishPhase::Prepared => {
-            Ok(PublishRecoveryAction::InstallStaged)
-        }
-        (false, false, false) if phase == PublishPhase::Prepared => {
-            Ok(PublishRecoveryAction::RemoveAbandoned)
-        }
-        (false, false, true) => Err(format!(
-            "{} publish journal has staged data but neither final nor backup",
-            publish_phase_name(phase)
-        )),
-        (false, false, false) => Err(format!(
-            "{} publish journal has no final, backup, or staged run",
-            publish_phase_name(phase)
-        )),
+    match phase {
+        PublishPhase::Prepared => match (final_exists, backup_exists, staged_exists) {
+            // Death before the first rename: the old final remains authoritative.
+            (true, false, true) => Ok(PublishRecoveryAction::KeepFinal),
+            // Death after staged -> final but before the durable commit marker.
+            // With no old run, move the new final back and restore absence.
+            (true, false, false) => Ok(PublishRecoveryAction::RollbackInstalled),
+            // A backup proves the old final crossed the first rename boundary.
+            (true, true, false) => Ok(PublishRecoveryAction::RollbackInstalled),
+            (false, true, _) => Ok(PublishRecoveryAction::RestoreBackup),
+            // Prepared is intent, not a commit: never finish an unpublished new run.
+            (false, false, _) => Ok(PublishRecoveryAction::RemoveAbandoned),
+            (true, true, true) => Err(
+                "prepared publish has simultaneous final, backup, and staged runs".to_string(),
+            ),
+        },
+        PublishPhase::BackupMoved => match (final_exists, backup_exists, staged_exists) {
+            // The new final exists, but FinalInstalled was never durable.
+            (true, true, false) => Ok(PublishRecoveryAction::RollbackInstalled),
+            // Rollback may already have restored the old final and moved the
+            // uncommitted new run back under staging before a process death.
+            (true, false, true) => Ok(PublishRecoveryAction::KeepFinal),
+            (false, true, _) => Ok(PublishRecoveryAction::RestoreBackup),
+            state => Err(format!(
+                "backup-moved publish has unrecoverable final/backup/staged state {state:?}"
+            )),
+        },
+        PublishPhase::FinalInstalled => match (final_exists, backup_exists, staged_exists) {
+            (true, _, _) => Ok(PublishRecoveryAction::KeepFinal),
+            // A failed attempt to sync/install FinalInstalled can leave its
+            // filename visible before rollback. Staged data is therefore not
+            // sufficient evidence of a commit when the final is absent.
+            (false, true, _) => Ok(PublishRecoveryAction::RestoreBackup),
+            (false, false, true) => Ok(PublishRecoveryAction::RemoveAbandoned),
+            (false, false, false) => Err(
+                "final-installed publish has no final, backup, or staged run".to_string(),
+            ),
+        },
     }
 }
 
@@ -953,34 +1103,63 @@ fn recover_publish_transactions_for_run(
                 )
                 .map_err(|err| format!("sync restored run parent: {err}"))?;
             }
-            PublishRecoveryAction::InstallStaged => {
-                validate_persisted_run(
-                    &transaction_root,
-                    &staged_run_dir,
-                    model,
-                    run,
-                    "recovery staged run",
-                )?;
+            PublishRecoveryAction::RollbackInstalled => {
+                // Preserve the uncommitted new run inside the transaction until
+                // the old final is safely restored. If any step fails, the
+                // journal plus whichever of staged/backup remains lets the next
+                // target-locked recovery attempt continue without guessing.
+                if backup_exists {
+                    validate_persisted_run(
+                        &transaction_root,
+                        &backup_run_dir,
+                        model,
+                        run,
+                        "pre-commit rollback backup run",
+                    )?;
+                }
+                let staged_parent = staged_run_dir
+                    .parent()
+                    .ok_or_else(|| "rollback staged run has no parent".to_string())?;
                 checked_rename(
+                    store_root,
+                    &final_run_dir,
                     &transaction_root,
                     &staged_run_dir,
-                    store_root,
-                    &final_run_dir,
-                    "complete interrupted publish",
-                )?;
-                validate_persisted_run(
-                    store_root,
-                    &final_run_dir,
-                    model,
-                    run,
-                    "completed recovered run",
+                    "return interrupted uncommitted final to staging",
                 )?;
                 sync_directory(
                     final_run_dir
                         .parent()
-                        .ok_or_else(|| "recovered run has no parent".to_string())?,
+                        .ok_or_else(|| "rollback final run has no parent".to_string())?,
                 )
-                .map_err(|err| format!("sync recovered run parent: {err}"))?;
+                .map_err(|err| format!("sync final parent during commit rollback: {err}"))?;
+                sync_directory(staged_parent)
+                    .map_err(|err| format!("sync staged parent during commit rollback: {err}"))?;
+
+                if backup_exists {
+                    checked_rename(
+                        &transaction_root,
+                        &backup_run_dir,
+                        store_root,
+                        &final_run_dir,
+                        "restore pre-commit publish backup",
+                    )?;
+                    validate_persisted_run(
+                        store_root,
+                        &final_run_dir,
+                        model,
+                        run,
+                        "pre-commit restored previous run",
+                    )?;
+                    sync_directory(
+                        final_run_dir
+                            .parent()
+                            .ok_or_else(|| "restored pre-commit run has no parent".to_string())?,
+                    )
+                    .map_err(|err| format!("sync restored pre-commit run parent: {err}"))?;
+                    sync_directory(&transaction_root)
+                        .map_err(|err| format!("sync consumed rollback backup: {err}"))?;
+                }
             }
             PublishRecoveryAction::RemoveAbandoned => {}
         }
@@ -4478,7 +4657,9 @@ mod tests {
 
     #[test]
     fn publish_recovery_state_machine_covers_every_rename_boundary() {
-        use PublishRecoveryAction::{InstallStaged, KeepFinal, RestoreBackup};
+        use PublishRecoveryAction::{
+            KeepFinal, RemoveAbandoned, RestoreBackup, RollbackInstalled,
+        };
 
         // Journal durable, death before the first rename: retain the old run.
         assert_eq!(
@@ -4494,10 +4675,10 @@ mod tests {
             publish_recovery_action(PublishPhase::BackupMoved, false, true, true).unwrap(),
             RestoreBackup
         );
-        // Death after staged -> final, before or after its phase marker.
+        // Death after staged -> final remains pre-commit until FinalInstalled.
         assert_eq!(
             publish_recovery_action(PublishPhase::BackupMoved, true, true, false).unwrap(),
-            KeepFinal
+            RollbackInstalled
         );
         assert_eq!(
             publish_recovery_action(PublishPhase::FinalInstalled, true, true, false).unwrap(),
@@ -4508,10 +4689,21 @@ mod tests {
             publish_recovery_action(PublishPhase::FinalInstalled, true, false, false).unwrap(),
             KeepFinal
         );
-        // With no previous run, a prepared valid stage can be completed.
+        // Prepared is intent only: with no previous run, abandon the stage and
+        // preserve the target's original absence.
         assert_eq!(
             publish_recovery_action(PublishPhase::Prepared, false, false, true).unwrap(),
-            InstallStaged
+            RemoveAbandoned
+        );
+        assert_eq!(
+            publish_recovery_action(PublishPhase::Prepared, true, false, false).unwrap(),
+            RollbackInstalled
+        );
+        // A visible marker without its final can be the residue of a failed
+        // marker-directory sync followed by rollback; it must not republish.
+        assert_eq!(
+            publish_recovery_action(PublishPhase::FinalInstalled, false, false, true).unwrap(),
+            RemoveAbandoned
         );
         assert!(
             publish_recovery_action(PublishPhase::BackupMoved, false, false, true).is_err(),
@@ -4636,7 +4828,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_recovery_reconciles_completed_second_rename() {
+    fn publish_recovery_rolls_back_second_rename_without_commit_marker() {
         let root = temp_dir("publisher-recover-final");
         let model = "wrf";
         let run = format!("recover_final_{IMPORT_SCIENCE_SCHEMA_VERSION}");
@@ -4665,6 +4857,43 @@ mod tests {
             &run,
         )
         .unwrap();
+        assert!(final_run.join("old.marker").is_file());
+        assert!(!final_run.join("new.marker").exists());
+        assert!(!transaction.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publish_recovery_keeps_second_rename_after_durable_commit_marker() {
+        let root = temp_dir("publisher-recover-committed-final");
+        let model = "wrf";
+        let run = format!("recover_committed_{IMPORT_SCIENCE_SCHEMA_VERSION}");
+        write_valid_test_run(&root, model, &run, 270.0);
+        let final_run = root.join(model).join(&run);
+        std::fs::write(final_run.join("old.marker"), b"old").unwrap();
+
+        let staging_root = root.join(STAGING_DIR_NAME);
+        std::fs::create_dir_all(&staging_root).unwrap();
+        let transaction = create_unique_transaction_dir(&staging_root).unwrap();
+        let work = transaction.join(STAGING_WORK_DIR_NAME);
+        std::fs::create_dir(&work).unwrap();
+        let staged_run = work.join(model).join(&run);
+        write_valid_test_run(&work, model, &run, 300.0);
+        std::fs::write(staged_run.join("new.marker"), b"new").unwrap();
+        write_publish_journal(&transaction, model, &run, PublishPhase::Prepared).unwrap();
+        std::fs::rename(&final_run, transaction.join(STAGING_BACKUP_DIR_NAME)).unwrap();
+        write_publish_journal(&transaction, model, &run, PublishPhase::BackupMoved).unwrap();
+        std::fs::rename(&staged_run, &final_run).unwrap();
+        write_publish_journal(&transaction, model, &run, PublishPhase::FinalInstalled).unwrap();
+
+        recover_publish_transactions_for_run(
+            &root,
+            &staging_root,
+            &staging_root.join("current-not-this-transaction"),
+            model,
+            &run,
+        )
+        .unwrap();
         assert!(final_run.join("new.marker").is_file());
         assert!(!final_run.join("old.marker").exists());
         assert!(!transaction.exists());
@@ -4672,7 +4901,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_recovery_installs_prepared_stage_when_no_previous_run_existed() {
+    fn publish_recovery_discards_prepared_stage_when_no_previous_run_existed() {
         let root = temp_dir("publisher-recover-new");
         let model = "wrf";
         let run = format!("recover_new_{IMPORT_SCIENCE_SCHEMA_VERSION}");
@@ -4695,7 +4924,40 @@ mod tests {
             &run,
         )
         .unwrap();
-        assert!(root.join(model).join(&run).join("new.marker").is_file());
+        assert!(!root.join(model).join(&run).exists());
+        assert!(!staged_run.exists());
+        assert!(!transaction.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publish_recovery_removes_uncommitted_final_when_no_previous_run_existed() {
+        let root = temp_dir("publisher-recover-uncommitted-new");
+        let model = "wrf";
+        let run = format!("recover_uncommitted_{IMPORT_SCIENCE_SCHEMA_VERSION}");
+        std::fs::create_dir_all(&root).unwrap();
+        let staging_root = root.join(STAGING_DIR_NAME);
+        std::fs::create_dir_all(&staging_root).unwrap();
+        let transaction = create_unique_transaction_dir(&staging_root).unwrap();
+        let work = transaction.join(STAGING_WORK_DIR_NAME);
+        std::fs::create_dir(&work).unwrap();
+        let staged_run = work.join(model).join(&run);
+        write_valid_test_run(&work, model, &run, 300.0);
+        std::fs::write(staged_run.join("new.marker"), b"new").unwrap();
+        write_publish_journal(&transaction, model, &run, PublishPhase::Prepared).unwrap();
+        let final_run = root.join(model).join(&run);
+        std::fs::create_dir_all(final_run.parent().unwrap()).unwrap();
+        std::fs::rename(&staged_run, &final_run).unwrap();
+
+        recover_publish_transactions_for_run(
+            &root,
+            &staging_root,
+            &staging_root.join("current-not-this-transaction"),
+            model,
+            &run,
+        )
+        .unwrap();
+        assert!(!final_run.exists());
         assert!(!transaction.exists());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4753,6 +5015,55 @@ mod tests {
             !transaction.exists(),
             "failed transaction staging must be cleaned"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staging_publisher_rolls_back_installed_run_before_commit_marker() {
+        let root = temp_dir("publisher-precommit-rollback");
+        let run = format!("publisher_{IMPORT_SCIENCE_SCHEMA_VERSION}");
+        let mut publisher = RunStagingPublisher::new(&root, "wrf", &run).unwrap();
+        std::fs::create_dir_all(&publisher.staged_run_dir).unwrap();
+        std::fs::write(publisher.staged_run_dir.join("new.marker"), b"new").unwrap();
+        std::fs::create_dir_all(&publisher.final_run_dir).unwrap();
+        std::fs::write(publisher.final_run_dir.join("old.marker"), b"old").unwrap();
+        let transaction = publisher.transaction_root.clone();
+
+        std::fs::rename(&publisher.final_run_dir, &publisher.backup_run_dir).unwrap();
+        publisher.backup_active = true;
+        std::fs::rename(&publisher.staged_run_dir, &publisher.final_run_dir).unwrap();
+        publisher.rollback_uncommitted_install().unwrap();
+
+        assert!(publisher.final_run_dir.join("old.marker").is_file());
+        assert!(!publisher.final_run_dir.join("new.marker").exists());
+        assert!(publisher.staged_run_dir.join("new.marker").is_file());
+        assert!(!publisher.backup_run_dir.exists());
+        drop(publisher);
+        assert!(!transaction.exists(), "completed rollback may discard staging");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staging_publisher_drop_preserves_uncommitted_final_and_backup() {
+        let root = temp_dir("publisher-precommit-preserve");
+        let run = format!("publisher_{IMPORT_SCIENCE_SCHEMA_VERSION}");
+        let mut publisher = RunStagingPublisher::new(&root, "wrf", &run).unwrap();
+        std::fs::create_dir_all(&publisher.staged_run_dir).unwrap();
+        std::fs::write(publisher.staged_run_dir.join("new.marker"), b"new").unwrap();
+        std::fs::create_dir_all(&publisher.final_run_dir).unwrap();
+        std::fs::write(publisher.final_run_dir.join("old.marker"), b"old").unwrap();
+        let transaction = publisher.transaction_root.clone();
+        let final_run = publisher.final_run_dir.clone();
+        let backup = publisher.backup_run_dir.clone();
+
+        std::fs::rename(&publisher.final_run_dir, &publisher.backup_run_dir).unwrap();
+        publisher.backup_active = true;
+        std::fs::rename(&publisher.staged_run_dir, &publisher.final_run_dir).unwrap();
+        drop(publisher);
+
+        assert!(final_run.join("new.marker").is_file());
+        assert!(backup.join("old.marker").is_file());
+        assert!(transaction.is_dir(), "pre-commit recovery evidence must survive Drop");
         let _ = std::fs::remove_dir_all(root);
     }
 
