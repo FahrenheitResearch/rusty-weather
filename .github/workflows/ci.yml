@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Check ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxi-dev \
+            libxkbcommon-dev
+
+      - name: Install Rust 1.92 with rustfmt
+        run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt
+
+      - name: Verify formatting
+        if: runner.os == 'Linux'
+        run: cargo +1.92.0 fmt --all -- --check
+
+      - name: Check full workspace and all targets
+        run: cargo +1.92.0 check --locked --workspace --all-targets
+
+      - name: Run workspace library and integration tests
+        if: runner.os == 'Linux'
+        run: cargo +1.92.0 test --locked --workspace --lib --tests
