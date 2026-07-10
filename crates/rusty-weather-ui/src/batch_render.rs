@@ -22,8 +22,7 @@ use rusty_weather::batch_render::{
 use rw_ui::{HourKey, StoreView};
 
 const MAX_LOG_ROWS: usize = 120;
-const EXACT_TIME_BATCH_UNSUPPORTED: &str =
-    "Production batch rendering is not yet available for exact-time ordinal runs. The direct viewer, Native Plot, soundings, and Formula Lab remain available; batch rendering is disabled rather than treating storage slots as forecast hours.";
+const EXACT_TIME_BATCH_UNSUPPORTED: &str = "Production batch rendering is not yet available for exact-time ordinal runs. The direct viewer, Native Plot, soundings, and Formula Lab remain available; batch rendering is disabled rather than treating storage slots as forecast hours.";
 
 /// Plain-data messages emitted by [`BatchRenderTask`].
 #[derive(Debug, Clone)]
@@ -286,8 +285,7 @@ impl BatchRenderPanel {
         let running = self.is_running();
         if hour.has_exact_time() {
             ui.label(
-                egui::RichText::new(EXACT_TIME_BATCH_UNSUPPORTED)
-                    .color(egui::Color32::YELLOW),
+                egui::RichText::new(EXACT_TIME_BATCH_UNSUPPORTED).color(egui::Color32::YELLOW),
             );
             if !running {
                 self.render_status(ui);
@@ -1140,11 +1138,7 @@ mod tests {
             .expect_err("exact run must fail closed before catalog validation");
         assert!(error.contains("storage slots as forecast hours"));
 
-        panel.start(
-            hour,
-            PathBuf::from("store"),
-            egui::Context::default(),
-        );
+        panel.start(hour, PathBuf::from("store"), egui::Context::default());
         assert!(panel.task.is_none());
         assert!(
             panel

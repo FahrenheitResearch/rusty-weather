@@ -295,9 +295,7 @@ impl StoreRunResolver {
             });
         }
         if hours.is_empty() {
-            return Err(BridgeError::Store(
-                "run contains no timesteps".to_string(),
-            ));
+            return Err(BridgeError::Store("run contains no timesteps".to_string()));
         }
         let base_index = hours
             .iter()
@@ -1259,9 +1257,8 @@ fn time_axis_hash(
 
 fn exact_lead_seconds_f64(storage_slot: u16, lead_seconds: u64) -> BridgeResult<f64> {
     if lead_seconds != 0 {
-        let significant_bits = u64::BITS
-            - lead_seconds.leading_zeros()
-            - lead_seconds.trailing_zeros();
+        let significant_bits =
+            u64::BITS - lead_seconds.leading_zeros() - lead_seconds.trailing_zeros();
         if significant_bits > f64::MANTISSA_DIGITS {
             return Err(BridgeError::Store(format!(
                 "persisted lead time {lead_seconds} seconds for storage slot {storage_slot} cannot be represented exactly for Formula Lab timing"
@@ -1401,10 +1398,7 @@ mod tests {
 
     #[test]
     fn exact_manifest_reconciliation_uses_leads_and_preserves_ui_labels() {
-        let manifest = exact_manifest(&[
-            (0, 31_680, 134_000_000),
-            (1, 31_740, 134_000_060),
-        ]);
+        let manifest = exact_manifest(&[(0, 31_680, 134_000_000), (1, 31_740, 134_000_060)]);
         let derived = reconcile_exact_times(&manifest, BTreeMap::new()).unwrap();
         assert_eq!(derived[&1].seconds - derived[&0].seconds, 60.0);
         assert!(derived[&0].label.as_deref().unwrap().contains("31680"));
@@ -1430,10 +1424,8 @@ mod tests {
         assert!(reconcile_exact_times(&manifest, incomplete).is_err());
 
         let base_hash = time_axis_hash(&manifest, &reconciled);
-        let changed_manifest = exact_manifest(&[
-            (0, 31_680, 134_000_000),
-            (1, 31_800, 134_000_120),
-        ]);
+        let changed_manifest =
+            exact_manifest(&[(0, 31_680, 134_000_000), (1, 31_800, 134_000_120)]);
         let changed = reconcile_exact_times(&changed_manifest, BTreeMap::new()).unwrap();
         assert_ne!(base_hash, time_axis_hash(&changed_manifest, &changed));
     }

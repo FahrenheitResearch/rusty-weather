@@ -150,11 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--samples must be >= 1".into());
     }
     let run_dir = args.store_root.join(&args.model).join(&args.run);
-    let manifest = RwsRunManifest::load_for_run(
-        &run_dir.join("run.json"),
-        &args.model,
-        &args.run,
-    )?;
+    let manifest = RwsRunManifest::load_for_run(&run_dir.join("run.json"), &args.model, &args.run)?;
     let entry = manifest.hours.get(&args.hour).ok_or_else(|| {
         format!(
             "storage key {} is absent from {}/{}/run.json",

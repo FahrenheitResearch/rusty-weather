@@ -12,9 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic::atomic_write_bytes;
 use crate::error::{RwResult, RwStoreError};
-use crate::format::{
-    RwsExactTime, RwsHourMeta, RwsWriterInfo, SCHEMA_HOUR, SCHEMA_HOUR_V2,
-};
+use crate::format::{RwsExactTime, RwsHourMeta, RwsWriterInfo, SCHEMA_HOUR, SCHEMA_HOUR_V2};
 
 /// Schema identifier embedded in run manifests.
 pub const SCHEMA_RUN: &str = "rw-store.run.v1";
@@ -289,8 +287,7 @@ impl RwsRunManifest {
         if meta_time != entry_time {
             return Err(RwStoreError::Meta(format!(
                 "storage slot {storage_slot} hour exact time {:?} does not match manifest {:?}",
-                meta_time,
-                entry_time
+                meta_time, entry_time
             )));
         }
         Ok(entry)
@@ -418,9 +415,7 @@ impl RwsRunManifest {
         ny: usize,
         writer: RwsWriterInfo,
     ) -> RwResult<Self> {
-        Self::load_or_new_schema(
-            path, model, run, grid_hash, nx, ny, writer, SCHEMA_RUN,
-        )
+        Self::load_or_new_schema(path, model, run, grid_hash, nx, ny, writer, SCHEMA_RUN)
     }
 
     /// Exact-time counterpart to [`Self::load_or_new`]. Existing v1 runs are
@@ -435,16 +430,7 @@ impl RwsRunManifest {
         ny: usize,
         writer: RwsWriterInfo,
     ) -> RwResult<Self> {
-        Self::load_or_new_schema(
-            path,
-            model,
-            run,
-            grid_hash,
-            nx,
-            ny,
-            writer,
-            SCHEMA_RUN_V2,
-        )
+        Self::load_or_new_schema(path, model, run, grid_hash, nx, ny, writer, SCHEMA_RUN_V2)
     }
 
     fn load_or_new_schema(
@@ -682,7 +668,12 @@ mod tests {
         };
         v1.hours.get_mut(&0).unwrap().lead_seconds = Some(0);
         v1.hours.get_mut(&0).unwrap().valid_unix = Some(1_700_000_000);
-        assert!(v1.validate_contents().unwrap_err().to_string().contains("v1"));
+        assert!(
+            v1.validate_contents()
+                .unwrap_err()
+                .to_string()
+                .contains("v1")
+        );
 
         let mut missing = exact_manifest();
         missing.hours.get_mut(&1).unwrap().valid_unix = None;
@@ -716,7 +707,9 @@ mod tests {
         );
 
         let mut non_increasing = exact_manifest();
-        non_increasing.hours.insert(1, exact_entry(1, 0, 1_700_000_000));
+        non_increasing
+            .hours
+            .insert(1, exact_entry(1, 0, 1_700_000_000));
         assert!(
             non_increasing
                 .validate_contents()
@@ -769,10 +762,7 @@ mod tests {
             writer: writer_info(),
         };
         assert_eq!(
-            manifest
-                .validate_hour_meta(1, &meta)
-                .unwrap()
-                .exact_time(),
+            manifest.validate_hour_meta(1, &meta).unwrap().exact_time(),
             meta.exact_time()
         );
 

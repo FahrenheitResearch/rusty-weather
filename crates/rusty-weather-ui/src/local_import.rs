@@ -263,12 +263,7 @@ impl RunStagingPublisher {
     }
 
     fn write_publish_phase(&self, phase: PublishPhase) -> Result<(), String> {
-        write_publish_journal(
-            &self.transaction_root,
-            &self.model,
-            &self.run,
-            phase,
-        )
+        write_publish_journal(&self.transaction_root, &self.model, &self.run, phase)
     }
 
     fn recover_interrupted_publications(&self) -> Result<(), String> {
@@ -603,10 +598,7 @@ impl Drop for RunStagingPublisher {
             }
         }
         if !self.backup_active {
-            if !self.published
-                && self.final_run_dir.exists()
-                && !self.staged_run_dir.exists()
-            {
+            if !self.published && self.final_run_dir.exists() && !self.staged_run_dir.exists() {
                 // Same pre-commit window for a target that had no prior run.
                 // Its Prepared journal lets recovery move the new final back
                 // under the transaction and restore the original absence.
@@ -704,8 +696,8 @@ fn write_publish_journal(
         run: run.to_string(),
         phase,
     };
-    let bytes = serde_json::to_vec(&journal)
-        .map_err(|err| format!("serialize publish journal: {err}"))?;
+    let bytes =
+        serde_json::to_vec(&journal).map_err(|err| format!("serialize publish journal: {err}"))?;
     if bytes.len() as u64 > MAX_PUBLISH_JOURNAL_BYTES {
         return Err(format!(
             "publish journal is {} bytes; limit is {MAX_PUBLISH_JOURNAL_BYTES}",
@@ -730,7 +722,11 @@ fn write_publish_journal(
         publish_target_key(model, run),
         publish_phase_name(phase),
     ));
-    checked_destination(transaction_root, &temporary, "publish journal temporary file")?;
+    checked_destination(
+        transaction_root,
+        &temporary,
+        "publish journal temporary file",
+    )?;
 
     let write_result = (|| -> Result<(), String> {
         let mut file = std::fs::OpenOptions::new()
@@ -867,9 +863,9 @@ fn publish_recovery_action(
             (false, true, _) => Ok(PublishRecoveryAction::RestoreBackup),
             // Prepared is intent, not a commit: never finish an unpublished new run.
             (false, false, _) => Ok(PublishRecoveryAction::RemoveAbandoned),
-            (true, true, true) => Err(
-                "prepared publish has simultaneous final, backup, and staged runs".to_string(),
-            ),
+            (true, true, true) => {
+                Err("prepared publish has simultaneous final, backup, and staged runs".to_string())
+            }
         },
         PublishPhase::BackupMoved => match (final_exists, backup_exists, staged_exists) {
             // The new final exists, but FinalInstalled was never durable.
@@ -889,9 +885,9 @@ fn publish_recovery_action(
             // sufficient evidence of a commit when the final is absent.
             (false, true, _) => Ok(PublishRecoveryAction::RestoreBackup),
             (false, false, true) => Ok(PublishRecoveryAction::RemoveAbandoned),
-            (false, false, false) => Err(
-                "final-installed publish has no final, backup, or staged run".to_string(),
-            ),
+            (false, false, false) => {
+                Err("final-installed publish has no final, backup, or staged run".to_string())
+            }
         },
     }
 }
@@ -903,7 +899,10 @@ fn existing_real_directory(path: &Path, label: &str) -> Result<bool, String> {
         Err(err) => return Err(format!("inspect {label} {}: {err}", path.display())),
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(format!("{label} {} is not a real directory", path.display()));
+        return Err(format!(
+            "{label} {} is not a real directory",
+            path.display()
+        ));
     }
     Ok(true)
 }
@@ -923,10 +922,7 @@ fn latest_publish_journal(
             Ok(_) => return read_publish_journal(&path, model, run, phase).map(Some),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
-                return Err(format!(
-                    "inspect publish journal {}: {err}",
-                    path.display()
-                ));
+                return Err(format!("inspect publish journal {}: {err}", path.display()));
             }
         }
     }
@@ -1020,15 +1016,12 @@ fn recover_publish_transactions_for_run(
                 transaction_root.display()
             ));
         }
-        let transaction_root = match checked_real_directory(
-            staging_root,
-            &transaction_root,
-            "recovery transaction",
-        ) {
-            Ok(path) => path,
-            Err(_) if !transaction_root.exists() => continue,
-            Err(err) => return Err(err),
-        };
+        let transaction_root =
+            match checked_real_directory(staging_root, &transaction_root, "recovery transaction") {
+                Ok(path) => path,
+                Err(_) if !transaction_root.exists() => continue,
+                Err(err) => return Err(err),
+            };
         let Some(journal) = latest_publish_journal(&transaction_root, model, run)? else {
             // A target-keyed temporary with no installed Prepared journal
             // can only precede every destructive rename. Under the target's
@@ -1050,18 +1043,14 @@ fn recover_publish_transactions_for_run(
         let final_exists = existing_real_directory(&final_run_dir, "recovery final run")?;
         let backup_exists = existing_real_directory(&backup_run_dir, "recovery backup run")?;
         let staged_exists = existing_real_directory(&staged_run_dir, "recovery staged run")?;
-        let action = publish_recovery_action(
-            journal.phase,
-            final_exists,
-            backup_exists,
-            staged_exists,
-        )
-        .map_err(|reason| {
-            format!(
-                "cannot recover interrupted publication for {model}/{run} in {}: {reason}",
-                transaction_root.display()
-            )
-        })?;
+        let action =
+            publish_recovery_action(journal.phase, final_exists, backup_exists, staged_exists)
+                .map_err(|reason| {
+                    format!(
+                        "cannot recover interrupted publication for {model}/{run} in {}: {reason}",
+                        transaction_root.display()
+                    )
+                })?;
 
         match action {
             PublishRecoveryAction::KeepFinal => {
@@ -1388,11 +1377,7 @@ impl ForecastHourTimeline {
     /// identity, and the processing profile. The profile is part of the key
     /// because rw-store replaces an existing forecast-hour file atomically;
     /// light and full imports of the same source must never erase each other.
-    pub(crate) fn run_name(
-        &self,
-        source_identity: &str,
-        processing_profile: &str,
-    ) -> String {
+    pub(crate) fn run_name(&self, source_identity: &str, processing_profile: &str) -> String {
         let stamp = chrono::DateTime::from_timestamp(self.origin_unix, 0)
             .map(|time| time.format("%Y%m%d%H%M%S").to_string())
             .unwrap_or_else(|| self.origin_unix.to_string());
@@ -1525,14 +1510,13 @@ impl ForecastHourTimeline {
         // Without a real model initialization timestamp, even an apparently
         // whole-hour cadence is not proof that ordinal labels are forecast
         // hours. Persist the known valid times explicitly instead.
-        let exact_time_axis = !has_authoritative_reference
-            || flat.iter().any(|item| item.lead_seconds % 3_600 != 0);
+        let exact_time_axis =
+            !has_authoritative_reference || flat.iter().any(|item| item.lead_seconds % 3_600 != 0);
         let mut planned = vec![Vec::<PlannedSourceTime>::new(); sources.len()];
         for (ordinal, item) in flat.into_iter().enumerate() {
             let (storage_slot, exact_time) = if exact_time_axis {
-                let slot = u16::try_from(ordinal).map_err(|_| {
-                    "exact-time WRF ordinal slot exceeds u16 range".to_string()
-                })?;
+                let slot = u16::try_from(ordinal)
+                    .map_err(|_| "exact-time WRF ordinal slot exceeds u16 range".to_string())?;
                 (
                     slot,
                     Some(rw_store::RwsExactTime::new(
@@ -2048,9 +2032,9 @@ fn wrf_times_from_netcdf(
             "Times DateStrLen is {width}; the supported maximum is {MAX_TIME_LABEL_WIDTH} bytes"
         )));
     }
-    let elements = record_count.checked_mul(width).ok_or_else(|| {
-        ImportError::TimeAxis("Times element count overflowed usize".to_string())
-    })?;
+    let elements = record_count
+        .checked_mul(width)
+        .ok_or_else(|| ImportError::TimeAxis("Times element count overflowed usize".to_string()))?;
     if elements > MAX_TIME_LABEL_ELEMENTS {
         return Err(ImportError::TimeAxis(format!(
             "Times contains {elements} character elements; the safety limit is {MAX_TIME_LABEL_ELEMENTS}"
@@ -2478,10 +2462,7 @@ fn preflight_local_sources(
                 ))
             })?
             .to_vec();
-        plans.push(LocalSourcePlan {
-            path,
-            records,
-        });
+        plans.push(LocalSourcePlan { path, records });
     }
     let run = timeline.run_name(source_identity, processing_profile);
     Ok((plans, run))
@@ -4108,8 +4089,7 @@ const CONUS_II_WRF2D_REQUIRED_RAW_FIELDS: [&str; 5] = [
     "wrf_swupt",
     "wrf_acedir",
 ];
-const CONUS_II_WRF2D_REQUIRED_CANONICAL_WINDS: [&str; 3] =
-    ["u_10m", "v_10m", "wind_speed_10m"];
+const CONUS_II_WRF2D_REQUIRED_CANONICAL_WINDS: [&str; 3] = ["u_10m", "v_10m", "wind_speed_10m"];
 
 fn missing_conus_ii_wrf2d_fields<'a>(
     nx: usize,
@@ -4824,13 +4804,10 @@ mod tests {
 
     #[test]
     fn time_label_conversion_rejects_oversized_axes_before_labels_are_read() {
-        let error = source_records_from_labels(
-            Vec::new(),
-            MAX_RUN_TIMESTEPS + 1,
-            "hostile WRF Times",
-        )
-        .unwrap_err()
-        .to_string();
+        let error =
+            source_records_from_labels(Vec::new(), MAX_RUN_TIMESTEPS + 1, "hostile WRF Times")
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("per-run limit"), "{error}");
     }
 
@@ -4877,9 +4854,7 @@ mod tests {
 
     #[test]
     fn publish_recovery_state_machine_covers_every_rename_boundary() {
-        use PublishRecoveryAction::{
-            KeepFinal, RemoveAbandoned, RestoreBackup, RollbackInstalled,
-        };
+        use PublishRecoveryAction::{KeepFinal, RemoveAbandoned, RestoreBackup, RollbackInstalled};
 
         // Journal durable, death before the first rename: retain the old run.
         assert_eq!(
@@ -5040,7 +5015,10 @@ mod tests {
             &run,
         )
         .unwrap_err();
-        assert!(error.contains("validate recovery backup run manifest"), "{error}");
+        assert!(
+            error.contains("validate recovery backup run manifest"),
+            "{error}"
+        );
         assert!(!final_run.exists());
         assert!(backup.is_dir(), "invalid backup must remain for inspection");
         assert!(transaction.is_dir());
@@ -5259,7 +5237,10 @@ mod tests {
         assert!(publisher.staged_run_dir.join("new.marker").is_file());
         assert!(!publisher.backup_run_dir.exists());
         drop(publisher);
-        assert!(!transaction.exists(), "completed rollback may discard staging");
+        assert!(
+            !transaction.exists(),
+            "completed rollback may discard staging"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5283,7 +5264,10 @@ mod tests {
 
         assert!(final_run.join("new.marker").is_file());
         assert!(backup.join("old.marker").is_file());
-        assert!(transaction.is_dir(), "pre-commit recovery evidence must survive Drop");
+        assert!(
+            transaction.is_dir(),
+            "pre-commit recovery evidence must survive Drop"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5676,13 +5660,8 @@ mod tests {
         // archive geometry; another wrf2d dialect is not rejected for a
         // scientifically legitimate, smaller diagnostic suite.
         assert!(
-            missing_conus_ii_wrf2d_fields(
-                100,
-                100,
-                std::iter::empty(),
-                std::iter::empty()
-            )
-            .is_empty()
+            missing_conus_ii_wrf2d_fields(100, 100, std::iter::empty(), std::iter::empty())
+                .is_empty()
         );
     }
 
@@ -6344,10 +6323,7 @@ pub(crate) enum ImportError {
     #[error(
         "incomplete CONUS-II wrf2d dataset in {path}: missing required fields {missing:?}; refusing a partial import"
     )]
-    IncompleteWrf2d {
-        path: PathBuf,
-        missing: Vec<String>,
-    },
+    IncompleteWrf2d { path: PathBuf, missing: Vec<String> },
     #[error("post-processed WRF volume allocation is unsupported: {0}")]
     PostprocessedVolume(String),
     #[error("{context}: store write failed: {source}")]

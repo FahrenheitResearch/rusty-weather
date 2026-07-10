@@ -608,15 +608,7 @@ impl HourIngestWriter {
                 &grid_hash,
                 writer_build,
             ),
-            None => HourWriter::new(
-                model,
-                run,
-                storage_slot,
-                nx,
-                ny,
-                &grid_hash,
-                writer_build,
-            ),
+            None => HourWriter::new(model, run, storage_slot, nx, ny, &grid_hash, writer_build),
         }
         .with_spill_dir(&run_dir);
         Ok(Self {

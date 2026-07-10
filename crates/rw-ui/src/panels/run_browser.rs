@@ -97,26 +97,27 @@ impl RunBrowserPanel {
                                     .small()
                                     .weak(),
                                 );
-                                let mut show_hour = |ui: &mut Ui, hour: &crate::store_view::HourEntry| {
-                                    let key = HourKey {
-                                        model: model.model.clone(),
-                                        run: run.run.clone(),
-                                        hour: hour.hour,
-                                        exact_time: hour.exact_time,
+                                let mut show_hour =
+                                    |ui: &mut Ui, hour: &crate::store_view::HourEntry| {
+                                        let key = HourKey {
+                                            model: model.model.clone(),
+                                            run: run.run.clone(),
+                                            hour: hour.hour,
+                                            exact_time: hour.exact_time,
+                                        };
+                                        let is_selected = self.selected.as_ref() == Some(&key);
+                                        let label = format!(
+                                            "{}  ·  {} vars",
+                                            key.time_label(),
+                                            hour.variable_count
+                                        );
+                                        if ui.selectable_label(is_selected, label).clicked()
+                                            && !is_selected
+                                        {
+                                            self.selected = Some(key.clone());
+                                            picked = Some(key);
+                                        }
                                     };
-                                    let is_selected = self.selected.as_ref() == Some(&key);
-                                    let label = format!(
-                                        "{}  ·  {} vars",
-                                        key.time_label(),
-                                        hour.variable_count
-                                    );
-                                    if ui.selectable_label(is_selected, label).clicked()
-                                        && !is_selected
-                                    {
-                                        self.selected = Some(key.clone());
-                                        picked = Some(key);
-                                    }
-                                };
                                 if run.hours.len() > 256 {
                                     // Minute-cadence runs commonly contain
                                     // thousands of frames. Only build labels

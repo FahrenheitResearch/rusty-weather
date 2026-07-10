@@ -116,9 +116,7 @@ impl RwsHourMeta {
         };
         match self.schema.as_str() {
             SCHEMA_HOUR if timing.is_none() => Ok(None),
-            SCHEMA_HOUR => {
-                Err("v1 hour metadata must not contain exact-time metadata".to_string())
-            }
+            SCHEMA_HOUR => Err("v1 hour metadata must not contain exact-time metadata".to_string()),
             SCHEMA_HOUR_V2 => {
                 let timing = timing.ok_or_else(|| {
                     "v2 hour metadata requires lead_seconds and valid_unix".to_string()
@@ -198,12 +196,12 @@ mod tests {
 
     #[test]
     fn hour_schema_requires_exactly_the_matching_time_contract() {
-        assert_eq!(meta(SCHEMA_HOUR, None).validate_time_schema().unwrap(), None);
-
-        let v1_with_time = meta(
-            SCHEMA_HOUR,
-            Some((Some(0), Some(1_700_000_000))),
+        assert_eq!(
+            meta(SCHEMA_HOUR, None).validate_time_schema().unwrap(),
+            None
         );
+
+        let v1_with_time = meta(SCHEMA_HOUR, Some((Some(0), Some(1_700_000_000))));
         assert!(
             v1_with_time
                 .validate_time_schema()

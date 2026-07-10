@@ -25,6 +25,7 @@ pub use diff::{
 };
 pub use error::{RwResult, RwStoreError};
 pub use export::{ExportSummary, export_hour_to_netcdf3};
+pub use format::RwsExactTime;
 pub use ingest::{
     DerivedFieldInput, HourIngestWriter, PressureVolumeInput, StoredField2D, WrittenHour,
     derived_selector, derived_selector_slug, read_field_2d, read_grid_2d, write_hour_from_fields,
@@ -32,7 +33,6 @@ pub use ingest::{
     write_hour_from_fields_with_derived_exact, write_hour_from_grid_with_derived,
     write_hour_from_grid_with_derived_exact,
 };
-pub use format::RwsExactTime;
 pub use lock::{LOCK_FILE_NAME, RunLock};
 pub use validate::{
     ValidateDepth, ValidationReport, ValidationStats, validate_hour_file, validate_run_dir,

@@ -39,7 +39,10 @@ fn enumerate_synthetic_store() {
     assert_eq!(run.run, SYNTHETIC_RUN);
     assert_eq!(run.build, SYNTHETIC_BUILD, "build stamp from run.json");
     assert!(run.nx > 0 && run.ny > 0);
-    assert!(!run.exact_time_axis, "legacy synthetic store stays rw-store v1");
+    assert!(
+        !run.exact_time_axis,
+        "legacy synthetic store stays rw-store v1"
+    );
     assert!(run.exact_times().is_none());
     let hours: Vec<u16> = run.hours.iter().map(|h| h.hour).collect();
     assert_eq!(hours, SYNTHETIC_HOURS.to_vec(), "hours ascending");
@@ -115,7 +118,10 @@ fn exact_time_store_enumerates_labels_and_worker_identity_without_fake_hours() {
         exact_time: first.exact_time,
     };
     assert_eq!(key.lead_label(), "+08:48:00");
-    assert_eq!(key.valid_time_label().as_deref(), Some("1974-04-03 17:48:00Z"));
+    assert_eq!(
+        key.valid_time_label().as_deref(),
+        Some("1974-04-03 17:48:00Z")
+    );
     assert!(!key.time_label().contains('F'));
     assert!(!key.time_label().contains("f000"));
 

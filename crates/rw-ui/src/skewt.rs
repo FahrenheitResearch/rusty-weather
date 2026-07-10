@@ -100,10 +100,9 @@ pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, Stri
     let surface_value = |name: &str, approximate: &str| -> Result<f64, String> {
         match surface_value_optional(name)? {
             Some(value) => Ok(value),
-            None => surface_value_optional(approximate)?
-                .ok_or_else(|| {
-                    format!("store timestep lacks skew-T inputs: {name} or {approximate}")
-                }),
+            None => surface_value_optional(approximate)?.ok_or_else(|| {
+                format!("store timestep lacks skew-T inputs: {name} or {approximate}")
+            }),
         }
     };
     let t2_c = surface_value("temperature_2m", "approx_temperature_2m")?;
@@ -289,11 +288,7 @@ fn metadata_for(data: &SoundingData, orog_m: f64) -> SoundingMetadata {
     };
     SoundingMetadata {
         station_id,
-        valid_time: format!(
-            "{} {}",
-            data.hour.run.replace('_', " "),
-            time_label
-        ),
+        valid_time: format!("{} {}", data.hour.run.replace('_', " "), time_label),
         latitude_deg: data.lat.map(f64::from),
         longitude_deg: data.lon.map(f64::from).map(normalize_lon),
         elevation_m: Some(orog_m),

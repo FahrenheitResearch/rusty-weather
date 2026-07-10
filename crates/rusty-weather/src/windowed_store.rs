@@ -1815,20 +1815,13 @@ mod tests {
         )
         .unwrap();
 
-        let hours_error = stored_run_hours(&dir, "hrrr", run)
-            .unwrap_err()
-            .to_string();
+        let hours_error = stored_run_hours(&dir, "hrrr", run).unwrap_err().to_string();
         assert!(hours_error.contains("exact-time ordinal axis"));
 
-        let compute_error = compute_windowed_products(
-            &dir,
-            "hrrr",
-            run,
-            &[0],
-            &["qpf_1h".to_string()],
-        )
-        .unwrap_err()
-        .to_string();
+        let compute_error =
+            compute_windowed_products(&dir, "hrrr", run, &[0], &["qpf_1h".to_string()])
+                .unwrap_err()
+                .to_string();
         assert!(compute_error.contains("exact-time ordinal axis"));
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1482,9 +1482,7 @@ fn inspect_store_run_revision(source: &StoreFormulaSource) -> Result<StoreRunRev
             }
         }
     } else if !source.exact_times.is_empty() {
-        return Err(
-            "Formula Lab received exact times for a legacy forecast-hour run".to_string(),
-        );
+        return Err("Formula Lab received exact times for a legacy forecast-hour run".to_string());
     }
 
     let grid = inspect_raw_file_revision(&run_dir.join("grid.rwg"))?;

@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
 
-use rw_store::lock::RunLock;
 use rw_store::RwStoreError;
+use rw_store::lock::RunLock;
 use rw_store::run::{RwsRunManifest, validate_store_component};
 
 use crate::store::{frame_time, run_day};

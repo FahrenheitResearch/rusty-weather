@@ -216,23 +216,21 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
         let exact_time_axis = manifest.is_exact_time_axis();
         let hour_json: Vec<serde_json::Value> = hours
             .iter()
-            .map(|h| {
-                match h.exact_time {
-                    Some(time) => json!({
-                        "storage_slot": h.storage_key,
-                        "lead_seconds": time.lead_seconds,
-                        "valid_unix": time.valid_unix,
-                        "file": h.file,
-                        "variables": h.variables,
-                        "file_bytes": h.file_bytes
-                    }),
-                    None => json!({
-                        "forecast_hour": h.storage_key,
-                        "file": h.file,
-                        "variables": h.variables,
-                        "file_bytes": h.file_bytes
-                    }),
-                }
+            .map(|h| match h.exact_time {
+                Some(time) => json!({
+                    "storage_slot": h.storage_key,
+                    "lead_seconds": time.lead_seconds,
+                    "valid_unix": time.valid_unix,
+                    "file": h.file,
+                    "variables": h.variables,
+                    "file_bytes": h.file_bytes
+                }),
+                None => json!({
+                    "forecast_hour": h.storage_key,
+                    "file": h.file,
+                    "variables": h.variables,
+                    "file_bytes": h.file_bytes
+                }),
             })
             .collect();
         runs.push(json!({
@@ -268,7 +266,11 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
                 listing.ny,
                 listing.nx,
                 listing.writer_build,
-                if listing.exact_time_axis { "exact" } else { "forecast_hour" }
+                if listing.exact_time_axis {
+                    "exact"
+                } else {
+                    "forecast_hour"
+                }
             );
             println!("  grid_hash: {}", listing.grid_hash);
             for hour in &listing.hours {

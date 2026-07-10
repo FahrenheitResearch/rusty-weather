@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use rustwx_core::{
     CanonicalField, FieldSelector, GridProjection, GridShape, LatLonGrid, SelectedField2D,
 };
+use rw_store::RwsExactTime;
 use rw_store::error::RwStoreError;
 use rw_store::grid::GridFile;
 use rw_store::ingest::{
@@ -23,7 +24,6 @@ use rw_store::ingest::{
 use rw_store::lock::RunLock;
 use rw_store::reader::HourReader;
 use rw_store::run::RwsRunManifest;
-use rw_store::RwsExactTime;
 
 const NX: usize = 80;
 const NY: usize = 60;
@@ -775,7 +775,11 @@ fn exact_time_hours_use_ordinal_slots_and_preserve_second_resolution() {
         rw_store::validate::ValidateDepth::Structural,
     )
     .unwrap();
-    assert!(report.is_ok(), "exact v2 run validation: {:?}", report.errors);
+    assert!(
+        report.is_ok(),
+        "exact v2 run validation: {:?}",
+        report.errors
+    );
 
     let remap_error = write_hour_from_fields_exact(
         &store_root,

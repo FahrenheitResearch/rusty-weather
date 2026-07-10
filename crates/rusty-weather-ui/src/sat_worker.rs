@@ -470,12 +470,8 @@ fn load_frame(
     puffin::profile_scope!("sat_load_frame");
     let started = Instant::now();
     let run_dir = store_root.join(&key.model).join(&key.run);
-    let manifest = RwsRunManifest::load_for_run(
-        &run_dir.join("run.json"),
-        &key.model,
-        &key.run,
-    )
-    .map_err(|err| err.to_string())?;
+    let manifest = RwsRunManifest::load_for_run(&run_dir.join("run.json"), &key.model, &key.run)
+        .map_err(|err| err.to_string())?;
     if manifest.is_exact_time_axis() {
         return Err(format!(
             "{key} uses exact-time ordinal slots and is not a satellite HHMM run"
