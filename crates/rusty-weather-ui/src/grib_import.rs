@@ -22,6 +22,8 @@
 //! - the store-write plan: canonical `FieldSelector`s for the params whose
 //!   units match what the WRF import precedent stores, derived slugs for the
 //!   rest, and hour keys derived from each message's valid time;
+//! - scan-mode normalization: +/-i rows become one eastward row-major layout;
+//!   column-major modes and GRIB1's reserved bits (including `0x10`) fail closed;
 //! - global-grid longitude normalization (columns rotated so longitudes run
 //!   -180..180 monotonic — the map layer's inverse LUT does not wrap, so a
 //!   raw 0..360 grid would blank the western hemisphere).
@@ -766,19 +768,130 @@ pub(crate) fn plan_field(msg: &IndexedMessage) -> PlannedField {
 // Grid plan
 // ---------------------------------------------------------------------------
 
-/// The run grid plus the column rotation every decoded plane must apply.
-/// Global rectilinear grids (span >= 350 degrees) rotate so longitudes run
-/// -180..180 monotonic; regional grids pass through untouched.
+/// The run grid plus the scan normalization and column rotation every decoded
+/// plane must apply.
+/// Rows crossing the signed-longitude seam rotate so longitudes run
+/// monotonically through -180..180; rows already monotonic pass through.
 pub(crate) struct GridPlan {
     pub nx: usize,
     pub ny: usize,
-    /// Source column index that becomes output column 0.
+    /// Eastward-normalized source column index that becomes output column 0.
     pub rotate: usize,
+    /// The first serialized row scans from east to west. Output columns are
+    /// normalized to the opposite, eastward direction.
+    i_negative: bool,
     pub grid: LatLonGrid,
 }
 
 fn normalize_lon_180(lon: f64) -> f64 {
     (lon + 180.0).rem_euclid(360.0) - 180.0
+}
+
+/// Normalize one eastward rectilinear row without breaking regional dateline
+/// domains. Nonperiodic rows preserve column order and unwrap continuously
+/// (170/180/190 stays that way); no-duplicate periodic rows rotate to a signed
+/// axis. Periodicity comes from `Ni * step ~= 360`, so coarse global grids such
+/// as 0/90/180/270 no longer depend on a misleading raw-span threshold.
+fn normalize_longitude_row(row_lons: &[f64]) -> Result<(usize, Vec<f64>), String> {
+    if row_lons.is_empty() {
+        return Err("GRIB1 longitude row is empty".to_string());
+    }
+    let normalized = row_lons
+        .iter()
+        .map(|longitude| {
+            if longitude.is_finite() {
+                Ok(normalize_lon_180(*longitude))
+            } else {
+                Err(format!("GRIB1 grid has non-finite longitude {longitude}"))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if normalized.len() == 1 {
+        return Ok((0, normalized));
+    }
+
+    let mut unwrapped = Vec::with_capacity(normalized.len());
+    unwrapped.push(normalized[0]);
+    for &longitude in &normalized[1..] {
+        let previous = *unwrapped.last().unwrap();
+        let mut longitude = longitude;
+        while longitude - previous <= -180.0 {
+            longitude += 360.0;
+        }
+        while longitude - previous > 180.0 {
+            longitude -= 360.0;
+        }
+        unwrapped.push(longitude);
+    }
+    let step = unwrapped[1] - unwrapped[0];
+    if !step.is_finite() || step <= 0.0 {
+        return Err(format!(
+            "GRIB1 eastward longitude row has invalid first step {step}"
+        ));
+    }
+    let uniform_tolerance = (step.abs() * 1.0e-6).max(1.0e-9);
+    if unwrapped
+        .windows(2)
+        .any(|pair| ((pair[1] - pair[0]) - step).abs() > uniform_tolerance)
+    {
+        return Err("GRIB1 longitude row is not uniformly rectilinear".to_string());
+    }
+    let periodic_tolerance = (step * 0.01).max(0.002);
+    let no_duplicate_periodic =
+        (unwrapped.len() as f64 * step - 360.0).abs() <= periodic_tolerance;
+    let duplicate_endpoint_periodic = (((unwrapped.len() - 1) as f64 * step) - 360.0).abs()
+        <= periodic_tolerance;
+    let span = unwrapped.last().unwrap() - unwrapped[0];
+    if !no_duplicate_periodic && !duplicate_endpoint_periodic && span >= 360.0 {
+        return Err(format!(
+            "nonperiodic GRIB1 longitude row spans {span} degrees"
+        ));
+    }
+
+    // A duplicate-endpoint periodic axis cannot be cycle-rotated with one
+    // source-column offset without moving its duplicate into the middle. Keep
+    // its continuous order; the renderer recognizes `(Ni-1)*step == 360`.
+    if !no_duplicate_periodic {
+        return Ok((0, unwrapped));
+    }
+
+    let seam = normalized
+        .windows(2)
+        .position(|pair| pair[1] < pair[0])
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let out = (0..normalized.len())
+        .map(|index| normalized[(seam + index) % normalized.len()])
+        .collect::<Vec<_>>();
+    if out.windows(2).any(|pair| pair[1] < pair[0]) {
+        return Err("periodic GRIB1 longitude row has more than one signed seam".to_string());
+    }
+    Ok((seam, out))
+}
+
+/// Validate the GRIB1 scanning-mode octet for the row-major rectilinear lane.
+/// We normalize both i directions and accept both j directions. Column-major
+/// serialization and reserved bits fail closed instead of being
+/// decoded into a plausible-looking but geographically misplaced field.
+fn validate_rectilinear_scanning_mode(scanning_mode: u8) -> Result<(), String> {
+    if scanning_mode & 0x20 != 0 {
+        return Err(
+            "j-consecutive (column-major) scanning is not supported; use a row-major GRIB1 product"
+                .to_string(),
+        );
+    }
+    if scanning_mode & 0x10 != 0 {
+        return Err(format!(
+            "GRIB1 scanning mode 0x{scanning_mode:02x} sets reserved bit 0x10; alternative-row scanning is defined for GRIB2, not GRIB1"
+        ));
+    }
+    if scanning_mode & 0x0f != 0 {
+        return Err(format!(
+            "GRIB1 scanning mode 0x{scanning_mode:02x} sets reserved bit(s) 0x{:02x}",
+            scanning_mode & 0x0f
+        ));
+    }
+    Ok(())
 }
 
 /// Build the grid plan from a fully parsed first message. Rectilinear grids
@@ -810,13 +923,7 @@ pub(crate) fn build_grid_plan(msg: &Grib1Message) -> Result<GridPlan, String> {
         }
     };
     let grid_cells = checked_grid_cells(ni, nj)?;
-    if scanning_mode & 0x20 != 0 {
-        return Err(
-            "j-consecutive (column-major) scanning not supported — ERA-20C regular grids \
-             are row-major"
-                .to_string(),
-        );
-    }
+    validate_rectilinear_scanning_mode(scanning_mode)?;
     let coords = msg
         .latlons()
         .map_err(|err| format!("grid coordinates: {err}"))?;
@@ -830,27 +937,21 @@ pub(crate) fn build_grid_plan(msg: &Grib1Message) -> Result<GridPlan, String> {
 
     // Rectilinear: longitudes from the first row, latitudes from the first
     // column (grib-core emits coordinates in data order).
-    let row_lons: Vec<f64> = coords[..ni].iter().map(|c| c.lon).collect();
+    let source_row_lons: Vec<f64> = coords[..ni].iter().map(|c| c.lon).collect();
     let col_lats: Vec<f64> = (0..nj).map(|j| coords[j * ni].lat).collect();
 
-    let (min_lon, max_lon) = row_lons
-        .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &lon| {
-            (lo.min(lon), hi.max(lon))
-        });
-    let rotate = if max_lon - min_lon >= 350.0 {
-        // Global grid: rotate so output longitudes ascend from -180. The
-        // rotation point is the first column at or past the antimeridian.
-        row_lons.iter().position(|&lon| lon >= 180.0).unwrap_or(0)
+    // Normalize the first row to +i/eastward before deriving the shared grid.
+    let i_negative = scanning_mode & 0x80 != 0;
+    let row_lons: Vec<f64> = if i_negative {
+        source_row_lons.iter().rev().copied().collect()
     } else {
-        0
+        source_row_lons
     };
+
+    let (rotate, out_lons) = normalize_longitude_row(&row_lons)?;
 
     let mut lat_deg = Vec::with_capacity(grid_cells);
     let mut lon_deg = Vec::with_capacity(grid_cells);
-    let out_lons: Vec<f64> = (0..ni)
-        .map(|i| normalize_lon_180(row_lons[(rotate + i) % ni]))
-        .collect();
     for &lat in &col_lats {
         for &lon in &out_lons {
             lat_deg.push(lat as f32);
@@ -864,18 +965,26 @@ pub(crate) fn build_grid_plan(msg: &Grib1Message) -> Result<GridPlan, String> {
         nx: ni,
         ny: nj,
         rotate,
+        i_negative,
         grid,
     })
 }
 
-/// Apply the plan's column rotation and unit scale to one decoded plane.
+/// Normalize scan direction, apply the global column rotation, and scale one
+/// decoded plane.
 fn rotate_and_scale(values: &[f64], plan: &GridPlan, scale: f64) -> Vec<f32> {
     let (nx, ny, rotate) = (plan.nx, plan.ny, plan.rotate);
     let mut out = Vec::with_capacity(values.len());
     for j in 0..ny {
         let row = &values[j * nx..(j + 1) * nx];
         for i in 0..nx {
-            out.push((row[(rotate + i) % nx] * scale) as f32);
+            let normalized_i = (rotate + i) % nx;
+            let source_i = if plan.i_negative {
+                nx - 1 - normalized_i
+            } else {
+                normalized_i
+            };
+            out.push((row[source_i] * scale) as f32);
         }
     }
     out
@@ -1384,6 +1493,102 @@ mod tests {
         ));
         std::fs::write(&path, bytes).expect("write temp grib");
         path
+    }
+
+    fn synthetic_grid_plan(
+        nx: usize,
+        ny: usize,
+        rotate: usize,
+        i_negative: bool,
+    ) -> GridPlan {
+        let shape = GridShape::new(nx, ny).expect("synthetic shape");
+        let cells = nx * ny;
+        GridPlan {
+            nx,
+            ny,
+            rotate,
+            i_negative,
+            grid: LatLonGrid::new(shape, vec![0.0; cells], vec![0.0; cells])
+                .expect("synthetic grid"),
+        }
+    }
+
+    #[test]
+    fn rectilinear_scan_mode_accepts_normalizable_flags_and_rejects_others() {
+        // +/- i and +/- j combinations are accepted and normalized.
+        for scanning_mode in [0x00_u8, 0x40, 0x80, 0xc0] {
+            assert!(
+                validate_rectilinear_scanning_mode(scanning_mode).is_ok(),
+                "scan mode 0x{scanning_mode:02x}"
+            );
+        }
+
+        for scanning_mode in [0x20_u8, 0x60, 0xa0, 0xe0] {
+            let error = validate_rectilinear_scanning_mode(scanning_mode)
+                .expect_err("column-major scan must fail closed");
+            assert!(error.contains("column-major"), "{error}");
+        }
+        for scanning_mode in [0x10_u8, 0x50] {
+            let error = validate_rectilinear_scanning_mode(scanning_mode)
+                .expect_err("GRIB2-only alternative-row flag must fail closed");
+            assert!(error.contains("GRIB2, not GRIB1"), "{error}");
+        }
+        for scanning_mode in [0x01_u8, 0x08] {
+            let error = validate_rectilinear_scanning_mode(scanning_mode)
+                .expect_err("reserved scan bits must fail closed");
+            assert!(error.contains("reserved bit"), "{error}");
+        }
+    }
+
+    #[test]
+    fn longitude_seam_detection_handles_coarse_and_regional_rows() {
+        let (rotate, normalized) =
+            normalize_longitude_row(&[0.0, 90.0, 180.0, 270.0]).expect("coarse global row");
+        assert_eq!(rotate, 2);
+        assert_eq!(normalized, vec![-180.0, -90.0, 0.0, 90.0]);
+
+        let (rotate, normalized) =
+            normalize_longitude_row(&[170.0, 180.0, 190.0]).expect("regional seam row");
+        assert_eq!(rotate, 0);
+        assert_eq!(normalized, vec![170.0, 180.0, 190.0]);
+
+        let error = normalize_longitude_row(&[0.0, 180.0, 0.0, 180.0])
+            .expect_err("a nonperiodic row cannot span more than a revolution");
+        assert!(error.contains("spans 540"), "{error}");
+
+        let (rotate, duplicate) = normalize_longitude_row(&[0.0, 90.0, 180.0, 270.0, 360.0])
+            .expect("duplicate-endpoint periodic row");
+        assert_eq!(rotate, 0);
+        assert_eq!(duplicate, vec![0.0, 90.0, 180.0, 270.0, 360.0]);
+    }
+
+    #[test]
+    fn negative_i_rows_are_normalized_before_column_rotation() {
+        let eastward = synthetic_grid_plan(4, 3, 1, false);
+        let eastward_values = vec![
+            0.0, 1.0, 2.0, 3.0, // row 0 eastward
+            10.0, 11.0, 12.0, 13.0, // row 1 eastward
+            20.0, 21.0, 22.0, 23.0, // row 2 eastward
+        ];
+        assert_eq!(
+            rotate_and_scale(&eastward_values, &eastward, 2.0),
+            vec![
+                2.0, 4.0, 6.0, 0.0, 22.0, 24.0, 26.0, 20.0, 42.0, 44.0, 46.0, 40.0,
+            ]
+        );
+
+        // With -i, every serialized row is reversed; the normalized
+        // geographic result remains identical.
+        let westward = synthetic_grid_plan(4, 3, 1, true);
+        let westward_values = vec![
+            3.0, 2.0, 1.0, 0.0, // row 0 westward
+            13.0, 12.0, 11.0, 10.0, // row 1 westward
+            23.0, 22.0, 21.0, 20.0, // row 2 westward
+        ];
+        assert_eq!(
+            rotate_and_scale(&westward_values, &westward, 2.0),
+            rotate_and_scale(&eastward_values, &eastward, 2.0)
+        );
     }
 
     /// Small index-only GRIB1 record. It is intentionally not a decodable BDS

@@ -15,7 +15,9 @@ use rustwx_core::{
 use rw_store::{DerivedFieldInput, WrittenHour, write_hour_from_grid_with_derived};
 use serde::{Deserialize, Serialize};
 
-use crate::wrf_volumes::{IsoVolume, SurfaceFallback, build_iso_volumes};
+use crate::wrf_volumes::{
+    IsoVolume, SurfaceFallback, build_iso_volumes, preflight_iso_volume_shape,
+};
 use wrf_core::variables::{VARS, VarDim};
 use wrf_core::{ComputeOpts, VarOutput, WrfFile, getvar};
 
@@ -232,6 +234,13 @@ struct OwnedDerivedField {
     name: String,
     units: String,
     values: Vec<f32>,
+}
+
+fn volume_omission_note(retained_2d_products: usize, error: &str) -> String {
+    let suffix = if retained_2d_products == 1 { "" } else { "s" };
+    format!(
+        "WRF 3-D pressure-volume products omitted; retained {retained_2d_products} independently available 2-D product{suffix}: {error}"
+    )
 }
 
 pub fn spawn_process_paths(
@@ -912,9 +921,16 @@ fn read_wrf_products(
     if options.core_fields {
         // Isolated for the same reason as `compute_var`: the volume builder's
         // `getvar` reads must degrade to a note, not kill the hour.
-        let volumes_result = isolate_panics("isobaric volumes", || {
-            build_iso_volumes(file, timeidx, shape.len(), progress)
-        });
+        // Preflight outside the isolated builder as well as inside it so this
+        // process layer explicitly chooses the 2-D-only degradation before the
+        // first volume getvar. The builder repeats the check to protect every
+        // other caller.
+        let volumes_result = match preflight_iso_volume_shape(file.nz, shape.len()) {
+            Ok(_) => isolate_panics("isobaric volumes", || {
+                build_iso_volumes(file, timeidx, shape.len(), progress)
+            }),
+            Err(err) => Err(err),
+        };
         match volumes_result {
             Ok((volumes, surface)) => {
                 fields.volumes = volumes;
@@ -925,9 +941,12 @@ fn read_wrf_products(
                 // observations or diagnostics.
                 fill_missing_surface(&mut fields, &grid, projection.clone(), surface, options);
             }
-            Err(err) => fields
-                .notes
-                .push(format!("WRF isobaric sounding volumes unavailable: {err}")),
+            Err(err) => {
+                let retained_2d_products = fields.canonical.len() + fields.derived.len();
+                let note = volume_omission_note(retained_2d_products, &err);
+                progress(note.clone());
+                fields.notes.push(note);
+            }
         }
     }
 
@@ -1642,6 +1661,19 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_omission_note_reports_only_the_actual_retained_2d_count() {
+        let none = volume_omission_note(0, "working set too large");
+        assert!(none.contains("retained 0 independently available 2-D products"));
+        assert!(!none.contains("preserved"));
+
+        let one = volume_omission_note(1, "bad native shape");
+        assert!(one.contains("retained 1 independently available 2-D product:"));
+
+        let several = volume_omission_note(7, "allocation failed");
+        assert!(several.contains("retained 7 independently available 2-D products:"));
+    }
 
     #[test]
     fn parses_wrf_timestamp_with_colons_or_underscores() {

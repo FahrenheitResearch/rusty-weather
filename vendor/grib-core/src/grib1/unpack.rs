@@ -53,27 +53,28 @@ fn read_signed_16(hi: u8, lo: u8) -> i16 {
 
 /// Extract a single datum of `nbits` width from a byte slice starting at bit offset `bit_pos`.
 ///
-/// Returns the extracted unsigned integer value.
+/// Returns `None` when the requested bit range is outside `data` or overflows.
 #[inline]
-fn extract_bits(data: &[u8], bit_pos: usize, nbits: u8) -> u32 {
+fn extract_bits(data: &[u8], bit_pos: usize, nbits: u8) -> Option<u32> {
     if nbits == 0 {
-        return 0;
+        return Some(0);
     }
 
+    let end = bit_pos.checked_add(nbits as usize)?;
+    let available = data.len().checked_mul(8)?;
+    if end > available {
+        return None;
+    }
     let mut value: u32 = 0;
     let nbits = nbits as usize;
 
     for i in 0..nbits {
         let byte_idx = (bit_pos + i) / 8;
         let bit_idx = 7 - ((bit_pos + i) % 8);
-        if byte_idx < data.len() {
-            value = (value << 1) | (((data[byte_idx] >> bit_idx) & 1) as u32);
-        } else {
-            value <<= 1;
-        }
+        value = (value << 1) | (((data[byte_idx] >> bit_idx) & 1) as u32);
     }
 
-    value
+    Some(value)
 }
 
 /// Unpack the Binary Data Section (BDS) from raw section bytes.
@@ -105,12 +106,23 @@ pub fn unpack_bds(
         ));
     }
 
+    let declared_length = ((bds_data[0] as usize) << 16)
+        | ((bds_data[1] as usize) << 8)
+        | bds_data[2] as usize;
+    if declared_length != bds_data.len() {
+        return Err(GribError::Unpack(format!(
+            "BDS declares {declared_length} bytes but decoder received {}",
+            bds_data.len()
+        )));
+    }
+
     // Byte 4: flag byte
     let flags = bds_data[3];
     let is_spherical_harmonic = flags & 0x80 != 0;
     let is_complex_packing = flags & 0x40 != 0;
     let _is_integer = flags & 0x20 != 0;
-    let _has_additional_flags = flags & 0x10 != 0;
+    let has_additional_flags = flags & 0x10 != 0;
+    let unused_bits = usize::from(flags & 0x0f);
 
     if is_spherical_harmonic {
         return Err(GribError::Unpack(
@@ -120,6 +132,11 @@ pub fn unpack_bds(
     if is_complex_packing {
         return Err(GribError::Unpack(
             "Complex/second-order packing not supported".into(),
+        ));
+    }
+    if has_additional_flags {
+        return Err(GribError::Unpack(
+            "BDS additional-flags layout is not supported by the simple-packing decoder".into(),
         ));
     }
 
@@ -135,6 +152,35 @@ pub fn unpack_bds(
 
     // Byte 11: number of bits per datum
     let nbits = bds_data[10];
+    if nbits > 32 {
+        return Err(GribError::Unpack(format!(
+            "BDS simple packing uses {nbits} bits per value; maximum supported width is 32"
+        )));
+    }
+
+    // Packed data starts at byte 12 (index 11). The low four flag bits state
+    // exactly how many bits in the final octet are padding. Require the
+    // resulting budget to match the bitmap/GDS-derived value count; silently
+    // shifting zeroes into truncated values creates plausible corrupt fields.
+    let packed_data = &bds_data[11..];
+    let total_packed_bits = packed_data
+        .len()
+        .checked_mul(8)
+        .ok_or_else(|| GribError::Unpack("BDS packed-bit budget overflows".into()))?;
+    if unused_bits > total_packed_bits {
+        return Err(GribError::Unpack(format!(
+            "BDS declares {unused_bits} unused trailing bits, but its payload contains only {total_packed_bits} bits"
+        )));
+    }
+    let packed_bits = total_packed_bits - unused_bits;
+    let required_bits = num_points
+        .checked_mul(usize::from(nbits))
+        .ok_or_else(|| GribError::Unpack("BDS required packed-bit count overflows".into()))?;
+    if required_bits != packed_bits {
+        return Err(GribError::Unpack(format!(
+            "BDS packed payload has {packed_bits} usable bits, but {num_points} values x {nbits} bits require {required_bits}"
+        )));
+    }
 
     // Compute scaling factors
     let binary_factor = (2.0_f64).powi(binary_scale as i32);
@@ -146,13 +192,18 @@ pub fn unpack_bds(
         return Ok(vec![value; num_points]);
     }
 
-    // Packed data starts at byte 12 (index 11)
-    let packed_data = &bds_data[11..];
     let mut values = Vec::with_capacity(num_points);
 
     for i in 0..num_points {
-        let bit_pos = i * (nbits as usize);
-        let x = extract_bits(packed_data, bit_pos, nbits) as f64;
+        let bit_pos = i
+            .checked_mul(usize::from(nbits))
+            .ok_or_else(|| GribError::Unpack("BDS datum bit offset overflows".into()))?;
+        let x = extract_bits(packed_data, bit_pos, nbits)
+            .ok_or_else(|| {
+                GribError::Unpack(format!(
+                    "BDS datum {i} extends beyond the declared packed payload"
+                ))
+            })? as f64;
         let y = reference + x * binary_factor;
         values.push(y * decimal_factor);
     }
@@ -255,19 +306,20 @@ mod tests {
     fn test_extract_bits_aligned() {
         let data = [0b1010_1100, 0b0011_0101];
         // First 8 bits: 0b10101100 = 172
-        assert_eq!(extract_bits(&data, 0, 8), 172);
+        assert_eq!(extract_bits(&data, 0, 8), Some(172));
         // Next 8 bits: 0b00110101 = 53
-        assert_eq!(extract_bits(&data, 8, 8), 53);
+        assert_eq!(extract_bits(&data, 8, 8), Some(53));
     }
 
     #[test]
     fn test_extract_bits_unaligned() {
         let data = [0b1010_1100, 0b0011_0101];
         // 4 bits starting at bit 4: 1100 = 12
-        assert_eq!(extract_bits(&data, 4, 4), 12);
+        assert_eq!(extract_bits(&data, 4, 4), Some(12));
         // 4 bits starting at bit 6: 0000 = 0011 => first 2 from byte 0, next 2 from byte 1
         // bit 6 of byte 0 = 0, bit 7 of byte 0 = 0, bit 0 of byte 1 = 0, bit 1 of byte 1 = 0
-        assert_eq!(extract_bits(&data, 6, 4), 0b0000);
+        assert_eq!(extract_bits(&data, 6, 4), Some(0b0000));
+        assert_eq!(extract_bits(&data, 13, 4), None);
     }
 
     #[test]
@@ -311,6 +363,51 @@ mod tests {
         for v in &values {
             assert_eq!(*v, 0.0);
         }
+    }
+
+    fn simple_bds(nbits: u8, unused_bits: u8, packed: &[u8]) -> Vec<u8> {
+        let length = 11 + packed.len();
+        let mut bds = vec![0u8; 11];
+        bds[0] = ((length >> 16) & 0xff) as u8;
+        bds[1] = ((length >> 8) & 0xff) as u8;
+        bds[2] = (length & 0xff) as u8;
+        bds[3] = unused_bits;
+        bds[10] = nbits;
+        bds.extend_from_slice(packed);
+        bds
+    }
+
+    #[test]
+    fn test_unpack_non_byte_aligned_payload_honors_unused_bits() {
+        // Three 4-bit values occupy 12 bits. GRIB1 sections are normally even
+        // octets, so the remaining nibble plus an extra octet are 12 unused
+        // bits (the reason this field is four bits wide rather than three).
+        let bds = simple_bds(4, 12, &[0x12, 0x30, 0x00]);
+        assert_eq!(unpack_bds(&bds, 0, 3).unwrap(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_unpack_rejects_truncated_or_inconsistent_bit_budget() {
+        let truncated = simple_bds(4, 0, &[0x12]);
+        let error = unpack_bds(&truncated, 0, 3).expect_err("12 required bits cannot fit in 8");
+        assert!(error.to_string().contains("require 12"), "{error}");
+
+        let extra = simple_bds(4, 0, &[0x12]);
+        let error = unpack_bds(&extra, 0, 1).expect_err("undeclared extra datum must fail");
+        assert!(error.to_string().contains("usable bits"), "{error}");
+
+        let invalid_unused = simple_bds(1, 15, &[0x80]);
+        let error = unpack_bds(&invalid_unused, 0, 1)
+            .expect_err("unused count cannot exceed the complete payload");
+        assert!(error.to_string().contains("only 8 bits"), "{error}");
+    }
+
+    #[test]
+    fn test_unpack_rejects_declared_length_mismatch() {
+        let mut bds = simple_bds(8, 0, &[7]);
+        bds[2] -= 1;
+        let error = unpack_bds(&bds, 0, 1).expect_err("declared section must bound payload");
+        assert!(error.to_string().contains("decoder received"), "{error}");
     }
 
     #[test]

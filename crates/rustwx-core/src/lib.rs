@@ -123,7 +123,12 @@ impl<'de> Deserialize<'de> for GridShape {
     }
 }
 
-fn checked_volume_elements(levels: usize, cells: usize) -> Result<usize, RustwxError> {
+/// Validate a dense level-by-cell volume against the shared desktop ceiling.
+///
+/// Call this before reading or allocating a dense 3-D product. Both arithmetic
+/// overflow and products larger than [`MAX_VOLUME_ELEMENTS`] fail closed with
+/// [`RustwxError::VolumeTooLarge`].
+pub fn checked_volume_elements(levels: usize, cells: usize) -> Result<usize, RustwxError> {
     let elements = levels
         .checked_mul(cells)
         .ok_or(RustwxError::VolumeTooLarge {

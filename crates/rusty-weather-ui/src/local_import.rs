@@ -22,7 +22,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, channel};
@@ -39,7 +39,10 @@ use rw_store::{DerivedFieldInput, RunLock, WrittenHour, write_hour_from_fields_w
 use sha2::{Digest, Sha256};
 use wrf_core::WrfFile;
 
-use crate::wrf_volumes::{IsoVolume, SurfaceFallback, build_iso_volumes, interpolate_iso_volumes};
+use crate::wrf_volumes::{
+    IsoVolume, SurfaceFallback, build_iso_volumes, preflight_iso_volume_shape,
+    try_interpolate_iso_volumes,
+};
 
 const LOCAL_IMPORT_MAX_SCAN_DEPTH: usize = 8;
 const LOCAL_IMPORT_MAX_DISCOVERED_FILES: usize = 10_000;
@@ -51,14 +54,43 @@ pub(crate) const IMPORT_SCIENCE_SCHEMA_VERSION: &str = "science_v1";
 const STAGING_DIR_NAME: &str = ".rw-staging";
 const STAGING_WORK_DIR_NAME: &str = "work";
 const STAGING_BACKUP_DIR_NAME: &str = "previous-run";
+const PUBLISH_JOURNAL_SCHEMA: &str = "rw-run-publish.v1";
+const MAX_PUBLISH_JOURNAL_BYTES: u64 = 16 * 1024;
+const MAX_STAGING_RECOVERY_ENTRIES: usize = 256;
 const PUBLISH_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 static STAGING_TRANSACTION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PublishPhase {
+    Prepared,
+    BackupMoved,
+    FinalInstalled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PublishJournal {
+    schema: String,
+    model: String,
+    run: String,
+    phase: PublishPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishRecoveryAction {
+    KeepFinal,
+    RestoreBackup,
+    InstallStaged,
+    RemoveAbandoned,
+}
 
 /// Same-filesystem run transaction. Writers receive [`Self::staging_store_root`]
 /// and use the FINAL model/run identity beneath a unique hidden transaction,
 /// so hour metadata is already truthful. Publication moves the whole complete
 /// run directory into place; an existing run is first moved to a transaction
-/// backup and restored if the second rename fails.
+/// backup and restored if the second rename fails. Immutable, synced phase
+/// journals let the next publisher for the same target reconcile a process
+/// death at either rename boundary while holding the same per-run lock.
 pub(crate) struct RunStagingPublisher {
     store_root: PathBuf,
     staging_root: PathBuf,
@@ -229,6 +261,25 @@ impl RunStagingPublisher {
         Ok(())
     }
 
+    fn write_publish_phase(&self, phase: PublishPhase) -> Result<(), String> {
+        write_publish_journal(
+            &self.transaction_root,
+            &self.model,
+            &self.run,
+            phase,
+        )
+    }
+
+    fn recover_interrupted_publications(&self) -> Result<(), String> {
+        recover_publish_transactions_for_run(
+            &self.store_root,
+            &self.staging_root,
+            &self.transaction_root,
+            &self.model,
+            &self.run,
+        )
+    }
+
     fn publish_prevalidated_with<F>(&mut self, move_staged: F) -> Result<(), String>
     where
         F: FnOnce(&Path, &Path) -> std::io::Result<()>,
@@ -289,6 +340,12 @@ impl RunStagingPublisher {
             },
         )?);
 
+        // Recovery is serialized by the same target-specific lock as the
+        // live rename sequence. Only after older journals are reconciled do
+        // we durably announce this transaction's intent.
+        self.recover_interrupted_publications()?;
+        self.write_publish_phase(PublishPhase::Prepared)?;
+
         if self.final_run_dir.exists() {
             let metadata = std::fs::symlink_metadata(&self.final_run_dir).map_err(|err| {
                 format!(
@@ -310,6 +367,11 @@ impl RunStagingPublisher {
                 "backup existing run",
             )?;
             self.backup_active = true;
+            sync_directory(final_model_dir)
+                .map_err(|err| format!("sync final model directory after backup: {err}"))?;
+            sync_directory(&self.transaction_root)
+                .map_err(|err| format!("sync transaction directory after backup: {err}"))?;
+            self.write_publish_phase(PublishPhase::BackupMoved)?;
         }
 
         let staged_run = checked_real_directory(
@@ -350,13 +412,22 @@ impl RunStagingPublisher {
             };
         }
         self.published = true;
+        sync_directory(final_model_dir)
+            .map_err(|err| format!("sync final model directory after publish: {err}"))?;
+        sync_directory(&self.transaction_root)
+            .map_err(|err| format!("sync transaction directory after publish: {err}"))?;
+        self.write_publish_phase(PublishPhase::FinalInstalled)?;
 
         if self.backup_active {
             safe_remove_tree(&self.transaction_root, &self.backup_run_dir)?;
             self.backup_active = false;
+            sync_directory(&self.transaction_root)
+                .map_err(|err| format!("sync transaction after backup cleanup: {err}"))?;
         }
         safe_remove_tree(&self.staging_root, &self.transaction_root)?;
         self.cleanup_complete = true;
+        sync_directory(&self.staging_root)
+            .map_err(|err| format!("sync staging root after publish cleanup: {err}"))?;
         self.publish_lock.take();
         debug_assert!(self.final_run_dir.starts_with(final_model_dir));
         Ok(())
@@ -380,6 +451,14 @@ impl RunStagingPublisher {
             "restore previous run",
         )?;
         self.backup_active = false;
+        sync_directory(
+            self.final_run_dir
+                .parent()
+                .ok_or_else(|| "restored final run has no parent".to_string())?,
+        )
+        .map_err(|err| format!("sync restored final run parent: {err}"))?;
+        sync_directory(&self.transaction_root)
+            .map_err(|err| format!("sync transaction after rollback: {err}"))?;
         Ok(())
     }
 }
@@ -451,13 +530,519 @@ fn create_unique_transaction_dir(staging_root: &Path) -> Result<PathBuf, String>
 }
 
 fn publish_lock_dir(locks_root: &Path, model: &str, run: &str) -> PathBuf {
+    locks_root.join(format!("run-{}", publish_target_key(model, run)))
+}
+
+fn publish_target_key(model: &str, run: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"rw-run-publish-lock-v1\0");
     hasher.update(model.as_bytes());
     hasher.update([0u8]);
     hasher.update(run.as_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
-    locks_root.join(format!("run-{}", &sha256_hex(&digest)[..24]))
+    sha256_hex(&digest)[..24].to_string()
+}
+
+fn publish_phase_name(phase: PublishPhase) -> &'static str {
+    match phase {
+        PublishPhase::Prepared => "prepared",
+        PublishPhase::BackupMoved => "backup-moved",
+        PublishPhase::FinalInstalled => "final-installed",
+    }
+}
+
+fn publish_journal_path(
+    transaction_root: &Path,
+    model: &str,
+    run: &str,
+    phase: PublishPhase,
+) -> PathBuf {
+    transaction_root.join(format!(
+        "publish-{}-{}.json",
+        publish_target_key(model, run),
+        publish_phase_name(phase)
+    ))
+}
+
+fn write_publish_journal(
+    transaction_root: &Path,
+    model: &str,
+    run: &str,
+    phase: PublishPhase,
+) -> Result<(), String> {
+    let journal = PublishJournal {
+        schema: PUBLISH_JOURNAL_SCHEMA.to_string(),
+        model: model.to_string(),
+        run: run.to_string(),
+        phase,
+    };
+    let bytes = serde_json::to_vec(&journal)
+        .map_err(|err| format!("serialize publish journal: {err}"))?;
+    if bytes.len() as u64 > MAX_PUBLISH_JOURNAL_BYTES {
+        return Err(format!(
+            "publish journal is {} bytes; limit is {MAX_PUBLISH_JOURNAL_BYTES}",
+            bytes.len()
+        ));
+    }
+
+    let destination = publish_journal_path(transaction_root, model, run, phase);
+    if destination.exists() {
+        let existing = read_publish_journal(&destination, model, run, phase)?;
+        if existing == journal {
+            return Ok(());
+        }
+        return Err(format!(
+            "publish journal {} already exists with different contents",
+            destination.display()
+        ));
+    }
+    checked_destination(transaction_root, &destination, "publish journal")?;
+    let temporary = transaction_root.join(format!(
+        ".publish-{}-{}.tmp",
+        publish_target_key(model, run),
+        publish_phase_name(phase),
+    ));
+    checked_destination(transaction_root, &temporary, "publish journal temporary file")?;
+
+    let write_result = (|| -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|err| format!("create publish journal {}: {err}", temporary.display()))?;
+        file.write_all(&bytes)
+            .map_err(|err| format!("write publish journal {}: {err}", temporary.display()))?;
+        file.flush()
+            .map_err(|err| format!("flush publish journal {}: {err}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|err| format!("sync publish journal {}: {err}", temporary.display()))?;
+        std::fs::rename(&temporary, &destination).map_err(|err| {
+            format!(
+                "install publish journal {} as {}: {err}",
+                temporary.display(),
+                destination.display()
+            )
+        })?;
+        sync_directory(transaction_root).map_err(|err| {
+            format!(
+                "sync publish transaction directory {}: {err}",
+                transaction_root.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if write_result.is_err() && temporary.exists() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn read_publish_journal(
+    path: &Path,
+    model: &str,
+    run: &str,
+    phase: PublishPhase,
+) -> Result<PublishJournal, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|err| format!("inspect publish journal {}: {err}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "publish journal {} is not a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_PUBLISH_JOURNAL_BYTES {
+        return Err(format!(
+            "publish journal {} is {} bytes; limit is {MAX_PUBLISH_JOURNAL_BYTES}",
+            path.display(),
+            metadata.len()
+        ));
+    }
+    let file = std::fs::File::open(path)
+        .map_err(|err| format!("open publish journal {}: {err}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_PUBLISH_JOURNAL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("read publish journal {}: {err}", path.display()))?;
+    if bytes.len() as u64 > MAX_PUBLISH_JOURNAL_BYTES {
+        return Err(format!(
+            "publish journal {} grew beyond {MAX_PUBLISH_JOURNAL_BYTES} bytes",
+            path.display()
+        ));
+    }
+    let journal: PublishJournal = serde_json::from_slice(&bytes)
+        .map_err(|err| format!("parse publish journal {}: {err}", path.display()))?;
+    if journal.schema != PUBLISH_JOURNAL_SCHEMA
+        || journal.model != model
+        || journal.run != run
+        || journal.phase != phase
+    {
+        return Err(format!(
+            "publish journal {} identity or phase does not match {model}/{run} ({})",
+            path.display(),
+            publish_phase_name(phase)
+        ));
+    }
+    Ok(journal)
+}
+
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let result = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .and_then(|directory| directory.sync_all());
+    match result {
+        Ok(()) => Ok(()),
+        // Windows filesystems do not uniformly support FlushFileBuffers on
+        // directory handles. Journal FILE contents were already sync_all'd;
+        // do not make publication unusable when only directory fsync is
+        // unavailable on the host volume.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(windows))]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+fn publish_recovery_action(
+    phase: PublishPhase,
+    final_exists: bool,
+    backup_exists: bool,
+    staged_exists: bool,
+) -> Result<PublishRecoveryAction, String> {
+    match (final_exists, backup_exists, staged_exists) {
+        (true, _, _) => Ok(PublishRecoveryAction::KeepFinal),
+        (false, true, _) => Ok(PublishRecoveryAction::RestoreBackup),
+        (false, false, true) if phase == PublishPhase::Prepared => {
+            Ok(PublishRecoveryAction::InstallStaged)
+        }
+        (false, false, false) if phase == PublishPhase::Prepared => {
+            Ok(PublishRecoveryAction::RemoveAbandoned)
+        }
+        (false, false, true) => Err(format!(
+            "{} publish journal has staged data but neither final nor backup",
+            publish_phase_name(phase)
+        )),
+        (false, false, false) => Err(format!(
+            "{} publish journal has no final, backup, or staged run",
+            publish_phase_name(phase)
+        )),
+    }
+}
+
+fn existing_real_directory(path: &Path, label: &str) -> Result<bool, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("inspect {label} {}: {err}", path.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("{label} {} is not a real directory", path.display()));
+    }
+    Ok(true)
+}
+
+fn latest_publish_journal(
+    transaction_root: &Path,
+    model: &str,
+    run: &str,
+) -> Result<Option<PublishJournal>, String> {
+    for phase in [
+        PublishPhase::FinalInstalled,
+        PublishPhase::BackupMoved,
+        PublishPhase::Prepared,
+    ] {
+        let path = publish_journal_path(transaction_root, model, run, phase);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return read_publish_journal(&path, model, run, phase).map(Some),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "inspect publish journal {}: {err}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn has_target_publish_journal_temporary(
+    transaction_root: &Path,
+    model: &str,
+    run: &str,
+) -> Result<bool, String> {
+    for phase in [
+        PublishPhase::Prepared,
+        PublishPhase::BackupMoved,
+        PublishPhase::FinalInstalled,
+    ] {
+        let path = transaction_root.join(format!(
+            ".publish-{}-{}.tmp",
+            publish_target_key(model, run),
+            publish_phase_name(phase)
+        ));
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "inspect temporary publish journal {}: {err}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn recover_publish_transactions_for_run(
+    store_root: &Path,
+    staging_root: &Path,
+    current_transaction: &Path,
+    model: &str,
+    run: &str,
+) -> Result<(), String> {
+    let final_model_dir = store_root.join(model);
+    std::fs::create_dir_all(&final_model_dir).map_err(|err| {
+        format!(
+            "create recovery model directory {}: {err}",
+            final_model_dir.display()
+        )
+    })?;
+    let final_model_dir =
+        checked_real_directory(store_root, &final_model_dir, "recovery model directory")?;
+    let final_run_dir = final_model_dir.join(run);
+    let entries = std::fs::read_dir(staging_root)
+        .map_err(|err| format!("scan staging root {}: {err}", staging_root.display()))?;
+    let mut inspected = 0usize;
+    for entry in entries {
+        inspected += 1;
+        if inspected > MAX_STAGING_RECOVERY_ENTRIES {
+            return Err(format!(
+                "staging recovery found more than {MAX_STAGING_RECOVERY_ENTRIES} entries in {}; refusing an unbounded scan",
+                staging_root.display()
+            ));
+        }
+        let entry = entry
+            .map_err(|err| format!("read staging entry in {}: {err}", staging_root.display()))?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| "staging entry has a non-UTF-8 name".to_string())?
+            .to_string();
+        if !name.starts_with("txn-") {
+            continue;
+        }
+        let transaction_root = entry.path();
+        if transaction_root == current_transaction {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&transaction_root) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(format!(
+                    "inspect recovery transaction {}: {err}",
+                    transaction_root.display()
+                ));
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(format!(
+                "recovery transaction {} is not a real directory",
+                transaction_root.display()
+            ));
+        }
+        let transaction_root = match checked_real_directory(
+            staging_root,
+            &transaction_root,
+            "recovery transaction",
+        ) {
+            Ok(path) => path,
+            Err(_) if !transaction_root.exists() => continue,
+            Err(err) => return Err(err),
+        };
+        let Some(journal) = latest_publish_journal(&transaction_root, model, run)? else {
+            // A target-keyed temporary with no installed Prepared journal
+            // can only precede every destructive rename. Under the target's
+            // publish lock it is safe to discard that interrupted intent.
+            if has_target_publish_journal_temporary(&transaction_root, model, run)? {
+                safe_remove_tree(staging_root, &transaction_root)?;
+                sync_directory(staging_root)
+                    .map_err(|err| format!("sync orphan journal cleanup: {err}"))?;
+            }
+            // Otherwise this is an import still being staged or a different
+            // target's transaction and must remain untouched.
+            continue;
+        };
+        let staged_run_dir = transaction_root
+            .join(STAGING_WORK_DIR_NAME)
+            .join(model)
+            .join(run);
+        let backup_run_dir = transaction_root.join(STAGING_BACKUP_DIR_NAME);
+        let final_exists = existing_real_directory(&final_run_dir, "recovery final run")?;
+        let backup_exists = existing_real_directory(&backup_run_dir, "recovery backup run")?;
+        let staged_exists = existing_real_directory(&staged_run_dir, "recovery staged run")?;
+        let action = publish_recovery_action(
+            journal.phase,
+            final_exists,
+            backup_exists,
+            staged_exists,
+        )
+        .map_err(|reason| {
+            format!(
+                "cannot recover interrupted publication for {model}/{run} in {}: {reason}",
+                transaction_root.display()
+            )
+        })?;
+
+        match action {
+            PublishRecoveryAction::KeepFinal => {
+                validate_persisted_run(
+                    store_root,
+                    &final_run_dir,
+                    model,
+                    run,
+                    "recovered final run",
+                )?;
+            }
+            PublishRecoveryAction::RestoreBackup => {
+                validate_persisted_run(
+                    &transaction_root,
+                    &backup_run_dir,
+                    model,
+                    run,
+                    "recovery backup run",
+                )?;
+                checked_rename(
+                    &transaction_root,
+                    &backup_run_dir,
+                    store_root,
+                    &final_run_dir,
+                    "restore interrupted publish backup",
+                )?;
+                validate_persisted_run(
+                    store_root,
+                    &final_run_dir,
+                    model,
+                    run,
+                    "restored previous run",
+                )?;
+                sync_directory(
+                    final_run_dir
+                        .parent()
+                        .ok_or_else(|| "restored run has no parent".to_string())?,
+                )
+                .map_err(|err| format!("sync restored run parent: {err}"))?;
+            }
+            PublishRecoveryAction::InstallStaged => {
+                validate_persisted_run(
+                    &transaction_root,
+                    &staged_run_dir,
+                    model,
+                    run,
+                    "recovery staged run",
+                )?;
+                checked_rename(
+                    &transaction_root,
+                    &staged_run_dir,
+                    store_root,
+                    &final_run_dir,
+                    "complete interrupted publish",
+                )?;
+                validate_persisted_run(
+                    store_root,
+                    &final_run_dir,
+                    model,
+                    run,
+                    "completed recovered run",
+                )?;
+                sync_directory(
+                    final_run_dir
+                        .parent()
+                        .ok_or_else(|| "recovered run has no parent".to_string())?,
+                )
+                .map_err(|err| format!("sync recovered run parent: {err}"))?;
+            }
+            PublishRecoveryAction::RemoveAbandoned => {}
+        }
+
+        safe_remove_tree(staging_root, &transaction_root)?;
+        sync_directory(staging_root)
+            .map_err(|err| format!("sync staging recovery cleanup: {err}"))?;
+    }
+    Ok(())
+}
+
+fn validate_persisted_run(
+    containment_root: &Path,
+    run_dir: &Path,
+    model: &str,
+    run: &str,
+    label: &str,
+) -> Result<(), String> {
+    let run_dir = checked_real_directory(containment_root, run_dir, label)?;
+    let manifest_path = checked_regular_file_descendant(
+        &run_dir,
+        &run_dir.join("run.json"),
+        &format!("{label} manifest"),
+    )?;
+    let manifest = RwsRunManifest::load_for_run(&manifest_path, model, run)
+        .map_err(|err| format!("validate {label} manifest: {err}"))?;
+    if manifest.hours.is_empty() {
+        return Err(format!("{label} contains no forecast hours"));
+    }
+    let grid_path = checked_regular_file_descendant(
+        &run_dir,
+        &run_dir.join("grid.rwg"),
+        &format!("{label} grid"),
+    )?;
+    let grid = GridFile::open(&grid_path)
+        .map_err(|err| format!("open {label} grid {}: {err}", grid_path.display()))?;
+    manifest
+        .validate_grid(&grid.hash, grid.nx, grid.ny)
+        .map_err(|err| format!("{label} grid does not match manifest: {err}"))?;
+    for (&hour, entry) in &manifest.hours {
+        let hour_path = checked_regular_file_descendant(
+            &run_dir,
+            &run_dir.join(&entry.file),
+            &format!("{label} hour F{hour:03}"),
+        )?;
+        let reader = HourReader::open(&hour_path)
+            .map_err(|err| format!("open {label} hour F{hour:03}: {err}"))?;
+        let meta = reader.meta();
+        manifest
+            .validate_identity(&meta.model, &meta.run)
+            .map_err(|err| format!("{label} hour F{hour:03} identity mismatch: {err}"))?;
+        manifest
+            .validate_grid(&meta.grid_hash, meta.nx, meta.ny)
+            .map_err(|err| format!("{label} hour F{hour:03} grid mismatch: {err}"))?;
+        if meta.forecast_hour != hour {
+            return Err(format!(
+                "{label} manifest F{hour:03} points to hour metadata F{:03}",
+                meta.forecast_hour
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn checked_existing_descendant(root: &Path, path: &Path, label: &str) -> Result<PathBuf, String> {
@@ -473,6 +1058,19 @@ fn checked_existing_descendant(root: &Path, path: &Path, label: &str) -> Result<
         ));
     }
     Ok(path)
+}
+
+fn checked_regular_file_descendant(
+    root: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|err| format!("inspect {label} {}: {err}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!("{label} {} is not a regular file", path.display()));
+    }
+    checked_existing_descendant(root, path, label)
 }
 
 fn checked_real_directory(root: &Path, path: &Path, label: &str) -> Result<PathBuf, String> {
@@ -2618,15 +3216,16 @@ fn read_first_2d(src: &PlaneSource, name: &str) -> Result<Option<Plane2D>, Impor
 /// datasets (measured on the real CONUS-II wrf2d file: 5 of 192 —
 /// U10/MUCAPE/SRH03/SWUPT/ACEDIR), so a name absent from the LISTING is
 /// attempted through the selected-record reader, whose by-name HDF5 fallback
-/// now supports arbitrary records too. NOTE: on that wrf2d file the fallback
-/// still fails for the five (the whole pinned stack cannot see them). A name
-/// absent from both readers stays `None`; listed variables propagate errors.
+/// supports arbitrary records too. Dense-group internal-node records are now
+/// included by the vendored HDF5 v2 B-tree traversal, so those exact-name
+/// reads resolve as well. A name absent from both readers stays `None`;
+/// listed variables propagate errors.
 fn read_first_2d_netcrust(
     nc: &NcFile,
     name: &str,
     time_index: usize,
 ) -> Result<Option<Plane2D>, ImportError> {
-    let listed = nc.variable(name).is_some();
+    let listed = nc.variable(name).is_some() || nc.has_hdf5_dataset(name);
     let array = match read_array_f64_record_or_all(nc, name, time_index) {
         Ok(array) => array,
         Err(_) if !listed => return Ok(None),
@@ -2674,10 +3273,14 @@ fn plane_from_last_record(
 }
 
 fn variable_units(nc: &NcFile, name: &str) -> Option<String> {
-    nc.variable(name)?
-        .attribute("units")
-        .and_then(|attr| attr.as_string())
-        .map(str::to_string)
+    nc.variable(name)
+        .and_then(|variable| {
+            variable
+                .attribute("units")
+                .and_then(|attribute| attribute.as_string())
+                .map(str::to_string)
+        })
+        .or_else(|| nc.hdf5_dataset_attribute_string(name, "units"))
 }
 
 fn combine_same_grid(
@@ -3132,6 +3735,65 @@ fn is_postproc_2d_data_plane(
     }
 }
 
+/// Raw-HDF5 counterpart to [`is_postproc_2d_data_plane`]. Dataset names and
+/// shapes survive even when the NetCDF-4 variable index omits an entry, but
+/// dimension labels do not. A rank-three plane is therefore accepted only
+/// for a singleton leading axis or when HDF5 explicitly marks that axis as
+/// unlimited.
+fn is_postproc_2d_hdf5_data_plane(
+    name: &str,
+    shape: &[u64],
+    has_leading_record_axis: bool,
+    ny: usize,
+    nx: usize,
+) -> bool {
+    if !raw_wrf_variable_allowed(name) || is_coordinate_axis_name(name) {
+        return false;
+    }
+    let (Ok(ny), Ok(nx)) = (u64::try_from(ny), u64::try_from(nx)) else {
+        return false;
+    };
+    match shape {
+        [y, x] => *y == ny && *x == nx,
+        [t, y, x] => (*t == 1 || has_leading_record_axis) && *y == ny && *x == nx,
+        _ => false,
+    }
+}
+
+const CONUS_II_WRF2D_SHAPE: (usize, usize) = (1429, 1419);
+const CONUS_II_WRF2D_REQUIRED_RAW_FIELDS: [&str; 5] = [
+    "wrf_u10",
+    "wrf_mucape",
+    "wrf_srh03",
+    "wrf_swupt",
+    "wrf_acedir",
+];
+const CONUS_II_WRF2D_REQUIRED_CANONICAL_WINDS: [&str; 3] =
+    ["u_10m", "v_10m", "wind_speed_10m"];
+
+fn missing_conus_ii_wrf2d_fields<'a>(
+    nx: usize,
+    ny: usize,
+    raw_names: impl IntoIterator<Item = &'a str>,
+    canonical_names: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    if (nx, ny) != CONUS_II_WRF2D_SHAPE {
+        return Vec::new();
+    }
+    let raw_names = raw_names.into_iter().collect::<HashSet<_>>();
+    let canonical_names = canonical_names.into_iter().collect::<HashSet<_>>();
+    CONUS_II_WRF2D_REQUIRED_RAW_FIELDS
+        .into_iter()
+        .filter(|name| !raw_names.contains(name))
+        .chain(
+            CONUS_II_WRF2D_REQUIRED_CANONICAL_WINDS
+                .into_iter()
+                .filter(|name| !canonical_names.contains(name)),
+        )
+        .map(str::to_string)
+        .collect()
+}
+
 /// Coordinate-axis variable names the 2-D enumeration must skip (the grid
 /// reader consumes these; they are not data planes). The uppercase WRF forms
 /// (XLAT/XLONG/…) are already on `raw_wrf_variable_allowed`'s blocklist.
@@ -3201,17 +3863,13 @@ fn postprocessed_wrf2d_hour(
     // line every few planes keeps the dock's progress live without spamming
     // the channel (~190 variables on a real wrf2d file).
     //
-    // KNOWN BOUND (measured on the owner's real file, two node runs): the
-    // pinned netcdf-reader metadata index exposes 180 of the 185 candidate
-    // planes — U10, MUCAPE, SRH03, SWUPT, and ACEDIR are invisible to the
-    // whole pinned netcrust/hdf5-reader stack (both the group enumeration
-    // AND the by-name dataset lookup fail on them; h5py reads them fine).
-    // They cannot be recovered at an app seam — a root-group hdf5-reader
-    // walk was tried and dropped the same five. Fix belongs upstream in
-    // rusty-weather's hdf5-reader. Owner-visible consequence: no `u_10m` /
-    // `wind_speed_10m` canonical fields on wrf2d (v_10m imports fine).
+    // The raw HDF5 walk is intentional. netcdf-reader's index omitted five
+    // real CONUS-II datasets (U10/MUCAPE/SRH03/SWUPT/ACEDIR); hdf5-reader's
+    // dense-group B-tree traversal now includes internal-node records, and
+    // this second metadata source ensures those recovered datasets enter the
+    // import plan instead of remaining reachable only by an exact-name read.
     let variables = nc.variables()?;
-    let planned = variables
+    let mut planned = variables
         .iter()
         .filter(|var| {
             let names: Vec<&str> = var.dimensions().iter().map(|dim| dim.name()).collect();
@@ -3219,6 +3877,19 @@ fn postprocessed_wrf2d_hour(
         })
         .map(|var| var.name().to_string())
         .collect::<Vec<_>>();
+    let mut planned_names = planned.iter().cloned().collect::<HashSet<_>>();
+    for dataset in nc.hdf5_root_datasets()? {
+        if is_postproc_2d_hdf5_data_plane(
+            dataset.name(),
+            dataset.shape(),
+            dataset.has_leading_record_axis(),
+            ny,
+            nx,
+        ) && planned_names.insert(dataset.name().to_string())
+        {
+            planned.push(dataset.name().to_string());
+        }
+    }
     let total = planned.len();
     progress(format!("reading {total} 2-D surface planes"));
     let mut seen = HashSet::<String>::new();
@@ -3244,6 +3915,18 @@ fn postprocessed_wrf2d_hour(
             name,
             units: variable_units(nc, wrf_name).unwrap_or_else(|| "1".to_string()),
             values: plane.values,
+        });
+    }
+    let missing = missing_conus_ii_wrf2d_fields(
+        nx,
+        ny,
+        raw_2d.iter().map(|field| field.name.as_str()),
+        canonical.iter().map(|(name, _)| name.as_str()),
+    );
+    if !missing.is_empty() {
+        return Err(ImportError::IncompleteWrf2d {
+            path: path.to_path_buf(),
+            missing,
         });
     }
     progress(format!(
@@ -3316,11 +3999,36 @@ pub(crate) fn try_postprocessed_wrf_shared(
         let nz = s[0];
         Ok((array.into_values(), nz))
     };
+    // Read only TK's small metadata first. The aggregate working-set gate
+    // must know nz, but it must run before any multi-hundred-MB 3-D value
+    // buffer is decoded or allocated.
+    let tk_var = nc
+        .variable("TK")
+        .ok_or_else(|| ImportError::MissingAny(vec!["TK".to_string()]))?;
+    let tk_shape = tk_var.shape();
+    let tk_dims = tk_var.dimensions();
+    let tk_data_shape = if tk_dims
+        .first()
+        .is_some_and(|dimension| is_time_dimension(dimension.name()))
+    {
+        tk_shape.get(1..).unwrap_or_default()
+    } else {
+        tk_shape.as_slice()
+    };
+    if tk_data_shape.len() != 3 || tk_data_shape[1] != ny || tk_data_shape[2] != nx {
+        return Err(ImportError::BadShape("TK".to_string(), tk_shape.clone()));
+    }
+    let preflight_nz = tk_data_shape[0];
+    let _working_set_bytes = preflight_iso_volume_shape(preflight_nz, cells)
+        .map_err(ImportError::PostprocessedVolume)?;
     progress("reading post-processed 3D fields (TK/P/Z/QVAPOR)".to_string());
     // `tk` and `z_m` are `mut`: after the iso interpolation they are converted
     // in place (K -> C, MSL -> AGL) for the severe suite below, instead of
     // allocating two more full-3D arrays (hundreds of MB each on CONUS-II).
     let (mut tk, nz) = read3d("TK")?;
+    if nz != preflight_nz {
+        return Err(ImportError::BadShape("TK".to_string(), vec![nz, ny, nx]));
+    }
     let (mut p_pa, _) = read3d("P")?;
     let (mut z_m, z_nz) = read3d("Z")?;
     let (mut qv, _) = read3d("QVAPOR")?;
@@ -3387,7 +4095,7 @@ pub(crate) fn try_postprocessed_wrf_shared(
         .map(|(&q, &pa)| dewpoint_k_from_q_p(q, pa))
         .collect();
 
-    let (mut volumes, surface) = interpolate_iso_volumes(
+    let (mut volumes, surface) = try_interpolate_iso_volumes(
         &p_hpa,
         &tk,
         &dewpoint_k,
@@ -3397,7 +4105,8 @@ pub(crate) fn try_postprocessed_wrf_shared(
         nz,
         cells,
         progress,
-    );
+    )
+    .map_err(ImportError::PostprocessedVolume)?;
     if !winds_are_earth_relative {
         volumes.retain(|volume| !matches!(volume.name.as_str(), "u_iso" | "v_iso"));
     }
@@ -3768,6 +4477,230 @@ mod tests {
     }
 
     #[test]
+    fn publish_recovery_state_machine_covers_every_rename_boundary() {
+        use PublishRecoveryAction::{InstallStaged, KeepFinal, RestoreBackup};
+
+        // Journal durable, death before the first rename: retain the old run.
+        assert_eq!(
+            publish_recovery_action(PublishPhase::Prepared, true, false, true).unwrap(),
+            KeepFinal
+        );
+        // Death after final -> backup, both before and after its phase marker.
+        assert_eq!(
+            publish_recovery_action(PublishPhase::Prepared, false, true, true).unwrap(),
+            RestoreBackup
+        );
+        assert_eq!(
+            publish_recovery_action(PublishPhase::BackupMoved, false, true, true).unwrap(),
+            RestoreBackup
+        );
+        // Death after staged -> final, before or after its phase marker.
+        assert_eq!(
+            publish_recovery_action(PublishPhase::BackupMoved, true, true, false).unwrap(),
+            KeepFinal
+        );
+        assert_eq!(
+            publish_recovery_action(PublishPhase::FinalInstalled, true, true, false).unwrap(),
+            KeepFinal
+        );
+        // Death after backup cleanup leaves a complete final and journal only.
+        assert_eq!(
+            publish_recovery_action(PublishPhase::FinalInstalled, true, false, false).unwrap(),
+            KeepFinal
+        );
+        // With no previous run, a prepared valid stage can be completed.
+        assert_eq!(
+            publish_recovery_action(PublishPhase::Prepared, false, false, true).unwrap(),
+            InstallStaged
+        );
+        assert!(
+            publish_recovery_action(PublishPhase::BackupMoved, false, false, true).is_err(),
+            "lost backup after the destructive phase must remain preserved for inspection"
+        );
+    }
+
+    #[test]
+    fn publish_recovery_scan_is_bounded() {
+        let root = temp_dir("publisher-recovery-bound");
+        let staging_root = root.join(STAGING_DIR_NAME);
+        std::fs::create_dir_all(&staging_root).unwrap();
+        for index in 0..=MAX_STAGING_RECOVERY_ENTRIES {
+            std::fs::create_dir(staging_root.join(format!("unrelated-{index:04}"))).unwrap();
+        }
+        let run = format!("recover_bound_{IMPORT_SCIENCE_SCHEMA_VERSION}");
+        let error = recover_publish_transactions_for_run(
+            &root,
+            &staging_root,
+            &staging_root.join("current-not-present"),
+            "wrf",
+            &run,
+        )
+        .unwrap_err();
+        assert!(error.contains("refusing an unbounded scan"), "{error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publish_recovery_cleans_orphaned_prepared_journal_temporary() {
+        let root = temp_dir("publisher-recovery-journal-temp");
+        let staging_root = root.join(STAGING_DIR_NAME);
+        std::fs::create_dir_all(&staging_root).unwrap();
+        let transaction = create_unique_transaction_dir(&staging_root).unwrap();
+        std::fs::create_dir(transaction.join(STAGING_WORK_DIR_NAME)).unwrap();
+        let model = "wrf";
+        let run = format!("recover_temp_{IMPORT_SCIENCE_SCHEMA_VERSION}");
+        std::fs::write(
+            transaction.join(format!(
+                ".publish-{}-prepared.tmp",
+                publish_target_key(model, &run)
+            )),
+            b"partial",
+        )
+        .unwrap();
+
+        recover_publish_transactions_for_run(
+            &root,
+            &staging_root,
+            &staging_root.join("current-not-present"),
+            model,
+            &run,
+        )
+        .unwrap();
+        assert!(!transaction.exists());
+        assert!(!root.join(model).join(&run).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publish_recovery_restores_previous_run_after_first_rename() {
+        let root = temp_dir("publisher-recover-backup");
+        let model = "wrf";
+        let run = format!("recover_backup_{IMPORT_SCIENCE_SCHEMA_VERSION}");
+        write_valid_test_run(&root, model, &run, 270.0);
+        let final_run = root.join(model).join(&run);
+        std::fs::write(final_run.join("old.marker"), b"old").unwrap();
+
+        let staging_root = root.join(STAGING_DIR_NAME);
+        std::fs::create_dir_all(&staging_root).unwrap();
+        let transaction = create_unique_transaction_dir(&staging_root).unwrap();
+        let work = transaction.join(STAGING_WORK_DIR_NAME);
+        std::fs::create_dir(&work).unwrap();
+        write_valid_test_run(&work, model, &run, 300.0);
+        std::fs::write(work.join(model).join(&run).join("new.marker"), b"new").unwrap();
+        write_publish_journal(&transaction, model, &run, PublishPhase::Prepared).unwrap();
+        std::fs::rename(&final_run, transaction.join(STAGING_BACKUP_DIR_NAME)).unwrap();
+
+        recover_publish_transactions_for_run(
+            &root,
+            &staging_root,
+            &staging_root.join("current-not-this-transaction"),
+            model,
+            &run,
+        )
+        .unwrap();
+        assert!(final_run.join("old.marker").is_file());
+        assert!(!final_run.join("new.marker").exists());
+        assert!(!transaction.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publish_recovery_preserves_invalid_backup_instead_of_restoring_it() {
+        let root = temp_dir("publisher-recover-invalid-backup");
+        let model = "wrf";
+        let run = format!("recover_invalid_{IMPORT_SCIENCE_SCHEMA_VERSION}");
+        write_valid_test_run(&root, model, &run, 270.0);
+        let final_run = root.join(model).join(&run);
+        let staging_root = root.join(STAGING_DIR_NAME);
+        std::fs::create_dir_all(&staging_root).unwrap();
+        let transaction = create_unique_transaction_dir(&staging_root).unwrap();
+        std::fs::create_dir(transaction.join(STAGING_WORK_DIR_NAME)).unwrap();
+        write_publish_journal(&transaction, model, &run, PublishPhase::Prepared).unwrap();
+        let backup = transaction.join(STAGING_BACKUP_DIR_NAME);
+        std::fs::rename(&final_run, &backup).unwrap();
+        std::fs::write(backup.join("run.json"), b"not valid JSON").unwrap();
+
+        let error = recover_publish_transactions_for_run(
+            &root,
+            &staging_root,
+            &staging_root.join("current-not-this-transaction"),
+            model,
+            &run,
+        )
+        .unwrap_err();
+        assert!(error.contains("validate recovery backup run manifest"), "{error}");
+        assert!(!final_run.exists());
+        assert!(backup.is_dir(), "invalid backup must remain for inspection");
+        assert!(transaction.is_dir());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publish_recovery_reconciles_completed_second_rename() {
+        let root = temp_dir("publisher-recover-final");
+        let model = "wrf";
+        let run = format!("recover_final_{IMPORT_SCIENCE_SCHEMA_VERSION}");
+        write_valid_test_run(&root, model, &run, 270.0);
+        let final_run = root.join(model).join(&run);
+        std::fs::write(final_run.join("old.marker"), b"old").unwrap();
+
+        let staging_root = root.join(STAGING_DIR_NAME);
+        std::fs::create_dir_all(&staging_root).unwrap();
+        let transaction = create_unique_transaction_dir(&staging_root).unwrap();
+        let work = transaction.join(STAGING_WORK_DIR_NAME);
+        std::fs::create_dir(&work).unwrap();
+        let staged_run = work.join(model).join(&run);
+        write_valid_test_run(&work, model, &run, 300.0);
+        std::fs::write(staged_run.join("new.marker"), b"new").unwrap();
+        write_publish_journal(&transaction, model, &run, PublishPhase::Prepared).unwrap();
+        std::fs::rename(&final_run, transaction.join(STAGING_BACKUP_DIR_NAME)).unwrap();
+        write_publish_journal(&transaction, model, &run, PublishPhase::BackupMoved).unwrap();
+        std::fs::rename(&staged_run, &final_run).unwrap();
+
+        recover_publish_transactions_for_run(
+            &root,
+            &staging_root,
+            &staging_root.join("current-not-this-transaction"),
+            model,
+            &run,
+        )
+        .unwrap();
+        assert!(final_run.join("new.marker").is_file());
+        assert!(!final_run.join("old.marker").exists());
+        assert!(!transaction.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publish_recovery_installs_prepared_stage_when_no_previous_run_existed() {
+        let root = temp_dir("publisher-recover-new");
+        let model = "wrf";
+        let run = format!("recover_new_{IMPORT_SCIENCE_SCHEMA_VERSION}");
+        std::fs::create_dir_all(&root).unwrap();
+        let staging_root = root.join(STAGING_DIR_NAME);
+        std::fs::create_dir_all(&staging_root).unwrap();
+        let transaction = create_unique_transaction_dir(&staging_root).unwrap();
+        let work = transaction.join(STAGING_WORK_DIR_NAME);
+        std::fs::create_dir(&work).unwrap();
+        let staged_run = work.join(model).join(&run);
+        write_valid_test_run(&work, model, &run, 300.0);
+        std::fs::write(staged_run.join("new.marker"), b"new").unwrap();
+        write_publish_journal(&transaction, model, &run, PublishPhase::Prepared).unwrap();
+
+        recover_publish_transactions_for_run(
+            &root,
+            &staging_root,
+            &staging_root.join("current-not-this-transaction"),
+            model,
+            &run,
+        )
+        .unwrap();
+        assert!(root.join(model).join(&run).join("new.marker").is_file());
+        assert!(!transaction.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn staging_publisher_swaps_complete_directory_and_removes_backup() {
         let root = temp_dir("publisher-success");
         let run = format!("publisher_{IMPORT_SCIENCE_SCHEMA_VERSION}");
@@ -4019,6 +4952,35 @@ mod tests {
         std::env::temp_dir().join(format!("rw-local-import-{name}-{unique}"))
     }
 
+    fn write_valid_test_run(store_root: &Path, model: &str, run: &str, value: f32) {
+        let shape = GridShape::new(2, 2).unwrap();
+        let grid = LatLonGrid::new(
+            shape,
+            vec![40.0, 40.0, 39.0, 39.0],
+            vec![-101.0, -100.0, -101.0, -100.0],
+        )
+        .unwrap();
+        let field = SelectedField2D::new(
+            FieldSelector::height_agl(CanonicalField::Temperature, 2),
+            "K",
+            grid,
+            vec![value; 4],
+        )
+        .unwrap();
+        write_hour_from_fields_with_derived(
+            store_root,
+            model,
+            run,
+            0,
+            &[("temperature_2m", &field)],
+            &[],
+            &[],
+            "publish-recovery-test",
+            1,
+        )
+        .unwrap();
+    }
+
     /// The post-processed routing rule (owner-reported CONUS-II wrf2d
     /// misroute, "bad shape for variable TK: [1419, 1429]"): single-plane TK
     /// (surface archive) routes 2-D, model-level TK (wrf3d, either Z era)
@@ -4134,6 +5096,76 @@ mod tests {
             ny,
             nx
         ));
+
+        assert!(is_postproc_2d_hdf5_data_plane(
+            "U10",
+            &[1, ny as u64, nx as u64],
+            false,
+            ny,
+            nx
+        ));
+        assert!(is_postproc_2d_hdf5_data_plane(
+            "MUCAPE",
+            &[4, ny as u64, nx as u64],
+            true,
+            ny,
+            nx
+        ));
+        assert!(!is_postproc_2d_hdf5_data_plane(
+            "MUCAPE",
+            &[4, ny as u64, nx as u64],
+            false,
+            ny,
+            nx
+        ));
+        assert!(!is_postproc_2d_hdf5_data_plane(
+            "U",
+            &[1, ny as u64, nx as u64 + 1],
+            true,
+            ny,
+            nx
+        ));
+    }
+
+    #[test]
+    fn conus_ii_wrf2d_completeness_fails_closed_on_reader_omissions() {
+        let raw = ["wrf_u10", "wrf_mucape", "wrf_srh03", "wrf_swupt"];
+        let canonical = ["u_10m", "v_10m"];
+        assert_eq!(
+            missing_conus_ii_wrf2d_fields(
+                1429,
+                1419,
+                raw.iter().copied(),
+                canonical.iter().copied()
+            ),
+            vec!["wrf_acedir", "wind_speed_10m"]
+        );
+
+        // The exact field contract is specific to the measured CONUS-II
+        // archive geometry; another wrf2d dialect is not rejected for a
+        // scientifically legitimate, smaller diagnostic suite.
+        assert!(
+            missing_conus_ii_wrf2d_fields(
+                100,
+                100,
+                std::iter::empty(),
+                std::iter::empty()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn conus_ii_wrf2d_completeness_accepts_all_recovered_fields() {
+        assert!(
+            missing_conus_ii_wrf2d_fields(
+                1429,
+                1419,
+                CONUS_II_WRF2D_REQUIRED_RAW_FIELDS.iter().copied(),
+                CONUS_II_WRF2D_REQUIRED_CANONICAL_WINDS.iter().copied(),
+            )
+            .is_empty()
+        );
     }
 
     /// Real-data proof for the CONUS-II `wrf2d` 2-D route (the owner's
@@ -4162,18 +5194,17 @@ mod tests {
         );
         assert_eq!(summary.model, "wrf");
         assert_eq!(summary.hours_written, 1);
-        // Canonical suite from the file's own T2/Q2/PSFC planes. NOT
-        // asserted: u_10m and wind_speed_10m — the pinned netcdf-reader
-        // metadata index drops U10 (with MUCAPE/SRH03/SWUPT/ACEDIR, 5 of
-        // 192 datasets) on the real CONUS-II wrf2d files, and the whole
-        // pinned stack (enumeration AND by-name fallback) cannot see them;
-        // measured on two node runs. If an upstream hdf5-reader fix lands,
-        // add them back here — the import code needs no change.
+        // Canonical suite from the file's own T2/Q2/PSFC/U10/V10 planes.
+        // These wind assertions prove the formerly omitted internal B-tree
+        // record for U10 is now both discoverable and readable.
         for var in [
             "temperature_2m",
             "dewpoint_2m",
             "relative_humidity_2m",
             "surface_pressure",
+            "u_10m",
+            "v_10m",
+            "wind_speed_10m",
             "wind_speed_10m_max",
         ] {
             assert!(
@@ -4183,15 +5214,20 @@ mod tests {
             );
         }
         // Raw planes: the misrouting trio plus a severe plane, an
-        // accumulated-flux plane, and the 10 m v-wind, under the
-        // light-import wrf_* naming.
+        // accumulated-flux plane, and every formerly omitted internal-node
+        // record, under the light-import wrf_* naming.
         for var in [
             "wrf_tk",
             "wrf_z",
             "wrf_p",
             "wrf_sbcape",
             "wrf_aclwdnb",
+            "wrf_u10",
             "wrf_v10",
+            "wrf_mucape",
+            "wrf_srh03",
+            "wrf_swupt",
+            "wrf_acedir",
         ] {
             assert!(
                 summary.variables.iter().any(|name| name == var),
@@ -4200,9 +5236,9 @@ mod tests {
             );
         }
         // The 2-D route must land the full plane set the metadata listing
-        // exposes (180 raw + 6 canonical on the real file).
+        // exposes (185 raw plus the canonical suite on the real file).
         assert!(
-            summary.variables.len() >= 180,
+            summary.variables.len() >= 190,
             "expected the full 2-D plane set, got {} variables: {:?}",
             summary.variables.len(),
             summary.variables
@@ -4774,6 +5810,15 @@ pub(crate) enum ImportError {
     },
     #[error("post-processed variable {0} has no finite physically plausible values")]
     NoPlausibleValues(String),
+    #[error(
+        "incomplete CONUS-II wrf2d dataset in {path}: missing required fields {missing:?}; refusing a partial import"
+    )]
+    IncompleteWrf2d {
+        path: PathBuf,
+        missing: Vec<String>,
+    },
+    #[error("post-processed WRF volume allocation is unsupported: {0}")]
+    PostprocessedVolume(String),
     #[error(transparent)]
     Netcdf(#[from] netcrust::Error),
     #[error(transparent)]

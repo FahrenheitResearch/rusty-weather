@@ -95,6 +95,36 @@ pub struct File {
     dimension_overrides: Arc<HashMap<String, usize>>,
 }
 
+/// Dataset metadata read directly from the HDF5 root group.
+///
+/// NetCDF-4 readers normally expose the same objects through their NetCDF
+/// index. Keeping this small fallback surface lets callers enumerate a valid
+/// dataset that the NetCDF index omitted without constructing synthetic
+/// dimensions or weakening the normal [`Variable`] API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hdf5DatasetMetadata {
+    name: String,
+    shape: Vec<u64>,
+    max_dims: Option<Vec<u64>>,
+}
+
+impl Hdf5DatasetMetadata {
+    /// Root-relative dataset name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Stored HDF5 dimensions.
+    pub fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+
+    /// Whether HDF5 metadata proves an explicit leading record axis.
+    pub fn has_leading_record_axis(&self) -> bool {
+        hdf5_metadata_has_leading_record_axis(&self.shape, self.max_dims.as_deref())
+    }
+}
+
 impl File {
     /// Open a NetCDF file from disk.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -191,6 +221,52 @@ impl File {
                 )
             })
             .collect()
+    }
+
+    /// Root-group dataset metadata from the raw HDF5 index.
+    ///
+    /// Returns an empty list for classic NetCDF inputs. For NetCDF-4/HDF5,
+    /// every reported shape is checked against the same allocation ceilings
+    /// used by data reads before it reaches callers.
+    pub fn hdf5_root_datasets(&self) -> Result<Vec<Hdf5DatasetMetadata>> {
+        let Some(hdf5) = self.hdf5.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let root = hdf5
+            .root_group()
+            .map_err(|err| Error::Hdf5(format!("cannot open HDF5 root group: {err}")))?;
+        root.datasets()
+            .map_err(|err| Error::Hdf5(format!("cannot enumerate HDF5 root datasets: {err}")))?
+            .into_iter()
+            .map(|dataset| {
+                checked_array_elements(dataset.name(), dataset.shape())?;
+                Ok(Hdf5DatasetMetadata {
+                    name: dataset.name().to_string(),
+                    shape: dataset.shape().to_vec(),
+                    max_dims: dataset.max_dims().map(ToOwned::to_owned),
+                })
+            })
+            .collect()
+    }
+
+    /// Read one scalar string attribute directly from an HDF5 dataset.
+    /// This is the metadata counterpart to the raw-HDF5 by-name data fallback.
+    pub fn hdf5_dataset_attribute_string(&self, name: &str, attribute: &str) -> Option<String> {
+        self.hdf5
+            .as_ref()?
+            .dataset(name)
+            .ok()?
+            .attribute(attribute)
+            .ok()?
+            .read_string()
+            .ok()
+    }
+
+    /// Whether raw HDF5 lookup resolves a root-relative dataset name.
+    pub fn has_hdf5_dataset(&self, name: &str) -> bool {
+        self.hdf5
+            .as_ref()
+            .is_some_and(|hdf5| hdf5.dataset(name).is_ok())
     }
 
     /// Find a variable by name or root-relative path.
@@ -292,10 +368,11 @@ impl File {
     }
 
     /// Read one indexed WRF time record only when metadata proves that the
-    /// leading axis is time; otherwise read all values for rank < 3 or fail
-    /// closed for an ambiguous rank >= 3 dataset. Unlike constructing a slice
-    /// from listed metadata at the caller, this retains a guarded raw-HDF5
-    /// by-name fallback for datasets omitted from netcdf-reader's index.
+    /// leading axis is time; otherwise read all values for rank < 3, or for a
+    /// lossless singleton leading axis at index zero, and fail closed for any
+    /// other ambiguous rank >= 3 dataset. Unlike constructing a slice from
+    /// listed metadata at the caller, this retains a guarded raw-HDF5 by-name
+    /// fallback for datasets omitted from netcdf-reader's index.
     pub fn read_array_f64_record_or_all(&self, name: &str, time_index: u64) -> Result<DataArray> {
         let variable = match self.inner.variable(name) {
             Ok(variable) => variable,
@@ -350,6 +427,20 @@ impl File {
         {
             checked_record_elements(name, dataset.shape(), time_index)?;
             Some(hdf5_record_selection(dataset.ndim(), time_index))
+        } else if dataset.ndim() >= 3 && dataset.shape().first() == Some(&1) {
+            if time_index != 0 {
+                return Err(Error::InvalidSelection {
+                    name: name.to_string(),
+                    reason: format!(
+                        "singleton leading axis has only record 0, cannot read record {time_index}"
+                    ),
+                });
+            }
+            // A singleton ambiguous axis can be read in full without losing
+            // or relabeling any data. Keep the axis in DataArray metadata;
+            // callers that consume the last 2-D plane see the same values.
+            checked_array_elements(name, dataset.shape())?;
+            None
         } else if dataset.ndim() >= 3 {
             return Err(Error::UnprovenRecordAxis {
                 name: name.to_string(),

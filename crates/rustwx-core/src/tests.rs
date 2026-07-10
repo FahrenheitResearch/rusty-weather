@@ -67,6 +67,19 @@ fn grid_shape_rejects_overflow_ceiling_and_invalid_deserialization() {
 #[test]
 fn dense_volume_products_are_checked_and_bounded() {
     assert_eq!(checked_volume_elements(37, 1_000).unwrap(), 37_000);
+    let max_37_level_cells = MAX_VOLUME_ELEMENTS / 37;
+    assert_eq!(
+        checked_volume_elements(37, max_37_level_cells).unwrap(),
+        37 * max_37_level_cells
+    );
+    assert!(matches!(
+        checked_volume_elements(37, max_37_level_cells + 1),
+        Err(RustwxError::VolumeTooLarge {
+            levels: 37,
+            cells,
+            max_elements: MAX_VOLUME_ELEMENTS,
+        }) if cells == max_37_level_cells + 1
+    ));
     assert!(matches!(
         checked_volume_elements(usize::MAX, 2),
         Err(RustwxError::VolumeTooLarge { .. })
