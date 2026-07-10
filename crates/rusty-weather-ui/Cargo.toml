@@ -19,7 +19,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 thiserror = { workspace = true }
-wrf-core = { git = "https://github.com/FahrenheitResearch/wrf-rust.git", rev = "8150314d508b60b4904e4adc992c15eeaa1394bd", package = "wrf-core", default-features = false, features = ["pure-rust-reader"] }
+wrf-core = { git = "https://github.com/FahrenheitResearch/wrf-rust.git", rev = "96b8fd9d29c3477474da18f1277971bb89a61a9c", package = "wrf-core", default-features = false, features = ["pure-rust-reader"] }
 rustwx-core = { path = "../rustwx-core" }
 rustwx-io = { path = "../rustwx-io" }
 rustwx-models = { path = "../rustwx-models" }
