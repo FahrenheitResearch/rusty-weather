@@ -1147,7 +1147,7 @@ mod tests {
             let mut second = sample_table();
             let values = [center, center, f32::NAN];
             let first_outcome = fit_table_to_values(&mut first, &values).unwrap();
-            let second_outcome = fit_table_to_values(&mut second, &values).unwrap();
+            let _second_outcome = fit_table_to_values(&mut second, &values).unwrap();
             assert!(first_outcome.constant);
             assert_eq!(first, second);
             let expected = if center == 0.0 {

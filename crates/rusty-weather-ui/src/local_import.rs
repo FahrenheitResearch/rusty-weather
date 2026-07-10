@@ -367,7 +367,7 @@ impl RunStagingPublisher {
                 "backup existing run",
             )?;
             self.backup_active = true;
-            sync_directory(final_model_dir)
+            sync_directory(&final_model_dir)
                 .map_err(|err| format!("sync final model directory after backup: {err}"))?;
             sync_directory(&self.transaction_root)
                 .map_err(|err| format!("sync transaction directory after backup: {err}"))?;
@@ -412,7 +412,7 @@ impl RunStagingPublisher {
             };
         }
         self.published = true;
-        sync_directory(final_model_dir)
+        sync_directory(&final_model_dir)
             .map_err(|err| format!("sync final model directory after publish: {err}"))?;
         sync_directory(&self.transaction_root)
             .map_err(|err| format!("sync transaction directory after publish: {err}"))?;
