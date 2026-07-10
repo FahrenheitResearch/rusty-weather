@@ -156,8 +156,26 @@ impl ColorTableEditorPanel {
         }
         ui.horizontal_wrapped(|ui| {
             let can_create = self.selected_template().is_some();
+            let can_use_colors = can_create && field.style.is_some();
             if ui
-                .add_enabled(can_create, egui::Button::new("Apply to map"))
+                .add_enabled(can_use_colors, egui::Button::new("Use colors only"))
+                .on_hover_text(
+                    "Resample these colors onto the current map's intervals. Keeps the current scale, display units, conversion, legend, mask, and tick settings, then saves and binds an editable preset.",
+                )
+                .clicked()
+            {
+                if let Some(template) = self.selected_template().cloned() {
+                    self.apply_template_colors_only(&template, &product, field);
+                }
+            }
+            if ui
+                .add_enabled(
+                    can_create,
+                    egui::Button::new("Apply full preset (scale + units)"),
+                )
+                .on_hover_text(
+                    "Replace the complete map style with this built-in preset, including its levels, display units, unit conversion, legend, mask, and tick settings.",
+                )
                 .clicked()
             {
                 if let Some(template) = self.selected_template().cloned() {
@@ -166,6 +184,7 @@ impl ColorTableEditorPanel {
             }
             if ui
                 .add_enabled(can_create, egui::Button::new("Save copy"))
+                .on_hover_text("Save the complete built-in preset without applying it to the map.")
                 .clicked()
             {
                 if let Some(template) = self.selected_template().cloned() {
@@ -219,7 +238,10 @@ impl ColorTableEditorPanel {
                 });
             let can_apply = current_field.is_some() && self.selected_table.is_some();
             if ui
-                .add_enabled(can_apply, egui::Button::new("Apply to map"))
+                .add_enabled(can_apply, egui::Button::new("Use preset as-is"))
+                .on_hover_text(
+                    "Bind the complete saved preset to this map, including its scale and unit conversion.",
+                )
                 .clicked()
             {
                 if let (Some(field), Some(table)) = (current_field, self.selected_table.clone()) {
@@ -227,6 +249,26 @@ impl ColorTableEditorPanel {
                     self.settings.bind_product(&product, &table);
                     self.status = Some(format!("Applied {table} to {product}"));
                     self.changed = true;
+                }
+            }
+            let fit_availability =
+                fit_scale_availability(&self.settings, self.selected_table.as_deref(), current_field);
+            let fit_help = match fit_availability {
+                Ok(()) => "Evenly redistribute this preset's existing levels over the exact finite range of the currently displayed values. Outliers are included. Colors, units, conversion, legend, extend mode, and mask are preserved; a stale fixed tick step is cleared.",
+                Err(reason) => reason.help(),
+            };
+            if ui
+                .add_enabled(
+                    fit_availability.is_ok(),
+                    egui::Button::new("Fit scale to full range"),
+                )
+                .on_hover_text(fit_help)
+                .clicked()
+            {
+                if let (Some(field), Some(table_name)) =
+                    (current_field, self.selected_table.clone())
+                {
+                    self.fit_selected_table_to_field(&table_name, field);
                 }
             }
             if ui.button("New blank").clicked() {
@@ -397,6 +439,85 @@ impl ColorTableEditorPanel {
         }
         self.selected_table = Some(name);
         self.changed = true;
+    }
+
+    fn apply_template_colors_only(
+        &mut self,
+        template: &StoreVariableStyleTemplate,
+        product: &str,
+        field: &FieldData,
+    ) {
+        let Some(style) = field.style.as_ref() else {
+            self.status = Some(
+                "Colors were not applied: the current field has no scale to preserve.".to_string(),
+            );
+            return;
+        };
+        let source = UserColorTable::from_store_style("built-in colors", &template.style);
+        let name = editable_table_name(
+            &self.settings,
+            product,
+            &format!("{product} custom colors"),
+        );
+        let current = UserColorTable::from_store_style(name.clone(), style);
+        let Some(table) = with_resampled_colors(current, &source.colors) else {
+            self.status = Some(format!(
+                "Colors were not applied: {} has no usable colors.",
+                template.label
+            ));
+            return;
+        };
+        let interval_count = table.colors.len();
+        self.settings.upsert_table(table);
+        self.settings.bind_product(product, &name);
+        self.selected_table = Some(name.clone());
+        self.status = Some(format!(
+            "Used {} colors for {product} across {interval_count} existing intervals; scale and units were kept in {name}",
+            template.label
+        ));
+        self.changed = true;
+    }
+
+    fn fit_selected_table_to_field(&mut self, table_name: &str, field: &FieldData) {
+        if let Err(reason) =
+            fit_scale_availability(&self.settings, Some(table_name), Some(field))
+        {
+            self.status = Some(format!("Scale was not changed: {}", reason.help()));
+            return;
+        }
+        let Some(mut table) = self.settings.table(table_name).cloned() else {
+            self.status = Some("Scale was not changed: the selected preset is missing.".to_string());
+            return;
+        };
+        match fit_table_to_values(&mut table, &field.values) {
+            Ok(outcome) => {
+                self.settings.upsert_table(table);
+                self.status = Some(if outcome.constant {
+                    format!(
+                        "Fitted {table_name} around the constant displayed value {}; colors and units were kept and the fixed tick step was cleared",
+                        format_number(outcome.source_min)
+                    )
+                } else {
+                    format!(
+                        "Fitted {table_name} to the full displayed range {} to {}; colors and units were kept and the fixed tick step was cleared",
+                        format_number(outcome.source_min),
+                        format_number(outcome.source_max)
+                    )
+                });
+                self.changed = true;
+            }
+            Err(FitScaleError::NoFiniteValues) => {
+                self.status = Some(
+                    "Scale was not changed: the current field has no finite displayed values."
+                        .to_string(),
+                );
+            }
+            Err(FitScaleError::TooFewLevels) => {
+                self.status = Some(
+                    "Scale was not changed: the preset needs at least two levels.".to_string(),
+                );
+            }
+        }
     }
 
     fn reset_table_from_template(&mut self, name: &str, template: &StoreVariableStyleTemplate) {
@@ -613,6 +734,203 @@ impl ColorTableEditorPanel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FitScaleUnavailable {
+    NoCurrentField,
+    NoSelectedPreset,
+    MissingPreset,
+    PresetNotBound,
+    NoCurrentStyle,
+    UnsafeUnitContext,
+    NoFiniteValues,
+}
+
+impl FitScaleUnavailable {
+    fn help(self) -> &'static str {
+        match self {
+            Self::NoCurrentField => "Load or generate a field before fitting a scale.",
+            Self::NoSelectedPreset => "Select a saved preset before fitting its scale.",
+            Self::MissingPreset => "The selected preset no longer exists.",
+            Self::PresetNotBound => {
+                "Apply the selected saved preset to the current map before fitting it. This keeps the displayed value units unambiguous."
+            }
+            Self::NoCurrentStyle => {
+                "The current field has no resolved display scale. Use a full preset first."
+            }
+            Self::UnsafeUnitContext => {
+                "Wait for the map to refresh after changing this preset's units or conversion; fitting is disabled while the displayed values and preset units differ."
+            }
+            Self::NoFiniteValues => {
+                "The current field has no finite displayed values, so there is no range to fit."
+            }
+        }
+    }
+}
+
+fn fit_scale_availability(
+    settings: &StyleOverrideSettings,
+    selected_table: Option<&str>,
+    current_field: Option<&FieldData>,
+) -> Result<(), FitScaleUnavailable> {
+    let field = current_field.ok_or(FitScaleUnavailable::NoCurrentField)?;
+    let selected = selected_table.ok_or(FitScaleUnavailable::NoSelectedPreset)?;
+    let table = settings
+        .table(selected)
+        .ok_or(FitScaleUnavailable::MissingPreset)?;
+    let product = normalize_product_key(&field.key.var);
+    let binding = settings
+        .binding_for_product(&product)
+        .ok_or(FitScaleUnavailable::PresetNotBound)?;
+    if !binding.table.trim().eq_ignore_ascii_case(selected.trim()) {
+        return Err(FitScaleUnavailable::PresetNotBound);
+    }
+    let style = field
+        .style
+        .as_ref()
+        .ok_or(FitScaleUnavailable::NoCurrentStyle)?;
+    let expected_convert = rustwx_products::viewer::UnitConvert::from(table.convert);
+    let configured_units_match = table.display_units.trim().is_empty()
+        || table.display_units == style.display_units;
+    if field.units != style.display_units
+        || style.convert != expected_convert
+        || !configured_units_match
+    {
+        return Err(FitScaleUnavailable::UnsafeUnitContext);
+    }
+    finite_display_range(&field.values).ok_or(FitScaleUnavailable::NoFiniteValues)?;
+    Ok(())
+}
+
+fn editable_table_name(
+    settings: &StyleOverrideSettings,
+    product: &str,
+    fallback_base: &str,
+) -> String {
+    if let Some(existing) = settings
+        .binding_for_product(product)
+        .and_then(|binding| settings.table(&binding.table))
+    {
+        return existing.name.clone();
+    }
+    unique_table_name(settings, fallback_base)
+}
+
+/// Replace only the RGBA sequence. All scale, unit, conversion, legend, mask,
+/// tick, title, and extend fields remain byte-for-byte unchanged.
+fn with_resampled_colors(
+    mut current: UserColorTable,
+    palette: &[[u8; 4]],
+) -> Option<UserColorTable> {
+    let interval_count = current.levels.len().checked_sub(1)?;
+    if interval_count == 0 {
+        return None;
+    }
+    current.colors = resample_palette_colors(palette, interval_count)?;
+    Some(current)
+}
+
+/// Linearly sample RGBA channels at evenly spaced positions. The two endpoints
+/// are exact when at least two colors are requested; a one-color result uses
+/// the deterministic lower-middle source color.
+fn resample_palette_colors(source: &[[u8; 4]], count: usize) -> Option<Vec<[u8; 4]>> {
+    if source.is_empty() || count == 0 {
+        return None;
+    }
+    if count == 1 {
+        return Some(vec![source[(source.len() - 1) / 2]]);
+    }
+    if source.len() == 1 {
+        return Some(vec![source[0]; count]);
+    }
+
+    let denominator = (count - 1) as u128;
+    let source_span = (source.len() - 1) as u128;
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
+        let numerator = (index as u128) * source_span;
+        let left = (numerator / denominator) as usize;
+        let remainder = numerator % denominator;
+        let right = (left + 1).min(source.len() - 1);
+        let mut color = [0_u8; 4];
+        for channel in 0..4 {
+            let left_weight = denominator - remainder;
+            let weighted = u128::from(source[left][channel]) * left_weight
+                + u128::from(source[right][channel]) * remainder;
+            color[channel] = ((weighted + denominator / 2) / denominator) as u8;
+        }
+        out.push(color);
+    }
+    Some(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FitScaleOutcome {
+    source_min: f64,
+    source_max: f64,
+    constant: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FitScaleError {
+    NoFiniteValues,
+    TooFewLevels,
+}
+
+fn fit_table_to_values(
+    table: &mut UserColorTable,
+    values: &[f32],
+) -> Result<FitScaleOutcome, FitScaleError> {
+    if table.levels.len() < 2 {
+        return Err(FitScaleError::TooFewLevels);
+    }
+    let (source_min, source_max) =
+        finite_display_range(values).ok_or(FitScaleError::NoFiniteValues)?;
+    let constant = source_min == source_max;
+    let (scale_min, scale_max) = if constant {
+        padded_constant_range(source_min)
+    } else {
+        (source_min, source_max)
+    };
+    let last = table.levels.len() - 1;
+    for (index, level) in table.levels.iter_mut().enumerate() {
+        *level = if index == 0 {
+            scale_min
+        } else if index == last {
+            scale_max
+        } else {
+            scale_min + (scale_max - scale_min) * index as f64 / last as f64
+        };
+    }
+    // A user-specified tick step describes the old scale and can become
+    // nonsensical after fitting. Auto ticks are deterministic for the new one.
+    table.tick_step = None;
+    Ok(FitScaleOutcome {
+        source_min,
+        source_max,
+        constant,
+    })
+}
+
+fn finite_display_range(values: &[f32]) -> Option<(f64, f64)> {
+    let mut range: Option<(f64, f64)> = None;
+    for value in values.iter().copied().filter(|value| value.is_finite()) {
+        let value = f64::from(value);
+        range = Some(match range {
+            Some((min, max)) => (min.min(value), max.max(value)),
+            None => (value, value),
+        });
+    }
+    range
+}
+
+fn padded_constant_range(center: f64) -> (f64, f64) {
+    if center == 0.0 {
+        return (-1.0, 1.0);
+    }
+    let padding = (center.abs() * 0.05).max(1.0e-6);
+    (center - padding, center + padding)
+}
+
 fn color32_from_rgba([r, g, b, a]: [u8; 4]) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, a)
 }
@@ -706,4 +1024,207 @@ fn template_matches_filter(template: &StoreVariableStyleTemplate, filter: &str) 
     normalize_product_key(&template.label).contains(filter)
         || normalize_product_key(&template.slug).contains(filter)
         || normalize_product_key(&template.category).contains(filter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::{FieldKey, HourKey};
+
+    fn sample_table() -> UserColorTable {
+        UserColorTable {
+            name: "Custom wind".to_string(),
+            title: "Formula wind".to_string(),
+            display_units: "m/s".to_string(),
+            convert: UserUnitConvert::None,
+            legend_mode: UserLegendMode::SmoothRamp,
+            extend: UserExtendMode::Both,
+            mask_below: Some(0.25),
+            tick_step: Some(2.5),
+            levels: vec![-10.0, 0.0, 10.0, 20.0, 30.0],
+            colors: vec![
+                [1, 2, 3, 4],
+                [5, 6, 7, 8],
+                [9, 10, 11, 12],
+                [13, 14, 15, 16],
+            ],
+        }
+    }
+
+    #[test]
+    fn palette_resampling_is_deterministic_and_keeps_endpoints() {
+        let source = [
+            [0, 10, 20, 30],
+            [100, 110, 120, 130],
+            [200, 210, 220, 230],
+        ];
+        assert_eq!(
+            resample_palette_colors(&source, 5),
+            Some(vec![
+                [0, 10, 20, 30],
+                [50, 60, 70, 80],
+                [100, 110, 120, 130],
+                [150, 160, 170, 180],
+                [200, 210, 220, 230],
+            ])
+        );
+        assert_eq!(
+            resample_palette_colors(&source, 1),
+            Some(vec![[100, 110, 120, 130]])
+        );
+        assert_eq!(resample_palette_colors(&[], 4), None);
+        assert_eq!(resample_palette_colors(&source, 0), None);
+    }
+
+    #[test]
+    fn colors_only_preserves_scale_units_conversion_and_legend_controls() {
+        let current = sample_table();
+        let palette = [
+            [0, 0, 255, 255],
+            [255, 255, 255, 255],
+            [255, 0, 0, 255],
+        ];
+        let recolored = with_resampled_colors(current.clone(), &palette).unwrap();
+        let mut expected = current;
+        expected.colors = vec![
+            [0, 0, 255, 255],
+            [170, 170, 255, 255],
+            [255, 170, 170, 255],
+            [255, 0, 0, 255],
+        ];
+        assert_eq!(recolored, expected);
+    }
+
+    #[test]
+    fn temperature_palette_colors_cannot_change_a_wind_fields_units() {
+        let wind = sample_table();
+        let mut temperature_palette = sample_table();
+        temperature_palette.display_units = "degF".to_string();
+        temperature_palette.convert = UserUnitConvert::KelvinToFahrenheit;
+        temperature_palette.colors = vec![[20, 40, 200, 255], [240, 30, 20, 255]];
+
+        let recolored =
+            with_resampled_colors(wind.clone(), &temperature_palette.colors).unwrap();
+        assert_eq!(recolored.display_units, "m/s");
+        assert_eq!(recolored.convert, UserUnitConvert::None);
+        assert_eq!(recolored.levels, wind.levels);
+        assert_eq!(recolored.mask_below, wind.mask_below);
+        assert_eq!(recolored.tick_step, wind.tick_step);
+    }
+
+    #[test]
+    fn full_range_fit_includes_exact_outliers_and_preserves_other_style() {
+        let mut fitted = sample_table();
+        let before = fitted.clone();
+        let outcome = fit_table_to_values(
+            &mut fitted,
+            &[f32::NAN, -999.0, 0.0, 1.0, 999.0, f32::INFINITY],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.source_min, -999.0);
+        assert_eq!(outcome.source_max, 999.0);
+        assert!(!outcome.constant);
+        assert_eq!(
+            fitted.levels,
+            vec![-999.0, -499.5, 0.0, 499.5, 999.0]
+        );
+        assert_eq!(fitted.colors, before.colors);
+        assert_eq!(fitted.name, before.name);
+        assert_eq!(fitted.title, before.title);
+        assert_eq!(fitted.display_units, before.display_units);
+        assert_eq!(fitted.convert, before.convert);
+        assert_eq!(fitted.legend_mode, before.legend_mode);
+        assert_eq!(fitted.extend, before.extend);
+        assert_eq!(fitted.mask_below, before.mask_below);
+        assert_eq!(fitted.tick_step, None);
+    }
+
+    #[test]
+    fn full_range_fit_handles_constant_and_all_zero_fields_deterministically() {
+        for center in [0.0_f32, 7.0_f32] {
+            let mut first = sample_table();
+            let mut second = sample_table();
+            let values = [center, center, f32::NAN];
+            let first_outcome = fit_table_to_values(&mut first, &values).unwrap();
+            let second_outcome = fit_table_to_values(&mut second, &values).unwrap();
+            assert!(first_outcome.constant);
+            assert_eq!(first, second);
+            let expected = if center == 0.0 {
+                (-1.0, 1.0)
+            } else {
+                (6.65, 7.35)
+            };
+            assert_eq!(first.levels.first(), Some(&expected.0));
+            assert_eq!(first.levels.last(), Some(&expected.1));
+            assert!(first.levels.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+    }
+
+    #[test]
+    fn full_range_fit_rejects_no_finite_values_without_mutation() {
+        let mut table = sample_table();
+        let before = table.clone();
+        assert_eq!(
+            fit_table_to_values(&mut table, &[f32::NAN, f32::INFINITY, f32::NEG_INFINITY]),
+            Err(FitScaleError::NoFiniteValues)
+        );
+        assert_eq!(table, before);
+    }
+
+    #[test]
+    fn palette_actions_reuse_the_existing_bound_editable_table() {
+        let mut settings = StyleOverrideSettings::default();
+        settings.upsert_table(sample_table());
+        settings.bind_product("wind_over_15ms", "Custom wind");
+        assert_eq!(
+            editable_table_name(&settings, "wind_over_15ms", "new colors"),
+            "Custom wind"
+        );
+        assert_eq!(
+            editable_table_name(&settings, "unbound_formula", "new colors"),
+            "new colors"
+        );
+    }
+
+    #[test]
+    fn fit_is_disabled_when_binding_or_display_units_are_unsafe() {
+        let table = sample_table();
+        let style = table.to_store_style("Formula wind", "m/s").unwrap();
+        let field = FieldData {
+            key: FieldKey {
+                hour: HourKey {
+                    model: "wrf".to_string(),
+                    run: "test".to_string(),
+                    hour: 0,
+                },
+                var: "wind_over_15ms".to_string(),
+            },
+            units: "m/s".to_string(),
+            nx: 2,
+            ny: 1,
+            values: vec![1.0, 20.0],
+            range: Some((1.0, 20.0)),
+            grid: None,
+            lat_descending: false,
+            style: Some(style),
+        };
+        let mut settings = StyleOverrideSettings::default();
+        settings.upsert_table(table);
+        assert_eq!(
+            fit_scale_availability(&settings, Some("Custom wind"), Some(&field)),
+            Err(FitScaleUnavailable::PresetNotBound)
+        );
+        settings.bind_product("wind_over_15ms", "Custom wind");
+        assert_eq!(
+            fit_scale_availability(&settings, Some("Custom wind"), Some(&field)),
+            Ok(())
+        );
+        let mut mismatched = field;
+        mismatched.units = "kt".to_string();
+        assert_eq!(
+            fit_scale_availability(&settings, Some("Custom wind"), Some(&mismatched)),
+            Err(FitScaleUnavailable::UnsafeUnitContext)
+        );
+    }
 }

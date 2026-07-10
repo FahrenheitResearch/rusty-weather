@@ -120,8 +120,8 @@ impl EvaluationSource {
 }
 
 /// A completed UI result. The host should pass `field` to
-/// `FieldViewerPanel::install_generated_field` and may retain provenance for
-/// export/research records.
+/// `FieldViewerPanel::install_generated_field` with the current style settings
+/// and may retain provenance for export/research records.
 #[derive(Debug, Clone)]
 pub struct FormulaLabResult {
     pub field: FieldData,

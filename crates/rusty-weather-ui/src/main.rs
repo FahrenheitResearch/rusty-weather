@@ -1992,7 +1992,7 @@ impl App {
         self.plot_viewer.clear();
         self.recorded_plot_timings = None;
         if let Some(field) = self.viewer.wanted_field() {
-            if !self.viewer.restore_generated_field(&field.var) {
+            if !self.viewer.restyle_generated_field(&settings) {
                 self.viewer.set_loading(&field.var);
                 self.worker.send(StoreRequest::LoadField(field));
             }
@@ -3154,7 +3154,9 @@ impl eframe::App for App {
                 if raw_result {
                     self.sounding.clear();
                 }
-                self.viewer.install_generated_field(result.field);
+                let settings = self.color_tables.settings().clone().normalized();
+                self.viewer
+                    .install_generated_field(result.field, &settings);
             } else {
                 self.formula_lab
                     .note_result_discarded("the selected data source changed while it ran");
