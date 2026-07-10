@@ -148,7 +148,10 @@ pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<Valida
     let run_dir = match std::fs::canonicalize(run_dir) {
         Ok(path) => path,
         Err(err) => {
-            report.error(format!("run dir: cannot resolve {}: {err}", run_dir.display()));
+            report.error(format!(
+                "run dir: cannot resolve {}: {err}",
+                run_dir.display()
+            ));
             return Ok(report);
         }
     };
@@ -257,52 +260,52 @@ pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<Valida
                     if let Ok(meta) =
                         serde_json::from_slice::<RwsHourMeta>(&hour_bytes[HEADER_LEN..meta_end])
                     {
-                    if meta.model != manifest.model {
-                        report.error(format!(
-                            "{}: hour meta model '{}' != manifest model '{}'",
-                            entry.file, meta.model, manifest.model
-                        ));
-                    }
-                    if meta.run != manifest.run {
-                        report.error(format!(
-                            "{}: hour meta run '{}' != manifest run '{}'",
-                            entry.file, meta.run, manifest.run
-                        ));
-                    }
-                    if meta.grid_hash != manifest.grid_hash {
-                        report.error(format!(
-                            "{}: hour meta grid_hash '{}' != manifest grid_hash '{}'",
-                            entry.file, meta.grid_hash, manifest.grid_hash
-                        ));
-                    }
-                    if meta.nx != manifest.nx || meta.ny != manifest.ny {
-                        report.error(format!(
-                            "{}: hour meta {}x{} != manifest {}x{}",
-                            entry.file, meta.nx, meta.ny, manifest.nx, manifest.ny
-                        ));
-                    }
-                    // Check that all manifest-listed vars are present in the hour file.
-                    let hour_var_names: HashSet<&str> =
-                        meta.variables.iter().map(|v| v.name.as_str()).collect();
-                    for var_name in &entry.variables {
-                        if !hour_var_names.contains(var_name.as_str()) {
+                        if meta.model != manifest.model {
                             report.error(format!(
+                                "{}: hour meta model '{}' != manifest model '{}'",
+                                entry.file, meta.model, manifest.model
+                            ));
+                        }
+                        if meta.run != manifest.run {
+                            report.error(format!(
+                                "{}: hour meta run '{}' != manifest run '{}'",
+                                entry.file, meta.run, manifest.run
+                            ));
+                        }
+                        if meta.grid_hash != manifest.grid_hash {
+                            report.error(format!(
+                                "{}: hour meta grid_hash '{}' != manifest grid_hash '{}'",
+                                entry.file, meta.grid_hash, manifest.grid_hash
+                            ));
+                        }
+                        if meta.nx != manifest.nx || meta.ny != manifest.ny {
+                            report.error(format!(
+                                "{}: hour meta {}x{} != manifest {}x{}",
+                                entry.file, meta.nx, meta.ny, manifest.nx, manifest.ny
+                            ));
+                        }
+                        // Check that all manifest-listed vars are present in the hour file.
+                        let hour_var_names: HashSet<&str> =
+                            meta.variables.iter().map(|v| v.name.as_str()).collect();
+                        for var_name in &entry.variables {
+                            if !hour_var_names.contains(var_name.as_str()) {
+                                report.error(format!(
                                 "{}: manifest lists variable '{}' but it is not in the hour file",
                                 entry.file, var_name
                             ));
+                            }
                         }
-                    }
-                    // Hour file has more variables than the manifest entry lists -> stale manifest.
-                    let manifest_var_set: HashSet<&str> =
-                        entry.variables.iter().map(|v| v.as_str()).collect();
-                    for var in &meta.variables {
-                        if !manifest_var_set.contains(var.name.as_str()) {
-                            report.warn(format!(
+                        // Hour file has more variables than the manifest entry lists -> stale manifest.
+                        let manifest_var_set: HashSet<&str> =
+                            entry.variables.iter().map(|v| v.as_str()).collect();
+                        for var in &meta.variables {
+                            if !manifest_var_set.contains(var.name.as_str()) {
+                                report.warn(format!(
                                 "{}: hour file variable '{}' is not listed in the manifest entry (stale manifest?)",
                                 entry.file, var.name
                             ));
+                            }
                         }
-                    }
                     }
                 }
             }
@@ -2044,7 +2047,10 @@ mod tests {
     #[test]
     fn impossible_index_capacity_fails_fallibly() {
         let error = try_record_buffer(usize::MAX).unwrap_err();
-        assert!(error.contains("cannot allocate index"), "unexpected error: {error}");
+        assert!(
+            error.contains("cannot allocate index"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

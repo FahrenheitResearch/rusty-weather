@@ -216,11 +216,7 @@ impl BatchRenderPanel {
     /// Seed a non-native render extent, for example from the viewer's saved
     /// custom-domain picker.  The next job uses it unless the user switches
     /// back to "full native grid".
-    pub fn set_domain_bounds(
-        &mut self,
-        slug: impl Into<String>,
-        bounds: (f64, f64, f64, f64),
-    ) {
+    pub fn set_domain_bounds(&mut self, slug: impl Into<String>, bounds: (f64, f64, f64, f64)) {
         self.domain_slug = slug.into();
         self.domain_bounds = [bounds.0, bounds.1, bounds.2, bounds.3];
         self.native_domain = false;
@@ -312,10 +308,18 @@ impl BatchRenderPanel {
             }
         });
         if let Err(message) = &validation {
-            ui.label(egui::RichText::new(message).small().color(egui::Color32::YELLOW));
+            ui.label(
+                egui::RichText::new(message)
+                    .small()
+                    .color(egui::Color32::YELLOW),
+            );
         }
         if let Some(message) = start_blocked {
-            ui.label(egui::RichText::new(message).small().color(egui::Color32::YELLOW));
+            ui.label(
+                egui::RichText::new(message)
+                    .small()
+                    .color(egui::Color32::YELLOW),
+            );
         }
         ui.label(
             egui::RichText::new("Existing PNGs with the same production filename are replaced.")
@@ -326,12 +330,7 @@ impl BatchRenderPanel {
         self.render_status(ui);
     }
 
-    fn ensure_catalog(
-        &mut self,
-        ctx: &egui::Context,
-        store_root: &Path,
-        hour: Option<&HourKey>,
-    ) {
+    fn ensure_catalog(&mut self, ctx: &egui::Context, store_root: &Path, hour: Option<&HourKey>) {
         let Some(hour) = hour else {
             return;
         };
@@ -519,11 +518,7 @@ impl BatchRenderPanel {
                 false,
                 format!("Current (F{current_hour:03})"),
             );
-            ui.radio_value(
-                &mut self.all_hours,
-                true,
-                format!("All stored ({stored})"),
-            );
+            ui.radio_value(&mut self.all_hours, true, format!("All stored ({stored})"));
         });
     }
 
@@ -632,9 +627,10 @@ impl BatchRenderPanel {
         }
         let inferred = infer_run_cycle(&_hour.run);
         let date = if self.date_override.trim().is_empty() {
-            inferred.as_ref().map(|(date, _)| date.clone()).ok_or_else(|| {
-                "Set an init date; this run name has no timestamp.".to_string()
-            })?
+            inferred
+                .as_ref()
+                .map(|(date, _)| date.clone())
+                .ok_or_else(|| "Set an init date; this run name has no timestamp.".to_string())?
         } else {
             self.date_override.trim().to_string()
         };
@@ -717,8 +713,8 @@ impl BatchRenderPanel {
         } else {
             self.cycle_override.trim().parse::<u8>().ok()
         };
-        let date_yyyymmdd = (!self.date_override.trim().is_empty())
-            .then(|| self.date_override.trim().to_string());
+        let date_yyyymmdd =
+            (!self.date_override.trim().is_empty()).then(|| self.date_override.trim().to_string());
         let domain = if self.native_domain {
             BatchRenderDomain::NativeGrid
         } else {
@@ -898,7 +894,11 @@ impl BatchRenderPanel {
                         summary.skipped,
                         summary.failed,
                         summary.elapsed_ms,
-                        if summary.cancelled { " (cancelled)" } else { "" }
+                        if summary.cancelled {
+                            " (cancelled)"
+                        } else {
+                            ""
+                        }
                     ));
                     self.summary = Some(summary);
                     true
@@ -951,7 +951,11 @@ impl BatchRenderPanel {
                     summary.rendered,
                     summary.skipped,
                     summary.failed,
-                    if summary.cancelled { " (cancelled)" } else { "" }
+                    if summary.cancelled {
+                        " (cancelled)"
+                    } else {
+                        ""
+                    }
                 ))
                 .color(color),
             );

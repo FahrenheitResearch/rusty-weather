@@ -125,11 +125,8 @@ fn load_run_manifest(
             root.display()
         )));
     }
-    let manifest_path = canonical_contained_path(
-        &run_dir,
-        &run_dir.join("run.json"),
-        "run manifest",
-    )?;
+    let manifest_path =
+        canonical_contained_path(&run_dir, &run_dir.join("run.json"), "run manifest")?;
     let manifest = RwsRunManifest::load_for_run(&manifest_path, model_slug, run_slug)?;
     Ok((run_dir, manifest))
 }

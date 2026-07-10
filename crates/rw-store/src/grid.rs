@@ -55,8 +55,7 @@ const MAX_COORD_COMP_LEN: u64 = MAX_COORD_RAW_LEN + 1024 * 1024;
 /// zstd decoder's history allocation for hostile frame headers.
 const MAX_GRID_WINDOW_LOG: u32 = 27;
 /// Absolute `.rwg` size ceiling derived from the bounded sections above.
-const MAX_GRID_FILE_LEN: u64 =
-    HEADER_LEN as u64 + MAX_GRID_META_LEN + 2 * MAX_COORD_COMP_LEN;
+const MAX_GRID_FILE_LEN: u64 = HEADER_LEN as u64 + MAX_GRID_META_LEN + 2 * MAX_COORD_COMP_LEN;
 
 #[derive(Debug, Clone, Copy)]
 struct GridLayout {
@@ -68,9 +67,7 @@ struct GridLayout {
 fn try_zeroed_bytes(len: usize, what: &str) -> RwResult<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(len).map_err(|err| {
-        RwStoreError::Format(format!(
-            "cannot allocate {len} bytes for {what}: {err}"
-        ))
+        RwStoreError::Format(format!("cannot allocate {len} bytes for {what}: {err}"))
     })?;
     bytes.resize(len, 0);
     Ok(bytes)
@@ -776,8 +773,7 @@ mod tests {
         header[8..12].copy_from_slice(&GRID_VERSION.to_le_bytes());
         let declared = (MAX_GRID_META_LEN + 1) as u32;
         header[12..16].copy_from_slice(&declared.to_le_bytes());
-        let err = parse_grid_layout(&header, HEADER_LEN as u64 + u64::from(declared))
-            .unwrap_err();
+        let err = parse_grid_layout(&header, HEADER_LEN as u64 + u64::from(declared)).unwrap_err();
         match err {
             RwStoreError::Format(message) => assert!(
                 message.contains("meta") && message.contains("limit"),

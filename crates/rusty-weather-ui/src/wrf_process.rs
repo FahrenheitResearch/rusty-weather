@@ -364,8 +364,9 @@ fn preflight_wrf_sources(
                 })?;
                 let times = crate::local_import::netcdf_source_times(&nc, path)
                     .map_err(|err| format!("Read times from {} failed: {err}", path.display()))?;
-                let shape = crate::local_import::netcdf_grid_shape(&nc, path)
-                    .map_err(|err| format!("Read grid shape from {} failed: {err}", path.display()))?;
+                let shape = crate::local_import::netcdf_grid_shape(&nc, path).map_err(|err| {
+                    format!("Read grid shape from {} failed: {err}", path.display())
+                })?;
                 (WrfSourceKind::Postprocessed, times, shape)
             }
         };
@@ -416,12 +417,7 @@ fn process_paths(
     // an earlier default or heavy import of the exact same source files.
     let processing_profile = processing_profile_suffix(options);
     let model = "wrf".to_string();
-    let (plans, run) = preflight_wrf_sources(
-        &files,
-        source_identity,
-        &processing_profile,
-        tx,
-    )?;
+    let (plans, run) = preflight_wrf_sources(&files, source_identity, &processing_profile, tx)?;
     let publisher = crate::local_import::RunStagingPublisher::new(store_root, &model, &run)?;
     let staging_store_root = publisher.staging_store_root().to_path_buf();
     let mut written = Vec::<WrittenHour>::new();
@@ -443,125 +439,127 @@ fn process_paths(
         // raw files have T (wrf-core opens), post-processed have TK/Z/P and
         // no PB (netcrust path claims them).
         if plan.kind == WrfSourceKind::Postprocessed {
-            let nc = netcrust::open(path)
-                .map_err(|err| format!("Open post-processed WRF {} failed: {err}", path.display()))?;
-            let compute_postproc_severe = crate::postproc_severe::APPROX_SEVERE_SLUGS
-                .iter()
-                .any(|slug| {
-                    let slug = *slug;
-                    options.should_process(slug, Some(slug), WrfProductGroup::Diagnostic)
-                });
+            let nc = netcrust::open(path).map_err(|err| {
+                format!("Open post-processed WRF {} failed: {err}", path.display())
+            })?;
+            let compute_postproc_severe =
+                crate::postproc_severe::APPROX_SEVERE_SLUGS
+                    .iter()
+                    .any(|slug| {
+                        let slug = *slug;
+                        options.should_process(slug, Some(slug), WrfProductGroup::Diagnostic)
+                    });
             for record in &plan.records {
                 let hour = record.forecast_hour;
-            // Post-processed climate wrfout (CONUS-I/II, GDEX: derived
-            // TK/Z/P, no raw T/PB) — wrf-core can't open these, so route
-            // them through the netcrust-based reader before reporting the
-            // raw open error below.
-            match crate::local_import::try_postprocessed_wrf_shared(
-                &nc,
-                path,
-                record.time_index,
-                compute_postproc_severe,
-                &mut |message: String| {
-                    let _ = tx.send(WrfProcessMessage::Progress(message));
-                },
-            ) {
-                Ok(Some((canonical, severe, volumes, raw_2d))) => {
-                    let _ = tx.send(WrfProcessMessage::Progress(format!(
-                        "Reading post-processed WRF {} time {} ({}) -> f{hour:03}",
-                        display_name(path),
-                        record.time_index,
-                        record.label
-                    )));
-                    let Some((_, grid_field)) = canonical.first() else {
-                        return Err(format!(
-                            "Post-processed WRF {} did not provide a grid-bearing field",
-                            path.display()
-                        ));
-                    };
-                    let refs = canonical
-                        .iter()
-                        .filter(|(name, _)| {
-                            options.should_process(name, Some(name), WrfProductGroup::Core)
-                        })
-                        .map(|(name, field)| (name.as_str(), field))
-                        .collect::<Vec<_>>();
-                    // Approximate post-processed severe/thermo suite. Its
-                    // `approx_*` namespace deliberately cannot masquerade as
-                    // the raw-wrfout getvar diagnostics.
-                    let mut derived_refs = severe
-                        .iter()
-                        .filter(|field| {
-                            options.should_process(
-                                field.name,
-                                Some(field.name),
-                                WrfProductGroup::Diagnostic,
-                            )
-                        })
-                        .map(|field| DerivedFieldInput {
-                            name: field.name,
-                            units: field.units,
-                            values: field.values.as_slice(),
-                        })
-                        .collect::<Vec<_>>();
-                    // Raw `wrf_*` planes from the 2-D wrf2d route (empty on
-                    // the 3-D route) — the wrench flow imports pure surface
-                    // archives the same way the light import does.
-                    derived_refs.extend(
-                        raw_2d
+                // Post-processed climate wrfout (CONUS-I/II, GDEX: derived
+                // TK/Z/P, no raw T/PB) — wrf-core can't open these, so route
+                // them through the netcrust-based reader before reporting the
+                // raw open error below.
+                match crate::local_import::try_postprocessed_wrf_shared(
+                    &nc,
+                    path,
+                    record.time_index,
+                    compute_postproc_severe,
+                    &mut |message: String| {
+                        let _ = tx.send(WrfProcessMessage::Progress(message));
+                    },
+                ) {
+                    Ok(Some((canonical, severe, volumes, raw_2d))) => {
+                        let _ = tx.send(WrfProcessMessage::Progress(format!(
+                            "Reading post-processed WRF {} time {} ({}) -> f{hour:03}",
+                            display_name(path),
+                            record.time_index,
+                            record.label
+                        )));
+                        let Some((_, grid_field)) = canonical.first() else {
+                            return Err(format!(
+                                "Post-processed WRF {} did not provide a grid-bearing field",
+                                path.display()
+                            ));
+                        };
+                        let refs = canonical
+                            .iter()
+                            .filter(|(name, _)| {
+                                options.should_process(name, Some(name), WrfProductGroup::Core)
+                            })
+                            .map(|(name, field)| (name.as_str(), field))
+                            .collect::<Vec<_>>();
+                        // Approximate post-processed severe/thermo suite. Its
+                        // `approx_*` namespace deliberately cannot masquerade as
+                        // the raw-wrfout getvar diagnostics.
+                        let mut derived_refs = severe
                             .iter()
                             .filter(|field| {
                                 options.should_process(
-                                    field.name.as_str(),
-                                    Some(field.name.as_str()),
-                                    WrfProductGroup::Raw,
+                                    field.name,
+                                    Some(field.name),
+                                    WrfProductGroup::Diagnostic,
                                 )
                             })
                             .map(|field| DerivedFieldInput {
-                                name: field.name.as_str(),
-                                units: field.units.as_str(),
+                                name: field.name,
+                                units: field.units,
                                 values: field.values.as_slice(),
-                            }),
-                    );
-                    let volume_inputs = if options.core_fields {
-                        volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>()
-                    } else {
-                        Vec::new()
-                    };
-                    if refs.is_empty() && derived_refs.is_empty() && volume_inputs.is_empty() {
+                            })
+                            .collect::<Vec<_>>();
+                        // Raw `wrf_*` planes from the 2-D wrf2d route (empty on
+                        // the 3-D route) — the wrench flow imports pure surface
+                        // archives the same way the light import does.
+                        derived_refs.extend(
+                            raw_2d
+                                .iter()
+                                .filter(|field| {
+                                    options.should_process(
+                                        field.name.as_str(),
+                                        Some(field.name.as_str()),
+                                        WrfProductGroup::Raw,
+                                    )
+                                })
+                                .map(|field| DerivedFieldInput {
+                                    name: field.name.as_str(),
+                                    units: field.units.as_str(),
+                                    values: field.values.as_slice(),
+                                }),
+                        );
+                        let volume_inputs = if options.core_fields {
+                            volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        if refs.is_empty() && derived_refs.is_empty() && volume_inputs.is_empty() {
+                            return Err(format!(
+                                "Post-processed WRF {} produced no fields for the selected processing options",
+                                path.display()
+                            ));
+                        }
+                        let result = write_hour_from_grid_with_derived(
+                            &staging_store_root,
+                            &model,
+                            &run,
+                            hour,
+                            &grid_field.grid,
+                            grid_field.projection.as_ref(),
+                            &refs,
+                            &derived_refs,
+                            &volume_inputs,
+                            writer_build(),
+                            now_unix(),
+                        )
+                        .map_err(|err| format!("Write WRF f{hour:03} failed: {err}"))?;
+                        all_vars.extend(result.vars.iter().cloned());
+                        written.push(result);
+                        continue;
+                    }
+                    Ok(None) => {
                         return Err(format!(
-                            "Post-processed WRF {} produced no fields for the selected processing options",
+                            "Open WRF {} failed and the file is not a supported post-processed WRF archive",
                             path.display()
                         ));
                     }
-                    let result = write_hour_from_grid_with_derived(
-                        &staging_store_root,
-                        &model,
-                        &run,
-                        hour,
-                        &grid_field.grid,
-                        grid_field.projection.as_ref(),
-                        &refs,
-                        &derived_refs,
-                        &volume_inputs,
-                        writer_build(),
-                        now_unix(),
-                    )
-                    .map_err(|err| format!("Write WRF f{hour:03} failed: {err}"))?;
-                    all_vars.extend(result.vars.iter().cloned());
-                    written.push(result);
-                    continue;
+                    Err(err) => {
+                        return Err(format!("Process WRF {} failed: {err}", path.display()));
+                    }
                 }
-                Ok(None) => {
-                    return Err(format!(
-                        "Open WRF {} failed and the file is not a supported post-processed WRF archive",
-                        path.display()
-                    ));
-                }
-                Err(err) => {
-                    return Err(format!("Process WRF {} failed: {err}", path.display()));
-                }
-            }
             }
             continue;
         }
@@ -583,9 +581,7 @@ fn process_paths(
                 let _ = tx.send(WrfProcessMessage::Progress(message));
             };
             let fields = read_wrf_products(&file, path, timeidx, options, &mut progress)?;
-            if fields.canonical.is_empty()
-                && fields.derived.is_empty()
-                && fields.volumes.is_empty()
+            if fields.canonical.is_empty() && fields.derived.is_empty() && fields.volumes.is_empty()
             {
                 return Err(format!(
                     "WRF {} time {} produced no fields for the selected processing options",
@@ -742,10 +738,8 @@ fn read_wrf_products(
     // store names and sounding wind barbs are genuinely earth-relative. Keep
     // U10/V10 as the option-filter keys so saved `only`/`skip` profiles retain
     // their existing meaning.
-    let want_u10 =
-        options.should_process("U10", Some("u_10m"), WrfProductGroup::Core);
-    let want_v10 =
-        options.should_process("V10", Some("v_10m"), WrfProductGroup::Core);
+    let want_u10 = options.should_process("U10", Some("u_10m"), WrfProductGroup::Core);
+    let want_v10 = options.should_process("V10", Some("v_10m"), WrfProductGroup::Core);
     if want_u10 || want_v10 {
         match compute_var(file, "uvmet10", timeidx, Some("m/s"))
             .and_then(|output| split_uvmet10(output, shape.len()))
@@ -929,13 +923,7 @@ fn read_wrf_products(
                 // substitutes under explicit `approx_*` names so they remain
                 // usable for a sounding without pretending to be true 2 m/10 m
                 // observations or diagnostics.
-                fill_missing_surface(
-                    &mut fields,
-                    &grid,
-                    projection.clone(),
-                    surface,
-                    options,
-                );
+                fill_missing_surface(&mut fields, &grid, projection.clone(), surface, options);
             }
             Err(err) => fields
                 .notes
@@ -1241,9 +1229,9 @@ fn split_uvmet10(output: VarOutput, cells: usize) -> Result<(Vec<f32>, Vec<f32>,
             output.shape
         ));
     }
-    let expected_values = (*components)
-        .checked_mul(cells)
-        .ok_or_else(|| "uvmet10 component length overflows the platform address space".to_string())?;
+    let expected_values = (*components).checked_mul(cells).ok_or_else(|| {
+        "uvmet10 component length overflows the platform address space".to_string()
+    })?;
     if output.data.len() != expected_values {
         return Err(format!(
             "uvmet10 shape {:?} requires {expected_values} values, got {}",
@@ -1257,9 +1245,7 @@ fn split_uvmet10(output: VarOutput, cells: usize) -> Result<(Vec<f32>, Vec<f32>,
 
 fn checked_horizontal_cells(ny: usize, nx: usize) -> Result<usize, String> {
     ny.checked_mul(nx).ok_or_else(|| {
-        format!(
-            "horizontal dimensions [{ny}, {nx}] overflow the platform address space"
-        )
+        format!("horizontal dimensions [{ny}, {nx}] overflow the platform address space")
     })
 }
 
@@ -1440,8 +1426,9 @@ fn wrf_projection(file: &WrfFile) -> Option<GridProjection> {
                 central_meridian_deg: stand_lon,
                 // wrf-python chooses the pole from TRUELAT1. CEN_LAT can have
                 // the opposite sign for a nested domain and is not authoritative.
-                south_pole_on_projection_plane:
-                    crate::local_import::wrf_polar_uses_south_pole(truelat1),
+                south_pole_on_projection_plane: crate::local_import::wrf_polar_uses_south_pole(
+                    truelat1,
+                ),
             })
         }
         3 => Some(GridProjection::Mercator {
@@ -1453,7 +1440,10 @@ fn wrf_projection(file: &WrfFile) -> Option<GridProjection> {
         6 if crate::local_import::wrf_latlon_is_unrotated(
             file.global_attr_f64("POLE_LAT").ok(),
             file.global_attr_f64("POLE_LON").ok(),
-        ) => Some(GridProjection::Geographic),
+        ) =>
+        {
+            Some(GridProjection::Geographic)
+        }
         // GridProjection has no rotated-pole representation. The caller still
         // supplies the exact curvilinear XLAT/XLONG grid, so None is accurate.
         6 => None,
@@ -1748,17 +1738,9 @@ mod tests {
             &WrfProcessOptions::default(),
         );
 
-        for exact_name in [
-            "surface_pressure",
-            "dewpoint_2m",
-            "u_10m",
-            "v_10m",
-        ] {
+        for exact_name in ["surface_pressure", "dewpoint_2m", "u_10m", "v_10m"] {
             assert!(
-                !fields
-                    .canonical
-                    .iter()
-                    .any(|(name, _)| name == exact_name),
+                !fields.canonical.iter().any(|(name, _)| name == exact_name),
                 "fallback must not masquerade as {exact_name}"
             );
         }

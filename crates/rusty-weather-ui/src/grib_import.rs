@@ -375,8 +375,7 @@ pub(crate) fn index_grib1_file(path: &Path) -> Result<Vec<IndexedMessage>, Strin
         checked_grid_cells(usize::from(ni), usize::from(nj))
             .map_err(|error| format!("{name}: message at byte {pos}: {error}"))?;
         let mut gds = vec![0u8; gds_len as usize];
-        read_exact_at(&mut file, gds_offset, &mut gds)
-            .map_err(|err| format!("{name}: {err}"))?;
+        read_exact_at(&mut file, gds_offset, &mut gds).map_err(|err| format!("{name}: {err}"))?;
         let grid_identity = grid_identity(&gds);
 
         // End section: `7777` exactly where the length word says.
@@ -1005,18 +1004,12 @@ fn stable_run_identity(paths: &[PathBuf], indexed: &[(usize, IndexedMessage)]) -
     hash_identity_part(&mut hash, b"messages");
     fnv1a_update(
         &mut hash,
-        &u64::try_from(messages.len()).unwrap_or(u64::MAX).to_le_bytes(),
+        &u64::try_from(messages.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
     );
-    for (
-        valid_unix,
-        center,
-        table,
-        parameter,
-        level_type,
-        level_value,
-        gds_len,
-        grid_hash,
-    ) in messages
+    for (valid_unix, center, table, parameter, level_type, level_value, gds_len, grid_hash) in
+        messages
     {
         fnv1a_update(&mut hash, &valid_unix.to_le_bytes());
         fnv1a_update(&mut hash, &[center, table, parameter, level_type]);
@@ -1438,7 +1431,10 @@ mod tests {
             let path = temp_file(tag, &synthetic_index_message(ni, nj, 4));
             let error = index_grib1_file(&path).expect_err("zero grid must be rejected");
             std::fs::remove_file(path).ok();
-            assert!(error.contains("zero-sized grid"), "unexpected error: {error}");
+            assert!(
+                error.contains("zero-sized grid"),
+                "unexpected error: {error}"
+            );
         }
     }
 
@@ -1739,10 +1735,8 @@ mod tests {
 
     #[test]
     fn grib_run_identity_is_order_independent() {
-        let base = std::env::temp_dir().join(format!(
-            "grib-run-identity-order-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("grib-run-identity-order-{}", std::process::id()));
         let paths = vec![base.join("temperature.grb"), base.join("wind.grb")];
         let reordered_paths = vec![paths[1].clone(), paths[0].clone()];
         let temperature = indexed(130, 100, 850);
@@ -1763,10 +1757,8 @@ mod tests {
 
     #[test]
     fn grib_run_identity_separates_same_count_source_and_parameter_sets() {
-        let base = std::env::temp_dir().join(format!(
-            "grib-run-identity-distinct-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("grib-run-identity-distinct-{}", std::process::id()));
         let paths_ab = vec![base.join("a.grb"), base.join("b.grb")];
         let paths_ac = vec![base.join("a.grb"), base.join("c.grb")];
         let temperature = indexed(130, 100, 850);
@@ -1786,7 +1778,10 @@ mod tests {
         let source_run = run_name(&paths_ac, &temperature, 0, different_source);
         assert_ne!(base_run, parameter_run);
         assert_ne!(base_run, source_run);
-        assert!(base_run.contains(IMPORT_SCIENCE_SCHEMA_VERSION), "{base_run}");
+        assert!(
+            base_run.contains(IMPORT_SCIENCE_SCHEMA_VERSION),
+            "{base_run}"
+        );
         let suffix = base_run.rsplit('_').next().expect("identity suffix");
         assert_eq!(suffix.len(), 16);
         assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
@@ -1798,7 +1793,10 @@ mod tests {
         let mut hours = BTreeMap::new();
         hours.insert(0, vec![(0, duplicate.clone()), (1, duplicate)]);
         let err = preflight_hour_fields(&hours).unwrap_err();
-        assert!(err.contains("temperature_850") && err.contains("f000"), "{err}");
+        assert!(
+            err.contains("temperature_850") && err.contains("f000"),
+            "{err}"
+        );
     }
 
     #[test]

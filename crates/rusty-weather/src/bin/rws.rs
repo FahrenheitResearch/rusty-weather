@@ -166,18 +166,15 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
     let mut any_error = false;
 
     for run_dir in &run_dirs {
-        let manifest_path = match canonical_contained_path(
-            run_dir,
-            &run_dir.join("run.json"),
-            "run manifest",
-        ) {
-            Ok(path) => path,
-            Err(err) => {
-                eprintln!("error: {err}");
-                any_error = true;
-                continue;
-            }
-        };
+        let manifest_path =
+            match canonical_contained_path(run_dir, &run_dir.join("run.json"), "run manifest") {
+                Ok(path) => path,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    any_error = true;
+                    continue;
+                }
+            };
         let manifest = match RwsRunManifest::load(&manifest_path) {
             Ok(manifest) => manifest,
             Err(err) => {

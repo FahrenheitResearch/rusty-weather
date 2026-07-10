@@ -19,9 +19,7 @@ pub const MAX_VOLUME_ELEMENTS: usize = 128 * 1024 * 1024;
 pub enum RustwxError {
     #[error("invalid grid shape: nx={nx}, ny={ny}")]
     InvalidGridShape { nx: usize, ny: usize },
-    #[error(
-        "grid shape nx={nx}, ny={ny} has {cells} cells; supported maximum is {max_cells}"
-    )]
+    #[error("grid shape nx={nx}, ny={ny} has {cells} cells; supported maximum is {max_cells}")]
     GridTooLarge {
         nx: usize,
         ny: usize,
@@ -222,8 +220,7 @@ impl<'de> Deserialize<'de> for LatLonGrid {
         }
 
         let wire = LatLonGridWire::deserialize(deserializer)?;
-        Self::new(wire.shape, wire.lat_deg, wire.lon_deg)
-            .map_err(serde::de::Error::custom)
+        Self::new(wire.shape, wire.lat_deg, wire.lon_deg).map_err(serde::de::Error::custom)
     }
 }
 

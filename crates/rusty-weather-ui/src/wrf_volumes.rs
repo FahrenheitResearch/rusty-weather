@@ -317,9 +317,7 @@ fn split_earth_relative_uvmet(
 fn checked_dimension_product(name: &str, dimensions: &[usize]) -> Result<usize, String> {
     dimensions.iter().try_fold(1usize, |product, &dimension| {
         product.checked_mul(dimension).ok_or_else(|| {
-            format!(
-                "{name} dimensions {dimensions:?} overflow the platform address space"
-            )
+            format!("{name} dimensions {dimensions:?} overflow the platform address space")
         })
     })
 }

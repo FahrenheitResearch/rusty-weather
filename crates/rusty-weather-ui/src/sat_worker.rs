@@ -122,7 +122,10 @@ impl SatWorker {
             });
         let (thread, startup_error) = match thread {
             Ok(thread) => (Some(thread), None),
-            Err(error) => (None, Some(format!("could not start satellite worker: {error}"))),
+            Err(error) => (
+                None,
+                Some(format!("could not start satellite worker: {error}")),
+            ),
         };
         Self {
             tx: req_tx,

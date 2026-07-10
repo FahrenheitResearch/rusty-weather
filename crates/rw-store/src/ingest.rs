@@ -13,9 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rustwx_core::{
-    GridProjection, GridShape, LatLonGrid, MAX_VOLUME_ELEMENTS, SelectedField2D,
-};
+use rustwx_core::{GridProjection, GridShape, LatLonGrid, MAX_VOLUME_ELEMENTS, SelectedField2D};
 
 use crate::atomic::atomic_write_bytes;
 use crate::error::{RwResult, RwStoreError};
@@ -647,7 +645,10 @@ mod dimension_tests {
 
     #[test]
     fn store_volume_boundary_checks_product_before_cloning_levels() {
-        assert_eq!(validated_volume_elements("temperature", 37, 1_000).unwrap(), 37_000);
+        assert_eq!(
+            validated_volume_elements("temperature", 37, 1_000).unwrap(),
+            37_000
+        );
         assert!(validated_volume_elements("temperature", usize::MAX, 2).is_err());
         assert!(validated_volume_elements("temperature", 6, MAX_GRID_CELLS).is_err());
     }

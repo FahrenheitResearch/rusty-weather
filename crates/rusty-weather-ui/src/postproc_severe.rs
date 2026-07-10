@@ -189,13 +189,13 @@ pub(crate) fn compute(
             ("approx_lfc", "m", lfc),
             ("approx_el", "m", el),
         ]
-            .into_iter()
-            .map(|(name, units, values)| SevereField {
-                name,
-                units,
-                values: clean_plane(values),
-            })
-            .collect();
+        .into_iter()
+        .map(|(name, units, values)| SevereField {
+            name,
+            units,
+            values: clean_plane(values),
+        })
+        .collect();
     }
 
     // Kinematics use earth-relative winds. Scalar magnitudes are theoretically

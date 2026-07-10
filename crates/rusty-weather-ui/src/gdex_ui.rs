@@ -156,7 +156,6 @@ impl<T: Send + 'static> WorkerSlot<T> {
     }
 }
 
-
 /// The dataset the browser opens on (first registry entry: CONUS II).
 fn default_dataset() -> &'static gdex::GdexDataset {
     &gdex::GDEX_DATASETS[0]
@@ -423,9 +422,7 @@ impl SubsetForm {
             .unwrap_or_else(|| "subset".to_owned());
         let canonical_request = gdex::ncss_subset_url(&self.leaf.url_path, subset);
         let fingerprint = stable_request_fingerprint(&canonical_request);
-        gdex::sanitize_leaf_filename(&format!(
-            "{stem}_subset_{tag}_{fingerprint:016x}.nc"
-        ))
+        gdex::sanitize_leaf_filename(&format!("{stem}_subset_{tag}_{fingerprint:016x}.nc"))
     }
 }
 
@@ -1201,7 +1198,10 @@ fn leaf_supports_importable_ncss_subset(leaf: &Leaf) -> bool {
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
-            matches!(extension.to_ascii_lowercase().as_str(), "nc" | "nc4" | "cdf")
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "nc" | "nc4" | "cdf"
+            )
         })
 }
 

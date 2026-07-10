@@ -15,11 +15,10 @@ use std::time::SystemTime;
 
 use eframe::egui;
 use rw_formula::{
-    BoundaryPolicy, BridgeError, CompiledFormula, ErrorKind, EvaluationOptions,
-    ExactStoreTime, FormulaError, FormulaProvenance, MissingPolicy, NonFinitePolicy,
-    ParameterSpec, ParameterValues, Recipe, RecipeReference, RecipeRequirements, Requirement,
-    ResourceLimits, Span, StoreRunResolver, evaluate_resolver_2d,
-    evaluate_wrf_path_2d_with_limits,
+    BoundaryPolicy, BridgeError, CompiledFormula, ErrorKind, EvaluationOptions, ExactStoreTime,
+    FormulaError, FormulaProvenance, MissingPolicy, NonFinitePolicy, ParameterSpec,
+    ParameterValues, Recipe, RecipeReference, RecipeRequirements, Requirement, ResourceLimits,
+    Span, StoreRunResolver, evaluate_resolver_2d, evaluate_wrf_path_2d_with_limits,
 };
 use rw_store::atomic::atomic_write_bytes;
 use rw_store::grid::GridFile;
@@ -137,7 +136,10 @@ pub struct FormulaLabResult {
 /// the worker completes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormulaResultSource {
-    Store { store_root: PathBuf, hour: HourKey },
+    Store {
+        store_root: PathBuf,
+        hour: HourKey,
+    },
     RawWrf {
         path: PathBuf,
         time_index: usize,
@@ -355,11 +357,7 @@ impl FormulaLabPanel {
         completed
     }
 
-    fn window_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        sources: FormulaLabSources<'_>,
-    ) {
+    fn window_ui(&mut self, ui: &mut egui::Ui, sources: FormulaLabSources<'_>) {
         let source_kind_before = self.source_kind;
         ui.horizontal_wrapped(|ui| {
             if ui.button("Open recipe…").clicked() {
@@ -374,11 +372,7 @@ impl FormulaLabPanel {
                 ui.selectable_value(&mut self.source_kind, FormulaSourceKind::Store, "Store");
             });
             ui.add_enabled_ui(sources.raw_wrf.is_some(), |ui| {
-                ui.selectable_value(
-                    &mut self.source_kind,
-                    FormulaSourceKind::RawWrf,
-                    "Raw WRF",
-                );
+                ui.selectable_value(&mut self.source_kind, FormulaSourceKind::RawWrf, "Raw WRF");
             });
             ui.separator();
             match self.effective_source(sources) {
@@ -459,14 +453,20 @@ impl FormulaLabPanel {
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("Starters:").small().weak());
             if ui
-                .add_enabled(sources.store.is_some(), egui::Button::new("Store 10 m wind"))
+                .add_enabled(
+                    sources.store.is_some(),
+                    egui::Button::new("Store 10 m wind"),
+                )
                 .clicked()
             {
                 self.set_source_kind(FormulaSourceKind::Store);
                 self.set_source("sqrt(u_10m^2 + v_10m^2)");
             }
             if ui
-                .add_enabled(sources.raw_wrf.is_some(), egui::Button::new("Raw WRF 10 m wind"))
+                .add_enabled(
+                    sources.raw_wrf.is_some(),
+                    egui::Button::new("Raw WRF 10 m wind"),
+                )
                 .clicked()
             {
                 self.set_source_kind(FormulaSourceKind::RawWrf);
@@ -497,10 +497,7 @@ impl FormulaLabPanel {
                 .changed();
             ui.label("Version");
             let version_changed = ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.recipe_version)
-                        .desired_width(90.0),
-                )
+                .add(egui::TextEdit::singleline(&mut self.recipe_version).desired_width(90.0))
                 .changed();
             if name_changed || version_changed {
                 self.refresh_compile();
@@ -558,7 +555,11 @@ impl FormulaLabPanel {
             }
         });
         if let Err(error) = normalized_output_name(&self.output_name) {
-            ui.label(egui::RichText::new(error).small().color(egui::Color32::LIGHT_RED));
+            ui.label(
+                egui::RichText::new(error)
+                    .small()
+                    .color(egui::Color32::LIGHT_RED),
+            );
         }
         if let Some(reason) = sources.evaluation_blocked {
             ui.label(
@@ -909,9 +910,7 @@ impl FormulaLabPanel {
     fn refresh_compile(&mut self) {
         self.mark_editor_changed();
         self.sync_parameter_values();
-        let result = self
-            .build_recipe()
-            .and_then(|recipe| recipe.compile());
+        let result = self.build_recipe().and_then(|recipe| recipe.compile());
         match result {
             Ok(compiled) => {
                 self.compiled = Some(compiled);
@@ -927,9 +926,8 @@ impl FormulaLabPanel {
     fn mark_editor_changed(&mut self) {
         self.editor_generation = self.editor_generation.wrapping_add(1);
         if self.task.is_some() {
-            self.status = Some(
-                "Formula inputs changed; the running result will be discarded".to_string(),
-            );
+            self.status =
+                Some("Formula inputs changed; the running result will be discarded".to_string());
         }
     }
 
@@ -976,10 +974,7 @@ impl FormulaLabPanel {
             .is_some_and(|revision| revision.len >= LARGE_RAW_WRF_BYTES)
     }
 
-    fn effective_source(
-        &self,
-        sources: FormulaLabSources<'_>,
-    ) -> Option<EvaluationSource> {
+    fn effective_source(&self, sources: FormulaLabSources<'_>) -> Option<EvaluationSource> {
         match self.source_kind {
             FormulaSourceKind::Store => sources.store.cloned().map(EvaluationSource::Store),
             FormulaSourceKind::RawWrf => self.raw_evaluation_source(sources.raw_wrf),
@@ -1238,11 +1233,7 @@ impl FormulaLabPanel {
         }
     }
 
-    fn task_is_stale(
-        &self,
-        task: &EvaluationTask,
-        sources: FormulaLabSources<'_>,
-    ) -> bool {
+    fn task_is_stale(&self, task: &EvaluationTask, sources: FormulaLabSources<'_>) -> bool {
         task.generation != self.editor_generation
             || self
                 .effective_source(sources)
@@ -1250,18 +1241,18 @@ impl FormulaLabPanel {
                 .as_ref()
                 != Some(&task.source)
             || match (&task.store_revision, &task.raw_revision, &task.source) {
-                (Some(expected), None, FormulaResultSource::Store { .. }) => sources
-                    .store
-                    .and_then(|source| inspect_store_run_revision(source).ok())
-                    .as_ref()
-                    != Some(expected),
-                (
-                    None,
-                    Some(expected),
-                    FormulaResultSource::RawWrf { path, .. },
-                ) => inspect_raw_file_revision(path)
-                    .map(|current| &current != expected)
-                    .unwrap_or(true),
+                (Some(expected), None, FormulaResultSource::Store { .. }) => {
+                    sources
+                        .store
+                        .and_then(|source| inspect_store_run_revision(source).ok())
+                        .as_ref()
+                        != Some(expected)
+                }
+                (None, Some(expected), FormulaResultSource::RawWrf { path, .. }) => {
+                    inspect_raw_file_revision(path)
+                        .map(|current| &current != expected)
+                        .unwrap_or(true)
+                }
                 // Missing or cross-wired revisions violate the launch
                 // invariant and must never land.
                 _ => true,
@@ -1278,9 +1269,10 @@ impl FormulaLabPanel {
         let result = load_recipe_bounded(&path);
         match result {
             Ok(recipe) => {
-                let limits_clamped = recipe.resource_limits.as_ref().is_some_and(|limits| {
-                    clamp_desktop_limits(limits.clone()) != *limits
-                });
+                let limits_clamped = recipe
+                    .resource_limits
+                    .as_ref()
+                    .is_some_and(|limits| clamp_desktop_limits(limits.clone()) != *limits);
                 self.apply_recipe(recipe);
                 self.status = Some(if limits_clamped {
                     format!(
@@ -1312,7 +1304,10 @@ impl FormulaLabPanel {
             })?;
             bytes.push(b'\n');
             atomic_write_bytes(&path, &bytes).map_err(|error| {
-                FormulaError::new(ErrorKind::Internal, format!("atomically write recipe: {error}"))
+                FormulaError::new(
+                    ErrorKind::Internal,
+                    format!("atomically write recipe: {error}"),
+                )
             })?;
             Ok(())
         });
@@ -1435,9 +1430,7 @@ fn load_recipe_bounded(path: &Path) -> Result<Recipe, FormulaError> {
     if len > MAX_RECIPE_BYTES {
         return Err(FormulaError::new(
             ErrorKind::Limit,
-            format!(
-                "recipe is {len} bytes; desktop limit is {MAX_RECIPE_BYTES} bytes"
-            ),
+            format!("recipe is {len} bytes; desktop limit is {MAX_RECIPE_BYTES} bytes"),
         ));
     }
     // Keep the read bounded even if another process grows the file after the
@@ -1461,12 +1454,9 @@ fn inspect_store_run_revision(source: &StoreFormulaSource) -> Result<StoreRunRev
 
     let manifest_path = run_dir.join("run.json");
     let manifest_before = inspect_raw_file_revision(&manifest_path)?;
-    let manifest = RwsRunManifest::load_for_run(
-        &manifest_path,
-        &source.hour.model,
-        &source.hour.run,
-    )
-    .map_err(|error| format!("load Formula Lab run manifest: {error}"))?;
+    let manifest =
+        RwsRunManifest::load_for_run(&manifest_path, &source.hour.model, &source.hour.run)
+            .map_err(|error| format!("load Formula Lab run manifest: {error}"))?;
     if !manifest.hours.contains_key(&source.hour.hour) {
         return Err(format!(
             "Formula Lab run no longer contains f{:03}",
@@ -1500,12 +1490,15 @@ fn inspect_store_run_revision(source: &StoreFormulaSource) -> Result<StoreRunRev
 }
 
 fn inspect_raw_file_revision(path: &Path) -> Result<RawFileRevision, String> {
-    let canonical_path = fs::canonicalize(path)
-        .map_err(|error| format!("resolve {}: {error}", path.display()))?;
+    let canonical_path =
+        fs::canonicalize(path).map_err(|error| format!("resolve {}: {error}", path.display()))?;
     let metadata = fs::metadata(&canonical_path)
         .map_err(|error| format!("inspect {}: {error}", canonical_path.display()))?;
     if !metadata.is_file() {
-        return Err(format!("{} is not a regular file", canonical_path.display()));
+        return Err(format!(
+            "{} is not a regular file",
+            canonical_path.display()
+        ));
     }
     let modified = metadata.modified().map_err(|error| {
         format!(
@@ -1609,10 +1602,7 @@ fn clamp_desktop_limits(requested: ResourceLimits) -> ResourceLimits {
     clamp_limits_to(requested, &ResourceLimits::default())
 }
 
-fn clamp_limits_to(
-    mut requested: ResourceLimits,
-    ceiling: &ResourceLimits,
-) -> ResourceLimits {
+fn clamp_limits_to(mut requested: ResourceLimits, ceiling: &ResourceLimits) -> ResourceLimits {
     requested.max_source_bytes = requested.max_source_bytes.min(ceiling.max_source_bytes);
     requested.max_tokens = requested.max_tokens.min(ceiling.max_tokens);
     requested.max_ast_nodes = requested.max_ast_nodes.min(ceiling.max_ast_nodes);
@@ -1735,7 +1725,10 @@ mod tests {
 
     #[test]
     fn output_names_are_store_safe() {
-        assert_eq!(normalized_output_name(" 0–3 km lapse rate ").unwrap(), "formula_0_3_km_lapse_rate");
+        assert_eq!(
+            normalized_output_name(" 0–3 km lapse rate ").unwrap(),
+            "formula_0_3_km_lapse_rate"
+        );
         assert!(normalized_output_name("***").is_err());
     }
 

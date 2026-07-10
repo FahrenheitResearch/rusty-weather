@@ -28,9 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use netcrust::{
-    File as NcFile, NcSliceInfo, NcSliceInfoElem, Variable as NcVariable,
-};
+use netcrust::{File as NcFile, NcSliceInfo, NcSliceInfoElem, Variable as NcVariable};
 use rustwx_core::{
     CanonicalField, FieldSelector, GridProjection, GridShape, LatLonGrid, SelectedField2D,
 };
@@ -87,20 +85,14 @@ impl RunStagingPublisher {
             ));
         }
 
-        std::fs::create_dir_all(store_root).map_err(|err| {
-            format!("create store root {}: {err}", store_root.display())
-        })?;
+        std::fs::create_dir_all(store_root)
+            .map_err(|err| format!("create store root {}: {err}", store_root.display()))?;
         let store_root = std::fs::canonicalize(store_root)
             .map_err(|err| format!("resolve store root {}: {err}", store_root.display()))?;
         let staging_root = store_root.join(STAGING_DIR_NAME);
-        std::fs::create_dir_all(&staging_root).map_err(|err| {
-            format!("create staging root {}: {err}", staging_root.display())
-        })?;
-        let staging_root = checked_real_directory(
-            &store_root,
-            &staging_root,
-            "staging root",
-        )?;
+        std::fs::create_dir_all(&staging_root)
+            .map_err(|err| format!("create staging root {}: {err}", staging_root.display()))?;
+        let staging_root = checked_real_directory(&store_root, &staging_root, "staging root")?;
 
         let transaction_root = create_unique_transaction_dir(&staging_root)?;
         let staging_store_root = transaction_root.join(STAGING_WORK_DIR_NAME);
@@ -150,18 +142,13 @@ impl RunStagingPublisher {
     /// the run as one directory transaction.
     pub(crate) fn publish(mut self) -> Result<PathBuf, String> {
         self.validate_staged_run()?;
-        self.publish_prevalidated_with(|source, destination| {
-            std::fs::rename(source, destination)
-        })?;
+        self.publish_prevalidated_with(|source, destination| std::fs::rename(source, destination))?;
         Ok(self.final_run_dir.clone())
     }
 
     fn validate_staged_run(&self) -> Result<(), String> {
-        let staged_run = checked_real_directory(
-            &self.transaction_root,
-            &self.staged_run_dir,
-            "staged run",
-        )?;
+        let staged_run =
+            checked_real_directory(&self.transaction_root, &self.staged_run_dir, "staged run")?;
         let manifest_path = checked_existing_descendant(
             &staged_run,
             &staged_run.join("run.json"),
@@ -185,11 +172,8 @@ impl RunStagingPublisher {
             return Err("staged run contains no forecast hours".to_string());
         }
 
-        let grid_path = checked_existing_descendant(
-            &staged_run,
-            &staged_run.join("grid.rwg"),
-            "staged grid",
-        )?;
+        let grid_path =
+            checked_existing_descendant(&staged_run, &staged_run.join("grid.rwg"), "staged grid")?;
         let grid = GridFile::open(&grid_path)
             .map_err(|err| format!("open staged grid {}: {err}", grid_path.display()))?;
         manifest
@@ -222,7 +206,10 @@ impl RunStagingPublisher {
         let staged_lock = staged_run.join(rw_store::LOCK_FILE_NAME);
         if staged_lock.exists() {
             let metadata = std::fs::symlink_metadata(&staged_lock).map_err(|err| {
-                format!("inspect staged advisory lock {}: {err}", staged_lock.display())
+                format!(
+                    "inspect staged advisory lock {}: {err}",
+                    staged_lock.display()
+                )
             })?;
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(format!(
@@ -230,13 +217,13 @@ impl RunStagingPublisher {
                     staged_lock.display()
                 ));
             }
-            let staged_lock = checked_existing_descendant(
-                &staged_run,
-                &staged_lock,
-                "staged advisory lock",
-            )?;
+            let staged_lock =
+                checked_existing_descendant(&staged_run, &staged_lock, "staged advisory lock")?;
             std::fs::remove_file(&staged_lock).map_err(|err| {
-                format!("remove staged advisory lock {}: {err}", staged_lock.display())
+                format!(
+                    "remove staged advisory lock {}: {err}",
+                    staged_lock.display()
+                )
             })?;
         }
         Ok(())
@@ -251,13 +238,13 @@ impl RunStagingPublisher {
             .parent()
             .ok_or_else(|| "final run has no model directory".to_string())?;
         std::fs::create_dir_all(final_model_dir).map_err(|err| {
-            format!("create final model directory {}: {err}", final_model_dir.display())
+            format!(
+                "create final model directory {}: {err}",
+                final_model_dir.display()
+            )
         })?;
-        let final_model_dir = checked_real_directory(
-            &self.store_root,
-            final_model_dir,
-            "final model directory",
-        )?;
+        let final_model_dir =
+            checked_real_directory(&self.store_root, final_model_dir, "final model directory")?;
         checked_destination_location(
             &self.store_root,
             &self.final_run_dir,
@@ -273,33 +260,41 @@ impl RunStagingPublisher {
         // honor this hidden lock; the run itself is never locked while being
         // renamed, which avoids Windows' open-handle directory-rename trap.
         let locks_root = self.staging_root.join("publish-locks");
-        std::fs::create_dir_all(&locks_root).map_err(|err| {
-            format!("create publish locks root {}: {err}", locks_root.display())
-        })?;
-        let locks_root = checked_real_directory(
-            &self.staging_root,
-            &locks_root,
-            "publish locks root",
-        )?;
+        std::fs::create_dir_all(&locks_root)
+            .map_err(|err| format!("create publish locks root {}: {err}", locks_root.display()))?;
+        let locks_root =
+            checked_real_directory(&self.staging_root, &locks_root, "publish locks root")?;
         let lock_dir = publish_lock_dir(&locks_root, &self.model, &self.run);
-        std::fs::create_dir(&lock_dir).or_else(|err| {
-            if err.kind() == std::io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(err)
-            }
-        })
-        .map_err(|err| format!("create publish lock directory {}: {err}", lock_dir.display()))?;
+        std::fs::create_dir(&lock_dir)
+            .or_else(|err| {
+                if err.kind() == std::io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            })
+            .map_err(|err| {
+                format!(
+                    "create publish lock directory {}: {err}",
+                    lock_dir.display()
+                )
+            })?;
         let lock_dir = checked_real_directory(&locks_root, &lock_dir, "publish lock")?;
-        self.publish_lock = Some(
-            RunLock::acquire(&lock_dir, PUBLISH_LOCK_TIMEOUT).map_err(|err| {
-                format!("acquire publish lock for {}/{}: {err}", self.model, self.run)
-            })?,
-        );
+        self.publish_lock = Some(RunLock::acquire(&lock_dir, PUBLISH_LOCK_TIMEOUT).map_err(
+            |err| {
+                format!(
+                    "acquire publish lock for {}/{}: {err}",
+                    self.model, self.run
+                )
+            },
+        )?);
 
         if self.final_run_dir.exists() {
             let metadata = std::fs::symlink_metadata(&self.final_run_dir).map_err(|err| {
-                format!("inspect existing run {}: {err}", self.final_run_dir.display())
+                format!(
+                    "inspect existing run {}: {err}",
+                    self.final_run_dir.display()
+                )
             })?;
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 return Err(format!(
@@ -327,12 +322,10 @@ impl RunStagingPublisher {
             Ok(()) if staged_run.exists() || !self.final_run_dir.is_dir() => Some(
                 "publish rename returned success without moving the staged directory".to_string(),
             ),
-            Ok(()) => checked_real_directory(
-                &self.store_root,
-                &self.final_run_dir,
-                "published final run",
-            )
-            .err(),
+            Ok(()) => {
+                checked_real_directory(&self.store_root, &self.final_run_dir, "published final run")
+                    .err()
+            }
         };
         if let Some(publish_error) = publish_error {
             let had_backup = self.backup_active;
@@ -446,7 +439,12 @@ fn create_unique_transaction_dir(staging_root: &Path) -> Result<PathBuf, String>
                 }
             },
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(format!("create staging transaction {}: {err}", path.display())),
+            Err(err) => {
+                return Err(format!(
+                    "create staging transaction {}: {err}",
+                    path.display()
+                ));
+            }
         }
     }
     Err("could not allocate a unique staging transaction directory".to_string())
@@ -481,7 +479,10 @@ fn checked_real_directory(root: &Path, path: &Path, label: &str) -> Result<PathB
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|err| format!("inspect {label} {}: {err}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(format!("{label} {} is not a real directory", path.display()));
+        return Err(format!(
+            "{label} {} is not a real directory",
+            path.display()
+        ));
     }
     checked_existing_descendant(root, path, label)
 }
@@ -523,7 +524,11 @@ fn checked_rename(
     label: &str,
 ) -> Result<(), String> {
     let source = checked_existing_descendant(source_root, source, &format!("{label} source"))?;
-    checked_destination(destination_root, destination, &format!("{label} destination"))?;
+    checked_destination(
+        destination_root,
+        destination,
+        &format!("{label} destination"),
+    )?;
     std::fs::rename(&source, destination).map_err(|err| {
         format!(
             "{label}: rename {} to {} failed: {err}",
@@ -547,7 +552,10 @@ fn safe_remove_tree(root: &Path, target: &Path) -> Result<(), String> {
     }
     let target = checked_existing_descendant(root, target, "cleanup path")?;
     if !metadata.is_dir() {
-        return Err(format!("cleanup path {} is not a directory", target.display()));
+        return Err(format!(
+            "cleanup path {} is not a directory",
+            target.display()
+        ));
     }
     std::fs::remove_dir_all(&target)
         .map_err(|err| format!("remove cleanup tree {}: {err}", target.display()))
@@ -858,10 +866,17 @@ pub(crate) struct SourceIdentitySnapshot {
 fn inspect_source_file_revision(path: &Path) -> Result<SourceFileRevision, String> {
     let canonical_path = std::fs::canonicalize(path)
         .map_err(|err| format!("cannot resolve source file '{}': {err}", path.display()))?;
-    let metadata = std::fs::metadata(&canonical_path)
-        .map_err(|err| format!("cannot inspect source file '{}': {err}", canonical_path.display()))?;
+    let metadata = std::fs::metadata(&canonical_path).map_err(|err| {
+        format!(
+            "cannot inspect source file '{}': {err}",
+            canonical_path.display()
+        )
+    })?;
     if !metadata.is_file() {
-        return Err(format!("source path '{}' is not a regular file", path.display()));
+        return Err(format!(
+            "source path '{}' is not a regular file",
+            path.display()
+        ));
     }
     let modified = metadata.modified().map_err(|err| {
         format!(
@@ -879,8 +894,12 @@ fn inspect_source_file_revision(path: &Path) -> Result<SourceFileRevision, Strin
 
 fn source_file_fingerprint(path: &Path) -> Result<([u8; 32], SourceFileRevision), String> {
     let before = inspect_source_file_revision(path)?;
-    let file = std::fs::File::open(&before.canonical_path)
-        .map_err(|err| format!("cannot open source identity file '{}': {err}", path.display()))?;
+    let file = std::fs::File::open(&before.canonical_path).map_err(|err| {
+        format!(
+            "cannot open source identity file '{}': {err}",
+            path.display()
+        )
+    })?;
     let length = before.len;
     let name = path
         .file_name()
@@ -960,9 +979,7 @@ pub(crate) fn capture_source_set_identity(
     })
 }
 
-pub(crate) fn verify_source_set_unchanged(
-    snapshot: &SourceIdentitySnapshot,
-) -> Result<(), String> {
+pub(crate) fn verify_source_set_unchanged(snapshot: &SourceIdentitySnapshot) -> Result<(), String> {
     for (path, expected) in &snapshot.files {
         let current = inspect_source_file_revision(path)?;
         if &current != expected {
@@ -1045,8 +1062,7 @@ fn parse_utc_timestamp(value: &str) -> Option<i64> {
         "%Y-%m-%d %H:%M:%S%.f %z",
         "%Y-%m-%dT%H:%M:%S%.f %:z",
     ] {
-        if let Ok(parsed) =
-            chrono::DateTime::<chrono::FixedOffset>::parse_from_str(trimmed, format)
+        if let Ok(parsed) = chrono::DateTime::<chrono::FixedOffset>::parse_from_str(trimmed, format)
         {
             return Some(parsed.timestamp());
         }
@@ -1085,11 +1101,16 @@ fn format_valid_unix(unix: i64) -> String {
 fn explicit_netcdf_reference_time(nc: &NcFile) -> Result<Option<i64>, ImportError> {
     let mut found = None::<(String, i64)>;
     for name in ["START_DATE", "SIMULATION_START_DATE"] {
-        let Some(value) = nc.attribute(name).and_then(|attribute| attribute.as_string()) else {
+        let Some(value) = nc
+            .attribute(name)
+            .and_then(|attribute| attribute.as_string())
+        else {
             continue;
         };
         let parsed = parse_utc_timestamp(value).ok_or_else(|| {
-            ImportError::TimeAxis(format!("global attribute {name} is not a valid UTC timestamp"))
+            ImportError::TimeAxis(format!(
+                "global attribute {name} is not a valid UTC timestamp"
+            ))
         })?;
         if let Some((prior_name, prior)) = &found {
             if *prior != parsed {
@@ -1176,10 +1197,7 @@ fn wrf_times_from_netcdf(
         })?;
         let mut bytes = Vec::with_capacity(width);
         for value in values {
-            if !value.is_finite()
-                || value.fract() != 0.0
-                || *value < 0.0
-                || *value > u8::MAX as f64
+            if !value.is_finite() || value.fract() != 0.0 || *value < 0.0 || *value > u8::MAX as f64
             {
                 return Err(ImportError::TimeAxis(format!(
                     "Times record {time_index} contains a non-byte value {value}"
@@ -1360,10 +1378,7 @@ fn cf_time_records(
 /// Discover every exact record time in a generic NetCDF/WRF file. Multi-time
 /// files without an unambiguous `Times` or CF coordinate are rejected; a
 /// single-record file may use an exact WRF timestamp embedded in its path.
-pub(crate) fn netcdf_source_times(
-    nc: &NcFile,
-    path: &Path,
-) -> Result<SourceTimeAxis, ImportError> {
+pub(crate) fn netcdf_source_times(nc: &NcFile, path: &Path) -> Result<SourceTimeAxis, ImportError> {
     let dimensions = nc.dimensions()?;
     let time_dimensions = dimensions
         .iter()
@@ -1400,13 +1415,7 @@ pub(crate) fn netcdf_source_times(
                             .map(|name| name.eq_ignore_ascii_case("time"))
                             .unwrap_or(false))
             })
-            .map(|variable| {
-                format!(
-                    "{}({})",
-                    variable.name(),
-                    variable.dimensions()[0].name()
-                )
-            })
+            .map(|variable| format!("{}({})", variable.name(), variable.dimensions()[0].name()))
             .collect::<Vec<_>>();
         if !advertised.is_empty() {
             return Err(ImportError::TimeAxis(format!(
@@ -1462,20 +1471,20 @@ pub(crate) fn netcdf_source_times(
         (Err(times_err), Ok(None)) => return Err(times_err),
         (_, Err(cf_err)) => return Err(cf_err),
         (Ok(None), Ok(None)) if record_count == 1 => {
-        let timestamp = timestamp_from_path(path)
-            .and_then(|value| parse_utc_timestamp(&value))
-            .or(reference_unix);
-        let valid_unix = timestamp.ok_or_else(|| {
-            ImportError::TimeAxis(format!(
-                "{} has one time record but no Times/CF coordinate or exact filename timestamp",
-                path.display()
-            ))
-        })?;
-        vec![SourceTimeRecord {
-            time_index: 0,
-            valid_unix,
-            label: format_valid_unix(valid_unix),
-        }]
+            let timestamp = timestamp_from_path(path)
+                .and_then(|value| parse_utc_timestamp(&value))
+                .or(reference_unix);
+            let valid_unix = timestamp.ok_or_else(|| {
+                ImportError::TimeAxis(format!(
+                    "{} has one time record but no Times/CF coordinate or exact filename timestamp",
+                    path.display()
+                ))
+            })?;
+            vec![SourceTimeRecord {
+                time_index: 0,
+                valid_unix,
+                label: format_valid_unix(valid_unix),
+            }]
         }
         (Ok(None), Ok(None)) => {
             return Err(ImportError::TimeAxis(format!(
@@ -1492,10 +1501,7 @@ pub(crate) fn netcdf_source_times(
 
 /// Exact WRF time discovery for the raw wrf-core path. `Times` must cover
 /// every record; missing or truncated labels are never replaced by ordinals.
-pub(crate) fn wrf_source_times(
-    file: &WrfFile,
-    path: &Path,
-) -> Result<SourceTimeAxis, String> {
+pub(crate) fn wrf_source_times(file: &WrfFile, path: &Path) -> Result<SourceTimeAxis, String> {
     let labels = file
         .times()
         .map_err(|err| format!("Read WRF Times from {} failed: {err}", path.display()))?;
@@ -1506,9 +1512,8 @@ pub(crate) fn wrf_source_times(
         let Ok(value) = file.global_attr_str(name) else {
             continue;
         };
-        let parsed = parse_utc_timestamp(&value).ok_or_else(|| {
-            format!("{} has invalid WRF {name} {value:?}", path.display())
-        })?;
+        let parsed = parse_utc_timestamp(&value)
+            .ok_or_else(|| format!("{} has invalid WRF {name} {value:?}", path.display()))?;
         if let Some((prior_name, prior)) = &reference_unix {
             if *prior != parsed {
                 return Err(format!(
@@ -1560,7 +1565,10 @@ fn preflight_local_sources(
             ),
             Err(_) => {
                 let nc = netcrust::open(path)?;
-                (netcdf_source_times(&nc, path)?, netcdf_grid_shape(&nc, path)?)
+                (
+                    netcdf_source_times(&nc, path)?,
+                    netcdf_grid_shape(&nc, path)?,
+                )
             }
         };
         merge_preflight_grid_shape(&mut expected_shape, shape, path)
@@ -1579,10 +1587,7 @@ fn preflight_local_sources(
     Ok((plans, run))
 }
 
-pub(crate) fn netcdf_grid_shape(
-    nc: &NcFile,
-    path: &Path,
-) -> Result<(usize, usize), ImportError> {
+pub(crate) fn netcdf_grid_shape(nc: &NcFile, path: &Path) -> Result<(usize, usize), ImportError> {
     let find_shape = |names: &[&str]| {
         names.iter().find_map(|name| {
             let variable = nc.variable(name)?;
@@ -1590,12 +1595,10 @@ pub(crate) fn netcdf_grid_shape(
             (shape.len() >= 2).then(|| (shape[shape.len() - 1], shape[shape.len() - 2]))
         })
     };
-    let lat = find_shape(&["XLAT", "XLAT_M", "lat", "latitude"]).ok_or_else(|| {
-        ImportError::MissingAny(vec!["XLAT".to_string(), "lat".to_string()])
-    })?;
-    let lon = find_shape(&["XLONG", "XLONG_M", "lon", "longitude"]).ok_or_else(|| {
-        ImportError::MissingAny(vec!["XLONG".to_string(), "lon".to_string()])
-    })?;
+    let lat = find_shape(&["XLAT", "XLAT_M", "lat", "latitude"])
+        .ok_or_else(|| ImportError::MissingAny(vec!["XLAT".to_string(), "lat".to_string()]))?;
+    let lon = find_shape(&["XLONG", "XLONG_M", "lon", "longitude"])
+        .ok_or_else(|| ImportError::MissingAny(vec!["XLONG".to_string(), "lon".to_string()]))?;
     if lat != lon || lat.0 == 0 || lat.1 == 0 {
         return Err(ImportError::TimeAxis(format!(
             "{} has incompatible latitude/longitude grid shapes {:?} and {:?}",
@@ -1682,8 +1685,8 @@ fn import_paths(
     let source_identity = &source_snapshot.identity;
     let model = "wrf".to_string();
     let (plans, run) = preflight_local_sources(&files, source_identity, "light")?;
-    let publisher = RunStagingPublisher::new(store_root, &model, &run)
-        .map_err(ImportError::Publish)?;
+    let publisher =
+        RunStagingPublisher::new(store_root, &model, &run).map_err(ImportError::Publish)?;
     let staging_store_root = publisher.staging_store_root().to_path_buf();
     let total = plans.len();
     let mut all_vars = Vec::new();
@@ -1720,42 +1723,130 @@ fn import_paths(
                 "{tag}, time {} ({}) -> f{hour:03}",
                 record.time_index, record.label
             );
-        // Post-processed climate wrfout (CONUS-I/II, GDEX: derived TK/Z/P, no
-        // raw T/PB) can't go through the raw-wrfout reader — build it directly.
-        // (Bound before the `if let` so the prefixing closure's borrow of
-        // `progress` ends before the block uses `progress` again.)
-        let postprocessed = try_postprocessed_wrf_shared(
-            &nc,
-            path,
-            record.time_index,
-            false,
-            &mut |message| progress(format!("{record_tag}: {message}")),
-        )?;
-        if let Some((canonical, severe, volumes, raw_2d)) = postprocessed {
-            let refs = canonical
+            // Post-processed climate wrfout (CONUS-I/II, GDEX: derived TK/Z/P, no
+            // raw T/PB) can't go through the raw-wrfout reader — build it directly.
+            // (Bound before the `if let` so the prefixing closure's borrow of
+            // `progress` ends before the block uses `progress` again.)
+            let postprocessed = try_postprocessed_wrf_shared(
+                &nc,
+                path,
+                record.time_index,
+                false,
+                &mut |message| progress(format!("{record_tag}: {message}")),
+            )?;
+            if let Some((canonical, severe, volumes, raw_2d)) = postprocessed {
+                let refs = canonical
+                    .iter()
+                    .map(|(name, field)| (name.as_str(), field))
+                    .collect::<Vec<_>>();
+                // Light import requests no computed severe fields. The derived
+                // slot remains here for the shared heavy path's explicit
+                // `approx_*` products and for raw wrf2d fields below.
+                let mut derived_refs = severe
+                    .iter()
+                    .map(|field| DerivedFieldInput {
+                        name: field.name,
+                        units: field.units,
+                        values: field.values.as_slice(),
+                    })
+                    .collect::<Vec<_>>();
+                // Raw `wrf_*` planes from the 2-D wrf2d route share that slot —
+                // the same convention the raw-wrfout light import uses (empty on
+                // the 3-D route, so its hours are written exactly as before).
+                derived_refs.extend(raw_2d.iter().map(|field| DerivedFieldInput {
+                    name: field.name.as_str(),
+                    units: field.units.as_str(),
+                    values: field.values.as_slice(),
+                }));
+                let volume_inputs = volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
+                progress(format!("{record_tag}: writing to store"));
+                let result = write_hour_from_fields_with_derived(
+                    &staging_store_root,
+                    &model,
+                    &run,
+                    hour,
+                    &refs,
+                    &derived_refs,
+                    &volume_inputs,
+                    writer_build(),
+                    now_unix(),
+                )?;
+                all_vars.extend(result.vars.iter().cloned());
+                written.push(result);
+                continue;
+            }
+            if is_postprocessed {
+                return Err(ImportError::TimeAxis(format!(
+                    "{} changed post-processed classification while reading record {}",
+                    path.display(),
+                    record.time_index
+                )));
+            }
+            progress(format!("{record_tag}: reading 2D surface fields"));
+            // One wrf-core handle per raw wrfout, shared by the fast 2D plane
+            // reads AND the isobaric volume build. `None` (plain NetCDF, or a
+            // panic on a pathological header) keeps every 2D read on netcrust
+            // and skips the volumes — exactly the pre-fast-path behavior.
+            let mut fields = read_wrf_2d_fields(
+                &nc,
+                path,
+                wrf_file.as_ref(),
+                record.time_index,
+                &mut |message| progress(format!("{record_tag}: {message}")),
+            )?;
+            if fields.canonical.is_empty() {
+                return Err(ImportError::NoFields(path.clone()));
+            }
+            // Isobaric sounding volumes + lowest-model-level surface fallback, so an
+            // imported WRF run makes soundings. Built through wrf-core; a plain
+            // NetCDF wrf-core can't open yields neither. Fill any surface field the
+            // 2D read missed (e.g. PSFC in a split wrf3d file) from the fallback.
+            let (iso_volumes, surface_fallback, volume_note) =
+                read_iso_volumes(wrf_file.as_ref(), record.time_index, &mut |message| {
+                    progress(format!("{record_tag}: {message}"))
+                });
+            if let Some(note) = volume_note {
+                progress(format!("{record_tag}: {note}"));
+                notes.push(format!(
+                    "{} time {}: {note}",
+                    display_name(path),
+                    record.label
+                ));
+            }
+            if let Some(surface) = surface_fallback {
+                fill_missing_surface(&mut fields, surface);
+            }
+            let refs = fields
+                .canonical
                 .iter()
                 .map(|(name, field)| (name.as_str(), field))
                 .collect::<Vec<_>>();
-            // Light import requests no computed severe fields. The derived
-            // slot remains here for the shared heavy path's explicit
-            // `approx_*` products and for raw wrf2d fields below.
-            let mut derived_refs = severe
+            let raw_refs = fields
+                .raw_2d
                 .iter()
                 .map(|field| DerivedFieldInput {
-                    name: field.name,
-                    units: field.units,
+                    name: field.name.as_str(),
+                    units: field.units.as_str(),
                     values: field.values.as_slice(),
                 })
                 .collect::<Vec<_>>();
-            // Raw `wrf_*` planes from the 2-D wrf2d route share that slot —
-            // the same convention the raw-wrfout light import uses (empty on
-            // the 3-D route, so its hours are written exactly as before).
-            derived_refs.extend(raw_2d.iter().map(|field| DerivedFieldInput {
-                name: field.name.as_str(),
-                units: field.units.as_str(),
-                values: field.values.as_slice(),
-            }));
-            let volume_inputs = volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
+            // Volume planes come from wrf-core, the 2D grid from netcrust; if they
+            // ever disagree on grid size, drop volumes rather than fail the hour.
+            let grid_cells = fields.grid.shape.len();
+            let volumes_match = iso_volumes.iter().all(|volume| {
+                volume
+                    .levels
+                    .iter()
+                    .all(|(_, plane)| plane.len() == grid_cells)
+            });
+            let volume_inputs = if volumes_match {
+                iso_volumes
+                    .iter()
+                    .map(IsoVolume::as_input)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             progress(format!("{record_tag}: writing to store"));
             let result = write_hour_from_fields_with_derived(
                 &staging_store_root,
@@ -1763,101 +1854,13 @@ fn import_paths(
                 &run,
                 hour,
                 &refs,
-                &derived_refs,
+                &raw_refs,
                 &volume_inputs,
                 writer_build(),
                 now_unix(),
             )?;
             all_vars.extend(result.vars.iter().cloned());
             written.push(result);
-            continue;
-        }
-        if is_postprocessed {
-            return Err(ImportError::TimeAxis(format!(
-                "{} changed post-processed classification while reading record {}",
-                path.display(),
-                record.time_index
-            )));
-        }
-        progress(format!("{record_tag}: reading 2D surface fields"));
-        // One wrf-core handle per raw wrfout, shared by the fast 2D plane
-        // reads AND the isobaric volume build. `None` (plain NetCDF, or a
-        // panic on a pathological header) keeps every 2D read on netcrust
-        // and skips the volumes — exactly the pre-fast-path behavior.
-        let mut fields = read_wrf_2d_fields(
-            &nc,
-            path,
-            wrf_file.as_ref(),
-            record.time_index,
-            &mut |message| progress(format!("{record_tag}: {message}")),
-        )?;
-        if fields.canonical.is_empty() {
-            return Err(ImportError::NoFields(path.clone()));
-        }
-        // Isobaric sounding volumes + lowest-model-level surface fallback, so an
-        // imported WRF run makes soundings. Built through wrf-core; a plain
-        // NetCDF wrf-core can't open yields neither. Fill any surface field the
-        // 2D read missed (e.g. PSFC in a split wrf3d file) from the fallback.
-        let (iso_volumes, surface_fallback, volume_note) =
-            read_iso_volumes(wrf_file.as_ref(), record.time_index, &mut |message| {
-                progress(format!("{record_tag}: {message}"))
-            });
-        if let Some(note) = volume_note {
-            progress(format!("{record_tag}: {note}"));
-            notes.push(format!(
-                "{} time {}: {note}",
-                display_name(path),
-                record.label
-            ));
-        }
-        if let Some(surface) = surface_fallback {
-            fill_missing_surface(&mut fields, surface);
-        }
-        let refs = fields
-            .canonical
-            .iter()
-            .map(|(name, field)| (name.as_str(), field))
-            .collect::<Vec<_>>();
-        let raw_refs = fields
-            .raw_2d
-            .iter()
-            .map(|field| DerivedFieldInput {
-                name: field.name.as_str(),
-                units: field.units.as_str(),
-                values: field.values.as_slice(),
-            })
-            .collect::<Vec<_>>();
-        // Volume planes come from wrf-core, the 2D grid from netcrust; if they
-        // ever disagree on grid size, drop volumes rather than fail the hour.
-        let grid_cells = fields.grid.shape.len();
-        let volumes_match = iso_volumes.iter().all(|volume| {
-            volume
-                .levels
-                .iter()
-                .all(|(_, plane)| plane.len() == grid_cells)
-        });
-        let volume_inputs = if volumes_match {
-            iso_volumes
-                .iter()
-                .map(IsoVolume::as_input)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        progress(format!("{record_tag}: writing to store"));
-        let result = write_hour_from_fields_with_derived(
-            &staging_store_root,
-            &model,
-            &run,
-            hour,
-            &refs,
-            &raw_refs,
-            &volume_inputs,
-            writer_build(),
-            now_unix(),
-        )?;
-        all_vars.extend(result.vars.iter().cloned());
-        written.push(result);
         }
     }
     all_vars.sort();
@@ -2178,8 +2181,9 @@ fn pressure_scale_to_pa(units: Option<&str>, missing_scale: f32) -> Option<f32> 
         .collect::<String>();
     match normalized.as_str() {
         "pa" | "pascal" | "pascals" => Some(1.0),
-        "hpa" | "hectopascal" | "hectopascals" | "mb" | "mbar" | "millibar"
-        | "millibars" => Some(100.0),
+        "hpa" | "hectopascal" | "hectopascals" | "mb" | "mbar" | "millibar" | "millibars" => {
+            Some(100.0)
+        }
         "kpa" | "kilopascal" | "kilopascals" => Some(1_000.0),
         _ => None,
     }
@@ -2225,32 +2229,26 @@ fn normalized_unit_token(units: &str) -> String {
         .collect()
 }
 
-fn postprocessed_unit_affine(
-    units: &str,
-    kind: PostprocessedUnitKind,
-) -> Option<(f64, f64)> {
+fn postprocessed_unit_affine(units: &str, kind: PostprocessedUnitKind) -> Option<(f64, f64)> {
     let units = normalized_unit_token(units);
     match kind {
         PostprocessedUnitKind::TemperatureKelvin => match units.as_str() {
             "k" | "kelvin" | "kelvins" => Some((1.0, 0.0)),
             "c" | "degc" | "degreec" | "degreesc" | "celsius" | "degreecelsius"
-            | "degreescelsius" => {
-                Some((1.0, 273.15))
-            }
+            | "degreescelsius" => Some((1.0, 273.15)),
             _ => None,
         },
         PostprocessedUnitKind::PressurePascal => match units.as_str() {
             "pa" | "pascal" | "pascals" => Some((1.0, 0.0)),
-            "hpa" | "hectopascal" | "hectopascals" | "mb" | "mbar" | "millibar"
-            | "millibars" => Some((100.0, 0.0)),
+            "hpa" | "hectopascal" | "hectopascals" | "mb" | "mbar" | "millibar" | "millibars" => {
+                Some((100.0, 0.0))
+            }
             "kpa" | "kilopascal" | "kilopascals" => Some((1_000.0, 0.0)),
             _ => None,
         },
         PostprocessedUnitKind::HeightMeter => match units.as_str() {
             "m" | "meter" | "meters" | "metre" | "metres" | "gpm" => Some((1.0, 0.0)),
-            "km" | "kilometer" | "kilometers" | "kilometre" | "kilometres" => {
-                Some((1_000.0, 0.0))
-            }
+            "km" | "kilometer" | "kilometers" | "kilometre" | "kilometres" => Some((1_000.0, 0.0)),
             _ => None,
         },
         PostprocessedUnitKind::MixingRatioKgKg => match units.as_str() {
@@ -2259,8 +2257,8 @@ fn postprocessed_unit_affine(
             _ => None,
         },
         PostprocessedUnitKind::WindMetersPerSecond => match units.as_str() {
-            "m/s" | "ms" | "ms1" | "meterpersecond" | "meterspersecond"
-            | "metrepersecond" | "metrespersecond" => Some((1.0, 0.0)),
+            "m/s" | "ms" | "ms1" | "meterpersecond" | "meterspersecond" | "metrepersecond"
+            | "metrespersecond" => Some((1.0, 0.0)),
             "kt" | "kts" | "knot" | "knots" => Some((0.514_444, 0.0)),
             _ => None,
         },
@@ -2440,8 +2438,7 @@ impl WrfWindRotation {
             {
                 let mut u_earth = Vec::with_capacity(u.values.len());
                 let mut v_earth = Vec::with_capacity(v.values.len());
-                for (((&u, &v), &sin), &cos) in u.values.iter().zip(&v.values).zip(sin).zip(cos)
-                {
+                for (((&u, &v), &sin), &cos) in u.values.iter().zip(&v.values).zip(sin).zip(cos) {
                     u_earth.push(u.mul_add(cos, -v * sin));
                     v_earth.push(u.mul_add(sin, v * cos));
                 }
@@ -2584,10 +2581,7 @@ fn read_first_2d(src: &PlaneSource, name: &str) -> Result<Option<Plane2D>, Impor
     if let (Some(wrf), Some(var)) = (src.wrf, src.nc.variable(name)) {
         let dims = var.dimensions();
         let shape = var.shape();
-        if dims.len() >= 3
-            && shape.len() == dims.len()
-            && is_time_dimension(dims[0].name())
-        {
+        if dims.len() >= 3 && shape.len() == dims.len() && is_time_dimension(dims[0].name()) {
             let expected = shape[1..]
                 .iter()
                 .try_fold(1usize, |acc, &dim| acc.checked_mul(dim));
@@ -2808,10 +2802,7 @@ pub(crate) fn wrf_mercator_central_longitude(stand_lon: Option<f64>) -> f64 {
 /// specified or non-default pole is intentionally not called Geographic:
 /// rw-store cannot encode a rotated pole, while the actual XLAT/XLONG arrays
 /// still let the curvilinear grid render correctly when projection is `None`.
-pub(crate) fn wrf_latlon_is_unrotated(
-    pole_lat: Option<f64>,
-    pole_lon: Option<f64>,
-) -> bool {
+pub(crate) fn wrf_latlon_is_unrotated(pole_lat: Option<f64>, pole_lon: Option<f64>) -> bool {
     matches!((pole_lat, pole_lon), (None, None))
         || matches!((pole_lat, pole_lon), (Some(lat), Some(lon)) if lat == 90.0 && lon == 0.0)
 }
@@ -2844,15 +2835,15 @@ fn wrf_projection(nc: &NcFile) -> Option<GridProjection> {
         }
         3 => Some(GridProjection::Mercator {
             latitude_of_true_scale_deg: global_attr_f64(nc, "TRUELAT1").unwrap_or(0.0),
-            central_meridian_deg: wrf_mercator_central_longitude(global_attr_f64(
-                nc,
-                "STAND_LON",
-            )),
+            central_meridian_deg: wrf_mercator_central_longitude(global_attr_f64(nc, "STAND_LON")),
         }),
         6 if wrf_latlon_is_unrotated(
             global_attr_f64(nc, "POLE_LAT"),
             global_attr_f64(nc, "POLE_LON"),
-        ) => Some(GridProjection::Geographic),
+        ) =>
+        {
+            Some(GridProjection::Geographic)
+        }
         6 => None,
         // Unknown WRF projections have no trustworthy native renderer
         // mapping. Keep the exact curvilinear XLAT/XLONG grid and omit a
@@ -3062,9 +3053,7 @@ fn destagger_z_to_mass_levels(
         .checked_add(1)
         .and_then(|levels| levels.checked_mul(cells))
         .ok_or(ImportError::PlaneMismatch)?;
-    let mass_values = nz
-        .checked_mul(cells)
-        .ok_or(ImportError::PlaneMismatch)?;
+    let mass_values = nz.checked_mul(cells).ok_or(ImportError::PlaneMismatch)?;
     if values.len() != staggered_values {
         return Err(ImportError::PlaneMismatch);
     }
@@ -3350,24 +3339,9 @@ pub(crate) fn try_postprocessed_wrf_shared(
     {
         return Err(ImportError::PlaneMismatch);
     }
-    normalize_postprocessed_values(
-        nc,
-        "TK",
-        &mut tk,
-        PostprocessedUnitKind::TemperatureKelvin,
-    )?;
-    normalize_postprocessed_values(
-        nc,
-        "P",
-        &mut p_pa,
-        PostprocessedUnitKind::PressurePascal,
-    )?;
-    normalize_postprocessed_values(
-        nc,
-        "Z",
-        &mut z_m,
-        PostprocessedUnitKind::HeightMeter,
-    )?;
+    normalize_postprocessed_values(nc, "TK", &mut tk, PostprocessedUnitKind::TemperatureKelvin)?;
+    normalize_postprocessed_values(nc, "P", &mut p_pa, PostprocessedUnitKind::PressurePascal)?;
+    normalize_postprocessed_values(nc, "Z", &mut z_m, PostprocessedUnitKind::HeightMeter)?;
     normalize_postprocessed_values(
         nc,
         "QVAPOR",
@@ -3486,9 +3460,7 @@ pub(crate) fn try_postprocessed_wrf_shared(
     }
 
     if !compute_severe {
-        progress(
-            "skipping approximate post-processed severe suite (light import)".to_string(),
-        );
+        progress("skipping approximate post-processed severe suite (light import)".to_string());
         return Ok(Some((canonical, Vec::new(), volumes, Vec::new())));
     }
 
@@ -3691,9 +3663,7 @@ mod tests {
             vec![0, 3, 9]
         );
         assert_eq!(
-            timeline
-                .run_name("0123456789abcdef", "light")
-                .as_deref(),
+            timeline.run_name("0123456789abcdef", "light").as_deref(),
             Some("local_20231114221320_0123456789abcdef_light_science_v1")
         );
         assert_ne!(
@@ -3764,10 +3734,7 @@ mod tests {
 
         let mut duplicate = ForecastHourTimeline::default();
         duplicate
-            .plan(
-                &test_time_axis(Some(origin), &[0]),
-                Path::new("first.nc"),
-            )
+            .plan(&test_time_axis(Some(origin), &[0]), Path::new("first.nc"))
             .expect("first record");
         let err = duplicate
             .plan(
@@ -3781,26 +3748,23 @@ mod tests {
     #[test]
     fn preflight_grid_shape_rejects_cross_file_geometry_before_writes() {
         let mut expected = None;
-        merge_preflight_grid_shape(&mut expected, (600, 500), Path::new("first.nc"))
-            .unwrap();
-        merge_preflight_grid_shape(&mut expected, (600, 500), Path::new("second.nc"))
-            .unwrap();
-        let err = merge_preflight_grid_shape(
-            &mut expected,
-            (601, 500),
-            Path::new("different.nc"),
-        )
-        .unwrap_err();
-        assert!(err.contains("different.nc") && err.contains("601x500"), "{err}");
+        merge_preflight_grid_shape(&mut expected, (600, 500), Path::new("first.nc")).unwrap();
+        merge_preflight_grid_shape(&mut expected, (600, 500), Path::new("second.nc")).unwrap();
+        let err = merge_preflight_grid_shape(&mut expected, (601, 500), Path::new("different.nc"))
+            .unwrap_err();
+        assert!(
+            err.contains("different.nc") && err.contains("601x500"),
+            "{err}"
+        );
 
         let mut hostile = None;
-        let err = merge_preflight_grid_shape(
-            &mut hostile,
-            (usize::MAX, 2),
-            Path::new("hostile.nc"),
-        )
-        .unwrap_err();
-        assert!(err.contains("hostile.nc") && err.contains("unsafe"), "{err}");
+        let err =
+            merge_preflight_grid_shape(&mut hostile, (usize::MAX, 2), Path::new("hostile.nc"))
+                .unwrap_err();
+        assert!(
+            err.contains("hostile.nc") && err.contains("unsafe"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3815,13 +3779,14 @@ mod tests {
         let transaction = publisher.transaction_root.clone();
 
         publisher
-            .publish_prevalidated_with(|source, destination| {
-                std::fs::rename(source, destination)
-            })
+            .publish_prevalidated_with(|source, destination| std::fs::rename(source, destination))
             .unwrap();
         assert!(publisher.final_run_dir.join("new.marker").is_file());
         assert!(!publisher.final_run_dir.join("old.marker").exists());
-        assert!(!transaction.exists(), "successful transaction must be cleaned");
+        assert!(
+            !transaction.exists(),
+            "successful transaction must be cleaned"
+        );
         drop(publisher);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3851,7 +3816,10 @@ mod tests {
         assert!(!final_run.join("new.marker").exists());
         assert!(publisher.staged_run_dir.join("new.marker").is_file());
         drop(publisher);
-        assert!(!transaction.exists(), "failed transaction staging must be cleaned");
+        assert!(
+            !transaction.exists(),
+            "failed transaction staging must be cleaned"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4020,8 +3988,8 @@ mod tests {
             parse_utc_timestamp("2026-07-09_18:30:00"),
             parse_utc_timestamp("2026-07-09T18:30:00Z")
         );
-        let (scale, origin) = cf_time_unit("hours since 2026-07-09 18:30:00 UTC")
-            .expect("CF hour units");
+        let (scale, origin) =
+            cf_time_unit("hours since 2026-07-09 18:30:00 UTC").expect("CF hour units");
         assert_eq!(scale, 3_600.0);
         assert_eq!(origin, parse_utc_timestamp("2026-07-09T18:30:00Z").unwrap());
     }
@@ -4431,8 +4399,8 @@ mod tests {
         eprintln!("read-path identity: {compared} planes bit-identical");
 
         // End-to-end: the exact field set the import writes, both routes.
-        let legacy_fields = read_wrf_2d_fields(&nc, &path, None, 0, &mut |_: String| {})
-            .expect("legacy 2D read");
+        let legacy_fields =
+            read_wrf_2d_fields(&nc, &path, None, 0, &mut |_: String| {}).expect("legacy 2D read");
         let fast_fields = read_wrf_2d_fields(&nc, &path, Some(&wrf), 0, &mut |_: String| {})
             .expect("fast-path 2D read");
         assert_bits_eq(
@@ -4564,8 +4532,7 @@ mod tests {
             summary
                 .variables
                 .iter()
-                .all(|name| !crate::postproc_severe::APPROX_SEVERE_SLUGS
-                    .contains(&name.as_str())),
+                .all(|name| !crate::postproc_severe::APPROX_SEVERE_SLUGS.contains(&name.as_str())),
             "light import must not run the approximate severe suite: {:?}",
             summary.variables
         );
@@ -4797,7 +4764,9 @@ pub(crate) enum ImportError {
     MixedGribSelection,
     #[error("cannot map {variable} to canonical pressure: unsupported units {units:?}")]
     UnsupportedPressureUnits { variable: String, units: String },
-    #[error("cannot normalize post-processed {variable}: unsupported units {units:?}; expected {expected}")]
+    #[error(
+        "cannot normalize post-processed {variable}: unsupported units {units:?}; expected {expected}"
+    )]
     UnsupportedFieldUnits {
         variable: String,
         units: String,

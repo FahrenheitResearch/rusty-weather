@@ -243,28 +243,46 @@ pub fn compare(path_a: &Path, path_b: &Path) -> Result<(), Difference> {
         let record_b = ChunkRecord::unpack(&record_bytes_b).map_err(|err| {
             Difference::Io(format!("{}: index record {index}: {err}", path_b.display()))
         })?;
-        let rel_a = record_a.offset.checked_sub(header_a.payload_offset).ok_or_else(|| {
-            Difference::Io(format!(
-                "{}: index record {index} offset {} precedes payload offset {}",
-                path_a.display(),
-                record_a.offset,
-                header_a.payload_offset
-            ))
-        })?;
-        let rel_b = record_b.offset.checked_sub(header_b.payload_offset).ok_or_else(|| {
-            Difference::Io(format!(
-                "{}: index record {index} offset {} precedes payload offset {}",
-                path_b.display(),
-                record_b.offset,
-                header_b.payload_offset
-            ))
-        })?;
-        let end_a = record_a.offset.checked_add(u64::from(record_a.len)).ok_or_else(|| {
-            Difference::Io(format!("{}: index record {index} payload end overflows", path_a.display()))
-        })?;
-        let end_b = record_b.offset.checked_add(u64::from(record_b.len)).ok_or_else(|| {
-            Difference::Io(format!("{}: index record {index} payload end overflows", path_b.display()))
-        })?;
+        let rel_a = record_a
+            .offset
+            .checked_sub(header_a.payload_offset)
+            .ok_or_else(|| {
+                Difference::Io(format!(
+                    "{}: index record {index} offset {} precedes payload offset {}",
+                    path_a.display(),
+                    record_a.offset,
+                    header_a.payload_offset
+                ))
+            })?;
+        let rel_b = record_b
+            .offset
+            .checked_sub(header_b.payload_offset)
+            .ok_or_else(|| {
+                Difference::Io(format!(
+                    "{}: index record {index} offset {} precedes payload offset {}",
+                    path_b.display(),
+                    record_b.offset,
+                    header_b.payload_offset
+                ))
+            })?;
+        let end_a = record_a
+            .offset
+            .checked_add(u64::from(record_a.len))
+            .ok_or_else(|| {
+                Difference::Io(format!(
+                    "{}: index record {index} payload end overflows",
+                    path_a.display()
+                ))
+            })?;
+        let end_b = record_b
+            .offset
+            .checked_add(u64::from(record_b.len))
+            .ok_or_else(|| {
+                Difference::Io(format!(
+                    "{}: index record {index} payload end overflows",
+                    path_b.display()
+                ))
+            })?;
         if end_a > hour_a.file_len || end_b > hour_b.file_len {
             return Err(Difference::Io(format!(
                 "index record {index} payload exceeds file length ({} > {} or {} > {})",
@@ -350,8 +368,7 @@ pub fn compare(path_a: &Path, path_b: &Path) -> Result<(), Difference> {
     ensure_same_len(&hour_b)?;
     println!(
         "compared: {} index records, {} payload bytes, meta keys minus writer.build",
-        header_a.index_count,
-        payload_len_a
+        header_a.index_count, payload_len_a
     );
     Ok(())
 }
@@ -449,8 +466,8 @@ pub fn read_writer_build(path: &Path) -> Result<String, String> {
             path.display()
         ));
     }
-    let meta: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|err| format!("{}: JSON: {err}", path.display()))?;
+    let meta: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|err| format!("{}: JSON: {err}", path.display()))?;
     meta.get("writer")
         .and_then(|writer| writer.get("build"))
         .and_then(|build| build.as_str())
@@ -559,7 +576,10 @@ mod tests {
 
         match compare(&path, &path) {
             Err(Difference::Io(message)) => {
-                assert!(message.contains("index_count"), "unexpected error: {message}")
+                assert!(
+                    message.contains("index_count"),
+                    "unexpected error: {message}"
+                )
             }
             other => panic!("expected index-count rejection, got {other:?}"),
         }

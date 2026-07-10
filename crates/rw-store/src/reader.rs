@@ -50,9 +50,7 @@ const MAX_CHUNK_WINDOW_LOG: u32 = 23;
 fn try_zeroed_bytes(len: usize, what: &str) -> RwResult<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(len).map_err(|err| {
-        RwStoreError::Format(format!(
-            "cannot allocate {len} bytes for {what}: {err}"
-        ))
+        RwStoreError::Format(format!("cannot allocate {len} bytes for {what}: {err}"))
     })?;
     bytes.resize(len, 0);
     Ok(bytes)
@@ -194,10 +192,7 @@ fn validate_hour_meta(meta: &RwsHourMeta, header: &RwsHeader) -> RwResult<()> {
     {
         return Err(RwStoreError::Meta(format!(
             "unsupported chunk geometry tile={}x{}, column={}x{}; format v1 requires tile={TILE_Y}x{TILE_X}, column={COL_Y}x{COL_X}",
-            meta.chunking.tile_y,
-            meta.chunking.tile_x,
-            meta.chunking.col_y,
-            meta.chunking.col_x
+            meta.chunking.tile_y, meta.chunking.tile_x, meta.chunking.col_y, meta.chunking.col_x
         )));
     }
     if meta.variables.len() > usize::from(u16::MAX) + 1 {
@@ -374,7 +369,9 @@ fn validate_chunk_record(
             RwStoreError::Format(format!("index record {index}: value count overflows usize"))
         })?;
     let expected_raw_len = values.checked_mul(bytes_per_value).ok_or_else(|| {
-        RwStoreError::Format(format!("index record {index}: raw byte count overflows usize"))
+        RwStoreError::Format(format!(
+            "index record {index}: raw byte count overflows usize"
+        ))
     })?;
 
     let is_empty = record.flags & FLAG_EMPTY != 0;
@@ -515,14 +512,7 @@ impl HourReader {
                 RwStoreError::Format(format!("chunk index record {i} end overflows usize"))
             })?;
             let record = ChunkRecord::unpack(&data[start..end])?;
-            validate_chunk_record(
-                i,
-                &record,
-                &meta,
-                &header,
-                data.len() as u64,
-                &variables,
-            )?;
+            validate_chunk_record(i, &record, &meta, &header, data.len() as u64, &variables)?;
             records.push(record);
         }
         for (i, pair) in records.windows(2).enumerate() {
@@ -661,7 +651,9 @@ impl HourReader {
         };
 
         let cells = ny.checked_mul(nx).ok_or_else(|| {
-            RwStoreError::Format(format!("variable '{name}': grid cell count overflows usize"))
+            RwStoreError::Format(format!(
+                "variable '{name}': grid cell count overflows usize"
+            ))
         })?;
         let mut values = try_filled_f32(cells, f32::NAN, &format!("variable '{name}'"))?;
         for (ty, tx, tile) in decoded {
@@ -839,8 +831,11 @@ impl HourReader {
         let chunks_y = ny.div_ceil(COL_Y);
         let chunks_x = nx.div_ceil(COL_X);
 
-        let mut output =
-            try_filled_f32(total, f32::NAN, &format!("variable '{name}' pressure volume"))?;
+        let mut output = try_filled_f32(
+            total,
+            f32::NAN,
+            &format!("variable '{name}' pressure volume"),
+        )?;
 
         for cy in 0..chunks_y {
             for cx in 0..chunks_x {
@@ -878,9 +873,7 @@ impl HourReader {
             .iter()
             .position(|level| *level == level_hpa)
             .ok_or_else(|| {
-                RwStoreError::Meta(format!(
-                    "variable '{name}' has no {level_hpa} hPa level"
-                ))
+                RwStoreError::Meta(format!("variable '{name}' has no {level_hpa} hPa level"))
             })?;
         let (nx, ny) = (self.meta.nx, self.meta.ny);
         let cells = nx.checked_mul(ny).ok_or_else(|| {
@@ -891,8 +884,11 @@ impl HourReader {
         let levels = var.levels_hpa.len();
         let chunks_y = ny.div_ceil(COL_Y);
         let chunks_x = nx.div_ceil(COL_X);
-        let mut output =
-            try_filled_f32(cells, f32::NAN, &format!("variable '{name}' pressure level"))?;
+        let mut output = try_filled_f32(
+            cells,
+            f32::NAN,
+            &format!("variable '{name}' pressure level"),
+        )?;
 
         for cy in 0..chunks_y {
             for cx in 0..chunks_x {
@@ -1601,18 +1597,16 @@ mod tests {
             .iter()
             .position(|record| record.flags & (FLAG_EMPTY | FLAG_CONSTANT) == 0)
             .expect("sample contains a dense chunk");
-        let raw_len_offset =
-            header.index_offset as usize + record_index * INDEX_RECORD_LEN + 24;
+        let raw_len_offset = header.index_offset as usize + record_index * INDEX_RECORD_LEN + 24;
         bytes[raw_len_offset..raw_len_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let hostile_path = dir.join("hostile.rws");
         fs::write(&hostile_path, &bytes).unwrap();
 
         let err = HourReader::open(&hostile_path).unwrap_err();
         match err {
-            RwStoreError::Format(message) => assert!(
-                message.contains("raw_len"),
-                "unexpected message: {message}"
-            ),
+            RwStoreError::Format(message) => {
+                assert!(message.contains("raw_len"), "unexpected message: {message}")
+            }
             other => panic!("expected Format error, got {other:?}"),
         }
         let _ = fs::remove_dir_all(&dir);

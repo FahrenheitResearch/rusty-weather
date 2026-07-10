@@ -145,19 +145,21 @@ where
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
-            handles.push(scope.spawn(|| loop {
-                if failed.load(Ordering::Relaxed) {
-                    break;
-                }
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                if index >= items.len() {
-                    break;
-                }
-                if let Err(err) = f(&items[index]) {
-                    failed.store(true, Ordering::Relaxed);
-                    if let Ok(mut slot) = first_error.lock() {
-                        if slot.as_ref().is_none_or(|(earliest, _)| index < *earliest) {
-                            *slot = Some((index, err));
+            handles.push(scope.spawn(|| {
+                loop {
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= items.len() {
+                        break;
+                    }
+                    if let Err(err) = f(&items[index]) {
+                        failed.store(true, Ordering::Relaxed);
+                        if let Ok(mut slot) = first_error.lock() {
+                            if slot.as_ref().is_none_or(|(earliest, _)| index < *earliest) {
+                                *slot = Some((index, err));
+                            }
                         }
                     }
                 }
@@ -180,7 +182,6 @@ where
         _ => Ok(()),
     }
 }
-
 
 /// TDS catalog base (a dataset's crawl entry point lives under here).
 const CATALOG_BASE: &str = "https://tds.gdex.ucar.edu/thredds/catalog/";
@@ -552,51 +553,45 @@ fn gdex_error(message: impl Into<String>) -> GdexError {
 /// KB and should never inherit the unbounded streaming-download deadline).
 fn gdex_fetch_text(url: &str) -> Result<String> {
     let client = metadata_http_client()?;
-    with_retry(GDEX_RETRY_BACKOFFS, |_| {
-        match client.get(url).send() {
-            Err(err) => Attempt::Retry(GdexError::Http(err)),
-            Ok(mut response) => {
-                let status = response.status().as_u16();
-                if (500..600).contains(&status) {
-                    return Attempt::Retry(gdex_error(format!(
-                        "gdex {url}: status {status}"
-                    )));
-                }
-                if !(200..300).contains(&status) {
-                    return Attempt::Fatal(gdex_error(format!(
-                        "gdex {url}: status {status}"
-                    )));
-                }
-                if response
-                    .content_length()
-                    .is_some_and(|length| length > MAX_METADATA_BODY_BYTES)
-                {
-                    return Attempt::Fatal(gdex_error(format!(
+    with_retry(GDEX_RETRY_BACKOFFS, |_| match client.get(url).send() {
+        Err(err) => Attempt::Retry(GdexError::Http(err)),
+        Ok(mut response) => {
+            let status = response.status().as_u16();
+            if (500..600).contains(&status) {
+                return Attempt::Retry(gdex_error(format!("gdex {url}: status {status}")));
+            }
+            if !(200..300).contains(&status) {
+                return Attempt::Fatal(gdex_error(format!("gdex {url}: status {status}")));
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAX_METADATA_BODY_BYTES)
+            {
+                return Attempt::Fatal(gdex_error(format!(
+                    "gdex {url}: metadata body exceeds {MAX_METADATA_BODY_BYTES} bytes"
+                )));
+            }
+            let mut bytes = Vec::new();
+            match response
+                .by_ref()
+                .take(MAX_METADATA_BODY_BYTES + 1)
+                .read_to_end(&mut bytes)
+            {
+                Err(error) => Attempt::Retry(GdexError::Io(error)),
+                Ok(_) if bytes.len() as u64 > MAX_METADATA_BODY_BYTES => {
+                    Attempt::Fatal(gdex_error(format!(
                         "gdex {url}: metadata body exceeds {MAX_METADATA_BODY_BYTES} bytes"
-                    )));
+                    )))
                 }
-                let mut bytes = Vec::new();
-                match response
-                    .by_ref()
-                    .take(MAX_METADATA_BODY_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                {
-                    Err(error) => Attempt::Retry(GdexError::Io(error)),
-                    Ok(_) if bytes.len() as u64 > MAX_METADATA_BODY_BYTES => {
-                        Attempt::Fatal(gdex_error(format!(
-                            "gdex {url}: metadata body exceeds {MAX_METADATA_BODY_BYTES} bytes"
-                        )))
+                Ok(_) => match String::from_utf8(bytes) {
+                    Err(error) => Attempt::Fatal(gdex_error(format!(
+                        "gdex {url}: metadata is not UTF-8: {error}"
+                    ))),
+                    Ok(body) if body.trim().is_empty() => {
+                        Attempt::Retry(gdex_error(format!("gdex {url}: empty metadata body")))
                     }
-                    Ok(_) => match String::from_utf8(bytes) {
-                        Err(error) => Attempt::Fatal(gdex_error(format!(
-                            "gdex {url}: metadata is not UTF-8: {error}"
-                        ))),
-                        Ok(body) if body.trim().is_empty() => Attempt::Retry(gdex_error(format!(
-                            "gdex {url}: empty metadata body"
-                        ))),
-                        Ok(body) => Attempt::Accept(body),
-                    },
-                }
+                    Ok(body) => Attempt::Accept(body),
+                },
             }
         }
     })
@@ -1168,10 +1163,8 @@ fn stage_download_sidecar(path: &Path, sidecar: &DownloadSidecar) -> Result<Path
     }
     for _ in 0..1024 {
         let sequence = SIDECAR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let candidate = path_with_suffix(
-            path,
-            &format!(".stage-{}-{sequence}", std::process::id()),
-        )?;
+        let candidate =
+            path_with_suffix(path, &format!(".stage-{}-{sequence}", std::process::id()))?;
         let mut file = match fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -1218,10 +1211,8 @@ fn quarantine_existing(path: &Path) -> Result<Option<PathBuf>> {
     }
     for _ in 0..1024 {
         let sequence = QUARANTINE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let candidate = path_with_suffix(
-            path,
-            &format!(".invalid-{}-{sequence}", std::process::id()),
-        )?;
+        let candidate =
+            path_with_suffix(path, &format!(".invalid-{}-{sequence}", std::process::id()))?;
         match fs::symlink_metadata(&candidate) {
             Ok(_) => continue,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -1457,9 +1448,9 @@ fn response_header_text(
         .headers()
         .get(header)
         .map(|value| {
-            let value = value.to_str().map_err(|_| {
-                gdex_error(format!("gdex {url}: invalid {label} response header"))
-            })?;
+            let value = value
+                .to_str()
+                .map_err(|_| gdex_error(format!("gdex {url}: invalid {label} response header")))?;
             if value.trim().is_empty() {
                 return Err(gdex_error(format!(
                     "gdex {url}: empty {label} response header"
@@ -1607,12 +1598,9 @@ pub fn download_to_path_with_cancel(
     if cancel.load(Ordering::Relaxed) {
         return Err(cancelled());
     }
-    if let Some(bytes) = trusted_final_cache_len(
-        dest,
-        &final_sidecar,
-        &canonical_url,
-        remote.as_ref(),
-    )? {
+    if let Some(bytes) =
+        trusted_final_cache_len(dest, &final_sidecar, &canonical_url, remote.as_ref())?
+    {
         return Ok(DownloadOutcome {
             path: dest.to_owned(),
             bytes,
@@ -1640,10 +1628,7 @@ pub fn download_to_path_with_cancel(
             prepared,
             cancel,
         )? {
-            DownloadAttempt::Complete {
-                resumed,
-                sidecar,
-            } => {
+            DownloadAttempt::Complete { resumed, sidecar } => {
                 let metadata = fs::symlink_metadata(&partial_path)?;
                 if !metadata.file_type().is_file() {
                     quarantine_partial(&partial_path, &partial_sidecar)?;
@@ -1748,9 +1733,7 @@ fn download_once(
                 } else if matches!(status, 200 | 206 | 416) {
                     Attempt::Accept(response)
                 } else {
-                    Attempt::Fatal(gdex_error(format!(
-                        "gdex {canonical_url}: status {status}"
-                    )))
+                    Attempt::Fatal(gdex_error(format!("gdex {canonical_url}: status {status}")))
                 }
             }
         }
@@ -1942,8 +1925,7 @@ fn download_200(
     // A full response is authoritative whether this was a fresh GET or
     // If-Range correctly rejected a stale validator. Do not retain old
     // validators when the new response omits them.
-    let response_remote = match response_remote_metadata(response, canonical_url, response_length)
-    {
+    let response_remote = match response_remote_metadata(response, canonical_url, response_length) {
         Ok(metadata) => metadata,
         Err(error) => return Ok(DownloadAttempt::Restart(error.to_string())),
     };
@@ -2031,11 +2013,7 @@ fn head_remote_metadata(url: &str, cancel: &AtomicBool) -> Option<RemoteObjectMe
                 url: url.to_owned(),
             });
         }
-        match client
-            .head(url)
-            .header(ACCEPT_ENCODING, "identity")
-            .send()
-        {
+        match client.head(url).header(ACCEPT_ENCODING, "identity").send() {
             Err(error) => Attempt::Retry(GdexError::Http(error)),
             Ok(response) => {
                 let status = response.status().as_u16();
@@ -2202,7 +2180,12 @@ mod tests {
         format!("http://{address}/file")
     }
 
-    fn seed_partial(url: &str, dest: &Path, bytes: &[u8], total: Option<u64>) -> (PathBuf, PathBuf) {
+    fn seed_partial(
+        url: &str,
+        dest: &Path,
+        bytes: &[u8],
+        total: Option<u64>,
+    ) -> (PathBuf, PathBuf) {
         let canonical_url = canonical_download_url(url).expect("test URL canonicalizes");
         let partial = download_partial_path(url, dest).expect("test partial path");
         let sidecar_path = partial_sidecar_path(&partial).expect("test sidecar path");
@@ -2301,7 +2284,10 @@ mod tests {
     #[test]
     fn public_crawl_dataset_ids_are_one_safe_component() {
         for valid in ["d612005", "dataset_2", "ERA-20C"] {
-            assert!(validate_dataset_id(valid).is_ok(), "{valid} should be valid");
+            assert!(
+                validate_dataset_id(valid).is_ok(),
+                "{valid} should be valid"
+            );
         }
         for invalid in [
             "",
@@ -2331,7 +2317,10 @@ mod tests {
         let without_fragment =
             download_partial_path("https://example.test/data/file.nc?run=1", dest_nc)
                 .expect("valid URL");
-        assert_eq!(with_fragment, without_fragment, "fragments are not HTTP identity");
+        assert_eq!(
+            with_fragment, without_fragment,
+            "fragments are not HTTP identity"
+        );
         assert!(
             with_fragment
                 .file_name()
@@ -2339,16 +2328,18 @@ mod tests {
                 .is_some_and(|name| name.starts_with("field.nc.") && name.ends_with(".download"))
         );
 
-        let other_query =
-            download_partial_path("https://example.test/data/file.nc?run=2", dest_nc)
-                .expect("valid URL");
+        let other_query = download_partial_path("https://example.test/data/file.nc?run=2", dest_nc)
+            .expect("valid URL");
         let other_extension = download_partial_path(
             "https://example.test/data/file.nc?run=1",
             Path::new("cache/field.grb"),
         )
         .expect("valid URL");
         assert_ne!(with_fragment, other_query, "query changes remote identity");
-        assert_ne!(with_fragment, other_extension, "full destination name is retained");
+        assert_ne!(
+            with_fragment, other_extension,
+            "full destination name is retained"
+        );
     }
 
     #[test]
@@ -2587,7 +2578,10 @@ mod tests {
             };
             let path = local_path_for_leaf(cache, &leaf);
             assert_eq!(path.parent(), Some(cache), "input {untrusted:?}");
-            assert_eq!(path.file_name().and_then(|name| name.to_str()), Some(expected));
+            assert_eq!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some(expected)
+            );
         }
     }
 
@@ -3022,7 +3016,10 @@ mod tests {
 
         assert!(!outcome.resumed);
         assert_eq!(fs::read(&dest).expect("fresh file installed"), b"fresh");
-        assert!(!temp.exists(), "unsafe original path is no longer resumable");
+        assert!(
+            !temp.exists(),
+            "unsafe original path is no longer resumable"
+        );
         assert!(
             fs::read_dir(&dir)
                 .expect("read temp dir")
@@ -3075,9 +3072,12 @@ mod tests {
     #[test]
     fn unproved_416_quarantines_partial_and_preserves_old_until_restart_finishes() {
         let url = spawn_http_server(vec![
-            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
-            b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
-            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+            b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh".to_vec(),
         ]);
         let dir = unique_temp_dir("gdex-unproved-416");
@@ -3097,7 +3097,8 @@ mod tests {
     #[test]
     fn get_length_verifies_full_download_when_head_is_unavailable() {
         let url = spawn_http_server(vec![
-            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_vec(),
         ]);
         let dir = unique_temp_dir("gdex-get-length");
@@ -3122,12 +3123,18 @@ mod tests {
         replace_validated_temp(&missing_temp, &dest)
             .expect_err("missing validated temp must fail installation");
 
-        assert_eq!(fs::read(&dest).expect("old destination restored"), b"known-old");
+        assert_eq!(
+            fs::read(&dest).expect("old destination restored"),
+            b"known-old"
+        );
         let leftovers = fs::read_dir(&dir)
             .expect("read temp dir")
             .map(|entry| entry.expect("directory entry").file_name())
             .collect::<Vec<_>>();
-        assert_eq!(leftovers, vec![dest.file_name().expect("destination name").to_os_string()]);
+        assert_eq!(
+            leftovers,
+            vec![dest.file_name().expect("destination name").to_os_string()]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3326,18 +3333,16 @@ mod tests {
         // Retry through the server's transient 503s (see the doc's flakiness
         // note) so the proof is stable.
         let client = download_http_client().expect("construct download client");
-        let response = with_retry(GDEX_RETRY_BACKOFFS, |_| match client
-            .get(url)
-            .header(RANGE, "bytes=0-1023")
-            .send()
-        {
-            Err(err) => Attempt::Retry(GdexError::Http(err)),
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                if (500..600).contains(&status) {
-                    Attempt::Retry(gdex_error(format!("range probe: status {status}")))
-                } else {
-                    Attempt::Accept(resp)
+        let response = with_retry(GDEX_RETRY_BACKOFFS, |_| {
+            match client.get(url).header(RANGE, "bytes=0-1023").send() {
+                Err(err) => Attempt::Retry(GdexError::Http(err)),
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    if (500..600).contains(&status) {
+                        Attempt::Retry(gdex_error(format!("range probe: status {status}")))
+                    } else {
+                        Attempt::Accept(resp)
+                    }
                 }
             }
         })

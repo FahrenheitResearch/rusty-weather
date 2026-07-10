@@ -91,8 +91,7 @@ pub fn enforce_window(
         if !manifest_path.is_file() {
             continue;
         }
-        let manifest_path =
-            canonical_contained_path(&run_dir, &manifest_path, "run manifest")?;
+        let manifest_path = canonical_contained_path(&run_dir, &manifest_path, "run manifest")?;
         let manifest = RwsRunManifest::load_for_run(&manifest_path, model, &run_name)?;
         run_names.push(run_name.clone());
         for (&hhmm, hour) in &manifest.hours {
@@ -152,11 +151,8 @@ pub fn enforce_window(
     // this pass and let the next cycle retry — this is exactly the fix for
     // the two-process rolling-window collision that motivated the lock.
     for run_name in &run_names {
-        let run_dir = canonical_contained_path(
-            &model_dir,
-            &model_dir.join(run_name),
-            "run directory",
-        )?;
+        let run_dir =
+            canonical_contained_path(&model_dir, &model_dir.join(run_name), "run directory")?;
         let _lock = match RunLock::try_acquire(&run_dir)? {
             Some(lock) => lock,
             None => {

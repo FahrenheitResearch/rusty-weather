@@ -23,11 +23,11 @@ use rw_store::run::{RwsRunManifest, SCHEMA_RUN, validate_store_component};
 use thiserror::Error;
 use wrf_core::WrfFile;
 pub use wrf_formula::{
-    Axis, CompiledFormula, ErrorKind, EvaluationOptions, FieldRequest, FieldResolver,
-    FormulaError, FormulaOutput, FormulaProvenance, FormulaResult, GridConvention, GridLocation,
-    GridMetadata, ParameterValues, ResolvedField, BoundaryPolicy, CompileOptions, ENGINE_VERSION,
-    ExecutionPlan, HeightDatum, MissingPolicy, NonFinitePolicy, ParameterSpec, Recipe,
-    RecipeReference, RecipeRequirements, Requirement, ResourceLimits, Span, compile,
+    Axis, BoundaryPolicy, CompileOptions, CompiledFormula, ENGINE_VERSION, ErrorKind,
+    EvaluationOptions, ExecutionPlan, FieldRequest, FieldResolver, FormulaError, FormulaOutput,
+    FormulaProvenance, FormulaResult, GridConvention, GridLocation, GridMetadata, HeightDatum,
+    MissingPolicy, NonFinitePolicy, ParameterSpec, ParameterValues, Recipe, RecipeReference,
+    RecipeRequirements, Requirement, ResolvedField, ResourceLimits, Span, compile,
     compile_with_options,
 };
 
@@ -238,20 +238,26 @@ impl StoreRunResolver {
         }
 
         let manifest_path = run_dir.join("run.json");
-        let manifest = RwsRunManifest::load_for_run(&manifest_path, &model, &run).map_err(|error| {
-            BridgeError::Store(format!(
-                "cannot load run manifest '{}': {error}",
-                manifest_path.display()
-            ))
-        })?;
+        let manifest =
+            RwsRunManifest::load_for_run(&manifest_path, &model, &run).map_err(|error| {
+                BridgeError::Store(format!(
+                    "cannot load run manifest '{}': {error}",
+                    manifest_path.display()
+                ))
+            })?;
         validate_manifest(&manifest, &model, &run)?;
         GridShape::new(manifest.nx, manifest.ny).map_err(|error| {
-            BridgeError::Store(format!("run manifest grid is outside desktop limits: {error}"))
+            BridgeError::Store(format!(
+                "run manifest grid is outside desktop limits: {error}"
+            ))
         })?;
 
         let grid_path = run_dir.join("grid.rwg");
         let grid = Arc::new(GridFile::open(&grid_path).map_err(|error| {
-            BridgeError::Store(format!("cannot open grid '{}': {error}", grid_path.display()))
+            BridgeError::Store(format!(
+                "cannot open grid '{}': {error}",
+                grid_path.display()
+            ))
         })?);
         if grid.hash != manifest.grid_hash || grid.nx != manifest.nx || grid.ny != manifest.ny {
             return Err(BridgeError::Store(format!(
@@ -298,7 +304,9 @@ impl StoreRunResolver {
             });
         }
         if hours.is_empty() {
-            return Err(BridgeError::Store("run contains no forecast hours".to_string()));
+            return Err(BridgeError::Store(
+                "run contains no forecast hours".to_string(),
+            ));
         }
         let base_index = hours
             .iter()
@@ -361,7 +369,9 @@ impl StoreRunResolver {
         if index >= self.hours.len() {
             return Err(FormulaError::new(
                 ErrorKind::Time,
-                format!("store time offset {offset} is outside the run after the last available hour"),
+                format!(
+                    "store time offset {offset} is outside the run after the last available hour"
+                ),
             ));
         }
         Ok(index)
@@ -369,13 +379,19 @@ impl StoreRunResolver {
 
     fn reader(&self, index: usize) -> FormulaResult<Arc<HourReader>> {
         let mut readers = self.readers.lock().map_err(|_| {
-            FormulaError::new(ErrorKind::Internal, "rw-store Formula Lab reader cache was poisoned")
+            FormulaError::new(
+                ErrorKind::Internal,
+                "rw-store Formula Lab reader cache was poisoned",
+            )
         })?;
         if let Some(reader) = readers.get(&index) {
             return Ok(reader.clone());
         }
         let hour = self.hours.get(index).ok_or_else(|| {
-            FormulaError::new(ErrorKind::Time, format!("store hour index {index} is out of range"))
+            FormulaError::new(
+                ErrorKind::Time,
+                format!("store hour index {index} is out of range"),
+            )
         })?;
         let reader = Arc::new(HourReader::open(&hour.path).map_err(|error| {
             FormulaError::new(
@@ -428,7 +444,10 @@ impl FieldResolver for StoreRunResolver {
             _ => {
                 return Err(FormulaError::new(
                     ErrorKind::Resolver,
-                    format!("store contains case-colliding fields for '{}'", request.name),
+                    format!(
+                        "store contains case-colliding fields for '{}'",
+                        request.name
+                    ),
                 ));
             }
         };
@@ -504,7 +523,10 @@ impl FieldResolver for StoreRunResolver {
                 let values = reader.read_full_3d(&variable.name).map_err(|error| {
                     FormulaError::new(
                         ErrorKind::Resolver,
-                        format!("cannot read store pressure field '{}': {error}", variable.name),
+                        format!(
+                            "cannot read store pressure field '{}': {error}",
+                            variable.name
+                        ),
                     )
                 })?;
                 (
@@ -517,13 +539,19 @@ impl FieldResolver for StoreRunResolver {
             other => {
                 return Err(FormulaError::new(
                     ErrorKind::Unsupported,
-                    format!("store field '{}' has unsupported kind '{other}'", variable.name),
+                    format!(
+                        "store field '{}' has unsupported kind '{other}'",
+                        variable.name
+                    ),
                 ));
             }
         };
-        let expected = shape.iter().try_fold(1usize, |count, &dim| count.checked_mul(dim)).ok_or_else(|| {
-            FormulaError::new(ErrorKind::Limit, "store field shape overflows usize")
-        })?;
+        let expected = shape
+            .iter()
+            .try_fold(1usize, |count, &dim| count.checked_mul(dim))
+            .ok_or_else(|| {
+                FormulaError::new(ErrorKind::Limit, "store field shape overflows usize")
+            })?;
         if raw.len() != expected {
             return Err(FormulaError::new(
                 ErrorKind::Shape,
@@ -737,18 +765,18 @@ fn output_to_field_2d(output: FormulaOutput) -> BridgeResult<EvaluatedField2D> {
         ))
     })?;
     values.extend(output.data.into_iter().map(|value| {
-            if value.is_nan() {
-                f32::NAN
-            } else if !value.is_finite() {
-                replaced_infinite += 1;
-                f32::NAN
-            } else if value > f32::MAX as f64 || value < f32::MIN as f64 {
-                replaced_overflow += 1;
-                f32::NAN
-            } else {
-                value as f32
-            }
-        }));
+        if value.is_nan() {
+            f32::NAN
+        } else if !value.is_finite() {
+            replaced_infinite += 1;
+            f32::NAN
+        } else if value > f32::MAX as f64 || value < f32::MIN as f64 {
+            replaced_overflow += 1;
+            f32::NAN
+        } else {
+            value as f32
+        }
+    }));
     let mut warnings = Vec::new();
     if replaced_infinite > 0 {
         warnings.push(format!(
@@ -804,16 +832,16 @@ fn grid_from_wrf(
                 .global_attr_f64("STAND_LON")
                 .ok()
                 .or_else(|| file.global_attr_f64("CEN_LON").ok());
-            truelat1.zip(stand_lon).map(|(truelat1, stand_lon)| {
-                GridProjection::LambertConformal {
+            truelat1
+                .zip(stand_lon)
+                .map(|(truelat1, stand_lon)| GridProjection::LambertConformal {
                     standard_parallel_1_deg: truelat1,
                     standard_parallel_2_deg: normalized_lambert_second_parallel(
                         truelat1,
                         file.global_attr_f64("TRUELAT2").ok(),
                     ),
                     central_meridian_deg: stand_lon,
-                }
-            })
+                })
         }
         Some(2) => {
             let truelat1 = file.global_attr_f64("TRUELAT1").ok();
@@ -843,13 +871,18 @@ fn grid_from_wrf(
             // GridProjection has no rotated-pole representation. Returning no
             // native projection is honest and keeps the actual curvilinear
             // XLAT/XLONG grid in control instead of claiming a regular axis.
-            is_default_wrf_latlon_pole(pole_lat, pole_lon)
-                .then_some(GridProjection::Geographic)
+            is_default_wrf_latlon_pole(pole_lat, pole_lon).then_some(GridProjection::Geographic)
         }
         _ => None,
     };
     let identity = fs::metadata(path)
-        .map(|metadata| format!("bytes={};modified={:?}", metadata.len(), metadata.modified().ok()))
+        .map(|metadata| {
+            format!(
+                "bytes={};modified={:?}",
+                metadata.len(),
+                metadata.modified().ok()
+            )
+        })
         .unwrap_or_else(|_| "metadata-unavailable".to_string());
     let lat = narrow_coordinates(&lat, expected, "XLAT")?;
     let lon = narrow_coordinates(&lon, expected, "XLONG")?;
@@ -865,11 +898,7 @@ fn grid_from_wrf(
     })
 }
 
-fn checked_wrf_grid_elements(
-    nx: usize,
-    ny: usize,
-    limits: &ResourceLimits,
-) -> BridgeResult<usize> {
+fn checked_wrf_grid_elements(nx: usize, ny: usize, limits: &ResourceLimits) -> BridgeResult<usize> {
     let shape = GridShape::new(nx, ny)
         .map_err(|error| BridgeError::Wrf(format!("WRF horizontal grid is invalid: {error}")))?;
     let elements = shape
@@ -886,7 +915,9 @@ fn checked_wrf_grid_elements(
         .ok_or_else(|| BridgeError::Wrf("WRF coordinate byte size overflows usize".to_string()))?;
     let display_bytes = elements
         .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| BridgeError::Wrf("WRF display-coordinate byte size overflows usize".to_string()))?;
+        .ok_or_else(|| {
+            BridgeError::Wrf("WRF display-coordinate byte size overflows usize".to_string())
+        })?;
     if decoded_bytes > limits.max_working_bytes || display_bytes > limits.max_working_bytes {
         return Err(BridgeError::Wrf(format!(
             "one WRF coordinate needs up to {decoded_bytes} decoded bytes and {display_bytes} display bytes; per-allocation limit is {}",
@@ -902,7 +933,9 @@ fn checked_wrf_grid_elements(
                 .and_then(|display| display.checked_mul(2))
                 .and_then(|display| decoded.checked_add(display))
         })
-        .ok_or_else(|| BridgeError::Wrf("WRF coordinate allocation estimate overflows u64".to_string()))?;
+        .ok_or_else(|| {
+            BridgeError::Wrf("WRF coordinate allocation estimate overflows u64".to_string())
+        })?;
     if concurrent_bytes > limits.max_total_allocated_bytes {
         return Err(BridgeError::Wrf(format!(
             "WRF latitude/longitude decode and display buffers need up to {concurrent_bytes} concurrent bytes; total allocation limit is {}",
@@ -949,8 +982,7 @@ fn narrow_coordinate(value: f64) -> f32 {
 }
 
 fn validate_store_segment(label: &str, value: &str) -> BridgeResult<()> {
-    validate_store_component(label, value)
-        .map_err(|error| BridgeError::Store(error.to_string()))
+    validate_store_component(label, value).map_err(|error| BridgeError::Store(error.to_string()))
 }
 
 fn checked_store_elements(
@@ -975,10 +1007,14 @@ fn checked_store_elements(
     }
     let raw_bytes = elements
         .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| FormulaError::new(ErrorKind::Limit, "store f32 byte size overflows usize"))?;
+        .ok_or_else(|| {
+            FormulaError::new(ErrorKind::Limit, "store f32 byte size overflows usize")
+        })?;
     let promoted_bytes = elements
         .checked_mul(std::mem::size_of::<f64>())
-        .ok_or_else(|| FormulaError::new(ErrorKind::Limit, "store f64 byte size overflows usize"))?;
+        .ok_or_else(|| {
+            FormulaError::new(ErrorKind::Limit, "store f64 byte size overflows usize")
+        })?;
     if raw_bytes > limits.max_working_bytes {
         return Err(FormulaError::new(
             ErrorKind::Limit,
@@ -997,12 +1033,10 @@ fn checked_store_elements(
             ),
         ));
     }
-    let raw_bytes_u64 = u64::try_from(raw_bytes).map_err(|_| {
-        FormulaError::new(ErrorKind::Limit, "store f32 byte size does not fit u64")
-    })?;
-    let promoted_bytes_u64 = u64::try_from(promoted_bytes).map_err(|_| {
-        FormulaError::new(ErrorKind::Limit, "store f64 byte size does not fit u64")
-    })?;
+    let raw_bytes_u64 = u64::try_from(raw_bytes)
+        .map_err(|_| FormulaError::new(ErrorKind::Limit, "store f32 byte size does not fit u64"))?;
+    let promoted_bytes_u64 = u64::try_from(promoted_bytes)
+        .map_err(|_| FormulaError::new(ErrorKind::Limit, "store f64 byte size does not fit u64"))?;
     let concurrent_bytes = raw_bytes_u64
         .checked_add(promoted_bytes_u64)
         .ok_or_else(|| {
@@ -1162,7 +1196,10 @@ mod tests {
     fn projection_compatibility_helpers_fail_closed() {
         assert_eq!(normalized_lambert_second_parallel(30.0, Some(60.0)), 60.0);
         assert_eq!(normalized_lambert_second_parallel(30.0, Some(120.0)), 30.0);
-        assert_eq!(normalized_lambert_second_parallel(30.0, Some(f64::NAN)), 30.0);
+        assert_eq!(
+            normalized_lambert_second_parallel(30.0, Some(f64::NAN)),
+            30.0
+        );
         assert_eq!(normalized_lambert_second_parallel(30.0, None), 30.0);
         assert!(is_default_wrf_latlon_pole(None, None));
         assert!(is_default_wrf_latlon_pole(Some(90.0), Some(0.0)));
@@ -1196,10 +1233,7 @@ mod tests {
         let limits = ResourceLimits::default();
         assert!(checked_wrf_grid_elements(0, 10, &limits).is_err());
         assert!(checked_wrf_grid_elements(usize::MAX, 2, &limits).is_err());
-        assert!(
-            checked_wrf_grid_elements(rustwx_core::MAX_GRID_CELLS + 1, 1, &limits)
-                .is_err()
-        );
+        assert!(checked_wrf_grid_elements(rustwx_core::MAX_GRID_CELLS + 1, 1, &limits).is_err());
 
         let mut narrow = limits;
         narrow.max_output_elements = 99;
@@ -1218,12 +1252,8 @@ mod tests {
         standard.max_working_bytes = 512 * 1024 * 1024;
         standard.max_total_allocated_bytes = 2 * 1024 * 1024 * 1024;
         let standard_elements = standard.max_output_elements;
-        assert!(
-            checked_store_elements(standard_elements, 1, 1, "field", &standard).is_ok()
-        );
-        assert!(
-            checked_store_elements(standard_elements + 1, 1, 1, "field", &standard).is_err()
-        );
+        assert!(checked_store_elements(standard_elements, 1, 1, "field", &standard).is_ok());
+        assert!(checked_store_elements(standard_elements + 1, 1, 1, "field", &standard).is_err());
 
         let elements = 1_000usize;
         let mut working = ResourceLimits::default();
@@ -1232,14 +1262,11 @@ mod tests {
 
         let mut total = ResourceLimits::default();
         total.max_total_allocated_bytes =
-            (elements * (std::mem::size_of::<f32>() + std::mem::size_of::<f64>()) - 1)
-                as u64;
+            (elements * (std::mem::size_of::<f32>() + std::mem::size_of::<f64>()) - 1) as u64;
         assert!(checked_store_elements(elements, 1, 1, "field", &total).is_err());
 
         let large = ResourceLimits::default();
-        assert!(
-            checked_store_elements(MAX_STORE_FIELD_ELEMENTS, 1, 1, "field", &large).is_ok()
-        );
+        assert!(checked_store_elements(MAX_STORE_FIELD_ELEMENTS, 1, 1, "field", &large).is_ok());
     }
 
     #[test]

@@ -1,9 +1,7 @@
 use std::path::PathBuf;
 use std::{fs::File, io::Read};
 
-use netcrust::{
-    DataType, NcSliceInfo, NcSliceInfoElem, looks_like_hdf5,
-};
+use netcrust::{looks_like_hdf5, DataType, NcSliceInfo, NcSliceInfoElem};
 
 fn record_selection(ndim: usize, index: u64) -> NcSliceInfo {
     let mut selections = Vec::with_capacity(ndim);

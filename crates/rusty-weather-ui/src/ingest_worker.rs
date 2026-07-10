@@ -103,7 +103,10 @@ impl IngestWorker {
             });
         let (thread, startup_error) = match thread {
             Ok(thread) => (Some(thread), None),
-            Err(error) => (None, Some(format!("could not start ingest worker: {error}"))),
+            Err(error) => (
+                None,
+                Some(format!("could not start ingest worker: {error}")),
+            ),
         };
         Self {
             tx: req_tx,

@@ -579,9 +579,9 @@ fn load_iso_level_field(
         }
         u
     } else {
-        planes.pop().ok_or_else(|| {
-            RwStoreError::Format("isobaric field has no source plane".to_string())
-        })?
+        planes
+            .pop()
+            .ok_or_else(|| RwStoreError::Format("isobaric field has no source plane".to_string()))?
     };
     let canonical = match spec.field {
         IsoLevelField::Temperature => CanonicalField::Temperature,

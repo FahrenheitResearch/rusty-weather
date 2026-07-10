@@ -47,11 +47,7 @@ pub enum Error {
     DimensionTooLarge { name: String, size: u64 },
 
     #[error("dimension {name} has length {size}; supported maximum is {max}")]
-    DimensionLimit {
-        name: String,
-        size: u64,
-        max: u64,
-    },
+    DimensionLimit { name: String, size: u64, max: u64 },
 
     #[error("unlimited dimension {name} has an unresolved zero length")]
     UnresolvedDimension { name: String },
@@ -300,11 +296,7 @@ impl File {
     /// closed for an ambiguous rank >= 3 dataset. Unlike constructing a slice
     /// from listed metadata at the caller, this retains a guarded raw-HDF5
     /// by-name fallback for datasets omitted from netcdf-reader's index.
-    pub fn read_array_f64_record_or_all(
-        &self,
-        name: &str,
-        time_index: u64,
-    ) -> Result<DataArray> {
+    pub fn read_array_f64_record_or_all(&self, name: &str, time_index: u64) -> Result<DataArray> {
         let variable = match self.inner.variable(name) {
             Ok(variable) => variable,
             Err(_) => return self.read_hdf5_dataset_record_or_all(name, time_index),
@@ -334,11 +326,7 @@ impl File {
         read_hdf5_dataset_as_f64(&dataset, None)
     }
 
-    fn read_hdf5_dataset_slice(
-        &self,
-        name: &str,
-        selection: &NcSliceInfo,
-    ) -> Result<DataArray> {
+    fn read_hdf5_dataset_slice(&self, name: &str, selection: &NcSliceInfo) -> Result<DataArray> {
         let Some(hdf5) = self.hdf5.as_ref() else {
             return Err(Error::VariableNotFound(name.to_string()));
         };
@@ -350,11 +338,7 @@ impl File {
         read_hdf5_dataset_as_f64(&dataset, Some(&selection))
     }
 
-    fn read_hdf5_dataset_record_or_all(
-        &self,
-        name: &str,
-        time_index: u64,
-    ) -> Result<DataArray> {
+    fn read_hdf5_dataset_record_or_all(&self, name: &str, time_index: u64) -> Result<DataArray> {
         let Some(hdf5) = self.hdf5.as_ref() else {
             return Err(Error::VariableNotFound(name.to_string()));
         };
@@ -563,11 +547,7 @@ impl Variable {
             .is_some_and(|dimension| is_time_dimension_name(&dimension.name));
         if self.ndim() >= 3 && has_leading_time {
             let selection = first_record_selection(self.ndim());
-            checked_selection_elements(
-                &self.name,
-                &dimension_shape(&self.dimensions),
-                &selection,
-            )?;
+            checked_selection_elements(&self.name, &dimension_shape(&self.dimensions), &selection)?;
             self.validate_overridden_hdf_shape(Some(&selection))?;
             let array = self
                 .file
@@ -816,10 +796,7 @@ fn listed_variable_has_leading_time_axis(variable: &NcVariable) -> bool {
 /// A dataset missing from the NetCDF index has no dimension labels available
 /// here. HDF5 still proves a record axis when exactly its leading dataspace
 /// dimension is explicitly unlimited; rank alone is never evidence of time.
-fn hdf5_metadata_has_leading_record_axis(
-    shape: &[u64],
-    max_dims: Option<&[u64]>,
-) -> bool {
+fn hdf5_metadata_has_leading_record_axis(shape: &[u64], max_dims: Option<&[u64]>) -> bool {
     shape.len() >= 3
         && max_dims.is_some_and(|max_dims| {
             max_dims.len() == shape.len()
@@ -919,10 +896,7 @@ fn nc_variable_shape(
         .collect()
 }
 
-fn nc_variable_uses_overrides(
-    variable: &NcVariable,
-    overrides: &HashMap<String, usize>,
-) -> bool {
+fn nc_variable_uses_overrides(variable: &NcVariable, overrides: &HashMap<String, usize>) -> bool {
     variable
         .dimensions()
         .iter()
@@ -940,10 +914,12 @@ fn checked_array_elements(name: &str, shape: &[u64]) -> Result<usize> {
         }
     }
     let elements = shape.iter().try_fold(1u64, |product, &size| {
-        product.checked_mul(size).ok_or_else(|| Error::ArrayShapeOverflow {
-            name: name.to_string(),
-            shape: shape.to_vec(),
-        })
+        product
+            .checked_mul(size)
+            .ok_or_else(|| Error::ArrayShapeOverflow {
+                name: name.to_string(),
+                shape: shape.to_vec(),
+            })
     })?;
     if elements > MAX_ARRAY_ELEMENTS {
         return Err(Error::ArrayTooLarge {
@@ -958,11 +934,7 @@ fn checked_array_elements(name: &str, shape: &[u64]) -> Result<usize> {
     })
 }
 
-fn checked_selection_elements(
-    name: &str,
-    shape: &[u64],
-    selection: &NcSliceInfo,
-) -> Result<usize> {
+fn checked_selection_elements(name: &str, shape: &[u64], selection: &NcSliceInfo) -> Result<usize> {
     if selection.selections.len() != shape.len() {
         return Err(Error::InvalidSelection {
             name: name.to_string(),
@@ -1047,10 +1019,7 @@ fn consistent_inferred_extent(extents: impl IntoIterator<Item = u64>) -> Option<
     inferred.and_then(|extent| usize::try_from(extent).ok())
 }
 
-fn infer_dimension_overrides(
-    file: &NcFile,
-    hdf5: Option<&Hdf5File>,
-) -> HashMap<String, usize> {
+fn infer_dimension_overrides(file: &NcFile, hdf5: Option<&Hdf5File>) -> HashMap<String, usize> {
     let Ok(dimensions) = file.dimensions() else {
         return HashMap::new();
     };
@@ -1285,10 +1254,7 @@ mod tests {
         assert_eq!(consistent_inferred_extent([4, 4, 4]), Some(4));
         assert_eq!(consistent_inferred_extent([4, 5]), None);
         assert_eq!(consistent_inferred_extent([0, 4]), None);
-        assert_eq!(
-            consistent_inferred_extent([MAX_DIMENSION_LEN + 1]),
-            None
-        );
+        assert_eq!(consistent_inferred_extent([MAX_DIMENSION_LEN + 1]), None);
     }
 
     #[test]

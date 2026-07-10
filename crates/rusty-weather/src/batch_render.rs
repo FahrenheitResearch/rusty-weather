@@ -216,12 +216,9 @@ pub fn inspect_renderable_products(
         });
     }
 
-    let stored_hours = crate::render_all::windowed_store::stored_run_hours(
-        store_root,
-        model_slug,
-        run_slug,
-    )
-    .map_err(|err| err.to_string())?;
+    let stored_hours =
+        crate::render_all::windowed_store::stored_run_hours(store_root, model_slug, run_slug)
+            .map_err(|err| err.to_string())?;
     if model == ModelId::Hrrr && stored_hours.len() > 1 {
         products.extend(
             HrrrWindowedProduct::supported_products()
@@ -338,8 +335,8 @@ pub fn run_batch_render(
             .ok_or_else(|| format!("model {model} has no configured provenance source"))?,
     };
 
-    let mut product_request = partition_products(&request.product_spec, model)
-        .map_err(|err| err.to_string())?;
+    let mut product_request =
+        partition_products(&request.product_spec, model).map_err(|err| err.to_string())?;
     dedup(&mut product_request.direct);
     dedup(&mut product_request.derived);
     dedup(&mut product_request.windowed);
@@ -380,9 +377,18 @@ pub fn run_batch_render(
         };
         (kind, slug)
     }));
-    validate_work(&request, &hours, per_hour.len(), product_request.windowed.len())?;
-    std::fs::create_dir_all(&request.out_dir)
-        .map_err(|err| format!("create output directory {}: {err}", request.out_dir.display()))?;
+    validate_work(
+        &request,
+        &hours,
+        per_hour.len(),
+        product_request.windowed.len(),
+    )?;
+    std::fs::create_dir_all(&request.out_dir).map_err(|err| {
+        format!(
+            "create output directory {}: {err}",
+            request.out_dir.display()
+        )
+    })?;
 
     let planned = hours
         .len()
@@ -525,8 +531,7 @@ pub fn run_batch_render(
         });
         match store {
             Ok(store) => {
-                let domain =
-                    resolve_render_domain(&request.domain, &store, &mut native_domain)?;
+                let domain = resolve_render_domain(&request.domain, &store, &mut native_domain)?;
                 let config = render_config(&request, model, &cycle, source, domain);
                 for slug in &product_request.windowed {
                     emit(BatchRenderEvent::ItemStarted {
@@ -670,13 +675,7 @@ fn render_windowed_items(
     requested: &[String],
 ) -> Result<Vec<(String, ProductOutcome)>, String> {
     let Some(mut outcome) = render_windowed_products(
-        config,
-        store,
-        store_root,
-        model_slug,
-        run_slug,
-        requested,
-        false,
+        config, store, store_root, model_slug, run_slug, requested, false,
     )
     .map_err(|err| err.to_string())?
     else {
@@ -745,9 +744,7 @@ fn render_config(
 
 fn parse_model(model_slug: &str) -> Result<ModelId, String> {
     model_slug.parse::<ModelId>().map_err(|err| {
-        format!(
-            "store model '{model_slug}' has no production renderer identity: {err}"
-        )
+        format!("store model '{model_slug}' has no production renderer identity: {err}")
     })
 }
 
@@ -991,10 +988,7 @@ fn native_grid_domain(store: &StoreFieldSource) -> Result<DomainSpec, String> {
     }
     south = south.max(-90.0);
     north = north.min(90.0);
-    Ok(DomainSpec::new(
-        "native_grid",
-        (west, east, south, north),
-    ))
+    Ok(DomainSpec::new("native_grid", (west, east, south, north)))
 }
 
 fn dedup(values: &mut Vec<String>) {

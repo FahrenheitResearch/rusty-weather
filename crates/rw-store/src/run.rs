@@ -66,13 +66,10 @@ fn is_windows_device_name(value: &str) -> bool {
     matches!(
         stem.as_str(),
         "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
-    )
-        || stem
-            .strip_prefix("COM")
-            .or_else(|| stem.strip_prefix("LPT"))
-            .is_some_and(|suffix| {
-                suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9')
-            })
+    ) || stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+        .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
 }
 
 /// One registered forecast hour: the hour file plus write provenance.
@@ -446,18 +443,13 @@ mod tests {
         assert!(err.to_string().contains("manifest identity"), "{err}");
 
         // Expected identities are checked before any attempted read.
-        let err = RwsRunManifest::load_for_run(
-            &dir.join("missing.json"),
-            "../hrrr",
-            "20260609_12z",
-        )
-        .unwrap_err();
+        let err =
+            RwsRunManifest::load_for_run(&dir.join("missing.json"), "../hrrr", "20260609_12z")
+                .unwrap_err();
         assert!(matches!(err, RwStoreError::Meta(_)));
 
-        for (unsafe_model, unsafe_run) in [
-            ("../hrrr", "20260609_12z"),
-            ("hrrr", "../20260609_12z"),
-        ] {
+        for (unsafe_model, unsafe_run) in [("../hrrr", "20260609_12z"), ("hrrr", "../20260609_12z")]
+        {
             let mut tampered = manifest.clone();
             tampered.model = unsafe_model.to_string();
             tampered.run = unsafe_run.to_string();
@@ -492,8 +484,7 @@ mod tests {
         ] {
             manifest.hours.get_mut(&0).unwrap().file = unsafe_file.to_string();
             fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-            let err = RwsRunManifest::load_for_run(&path, "hrrr", "20260609_12z")
-                .unwrap_err();
+            let err = RwsRunManifest::load_for_run(&path, "hrrr", "20260609_12z").unwrap_err();
             assert!(
                 matches!(err, RwStoreError::Meta(_)),
                 "'{unsafe_file}' must be rejected: {err:?}"
@@ -535,7 +526,10 @@ mod tests {
         degenerate.nx = 0;
         fs::write(&path, serde_json::to_vec(&degenerate).unwrap()).unwrap();
         let err = RwsRunManifest::load(&path).unwrap_err();
-        assert!(err.to_string().contains("degenerate manifest grid"), "{err}");
+        assert!(
+            err.to_string().contains("degenerate manifest grid"),
+            "{err}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

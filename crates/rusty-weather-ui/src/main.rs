@@ -39,11 +39,11 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod ingest_worker;
 mod batch_render;
-mod gdex_ui;
 mod formula_lab;
+mod gdex_ui;
 mod grib_import;
+mod ingest_worker;
 mod local_import;
 mod postproc_severe;
 #[cfg(feature = "profiling")]
@@ -58,14 +58,14 @@ use std::process::ExitCode;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
-use eframe::egui;
 use batch_render::BatchRenderPanel;
-use ingest_worker::{IngestRequest, IngestResponse, IngestWorker};
-use gdex_ui::GdexBrowser;
+use eframe::egui;
 use formula_lab::{
     FormulaLabPanel, FormulaLabSources, FormulaResultSource, FormulaSourceKind,
     RawWrfFormulaSource, StoreFormulaSource,
 };
+use gdex_ui::GdexBrowser;
+use ingest_worker::{IngestRequest, IngestResponse, IngestWorker};
 use local_import::{LocalImportMessage, LocalImportSummary, LocalImportTask};
 use rustwx_models::{model_summary, supported_forecast_hours, supported_models};
 use rw_ui::{
@@ -1111,9 +1111,9 @@ impl ImportSizeAssessment {
         }
         self.records_exact &= geometry.records_exact;
         if let (Some(shape), Some(elements)) = (geometry.shape, geometry.record_elements) {
-            self.total_record_elements = self.total_record_elements.saturating_add(
-                (elements as u128).saturating_mul(records as u128),
-            );
+            self.total_record_elements = self
+                .total_record_elements
+                .saturating_add((elements as u128).saturating_mul(records as u128));
             let replace = self
                 .largest_record
                 .as_ref()
@@ -1279,7 +1279,9 @@ fn normalize_import_probe_files(mut files: Vec<PathBuf>) -> Vec<PathBuf> {
 
 fn checked_shape_elements(shape: &[usize], context: &str) -> Result<usize, String> {
     if shape.is_empty() || shape.iter().any(|value| *value == 0) {
-        return Err(format!("{context} has an empty or zero-length grid dimension"));
+        return Err(format!(
+            "{context} has an empty or zero-length grid dimension"
+        ));
     }
     shape.iter().try_fold(1usize, |elements, value| {
         elements
@@ -1297,8 +1299,8 @@ fn is_probe_time_dimension(name: &str) -> bool {
 }
 
 fn probe_netcdf_geometry(path: &Path) -> Result<ProbedFileGeometry, String> {
-    let nc = netcrust::open(path)
-        .map_err(|error| format!("open NetCDF metadata failed: {error}"))?;
+    let nc =
+        netcrust::open(path).map_err(|error| format!("open NetCDF metadata failed: {error}"))?;
     let dimensions = nc
         .dimensions()
         .map_err(|error| format!("read NetCDF dimensions failed: {error}"))?;
@@ -1942,8 +1944,10 @@ impl App {
             || self.formula_lab.busy()
             || self.batch_render.is_running()
         {
-            self.wrf_process_status =
-                Some("Another model import, Formula Lab evaluation, or batch render is active".to_string());
+            self.wrf_process_status = Some(
+                "Another model import, Formula Lab evaluation, or batch render is active"
+                    .to_string(),
+            );
             return;
         }
         if self.pending_wrf_paths.is_empty() {
@@ -1955,10 +1959,7 @@ impl App {
             return;
         }
         let files = self.pending_wrf_paths.clone();
-        self.start_import_size_probe(ImportProbeLaunch::wrf(
-            files,
-            self.wrf_options.clone(),
-        ));
+        self.start_import_size_probe(ImportProbeLaunch::wrf(files, self.wrf_options.clone()));
     }
 
     fn launch_wrf_process(&mut self, files: Vec<PathBuf>, options: WrfProcessOptions) {
@@ -1972,8 +1973,10 @@ impl App {
             || self.pending_heavy_import.is_some()
             || self.pending_light_import.is_some()
         {
-            self.wrf_process_status =
-                Some("Another model import, Formula Lab evaluation, or batch render is active".to_string());
+            self.wrf_process_status = Some(
+                "Another model import, Formula Lab evaluation, or batch render is active"
+                    .to_string(),
+            );
             return;
         }
         let task = wrf_process::spawn_process_paths(files, self.store_root.clone(), options);
@@ -2015,12 +2018,15 @@ impl App {
             || self.formula_lab.busy()
             || self.batch_render.is_running()
         {
-            self.local_import_status =
-                Some("Another model import, Formula Lab evaluation, or batch render is active".to_string());
+            self.local_import_status = Some(
+                "Another model import, Formula Lab evaluation, or batch render is active"
+                    .to_string(),
+            );
             return;
         }
         if self.pending_heavy_import.is_some() || self.pending_light_import.is_some() {
-            self.local_import_status = Some("Finish the open import confirmation first".to_string());
+            self.local_import_status =
+                Some("Finish the open import confirmation first".to_string());
             return;
         }
         self.start_import_size_probe(ImportProbeLaunch::local(paths));
@@ -2037,8 +2043,10 @@ impl App {
             || self.pending_heavy_import.is_some()
             || self.pending_light_import.is_some()
         {
-            self.local_import_status =
-                Some("Another model import, Formula Lab evaluation, or batch render is active".to_string());
+            self.local_import_status = Some(
+                "Another model import, Formula Lab evaluation, or batch render is active"
+                    .to_string(),
+            );
             return;
         }
         let task = local_import::spawn_import_paths(paths, self.store_root.clone());
@@ -2108,8 +2116,9 @@ impl App {
             || self.pending_heavy_import.is_some()
             || self.pending_light_import.is_some()
         {
-            let message = "Import size probe finished after another import became active; start it again"
-                .to_string();
+            let message =
+                "Import size probe finished after another import became active; start it again"
+                    .to_string();
             match task.launch {
                 ImportProbeLaunch::Wrf { .. } => self.wrf_process_status = Some(message),
                 ImportProbeLaunch::Local { .. } => self.local_import_status = Some(message),
@@ -3079,13 +3088,17 @@ impl eframe::App for App {
             self.show_batch_render = open;
         }
 
-        let store_formula_source = self.browser.selected().cloned().map(|hour| StoreFormulaSource {
-            store_root: self.store_root.clone(),
-            hour,
-            // rw-store v1 does not persist verified valid timestamps. Keep
-            // temporal derivatives disabled rather than infer a cadence.
-            exact_times: BTreeMap::new(),
-        });
+        let store_formula_source =
+            self.browser
+                .selected()
+                .cloned()
+                .map(|hour| StoreFormulaSource {
+                    store_root: self.store_root.clone(),
+                    hour,
+                    // rw-store v1 does not persist verified valid timestamps. Keep
+                    // temporal derivatives disabled rather than infer a cadence.
+                    exact_times: BTreeMap::new(),
+                });
         let raw_formula_source = self.formula_raw_path.clone().map(|path| {
             let display_hour = HourKey {
                 model: "raw-wrf".to_string(),
@@ -3111,7 +3124,7 @@ impl eframe::App for App {
             || self.download.is_running()
             || self.download_start_pending
             || self.batch_render.is_running())
-            .then_some("a model import/download, its size confirmation, or a batch render is active");
+        .then_some("a model import/download, its size confirmation, or a batch render is active");
         if let Some(result) = self.formula_lab.show(
             ui.ctx(),
             FormulaLabSources {
@@ -3291,7 +3304,10 @@ mod tests {
         assert_eq!(assessment.record_count, 4);
         let description = assessment.description().expect("large record warns");
         assert!(description.contains("second-large.nc"), "{description}");
-        assert!(description.contains("4 distinct time record"), "{description}");
+        assert!(
+            description.contains("4 distinct time record"),
+            "{description}"
+        );
     }
 
     #[test]

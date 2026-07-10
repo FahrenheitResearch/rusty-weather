@@ -12,7 +12,11 @@ fn grid_shape_rejects_overflow_ceiling_and_invalid_deserialization() {
         nx: usize::MAX,
         ny: 2,
     };
-    assert_eq!(unchecked_overflow.len(), 0, "legacy len must not panic or wrap");
+    assert_eq!(
+        unchecked_overflow.len(),
+        0,
+        "legacy len must not panic or wrap"
+    );
     assert!(unchecked_overflow.checked_len().is_err());
     assert!(matches!(
         GridShape::new(usize::MAX, 2),
