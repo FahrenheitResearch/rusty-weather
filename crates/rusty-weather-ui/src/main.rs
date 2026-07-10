@@ -3374,7 +3374,7 @@ mod tests {
     fn resolve_defaults_when_nothing_provided() {
         let paths = resolve_storage_paths(None, None, None);
         assert!(paths.store_root.ends_with(DEFAULT_STORE_ROOT));
-        assert!(paths.cache_dir.ends_with("cache"));
+        assert_eq!(paths.cache_dir, default_cache_dir());
         assert_eq!(paths.store_root_source, PathSource::Default);
         assert_eq!(paths.cache_dir_source, PathSource::Default);
     }
