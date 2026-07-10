@@ -55,6 +55,15 @@ const LOCAL_IMPORT_MAX_DISCOVERED_FILES: usize = 10_000;
 const MAX_RUN_TIMESTEPS: usize = (u16::MAX as usize) + 1;
 const MAX_TIME_LABEL_WIDTH: usize = 256;
 const MAX_TIME_LABEL_ELEMENTS: usize = 4 * 1024 * 1024;
+/// `Times` has whole-second precision. Permit enough error for an `XTIME`
+/// minute value stored as f32 to round back to that second, while remaining
+/// comfortably below the half-second boundary where the result is ambiguous.
+const WRF_XTIME_SECOND_ROUNDING_TOLERANCE: f64 = 0.25;
+/// Two independently rounded `XTIME` records can carry opposite-sign errors.
+/// Their floating-point origins may therefore differ by twice the per-record
+/// tolerance, but their integral-second origins must still match exactly.
+const WRF_XTIME_ORIGIN_AGREEMENT_TOLERANCE: f64 =
+    2.0 * WRF_XTIME_SECOND_ROUNDING_TOLERANCE;
 const SOURCE_ID_READ_BUFFER_BYTES: usize = 1_024 * 1_024;
 /// Bump whenever a scientific formula, unit normalization, grid convention,
 /// or field-selection meaning changes. It is embedded in every imported run
@@ -2368,8 +2377,124 @@ pub(crate) fn netcdf_source_times(nc: &NcFile, path: &Path) -> Result<SourceTime
     })
 }
 
+fn parse_matching_wrf_reference_attributes(
+    attributes: &[(&str, String)],
+) -> Result<(Option<i64>, Vec<String>), String> {
+    let mut found = None::<(String, i64)>;
+    let mut malformed = Vec::new();
+    for (name, value) in attributes {
+        let Some(parsed) = parse_utc_timestamp(value) else {
+            malformed.push(format!(
+                "{name}={value:?} is not a valid UTC timestamp"
+            ));
+            continue;
+        };
+        if let Some((prior_name, prior)) = &found {
+            if *prior != parsed {
+                return Err(format!(
+                    "conflicting WRF references {prior_name}={} and {name}={}",
+                    format_valid_unix(*prior),
+                    format_valid_unix(parsed)
+                ));
+            }
+        } else {
+            found = Some(((*name).to_string(), parsed));
+        }
+    }
+    Ok((found.map(|(_, value)| value), malformed))
+}
+
+/// Infer the WRF initialization time from authoritative absolute `Times` and
+/// the standard WRF `XTIME` coordinate (minutes since initialization). This is
+/// deliberately strict: every record must participate, conversion to the
+/// whole-second precision of `Times` must be unambiguous, and both the raw
+/// floating-point and rounded integral origins must agree across the file.
+fn wrf_reference_from_xtime(
+    records: &[SourceTimeRecord],
+    xtime_minutes: &[f64],
+) -> Result<i64, String> {
+    if records.is_empty() {
+        return Err("cannot derive a WRF run origin from an empty Times axis".to_string());
+    }
+    if xtime_minutes.len() != records.len() {
+        return Err(format!(
+            "XTIME contains {} values for {} WRF Times records",
+            xtime_minutes.len(),
+            records.len()
+        ));
+    }
+
+    let mut reference_unix = None::<i64>;
+    let mut floating_reference = None::<f64>;
+    for (record, &minutes) in records.iter().zip(xtime_minutes) {
+        if !minutes.is_finite() || minutes < 0.0 {
+            return Err(format!(
+                "XTIME record {} must be finite and nonnegative, got {minutes:?}",
+                record.time_index
+            ));
+        }
+        let seconds = minutes * 60.0;
+        if !seconds.is_finite() {
+            return Err(format!(
+                "XTIME record {} overflows when converted from minutes to seconds",
+                record.time_index
+            ));
+        }
+        let rounded_seconds = seconds.round();
+        let rounding_error = (seconds - rounded_seconds).abs();
+        if rounding_error > WRF_XTIME_SECOND_ROUNDING_TOLERANCE {
+            return Err(format!(
+                "XTIME record {} ({minutes:?} minutes) is {rounding_error:.6} seconds from whole-second WRF Times precision; tolerance is {:.3} seconds",
+                record.time_index, WRF_XTIME_SECOND_ROUNDING_TOLERANCE
+            ));
+        }
+        if rounded_seconds < 0.0 || rounded_seconds >= i64::MAX as f64 {
+            return Err(format!(
+                "XTIME record {} cannot be represented as an integral lead time in seconds",
+                record.time_index
+            ));
+        }
+        let lead_seconds = rounded_seconds as i64;
+        let candidate = record.valid_unix.checked_sub(lead_seconds).ok_or_else(|| {
+            format!(
+                "XTIME record {} underflows UTC while deriving the WRF run origin",
+                record.time_index
+            )
+        })?;
+        let floating_candidate = record.valid_unix as f64 - seconds;
+
+        if let Some(prior) = floating_reference {
+            let difference = (floating_candidate - prior).abs();
+            if difference > WRF_XTIME_ORIGIN_AGREEMENT_TOLERANCE {
+                return Err(format!(
+                    "XTIME-derived origins disagree at record {} by {difference:.6} seconds; tolerance is {:.3} seconds",
+                    record.time_index, WRF_XTIME_ORIGIN_AGREEMENT_TOLERANCE
+                ));
+            }
+        } else {
+            floating_reference = Some(floating_candidate);
+        }
+        if let Some(prior) = reference_unix {
+            if prior != candidate {
+                return Err(format!(
+                    "XTIME-derived integral origins disagree at record {}: {} versus {}",
+                    record.time_index,
+                    format_valid_unix(prior),
+                    format_valid_unix(candidate)
+                ));
+            }
+        } else {
+            reference_unix = Some(candidate);
+        }
+    }
+
+    reference_unix.ok_or_else(|| "XTIME did not yield a WRF run origin".to_string())
+}
+
 /// Exact WRF time discovery for the raw wrf-core path. `Times` must cover
 /// every record; missing or truncated labels are never replaced by ordinals.
+/// Parseable WRF reference attributes are preferred. A malformed or unreadable
+/// attribute can fall back only to a complete, self-consistent `XTIME` axis.
 pub(crate) fn wrf_source_times(file: &WrfFile, path: &Path) -> Result<SourceTimeAxis, String> {
     if file.nt > MAX_RUN_TIMESTEPS {
         return Err(format!(
@@ -2383,29 +2508,48 @@ pub(crate) fn wrf_source_times(file: &WrfFile, path: &Path) -> Result<SourceTime
         .map_err(|err| format!("Read WRF Times from {} failed: {err}", path.display()))?;
     let records = source_records_from_labels(labels, file.nt, "WRF Times")
         .map_err(|err| format!("{}: {err}", path.display()))?;
-    let mut reference_unix = None::<(String, i64)>;
+    let mut attributes = Vec::<(&str, String)>::new();
+    let mut attribute_diagnostics = Vec::new();
     for name in ["START_DATE", "SIMULATION_START_DATE"] {
-        let Ok(value) = file.global_attr_str(name) else {
-            continue;
-        };
-        let parsed = parse_utc_timestamp(&value)
-            .ok_or_else(|| format!("{} has invalid WRF {name} {value:?}", path.display()))?;
-        if let Some((prior_name, prior)) = &reference_unix {
-            if *prior != parsed {
-                return Err(format!(
-                    "{} has conflicting WRF references {prior_name}={} and {name}={}",
-                    path.display(),
-                    format_valid_unix(*prior),
-                    format_valid_unix(parsed)
-                ));
-            }
-        } else {
-            reference_unix = Some((name.to_string(), parsed));
+        match file.global_attr_str(name) {
+            Ok(value) => attributes.push((name, value)),
+            Err(err) => attribute_diagnostics.push(format!("{name} unavailable ({err})")),
         }
     }
+    let (reference_unix, malformed) = parse_matching_wrf_reference_attributes(&attributes)
+        .map_err(|err| format!("{} has {err}", path.display()))?;
+    if let Some(reference_unix) = reference_unix {
+        return Ok(SourceTimeAxis {
+            records,
+            reference_unix: Some(reference_unix),
+        });
+    }
+    attribute_diagnostics.extend(malformed);
+
+    // WRF defines one-dimensional XTIME as minutes since initialization.
+    // wrf-core returns the complete vector for a one-dimensional variable.
+    let xtime_result = if file.has_var("XTIME") {
+        file.read_var("XTIME", 0)
+            .map_err(|err| format!("reading XTIME failed ({err})"))
+    } else {
+        Err("XTIME is unavailable".to_string())
+    };
+    let reference_unix = xtime_result
+        .and_then(|xtime| wrf_reference_from_xtime(&records, &xtime))
+        .map_err(|xtime_err| {
+            let attributes = if attribute_diagnostics.is_empty() {
+                "no parseable START_DATE or SIMULATION_START_DATE attribute".to_string()
+            } else {
+                attribute_diagnostics.join("; ")
+            };
+            format!(
+                "{} has no sound WRF run origin: {attributes}; XTIME fallback failed: {xtime_err}",
+                path.display()
+            )
+        })?;
     Ok(SourceTimeAxis {
         records,
-        reference_unix: reference_unix.map(|(_, value)| value),
+        reference_unix: Some(reference_unix),
     })
 }
 
@@ -4809,6 +4953,70 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(error.contains("per-run limit"), "{error}");
+    }
+
+    #[test]
+    fn malformed_wrf_reference_can_fall_back_to_consistent_xtime() {
+        let origin = parse_utc_timestamp("1974-04-03_23:00:00").unwrap();
+        let records = test_time_axis(Some(origin), &[2_220, 2_281]).records;
+        let attributes = vec![
+            ("START_DATE", "1".to_string()),
+            ("SIMULATION_START_DATE", "also-invalid".to_string()),
+        ];
+        let (attribute_reference, malformed) =
+            parse_matching_wrf_reference_attributes(&attributes).unwrap();
+        assert_eq!(attribute_reference, None);
+        assert_eq!(malformed.len(), 2);
+
+        // Exercise the f32 representation a WRF XTIME variable commonly uses:
+        // 2,281 seconds is a repeating fractional minute, but its conversion
+        // is still unambiguously within the whole-second tolerance.
+        let xtime = [37.0, f64::from(2_281.0_f32 / 60.0_f32)];
+        assert_eq!(wrf_reference_from_xtime(&records, &xtime), Ok(origin));
+    }
+
+    #[test]
+    fn matching_wrf_reference_attributes_are_preferred_and_conflicts_fail() {
+        let expected = parse_utc_timestamp("1974-04-03_23:00:00").unwrap();
+        let attributes = vec![
+            ("START_DATE", "1974-04-03_23:00:00".to_string()),
+            ("SIMULATION_START_DATE", "1".to_string()),
+        ];
+        let (reference, malformed) =
+            parse_matching_wrf_reference_attributes(&attributes).unwrap();
+        assert_eq!(reference, Some(expected));
+        assert_eq!(malformed.len(), 1);
+
+        let conflicting = vec![
+            ("START_DATE", "1974-04-03_23:00:00".to_string()),
+            (
+                "SIMULATION_START_DATE",
+                "1974-04-03_23:01:00".to_string(),
+            ),
+        ];
+        let error = parse_matching_wrf_reference_attributes(&conflicting).unwrap_err();
+        assert!(error.contains("conflicting WRF references"), "{error}");
+    }
+
+    #[test]
+    fn xtime_reference_fallback_fails_closed_on_unsound_axes() {
+        let origin = parse_utc_timestamp("1974-04-03_23:00:00").unwrap();
+        let records = test_time_axis(Some(origin), &[2_220, 2_280]).records;
+
+        let error = wrf_reference_from_xtime(&records, &[37.0]).unwrap_err();
+        assert!(error.contains("1 values for 2 WRF Times records"), "{error}");
+
+        let error = wrf_reference_from_xtime(&records, &[37.0, f64::NAN]).unwrap_err();
+        assert!(error.contains("finite and nonnegative"), "{error}");
+
+        let error = wrf_reference_from_xtime(&records, &[37.0, -1.0]).unwrap_err();
+        assert!(error.contains("finite and nonnegative"), "{error}");
+
+        let error = wrf_reference_from_xtime(&records, &[37.005, 38.0]).unwrap_err();
+        assert!(error.contains("whole-second WRF Times precision"), "{error}");
+
+        let error = wrf_reference_from_xtime(&records, &[37.0, 39.0]).unwrap_err();
+        assert!(error.contains("origins disagree"), "{error}");
     }
 
     #[test]
