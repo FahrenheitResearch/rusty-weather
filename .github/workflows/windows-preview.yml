@@ -1,0 +1,54 @@
+name: Windows Preview (Temporary)
+
+on:
+  push:
+    branches: [codex/bowecho-modernization]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preview:
+    name: Build one Windows x64 preview
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.92 with rustfmt
+        run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt
+
+      - name: Format preview source remotely
+        run: cargo +1.92.0 fmt --all
+
+      - name: Capture formatting patch
+        shell: bash
+        run: git diff --binary > rustfmt.patch
+
+      - name: Build only the Rusty Weather GUI
+        run: cargo +1.92.0 build --locked --release -p rusty-weather-ui --bin rusty-weather-ui
+
+      - name: Package local-test preview
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item target\release\rusty-weather-ui.exe package\rusty-weather-ui.exe
+          Copy-Item assets package\assets -Recurse
+          Copy-Item README.md package\README.md
+          Copy-Item LICENSE package\LICENSE
+          Copy-Item rustfmt.patch package\rustfmt.patch
+          Compress-Archive -Path package\* -DestinationPath rusty-weather-windows-x64-preview.zip -Force
+
+      - name: Upload temporary preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: rusty-weather-windows-x64-preview
+          path: rusty-weather-windows-x64-preview.zip
+          if-no-files-found: error
+          retention-days: 1
