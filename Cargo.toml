@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crates/rw-glm",
+    "crates/rw-gdex",
+    "crates/rw-formula",
     "crates/rw-ingest",
     "crates/rw-sat",
     "crates/rw-sat-check",

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
-use rw_store::run::{RwsRunManifest, SCHEMA_RUN};
+use rw_store::run::{RwsRunManifest, validate_store_component};
 use rw_store::{RwResult, RwStoreError};
 
 /// Handle to a store root directory. Cheap to create; all IO happens in
@@ -106,12 +106,13 @@ impl StoreView {
             };
             let mut runs = Vec::new();
             for run_dir in run_dirs {
+                let run = dir_name(&run_dir);
                 let manifest_path = run_dir.join("run.json");
                 if !manifest_path.is_file() {
                     continue; // not a run directory; skip silently
                 }
-                match load_manifest(&manifest_path) {
-                    Ok(manifest) => runs.push(run_entry(&run_dir, manifest)),
+                match self.load_run_manifest(&model, &run) {
+                    Ok((_, manifest)) => runs.push(run_entry(run, manifest)),
                     Err(err) => tree
                         .warnings
                         .push(format!("{}: {err}", manifest_path.display())),
@@ -130,21 +131,74 @@ impl StoreView {
     /// Open the hour file for (`model`, `run`, `hour`), resolving the file
     /// name through `run.json` (the manifest is the source of truth).
     pub fn open_hour(&self, model: &str, run: &str, hour: u16) -> RwResult<HourReader> {
-        let run_dir = self.run_dir(model, run);
-        let manifest = load_manifest(&run_dir.join("run.json"))?;
+        let (run_dir, manifest) = self.load_run_manifest(model, run)?;
         let entry = manifest.hours.get(&hour).ok_or_else(|| {
             RwStoreError::Meta(format!("run {model}/{run} has no forecast hour {hour}"))
         })?;
-        HourReader::open(&run_dir.join(&entry.file))
+        let hour_path = canonical_contained_path(
+            &run_dir,
+            &run_dir.join(&entry.file),
+            &format!("hour F{hour:03} file"),
+        )?;
+        let reader = HourReader::open(&hour_path)?;
+        let meta = reader.meta();
+        manifest.validate_identity(&meta.model, &meta.run)?;
+        manifest.validate_grid(&meta.grid_hash, meta.nx, meta.ny)?;
+        if meta.forecast_hour != hour {
+            return Err(RwStoreError::Meta(format!(
+                "manifest hour F{hour:03} resolves to {}, whose metadata says F{:03}",
+                hour_path.display(),
+                meta.forecast_hour
+            )));
+        }
+        Ok(reader)
     }
 
     /// Open the run's grid file (`grid.rwg`).
     pub fn open_grid(&self, model: &str, run: &str) -> RwResult<GridFile> {
-        GridFile::open(&self.run_dir(model, run).join("grid.rwg"))
+        let (run_dir, manifest) = self.load_run_manifest(model, run)?;
+        let grid_path = canonical_contained_path(&run_dir, &run_dir.join("grid.rwg"), "grid file")?;
+        let grid = GridFile::open(&grid_path)?;
+        manifest.validate_grid(&grid.hash, grid.nx, grid.ny)?;
+        Ok(grid)
+    }
+
+    fn load_run_manifest(&self, model: &str, run: &str) -> RwResult<(PathBuf, RwsRunManifest)> {
+        let run_dir = self.canonical_run_dir(model, run)?;
+        let manifest_path =
+            canonical_contained_path(&run_dir, &run_dir.join("run.json"), "run manifest")?;
+        let manifest = RwsRunManifest::load_for_run(&manifest_path, model, run)?;
+        Ok((run_dir, manifest))
+    }
+
+    fn canonical_run_dir(&self, model: &str, run: &str) -> RwResult<PathBuf> {
+        validate_store_component("model", model)?;
+        validate_store_component("run", run)?;
+        let root = fs::canonicalize(&self.root).map_err(|err| {
+            RwStoreError::Meta(format!(
+                "cannot resolve store root {}: {err}",
+                self.root.display()
+            ))
+        })?;
+        let requested = self.run_dir(model, run);
+        let run_dir = fs::canonicalize(&requested).map_err(|err| {
+            RwStoreError::Meta(format!(
+                "cannot resolve run directory {}: {err}",
+                requested.display()
+            ))
+        })?;
+        if !run_dir.starts_with(&root) {
+            return Err(RwStoreError::Meta(format!(
+                "run directory {} resolves outside store root {}",
+                requested.display(),
+                root.display()
+            )));
+        }
+        Ok(run_dir)
     }
 }
 
-fn run_entry(run_dir: &Path, manifest: RwsRunManifest) -> RunEntry {
+fn run_entry(run: String, manifest: RwsRunManifest) -> RunEntry {
     let hours = manifest
         .hours
         .iter() // BTreeMap: already ascending by hour
@@ -156,12 +210,7 @@ fn run_entry(run_dir: &Path, manifest: RwsRunManifest) -> RunEntry {
         })
         .collect();
     RunEntry {
-        // Prefer the manifest's run name; the directory name should match.
-        run: if manifest.run.is_empty() {
-            dir_name(run_dir)
-        } else {
-            manifest.run
-        },
+        run,
         build: manifest.writer.build,
         writer_version: manifest.writer.version,
         nx: manifest.nx,
@@ -170,18 +219,18 @@ fn run_entry(run_dir: &Path, manifest: RwsRunManifest) -> RunEntry {
     }
 }
 
-/// Load and schema-check a `run.json` manifest.
-fn load_manifest(path: &Path) -> RwResult<RwsRunManifest> {
-    let bytes = fs::read(path)?;
-    let manifest: RwsRunManifest = serde_json::from_slice(&bytes)
-        .map_err(|err| RwStoreError::Meta(format!("run manifest JSON: {err}")))?;
-    if manifest.schema != SCHEMA_RUN {
+fn canonical_contained_path(run_dir: &Path, path: &Path, label: &str) -> RwResult<PathBuf> {
+    let canonical = fs::canonicalize(path).map_err(|err| {
+        RwStoreError::Meta(format!("cannot resolve {label} {}: {err}", path.display()))
+    })?;
+    if !canonical.starts_with(run_dir) {
         return Err(RwStoreError::Meta(format!(
-            "unexpected schema '{}' (expected '{SCHEMA_RUN}')",
-            manifest.schema
+            "{label} {} resolves outside run directory {}",
+            path.display(),
+            run_dir.display()
         )));
     }
-    Ok(manifest)
+    Ok(canonical)
 }
 
 /// Subdirectories of `dir`, sorted by name for deterministic scans.

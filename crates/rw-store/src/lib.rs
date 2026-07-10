@@ -28,7 +28,7 @@ pub use export::{ExportSummary, export_hour_to_netcdf3};
 pub use ingest::{
     DerivedFieldInput, HourIngestWriter, PressureVolumeInput, StoredField2D, WrittenHour,
     derived_selector, derived_selector_slug, read_field_2d, read_grid_2d, write_hour_from_fields,
-    write_hour_from_fields_with_derived,
+    write_hour_from_fields_with_derived, write_hour_from_grid_with_derived,
 };
 pub use lock::{LOCK_FILE_NAME, RunLock};
 pub use validate::{

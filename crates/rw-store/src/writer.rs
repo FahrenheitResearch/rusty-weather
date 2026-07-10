@@ -632,7 +632,7 @@ mod tests {
     fn write_sample(path: &Path) -> RwsHourMeta {
         let mut writer = HourWriter::new(
             "hrrr",
-            "2026-06-09T12:00:00Z",
+            "20260609_12z",
             6,
             NX,
             NY,
@@ -674,7 +674,7 @@ mod tests {
         assert_eq!(meta, returned_meta, "finish() must return the written meta");
         assert_eq!(meta.schema, SCHEMA_HOUR);
         assert_eq!(meta.model, "hrrr");
-        assert_eq!(meta.run, "2026-06-09T12:00:00Z");
+        assert_eq!(meta.run, "20260609_12z");
         assert_eq!(meta.forecast_hour, 6);
         assert_eq!(meta.nx, NX);
         assert_eq!(meta.ny, NY);

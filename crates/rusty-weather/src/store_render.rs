@@ -163,6 +163,13 @@ impl StoreFieldSource {
         self.grid.projection.as_ref()
     }
 
+    /// Borrow the run grid coordinates without cloning the full arrays.
+    /// Batch orchestration uses this to derive a native-domain extent once;
+    /// the render paths continue to receive their existing owned grid value.
+    pub fn grid_coordinates(&self) -> (&[f32], &[f32]) {
+        (&self.grid.lat, &self.grid.lon)
+    }
+
     /// Provenance strings for the rendered-recipe reports (never pixels).
     pub fn fetch_key(&self) -> String {
         let meta = self.reader.meta();

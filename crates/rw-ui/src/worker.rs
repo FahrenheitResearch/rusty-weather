@@ -12,11 +12,14 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use rustwx_core::{CanonicalField, FieldSelector};
 use rustwx_products::viewer::StoreVariableStyle;
+use rw_store::RwStoreError;
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
 
 use crate::colormap::finite_min_max;
+use crate::iso_levels::{ISO_PICKER_LEVELS_HPA, IsoLevelField, IsoLevelSpec, parse_iso_slug};
 use crate::profile_scope;
 use crate::stats::StatsRegistry;
 use crate::store_view::{StoreTree, StoreView};
@@ -118,6 +121,11 @@ pub const SURFACE_SAMPLE_VARS: &[&str] = &[
     "u_10m",
     "v_10m",
     "surface_pressure",
+    "approx_temperature_2m",
+    "approx_dewpoint_2m",
+    "approx_u_10m",
+    "approx_v_10m",
+    "approx_surface_pressure",
     "orography",
     "mslp",
 ];
@@ -182,7 +190,8 @@ pub struct StoreWorker {
     tx: Sender<StoreRequest>,
     rx: Receiver<StoreResponse>,
     stats: Arc<StatsRegistry>,
-    _thread: JoinHandle<()>,
+    _thread: Option<JoinHandle<()>>,
+    startup_error: Option<String>,
 }
 
 impl StoreWorker {
@@ -195,14 +204,28 @@ impl StoreWorker {
         let worker_stats = Arc::clone(&stats);
         let thread = std::thread::Builder::new()
             .name("rw-ui-store-worker".to_string())
-            .spawn(move || worker_loop(view, &req_rx, &resp_tx, &notify, &worker_stats))
-            .expect("spawn rw-ui store worker thread");
+            .spawn(move || worker_loop(view, &req_rx, &resp_tx, &notify, &worker_stats));
+        let (thread, startup_error) = match thread {
+            Ok(thread) => (Some(thread), None),
+            Err(error) => (
+                None,
+                Some(format!("could not start rw-store worker thread: {error}")),
+            ),
+        };
         Self {
             tx: req_tx,
             rx: resp_rx,
             stats,
             _thread: thread,
+            startup_error,
         }
+    }
+
+    /// Thread creation can fail under OS resource pressure. Hosts can surface
+    /// this terminal startup error while the disconnected worker handle keeps
+    /// the rest of the UI alive.
+    pub fn startup_error(&self) -> Option<&str> {
+        self.startup_error.as_deref()
     }
 
     /// Per-request-kind wall times recorded by the worker thread
@@ -360,7 +383,7 @@ fn reader_for<'s>(state: &'s mut WorkerState, key: &HourKey) -> rw_store::RwResu
 
 fn hour_vars(state: &mut WorkerState, key: &HourKey) -> rw_store::RwResult<Vec<VarInfo>> {
     let reader = reader_for(state, key)?;
-    Ok(reader
+    let mut vars = reader
         .meta()
         .variables
         .iter()
@@ -374,7 +397,38 @@ fn hour_vars(state: &mut WorkerState, key: &HourKey) -> rw_store::RwResult<Vec<V
             },
             levels_hpa: var.levels_hpa.clone(),
         })
-        .collect())
+        .collect::<Vec<_>>();
+
+    // Pressure volumes primarily serve soundings, but the classic analysis
+    // surfaces are also useful map fields. Add display-time virtual 2-D
+    // entries only when every source volume actually carries that level.
+    for field in IsoLevelField::ALL {
+        let sources = field.source_volumes();
+        let Some(first) = sources.first().and_then(|name| reader.variable(name)) else {
+            continue;
+        };
+        for level_hpa in ISO_PICKER_LEVELS_HPA {
+            let available = sources.iter().all(|name| {
+                reader.variable(name).is_some_and(|var| {
+                    var.kind == "pressure3d" && var.levels_hpa.contains(&level_hpa)
+                })
+            });
+            if !available {
+                continue;
+            }
+            let spec = IsoLevelSpec { field, level_hpa };
+            if vars.iter().any(|var| var.name == spec.slug()) {
+                continue;
+            }
+            vars.push(VarInfo {
+                name: spec.slug(),
+                units: first.units.clone(),
+                kind: VarKind::Surface2D,
+                levels_hpa: Vec::new(),
+            });
+        }
+    }
+    Ok(vars)
 }
 
 /// Open (or reuse) the run grid for `key`'s run. Failures are tolerated —
@@ -406,25 +460,31 @@ fn load_field(state: &mut WorkerState, key: &FieldKey) -> rw_store::RwResult<Fie
         .as_deref()
         .and_then(GridFile::lat_descending)
         .unwrap_or(false);
-    // Resolve the variable's production plot styling from its stored
-    // selector JSON. Unknown models (e.g. the synthetic test store) and
-    // unmapped variables resolve to `None` -> the generic ramp.
-    let style = reader.variable(&key.var).and_then(|var| {
-        style_overrides.style_for_store_variable(
-            &var.name,
-            &var.selector,
-            &var.units,
-            meta.model.parse::<rustwx_core::ModelId>().ok(),
-        )
-    });
-    let stored_units = reader
+    let synthesized = reader
         .variable(&key.var)
-        .map(|var| var.units.clone())
-        .unwrap_or_default();
-    let mut values = {
-        profile_scope!("store_read_full_2d");
-        reader.read_full_2d(&key.var)?
+        .is_none()
+        .then(|| parse_iso_slug(&key.var))
+        .flatten();
+    let (stored_units, selector, mut values) = if let Some(spec) = synthesized {
+        profile_scope!("store_read_iso_level_2d");
+        load_iso_level_field(reader, spec, nx, ny)?
+    } else {
+        let var = reader
+            .variable(&key.var)
+            .ok_or_else(|| RwStoreError::UnknownVariable(key.var.clone()))?;
+        let values = {
+            profile_scope!("store_read_full_2d");
+            reader.read_full_2d(&key.var)?
+        };
+        (var.units.clone(), var.selector.clone(), values)
     };
+    // Resolve production/user styling for the real or synthesized slug.
+    let style = style_overrides.style_for_store_variable(
+        &key.var,
+        &selector,
+        &stored_units,
+        meta.model.parse::<rustwx_core::ModelId>().ok(),
+    );
     // Convert to display units with the production arithmetic so the scale,
     // the hover readout, and the range chip all speak the same units.
     let units = match &style {
@@ -450,6 +510,94 @@ fn load_field(state: &mut WorkerState, key: &FieldKey) -> rw_store::RwResult<Fie
         lat_descending,
         style,
     })
+}
+
+/// Slice one classic pressure surface from its backing volume(s). Wind speed
+/// is derived from the colocated U/V components; every other field reads one
+/// volume. `HourReader::read_level_3d` decodes only the column chunks needed
+/// for this pressure plane and never retains the full 3-D volume.
+fn load_iso_level_field(
+    reader: &HourReader,
+    spec: IsoLevelSpec,
+    nx: usize,
+    ny: usize,
+) -> rw_store::RwResult<(String, serde_json::Value, Vec<f32>)> {
+    let cells = nx.checked_mul(ny).ok_or_else(|| {
+        RwStoreError::Format(format!("isobaric field grid {nx}x{ny} overflows usize"))
+    })?;
+    let mut units = None;
+    let mut planes = Vec::with_capacity(spec.field.source_volumes().len());
+    for source in spec.field.source_volumes() {
+        let var = reader
+            .variable(source)
+            .ok_or_else(|| RwStoreError::UnknownVariable((*source).to_string()))?;
+        if !var.levels_hpa.contains(&spec.level_hpa) {
+            return Err(RwStoreError::Meta(format!(
+                "variable '{source}' has no {} hPa level",
+                spec.level_hpa
+            )));
+        }
+        if let Some(expected) = &units {
+            if expected != &var.units {
+                return Err(RwStoreError::Meta(format!(
+                    "isobaric vector components have incompatible units '{expected}' and '{}'",
+                    var.units
+                )));
+            }
+        } else {
+            units = Some(var.units.clone());
+        }
+        let plane = reader.read_level_3d(source, spec.level_hpa)?;
+        if plane.len() != cells {
+            return Err(RwStoreError::Format(format!(
+                "{source} pressure plane has {} values, expected {cells}",
+                plane.len()
+            )));
+        }
+        if plane.is_empty() && cells != 0 {
+            return Err(RwStoreError::Format(format!(
+                "{source} pressure plane is unexpectedly empty"
+            )));
+        }
+        planes.push(plane);
+    }
+
+    let values = if spec.field == IsoLevelField::WindSpeed {
+        if planes.len() != 2 {
+            return Err(RwStoreError::Format(
+                "wind speed needs exactly U and V pressure planes".to_string(),
+            ));
+        }
+        let v = planes.pop().ok_or_else(|| {
+            RwStoreError::Format("wind speed is missing its V pressure plane".to_string())
+        })?;
+        let mut u = planes.pop().ok_or_else(|| {
+            RwStoreError::Format("wind speed is missing its U pressure plane".to_string())
+        })?;
+        for (u_value, v_value) in u.iter_mut().zip(v) {
+            *u_value = u_value.hypot(v_value);
+        }
+        u
+    } else {
+        planes.pop().ok_or_else(|| {
+            RwStoreError::Format("isobaric field has no source plane".to_string())
+        })?
+    };
+    let canonical = match spec.field {
+        IsoLevelField::Temperature => CanonicalField::Temperature,
+        IsoLevelField::Dewpoint => CanonicalField::Dewpoint,
+        IsoLevelField::RelativeHumidity => CanonicalField::RelativeHumidity,
+        IsoLevelField::WindSpeed => CanonicalField::WindSpeed,
+        IsoLevelField::Height => CanonicalField::GeopotentialHeight,
+    };
+    let selector = serde_json::to_value(FieldSelector::isobaric(canonical, spec.level_hpa))
+        .map_err(|error| {
+            RwStoreError::Meta(format!(
+                "cannot encode {} hPa field selector: {error}",
+                spec.level_hpa
+            ))
+        })?;
+    Ok((units.unwrap_or_default(), selector, values))
 }
 
 fn load_sounding(

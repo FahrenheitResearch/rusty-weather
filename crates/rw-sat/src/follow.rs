@@ -27,7 +27,7 @@ use crate::s3::{
 };
 use crate::store::{WrittenFrame, downsample_field, frame_time, write_band_frame};
 use crate::window::{WindowConfig, enforce_window};
-use rw_store::run::RwsRunManifest;
+use rw_store::run::{RwsRunManifest, validate_store_component};
 
 /// Minutes after the top of the hour during which the previous hour's
 /// prefix keeps being polled (stragglers + clock skew).
@@ -194,11 +194,29 @@ pub fn primed_seen_scans(
     bands: &[u8],
 ) -> SeenScans {
     let mut seen = SeenScans::default();
-    let Ok(entries) = std::fs::read_dir(store_root.join(model)) else {
+    if validate_store_component("model", model).is_err() {
+        return seen;
+    }
+    let Ok(root) = std::fs::canonicalize(store_root) else {
+        return seen;
+    };
+    let Ok(model_dir) = std::fs::canonicalize(store_root.join(model)) else {
+        return seen;
+    };
+    if !model_dir.starts_with(&root) {
+        return seen;
+    }
+    let Ok(entries) = std::fs::read_dir(&model_dir) else {
         return seen;
     };
     for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
         let run_name = entry.file_name().to_string_lossy().to_string();
+        if validate_store_component("run", &run_name).is_err() {
+            continue;
+        }
         // Run dirs are `<sector>_c<band>_<YYYYMMDD>[_<k>]`.
         let Some(band) = bands
             .iter()
@@ -207,10 +225,19 @@ pub fn primed_seen_scans(
         else {
             continue;
         };
-        let Ok(bytes) = std::fs::read(entry.path().join("run.json")) else {
+        let Ok(run_dir) = std::fs::canonicalize(entry.path()) else {
             continue;
         };
-        let Ok(manifest) = serde_json::from_slice::<RwsRunManifest>(&bytes) else {
+        if !run_dir.starts_with(&model_dir) {
+            continue;
+        }
+        let Ok(manifest_path) = std::fs::canonicalize(run_dir.join("run.json")) else {
+            continue;
+        };
+        if !manifest_path.starts_with(&run_dir) {
+            continue;
+        }
+        let Ok(manifest) = RwsRunManifest::load_for_run(&manifest_path, model, &run_name) else {
             continue;
         };
         for &hhmm in manifest.hours.keys() {

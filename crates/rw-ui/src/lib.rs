@@ -29,6 +29,7 @@
 //! rusty-weather-ui shell) turn it on; bowecho compiles it out.
 
 pub mod colormap;
+pub mod iso_levels;
 mod panels;
 pub mod skewt;
 pub mod stats;

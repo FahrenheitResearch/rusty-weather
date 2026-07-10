@@ -30,6 +30,7 @@ use rustwx_render::{
 use rw_store::grid::{GridFile, GridLocator};
 
 use crate::colormap::{Colormap, VIRIDIS, field_to_color_image, field_to_production_color_image};
+use crate::iso_levels::parse_iso_slug;
 use crate::profile_scope;
 use crate::worker::{FieldData, FieldKey, HourKey, VarInfo, VarKind};
 
@@ -236,6 +237,8 @@ pub struct FieldViewerPanel {
     selected_var: Option<String>,
     var_filter: String,
     field: Option<FieldData>,
+    /// One ephemeral Formula Lab field retained while this hour is selected.
+    generated_field: Option<FieldData>,
     texture: Option<TextureHandle>,
     texture_dirty: bool,
     state: LoadState,
@@ -276,6 +279,7 @@ impl Default for FieldViewerPanel {
             selected_var: None,
             var_filter: String::new(),
             field: None,
+            generated_field: None,
             texture: None,
             texture_dirty: false,
             state: LoadState::Idle,
@@ -482,7 +486,20 @@ impl FieldViewerPanel {
     /// selection when the new hour still has it; otherwise falls back to
     /// `temperature_2m`, then the first 2D variable. The host should then
     /// fire a load for [`FieldViewerPanel::selected_var`].
-    pub fn set_hour(&mut self, hour: HourKey, vars: Vec<VarInfo>) {
+    pub fn set_hour(&mut self, hour: HourKey, mut vars: Vec<VarInfo>) {
+        let generated = self
+            .generated_field
+            .take()
+            .filter(|field| field.key.hour == hour)
+            .filter(|field| !vars.iter().any(|var| var.name == field.key.var));
+        if let Some(field) = &generated {
+            vars.push(VarInfo {
+                name: field.key.var.clone(),
+                units: field.units.clone(),
+                kind: VarKind::Surface2D,
+                levels_hpa: Vec::new(),
+            });
+        }
         let keep = self.selected_var.take().filter(|name| {
             vars.iter()
                 .any(|v| v.kind == VarKind::Surface2D && v.name == *name)
@@ -500,6 +517,7 @@ impl FieldViewerPanel {
             });
         self.hour = Some(hour);
         self.vars = vars;
+        self.generated_field = generated;
         self.var_filter.clear();
         self.field = None;
         self.texture = None;
@@ -521,6 +539,12 @@ impl FieldViewerPanel {
 
     pub fn selected_var(&self) -> Option<&str> {
         self.selected_var.as_deref()
+    }
+
+    /// Variables currently advertised for the selected hour. Hosts use this
+    /// read-only view for equation editors and other field pickers.
+    pub fn vars(&self) -> &[VarInfo] {
+        &self.vars
     }
 
     /// Key of the field the panel currently wants loaded, if any.
@@ -563,6 +587,64 @@ impl FieldViewerPanel {
         self.field = Some(data);
         self.texture_dirty = true;
         self.state = LoadState::Ready;
+    }
+
+    /// Install an in-memory generated field (for example Formula Lab output)
+    /// as the current selection without requiring it to exist in rw-store.
+    /// It remains in the picker until the user selects another hour.
+    pub fn install_generated_field(&mut self, mut data: FieldData) {
+        if self.hour.as_ref() != Some(&data.key.hour) {
+            self.vars.clear();
+        }
+        if let Some(previous) = self.generated_field.take() {
+            self.vars.retain(|var| var.name != previous.key.var);
+        }
+        if self.vars.iter().any(|var| var.name == data.key.var) {
+            let base = format!("formula_{}", data.key.var);
+            let mut candidate = base.clone();
+            let mut suffix = 2usize;
+            while self.vars.iter().any(|var| var.name == candidate) {
+                candidate = format!("{base}_{suffix}");
+                suffix += 1;
+            }
+            data.key.var = candidate;
+        }
+        self.hour = Some(data.key.hour.clone());
+        self.selected_var = Some(data.key.var.clone());
+        if !self.vars.iter().any(|var| var.name == data.key.var) {
+            self.vars.push(VarInfo {
+                name: data.key.var.clone(),
+                units: data.units.clone(),
+                kind: VarKind::Surface2D,
+                levels_hpa: Vec::new(),
+            });
+        }
+        self.field = None;
+        self.texture = None;
+        self.texture_dirty = false;
+        self.clicked = None;
+        self.domain_drag = None;
+        self.domain_rotate = None;
+        self.domain_selection = None;
+        self.cmap = None;
+        self.legend_texture = None;
+        self.basemap_pending = None;
+        self.generated_field = Some(data.clone());
+        self.set_field(data);
+    }
+
+    /// Restore the retained Formula Lab field instead of asking the store
+    /// worker for a variable that intentionally exists only in memory.
+    pub fn restore_generated_field(&mut self, var: &str) -> bool {
+        let Some(field) = self.generated_field.as_ref() else {
+            return false;
+        };
+        if field.key.var != var || Some(&field.key.hour) != self.hour.as_ref() {
+            return false;
+        }
+        let field = field.clone();
+        self.set_field(field);
+        true
     }
 
     pub fn clear(&mut self) {
@@ -616,28 +698,37 @@ impl FieldViewerPanel {
                 .iter()
                 .filter(|v| v.kind == VarKind::Surface2D)
                 .filter(|v| {
+                    let label = display_variable_name(&v.name).to_ascii_lowercase();
                     filter.is_empty()
                         || v.name.to_ascii_lowercase().contains(&filter)
+                        || label.contains(&filter)
                         || v.units.to_ascii_lowercase().contains(&filter)
                 })
-                .map(|v| (v.name.clone(), v.units.clone()))
-                .collect::<Vec<_>>();
-            ComboBox::from_id_salt("rw-ui-field-var")
-                .selected_text(if current.is_empty() {
-                    "pick a variable"
-                } else {
-                    &current
+                .map(|v| {
+                    (
+                        v.name.clone(),
+                        display_variable_name(&v.name),
+                        v.units.clone(),
+                    )
                 })
+                .collect::<Vec<_>>();
+            let current_label = if current.is_empty() {
+                "pick a variable".to_string()
+            } else {
+                display_variable_name(&current)
+            };
+            ComboBox::from_id_salt("rw-ui-field-var")
+                .selected_text(current_label)
                 .width(220.0)
                 .show_ui(ui, |ui| {
                     if matching_vars.is_empty() {
                         ui.label(RichText::new("No variables match").small().weak());
                     }
-                    for (name, units) in &matching_vars {
+                    for (name, label, units) in &matching_vars {
                         ui.selectable_value(
                             &mut current,
                             name.clone(),
-                            format!("{} ({})", name, units),
+                            format!("{label} ({units})"),
                         );
                     }
                 });
@@ -1285,6 +1376,35 @@ impl FieldViewerPanel {
     }
 }
 
+fn display_variable_name(name: &str) -> String {
+    if let Some(spec) = parse_iso_slug(name) {
+        return spec.label();
+    }
+    if let Some(slug) = name.strip_prefix("approx_") {
+        let label = match slug {
+            "sbcape" => "SBCAPE",
+            "sbcin" => "SBCIN",
+            "mlcape" => "MLCAPE",
+            "mlcin" => "MLCIN",
+            "mucape" => "MUCAPE",
+            "mucin" => "MUCIN",
+            "lcl" => "LCL height",
+            "lfc" => "LFC height",
+            "el" => "EL height",
+            "srh_0_1km" => "0-1 km SRH",
+            "srh_0_3km" => "0-3 km SRH",
+            "bulk_shear_0_1km" => "0-1 km bulk shear",
+            "bulk_shear_0_6km" => "0-6 km bulk shear",
+            "stp" => "STP",
+            "scp" => "SCP",
+            "ehi" => "EHI",
+            _ => slug,
+        };
+        return format!("Approximate {label}");
+    }
+    name.to_string()
+}
+
 /// One production colorbar sample per row, top = the highest legend level —
 /// the same per-pixel sampling `draw_vertical_colorbar` paints.
 fn legend_bar_image(cmap: &LeveledColormap, mode: rustwx_render::LegendMode) -> ColorImage {
@@ -1925,6 +2045,51 @@ mod tests {
 
     const NX: usize = 8;
     const NY: usize = 6;
+
+    fn test_hour(hour: u16) -> HourKey {
+        HourKey {
+            model: "wrf".to_string(),
+            run: "test".to_string(),
+            hour,
+        }
+    }
+
+    #[test]
+    fn generated_field_is_namespaced_retained_and_never_loaded_from_store() {
+        let hour = test_hour(0);
+        let real = VarInfo {
+            name: "temperature_2m".to_string(),
+            units: "K".to_string(),
+            kind: VarKind::Surface2D,
+            levels_hpa: Vec::new(),
+        };
+        let mut panel = FieldViewerPanel::new();
+        panel.set_hour(hour.clone(), vec![real.clone()]);
+        panel.install_generated_field(FieldData {
+            key: FieldKey {
+                hour: hour.clone(),
+                var: "temperature_2m".to_string(),
+            },
+            units: "K".to_string(),
+            nx: NX,
+            ny: NY,
+            values: vec![300.0; NX * NY],
+            range: Some((300.0, 300.0)),
+            grid: None,
+            lat_descending: false,
+            style: None,
+        });
+        let generated_name = panel.selected_var().unwrap().to_string();
+        assert_eq!(generated_name, "formula_temperature_2m");
+        assert!(panel.restore_generated_field(&generated_name));
+
+        panel.set_hour(hour, vec![real.clone()]);
+        panel.selected_var = Some(generated_name.clone());
+        assert!(panel.restore_generated_field(&generated_name));
+        panel.set_hour(test_hour(1), vec![real]);
+        panel.selected_var = Some(generated_name.clone());
+        assert!(!panel.restore_generated_field(&generated_name));
+    }
 
     /// Row-major lat array: ascending = row 0 south (20°N..), descending =
     /// row 0 north (50°N..).

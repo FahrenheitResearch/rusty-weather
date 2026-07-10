@@ -1,0 +1,16 @@
+[package]
+name = "rw-gdex"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Reusable NSF NCAR GDEX/THREDDS catalog, subset, and resumable-download client"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+quick-xml = { version = "0.39", features = ["serialize"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

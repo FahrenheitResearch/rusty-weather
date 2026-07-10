@@ -51,14 +51,14 @@
 //! per-hour plane outlives its hour iteration.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rustwx_products::windowed::HrrrWindowedProduct;
 use rw_store::error::RwStoreError;
 use rw_store::grid::GridFile;
 use rw_store::ingest::read_grid_2d;
 use rw_store::reader::HourReader;
-use rw_store::run::{RwsRunManifest, SCHEMA_RUN};
+use rw_store::run::{RwsRunManifest, validate_store_component};
 
 pub(crate) const MM_PER_INCH: f64 = 25.4;
 pub(crate) const MS_TO_KT: f64 = 1.943_844_5;
@@ -94,19 +94,62 @@ pub fn stored_run_hours(
     model_slug: &str,
     run_slug: &str,
 ) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
-    let path = store_root.join(model_slug).join(run_slug).join("run.json");
-    let bytes = std::fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
-    let manifest: RwsRunManifest =
-        serde_json::from_slice(&bytes).map_err(|err| format!("parse {}: {err}", path.display()))?;
-    if manifest.schema != SCHEMA_RUN {
-        return Err(format!(
-            "{}: unexpected schema '{}' (expected '{SCHEMA_RUN}')",
-            path.display(),
-            manifest.schema
-        )
-        .into());
-    }
+    let (_, manifest) = load_run_manifest(store_root, model_slug, run_slug)?;
     Ok(manifest.hours.keys().copied().collect())
+}
+
+fn load_run_manifest(
+    store_root: &Path,
+    model_slug: &str,
+    run_slug: &str,
+) -> Result<(PathBuf, RwsRunManifest), RwStoreError> {
+    validate_store_component("model", model_slug)?;
+    validate_store_component("run", run_slug)?;
+    let root = std::fs::canonicalize(store_root).map_err(|err| {
+        RwStoreError::Meta(format!(
+            "cannot resolve store root {}: {err}",
+            store_root.display()
+        ))
+    })?;
+    let requested = store_root.join(model_slug).join(run_slug);
+    let run_dir = std::fs::canonicalize(&requested).map_err(|err| {
+        RwStoreError::Meta(format!(
+            "cannot resolve run directory {}: {err}",
+            requested.display()
+        ))
+    })?;
+    if !run_dir.starts_with(&root) {
+        return Err(RwStoreError::Meta(format!(
+            "run directory {} resolves outside store root {}",
+            requested.display(),
+            root.display()
+        )));
+    }
+    let manifest_path = canonical_contained_path(
+        &run_dir,
+        &run_dir.join("run.json"),
+        "run manifest",
+    )?;
+    let manifest = RwsRunManifest::load_for_run(&manifest_path, model_slug, run_slug)?;
+    Ok((run_dir, manifest))
+}
+
+fn canonical_contained_path(
+    run_dir: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<PathBuf, RwStoreError> {
+    let canonical = std::fs::canonicalize(path).map_err(|err| {
+        RwStoreError::Meta(format!("cannot resolve {label} {}: {err}", path.display()))
+    })?;
+    if !canonical.starts_with(run_dir) {
+        return Err(RwStoreError::Meta(format!(
+            "{label} {} resolves outside run directory {}",
+            path.display(),
+            run_dir.display()
+        )));
+    }
+    Ok(canonical)
 }
 
 /// Compute the requested windowed products from the stored hour files of
@@ -126,10 +169,20 @@ pub fn compute_windowed_products(
     let Some(&anchor_hour) = available.iter().next_back() else {
         return Err("windowed compute needs at least one stored hour".into());
     };
-    let run_dir = store_root.join(model_slug).join(run_slug);
-    let grid_path = run_dir.join("grid.rwg");
+    let (run_dir, manifest) = load_run_manifest(store_root, model_slug, run_slug)?;
+    if let Some(hour) = available
+        .iter()
+        .find(|&&hour| !manifest.hours.contains_key(&hour))
+    {
+        return Err(format!(
+            "available hour F{hour:03} is not registered in {model_slug}/{run_slug}/run.json"
+        )
+        .into());
+    }
+    let grid_path = canonical_contained_path(&run_dir, &run_dir.join("grid.rwg"), "grid file")?;
     let grid =
         GridFile::open(&grid_path).map_err(|err| format!("open {}: {err}", grid_path.display()))?;
+    manifest.validate_grid(&grid.hash, grid.nx, grid.ny)?;
 
     // Plan: dedupe slugs (mirroring the GRIB lane), block products whose
     // window minimum exceeds the anchor or whose window has store gaps.
@@ -199,7 +252,36 @@ pub fn compute_windowed_products(
         {
             continue;
         }
-        let hour_path = run_dir.join(format!("f{hour:03}.rws"));
+        let entry = match manifest.hours.get(&hour) {
+            Some(entry) => entry,
+            None => {
+                let reason = format!(
+                    "hour F{hour:03} is not registered in {model_slug}/{run_slug}/run.json"
+                );
+                for accum in accums.iter_mut() {
+                    if accum.failed.is_none() && accum.spec.hours.contains(&hour) {
+                        accum.failed = Some(reason.clone());
+                    }
+                }
+                continue;
+            }
+        };
+        let hour_path = match canonical_contained_path(
+            &run_dir,
+            &run_dir.join(&entry.file),
+            &format!("hour F{hour:03} file"),
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                let reason = err.to_string();
+                for accum in accums.iter_mut() {
+                    if accum.failed.is_none() && accum.spec.hours.contains(&hour) {
+                        accum.failed = Some(reason.clone());
+                    }
+                }
+                continue;
+            }
+        };
         let reader = match HourReader::open(&hour_path) {
             Ok(reader) => reader,
             Err(err) => {
@@ -212,6 +294,30 @@ pub fn compute_windowed_products(
                 continue;
             }
         };
+        let meta = reader.meta();
+        let metadata_result = manifest
+            .validate_identity(&meta.model, &meta.run)
+            .and_then(|()| manifest.validate_grid(&meta.grid_hash, meta.nx, meta.ny))
+            .and_then(|()| {
+                if meta.forecast_hour == hour {
+                    Ok(())
+                } else {
+                    Err(RwStoreError::Meta(format!(
+                        "manifest hour F{hour:03} resolves to {}, whose metadata says F{:03}",
+                        hour_path.display(),
+                        meta.forecast_hour
+                    )))
+                }
+            });
+        if let Err(err) = metadata_result {
+            let reason = err.to_string();
+            for accum in accums.iter_mut() {
+                if accum.failed.is_none() && accum.spec.hours.contains(&hour) {
+                    accum.failed = Some(reason.clone());
+                }
+            }
+            continue;
+        }
         for &kind in kinds {
             if !accums.iter().any(|accum| needs(accum, kind)) {
                 continue;
@@ -1667,6 +1773,41 @@ mod tests {
         let hours = stored_run_hours(&dir, "hrrr", "20260608_00z").unwrap();
         assert_eq!(hours, vec![1, 2, 5]);
         assert!(stored_run_hours(&dir, "hrrr", "20990101_00z").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windowed_compute_uses_the_validated_manifest_hour_filename() {
+        let dir = test_dir("manifest-hour-filename");
+        let run = "20260608_00z";
+        write_test_run(&dir, run, &[1]);
+        let run_dir = dir.join("hrrr").join(run);
+        let manifest_path = run_dir.join("run.json");
+        let mut manifest = RwsRunManifest::load_for_run(&manifest_path, "hrrr", run).unwrap();
+        fs::rename(run_dir.join("f001.rws"), run_dir.join("renamed-f001.rws")).unwrap();
+        manifest.hours.get_mut(&1).unwrap().file = "renamed-f001.rws".to_string();
+        manifest.save(&manifest_path).unwrap();
+
+        let outcome = compute(&dir, run, &[1], &["qpf_1h"]);
+        assert!(outcome.blockers.is_empty(), "{:?}", outcome.blockers);
+        assert_eq!(grid_named(&outcome, "qpf_1h").hours_used, vec![1]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stored_run_hours_rejects_unsafe_persisted_hour_path() {
+        let dir = test_dir("unsafe-manifest-hour");
+        let run = "20260608_00z";
+        write_test_run(&dir, run, &[1]);
+        let manifest_path = dir.join("hrrr").join(run).join("run.json");
+        let mut manifest = RwsRunManifest::load_for_run(&manifest_path, "hrrr", run).unwrap();
+        manifest.hours.get_mut(&1).unwrap().file = "../outside.rws".to_string();
+        // Deliberately bypass save(), which rejects this before persistence,
+        // to model an externally modified/untrusted store.
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let err = stored_run_hours(&dir, "hrrr", run).unwrap_err().to_string();
+        assert!(err.contains("normal path component"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

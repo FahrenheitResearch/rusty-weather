@@ -1,3 +1,10 @@
+//! Full WRF processing, updated from BowEcho v0.30.5's hardened model path.
+//! Computes the model's 2D diagnostics (CAPE/severe/etc.) and isobaric
+//! sounding volumes through `wrf-core::getvar`, then writes each WRF time as
+//! one forecast-hour slot. Heavier than `local_import`, but produces the full
+//! model field set.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -5,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rustwx_core::{
     CanonicalField, FieldSelector, GridProjection, GridShape, LatLonGrid, SelectedField2D,
 };
-use rw_store::{DerivedFieldInput, WrittenHour, write_hour_from_fields_with_derived};
+use rw_store::{DerivedFieldInput, WrittenHour, write_hour_from_grid_with_derived};
 use serde::{Deserialize, Serialize};
 
 use crate::wrf_volumes::{IsoVolume, SurfaceFallback, build_iso_volumes};
@@ -54,6 +61,54 @@ impl WrfProcessOptions {
         self
     }
 
+    /// The store field names the current selection WOULD write, for the
+    /// import UI's "what will be processed" preview. Mirrors the decisions in
+    /// [`read_wrf_products`] using the same [`Self::should_process`] predicate
+    /// and the same field catalogs, so the preview tracks the real output.
+    /// This is a static plan (it never opens a file); a field a given `wrfout`
+    /// happens not to carry is simply skipped at process time with a note.
+    pub fn planned_store_fields(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for (wrf_name, store_name) in CORE_FIELD_CATALOG {
+            if self.should_process(wrf_name, Some(store_name), WrfProductGroup::Core) {
+                names.push((*store_name).to_string());
+            }
+        }
+        // Isobaric sounding volumes ride along with the core group (they are
+        // gated on `core_fields` in `read_wrf_products`).
+        if self.core_fields {
+            for iso in ISO_VOLUME_NAMES {
+                names.push((*iso).to_string());
+            }
+        }
+        for def in VARS {
+            if def.dim != VarDim::TwoD
+                || matches!(def.name, "lat" | "lon" | "cape2d" | "cape2d_wrfpython")
+            {
+                continue;
+            }
+            let store_name = derived_name(def.name, None);
+            let group = if is_heavy_wrf_diagnostic(&store_name) || is_heavy_wrf_diagnostic(def.name)
+            {
+                WrfProductGroup::Heavy
+            } else {
+                WrfProductGroup::Diagnostic
+            };
+            if self.should_process(def.name, Some(&store_name), group) {
+                names.push(store_name);
+            }
+        }
+        for raw in RAW_EXTRA_CATALOG {
+            let store_name = derived_name(raw, None);
+            if self.should_process(raw, Some(&store_name), WrfProductGroup::Raw) {
+                names.push(store_name);
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
     fn should_process(
         &self,
         wrf_name: &str,
@@ -92,6 +147,61 @@ enum WrfProductGroup {
     Raw,
 }
 
+/// Core 2D surface fields the heavy path writes, as `(WRF filter key, store
+/// field name)`. Single source of truth for the `Core` group, shared by the
+/// processor and the UI's planned-field preview so the two never drift.
+/// `U10`/`V10` remain the public filter keys for compatibility, but their
+/// canonical earth-relative values are split from one `uvmet10` diagnostic;
+/// raw WRF U10/V10 are grid-relative and must never be published under the
+/// canonical component names. `PSFC`/`apcp` are pushed by dedicated blocks but
+/// still belong to the `Core` group (they check `should_process(.., Core)`).
+const CORE_FIELD_CATALOG: &[(&str, &str)] = &[
+    ("terrain", "orography"),
+    ("t2", "temperature_2m"),
+    ("dp2m", "dewpoint_2m"),
+    ("rh2m", "relative_humidity_2m"),
+    ("U10", "u_10m"),
+    ("V10", "v_10m"),
+    ("wspd10", "wind_speed_10m"),
+    ("slp", "mslp"),
+    ("PSFC", "surface_pressure"),
+    ("pw", "pwat"),
+    ("maxdbz", "composite_reflectivity"),
+    ("UP_HELI_MAX", "updraft_helicity_2to5km"),
+    ("apcp", "apcp"),
+];
+
+/// Isobaric sounding volumes written alongside the `Core` group (skew-T
+/// columns). 3D `pressure3d` store variables, not 2D fields.
+const ISO_VOLUME_NAMES: &[&str] = &[
+    "temperature_iso",
+    "dewpoint_iso",
+    "u_iso",
+    "v_iso",
+    "height_iso",
+];
+
+/// Raw WRF model outputs pulled verbatim (no `getvar` diagnostic) for the
+/// `Raw` extras group. Single source of truth shared by the processor loop and
+/// the planned-field preview.
+const RAW_EXTRA_CATALOG: &[&str] = &[
+    "PBLH",
+    "HFX",
+    "LH",
+    "SWDOWN",
+    "GLW",
+    "OLR",
+    "TSK",
+    "SST",
+    "SNOWNC",
+    "GRAUPELNC",
+    "WSPD10MAX",
+    "UP_HELI_MAX",
+];
+
+const PROFILE_FNV64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const PROFILE_FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
 #[derive(Debug)]
 pub enum WrfProcessMessage {
     Progress(String),
@@ -110,6 +220,8 @@ pub struct WrfProcessSummary {
 }
 
 struct WrfHourFields {
+    grid: LatLonGrid,
+    projection: Option<GridProjection>,
     canonical: Vec<(String, SelectedField2D)>,
     derived: Vec<OwnedDerivedField>,
     volumes: Vec<IsoVolume>,
@@ -134,23 +246,38 @@ pub fn spawn_process_paths(
         format!("Process {} WRF files", paths.len())
     };
     let (tx, rx) = channel();
-    std::thread::Builder::new()
+    let worker_tx = tx.clone();
+    let spawn_result = std::thread::Builder::new()
         .name("rw-ui-wrf-process".to_string())
         .spawn({
             let label = label.clone();
             move || {
-                let result = process_paths(&paths, &store_root, &options, &tx).map_err(|err| {
-                    if err.trim().is_empty() {
-                        format!("{label} failed")
-                    } else {
-                        err
-                    }
+                let result = isolate_panics("WRF processing worker", || {
+                    lower_import_thread_priority();
+                    process_paths(&paths, &store_root, &options, &worker_tx).map_err(|err| {
+                        if err.trim().is_empty() {
+                            format!("{label} failed")
+                        } else {
+                            err
+                        }
+                    })
                 });
-                let _ = tx.send(WrfProcessMessage::Done(result));
+                let _ = worker_tx.send(WrfProcessMessage::Done(result));
             }
-        })
-        .expect("spawn WRF processing worker");
+        });
+    if let Err(err) = spawn_result {
+        let _ = tx.send(WrfProcessMessage::Done(Err(format!(
+            "could not start WRF processing worker: {err}"
+        ))));
+    }
     WrfProcessTask { label, rx }
+}
+
+/// Large-grid imports grind for minutes with heavy allocation churn; run the
+/// worker below normal priority so the desktop stays responsive. The shared
+/// throttle helper is Windows-specific and a no-op on other platforms.
+pub(crate) fn lower_import_thread_priority() {
+    rw_ingest::throttle::set_current_thread_background_priority();
 }
 
 pub fn is_supported_wrf_file(path: &Path) -> bool {
@@ -196,6 +323,66 @@ pub fn wrf_files_in_folder(folder: &Path) -> Vec<PathBuf> {
     paths
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrfSourceKind {
+    Raw,
+    Postprocessed,
+}
+
+#[derive(Debug, Clone)]
+struct WrfSourcePlan {
+    path: PathBuf,
+    kind: WrfSourceKind,
+    records: Vec<crate::local_import::PlannedSourceTime>,
+}
+
+fn preflight_wrf_sources(
+    files: &[PathBuf],
+    source_identity: &str,
+    processing_profile: &str,
+    tx: &Sender<WrfProcessMessage>,
+) -> Result<(Vec<WrfSourcePlan>, String), String> {
+    let mut timeline = crate::local_import::ForecastHourTimeline::default();
+    let mut expected_shape = None::<(usize, usize)>;
+    let mut plans = Vec::with_capacity(files.len());
+    for path in files {
+        let _ = tx.send(WrfProcessMessage::Progress(format!(
+            "Preflighting WRF {}",
+            display_name(path)
+        )));
+        let raw = isolate_panics("preflight WRF file", || {
+            WrfFile::open(path).map_err(|err| err.to_string())
+        });
+        let (kind, source_times, shape) = match raw {
+            Ok(file) => {
+                let times = crate::local_import::wrf_source_times(&file, path)?;
+                (WrfSourceKind::Raw, times, (file.nx, file.ny))
+            }
+            Err(_) => {
+                let nc = netcrust::open(path).map_err(|err| {
+                    format!("Open post-processed WRF {} failed: {err}", path.display())
+                })?;
+                let times = crate::local_import::netcdf_source_times(&nc, path)
+                    .map_err(|err| format!("Read times from {} failed: {err}", path.display()))?;
+                let shape = crate::local_import::netcdf_grid_shape(&nc, path)
+                    .map_err(|err| format!("Read grid shape from {} failed: {err}", path.display()))?;
+                (WrfSourceKind::Postprocessed, times, shape)
+            }
+        };
+        crate::local_import::merge_preflight_grid_shape(&mut expected_shape, shape, path)?;
+        let records = timeline.plan(&source_times, path)?;
+        plans.push(WrfSourcePlan {
+            path: path.clone(),
+            kind,
+            records,
+        });
+    }
+    let run = timeline
+        .run_name(source_identity, processing_profile)
+        .ok_or_else(|| "forecast timeline has no run origin".to_string())?;
+    Ok((plans, run))
+}
+
 fn process_paths(
     paths: &[PathBuf],
     store_root: &Path,
@@ -205,6 +392,12 @@ fn process_paths(
     if paths.is_empty() {
         return Err("No WRF files selected".to_string());
     }
+    // `spawn_process_paths` normalizes at the public boundary, but keeping the
+    // worker itself canonical makes direct/internal callers obey the same
+    // filtering semantics and guarantees the profile key describes the plan
+    // actually executed.
+    let normalized_options = options.clone().normalized();
+    let options = &normalized_options;
 
     let mut files = paths
         .iter()
@@ -216,77 +409,186 @@ fn process_paths(
         return Err("No supported WRF files selected".to_string());
     }
 
+    let source_snapshot = crate::local_import::capture_source_set_identity(&files)?;
+    let source_identity = &source_snapshot.identity;
+    // A store hour is replaced as a unit. Keep every full-processing plan in
+    // its own run so a later core-only/custom import cannot erase fields from
+    // an earlier default or heavy import of the exact same source files.
+    let processing_profile = processing_profile_suffix(options);
     let model = "wrf".to_string();
-    let run = process_run_name(&files);
+    let (plans, run) = preflight_wrf_sources(
+        &files,
+        source_identity,
+        &processing_profile,
+        tx,
+    )?;
+    let publisher = crate::local_import::RunStagingPublisher::new(store_root, &model, &run)?;
+    let staging_store_root = publisher.staging_store_root().to_path_buf();
     let mut written = Vec::<WrittenHour>::new();
     let mut all_vars = Vec::<String>::new();
     let mut all_notes = Vec::<String>::new();
 
-    for path in &files {
-        if written.len() > u16::MAX as usize {
-            return Err(format!("Too many WRF times to store: {}", written.len()));
-        }
-        // Post-processed climate wrfout (CONUS-I/II, GDEX: derived TK/Z/P, no
-        // raw T/PB) — wrf-core can't open these, so route them through the
-        // netcrust-based reader before falling through to the raw path.
-        match crate::local_import::try_postprocessed_wrf(path) {
-            Ok(Some((canonical, volumes))) => {
-                let hour = u16::try_from(written.len()).expect("bounded above");
-                let _ = tx.send(WrfProcessMessage::Progress(format!(
-                    "Reading post-processed WRF {} -> f{hour:03}",
-                    display_name(path)
-                )));
-                let refs = canonical
-                    .iter()
-                    .map(|(name, field)| (name.as_str(), field))
-                    .collect::<Vec<_>>();
-                let volume_inputs = volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
-                let result = write_hour_from_fields_with_derived(
-                    store_root,
-                    &model,
-                    &run,
-                    hour,
-                    &refs,
-                    &[],
-                    &volume_inputs,
-                    writer_build(),
-                    now_unix(),
-                )
-                .map_err(|err| format!("Write WRF f{hour:03} failed: {err}"))?;
-                all_vars.extend(result.vars.iter().cloned());
-                written.push(result);
-                continue;
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return Err(format!("Process WRF {} failed: {err}", path.display()));
-            }
-        }
-
+    for plan in &plans {
+        let path = &plan.path;
         let _ = tx.send(WrfProcessMessage::Progress(format!(
             "Opening WRF {}",
             display_name(path)
         )));
-        let file = WrfFile::open(path)
-            .map_err(|err| format!("Open WRF {} failed: {err}", path.display()))?;
-
-        for timeidx in 0..file.nt {
-            if written.len() > u16::MAX as usize {
-                return Err(format!("Too many WRF times to store: {}", written.len()));
+        // Probe the raw wrf-core reader FIRST: raw wrfouts are the common
+        // wrench-flow case and the probe fails fast on post-processed files
+        // (they carry no raw T). The previous order ran netcrust::open's
+        // eager NetCDF-4 metadata indexing (~57 s on a 2 GB compressed
+        // wrfout, docs/wrf-import-large-grids.md) on EVERY raw file just to
+        // conclude "not post-processed". The two detectors cannot overlap:
+        // raw files have T (wrf-core opens), post-processed have TK/Z/P and
+        // no PB (netcrust path claims them).
+        if plan.kind == WrfSourceKind::Postprocessed {
+            let nc = netcrust::open(path)
+                .map_err(|err| format!("Open post-processed WRF {} failed: {err}", path.display()))?;
+            let compute_postproc_severe = crate::postproc_severe::APPROX_SEVERE_SLUGS
+                .iter()
+                .any(|slug| {
+                    let slug = *slug;
+                    options.should_process(slug, Some(slug), WrfProductGroup::Diagnostic)
+                });
+            for record in &plan.records {
+                let hour = record.forecast_hour;
+            // Post-processed climate wrfout (CONUS-I/II, GDEX: derived
+            // TK/Z/P, no raw T/PB) — wrf-core can't open these, so route
+            // them through the netcrust-based reader before reporting the
+            // raw open error below.
+            match crate::local_import::try_postprocessed_wrf_shared(
+                &nc,
+                path,
+                record.time_index,
+                compute_postproc_severe,
+                &mut |message: String| {
+                    let _ = tx.send(WrfProcessMessage::Progress(message));
+                },
+            ) {
+                Ok(Some((canonical, severe, volumes, raw_2d))) => {
+                    let _ = tx.send(WrfProcessMessage::Progress(format!(
+                        "Reading post-processed WRF {} time {} ({}) -> f{hour:03}",
+                        display_name(path),
+                        record.time_index,
+                        record.label
+                    )));
+                    let Some((_, grid_field)) = canonical.first() else {
+                        return Err(format!(
+                            "Post-processed WRF {} did not provide a grid-bearing field",
+                            path.display()
+                        ));
+                    };
+                    let refs = canonical
+                        .iter()
+                        .filter(|(name, _)| {
+                            options.should_process(name, Some(name), WrfProductGroup::Core)
+                        })
+                        .map(|(name, field)| (name.as_str(), field))
+                        .collect::<Vec<_>>();
+                    // Approximate post-processed severe/thermo suite. Its
+                    // `approx_*` namespace deliberately cannot masquerade as
+                    // the raw-wrfout getvar diagnostics.
+                    let mut derived_refs = severe
+                        .iter()
+                        .filter(|field| {
+                            options.should_process(
+                                field.name,
+                                Some(field.name),
+                                WrfProductGroup::Diagnostic,
+                            )
+                        })
+                        .map(|field| DerivedFieldInput {
+                            name: field.name,
+                            units: field.units,
+                            values: field.values.as_slice(),
+                        })
+                        .collect::<Vec<_>>();
+                    // Raw `wrf_*` planes from the 2-D wrf2d route (empty on
+                    // the 3-D route) — the wrench flow imports pure surface
+                    // archives the same way the light import does.
+                    derived_refs.extend(
+                        raw_2d
+                            .iter()
+                            .filter(|field| {
+                                options.should_process(
+                                    field.name.as_str(),
+                                    Some(field.name.as_str()),
+                                    WrfProductGroup::Raw,
+                                )
+                            })
+                            .map(|field| DerivedFieldInput {
+                                name: field.name.as_str(),
+                                units: field.units.as_str(),
+                                values: field.values.as_slice(),
+                            }),
+                    );
+                    let volume_inputs = if options.core_fields {
+                        volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    if refs.is_empty() && derived_refs.is_empty() && volume_inputs.is_empty() {
+                        return Err(format!(
+                            "Post-processed WRF {} produced no fields for the selected processing options",
+                            path.display()
+                        ));
+                    }
+                    let result = write_hour_from_grid_with_derived(
+                        &staging_store_root,
+                        &model,
+                        &run,
+                        hour,
+                        &grid_field.grid,
+                        grid_field.projection.as_ref(),
+                        &refs,
+                        &derived_refs,
+                        &volume_inputs,
+                        writer_build(),
+                        now_unix(),
+                    )
+                    .map_err(|err| format!("Write WRF f{hour:03} failed: {err}"))?;
+                    all_vars.extend(result.vars.iter().cloned());
+                    written.push(result);
+                    continue;
+                }
+                Ok(None) => {
+                    return Err(format!(
+                        "Open WRF {} failed and the file is not a supported post-processed WRF archive",
+                        path.display()
+                    ));
+                }
+                Err(err) => {
+                    return Err(format!("Process WRF {} failed: {err}", path.display()));
+                }
             }
-            let hour = u16::try_from(written.len()).expect("bounded above");
+            }
+            continue;
+        }
+
+        let file = isolate_panics("open WRF file", || {
+            WrfFile::open(path).map_err(|err| err.to_string())
+        })
+        .map_err(|err| format!("Open WRF {} failed after preflight: {err}", path.display()))?;
+        for record in &plan.records {
+            let timeidx = record.time_index;
+            let hour = record.forecast_hour;
             let _ = tx.send(WrfProcessMessage::Progress(format!(
-                "Computing WRF {} time {} -> f{hour:03}",
+                "Computing WRF {} time {} ({}) -> f{hour:03}",
                 display_name(path),
-                timeidx
+                timeidx,
+                record.label
             )));
             let mut progress = |message: String| {
                 let _ = tx.send(WrfProcessMessage::Progress(message));
             };
             let fields = read_wrf_products(&file, path, timeidx, options, &mut progress)?;
-            if fields.canonical.is_empty() {
+            if fields.canonical.is_empty()
+                && fields.derived.is_empty()
+                && fields.volumes.is_empty()
+            {
                 return Err(format!(
-                    "WRF {} time {} produced no canonical 2D grid fields",
+                    "WRF {} time {} produced no fields for the selected processing options",
                     path.display(),
                     timeidx
                 ));
@@ -311,11 +613,13 @@ fn process_paths(
                 .iter()
                 .map(IsoVolume::as_input)
                 .collect::<Vec<_>>();
-            let result = write_hour_from_fields_with_derived(
-                store_root,
+            let result = write_hour_from_grid_with_derived(
+                &staging_store_root,
                 &model,
                 &run,
                 hour,
+                &fields.grid,
+                fields.projection.as_ref(),
                 &refs,
                 &derived_refs,
                 &volume_inputs,
@@ -333,6 +637,11 @@ fn process_paths(
     all_vars.dedup();
     all_notes.sort();
     all_notes.dedup();
+    crate::local_import::verify_source_set_unchanged(&source_snapshot)?;
+    let _ = tx.send(WrfProcessMessage::Progress(format!(
+        "Publishing complete WRF run {model}/{run}"
+    )));
+    publisher.publish()?;
     Ok(WrfProcessSummary {
         store_root: store_root.to_path_buf(),
         model,
@@ -351,13 +660,15 @@ fn read_wrf_products(
     options: &WrfProcessOptions,
     progress: &mut impl FnMut(String),
 ) -> Result<WrfHourFields, String> {
+    // Validate hostile/corrupt dimensions before xlat/xlong can allocate
+    // coordinate planes. GridShape owns the shared desktop cell ceiling.
+    let shape = GridShape::new(file.nx, file.ny).map_err(|err| err.to_string())?;
     let lat = file
         .xlat(timeidx)
         .map_err(|err| format!("Read XLAT from {} failed: {err}", path.display()))?;
     let lon = file
         .xlong(timeidx)
         .map_err(|err| format!("Read XLONG from {} failed: {err}", path.display()))?;
-    let shape = GridShape::new(file.nx, file.ny).map_err(|err| err.to_string())?;
     if lat.len() != shape.len() || lon.len() != shape.len() {
         return Err(format!(
             "WRF {} grid mismatch: expected {} cells, got lat {} lon {}",
@@ -376,6 +687,8 @@ fn read_wrf_products(
     let projection = wrf_projection(file);
 
     let mut fields = WrfHourFields {
+        grid: grid.clone(),
+        projection: projection.clone(),
         canonical: Vec::new(),
         derived: Vec::new(),
         volumes: Vec::new(),
@@ -424,18 +737,57 @@ fn read_wrf_products(
         FieldSelector::height_agl(CanonicalField::RelativeHumidity, 2),
         Some("%")
     );
-    push_core!(
-        "U10",
-        "u_10m",
-        FieldSelector::height_agl(CanonicalField::UWind, 10),
-        Some("m/s")
-    );
-    push_core!(
-        "V10",
-        "v_10m",
-        FieldSelector::height_agl(CanonicalField::VWind, 10),
-        Some("m/s")
-    );
+    // WRF's raw U10/V10 components are grid-relative. Ask wrf-core for
+    // `uvmet10` once, then split its [u_earth, v_earth] planes so the canonical
+    // store names and sounding wind barbs are genuinely earth-relative. Keep
+    // U10/V10 as the option-filter keys so saved `only`/`skip` profiles retain
+    // their existing meaning.
+    let want_u10 =
+        options.should_process("U10", Some("u_10m"), WrfProductGroup::Core);
+    let want_v10 =
+        options.should_process("V10", Some("v_10m"), WrfProductGroup::Core);
+    if want_u10 || want_v10 {
+        match compute_var(file, "uvmet10", timeidx, Some("m/s"))
+            .and_then(|output| split_uvmet10(output, shape.len()))
+        {
+            Ok((u_earth, v_earth, units)) => {
+                if want_u10 {
+                    push_canonical_values(
+                        &mut fields,
+                        &grid,
+                        projection.clone(),
+                        "u_10m",
+                        FieldSelector::height_agl(CanonicalField::UWind, 10),
+                        &units,
+                        u_earth,
+                    );
+                }
+                if want_v10 {
+                    push_canonical_values(
+                        &mut fields,
+                        &grid,
+                        projection.clone(),
+                        "v_10m",
+                        FieldSelector::height_agl(CanonicalField::VWind, 10),
+                        &units,
+                        v_earth,
+                    );
+                }
+            }
+            Err(err) => {
+                if want_u10 {
+                    fields
+                        .notes
+                        .push(format!("u_10m unavailable: earth-rotated uvmet10: {err}"));
+                }
+                if want_v10 {
+                    fields
+                        .notes
+                        .push(format!("v_10m unavailable: earth-rotated uvmet10: {err}"));
+                }
+            }
+        }
+    }
     push_core!(
         "wspd10",
         "wind_speed_10m",
@@ -487,27 +839,32 @@ fn read_wrf_products(
         Some("m2/s2")
     );
 
-    if options.should_process("apcp", Some("apcp"), WrfProductGroup::Core)
-        && let Some(values) = total_precip(file, timeidx, shape.len())
-    {
-        push_canonical_values(
-            &mut fields,
-            &grid,
-            projection.clone(),
-            "apcp",
-            FieldSelector::surface(CanonicalField::TotalPrecipitation),
-            "kg/m^2",
-            values,
-        );
+    if options.should_process("apcp", Some("apcp"), WrfProductGroup::Core) {
+        if let Some(values) = total_precip(file, timeidx, shape.len()) {
+            push_canonical_values(
+                &mut fields,
+                &grid,
+                projection.clone(),
+                "apcp",
+                FieldSelector::surface(CanonicalField::TotalPrecipitation),
+                "kg/m^2",
+                values,
+            );
+        }
     }
 
     let total_twod = VARS
         .iter()
-        .filter(|def| def.dim == VarDim::TwoD && !matches!(def.name, "lat" | "lon" | "cape2d"))
+        .filter(|def| {
+            def.dim == VarDim::TwoD
+                && !matches!(def.name, "lat" | "lon" | "cape2d" | "cape2d_wrfpython")
+        })
         .count();
     let mut diagnostic_index = 0usize;
     for def in VARS {
-        if def.dim != VarDim::TwoD || matches!(def.name, "lat" | "lon" | "cape2d") {
+        if def.dim != VarDim::TwoD
+            || matches!(def.name, "lat" | "lon" | "cape2d" | "cape2d_wrfpython")
+        {
             continue;
         }
         let store_name = derived_name(def.name, None);
@@ -532,27 +889,13 @@ fn read_wrf_products(
         }
     }
 
-    for raw in [
-        "PBLH",
-        "HFX",
-        "LH",
-        "SWDOWN",
-        "GLW",
-        "OLR",
-        "TSK",
-        "SST",
-        "SNOWNC",
-        "GRAUPELNC",
-        "WSPD10MAX",
-        "UP_HELI_MAX",
-    ] {
+    for raw in RAW_EXTRA_CATALOG {
         let store_name = derived_name(raw, None);
         if !options.should_process(raw, Some(&store_name), WrfProductGroup::Raw) {
             continue;
         }
-        match compute_var(file, raw, timeidx, None) {
-            Ok(output) => push_derived_output(&mut fields, raw, output, shape.len()),
-            Err(_) => {}
+        if let Ok(output) = compute_var(file, raw, timeidx, None) {
+            push_derived_output(&mut fields, raw, output, shape.len());
         }
     }
 
@@ -560,14 +903,39 @@ fn read_wrf_products(
     // height_iso) so imported WRF runs produce skew-T soundings like the
     // downloaded models. Failure here never fails the hour — the 2D fields
     // still write; only the sounding is unavailable.
+    //
+    // NOTE: wrf-core's per-timestep intermediate cache must stay WARM into
+    // this block. The volume build re-getvars pressure/temp/td/height/uvmet;
+    // with the cache populated by the diagnostics above those are cheap
+    // copies (measured peak 8.85 GB on the 800x800x79 Enderlin grid).
+    // Clearing the cache first was measured to more than DOUBLE the peak
+    // (18.3 GB): every read then recomputes its whole dependency chain
+    // (staggered reads, destaggering, theta->T, …) with multi-hundred-MB
+    // transients stacking on the re-growing cache. `build_iso_volumes` itself
+    // clears the cache right after its LAST getvar (the hour's last), so the
+    // interpolation loop and the store write below run without the ~5 GB of
+    // dead intermediates.
     if options.core_fields {
-        match build_iso_volumes(file, timeidx, shape.len()) {
+        // Isolated for the same reason as `compute_var`: the volume builder's
+        // `getvar` reads must degrade to a note, not kill the hour.
+        let volumes_result = isolate_panics("isobaric volumes", || {
+            build_iso_volumes(file, timeidx, shape.len(), progress)
+        });
+        match volumes_result {
             Ok((volumes, surface)) => {
                 fields.volumes = volumes;
                 // Split wrf3d files (CONUS404 / GDEX CONUS-II) omit PSFC (and
-                // sometimes T2/Td2/winds); synthesize any missing surface field
-                // from the lowest model level so the sounding still builds.
-                fill_missing_surface(&mut fields, &grid, projection.clone(), surface);
+                // sometimes T2/Td2/winds). Preserve their lowest-model-level
+                // substitutes under explicit `approx_*` names so they remain
+                // usable for a sounding without pretending to be true 2 m/10 m
+                // observations or diagnostics.
+                fill_missing_surface(
+                    &mut fields,
+                    &grid,
+                    projection.clone(),
+                    surface,
+                    options,
+                );
             }
             Err(err) => fields
                 .notes
@@ -575,54 +943,105 @@ fn read_wrf_products(
         }
     }
 
+    // Release wrf-core's per-timestep intermediate cache before the caller
+    // writes the hour to the store. `getvar` memoizes every 3-D f64
+    // intermediate (pressure, theta, temperature, geopotential, heights,
+    // QVAPOR, destaggered winds, …) inside `WrfFile` and only evicts when the
+    // *timestep changes* (`prepare_cache_for_time`); its `clear_cache` is
+    // never invoked upstream despite its doc comment. On a 250 m Enderlin
+    // grid (800x800x79 ≈ 50.5 M cells, ~400 MB per cached field) that cache
+    // holds ~5 GB. Dropping it here — after the hour's last `getvar`, before
+    // `write_hour_from_fields_with_derived` — releases that memory for the
+    // write phase and beyond at zero recompute cost (measured: working set
+    // fell 8.8 GB -> 1.3 GB at this point instead of riding the write).
+    // Usually a no-op now that `build_iso_volumes` clears after its last
+    // getvar, but still load-bearing when `core_fields` is off (no volume
+    // build) or the volume build failed partway. catch_unwind: if a caught
+    // diagnostic panic above poisoned the cache mutex, clearing would
+    // re-panic; a stuck cache must not fail the hour.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| file.clear_cache()));
+
     Ok(fields)
 }
 
-/// Add any skew-T surface field the file did not already provide, using the
-/// lowest-model-level [`SurfaceFallback`]. Real 2D fields (T2, U10, V10, …)
-/// already pushed win; only the genuinely-missing ones (chiefly
-/// `surface_pressure`) are synthesized.
+/// Add lowest-model-level [`SurfaceFallback`] values for skew-T use when the
+/// file did not provide the real surface product. These are approximations,
+/// not true PSFC/T2/Td2/U10/V10 values, so they stay under explicit
+/// `approx_*` store names and surface selectors; an exact counterpart always
+/// wins.
 fn fill_missing_surface(
     fields: &mut WrfHourFields,
     grid: &LatLonGrid,
     projection: Option<GridProjection>,
     surface: SurfaceFallback,
+    options: &WrfProcessOptions,
 ) {
-    let entries: [(&str, FieldSelector, &str, Vec<f32>); 5] = [
+    let entries: [(&str, &str, &str, FieldSelector, &str, Vec<f32>); 5] = [
         (
+            "PSFC",
             "surface_pressure",
+            "approx_surface_pressure",
             FieldSelector::surface(CanonicalField::Pressure),
             "Pa",
             surface.surface_pressure_pa,
         ),
         (
+            "t2",
             "temperature_2m",
-            FieldSelector::height_agl(CanonicalField::Temperature, 2),
+            "approx_temperature_2m",
+            FieldSelector::surface(CanonicalField::Temperature),
             "K",
             surface.temperature_2m_k,
         ),
         (
+            "dp2m",
             "dewpoint_2m",
-            FieldSelector::height_agl(CanonicalField::Dewpoint, 2),
+            "approx_dewpoint_2m",
+            FieldSelector::surface(CanonicalField::Dewpoint),
             "K",
             surface.dewpoint_2m_k,
         ),
         (
+            "U10",
             "u_10m",
-            FieldSelector::height_agl(CanonicalField::UWind, 10),
+            "approx_u_10m",
+            FieldSelector::surface(CanonicalField::UWind),
             "m/s",
             surface.u_10m,
         ),
         (
+            "V10",
             "v_10m",
-            FieldSelector::height_agl(CanonicalField::VWind, 10),
+            "approx_v_10m",
+            FieldSelector::surface(CanonicalField::VWind),
             "m/s",
             surface.v_10m,
         ),
     ];
-    for (name, selector, units, values) in entries {
-        if !fields.canonical.iter().any(|(existing, _)| existing == name) {
-            push_canonical_values(fields, grid, projection.clone(), name, selector, units, values);
+    for (source_name, exact_name, approx_name, selector, units, values) in entries {
+        if !options.should_process(source_name, Some(approx_name), WrfProductGroup::Core) {
+            continue;
+        }
+        let exact_exists = fields
+            .canonical
+            .iter()
+            .any(|(existing, _)| existing == exact_name);
+        if !exact_exists {
+            let previous_len = fields.canonical.len();
+            push_canonical_values(
+                fields,
+                grid,
+                projection.clone(),
+                approx_name,
+                selector,
+                units,
+                values,
+            );
+            if fields.canonical.len() > previous_len {
+                fields.notes.push(format!(
+                    "{approx_name} synthesized from the lowest WRF model level because {exact_name} was unavailable"
+                ));
+            }
         }
     }
 }
@@ -688,29 +1107,84 @@ fn push_derived_output(
 ) {
     let units = output.units.clone();
     match output.shape.as_slice() {
-        [ny, nx] if ny * nx == cells => {
+        [ny, nx] => {
+            let plane_cells = match checked_horizontal_cells(*ny, *nx) {
+                Ok(value) => value,
+                Err(err) => {
+                    fields.notes.push(format!("{wrf_name} skipped: {err}"));
+                    return;
+                }
+            };
+            if plane_cells != cells || output.data.len() != cells {
+                fields.notes.push(format!(
+                    "{wrf_name} skipped: shape {:?} describes {plane_cells} cells and carries {} values; expected {cells}",
+                    output.shape,
+                    output.data.len()
+                ));
+                return;
+            }
             fields.derived.push(OwnedDerivedField {
                 name: derived_name(wrf_name, None),
                 units,
                 values: clean_values(&output.data),
             });
         }
-        [count, ny, nx] if ny * nx == cells => {
-            for index in 0..*count {
-                let start = index * cells;
-                let end = start + cells;
-                if end > output.data.len() {
+        [count, ny, nx] => {
+            let plane_cells = match checked_horizontal_cells(*ny, *nx) {
+                Ok(value) => value,
+                Err(err) => {
+                    fields.notes.push(format!("{wrf_name} skipped: {err}"));
+                    return;
+                }
+            };
+            if plane_cells != cells {
+                fields.notes.push(format!(
+                    "{wrf_name} skipped: shape {:?} describes {plane_cells} cells per plane; expected {cells}",
+                    output.shape
+                ));
+                return;
+            }
+            let expected_values = match count.checked_mul(cells) {
+                Some(value) => value,
+                None => {
                     fields.notes.push(format!(
-                        "{wrf_name} skipped split {index}: shape {:?} exceeded data length {}",
-                        output.shape,
-                        output.data.len()
+                        "{wrf_name} skipped: component count {count} times {cells} cells overflows the platform address space"
                     ));
                     return;
                 }
+            };
+            if output.data.len() != expected_values {
+                fields.notes.push(format!(
+                    "{wrf_name} skipped: shape {:?} requires {expected_values} values, got {}",
+                    output.shape,
+                    output.data.len()
+                ));
+                return;
+            }
+            for index in 0..*count {
+                let Some(start) = index.checked_mul(cells) else {
+                    fields.notes.push(format!(
+                        "{wrf_name} skipped split {index}: component offset overflow"
+                    ));
+                    return;
+                };
+                let Some(end) = start.checked_add(cells) else {
+                    fields.notes.push(format!(
+                        "{wrf_name} skipped split {index}: component end offset overflow"
+                    ));
+                    return;
+                };
+                let Some(values) = output.data.get(start..end) else {
+                    fields.notes.push(format!(
+                        "{wrf_name} skipped split {index}: offsets {start}..{end} exceeded data length {}",
+                        output.data.len()
+                    ));
+                    return;
+                };
                 fields.derived.push(OwnedDerivedField {
                     name: derived_name(wrf_name, Some(index)),
                     units: units.clone(),
-                    values: clean_values(&output.data[start..end]),
+                    values: clean_values(values),
                 });
             }
         }
@@ -722,11 +1196,71 @@ fn push_derived_output(
 }
 
 fn single_plane(output: VarOutput, cells: usize) -> Result<(Vec<f32>, String), String> {
-    match output.shape.as_slice() {
-        [ny, nx] if ny * nx == cells => Ok((clean_values(&output.data), output.units)),
-        [1, ny, nx] if ny * nx == cells => Ok((clean_values(&output.data), output.units)),
-        other => Err(format!("expected [ny,nx], got {other:?}")),
+    let (ny, nx) = match output.shape.as_slice() {
+        [ny, nx] | [1, ny, nx] => (*ny, *nx),
+        other => return Err(format!("expected [ny,nx], got {other:?}")),
+    };
+    let plane_cells = checked_horizontal_cells(ny, nx)?;
+    if plane_cells != cells {
+        return Err(format!(
+            "shape {:?} describes {plane_cells} cells, expected {cells}",
+            output.shape
+        ));
     }
+    if output.data.len() != cells {
+        return Err(format!(
+            "shape {:?} requires {cells} values, got {}",
+            output.shape,
+            output.data.len()
+        ));
+    }
+    Ok((clean_values(&output.data), output.units))
+}
+
+/// Split wrf-core's earth-rotated `uvmet10` result into canonical 2-D planes.
+/// The diagnostic contract is `[2, ny, nx]`; validating both the advertised
+/// shape and backing length keeps malformed output from being mistaken for a
+/// pair of surface components.
+fn split_uvmet10(output: VarOutput, cells: usize) -> Result<(Vec<f32>, Vec<f32>, String), String> {
+    let [components, ny, nx] = output.shape.as_slice() else {
+        return Err(format!(
+            "expected uvmet10 shape [2,ny,nx], got {:?}",
+            output.shape
+        ));
+    };
+    if *components != 2 {
+        return Err(format!(
+            "expected two uvmet10 components, got shape {:?}",
+            output.shape
+        ));
+    }
+    let plane_cells = checked_horizontal_cells(*ny, *nx)?;
+    if plane_cells != cells {
+        return Err(format!(
+            "uvmet10 shape {:?} describes {plane_cells} cells per component, expected {cells}",
+            output.shape
+        ));
+    }
+    let expected_values = (*components)
+        .checked_mul(cells)
+        .ok_or_else(|| "uvmet10 component length overflows the platform address space".to_string())?;
+    if output.data.len() != expected_values {
+        return Err(format!(
+            "uvmet10 shape {:?} requires {expected_values} values, got {}",
+            output.shape,
+            output.data.len()
+        ));
+    }
+    let (u, v) = output.data.split_at(cells);
+    Ok((clean_values(u), clean_values(v), output.units))
+}
+
+fn checked_horizontal_cells(ny: usize, nx: usize) -> Result<usize, String> {
+    ny.checked_mul(nx).ok_or_else(|| {
+        format!(
+            "horizontal dimensions [{ny}, {nx}] overflow the platform address space"
+        )
+    })
 }
 
 fn compute_var(
@@ -739,7 +1273,35 @@ fn compute_var(
         units: units.map(str::to_string),
         ..ComputeOpts::default()
     };
-    getvar(file, name, Some(timeidx), &opts).map_err(|err| err.to_string())
+    // Isolate each diagnostic: a panic inside wrf-core (or a crate it calls
+    // into, e.g. ecape-rs) on a pathological grid/profile must cost that ONE
+    // field — recorded as a note — not the whole multi-minute import. Without
+    // this, the unwind kills the rw-ui-wrf-process worker and the entire
+    // import dies with "WRF worker stopped unexpectedly".
+    isolate_panics(name, || {
+        getvar(file, name, Some(timeidx), &opts).map_err(|err| err.to_string())
+    })
+}
+
+/// Run `f`, converting a panic into an `Err` naming `what`, so one failing
+/// field computation degrades to a per-field note instead of unwinding the
+/// import worker thread (shared with `local_import`'s volume build, which
+/// needs the same guarantee). Inputs are shared references plus `WrfFile`'s
+/// internal mutex (which poisons — and is then handled — rather than being
+/// observed broken) and progress closures that only append/send messages,
+/// so `AssertUnwindSafe` is sound here.
+pub(crate) fn isolate_panics<T>(
+    what: &str,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|msg| (*msg).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        Err(format!("panicked computing {what}: {message}"))
+    })
 }
 
 fn total_precip(file: &WrfFile, timeidx: usize, cells: usize) -> Option<Vec<f32>> {
@@ -799,7 +1361,10 @@ fn derived_name(wrf_name: &str, split_index: Option<usize>) -> String {
         .unwrap_or_else(|| format!("wrf_{base}"))
 }
 
-fn wrf_product_slug(base: &str) -> Option<&'static str> {
+/// Canonical store names for authoritative raw-wrfout diagnostics. The
+/// post-processed approximation tests strip their mandatory `approx_` prefix
+/// and verify the remaining diagnostic family against this map.
+pub(crate) fn wrf_product_slug(base: &str) -> Option<&'static str> {
     match base {
         "sbcape" => Some("sbcape"),
         "sbcin" => Some("sbcin"),
@@ -846,50 +1411,61 @@ fn wrf_product_slug(base: &str) -> Option<&'static str> {
 }
 
 fn wrf_projection(file: &WrfFile) -> Option<GridProjection> {
-    match wrf_core::WrfProjection::from_file(file).ok()? {
-        wrf_core::WrfProjection::Lambert {
-            truelat1,
-            truelat2,
-            stand_lon,
-            ..
-        } => Some(GridProjection::LambertConformal {
-            standard_parallel_1_deg: truelat1,
-            standard_parallel_2_deg: truelat2,
-            central_meridian_deg: stand_lon,
+    let map_proj = file.global_attr_i32("MAP_PROJ").ok()?;
+    match map_proj {
+        1 => {
+            let truelat1 = file.global_attr_f64("TRUELAT1").ok()?;
+            let truelat2 = crate::local_import::normalize_lambert_truelat2(
+                truelat1,
+                file.global_attr_f64("TRUELAT2").ok(),
+            );
+            let stand_lon = file
+                .global_attr_f64("STAND_LON")
+                .ok()
+                .or_else(|| file.global_attr_f64("CEN_LON").ok())?;
+            Some(GridProjection::LambertConformal {
+                standard_parallel_1_deg: truelat1,
+                standard_parallel_2_deg: truelat2,
+                central_meridian_deg: stand_lon,
+            })
+        }
+        2 => {
+            let truelat1 = file.global_attr_f64("TRUELAT1").ok()?;
+            let stand_lon = file
+                .global_attr_f64("STAND_LON")
+                .ok()
+                .or_else(|| file.global_attr_f64("CEN_LON").ok())?;
+            Some(GridProjection::PolarStereographic {
+                true_latitude_deg: truelat1,
+                central_meridian_deg: stand_lon,
+                // wrf-python chooses the pole from TRUELAT1. CEN_LAT can have
+                // the opposite sign for a nested domain and is not authoritative.
+                south_pole_on_projection_plane:
+                    crate::local_import::wrf_polar_uses_south_pole(truelat1),
+            })
+        }
+        3 => Some(GridProjection::Mercator {
+            latitude_of_true_scale_deg: file.global_attr_f64("TRUELAT1").unwrap_or(0.0),
+            central_meridian_deg: crate::local_import::wrf_mercator_central_longitude(
+                file.global_attr_f64("STAND_LON").ok(),
+            ),
         }),
-        wrf_core::WrfProjection::PolarStereographic {
-            truelat1,
-            stand_lon,
-            ..
-        } => Some(GridProjection::PolarStereographic {
-            true_latitude_deg: truelat1,
-            central_meridian_deg: stand_lon,
-            south_pole_on_projection_plane: false,
-        }),
-        wrf_core::WrfProjection::Mercator {
-            truelat1, cen_lon, ..
-        } => Some(GridProjection::Mercator {
-            latitude_of_true_scale_deg: truelat1,
-            central_meridian_deg: cen_lon,
-        }),
-        wrf_core::WrfProjection::LatLon { .. } => Some(GridProjection::Geographic),
+        6 if crate::local_import::wrf_latlon_is_unrotated(
+            file.global_attr_f64("POLE_LAT").ok(),
+            file.global_attr_f64("POLE_LON").ok(),
+        ) => Some(GridProjection::Geographic),
+        // GridProjection has no rotated-pole representation. The caller still
+        // supplies the exact curvilinear XLAT/XLONG grid, so None is accurate.
+        6 => None,
+        _ => None,
     }
 }
 
-fn process_run_name(files: &[PathBuf]) -> String {
-    let first = files
-        .first()
-        .and_then(|path| path.file_name())
-        .and_then(|value| value.to_str())
-        .unwrap_or("wrfout");
-    if let Some(stamp) = parse_wrf_timestamp(first) {
-        format!("local_{stamp}")
-    } else {
-        format!("local_{}", now_unix())
-    }
-}
-
-fn parse_wrf_timestamp(name: &str) -> Option<String> {
+/// Extract a sortable `YYYYMMDDHHMMSS` stamp from a wrfout-style filename
+/// (`wrfout_d03_2025-06-21_01_30_00` / `..._01:30:00`). Shared with
+/// `wrf_radar`'s multi-file loop ordering, which must sort frames by model
+/// time rather than raw filename.
+pub(crate) fn parse_wrf_timestamp(name: &str) -> Option<String> {
     for token in name.split(['.', '/', '\\']) {
         let bytes = token.as_bytes();
         if bytes.len() < 19 {
@@ -958,6 +1534,45 @@ fn normalize_filter_tokens(tokens: Vec<String>) -> Vec<String> {
     normalized
 }
 
+/// Stable store-key suffix for a full WRF processing plan. Hash the normalized
+/// option contract (rather than caller order or formatting) so semantically
+/// equivalent filter lists share a run while any option capable of changing
+/// the realized field set gets a distinct run. FNV-1a is explicit here because
+/// the standard library's hash implementation is not a persistent-format API.
+fn processing_profile_suffix(options: &WrfProcessOptions) -> String {
+    let normalized = options.clone().normalized();
+    let mut hash = profile_hash_update(PROFILE_FNV64_OFFSET, b"rw-wrf-profile-v1\0");
+    hash = profile_hash_update(
+        hash,
+        &[
+            u8::from(normalized.core_fields),
+            u8::from(normalized.diagnostics),
+            u8::from(normalized.heavy_ecape),
+            u8::from(normalized.raw_extras),
+        ],
+    );
+    for (label, tokens) in [
+        (b"only".as_slice(), normalized.only.as_slice()),
+        (b"skip".as_slice(), normalized.skip.as_slice()),
+    ] {
+        hash = profile_hash_update(hash, label);
+        hash = profile_hash_update(hash, &(tokens.len() as u64).to_le_bytes());
+        for token in tokens {
+            hash = profile_hash_update(hash, &(token.len() as u64).to_le_bytes());
+            hash = profile_hash_update(hash, token.as_bytes());
+        }
+    }
+    format!("full_{hash:016x}")
+}
+
+fn profile_hash_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PROFILE_FNV64_PRIME);
+    }
+    hash
+}
+
 fn product_filter_keys(wrf_name: &str, store_name: Option<&str>) -> Vec<String> {
     let mut keys = Vec::new();
     push_filter_key(&mut keys, wrf_name);
@@ -986,10 +1601,15 @@ fn filter_token_matches(key: &str, token: &str) -> bool {
 
 fn is_heavy_wrf_diagnostic(name: &str) -> bool {
     let key = slug(name);
+    // "ncape" is a full ecape-rs solve (normalized CAPE) but does not
+    // literally contain "ecape", so without the explicit match it leaks
+    // into the default pass at ~10 s/file on an 800x800x79 grid; in the
+    // Heavy group it rides the ecape stack cache for milliseconds.
     key.contains("ecape")
         || matches!(
             key.as_str(),
-            "sbecape"
+            "ncape"
+                | "sbecape"
                 | "mlecape"
                 | "muecape"
                 | "sbncape"
@@ -1014,7 +1634,12 @@ fn display_name(path: &Path) -> String {
 }
 
 fn writer_build() -> &'static str {
-    concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"))
+    concat!(
+        env!("CARGO_PKG_NAME"),
+        " ",
+        env!("CARGO_PKG_VERSION"),
+        " science_v1"
+    )
 }
 
 fn now_unix() -> u64 {
@@ -1047,6 +1672,129 @@ mod tests {
         assert_eq!(derived_name("sbcape", None), "sbcape");
         assert_eq!(derived_name("srh1", None), "srh_0_1km");
         assert_eq!(derived_name("shear_0_6km", None), "bulk_shear_0_6km");
+    }
+
+    #[test]
+    fn uvmet10_split_requires_two_complete_earth_relative_planes() {
+        let output = VarOutput {
+            data: vec![1.0, 2.0, 3.0, 4.0],
+            shape: vec![2, 1, 2],
+            units: "m/s".to_string(),
+            description: "earth-relative 10 m wind".to_string(),
+        };
+        let (u, v, units) = split_uvmet10(output, 2).expect("valid uvmet10 split");
+        assert_eq!(u, vec![1.0, 2.0]);
+        assert_eq!(v, vec![3.0, 4.0]);
+        assert_eq!(units, "m/s");
+
+        let malformed = VarOutput {
+            data: vec![1.0, 2.0, 3.0, 4.0],
+            shape: vec![1, 2, 2],
+            units: "m/s".to_string(),
+            description: "malformed wind".to_string(),
+        };
+        assert!(
+            split_uvmet10(malformed, 4)
+                .expect_err("one component must fail")
+                .contains("two uvmet10 components")
+        );
+
+        let truncated = VarOutput {
+            data: vec![1.0, 2.0, 3.0],
+            shape: vec![2, 1, 2],
+            units: "m/s".to_string(),
+            description: "truncated wind".to_string(),
+        };
+        assert!(
+            split_uvmet10(truncated, 2)
+                .expect_err("a truncated second component must fail")
+                .contains("requires 4 values")
+        );
+    }
+
+    #[test]
+    fn lowest_model_level_fallbacks_are_explicit_surface_approximations() {
+        let shape = GridShape::new(1, 1).expect("test shape");
+        let grid = LatLonGrid::new(shape, vec![35.0], vec![-97.0]).expect("test grid");
+        let mut fields = WrfHourFields {
+            grid: grid.clone(),
+            projection: None,
+            canonical: Vec::new(),
+            derived: Vec::new(),
+            volumes: Vec::new(),
+            notes: Vec::new(),
+        };
+        push_canonical_values(
+            &mut fields,
+            &grid,
+            None,
+            "temperature_2m",
+            FieldSelector::height_agl(CanonicalField::Temperature, 2),
+            "K",
+            vec![290.0],
+        );
+
+        fill_missing_surface(
+            &mut fields,
+            &grid,
+            None,
+            SurfaceFallback {
+                surface_pressure_pa: vec![95_000.0],
+                temperature_2m_k: vec![285.0],
+                dewpoint_2m_k: vec![280.0],
+                u_10m: vec![5.0],
+                v_10m: vec![-2.0],
+            },
+            &WrfProcessOptions::default(),
+        );
+
+        for exact_name in [
+            "surface_pressure",
+            "dewpoint_2m",
+            "u_10m",
+            "v_10m",
+        ] {
+            assert!(
+                !fields
+                    .canonical
+                    .iter()
+                    .any(|(name, _)| name == exact_name),
+                "fallback must not masquerade as {exact_name}"
+            );
+        }
+        assert!(
+            !fields
+                .canonical
+                .iter()
+                .any(|(name, _)| name == "approx_temperature_2m"),
+            "an exact 2 m temperature must suppress its approximation"
+        );
+
+        for (name, expected_selector) in [
+            (
+                "approx_surface_pressure",
+                FieldSelector::surface(CanonicalField::Pressure),
+            ),
+            (
+                "approx_dewpoint_2m",
+                FieldSelector::surface(CanonicalField::Dewpoint),
+            ),
+            (
+                "approx_u_10m",
+                FieldSelector::surface(CanonicalField::UWind),
+            ),
+            (
+                "approx_v_10m",
+                FieldSelector::surface(CanonicalField::VWind),
+            ),
+        ] {
+            let field = fields
+                .canonical
+                .iter()
+                .find_map(|(stored_name, field)| (stored_name == name).then_some(field))
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(field.selector, expected_selector);
+        }
     }
 
     #[test]
@@ -1179,6 +1927,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store);
     }
 
+    /// Instrumented harness for the large-grid full-diagnostics "crash"
+    /// (FABLE_BACKLOG #9): runs the DEFAULT full-diagnostics import — the
+    /// exact path the "Process WRF" dock button drives, including the same
+    /// `spawn_process_paths` worker-thread configuration — on the wrfout named
+    /// by `RW_WRF_CRASH_FIXTURE`, forwarding every Progress message to stderr
+    /// with a timestamp so any abort pinpoints WHICH diagnostic died. Run with
+    /// `--nocapture` and stderr captured to a file. Env-gated like the sibling
+    /// fixtures; heavy — release builds only on large grids.
+    ///
+    /// Findings from the 2026-07-06 investigation (Enderlin 250 m,
+    /// 800x800x79): the import COMPLETES in optimized builds (~275 s,
+    /// 117 variables) — the reported `0xffffffff` abort was an external
+    /// kill (only `process::exit(-1)`-style termination yields that code on
+    /// this toolchain; a Rust abort/alloc-failure is 0xC0000409, a stack
+    /// overflow 0xC00000FD, a panic 101), i.e. a tool-timeout kill of a
+    /// 20-40x-slower debug run — not an in-process bug. See
+    /// docs/wrf-import-large-grids.md.
+    #[test]
+    fn optional_real_fixture_default_import_instrumented() {
+        let Some(fixture) = std::env::var_os("RW_WRF_CRASH_FIXTURE") else {
+            return;
+        };
+        let store = std::env::temp_dir().join(format!("rw-wrf-crash-repro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let start = std::time::Instant::now();
+        let task = spawn_process_paths(
+            vec![PathBuf::from(fixture)],
+            store.clone(),
+            WrfProcessOptions::default(),
+        );
+        loop {
+            match task.rx.recv() {
+                Ok(WrfProcessMessage::Progress(line)) => {
+                    eprintln!("[{:9.2?}] {line}", start.elapsed());
+                }
+                Ok(WrfProcessMessage::Done(result)) => {
+                    let summary = result.expect("default full-diagnostics import should succeed");
+                    eprintln!(
+                        "[{:9.2?}] DONE: {} hour(s), {} variables: {}",
+                        start.elapsed(),
+                        summary.hours_written,
+                        summary.variables.len(),
+                        summary.variables.join(", ")
+                    );
+                    for note in &summary.notes {
+                        eprintln!("[note] {note}");
+                    }
+                    assert!(summary.hours_written >= 1);
+                    assert!(summary.variables.iter().any(|name| name == "sbcape"));
+                    break;
+                }
+                // Disconnected without Done == the worker thread panicked
+                // (a process-fatal abort never reaches this arm).
+                Err(err) => panic!(
+                    "[{:9.2?}] worker died without Done (panic in worker): {err}",
+                    start.elapsed()
+                ),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn isolate_panics_converts_panic_to_error_and_passes_results_through() {
+        assert_eq!(
+            isolate_panics("field_ok", || Ok::<_, String>(7)),
+            Ok(7),
+            "successful computations must pass through untouched"
+        );
+        assert_eq!(
+            isolate_panics("field_err", || Err::<(), _>("no such var".to_string())),
+            Err("no such var".to_string()),
+            "ordinary errors must pass through untouched"
+        );
+        let caught = isolate_panics::<()>("sbcape", || panic!("index out of bounds: 42"));
+        assert_eq!(
+            caught,
+            Err("panicked computing sbcape: index out of bounds: 42".to_string()),
+            "a panicking diagnostic must degrade to a named per-field error"
+        );
+        let caught_string =
+            isolate_panics::<()>("srh3", || std::panic::panic_any("boom".to_string()));
+        assert_eq!(
+            caught_string,
+            Err("panicked computing srh3: boom".to_string()),
+            "String payloads must be extracted too"
+        );
+    }
+
     #[test]
     fn wrf_options_filter_heavy_and_names() {
         let default_options = WrfProcessOptions::default().normalized();
@@ -1202,5 +2039,212 @@ mod tests {
         assert!(filtered.should_process("srh1", Some("srh_0_1km"), WrfProductGroup::Diagnostic));
         assert!(!filtered.should_process("srh3", Some("srh_0_3km"), WrfProductGroup::Diagnostic));
         assert!(!filtered.should_process("t2", Some("temperature_2m"), WrfProductGroup::Core));
+    }
+
+    #[test]
+    fn ncape_is_classified_with_the_heavy_ecape_group() {
+        // ncape is a full ecape-rs solve; misclassified as Diagnostic it cost
+        // ~10 s per 800x800x79 file in the default pass (perf audit
+        // 2026-07-09). In the Heavy group it rides the ecape stack cache.
+        assert!(is_heavy_wrf_diagnostic("ncape"));
+        assert!(is_heavy_wrf_diagnostic("sbncape"));
+        assert!(!is_heavy_wrf_diagnostic("sbcape"));
+        assert!(!is_heavy_wrf_diagnostic("stp"));
+    }
+
+    /// Real-data proof for the UI field selector: the SAME wrfout processed
+    /// with a narrowed selection (core fields only — no diagnostics, raw, or
+    /// heavy eCAPE) must write ONLY the selected fields into the store hour — a
+    /// strict, strictly-smaller subset of the full default set. This exercises
+    /// the exact path the "WRF full diagnostics…" import drives. Gated on
+    /// `RW_WRF_PROCESS_FIXTURE` (a `wrfout_*` path) like the sibling fixtures.
+    #[test]
+    fn real_fixture_selection_narrows_written_fields() {
+        let Some(fixture) = std::env::var_os("RW_WRF_PROCESS_FIXTURE") else {
+            return;
+        };
+        let path = PathBuf::from(fixture);
+
+        // Process `path` once under `options`, returning the store hour's
+        // authoritative on-disk variable-name set (sorted, deduped).
+        let written_fields = |options: WrfProcessOptions, tag: &str| -> Vec<String> {
+            let store =
+                std::env::temp_dir().join(format!("rw-wrf-select-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&store);
+            let (tx, _rx) = channel();
+            let summary = process_paths(std::slice::from_ref(&path), &store, &options, &tx)
+                .unwrap_or_else(|err| panic!("process ({tag}) failed: {err}"));
+            let hour_path = store
+                .join(&summary.model)
+                .join(&summary.run)
+                .join("f000.rws");
+            let reader = rw_store::reader::HourReader::open(&hour_path).expect("open hour file");
+            let mut names: Vec<String> = reader
+                .meta()
+                .variables
+                .iter()
+                .map(|var| var.name.clone())
+                .collect();
+            names.sort();
+            names.dedup();
+            let _ = std::fs::remove_dir_all(&store);
+            names
+        };
+
+        let narrowed = written_fields(
+            WrfProcessOptions {
+                diagnostics: false,
+                raw_extras: false,
+                heavy_ecape: false,
+                ..WrfProcessOptions::default()
+            }
+            .normalized(),
+            "narrow",
+        );
+        let default = written_fields(WrfProcessOptions::default().normalized(), "default");
+
+        eprintln!(
+            "NARROWED core-only ({} fields): {}",
+            narrowed.len(),
+            narrowed.join(", ")
+        );
+        eprintln!(
+            "DEFAULT full set ({} fields): {}",
+            default.len(),
+            default.join(", ")
+        );
+
+        // Narrowed keeps the core surface fields + isobaric sounding volumes…
+        assert!(
+            narrowed.iter().any(|name| name == "temperature_2m"),
+            "narrowed selection must still write the core surface fields"
+        );
+        assert!(
+            narrowed.iter().any(|name| name == "temperature_iso"),
+            "narrowed selection must still write the sounding volumes"
+        );
+        // …but drops the severe diagnostics and raw extras the default writes.
+        assert!(
+            !narrowed.iter().any(|name| name == "sbcape"),
+            "narrowed (diagnostics off) must NOT write CAPE and friends"
+        );
+        assert!(
+            default.iter().any(|name| name == "sbcape"),
+            "default set must include the severe diagnostics"
+        );
+        // Strict subset, strictly smaller: the selection genuinely narrowed the
+        // written store hour rather than falling back to the full default set.
+        assert!(
+            narrowed.iter().all(|name| default.contains(name)),
+            "narrowed field set must be a subset of the default field set"
+        );
+        assert!(
+            narrowed.len() < default.len(),
+            "narrowed selection must write fewer fields ({}) than the default ({})",
+            narrowed.len(),
+            default.len()
+        );
+    }
+
+    #[test]
+    fn planned_store_fields_track_the_group_selection() {
+        // Default: core + diagnostics + raw (no heavy eCAPE).
+        let default_plan = WrfProcessOptions::default()
+            .normalized()
+            .planned_store_fields();
+        assert!(default_plan.iter().any(|name| name == "temperature_2m"));
+        assert!(default_plan.iter().any(|name| name == "temperature_iso"));
+        assert!(default_plan.iter().any(|name| name == "sbcape"));
+        // Heavy eCAPE (any entrainment-CAPE field) is off by default.
+        assert!(!default_plan.iter().any(|name| name.contains("ecape")));
+
+        // Core-only, heavy off: drops every diagnostic and raw field but keeps
+        // the core surface fields and the isobaric sounding volumes.
+        let core_only = WrfProcessOptions {
+            diagnostics: false,
+            raw_extras: false,
+            heavy_ecape: false,
+            ..WrfProcessOptions::default()
+        }
+        .normalized()
+        .planned_store_fields();
+        assert!(core_only.iter().any(|name| name == "temperature_2m"));
+        assert!(core_only.iter().any(|name| name == "height_iso"));
+        assert!(!core_only.iter().any(|name| name == "sbcape"));
+
+        // Enabling heavy eCAPE adds the entrainment-CAPE family (e.g.
+        // ecape_scp / ecape_ehi from wrf-core's VARS).
+        let heavy = WrfProcessOptions {
+            heavy_ecape: true,
+            ..WrfProcessOptions::default()
+        }
+        .normalized()
+        .planned_store_fields();
+        assert!(heavy.iter().any(|name| name.contains("ecape")));
+        assert!(heavy.len() > default_plan.len());
+
+        // An only-list narrows the plan to the matching fields (plus the iso
+        // volumes, which ride with the core group toggle, not the name filter).
+        let only_cape = WrfProcessOptions {
+            only: vec!["sbcape".to_string()],
+            ..WrfProcessOptions::default()
+        }
+        .normalized()
+        .planned_store_fields();
+        assert!(only_cape.iter().any(|name| name == "sbcape"));
+        assert!(!only_cape.iter().any(|name| name == "temperature_2m"));
+
+        // Legacy U10/V10 filter keys still select the corresponding canonical
+        // earth-relative component even though both are computed via uvmet10.
+        let only_u10 = WrfProcessOptions {
+            only: vec!["U10".to_string()],
+            ..WrfProcessOptions::default()
+        }
+        .normalized()
+        .planned_store_fields();
+        assert!(only_u10.iter().any(|name| name == "u_10m"));
+        assert!(!only_u10.iter().any(|name| name == "v_10m"));
+    }
+
+    #[test]
+    fn processing_profile_is_order_independent_and_separates_field_plans() {
+        let reordered_a = WrfProcessOptions {
+            only: vec!["SBCAPE".to_string(), "temperature_2m".to_string()],
+            skip: vec!["raw".to_string(), "ecape".to_string()],
+            ..WrfProcessOptions::default()
+        };
+        let reordered_b = WrfProcessOptions {
+            only: vec![" temperature_2m, sbcape ".to_string()],
+            skip: vec!["ECAPE;raw;raw".to_string()],
+            ..WrfProcessOptions::default()
+        };
+        assert_eq!(
+            processing_profile_suffix(&reordered_a),
+            processing_profile_suffix(&reordered_b),
+            "equivalent normalized filters must reuse the same run"
+        );
+
+        let core_only = WrfProcessOptions {
+            diagnostics: false,
+            raw_extras: false,
+            ..WrfProcessOptions::default()
+        };
+        assert_ne!(
+            processing_profile_suffix(&WrfProcessOptions::default()),
+            processing_profile_suffix(&core_only),
+            "a different realized field plan must not replace the default run"
+        );
+        assert!(
+            processing_profile_suffix(&core_only).starts_with("full_"),
+            "full-processing profiles use a recognizable persistent suffix"
+        );
+    }
+
+    #[test]
+    fn malformed_horizontal_dimension_product_returns_an_error() {
+        let error = checked_horizontal_cells(usize::MAX, 2)
+            .expect_err("oversized file dimensions must fail closed");
+        assert!(error.contains("overflow"));
+        assert_eq!(checked_horizontal_cells(3, 4), Ok(12));
     }
 }

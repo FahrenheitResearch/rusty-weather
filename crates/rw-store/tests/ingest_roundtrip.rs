@@ -17,7 +17,7 @@ use rw_store::grid::GridFile;
 use rw_store::ingest::{
     DerivedFieldInput, HourIngestWriter, PressureVolumeInput, derived_selector,
     derived_selector_slug, read_field_2d, read_grid_2d, write_hour_from_fields,
-    write_hour_from_fields_with_derived,
+    write_hour_from_fields_with_derived, write_hour_from_grid_with_derived,
 };
 use rw_store::lock::RunLock;
 use rw_store::reader::HourReader;
@@ -707,6 +707,82 @@ fn derived_vars_round_trip_through_read_grid_2d() {
         "rejected hour must not leave an hour file behind"
     );
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn grid_seam_writes_a_derived_only_selection() {
+    let dir = test_dir("derived-only");
+    let store_root = dir.join("store");
+    let grid = regular_grid();
+    let values = vec![123.0f32; NX * NY];
+    let derived = [DerivedFieldInput {
+        name: "sbcape",
+        units: "J/kg",
+        values: &values,
+    }];
+
+    let written = write_hour_from_grid_with_derived(
+        &store_root,
+        MODEL,
+        RUN,
+        0,
+        &grid,
+        Some(&GridProjection::Geographic),
+        &[],
+        &derived,
+        &[],
+        BUILD,
+        WRITTEN_UNIX,
+    )
+    .unwrap();
+    assert_eq!(written.vars, vec!["sbcape".to_string()]);
+    let reader = HourReader::open(&written.path).unwrap();
+    let stored = reader.read_full_2d("sbcape").unwrap();
+    assert_bits_eq(&stored, &values, "derived-only field");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn grid_seam_rejects_publicly_constructible_zero_and_overflow_shapes() {
+    let dir = test_dir("malformed-grid-shape");
+    let store_root = dir.join("store");
+    let values = Vec::<f32>::new();
+    let derived = [DerivedFieldInput {
+        name: "diagnostic",
+        units: "1",
+        values: &values,
+    }];
+    for shape in [
+        GridShape { nx: 0, ny: 1 },
+        GridShape {
+            nx: usize::MAX,
+            ny: 2,
+        },
+    ] {
+        let grid = LatLonGrid {
+            shape,
+            lat_deg: Vec::new(),
+            lon_deg: Vec::new(),
+        };
+        let error = write_hour_from_grid_with_derived(
+            &store_root,
+            MODEL,
+            RUN,
+            0,
+            &grid,
+            None,
+            &[],
+            &derived,
+            &[],
+            BUILD,
+            WRITTEN_UNIX,
+        )
+        .unwrap_err();
+        assert!(matches!(error, RwStoreError::Format(_)));
+    }
+    assert!(!store_root.exists(), "invalid grids must not touch disk");
     let _ = fs::remove_dir_all(&dir);
 }
 

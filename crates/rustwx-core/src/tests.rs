@@ -7,6 +7,77 @@ fn grid_shape_len_matches() {
 }
 
 #[test]
+fn grid_shape_rejects_overflow_ceiling_and_invalid_deserialization() {
+    let unchecked_overflow = GridShape {
+        nx: usize::MAX,
+        ny: 2,
+    };
+    assert_eq!(unchecked_overflow.len(), 0, "legacy len must not panic or wrap");
+    assert!(unchecked_overflow.checked_len().is_err());
+    assert!(matches!(
+        GridShape::new(usize::MAX, 2),
+        Err(RustwxError::InvalidGridShape {
+            nx: usize::MAX,
+            ny: 2
+        })
+    ));
+    assert!(matches!(
+        GridShape::new(MAX_GRID_CELLS + 1, 1),
+        Err(RustwxError::GridTooLarge {
+            cells,
+            max_cells: MAX_GRID_CELLS,
+            ..
+        }) if cells == MAX_GRID_CELLS + 1
+    ));
+
+    let largest_square = GridShape::new(5_000, 5_000).expect("ceiling is accepted");
+    assert_eq!(largest_square.len(), MAX_GRID_CELLS);
+
+    #[derive(serde::Serialize)]
+    struct UncheckedShape {
+        nx: usize,
+        ny: usize,
+    }
+    let encoded = bincode::serialize(&UncheckedShape {
+        nx: usize::MAX,
+        ny: 2,
+    })
+    .unwrap();
+    assert!(bincode::deserialize::<GridShape>(&encoded).is_err());
+
+    #[derive(serde::Serialize)]
+    struct UncheckedGrid {
+        shape: GridShape,
+        lat_deg: Vec<f32>,
+        lon_deg: Vec<f32>,
+    }
+    let encoded = bincode::serialize(&UncheckedGrid {
+        shape: GridShape::new(2, 2).unwrap(),
+        lat_deg: vec![0.0],
+        lon_deg: vec![0.0],
+    })
+    .unwrap();
+    assert!(bincode::deserialize::<LatLonGrid>(&encoded).is_err());
+}
+
+#[test]
+fn dense_volume_products_are_checked_and_bounded() {
+    assert_eq!(checked_volume_elements(37, 1_000).unwrap(), 37_000);
+    assert!(matches!(
+        checked_volume_elements(usize::MAX, 2),
+        Err(RustwxError::VolumeTooLarge { .. })
+    ));
+    assert!(matches!(
+        checked_volume_elements(6, MAX_GRID_CELLS),
+        Err(RustwxError::VolumeTooLarge {
+            levels: 6,
+            cells: MAX_GRID_CELLS,
+            max_elements: MAX_VOLUME_ELEMENTS
+        })
+    ));
+}
+
+#[test]
 fn model_id_aliases_round_trip() {
     assert_eq!("rrfs_a".parse::<ModelId>().unwrap(), ModelId::RrfsA);
     assert_eq!(

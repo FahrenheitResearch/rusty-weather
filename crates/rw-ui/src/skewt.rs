@@ -27,12 +27,12 @@ use crate::worker::{ProfileVar, SoundingData};
 const PROFILE_VARS: [&str; 4] = ["temperature_iso", "u_iso", "v_iso", "height_iso"];
 
 /// Surface samples the skew-T needs directly (K, K, m/s, m/s, Pa).
-const REQUIRED_SURFACE_VARS: [&str; 5] = [
-    "temperature_2m",
-    "dewpoint_2m",
-    "u_10m",
-    "v_10m",
-    "surface_pressure",
+const REQUIRED_SURFACE_VARS: [(&str, &str); 5] = [
+    ("temperature_2m", "approx_temperature_2m"),
+    ("dewpoint_2m", "approx_dewpoint_2m"),
+    ("u_10m", "approx_u_10m"),
+    ("v_10m", "approx_v_10m"),
+    ("surface_pressure", "approx_surface_pressure"),
 ];
 
 /// Below-ground pruning epsilons — same values as the production
@@ -62,18 +62,20 @@ pub fn render_sounding_image(native: &NativeSounding) -> Result<ColorImage, Stri
 pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, String> {
     let has_dewpoint = data.vars.iter().any(|var| var.name == "dewpoint_iso");
     let has_rh = data.vars.iter().any(|var| var.name == "rh_iso");
-    let missing: Vec<&str> = PROFILE_VARS
+    let mut missing: Vec<String> = PROFILE_VARS
         .iter()
         .copied()
         .filter(|name| !data.vars.iter().any(|var| var.name == *name))
-        .chain((!has_dewpoint && !has_rh).then_some("dewpoint_iso or rh_iso"))
-        .chain(
-            REQUIRED_SURFACE_VARS
-                .iter()
-                .copied()
-                .filter(|name| data.surface_value(name).is_none()),
-        )
+        .map(str::to_string)
         .collect();
+    if !has_dewpoint && !has_rh {
+        missing.push("dewpoint_iso or rh_iso".to_string());
+    }
+    for &(exact, approximate) in &REQUIRED_SURFACE_VARS {
+        if data.surface_value(exact).is_none() && data.surface_value(approximate).is_none() {
+            missing.push(format!("{exact} or {approximate}"));
+        }
+    }
     if !missing.is_empty() {
         return Err(format!(
             "store hour lacks skew-T inputs: {}",
@@ -91,19 +93,23 @@ pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, Stri
         }
         Ok(Some(match (name, sample.units.as_str()) {
             (_, "K") => value - 273.15,
-            ("surface_pressure", "Pa") => value / 100.0,
+            ("surface_pressure" | "approx_surface_pressure", "Pa") => value / 100.0,
             _ => value,
         }))
     };
-    let surface_value = |name: &str| -> Result<f64, String> {
-        surface_value_optional(name)?
-            .ok_or_else(|| format!("store hour lacks skew-T inputs: {name}"))
+    let surface_value = |name: &str, approximate: &str| -> Result<f64, String> {
+        match surface_value_optional(name)? {
+            Some(value) => Ok(value),
+            None => surface_value_optional(approximate)?.ok_or_else(|| {
+                format!("store hour lacks skew-T inputs: {name} or {approximate}")
+            }),
+        }
     };
-    let t2_c = surface_value("temperature_2m")?;
-    let td2_c = surface_value("dewpoint_2m")?;
-    let u10_ms = surface_value("u_10m")?;
-    let v10_ms = surface_value("v_10m")?;
-    let psfc_hpa = surface_value("surface_pressure")?;
+    let t2_c = surface_value("temperature_2m", "approx_temperature_2m")?;
+    let td2_c = surface_value("dewpoint_2m", "approx_dewpoint_2m")?;
+    let u10_ms = surface_value("u_10m", "approx_u_10m")?;
+    let v10_ms = surface_value("v_10m", "approx_v_10m")?;
+    let psfc_hpa = surface_value("surface_pressure", "approx_surface_pressure")?;
 
     let profile = |name: &str| data.vars.iter().find(|var| var.name == name).unwrap();
     let temperature = profile("temperature_iso");
@@ -198,10 +204,10 @@ fn level_dewpoint_c(
     temperature_c: f64,
     level_hpa: u16,
 ) -> Option<f64> {
-    if let Some(dewpoint) = dewpoint
-        && let Some(td_c) = level_value(dewpoint, level_hpa)
-    {
-        return Some(td_c);
+    if let Some(dewpoint) = dewpoint {
+        if let Some(td_c) = level_value(dewpoint, level_hpa) {
+            return Some(td_c);
+        }
     }
     let rh_percent = level_value(rh?, level_hpa)?;
     Some(dewpoint_c_from_rh(temperature_c, rh_percent))
@@ -437,6 +443,27 @@ mod tests {
         );
         assert_eq!(column.pressure_hpa[0], 962.0);
         build_native_sounding(&data).expect("native sounding should build without orography");
+    }
+
+    #[test]
+    fn explicitly_approximate_surface_anchors_feed_soundings() {
+        let mut data = sample_data();
+        for sample in &mut data.surface {
+            sample.name = match sample.name.as_str() {
+                "temperature_2m" => "approx_temperature_2m",
+                "dewpoint_2m" => "approx_dewpoint_2m",
+                "u_10m" => "approx_u_10m",
+                "v_10m" => "approx_v_10m",
+                "surface_pressure" => "approx_surface_pressure",
+                _ => continue,
+            }
+            .to_string();
+        }
+        let column = build_sounding_column(&data).expect("approximate anchors should sound");
+        assert!((column.pressure_hpa[0] - 962.0).abs() < 1.0e-6);
+        assert!((column.temperature_c[0] - 29.0).abs() < 1.0e-3);
+        assert_eq!(column.u_ms[0], 1.5);
+        assert_eq!(column.v_ms[0], 4.0);
     }
 
     #[test]

@@ -68,7 +68,7 @@ fn test_dir(name: &str) -> PathBuf {
 fn new_writer() -> HourWriter {
     HourWriter::new(
         "hrrr",
-        "2026-06-09T12:00:00Z",
+        "20260609_12z",
         6,
         NX,
         NY,
@@ -617,6 +617,33 @@ fn read_full_3d_matches_column_reads() {
         matches!(err_2d, RwStoreError::Format(_)),
         "read_full_3d on 2D var: expected Format error, got {err_2d:?}"
     );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_level_3d_matches_full_volume_plane() {
+    let dir = test_dir("level3d");
+    let path = dir.join("hour.rws");
+    write_volume_for_full3d(&path);
+
+    let reader = HourReader::open(&path).unwrap();
+    let full = reader.read_full_3d("temperature").unwrap();
+    let plane = reader.read_level_3d("temperature", 300).unwrap();
+    assert_eq!(plane.len(), NY * NX);
+    let expected = &full[NY * NX..2 * NY * NX];
+    for (index, (actual, expected)) in plane.iter().zip(expected).enumerate() {
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "300 hPa mismatch at flat grid index {index}"
+        );
+    }
+
+    let missing = reader.read_level_3d("temperature", 850).unwrap_err();
+    assert!(matches!(missing, RwStoreError::Meta(_)));
+    let wrong_kind = reader.read_level_3d("temp_2m", 300).unwrap_err();
+    assert!(matches!(wrong_kind, RwStoreError::Format(_)));
 
     let _ = fs::remove_dir_all(&dir);
 }

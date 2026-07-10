@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Duration, Utc};
 
 use rw_store::lock::RunLock;
-use rw_store::run::RwsRunManifest;
+use rw_store::run::{RwsRunManifest, validate_store_component};
 
 use crate::store::{frame_time, run_day};
 
@@ -46,7 +46,6 @@ struct FrameRef {
     run_name: String,
     hhmm: u16,
     time: DateTime<Utc>,
-    path: PathBuf,
     bytes: u64,
 }
 
@@ -65,10 +64,13 @@ pub fn enforce_window(
     if config.is_unbounded() {
         return Ok(report);
     }
-    let model_dir = store_root.join(model);
-    if !model_dir.is_dir() {
+    validate_store_component("model", model)?;
+    let requested_model_dir = store_root.join(model);
+    if !requested_model_dir.is_dir() {
         return Ok(report);
     }
+    let root = fs::canonicalize(store_root)?;
+    let model_dir = canonical_contained_path(&root, &requested_model_dir, "model directory")?;
 
     // Inventory every frame across the matching run dirs, via run.json (the
     // manifests are the source of truth; orphan files are left alone).
@@ -83,23 +85,31 @@ pub fn enforce_window(
         if !run_name.starts_with(run_prefix) || run_day(&run_name).is_none() {
             continue;
         }
-        let manifest_path = entry.path().join("run.json");
+        validate_store_component("run", &run_name)?;
+        let run_dir = canonical_contained_path(&model_dir, &entry.path(), "run directory")?;
+        let manifest_path = run_dir.join("run.json");
         if !manifest_path.is_file() {
             continue;
         }
-        let manifest: RwsRunManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        let manifest_path =
+            canonical_contained_path(&run_dir, &manifest_path, "run manifest")?;
+        let manifest = RwsRunManifest::load_for_run(&manifest_path, model, &run_name)?;
         run_names.push(run_name.clone());
         for (&hhmm, hour) in &manifest.hours {
             let Some(time) = frame_time(&run_name, hhmm) else {
                 continue;
             };
-            let path = entry.path().join(&hour.file);
-            let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            let requested_path = run_dir.join(&hour.file);
+            let bytes = if requested_path.exists() {
+                let path = canonical_contained_path(&run_dir, &requested_path, "frame file")?;
+                fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+            } else {
+                0
+            };
             frames.push(FrameRef {
                 run_name: run_name.clone(),
                 hhmm,
                 time,
-                path,
                 bytes,
             });
         }
@@ -142,7 +152,11 @@ pub fn enforce_window(
     // this pass and let the next cycle retry — this is exactly the fix for
     // the two-process rolling-window collision that motivated the lock.
     for run_name in &run_names {
-        let run_dir = model_dir.join(run_name);
+        let run_dir = canonical_contained_path(
+            &model_dir,
+            &model_dir.join(run_name),
+            "run directory",
+        )?;
         let _lock = match RunLock::try_acquire(&run_dir)? {
             Some(lock) => lock,
             None => {
@@ -155,15 +169,25 @@ pub fn enforce_window(
                 continue;
             }
         };
-        let manifest_path = run_dir.join("run.json");
-        let mut manifest: RwsRunManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        let manifest_path =
+            canonical_contained_path(&run_dir, &run_dir.join("run.json"), "run manifest")?;
+        let mut manifest = RwsRunManifest::load_for_run(&manifest_path, model, run_name)?;
         let mut changed = false;
         for (index, frame) in frames.iter().enumerate() {
             if !evict[index] || frame.run_name != *run_name {
                 continue;
             }
-            if frame.path.is_file() {
-                fs::remove_file(&frame.path)?;
+            let Some(file) = manifest
+                .hours
+                .get(&frame.hhmm)
+                .map(|entry| entry.file.clone())
+            else {
+                continue;
+            };
+            let requested_path = run_dir.join(file);
+            if requested_path.exists() {
+                let path = canonical_contained_path(&run_dir, &requested_path, "frame file")?;
+                fs::remove_file(path)?;
             }
             manifest.hours.remove(&frame.hhmm);
             report.removed_frames += 1;
@@ -177,7 +201,8 @@ pub fn enforce_window(
             fs::remove_file(&manifest_path)?;
             let grid_path = run_dir.join("grid.rwg");
             if grid_path.is_file() {
-                fs::remove_file(&grid_path)?;
+                let grid_path = canonical_contained_path(&run_dir, &grid_path, "grid file")?;
+                fs::remove_file(grid_path)?;
             }
             // The store content is gone; all that can remain is the `.rw-lock`
             // file. Tearing down the whole run dir is the one place that file
@@ -204,6 +229,26 @@ pub fn enforce_window(
     report.removed_runs.sort();
     report.skipped_locked.sort();
     Ok(report)
+}
+
+fn canonical_contained_path(
+    parent: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let canonical = fs::canonicalize(path)?;
+    if !canonical.starts_with(parent) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{label} {} resolves outside {}",
+                path.display(),
+                parent.display()
+            ),
+        )
+        .into());
+    }
+    Ok(canonical)
 }
 
 /// Remove the `.rw-lock` file and then the (otherwise-empty) run dir, after
@@ -291,6 +336,36 @@ mod tests {
         .unwrap();
         assert_eq!(report, EvictionReport::default());
         assert!(dir.join("g19/conus_c13_20260610/t1851.rws").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hostile_manifest_frame_path_aborts_without_deleting_outside_run() {
+        let dir = test_dir("hostile-frame-path");
+        write_frames(&dir, &[(18, 41)]);
+        let run = "conus_c13_20260610";
+        let run_dir = dir.join("g19").join(run);
+        let manifest_path = run_dir.join("run.json");
+        let mut manifest = RwsRunManifest::load_for_run(&manifest_path, "g19", run).unwrap();
+        manifest.hours.get_mut(&1841).unwrap().file = "../outside.rws".to_string();
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let outside = dir.join("g19").join("outside.rws");
+        fs::write(&outside, b"must survive").unwrap();
+
+        let err = enforce_window(
+            &dir,
+            "g19",
+            "conus_c13",
+            now_at(19, 0),
+            &WindowConfig {
+                max_age_minutes: Some(5),
+                max_bytes: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("normal path component"), "{err}");
+        assert_eq!(fs::read(&outside).unwrap(), b"must survive");
         let _ = fs::remove_dir_all(&dir);
     }
 

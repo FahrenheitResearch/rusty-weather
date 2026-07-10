@@ -166,64 +166,80 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
     let mut any_error = false;
 
     for run_dir in &run_dirs {
-        let manifest_path = run_dir.join("run.json");
-        match std::fs::read(&manifest_path) {
-            Err(e) => {
-                eprintln!("error: read {}: {e}", manifest_path.display());
+        let manifest_path = match canonical_contained_path(
+            run_dir,
+            &run_dir.join("run.json"),
+            "run manifest",
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                eprintln!("error: {err}");
                 any_error = true;
                 continue;
             }
-            Ok(bytes) => match serde_json::from_slice::<RwsRunManifest>(&bytes) {
-                Err(e) => {
-                    eprintln!("error: parse {}: {e}", manifest_path.display());
-                    any_error = true;
-                    continue;
+        };
+        let manifest = match RwsRunManifest::load(&manifest_path) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                eprintln!("error: {}: {err}", manifest_path.display());
+                any_error = true;
+                continue;
+            }
+        };
+        let mut hours = Vec::with_capacity(manifest.hours.len());
+        let mut unsafe_hour_path = false;
+        for (&hour, entry) in &manifest.hours {
+            let requested = run_dir.join(&entry.file);
+            let file_bytes = if requested.exists() {
+                match canonical_contained_path(run_dir, &requested, "hour file") {
+                    Ok(path) => std::fs::metadata(path).ok().map(|meta| meta.len()),
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        unsafe_hour_path = true;
+                        break;
+                    }
                 }
-                Ok(manifest) => {
-                    let hours: Vec<HourListing> = manifest
-                        .hours
-                        .iter()
-                        .map(|(&hour, entry)| {
-                            let fpath = run_dir.join(&entry.file);
-                            let file_bytes = std::fs::metadata(&fpath).ok().map(|m| m.len());
-                            HourListing {
-                                hour,
-                                file: entry.file.clone(),
-                                variables: entry.variables.clone(),
-                                file_bytes,
-                            }
-                        })
-                        .collect();
-                    let hour_json: Vec<serde_json::Value> = hours
-                        .iter()
-                        .map(|h| {
-                            json!({
-                                "hour": h.hour, "file": h.file, "variables": h.variables,
-                                "file_bytes": h.file_bytes
-                            })
-                        })
-                        .collect();
-                    runs.push(json!({
-                        "model": manifest.model,
-                        "run": manifest.run,
-                        "grid_hash": manifest.grid_hash,
-                        "nx": manifest.nx,
-                        "ny": manifest.ny,
-                        "writer_build": manifest.writer.build,
-                        "hours": hour_json,
-                    }));
-                    run_displays.push(RunListing {
-                        model: manifest.model,
-                        run: manifest.run,
-                        grid_hash: manifest.grid_hash,
-                        nx: manifest.nx,
-                        ny: manifest.ny,
-                        writer_build: manifest.writer.build,
-                        hours,
-                    });
-                }
-            },
+            } else {
+                None
+            };
+            hours.push(HourListing {
+                hour,
+                file: entry.file.clone(),
+                variables: entry.variables.clone(),
+                file_bytes,
+            });
         }
+        if unsafe_hour_path {
+            any_error = true;
+            continue;
+        }
+        let hour_json: Vec<serde_json::Value> = hours
+            .iter()
+            .map(|h| {
+                json!({
+                    "hour": h.hour, "file": h.file, "variables": h.variables,
+                    "file_bytes": h.file_bytes
+                })
+            })
+            .collect();
+        runs.push(json!({
+            "model": manifest.model,
+            "run": manifest.run,
+            "grid_hash": manifest.grid_hash,
+            "nx": manifest.nx,
+            "ny": manifest.ny,
+            "writer_build": manifest.writer.build,
+            "hours": hour_json,
+        }));
+        run_displays.push(RunListing {
+            model: manifest.model,
+            run: manifest.run,
+            grid_hash: manifest.grid_hash,
+            nx: manifest.nx,
+            ny: manifest.ny,
+            writer_build: manifest.writer.build,
+            hours,
+        });
     }
 
     if args.json {
@@ -264,24 +280,37 @@ fn collect_run_dirs(path: &Path) -> Vec<PathBuf> {
     if !path.is_dir() {
         return Vec::new();
     }
+    let Ok(root) = std::fs::canonicalize(path) else {
+        return Vec::new();
+    };
     // If this directory itself has a run.json, it is a run dir.
-    if path.join("run.json").exists() {
-        return vec![path.to_path_buf()];
+    if root.join("run.json").exists() {
+        return vec![root];
     }
     // Walk up to depth 2 looking for run.json files.
     let mut result = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(path) {
+    if let Ok(entries) = std::fs::read_dir(&root) {
         for entry in entries.flatten() {
-            let child = entry.path();
-            if !child.is_dir() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let Ok(child) = std::fs::canonicalize(entry.path()) else {
+                continue;
+            };
+            if !child.starts_with(&root) {
                 continue;
             }
             if child.join("run.json").exists() {
                 result.push(child.clone());
             } else if let Ok(grandchildren) = std::fs::read_dir(&child) {
                 for gc in grandchildren.flatten() {
-                    let gc_path = gc.path();
-                    if gc_path.is_dir() && gc_path.join("run.json").exists() {
+                    if !gc.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        continue;
+                    }
+                    let Ok(gc_path) = std::fs::canonicalize(gc.path()) else {
+                        continue;
+                    };
+                    if gc_path.starts_with(&root) && gc_path.join("run.json").exists() {
                         result.push(gc_path);
                     }
                 }
@@ -290,6 +319,19 @@ fn collect_run_dirs(path: &Path) -> Vec<PathBuf> {
     }
     result.sort();
     result
+}
+
+fn canonical_contained_path(parent: &Path, path: &Path, label: &str) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|err| format!("cannot resolve {label} {}: {err}", path.display()))?;
+    if !canonical.starts_with(parent) {
+        return Err(format!(
+            "{label} {} resolves outside {}",
+            path.display(),
+            parent.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 // ── dump ──────────────────────────────────────────────────────────────────────

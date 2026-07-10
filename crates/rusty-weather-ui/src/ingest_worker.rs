@@ -82,7 +82,8 @@ pub struct IngestWorker {
     tx: Sender<IngestRequest>,
     rx: Receiver<IngestResponse>,
     cancel: Arc<AtomicBool>,
-    _thread: JoinHandle<()>,
+    _thread: Option<JoinHandle<()>>,
+    startup_error: Option<String>,
 }
 
 impl IngestWorker {
@@ -99,14 +100,22 @@ impl IngestWorker {
             .spawn(move || {
                 throttle::set_current_thread_background_priority();
                 worker_loop(store_root, &req_rx, &resp_tx, &notify, &worker_cancel);
-            })
-            .expect("spawn ingest worker thread");
+            });
+        let (thread, startup_error) = match thread {
+            Ok(thread) => (Some(thread), None),
+            Err(error) => (None, Some(format!("could not start ingest worker: {error}"))),
+        };
         Self {
             tx: req_tx,
             rx: resp_rx,
             cancel,
             _thread: thread,
+            startup_error,
         }
+    }
+
+    pub fn startup_error(&self) -> Option<&str> {
+        self.startup_error.as_deref()
     }
 
     /// Queue a request (dropped silently if the worker died).
