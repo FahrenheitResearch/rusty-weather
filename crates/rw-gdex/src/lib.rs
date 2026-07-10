@@ -857,7 +857,7 @@ fn read_catalog_cache(path: &Path) -> Result<Option<CatalogCache>> {
         return Ok(None);
     }
     let mut bytes = Vec::new();
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take(MAX_CATALOG_CACHE_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_CATALOG_CACHE_BYTES {
