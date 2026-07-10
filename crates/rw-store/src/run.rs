@@ -1,5 +1,6 @@
 //! Run-level manifest (`run.json`): which hour files exist for a model run,
-//! keyed by forecast hour, plus the grid identity they were written against.
+//! keyed by whole forecast hour in v1 or ordinal storage slot in exact-time
+//! v2, plus the grid identity they were written against.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -11,10 +12,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic::atomic_write_bytes;
 use crate::error::{RwResult, RwStoreError};
-use crate::format::RwsWriterInfo;
+use crate::format::{
+    RwsExactTime, RwsHourMeta, RwsWriterInfo, SCHEMA_HOUR, SCHEMA_HOUR_V2,
+};
 
 /// Schema identifier embedded in run manifests.
 pub const SCHEMA_RUN: &str = "rw-store.run.v1";
+/// Exact-time manifest schema. Map keys are ordinal storage slots, not an
+/// assertion that the corresponding lead is a whole number of hours.
+pub const SCHEMA_RUN_V2: &str = "rw-store.run.v2";
 
 /// Maximum accepted `run.json` size. Manifests are metadata, not payloads;
 /// bounding the read prevents a corrupt or hostile store from forcing an
@@ -72,20 +78,35 @@ fn is_windows_device_name(value: &str) -> bool {
         .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
 }
 
-/// One registered forecast hour: the hour file plus write provenance.
+/// One registered v1 forecast hour or v2 ordinal storage slot: the hour file,
+/// optional exact physical timing, and write provenance.
 /// `written_unix` is supplied by the caller (the library never reads the
 /// clock), so tests and replays stay deterministic.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct RwsHourEntry {
     pub file: String,
+    /// Present together only in exact-time v2; absent in v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_unix: Option<i64>,
     pub written_unix: u64,
     pub encode_ms: u64,
     pub variables: Vec<String>,
 }
 
-/// Run manifest: identity of the run (model, run, grid) and the map of
-/// forecast hours written so far. Hours are a BTreeMap so the JSON is
-/// stable-ordered and re-registering an hour overwrites in place.
+impl RwsHourEntry {
+    pub fn exact_time(&self) -> Option<RwsExactTime> {
+        Some(RwsExactTime {
+            lead_seconds: self.lead_seconds?,
+            valid_unix: self.valid_unix?,
+        })
+    }
+}
+
+/// Run manifest: identity of the run (model, run, grid) and its ordered map.
+/// Keys are whole forecast hours in v1 and ordinal slots in v2. A BTreeMap
+/// keeps JSON stable and gives v2 timing validation an unambiguous order.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct RwsRunManifest {
     pub schema: String,
@@ -186,13 +207,102 @@ impl RwsRunManifest {
         Ok(())
     }
 
+    /// Whether map keys are ordinal storage slots with exact physical timing.
+    pub fn is_exact_time_axis(&self) -> bool {
+        self.schema == SCHEMA_RUN_V2
+    }
+
+    /// Exact times in ordinal storage-slot order. A manifest returned by
+    /// [`Self::load`] is guaranteed to yield one item for every v2 entry and
+    /// no items for v1.
+    pub fn exact_times(&self) -> impl Iterator<Item = (u16, RwsExactTime)> + '_ {
+        self.hours
+            .iter()
+            .filter_map(|(&slot, entry)| entry.exact_time().map(|time| (slot, time)))
+    }
+
+    /// Validate one registered hour file's metadata against this manifest,
+    /// including the ordinal slot and exact-time pair. This is the shared seam
+    /// for store browsers, import recovery, and diagnostic validation.
+    pub fn validate_hour_meta(
+        &self,
+        storage_slot: u16,
+        meta: &RwsHourMeta,
+    ) -> RwResult<&RwsHourEntry> {
+        let entry = self.hours.get(&storage_slot).ok_or_else(|| {
+            RwStoreError::Meta(format!(
+                "storage slot {storage_slot} is absent from the run manifest"
+            ))
+        })?;
+        let expected_hour_schema = match self.schema.as_str() {
+            SCHEMA_RUN => SCHEMA_HOUR,
+            SCHEMA_RUN_V2 => SCHEMA_HOUR_V2,
+            other => {
+                return Err(RwStoreError::Meta(format!(
+                    "unexpected manifest schema '{other}'"
+                )));
+            }
+        };
+        if meta.schema != expected_hour_schema {
+            return Err(RwStoreError::Meta(format!(
+                "storage slot {storage_slot} hour schema '{}' does not match manifest schema '{}' (expected '{expected_hour_schema}')",
+                meta.schema, self.schema
+            )));
+        }
+        let meta_time = meta.validate_time_schema().map_err(RwStoreError::Meta)?;
+        let entry_time = match (entry.lead_seconds, entry.valid_unix) {
+            (Some(lead_seconds), Some(valid_unix)) => Some(RwsExactTime {
+                lead_seconds,
+                valid_unix,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(RwStoreError::Meta(format!(
+                    "storage slot {storage_slot} manifest entry must contain both lead_seconds and valid_unix or neither"
+                )));
+            }
+        };
+        if self.is_exact_time_axis() != entry_time.is_some() {
+            return Err(RwStoreError::Meta(format!(
+                "storage slot {storage_slot} timing does not satisfy manifest schema '{}'",
+                self.schema
+            )));
+        }
+        if meta.forecast_hour != storage_slot {
+            return Err(RwStoreError::Meta(format!(
+                "storage slot {storage_slot} contains hour metadata slot {}",
+                meta.forecast_hour
+            )));
+        }
+        if meta.model != self.model || meta.run != self.run {
+            return Err(RwStoreError::Meta(format!(
+                "storage slot {storage_slot} hour identity model='{}' run='{}' does not match manifest model='{}' run='{}'",
+                meta.model, meta.run, self.model, self.run
+            )));
+        }
+        if meta.grid_hash != self.grid_hash || meta.nx != self.nx || meta.ny != self.ny {
+            return Err(RwStoreError::Meta(format!(
+                "storage slot {storage_slot} hour grid {}x{} hash='{}' does not match manifest {}x{} hash='{}'",
+                meta.nx, meta.ny, meta.grid_hash, self.nx, self.ny, self.grid_hash
+            )));
+        }
+        if meta_time != entry_time {
+            return Err(RwStoreError::Meta(format!(
+                "storage slot {storage_slot} hour exact time {:?} does not match manifest {:?}",
+                meta_time,
+                entry_time
+            )));
+        }
+        Ok(entry)
+    }
+
     /// Validate a parsed manifest's schema, safe identities, geometry, and
     /// registered hour filenames. Primarily public for diagnostic tooling;
     /// regular readers get this automatically through [`Self::load`].
     pub fn validate_contents(&self) -> RwResult<()> {
-        if self.schema != SCHEMA_RUN {
+        if self.schema != SCHEMA_RUN && self.schema != SCHEMA_RUN_V2 {
             return Err(RwStoreError::Meta(format!(
-                "unexpected schema '{}' (expected '{SCHEMA_RUN}')",
+                "unexpected schema '{}' (expected '{SCHEMA_RUN}' or '{SCHEMA_RUN_V2}')",
                 self.schema
             )));
         }
@@ -224,14 +334,74 @@ impl RwsRunManifest {
         debug_assert!(raw_bytes > 0);
 
         let mut files = BTreeSet::new();
-        for (&hour, entry) in &self.hours {
-            validate_store_component(&format!("manifest hour F{hour:03} file"), &entry.file)?;
+        let exact_axis = self.schema == SCHEMA_RUN_V2;
+        let mut previous: Option<(u64, i64)> = None;
+        let mut origin_unix = None;
+        for (&slot, entry) in &self.hours {
+            validate_store_component(&format!("manifest slot {slot} file"), &entry.file)?;
             if !files.insert(entry.file.as_str()) {
                 return Err(RwStoreError::Meta(format!(
-                    "manifest hour F{hour:03} reuses file '{}' already registered to another hour",
+                    "manifest slot {slot} reuses file '{}' already registered to another slot",
                     entry.file
                 )));
             }
+            let exact_time = match (entry.lead_seconds, entry.valid_unix) {
+                (Some(lead_seconds), Some(valid_unix)) => Some(RwsExactTime {
+                    lead_seconds,
+                    valid_unix,
+                }),
+                (None, None) => None,
+                _ => {
+                    return Err(RwStoreError::Meta(format!(
+                        "manifest slot {slot} must contain both lead_seconds and valid_unix or neither"
+                    )));
+                }
+            };
+            if !exact_axis {
+                if exact_time.is_some() {
+                    return Err(RwStoreError::Meta(format!(
+                        "v1 manifest slot {slot} must not contain exact-time metadata"
+                    )));
+                }
+                continue;
+            }
+            let exact_time = exact_time.ok_or_else(|| {
+                RwStoreError::Meta(format!(
+                    "v2 manifest slot {slot} requires lead_seconds and valid_unix"
+                ))
+            })?;
+            let expected_file = format!("f{slot:03}.rws");
+            if entry.file != expected_file {
+                return Err(RwStoreError::Meta(format!(
+                    "v2 manifest slot {slot} file '{}' must use ordinal filename '{expected_file}'",
+                    entry.file
+                )));
+            }
+            let this_origin = exact_time.origin_unix().ok_or_else(|| {
+                RwStoreError::Meta(format!(
+                    "v2 manifest slot {slot} exact time cannot represent valid_unix - lead_seconds"
+                ))
+            })?;
+            if let Some(expected_origin) = origin_unix {
+                if this_origin != expected_origin {
+                    return Err(RwStoreError::Meta(format!(
+                        "v2 manifest slot {slot} implies origin {this_origin}, expected {expected_origin}"
+                    )));
+                }
+            } else {
+                origin_unix = Some(this_origin);
+            }
+            if let Some((previous_lead, previous_valid)) = previous {
+                if exact_time.lead_seconds <= previous_lead
+                    || exact_time.valid_unix <= previous_valid
+                {
+                    return Err(RwStoreError::Meta(format!(
+                        "v2 manifest exact times must increase strictly by storage slot; slot {slot} has lead_seconds={} valid_unix={} after lead_seconds={previous_lead} valid_unix={previous_valid}",
+                        exact_time.lead_seconds, exact_time.valid_unix
+                    )));
+                }
+            }
+            previous = Some((exact_time.lead_seconds, exact_time.valid_unix));
         }
         Ok(())
     }
@@ -248,13 +418,58 @@ impl RwsRunManifest {
         ny: usize,
         writer: RwsWriterInfo,
     ) -> RwResult<Self> {
+        Self::load_or_new_schema(
+            path, model, run, grid_hash, nx, ny, writer, SCHEMA_RUN,
+        )
+    }
+
+    /// Exact-time counterpart to [`Self::load_or_new`]. Existing v1 runs are
+    /// rejected rather than silently mixing whole-hour keys with ordinal
+    /// storage slots.
+    pub fn load_or_new_exact(
+        path: &Path,
+        model: &str,
+        run: &str,
+        grid_hash: &str,
+        nx: usize,
+        ny: usize,
+        writer: RwsWriterInfo,
+    ) -> RwResult<Self> {
+        Self::load_or_new_schema(
+            path,
+            model,
+            run,
+            grid_hash,
+            nx,
+            ny,
+            writer,
+            SCHEMA_RUN_V2,
+        )
+    }
+
+    fn load_or_new_schema(
+        path: &Path,
+        model: &str,
+        run: &str,
+        grid_hash: &str,
+        nx: usize,
+        ny: usize,
+        writer: RwsWriterInfo,
+        schema: &str,
+    ) -> RwResult<Self> {
         if path.exists() {
             let manifest = Self::load_for_run(path, model, run)?;
             manifest.validate_grid(grid_hash, nx, ny)?;
+            if manifest.schema != schema {
+                return Err(RwStoreError::Meta(format!(
+                    "existing manifest schema '{}' cannot be opened by writer for '{schema}'",
+                    manifest.schema
+                )));
+            }
             return Ok(manifest);
         }
         let manifest = Self {
-            schema: SCHEMA_RUN.to_string(),
+            schema: schema.to_string(),
             model: model.to_string(),
             run: run.to_string(),
             grid_hash: grid_hash.to_string(),
@@ -292,7 +507,8 @@ impl RwsRunManifest {
 mod tests {
     use super::*;
     use crate::error::RwStoreError;
-    use crate::format::RwsWriterInfo;
+    use crate::format::{RwsChunking, RwsHourMeta, RwsWriterInfo, SCHEMA_HOUR_V2};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
 
@@ -315,9 +531,38 @@ mod tests {
     fn entry(file: &str, written_unix: u64, encode_ms: u64, variables: &[&str]) -> RwsHourEntry {
         RwsHourEntry {
             file: file.to_string(),
+            lead_seconds: None,
+            valid_unix: None,
             written_unix,
             encode_ms,
             variables: variables.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    fn exact_entry(slot: u16, lead_seconds: u64, valid_unix: i64) -> RwsHourEntry {
+        RwsHourEntry {
+            file: format!("f{slot:03}.rws"),
+            lead_seconds: Some(lead_seconds),
+            valid_unix: Some(valid_unix),
+            written_unix: 1_770_000_000,
+            encode_ms: 10,
+            variables: vec!["temp_2m".to_string()],
+        }
+    }
+
+    fn exact_manifest() -> RwsRunManifest {
+        RwsRunManifest {
+            schema: SCHEMA_RUN_V2.to_string(),
+            model: "wrf".to_string(),
+            run: "research".to_string(),
+            grid_hash: "gridhash-test".to_string(),
+            nx: 2,
+            ny: 2,
+            hours: BTreeMap::from([
+                (0, exact_entry(0, 0, 1_700_000_000)),
+                (1, exact_entry(1, 1_800, 1_700_001_800)),
+            ]),
+            writer: writer_info(),
         }
     }
 
@@ -366,6 +611,9 @@ mod tests {
         assert_eq!(loaded.hours[&0].written_unix, 1_770_000_000);
         assert_eq!(loaded.hours[&0].variables, vec!["temp_2m", "dewpoint_2m"]);
         assert_eq!(loaded.hours[&6].encode_ms, 912);
+        let v1_json = serde_json::to_value(&loaded).unwrap();
+        assert!(v1_json["hours"]["0"].get("lead_seconds").is_none());
+        assert!(v1_json["hours"]["0"].get("valid_unix").is_none());
 
         // Re-registering an hour overwrites in place; the map does not grow.
         let mut manifest = loaded;
@@ -374,6 +622,177 @@ mod tests {
         assert_eq!(manifest.hours[&0].file, "f000-v2.rws");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_manifest_round_trips_and_exposes_ordered_times() {
+        let dir = test_dir("exact-round-trip");
+        let path = dir.join("run.json");
+        let manifest = exact_manifest();
+        manifest.save(&path).unwrap();
+
+        let loaded = RwsRunManifest::load(&path).unwrap();
+        assert!(loaded.is_exact_time_axis());
+        assert_eq!(loaded, manifest);
+        assert_eq!(
+            loaded.exact_times().collect::<Vec<_>>(),
+            vec![
+                (
+                    0,
+                    RwsExactTime {
+                        lead_seconds: 0,
+                        valid_unix: 1_700_000_000,
+                    },
+                ),
+                (
+                    1,
+                    RwsExactTime {
+                        lead_seconds: 1_800,
+                        valid_unix: 1_700_001_800,
+                    },
+                ),
+            ]
+        );
+        let err = RwsRunManifest::load_or_new(
+            &path,
+            "wrf",
+            "research",
+            "gridhash-test",
+            2,
+            2,
+            writer_info(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be opened"), "{err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schema_time_contract_rejects_missing_mixed_and_inconsistent_axes() {
+        let mut v1 = RwsRunManifest {
+            schema: SCHEMA_RUN.to_string(),
+            model: "wrf".to_string(),
+            run: "research".to_string(),
+            grid_hash: "gridhash-test".to_string(),
+            nx: 2,
+            ny: 2,
+            hours: BTreeMap::from([(0, entry("f000.rws", 0, 0, &["temp_2m"]))]),
+            writer: writer_info(),
+        };
+        v1.hours.get_mut(&0).unwrap().lead_seconds = Some(0);
+        v1.hours.get_mut(&0).unwrap().valid_unix = Some(1_700_000_000);
+        assert!(v1.validate_contents().unwrap_err().to_string().contains("v1"));
+
+        let mut missing = exact_manifest();
+        missing.hours.get_mut(&1).unwrap().valid_unix = None;
+        assert!(
+            missing
+                .validate_contents()
+                .unwrap_err()
+                .to_string()
+                .contains("both")
+        );
+
+        let mut absent = exact_manifest();
+        absent.hours.get_mut(&1).unwrap().lead_seconds = None;
+        absent.hours.get_mut(&1).unwrap().valid_unix = None;
+        assert!(
+            absent
+                .validate_contents()
+                .unwrap_err()
+                .to_string()
+                .contains("requires")
+        );
+
+        let mut wrong_file = exact_manifest();
+        wrong_file.hours.get_mut(&1).unwrap().file = "f900.rws".to_string();
+        assert!(
+            wrong_file
+                .validate_contents()
+                .unwrap_err()
+                .to_string()
+                .contains("ordinal filename")
+        );
+
+        let mut non_increasing = exact_manifest();
+        non_increasing.hours.insert(1, exact_entry(1, 0, 1_700_000_000));
+        assert!(
+            non_increasing
+                .validate_contents()
+                .unwrap_err()
+                .to_string()
+                .contains("increase strictly")
+        );
+
+        let mut inconsistent_origin = exact_manifest();
+        inconsistent_origin.hours.get_mut(&1).unwrap().valid_unix = Some(1_700_001_801);
+        assert!(
+            inconsistent_origin
+                .validate_contents()
+                .unwrap_err()
+                .to_string()
+                .contains("implies origin")
+        );
+
+        let mut unrepresentable = exact_manifest();
+        unrepresentable.hours = BTreeMap::from([(0, exact_entry(0, u64::MAX, 0))]);
+        assert!(
+            unrepresentable
+                .validate_contents()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot represent")
+        );
+    }
+
+    #[test]
+    fn manifest_hour_cross_check_requires_slot_and_exact_time_equality() {
+        let manifest = exact_manifest();
+        let mut meta = RwsHourMeta {
+            schema: SCHEMA_HOUR_V2.to_string(),
+            model: manifest.model.clone(),
+            run: manifest.run.clone(),
+            forecast_hour: 1,
+            lead_seconds: Some(1_800),
+            valid_unix: Some(1_700_001_800),
+            nx: manifest.nx,
+            ny: manifest.ny,
+            grid_hash: manifest.grid_hash.clone(),
+            variables: Vec::new(),
+            chunking: RwsChunking {
+                tile_y: 256,
+                tile_x: 256,
+                col_y: 16,
+                col_x: 16,
+            },
+            writer: writer_info(),
+        };
+        assert_eq!(
+            manifest
+                .validate_hour_meta(1, &meta)
+                .unwrap()
+                .exact_time(),
+            meta.exact_time()
+        );
+
+        meta.forecast_hour = 0;
+        assert!(
+            manifest
+                .validate_hour_meta(1, &meta)
+                .unwrap_err()
+                .to_string()
+                .contains("metadata slot")
+        );
+        meta.forecast_hour = 1;
+        meta.valid_unix = Some(1_700_001_801);
+        assert!(
+            manifest
+                .validate_hour_meta(1, &meta)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
     }
 
     #[test]

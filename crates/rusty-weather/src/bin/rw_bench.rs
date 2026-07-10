@@ -42,6 +42,7 @@ use std::time::Instant;
 use clap::Parser;
 use rw_store::grid::{GridFile, GridLocator};
 use rw_store::reader::HourReader;
+use rw_store::run::RwsRunManifest;
 
 use rw_ingest::size_estimate::walk_hour_sizes;
 
@@ -73,7 +74,11 @@ struct Args {
     model: String,
     #[arg(long, help = "Run slug, e.g. 20260608_00z")]
     run: String,
-    #[arg(long, default_value_t = 6)]
+    #[arg(
+        long,
+        default_value_t = 6,
+        help = "Forecast hour for v1, or ordinal storage slot for exact-time v2"
+    )]
     hour: u16,
     #[arg(
         long,
@@ -145,7 +150,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--samples must be >= 1".into());
     }
     let run_dir = args.store_root.join(&args.model).join(&args.run);
-    let hour_path = run_dir.join(format!("f{:03}.rws", args.hour));
+    let manifest = RwsRunManifest::load_for_run(
+        &run_dir.join("run.json"),
+        &args.model,
+        &args.run,
+    )?;
+    let entry = manifest.hours.get(&args.hour).ok_or_else(|| {
+        format!(
+            "storage key {} is absent from {}/{}/run.json",
+            args.hour, args.model, args.run
+        )
+    })?;
+    let hour_path = run_dir.join(&entry.file);
     let grid_path = run_dir.join("grid.rwg");
     let file_bytes = fs::metadata(&hour_path)?.len();
     let grid_bytes = fs::metadata(&grid_path)?.len();
@@ -153,8 +169,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pre-opened handles for the warm-path metrics.
     let reader = HourReader::open(&hour_path)?;
     let grid = GridFile::open(&grid_path)?;
+    manifest.validate_grid(&grid.hash, grid.nx, grid.ny)?;
     let locator = GridLocator::build(&grid);
     let meta = reader.meta().clone();
+    manifest.validate_hour_meta(args.hour, &meta)?;
     let (nx, ny) = (meta.nx, meta.ny);
 
     let vars_2d: Vec<String> = meta
@@ -171,7 +189,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     if vars_2d.is_empty() || vars_3d.is_empty() {
         return Err(format!(
-            "hour has {} 2D and {} 3D variables; the bench needs at least one of each",
+            "timestep has {} 2D and {} 3D variables; the bench needs at least one of each",
             vars_2d.len(),
             vars_3d.len()
         )
@@ -187,18 +205,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "locate({SOUNDING_LAT}, {SOUNDING_LON}) is off-grid"
     ))?;
 
+    let timestep_label = match meta.exact_time() {
+        Some(time) => format!(
+            "slot {} (+{}s, valid Unix {})",
+            args.hour, time.lead_seconds, time.valid_unix
+        ),
+        None => format!("f{:03}", args.hour),
+    };
     println!(
-        "rw_bench build {} | {} {} f{:03} | grid {} x {} | samples {} (median, 1 warmup)",
+        "rw_bench build {} | {} {} {} | grid {} x {} | samples {} (median, 1 warmup)",
         env!("RW_BUILD_SHA"),
         args.model,
         args.run,
-        args.hour,
+        timestep_label,
         nx,
         ny,
         args.samples,
     );
     println!(
-        "hour file {} ({:.1} MB) | grid file {:.1} MB | 2D vars {} | 3D vars {} ({} levels)",
+        "timestep file {} ({:.1} MB) | grid file {:.1} MB | 2D vars {} | 3D vars {} ({} levels)",
         hour_path.display(),
         mb(file_bytes),
         mb(grid_bytes),

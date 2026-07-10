@@ -32,8 +32,10 @@
 //! - 3D vars additionally carry `rw_quantization` (scientific-honesty note).
 //!
 //! ### Global attributes
-//! `Conventions`, `title`, `model`, `run`, `forecast_hour` (Floats, 1 value),
-//! `grid_hash`, `source`, `comment`.
+//! `Conventions`, `title`, `model`, `run`, `grid_hash`, `source`, `comment`,
+//! plus either v1 `forecast_hour` or v2 `storage_slot`, `lead_seconds`, and
+//! `valid_unix`. Exact integer times use decimal text because NetCDF-3 has no
+//! i64 attribute type and an f32 timestamp would be lossy.
 //!
 //! ### Name sanitation
 //! rw-store names are `[a-z0-9_]` — the only chars that could violate
@@ -175,19 +177,41 @@ pub fn export_hour_to_netcdf3(
         "rw-store {} via rws export, writer {} {} {}",
         meta.schema, meta.writer.name, meta.writer.version, meta.writer.build
     );
-    let gattrs = vec![
+    let mut gattrs = vec![
         Nc3Attr::text("Conventions", "CF-1.6"),
         Nc3Attr::text("title", "rusty-weather rw-store export"),
         Nc3Attr::text("model", &meta.model),
         Nc3Attr::text("run", &meta.run),
-        Nc3Attr::floats("forecast_hour", vec![meta.forecast_hour as f32]),
+    ];
+    if let Some(exact_time) = meta.exact_time() {
+        // NetCDF-3 has no i64 attribute type. Decimal text preserves both
+        // values exactly; using f32 would silently lose timestamp precision.
+        gattrs.push(Nc3Attr::floats(
+            "storage_slot",
+            vec![meta.forecast_hour as f32],
+        ));
+        gattrs.push(Nc3Attr::text(
+            "lead_seconds",
+            exact_time.lead_seconds.to_string(),
+        ));
+        gattrs.push(Nc3Attr::text(
+            "valid_unix",
+            exact_time.valid_unix.to_string(),
+        ));
+    } else {
+        gattrs.push(Nc3Attr::floats(
+            "forecast_hour",
+            vec![meta.forecast_hour as f32],
+        ));
+    }
+    gattrs.extend([
         Nc3Attr::text("grid_hash", &meta.grid_hash),
         Nc3Attr::text("source", &source),
         Nc3Attr::text(
             "comment",
             "Format spec: https://github.com/FahrenheitResearch/rusty-weather/blob/main/docs/FORMAT.md",
         ),
-    ];
+    ]);
 
     // ── 6. Variable definitions (order: lat, lon, level coords, data vars) ─
     let mut var_defs: Vec<Nc3VarDef> = Vec::new();
@@ -305,6 +329,7 @@ pub fn export_hour_to_netcdf3(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::RwsExactTime;
     use crate::netcdf3::NC_FLOAT;
     use crate::netcdf3::test_parser::{ParsedAttrValue, ParsedNc};
     use rustwx_core::{GridShape, LatLonGrid};
@@ -667,7 +692,63 @@ mod tests {
         }
     }
 
-    // ── Test 2: export_vars_filter ──────────────────────────────────────────
+    // ── Exact-time export attributes ────────────────────────────────────────
+
+    #[test]
+    fn exact_export_uses_lossless_time_attributes_not_forecast_hour() {
+        use crate::ingest::HourIngestWriter;
+
+        let dir = test_dir("exact-time");
+        let store_root = dir.join("store");
+        let grid = build_latlongrid();
+        let exact = RwsExactTime {
+            lead_seconds: 2_700,
+            valid_unix: 1_700_002_700,
+        };
+        let mut writer = HourIngestWriter::begin_exact(
+            &store_root,
+            "test_model",
+            "exact_run",
+            7,
+            exact,
+            &grid,
+            None,
+            "test-build",
+        )
+        .unwrap();
+        writer
+            .add_field_2d("t2m", "K", serde_json::json!({"var":"TMP"}), &t2m_values())
+            .unwrap();
+        let written = writer.finish(1_770_000_000).unwrap();
+        let grid_file = GridFile::open(
+            &store_root
+                .join("test_model")
+                .join("exact_run")
+                .join("grid.rwg"),
+        )
+        .unwrap();
+        let hour = HourReader::open(&written.path).unwrap();
+        let out = dir.join("exact.nc");
+        export_hour_to_netcdf3(&hour, &grid_file, None, &out).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let parsed = ParsedNc::parse(&bytes).unwrap();
+
+        assert!(parsed.gattr("forecast_hour").is_none());
+        assert_eq!(
+            parsed.gattr("storage_slot"),
+            Some(&ParsedAttrValue::Floats(vec![7.0]))
+        );
+        assert_eq!(
+            parsed.gattr("lead_seconds"),
+            Some(&ParsedAttrValue::Text("2700".to_string()))
+        );
+        assert_eq!(
+            parsed.gattr("valid_unix"),
+            Some(&ParsedAttrValue::Text("1700002700".to_string()))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn export_vars_filter() {

@@ -10,9 +10,10 @@
 //! docs/wrf-import-large-grids.md — while wrf-core reads the same slice in
 //! tens of ms). Plain NetCDF and post-processed climate files stay entirely
 //! on netcrust. Every source time record is mapped from WRF `Times` or a CF
-//! time coordinate to its exact integral forecast hour, then written through
-//! `rw_store::write_hour_from_fields_with_derived`; malformed, duplicate, or
-//! sub-hourly axes fail closed instead of being relabeled as file ordinals.
+//! time coordinate to an exact run timeline. Whole-hour runs with an explicit
+//! model reference retain the legacy v1 forecast-hour layout byte-for-byte;
+//! sub-hourly records or a missing authoritative reference switch the complete
+//! run to v2 ordinal storage slots carrying exact lead/valid times.
 #![allow(dead_code)]
 // Compatibility note: `push_direct` threads the netcrust handle + grid + selector
 // as separate args, and `try_postprocessed_wrf` returns the nested field/volume
@@ -20,7 +21,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -35,7 +36,10 @@ use rustwx_core::{
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
 use rw_store::run::{RwsRunManifest, validate_store_component};
-use rw_store::{DerivedFieldInput, RunLock, WrittenHour, write_hour_from_fields_with_derived};
+use rw_store::{
+    DerivedFieldInput, RunLock, WrittenHour, write_hour_from_fields_with_derived,
+    write_hour_from_fields_with_derived_exact,
+};
 use sha2::{Digest, Sha256};
 use wrf_core::WrfFile;
 
@@ -46,6 +50,11 @@ use crate::wrf_volumes::{
 
 const LOCAL_IMPORT_MAX_SCAN_DEPTH: usize = 8;
 const LOCAL_IMPORT_MAX_DISCOVERED_FILES: usize = 10_000;
+/// The store key is u16 and one run must remain practical to browse. Enforce
+/// this before hostile time coordinates can drive unbounded allocations.
+const MAX_RUN_TIMESTEPS: usize = (u16::MAX as usize) + 1;
+const MAX_TIME_LABEL_WIDTH: usize = 256;
+const MAX_TIME_LABEL_ELEMENTS: usize = 4 * 1024 * 1024;
 const SOURCE_ID_READ_BUFFER_BYTES: usize = 1_024 * 1_024;
 /// Bump whenever a scientific formula, unit normalization, grid convention,
 /// or field-selection meaning changes. It is embedded in every imported run
@@ -203,7 +212,7 @@ impl RunStagingPublisher {
         let manifest = RwsRunManifest::load_for_run(&manifest_path, &self.model, &self.run)
             .map_err(|err| format!("validate staged manifest: {err}"))?;
         if manifest.hours.is_empty() {
-            return Err("staged run contains no forecast hours".to_string());
+            return Err("staged run contains no timesteps".to_string());
         }
 
         let grid_path =
@@ -223,19 +232,9 @@ impl RunStagingPublisher {
             let reader = HourReader::open(&hour_path).map_err(|err| {
                 format!("open staged hour F{hour:03} {}: {err}", hour_path.display())
             })?;
-            let meta = reader.meta();
             manifest
-                .validate_identity(&meta.model, &meta.run)
-                .map_err(|err| format!("staged hour F{hour:03} identity mismatch: {err}"))?;
-            manifest
-                .validate_grid(&meta.grid_hash, meta.nx, meta.ny)
-                .map_err(|err| format!("staged hour F{hour:03} grid mismatch: {err}"))?;
-            if meta.forecast_hour != hour {
-                return Err(format!(
-                    "staged manifest F{hour:03} points to hour metadata F{:03}",
-                    meta.forecast_hour
-                ));
-            }
+                .validate_hour_meta(hour, reader.meta())
+                .map_err(|err| format!("staged storage slot {hour} metadata mismatch: {err}"))?;
         }
         let staged_lock = staged_run.join(rw_store::LOCK_FILE_NAME);
         if staged_lock.exists() {
@@ -1187,7 +1186,7 @@ fn validate_persisted_run(
     let manifest = RwsRunManifest::load_for_run(&manifest_path, model, run)
         .map_err(|err| format!("validate {label} manifest: {err}"))?;
     if manifest.hours.is_empty() {
-        return Err(format!("{label} contains no forecast hours"));
+        return Err(format!("{label} contains no timesteps"));
     }
     let grid_path = checked_regular_file_descendant(
         &run_dir,
@@ -1207,19 +1206,9 @@ fn validate_persisted_run(
         )?;
         let reader = HourReader::open(&hour_path)
             .map_err(|err| format!("open {label} hour F{hour:03}: {err}"))?;
-        let meta = reader.meta();
         manifest
-            .validate_identity(&meta.model, &meta.run)
-            .map_err(|err| format!("{label} hour F{hour:03} identity mismatch: {err}"))?;
-        manifest
-            .validate_grid(&meta.grid_hash, meta.nx, meta.ny)
-            .map_err(|err| format!("{label} hour F{hour:03} grid mismatch: {err}"))?;
-        if meta.forecast_hour != hour {
-            return Err(format!(
-                "{label} manifest F{hour:03} points to hour metadata F{:03}",
-                meta.forecast_hour
-            ));
-        }
+            .validate_hour_meta(hour, reader.meta())
+            .map_err(|err| format!("{label} storage slot {hour} metadata mismatch: {err}"))?;
     }
     Ok(())
 }
@@ -1338,9 +1327,9 @@ fn safe_remove_tree(root: &Path, target: &Path) -> Result<(), String> {
         .map_err(|err| format!("remove cleanup tree {}: {err}", target.display()))
 }
 
-/// One source-file record with an exact UTC valid time. The store format only
-/// has an integer `u16` forecast-hour key, so every ingest path must pass
-/// through [`ForecastHourTimeline`] before it writes anything.
+/// One source-file record with an exact UTC valid time. Every ingest path must
+/// settle the complete cross-file axis through [`ForecastHourTimeline`] before
+/// it writes anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceTimeRecord {
     pub(crate) time_index: usize,
@@ -1358,24 +1347,40 @@ pub(crate) struct SourceTimeAxis {
     pub(crate) reference_unix: Option<i64>,
 }
 
-/// A source record after it has been proven representable by rw-store's
-/// integer forecast-hour schema.
+/// A source record after the complete run timeline has been validated. For a
+/// legacy v1 run `storage_slot` is the true forecast hour and `exact_time` is
+/// `None`. For a v2 run the slot is only a stable ordinal identity; the exact
+/// lead and valid time are load-bearing metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlannedSourceTime {
     pub(crate) time_index: usize,
-    pub(crate) forecast_hour: u16,
+    pub(crate) storage_slot: u16,
+    pub(crate) exact_time: Option<rw_store::RwsExactTime>,
     pub(crate) valid_unix: i64,
     pub(crate) label: String,
 }
 
-/// Cross-file forecast-hour allocator. It never invents ordinal hours: hour
-/// keys are exact elapsed whole hours from `START_DATE`, or from the first
-/// selected valid time when the source carries no forecast-reference time.
-/// Duplicate keys are rejected before a store writer can overwrite them.
-#[derive(Debug, Default)]
+impl PlannedSourceTime {
+    pub(crate) fn display_key(&self) -> String {
+        match self.exact_time {
+            Some(exact) => format!(
+                "+{} · {}",
+                format_lead_duration(exact.lead_seconds),
+                self.label
+            ),
+            None => format!("f{:03}", self.storage_slot),
+        }
+    }
+}
+
+/// Complete cross-file timeline plan. Planning is deliberately global: an
+/// exact-time run's ordinal slots are assigned only after every valid time is
+/// known and sorted, so filename/selection order cannot change store identity.
+#[derive(Debug, Clone)]
 pub(crate) struct ForecastHourTimeline {
-    origin_unix: Option<i64>,
-    seen_hours: BTreeSet<u16>,
+    origin_unix: i64,
+    exact_time_axis: bool,
+    records: Vec<Vec<PlannedSourceTime>>,
 }
 
 impl ForecastHourTimeline {
@@ -1387,115 +1392,188 @@ impl ForecastHourTimeline {
         &self,
         source_identity: &str,
         processing_profile: &str,
-    ) -> Option<String> {
-        self.origin_unix.map(|origin| {
-            let stamp = chrono::DateTime::from_timestamp(origin, 0)
-                .map(|time| time.format("%Y%m%d%H%M%S").to_string())
-                .unwrap_or_else(|| origin.to_string());
-            format!(
-                "local_{stamp}_{source_identity}_{processing_profile}_{IMPORT_SCIENCE_SCHEMA_VERSION}"
-            )
-        })
+    ) -> String {
+        let stamp = chrono::DateTime::from_timestamp(self.origin_unix, 0)
+            .map(|time| time.format("%Y%m%d%H%M%S").to_string())
+            .unwrap_or_else(|| self.origin_unix.to_string());
+        format!(
+            "local_{stamp}_{source_identity}_{processing_profile}_{IMPORT_SCIENCE_SCHEMA_VERSION}"
+        )
     }
 
-    pub(crate) fn plan(
-        &mut self,
-        source: &SourceTimeAxis,
-        path: &Path,
-    ) -> Result<Vec<PlannedSourceTime>, String> {
-        if source.records.is_empty() {
-            return Err(format!("{} has an empty time axis", path.display()));
-        }
-        for pair in source.records.windows(2) {
-            if pair[1].valid_unix <= pair[0].valid_unix {
-                return Err(format!(
-                    "{} has a non-increasing or duplicate time axis at records {} ({}) and {} ({})",
-                    path.display(),
-                    pair[0].time_index,
-                    pair[0].label,
-                    pair[1].time_index,
-                    pair[1].label
-                ));
-            }
+    pub(crate) fn is_exact_time_axis(&self) -> bool {
+        self.exact_time_axis
+    }
+
+    pub(crate) fn records_for_source(&self, index: usize) -> Option<&[PlannedSourceTime]> {
+        self.records.get(index).map(Vec::as_slice)
+    }
+
+    pub(crate) fn plan_all(sources: &[(PathBuf, SourceTimeAxis)]) -> Result<Self, String> {
+        if sources.is_empty() {
+            return Err("forecast timeline has no sources".to_string());
         }
 
-        let candidate_origin = source
-            .reference_unix
-            .unwrap_or(source.records[0].valid_unix);
-        match self.origin_unix {
-            None => {
-                self.origin_unix = Some(candidate_origin);
+        let total_records = sources.iter().try_fold(0_usize, |total, (_, source)| {
+            total
+                .checked_add(source.records.len())
+                .ok_or_else(|| "forecast timeline record count overflowed usize".to_string())
+        })?;
+        if total_records > MAX_RUN_TIMESTEPS {
+            return Err(format!(
+                "forecast timeline contains {total_records} records; rw-store supports at most {MAX_RUN_TIMESTEPS} timesteps per run"
+            ));
+        }
+
+        let mut reference = None::<(PathBuf, i64)>;
+        let mut earliest_valid = None::<i64>;
+        for (path, source) in sources {
+            if source.records.is_empty() {
+                return Err(format!("{} has an empty time axis", path.display()));
             }
-            Some(origin) => {
-                if let Some(reference) = source.reference_unix {
-                    if reference != origin {
-                        return Err(format!(
-                            "{} belongs to a different forecast run: reference time {} does not match {}",
-                            path.display(),
-                            format_valid_unix(reference),
-                            format_valid_unix(origin)
-                        ));
-                    }
+            for pair in source.records.windows(2) {
+                if pair[1].valid_unix <= pair[0].valid_unix {
+                    return Err(format!(
+                        "{} has a non-increasing or duplicate time axis at records {} ({}) and {} ({})",
+                        path.display(),
+                        pair[0].time_index,
+                        pair[0].label,
+                        pair[1].time_index,
+                        pair[1].label
+                    ));
                 }
             }
+            if let Some(candidate) = source.reference_unix {
+                if let Some((prior_path, prior)) = &reference {
+                    if *prior != candidate {
+                        return Err(format!(
+                            "{} belongs to a different forecast run: reference time {} does not match {} from {}",
+                            path.display(),
+                            format_valid_unix(candidate),
+                            format_valid_unix(*prior),
+                            prior_path.display()
+                        ));
+                    }
+                } else {
+                    reference = Some((path.clone(), candidate));
+                }
+            }
+            for record in &source.records {
+                earliest_valid = Some(
+                    earliest_valid
+                        .map(|prior| prior.min(record.valid_unix))
+                        .unwrap_or(record.valid_unix),
+                );
+            }
         }
-        let origin = self
-            .origin_unix
-            .ok_or_else(|| "internal error: forecast origin was not initialized".to_string())?;
+        let has_authoritative_reference = reference.is_some();
+        let origin_unix = reference
+            .as_ref()
+            .map(|(_, value)| *value)
+            .or(earliest_valid)
+            .ok_or_else(|| "forecast timeline has no valid times".to_string())?;
 
-        let mut planned = Vec::with_capacity(source.records.len());
-        let mut file_hours = BTreeSet::<u16>::new();
-        for record in &source.records {
-            let delta = record.valid_unix.checked_sub(origin).ok_or_else(|| {
-                format!(
-                    "{} time {} cannot be differenced from run origin {}",
-                    path.display(),
-                    record.label,
-                    format_valid_unix(origin)
+        #[derive(Debug)]
+        struct FlatRecord<'a> {
+            source_index: usize,
+            record: &'a SourceTimeRecord,
+            lead_seconds: u64,
+        }
+        let mut flat = Vec::<FlatRecord<'_>>::new();
+        for (source_index, (path, source)) in sources.iter().enumerate() {
+            for record in &source.records {
+                let delta = record.valid_unix.checked_sub(origin_unix).ok_or_else(|| {
+                    format!(
+                        "{} time {} cannot be differenced from run origin {}",
+                        path.display(),
+                        record.label,
+                        format_valid_unix(origin_unix)
+                    )
+                })?;
+                let lead_seconds = u64::try_from(delta).map_err(|_| {
+                    format!(
+                        "{} time {} precedes run origin {}",
+                        path.display(),
+                        record.label,
+                        format_valid_unix(origin_unix)
+                    )
+                })?;
+                flat.push(FlatRecord {
+                    source_index,
+                    record,
+                    lead_seconds,
+                });
+            }
+        }
+        flat.sort_by_key(|item| item.record.valid_unix);
+        if let Some(pair) = flat
+            .windows(2)
+            .find(|pair| pair[0].record.valid_unix == pair[1].record.valid_unix)
+        {
+            let left_path = &sources[pair[0].source_index].0;
+            let right_path = &sources[pair[1].source_index].0;
+            return Err(format!(
+                "duplicate forecast valid time {} appears in {} record {} and {} record {}; refusing to overwrite a timestep",
+                pair[0].record.label,
+                left_path.display(),
+                pair[0].record.time_index,
+                right_path.display(),
+                pair[1].record.time_index
+            ));
+        }
+
+        // Without a real model initialization timestamp, even an apparently
+        // whole-hour cadence is not proof that ordinal labels are forecast
+        // hours. Persist the known valid times explicitly instead.
+        let exact_time_axis = !has_authoritative_reference
+            || flat.iter().any(|item| item.lead_seconds % 3_600 != 0);
+        let mut planned = vec![Vec::<PlannedSourceTime>::new(); sources.len()];
+        for (ordinal, item) in flat.into_iter().enumerate() {
+            let (storage_slot, exact_time) = if exact_time_axis {
+                let slot = u16::try_from(ordinal).map_err(|_| {
+                    "exact-time WRF ordinal slot exceeds u16 range".to_string()
+                })?;
+                (
+                    slot,
+                    Some(rw_store::RwsExactTime::new(
+                        item.lead_seconds,
+                        item.record.valid_unix,
+                    )),
                 )
-            })?;
-            if delta < 0 {
-                return Err(format!(
-                    "{} time {} precedes run origin {}",
-                    path.display(),
-                    record.label,
-                    format_valid_unix(origin)
-                ));
-            }
-            if delta % 3_600 != 0 {
-                return Err(format!(
-                    "{} time {} is {} seconds from run origin {}; rw-store can only represent integral forecast hours",
-                    path.display(),
-                    record.label,
-                    delta,
-                    format_valid_unix(origin)
-                ));
-            }
-            let hour_i64 = delta / 3_600;
-            let hour = u16::try_from(hour_i64).map_err(|_| {
-                format!(
-                    "{} time {} is forecast hour {hour_i64}, beyond rw-store's u16 hour range",
-                    path.display(),
-                    record.label
-                )
-            })?;
-            if self.seen_hours.contains(&hour) || !file_hours.insert(hour) {
-                return Err(format!(
-                    "{} time {} maps to duplicate forecast hour f{hour:03}; refusing to overwrite an existing timestep",
-                    path.display(),
-                    record.label
-                ));
-            }
-            planned.push(PlannedSourceTime {
-                time_index: record.time_index,
-                forecast_hour: hour,
-                valid_unix: record.valid_unix,
-                label: record.label.clone(),
+            } else {
+                let hour = item.lead_seconds / 3_600;
+                let slot = u16::try_from(hour).map_err(|_| {
+                    format!(
+                        "time {} is forecast hour {hour}, beyond rw-store's u16 hour range",
+                        item.record.label
+                    )
+                })?;
+                (slot, None)
+            };
+            planned[item.source_index].push(PlannedSourceTime {
+                time_index: item.record.time_index,
+                storage_slot,
+                exact_time,
+                valid_unix: item.record.valid_unix,
+                label: item.record.label.clone(),
             });
         }
-        self.seen_hours.extend(file_hours);
-        Ok(planned)
+        for records in &mut planned {
+            records.sort_by_key(|record| record.time_index);
+        }
+        Ok(Self {
+            origin_unix,
+            exact_time_axis,
+            records: planned,
+        })
     }
+}
+
+fn format_lead_duration(seconds: u64) -> String {
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    format!("{hours:03}:{minutes:02}:{seconds:02}")
 }
 
 #[derive(Debug)]
@@ -1909,6 +1987,11 @@ fn source_records_from_labels(
     expected_records: usize,
     context: &str,
 ) -> Result<Vec<SourceTimeRecord>, ImportError> {
+    if expected_records > MAX_RUN_TIMESTEPS {
+        return Err(ImportError::TimeAxis(format!(
+            "{context} contains {expected_records} records; the per-run limit is {MAX_RUN_TIMESTEPS}"
+        )));
+    }
     if labels.len() != expected_records {
         return Err(ImportError::TimeAxis(format!(
             "{context} contains {} timestamps for {expected_records} time records",
@@ -1919,6 +2002,12 @@ fn source_records_from_labels(
         .into_iter()
         .enumerate()
         .map(|(time_index, label)| {
+            if label.len() > MAX_TIME_LABEL_WIDTH {
+                return Err(ImportError::TimeAxis(format!(
+                    "{context} record {time_index} timestamp is {} bytes; the limit is {MAX_TIME_LABEL_WIDTH}",
+                    label.len()
+                )));
+            }
             let valid_unix = parse_utc_timestamp(&label).ok_or_else(|| {
                 ImportError::TimeAxis(format!(
                     "{context} record {time_index} has invalid timestamp {label:?}"
@@ -1953,6 +2042,20 @@ fn wrf_times_from_netcdf(
             "Times has shape {shape:?}; expected [{record_count}, DateStrLen] on dimension {time_dimension}"
         )));
     }
+    let width = shape[1];
+    if width > MAX_TIME_LABEL_WIDTH {
+        return Err(ImportError::TimeAxis(format!(
+            "Times DateStrLen is {width}; the supported maximum is {MAX_TIME_LABEL_WIDTH} bytes"
+        )));
+    }
+    let elements = record_count.checked_mul(width).ok_or_else(|| {
+        ImportError::TimeAxis("Times element count overflowed usize".to_string())
+    })?;
+    if elements > MAX_TIME_LABEL_ELEMENTS {
+        return Err(ImportError::TimeAxis(format!(
+            "Times contains {elements} character elements; the safety limit is {MAX_TIME_LABEL_ELEMENTS}"
+        )));
+    }
     let array = nc.read_array_f64("Times")?;
     if array.shape() != shape.as_slice() {
         return Err(ImportError::TimeAxis(format!(
@@ -1960,7 +2063,6 @@ fn wrf_times_from_netcdf(
             array.shape()
         )));
     }
-    let width = shape[1];
     let mut labels = Vec::with_capacity(record_count);
     for time_index in 0..record_count {
         let start = time_index
@@ -2227,6 +2329,12 @@ pub(crate) fn netcdf_source_times(nc: &NcFile, path: &Path) -> Result<SourceTime
             time_dimension.name()
         )));
     }
+    if record_count > MAX_RUN_TIMESTEPS {
+        return Err(ImportError::TimeAxis(format!(
+            "{} has {record_count} time records; the per-run limit is {MAX_RUN_TIMESTEPS}",
+            path.display()
+        )));
+    }
     let wrf_times = wrf_times_from_netcdf(nc, time_dimension.name(), record_count);
     let cf_times = cf_time_records(nc, time_dimension.name(), record_count);
     let records = match (wrf_times, cf_times) {
@@ -2279,6 +2387,13 @@ pub(crate) fn netcdf_source_times(nc: &NcFile, path: &Path) -> Result<SourceTime
 /// Exact WRF time discovery for the raw wrf-core path. `Times` must cover
 /// every record; missing or truncated labels are never replaced by ordinals.
 pub(crate) fn wrf_source_times(file: &WrfFile, path: &Path) -> Result<SourceTimeAxis, String> {
+    if file.nt > MAX_RUN_TIMESTEPS {
+        return Err(format!(
+            "{} has {} WRF time records; the per-run limit is {MAX_RUN_TIMESTEPS}",
+            path.display(),
+            file.nt
+        ));
+    }
     let labels = file
         .times()
         .map_err(|err| format!("Read WRF Times from {} failed: {err}", path.display()))?;
@@ -2326,9 +2441,8 @@ fn preflight_local_sources(
     source_identity: &str,
     processing_profile: &str,
 ) -> Result<(Vec<LocalSourcePlan>, String), ImportError> {
-    let mut timeline = ForecastHourTimeline::default();
     let mut expected_shape = None::<(usize, usize)>;
-    let mut plans = Vec::with_capacity(files.len());
+    let mut sources = Vec::<(PathBuf, SourceTimeAxis)>::with_capacity(files.len());
     for path in files {
         // Probe wrf-core first so common raw wrfouts do not pay netcrust's
         // expensive eager metadata indexing twice (preflight + processing).
@@ -2350,17 +2464,26 @@ fn preflight_local_sources(
         };
         merge_preflight_grid_shape(&mut expected_shape, shape, path)
             .map_err(ImportError::TimeAxis)?;
+        sources.push((path.clone(), source_times));
+    }
+    let timeline = ForecastHourTimeline::plan_all(&sources).map_err(ImportError::TimeAxis)?;
+    let mut plans = Vec::with_capacity(sources.len());
+    for (index, (path, _)) in sources.into_iter().enumerate() {
         let records = timeline
-            .plan(&source_times, path)
-            .map_err(ImportError::TimeAxis)?;
+            .records_for_source(index)
+            .ok_or_else(|| {
+                ImportError::TimeAxis(format!(
+                    "internal error: forecast timeline omitted source {}",
+                    path.display()
+                ))
+            })?
+            .to_vec();
         plans.push(LocalSourcePlan {
-            path: path.clone(),
+            path,
             records,
         });
     }
-    let run = timeline
-        .run_name(source_identity, processing_profile)
-        .ok_or_else(|| ImportError::TimeAxis("forecast timeline has no run origin".to_string()))?;
+    let run = timeline.run_name(source_identity, processing_profile);
     Ok((plans, run))
 }
 
@@ -2495,10 +2618,12 @@ fn import_paths(
             plan.records.len()
         ));
         for record in &plan.records {
-            let hour = record.forecast_hour;
+            let storage_slot = record.storage_slot;
             let record_tag = format!(
-                "{tag}, time {} ({}) -> f{hour:03}",
-                record.time_index, record.label
+                "{tag}, time {} ({}) -> {}",
+                record.time_index,
+                record.label,
+                record.display_key()
             );
             // Post-processed climate wrfout (CONUS-I/II, GDEX: derived TK/Z/P, no
             // raw T/PB) can't go through the raw-wrfout reader — build it directly.
@@ -2537,17 +2662,35 @@ fn import_paths(
                 }));
                 let volume_inputs = volumes.iter().map(IsoVolume::as_input).collect::<Vec<_>>();
                 progress(format!("{record_tag}: writing to store"));
-                let result = write_hour_from_fields_with_derived(
-                    &staging_store_root,
-                    &model,
-                    &run,
-                    hour,
-                    &refs,
-                    &derived_refs,
-                    &volume_inputs,
-                    writer_build(),
-                    now_unix(),
-                )?;
+                let result = match record.exact_time {
+                    Some(exact_time) => write_hour_from_fields_with_derived_exact(
+                        &staging_store_root,
+                        &model,
+                        &run,
+                        storage_slot,
+                        exact_time,
+                        &refs,
+                        &derived_refs,
+                        &volume_inputs,
+                        writer_build(),
+                        now_unix(),
+                    ),
+                    None => write_hour_from_fields_with_derived(
+                        &staging_store_root,
+                        &model,
+                        &run,
+                        storage_slot,
+                        &refs,
+                        &derived_refs,
+                        &volume_inputs,
+                        writer_build(),
+                        now_unix(),
+                    ),
+                }
+                .map_err(|source| ImportError::StoreWrite {
+                    context: record_tag.clone(),
+                    source,
+                })?;
                 all_vars.extend(result.vars.iter().cloned());
                 written.push(result);
                 continue;
@@ -2625,17 +2768,35 @@ fn import_paths(
                 Vec::new()
             };
             progress(format!("{record_tag}: writing to store"));
-            let result = write_hour_from_fields_with_derived(
-                &staging_store_root,
-                &model,
-                &run,
-                hour,
-                &refs,
-                &raw_refs,
-                &volume_inputs,
-                writer_build(),
-                now_unix(),
-            )?;
+            let result = match record.exact_time {
+                Some(exact_time) => write_hour_from_fields_with_derived_exact(
+                    &staging_store_root,
+                    &model,
+                    &run,
+                    storage_slot,
+                    exact_time,
+                    &refs,
+                    &raw_refs,
+                    &volume_inputs,
+                    writer_build(),
+                    now_unix(),
+                ),
+                None => write_hour_from_fields_with_derived(
+                    &staging_store_root,
+                    &model,
+                    &run,
+                    storage_slot,
+                    &refs,
+                    &raw_refs,
+                    &volume_inputs,
+                    writer_build(),
+                    now_unix(),
+                ),
+            }
+            .map_err(|source| ImportError::StoreWrite {
+                context: record_tag.clone(),
+                source,
+            })?;
             all_vars.extend(result.vars.iter().cloned());
             written.push(result);
         }
@@ -4536,23 +4697,23 @@ mod tests {
     #[test]
     fn forecast_timeline_uses_exact_elapsed_hours_not_ordinals() {
         let origin = 1_700_000_000;
-        let mut timeline = ForecastHourTimeline::default();
-        let planned = timeline
-            .plan(
-                &test_time_axis(Some(origin), &[0, 3 * 3_600, 9 * 3_600]),
-                Path::new("wrfout.nc"),
-            )
-            .expect("integral timeline");
+        let sources = vec![(
+            PathBuf::from("wrfout.nc"),
+            test_time_axis(Some(origin), &[0, 3 * 3_600, 9 * 3_600]),
+        )];
+        let timeline = ForecastHourTimeline::plan_all(&sources).expect("integral timeline");
+        let planned = timeline.records_for_source(0).unwrap();
         assert_eq!(
             planned
                 .iter()
-                .map(|record| record.forecast_hour)
+                .map(|record| record.storage_slot)
                 .collect::<Vec<_>>(),
             vec![0, 3, 9]
         );
+        assert!(planned.iter().all(|record| record.exact_time.is_none()));
         assert_eq!(
-            timeline.run_name("0123456789abcdef", "light").as_deref(),
-            Some("local_20231114221320_0123456789abcdef_light_science_v1")
+            timeline.run_name("0123456789abcdef", "light"),
+            "local_20231114221320_0123456789abcdef_light_science_v1"
         );
         assert_ne!(
             timeline.run_name("0123456789abcdef", "light"),
@@ -4609,28 +4770,87 @@ mod tests {
     }
 
     #[test]
-    fn forecast_timeline_rejects_subhourly_and_duplicate_records() {
+    fn forecast_timeline_preserves_subhourly_times_and_rejects_duplicates() {
         let origin = 1_700_000_000;
-        let mut subhourly = ForecastHourTimeline::default();
-        let err = subhourly
-            .plan(
-                &test_time_axis(Some(origin), &[0, 1_800]),
-                Path::new("subhourly.nc"),
-            )
-            .expect_err("half-hour record is not representable");
-        assert!(err.contains("integral forecast hours"));
+        let sources = vec![(
+            PathBuf::from("wrfout_1974-04-03_17_48_00"),
+            test_time_axis(Some(origin), &[31_680, 31_740]),
+        )];
+        let timeline = ForecastHourTimeline::plan_all(&sources).expect("one-minute timeline");
+        assert!(timeline.is_exact_time_axis());
+        let records = timeline.records_for_source(0).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.storage_slot)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.exact_time.unwrap().lead_seconds)
+                .collect::<Vec<_>>(),
+            vec![31_680, 31_740]
+        );
 
-        let mut duplicate = ForecastHourTimeline::default();
-        duplicate
-            .plan(&test_time_axis(Some(origin), &[0]), Path::new("first.nc"))
-            .expect("first record");
-        let err = duplicate
-            .plan(
-                &test_time_axis(Some(origin), &[0]),
-                Path::new("duplicate.nc"),
-            )
-            .expect_err("duplicate hour must not overwrite");
-        assert!(err.contains("duplicate forecast hour"));
+        let duplicates = vec![
+            (
+                PathBuf::from("first.nc"),
+                test_time_axis(Some(origin), &[0]),
+            ),
+            (
+                PathBuf::from("duplicate.nc"),
+                test_time_axis(Some(origin), &[0]),
+            ),
+        ];
+        let err = ForecastHourTimeline::plan_all(&duplicates)
+            .expect_err("duplicate valid time must not overwrite");
+        assert!(err.contains("duplicate forecast valid time"));
+    }
+
+    #[test]
+    fn timeline_without_authoritative_origin_always_persists_exact_times() {
+        let sources = vec![(
+            PathBuf::from("snapshot_1974-04-03_17_48_00.nc"),
+            test_time_axis(None, &[0, 3_600]),
+        )];
+        let timeline = ForecastHourTimeline::plan_all(&sources).unwrap();
+        assert!(timeline.is_exact_time_axis());
+        let records = timeline.records_for_source(0).unwrap();
+        assert_eq!(records[0].exact_time.unwrap().lead_seconds, 0);
+        assert_eq!(records[1].exact_time.unwrap().lead_seconds, 3_600);
+    }
+
+    #[test]
+    fn time_label_conversion_rejects_oversized_axes_before_labels_are_read() {
+        let error = source_records_from_labels(
+            Vec::new(),
+            MAX_RUN_TIMESTEPS + 1,
+            "hostile WRF Times",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("per-run limit"), "{error}");
+    }
+
+    #[test]
+    fn exact_timeline_slots_are_independent_of_filename_order() {
+        let origin = 1_700_000_000;
+        let late = (
+            PathBuf::from("aaa-late.nc"),
+            test_time_axis(Some(origin), &[31_740]),
+        );
+        let early = (
+            PathBuf::from("zzz-early.nc"),
+            test_time_axis(Some(origin), &[31_680]),
+        );
+        let forward = ForecastHourTimeline::plan_all(&[late.clone(), early.clone()]).unwrap();
+        let reverse = ForecastHourTimeline::plan_all(&[early, late]).unwrap();
+        assert_eq!(forward.records_for_source(0).unwrap()[0].storage_slot, 1);
+        assert_eq!(forward.records_for_source(1).unwrap()[0].storage_slot, 0);
+        assert_eq!(reverse.records_for_source(0).unwrap()[0].storage_slot, 0);
+        assert_eq!(reverse.records_for_source(1).unwrap()[0].storage_slot, 1);
     }
 
     #[test]
@@ -5675,7 +5895,7 @@ mod tests {
             "missing interpolation stages: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("writing forecast hour")),
+            lines.iter().any(|l| l.contains("writing to store")),
             "missing store-write stage: {lines:?}"
         );
 
@@ -6130,6 +6350,12 @@ pub(crate) enum ImportError {
     },
     #[error("post-processed WRF volume allocation is unsupported: {0}")]
     PostprocessedVolume(String),
+    #[error("{context}: store write failed: {source}")]
+    StoreWrite {
+        context: String,
+        #[source]
+        source: rw_store::RwStoreError,
+    },
     #[error(transparent)]
     Netcdf(#[from] netcrust::Error),
     #[error(transparent)]

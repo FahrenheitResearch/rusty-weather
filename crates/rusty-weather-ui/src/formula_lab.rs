@@ -33,7 +33,8 @@ const MAX_RECIPE_BYTES: u64 = 4 * 1024 * 1024;
 pub struct StoreFormulaSource {
     pub store_root: PathBuf,
     pub hour: HourKey,
-    /// Must be empty unless the host verified every run hour's valid time.
+    /// Must be empty unless the host verified every stored timestep's valid
+    /// time. Exact-time runs supply the complete map, never a partial axis.
     pub exact_times: BTreeMap<u16, ExactStoreTime>,
 }
 
@@ -165,7 +166,6 @@ struct EvaluationTask {
     rx: Receiver<Result<FormulaLabResult, String>>,
     generation: u64,
     source: FormulaResultSource,
-    store_revision: Option<StoreRunRevision>,
     raw_revision: Option<RawFileRevision>,
 }
 
@@ -381,7 +381,7 @@ impl FormulaLabPanel {
                 }
                 None => {
                     ui.label(
-                        egui::RichText::new("Select a store hour or stage a raw WRF file")
+                        egui::RichText::new("Select a store timestep or stage a raw WRF file")
                             .small()
                             .weak(),
                     );
@@ -1099,19 +1099,6 @@ impl FormulaLabPanel {
             }
             EvaluationSource::Store(_) => None,
         };
-        let store_revision = match store_revision_source.as_ref() {
-            Some(source) => match inspect_store_run_revision(source) {
-                Ok(revision) => Some(revision),
-                Err(error) => {
-                    self.status = Some(format!(
-                        "Could not capture a stable Formula Lab store source: {error}"
-                    ));
-                    return;
-                }
-            },
-            None => None,
-        };
-        let worker_store_revision = store_revision.clone();
         let raw_revision = raw_revision_source
             .as_ref()
             .map(|(_, revision)| revision.clone());
@@ -1125,6 +1112,15 @@ impl FormulaLabPanel {
             .spawn(move || {
                 rw_ingest::throttle::set_current_thread_background_priority();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // A minute-cadence run may contain thousands of files. Keep
+                    // both run-wide revision walks on the background worker so
+                    // clicking Evaluate and accepting its result never blocks
+                    // the egui thread on O(timesteps) filesystem calls.
+                    let store_revision_before = store_revision_source
+                        .as_ref()
+                        .map(inspect_store_run_revision)
+                        .transpose()
+                        .map_err(BridgeError::Store)?;
                     let evaluated = evaluate_source(
                         source,
                         display_hour,
@@ -1135,7 +1131,7 @@ impl FormulaLabPanel {
                         &resource_limits,
                     )?;
                     if let (Some(source), Some(before)) =
-                        (store_revision_source.as_ref(), worker_store_revision.as_ref())
+                        (store_revision_source.as_ref(), store_revision_before.as_ref())
                     {
                         let after = inspect_store_run_revision(source).map_err(BridgeError::Store)?;
                         if &after != before {
@@ -1169,7 +1165,6 @@ impl FormulaLabPanel {
                     rx,
                     generation,
                     source: source_identity,
-                    store_revision,
                     raw_revision,
                 })
             }
@@ -1240,15 +1235,13 @@ impl FormulaLabPanel {
                 .map(|source| source.result_source())
                 .as_ref()
                 != Some(&task.source)
-            || match (&task.store_revision, &task.raw_revision, &task.source) {
-                (Some(expected), None, FormulaResultSource::Store { .. }) => {
-                    sources
-                        .store
-                        .and_then(|source| inspect_store_run_revision(source).ok())
-                        .as_ref()
-                        != Some(expected)
-                }
-                (None, Some(expected), FormulaResultSource::RawWrf { path, .. }) => {
+            || match (&task.raw_revision, &task.source) {
+                // Store stability is verified by two complete revision walks
+                // inside the worker. Source selection identity was compared
+                // immediately above, so no run-wide scan belongs on this UI
+                // polling path.
+                (None, FormulaResultSource::Store { .. }) => false,
+                (Some(expected), FormulaResultSource::RawWrf { path, .. }) => {
                     inspect_raw_file_revision(path)
                         .map(|current| &current != expected)
                         .unwrap_or(true)
@@ -1457,11 +1450,41 @@ fn inspect_store_run_revision(source: &StoreFormulaSource) -> Result<StoreRunRev
     let manifest =
         RwsRunManifest::load_for_run(&manifest_path, &source.hour.model, &source.hour.run)
             .map_err(|error| format!("load Formula Lab run manifest: {error}"))?;
-    if !manifest.hours.contains_key(&source.hour.hour) {
+    let Some(selected_entry) = manifest.hours.get(&source.hour.hour) else {
         return Err(format!(
-            "Formula Lab run no longer contains f{:03}",
-            source.hour.hour
+            "Formula Lab run no longer contains {}",
+            source.hour.time_label()
         ));
+    };
+    if selected_entry.exact_time() != source.hour.exact_time {
+        return Err(format!(
+            "Formula Lab selected timestep {} no longer matches the run manifest",
+            source.hour.time_label()
+        ));
+    }
+    if manifest.is_exact_time_axis() {
+        if source.exact_times.len() != manifest.hours.len() {
+            return Err(
+                "Formula Lab exact-time axis is incomplete for the selected run".to_string(),
+            );
+        }
+        for (&slot, entry) in &manifest.hours {
+            let exact = entry.exact_time().ok_or_else(|| {
+                format!("Formula Lab exact-time run is missing metadata for storage slot {slot}")
+            })?;
+            let supplied = source.exact_times.get(&slot).ok_or_else(|| {
+                format!("Formula Lab exact-time axis is missing storage slot {slot}")
+            })?;
+            if supplied.seconds != exact.lead_seconds as f64 {
+                return Err(format!(
+                    "Formula Lab exact time for storage slot {slot} no longer matches the run manifest"
+                ));
+            }
+        }
+    } else if !source.exact_times.is_empty() {
+        return Err(
+            "Formula Lab received exact times for a legacy forecast-hour run".to_string(),
+        );
     }
 
     let grid = inspect_raw_file_revision(&run_dir.join("grid.rwg"))?;
@@ -1473,7 +1496,7 @@ fn inspect_store_run_revision(source: &StoreFormulaSource) -> Result<StoreRunRev
         let revision = inspect_raw_file_revision(&run_dir.join(&entry.file))?;
         if !revision.canonical_path.starts_with(&run_dir) {
             return Err(format!(
-                "resolved Formula Lab hour f{hour:03} escapes its run directory"
+                "resolved Formula Lab storage slot {hour} escapes its run directory"
             ));
         }
         hours.push((hour, revision));
@@ -1780,6 +1803,7 @@ mod tests {
                 model: "wrf".to_string(),
                 run: "run".to_string(),
                 hour: 0,
+                exact_time: None,
             },
             exact_times: BTreeMap::new(),
         };
@@ -1812,6 +1836,7 @@ mod tests {
                 model: "raw-wrf".to_string(),
                 run: "revision-test".to_string(),
                 hour: 0,
+                exact_time: None,
             },
         };
         let mut panel = FormulaLabPanel::new();
@@ -1847,7 +1872,6 @@ mod tests {
             rx,
             generation: panel.editor_generation,
             source: stale_source,
-            store_revision: None,
             raw_revision: Some(first.clone()),
         };
         assert!(panel.task_is_stale(

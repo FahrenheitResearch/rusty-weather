@@ -17,8 +17,7 @@ use crate::codec::{decode_affine_i16, decode_f32_tile};
 use crate::error::{RwResult, RwStoreError};
 use crate::format::{
     CODEC_2D, CODEC_3D, COL_X, COL_Y, FLAG_CONSTANT, FLAG_EMPTY, FLAG_HAS_MISSING, HEADER_LEN,
-    INDEX_RECORD_LEN, KIND_COLUMN3D, KIND_TILE2D, RwsHourMeta, RwsVariableMeta, SCHEMA_HOUR,
-    TILE_X, TILE_Y,
+    INDEX_RECORD_LEN, KIND_COLUMN3D, KIND_TILE2D, RwsHourMeta, RwsVariableMeta, TILE_X, TILE_Y,
 };
 use crate::header::RwsHeader;
 use crate::index::ChunkRecord;
@@ -163,12 +162,7 @@ fn parse_hour_meta(bytes: &[u8]) -> RwResult<RwsHourMeta> {
 /// The expected index cardinality is exact for format v1: one record for each
 /// variable/chunk coordinate, including EMPTY and CONSTANT chunks.
 fn validate_hour_meta(meta: &RwsHourMeta, header: &RwsHeader) -> RwResult<()> {
-    if meta.schema != SCHEMA_HOUR {
-        return Err(RwStoreError::Meta(format!(
-            "unexpected schema '{}' (expected '{SCHEMA_HOUR}')",
-            meta.schema
-        )));
-    }
+    meta.validate_time_schema().map_err(RwStoreError::Meta)?;
     if meta.nx == 0 || meta.ny == 0 {
         return Err(RwStoreError::Meta(format!(
             "degenerate grid {}x{} (nx and ny must be nonzero)",

@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex};
 use rustwx_core::{GridProjection, GridShape};
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
-use rw_store::run::{RwsRunManifest, SCHEMA_RUN, validate_store_component};
+use rw_store::run::{RwsRunManifest, SCHEMA_RUN, SCHEMA_RUN_V2, validate_store_component};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wrf_core::WrfFile;
 pub use wrf_formula::{
@@ -48,11 +49,12 @@ pub enum BridgeError {
     Output(String),
 }
 
-/// A caller-verified valid time for one rw-store forecast hour.
+/// A caller-verified valid time for one rw-store timestep.
 ///
-/// `seconds` may use any epoch, but every entry supplied to one resolver must
-/// use the same epoch. Formula Lab only consumes differences. `label` is copied
-/// into result provenance when present.
+/// For a legacy v1 run, `seconds` may use any epoch as long as every entry uses
+/// the same one. For an exact-time v2 run it must equal the persisted lead time
+/// in seconds. Formula Lab only consumes differences. `label` is copied into
+/// result provenance when present.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExactStoreTime {
     pub seconds: f64,
@@ -85,8 +87,7 @@ pub struct EvaluatedField2D {
 /// an offset of +1 means the next stored valid hour, not necessarily f+1.
 pub struct StoreRunResolver {
     run_dir: PathBuf,
-    model: String,
-    run: String,
+    manifest: RwsRunManifest,
     grid: Arc<GridFile>,
     hours: Vec<StoreHour>,
     base_index: usize,
@@ -170,9 +171,9 @@ impl Drop for StoreAllocationReservation<'_> {
 }
 
 impl StoreRunResolver {
-    /// Open a run without claiming an exact time axis. Formulas using `dt`
-    /// fail with `ErrorKind::Time` instead of treating forecast-hour labels or
-    /// file write timestamps as verified valid times.
+    /// Open a run using persisted exact timing when it is a v2 run. Legacy v1
+    /// runs still leave `dt` disabled instead of treating forecast-hour labels
+    /// or file write timestamps as verified valid times.
     pub fn open(
         store_root: impl AsRef<Path>,
         model: impl Into<String>,
@@ -269,6 +270,7 @@ impl StoreRunResolver {
         let mut hours = Vec::with_capacity(manifest.hours.len());
         let mut hour_paths = BTreeSet::new();
         for (&forecast_hour, entry) in &manifest.hours {
+            let timestep_label = manifest_timestep_label(&manifest, forecast_hour);
             let relative = Path::new(&entry.file);
             if relative.is_absolute()
                 || relative
@@ -276,53 +278,48 @@ impl StoreRunResolver {
                     .any(|component| !matches!(component, Component::Normal(_)))
             {
                 return Err(BridgeError::Store(format!(
-                    "hour f{forecast_hour:03} has unsafe file path '{}'",
+                    "timestep {timestep_label} has unsafe file path '{}'",
                     entry.file
                 )));
             }
             let requested = run_dir.join(relative);
-            let path = fs::canonicalize(&requested).map_err(|error| {
-                BridgeError::Store(format!(
-                    "cannot resolve hour f{forecast_hour:03} file '{}': {error}",
+            if !hour_paths.insert(requested.clone()) {
+                return Err(BridgeError::Store(format!(
+                    "multiple manifest timesteps resolve to the same file '{}'",
                     requested.display()
-                ))
-            })?;
-            if !path.starts_with(&run_dir) {
-                return Err(BridgeError::Store(format!(
-                    "hour f{forecast_hour:03} file escapes its run directory"
-                )));
-            }
-            if !hour_paths.insert(path.clone()) {
-                return Err(BridgeError::Store(format!(
-                    "multiple manifest hours resolve to the same file '{}'",
-                    path.display()
                 )));
             }
             hours.push(StoreHour {
                 forecast_hour,
-                path,
+                path: requested,
             });
         }
         if hours.is_empty() {
             return Err(BridgeError::Store(
-                "run contains no forecast hours".to_string(),
+                "run contains no timesteps".to_string(),
             ));
         }
         let base_index = hours
             .iter()
             .position(|hour| hour.forecast_hour == base_hour)
-            .ok_or_else(|| BridgeError::Store(format!("run has no f{base_hour:03} hour")))?;
+            .ok_or_else(|| {
+                BridgeError::Store(format!(
+                    "run has no timestep {}",
+                    manifest_timestep_label(&manifest, base_hour)
+                ))
+            })?;
+        let exact_times = reconcile_exact_times(&manifest, exact_times)?;
         validate_exact_times(&hours, &exact_times)?;
+        let time_axis_hash = time_axis_hash(&manifest, &exact_times);
 
         let identity = format!(
-            "rw-store:{};model={model};run={run};grid={}",
+            "rw-store:{};model={model};run={run};grid={};time_axis={time_axis_hash}",
             run_dir.display(),
             grid.hash
         );
         Ok(Self {
             run_dir,
-            model,
-            run,
+            manifest,
             grid,
             hours,
             base_index,
@@ -393,30 +390,57 @@ impl StoreRunResolver {
                 format!("store hour index {index} is out of range"),
             )
         })?;
-        let reader = Arc::new(HourReader::open(&hour.path).map_err(|error| {
+        let canonical_path = fs::canonicalize(&hour.path).map_err(|error| {
             FormulaError::new(
                 ErrorKind::Resolver,
-                format!("cannot open store hour f{:03}: {error}", hour.forecast_hour),
+                format!(
+                    "cannot resolve store timestep {} file '{}': {error}",
+                    self.time_label(index),
+                    hour.path.display()
+                ),
             )
-        })?);
-        let meta = reader.meta();
-        if meta.model != self.model
-            || meta.run != self.run
-            || meta.forecast_hour != hour.forecast_hour
-            || meta.nx != self.grid.nx
-            || meta.ny != self.grid.ny
-            || meta.grid_hash != self.grid.hash
-        {
+        })?;
+        if !canonical_path.starts_with(&self.run_dir) {
             return Err(FormulaError::new(
                 ErrorKind::Resolver,
                 format!(
-                    "store hour f{:03} metadata does not match run/grid identity",
-                    hour.forecast_hour
+                    "store timestep {} file escapes its run directory",
+                    self.time_label(index)
                 ),
             ));
         }
+        let reader = Arc::new(HourReader::open(&canonical_path).map_err(|error| {
+            FormulaError::new(
+                ErrorKind::Resolver,
+                format!(
+                    "cannot open store timestep {}: {error}",
+                    self.time_label(index)
+                ),
+            )
+        })?);
+        self.manifest
+            .validate_hour_meta(hour.forecast_hour, reader.meta())
+            .map_err(|error| {
+                FormulaError::new(
+                    ErrorKind::Resolver,
+                    format!(
+                        "store timestep {} metadata does not match its manifest: {error}",
+                        self.time_label(index)
+                    ),
+                )
+            })?;
         readers.insert(index, reader.clone());
         Ok(reader)
+    }
+
+    fn time_label(&self, index: usize) -> String {
+        let Some(hour) = self.hours.get(index) else {
+            return format!("index {index}");
+        };
+        self.exact_times
+            .get(&hour.forecast_hour)
+            .and_then(|time| time.label.clone())
+            .unwrap_or_else(|| manifest_timestep_label(&self.manifest, hour.forecast_hour))
     }
 }
 
@@ -435,8 +459,9 @@ impl FieldResolver for StoreRunResolver {
                 return Err(FormulaError::new(
                     ErrorKind::Resolver,
                     format!(
-                        "store hour f{:03} has no field '{}'",
-                        self.hours[index].forecast_hour, request.name
+                        "store timestep {} has no field '{}'",
+                        self.time_label(index),
+                        request.name
                     ),
                 ));
             }
@@ -617,7 +642,8 @@ impl FieldResolver for StoreRunResolver {
             return Err(FormulaError::new(
                 ErrorKind::Time,
                 format!(
-                    "store valid time for f{forecast_hour:03} is not verified; dt is disabled for this imported run"
+                    "store valid time for {} is not verified; dt is disabled for this imported run",
+                    self.time_label(index)
                 ),
             )
             .note("supply a complete caller-verified ExactStoreTime map to enable temporal derivatives"));
@@ -1119,10 +1145,10 @@ fn reserve_store_allocation<'a>(
 }
 
 fn validate_manifest(manifest: &RwsRunManifest, model: &str, run: &str) -> BridgeResult<()> {
-    if manifest.schema != SCHEMA_RUN {
+    if !matches!(manifest.schema.as_str(), SCHEMA_RUN | SCHEMA_RUN_V2) {
         return Err(BridgeError::Store(format!(
-            "unsupported run schema '{}' (expected '{SCHEMA_RUN}')",
-            manifest.schema
+            "unsupported run schema '{}' (expected '{SCHEMA_RUN}' or '{SCHEMA_RUN_V2}')",
+            manifest.schema,
         )));
     }
     if manifest.model != model || manifest.run != run {
@@ -1137,6 +1163,112 @@ fn validate_manifest(manifest: &RwsRunManifest, model: &str, run: &str) -> Bridg
         ));
     }
     Ok(())
+}
+
+fn reconcile_exact_times(
+    manifest: &RwsRunManifest,
+    mut supplied: BTreeMap<u16, ExactStoreTime>,
+) -> BridgeResult<BTreeMap<u16, ExactStoreTime>> {
+    if !manifest.is_exact_time_axis() {
+        return Ok(supplied);
+    }
+    let persisted = manifest.exact_times().collect::<BTreeMap<_, _>>();
+    if supplied.is_empty() {
+        return persisted
+            .into_iter()
+            .map(|(slot, time)| {
+                Ok((
+                    slot,
+                    ExactStoreTime::new(
+                        exact_lead_seconds_f64(slot, time.lead_seconds)?,
+                        Some(manifest_timestep_label(manifest, slot)),
+                    ),
+                ))
+            })
+            .collect();
+    }
+    if supplied.len() != persisted.len() {
+        return Err(BridgeError::Store(format!(
+            "supplied exact time axis has {} entries, but v2 manifest has {}",
+            supplied.len(),
+            persisted.len()
+        )));
+    }
+    for (slot, persisted_time) in persisted {
+        let supplied_time = supplied.get_mut(&slot).ok_or_else(|| {
+            BridgeError::Store(format!(
+                "supplied exact time axis is missing storage slot {slot}"
+            ))
+        })?;
+        let persisted_seconds = exact_lead_seconds_f64(slot, persisted_time.lead_seconds)?;
+        if supplied_time.seconds != persisted_seconds {
+            return Err(BridgeError::Store(format!(
+                "supplied exact time for storage slot {slot} ({}) differs from persisted lead time {} seconds",
+                supplied_time.seconds, persisted_time.lead_seconds
+            )));
+        }
+    }
+    Ok(supplied)
+}
+
+fn manifest_timestep_label(manifest: &RwsRunManifest, storage_slot: u16) -> String {
+    if let Some(time) = manifest
+        .hours
+        .get(&storage_slot)
+        .and_then(|entry| entry.exact_time())
+    {
+        return format!(
+            "+{}s · Unix {} [storage slot {}]",
+            time.lead_seconds, time.valid_unix, storage_slot
+        );
+    }
+    if manifest.is_exact_time_axis() {
+        format!("storage slot {storage_slot}")
+    } else {
+        format!("f{storage_slot:03}")
+    }
+}
+
+fn time_axis_hash(
+    manifest: &RwsRunManifest,
+    exact_times: &BTreeMap<u16, ExactStoreTime>,
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(manifest.schema.as_bytes());
+    for (&slot, entry) in &manifest.hours {
+        hash.update(slot.to_le_bytes());
+        if let Some(time) = entry.exact_time() {
+            hash.update([1]);
+            hash.update(time.lead_seconds.to_le_bytes());
+            hash.update(time.valid_unix.to_le_bytes());
+        } else {
+            hash.update([0]);
+        }
+        if let Some(time) = exact_times.get(&slot) {
+            hash.update([1]);
+            hash.update(time.seconds.to_bits().to_le_bytes());
+        } else {
+            hash.update([0]);
+        }
+    }
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn exact_lead_seconds_f64(storage_slot: u16, lead_seconds: u64) -> BridgeResult<f64> {
+    if lead_seconds != 0 {
+        let significant_bits = u64::BITS
+            - lead_seconds.leading_zeros()
+            - lead_seconds.trailing_zeros();
+        if significant_bits > f64::MANTISSA_DIGITS {
+            return Err(BridgeError::Store(format!(
+                "persisted lead time {lead_seconds} seconds for storage slot {storage_slot} cannot be represented exactly for Formula Lab timing"
+            )));
+        }
+    }
+    Ok(lead_seconds as f64)
 }
 
 fn validate_exact_times(
@@ -1157,20 +1289,20 @@ fn validate_exact_times(
     for hour in hours {
         let time = exact_times.get(&hour.forecast_hour).ok_or_else(|| {
             BridgeError::Store(format!(
-                "exact time axis is missing f{:03}",
+                "exact time axis is missing storage slot {}",
                 hour.forecast_hour
             ))
         })?;
         if !time.seconds.is_finite() {
             return Err(BridgeError::Store(format!(
-                "exact time for f{:03} is not finite",
+                "exact time for storage slot {} is not finite",
                 hour.forecast_hour
             )));
         }
         if let Some(previous) = previous {
             if time.seconds <= previous {
                 return Err(BridgeError::Store(format!(
-                    "exact times are not strictly increasing at f{:03}",
+                    "exact times are not strictly increasing at storage slot {}",
                     hour.forecast_hour
                 )));
             }
@@ -1183,6 +1315,38 @@ fn validate_exact_times(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exact_manifest(times: &[(u16, u64, i64)]) -> RwsRunManifest {
+        RwsRunManifest {
+            schema: SCHEMA_RUN_V2.to_string(),
+            model: "wrf".to_string(),
+            run: "minute_loop".to_string(),
+            grid_hash: "grid".to_string(),
+            nx: 2,
+            ny: 2,
+            hours: times
+                .iter()
+                .map(|&(slot, lead_seconds, valid_unix)| {
+                    (
+                        slot,
+                        rw_store::run::RwsHourEntry {
+                            file: format!("f{slot:03}.rws"),
+                            lead_seconds: Some(lead_seconds),
+                            valid_unix: Some(valid_unix),
+                            written_unix: 0,
+                            encode_ms: 0,
+                            variables: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
+            writer: rw_store::format::RwsWriterInfo {
+                name: "test".to_string(),
+                version: "0".to_string(),
+                build: "test".to_string(),
+            },
+        }
+    }
 
     #[test]
     fn polar_projection_hemisphere_follows_wrf_true_scale_latitude() {
@@ -1226,6 +1390,52 @@ mod tests {
         assert!(validate_exact_times(&hours, &times).is_err());
         times.insert(3, ExactStoreTime::new(10_900.0, None));
         assert!(validate_exact_times(&hours, &times).is_ok());
+    }
+
+    #[test]
+    fn persisted_lead_seconds_must_be_exact_in_formula_timing() {
+        assert_eq!(exact_lead_seconds_f64(0, 31_680).unwrap(), 31_680.0);
+        assert!(exact_lead_seconds_f64(1, (1_u64 << 53) + 1).is_err());
+        assert!(exact_lead_seconds_f64(2, (1_u64 << 53) + 2).is_ok());
+    }
+
+    #[test]
+    fn exact_manifest_reconciliation_uses_leads_and_preserves_ui_labels() {
+        let manifest = exact_manifest(&[
+            (0, 31_680, 134_000_000),
+            (1, 31_740, 134_000_060),
+        ]);
+        let derived = reconcile_exact_times(&manifest, BTreeMap::new()).unwrap();
+        assert_eq!(derived[&1].seconds - derived[&0].seconds, 60.0);
+        assert!(derived[&0].label.as_deref().unwrap().contains("31680"));
+
+        let mut supplied = BTreeMap::new();
+        supplied.insert(
+            0,
+            ExactStoreTime::new(31_680.0, Some("first label".to_string())),
+        );
+        supplied.insert(
+            1,
+            ExactStoreTime::new(31_740.0, Some("second label".to_string())),
+        );
+        let reconciled = reconcile_exact_times(&manifest, supplied).unwrap();
+        assert_eq!(reconciled[&0].label.as_deref(), Some("first label"));
+
+        let mut unix_seconds = reconciled.clone();
+        unix_seconds.get_mut(&0).unwrap().seconds = 134_000_000.0;
+        assert!(reconcile_exact_times(&manifest, unix_seconds).is_err());
+
+        let mut incomplete = reconciled.clone();
+        incomplete.remove(&1);
+        assert!(reconcile_exact_times(&manifest, incomplete).is_err());
+
+        let base_hash = time_axis_hash(&manifest, &reconciled);
+        let changed_manifest = exact_manifest(&[
+            (0, 31_680, 134_000_000),
+            (1, 31_800, 134_000_120),
+        ]);
+        let changed = reconcile_exact_times(&changed_manifest, BTreeMap::new()).unwrap();
+        assert_ne!(base_hash, time_axis_hash(&changed_manifest, &changed));
     }
 
     #[test]

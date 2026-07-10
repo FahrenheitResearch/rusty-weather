@@ -1429,6 +1429,10 @@ struct App {
     gdex: GdexBrowser,
     /// Safe, unit-aware custom diagnostic editor/evaluator.
     formula_lab: FormulaLabPanel,
+    /// Exact-time store bridge cached by store-tree/selection revision. A
+    /// minute-cadence run can contain thousands of labels, so rebuilding it
+    /// every egui frame would be needless O(n) allocation churn.
+    formula_store_source: Option<StoreFormulaSource>,
     /// `None` until the first scan lands.
     tree: Option<StoreTree>,
     browser: RunBrowserPanel,
@@ -1659,6 +1663,7 @@ impl App {
             cache_dir,
             gdex: GdexBrowser::new(),
             formula_lab: FormulaLabPanel::new(),
+            formula_store_source: None,
             tree: None,
             browser: RunBrowserPanel::new(),
             viewer: FieldViewerPanel::new(),
@@ -1876,6 +1881,7 @@ impl App {
         self.store_root = store_root.clone();
         self.tree = None;
         self.browser = RunBrowserPanel::new();
+        self.formula_store_source = None;
         self.viewer.clear();
         self.plot_viewer.clear();
         self.sounding.clear();
@@ -2372,7 +2378,7 @@ impl App {
             format!("; {} warning(s): {shown}{suffix}", summary.notes.len())
         };
         format!(
-            "Imported {}/{} local files into {}/{} under {} ({} vars: {}{}){}",
+            "Imported {} timestep(s) from {} local file(s) into {}/{} under {} ({} vars: {}{}){}",
             summary.hours_written,
             summary.files_seen,
             summary.model,
@@ -2405,7 +2411,7 @@ impl App {
             format!("; {} skipped/unavailable", summary.notes.len())
         };
         format!(
-            "Processed {} WRF hour(s) from {} file(s) into {}/{} under {} ({} vars: {}{}{})",
+            "Processed {} WRF timestep(s) from {} file(s) into {}/{} under {} ({} vars: {}{}{})",
             summary.hours_written,
             summary.files_seen,
             summary.model,
@@ -2458,9 +2464,22 @@ impl App {
     }
 
     fn select_hour(&mut self, key: HourKey) {
+        self.refresh_formula_store_source();
         self.plot_viewer.clear();
         self.recorded_plot_timings = None;
         self.worker.send(StoreRequest::LoadHour(key));
+    }
+
+    fn refresh_formula_store_source(&mut self) {
+        let source = self.browser.selected().cloned().map(|hour| {
+            let exact_times = formula_exact_store_times(self.tree.as_ref(), &hour);
+            StoreFormulaSource {
+                store_root: self.store_root.clone(),
+                hour,
+                exact_times,
+            }
+        });
+        self.formula_store_source = source;
     }
 
     /// Drain store-worker responses into panel state.
@@ -2468,24 +2487,27 @@ impl App {
         while let Some(response) = self.worker.try_recv() {
             match response {
                 StoreResponse::Tree(tree) => {
-                    // First scan: auto-select the first hour so a store with
-                    // data shows something immediately.
-                    if self.browser.selected().is_none() {
-                        let first = tree.models.first().and_then(|model| {
-                            model.runs.first().and_then(|run| {
-                                run.hours.first().map(|hour| HourKey {
-                                    model: model.model.clone(),
-                                    run: run.run.clone(),
-                                    hour: hour.hour,
-                                })
-                            })
-                        });
-                        if let Some(key) = first {
-                            self.browser.select(key.clone());
-                            self.select_hour(key);
-                        }
-                    }
+                    // Refresh exact timing for the stable model/run/slot key.
+                    // This also prevents a stale legacy selection from reaching
+                    // hour-based tools after the run is replaced by exact v2.
+                    let selection_changed = self.browser.reconcile(&tree);
                     self.tree = Some(tree);
+                    if selection_changed {
+                        self.viewer.clear();
+                        self.plot_viewer.clear();
+                        self.sounding.clear();
+                        self.recorded_texture_ms = None;
+                        self.recorded_plot_timings = None;
+                        if let Some(key) = self.browser.selected().cloned() {
+                            self.select_hour(key);
+                        } else {
+                            self.refresh_formula_store_source();
+                        }
+                    } else {
+                        // Adjacent exact times can change while the selected
+                        // slot remains stable; refresh the complete dt axis.
+                        self.refresh_formula_store_source();
+                    }
                 }
                 StoreResponse::StyleOverridesApplied => {}
                 StoreResponse::HourVars(key, Ok(vars)) => {
@@ -2501,14 +2523,18 @@ impl App {
                         }
                     }
                 }
-                StoreResponse::HourVars(_, Err(message)) => {
-                    self.viewer.set_error(message);
+                StoreResponse::HourVars(key, Err(message)) => {
+                    if self.browser.selected() == Some(&key) {
+                        self.viewer.set_error(message);
+                    }
                 }
                 StoreResponse::Field(key, result) => match *result {
                     Ok(field) => {
-                        self.plot_viewer.clear();
-                        self.recorded_plot_timings = None;
-                        self.viewer.set_field(field);
+                        if self.viewer.wanted_field().as_ref() == Some(&key) {
+                            self.plot_viewer.clear();
+                            self.recorded_plot_timings = None;
+                            self.viewer.set_field(field);
+                        }
                     }
                     Err(message) => {
                         if self.viewer.wanted_field().as_ref() == Some(&key) {
@@ -2516,25 +2542,29 @@ impl App {
                         }
                     }
                 },
-                StoreResponse::Sounding(_, Ok(data)) => {
-                    self.worker.stats().record("sounding.read", data.read_ms);
-                    self.sounding.set_data(data);
-                    if let Some((read_ms, scene_ms)) = self.sounding.last_timings() {
-                        self.worker.stats().record("sounding.scene", scene_ms);
-                        self.worker
-                            .stats()
-                            .record("sounding.native_total", read_ms + scene_ms);
+                StoreResponse::Sounding(key, Ok(data)) => {
+                    if self.browser.selected() == Some(&key) && self.viewer.hour() == Some(&key) {
+                        self.worker.stats().record("sounding.read", data.read_ms);
+                        self.sounding.set_data(data);
+                        if let Some((read_ms, scene_ms)) = self.sounding.last_timings() {
+                            self.worker.stats().record("sounding.scene", scene_ms);
+                            self.worker
+                                .stats()
+                                .record("sounding.native_total", read_ms + scene_ms);
+                        }
                     }
                 }
-                StoreResponse::Sounding(_, Err(message)) => {
-                    self.sounding.set_error(message);
+                StoreResponse::Sounding(key, Err(message)) => {
+                    if self.browser.selected() == Some(&key) && self.viewer.hour() == Some(&key) {
+                        self.sounding.set_error(message);
+                    }
                 }
             }
         }
     }
 
     /// Drain ingest-worker responses into the download panel (and refresh
-    /// the run browser as hours land).
+    /// the run browser as timesteps land).
     fn handle_ingest_responses(&mut self) {
         while let Some(response) = self.ingest.try_recv() {
             match response {
@@ -3088,17 +3118,7 @@ impl eframe::App for App {
             self.show_batch_render = open;
         }
 
-        let store_formula_source =
-            self.browser
-                .selected()
-                .cloned()
-                .map(|hour| StoreFormulaSource {
-                    store_root: self.store_root.clone(),
-                    hour,
-                    // rw-store v1 does not persist verified valid timestamps. Keep
-                    // temporal derivatives disabled rather than infer a cadence.
-                    exact_times: BTreeMap::new(),
-                });
+        let store_formula_source = self.formula_store_source.as_ref();
         let raw_formula_source = self.formula_raw_path.clone().map(|path| {
             let display_hour = HourKey {
                 model: "raw-wrf".to_string(),
@@ -3109,6 +3129,7 @@ impl eframe::App for App {
                     .unwrap_or("raw_wrf")
                     .to_string(),
                 hour: 0,
+                exact_time: None,
             };
             RawWrfFormulaSource {
                 path,
@@ -3128,7 +3149,7 @@ impl eframe::App for App {
         if let Some(result) = self.formula_lab.show(
             ui.ctx(),
             FormulaLabSources {
-                store: store_formula_source.as_ref(),
+                store: store_formula_source,
                 raw_wrf: raw_formula_source.as_ref(),
                 evaluation_blocked: formula_evaluation_blocked,
             },
@@ -3261,12 +3282,136 @@ impl eframe::App for App {
     }
 }
 
+/// Build the complete, caller-verified Formula Lab time axis for an exact-time
+/// run. Returning an empty map is deliberate fail-closed behavior: legacy v1,
+/// a stale selection, or any incomplete axis keeps `dt` disabled rather than
+/// inventing a cadence from ordinal storage slots.
+fn formula_exact_store_times(
+    tree: Option<&StoreTree>,
+    selected: &HourKey,
+) -> BTreeMap<u16, rw_formula::ExactStoreTime> {
+    let Some(run) = tree.and_then(|tree| tree.run(&selected.model, &selected.run)) else {
+        return BTreeMap::new();
+    };
+    let Some(times) = run.exact_times() else {
+        return BTreeMap::new();
+    };
+    if times.get(&selected.hour) != selected.exact_time.as_ref() {
+        return BTreeMap::new();
+    }
+    if times
+        .values()
+        .any(|exact| !lead_seconds_exact_in_f64(exact.lead_seconds))
+    {
+        return BTreeMap::new();
+    }
+    times
+        .into_iter()
+        .map(|(slot, exact)| {
+            let label = format!(
+                "{} · {}",
+                rw_ui::format_lead_seconds(exact.lead_seconds),
+                rw_ui::format_valid_unix(exact.valid_unix)
+            );
+            (
+                slot,
+                rw_formula::ExactStoreTime::new(exact.lead_seconds as f64, Some(label)),
+            )
+        })
+        .collect()
+}
+
+/// An integer is losslessly representable by binary64 when, after removing
+/// trailing zero bits, its significant part fits the 53-bit significand.
+fn lead_seconds_exact_in_f64(seconds: u64) -> bool {
+    if seconds == 0 {
+        return true;
+    }
+    let significant_bits = u64::BITS - seconds.leading_zeros() - seconds.trailing_zeros();
+    significant_bits <= f64::MANTISSA_DIGITS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn test_abs_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rw-ui-{name}"))
+    }
+
+    #[test]
+    fn formula_exact_axis_is_complete_and_uses_real_sixty_second_spacing() {
+        let first = rw_store::RwsExactTime {
+            lead_seconds: 31_680,
+            valid_unix: 134_243_280,
+        };
+        let second = rw_store::RwsExactTime {
+            lead_seconds: 31_740,
+            valid_unix: 134_243_340,
+        };
+        let tree = StoreTree {
+            models: vec![rw_ui::ModelEntry {
+                model: "wrf".to_string(),
+                runs: vec![rw_ui::RunEntry {
+                    run: "exact-run".to_string(),
+                    build: "test".to_string(),
+                    writer_version: "test".to_string(),
+                    nx: 2,
+                    ny: 2,
+                    exact_time_axis: true,
+                    hours: vec![
+                        rw_ui::HourEntry {
+                            hour: 0,
+                            file: "f000.rws".to_string(),
+                            variable_count: 1,
+                            written_unix: 1,
+                            exact_time: Some(first),
+                        },
+                        rw_ui::HourEntry {
+                            hour: 1,
+                            file: "f001.rws".to_string(),
+                            variable_count: 1,
+                            written_unix: 2,
+                            exact_time: Some(second),
+                        },
+                    ],
+                }],
+            }],
+            warnings: Vec::new(),
+        };
+        let selected = HourKey {
+            model: "wrf".to_string(),
+            run: "exact-run".to_string(),
+            hour: 0,
+            exact_time: Some(first),
+        };
+        let times = formula_exact_store_times(Some(&tree), &selected);
+        assert_eq!(times.len(), 2);
+        assert_eq!(times[&1].seconds - times[&0].seconds, 60.0);
+        assert!(
+            times[&0]
+                .label
+                .as_deref()
+                .is_some_and(|label| label.contains("+08:48:00"))
+        );
+        assert!(
+            times[&0]
+                .label
+                .as_deref()
+                .is_some_and(|label| label.contains("1974-04-03 17:48:00Z"))
+        );
+
+        let mut partial = tree.clone();
+        partial.models[0].runs[0].hours[1].exact_time = None;
+        assert!(formula_exact_store_times(Some(&partial), &selected).is_empty());
+
+        let mut stale = selected;
+        stale.exact_time = Some(second);
+        assert!(formula_exact_store_times(Some(&tree), &stale).is_empty());
+
+        assert!(lead_seconds_exact_in_f64(0));
+        assert!(lead_seconds_exact_in_f64(1_u64 << 63));
+        assert!(!lead_seconds_exact_in_f64(u64::MAX));
     }
 
     #[test]
@@ -3782,6 +3927,7 @@ mod tests {
                 model: "gfs".to_string(),
                 run: "20260611_00z".to_string(),
                 hour: 0,
+                exact_time: None,
             },
             var: "temperature_2m".to_string(),
         };

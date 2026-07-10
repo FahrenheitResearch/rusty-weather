@@ -1181,6 +1181,7 @@ mod tests {
                     model: "wrf".to_string(),
                     run: "test".to_string(),
                     hour: 0,
+                    exact_time: None,
                 },
                 var: "wind_over_15ms".to_string(),
             },

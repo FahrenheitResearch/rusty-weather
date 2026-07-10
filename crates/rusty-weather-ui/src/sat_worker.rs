@@ -28,10 +28,11 @@ use rw_sat::follow::FollowConfig;
 use rw_sat::goes::{GoesSatellite, parse_goes_abi_filename};
 use rw_sat::palette::{anchor_color, band_anchors};
 use rw_sat::s3::{Sector, bucket_for_satellite, object_filename};
-use rw_sat::store::{frame_file_name, run_day, selector_band};
+use rw_sat::store::{run_day, selector_band};
 use rw_sat::window::WindowConfig;
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
+use rw_store::run::RwsRunManifest;
 use rw_ui::{
     SatDiskUsage, SatFollowSpec, SatFrameImage, SatLayerOption, SatRunKey, SatRunListing,
     SatSatelliteOption, SatSectorOption, StoreView, format_bytes,
@@ -418,6 +419,9 @@ fn scan_runs(store_root: &Path) -> Vec<SatRunListing> {
     let mut listings = Vec::new();
     for model in &tree.models {
         for run in &model.runs {
+            if run.exact_time_axis {
+                continue;
+            }
             listings.push(SatRunListing {
                 key: SatRunKey {
                     model: model.model.clone(),
@@ -466,8 +470,25 @@ fn load_frame(
     puffin::profile_scope!("sat_load_frame");
     let started = Instant::now();
     let run_dir = store_root.join(&key.model).join(&key.run);
-    let reader =
-        HourReader::open(&run_dir.join(frame_file_name(hhmm))).map_err(|err| err.to_string())?;
+    let manifest = RwsRunManifest::load_for_run(
+        &run_dir.join("run.json"),
+        &key.model,
+        &key.run,
+    )
+    .map_err(|err| err.to_string())?;
+    if manifest.is_exact_time_axis() {
+        return Err(format!(
+            "{key} uses exact-time ordinal slots and is not a satellite HHMM run"
+        ));
+    }
+    let entry = manifest
+        .hours
+        .get(&hhmm)
+        .ok_or_else(|| format!("{key} has no satellite frame t{hhmm:04}"))?;
+    let reader = HourReader::open(&run_dir.join(&entry.file)).map_err(|err| err.to_string())?;
+    manifest
+        .validate_hour_meta(hhmm, reader.meta())
+        .map_err(|err| err.to_string())?;
     let meta = reader.meta();
     let variable = meta
         .variables

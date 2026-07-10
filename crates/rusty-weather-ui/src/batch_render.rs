@@ -19,9 +19,11 @@ use rusty_weather::batch_render::{
     BatchRenderLimits, BatchRenderRequest, BatchRenderSummary, infer_run_cycle,
     inspect_renderable_products, run_batch_render,
 };
-use rw_ui::HourKey;
+use rw_ui::{HourKey, StoreView};
 
 const MAX_LOG_ROWS: usize = 120;
+const EXACT_TIME_BATCH_UNSUPPORTED: &str =
+    "Production batch rendering is not yet available for exact-time ordinal runs. The direct viewer, Native Plot, soundings, and Formula Lab remain available; batch rendering is disabled rather than treating storage slots as forecast hours.";
 
 /// Plain-data messages emitted by [`BatchRenderTask`].
 #[derive(Debug, Clone)]
@@ -234,7 +236,12 @@ impl BatchRenderPanel {
         start_blocked: Option<&str>,
     ) {
         let current_hour = current_hour.cloned();
-        self.ensure_catalog(ui.ctx(), store_root, current_hour.as_ref());
+        if current_hour
+            .as_ref()
+            .is_none_or(|hour| !hour.has_exact_time())
+        {
+            self.ensure_catalog(ui.ctx(), store_root, current_hour.as_ref());
+        }
         self.poll_catalog(current_var);
         self.poll_render_task();
 
@@ -254,7 +261,7 @@ impl BatchRenderPanel {
         ui.separator();
 
         let Some(hour) = current_hour.as_ref() else {
-            ui.label("Select a model run hour first.");
+            ui.label("Select a model run timestep first.");
             self.render_status(ui);
             return;
         };
@@ -266,7 +273,7 @@ impl BatchRenderPanel {
             }
             if ui
                 .small_button("Refresh products")
-                .on_hover_text("Re-read this hour's selector metadata")
+                .on_hover_text("Re-read this timestep's selector metadata")
                 .clicked()
             {
                 self.catalog_key = None;
@@ -277,10 +284,21 @@ impl BatchRenderPanel {
         });
 
         let running = self.is_running();
+        if hour.has_exact_time() {
+            ui.label(
+                egui::RichText::new(EXACT_TIME_BATCH_UNSUPPORTED)
+                    .color(egui::Color32::YELLOW),
+            );
+            if !running {
+                self.render_status(ui);
+                return;
+            }
+        }
+
         ui.add_enabled_ui(!running, |ui| {
             self.render_product_picker(ui, current_var);
             ui.separator();
-            self.render_hour_scope(ui, hour.hour);
+            self.render_hour_scope(ui, hour);
             ui.separator();
             self.render_output_options(ui, store_root);
         });
@@ -414,7 +432,7 @@ impl BatchRenderPanel {
         };
         let products = catalog.products.clone();
         if products.is_empty() {
-            ui.label("This hour has no complete production-map recipes.");
+            ui.label("This timestep has no complete production-map recipes.");
             return;
         }
 
@@ -505,18 +523,22 @@ impl BatchRenderPanel {
         }
     }
 
-    fn render_hour_scope(&mut self, ui: &mut egui::Ui, current_hour: u16) {
-        ui.label(egui::RichText::new("Hours").strong());
+    fn render_hour_scope(&mut self, ui: &mut egui::Ui, current_hour: &HourKey) {
+        ui.label(egui::RichText::new("Timesteps").strong());
         let stored = self
             .catalog
             .as_ref()
             .map(|catalog| catalog.stored_hours.len())
             .unwrap_or(0);
+        let current_label = match current_hour.exact_time {
+            Some(_) => current_hour.time_label(),
+            None => format!("F{:03}", current_hour.hour),
+        };
         ui.horizontal_wrapped(|ui| {
             ui.radio_value(
                 &mut self.all_hours,
                 false,
-                format!("Current (F{current_hour:03})"),
+                format!("Current ({current_label})"),
             );
             ui.radio_value(&mut self.all_hours, true, format!("All stored ({stored})"));
         });
@@ -614,7 +636,10 @@ impl BatchRenderPanel {
             });
     }
 
-    fn validate_start(&self, _hour: &HourKey) -> Result<usize, String> {
+    fn validate_start(&self, hour: &HourKey) -> Result<usize, String> {
+        if hour.has_exact_time() {
+            return Err(EXACT_TIME_BATCH_UNSUPPORTED.to_string());
+        }
         let catalog = self
             .catalog
             .as_ref()
@@ -625,7 +650,7 @@ impl BatchRenderPanel {
         if self.output_dir.trim().is_empty() {
             return Err("Choose an output directory.".to_string());
         }
-        let inferred = infer_run_cycle(&_hour.run);
+        let inferred = infer_run_cycle(&hour.run);
         let date = if self.date_override.trim().is_empty() {
             inferred
                 .as_ref()
@@ -672,11 +697,11 @@ impl BatchRenderPanel {
             1
         };
         if hours == 0 {
-            return Err("This run has no stored hours.".to_string());
+            return Err("This run has no stored timesteps.".to_string());
         }
         if hours > limits.max_hours {
             return Err(format!(
-                "{hours} hours exceeds the GUI limit of {}.",
+                "{hours} timesteps exceeds the GUI limit of {}.",
                 limits.max_hours
             ));
         }
@@ -690,7 +715,7 @@ impl BatchRenderPanel {
         let windowed = self.selected_products.len() - per_hour;
         if per_hour > limits.max_products_per_hour {
             return Err(format!(
-                "{per_hour} per-hour products exceeds the GUI limit of {}.",
+                "{per_hour} per-timestep products exceeds the GUI limit of {}.",
                 limits.max_products_per_hour
             ));
         }
@@ -700,7 +725,7 @@ impl BatchRenderPanel {
             .ok_or_else(|| "Selected work count overflowed.".to_string())?;
         if work > limits.max_work_items {
             return Err(format!(
-                "{work} product-hours exceeds the GUI limit of {}; split the job.",
+                "{work} product-timesteps exceeds the GUI limit of {}; split the job.",
                 limits.max_work_items
             ));
         }
@@ -708,6 +733,10 @@ impl BatchRenderPanel {
     }
 
     fn start(&mut self, hour: HourKey, store_root: PathBuf, repaint: egui::Context) {
+        if let Err(error) = validate_persisted_batch_hour(&store_root, &hour) {
+            self.error = Some(error);
+            return;
+        }
         let cycle_utc = if self.cycle_override.trim().is_empty() {
             None
         } else {
@@ -1066,5 +1095,85 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         message.clone()
     } else {
         "unknown panic payload".to_string()
+    }
+}
+
+/// Final on-click trust check. The browser key can become stale between a
+/// tree refresh and a click; reopening through StoreView validates both the
+/// manifest and hour metadata before an ordinal can reach the hour-based
+/// production engine.
+fn validate_persisted_batch_hour(store_root: &Path, hour: &HourKey) -> Result<(), String> {
+    if hour.has_exact_time() {
+        return Err(EXACT_TIME_BATCH_UNSUPPORTED.to_string());
+    }
+    let reader = StoreView::new(store_root)
+        .open_hour(&hour.model, &hour.run, hour.hour)
+        .map_err(|error| format!("Cannot verify selected batch-render timestep: {error}"))?;
+    if reader.meta().exact_time().is_some() {
+        return Err(EXACT_TIME_BATCH_UNSUPPORTED.to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exact_hour() -> HourKey {
+        HourKey {
+            model: "wrf".to_string(),
+            run: "exact-run".to_string(),
+            hour: 7,
+            exact_time: Some(rw_store::RwsExactTime {
+                lead_seconds: 31_680,
+                valid_unix: 134_243_280,
+            }),
+        }
+    }
+
+    #[test]
+    fn exact_time_batch_render_fails_before_slots_reach_hour_based_engine() {
+        let mut panel = BatchRenderPanel::new();
+        let hour = exact_hour();
+        let error = panel
+            .validate_start(&hour)
+            .expect_err("exact run must fail closed before catalog validation");
+        assert!(error.contains("storage slots as forecast hours"));
+
+        panel.start(
+            hour,
+            PathBuf::from("store"),
+            egui::Context::default(),
+        );
+        assert!(panel.task.is_none());
+        assert!(
+            panel
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("not yet available"))
+        );
+    }
+
+    #[test]
+    fn direct_start_fails_closed_when_persisted_hour_cannot_be_verified() {
+        let mut panel = BatchRenderPanel::new();
+        let hour = HourKey {
+            model: "wrf".to_string(),
+            run: "missing-run".to_string(),
+            hour: 0,
+            exact_time: None,
+        };
+        panel.start(
+            hour,
+            PathBuf::from("missing-store"),
+            egui::Context::default(),
+        );
+        assert!(panel.task.is_none());
+        assert!(
+            panel
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("Cannot verify"))
+        );
     }
 }

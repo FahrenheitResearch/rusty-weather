@@ -78,7 +78,7 @@ pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, Stri
     }
     if !missing.is_empty() {
         return Err(format!(
-            "store hour lacks skew-T inputs: {}",
+            "store timestep lacks skew-T inputs: {}",
             missing.join(", ")
         ));
     }
@@ -101,7 +101,9 @@ pub fn build_sounding_column(data: &SoundingData) -> Result<SoundingColumn, Stri
         match surface_value_optional(name)? {
             Some(value) => Ok(value),
             None => surface_value_optional(approximate)?
-                .ok_or_else(|| format!("store hour lacks skew-T inputs: {name} or {approximate}")),
+                .ok_or_else(|| {
+                    format!("store timestep lacks skew-T inputs: {name} or {approximate}")
+                }),
         }
     };
     let t2_c = surface_value("temperature_2m", "approx_temperature_2m")?;
@@ -281,9 +283,17 @@ fn metadata_for(data: &SoundingData, orog_m: f64) -> SoundingMetadata {
         (Some(lat), Some(lon)) => format!("{model} {}", format_latlon(lat, lon)),
         _ => format!("{model} grid {:.1},{:.1}", data.fx, data.fy),
     };
+    let time_label = match data.hour.exact_time {
+        Some(_) => data.hour.time_label(),
+        None => format!("F{:03}", data.hour.hour),
+    };
     SoundingMetadata {
         station_id,
-        valid_time: format!("{} F{:03}", data.hour.run.replace('_', " "), data.hour.hour),
+        valid_time: format!(
+            "{} {}",
+            data.hour.run.replace('_', " "),
+            time_label
+        ),
         latitude_deg: data.lat.map(f64::from),
         longitude_deg: data.lon.map(f64::from).map(normalize_lon),
         elevation_m: Some(orog_m),
@@ -338,6 +348,7 @@ mod tests {
                 model: "hrrr".to_string(),
                 run: "20260608_00z".to_string(),
                 hour: 6,
+                exact_time: None,
             },
             fx: 100.0,
             fy: 200.0,
@@ -423,6 +434,20 @@ mod tests {
 
         // And the bridge accepts it.
         build_native_sounding(&sample_data()).expect("native sounding should build");
+    }
+
+    #[test]
+    fn exact_time_sounding_title_never_exposes_the_ordinal_slot_as_forecast_hour() {
+        let mut data = sample_data();
+        data.hour.hour = 0;
+        data.hour.exact_time = Some(rw_store::RwsExactTime {
+            lead_seconds: 31_680,
+            valid_unix: 134_243_280,
+        });
+        let column = build_sounding_column(&data).expect("exact-time sounding should build");
+        assert!(column.metadata.valid_time.contains("+08:48:00"));
+        assert!(column.metadata.valid_time.contains("1974-04-03 17:48:00Z"));
+        assert!(!column.metadata.valid_time.contains("F000"));
     }
 
     #[test]

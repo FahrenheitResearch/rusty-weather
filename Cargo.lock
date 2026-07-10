@@ -4776,6 +4776,7 @@ version = "0.1.0"
 dependencies = [
  "rustwx-core",
  "rw-store",
+ "sha2",
  "thiserror 2.0.18",
  "wrf-core",
  "wrf-formula",

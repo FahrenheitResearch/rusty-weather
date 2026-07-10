@@ -25,21 +25,108 @@ use crate::stats::StatsRegistry;
 use crate::store_view::{StoreTree, StoreView};
 use crate::style_overrides::StyleOverrideSettings;
 
-/// One forecast hour of one model run.
+/// One stored timestep of one model run.
+///
+/// `hour` remains the on-disk `u16` slot used to resolve the manifest entry.
+/// For legacy rw-store v1 model runs it is also the integral forecast hour.
+/// Exact-time v2 runs deliberately use it only as opaque storage identity;
+/// their meteorological time lives in `exact_time` and must be used for every
+/// user-facing label and temporal calculation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HourKey {
     pub model: String,
     pub run: String,
     pub hour: u16,
+    pub exact_time: Option<rw_store::RwsExactTime>,
+}
+
+impl HourKey {
+    /// True when this is an ordinal slot from an exact-time rw-store v2 run.
+    pub fn has_exact_time(&self) -> bool {
+        self.exact_time.is_some()
+    }
+
+    /// Meteorological lead-time label. Exact runs use seconds without rounding;
+    /// legacy runs retain their established `f###` display.
+    pub fn lead_label(&self) -> String {
+        match self.exact_time {
+            Some(exact) => format_lead_seconds(exact.lead_seconds),
+            None => format!("f{:03}", self.hour),
+        }
+    }
+
+    /// Exact UTC valid time when present, formatted without consulting the
+    /// machine's local time zone.
+    pub fn valid_time_label(&self) -> Option<String> {
+        self.exact_time
+            .map(|exact| format_valid_unix(exact.valid_unix))
+    }
+
+    /// Complete timestep label used by browsers, plots, soundings, and errors.
+    /// An exact slot is never exposed as a fictitious forecast hour.
+    pub fn time_label(&self) -> String {
+        match self.exact_time {
+            Some(exact) => format!(
+                "{} · {}",
+                format_lead_seconds(exact.lead_seconds),
+                format_valid_unix(exact.valid_unix)
+            ),
+            None => format!("f{:03}", self.hour),
+        }
+    }
 }
 
 impl std::fmt::Display for HourKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{} f{:03}", self.model, self.run, self.hour)
+        write!(f, "{}/{} {}", self.model, self.run, self.time_label())
     }
 }
 
-/// One 2D variable of one forecast hour.
+/// Exact lead duration with an unbounded hour component and fixed minute /
+/// second fields. The `+` makes it visually distinct from an ordinal slot.
+pub fn format_lead_seconds(seconds: u64) -> String {
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    format!("+{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+/// UTC label for exact-time store metadata. Calendar conversion is kept local
+/// so the lightweight panel crate does not add a date-time dependency merely
+/// for labels. The civil-date algorithm uses Euclidean eras and i128
+/// intermediates, so every i64 Unix timestamp is handled without overflow.
+pub fn format_valid_unix(valid_unix: i64) -> String {
+    let days = valid_unix.div_euclid(86_400);
+    let second_of_day = valid_unix.rem_euclid(86_400);
+    let (year, month, day) = civil_date_from_unix_days(days);
+    let hour = second_of_day / 3_600;
+    let minute = (second_of_day % 3_600) / 60;
+    let second = second_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Proleptic-Gregorian civil date from days since 1970-01-01. Adapted from
+/// Howard Hinnant's era decomposition; `div_euclid` makes negative dates obey
+/// the same invariants as positive dates.
+fn civil_date_from_unix_days(days: i64) -> (i128, u32, u32) {
+    let z = i128::from(days) + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096)
+            / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month as u32, day as u32)
+}
+
+/// One 2D variable of one stored timestep.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FieldKey {
     pub hour: HourKey,
@@ -376,6 +463,12 @@ fn reader_for<'s>(state: &'s mut WorkerState, key: &HourKey) -> rw_store::RwResu
     if !cached {
         profile_scope!("store_open_hour");
         let reader = state.view.open_hour(&key.model, &key.run, key.hour)?;
+        if reader.meta().exact_time() != key.exact_time {
+            return Err(RwStoreError::Meta(format!(
+                "requested timestep {} does not match the exact-time metadata stored in its manifest",
+                key.time_label()
+            )));
+        }
         state.hour = Some((key.clone(), reader));
     }
     Ok(&state.hour.as_ref().expect("just cached").1)

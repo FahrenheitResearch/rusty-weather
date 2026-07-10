@@ -13,7 +13,7 @@ use rustwx_render::{DomainFrame, MapRenderRequest, ProductVisualMode, RgbaImage}
 use serde::{Deserialize, Serialize};
 
 use crate::profile_scope;
-use crate::worker::{FieldData, FieldKey};
+use crate::worker::{FieldData, FieldKey, HourKey};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlotCacheKey {
@@ -506,10 +506,7 @@ fn render_field_plot(
         Some(domain) => format!("{} - {}", style.title, domain.name),
         None => style.title.clone(),
     });
-    request.subtitle_left = Some(format!(
-        "{} f{:03}",
-        field.key.hour.run, field.key.hour.hour
-    ));
+    request.subtitle_left = Some(plot_time_subtitle(&field.key.hour));
     request.subtitle_right = Some(field.key.hour.model.to_ascii_uppercase());
     request.width = width;
     request.height = height;
@@ -520,6 +517,10 @@ fn render_field_plot(
     request.supersample_factor = 1;
 
     rustwx_render::render_image(&request).map_err(|err| err.to_string())
+}
+
+fn plot_time_subtitle(hour: &HourKey) -> String {
+    format!("{} {}", hour.run, hour.time_label())
 }
 
 fn geographic_bounds(lat: &[f32], lon: &[f32]) -> Option<(f64, f64, f64, f64)> {
@@ -731,5 +732,21 @@ mod tests {
     fn geographic_bounds_normalize_longitudes() {
         let bounds = geographic_bounds(&[30.0, 40.0], &[240.0, 250.0]).unwrap();
         assert_eq!(bounds, (-120.0, -110.0, 30.0, 40.0));
+    }
+
+    #[test]
+    fn exact_plot_subtitle_uses_physical_time_not_storage_slot() {
+        let subtitle = plot_time_subtitle(&HourKey {
+            model: "wrf".to_string(),
+            run: "exact-run".to_string(),
+            hour: 0,
+            exact_time: Some(rw_store::RwsExactTime {
+                lead_seconds: 31_680,
+                valid_unix: 134_243_280,
+            }),
+        });
+        assert!(subtitle.contains("+08:48:00"));
+        assert!(subtitle.contains("1974-04-03 17:48:00Z"));
+        assert!(!subtitle.contains("f000"));
     }
 }

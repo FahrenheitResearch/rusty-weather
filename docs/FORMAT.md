@@ -5,11 +5,15 @@ to write a conforming reader or writer in any language without reading the Rust
 source. Every offset, constant, and rule below was transcribed from and
 re-verified against the crate source; each section cites its source of truth.
 
+The binary header/index/payload layout remains version 1. Exact-time model
+runs use additive metadata schemas `rw-store.hour.v2` and `rw-store.run.v2`;
+their binary `VERSION` is still 1 and their grid remains `rw-store.grid.v1`.
+
 The format has three file kinds, all under one run directory:
 
 ```
 <store_root>/<model>/<run>/
-    f000.rws    forecast-hour file (one per hour)
+    f000.rws    timestep file (forecast hour in v1, ordinal slot in v2)
     f001.rws
     ...
     grid.rwg    per-run lat/lon coordinate file (written once)
@@ -26,8 +30,8 @@ A reader that wants raw bytes only needs the `.rws` and `.rwg` formats; the
 Source of truth: `crates/rw-store/src/header.rs`, `format.rs`, `writer.rs`,
 `atomic.rs`, `ingest.rs`.
 
-- **One self-contained file per forecast hour.** Each `.rws` file holds every
-  variable for a single model run hour. There are no cross-file references
+- **One self-contained file per timestep.** Each `.rws` file holds every
+  variable for a single model valid time. There are no cross-file references
   inside a `.rws` file except `grid_hash` (which names the run's `.rwg`).
 - **Little-endian throughout the binary files.** Every integer and IEEE-754
   float in `.rws` and `.rwg` headers, index records, and payloads is
@@ -49,8 +53,9 @@ Source of truth: `crates/rw-store/src/header.rs`, `format.rs`, `writer.rs`,
 The hour stem is chosen by the caller of `HourWriter::finish(path)`; rw-store
 itself does not impose a name. The two shipped writers use:
 
-- **Model runs** (`ingest.rs::HourIngestWriter::finish`, line 426):
-  `f{forecast_hour:03}.rws` — e.g. `f000.rws`, `f006.rws`.
+- **Model runs** (`ingest.rs::HourIngestWriter::finish`):
+  `f{key:03}.rws` — the true forecast hour for schema v1 and an ordinal
+  storage slot for exact-time schema v2.
 - **Satellite frames** (`crates/rw-sat/src/store.rs::frame_file_name`, line 81):
   `t{HHMM:04}.rws`, where the `forecast_hour` u16 slot carries `HHMM` of the
   scan start in UTC — e.g. `t1851.rws` for 18:51Z.
@@ -125,6 +130,20 @@ It deserializes to:
   "writer": { "name": "rw-store", "version": "0.1.0", "build": "<git sha>" }
 }
 ```
+
+For an exact-time file, `schema` is `rw-store.hour.v2`, `forecast_hour` is an
+ordinal storage slot, and two required integer fields carry physical time:
+
+```jsonc
+"forecast_hour": 17,
+"lead_seconds": 31680,
+"valid_unix": 134243280
+```
+
+The pair must imply a representable run origin
+`valid_unix - lead_seconds`. A v1 file must omit both fields; a v2 file must
+contain both. This explicit schema split makes an old v1-only reader reject an
+ordinal instead of silently displaying it as a forecast hour.
 
 Each entry of `variables` is an `RwsVariableMeta`:
 
@@ -440,11 +459,43 @@ far for the run:
 }
 ```
 
+Exact-time runs use `rw-store.run.v2`. The `hours` map name is retained for
+JSON compatibility, but its u16 keys are chronological ordinal storage slots;
+every entry repeats the exact pair written in its corresponding hour file:
+
+```jsonc
+{
+  "schema": "rw-store.run.v2",
+  "hours": {
+    "0": {
+      "file": "f000.rws",
+      "lead_seconds": 31680,
+      "valid_unix": 134243280,
+      "written_unix": 1770000000,
+      "encode_ms": 850,
+      "variables": ["temperature_2m"]
+    },
+    "1": {
+      "file": "f001.rws",
+      "lead_seconds": 31740,
+      "valid_unix": 134243340,
+      "written_unix": 1770000001,
+      "encode_ms": 840,
+      "variables": ["temperature_2m"]
+    }
+  }
+}
+```
+
 Rules:
 
-- `hours` is keyed by the forecast hour (u16) rendered as a string; entries are
-  emitted in ascending key order (the writer uses a `BTreeMap`). Re-registering
-  an hour overwrites in place.
+- `hours` is keyed by a u16 rendered as a string: a forecast hour in v1 and an
+  ordinal storage slot in v2. Entries are emitted in ascending key order (the
+  writer uses a `BTreeMap`). Re-registering a v1 hour overwrites in place.
+- In v2, keys are ordinal slots and filenames MUST be `f{slot:03}.rws`.
+  `lead_seconds` and `valid_unix` must both increase strictly in slot order and
+  every pair must imply the same run origin. Rewriting an existing slot may
+  replace its fields but may not change its exact-time pair.
 - `file` MUST be a **plain filename** — no `..`, no absolute path, no drive or
   root component. The validator rejects anything else as a path-traversal risk
   (`validate.rs::is_plain_filename`, lines 94–102, 165–171).
@@ -481,9 +532,10 @@ Source of truth: `format.rs` (`VERSION`, `SUPPORTED_VERSIONS`, lines 8–10),
 - **Unknown meta JSON keys**: readers MUST ignore them. Additive metadata (new
   keys) does NOT require a version bump — it is forward-compatible by the
   ignore rule.
-- **Schema strings version independently.** `rw-store.hour.v1`,
-  `rw-store.grid.v1`, and `rw-store.run.v1` carry their own `.vN` suffix and
-  evolve on their own schedule from the binary `VERSION`.
+- **Schema strings version independently.** `rw-store.hour.v1`/`.v2`,
+  `rw-store.grid.v1`, and `rw-store.run.v1`/`.v2` carry their own `.vN` suffix
+  and evolve on their own schedule from the binary `VERSION`. The v2 time
+  schemas are a metadata contract, not a second binary codec.
 - **Fixtures are kept forever.** Golden fixtures for every released version stay
   in the tree and gate CI, so old-version reads never silently regress.
 
@@ -559,8 +611,10 @@ software. The mapping from one hour file + its grid:
   (§3.2) — the scientific-honesty marker so a downstream user knows the 3-D
   data is lossy.
 - **Global attributes**: `Conventions="CF-1.6"`, plus `model`, `run`,
-  `forecast_hour`, `grid_hash`, and a `source` string identifying the rw-store
-  schema and writer.
+  `grid_hash`, and a `source` string identifying the rw-store schema and
+  writer. A v1 export carries numeric `forecast_hour`. A v2 export instead
+  carries numeric `storage_slot` plus lossless decimal-text `lead_seconds` and
+  `valid_unix` (NetCDF3 has no i64 attribute type).
 
 NetCDF3 is big-endian; that is a property of the foreign format, not of
 rw-store (which is little-endian, §1).

@@ -3258,7 +3258,7 @@ fn dir_speed_from_uv_kt(u_kt: f64, v_kt: f64) -> (f64, f64) {
 /// per 3D variable. Raw store values and units — no conversions.
 fn show_level_table(ui: &mut Ui, data: &SoundingData, table_text_scale: f32) {
     if data.vars.is_empty() {
-        ui.label(RichText::new("This hour has no 3D pressure-level variables.").weak());
+        ui.label(RichText::new("This timestep has no 3D pressure-level variables.").weak());
         return;
     }
     let header_size = (13.0 * table_text_scale).clamp(10.0, 26.0);
@@ -3388,6 +3388,7 @@ mod tests {
                 model: "m".into(),
                 run: "r".into(),
                 hour: 0,
+                exact_time: None,
             },
             fx: 1.0,
             fy: 2.0,
@@ -3410,6 +3411,7 @@ mod tests {
                 model: "m".into(),
                 run: "r".into(),
                 hour: 0,
+                exact_time: None,
             },
             fx: 1.0,
             fy: 2.0,
@@ -3438,6 +3440,7 @@ mod tests {
                 model: "synthetic".into(),
                 run: "20260609_00z".into(),
                 hour: 0,
+                exact_time: None,
             },
             fx: 1.0,
             fy: 2.0,

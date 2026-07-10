@@ -22,6 +22,7 @@ fn newest_hrrr_hour(store: &StoreView) -> Option<HourKey> {
         model: model.model.clone(),
         run: run.run.clone(),
         hour: hour.hour,
+        exact_time: hour.exact_time,
     })
 }
 
@@ -88,8 +89,12 @@ fn local_sounding_native_vs_png_perf() {
     }
 
     println!(
-        "sounding perf {}/{} f{:03} @ {:.1},{:.1}",
-        hour.model, hour.run, hour.hour, data.fx, data.fy
+        "sounding perf {}/{} {} @ {:.1},{:.1}",
+        hour.model,
+        hour.run,
+        hour.time_label(),
+        data.fx,
+        data.fy
     );
     println!("store profile read: {:.2} ms", data.read_ms);
     println!(

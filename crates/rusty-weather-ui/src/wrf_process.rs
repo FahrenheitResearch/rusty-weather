@@ -12,7 +12,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rustwx_core::{
     CanonicalField, FieldSelector, GridProjection, GridShape, LatLonGrid, SelectedField2D,
 };
-use rw_store::{DerivedFieldInput, WrittenHour, write_hour_from_grid_with_derived};
+use rw_store::{
+    DerivedFieldInput, WrittenHour, write_hour_from_grid_with_derived,
+    write_hour_from_grid_with_derived_exact,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::wrf_volumes::{
@@ -351,9 +354,9 @@ fn preflight_wrf_sources(
     processing_profile: &str,
     tx: &Sender<WrfProcessMessage>,
 ) -> Result<(Vec<WrfSourcePlan>, String), String> {
-    let mut timeline = crate::local_import::ForecastHourTimeline::default();
     let mut expected_shape = None::<(usize, usize)>;
-    let mut plans = Vec::with_capacity(files.len());
+    let mut sources = Vec::with_capacity(files.len());
+    let mut kinds = Vec::with_capacity(files.len());
     for path in files {
         let _ = tx.send(WrfProcessMessage::Progress(format!(
             "Preflighting WRF {}",
@@ -380,16 +383,28 @@ fn preflight_wrf_sources(
             }
         };
         crate::local_import::merge_preflight_grid_shape(&mut expected_shape, shape, path)?;
-        let records = timeline.plan(&source_times, path)?;
+        sources.push((path.clone(), source_times));
+        kinds.push(kind);
+    }
+    let timeline = crate::local_import::ForecastHourTimeline::plan_all(&sources)?;
+    let mut plans = Vec::with_capacity(sources.len());
+    for (index, ((path, _), kind)) in sources.into_iter().zip(kinds).enumerate() {
+        let records = timeline
+            .records_for_source(index)
+            .ok_or_else(|| {
+                format!(
+                    "internal error: WRF forecast timeline omitted source {}",
+                    path.display()
+                )
+            })?
+            .to_vec();
         plans.push(WrfSourcePlan {
-            path: path.clone(),
+            path,
             kind,
             records,
         });
     }
-    let run = timeline
-        .run_name(source_identity, processing_profile)
-        .ok_or_else(|| "forecast timeline has no run origin".to_string())?;
+    let run = timeline.run_name(source_identity, processing_profile);
     Ok((plans, run))
 }
 
@@ -459,7 +474,7 @@ fn process_paths(
                         options.should_process(slug, Some(slug), WrfProductGroup::Diagnostic)
                     });
             for record in &plan.records {
-                let hour = record.forecast_hour;
+                let storage_slot = record.storage_slot;
                 // Post-processed climate wrfout (CONUS-I/II, GDEX: derived
                 // TK/Z/P, no raw T/PB) — wrf-core can't open these, so route
                 // them through the netcrust-based reader before reporting the
@@ -475,10 +490,11 @@ fn process_paths(
                 ) {
                     Ok(Some((canonical, severe, volumes, raw_2d))) => {
                         let _ = tx.send(WrfProcessMessage::Progress(format!(
-                            "Reading post-processed WRF {} time {} ({}) -> f{hour:03}",
+                            "Reading post-processed WRF {} time {} ({}) -> {}",
                             display_name(path),
                             record.time_index,
-                            record.label
+                            record.label,
+                            record.display_key()
                         )));
                         let Some((_, grid_field)) = canonical.first() else {
                             return Err(format!(
@@ -541,20 +557,38 @@ fn process_paths(
                                 path.display()
                             ));
                         }
-                        let result = write_hour_from_grid_with_derived(
-                            &staging_store_root,
-                            &model,
-                            &run,
-                            hour,
-                            &grid_field.grid,
-                            grid_field.projection.as_ref(),
-                            &refs,
-                            &derived_refs,
-                            &volume_inputs,
-                            writer_build(),
-                            now_unix(),
-                        )
-                        .map_err(|err| format!("Write WRF f{hour:03} failed: {err}"))?;
+                        let result = match record.exact_time {
+                            Some(exact_time) => write_hour_from_grid_with_derived_exact(
+                                &staging_store_root,
+                                &model,
+                                &run,
+                                storage_slot,
+                                exact_time,
+                                &grid_field.grid,
+                                grid_field.projection.as_ref(),
+                                &refs,
+                                &derived_refs,
+                                &volume_inputs,
+                                writer_build(),
+                                now_unix(),
+                            ),
+                            None => write_hour_from_grid_with_derived(
+                                &staging_store_root,
+                                &model,
+                                &run,
+                                storage_slot,
+                                &grid_field.grid,
+                                grid_field.projection.as_ref(),
+                                &refs,
+                                &derived_refs,
+                                &volume_inputs,
+                                writer_build(),
+                                now_unix(),
+                            ),
+                        }
+                        .map_err(|err| {
+                            format!("Write WRF {} failed: {err}", record.display_key())
+                        })?;
                         all_vars.extend(result.vars.iter().cloned());
                         written.push(result);
                         continue;
@@ -579,12 +613,13 @@ fn process_paths(
         .map_err(|err| format!("Open WRF {} failed after preflight: {err}", path.display()))?;
         for record in &plan.records {
             let timeidx = record.time_index;
-            let hour = record.forecast_hour;
+            let storage_slot = record.storage_slot;
             let _ = tx.send(WrfProcessMessage::Progress(format!(
-                "Computing WRF {} time {} ({}) -> f{hour:03}",
+                "Computing WRF {} time {} ({}) -> {}",
                 display_name(path),
                 timeidx,
-                record.label
+                record.label,
+                record.display_key()
             )));
             let mut progress = |message: String| {
                 let _ = tx.send(WrfProcessMessage::Progress(message));
@@ -618,20 +653,36 @@ fn process_paths(
                 .iter()
                 .map(IsoVolume::as_input)
                 .collect::<Vec<_>>();
-            let result = write_hour_from_grid_with_derived(
-                &staging_store_root,
-                &model,
-                &run,
-                hour,
-                &fields.grid,
-                fields.projection.as_ref(),
-                &refs,
-                &derived_refs,
-                &volume_inputs,
-                writer_build(),
-                now_unix(),
-            )
-            .map_err(|err| format!("Write WRF f{hour:03} failed: {err}"))?;
+            let result = match record.exact_time {
+                Some(exact_time) => write_hour_from_grid_with_derived_exact(
+                    &staging_store_root,
+                    &model,
+                    &run,
+                    storage_slot,
+                    exact_time,
+                    &fields.grid,
+                    fields.projection.as_ref(),
+                    &refs,
+                    &derived_refs,
+                    &volume_inputs,
+                    writer_build(),
+                    now_unix(),
+                ),
+                None => write_hour_from_grid_with_derived(
+                    &staging_store_root,
+                    &model,
+                    &run,
+                    storage_slot,
+                    &fields.grid,
+                    fields.projection.as_ref(),
+                    &refs,
+                    &derived_refs,
+                    &volume_inputs,
+                    writer_build(),
+                    now_unix(),
+                ),
+            }
+            .map_err(|err| format!("Write WRF {} failed: {err}", record.display_key()))?;
             all_vars.extend(result.vars.iter().cloned());
             all_notes.extend(fields.notes);
             written.push(result);

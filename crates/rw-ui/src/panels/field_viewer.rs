@@ -956,7 +956,7 @@ impl FieldViewerPanel {
         match &self.state {
             LoadState::Idle if self.hour.is_none() => {
                 ui.add_space(12.0);
-                ui.label(RichText::new("Pick a run hour on the left.").weak());
+                ui.label(RichText::new("Pick a run timestep on the left.").weak());
                 return event;
             }
             LoadState::Idle => {
@@ -2210,6 +2210,7 @@ mod tests {
             model: "wrf".to_string(),
             run: "test".to_string(),
             hour,
+            exact_time: None,
         }
     }
 

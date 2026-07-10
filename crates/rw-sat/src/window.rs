@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Duration, Utc};
 
 use rw_store::lock::RunLock;
+use rw_store::RwStoreError;
 use rw_store::run::{RwsRunManifest, validate_store_component};
 
 use crate::store::{frame_time, run_day};
@@ -93,6 +94,12 @@ pub fn enforce_window(
         }
         let manifest_path = canonical_contained_path(&run_dir, &manifest_path, "run manifest")?;
         let manifest = RwsRunManifest::load_for_run(&manifest_path, model, &run_name)?;
+        if manifest.is_exact_time_axis() {
+            return Err(RwStoreError::Meta(format!(
+                "satellite retention run {model}/{run_name} uses exact-time ordinal slots instead of HHMM frame keys"
+            ))
+            .into());
+        }
         run_names.push(run_name.clone());
         for (&hhmm, hour) in &manifest.hours {
             let Some(time) = frame_time(&run_name, hhmm) else {
@@ -168,6 +175,12 @@ pub fn enforce_window(
         let manifest_path =
             canonical_contained_path(&run_dir, &run_dir.join("run.json"), "run manifest")?;
         let mut manifest = RwsRunManifest::load_for_run(&manifest_path, model, run_name)?;
+        if manifest.is_exact_time_axis() {
+            return Err(RwStoreError::Meta(format!(
+                "satellite retention run {model}/{run_name} changed to exact-time ordinal slots while pruning"
+            ))
+            .into());
+        }
         let mut changed = false;
         for (index, frame) in frames.iter().enumerate() {
             if !evict[index] || frame.run_name != *run_name {

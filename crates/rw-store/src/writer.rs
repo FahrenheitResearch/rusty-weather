@@ -32,8 +32,8 @@ use crate::atomic::atomic_write_with;
 use crate::codec::{encode_affine_i16, encode_f32_tile};
 use crate::error::{RwResult, RwStoreError};
 use crate::format::{
-    CODEC_2D, CODEC_3D, COL_X, COL_Y, KIND_COLUMN3D, KIND_TILE2D, RwsChunking, RwsHourMeta,
-    RwsVariableMeta, RwsWriterInfo, SCHEMA_HOUR, TILE_X, TILE_Y,
+    CODEC_2D, CODEC_3D, COL_X, COL_Y, KIND_COLUMN3D, KIND_TILE2D, RwsChunking, RwsExactTime,
+    RwsHourMeta, RwsVariableMeta, RwsWriterInfo, SCHEMA_HOUR, SCHEMA_HOUR_V2, TILE_X, TILE_Y,
 };
 use crate::header::RwsHeader;
 use crate::index::ChunkRecord;
@@ -105,6 +105,7 @@ pub struct HourWriter {
     model: String,
     run: String,
     forecast_hour: u16,
+    exact_time: Option<RwsExactTime>,
     nx: usize,
     ny: usize,
     grid_hash: String,
@@ -128,10 +129,57 @@ impl HourWriter {
         grid_hash: &str,
         writer_build: &str,
     ) -> Self {
+        Self::new_with_time(
+            model,
+            run,
+            forecast_hour,
+            None,
+            nx,
+            ny,
+            grid_hash,
+            writer_build,
+        )
+    }
+
+    /// Build a v2 hour whose numeric key is an ordinal storage slot and whose
+    /// physical lead/valid time is exact to the second.
+    pub fn new_exact(
+        model: &str,
+        run: &str,
+        storage_slot: u16,
+        exact_time: RwsExactTime,
+        nx: usize,
+        ny: usize,
+        grid_hash: &str,
+        writer_build: &str,
+    ) -> Self {
+        Self::new_with_time(
+            model,
+            run,
+            storage_slot,
+            Some(exact_time),
+            nx,
+            ny,
+            grid_hash,
+            writer_build,
+        )
+    }
+
+    fn new_with_time(
+        model: &str,
+        run: &str,
+        forecast_hour: u16,
+        exact_time: Option<RwsExactTime>,
+        nx: usize,
+        ny: usize,
+        grid_hash: &str,
+        writer_build: &str,
+    ) -> Self {
         Self {
             model: model.to_string(),
             run: run.to_string(),
             forecast_hour,
+            exact_time,
             nx,
             ny,
             grid_hash: grid_hash.to_string(),
@@ -466,6 +514,14 @@ impl HourWriter {
                 self.nx, self.ny
             )));
         }
+        if self
+            .exact_time
+            .is_some_and(|time| time.origin_unix().is_none())
+        {
+            return Err(RwStoreError::Meta(
+                "exact hour cannot represent valid_unix - lead_seconds".to_string(),
+            ));
+        }
 
         // Final ids for deferred variables: numbered after the normal set.
         let normal_count = self.variables.len();
@@ -488,11 +544,18 @@ impl HourWriter {
         }
         self.chunks.sort_by_key(|chunk| chunk.record.sort_key());
 
+        let exact_time = self.exact_time;
         let meta = RwsHourMeta {
-            schema: SCHEMA_HOUR.to_string(),
+            schema: if exact_time.is_some() {
+                SCHEMA_HOUR_V2.to_string()
+            } else {
+                SCHEMA_HOUR.to_string()
+            },
             model: self.model,
             run: self.run,
             forecast_hour: self.forecast_hour,
+            lead_seconds: exact_time.map(|time| time.lead_seconds),
+            valid_unix: exact_time.map(|time| time.valid_unix),
             nx: self.nx,
             ny: self.ny,
             grid_hash: self.grid_hash,
@@ -580,10 +643,12 @@ mod tests {
     use super::*;
     use crate::error::RwStoreError;
     use crate::format::{
-        CODEC_2D, FLAG_CONSTANT, FLAG_EMPTY, KIND_TILE2D, RwsHourMeta, SCHEMA_HOUR, TILE_X, TILE_Y,
+        CODEC_2D, FLAG_CONSTANT, FLAG_EMPTY, KIND_TILE2D, RwsExactTime, RwsHourMeta, SCHEMA_HOUR,
+        SCHEMA_HOUR_V2, TILE_X, TILE_Y,
     };
     use crate::header::RwsHeader;
     use crate::index::ChunkRecord;
+    use crate::reader::HourReader;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -780,6 +845,53 @@ mod tests {
             }
         }
         assert_eq!(raw, expected, "tile payload must be row-major within tile");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_writer_emits_v2_schema_and_complete_time_pair() {
+        let dir = test_dir("exact-meta");
+        let path = dir.join("f007.rws");
+        let exact = RwsExactTime {
+            lead_seconds: 2_700,
+            valid_unix: 1_700_002_700,
+        };
+        let meta = HourWriter::new_exact(
+            "wrf",
+            "research",
+            7,
+            exact,
+            1,
+            1,
+            "gridhash-test",
+            "test-build",
+        )
+        .finish(&path)
+        .unwrap();
+        assert_eq!(meta.schema, SCHEMA_HOUR_V2);
+        assert_eq!(meta.forecast_hour, 7);
+        assert_eq!(meta.exact_time(), Some(exact));
+        assert_eq!(HourReader::open(&path).unwrap().meta(), &meta);
+
+        let invalid = dir.join("invalid.rws");
+        let error = HourWriter::new_exact(
+            "wrf",
+            "research",
+            8,
+            RwsExactTime {
+                lead_seconds: u64::MAX,
+                valid_unix: 0,
+            },
+            1,
+            1,
+            "gridhash-test",
+            "test-build",
+        )
+        .finish(&invalid)
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot represent"), "{error}");
+        assert!(!invalid.exists());
 
         let _ = fs::remove_dir_all(&dir);
     }

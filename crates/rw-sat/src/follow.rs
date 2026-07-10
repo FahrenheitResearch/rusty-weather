@@ -240,6 +240,9 @@ pub fn primed_seen_scans(
         let Ok(manifest) = RwsRunManifest::load_for_run(&manifest_path, model, &run_name) else {
             continue;
         };
+        if manifest.is_exact_time_axis() {
+            continue;
+        }
         for &hhmm in manifest.hours.keys() {
             if let Some(time) = frame_time(&run_name, hhmm) {
                 seen.insert(band, time);

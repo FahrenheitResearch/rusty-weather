@@ -1,18 +1,21 @@
-//! Read-only view of an rw-store root: enumerate models / runs / hours from
-//! the on-disk layout (`<root>/<model>/<run>/run.json`) and open hour files
+//! Read-only view of an rw-store root: enumerate models / runs / timesteps from
+//! the on-disk layout (`<root>/<model>/<run>/run.json`) and open timestep files
 //! and grid files for the panels.
 //!
 //! Enumeration is deliberately forgiving: unreadable directories or
 //! malformed manifests become warnings on the returned [`StoreTree`] instead
 //! of errors, so one broken run never blanks the whole browser.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
 use rw_store::run::{RwsRunManifest, validate_store_component};
-use rw_store::{RwResult, RwStoreError};
+use rw_store::{RwResult, RwStoreError, RwsExactTime};
+
+use crate::worker::format_lead_seconds;
 
 /// Handle to a store root directory. Cheap to create; all IO happens in
 /// [`StoreView::enumerate`] and the `open_*` calls (run them off the UI
@@ -32,6 +35,18 @@ pub struct StoreTree {
     pub warnings: Vec<String>,
 }
 
+impl StoreTree {
+    /// Find one enumerated run without reopening its manifest.
+    pub fn run(&self, model: &str, run: &str) -> Option<&RunEntry> {
+        self.models
+            .iter()
+            .find(|entry| entry.model == model)?
+            .runs
+            .iter()
+            .find(|entry| entry.run == run)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelEntry {
     pub model: String,
@@ -48,17 +63,39 @@ pub struct RunEntry {
     pub writer_version: String,
     pub nx: usize,
     pub ny: usize,
-    /// Hours sorted ascending by forecast hour.
+    /// True only for a validated rw-store v2 exact-time axis. In that case
+    /// every `hours` entry carries `exact_time`, and `hour` is an ordinal slot.
+    pub exact_time_axis: bool,
+    /// Timesteps sorted by their manifest key. That key is a forecast hour in
+    /// v1 and an ordinal storage slot in exact-time v2.
     pub hours: Vec<HourEntry>,
+}
+
+impl RunEntry {
+    /// Complete exact axis keyed by storage slot. A partial axis is never
+    /// returned: temporal consumers must either receive every verified time or
+    /// stay disabled.
+    pub fn exact_times(&self) -> Option<BTreeMap<u16, RwsExactTime>> {
+        if !self.exact_time_axis {
+            return None;
+        }
+        self.hours
+            .iter()
+            .map(|entry| entry.exact_time.map(|exact| (entry.hour, exact)))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HourEntry {
+    /// Manifest storage slot. This is the forecast hour only for legacy v1.
     pub hour: u16,
-    /// Hour file name inside the run directory (e.g. `f006.rws`).
+    /// Timestep file name inside the run directory. Exact-time v2 retains the
+    /// `f###.rws` physical naming, but the number is only a storage slot.
     pub file: String,
     pub variable_count: usize,
     pub written_unix: u64,
+    pub exact_time: Option<RwsExactTime>,
 }
 
 impl StoreView {
@@ -128,29 +165,32 @@ impl StoreView {
         tree
     }
 
-    /// Open the hour file for (`model`, `run`, `hour`), resolving the file
-    /// name through `run.json` (the manifest is the source of truth).
+    /// Open the timestep file for (`model`, `run`, `hour`), resolving the file
+    /// name through `run.json` (the manifest is the source of truth). `hour`
+    /// is an opaque ordinal slot for an exact-time v2 run.
     pub fn open_hour(&self, model: &str, run: &str, hour: u16) -> RwResult<HourReader> {
         let (run_dir, manifest) = self.load_run_manifest(model, run)?;
         let entry = manifest.hours.get(&hour).ok_or_else(|| {
-            RwStoreError::Meta(format!("run {model}/{run} has no forecast hour {hour}"))
+            RwStoreError::Meta(format!("run {model}/{run} has no storage slot {hour}"))
         })?;
+        let entry_time = entry.exact_time();
+        let entry_label = entry_time.map_or_else(
+            || format!("forecast hour F{hour:03}"),
+            |exact| {
+                format!(
+                    "exact-time slot {hour} ({})",
+                    format_lead_seconds(exact.lead_seconds)
+                )
+            },
+        );
         let hour_path = canonical_contained_path(
             &run_dir,
             &run_dir.join(&entry.file),
-            &format!("hour F{hour:03} file"),
+            &format!("{entry_label} file"),
         )?;
         let reader = HourReader::open(&hour_path)?;
         let meta = reader.meta();
-        manifest.validate_identity(&meta.model, &meta.run)?;
-        manifest.validate_grid(&meta.grid_hash, meta.nx, meta.ny)?;
-        if meta.forecast_hour != hour {
-            return Err(RwStoreError::Meta(format!(
-                "manifest hour F{hour:03} resolves to {}, whose metadata says F{:03}",
-                hour_path.display(),
-                meta.forecast_hour
-            )));
-        }
+        manifest.validate_hour_meta(hour, meta)?;
         Ok(reader)
     }
 
@@ -199,6 +239,7 @@ impl StoreView {
 }
 
 fn run_entry(run: String, manifest: RwsRunManifest) -> RunEntry {
+    let exact_time_axis = manifest.is_exact_time_axis();
     let hours = manifest
         .hours
         .iter() // BTreeMap: already ascending by hour
@@ -207,6 +248,7 @@ fn run_entry(run: String, manifest: RwsRunManifest) -> RunEntry {
             file: entry.file.clone(),
             variable_count: entry.variables.len(),
             written_unix: entry.written_unix,
+            exact_time: entry.exact_time(),
         })
         .collect();
     RunEntry {
@@ -215,6 +257,7 @@ fn run_entry(run: String, manifest: RwsRunManifest) -> RunEntry {
         writer_version: manifest.writer.version,
         nx: manifest.nx,
         ny: manifest.ny,
+        exact_time_axis,
         hours,
     }
 }

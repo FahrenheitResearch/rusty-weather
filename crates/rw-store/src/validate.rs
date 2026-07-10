@@ -20,7 +20,7 @@ use crate::codec::MISSING_Q;
 use crate::error::{RwResult, RwStoreError};
 use crate::format::{
     CODEC_2D, CODEC_3D, COL_X, COL_Y, FLAG_CONSTANT, FLAG_EMPTY, FLAG_HAS_MISSING, HEADER_LEN,
-    INDEX_RECORD_LEN, KIND_COLUMN3D, KIND_TILE2D, RwsHourMeta, SCHEMA_HOUR, TILE_X, TILE_Y,
+    INDEX_RECORD_LEN, KIND_COLUMN3D, KIND_TILE2D, RwsHourMeta, TILE_X, TILE_Y,
 };
 use crate::grid::GridFile;
 use crate::header::RwsHeader;
@@ -260,29 +260,8 @@ pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<Valida
                     if let Ok(meta) =
                         serde_json::from_slice::<RwsHourMeta>(&hour_bytes[HEADER_LEN..meta_end])
                     {
-                        if meta.model != manifest.model {
-                            report.error(format!(
-                                "{}: hour meta model '{}' != manifest model '{}'",
-                                entry.file, meta.model, manifest.model
-                            ));
-                        }
-                        if meta.run != manifest.run {
-                            report.error(format!(
-                                "{}: hour meta run '{}' != manifest run '{}'",
-                                entry.file, meta.run, manifest.run
-                            ));
-                        }
-                        if meta.grid_hash != manifest.grid_hash {
-                            report.error(format!(
-                                "{}: hour meta grid_hash '{}' != manifest grid_hash '{}'",
-                                entry.file, meta.grid_hash, manifest.grid_hash
-                            ));
-                        }
-                        if meta.nx != manifest.nx || meta.ny != manifest.ny {
-                            report.error(format!(
-                                "{}: hour meta {}x{} != manifest {}x{}",
-                                entry.file, meta.nx, meta.ny, manifest.nx, manifest.ny
-                            ));
+                        if let Err(error) = manifest.validate_hour_meta(*hour, &meta) {
+                            report.error(format!("{}: {error}", entry.file));
                         }
                         // Check that all manifest-listed vars are present in the hour file.
                         let hour_var_names: HashSet<&str> =
@@ -450,11 +429,8 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
             return;
         }
     };
-    if meta.schema != SCHEMA_HOUR {
-        report.error(format!(
-            "meta schema '{}' != expected '{SCHEMA_HOUR}'",
-            meta.schema
-        ));
+    if let Err(error) = meta.validate_time_schema() {
+        report.error(error);
     }
     if meta.nx == 0 || meta.ny == 0 {
         report.error(format!(
@@ -2128,6 +2104,8 @@ mod tests {
             6,
             RwsHourEntry {
                 file: absolute_target.clone(),
+                lead_seconds: None,
+                valid_unix: None,
                 written_unix: 0,
                 encode_ms: 0,
                 variables: vec!["temp_2m".to_string()],
@@ -2137,6 +2115,8 @@ mod tests {
             9,
             RwsHourEntry {
                 file: r"..\evil.rws".to_string(),
+                lead_seconds: None,
+                valid_unix: None,
                 written_unix: 0,
                 encode_ms: 0,
                 variables: vec!["temp_2m".to_string()],

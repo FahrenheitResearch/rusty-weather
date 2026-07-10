@@ -132,9 +132,10 @@ fn main() -> ExitCode {
 
 // ── ls ────────────────────────────────────────────────────────────────────────
 
-/// One hour entry collected for human-readable `ls` output.
+/// One timestep entry collected for human-readable `ls` output.
 struct HourListing {
-    hour: u16,
+    storage_key: u16,
+    exact_time: Option<rw_store::RwsExactTime>,
     file: String,
     variables: Vec<String>,
     file_bytes: Option<u64>,
@@ -148,6 +149,7 @@ struct RunListing {
     nx: usize,
     ny: usize,
     writer_build: String,
+    exact_time_axis: bool,
     hours: Vec<HourListing>,
 }
 
@@ -200,7 +202,8 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
                 None
             };
             hours.push(HourListing {
-                hour,
+                storage_key: hour,
+                exact_time: entry.exact_time(),
                 file: entry.file.clone(),
                 variables: entry.variables.clone(),
                 file_bytes,
@@ -210,23 +213,37 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
             any_error = true;
             continue;
         }
+        let exact_time_axis = manifest.is_exact_time_axis();
         let hour_json: Vec<serde_json::Value> = hours
             .iter()
             .map(|h| {
-                json!({
-                    "hour": h.hour, "file": h.file, "variables": h.variables,
-                    "file_bytes": h.file_bytes
-                })
+                match h.exact_time {
+                    Some(time) => json!({
+                        "storage_slot": h.storage_key,
+                        "lead_seconds": time.lead_seconds,
+                        "valid_unix": time.valid_unix,
+                        "file": h.file,
+                        "variables": h.variables,
+                        "file_bytes": h.file_bytes
+                    }),
+                    None => json!({
+                        "forecast_hour": h.storage_key,
+                        "file": h.file,
+                        "variables": h.variables,
+                        "file_bytes": h.file_bytes
+                    }),
+                }
             })
             .collect();
         runs.push(json!({
+            "schema": manifest.schema,
             "model": manifest.model,
             "run": manifest.run,
             "grid_hash": manifest.grid_hash,
             "nx": manifest.nx,
             "ny": manifest.ny,
             "writer_build": manifest.writer.build,
-            "hours": hour_json,
+            "timesteps": hour_json,
         }));
         run_displays.push(RunListing {
             model: manifest.model,
@@ -235,6 +252,7 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
             nx: manifest.nx,
             ny: manifest.ny,
             writer_build: manifest.writer.build,
+            exact_time_axis,
             hours,
         });
     }
@@ -244,8 +262,13 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
     } else {
         for listing in &run_displays {
             println!(
-                "model={} run={} grid={}x{} build={}",
-                listing.model, listing.run, listing.ny, listing.nx, listing.writer_build
+                "model={} run={} grid={}x{} build={} time_axis={}",
+                listing.model,
+                listing.run,
+                listing.ny,
+                listing.nx,
+                listing.writer_build,
+                if listing.exact_time_axis { "exact" } else { "forecast_hour" }
             );
             println!("  grid_hash: {}", listing.grid_hash);
             for hour in &listing.hours {
@@ -253,13 +276,25 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
                     Some(b) => format!("{b} B"),
                     None => "?".to_string(),
                 };
-                println!(
-                    "  f{:03}  {}  {}  vars: {}",
-                    hour.hour,
-                    hour.file,
-                    size_str,
-                    hour.variables.join(", ")
-                );
+                if let Some(time) = hour.exact_time {
+                    println!(
+                        "  slot {:05}  +{}s  valid_unix={}  {}  {}  vars: {}",
+                        hour.storage_key,
+                        time.lead_seconds,
+                        time.valid_unix,
+                        hour.file,
+                        size_str,
+                        hour.variables.join(", ")
+                    );
+                } else {
+                    println!(
+                        "  f{:03}  {}  {}  vars: {}",
+                        hour.storage_key,
+                        hour.file,
+                        size_str,
+                        hour.variables.join(", ")
+                    );
+                }
             }
         }
     }
@@ -449,6 +484,14 @@ fn cmd_dump(args: DumpArgs) -> ExitCode {
 
     // Summary dump: header + meta overview + per-variable table.
     if args.json {
+        let timing = match meta.exact_time() {
+            Some(time) => json!({
+                "storage_slot": meta.forecast_hour,
+                "lead_seconds": time.lead_seconds,
+                "valid_unix": time.valid_unix,
+            }),
+            None => json!({ "forecast_hour": meta.forecast_hour }),
+        };
         let vars: Vec<serde_json::Value> = meta
             .variables
             .iter()
@@ -475,7 +518,7 @@ fn cmd_dump(args: DumpArgs) -> ExitCode {
                 "schema": meta.schema,
                 "model": meta.model,
                 "run": meta.run,
-                "forecast_hour": meta.forecast_hour,
+                "time": timing,
                 "nx": meta.nx,
                 "ny": meta.ny,
                 "grid_hash": meta.grid_hash,
@@ -490,7 +533,13 @@ fn cmd_dump(args: DumpArgs) -> ExitCode {
         println!("schema:    {}", meta.schema);
         println!("model:     {}", meta.model);
         println!("run:       {}", meta.run);
-        println!("fh:        {}", meta.forecast_hour);
+        if let Some(time) = meta.exact_time() {
+            println!("slot:      {}", meta.forecast_hour);
+            println!("lead:      {} s", time.lead_seconds);
+            println!("valid:     {} (Unix UTC)", time.valid_unix);
+        } else {
+            println!("fh:        {}", meta.forecast_hour);
+        }
         println!("grid:      {}x{}", meta.ny, meta.nx);
         println!("grid_hash: {}", meta.grid_hash);
         println!(

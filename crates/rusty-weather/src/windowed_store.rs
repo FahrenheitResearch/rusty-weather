@@ -95,7 +95,21 @@ pub fn stored_run_hours(
     run_slug: &str,
 ) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
     let (_, manifest) = load_run_manifest(store_root, model_slug, run_slug)?;
+    reject_exact_time_axis(&manifest, model_slug, run_slug)?;
     Ok(manifest.hours.keys().copied().collect())
+}
+
+fn reject_exact_time_axis(
+    manifest: &RwsRunManifest,
+    model_slug: &str,
+    run_slug: &str,
+) -> Result<(), RwStoreError> {
+    if manifest.is_exact_time_axis() {
+        return Err(RwStoreError::Meta(format!(
+            "run {model_slug}/{run_slug} uses an exact-time ordinal axis; production batch/windowed rendering is disabled until render requests carry exact lead and valid times"
+        )));
+    }
+    Ok(())
 }
 
 fn load_run_manifest(
@@ -162,11 +176,12 @@ pub fn compute_windowed_products(
     available_hours: &[u16],
     requested: &[String],
 ) -> Result<WindowedStoreOutcome, Box<dyn std::error::Error>> {
+    let (run_dir, manifest) = load_run_manifest(store_root, model_slug, run_slug)?;
+    reject_exact_time_axis(&manifest, model_slug, run_slug)?;
     let available: BTreeSet<u16> = available_hours.iter().copied().collect();
     let Some(&anchor_hour) = available.iter().next_back() else {
         return Err("windowed compute needs at least one stored hour".into());
     };
-    let (run_dir, manifest) = load_run_manifest(store_root, model_slug, run_slug)?;
     if let Some(hour) = available
         .iter()
         .find(|&&hour| !manifest.hours.contains_key(&hour))
@@ -1009,7 +1024,11 @@ mod tests {
     use std::path::PathBuf;
 
     use rustwx_core::{CanonicalField, FieldSelector, GridShape, LatLonGrid, SelectedField2D};
-    use rw_store::ingest::{DerivedFieldInput, write_hour_from_fields_with_derived};
+    use rw_store::RwsExactTime;
+    use rw_store::ingest::{
+        DerivedFieldInput, write_hour_from_fields_with_derived,
+        write_hour_from_fields_with_derived_exact,
+    };
 
     const NX: usize = 2;
     const NY: usize = 2;
@@ -1770,6 +1789,47 @@ mod tests {
         let hours = stored_run_hours(&dir, "hrrr", "20260608_00z").unwrap();
         assert_eq!(hours, vec![1, 2, 5]);
         assert!(stored_run_hours(&dir, "hrrr", "20990101_00z").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_time_runs_are_rejected_at_both_windowed_entry_points() {
+        let dir = test_dir("exact-time-guard");
+        let run = "minute_loop";
+        let temp = field(
+            FieldSelector::height_agl(CanonicalField::Temperature, 2),
+            "K",
+            temp_k_plane(0),
+        );
+        write_hour_from_fields_with_derived_exact(
+            &dir,
+            "hrrr",
+            run,
+            0,
+            RwsExactTime::new(31_680, 134_000_000),
+            &[("temperature_2m", &temp)],
+            &[],
+            &[],
+            "windowed-store-test",
+            1_780_000_000,
+        )
+        .unwrap();
+
+        let hours_error = stored_run_hours(&dir, "hrrr", run)
+            .unwrap_err()
+            .to_string();
+        assert!(hours_error.contains("exact-time ordinal axis"));
+
+        let compute_error = compute_windowed_products(
+            &dir,
+            "hrrr",
+            run,
+            &[0],
+            &["qpf_1h".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(compute_error.contains("exact-time ordinal axis"));
         let _ = fs::remove_dir_all(&dir);
     }
 

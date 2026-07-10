@@ -5,8 +5,8 @@
 //! mount in any egui app (the `rusty-weather-ui` shell here, bowecho, ...).
 //!
 //! Building blocks:
-//! - [`StoreView`]: enumerate a store root (models → runs → hours via
-//!   `run.json`) and open hour/grid files.
+//! - [`StoreView`]: enumerate a store root (models → runs → timesteps via
+//!   `run.json`) and open timestep/grid files.
 //! - [`StoreWorker`]: a background IO thread so the UI never blocks on file
 //!   reads; plain-data requests/responses over channels.
 //! - [`RunBrowserPanel`], [`FieldViewerPanel`], [`PlotViewerPanel`],
@@ -54,7 +54,7 @@ pub use style_overrides::{
 };
 pub use worker::{
     FieldData, FieldKey, HourKey, ProfileVar, SoundingData, StoreRequest, StoreResponse,
-    StoreWorker, SurfaceSample, VarInfo, VarKind,
+    StoreWorker, SurfaceSample, VarInfo, VarKind, format_lead_seconds, format_valid_unix,
 };
 
 /// Crate-local profiling scope: expands to `puffin::profile_scope!` under

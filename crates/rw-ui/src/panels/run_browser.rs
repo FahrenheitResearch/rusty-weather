@@ -1,12 +1,12 @@
-//! Run browser: model -> run -> hours tree over a [`StoreTree`], with
-//! variable counts per hour and the writer build stamp per run.
+//! Run browser: model -> run -> timesteps tree over a [`StoreTree`], with
+//! exact-time labels where available, variable counts, and the writer build.
 
-use egui::{CollapsingHeader, RichText, Ui};
+use egui::{CollapsingHeader, RichText, ScrollArea, Ui};
 
 use crate::store_view::StoreTree;
 use crate::worker::HourKey;
 
-/// Tree panel for picking a forecast hour. Pure widget: render with
+/// Tree panel for picking a stored timestep. Pure widget: render with
 /// [`RunBrowserPanel::ui`] inside any container; it returns the newly picked
 /// hour, and the host drives loading.
 #[derive(Debug, Default)]
@@ -27,6 +27,48 @@ impl RunBrowserPanel {
     /// auto-select of the first hour).
     pub fn select(&mut self, key: HourKey) {
         self.selected = Some(key);
+    }
+
+    /// Reconcile the current selection with a freshly enumerated store tree.
+    /// Matching uses the stable model/run/slot identity, then refreshes exact
+    /// timing from the new manifest snapshot. If the old timestep vanished,
+    /// the first available timestep is selected; an empty tree clears it.
+    /// Returns true only when the effective key changed.
+    pub fn reconcile(&mut self, tree: &StoreTree) -> bool {
+        let refreshed = self
+            .selected
+            .as_ref()
+            .and_then(|selected| {
+                tree.models
+                    .iter()
+                    .find(|model| model.model == selected.model)?
+                    .runs
+                    .iter()
+                    .find(|run| run.run == selected.run)?
+                    .hours
+                    .iter()
+                    .find(|hour| hour.hour == selected.hour)
+                    .map(|hour| HourKey {
+                        model: selected.model.clone(),
+                        run: selected.run.clone(),
+                        hour: hour.hour,
+                        exact_time: hour.exact_time,
+                    })
+            })
+            .or_else(|| {
+                let model = tree.models.first()?;
+                let run = model.runs.first()?;
+                let hour = run.hours.first()?;
+                Some(HourKey {
+                    model: model.model.clone(),
+                    run: run.run.clone(),
+                    hour: hour.hour,
+                    exact_time: hour.exact_time,
+                })
+            });
+        let changed = self.selected != refreshed;
+        self.selected = refreshed;
+        changed
     }
 
     /// Render the tree. Returns `Some(key)` only on the frame the user picks
@@ -55,22 +97,47 @@ impl RunBrowserPanel {
                                     .small()
                                     .weak(),
                                 );
-                                for hour in &run.hours {
+                                let mut show_hour = |ui: &mut Ui, hour: &crate::store_view::HourEntry| {
                                     let key = HourKey {
                                         model: model.model.clone(),
                                         run: run.run.clone(),
                                         hour: hour.hour,
+                                        exact_time: hour.exact_time,
                                     };
                                     let is_selected = self.selected.as_ref() == Some(&key);
                                     let label = format!(
-                                        "f{:03}  ·  {} vars",
-                                        hour.hour, hour.variable_count
+                                        "{}  ·  {} vars",
+                                        key.time_label(),
+                                        hour.variable_count
                                     );
                                     if ui.selectable_label(is_selected, label).clicked()
                                         && !is_selected
                                     {
                                         self.selected = Some(key.clone());
                                         picked = Some(key);
+                                    }
+                                };
+                                if run.hours.len() > 256 {
+                                    // Minute-cadence runs commonly contain
+                                    // thousands of frames. Only build labels
+                                    // and HourKeys for visible rows.
+                                    let row_height = ui.spacing().interact_size.y;
+                                    ScrollArea::vertical()
+                                        .id_salt(("rw-run-hours", &model.model, &run.run))
+                                        .max_height(420.0)
+                                        .show_rows(
+                                            ui,
+                                            row_height,
+                                            run.hours.len(),
+                                            |ui, visible| {
+                                                for index in visible {
+                                                    show_hour(ui, &run.hours[index]);
+                                                }
+                                            },
+                                        );
+                                } else {
+                                    for hour in &run.hours {
+                                        show_hour(ui, hour);
                                     }
                                 }
                             });
@@ -91,5 +158,53 @@ impl RunBrowserPanel {
         }
 
         picked
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store_view::{HourEntry, ModelEntry, RunEntry};
+
+    fn tree(exact_time: Option<rw_store::RwsExactTime>) -> StoreTree {
+        StoreTree {
+            models: vec![ModelEntry {
+                model: "wrf".to_string(),
+                runs: vec![RunEntry {
+                    run: "run".to_string(),
+                    build: "test".to_string(),
+                    writer_version: "test".to_string(),
+                    nx: 2,
+                    ny: 2,
+                    exact_time_axis: exact_time.is_some(),
+                    hours: vec![HourEntry {
+                        hour: 0,
+                        file: "f000.rws".to_string(),
+                        variable_count: 1,
+                        written_unix: 1,
+                        exact_time,
+                    }],
+                }],
+            }],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reconcile_refreshes_timing_and_clears_a_removed_selection() {
+        let mut panel = RunBrowserPanel::new();
+        assert!(panel.reconcile(&tree(None)));
+        assert_eq!(panel.selected().and_then(|key| key.exact_time), None);
+
+        let exact = rw_store::RwsExactTime {
+            lead_seconds: 31_680,
+            valid_unix: 134_243_280,
+        };
+        assert!(panel.reconcile(&tree(Some(exact))));
+        assert_eq!(panel.selected().and_then(|key| key.exact_time), Some(exact));
+        assert!(!panel.reconcile(&tree(Some(exact))));
+
+        assert!(panel.reconcile(&StoreTree::default()));
+        assert!(panel.selected().is_none());
     }
 }
