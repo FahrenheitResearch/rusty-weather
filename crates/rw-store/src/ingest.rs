@@ -13,11 +13,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rustwx_core::{GridProjection, GridShape, LatLonGrid, SelectedField2D};
+use rustwx_core::{GridProjection, GridShape, LatLonGrid, MAX_VOLUME_ELEMENTS, SelectedField2D};
 
 use crate::atomic::atomic_write_bytes;
 use crate::error::{RwResult, RwStoreError};
-use crate::format::RwsWriterInfo;
+use crate::format::{RwsExactTime, RwsWriterInfo};
 use crate::grid::{GridFile, encode_grid_bytes};
 use crate::lock::RunLock;
 use crate::reader::HourReader;
@@ -29,6 +29,26 @@ use crate::writer::HourWriter;
 /// contention is a competing hour encode finishing (seconds), which we want
 /// to wait out rather than fail on.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn validated_grid_cells(nx: usize, ny: usize) -> Result<usize, String> {
+    GridShape { nx, ny }
+        .checked_len()
+        .map_err(|err| err.to_string())
+}
+
+fn validated_volume_elements(name: &str, levels: usize, cells: usize) -> RwResult<usize> {
+    let elements = levels.checked_mul(cells).ok_or_else(|| {
+        RwStoreError::Format(format!(
+            "volume '{name}': {levels} levels x {cells} cells overflows the addressable element count"
+        ))
+    })?;
+    if elements > MAX_VOLUME_ELEMENTS {
+        return Err(RwStoreError::Format(format!(
+            "volume '{name}': {elements} values ({levels} levels x {cells} cells) exceeds the supported ceiling of {MAX_VOLUME_ELEMENTS}"
+        )));
+    }
+    Ok(elements)
+}
 
 /// One 3D pressure volume to ingest: a selector template plus one full-grid
 /// row-major plane per level. Levels may arrive in any order; they are
@@ -109,6 +129,35 @@ pub fn write_hour_from_fields(
     )
 }
 
+/// Exact-time v2 counterpart to [`write_hour_from_fields`]. `storage_slot`
+/// is an ordinal filename/manifest key; physical timing is carried only by
+/// `exact_time` and may be sub-hourly.
+#[allow(clippy::too_many_arguments)]
+pub fn write_hour_from_fields_exact(
+    store_root: &Path,
+    model: &str,
+    run: &str,
+    storage_slot: u16,
+    exact_time: RwsExactTime,
+    fields_2d: &[(&str, &SelectedField2D)],
+    volumes: &[PressureVolumeInput<'_>],
+    writer_build: &str,
+    written_unix: u64,
+) -> RwResult<WrittenHour> {
+    write_hour_from_fields_with_derived_exact(
+        store_root,
+        model,
+        run,
+        storage_slot,
+        exact_time,
+        fields_2d,
+        &[],
+        volumes,
+        writer_build,
+        written_unix,
+    )
+}
+
 /// [`write_hour_from_fields`] plus ingest-computed derived 2D variables,
 /// written after the extracted 2D fields (the grid still rides on the first
 /// extracted field) and before the volumes. Derived planes are bare slices
@@ -126,6 +175,61 @@ pub fn write_hour_from_fields_with_derived(
     writer_build: &str,
     written_unix: u64,
 ) -> RwResult<WrittenHour> {
+    write_hour_from_fields_with_derived_time(
+        store_root,
+        model,
+        run,
+        forecast_hour,
+        None,
+        fields_2d,
+        derived_2d,
+        volumes,
+        writer_build,
+        written_unix,
+    )
+}
+
+/// Exact-time v2 counterpart to [`write_hour_from_fields_with_derived`].
+#[allow(clippy::too_many_arguments)]
+pub fn write_hour_from_fields_with_derived_exact(
+    store_root: &Path,
+    model: &str,
+    run: &str,
+    storage_slot: u16,
+    exact_time: RwsExactTime,
+    fields_2d: &[(&str, &SelectedField2D)],
+    derived_2d: &[DerivedFieldInput<'_>],
+    volumes: &[PressureVolumeInput<'_>],
+    writer_build: &str,
+    written_unix: u64,
+) -> RwResult<WrittenHour> {
+    write_hour_from_fields_with_derived_time(
+        store_root,
+        model,
+        run,
+        storage_slot,
+        Some(exact_time),
+        fields_2d,
+        derived_2d,
+        volumes,
+        writer_build,
+        written_unix,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_hour_from_fields_with_derived_time(
+    store_root: &Path,
+    model: &str,
+    run: &str,
+    storage_slot: u16,
+    exact_time: Option<RwsExactTime>,
+    fields_2d: &[(&str, &SelectedField2D)],
+    derived_2d: &[DerivedFieldInput<'_>],
+    volumes: &[PressureVolumeInput<'_>],
+    writer_build: &str,
+    written_unix: u64,
+) -> RwResult<WrittenHour> {
     // v1: the grid rides on the first 2D field — volume planes are bare
     // slices with no (nx, ny) of their own. This also covers "no inputs".
     let Some((_, first)) = fields_2d.first() else {
@@ -136,14 +240,114 @@ pub fn write_hour_from_fields_with_derived(
             volumes.len()
         )));
     };
-    let reference = &first.grid;
+    write_hour_from_grid_with_derived_time(
+        store_root,
+        model,
+        run,
+        storage_slot,
+        exact_time,
+        &first.grid,
+        first.projection.as_ref(),
+        fields_2d,
+        derived_2d,
+        volumes,
+        writer_build,
+        written_unix,
+    )
+}
+
+/// Write an hour when the caller already owns the grid separately from its
+/// selected fields. This permits intentionally narrow diagnostic selections
+/// containing only derived planes and/or pressure volumes without inventing
+/// an unwanted 2-D "grid carrier" variable.
+#[allow(clippy::too_many_arguments)]
+pub fn write_hour_from_grid_with_derived(
+    store_root: &Path,
+    model: &str,
+    run: &str,
+    forecast_hour: u16,
+    reference: &LatLonGrid,
+    projection: Option<&GridProjection>,
+    fields_2d: &[(&str, &SelectedField2D)],
+    derived_2d: &[DerivedFieldInput<'_>],
+    volumes: &[PressureVolumeInput<'_>],
+    writer_build: &str,
+    written_unix: u64,
+) -> RwResult<WrittenHour> {
+    write_hour_from_grid_with_derived_time(
+        store_root,
+        model,
+        run,
+        forecast_hour,
+        None,
+        reference,
+        projection,
+        fields_2d,
+        derived_2d,
+        volumes,
+        writer_build,
+        written_unix,
+    )
+}
+
+/// Exact-time v2 counterpart to [`write_hour_from_grid_with_derived`].
+#[allow(clippy::too_many_arguments)]
+pub fn write_hour_from_grid_with_derived_exact(
+    store_root: &Path,
+    model: &str,
+    run: &str,
+    storage_slot: u16,
+    exact_time: RwsExactTime,
+    reference: &LatLonGrid,
+    projection: Option<&GridProjection>,
+    fields_2d: &[(&str, &SelectedField2D)],
+    derived_2d: &[DerivedFieldInput<'_>],
+    volumes: &[PressureVolumeInput<'_>],
+    writer_build: &str,
+    written_unix: u64,
+) -> RwResult<WrittenHour> {
+    write_hour_from_grid_with_derived_time(
+        store_root,
+        model,
+        run,
+        storage_slot,
+        Some(exact_time),
+        reference,
+        projection,
+        fields_2d,
+        derived_2d,
+        volumes,
+        writer_build,
+        written_unix,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_hour_from_grid_with_derived_time(
+    store_root: &Path,
+    model: &str,
+    run: &str,
+    storage_slot: u16,
+    exact_time: Option<RwsExactTime>,
+    reference: &LatLonGrid,
+    projection: Option<&GridProjection>,
+    fields_2d: &[(&str, &SelectedField2D)],
+    derived_2d: &[DerivedFieldInput<'_>],
+    volumes: &[PressureVolumeInput<'_>],
+    writer_build: &str,
+    written_unix: u64,
+) -> RwResult<WrittenHour> {
+    if fields_2d.is_empty() && derived_2d.is_empty() && volumes.is_empty() {
+        return Err(RwStoreError::Format(
+            "write_hour requires at least one 2-D field, derived plane, or pressure volume"
+                .to_string(),
+        ));
+    }
     let (nx, ny) = (reference.shape.nx, reference.shape.ny);
-    let cells = reference.shape.len();
+    let cells = validated_grid_cells(nx, ny).map_err(RwStoreError::Format)?;
     if reference.lat_deg.len() != cells || reference.lon_deg.len() != cells {
         return Err(RwStoreError::Format(format!(
-            "2D field '{}': coordinate arrays must hold {cells} values ({ny} x {nx}), \
-             got lat {} / lon {}",
-            fields_2d[0].0,
+            "hour grid coordinate arrays must hold {cells} values ({ny} x {nx}), got lat {} / lon {}",
             reference.lat_deg.len(),
             reference.lon_deg.len()
         )));
@@ -153,16 +357,13 @@ pub fn write_hour_from_fields_with_derived(
     // and every 2D field after the first must sit on bit-identical
     // coordinates: two same-dims fields from different grids must error,
     // not store silently under the first field's coordinates.
-    for (index, (name, field)) in fields_2d.iter().enumerate() {
+    for (name, field) in fields_2d {
         let shape = field.grid.shape;
         if (shape.nx, shape.ny) != (nx, ny) {
             return Err(RwStoreError::Format(format!(
                 "2D field '{name}': grid {}x{} does not match the hour grid {nx}x{ny}",
                 shape.nx, shape.ny
             )));
-        }
-        if index == 0 {
-            continue;
         }
         let coords_match = field.grid.lat_deg.len() == cells
             && field.grid.lon_deg.len() == cells
@@ -182,7 +383,7 @@ pub fn write_hour_from_fields_with_derived(
             return Err(RwStoreError::Format(format!(
                 "2D field '{name}': same {nx}x{ny} dims as the first field '{}' \
                  but different coordinates",
-                fields_2d[0].0
+                fields_2d.first().map(|field| field.0).unwrap_or("<none>")
             )));
         }
     }
@@ -200,13 +401,14 @@ pub fn write_hour_from_fields_with_derived(
     // Volume validation (level sort, duplicate levels, plane sizes) happens
     // in HourIngestWriter::add_volume below, with the same error messages.
 
-    let mut writer = HourIngestWriter::begin(
+    let mut writer = HourIngestWriter::begin_with_time(
         store_root,
         model,
         run,
-        forecast_hour,
+        storage_slot,
+        exact_time,
         reference,
-        first.projection.as_ref(),
+        projection,
         writer_build,
     )?;
     for (name, field) in fields_2d {
@@ -257,6 +459,7 @@ pub struct HourIngestWriter {
     ny: usize,
     cells: usize,
     forecast_hour: u16,
+    exact_time: Option<RwsExactTime>,
     model: String,
     run: String,
     writer_build: String,
@@ -285,8 +488,59 @@ impl HourIngestWriter {
         projection: Option<&GridProjection>,
         writer_build: &str,
     ) -> RwResult<Self> {
+        Self::begin_with_time(
+            store_root,
+            model,
+            run,
+            forecast_hour,
+            None,
+            grid,
+            projection,
+            writer_build,
+        )
+    }
+
+    /// Start an exact-time v2 ingest at one ordinal storage slot.
+    pub fn begin_exact(
+        store_root: &Path,
+        model: &str,
+        run: &str,
+        storage_slot: u16,
+        exact_time: RwsExactTime,
+        grid: &LatLonGrid,
+        projection: Option<&GridProjection>,
+        writer_build: &str,
+    ) -> RwResult<Self> {
+        Self::begin_with_time(
+            store_root,
+            model,
+            run,
+            storage_slot,
+            Some(exact_time),
+            grid,
+            projection,
+            writer_build,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_with_time(
+        store_root: &Path,
+        model: &str,
+        run: &str,
+        storage_slot: u16,
+        exact_time: Option<RwsExactTime>,
+        grid: &LatLonGrid,
+        projection: Option<&GridProjection>,
+        writer_build: &str,
+    ) -> RwResult<Self> {
+        if exact_time.is_some_and(|time| time.origin_unix().is_none()) {
+            return Err(RwStoreError::Meta(
+                "exact hour cannot represent valid_unix - lead_seconds".to_string(),
+            ));
+        }
         let (nx, ny) = (grid.shape.nx, grid.shape.ny);
-        let cells = grid.shape.len();
+        let cells = validated_grid_cells(nx, ny).map_err(RwStoreError::Grid)?;
         if grid.lat_deg.len() != cells || grid.lon_deg.len() != cells {
             return Err(RwStoreError::Grid(format!(
                 "hour grid coordinate arrays must hold {cells} values ({ny} x {nx}), \
@@ -343,8 +597,20 @@ impl HourIngestWriter {
             (hash, Some(bytes))
         };
 
-        let writer = HourWriter::new(model, run, forecast_hour, nx, ny, &grid_hash, writer_build)
-            .with_spill_dir(&run_dir);
+        let writer = match exact_time {
+            Some(time) => HourWriter::new_exact(
+                model,
+                run,
+                storage_slot,
+                time,
+                nx,
+                ny,
+                &grid_hash,
+                writer_build,
+            ),
+            None => HourWriter::new(model, run, storage_slot, nx, ny, &grid_hash, writer_build),
+        }
+        .with_spill_dir(&run_dir);
         Ok(Self {
             run_dir,
             grid_hash,
@@ -352,7 +618,8 @@ impl HourIngestWriter {
             nx,
             ny,
             cells,
-            forecast_hour,
+            forecast_hour: storage_slot,
+            exact_time,
             model: model.to_string(),
             run: run.to_string(),
             writer_build: writer_build.to_string(),
@@ -409,6 +676,7 @@ impl HourIngestWriter {
         selector_template: serde_json::Value,
         levels: &[(u16, &[f32])],
     ) -> RwResult<()> {
+        validated_volume_elements(name, levels.len(), self.cells)?;
         let mut sorted: Vec<(u16, &[f32])> = levels.to_vec();
         sorted.sort_by(|a, b| b.0.cmp(&a.0));
         if let Some(pair) = sorted.windows(2).find(|pair| pair[0].0 == pair[1].0) {
@@ -451,43 +719,91 @@ impl HourIngestWriter {
         let file_name = format!("f{:03}.rws", self.forecast_hour);
         let hour_path = self.run_dir.join(&file_name);
 
-        if let Some(bytes) = self.pending_grid.take() {
-            atomic_write_bytes(&self.run_dir.join("grid.rwg"), &bytes)?;
-        }
-
-        let started = Instant::now();
-        self.writer.finish(&hour_path)?;
-        self.encode_elapsed += started.elapsed();
-        let encode_ms = self.encode_elapsed.as_millis() as u64;
-        let bytes = fs::metadata(&hour_path)?.len();
-
-        let mut vars = self.vars_normal;
-        vars.extend(self.vars_deferred);
-
+        let mut vars = self.vars_normal.clone();
+        vars.extend(self.vars_deferred.iter().cloned());
         let manifest_path = self.run_dir.join("run.json");
         let writer_info = RwsWriterInfo {
             name: "rw-store".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             build: self.writer_build.clone(),
         };
-        let mut manifest = RwsRunManifest::load_or_new(
-            &manifest_path,
-            &self.model,
-            &self.run,
-            &self.grid_hash,
-            self.nx,
-            self.ny,
-            writer_info,
-        )?;
+        let mut manifest = if self.exact_time.is_some() {
+            RwsRunManifest::load_or_new_exact(
+                &manifest_path,
+                &self.model,
+                &self.run,
+                &self.grid_hash,
+                self.nx,
+                self.ny,
+                writer_info,
+            )?
+        } else {
+            RwsRunManifest::load_or_new(
+                &manifest_path,
+                &self.model,
+                &self.run,
+                &self.grid_hash,
+                self.nx,
+                self.ny,
+                writer_info,
+            )?
+        };
+        if let (Some(requested_time), Some(existing)) =
+            (self.exact_time, manifest.hours.get(&self.forecast_hour))
+        {
+            let persisted_time = existing.exact_time().ok_or_else(|| {
+                RwStoreError::Meta(format!(
+                    "existing exact-time storage slot {} has no complete physical time",
+                    self.forecast_hour
+                ))
+            })?;
+            if persisted_time != requested_time {
+                return Err(RwStoreError::Meta(format!(
+                    "refusing to remap exact-time storage slot {} from lead_seconds={} valid_unix={} to lead_seconds={} valid_unix={}; write a new run instead",
+                    self.forecast_hour,
+                    persisted_time.lead_seconds,
+                    persisted_time.valid_unix,
+                    requested_time.lead_seconds,
+                    requested_time.valid_unix
+                )));
+            }
+        }
+        // Validate the prospective time-axis update before replacing any hour
+        // file. encode_ms has no bearing on schema/order validation.
         manifest.register_hour(
             self.forecast_hour,
             RwsHourEntry {
-                file: file_name,
+                file: file_name.clone(),
+                lead_seconds: self.exact_time.map(|time| time.lead_seconds),
+                valid_unix: self.exact_time.map(|time| time.valid_unix),
+                written_unix,
+                encode_ms: 0,
+                variables: vars.clone(),
+            },
+        );
+        manifest.validate_contents()?;
+
+        if let Some(bytes) = self.pending_grid.take() {
+            atomic_write_bytes(&self.run_dir.join("grid.rwg"), &bytes)?;
+        }
+
+        let started = Instant::now();
+        let hour_meta = self.writer.finish(&hour_path)?;
+        self.encode_elapsed += started.elapsed();
+        let encode_ms = self.encode_elapsed.as_millis() as u64;
+        let bytes = fs::metadata(&hour_path)?.len();
+        manifest.register_hour(
+            self.forecast_hour,
+            RwsHourEntry {
+                file: file_name.clone(),
+                lead_seconds: self.exact_time.map(|time| time.lead_seconds),
+                valid_unix: self.exact_time.map(|time| time.valid_unix),
                 written_unix,
                 encode_ms,
                 variables: vars.clone(),
             },
         );
+        manifest.validate_hour_meta(self.forecast_hour, &hour_meta)?;
         manifest.save(&manifest_path)?;
 
         Ok(WrittenHour {
@@ -537,14 +853,13 @@ pub fn read_grid_2d(reader: &HourReader, grid: &GridFile, name: &str) -> RwResul
         )));
     }
     let values = reader.read_full_2d(name)?;
+    let shape = GridShape::new(grid.nx, grid.ny)
+        .map_err(|err| RwStoreError::Grid(format!("stored grid shape is invalid: {err}")))?;
     Ok(StoredField2D {
         units: var.units.clone(),
         selector: var.selector.clone(),
         grid: LatLonGrid {
-            shape: GridShape {
-                nx: grid.nx,
-                ny: grid.ny,
-            },
+            shape,
             lat_deg: grid.lat.clone(),
             lon_deg: grid.lon.clone(),
         },
@@ -576,4 +891,27 @@ pub fn read_field_2d(
         values: stored.values,
         projection: stored.projection,
     })
+}
+
+#[cfg(test)]
+mod dimension_tests {
+    use super::*;
+    use rustwx_core::MAX_GRID_CELLS;
+
+    #[test]
+    fn store_grid_boundary_rejects_overflow_and_desktop_ceiling() {
+        assert!(validated_grid_cells(usize::MAX, 2).is_err());
+        assert!(validated_grid_cells(MAX_GRID_CELLS + 1, 1).is_err());
+        assert_eq!(validated_grid_cells(5_000, 5_000), Ok(MAX_GRID_CELLS));
+    }
+
+    #[test]
+    fn store_volume_boundary_checks_product_before_cloning_levels() {
+        assert_eq!(
+            validated_volume_elements("temperature", 37, 1_000).unwrap(),
+            37_000
+        );
+        assert!(validated_volume_elements("temperature", usize::MAX, 2).is_err());
+        assert!(validated_volume_elements("temperature", 6, MAX_GRID_CELLS).is_err());
+    }
 }

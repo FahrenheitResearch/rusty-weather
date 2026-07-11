@@ -35,6 +35,25 @@ use rw_store::error::RwStoreError;
 use rw_store::grid::GridFile;
 use rw_store::ingest::{StoredField2D, derived_selector_slug, read_field_2d, read_grid_2d};
 use rw_store::reader::HourReader;
+use rw_store::run::{RwsRunManifest, validate_store_component};
+
+fn canonical_contained_path(
+    run_dir: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| format!("cannot resolve {label} {}: {error}", path.display()))?;
+    if !canonical.starts_with(run_dir) {
+        return Err(format!(
+            "{label} {} resolves outside run directory {}",
+            path.display(),
+            run_dir.display()
+        )
+        .into());
+    }
+    Ok(canonical)
+}
 
 /// One stored hour opened for rendering: the hour reader, the run grid,
 /// and the resolution maps built from the stored variable metadata.
@@ -54,31 +73,64 @@ pub struct StoreFieldSource {
 }
 
 impl StoreFieldSource {
-    /// Open `<store_root>/<model_slug>/<run_slug>/f{hour:03}.rws` plus the
-    /// run's `grid.rwg` and build the selector/derived resolution maps.
+    /// Open one legacy whole-hour manifest entry plus the run's `grid.rwg` and
+    /// build the selector/derived resolution maps. Exact-time v2 runs are
+    /// rejected until production render requests carry physical timestamps.
     pub fn open(
         store_root: &Path,
         model_slug: &str,
         run_slug: &str,
         hour: u16,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let run_dir = store_root.join(model_slug).join(run_slug);
-        let hour_path = run_dir.join(format!("f{hour:03}.rws"));
-        let reader = HourReader::open(&hour_path)
-            .map_err(|err| format!("open {}: {err}", hour_path.display()))?;
-        let grid_path = run_dir.join("grid.rwg");
-        let grid = GridFile::open(&grid_path)
-            .map_err(|err| format!("open {}: {err}", grid_path.display()))?;
-        if reader.meta().grid_hash != grid.hash {
+        validate_store_component("model", model_slug)?;
+        validate_store_component("run", run_slug)?;
+        let root = std::fs::canonicalize(store_root).map_err(|error| {
+            format!(
+                "cannot resolve store root {}: {error}",
+                store_root.display()
+            )
+        })?;
+        let requested_run = root.join(model_slug).join(run_slug);
+        let run_dir = std::fs::canonicalize(&requested_run).map_err(|error| {
+            format!(
+                "cannot resolve run directory {}: {error}",
+                requested_run.display()
+            )
+        })?;
+        if !run_dir.starts_with(&root) {
             return Err(format!(
-                "hour {} was written against grid {} but {} holds {}",
-                hour_path.display(),
-                reader.meta().grid_hash,
-                grid_path.display(),
-                grid.hash
+                "run directory {} resolves outside store root {}",
+                requested_run.display(),
+                root.display()
             )
             .into());
         }
+        let manifest_path =
+            canonical_contained_path(&run_dir, &run_dir.join("run.json"), "run manifest")?;
+        let manifest = RwsRunManifest::load_for_run(&manifest_path, model_slug, run_slug)?;
+        if manifest.is_exact_time_axis() {
+            return Err(RwStoreError::Meta(format!(
+                "run {model_slug}/{run_slug} uses an exact-time ordinal axis; production rendering is disabled until render requests carry exact lead and valid times"
+            ))
+            .into());
+        }
+        let entry = manifest.hours.get(&hour).ok_or_else(|| {
+            RwStoreError::Meta(format!(
+                "forecast hour f{hour:03} is absent from {model_slug}/{run_slug}/run.json"
+            ))
+        })?;
+        let hour_path = canonical_contained_path(
+            &run_dir,
+            &run_dir.join(&entry.file),
+            &format!("forecast hour f{hour:03}"),
+        )?;
+        let reader = HourReader::open(&hour_path)
+            .map_err(|err| format!("open {}: {err}", hour_path.display()))?;
+        let grid_path = canonical_contained_path(&run_dir, &run_dir.join("grid.rwg"), "grid file")?;
+        let grid = GridFile::open(&grid_path)
+            .map_err(|err| format!("open {}: {err}", grid_path.display()))?;
+        manifest.validate_grid(&grid.hash, grid.nx, grid.ny)?;
+        manifest.validate_hour_meta(hour, reader.meta())?;
 
         let mut selector_vars = HashMap::new();
         let mut derived_slugs = Vec::new();
@@ -161,6 +213,13 @@ impl StoreFieldSource {
 
     pub fn projection(&self) -> Option<&rustwx_core::GridProjection> {
         self.grid.projection.as_ref()
+    }
+
+    /// Borrow the run grid coordinates without cloning the full arrays.
+    /// Batch orchestration uses this to derive a native-domain extent once;
+    /// the render paths continue to receive their existing owned grid value.
+    pub fn grid_coordinates(&self) -> (&[f32], &[f32]) {
+        (&self.grid.lat, &self.grid.lon)
     }
 
     /// Provenance strings for the rendered-recipe reports (never pixels).

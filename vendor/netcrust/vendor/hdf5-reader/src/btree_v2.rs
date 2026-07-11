@@ -496,6 +496,10 @@ fn parse_internal_node(
     // Records first, then child pointers with their metadata.
 
     // Read all records.
+    // Internal-node records are real B-tree records, not duplicate separator
+    // keys. Preserve their slots so traversal can emit child[i], record[i]
+    // in HDF5's in-order sequence even when chunk-bound filtering excludes a
+    // particular record.
     let mut node_records = Vec::with_capacity(num_records as usize);
     for _ in 0..num_records {
         let record = parse_record(
@@ -507,9 +511,8 @@ fn parse_internal_node(
             ndims,
             heap_id_len,
         )?;
-        if record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds) {
-            node_records.push(record);
-        }
+        node_records
+            .push(record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds).then_some(record));
     }
 
     // Read child node pointers (num_records + 1 of them).
@@ -552,52 +555,50 @@ fn parse_internal_node(
         });
     }
 
-    // The records from this internal node are NOT included in the leaf
-    // collection — they are separators. We do NOT add them to results.
-    // Only leaf records are collected.
-    // (Actually, in HDF5 v2 B-trees, records in internal nodes are real
-    // records too, not just separators. We should collect them.)
-    let _ = node_records;
-
-    // Recurse into children.
+    // Recurse in order and emit each internal record between its adjacent
+    // children. Omitting these records makes dense groups lose exactly one
+    // object per internal record, so dataset lookup and enumeration can both
+    // silently miss valid variables.
     let child_depth = depth - 1;
     for (i, &child_addr) in child_addresses.iter().enumerate() {
-        if Cursor::is_undefined_offset(child_addr, offset_size) {
-            continue;
+        if !Cursor::is_undefined_offset(child_addr, offset_size) {
+            let child_nrec = child_nrecords[i];
+            if child_depth == 0 {
+                // Child is a leaf.
+                let mut child_cursor = Cursor::new(data);
+                child_cursor.set_position(child_addr);
+                parse_leaf_node(
+                    &mut child_cursor,
+                    header,
+                    offset_size,
+                    length_size,
+                    ndims,
+                    chunk_dims,
+                    chunk_bounds,
+                    child_nrec,
+                    heap_id_len,
+                    records,
+                )?;
+            } else {
+                // Child is another internal node.
+                parse_internal_node(
+                    data,
+                    child_addr,
+                    header,
+                    offset_size,
+                    length_size,
+                    ndims,
+                    chunk_dims,
+                    chunk_bounds,
+                    child_nrec,
+                    child_depth,
+                    heap_id_len,
+                    records,
+                )?;
+            }
         }
-        let child_nrec = child_nrecords[i];
-        if child_depth == 0 {
-            // Child is a leaf.
-            let mut child_cursor = Cursor::new(data);
-            child_cursor.set_position(child_addr);
-            parse_leaf_node(
-                &mut child_cursor,
-                header,
-                offset_size,
-                length_size,
-                ndims,
-                chunk_dims,
-                chunk_bounds,
-                child_nrec,
-                heap_id_len,
-                records,
-            )?;
-        } else {
-            // Child is another internal node.
-            parse_internal_node(
-                data,
-                child_addr,
-                header,
-                offset_size,
-                length_size,
-                ndims,
-                chunk_dims,
-                chunk_bounds,
-                child_nrec,
-                child_depth,
-                heap_id_len,
-                records,
-            )?;
+        if let Some(record) = node_records.get_mut(i).and_then(|record| record.take()) {
+            records.push(record);
         }
     }
 
@@ -621,12 +622,19 @@ pub fn collect_btree_v2_records(
     chunk_dims: &[u32],
     chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Result<Vec<BTreeV2Record>> {
-    if Cursor::is_undefined_offset(header.root_node_address, offset_size) {
+    if header.total_records == 0 && header.num_records_in_root == 0 {
         return Ok(Vec::new());
     }
-
+    if Cursor::is_undefined_offset(header.root_node_address, offset_size) {
+        return Err(Error::InvalidData(
+            "non-empty B-tree v2 has an undefined root address".into(),
+        ));
+    }
     if header.total_records == 0 || header.num_records_in_root == 0 {
-        return Ok(Vec::new());
+        return Err(Error::InvalidData(format!(
+            "inconsistent B-tree v2 counts: root has {}, tree declares {} total",
+            header.num_records_in_root, header.total_records
+        )));
     }
 
     // Determine heap_id_len from the record_size and btree_type.
@@ -668,6 +676,14 @@ pub fn collect_btree_v2_records(
         )?;
     }
 
+    if chunk_bounds.is_none() && u64::try_from(records.len()).ok() != Some(header.total_records) {
+        return Err(Error::InvalidData(format!(
+            "B-tree v2 traversal collected {} records, header declares {}",
+            records.len(),
+            header.total_records
+        )));
+    }
+
     Ok(records)
 }
 
@@ -681,12 +697,19 @@ pub fn collect_btree_v2_records_storage(
     chunk_dims: &[u32],
     chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Result<Vec<BTreeV2Record>> {
-    if Cursor::is_undefined_offset(header.root_node_address, offset_size) {
+    if header.total_records == 0 && header.num_records_in_root == 0 {
         return Ok(Vec::new());
     }
-
+    if Cursor::is_undefined_offset(header.root_node_address, offset_size) {
+        return Err(Error::InvalidData(
+            "non-empty B-tree v2 has an undefined root address".into(),
+        ));
+    }
     if header.total_records == 0 || header.num_records_in_root == 0 {
-        return Ok(Vec::new());
+        return Err(Error::InvalidData(format!(
+            "inconsistent B-tree v2 counts: root has {}, tree declares {} total",
+            header.num_records_in_root, header.total_records
+        )));
     }
 
     let heap_id_len = compute_heap_id_len(header);
@@ -723,6 +746,14 @@ pub fn collect_btree_v2_records_storage(
         )?;
     }
 
+    if chunk_bounds.is_none() && u64::try_from(records.len()).ok() != Some(header.total_records) {
+        return Err(Error::InvalidData(format!(
+            "B-tree v2 traversal collected {} records, header declares {}",
+            records.len(),
+            header.total_records
+        )));
+    }
+
     Ok(records)
 }
 
@@ -740,13 +771,10 @@ fn parse_leaf_node_storage(
     heap_id_len: usize,
     records: &mut Vec<BTreeV2Record>,
 ) -> Result<()> {
-    let _node_len = usize::try_from(header.node_size).map_err(|_| {
+    let node_len = usize::try_from(header.node_size).map_err(|_| {
         Error::InvalidData("B-tree v2 node size exceeds platform usize capacity".into())
     })?;
-    let read_len = usize::try_from(storage.len().saturating_sub(address)).map_err(|_| {
-        Error::InvalidData("B-tree v2 node read exceeds platform usize capacity".into())
-    })?;
-    let node_bytes = storage.read_range(address, read_len)?;
+    let node_bytes = storage.read_range(address, node_len)?;
     let mut cursor = Cursor::new(node_bytes.as_ref());
     parse_leaf_node(
         &mut cursor,
@@ -777,13 +805,10 @@ fn parse_internal_node_storage(
     heap_id_len: usize,
     records: &mut Vec<BTreeV2Record>,
 ) -> Result<()> {
-    let _node_len = usize::try_from(header.node_size).map_err(|_| {
+    let node_len = usize::try_from(header.node_size).map_err(|_| {
         Error::InvalidData("B-tree v2 node size exceeds platform usize capacity".into())
     })?;
-    let read_len = usize::try_from(storage.len().saturating_sub(address)).map_err(|_| {
-        Error::InvalidData("B-tree v2 node read exceeds platform usize capacity".into())
-    })?;
-    let node_bytes = storage.read_range(address, read_len)?;
+    let node_bytes = storage.read_range(address, node_len)?;
     let mut cursor = Cursor::new(node_bytes.as_ref());
     let start = cursor.position();
 
@@ -831,9 +856,8 @@ fn parse_internal_node_storage(
             ndims,
             heap_id_len,
         )?;
-        if record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds) {
-            node_records.push(record);
-        }
+        node_records
+            .push(record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds).then_some(record));
     }
 
     let num_children = usize::from(num_records) + 1;
@@ -864,43 +888,43 @@ fn parse_internal_node_storage(
         });
     }
 
-    let _ = node_records;
-
     let child_depth = depth - 1;
     for (i, &child_addr) in child_addresses.iter().enumerate() {
-        if Cursor::is_undefined_offset(child_addr, offset_size) {
-            continue;
+        if !Cursor::is_undefined_offset(child_addr, offset_size) {
+            let child_nrec = child_nrecords[i];
+            if child_depth == 0 {
+                parse_leaf_node_storage(
+                    storage,
+                    child_addr,
+                    header,
+                    offset_size,
+                    length_size,
+                    ndims,
+                    chunk_dims,
+                    chunk_bounds,
+                    child_nrec,
+                    heap_id_len,
+                    records,
+                )?;
+            } else {
+                parse_internal_node_storage(
+                    storage,
+                    child_addr,
+                    header,
+                    offset_size,
+                    length_size,
+                    ndims,
+                    chunk_dims,
+                    chunk_bounds,
+                    child_nrec,
+                    child_depth,
+                    heap_id_len,
+                    records,
+                )?;
+            }
         }
-        let child_nrec = child_nrecords[i];
-        if child_depth == 0 {
-            parse_leaf_node_storage(
-                storage,
-                child_addr,
-                header,
-                offset_size,
-                length_size,
-                ndims,
-                chunk_dims,
-                chunk_bounds,
-                child_nrec,
-                heap_id_len,
-                records,
-            )?;
-        } else {
-            parse_internal_node_storage(
-                storage,
-                child_addr,
-                header,
-                offset_size,
-                length_size,
-                ndims,
-                chunk_dims,
-                chunk_bounds,
-                child_nrec,
-                child_depth,
-                heap_id_len,
-                records,
-            )?;
+        if let Some(record) = node_records.get_mut(i).and_then(|record| record.take()) {
+            records.push(record);
         }
     }
 
@@ -1136,5 +1160,106 @@ mod tests {
             }
             _ => panic!("expected LinkNameHash"),
         }
+    }
+
+    fn type5_record(hash: u32, heap_byte: u8) -> Vec<u8> {
+        let mut record = Vec::with_capacity(12);
+        record.extend_from_slice(&hash.to_le_bytes());
+        record.extend_from_slice(&[heap_byte; 8]);
+        record
+    }
+
+    fn type5_leaf(hash: u32, heap_byte: u8, node_size: usize) -> Vec<u8> {
+        let mut leaf = Vec::with_capacity(node_size);
+        leaf.extend_from_slice(b"BTLF");
+        leaf.push(0);
+        leaf.push(5);
+        leaf.extend_from_slice(&type5_record(hash, heap_byte));
+        let checksum = jenkins_lookup3(&leaf);
+        leaf.extend_from_slice(&checksum.to_le_bytes());
+        leaf.resize(node_size, 0);
+        leaf
+    }
+
+    fn type5_depth_one_tree() -> (Vec<u8>, BTreeV2Header) {
+        const NODE_SIZE: usize = 128;
+        const LEFT_ADDRESS: u64 = NODE_SIZE as u64;
+        const RIGHT_ADDRESS: u64 = (NODE_SIZE * 2) as u64;
+
+        let header = BTreeV2Header {
+            btree_type: 5,
+            node_size: NODE_SIZE as u32,
+            record_size: 12,
+            depth: 1,
+            split_percent: 75,
+            merge_percent: 40,
+            root_node_address: 0,
+            num_records_in_root: 1,
+            total_records: 3,
+        };
+
+        let mut internal = Vec::with_capacity(NODE_SIZE);
+        internal.extend_from_slice(b"BTIN");
+        internal.push(0);
+        internal.push(5);
+        internal.extend_from_slice(&type5_record(20, 2));
+        // A depth-one internal node stores address + one-byte child record
+        // count for each of its two leaf children.
+        internal.extend_from_slice(&LEFT_ADDRESS.to_le_bytes());
+        internal.push(1);
+        internal.extend_from_slice(&RIGHT_ADDRESS.to_le_bytes());
+        internal.push(1);
+        let checksum = jenkins_lookup3(&internal);
+        internal.extend_from_slice(&checksum.to_le_bytes());
+        internal.resize(NODE_SIZE, 0);
+
+        let mut data = internal;
+        data.extend_from_slice(&type5_leaf(10, 1, NODE_SIZE));
+        data.extend_from_slice(&type5_leaf(30, 3, NODE_SIZE));
+        (data, header)
+    }
+
+    fn link_hashes(records: &[BTreeV2Record]) -> Vec<u32> {
+        records
+            .iter()
+            .map(|record| match record {
+                BTreeV2Record::LinkNameHash { hash, .. } => *hash,
+                other => panic!("expected link-name record, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn internal_records_are_collected_in_order_from_buffered_tree() {
+        let (data, header) = type5_depth_one_tree();
+        let records = collect_btree_v2_records(&data, &header, 8, 8, None, &[], None).unwrap();
+
+        assert_eq!(link_hashes(&records), vec![10, 20, 30]);
+        assert_eq!(records.len() as u64, header.total_records);
+    }
+
+    #[test]
+    fn full_traversal_fails_closed_when_header_count_disagrees() {
+        let (data, mut header) = type5_depth_one_tree();
+        header.total_records = 4;
+        let error = collect_btree_v2_records(&data, &header, 8, 8, None, &[], None)
+            .expect_err("record-count disagreement must not return a partial index");
+
+        assert!(
+            error.to_string().contains("collected 3 records")
+                && error.to_string().contains("declares 4"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn internal_records_are_collected_in_order_from_random_access_tree() {
+        let (data, header) = type5_depth_one_tree();
+        let storage = crate::storage::BytesStorage::new(data);
+        let records =
+            collect_btree_v2_records_storage(&storage, &header, 8, 8, None, &[], None).unwrap();
+
+        assert_eq!(link_hashes(&records), vec![10, 20, 30]);
+        assert_eq!(records.len() as u64, header.total_records);
     }
 }

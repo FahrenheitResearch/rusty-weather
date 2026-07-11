@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crates/rw-glm",
+    "crates/rw-gdex",
+    "crates/rw-formula",
     "crates/rw-ingest",
     "crates/rw-sat",
     "crates/rw-sat-check",
@@ -17,12 +19,12 @@ members = [
     "crates/rustwx-sounding",
     "crates/rusty-weather",
     "crates/rusty-weather-ui",
+    "vendor/netcrust",
 ]
 exclude = [
     "vendor/ecape-rs",
     "vendor/grib-core",
     "vendor/metrust",
-    "vendor/netcrust",
     "vendor/netcrust/vendor/hdf5-reader",
     "vendor/sharprs",
     "vendor/wx-core",
@@ -36,7 +38,7 @@ resolver = "2"
 edition = "2024"
 license = "MIT"
 publish = false
-rust-version = "1.85"
+rust-version = "1.92"
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }

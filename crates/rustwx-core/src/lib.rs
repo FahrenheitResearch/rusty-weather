@@ -3,10 +3,37 @@ use thiserror::Error;
 
 const AIFS_MAX_FORECAST_HOUR: u16 = 43_848;
 
+/// Largest horizontal grid accepted by the shared desktop data model. One
+/// f32 plane at this ceiling is about 95 MiB; a lat/lon grid plus one field is
+/// already about 286 MiB. Rejecting larger metadata before allocation keeps a
+/// corrupt local file from turning a shape header into a multi-gigabyte job.
+pub const MAX_GRID_CELLS: usize = 25_000_000;
+
+/// Largest dense 3-D value buffer accepted by the shared data model. This is
+/// independent of [`MAX_GRID_CELLS`]: a reasonable horizontal grid paired
+/// with a hostile level count must still fail before the level×cell product
+/// wraps or authorizes an impractical allocation.
+pub const MAX_VOLUME_ELEMENTS: usize = 128 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum RustwxError {
     #[error("invalid grid shape: nx={nx}, ny={ny}")]
     InvalidGridShape { nx: usize, ny: usize },
+    #[error("grid shape nx={nx}, ny={ny} has {cells} cells; supported maximum is {max_cells}")]
+    GridTooLarge {
+        nx: usize,
+        ny: usize,
+        cells: usize,
+        max_cells: usize,
+    },
+    #[error(
+        "volume shape {levels} levels x {cells} cells exceeds the supported maximum of {max_elements} values"
+    )]
+    VolumeTooLarge {
+        levels: usize,
+        cells: usize,
+        max_elements: usize,
+    },
     #[error("invalid field data length: expected {expected}, got {actual}")]
     InvalidFieldDataLength { expected: usize, actual: usize },
     #[error("unknown model '{0}'")]
@@ -31,7 +58,7 @@ pub enum RustwxError {
     InvalidHybridLevel { index: usize, value: u16 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct GridShape {
     pub nx: usize,
     pub ny: usize,
@@ -39,15 +66,84 @@ pub struct GridShape {
 
 impl GridShape {
     pub fn new(nx: usize, ny: usize) -> Result<Self, RustwxError> {
-        if nx == 0 || ny == 0 {
-            return Err(RustwxError::InvalidGridShape { nx, ny });
-        }
-        Ok(Self { nx, ny })
+        let shape = Self { nx, ny };
+        shape.checked_len()?;
+        Ok(shape)
     }
 
-    pub fn len(self) -> usize {
-        self.nx * self.ny
+    /// Validate this shape and return its cell count. Use this at every
+    /// allocation or persistence boundary: `GridShape` keeps public fields for
+    /// API compatibility, so Rust callers can still create unchecked literals.
+    pub fn checked_len(self) -> Result<usize, RustwxError> {
+        if self.nx == 0 || self.ny == 0 {
+            return Err(RustwxError::InvalidGridShape {
+                nx: self.nx,
+                ny: self.ny,
+            });
+        }
+        let cells = self
+            .nx
+            .checked_mul(self.ny)
+            .ok_or(RustwxError::InvalidGridShape {
+                nx: self.nx,
+                ny: self.ny,
+            })?;
+        if cells > MAX_GRID_CELLS {
+            return Err(RustwxError::GridTooLarge {
+                nx: self.nx,
+                ny: self.ny,
+                cells,
+                max_cells: MAX_GRID_CELLS,
+            });
+        }
+        Ok(cells)
     }
+
+    /// Cell count for already-validated shapes. Invalid public struct literals
+    /// return zero rather than panicking or wrapping; error-bearing code should
+    /// call [`Self::checked_len`] so it can report the malformed dimensions.
+    pub fn len(self) -> usize {
+        self.checked_len().unwrap_or(0)
+    }
+}
+
+impl<'de> Deserialize<'de> for GridShape {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct GridShapeWire {
+            nx: usize,
+            ny: usize,
+        }
+
+        let wire = GridShapeWire::deserialize(deserializer)?;
+        Self::new(wire.nx, wire.ny).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Validate a dense level-by-cell volume against the shared desktop ceiling.
+///
+/// Call this before reading or allocating a dense 3-D product. Both arithmetic
+/// overflow and products larger than [`MAX_VOLUME_ELEMENTS`] fail closed with
+/// [`RustwxError::VolumeTooLarge`].
+pub fn checked_volume_elements(levels: usize, cells: usize) -> Result<usize, RustwxError> {
+    let elements = levels
+        .checked_mul(cells)
+        .ok_or(RustwxError::VolumeTooLarge {
+            levels,
+            cells,
+            max_elements: MAX_VOLUME_ELEMENTS,
+        })?;
+    if elements > MAX_VOLUME_ELEMENTS {
+        return Err(RustwxError::VolumeTooLarge {
+            levels,
+            cells,
+            max_elements: MAX_VOLUME_ELEMENTS,
+        });
+    }
+    Ok(elements)
 }
 
 /// Native map-projection metadata carried alongside a lat/lon grid when the
@@ -85,7 +181,7 @@ impl GridProjection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LatLonGrid {
     pub shape: GridShape,
     pub lat_deg: Vec<f32>,
@@ -98,7 +194,11 @@ impl LatLonGrid {
         lat_deg: Vec<f32>,
         lon_deg: Vec<f32>,
     ) -> Result<Self, RustwxError> {
-        if lat_deg.len() != shape.len() || lon_deg.len() != shape.len() {
+        // `GridShape` retains public fields for API compatibility, so a Rust
+        // caller can still form a literal that bypasses `GridShape::new`.
+        // Re-establish the invariant at this allocation-bearing boundary.
+        let cells = shape.checked_len()?;
+        if lat_deg.len() != cells || lon_deg.len() != cells {
             return Err(RustwxError::InvalidGridShape {
                 nx: shape.nx,
                 ny: shape.ny,
@@ -109,6 +209,23 @@ impl LatLonGrid {
             lat_deg,
             lon_deg,
         })
+    }
+}
+
+impl<'de> Deserialize<'de> for LatLonGrid {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct LatLonGridWire {
+            shape: GridShape,
+            lat_deg: Vec<f32>,
+            lon_deg: Vec<f32>,
+        }
+
+        let wire = LatLonGridWire::deserialize(deserializer)?;
+        Self::new(wire.shape, wire.lat_deg, wire.lon_deg).map_err(serde::de::Error::custom)
     }
 }
 
@@ -914,7 +1031,7 @@ impl SelectedField2D {
         grid: LatLonGrid,
         values: Vec<f32>,
     ) -> Result<Self, RustwxError> {
-        let expected = grid.shape.len();
+        let expected = grid.shape.checked_len()?;
         if values.len() != expected {
             return Err(RustwxError::InvalidFieldDataLength {
                 expected,
@@ -982,7 +1099,8 @@ impl SelectedHybridLevelVolume {
         values: Vec<f32>,
     ) -> Result<Self, RustwxError> {
         validate_hybrid_levels(&levels_hybrid)?;
-        let expected = levels_hybrid.len() * grid.shape.len();
+        let cells = grid.shape.checked_len()?;
+        let expected = checked_volume_elements(levels_hybrid.len(), cells)?;
         if values.len() != expected {
             return Err(RustwxError::InvalidFieldDataLength {
                 expected,
@@ -1187,7 +1305,8 @@ impl Field2D {
         grid: LatLonGrid,
         values: Vec<f32>,
     ) -> Result<Self, RustwxError> {
-        if values.len() != grid.shape.len() {
+        let expected = grid.shape.checked_len()?;
+        if values.len() != expected {
             return Err(RustwxError::InvalidGridShape {
                 nx: grid.shape.nx,
                 ny: grid.shape.ny,
@@ -1468,7 +1587,8 @@ impl Field3D {
         grid: LatLonGrid,
         values: Vec<f32>,
     ) -> Result<Self, RustwxError> {
-        let expected = levels.len() * grid.shape.len();
+        let cells = grid.shape.checked_len()?;
+        let expected = checked_volume_elements(levels.len(), cells)?;
         if values.len() != expected {
             return Err(RustwxError::InvalidGridShape {
                 nx: grid.shape.nx,
@@ -1498,7 +1618,7 @@ impl ModelField2D {
         grid: LatLonGrid,
         values: Vec<f32>,
     ) -> Result<Self, RustwxError> {
-        let expected = grid.shape.len();
+        let expected = grid.shape.checked_len()?;
         if values.len() != expected {
             return Err(RustwxError::InvalidFieldDataLength {
                 expected,
@@ -1544,7 +1664,8 @@ impl PressureLevelVolume {
         values: Vec<f32>,
     ) -> Result<Self, RustwxError> {
         validate_pressure_levels(&levels_hpa)?;
-        let expected = levels_hpa.len() * grid.shape.len();
+        let cells = grid.shape.checked_len()?;
+        let expected = checked_volume_elements(levels_hpa.len(), cells)?;
         if values.len() != expected {
             return Err(RustwxError::InvalidFieldDataLength {
                 expected,

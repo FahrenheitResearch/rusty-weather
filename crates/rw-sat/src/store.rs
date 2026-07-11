@@ -335,6 +335,8 @@ pub fn write_band_frame(
             written_unix,
             encode_ms,
             variables: vec![variable.clone()],
+            lead_seconds: None,
+            valid_unix: None,
         },
     );
     manifest.save(&manifest_path)?;
@@ -430,6 +432,8 @@ pub fn write_satellite_grid_frame(
             written_unix,
             encode_ms,
             variables: vec![variable.clone()],
+            lead_seconds: None,
+            valid_unix: None,
         },
     );
     manifest.save(&manifest_path)?;

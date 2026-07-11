@@ -10,18 +10,70 @@
 //! than stopping at the first. `Err(_)` is reserved for I/O failures.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Component, Path};
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+use memmap2::Mmap;
+use rustwx_core::{MAX_GRID_CELLS, MAX_VOLUME_ELEMENTS};
 
 use crate::codec::MISSING_Q;
-use crate::error::RwResult;
+use crate::error::{RwResult, RwStoreError};
 use crate::format::{
     CODEC_2D, CODEC_3D, COL_X, COL_Y, FLAG_CONSTANT, FLAG_EMPTY, FLAG_HAS_MISSING, HEADER_LEN,
-    INDEX_RECORD_LEN, KIND_COLUMN3D, KIND_TILE2D, RwsHourMeta, SCHEMA_HOUR, TILE_X, TILE_Y,
+    INDEX_RECORD_LEN, KIND_COLUMN3D, KIND_TILE2D, RwsHourMeta, TILE_X, TILE_Y,
 };
 use crate::grid::GridFile;
 use crate::header::RwsHeader;
 use crate::index::ChunkRecord;
-use crate::run::{RwsRunManifest, SCHEMA_RUN};
+use crate::run::{RwsRunManifest, validate_store_component};
+
+/// Metadata is JSON, not gridded payload. Normal hour metadata is far smaller;
+/// this leaves room for large variable catalogs while preventing a hostile
+/// header from asking serde to scan a multi-GiB sparse region.
+const MAX_HOUR_META_BYTES: u64 = 16 * 1024 * 1024;
+/// Keep validation within the same index envelope as `HourReader`.
+const MAX_INDEX_RECORDS: u64 = 8_388_608;
+
+/// Read-only validation backing. Mapping keeps validation memory independent
+/// of the hour-file payload size, so large legitimate stores remain supported
+/// and sparse/trailing files cannot force a file-sized heap allocation.
+enum ValidationBytes {
+    Empty,
+    Mapped(Mmap),
+}
+
+impl ValidationBytes {
+    fn open(path: &Path) -> RwResult<Self> {
+        let file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len == 0 {
+            return Ok(Self::Empty);
+        }
+        usize::try_from(file_len).map_err(|_| {
+            RwStoreError::Format(format!(
+                "file {} is {file_len} bytes and cannot be addressed on this platform",
+                path.display()
+            ))
+        })?;
+        // SAFETY: the mapping is read-only and all access below is through
+        // checked slices. The map is created from the already-open handle, so
+        // replacing `path` cannot redirect later validation reads.
+        let mapped = unsafe { Mmap::map(&file) }.map_err(|err| {
+            RwStoreError::Io(std::io::Error::new(
+                err.kind(),
+                format!("map {} for validation: {err}", path.display()),
+            ))
+        })?;
+        Ok(Self::Mapped(mapped))
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Empty => &[],
+            Self::Mapped(mapped) => &mapped[..],
+        }
+    }
+}
 
 /// How deeply to validate a store file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,23 +134,10 @@ impl ValidationReport {
 /// Returns `Err` only for I/O failure opening the file. All format problems
 /// are reported in `report.errors`.
 pub fn validate_hour_file(path: &Path, depth: ValidateDepth) -> RwResult<ValidationReport> {
-    let data = std::fs::read(path)?;
+    let data = ValidationBytes::open(path)?;
     let mut report = ValidationReport::default();
-    check_hour_file(&data, depth, &mut report);
+    check_hour_file(data.as_slice(), depth, &mut report);
     Ok(report)
-}
-
-/// Return `true` iff every component of `s` is a plain filename component
-/// (`Component::Normal`). Rejects absolute paths (RootDir/Prefix), parent
-/// traversals (`..`, `ParentDir`), and current-dir dots (`.`, `CurDir`).
-fn is_plain_filename(s: &str) -> bool {
-    let p = Path::new(s);
-    let mut components = p.components().peekable();
-    // Must have at least one component and every one must be Normal.
-    if components.peek().is_none() {
-        return false;
-    }
-    components.all(|c| matches!(c, Component::Normal(_)))
 }
 
 /// Validate all hour files referenced by the run manifest in `run_dir`, plus
@@ -106,35 +145,52 @@ fn is_plain_filename(s: &str) -> bool {
 pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<ValidationReport> {
     let mut report = ValidationReport::default();
 
+    let run_dir = match std::fs::canonicalize(run_dir) {
+        Ok(path) => path,
+        Err(err) => {
+            report.error(format!(
+                "run dir: cannot resolve {}: {err}",
+                run_dir.display()
+            ));
+            return Ok(report);
+        }
+    };
+
     // 1. run.json
     let manifest_path = run_dir.join("run.json");
-    let manifest_bytes = match std::fs::read(&manifest_path) {
-        Ok(b) => b,
+    let manifest_path = match canonical_contained_path(&run_dir, &manifest_path, "run.json") {
+        Ok(path) => path,
         Err(err) => {
-            report.error(format!("run.json: I/O error: {err}"));
+            report.error(err);
             return Ok(report);
         }
     };
-    let manifest: RwsRunManifest = match serde_json::from_slice(&manifest_bytes) {
-        Ok(m) => m,
+    let manifest = match RwsRunManifest::load_bounded(&manifest_path) {
+        Ok(manifest) => manifest,
         Err(err) => {
-            report.error(format!("run.json: JSON parse error: {err}"));
+            report.error(format!("run.json: {err}"));
             return Ok(report);
         }
     };
-    if manifest.schema != SCHEMA_RUN {
-        report.error(format!(
-            "run.json: unexpected schema '{}' (expected '{SCHEMA_RUN}')",
-            manifest.schema
-        ));
+    if let Err(err) = manifest.validate_contents() {
+        // Keep the parsed manifest so the validator can still report grid,
+        // hour, and stray-file problems. Every manifest-derived path is
+        // independently checked below before it is touched.
+        report.error(format!("run.json: {err}"));
     }
 
     // 2. grid.rwg
     let grid_path = run_dir.join("grid.rwg");
-    let grid_file = match GridFile::open(&grid_path) {
-        Ok(g) => Some(g),
+    let grid_file = match canonical_contained_path(&run_dir, &grid_path, "grid.rwg") {
+        Ok(path) => match GridFile::open(&path) {
+            Ok(grid) => Some(grid),
+            Err(err) => {
+                report.error(format!("grid.rwg: {err}"));
+                None
+            }
+        },
         Err(err) => {
-            report.error(format!("grid.rwg: {err}"));
+            report.error(err);
             None
         }
     };
@@ -162,7 +218,7 @@ pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<Valida
         // component (no absolute paths, no `..` traversals, no `.` components).
         // An absolute path passed to `run_dir.join()` silently replaces the base
         // directory entirely, allowing path traversal outside the run dir.
-        if !is_plain_filename(&entry.file) {
+        if validate_store_component("hour filename", &entry.file).is_err() {
             report.error(format!(
                 "run.json: hour {hour} file '{}' must be a relative path without '..', root, or drive components",
                 entry.file
@@ -170,12 +226,18 @@ pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<Valida
             continue;
         }
 
-        let hour_path = run_dir.join(&entry.file);
-        if !hour_path.exists() {
-            report.error(format!("hour {hour}: file '{}' not found", entry.file));
-            continue;
-        }
-        let hour_data = match std::fs::read(&hour_path) {
+        let hour_path = match canonical_contained_path(
+            &run_dir,
+            &run_dir.join(&entry.file),
+            &format!("hour {hour} file '{}'", entry.file),
+        ) {
+            Ok(path) => path,
+            Err(err) => {
+                report.error(err);
+                continue;
+            }
+        };
+        let hour_data = match ValidationBytes::open(&hour_path) {
             Ok(b) => b,
             Err(err) => {
                 report.error(format!(
@@ -186,60 +248,42 @@ pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<Valida
             }
         };
         let mut hour_report = ValidationReport::default();
-        check_hour_file(&hour_data, depth, &mut hour_report);
+        let hour_bytes = hour_data.as_slice();
+        check_hour_file(hour_bytes, depth, &mut hour_report);
         report.merge_prefixed(&entry.file, hour_report);
 
         // Cross-check hour meta against manifest.
-        if let Ok(header) = RwsHeader::parse(&hour_data) {
-            let meta_end = HEADER_LEN + header.meta_len as usize;
-            if meta_end <= hour_data.len() {
-                if let Ok(meta) =
-                    serde_json::from_slice::<RwsHourMeta>(&hour_data[HEADER_LEN..meta_end])
-                {
-                    if meta.model != manifest.model {
-                        report.error(format!(
-                            "{}: hour meta model '{}' != manifest model '{}'",
-                            entry.file, meta.model, manifest.model
-                        ));
-                    }
-                    if meta.run != manifest.run {
-                        report.error(format!(
-                            "{}: hour meta run '{}' != manifest run '{}'",
-                            entry.file, meta.run, manifest.run
-                        ));
-                    }
-                    if meta.grid_hash != manifest.grid_hash {
-                        report.error(format!(
-                            "{}: hour meta grid_hash '{}' != manifest grid_hash '{}'",
-                            entry.file, meta.grid_hash, manifest.grid_hash
-                        ));
-                    }
-                    if meta.nx != manifest.nx || meta.ny != manifest.ny {
-                        report.error(format!(
-                            "{}: hour meta {}x{} != manifest {}x{}",
-                            entry.file, meta.nx, meta.ny, manifest.nx, manifest.ny
-                        ));
-                    }
-                    // Check that all manifest-listed vars are present in the hour file.
-                    let hour_var_names: HashSet<&str> =
-                        meta.variables.iter().map(|v| v.name.as_str()).collect();
-                    for var_name in &entry.variables {
-                        if !hour_var_names.contains(var_name.as_str()) {
-                            report.error(format!(
+        if let Ok(header) = RwsHeader::parse(hour_bytes) {
+            if u64::from(header.meta_len) <= MAX_HOUR_META_BYTES {
+                let meta_end = HEADER_LEN.checked_add(header.meta_len as usize);
+                if let Some(meta_end) = meta_end.filter(|end| *end <= hour_bytes.len()) {
+                    if let Ok(meta) =
+                        serde_json::from_slice::<RwsHourMeta>(&hour_bytes[HEADER_LEN..meta_end])
+                    {
+                        if let Err(error) = manifest.validate_hour_meta(*hour, &meta) {
+                            report.error(format!("{}: {error}", entry.file));
+                        }
+                        // Check that all manifest-listed vars are present in the hour file.
+                        let hour_var_names: HashSet<&str> =
+                            meta.variables.iter().map(|v| v.name.as_str()).collect();
+                        for var_name in &entry.variables {
+                            if !hour_var_names.contains(var_name.as_str()) {
+                                report.error(format!(
                                 "{}: manifest lists variable '{}' but it is not in the hour file",
                                 entry.file, var_name
                             ));
+                            }
                         }
-                    }
-                    // Hour file has more variables than the manifest entry lists -> stale manifest.
-                    let manifest_var_set: HashSet<&str> =
-                        entry.variables.iter().map(|v| v.as_str()).collect();
-                    for var in &meta.variables {
-                        if !manifest_var_set.contains(var.name.as_str()) {
-                            report.warn(format!(
+                        // Hour file has more variables than the manifest entry lists -> stale manifest.
+                        let manifest_var_set: HashSet<&str> =
+                            entry.variables.iter().map(|v| v.as_str()).collect();
+                        for var in &meta.variables {
+                            if !manifest_var_set.contains(var.name.as_str()) {
+                                report.warn(format!(
                                 "{}: hour file variable '{}' is not listed in the manifest entry (stale manifest?)",
                                 entry.file, var.name
                             ));
+                            }
                         }
                     }
                 }
@@ -248,7 +292,7 @@ pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<Valida
     }
 
     // 4. Stray .rws files not referenced by the manifest.
-    let entries = match std::fs::read_dir(run_dir) {
+    let entries = match std::fs::read_dir(&run_dir) {
         Ok(e) => e,
         Err(err) => {
             report.error(format!("run dir read: {err}"));
@@ -269,6 +313,19 @@ pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<Valida
     Ok(report)
 }
 
+fn canonical_contained_path(run_dir: &Path, path: &Path, label: &str) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|err| format!("{label}: cannot resolve {}: {err}", path.display()))?;
+    if !canonical.starts_with(run_dir) {
+        return Err(format!(
+            "{label}: {} resolves outside run directory {}",
+            path.display(),
+            run_dir.display()
+        ));
+    }
+    Ok(canonical)
+}
+
 // ---------------------------------------------------------------------------
 // Validation bounds constants
 // ---------------------------------------------------------------------------
@@ -277,6 +334,27 @@ pub fn validate_run_dir(run_dir: &Path, depth: ValidateDepth) -> RwResult<Valida
 /// Legitimate chunks are <= 256 KiB (2D 256x256 f32) or ~a few MiB (3D
 /// columns); anything larger is hostile or corrupt, not worth decoding.
 const MAX_DEEP_CHUNK_RAW_LEN: u32 = 64 * 1024 * 1024;
+const ISSUE_RANGE: u8 = 1 << 0;
+const ISSUE_SPAN: u8 = 1 << 1;
+const ISSUE_OVERFLOW: u8 = 1 << 2;
+const ISSUE_RAW_LEN: u8 = 1 << 3;
+
+fn try_record_buffer(index_count: usize) -> Result<Vec<ChunkRecord>, String> {
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(index_count)
+        .map_err(|err| format!("cannot allocate index for {index_count} records: {err}"))?;
+    Ok(records)
+}
+
+fn try_issue_buffer(index_count: usize) -> Result<Vec<u8>, String> {
+    let mut issues = Vec::new();
+    issues.try_reserve_exact(index_count).map_err(|err| {
+        format!("cannot allocate validation flags for {index_count} records: {err}")
+    })?;
+    issues.resize(index_count, 0);
+    Ok(issues)
+}
 
 // ---------------------------------------------------------------------------
 // Core hour-file checker (operates on in-memory bytes)
@@ -293,10 +371,43 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
             return;
         }
     };
+    if header.index_count > MAX_INDEX_RECORDS {
+        report.error(format!(
+            "index_count {} exceeds supported limit {MAX_INDEX_RECORDS}",
+            header.index_count
+        ));
+        return;
+    }
 
     // Check 2: meta region.
+    if u64::from(header.meta_len) > MAX_HOUR_META_BYTES {
+        report.error(format!(
+            "meta region is {} bytes; limit is {MAX_HOUR_META_BYTES} bytes",
+            header.meta_len
+        ));
+        return;
+    }
     let meta_start = HEADER_LEN;
-    let meta_end = meta_start + header.meta_len as usize;
+    let meta_len = match usize::try_from(header.meta_len) {
+        Ok(len) => len,
+        Err(_) => {
+            report.error(format!(
+                "meta length {} does not fit this platform",
+                header.meta_len
+            ));
+            return;
+        }
+    };
+    let meta_end = match meta_start.checked_add(meta_len) {
+        Some(end) => end,
+        None => {
+            report.error(format!(
+                "meta region length {} overflows this platform",
+                header.meta_len
+            ));
+            return;
+        }
+    };
     if data.len() < meta_end {
         report.error(format!(
             "meta region [{meta_start},{meta_end}) out of bounds (file_len {file_len})"
@@ -318,11 +429,8 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
             return;
         }
     };
-    if meta.schema != SCHEMA_HOUR {
-        report.error(format!(
-            "meta schema '{}' != expected '{SCHEMA_HOUR}'",
-            meta.schema
-        ));
+    if let Err(error) = meta.validate_time_schema() {
+        report.error(error);
     }
     if meta.nx == 0 || meta.ny == 0 {
         report.error(format!(
@@ -418,17 +526,6 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
         }
     }
 
-    // Track which record indices have out-of-range tile coords (Check 6) so
-    // that Check 8, Check 10, and the deep phase can safely skip them.
-    let mut range_bad_records: HashSet<usize> = HashSet::new();
-    // Track which record indices failed payload-span validation (Check 7) so
-    // the deep phase can safely skip them.
-    let mut span_bad_records: HashSet<usize> = HashSet::new();
-    // Subset of span_bad_records: records where offset+len overflows u64.
-    // These must also be excluded from the overlap check and Check 9 because
-    // their end offset is arithmetically undefined.
-    let mut overflow_records: HashSet<usize> = HashSet::new();
-
     // Check 4: index region in bounds and every record parses.
     let index_region_end = header.payload_offset;
     if file_len < index_region_end {
@@ -438,11 +535,37 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
         return;
     }
 
-    let index_count = header.index_count as usize;
+    let index_count = match usize::try_from(header.index_count) {
+        Ok(count) => count,
+        Err(_) => {
+            report.error(format!(
+                "index_count {} does not fit this platform",
+                header.index_count
+            ));
+            return;
+        }
+    };
     let var_id_map: HashMap<u16, &crate::format::RwsVariableMeta> =
         meta.variables.iter().map(|v| (v.id, v)).collect();
 
-    let mut records: Vec<ChunkRecord> = Vec::with_capacity(index_count);
+    // A byte-per-record issue mask is bounded and fallible. Four HashSets of
+    // hostile record indices could otherwise multiply memory use and panic in
+    // their infallible growth paths.
+    let mut record_issues = match try_issue_buffer(index_count) {
+        Ok(issues) => issues,
+        Err(err) => {
+            report.error(err);
+            return;
+        }
+    };
+
+    let mut records = match try_record_buffer(index_count) {
+        Ok(records) => records,
+        Err(err) => {
+            report.error(err);
+            return;
+        }
+    };
     for i in 0..index_count {
         let start = header.index_offset as usize + i * INDEX_RECORD_LEN;
         // Already checked file_len >= index_region_end which covers the index.
@@ -506,8 +629,10 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
     }
 
     // Check 5: index strictly ascending by sort_key.
+    let mut index_sort_bad = false;
     for i in 1..records.len() {
         if records[i - 1].sort_key() >= records[i].sort_key() {
+            index_sort_bad = true;
             report.error(format!(
                 "index sort order violated at records {}..{}: {:?} !< {:?}",
                 i - 1,
@@ -526,8 +651,8 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
     // pass the nx>0 check but make div_ceil produce huge tile counts whose
     // product overflows usize. We bound them here so every downstream multiply
     // is safe. geometry_bad is a superset of chunking_bad.
-    const MAX_NX_NY: usize = 1_000_000;
-    const MAX_NX_NY_PRODUCT: usize = 4_000_000_000;
+    const MAX_NX_NY: usize = MAX_GRID_CELLS;
+    const MAX_NX_NY_PRODUCT: usize = MAX_GRID_CELLS;
     const MAX_CHUNK_DIM: usize = 65_536;
     const MAX_LEVELS: usize = 4_096;
     let mut geometry_bad = chunking_bad;
@@ -574,6 +699,28 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
             ));
             geometry_bad = true;
         }
+        if var.kind == "pressure3d" {
+            match nx
+                .checked_mul(ny)
+                .and_then(|cells| cells.checked_mul(var.levels_hpa.len()))
+            {
+                Some(elements) if elements <= MAX_VOLUME_ELEMENTS => {}
+                Some(elements) => {
+                    report.error(format!(
+                        "variable '{}': nx*ny*levels={elements} exceeds supported volume ceiling {MAX_VOLUME_ELEMENTS}",
+                        var.name
+                    ));
+                    geometry_bad = true;
+                }
+                None => {
+                    report.error(format!(
+                        "variable '{}': nx*ny*levels overflows usize",
+                        var.name
+                    ));
+                    geometry_bad = true;
+                }
+            }
+        }
     }
 
     // Check 6: tile coords in range. Skipped entirely if geometry is bad (Issue
@@ -592,14 +739,14 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                                 "index record {i} (var '{}'): tile_y {} >= max {} for ny={ny} tile_y={tile_y}",
                                 var_meta.name, rec.tile_y, max_ty
                             ));
-                            range_bad_records.insert(i);
+                            record_issues[i] |= ISSUE_RANGE;
                         }
                         if rec.tile_x >= max_tx {
                             report.error(format!(
                                 "index record {i} (var '{}'): tile_x {} >= max {} for nx={nx} tile_x={tile_x}",
                                 var_meta.name, rec.tile_x, max_tx
                             ));
-                            range_bad_records.insert(i);
+                            record_issues[i] |= ISSUE_RANGE;
                         }
                     }
                     "pressure3d" => {
@@ -610,14 +757,14 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                                 "index record {i} (var '{}'): tile_y {} >= max {} for ny={ny} col_y={col_y}",
                                 var_meta.name, rec.tile_y, max_ty
                             ));
-                            range_bad_records.insert(i);
+                            record_issues[i] |= ISSUE_RANGE;
                         }
                         if rec.tile_x >= max_tx {
                             report.error(format!(
                                 "index record {i} (var '{}'): tile_x {} >= max {} for nx={nx} col_x={col_x}",
                                 var_meta.name, rec.tile_x, max_tx
                             ));
-                            range_bad_records.insert(i);
+                            record_issues[i] |= ISSUE_RANGE;
                         }
                     }
                     _ => {}
@@ -641,13 +788,13 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                 "index record {i} (var_id {}): EMPTY/CONSTANT-without-missing chunk has len {} != 0",
                 rec.var_id, rec.len
             ));
-            span_bad_records.insert(i);
+            record_issues[i] |= ISSUE_SPAN;
         } else if !expect_zero_len && rec.len == 0 {
             report.error(format!(
                 "index record {i} (var_id {}): non-empty chunk has len == 0",
                 rec.var_id
             ));
-            span_bad_records.insert(i);
+            record_issues[i] |= ISSUE_SPAN;
         }
 
         if rec.len > 0 {
@@ -657,7 +804,7 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                     "index record {i} (var_id {}): offset {} < payload_offset {}",
                     rec.var_id, rec.offset, header.payload_offset
                 ));
-                span_bad_records.insert(i);
+                record_issues[i] |= ISSUE_SPAN;
             }
             let end = match rec.offset.checked_add(rec.len as u64) {
                 Some(e) => e,
@@ -666,8 +813,7 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                         "index record {i} (var_id {}): offset+len overflows u64",
                         rec.var_id
                     ));
-                    span_bad_records.insert(i);
-                    overflow_records.insert(i);
+                    record_issues[i] |= ISSUE_SPAN | ISSUE_OVERFLOW;
                     continue;
                 }
             };
@@ -676,7 +822,7 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                     "index record {i} (var_id {}): payload [{},{}] exceeds file_len {file_len}",
                     rec.var_id, rec.offset, end
                 ));
-                span_bad_records.insert(i);
+                record_issues[i] |= ISSUE_SPAN;
             }
             report.stats.payload_bytes += rec.len as u64;
         }
@@ -686,12 +832,21 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
     // overflowed offset+len (overflow_records) are excluded — their end offset
     // is undefined and would panic or produce nonsense. Records that merely
     // exceed file_len are kept so Check 9 can still diagnose truncation.
-    let mut payload_records: Vec<&ChunkRecord> = records
-        .iter()
-        .enumerate()
-        .filter(|(idx, r)| r.len > 0 && !overflow_records.contains(idx))
-        .map(|(_, r)| r)
-        .collect();
+    let mut payload_records: Vec<&ChunkRecord> = Vec::new();
+    if let Err(err) = payload_records.try_reserve_exact(records.len()) {
+        report.error(format!(
+            "cannot allocate payload-span index for {} records: {err}",
+            records.len()
+        ));
+        return;
+    }
+    payload_records.extend(
+        records
+            .iter()
+            .enumerate()
+            .filter(|(idx, r)| r.len > 0 && record_issues[*idx] & ISSUE_OVERFLOW == 0)
+            .map(|(_, r)| r),
+    );
     payload_records.sort_by_key(|r| r.offset);
     for pair in payload_records.windows(2) {
         // overflow_records are excluded so offset+len cannot wrap here.
@@ -709,12 +864,11 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
     // coords (Issue 2) — both cases would cause subtract-with-overflow or
     // divide-by-zero panics.
     // Records that fail raw_len check are tracked so deep phase can skip them.
-    let mut raw_len_bad_records: HashSet<usize> = HashSet::new();
     if !geometry_bad {
         for (i, rec) in records.iter().enumerate() {
             // Skip records whose tile coords are out of range — their y0/x0
             // values would exceed ny/nx making (ny - y0) wrap around.
-            if range_bad_records.contains(&i) {
+            if record_issues[i] & ISSUE_RANGE != 0 {
                 continue;
             }
 
@@ -752,7 +906,7 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                                 "index record {i} (var '{}'): tile_y * tile_y overflows usize",
                                 var_meta.name
                             ));
-                            raw_len_bad_records.insert(i);
+                            record_issues[i] |= ISSUE_RAW_LEN;
                             continue;
                         }
                     };
@@ -763,7 +917,7 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                                 "index record {i} (var '{}'): tile_x * tile_x overflows usize",
                                 var_meta.name
                             ));
-                            raw_len_bad_records.insert(i);
+                            record_issues[i] |= ISSUE_RAW_LEN;
                             continue;
                         }
                     };
@@ -777,7 +931,7 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                                 "index record {i} (var '{}'): 4*th*tw overflows u32 (th={th}, tw={tw})",
                                 var_meta.name
                             ));
-                            raw_len_bad_records.insert(i);
+                            record_issues[i] |= ISSUE_RAW_LEN;
                             continue;
                         }
                     }
@@ -790,7 +944,7 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                                 "index record {i} (var '{}'): tile_y * col_y overflows usize",
                                 var_meta.name
                             ));
-                            raw_len_bad_records.insert(i);
+                            record_issues[i] |= ISSUE_RAW_LEN;
                             continue;
                         }
                     };
@@ -801,7 +955,7 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                                 "index record {i} (var '{}'): tile_x * col_x overflows usize",
                                 var_meta.name
                             ));
-                            raw_len_bad_records.insert(i);
+                            record_issues[i] |= ISSUE_RAW_LEN;
                             continue;
                         }
                     };
@@ -820,7 +974,7 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                                 "index record {i} (var '{}'): 2*ch*cw*levels overflows u32 (ch={ch}, cw={cw}, levels={levels})",
                                 var_meta.name
                             ));
-                            raw_len_bad_records.insert(i);
+                            record_issues[i] |= ISSUE_RAW_LEN;
                             continue;
                         }
                     }
@@ -833,7 +987,7 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                     "index record {i} (var '{}'): raw_len {} != expected {expected_raw_len}",
                     var_meta.name, rec.raw_len
                 ));
-                raw_len_bad_records.insert(i);
+                record_issues[i] |= ISSUE_RAW_LEN;
             }
         }
     }
@@ -861,11 +1015,11 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
     // bad (sanity bounds or zero chunking — Issue 1/sanity guard) since
     // div_ceil would produce hostile tile counts and the multiply below would
     // panic or produce wrong results.
-    if !geometry_bad {
+    if !geometry_bad && !index_sort_bad {
         for var_meta in &meta.variables {
-            let (tiles_y, tiles_x) = match var_meta.kind.as_str() {
-                "surface2d" => (ny.div_ceil(tile_y), nx.div_ceil(tile_x)),
-                "pressure3d" => (ny.div_ceil(col_y), nx.div_ceil(col_x)),
+            let (tiles_y, tiles_x, expected_kind) = match var_meta.kind.as_str() {
+                "surface2d" => (ny.div_ceil(tile_y), nx.div_ceil(tile_x), KIND_TILE2D),
+                "pressure3d" => (ny.div_ceil(col_y), nx.div_ceil(col_x), KIND_COLUMN3D),
                 _ => continue,
             };
             // Issue A: checked_mul so hostile-but-bounded tile counts cannot
@@ -881,21 +1035,47 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                     continue;
                 }
             };
-            // Exclude range-bad records from the present set: they already have
-            // errors from Check 6, and their tile coords are lies.
-            let present: HashSet<(u32, u32)> = records
+            // A valid index is strictly sorted, so expected-kind coordinates
+            // are unique and ordered. Count/merge them directly instead of
+            // allocating a potentially multi-million-entry HashSet.
+            let total_for_var = records
                 .iter()
                 .enumerate()
-                .filter(|(idx, r)| r.var_id == var_meta.id && !range_bad_records.contains(idx))
-                .map(|(_, r)| (r.tile_y, r.tile_x))
-                .collect();
-            if present.len() != expected_count {
-                let missing: Vec<(u32, u32)> = (0..tiles_y as u32)
-                    .flat_map(|ty| (0..tiles_x as u32).map(move |tx| (ty, tx)))
-                    .filter(|coord| !present.contains(coord))
-                    .take(5) // report up to 5 examples
-                    .collect();
-                let extra_msg = if present.len() + missing.len() < expected_count {
+                .filter(|(idx, r)| {
+                    r.var_id == var_meta.id
+                        && r.kind == expected_kind
+                        && record_issues[*idx] & ISSUE_RANGE == 0
+                })
+                .count();
+            if total_for_var != expected_count {
+                let mut present = records
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, r)| {
+                        r.var_id == var_meta.id
+                            && r.kind == expected_kind
+                            && record_issues[*idx] & ISSUE_RANGE == 0
+                    })
+                    .map(|(_, r)| (r.tile_y, r.tile_x))
+                    .peekable();
+                let mut missing = Vec::new();
+                'rows: for ty in 0..tiles_y as u32 {
+                    for tx in 0..tiles_x as u32 {
+                        let expected = (ty, tx);
+                        while present.peek().is_some_and(|coord| *coord < expected) {
+                            present.next();
+                        }
+                        if present.peek().is_some_and(|coord| *coord == expected) {
+                            present.next();
+                        } else {
+                            missing.push(expected);
+                            if missing.len() == 5 {
+                                break 'rows;
+                            }
+                        }
+                    }
+                }
+                let extra_msg = if expected_count.saturating_sub(total_for_var) > missing.len() {
                     " (too many missing to list)".to_string()
                 } else {
                     String::new()
@@ -903,20 +1083,8 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
                 report.error(format!(
                     "variable '{}': expected {expected_count} chunks, found {}; missing tiles: {:?}{extra_msg}",
                     var_meta.name,
-                    present.len(),
+                    total_for_var,
                     missing
-                ));
-            }
-            // Check for duplicate (tile_y, tile_x) per variable (exclude range-bad).
-            let total_for_var = records
-                .iter()
-                .enumerate()
-                .filter(|(idx, r)| r.var_id == var_meta.id && !range_bad_records.contains(idx))
-                .count();
-            if total_for_var != present.len() {
-                report.error(format!(
-                    "variable '{}': {} index records but only {} distinct (tile_y, tile_x) positions (duplicates present)",
-                    var_meta.name, total_for_var, present.len()
                 ));
             }
         }
@@ -968,10 +1136,7 @@ fn check_hour_file(data: &[u8], depth: ValidateDepth, report: &mut ValidationRep
         // had out-of-range tile coords, or failed the raw_len geometry check
         // (Issue D guard: those records' raw_len is untrustworthy, and we must
         // not use it as a decompression-buffer allocation size).
-        if span_bad_records.contains(&i)
-            || range_bad_records.contains(&i)
-            || raw_len_bad_records.contains(&i)
-        {
+        if record_issues[i] & (ISSUE_SPAN | ISSUE_RANGE | ISSUE_RAW_LEN) != 0 {
             continue;
         }
 
@@ -1790,6 +1955,95 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn oversized_run_manifest_is_reported_without_unbounded_read() {
+        let dir = test_dir("rundir-oversized-manifest");
+        let run_dir_path = dir.join("store").join("hrrr").join("20260610_00z");
+        fs::create_dir_all(&run_dir_path).unwrap();
+        let file = fs::File::create(run_dir_path.join("run.json")).unwrap();
+        file.set_len(crate::run::MAX_RUN_MANIFEST_BYTES + 1)
+            .unwrap();
+
+        let report = validate_run_dir(&run_dir_path, ValidateDepth::Structural).unwrap();
+        assert!(!report.is_ok());
+        assert!(
+            report.errors.iter().any(|error| error.contains("limit")),
+            "oversized manifest error must name the bound: {:?}",
+            report.errors
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_meta_region_is_rejected_from_sparse_file() {
+        let dir = test_dir("oversized-meta-region");
+        let path = dir.join("f000.rws");
+        let header = RwsHeader::for_layout((MAX_HOUR_META_BYTES + 1) as u32, 0);
+        fs::write(&path, header.pack()).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(header.payload_offset)
+            .unwrap();
+
+        let report = validate_hour_file(&path, ValidateDepth::Structural).unwrap();
+        assert!(
+            report.errors.iter().any(|error| error.contains("limit")),
+            "oversized metadata must report the bound: {:?}",
+            report.errors
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sparse_trailing_region_is_validated_without_file_sized_allocation() {
+        let dir = test_dir("sparse-trailing-region");
+        let path = dir.join("f003.rws");
+        write_valid_hour(&path);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+
+        let report = validate_hour_file(&path, ValidateDepth::Structural).unwrap();
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("trailing bytes")),
+            "sparse tail must be diagnosed without reading it: {:?}",
+            report.errors
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn impossible_index_capacity_fails_fallibly() {
+        let error = try_record_buffer(usize::MAX).unwrap_err();
+        assert!(
+            error.contains("cannot allocate index"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn excessive_index_count_is_rejected_from_header_only() {
+        let header = RwsHeader::for_layout(0, MAX_INDEX_RECORDS + 1).pack();
+        let mut report = ValidationReport::default();
+        check_hour_file(&header, ValidateDepth::Structural, &mut report);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("index_count")),
+            "unexpected errors: {:?}",
+            report.errors
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Path-traversal rejection test
     // -----------------------------------------------------------------------
@@ -1850,6 +2104,8 @@ mod tests {
             6,
             RwsHourEntry {
                 file: absolute_target.clone(),
+                lead_seconds: None,
+                valid_unix: None,
                 written_unix: 0,
                 encode_ms: 0,
                 variables: vec!["temp_2m".to_string()],
@@ -1859,6 +2115,8 @@ mod tests {
             9,
             RwsHourEntry {
                 file: r"..\evil.rws".to_string(),
+                lead_seconds: None,
+                valid_unix: None,
                 written_unix: 0,
                 encode_ms: 0,
                 variables: vec!["temp_2m".to_string()],
@@ -1941,6 +2199,44 @@ mod tests {
         out.extend_from_slice(meta_bytes);
         // No index records; payload immediately follows (payload_offset == file_len).
         out
+    }
+
+    #[test]
+    fn pressure_volume_over_supported_ceiling_is_reported() {
+        let meta_json = r#"{
+            "schema": "rw-store.hour.v1",
+            "model": "hrrr",
+            "run": "20260610_00z",
+            "forecast_hour": 3,
+            "nx": 5000,
+            "ny": 5000,
+            "grid_hash": "aaaa",
+            "variables": [{
+                "id": 0,
+                "name": "temperature",
+                "units": "K",
+                "kind": "pressure3d",
+                "codec": "zstd1_affine_i16",
+                "levels_hpa": [1000, 900, 800, 700, 600, 500],
+                "selector": {}
+            }],
+            "chunking": {"tile_y": 256, "tile_x": 256, "col_y": 16, "col_x": 16},
+            "writer": {"name": "test", "version": "0", "build": "0"}
+        }"#;
+        let bytes = build_file_with_meta(meta_json);
+        let dir = test_dir("volume-ceiling");
+        let path = write_corrupt(&dir, "volume-ceiling.rws", &bytes);
+
+        let report = validate_hour_file(&path, ValidateDepth::Structural).unwrap();
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("volume ceiling")),
+            "unexpected errors: {:?}",
+            report.errors
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// nx = ny = 18_000_000_000_000_000_000 (fits u64; passes the nx>0 guard but

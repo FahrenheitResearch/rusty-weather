@@ -23,14 +23,17 @@ use egui::{
     pos2,
 };
 use rustwx_render::{
-    BasemapDetail, BasemapStyle, LeveledColormap, LineworkRole, Rgba, build_colormap,
-    colorbar_ticks, format_tick, legend_color_at_rel, legend_tick_rel,
-    load_styled_basemap_features_for_detail,
+    BasemapDetail, BasemapStyle, Color, ColorScale, ColormapBuildOptions, DiscreteColorScale,
+    ExtendMode, LegendControls, LegendMode, LevelDensity, LeveledColormap, LineworkRole,
+    RenderDensity, Rgba, StaticPlotStyle, build_colormap, colorbar_ticks, format_tick,
+    legend_color_at_rel, legend_tick_rel, load_styled_basemap_features_for_detail,
 };
 use rw_store::grid::{GridFile, GridLocator};
 
 use crate::colormap::{Colormap, VIRIDIS, field_to_color_image, field_to_production_color_image};
+use crate::iso_levels::parse_iso_slug;
 use crate::profile_scope;
+use crate::style_overrides::StyleOverrideSettings;
 use crate::worker::{FieldData, FieldKey, HourKey, VarInfo, VarKind};
 
 use super::plot_viewer::CustomDomain;
@@ -228,18 +231,146 @@ struct RawBasemapLayer {
     role: LineworkRole,
 }
 
+/// A Formula Lab result kept in its unconverted scientific units plus the
+/// currently resolved display style. Every restyle starts from `raw`, so unit
+/// conversion is reversible and can never compound across palette edits.
+#[derive(Debug, Clone)]
+struct GeneratedField {
+    raw: FieldData,
+    style: Option<rustwx_products::viewer::StoreVariableStyle>,
+}
+
+impl GeneratedField {
+    fn from_raw(mut raw: FieldData, settings: &StyleOverrideSettings) -> Self {
+        // Formula Lab hands us native output values. Recompute this metadata
+        // here so the retained source cannot inherit display state.
+        raw.range = crate::colormap::finite_min_max(&raw.values);
+        raw.style = None;
+        let style = generated_field_style(&raw, settings);
+        Self { raw, style }
+    }
+
+    fn restyle(&mut self, settings: &StyleOverrideSettings) {
+        self.style = generated_field_style(&self.raw, settings);
+    }
+
+    fn display_units(&self) -> &str {
+        self.style
+            .as_ref()
+            .map(|style| style.display_units.as_str())
+            .unwrap_or(&self.raw.units)
+    }
+
+    fn display_field(&self) -> FieldData {
+        let mut displayed = self.raw.clone();
+        if let Some(style) = &self.style {
+            if !style.convert.is_none() {
+                for value in &mut displayed.values {
+                    *value = style.convert.apply(*value);
+                }
+            }
+            displayed.units = style.display_units.clone();
+        }
+        displayed.range = crate::colormap::finite_min_max(&displayed.values);
+        displayed.style = self.style.clone();
+        displayed
+    }
+}
+
+fn generated_field_style(
+    raw: &FieldData,
+    settings: &StyleOverrideSettings,
+) -> Option<rustwx_products::viewer::StoreVariableStyle> {
+    let resolved = settings.style_for_store_variable(
+        &raw.key.var,
+        &serde_json::Value::Null,
+        &raw.units,
+        raw.key.hour.model.parse::<rustwx_core::ModelId>().ok(),
+    );
+    if settings.binding_for_product(&raw.key.var).is_some() {
+        return resolved;
+    }
+    Some(auto_generated_field_style(raw))
+}
+
+/// Neutral, non-meteorological Formula Lab fallback. The full finite range is
+/// represented (including outliers); constant fields get display padding only,
+/// and fields with no finite samples get an explicitly labeled placeholder
+/// scale because the native renderer still requires ordered levels.
+fn auto_generated_field_style(raw: &FieldData) -> rustwx_products::viewer::StoreVariableStyle {
+    const COLORS: [[u8; 4]; 9] = [
+        [68, 1, 84, 255],
+        [72, 40, 120, 255],
+        [62, 74, 137, 255],
+        [49, 104, 142, 255],
+        [38, 130, 142, 255],
+        [31, 158, 137, 255],
+        [53, 183, 121, 255],
+        [109, 205, 89, 255],
+        [253, 231, 37, 255],
+    ];
+    let (range, range_note) = match raw.range {
+        Some((lo, hi)) if lo.is_finite() && hi.is_finite() && lo < hi => {
+            ((f64::from(lo), f64::from(hi)), "full finite range")
+        }
+        Some((value, _)) if value.is_finite() => {
+            let center = f64::from(value);
+            let padded = if center == 0.0 {
+                (-1.0, 1.0)
+            } else {
+                let padding = (center.abs() * 0.05).max(1.0e-6);
+                (center - padding, center + padding)
+            };
+            (padded, "constant field")
+        }
+        _ => ((0.0, 1.0), "no finite values"),
+    };
+    let levels = (0..=COLORS.len())
+        .map(|index| range.0 + (range.1 - range.0) * index as f64 / COLORS.len() as f64)
+        .collect();
+    rustwx_products::viewer::StoreVariableStyle {
+        title: format!("{} (Formula Lab auto, {range_note})", raw.key.var),
+        display_units: raw.units.clone(),
+        convert: rustwx_products::viewer::UnitConvert::None,
+        scale: ColorScale::Discrete(DiscreteColorScale {
+            levels,
+            colors: COLORS
+                .into_iter()
+                .map(|[r, g, b, a]| Color::rgba(r, g, b, a))
+                .collect(),
+            extend: ExtendMode::Neither,
+            mask_below: None,
+        }),
+        colormap_options: ColormapBuildOptions {
+            render_density: StaticPlotStyle::from_env().render_density(RenderDensity::default()),
+            legend: LegendControls {
+                density: LevelDensity::default(),
+                mode: LegendMode::SmoothRamp,
+            },
+        },
+        cbar_tick_step: None,
+        legend_mode: LegendMode::SmoothRamp,
+    }
+}
+
 /// False-color 2D field inspector. Pure widget over host-pushed data:
 /// `set_hour` -> `set_loading` -> `set_field`/`set_error`, render with `ui`.
 pub struct FieldViewerPanel {
     hour: Option<HourKey>,
     vars: Vec<VarInfo>,
     selected_var: Option<String>,
+    var_filter: String,
     field: Option<FieldData>,
+    /// One ephemeral Formula Lab field retained while this hour is selected.
+    generated_field: Option<GeneratedField>,
     texture: Option<TextureHandle>,
     texture_dirty: bool,
     state: LoadState,
     /// Last clicked point in fractional grid coords (marker overlay).
     clicked: Option<(f64, f64)>,
+    /// Ctrl+Alt smooth-sounding mode: the last grid cell a live sounding was
+    /// fired for, so we only regenerate when the pointer enters a new cell.
+    live_sounding_cell: Option<(usize, usize)>,
     /// In-progress shift + pointer-button custom-domain selection.
     domain_drag: Option<DomainDrag>,
     /// In-progress shift + pointer-button corner rotation.
@@ -270,11 +401,14 @@ impl Default for FieldViewerPanel {
             hour: None,
             vars: Vec::new(),
             selected_var: None,
+            var_filter: String::new(),
             field: None,
+            generated_field: None,
             texture: None,
             texture_dirty: false,
             state: LoadState::Idle,
             clicked: None,
+            live_sounding_cell: None,
             domain_drag: None,
             domain_rotate: None,
             domain_selection: None,
@@ -476,7 +610,20 @@ impl FieldViewerPanel {
     /// selection when the new hour still has it; otherwise falls back to
     /// `temperature_2m`, then the first 2D variable. The host should then
     /// fire a load for [`FieldViewerPanel::selected_var`].
-    pub fn set_hour(&mut self, hour: HourKey, vars: Vec<VarInfo>) {
+    pub fn set_hour(&mut self, hour: HourKey, mut vars: Vec<VarInfo>) {
+        let generated = self
+            .generated_field
+            .take()
+            .filter(|field| field.raw.key.hour == hour)
+            .filter(|field| !vars.iter().any(|var| var.name == field.raw.key.var));
+        if let Some(field) = &generated {
+            vars.push(VarInfo {
+                name: field.raw.key.var.clone(),
+                units: field.display_units().to_string(),
+                kind: VarKind::Surface2D,
+                levels_hpa: Vec::new(),
+            });
+        }
         let keep = self.selected_var.take().filter(|name| {
             vars.iter()
                 .any(|v| v.kind == VarKind::Surface2D && v.name == *name)
@@ -494,6 +641,8 @@ impl FieldViewerPanel {
             });
         self.hour = Some(hour);
         self.vars = vars;
+        self.generated_field = generated;
+        self.var_filter.clear();
         self.field = None;
         self.texture = None;
         self.texture_dirty = false;
@@ -514,6 +663,12 @@ impl FieldViewerPanel {
 
     pub fn selected_var(&self) -> Option<&str> {
         self.selected_var.as_deref()
+    }
+
+    /// Variables currently advertised for the selected hour. Hosts use this
+    /// read-only view for equation editors and other field pickers.
+    pub fn vars(&self) -> &[VarInfo] {
+        &self.vars
     }
 
     /// Key of the field the panel currently wants loaded, if any.
@@ -558,6 +713,98 @@ impl FieldViewerPanel {
         self.state = LoadState::Ready;
     }
 
+    /// Install an in-memory generated field (for example Formula Lab output)
+    /// as the current selection without requiring it to exist in rw-store.
+    /// It remains in the picker until the user selects another hour.
+    pub fn install_generated_field(
+        &mut self,
+        mut data: FieldData,
+        settings: &StyleOverrideSettings,
+    ) {
+        if self.hour.as_ref() != Some(&data.key.hour) {
+            self.vars.clear();
+        }
+        if let Some(previous) = self.generated_field.take() {
+            self.vars.retain(|var| var.name != previous.raw.key.var);
+        }
+        if self.vars.iter().any(|var| var.name == data.key.var) {
+            let base = format!("formula_{}", data.key.var);
+            let mut candidate = base.clone();
+            let mut suffix = 2usize;
+            while self.vars.iter().any(|var| var.name == candidate) {
+                candidate = format!("{base}_{suffix}");
+                suffix += 1;
+            }
+            data.key.var = candidate;
+        }
+        let generated = GeneratedField::from_raw(data, settings);
+        let displayed = generated.display_field();
+        self.hour = Some(generated.raw.key.hour.clone());
+        self.selected_var = Some(generated.raw.key.var.clone());
+        if !self
+            .vars
+            .iter()
+            .any(|var| var.name == generated.raw.key.var)
+        {
+            self.vars.push(VarInfo {
+                name: generated.raw.key.var.clone(),
+                units: generated.display_units().to_string(),
+                kind: VarKind::Surface2D,
+                levels_hpa: Vec::new(),
+            });
+        }
+        self.field = None;
+        self.texture = None;
+        self.texture_dirty = false;
+        self.clicked = None;
+        self.domain_drag = None;
+        self.domain_rotate = None;
+        self.domain_selection = None;
+        self.cmap = None;
+        self.legend_texture = None;
+        self.basemap_pending = None;
+        self.generated_field = Some(generated);
+        self.set_field(displayed);
+    }
+
+    /// Re-resolve the retained Formula Lab result from its raw values and
+    /// immediately refresh it when it is the current selection. Returns true
+    /// only when the selected field was the generated field, allowing the host
+    /// to avoid a store load for an intentionally in-memory variable.
+    pub fn restyle_generated_field(&mut self, settings: &StyleOverrideSettings) -> bool {
+        let wanted = self.wanted_field();
+        let Some(generated) = self.generated_field.as_mut() else {
+            return false;
+        };
+        generated.restyle(settings);
+        let var = generated.raw.key.var.clone();
+        let units = generated.display_units().to_string();
+        let displayed =
+            (wanted.as_ref() == Some(&generated.raw.key)).then(|| generated.display_field());
+        if let Some(info) = self.vars.iter_mut().find(|info| info.name == var) {
+            info.units = units;
+        }
+        let Some(displayed) = displayed else {
+            return false;
+        };
+        self.set_field(displayed);
+        true
+    }
+
+    /// Restore the retained Formula Lab field instead of asking the store
+    /// worker for a variable that intentionally exists only in memory.
+    pub fn restore_generated_field(&mut self, var: &str) -> bool {
+        let Some(field) = self.generated_field.as_ref() else {
+            return false;
+        };
+        if field.raw.key.var != var || Some(&field.raw.key.hour) != self.hour.as_ref() {
+            return false;
+        }
+        let field = field.display_field();
+        self.set_field(field);
+        true
+    }
+
     pub fn clear(&mut self) {
         *self = Self {
             colormap: self.colormap,
@@ -589,22 +836,65 @@ impl FieldViewerPanel {
         ui.horizontal_wrapped(|ui| {
             let previous = self.selected_var.clone();
             let mut current = previous.clone().unwrap_or_default();
-            ComboBox::from_id_salt("rw-ui-field-var")
-                .selected_text(if current.is_empty() {
-                    "pick a variable"
-                } else {
-                    &current
+            let surface_total = self
+                .vars
+                .iter()
+                .filter(|v| v.kind == VarKind::Surface2D)
+                .count();
+            ui.add(
+                egui::TextEdit::singleline(&mut self.var_filter)
+                    .desired_width(130.0)
+                    .hint_text("filter variables"),
+            );
+            if !self.var_filter.is_empty() && ui.button("x").on_hover_text("clear filter").clicked()
+            {
+                self.var_filter.clear();
+            }
+            let filter = self.var_filter.trim().to_ascii_lowercase();
+            let matching_vars = self
+                .vars
+                .iter()
+                .filter(|v| v.kind == VarKind::Surface2D)
+                .filter(|v| {
+                    let label = display_variable_name(&v.name).to_ascii_lowercase();
+                    filter.is_empty()
+                        || v.name.to_ascii_lowercase().contains(&filter)
+                        || label.contains(&filter)
+                        || v.units.to_ascii_lowercase().contains(&filter)
                 })
+                .map(|v| {
+                    (
+                        v.name.clone(),
+                        display_variable_name(&v.name),
+                        v.units.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let current_label = if current.is_empty() {
+                "pick a variable".to_string()
+            } else {
+                display_variable_name(&current)
+            };
+            ComboBox::from_id_salt("rw-ui-field-var")
+                .selected_text(current_label)
                 .width(220.0)
                 .show_ui(ui, |ui| {
-                    for var in self.vars.iter().filter(|v| v.kind == VarKind::Surface2D) {
+                    if matching_vars.is_empty() {
+                        ui.label(RichText::new("No variables match").small().weak());
+                    }
+                    for (name, label, units) in &matching_vars {
                         ui.selectable_value(
                             &mut current,
-                            var.name.clone(),
-                            format!("{} ({})", var.name, var.units),
+                            name.clone(),
+                            format!("{label} ({units})"),
                         );
                     }
                 });
+            ui.label(
+                RichText::new(format!("{} of {} vars", matching_vars.len(), surface_total))
+                    .small()
+                    .weak(),
+            );
             if !current.is_empty() && Some(&current) != previous.as_ref() {
                 self.selected_var = Some(current.clone());
                 self.field = None;
@@ -666,7 +956,7 @@ impl FieldViewerPanel {
         match &self.state {
             LoadState::Idle if self.hour.is_none() => {
                 ui.add_space(12.0);
-                ui.label(RichText::new("Pick a run hour on the left.").weak());
+                ui.label(RichText::new("Pick a run timestep on the left.").weak());
                 return event;
             }
             LoadState::Idle => {
@@ -820,6 +1110,7 @@ impl FieldViewerPanel {
 
         let shift_down = ui.input(|input| input.modifiers.shift);
         let alt_down = ui.input(|input| input.modifiers.alt);
+        let ctrl_down = ui.input(|input| input.modifiers.ctrl || input.modifiers.mac_cmd);
 
         if response.hovered() {
             let scroll_delta = ui.input(|input| input.smooth_scroll_delta().y);
@@ -872,12 +1163,42 @@ impl FieldViewerPanel {
             ui.ctx().request_repaint();
         }
 
-        if response.clicked_by(PointerButton::Primary) && alt_down {
+        if response.clicked_by(PointerButton::Primary) && alt_down && !ctrl_down {
             if let Some(pos) = response.interact_pointer_pos() {
                 let (fx, fy) = to_grid(pos);
                 self.clicked = Some((fx, fy));
                 event = Some(FieldViewerEvent::PointClicked { fx, fy });
             }
+        }
+
+        // Ctrl+Alt held: smooth "scrubbing" soundings. Every time the pointer
+        // moves into a new grid cell over the field, fire a fresh sounding.
+        // The store read is sub-millisecond warm and the worker coalesces to
+        // the latest request; the sounding panel keeps its previous scene
+        // while the next one computes, so scrubbing stays fluid and flicker
+        // free. Gating on the integer grid cell caps regeneration to at most
+        // one sounding per column — all the data resolution supports.
+        if ctrl_down && alt_down && response.hovered() {
+            if let Some(pos) = response.hover_pos() {
+                let (fx, fy) = to_grid(pos);
+                if fx >= 0.0
+                    && fy >= 0.0
+                    && fx.round() < field.nx as f64
+                    && fy.round() < field.ny as f64
+                {
+                    let cell = (fx.round() as usize, fy.round() as usize);
+                    if self.live_sounding_cell != Some(cell) {
+                        self.live_sounding_cell = Some(cell);
+                        self.clicked = Some((fx, fy));
+                        event = Some(FieldViewerEvent::PointClicked { fx, fy });
+                    }
+                }
+            }
+            // Keep frames flowing while the modifier is held so pointer motion
+            // is sampled smoothly.
+            ui.ctx().request_repaint();
+        } else {
+            self.live_sounding_cell = None;
         }
 
         let domain_button = if shift_down && response.drag_started_by(PointerButton::Primary) {
@@ -1021,11 +1342,14 @@ impl FieldViewerPanel {
                 }
                 None => String::new(),
             };
-            let text = if value.is_nan() {
+            let mut text = if value.is_nan() {
                 format!("({ix}, {iy}){place}  missing")
             } else {
                 format!("({ix}, {iy}){place}  {value:.2} {}", field.units)
             };
+            if ctrl_down && alt_down {
+                text.push_str("   ⟳ live sounding");
+            }
             response.on_hover_text_at_pointer(text);
         }
 
@@ -1208,6 +1532,35 @@ impl FieldViewerPanel {
             }
         }
     }
+}
+
+fn display_variable_name(name: &str) -> String {
+    if let Some(spec) = parse_iso_slug(name) {
+        return spec.label();
+    }
+    if let Some(slug) = name.strip_prefix("approx_") {
+        let label = match slug {
+            "sbcape" => "SBCAPE",
+            "sbcin" => "SBCIN",
+            "mlcape" => "MLCAPE",
+            "mlcin" => "MLCIN",
+            "mucape" => "MUCAPE",
+            "mucin" => "MUCIN",
+            "lcl" => "LCL height",
+            "lfc" => "LFC height",
+            "el" => "EL height",
+            "srh_0_1km" => "0-1 km SRH",
+            "srh_0_3km" => "0-3 km SRH",
+            "bulk_shear_0_1km" => "0-1 km bulk shear",
+            "bulk_shear_0_6km" => "0-6 km bulk shear",
+            "stp" => "STP",
+            "scp" => "SCP",
+            "ehi" => "EHI",
+            _ => slug,
+        };
+        return format!("Approximate {label}");
+    }
+    name.to_string()
 }
 
 /// One production colorbar sample per row, top = the highest legend level —
@@ -1847,9 +2200,221 @@ fn normalize_lon(lon: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::style_overrides::{UserColorTable, UserUnitConvert};
 
     const NX: usize = 8;
     const NY: usize = 6;
+
+    fn test_hour(hour: u16) -> HourKey {
+        HourKey {
+            model: "wrf".to_string(),
+            run: "test".to_string(),
+            hour,
+            exact_time: None,
+        }
+    }
+
+    #[test]
+    fn generated_field_is_namespaced_retained_and_never_loaded_from_store() {
+        let hour = test_hour(0);
+        let real = VarInfo {
+            name: "temperature_2m".to_string(),
+            units: "K".to_string(),
+            kind: VarKind::Surface2D,
+            levels_hpa: Vec::new(),
+        };
+        let mut panel = FieldViewerPanel::new();
+        panel.set_hour(hour.clone(), vec![real.clone()]);
+        panel.install_generated_field(
+            FieldData {
+                key: FieldKey {
+                    hour: hour.clone(),
+                    var: "temperature_2m".to_string(),
+                },
+                units: "K".to_string(),
+                nx: NX,
+                ny: NY,
+                values: vec![300.0; NX * NY],
+                range: Some((300.0, 300.0)),
+                grid: None,
+                lat_descending: false,
+                style: None,
+            },
+            &StyleOverrideSettings::default(),
+        );
+        let generated_name = panel.selected_var().unwrap().to_string();
+        assert_eq!(generated_name, "formula_temperature_2m");
+        assert!(panel.restore_generated_field(&generated_name));
+
+        panel.set_hour(hour, vec![real.clone()]);
+        panel.selected_var = Some(generated_name.clone());
+        assert!(panel.restore_generated_field(&generated_name));
+        panel.set_hour(test_hour(1), vec![real]);
+        panel.selected_var = Some(generated_name.clone());
+        assert!(!panel.restore_generated_field(&generated_name));
+    }
+
+    fn formula_field(hour: HourKey, var: &str, values: Vec<f32>) -> FieldData {
+        FieldData {
+            key: FieldKey {
+                hour,
+                var: var.to_string(),
+            },
+            units: "m/s".to_string(),
+            nx: values.len(),
+            ny: 1,
+            range: crate::colormap::finite_min_max(&values),
+            values,
+            grid: None,
+            lat_descending: false,
+            style: None,
+        }
+    }
+
+    fn formula_wind_settings(product: &str) -> StyleOverrideSettings {
+        let mut settings = StyleOverrideSettings::default();
+        let mut table = UserColorTable::simple("Formula wind", "Formula wind", "kt");
+        table.convert = UserUnitConvert::MsToKnots;
+        settings.upsert_table(table);
+        settings.bind_product(product, "Formula wind");
+        settings
+    }
+
+    #[test]
+    fn generated_field_has_plot_ready_auto_style_without_a_saved_binding() {
+        let hour = test_hour(0);
+        let mut panel = FieldViewerPanel::new();
+        panel.set_hour(hour.clone(), Vec::new());
+        panel.install_generated_field(
+            formula_field(hour, "custom_diagnostic", vec![-4.0, 2.0, 1000.0]),
+            &StyleOverrideSettings::default(),
+        );
+
+        let displayed = panel.current_field().unwrap();
+        let style = displayed.style.as_ref().unwrap();
+        assert_eq!(displayed.units, "m/s");
+        assert_eq!(displayed.values, vec![-4.0, 2.0, 1000.0]);
+        assert_eq!(displayed.range, Some((-4.0, 1000.0)));
+        assert!(style.convert.is_none());
+        assert!(style.title.contains("auto, full finite range"));
+        let scale = style.scale.resolved_discrete();
+        assert_eq!(scale.levels.first(), Some(&-4.0));
+        assert_eq!(scale.levels.last(), Some(&1000.0));
+    }
+
+    #[test]
+    fn generated_field_uses_existing_exact_output_binding_on_install() {
+        let hour = test_hour(0);
+        let raw_values = vec![5.0, 10.0, f32::NAN];
+        let settings = formula_wind_settings("wind_over_15ms");
+        let mut panel = FieldViewerPanel::new();
+        panel.set_hour(hour.clone(), Vec::new());
+        panel.install_generated_field(
+            formula_field(hour, "wind_over_15ms", raw_values.clone()),
+            &settings,
+        );
+
+        let displayed = panel.current_field().unwrap();
+        let convert = rustwx_products::viewer::UnitConvert::MsToKnots;
+        assert!(displayed.style.is_some());
+        assert_eq!(displayed.units, "kt");
+        assert_eq!(displayed.values[0], convert.apply(raw_values[0]));
+        assert_eq!(displayed.values[1], convert.apply(raw_values[1]));
+        assert!(displayed.values[2].is_nan());
+        assert_eq!(
+            displayed.range,
+            Some((convert.apply(5.0), convert.apply(10.0)))
+        );
+        let retained = &panel.generated_field.as_ref().unwrap().raw.values;
+        assert_eq!(retained.len(), raw_values.len());
+        assert_eq!(retained[..2], raw_values[..2]);
+        assert!(retained[2].is_nan());
+        assert_eq!(panel.generated_field.as_ref().unwrap().raw.units, "m/s");
+    }
+
+    #[test]
+    fn generated_field_restyle_always_converts_from_raw_once() {
+        let hour = test_hour(0);
+        let raw_values = vec![10.0, 20.0];
+        let settings = formula_wind_settings("formula_wind");
+        let mut panel = FieldViewerPanel::new();
+        panel.set_hour(hour.clone(), Vec::new());
+        panel.install_generated_field(
+            formula_field(hour, "formula_wind", raw_values.clone()),
+            &settings,
+        );
+        let first = panel.current_field().unwrap().values.clone();
+
+        assert!(panel.restyle_generated_field(&settings));
+        assert_eq!(panel.current_field().unwrap().values, first);
+        assert!(panel.restyle_generated_field(&settings));
+        assert_eq!(panel.current_field().unwrap().values, first);
+        assert_eq!(
+            panel.generated_field.as_ref().unwrap().raw.values,
+            raw_values
+        );
+    }
+
+    #[test]
+    fn removing_generated_binding_reverts_to_unconverted_auto_style() {
+        let hour = test_hour(0);
+        let raw_values = vec![10.0, 20.0];
+        let settings = formula_wind_settings("formula_wind");
+        let mut panel = FieldViewerPanel::new();
+        panel.set_hour(hour.clone(), Vec::new());
+        panel.install_generated_field(
+            formula_field(hour, "formula_wind", raw_values.clone()),
+            &settings,
+        );
+
+        assert!(panel.restyle_generated_field(&StyleOverrideSettings::default()));
+        let displayed = panel.current_field().unwrap();
+        assert!(displayed.style.as_ref().unwrap().convert.is_none());
+        assert_eq!(displayed.units, "m/s");
+        assert_eq!(displayed.values, raw_values);
+        assert_eq!(displayed.range, Some((10.0, 20.0)));
+    }
+
+    #[test]
+    fn generated_field_restore_keeps_style_and_single_conversion() {
+        let hour = test_hour(0);
+        let settings = formula_wind_settings("formula_wind");
+        let mut panel = FieldViewerPanel::new();
+        panel.set_hour(hour.clone(), Vec::new());
+        panel.install_generated_field(
+            formula_field(hour.clone(), "formula_wind", vec![10.0]),
+            &settings,
+        );
+        let expected = panel.current_field().unwrap().clone();
+
+        panel.set_hour(hour, Vec::new());
+        assert_eq!(panel.selected_var(), Some("formula_wind"));
+        assert!(panel.restore_generated_field("formula_wind"));
+        assert_eq!(panel.current_field(), Some(&expected));
+    }
+
+    #[test]
+    fn generated_auto_style_handles_constant_and_nonfinite_ranges() {
+        let hour = test_hour(0);
+        let constant = formula_field(hour.clone(), "constant", vec![7.0, 7.0]);
+        let constant_style = auto_generated_field_style(&constant);
+        let constant_scale = constant_style.scale.resolved_discrete();
+        assert!(constant_scale.levels.first().unwrap() < &7.0);
+        assert!(constant_scale.levels.last().unwrap() > &7.0);
+
+        let zero = formula_field(hour.clone(), "zero", vec![0.0, 0.0]);
+        let zero_style = auto_generated_field_style(&zero);
+        let zero_scale = zero_style.scale.resolved_discrete();
+        assert_eq!(zero_scale.levels.first(), Some(&-1.0));
+        assert_eq!(zero_scale.levels.last(), Some(&1.0));
+
+        let missing = formula_field(hour, "missing", vec![f32::NAN, f32::INFINITY]);
+        let missing_style = auto_generated_field_style(&missing);
+        let missing_scale = missing_style.scale.resolved_discrete();
+        assert_eq!(missing_scale.levels.first(), Some(&0.0));
+        assert_eq!(missing_scale.levels.last(), Some(&1.0));
+        assert!(missing_style.title.contains("no finite values"));
+    }
 
     /// Row-major lat array: ascending = row 0 south (20°N..), descending =
     /// row 0 north (50°N..).

@@ -132,9 +132,10 @@ fn main() -> ExitCode {
 
 // ── ls ────────────────────────────────────────────────────────────────────────
 
-/// One hour entry collected for human-readable `ls` output.
+/// One timestep entry collected for human-readable `ls` output.
 struct HourListing {
-    hour: u16,
+    storage_key: u16,
+    exact_time: Option<rw_store::RwsExactTime>,
     file: String,
     variables: Vec<String>,
     file_bytes: Option<u64>,
@@ -148,6 +149,7 @@ struct RunListing {
     nx: usize,
     ny: usize,
     writer_build: String,
+    exact_time_axis: bool,
     hours: Vec<HourListing>,
 }
 
@@ -166,64 +168,91 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
     let mut any_error = false;
 
     for run_dir in &run_dirs {
-        let manifest_path = run_dir.join("run.json");
-        match std::fs::read(&manifest_path) {
-            Err(e) => {
-                eprintln!("error: read {}: {e}", manifest_path.display());
-                any_error = true;
-                continue;
-            }
-            Ok(bytes) => match serde_json::from_slice::<RwsRunManifest>(&bytes) {
-                Err(e) => {
-                    eprintln!("error: parse {}: {e}", manifest_path.display());
+        let manifest_path =
+            match canonical_contained_path(run_dir, &run_dir.join("run.json"), "run manifest") {
+                Ok(path) => path,
+                Err(err) => {
+                    eprintln!("error: {err}");
                     any_error = true;
                     continue;
                 }
-                Ok(manifest) => {
-                    let hours: Vec<HourListing> = manifest
-                        .hours
-                        .iter()
-                        .map(|(&hour, entry)| {
-                            let fpath = run_dir.join(&entry.file);
-                            let file_bytes = std::fs::metadata(&fpath).ok().map(|m| m.len());
-                            HourListing {
-                                hour,
-                                file: entry.file.clone(),
-                                variables: entry.variables.clone(),
-                                file_bytes,
-                            }
-                        })
-                        .collect();
-                    let hour_json: Vec<serde_json::Value> = hours
-                        .iter()
-                        .map(|h| {
-                            json!({
-                                "hour": h.hour, "file": h.file, "variables": h.variables,
-                                "file_bytes": h.file_bytes
-                            })
-                        })
-                        .collect();
-                    runs.push(json!({
-                        "model": manifest.model,
-                        "run": manifest.run,
-                        "grid_hash": manifest.grid_hash,
-                        "nx": manifest.nx,
-                        "ny": manifest.ny,
-                        "writer_build": manifest.writer.build,
-                        "hours": hour_json,
-                    }));
-                    run_displays.push(RunListing {
-                        model: manifest.model,
-                        run: manifest.run,
-                        grid_hash: manifest.grid_hash,
-                        nx: manifest.nx,
-                        ny: manifest.ny,
-                        writer_build: manifest.writer.build,
-                        hours,
-                    });
+            };
+        let manifest = match RwsRunManifest::load(&manifest_path) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                eprintln!("error: {}: {err}", manifest_path.display());
+                any_error = true;
+                continue;
+            }
+        };
+        let mut hours = Vec::with_capacity(manifest.hours.len());
+        let mut unsafe_hour_path = false;
+        for (&hour, entry) in &manifest.hours {
+            let requested = run_dir.join(&entry.file);
+            let file_bytes = if requested.exists() {
+                match canonical_contained_path(run_dir, &requested, "hour file") {
+                    Ok(path) => std::fs::metadata(path).ok().map(|meta| meta.len()),
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        unsafe_hour_path = true;
+                        break;
+                    }
                 }
-            },
+            } else {
+                None
+            };
+            hours.push(HourListing {
+                storage_key: hour,
+                exact_time: entry.exact_time(),
+                file: entry.file.clone(),
+                variables: entry.variables.clone(),
+                file_bytes,
+            });
         }
+        if unsafe_hour_path {
+            any_error = true;
+            continue;
+        }
+        let exact_time_axis = manifest.is_exact_time_axis();
+        let hour_json: Vec<serde_json::Value> = hours
+            .iter()
+            .map(|h| match h.exact_time {
+                Some(time) => json!({
+                    "storage_slot": h.storage_key,
+                    "lead_seconds": time.lead_seconds,
+                    "valid_unix": time.valid_unix,
+                    "file": h.file,
+                    "variables": h.variables,
+                    "file_bytes": h.file_bytes
+                }),
+                None => json!({
+                    "forecast_hour": h.storage_key,
+                    "file": h.file,
+                    "variables": h.variables,
+                    "file_bytes": h.file_bytes
+                }),
+            })
+            .collect();
+        runs.push(json!({
+            "schema": manifest.schema,
+            "model": manifest.model,
+            "run": manifest.run,
+            "grid_hash": manifest.grid_hash,
+            "nx": manifest.nx,
+            "ny": manifest.ny,
+            "writer_build": manifest.writer.build,
+            "timesteps": hour_json,
+        }));
+        run_displays.push(RunListing {
+            model: manifest.model,
+            run: manifest.run,
+            grid_hash: manifest.grid_hash,
+            nx: manifest.nx,
+            ny: manifest.ny,
+            writer_build: manifest.writer.build,
+            exact_time_axis,
+            hours,
+        });
     }
 
     if args.json {
@@ -231,8 +260,17 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
     } else {
         for listing in &run_displays {
             println!(
-                "model={} run={} grid={}x{} build={}",
-                listing.model, listing.run, listing.ny, listing.nx, listing.writer_build
+                "model={} run={} grid={}x{} build={} time_axis={}",
+                listing.model,
+                listing.run,
+                listing.ny,
+                listing.nx,
+                listing.writer_build,
+                if listing.exact_time_axis {
+                    "exact"
+                } else {
+                    "forecast_hour"
+                }
             );
             println!("  grid_hash: {}", listing.grid_hash);
             for hour in &listing.hours {
@@ -240,13 +278,25 @@ fn cmd_ls(args: LsArgs) -> ExitCode {
                     Some(b) => format!("{b} B"),
                     None => "?".to_string(),
                 };
-                println!(
-                    "  f{:03}  {}  {}  vars: {}",
-                    hour.hour,
-                    hour.file,
-                    size_str,
-                    hour.variables.join(", ")
-                );
+                if let Some(time) = hour.exact_time {
+                    println!(
+                        "  slot {:05}  +{}s  valid_unix={}  {}  {}  vars: {}",
+                        hour.storage_key,
+                        time.lead_seconds,
+                        time.valid_unix,
+                        hour.file,
+                        size_str,
+                        hour.variables.join(", ")
+                    );
+                } else {
+                    println!(
+                        "  f{:03}  {}  {}  vars: {}",
+                        hour.storage_key,
+                        hour.file,
+                        size_str,
+                        hour.variables.join(", ")
+                    );
+                }
             }
         }
     }
@@ -264,24 +314,37 @@ fn collect_run_dirs(path: &Path) -> Vec<PathBuf> {
     if !path.is_dir() {
         return Vec::new();
     }
+    let Ok(root) = std::fs::canonicalize(path) else {
+        return Vec::new();
+    };
     // If this directory itself has a run.json, it is a run dir.
-    if path.join("run.json").exists() {
-        return vec![path.to_path_buf()];
+    if root.join("run.json").exists() {
+        return vec![root];
     }
     // Walk up to depth 2 looking for run.json files.
     let mut result = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(path) {
+    if let Ok(entries) = std::fs::read_dir(&root) {
         for entry in entries.flatten() {
-            let child = entry.path();
-            if !child.is_dir() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let Ok(child) = std::fs::canonicalize(entry.path()) else {
+                continue;
+            };
+            if !child.starts_with(&root) {
                 continue;
             }
             if child.join("run.json").exists() {
                 result.push(child.clone());
             } else if let Ok(grandchildren) = std::fs::read_dir(&child) {
                 for gc in grandchildren.flatten() {
-                    let gc_path = gc.path();
-                    if gc_path.is_dir() && gc_path.join("run.json").exists() {
+                    if !gc.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        continue;
+                    }
+                    let Ok(gc_path) = std::fs::canonicalize(gc.path()) else {
+                        continue;
+                    };
+                    if gc_path.starts_with(&root) && gc_path.join("run.json").exists() {
                         result.push(gc_path);
                     }
                 }
@@ -290,6 +353,19 @@ fn collect_run_dirs(path: &Path) -> Vec<PathBuf> {
     }
     result.sort();
     result
+}
+
+fn canonical_contained_path(parent: &Path, path: &Path, label: &str) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|err| format!("cannot resolve {label} {}: {err}", path.display()))?;
+    if !canonical.starts_with(parent) {
+        return Err(format!(
+            "{label} {} resolves outside {}",
+            path.display(),
+            parent.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 // ── dump ──────────────────────────────────────────────────────────────────────
@@ -410,6 +486,14 @@ fn cmd_dump(args: DumpArgs) -> ExitCode {
 
     // Summary dump: header + meta overview + per-variable table.
     if args.json {
+        let timing = match meta.exact_time() {
+            Some(time) => json!({
+                "storage_slot": meta.forecast_hour,
+                "lead_seconds": time.lead_seconds,
+                "valid_unix": time.valid_unix,
+            }),
+            None => json!({ "forecast_hour": meta.forecast_hour }),
+        };
         let vars: Vec<serde_json::Value> = meta
             .variables
             .iter()
@@ -436,7 +520,7 @@ fn cmd_dump(args: DumpArgs) -> ExitCode {
                 "schema": meta.schema,
                 "model": meta.model,
                 "run": meta.run,
-                "forecast_hour": meta.forecast_hour,
+                "time": timing,
                 "nx": meta.nx,
                 "ny": meta.ny,
                 "grid_hash": meta.grid_hash,
@@ -451,7 +535,13 @@ fn cmd_dump(args: DumpArgs) -> ExitCode {
         println!("schema:    {}", meta.schema);
         println!("model:     {}", meta.model);
         println!("run:       {}", meta.run);
-        println!("fh:        {}", meta.forecast_hour);
+        if let Some(time) = meta.exact_time() {
+            println!("slot:      {}", meta.forecast_hour);
+            println!("lead:      {} s", time.lead_seconds);
+            println!("valid:     {} (Unix UTC)", time.valid_unix);
+        } else {
+            println!("fh:        {}", meta.forecast_hour);
+        }
         println!("grid:      {}x{}", meta.ny, meta.nx);
         println!("grid_hash: {}", meta.grid_hash);
         println!(

@@ -1,0 +1,16 @@
+[package]
+name = "rw-formula"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+rust-version.workspace = true
+description = "Rusty Weather bridge for safe wrf-formula diagnostics"
+
+[dependencies]
+rw-store = { path = "../rw-store" }
+rustwx-core = { path = "../rustwx-core" }
+sha2 = "0.10"
+thiserror = "2"
+wrf-core = { git = "https://github.com/FahrenheitResearch/wrf-rust.git", rev = "2550d4e2f85c61a190cf639d59e713f553facd07", package = "wrf-core", default-features = false, features = ["pure-rust-reader"] }
+wrf-formula = { git = "https://github.com/FahrenheitResearch/wrf-rust.git", rev = "2550d4e2f85c61a190cf639d59e713f553facd07", package = "wrf-formula", default-features = false, features = ["pure-rust-reader"] }

@@ -11,6 +11,48 @@ launches (precedence: CLI arg > persisted setting > built-in default).
 
 Design: docs/superpowers/specs/2026-06-09-rusty-weather-design.md
 
+## Desktop model workflows
+
+The native `rusty-weather-ui` app can work from downloaded forecast stores or
+local research files:
+
+- The **GDEX** browser lazily explores NSF NCAR THREDDS catalogs, including
+  CONUS-II (`d612005`) and ERA-20C (`d626000`), supports NCSS variable/time/
+  bounding-box subsets for NetCDF-backed leaves, resumable downloads,
+  cancellation, and automatic handoff to the importer. ERA-20C uses full-file
+  GRIB1 downloads until generic CF NCSS output is supported by local import.
+- Local import accepts raw/postprocessed WRF NetCDF, ordinary NetCDF, and
+  GRIB Edition 1 (including ECMWF table 128 and Gaussian ERA-20C grids).
+- Full WRF processing uses the pinned `wrf-rust` science/performance release
+  for the corrected CAPE/CIN parcel selection, wrf-python-compatible CAPE and
+  SRH lanes, map-metric vorticity, severe composites, low-priority parallel
+  processing, bounded failure isolation, and the optimized pure-Rust reader.
+- Projected WRF winds are rotated from the model grid to earth-relative
+  components before they are exposed as canonical vectors or used by
+  kinematic products. If the required rotation metadata is absent, those
+  products are withheld instead of silently treating grid-relative winds as
+  true east/north winds.
+- Multi-file local imports are preflighted as one run, written under a hidden
+  same-filesystem staging tree, validated, and published only after every hour
+  succeeds. Source content and file revisions are checked again before the
+  complete run replaces an older copy.
+- Stored pressure volumes expose 925/850/700/500/300/250 hPa temperature,
+  dewpoint/RH, wind-speed, and height maps directly in the normal field
+  picker. These are display-time slices; existing stores need no conversion.
+- **Formula Lab** compiles safe, unit-aware custom diagnostics. Raw WRF files
+  provide the full WRF geometry, map factors, heights, and time axis needed by
+  horizontal/vertical/temporal calculus. The rw-store lane deliberately
+  rejects operations whose exact geometry or valid-time metadata is absent
+  instead of guessing.
+- **Batch render** runs Rusty Weather's production renderer off the UI thread
+  for a bounded product/hour selection, with progress, cancellation, native
+  or explicit domains, and per-item failure reporting.
+
+Postprocessed climate archives do not contain every raw-WRF surface and
+effective-layer input. Diagnostics reconstructed from those reduced inputs
+are therefore stored and labeled with an `approx_` prefix; they are never
+presented as equivalent to the authoritative raw-WRF diagnostics.
+
 ## Using crates from this repo as dependencies
 
 The embeddable pieces (`rw-ui` panels, `rw-store`, `rw-ingest`, `rw-sat`) work
@@ -40,7 +82,7 @@ fails GOES-19 CMIP files with a checksum mismatch on the `x` variable.
 
 Format spec: docs/FORMAT.md
 
-Each forecast hour is a self-contained `.rws` file: 256×256 spatial tiles of 2D surface fields, zstd-1 compressed f32, with true windowed reads so a regional plot decodes only the intersecting tile set. Pressure-level volumes are stored as 16×16-column 3D chunks (all levels contiguous per column), affine-i16 quantized then zstd-1, so a point sounding mmaps the file, binary-searches the index, and decodes 1–4 small chunks for instant bilinear profiles across all levels. Per-run provenance lives in `grid.rwg` (lat/lon arrays + projection, sha256-hashed for grid-identity checks) and `run.json` (model, cycle, hours present, schema id `rw-store.run.v1`, build-hash from `git rev-parse` compiled in at build time).
+Each model timestep is a self-contained `.rws` file: 256×256 spatial tiles of 2D surface fields, zstd-1 compressed f32, with true windowed reads so a regional plot decodes only the intersecting tile set. Pressure-level volumes are stored as 16×16-column 3D chunks (all levels contiguous per column), affine-i16 quantized then zstd-1, so a point sounding mmaps the file, binary-searches the index, and decodes 1–4 small chunks for instant bilinear profiles across all levels. Per-run provenance lives in `grid.rwg` (lat/lon arrays + projection, sha256-hashed for grid-identity checks) and `run.json`: whole-hour forecast runs retain `rw-store.run.v1`, while minute/irregular or otherwise non-authoritative forecast axes use `rw-store.run.v2` ordinal slots with exact lead seconds and UTC valid times. Both use the frozen binary-v1 codec.
 
     cargo run --release -p rusty-weather --bin rw_ingest -- --model hrrr --date YYYYMMDD --cycle 0 --hours 0-6 --store-root store --verify
     cargo run --release -p rusty-weather --bin rw_bench -- --run YYYYMMDD_00z

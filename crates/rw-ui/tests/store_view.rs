@@ -4,11 +4,16 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use rustwx_core::{CanonicalField, FieldSelector, GridShape, LatLonGrid, SelectedField2D};
+use rw_store::{RwsExactTime, write_hour_from_fields_exact};
 use rw_ui::synthetic::{
     SYNTHETIC_BUILD, SYNTHETIC_HOURS, SYNTHETIC_LEVELS, SYNTHETIC_MODEL, SYNTHETIC_RUN,
     write_synthetic_store,
 };
-use rw_ui::{FieldKey, HourKey, StoreRequest, StoreResponse, StoreView, StoreWorker, VarKind};
+use rw_ui::{
+    FieldKey, HourKey, StoreRequest, StoreResponse, StoreView, StoreWorker, VarKind,
+    format_lead_seconds, format_valid_unix,
+};
 
 fn test_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rw-ui-{}-{}", std::process::id(), name));
@@ -34,6 +39,11 @@ fn enumerate_synthetic_store() {
     assert_eq!(run.run, SYNTHETIC_RUN);
     assert_eq!(run.build, SYNTHETIC_BUILD, "build stamp from run.json");
     assert!(run.nx > 0 && run.ny > 0);
+    assert!(
+        !run.exact_time_axis,
+        "legacy synthetic store stays rw-store v1"
+    );
+    assert!(run.exact_times().is_none());
     let hours: Vec<u16> = run.hours.iter().map(|h| h.hour).collect();
     assert_eq!(hours, SYNTHETIC_HOURS.to_vec(), "hours ascending");
     for hour in &run.hours {
@@ -41,8 +51,101 @@ fn enumerate_synthetic_store() {
         // 3 surface fields + 2 volumes.
         assert_eq!(hour.variable_count, 5, "variable count from run.json");
         assert!(hour.written_unix > 0);
+        assert!(hour.exact_time.is_none());
     }
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn exact_test_field(value: f32) -> SelectedField2D {
+    let shape = GridShape::new(2, 2).unwrap();
+    let grid = LatLonGrid::new(
+        shape,
+        vec![35.0, 35.0, 36.0, 36.0],
+        vec![-100.0, -99.0, -100.0, -99.0],
+    )
+    .unwrap();
+    SelectedField2D::new(
+        FieldSelector::height_agl(CanonicalField::Temperature, 2),
+        "K",
+        grid,
+        vec![value; 4],
+    )
+    .unwrap()
+}
+
+#[test]
+fn exact_time_store_enumerates_labels_and_worker_identity_without_fake_hours() {
+    let dir = test_dir("exact-time");
+    let root = dir.join("store");
+    let model = "wrf";
+    let run = "local_exact_science_v2";
+    let origin = 134_211_600_i64; // 1974-04-03 09:00:00Z
+    let leads = [31_680_u64, 31_740, 31_800];
+    for (slot, lead_seconds) in leads.into_iter().enumerate() {
+        let field = exact_test_field(280.0 + slot as f32);
+        write_hour_from_fields_exact(
+            &root,
+            model,
+            run,
+            u16::try_from(slot).unwrap(),
+            RwsExactTime {
+                lead_seconds,
+                valid_unix: origin + i64::try_from(lead_seconds).unwrap(),
+            },
+            &[("temperature_2m", &field)],
+            &[],
+            "rw-ui-exact-test",
+            1_780_000_000 + slot as u64,
+        )
+        .unwrap();
+    }
+
+    let tree = StoreView::new(&root).enumerate();
+    assert!(tree.warnings.is_empty(), "exact store: {:?}", tree.warnings);
+    let run_entry = tree.run(model, run).expect("exact run enumerated");
+    assert!(run_entry.exact_time_axis);
+    let times = run_entry.exact_times().expect("complete exact time axis");
+    assert_eq!(times.len(), 3);
+    assert_eq!(times[&0].lead_seconds, 31_680);
+    assert_eq!(times[&1].valid_unix - times[&0].valid_unix, 60);
+
+    let first = &run_entry.hours[0];
+    let key = HourKey {
+        model: model.to_string(),
+        run: run.to_string(),
+        hour: first.hour,
+        exact_time: first.exact_time,
+    };
+    assert_eq!(key.lead_label(), "+08:48:00");
+    assert_eq!(
+        key.valid_time_label().as_deref(),
+        Some("1974-04-03 17:48:00Z")
+    );
+    assert!(!key.time_label().contains('F'));
+    assert!(!key.time_label().contains("f000"));
+
+    let worker = StoreWorker::spawn(StoreView::new(&root), || {});
+    worker.send(StoreRequest::LoadHour(key.clone()));
+    assert!(matches!(
+        worker.recv_timeout(Duration::from_secs(20)),
+        Some(StoreResponse::HourVars(returned, Ok(_))) if returned == key
+    ));
+
+    let mut forged = key;
+    forged.exact_time = Some(RwsExactTime {
+        lead_seconds: 31_681,
+        valid_unix: origin + 31_681,
+    });
+    worker.send(StoreRequest::LoadHour(forged));
+    assert!(matches!(
+        worker.recv_timeout(Duration::from_secs(20)),
+        Some(StoreResponse::HourVars(_, Err(message))) if message.contains("does not match")
+    ));
+
+    assert_eq!(format_lead_seconds(360_000), "+100:00:00");
+    assert_eq!(format_valid_unix(0), "1970-01-01 00:00:00Z");
+    assert_eq!(format_valid_unix(-1), "1969-12-31 23:59:59Z");
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -121,6 +224,7 @@ fn worker_round_trip_on_synthetic_store() {
         model: SYNTHETIC_MODEL.to_string(),
         run: SYNTHETIC_RUN.to_string(),
         hour: SYNTHETIC_HOURS[1],
+        exact_time: None,
     };
 
     worker.send(StoreRequest::Enumerate);
@@ -147,7 +251,19 @@ fn worker_round_trip_on_synthetic_store() {
             "dewpoint_2m",
             "wind_gust_10m",
             "temperature_iso",
-            "dewpoint_iso"
+            "dewpoint_iso",
+            "temperature_925",
+            "temperature_850",
+            "temperature_700",
+            "temperature_500",
+            "temperature_300",
+            "temperature_250",
+            "dewpoint_925",
+            "dewpoint_850",
+            "dewpoint_700",
+            "dewpoint_500",
+            "dewpoint_300",
+            "dewpoint_250",
         ]
     );
     assert_eq!(vars[0].kind, VarKind::Surface2D);
@@ -259,6 +375,7 @@ fn real_hrrr_store_field_is_north_to_south() {
             model: "hrrr".to_string(),
             run: "20260608_00z".to_string(),
             hour: 4,
+            exact_time: None,
         },
         var: "temperature_2m".to_string(),
     };

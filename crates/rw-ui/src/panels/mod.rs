@@ -2,6 +2,7 @@
 //! ownership, no eframe), holds its own widget state, and reports user
 //! intent back to the host as plain events.
 
+mod color_table_editor;
 mod download;
 mod field_viewer;
 mod plot_viewer;
@@ -10,6 +11,7 @@ mod sat_player;
 mod satellite;
 mod sounding;
 
+pub use color_table_editor::ColorTableEditorPanel;
 pub use download::{
     AvailabilityView, DownloadEvent, DownloadPanel, DownloadRunState, DownloadSpec, DownloadStage,
     EstimateView, HourDoneView, ModelOption, StageState, format_bytes, shift_date_yyyymmdd,

@@ -16,13 +16,15 @@
 //! that hour files and run manifests reference via `grid_hash`.
 
 use std::fmt::Write as _;
-use std::fs;
+use std::fs::File;
+use std::io::Read;
+use std::mem::size_of;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use rustwx_core::{GridProjection, LatLonGrid};
+use rustwx_core::{GridProjection, LatLonGrid, MAX_GRID_CELLS};
 
 use crate::atomic::atomic_write_bytes;
 use crate::error::{RwResult, RwStoreError};
@@ -39,9 +41,137 @@ pub const SCHEMA_GRID: &str = "rw-store.grid.v1";
 
 /// zstd compression level for coordinate arrays (cheap, they compress well).
 const ZSTD_LEVEL: i32 = 1;
-/// Upper bound on one decompressed coordinate array (2 GiB = 23k x 23k f32):
-/// caps the allocation a hostile meta block can request.
-const MAX_COORD_RAW_LEN: u64 = 1 << 31;
+/// Maximum JSON metadata block accepted from a grid file. Projection metadata
+/// is normally only a few hundred bytes; one MiB leaves ample forward room
+/// without allowing a sparse file to make serde scan gigabytes.
+const MAX_GRID_META_LEN: u64 = 1024 * 1024;
+/// One coordinate per supported horizontal grid cell.
+const MAX_COORD_RAW_LEN: u64 = MAX_GRID_CELLS as u64 * size_of::<f32>() as u64;
+/// zstd's incompressible-frame overhead is far below one MiB at this size.
+/// Keeping the allowance explicit rejects padded/skippable-frame bombs while
+/// accepting every file emitted by this crate at the grid ceiling.
+const MAX_COORD_COMP_LEN: u64 = MAX_COORD_RAW_LEN + 1024 * 1024;
+/// 128 MiB is above the largest supported raw coordinate array and bounds the
+/// zstd decoder's history allocation for hostile frame headers.
+const MAX_GRID_WINDOW_LOG: u32 = 27;
+/// Absolute `.rwg` size ceiling derived from the bounded sections above.
+const MAX_GRID_FILE_LEN: u64 = HEADER_LEN as u64 + MAX_GRID_META_LEN + 2 * MAX_COORD_COMP_LEN;
+
+#[derive(Debug, Clone, Copy)]
+struct GridLayout {
+    meta_end: usize,
+    lat_end: usize,
+    file_end: usize,
+}
+
+fn try_zeroed_bytes(len: usize, what: &str) -> RwResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|err| {
+        RwStoreError::Format(format!("cannot allocate {len} bytes for {what}: {err}"))
+    })?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
+/// Validate every header-declared section against both the actual file and
+/// the format ceilings before allocating a file-sized buffer.
+fn parse_grid_layout(header: &[u8; HEADER_LEN], file_len: u64) -> RwResult<GridLayout> {
+    if &header[0..8] != GRID_MAGIC.as_slice() {
+        return Err(RwStoreError::Format(format!(
+            "bad grid magic: expected {GRID_MAGIC:?}, got {:?}",
+            &header[0..8]
+        )));
+    }
+    let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    if !GRID_SUPPORTED_VERSIONS.contains(&version) {
+        return Err(RwStoreError::UnsupportedVersion {
+            found: version,
+            supported: GRID_SUPPORTED_VERSIONS,
+        });
+    }
+
+    let meta_len = u64::from(u32::from_le_bytes(header[12..16].try_into().unwrap()));
+    let lat_comp_len = u64::from_le_bytes(header[16..24].try_into().unwrap());
+    let lon_comp_len = u64::from_le_bytes(header[24..32].try_into().unwrap());
+    if meta_len > MAX_GRID_META_LEN {
+        return Err(RwStoreError::Format(format!(
+            "grid meta JSON is {meta_len} bytes; limit is {MAX_GRID_META_LEN} bytes"
+        )));
+    }
+    for (name, len) in [("lat", lat_comp_len), ("lon", lon_comp_len)] {
+        if len > MAX_COORD_COMP_LEN {
+            return Err(RwStoreError::Format(format!(
+                "grid {name} compressed section is {len} bytes; limit is {MAX_COORD_COMP_LEN} bytes"
+            )));
+        }
+    }
+
+    let meta_end = (HEADER_LEN as u64).checked_add(meta_len);
+    let lat_end = meta_end.and_then(|end| end.checked_add(lat_comp_len));
+    let file_end = lat_end.and_then(|end| end.checked_add(lon_comp_len));
+    let (meta_end, lat_end, file_end) = match (meta_end, lat_end, file_end) {
+        (Some(meta_end), Some(lat_end), Some(file_end)) => (meta_end, lat_end, file_end),
+        _ => {
+            return Err(RwStoreError::Format(
+                "grid section lengths overflow the file layout".to_string(),
+            ));
+        }
+    };
+    if file_end != file_len {
+        return Err(RwStoreError::Format(format!(
+            "grid file length mismatch: header describes {file_end} bytes, have {file_len}"
+        )));
+    }
+
+    Ok(GridLayout {
+        meta_end: usize::try_from(meta_end).map_err(|_| {
+            RwStoreError::Format(format!("grid meta end {meta_end} does not fit usize"))
+        })?,
+        lat_end: usize::try_from(lat_end).map_err(|_| {
+            RwStoreError::Format(format!("grid latitude end {lat_end} does not fit usize"))
+        })?,
+        file_end: usize::try_from(file_end).map_err(|_| {
+            RwStoreError::Format(format!("grid file length {file_end} does not fit usize"))
+        })?,
+    })
+}
+
+fn validate_grid_file_len(file_len: u64) -> RwResult<()> {
+    if file_len < HEADER_LEN as u64 {
+        return Err(RwStoreError::Format(format!(
+            "grid header requires {HEADER_LEN} bytes, got {file_len}"
+        )));
+    }
+    if file_len > MAX_GRID_FILE_LEN {
+        return Err(RwStoreError::Format(format!(
+            "grid file is {file_len} bytes; limit is {MAX_GRID_FILE_LEN} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn read_grid_bytes(path: &Path) -> RwResult<(Vec<u8>, GridLayout)> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    validate_grid_file_len(file_len)?;
+
+    let mut header = [0u8; HEADER_LEN];
+    file.read_exact(&mut header)?;
+    let layout = parse_grid_layout(&header, file_len)?;
+    let mut data = try_zeroed_bytes(layout.file_end, "grid file")?;
+    data[..HEADER_LEN].copy_from_slice(&header);
+    file.read_exact(&mut data[HEADER_LEN..])?;
+
+    // Detect growth between metadata() and the read instead of silently
+    // hashing/decoding only the old prefix.
+    let mut trailing = [0u8; 1];
+    if file.read(&mut trailing)? != 0 {
+        return Err(RwStoreError::Format(
+            "grid file grew while it was being read".to_string(),
+        ));
+    }
+    Ok((data, layout))
+}
 
 /// Grid-file metadata stored as JSON after the header.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -100,6 +230,11 @@ pub fn encode_grid_bytes(
     let cells = nx
         .checked_mul(ny)
         .ok_or_else(|| RwStoreError::Grid(format!("grid {nx}x{ny} overflows the cell count")))?;
+    if cells > MAX_GRID_CELLS {
+        return Err(RwStoreError::Grid(format!(
+            "grid {nx}x{ny} has {cells} cells; limit is {MAX_GRID_CELLS}"
+        )));
+    }
     if grid.lat_deg.len() != cells || grid.lon_deg.len() != cells {
         return Err(RwStoreError::Grid(format!(
             "coordinate arrays must hold {cells} values ({ny} x {nx}), \
@@ -193,50 +328,8 @@ impl GridFile {
     /// Open and fully validate a `.rwg` file (magic, version, lengths, all
     /// with checked math — trust nothing on disk).
     pub fn open(path: &Path) -> RwResult<Self> {
-        let data = fs::read(path)?;
-        if data.len() < HEADER_LEN {
-            return Err(RwStoreError::Format(format!(
-                "grid header requires {HEADER_LEN} bytes, got {}",
-                data.len()
-            )));
-        }
-        if &data[0..8] != GRID_MAGIC.as_slice() {
-            return Err(RwStoreError::Format(format!(
-                "bad grid magic: expected {GRID_MAGIC:?}, got {:?}",
-                &data[0..8]
-            )));
-        }
-        let version = u32::from_le_bytes(data[8..12].try_into().unwrap());
-        if !GRID_SUPPORTED_VERSIONS.contains(&version) {
-            return Err(RwStoreError::UnsupportedVersion {
-                found: version,
-                supported: GRID_SUPPORTED_VERSIONS,
-            });
-        }
-        let meta_len = u32::from_le_bytes(data[12..16].try_into().unwrap()) as u64;
-        let lat_comp_len = u64::from_le_bytes(data[16..24].try_into().unwrap());
-        let lon_comp_len = u64::from_le_bytes(data[24..32].try_into().unwrap());
-
-        // Checked layout math: hostile lengths must not wrap.
-        let meta_end = (HEADER_LEN as u64).checked_add(meta_len);
-        let lat_end = meta_end.and_then(|end| end.checked_add(lat_comp_len));
-        let lon_end = lat_end.and_then(|end| end.checked_add(lon_comp_len));
-        let (meta_end, lat_end, lon_end) = match (meta_end, lat_end, lon_end) {
-            (Some(meta_end), Some(lat_end), Some(lon_end)) => (meta_end, lat_end, lon_end),
-            _ => {
-                return Err(RwStoreError::Format(
-                    "grid section lengths overflow the file layout".to_string(),
-                ));
-            }
-        };
-        if data.len() as u64 != lon_end {
-            return Err(RwStoreError::Format(format!(
-                "grid file length mismatch: header describes {lon_end} bytes, have {}",
-                data.len()
-            )));
-        }
-
-        let meta: RwsGridMeta = serde_json::from_slice(&data[HEADER_LEN..meta_end as usize])
+        let (data, layout) = read_grid_bytes(path)?;
+        let meta: RwsGridMeta = serde_json::from_slice(&data[HEADER_LEN..layout.meta_end])
             .map_err(|err| RwStoreError::Meta(format!("grid meta JSON: {err}")))?;
         if meta.schema != SCHEMA_GRID {
             return Err(RwStoreError::Meta(format!(
@@ -250,11 +343,18 @@ impl GridFile {
                 meta.nx, meta.ny
             )));
         }
-        let raw_len = meta
+        let cells = meta
             .nx
             .checked_mul(meta.ny)
-            .map(|cells| cells as u64)
-            .and_then(|cells| cells.checked_mul(4))
+            .filter(|&cells| cells <= MAX_GRID_CELLS)
+            .ok_or_else(|| {
+                RwStoreError::Meta(format!(
+                    "grid {}x{} exceeds the supported ceiling of {MAX_GRID_CELLS} cells",
+                    meta.nx, meta.ny,
+                ))
+            })?;
+        let raw_len = (cells as u64)
+            .checked_mul(size_of::<f32>() as u64)
             .filter(|&len| len <= MAX_COORD_RAW_LEN)
             .ok_or_else(|| {
                 RwStoreError::Meta(format!(
@@ -270,12 +370,12 @@ impl GridFile {
         }
 
         let lat = decompress_coords(
-            &data[meta_end as usize..lat_end as usize],
+            &data[layout.meta_end..layout.lat_end],
             raw_len as usize,
             "lat",
         )?;
         let lon = decompress_coords(
-            &data[lat_end as usize..lon_end as usize],
+            &data[layout.lat_end..layout.file_end],
             raw_len as usize,
             "lon",
         )?;
@@ -295,18 +395,37 @@ impl GridFile {
 /// Decompress one coordinate section (capacity-capped at `raw_len`) and
 /// decode it as little-endian f32s.
 fn decompress_coords(comp: &[u8], raw_len: usize, name: &str) -> RwResult<Vec<f32>> {
-    let raw = zstd::bulk::decompress(comp, raw_len)
+    let mut raw = try_zeroed_bytes(raw_len, &format!("grid {name} coordinate bytes"))?;
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(comp)
         .map_err(|err| RwStoreError::Format(format!("grid {name} array decompress: {err}")))?;
-    if raw.len() != raw_len {
+    decoder
+        .window_log_max(MAX_GRID_WINDOW_LOG)
+        .map_err(|err| RwStoreError::Format(format!("grid {name} zstd window limit: {err}")))?;
+    decoder
+        .read_exact(&mut raw)
+        .map_err(|err| RwStoreError::Format(format!("grid {name} array decompress: {err}")))?;
+    let mut extra = [0u8; 1];
+    if decoder
+        .read(&mut extra)
+        .map_err(|err| RwStoreError::Format(format!("grid {name} array decompress: {err}")))?
+        != 0
+    {
         return Err(RwStoreError::Format(format!(
-            "grid {name} array decompressed to {} bytes, expected {raw_len}",
-            raw.len()
+            "grid {name} array decompressed beyond the expected {raw_len} bytes"
         )));
     }
-    Ok(raw
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-        .collect())
+
+    let value_count = raw_len / size_of::<f32>();
+    let mut values = Vec::new();
+    values.try_reserve_exact(value_count).map_err(|err| {
+        RwStoreError::Format(format!(
+            "cannot allocate {value_count} f32 values for grid {name} coordinates: {err}"
+        ))
+    })?;
+    for chunk in raw.chunks_exact(size_of::<f32>()) {
+        values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(values)
 }
 
 /// Coarse-mesh sampling stride for the locator (every 8th grid point).
@@ -633,6 +752,68 @@ mod tests {
             lon: grid.lon_deg.clone(),
             projection: None,
             hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn file_length_cap_rejects_before_allocation() {
+        let err = validate_grid_file_len(MAX_GRID_FILE_LEN + 1).unwrap_err();
+        match err {
+            RwStoreError::Format(message) => {
+                assert!(message.contains("limit"), "unexpected message: {message}")
+            }
+            other => panic!("expected Format error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declared_grid_meta_cap_rejects_before_allocation() {
+        let mut header = [0u8; HEADER_LEN];
+        header[0..8].copy_from_slice(GRID_MAGIC);
+        header[8..12].copy_from_slice(&GRID_VERSION.to_le_bytes());
+        let declared = (MAX_GRID_META_LEN + 1) as u32;
+        header[12..16].copy_from_slice(&declared.to_le_bytes());
+        let err = parse_grid_layout(&header, HEADER_LEN as u64 + u64::from(declared)).unwrap_err();
+        match err {
+            RwStoreError::Format(message) => assert!(
+                message.contains("meta") && message.contains("limit"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("expected Format error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_rejects_header_layout_before_file_allocation() {
+        let dir = test_dir("bad-layout");
+        let path = dir.join("bad-layout.rwg");
+        let mut header = [0u8; HEADER_LEN];
+        header[0..8].copy_from_slice(GRID_MAGIC);
+        header[8..12].copy_from_slice(&GRID_VERSION.to_le_bytes());
+        header[16..24].copy_from_slice(&1u64.to_le_bytes());
+        header[24..32].copy_from_slice(&1u64.to_le_bytes());
+        fs::write(&path, header).unwrap();
+
+        let err = GridFile::open(&path).unwrap_err();
+        match err {
+            RwStoreError::Format(message) => assert!(
+                message.contains("length mismatch"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("expected Format error, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn byte_buffer_allocation_failure_is_reported() {
+        let err = try_zeroed_bytes(usize::MAX, "test buffer").unwrap_err();
+        match err {
+            RwStoreError::Format(message) => assert!(
+                message.contains("cannot allocate"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("expected Format error, got {other:?}"),
         }
     }
 

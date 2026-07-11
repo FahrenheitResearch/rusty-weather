@@ -12,30 +12,120 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use rustwx_products::viewer::{StoreVariableStyle, operational_style_for_store_variable};
+use rustwx_core::{CanonicalField, FieldSelector};
+use rustwx_products::viewer::StoreVariableStyle;
+use rw_store::RwStoreError;
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
 
 use crate::colormap::finite_min_max;
+use crate::iso_levels::{ISO_PICKER_LEVELS_HPA, IsoLevelField, IsoLevelSpec, parse_iso_slug};
 use crate::profile_scope;
 use crate::stats::StatsRegistry;
 use crate::store_view::{StoreTree, StoreView};
+use crate::style_overrides::StyleOverrideSettings;
 
-/// One forecast hour of one model run.
+/// One stored timestep of one model run.
+///
+/// `hour` remains the on-disk `u16` slot used to resolve the manifest entry.
+/// For legacy rw-store v1 model runs it is also the integral forecast hour.
+/// Exact-time v2 runs deliberately use it only as opaque storage identity;
+/// their meteorological time lives in `exact_time` and must be used for every
+/// user-facing label and temporal calculation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HourKey {
     pub model: String,
     pub run: String,
     pub hour: u16,
+    pub exact_time: Option<rw_store::RwsExactTime>,
+}
+
+impl HourKey {
+    /// True when this is an ordinal slot from an exact-time rw-store v2 run.
+    pub fn has_exact_time(&self) -> bool {
+        self.exact_time.is_some()
+    }
+
+    /// Meteorological lead-time label. Exact runs use seconds without rounding;
+    /// legacy runs retain their established `f###` display.
+    pub fn lead_label(&self) -> String {
+        match self.exact_time {
+            Some(exact) => format_lead_seconds(exact.lead_seconds),
+            None => format!("f{:03}", self.hour),
+        }
+    }
+
+    /// Exact UTC valid time when present, formatted without consulting the
+    /// machine's local time zone.
+    pub fn valid_time_label(&self) -> Option<String> {
+        self.exact_time
+            .map(|exact| format_valid_unix(exact.valid_unix))
+    }
+
+    /// Complete timestep label used by browsers, plots, soundings, and errors.
+    /// An exact slot is never exposed as a fictitious forecast hour.
+    pub fn time_label(&self) -> String {
+        match self.exact_time {
+            Some(exact) => format!(
+                "{} · {}",
+                format_lead_seconds(exact.lead_seconds),
+                format_valid_unix(exact.valid_unix)
+            ),
+            None => format!("f{:03}", self.hour),
+        }
+    }
 }
 
 impl std::fmt::Display for HourKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{} f{:03}", self.model, self.run, self.hour)
+        write!(f, "{}/{} {}", self.model, self.run, self.time_label())
     }
 }
 
-/// One 2D variable of one forecast hour.
+/// Exact lead duration with an unbounded hour component and fixed minute /
+/// second fields. The `+` makes it visually distinct from an ordinal slot.
+pub fn format_lead_seconds(seconds: u64) -> String {
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    format!("+{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+/// UTC label for exact-time store metadata. Calendar conversion is kept local
+/// so the lightweight panel crate does not add a date-time dependency merely
+/// for labels. The civil-date algorithm uses Euclidean eras and i128
+/// intermediates, so every i64 Unix timestamp is handled without overflow.
+pub fn format_valid_unix(valid_unix: i64) -> String {
+    let days = valid_unix.div_euclid(86_400);
+    let second_of_day = valid_unix.rem_euclid(86_400);
+    let (year, month, day) = civil_date_from_unix_days(days);
+    let hour = second_of_day / 3_600;
+    let minute = (second_of_day % 3_600) / 60;
+    let second = second_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Proleptic-Gregorian civil date from days since 1970-01-01. Adapted from
+/// Howard Hinnant's era decomposition; `div_euclid` makes negative dates obey
+/// the same invariants as positive dates.
+fn civil_date_from_unix_days(days: i64) -> (i128, u32, u32) {
+    let z = i128::from(days) + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month as u32, day as u32)
+}
+
+/// One 2D variable of one stored timestep.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FieldKey {
     pub hour: HourKey,
@@ -117,6 +207,11 @@ pub const SURFACE_SAMPLE_VARS: &[&str] = &[
     "u_10m",
     "v_10m",
     "surface_pressure",
+    "approx_temperature_2m",
+    "approx_dewpoint_2m",
+    "approx_u_10m",
+    "approx_v_10m",
+    "approx_surface_pressure",
     "orography",
     "mslp",
 ];
@@ -151,6 +246,8 @@ impl SoundingData {
 pub enum StoreRequest {
     /// Re-scan the store root.
     Enumerate,
+    /// Replace the user-editable color table/product binding layer.
+    SetStyleOverrides(StyleOverrideSettings),
     /// Open an hour and report its variables.
     LoadHour(HourKey),
     /// Read a full 2D field.
@@ -164,6 +261,7 @@ pub enum StoreRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StoreResponse {
     Tree(StoreTree),
+    StyleOverridesApplied,
     HourVars(HourKey, Result<Vec<VarInfo>, String>),
     /// Boxed: [`FieldData`] carries the inline production style (color
     /// scale levels, title, ...) and would otherwise dwarf the other
@@ -178,7 +276,8 @@ pub struct StoreWorker {
     tx: Sender<StoreRequest>,
     rx: Receiver<StoreResponse>,
     stats: Arc<StatsRegistry>,
-    _thread: JoinHandle<()>,
+    _thread: Option<JoinHandle<()>>,
+    startup_error: Option<String>,
 }
 
 impl StoreWorker {
@@ -191,14 +290,28 @@ impl StoreWorker {
         let worker_stats = Arc::clone(&stats);
         let thread = std::thread::Builder::new()
             .name("rw-ui-store-worker".to_string())
-            .spawn(move || worker_loop(view, &req_rx, &resp_tx, &notify, &worker_stats))
-            .expect("spawn rw-ui store worker thread");
+            .spawn(move || worker_loop(view, &req_rx, &resp_tx, &notify, &worker_stats));
+        let (thread, startup_error) = match thread {
+            Ok(thread) => (Some(thread), None),
+            Err(error) => (
+                None,
+                Some(format!("could not start rw-store worker thread: {error}")),
+            ),
+        };
         Self {
             tx: req_tx,
             rx: resp_rx,
             stats,
             _thread: thread,
+            startup_error,
         }
+    }
+
+    /// Thread creation can fail under OS resource pressure. Hosts can surface
+    /// this terminal startup error while the disconnected worker handle keeps
+    /// the rest of the UI alive.
+    pub fn startup_error(&self) -> Option<&str> {
+        self.startup_error.as_deref()
     }
 
     /// Per-request-kind wall times recorded by the worker thread
@@ -232,6 +345,7 @@ struct WorkerState {
     view: StoreView,
     hour: Option<(HourKey, HourReader)>,
     grid: Option<((String, String), Arc<GridFile>)>,
+    style_overrides: StyleOverrideSettings,
 }
 
 fn worker_loop(
@@ -245,6 +359,7 @@ fn worker_loop(
         view,
         hour: None,
         grid: None,
+        style_overrides: StyleOverrideSettings::default(),
     };
     loop {
         // Block for the next request, then drain the queue and coalesce:
@@ -279,6 +394,7 @@ fn worker_loop(
 fn request_stat_name(request: &StoreRequest) -> &'static str {
     match request {
         StoreRequest::Enumerate => "store.enumerate",
+        StoreRequest::SetStyleOverrides(_) => "store.style",
         StoreRequest::LoadHour(_) => "store.hour",
         StoreRequest::LoadField(_) => "store.field",
         StoreRequest::LoadSounding { .. } => "store.sounding",
@@ -289,18 +405,20 @@ fn request_stat_name(request: &StoreRequest) -> &'static str {
 /// (enumerate, hour, field, sounding) so dependent loads stay sequenced.
 fn coalesce(batch: Vec<StoreRequest>) -> Vec<StoreRequest> {
     let mut enumerate = None;
+    let mut style = None;
     let mut hour = None;
     let mut field = None;
     let mut sounding = None;
     for request in batch {
         match request {
             StoreRequest::Enumerate => enumerate = Some(request),
+            StoreRequest::SetStyleOverrides(_) => style = Some(request),
             StoreRequest::LoadHour(_) => hour = Some(request),
             StoreRequest::LoadField(_) => field = Some(request),
             StoreRequest::LoadSounding { .. } => sounding = Some(request),
         }
     }
-    [enumerate, hour, field, sounding]
+    [enumerate, style, hour, field, sounding]
         .into_iter()
         .flatten()
         .collect()
@@ -315,6 +433,10 @@ fn handle(state: &mut WorkerState, request: StoreRequest) -> StoreResponse {
             state.hour = None;
             profile_scope!("store_enumerate");
             StoreResponse::Tree(state.view.enumerate())
+        }
+        StoreRequest::SetStyleOverrides(settings) => {
+            state.style_overrides = settings.normalized();
+            StoreResponse::StyleOverridesApplied
         }
         StoreRequest::LoadHour(key) => {
             profile_scope!("store_load_hour");
@@ -340,6 +462,12 @@ fn reader_for<'s>(state: &'s mut WorkerState, key: &HourKey) -> rw_store::RwResu
     if !cached {
         profile_scope!("store_open_hour");
         let reader = state.view.open_hour(&key.model, &key.run, key.hour)?;
+        if reader.meta().exact_time() != key.exact_time {
+            return Err(RwStoreError::Meta(format!(
+                "requested timestep {} does not match the exact-time metadata stored in its manifest",
+                key.time_label()
+            )));
+        }
         state.hour = Some((key.clone(), reader));
     }
     Ok(&state.hour.as_ref().expect("just cached").1)
@@ -347,7 +475,7 @@ fn reader_for<'s>(state: &'s mut WorkerState, key: &HourKey) -> rw_store::RwResu
 
 fn hour_vars(state: &mut WorkerState, key: &HourKey) -> rw_store::RwResult<Vec<VarInfo>> {
     let reader = reader_for(state, key)?;
-    Ok(reader
+    let mut vars = reader
         .meta()
         .variables
         .iter()
@@ -361,7 +489,38 @@ fn hour_vars(state: &mut WorkerState, key: &HourKey) -> rw_store::RwResult<Vec<V
             },
             levels_hpa: var.levels_hpa.clone(),
         })
-        .collect())
+        .collect::<Vec<_>>();
+
+    // Pressure volumes primarily serve soundings, but the classic analysis
+    // surfaces are also useful map fields. Add display-time virtual 2-D
+    // entries only when every source volume actually carries that level.
+    for field in IsoLevelField::ALL {
+        let sources = field.source_volumes();
+        let Some(first) = sources.first().and_then(|name| reader.variable(name)) else {
+            continue;
+        };
+        for level_hpa in ISO_PICKER_LEVELS_HPA {
+            let available = sources.iter().all(|name| {
+                reader.variable(name).is_some_and(|var| {
+                    var.kind == "pressure3d" && var.levels_hpa.contains(&level_hpa)
+                })
+            });
+            if !available {
+                continue;
+            }
+            let spec = IsoLevelSpec { field, level_hpa };
+            if vars.iter().any(|var| var.name == spec.slug()) {
+                continue;
+            }
+            vars.push(VarInfo {
+                name: spec.slug(),
+                units: first.units.clone(),
+                kind: VarKind::Surface2D,
+                levels_hpa: Vec::new(),
+            });
+        }
+    }
+    Ok(vars)
 }
 
 /// Open (or reuse) the run grid for `key`'s run. Failures are tolerated —
@@ -383,6 +542,7 @@ fn grid_for(state: &mut WorkerState, key: &HourKey) -> Option<Arc<GridFile>> {
 fn load_field(state: &mut WorkerState, key: &FieldKey) -> rw_store::RwResult<FieldData> {
     // Grid first (separate borrow scope from the hour reader).
     let grid = grid_for(state, &key.hour);
+    let style_overrides = state.style_overrides.clone();
     let reader = reader_for(state, &key.hour)?;
     let meta = reader.meta();
     let (nx, ny) = (meta.nx, meta.ny);
@@ -392,25 +552,31 @@ fn load_field(state: &mut WorkerState, key: &FieldKey) -> rw_store::RwResult<Fie
         .as_deref()
         .and_then(GridFile::lat_descending)
         .unwrap_or(false);
-    // Resolve the variable's production plot styling from its stored
-    // selector JSON. Unknown models (e.g. the synthetic test store) and
-    // unmapped variables resolve to `None` -> the generic ramp.
-    let style = meta
-        .model
-        .parse::<rustwx_core::ModelId>()
-        .ok()
-        .and_then(|model| {
-            let var = reader.variable(&key.var)?;
-            operational_style_for_store_variable(&var.name, &var.selector, &var.units, model)
-        });
-    let stored_units = reader
+    let synthesized = reader
         .variable(&key.var)
-        .map(|var| var.units.clone())
-        .unwrap_or_default();
-    let mut values = {
-        profile_scope!("store_read_full_2d");
-        reader.read_full_2d(&key.var)?
+        .is_none()
+        .then(|| parse_iso_slug(&key.var))
+        .flatten();
+    let (stored_units, selector, mut values) = if let Some(spec) = synthesized {
+        profile_scope!("store_read_iso_level_2d");
+        load_iso_level_field(reader, spec, nx, ny)?
+    } else {
+        let var = reader
+            .variable(&key.var)
+            .ok_or_else(|| RwStoreError::UnknownVariable(key.var.clone()))?;
+        let values = {
+            profile_scope!("store_read_full_2d");
+            reader.read_full_2d(&key.var)?
+        };
+        (var.units.clone(), var.selector.clone(), values)
     };
+    // Resolve production/user styling for the real or synthesized slug.
+    let style = style_overrides.style_for_store_variable(
+        &key.var,
+        &selector,
+        &stored_units,
+        meta.model.parse::<rustwx_core::ModelId>().ok(),
+    );
     // Convert to display units with the production arithmetic so the scale,
     // the hover readout, and the range chip all speak the same units.
     let units = match &style {
@@ -436,6 +602,94 @@ fn load_field(state: &mut WorkerState, key: &FieldKey) -> rw_store::RwResult<Fie
         lat_descending,
         style,
     })
+}
+
+/// Slice one classic pressure surface from its backing volume(s). Wind speed
+/// is derived from the colocated U/V components; every other field reads one
+/// volume. `HourReader::read_level_3d` decodes only the column chunks needed
+/// for this pressure plane and never retains the full 3-D volume.
+fn load_iso_level_field(
+    reader: &HourReader,
+    spec: IsoLevelSpec,
+    nx: usize,
+    ny: usize,
+) -> rw_store::RwResult<(String, serde_json::Value, Vec<f32>)> {
+    let cells = nx.checked_mul(ny).ok_or_else(|| {
+        RwStoreError::Format(format!("isobaric field grid {nx}x{ny} overflows usize"))
+    })?;
+    let mut units = None;
+    let mut planes = Vec::with_capacity(spec.field.source_volumes().len());
+    for source in spec.field.source_volumes() {
+        let var = reader
+            .variable(source)
+            .ok_or_else(|| RwStoreError::UnknownVariable((*source).to_string()))?;
+        if !var.levels_hpa.contains(&spec.level_hpa) {
+            return Err(RwStoreError::Meta(format!(
+                "variable '{source}' has no {} hPa level",
+                spec.level_hpa
+            )));
+        }
+        if let Some(expected) = &units {
+            if expected != &var.units {
+                return Err(RwStoreError::Meta(format!(
+                    "isobaric vector components have incompatible units '{expected}' and '{}'",
+                    var.units
+                )));
+            }
+        } else {
+            units = Some(var.units.clone());
+        }
+        let plane = reader.read_level_3d(source, spec.level_hpa)?;
+        if plane.len() != cells {
+            return Err(RwStoreError::Format(format!(
+                "{source} pressure plane has {} values, expected {cells}",
+                plane.len()
+            )));
+        }
+        if plane.is_empty() && cells != 0 {
+            return Err(RwStoreError::Format(format!(
+                "{source} pressure plane is unexpectedly empty"
+            )));
+        }
+        planes.push(plane);
+    }
+
+    let values = if spec.field == IsoLevelField::WindSpeed {
+        if planes.len() != 2 {
+            return Err(RwStoreError::Format(
+                "wind speed needs exactly U and V pressure planes".to_string(),
+            ));
+        }
+        let v = planes.pop().ok_or_else(|| {
+            RwStoreError::Format("wind speed is missing its V pressure plane".to_string())
+        })?;
+        let mut u = planes.pop().ok_or_else(|| {
+            RwStoreError::Format("wind speed is missing its U pressure plane".to_string())
+        })?;
+        for (u_value, v_value) in u.iter_mut().zip(v) {
+            *u_value = u_value.hypot(v_value);
+        }
+        u
+    } else {
+        planes
+            .pop()
+            .ok_or_else(|| RwStoreError::Format("isobaric field has no source plane".to_string()))?
+    };
+    let canonical = match spec.field {
+        IsoLevelField::Temperature => CanonicalField::Temperature,
+        IsoLevelField::Dewpoint => CanonicalField::Dewpoint,
+        IsoLevelField::RelativeHumidity => CanonicalField::RelativeHumidity,
+        IsoLevelField::WindSpeed => CanonicalField::WindSpeed,
+        IsoLevelField::Height => CanonicalField::GeopotentialHeight,
+    };
+    let selector = serde_json::to_value(FieldSelector::isobaric(canonical, spec.level_hpa))
+        .map_err(|error| {
+            RwStoreError::Meta(format!(
+                "cannot encode {} hPa field selector: {error}",
+                spec.level_hpa
+            ))
+        })?;
+    Ok((units.unwrap_or_default(), selector, values))
 }
 
 fn load_sounding(

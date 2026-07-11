@@ -376,10 +376,14 @@ fn run_follow(args: &FollowArgs) -> Result<(), Box<dyn Error>> {
     if let Some(mins) = args.duration_mins {
         let deadline = Duration::from_secs(mins.saturating_mul(60));
         let flag = Arc::clone(&cancel);
-        std::thread::spawn(move || {
-            std::thread::sleep(deadline);
-            flag.store(true, Ordering::Relaxed);
-        });
+        let timer = std::thread::Builder::new()
+            .name("rw-glm-duration-timer".to_string())
+            .spawn(move || {
+                std::thread::sleep(deadline);
+                flag.store(true, Ordering::Relaxed);
+            })
+            .map_err(|error| format!("could not start duration timer: {error}"))?;
+        drop(timer);
     }
 
     let mut stats = RunStats::default();

@@ -6,6 +6,10 @@
 use crate::grib1::parser::{GridDescriptionSection, GridType};
 use crate::GribError;
 
+/// GRIB1 grid endpoints are encoded to 0.001 degree. Allow one extra
+/// millidegree for rounding differences against computed Gaussian roots.
+const GRID_ENDPOINT_TOLERANCE_DEG: f64 = 0.002;
+
 /// A latitude/longitude coordinate pair in degrees.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LatLon {
@@ -20,6 +24,7 @@ pub struct LatLon {
 /// - Bit 2: 0 = points scan in -j (south), 1 = points scan in +j (north)
 /// - Bit 3: 0 = adjacent points in i-direction are consecutive,
 ///          1 = adjacent points in j-direction are consecutive
+/// - Bits 4-8 are reserved in GRIB Edition 1
 #[derive(Debug, Clone, Copy)]
 pub struct ScanningMode {
     /// True if points scan from east to west (negative i direction).
@@ -41,6 +46,89 @@ impl ScanningMode {
     }
 }
 
+fn validate_scanning_mode(byte: u8) -> Result<(), GribError> {
+    let reserved = byte & 0x1f;
+    if reserved != 0 {
+        return Err(GribError::Unpack(format!(
+            "GRIB1 scanning mode 0x{byte:02x} sets reserved bit(s) 0x{reserved:02x}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_latitude_endpoints(la1: f64, la2: f64, j_positive: bool) -> Result<(), GribError> {
+    if !la1.is_finite()
+        || !la2.is_finite()
+        || !(-90.0..=90.0).contains(&la1)
+        || !(-90.0..=90.0).contains(&la2)
+    {
+        return Err(GribError::Unpack(format!(
+            "invalid GRIB1 latitude endpoints La1={la1}, La2={la2}"
+        )));
+    }
+    let wrong_direction = if j_positive {
+        la2 + GRID_ENDPOINT_TOLERANCE_DEG < la1
+    } else {
+        la2 > la1 + GRID_ENDPOINT_TOLERANCE_DEG
+    };
+    if wrong_direction {
+        return Err(GribError::Unpack(format!(
+            "GRIB1 latitude endpoints La1={la1}, La2={la2} disagree with {} j scanning",
+            if j_positive { "positive" } else { "negative" }
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve the signed i increment. A finite positive Di supplies magnitude;
+/// zero/NaN means missing and is recovered from Lo1/Lo2 in the scan direction.
+fn longitude_increment(
+    ni: usize,
+    lo1: f64,
+    lo2: f64,
+    di: f64,
+    i_negative: bool,
+) -> Result<f64, GribError> {
+    if !lo1.is_finite()
+        || !lo2.is_finite()
+        || !(-360.0..=360.0).contains(&lo1)
+        || !(-360.0..=360.0).contains(&lo2)
+    {
+        return Err(GribError::Unpack(format!(
+            "invalid GRIB1 longitude endpoints Lo1={lo1}, Lo2={lo2}"
+        )));
+    }
+    if ni <= 1 {
+        return Ok(0.0);
+    }
+    if di.is_finite() && di > 0.0 {
+        return Ok(if i_negative { -di } else { di });
+    }
+    if di.is_finite() && di < 0.0 {
+        return Err(GribError::Unpack(format!(
+            "GRIB1 Di must be a positive magnitude or missing, got {di}"
+        )));
+    }
+
+    let mut delta = lo2 - lo1;
+    if i_negative {
+        while delta > 0.0 {
+            delta -= 360.0;
+        }
+    } else {
+        while delta < 0.0 {
+            delta += 360.0;
+        }
+    }
+    if delta.abs() <= f64::EPSILON {
+        return Err(GribError::Unpack(
+            "GRIB1 Di is missing and equal Lo1/Lo2 cannot determine a nonzero longitude increment"
+                .into(),
+        ));
+    }
+    Ok(delta / (ni as f64 - 1.0))
+}
+
 /// Generate grid coordinates for a GRIB1 Grid Description Section.
 ///
 /// Returns a vector of `LatLon` coordinates, one per grid point, in the
@@ -49,14 +137,23 @@ impl ScanningMode {
 ///
 /// # Supported grid types
 /// - `LatLon` (type 0): Regular latitude/longitude grid
-/// - `Gaussian` (type 4): Gaussian latitude/longitude grid (approximated
-///   with regular spacing for coordinate generation; true Gaussian latitudes
-///   require computing roots of Legendre polynomials)
+/// - `Gaussian` (type 4): Gaussian latitude/longitude grid using Legendre roots
 /// - `LambertConformal` (type 3): Lambert conformal conic projection
 ///
 /// # Errors
-/// Returns `GribError::Unpack` for unsupported grid types.
+/// Returns `GribError::Unpack` for unsupported grid types or reserved GRIB1
+/// scanning-mode bits.
 pub fn grid_coordinates(gds: &GridDescriptionSection) -> Result<Vec<LatLon>, GribError> {
+    match &gds.grid_type {
+        GridType::LatLon { scanning_mode, .. }
+        | GridType::Gaussian { scanning_mode, .. }
+        | GridType::LambertConformal { scanning_mode, .. }
+        | GridType::PolarStereographic { scanning_mode, .. } => {
+            validate_scanning_mode(*scanning_mode)?;
+        }
+        GridType::Unknown(_) => {}
+    }
+
     match &gds.grid_type {
         GridType::LatLon {
             ni,
@@ -166,24 +263,21 @@ fn generate_latlon(
     scanning_mode: u8,
 ) -> Result<Vec<LatLon>, GribError> {
     let scan = ScanningMode::from_byte(scanning_mode);
-    let n_points = ni * nj;
+    if ni == 0 || nj == 0 {
+        return Err(GribError::Unpack(format!(
+            "regular lat/lon grid has zero dimension {ni}x{nj}"
+        )));
+    }
+    validate_latitude_endpoints(la1, la2, scan.j_positive)?;
+    let n_points = ni
+        .checked_mul(nj)
+        .ok_or_else(|| GribError::Unpack("regular lat/lon grid size overflows".into()))?;
     let mut coords = Vec::with_capacity(n_points);
 
-    // Determine increments based on first/last points when di/dj are not provided
-    // (value of 0 means "not given").
-    let lon_inc = if di > 0.0 {
-        if scan.i_negative {
-            -di
-        } else {
-            di
-        }
-    } else if ni > 1 {
-        (lo2 - lo1) / (ni as f64 - 1.0)
-    } else {
-        0.0
-    };
+    // A zero or NaN increment is not given (0xFFFF is parsed as NaN).
+    let lon_inc = longitude_increment(ni, lo1, lo2, di, scan.i_negative)?;
 
-    let lat_inc = if dj > 0.0 {
+    let lat_inc = if dj.is_finite() && dj > 0.0 {
         if scan.j_positive {
             dj
         } else {
@@ -194,6 +288,12 @@ fn generate_latlon(
     } else {
         0.0
     };
+    let expected_la2 = la1 + (nj.saturating_sub(1) as f64) * lat_inc;
+    if (expected_la2 - la2).abs() > GRID_ENDPOINT_TOLERANCE_DEG {
+        return Err(GribError::Unpack(format!(
+            "regular lat/lon La1={la1}, La2={la2}, Nj={nj}, Dj={dj} are inconsistent; expected La2={expected_la2}"
+        )));
+    }
 
     if scan.j_consecutive {
         // Adjacent points in j-direction are consecutive
@@ -229,13 +329,32 @@ fn generate_gaussian(
     nj: usize,
     la1: f64,
     lo1: f64,
-    _la2: f64,
-    _lo2: f64,
+    la2: f64,
+    lo2: f64,
     di: f64,
     n: u16,
     scanning_mode: u8,
 ) -> Result<Vec<LatLon>, GribError> {
     let scan = ScanningMode::from_byte(scanning_mode);
+    if ni == 0 || nj == 0 {
+        return Err(GribError::Unpack(format!(
+            "Gaussian grid has zero dimension {ni}x{nj}"
+        )));
+    }
+    if n == 0 {
+        return Err(GribError::Unpack(
+            "Gaussian grid has N=0; at least one parallel per hemisphere is required".into(),
+        ));
+    }
+    validate_latitude_endpoints(la1, la2, scan.j_positive)?;
+    let total_latitudes = usize::from(n)
+        .checked_mul(2)
+        .ok_or_else(|| GribError::Unpack("Gaussian latitude count overflows".into()))?;
+    if nj > total_latitudes {
+        return Err(GribError::Unpack(format!(
+            "Gaussian grid requests Nj={nj} rows, but N={n} defines only {total_latitudes} global latitudes"
+        )));
+    }
 
     // Compute Gaussian latitudes
     let gauss_lats = compute_gaussian_latitudes(n as usize);
@@ -244,8 +363,8 @@ fn generate_gaussian(
     // starting from la1.
     let all_lats: Vec<f64> = if scan.j_positive {
         // South to north
-        let mut lats: Vec<f64> = gauss_lats.iter().copied().rev().collect();
-        lats.extend(gauss_lats.iter().copied());
+        let mut lats: Vec<f64> = gauss_lats.iter().map(|lat| -*lat).collect();
+        lats.extend(gauss_lats.iter().rev().copied());
         lats
     } else {
         // North to south
@@ -256,46 +375,45 @@ fn generate_gaussian(
     };
 
     // Find the starting latitude index closest to la1
-    let start_idx = all_lats
+    let (start_idx, start_lat) = all_lats
         .iter()
         .enumerate()
         .min_by(|(_, a), (_, b)| {
             let da = ((**a) - la1).abs();
             let db = ((**b) - la1).abs();
-            da.partial_cmp(&db).unwrap()
+            da.total_cmp(&db)
         })
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+        .map(|(index, latitude)| (index, *latitude))
+        .ok_or_else(|| GribError::Unpack("Gaussian latitude table is empty".into()))?;
+    if (start_lat - la1).abs() > GRID_ENDPOINT_TOLERANCE_DEG {
+        return Err(GribError::Unpack(format!(
+            "Gaussian La1={la1} does not match an N={n} latitude (nearest is {start_lat})"
+        )));
+    }
 
-    // Select nj latitudes
-    let selected_lats: Vec<f64> = (0..nj)
-        .map(|j| {
-            let idx = start_idx + j;
-            if idx < all_lats.len() {
-                all_lats[idx]
-            } else {
-                // Fallback: linearly extrapolate
-                la1 + (j as f64)
-                    * if scan.j_positive { 1.0 } else { -1.0 }
-                    * (180.0 / (2.0 * n as f64))
-            }
-        })
-        .collect();
+    let end_idx = start_idx
+        .checked_add(nj)
+        .ok_or_else(|| GribError::Unpack("Gaussian latitude window overflows".into()))?;
+    if end_idx > all_lats.len() {
+        return Err(GribError::Unpack(format!(
+            "Gaussian latitude window starts at row {start_idx} and requests {nj} rows, beyond the {total_latitudes} rows defined by N={n}"
+        )));
+    }
+    let selected_lats = all_lats[start_idx..end_idx].to_vec();
+    let last_lat = *selected_lats
+        .last()
+        .ok_or_else(|| GribError::Unpack("Gaussian latitude window is empty".into()))?;
+    if (last_lat - la2).abs() > GRID_ENDPOINT_TOLERANCE_DEG {
+        return Err(GribError::Unpack(format!(
+            "Gaussian La2={la2} is inconsistent with La1={la1}, Nj={nj}, N={n}; expected {last_lat}"
+        )));
+    }
 
-    // Longitude increment
-    let lon_inc = if di > 0.0 {
-        if scan.i_negative {
-            -di
-        } else {
-            di
-        }
-    } else if ni > 1 {
-        360.0 / ni as f64
-    } else {
-        0.0
-    };
+    let lon_inc = longitude_increment(ni, lo1, lo2, di, scan.i_negative)?;
 
-    let n_points = ni * nj;
+    let n_points = ni
+        .checked_mul(nj)
+        .ok_or_else(|| GribError::Unpack("Gaussian grid size overflows".into()))?;
     let mut coords = Vec::with_capacity(n_points);
 
     if scan.j_consecutive {
@@ -593,6 +711,36 @@ mod tests {
     }
 
     #[test]
+    fn test_reserved_grib1_scanning_mode_bits_are_rejected() {
+        for scanning_mode in [0x10_u8, 0x08, 0x01] {
+            let gds = GridDescriptionSection {
+                section_length: 32,
+                nv: 0,
+                pv_location: 255,
+                data_representation_type: 0,
+                grid_type: GridType::LatLon {
+                    ni: 2,
+                    nj: 2,
+                    la1: 10.0,
+                    lo1: 0.0,
+                    la2: 0.0,
+                    lo2: 10.0,
+                    di: 10.0,
+                    dj: 10.0,
+                    scanning_mode,
+                },
+                raw: vec![],
+            };
+
+            let error = grid_coordinates(&gds).expect_err("reserved mode must fail closed");
+            assert!(
+                error.to_string().contains("reserved bit"),
+                "scan mode 0x{scanning_mode:02x}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn test_latlon_grid_simple() {
         let gds = GridDescriptionSection {
             section_length: 32,
@@ -657,5 +805,167 @@ mod tests {
         assert!((coords[2].lat - 0.0).abs() < 1e-6);
         // Third row: lat=90
         assert!((coords[4].lat - 90.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_missing_di_derives_signed_increment_for_both_i_directions() {
+        let make_regular = |scanning_mode, lo2| GridDescriptionSection {
+            section_length: 32,
+            nv: 0,
+            pv_location: 255,
+            data_representation_type: 0,
+            grid_type: GridType::LatLon {
+                ni: 4,
+                nj: 1,
+                la1: 0.0,
+                lo1: 0.0,
+                la2: 0.0,
+                lo2,
+                di: f64::NAN,
+                dj: f64::NAN,
+                scanning_mode,
+            },
+            raw: vec![],
+        };
+        let east = grid_coordinates(&make_regular(0x00, 270.0)).unwrap();
+        assert_eq!(
+            east.iter().map(|point| point.lon).collect::<Vec<_>>(),
+            vec![0.0, 90.0, 180.0, 270.0]
+        );
+        let west = grid_coordinates(&make_regular(0x80, 90.0)).unwrap();
+        assert_eq!(
+            west.iter().map(|point| point.lon).collect::<Vec<_>>(),
+            vec![0.0, -90.0, -180.0, -270.0]
+        );
+
+        let roots = compute_gaussian_latitudes(1);
+        let gaussian = GridDescriptionSection {
+            section_length: 32,
+            nv: 0,
+            pv_location: 255,
+            data_representation_type: 4,
+            grid_type: GridType::Gaussian {
+                ni: 4,
+                nj: 2,
+                la1: roots[0],
+                lo1: 0.0,
+                la2: -roots[0],
+                lo2: 90.0,
+                di: f64::NAN,
+                n: 1,
+                scanning_mode: 0x80,
+            },
+            raw: vec![],
+        };
+        let gaussian = grid_coordinates(&gaussian).unwrap();
+        assert_eq!(
+            gaussian[..4]
+                .iter()
+                .map(|point| point.lon)
+                .collect::<Vec<_>>(),
+            vec![0.0, -90.0, -180.0, -270.0]
+        );
+    }
+
+    #[test]
+    fn test_inconsistent_regular_latitude_endpoints_are_rejected() {
+        let gds = GridDescriptionSection {
+            section_length: 32,
+            nv: 0,
+            pv_location: 255,
+            data_representation_type: 0,
+            grid_type: GridType::LatLon {
+                ni: 2,
+                nj: 3,
+                la1: 20.0,
+                lo1: 0.0,
+                la2: 0.0,
+                lo2: 10.0,
+                di: 10.0,
+                dj: 5.0,
+                scanning_mode: 0x00,
+            },
+            raw: vec![],
+        };
+        let error = grid_coordinates(&gds).expect_err("Dj does not reach La2");
+        assert!(error.to_string().contains("inconsistent"), "{error}");
+    }
+
+    #[test]
+    fn test_gaussian_zero_n_bad_endpoints_and_overrun_are_rejected() {
+        let roots = compute_gaussian_latitudes(2);
+        let make = |nj, la1, la2, n| GridDescriptionSection {
+            section_length: 32,
+            nv: 0,
+            pv_location: 255,
+            data_representation_type: 4,
+            grid_type: GridType::Gaussian {
+                ni: 4,
+                nj,
+                la1,
+                lo1: 0.0,
+                la2,
+                lo2: 270.0,
+                di: 90.0,
+                n,
+                scanning_mode: 0x00,
+            },
+            raw: vec![],
+        };
+
+        let error = grid_coordinates(&make(1, 0.0, 0.0, 0)).expect_err("N=0");
+        assert!(error.to_string().contains("N=0"), "{error}");
+
+        let error = grid_coordinates(&make(4, roots[1], -roots[0], 2))
+            .expect_err("window beginning at the second root overruns 2N");
+        assert!(error.to_string().contains("beyond"), "{error}");
+
+        let error = grid_coordinates(&make(4, roots[0] - 1.0, -roots[0], 2))
+            .expect_err("La1 must match a Gaussian root");
+        assert!(error.to_string().contains("does not match"), "{error}");
+
+        let error = grid_coordinates(&make(4, roots[0], -roots[0] + 1.0, 2))
+            .expect_err("La2 must match the selected final root");
+        assert!(error.to_string().contains("inconsistent"), "{error}");
+    }
+
+    #[test]
+    fn test_gaussian_grid_south_to_north_has_both_hemispheres() {
+        // A manufactured N2 full Gaussian grid. Scan bit 0x40 starts at the
+        // southernmost P4 root and proceeds northward through both hemispheres.
+        let gds = GridDescriptionSection {
+            section_length: 32,
+            nv: 0,
+            pv_location: 255,
+            data_representation_type: 4,
+            grid_type: GridType::Gaussian {
+                ni: 3,
+                nj: 4,
+                la1: -59.444_408,
+                lo1: 0.0,
+                la2: 59.444_408,
+                lo2: 240.0,
+                di: 120.0,
+                n: 2,
+                scanning_mode: 0x40,
+            },
+            raw: vec![],
+        };
+
+        let coords = grid_coordinates(&gds).unwrap();
+        assert_eq!(coords.len(), 12);
+        let row_lats = [coords[0].lat, coords[3].lat, coords[6].lat, coords[9].lat];
+        assert!(row_lats.windows(2).all(|pair| pair[1] > pair[0]));
+        assert!(row_lats[0] < 0.0 && row_lats[1] < 0.0);
+        assert!(row_lats[2] > 0.0 && row_lats[3] > 0.0);
+        assert!((row_lats[0] + row_lats[3]).abs() < 1e-9);
+        assert!((row_lats[1] + row_lats[2]).abs() < 1e-9);
+        assert_eq!(
+            coords[3..6]
+                .iter()
+                .map(|point| point.lon)
+                .collect::<Vec<_>>(),
+            vec![0.0, 120.0, 240.0]
+        );
     }
 }

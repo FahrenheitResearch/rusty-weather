@@ -12,12 +12,14 @@ use std::path::{Path, PathBuf};
 use rustwx_core::{
     CanonicalField, FieldSelector, GridProjection, GridShape, LatLonGrid, SelectedField2D,
 };
+use rw_store::RwsExactTime;
 use rw_store::error::RwStoreError;
 use rw_store::grid::GridFile;
 use rw_store::ingest::{
     DerivedFieldInput, HourIngestWriter, PressureVolumeInput, derived_selector,
     derived_selector_slug, read_field_2d, read_grid_2d, write_hour_from_fields,
-    write_hour_from_fields_with_derived,
+    write_hour_from_fields_exact, write_hour_from_fields_with_derived,
+    write_hour_from_grid_with_derived,
 };
 use rw_store::lock::RunLock;
 use rw_store::reader::HourReader;
@@ -707,6 +709,208 @@ fn derived_vars_round_trip_through_read_grid_2d() {
         "rejected hour must not leave an hour file behind"
     );
 
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn exact_time_hours_use_ordinal_slots_and_preserve_second_resolution() {
+    let dir = test_dir("exact-time-round-trip");
+    let store_root = dir.join("store");
+    let temp = temp_field();
+    let origin = 1_700_000_000i64;
+
+    for (slot, lead_seconds) in [(0u16, 0u64), (1, 1_800)] {
+        write_hour_from_fields_exact(
+            &store_root,
+            MODEL,
+            RUN,
+            slot,
+            RwsExactTime {
+                lead_seconds,
+                valid_unix: origin + lead_seconds as i64,
+            },
+            &[("temp_2m", &temp)],
+            &[],
+            BUILD,
+            WRITTEN_UNIX,
+        )
+        .unwrap();
+    }
+
+    let manifest = load_manifest(&store_root);
+    assert!(manifest.is_exact_time_axis());
+    assert_eq!(manifest.hours[&0].file, "f000.rws");
+    assert_eq!(manifest.hours[&1].file, "f001.rws");
+    assert_eq!(
+        manifest.exact_times().collect::<Vec<_>>(),
+        vec![
+            (
+                0,
+                RwsExactTime {
+                    lead_seconds: 0,
+                    valid_unix: origin,
+                },
+            ),
+            (
+                1,
+                RwsExactTime {
+                    lead_seconds: 1_800,
+                    valid_unix: origin + 1_800,
+                },
+            ),
+        ]
+    );
+    let hour = HourReader::open(&run_dir(&store_root).join("f001.rws")).unwrap();
+    assert_eq!(hour.meta().forecast_hour, 1);
+    assert_eq!(
+        hour.meta().exact_time(),
+        Some(RwsExactTime {
+            lead_seconds: 1_800,
+            valid_unix: origin + 1_800,
+        })
+    );
+    manifest.validate_hour_meta(1, hour.meta()).unwrap();
+    let report = rw_store::validate::validate_run_dir(
+        &run_dir(&store_root),
+        rw_store::validate::ValidateDepth::Structural,
+    )
+    .unwrap();
+    assert!(
+        report.is_ok(),
+        "exact v2 run validation: {:?}",
+        report.errors
+    );
+
+    let remap_error = write_hour_from_fields_exact(
+        &store_root,
+        MODEL,
+        RUN,
+        1,
+        RwsExactTime {
+            lead_seconds: 1_860,
+            valid_unix: origin + 1_860,
+        },
+        &[("temp_2m", &temp)],
+        &[],
+        BUILD,
+        WRITTEN_UNIX,
+    )
+    .unwrap_err();
+    assert!(
+        remap_error.to_string().contains("refusing to remap"),
+        "{remap_error}"
+    );
+    let unchanged = HourReader::open(&run_dir(&store_root).join("f001.rws")).unwrap();
+    assert_eq!(unchanged.meta().exact_time().unwrap().lead_seconds, 1_800);
+
+    let error = write_hour_from_fields_exact(
+        &store_root,
+        MODEL,
+        RUN,
+        2,
+        RwsExactTime {
+            lead_seconds: 900,
+            valid_unix: origin + 900,
+        },
+        &[("temp_2m", &temp)],
+        &[],
+        BUILD,
+        WRITTEN_UNIX,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("increase strictly"), "{error}");
+    assert!(!run_dir(&store_root).join("f002.rws").exists());
+
+    let error = write_hour_from_fields(
+        &store_root,
+        MODEL,
+        RUN,
+        3,
+        &[("temp_2m", &temp)],
+        &[],
+        BUILD,
+        WRITTEN_UNIX,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("cannot be opened"), "{error}");
+    assert!(!run_dir(&store_root).join("f003.rws").exists());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn grid_seam_writes_a_derived_only_selection() {
+    let dir = test_dir("derived-only");
+    let store_root = dir.join("store");
+    let grid = regular_grid();
+    let values = vec![123.0f32; NX * NY];
+    let derived = [DerivedFieldInput {
+        name: "sbcape",
+        units: "J/kg",
+        values: &values,
+    }];
+
+    let written = write_hour_from_grid_with_derived(
+        &store_root,
+        MODEL,
+        RUN,
+        0,
+        &grid,
+        Some(&GridProjection::Geographic),
+        &[],
+        &derived,
+        &[],
+        BUILD,
+        WRITTEN_UNIX,
+    )
+    .unwrap();
+    assert_eq!(written.vars, vec!["sbcape".to_string()]);
+    let reader = HourReader::open(&written.path).unwrap();
+    let stored = reader.read_full_2d("sbcape").unwrap();
+    assert_bits_eq(&stored, &values, "derived-only field");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn grid_seam_rejects_publicly_constructible_zero_and_overflow_shapes() {
+    let dir = test_dir("malformed-grid-shape");
+    let store_root = dir.join("store");
+    let values = Vec::<f32>::new();
+    let derived = [DerivedFieldInput {
+        name: "diagnostic",
+        units: "1",
+        values: &values,
+    }];
+    for shape in [
+        GridShape { nx: 0, ny: 1 },
+        GridShape {
+            nx: usize::MAX,
+            ny: 2,
+        },
+    ] {
+        let grid = LatLonGrid {
+            shape,
+            lat_deg: Vec::new(),
+            lon_deg: Vec::new(),
+        };
+        let error = write_hour_from_grid_with_derived(
+            &store_root,
+            MODEL,
+            RUN,
+            0,
+            &grid,
+            None,
+            &[],
+            &derived,
+            &[],
+            BUILD,
+            WRITTEN_UNIX,
+        )
+        .unwrap_err();
+        assert!(matches!(error, RwStoreError::Format(_)));
+    }
+    assert!(!store_root.exists(), "invalid grids must not touch disk");
     let _ = fs::remove_dir_all(&dir);
 }
 

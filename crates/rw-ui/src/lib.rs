@@ -5,8 +5,8 @@
 //! mount in any egui app (the `rusty-weather-ui` shell here, bowecho, ...).
 //!
 //! Building blocks:
-//! - [`StoreView`]: enumerate a store root (models → runs → hours via
-//!   `run.json`) and open hour/grid files.
+//! - [`StoreView`]: enumerate a store root (models → runs → timesteps via
+//!   `run.json`) and open timestep/grid files.
 //! - [`StoreWorker`]: a background IO thread so the UI never blocks on file
 //!   reads; plain-data requests/responses over channels.
 //! - [`RunBrowserPanel`], [`FieldViewerPanel`], [`PlotViewerPanel`],
@@ -29,25 +29,32 @@
 //! rusty-weather-ui shell) turn it on; bowecho compiles it out.
 
 pub mod colormap;
+pub mod iso_levels;
 mod panels;
 pub mod skewt;
 pub mod stats;
 mod store_view;
+pub mod style_overrides;
 pub mod synthetic;
 mod worker;
 
 pub use panels::{
-    AvailabilityView, CustomDomain, DownloadEvent, DownloadPanel, DownloadRunState, DownloadSpec,
-    DownloadStage, EstimateView, FieldViewerEvent, FieldViewerPanel, HourDoneView, ModelOption,
-    PlotViewerPanel, RunBrowserPanel, SatDiskUsage, SatFollowSpec, SatFollowState, SatFrameImage,
-    SatLayerOption, SatPlayerEvent, SatPlayerPanel, SatRunKey, SatRunListing, SatSatelliteOption,
-    SatSectorOption, SatelliteEvent, SatellitePanel, SoundingPanel, SoundingViewState, StageState,
-    format_bytes, shift_date_yyyymmdd, today_yyyymmdd_utc,
+    AvailabilityView, ColorTableEditorPanel, CustomDomain, DownloadEvent, DownloadPanel,
+    DownloadRunState, DownloadSpec, DownloadStage, EstimateView, FieldViewerEvent,
+    FieldViewerPanel, HourDoneView, ModelOption, PlotViewerPanel, RunBrowserPanel, SatDiskUsage,
+    SatFollowSpec, SatFollowState, SatFrameImage, SatLayerOption, SatPlayerEvent, SatPlayerPanel,
+    SatRunKey, SatRunListing, SatSatelliteOption, SatSectorOption, SatelliteEvent, SatellitePanel,
+    SoundingPanel, SoundingViewState, StageState, format_bytes, shift_date_yyyymmdd,
+    today_yyyymmdd_utc,
 };
 pub use store_view::{HourEntry, ModelEntry, RunEntry, StoreTree, StoreView};
+pub use style_overrides::{
+    ProductStyleBinding, StyleOverrideSettings, UserColorTable, UserExtendMode, UserLegendMode,
+    UserUnitConvert, normalize_product_key,
+};
 pub use worker::{
     FieldData, FieldKey, HourKey, ProfileVar, SoundingData, StoreRequest, StoreResponse,
-    StoreWorker, SurfaceSample, VarInfo, VarKind,
+    StoreWorker, SurfaceSample, VarInfo, VarKind, format_lead_seconds, format_valid_unix,
 };
 
 /// Crate-local profiling scope: expands to `puffin::profile_scope!` under

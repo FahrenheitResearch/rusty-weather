@@ -557,7 +557,9 @@ fn parse_message(data: &[u8], offset: usize) -> Result<(Grib1Message, usize), Gr
         edition,
     };
 
-    let msg_end = base + total_length as usize;
+    let msg_end = base
+        .checked_add(total_length as usize)
+        .ok_or_else(|| GribError::Parse("GRIB1 message length overflows usize".into()))?;
     if msg_end > data.len() {
         return Err(GribError::Parse(format!(
             "GRIB1 message claims {} bytes but only {} available",
@@ -566,15 +568,18 @@ fn parse_message(data: &[u8], offset: usize) -> Result<(Grib1Message, usize), Gr
         )));
     }
 
+    // Restrict every section parser to this message. A corrupt section length
+    // must not borrow template bytes from a following GRIB message.
+    let message_data = &data[..msg_end];
     let mut pos = base + 8;
 
     // --- Section 1: Product Definition Section ---
-    let pds = parse_pds(data, pos)?;
+    let pds = parse_pds(message_data, pos)?;
     pos += pds.section_length as usize;
 
     // --- Section 2: Grid Description Section (optional) ---
     let gds = if pds.gds_present {
-        let g = parse_gds(data, pos)?;
+        let g = parse_gds(message_data, pos)?;
         pos += g.section_length as usize;
         Some(g)
     } else {
@@ -583,7 +588,7 @@ fn parse_message(data: &[u8], offset: usize) -> Result<(Grib1Message, usize), Gr
 
     // --- Section 3: Bit Map Section (optional) ---
     let bms = if pds.bms_present {
-        let b = parse_bms(data, pos)?;
+        let b = parse_bms(message_data, pos)?;
         pos += b.section_length as usize;
         Some(b)
     } else {
@@ -591,27 +596,20 @@ fn parse_message(data: &[u8], offset: usize) -> Result<(Grib1Message, usize), Gr
     };
 
     // --- Section 4: Binary Data Section ---
-    let bds = parse_bds(data, pos)?;
+    let bds = parse_bds(message_data, pos)?;
     pos += bds.section_length as usize;
 
     // --- Section 5: End Section ---
-    if pos + 4 > data.len() {
-        return Err(GribError::Parse(
-            "Data too short for GRIB1 end section".into(),
-        ));
+    if pos.checked_add(4) != Some(msg_end) {
+        return Err(GribError::Parse(format!(
+            "GRIB1 section lengths end at byte {pos}, but the message end marker must start at byte {}",
+            msg_end.saturating_sub(4)
+        )));
     }
-    if &data[pos..pos + 4] != b"7777" {
-        // Some files have padding; try to tolerate minor offsets
-        // but warn if the end marker is not where expected.
-        // We still accept the message if the total_length is consistent.
-        if msg_end >= 4 && &data[msg_end - 4..msg_end] == b"7777" {
-            // End marker is at the expected position based on total_length
-        } else {
-            return Err(GribError::Parse(format!(
-                "Missing GRIB1 end marker '7777' at offset {}",
-                pos
-            )));
-        }
+    if &message_data[pos..msg_end] != b"7777" {
+        return Err(GribError::Parse(format!(
+            "Missing GRIB1 end marker '7777' at offset {pos}"
+        )));
     }
 
     let consumed = total_length as usize;
@@ -631,14 +629,27 @@ fn parse_message(data: &[u8], offset: usize) -> Result<(Grib1Message, usize), Gr
 
 /// Parse Section 1 (PDS) starting at `pos`.
 fn parse_pds(data: &[u8], pos: usize) -> Result<ProductDefinitionSection, GribError> {
-    if data.len() < pos + 28 {
+    if pos.checked_add(3).is_none_or(|end| end > data.len()) {
         return Err(GribError::Parse(
-            "Data too short for GRIB1 Product Definition Section (need at least 28 bytes)".into(),
+            "Data too short for GRIB1 Product Definition Section header".into(),
         ));
     }
 
     let section_length = read_u24(data, pos)?;
-    let raw = data[pos..pos + section_length as usize].to_vec();
+    if section_length < 28 {
+        return Err(GribError::Parse(format!(
+            "GRIB1 Product Definition Section is {section_length} bytes; need at least 28"
+        )));
+    }
+    let end = pos
+        .checked_add(section_length as usize)
+        .ok_or_else(|| GribError::Parse("PDS section length overflows usize".into()))?;
+    if end > data.len() {
+        return Err(GribError::Parse(format!(
+            "PDS section length {section_length} exceeds the current GRIB1 message"
+        )));
+    }
+    let raw = data[pos..end].to_vec();
 
     let flag_byte = data[pos + 7];
     let gds_present = flag_byte & 0x80 != 0;
@@ -695,17 +706,24 @@ fn parse_pds(data: &[u8], pos: usize) -> Result<ProductDefinitionSection, GribEr
 
 /// Parse Section 2 (GDS) starting at `pos`.
 fn parse_gds(data: &[u8], pos: usize) -> Result<GridDescriptionSection, GribError> {
-    if data.len() < pos + 6 {
+    if pos.checked_add(6).is_none_or(|end| end > data.len()) {
         return Err(GribError::Parse(
             "Data too short for GRIB1 Grid Description Section header".into(),
         ));
     }
 
     let section_length = read_u24(data, pos)?;
-    let end = pos + section_length as usize;
+    if section_length < 6 {
+        return Err(GribError::Parse(format!(
+            "GDS section is {section_length} bytes; need at least 6"
+        )));
+    }
+    let end = pos
+        .checked_add(section_length as usize)
+        .ok_or_else(|| GribError::Parse("GDS section length overflows usize".into()))?;
     if end > data.len() {
         return Err(GribError::Parse(format!(
-            "GDS section length {} exceeds available data",
+            "GDS section length {} exceeds the current GRIB1 message",
             section_length
         )));
     }
@@ -715,11 +733,13 @@ fn parse_gds(data: &[u8], pos: usize) -> Result<GridDescriptionSection, GribErro
     let pv_location = data[pos + 4];
     let data_rep_type = data[pos + 5];
 
+    // Parse templates only from their declared section bytes. Previously a
+    // short grid-0/4 GDS could read its final fields out of the following BDS.
     let grid_type = match data_rep_type {
-        0 => parse_gds_latlon(data, pos)?,
-        4 => parse_gds_gaussian(data, pos)?,
-        3 => parse_gds_lambert(data, pos)?,
-        5 => parse_gds_polar_stereo(data, pos)?,
+        0 => parse_gds_latlon(&raw, 0)?,
+        4 => parse_gds_gaussian(&raw, 0)?,
+        3 => parse_gds_lambert(&raw, 0)?,
+        5 => parse_gds_polar_stereo(&raw, 0)?,
         other => GridType::Unknown(other),
     };
 
@@ -735,9 +755,9 @@ fn parse_gds(data: &[u8], pos: usize) -> Result<GridDescriptionSection, GribErro
 
 /// Parse lat/lon grid definition (GDS type 0) from bytes starting at `pos`.
 fn parse_gds_latlon(data: &[u8], pos: usize) -> Result<GridType, GribError> {
-    if data.len() < pos + 28 {
+    if pos.checked_add(32).is_none_or(|end| end > data.len()) {
         return Err(GribError::Parse(
-            "Data too short for lat/lon GDS (need 28 bytes)".into(),
+            "Data too short for lat/lon GDS template (need at least 32 section bytes)".into(),
         ));
     }
 
@@ -748,8 +768,18 @@ fn parse_gds_latlon(data: &[u8], pos: usize) -> Result<GridType, GribError> {
     // byte 17 (pos+16) is resolution flags, skip
     let la2 = read_signed_24(data, pos + 17)? as f64 / 1000.0;
     let lo2 = read_signed_24(data, pos + 20)? as f64 / 1000.0;
-    let di = read_u16(data, pos + 23)? as f64 / 1000.0;
-    let dj = read_u16(data, pos + 25)? as f64 / 1000.0;
+    let di_raw = read_u16(data, pos + 23)?;
+    let dj_raw = read_u16(data, pos + 25)?;
+    let di = if di_raw == u16::MAX {
+        f64::NAN
+    } else {
+        f64::from(di_raw) / 1000.0
+    };
+    let dj = if dj_raw == u16::MAX {
+        f64::NAN
+    } else {
+        f64::from(dj_raw) / 1000.0
+    };
     let scanning_mode = data[pos + 27];
 
     Ok(GridType::LatLon {
@@ -767,9 +797,9 @@ fn parse_gds_latlon(data: &[u8], pos: usize) -> Result<GridType, GribError> {
 
 /// Parse Gaussian grid definition (GDS type 4) from bytes starting at `pos`.
 fn parse_gds_gaussian(data: &[u8], pos: usize) -> Result<GridType, GribError> {
-    if data.len() < pos + 28 {
+    if pos.checked_add(32).is_none_or(|end| end > data.len()) {
         return Err(GribError::Parse(
-            "Data too short for Gaussian GDS (need 28 bytes)".into(),
+            "Data too short for Gaussian GDS template (need at least 32 section bytes)".into(),
         ));
     }
 
@@ -779,8 +809,18 @@ fn parse_gds_gaussian(data: &[u8], pos: usize) -> Result<GridType, GribError> {
     let lo1 = read_signed_24(data, pos + 13)? as f64 / 1000.0;
     let la2 = read_signed_24(data, pos + 17)? as f64 / 1000.0;
     let lo2 = read_signed_24(data, pos + 20)? as f64 / 1000.0;
-    let di = read_u16(data, pos + 23)? as f64 / 1000.0;
+    let di_raw = read_u16(data, pos + 23)?;
+    let di = if di_raw == u16::MAX {
+        f64::NAN
+    } else {
+        f64::from(di_raw) / 1000.0
+    };
     let n = read_u16(data, pos + 25)?; // number of parallels between pole and equator
+    if n == 0 {
+        return Err(GribError::Parse(
+            "Gaussian GDS has N=0; at least one parallel per hemisphere is required".into(),
+        ));
+    }
     let scanning_mode = data[pos + 27];
 
     Ok(GridType::Gaussian {
@@ -872,17 +912,24 @@ fn parse_gds_polar_stereo(data: &[u8], pos: usize) -> Result<GridType, GribError
 
 /// Parse Section 3 (BMS) starting at `pos`.
 fn parse_bms(data: &[u8], pos: usize) -> Result<BitMapSection, GribError> {
-    if data.len() < pos + 6 {
+    if pos.checked_add(6).is_none_or(|end| end > data.len()) {
         return Err(GribError::Parse(
             "Data too short for GRIB1 Bit Map Section header".into(),
         ));
     }
 
     let section_length = read_u24(data, pos)?;
-    let end = pos + section_length as usize;
+    if section_length < 6 {
+        return Err(GribError::Parse(format!(
+            "BMS section is {section_length} bytes; need at least 6"
+        )));
+    }
+    let end = pos
+        .checked_add(section_length as usize)
+        .ok_or_else(|| GribError::Parse("BMS section length overflows usize".into()))?;
     if end > data.len() {
         return Err(GribError::Parse(format!(
-            "BMS section length {} exceeds available data",
+            "BMS section length {} exceeds the current GRIB1 message",
             section_length
         )));
     }
@@ -906,17 +953,24 @@ fn parse_bms(data: &[u8], pos: usize) -> Result<BitMapSection, GribError> {
 
 /// Parse Section 4 (BDS) starting at `pos`.
 fn parse_bds(data: &[u8], pos: usize) -> Result<BinaryDataSection, GribError> {
-    if data.len() < pos + 11 {
+    if pos.checked_add(11).is_none_or(|end| end > data.len()) {
         return Err(GribError::Parse(
             "Data too short for GRIB1 Binary Data Section header".into(),
         ));
     }
 
     let section_length = read_u24(data, pos)?;
-    let end = pos + section_length as usize;
+    if section_length < 11 {
+        return Err(GribError::Parse(format!(
+            "BDS section is {section_length} bytes; need at least 11"
+        )));
+    }
+    let end = pos
+        .checked_add(section_length as usize)
+        .ok_or_else(|| GribError::Parse("BDS section length overflows usize".into()))?;
     if end > data.len() {
         return Err(GribError::Parse(format!(
-            "BDS section length {} exceeds available data",
+            "BDS section length {} exceeds the current GRIB1 message",
             section_length
         )));
     }
@@ -1133,6 +1187,46 @@ mod tests {
                 v
             );
         }
+    }
+
+    #[test]
+    fn test_grid_zero_and_four_require_section_local_32_byte_templates() {
+        const GDS_START: usize = 8 + 28;
+        for grid_type in [0_u8, 4] {
+            let mut data = build_test_message();
+            data[GDS_START..GDS_START + 3].copy_from_slice(&[0, 0, 31]);
+            data[GDS_START + 5] = grid_type;
+            let error = parse_message(&data, 0).expect_err("short GDS must not read into BDS");
+            assert!(
+                error.to_string().contains("at least 32 section bytes"),
+                "grid {grid_type}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_missing_di_is_preserved_and_derived_from_endpoints() {
+        const GDS_START: usize = 8 + 28;
+        let mut data = build_test_message();
+        data[GDS_START + 23..GDS_START + 25].copy_from_slice(&u16::MAX.to_be_bytes());
+        let (message, _) = parse_message(&data, 0).expect("valid missing-Di message");
+        match &message.gds.as_ref().expect("GDS").grid_type {
+            GridType::LatLon { di, .. } => assert!(di.is_nan()),
+            other => panic!("expected lat/lon grid, got {other:?}"),
+        }
+        let coordinates = message.latlons().expect("derive Di from Lo1/Lo2");
+        assert!((coordinates[0].lon + 90.0).abs() < 1e-9);
+        assert!((coordinates[1].lon + 85.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_gaussian_n_zero_is_rejected_during_parse() {
+        const GDS_START: usize = 8 + 28;
+        let mut data = build_test_message();
+        data[GDS_START + 5] = 4;
+        data[GDS_START + 25..GDS_START + 27].copy_from_slice(&0_u16.to_be_bytes());
+        let error = parse_message(&data, 0).expect_err("N=0 Gaussian grid must fail closed");
+        assert!(error.to_string().contains("N=0"), "{error}");
     }
 
     #[test]

@@ -39,26 +39,44 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod batch_render;
+mod formula_lab;
+mod gdex_ui;
+mod grib_import;
 mod ingest_worker;
+mod local_import;
+mod postproc_severe;
 #[cfg(feature = "profiling")]
 mod profiler;
 mod sat_worker;
+mod wrf_process;
+mod wrf_volumes;
 
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::time::{Duration, Instant};
 
+use batch_render::BatchRenderPanel;
 use eframe::egui;
+use formula_lab::{
+    FormulaLabPanel, FormulaLabSources, FormulaResultSource, FormulaSourceKind,
+    RawWrfFormulaSource, StoreFormulaSource,
+};
+use gdex_ui::GdexBrowser;
 use ingest_worker::{IngestRequest, IngestResponse, IngestWorker};
+use local_import::{LocalImportMessage, LocalImportSummary, LocalImportTask};
 use rustwx_models::{model_summary, supported_forecast_hours, supported_models};
 use rw_ui::{
-    CustomDomain, DownloadEvent, DownloadPanel, DownloadSpec, FieldViewerEvent, FieldViewerPanel,
-    HourKey, ModelOption, PlotViewerPanel, RunBrowserPanel, SatFollowSpec, SatPlayerEvent,
-    SatPlayerPanel, SatelliteEvent, SatellitePanel, SoundingPanel, StoreRequest, StoreResponse,
-    StoreTree, StoreView, StoreWorker,
+    ColorTableEditorPanel, CustomDomain, DownloadEvent, DownloadPanel, DownloadSpec,
+    FieldViewerEvent, FieldViewerPanel, HourKey, ModelOption, PlotViewerPanel, RunBrowserPanel,
+    SatFollowSpec, SatPlayerEvent, SatPlayerPanel, SatelliteEvent, SatellitePanel, SoundingPanel,
+    StoreRequest, StoreResponse, StoreTree, StoreView, StoreWorker, StyleOverrideSettings,
 };
 use sat_worker::{SatRequest, SatResponse, SatWorker};
 use serde::{Deserialize, Serialize};
+use wrf_process::{WrfProcessMessage, WrfProcessOptions, WrfProcessSummary, WrfProcessTask};
 
 // ---------------------------------------------------------------------------
 // Storage path resolution
@@ -68,6 +86,10 @@ use serde::{Deserialize, Serialize};
 const STORAGE_KEY: &str = "rw.storage_paths";
 /// eframe Storage key for user-saved native plot domains.
 const DOMAIN_STORAGE_KEY: &str = "rw.custom_domains";
+/// eframe Storage key for user color tables and product -> table bindings.
+const STYLE_STORAGE_KEY: &str = "rw.style_overrides";
+/// eframe Storage key for local WRF processing options.
+const WRF_PROCESS_STORAGE_KEY: &str = "rw.wrf_process_options";
 
 /// Legacy/default store leaf when neither CLI nor persisted settings provide one.
 const DEFAULT_STORE_ROOT: &str = "store";
@@ -143,6 +165,26 @@ fn serialize_custom_domains(domains: &[CustomDomain]) -> String {
 
 fn deserialize_custom_domains(s: &str) -> Vec<CustomDomain> {
     serde_json::from_str(s).unwrap_or_default()
+}
+
+fn serialize_style_settings(settings: &StyleOverrideSettings) -> String {
+    serde_json::to_string(settings).unwrap_or_default()
+}
+
+fn deserialize_style_settings(s: &str) -> StyleOverrideSettings {
+    serde_json::from_str::<StyleOverrideSettings>(s)
+        .unwrap_or_default()
+        .normalized()
+}
+
+fn serialize_wrf_process_options(options: &WrfProcessOptions) -> String {
+    serde_json::to_string(options).unwrap_or_default()
+}
+
+fn deserialize_wrf_process_options(s: &str) -> WrfProcessOptions {
+    serde_json::from_str::<WrfProcessOptions>(s)
+        .unwrap_or_default()
+        .normalized()
 }
 
 /// Pure resolution function: merges CLI overrides + persisted settings +
@@ -636,6 +678,124 @@ impl StorageSettingsUi {
 }
 
 // ---------------------------------------------------------------------------
+// WRF processing settings UI (app-shell only)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct WrfProcessSettingsUi {
+    only_edit: String,
+    skip_edit: String,
+}
+
+impl WrfProcessSettingsUi {
+    fn new(options: &WrfProcessOptions) -> Self {
+        Self {
+            only_edit: format_product_filter_tokens(&options.only),
+            skip_edit: format_product_filter_tokens(&options.skip),
+        }
+    }
+
+    fn set_from_options(&mut self, options: &WrfProcessOptions) {
+        self.only_edit = format_product_filter_tokens(&options.only);
+        self.skip_edit = format_product_filter_tokens(&options.skip);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, options: &mut WrfProcessOptions) -> bool {
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Fast core").clicked() {
+                *options = WrfProcessOptions {
+                    core_fields: true,
+                    diagnostics: false,
+                    heavy_ecape: false,
+                    raw_extras: false,
+                    only: Vec::new(),
+                    skip: Vec::new(),
+                };
+                self.set_from_options(options);
+                changed = true;
+            }
+            if ui.button("WRF default").clicked() {
+                *options = WrfProcessOptions::default();
+                self.set_from_options(options);
+                changed = true;
+            }
+            if ui.button("Everything").clicked() {
+                *options = WrfProcessOptions {
+                    core_fields: true,
+                    diagnostics: true,
+                    heavy_ecape: true,
+                    raw_extras: true,
+                    only: Vec::new(),
+                    skip: Vec::new(),
+                };
+                self.set_from_options(options);
+                changed = true;
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            changed |= ui
+                .checkbox(&mut options.core_fields, "Core fields")
+                .changed();
+            changed |= ui
+                .checkbox(&mut options.diagnostics, "Diagnostics")
+                .changed();
+            changed |= ui
+                .checkbox(&mut options.heavy_ecape, "ECAPE/heavy")
+                .changed();
+            changed |= ui.checkbox(&mut options.raw_extras, "Raw extras").changed();
+        });
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Only products").small().strong());
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut self.only_edit)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("blank = any selected group"),
+            )
+            .changed()
+        {
+            options.only = parse_product_filter_tokens(&self.only_edit);
+            changed = true;
+        }
+        ui.label(egui::RichText::new("Skip products").small().strong());
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut self.skip_edit)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("ecape, hail, graupel, ..."),
+            )
+            .changed()
+        {
+            options.skip = parse_product_filter_tokens(&self.skip_edit);
+            changed = true;
+        }
+        ui.label(
+            egui::RichText::new(
+                "Filters match WRF names, store product names, and stripped wrf_ aliases.",
+            )
+            .small()
+            .weak(),
+        );
+        changed
+    }
+}
+
+fn parse_product_filter_tokens(value: &str) -> Vec<String> {
+    value
+        .split([',', ';', '\n', '\r', '\t'])
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn format_product_filter_tokens(tokens: &[String]) -> String {
+    tokens.join(", ")
+}
+
+// ---------------------------------------------------------------------------
 // main + CLI parsing
 // ---------------------------------------------------------------------------
 
@@ -878,19 +1038,415 @@ fn model_options() -> Vec<ModelOption> {
         .collect()
 }
 
+const LARGE_WRF_WARN_CELLS_3D: usize = 10_000_000;
+const LARGE_WRF_WARN_FILE_BYTES: u64 = 1 << 30;
+
+struct PendingWrfImport {
+    files: Vec<PathBuf>,
+    warning: String,
+    wrf_options: Option<WrfProcessOptions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportRecordGeometry {
+    path: PathBuf,
+    shape: Vec<usize>,
+    elements: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbedFileGeometry {
+    shape: Option<Vec<usize>>,
+    record_elements: Option<usize>,
+    records: usize,
+    records_exact: bool,
+}
+
+/// Conservative, selection-wide preflight result. Probe failures deliberately
+/// force confirmation instead of silently treating an unknown file as small.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportSizeAssessment {
+    file_count: usize,
+    record_count: usize,
+    records_exact: bool,
+    total_record_elements: u128,
+    max_bytes: u64,
+    largest_record: Option<ImportRecordGeometry>,
+    uncertainties: Vec<String>,
+}
+
+impl ImportSizeAssessment {
+    fn new(file_count: usize) -> Self {
+        Self {
+            file_count,
+            record_count: 0,
+            records_exact: true,
+            total_record_elements: 0,
+            max_bytes: 0,
+            largest_record: None,
+            uncertainties: Vec::new(),
+        }
+    }
+
+    fn failed(file_count: usize, error: String) -> Self {
+        let mut assessment = Self::new(file_count);
+        assessment.record_count = file_count;
+        assessment.records_exact = false;
+        assessment.uncertainties.push(error);
+        assessment
+    }
+
+    fn include_geometry(&mut self, path: &Path, geometry: ProbedFileGeometry) {
+        let records = geometry.records.max(1);
+        match self.record_count.checked_add(records) {
+            Some(record_count) => self.record_count = record_count,
+            None => {
+                self.record_count = usize::MAX;
+                self.records_exact = false;
+                self.uncertainties.push(format!(
+                    "{}: time-record count overflows usize",
+                    path.display()
+                ));
+            }
+        }
+        self.records_exact &= geometry.records_exact;
+        if let (Some(shape), Some(elements)) = (geometry.shape, geometry.record_elements) {
+            self.total_record_elements = self
+                .total_record_elements
+                .saturating_add((elements as u128).saturating_mul(records as u128));
+            let replace = self
+                .largest_record
+                .as_ref()
+                .is_none_or(|largest| elements > largest.elements);
+            if replace {
+                self.largest_record = Some(ImportRecordGeometry {
+                    path: path.to_path_buf(),
+                    shape,
+                    elements,
+                });
+            }
+        }
+    }
+
+    fn include_probe_failure(&mut self, path: &Path, error: String) {
+        self.record_count = self.record_count.saturating_add(1);
+        self.records_exact = false;
+        self.uncertainties
+            .push(format!("{}: {error}", path.display()));
+    }
+
+    fn needs_confirmation(&self) -> bool {
+        self.max_bytes >= LARGE_WRF_WARN_FILE_BYTES
+            || self
+                .largest_record
+                .as_ref()
+                .is_some_and(|record| record.elements >= LARGE_WRF_WARN_CELLS_3D)
+            || self.total_record_elements >= LARGE_WRF_WARN_CELLS_3D as u128
+            || !self.uncertainties.is_empty()
+    }
+
+    fn description(&self) -> Option<String> {
+        if !self.needs_confirmation() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if let Some(record) = &self.largest_record {
+            let shape = record
+                .shape
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join("x");
+            let millions = record.elements as f64 / 1.0e6;
+            parts.push(format!(
+                "largest record {shape} (~{millions:.0}M elements) in {}",
+                record.path.display()
+            ));
+        }
+        if self.max_bytes > 0 {
+            parts.push(format!(
+                "largest file {:.1} GB",
+                self.max_bytes as f64 / 1.0e9
+            ));
+        }
+        if self.total_record_elements >= LARGE_WRF_WARN_CELLS_3D as u128 {
+            let total_millions = self.total_record_elements as f64 / 1.0e6;
+            parts.push(format!(
+                "~{total_millions:.0}M grid elements across all distinct records"
+            ));
+        }
+        let record_count = if self.records_exact {
+            self.record_count.to_string()
+        } else {
+            format!("at least {}", self.record_count)
+        };
+        parts.push(format!(
+            "{record_count} distinct time record(s) across {} file(s)",
+            self.file_count
+        ));
+        if let Some(first) = self.uncertainties.first() {
+            let extra = self.uncertainties.len().saturating_sub(1);
+            let suffix = if extra == 0 {
+                String::new()
+            } else {
+                format!(" (+{extra} more)")
+            };
+            parts.push(format!(
+                "size could not be fully verified ({} probe issue(s)): {first}{suffix}",
+                self.uncertainties.len()
+            ));
+        }
+        Some(parts.join(", "))
+    }
+}
+
+#[derive(Debug)]
+enum ImportProbeLaunch {
+    Wrf {
+        files: Vec<PathBuf>,
+        options: WrfProcessOptions,
+    },
+    Local {
+        files: Vec<PathBuf>,
+    },
+}
+
+impl ImportProbeLaunch {
+    fn wrf(files: Vec<PathBuf>, options: WrfProcessOptions) -> Self {
+        Self::Wrf {
+            files: normalize_import_probe_files(files),
+            options,
+        }
+    }
+
+    fn local(files: Vec<PathBuf>) -> Self {
+        Self::Local {
+            files: normalize_import_probe_files(files),
+        }
+    }
+
+    fn files(&self) -> &[PathBuf] {
+        match self {
+            Self::Wrf { files, .. } | Self::Local { files } => files,
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Wrf { files, .. } => {
+                format!("Inspecting {} WRF file(s) before processing", files.len())
+            }
+            Self::Local { files } => {
+                format!("Inspecting {} model file(s) before import", files.len())
+            }
+        }
+    }
+}
+
+struct ImportSizeProbeTask {
+    launch: ImportProbeLaunch,
+    label: String,
+    rx: Receiver<Result<ImportSizeAssessment, String>>,
+}
+
+impl ImportSizeProbeTask {
+    fn spawn(launch: ImportProbeLaunch) -> Result<Self, String> {
+        if launch.files().is_empty() {
+            return Err("cannot inspect an empty import selection".to_string());
+        }
+        let label = launch.label();
+        let files = launch.files().to_vec();
+        let (tx, rx) = channel();
+        let _worker = std::thread::Builder::new()
+            .name("rw-ui-import-size-probe".to_string())
+            .spawn(move || {
+                wrf_process::lower_import_thread_priority();
+                let result = wrf_process::isolate_panics("import size probe", || {
+                    Ok(inspect_import_selection(&files))
+                });
+                let _ = tx.send(result);
+            })
+            .map_err(|error| format!("could not start import size probe: {error}"))?;
+        Ok(Self { launch, label, rx })
+    }
+}
+
+fn normalize_import_probe_files(mut files: Vec<PathBuf>) -> Vec<PathBuf> {
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn checked_shape_elements(shape: &[usize], context: &str) -> Result<usize, String> {
+    if shape.is_empty() || shape.iter().any(|value| *value == 0) {
+        return Err(format!(
+            "{context} has an empty or zero-length grid dimension"
+        ));
+    }
+    shape.iter().try_fold(1usize, |elements, value| {
+        elements
+            .checked_mul(*value)
+            .ok_or_else(|| format!("{context} grid dimensions overflow usize"))
+    })
+}
+
+fn is_probe_time_dimension(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "time" | "times" | "xtime" | "valid_time" | "forecast_time" | "t"
+    ) || lower.starts_with("time")
+}
+
+fn probe_netcdf_geometry(path: &Path) -> Result<ProbedFileGeometry, String> {
+    let nc =
+        netcrust::open(path).map_err(|error| format!("open NetCDF metadata failed: {error}"))?;
+    let dimensions = nc
+        .dimensions()
+        .map_err(|error| format!("read NetCDF dimensions failed: {error}"))?;
+    let time_dimensions = dimensions
+        .iter()
+        .filter(|dimension| is_probe_time_dimension(dimension.name()))
+        .collect::<Vec<_>>();
+    if time_dimensions.iter().any(|dimension| dimension.len() == 0) {
+        return Err("NetCDF time dimension is empty".to_string());
+    }
+    let records = time_dimensions
+        .iter()
+        .map(|dimension| dimension.len())
+        .max()
+        .unwrap_or(1);
+    let records_exact = time_dimensions.len() <= 1;
+
+    let variables = nc
+        .variables()
+        .map_err(|error| format!("read NetCDF variables failed: {error}"))?;
+    let mut largest_shape = None::<Vec<usize>>;
+    let mut largest_elements = 0usize;
+    for variable in variables {
+        let shape = variable
+            .dimensions()
+            .iter()
+            .filter(|dimension| !is_probe_time_dimension(dimension.name()))
+            .map(|dimension| dimension.len())
+            .collect::<Vec<_>>();
+        if shape.is_empty() || shape.iter().any(|value| *value == 0) {
+            continue;
+        }
+        let context = format!("NetCDF variable '{}'", variable.name());
+        let elements = checked_shape_elements(&shape, &context)?;
+        if elements > largest_elements {
+            largest_elements = elements;
+            largest_shape = Some(shape);
+        }
+    }
+    let shape = largest_shape.ok_or_else(|| {
+        "NetCDF metadata contains no non-empty record-shaped variable".to_string()
+    })?;
+    Ok(ProbedFileGeometry {
+        shape: Some(shape),
+        record_elements: Some(largest_elements),
+        records,
+        records_exact,
+    })
+}
+
+fn probe_model_geometry(path: &Path) -> Result<ProbedFileGeometry, String> {
+    if grib_import::is_grib1_file(path) {
+        // GRIB1 import is streaming and does not use wrf-core's 3-D cache. Its
+        // byte size is still assessed selection-wide; record count is a lower
+        // bound because the GRIB inventory is intentionally left to import.
+        return Ok(ProbedFileGeometry {
+            shape: None,
+            record_elements: None,
+            records: 1,
+            records_exact: false,
+        });
+    }
+
+    let wrf = wrf_process::isolate_panics("open WRF metadata for size probe", || {
+        wrf_core::WrfFile::open(path).map_err(|error| error.to_string())
+    });
+    match wrf {
+        Ok(file) => {
+            let shape = vec![file.nx, file.ny, file.nz.max(1)];
+            let record_elements = checked_shape_elements(&shape, "WRF")?;
+            if file.nt == 0 {
+                return Err("WRF Time dimension is empty".to_string());
+            }
+            Ok(ProbedFileGeometry {
+                shape: Some(shape),
+                record_elements: Some(record_elements),
+                records: file.nt,
+                records_exact: true,
+            })
+        }
+        Err(wrf_error) => probe_netcdf_geometry(path).map_err(|netcdf_error| {
+            format!("WRF metadata probe failed ({wrf_error}); {netcdf_error}")
+        }),
+    }
+}
+
+fn inspect_import_selection(files: &[PathBuf]) -> ImportSizeAssessment {
+    let mut assessment = ImportSizeAssessment::new(files.len());
+    for path in files {
+        match std::fs::metadata(path) {
+            Ok(metadata) => assessment.max_bytes = assessment.max_bytes.max(metadata.len()),
+            Err(error) => assessment.uncertainties.push(format!(
+                "{}: file metadata could not be read: {error}",
+                path.display()
+            )),
+        }
+        let what = format!("size probe for {}", path.display());
+        match wrf_process::isolate_panics(&what, || probe_model_geometry(path)) {
+            Ok(geometry) => assessment.include_geometry(path, geometry),
+            Err(error) => assessment.include_probe_failure(path, error),
+        }
+    }
+    assessment
+}
+
+fn heavy_import_size_warning(assessment: &ImportSizeAssessment) -> Option<String> {
+    Some(format!(
+        "{}. Full diagnostics computes the selected severe/thermodynamic suite through wrf-core. Expect long processing and, for large individual grids, several GB of RAM; save other work first.",
+        assessment.description()?
+    ))
+}
+
+fn light_import_size_warning(assessment: &ImportSizeAssessment) -> Option<String> {
+    Some(format!(
+        "{}. Even the light import may interpolate five 3-D sounding fields to 37 pressure levels for every record. Expect long processing and, for large individual grids, several GB of RAM.",
+        assessment.description()?
+    ))
+}
+
 struct App {
     worker: StoreWorker,
     ingest: IngestWorker,
     store_root: PathBuf,
     cache_dir: PathBuf,
+    /// Lazy NSF NCAR GDEX catalog/subset browser and download worker.
+    gdex: GdexBrowser,
+    /// Safe, unit-aware custom diagnostic editor/evaluator.
+    formula_lab: FormulaLabPanel,
+    /// Exact-time store bridge cached by store-tree/selection revision. A
+    /// minute-cadence run can contain thousands of labels, so rebuilding it
+    /// every egui frame would be needless O(n) allocation churn.
+    formula_store_source: Option<StoreFormulaSource>,
     /// `None` until the first scan lands.
     tree: Option<StoreTree>,
     browser: RunBrowserPanel,
     viewer: FieldViewerPanel,
     plot_viewer: PlotViewerPanel,
     show_plot_viewer: bool,
+    batch_render: BatchRenderPanel,
+    show_batch_render: bool,
+    color_tables: ColorTableEditorPanel,
+    show_color_tables: bool,
     sounding: SoundingPanel,
     download: DownloadPanel,
+    /// A download-ingest Start request queued before its Started response.
+    download_start_pending: bool,
     show_download: bool,
     sat: SatWorker,
     sat_panel: SatellitePanel,
@@ -907,6 +1463,32 @@ struct App {
     recorded_plot_timings: Option<(f32, f32)>,
     /// Same dedup for the sat player's texture uploads.
     recorded_sat_texture_ms: Option<f32>,
+    /// Background local file/folder import, currently focused on WRF NetCDF.
+    local_import: Option<LocalImportTask>,
+    /// Short file/open/import status shown in the toolbar.
+    local_import_status: Option<String>,
+    /// Completed GDEX downloads waiting for the single local-import worker.
+    pending_auto_imports: VecDeque<PathBuf>,
+    /// Background metadata preflight shared by full and light model imports.
+    import_size_probe: Option<ImportSizeProbeTask>,
+    /// Large full-diagnostic import awaiting explicit confirmation.
+    pending_heavy_import: Option<PendingWrfImport>,
+    /// Large light/store import awaiting explicit confirmation.
+    pending_light_import: Option<PendingWrfImport>,
+    /// WRF files staged by File -> Open before explicit product processing.
+    pending_wrf_paths: Vec<PathBuf>,
+    /// Last explicitly staged raw WRF file retained as a Formula Lab source.
+    formula_raw_path: Option<PathBuf>,
+    /// Background WRF diagnostic/product processing.
+    wrf_process: Option<WrfProcessTask>,
+    /// Short WRF open/process status shown in the toolbar.
+    wrf_process_status: Option<String>,
+    /// Persistent local WRF product-processing profile.
+    wrf_options: WrfProcessOptions,
+    /// Edit buffers for WRF product filters.
+    wrf_options_ui: WrfProcessSettingsUi,
+    /// Toggle for the WRF processing settings window.
+    show_wrf_options: bool,
     /// State for the collapsible Storage settings section.
     storage_ui: StorageSettingsUi,
     /// Pending JSON to write via `App::save` on the next eframe save tick.
@@ -916,6 +1498,10 @@ struct App {
     pending_persist: Option<String>,
     /// Pending saved-domain JSON written by the native plot panel.
     pending_domain_persist: Option<String>,
+    /// Pending color table/product binding JSON.
+    pending_style_persist: Option<String>,
+    /// Pending WRF processing options JSON.
+    pending_wrf_options_persist: Option<String>,
     #[cfg(feature = "profiling")]
     profiler: profiler::ProfilerPanel,
     #[cfg(feature = "profiling")]
@@ -951,12 +1537,32 @@ impl App {
         let worker = StoreWorker::spawn(StoreView::new(&store_root), move || {
             ctx.request_repaint();
         });
+        let mut startup_errors = worker
+            .startup_error()
+            .map(str::to_string)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let style_settings = cc
+            .storage
+            .and_then(|storage| {
+                storage
+                    .get_string(STYLE_STORAGE_KEY)
+                    .map(|value| deserialize_style_settings(&value))
+            })
+            .unwrap_or_default()
+            .normalized();
+        let mut color_tables = ColorTableEditorPanel::new();
+        color_tables.set_settings(style_settings.clone());
+        worker.send(StoreRequest::SetStyleOverrides(style_settings));
         worker.send(StoreRequest::Enumerate);
 
         let ctx = cc.egui_ctx.clone();
         let ingest = IngestWorker::spawn(store_root.clone(), move || {
             ctx.request_repaint();
         });
+        if let Some(error) = ingest.startup_error() {
+            startup_errors.push(error.to_string());
+        }
 
         // Satellite frames live under their own subroot so the model-run
         // browser stays free of sat runs.
@@ -964,6 +1570,9 @@ impl App {
         let sat = SatWorker::spawn(store_root.join("sat"), move || {
             ctx.request_repaint();
         });
+        if let Some(error) = sat.startup_error() {
+            startup_errors.push(error.to_string());
+        }
         let mut sat_panel = SatellitePanel::new(SatFollowSpec::default());
         sat_panel.set_satellite_options(sat_worker::satellite_options());
         sat_panel.set_sector_options(sat_worker::sector_options());
@@ -1036,19 +1645,37 @@ impl App {
             .unwrap_or_default();
         let mut plot_viewer = PlotViewerPanel::new();
         plot_viewer.set_saved_domains(saved_domains);
+        let wrf_options = cc
+            .storage
+            .and_then(|storage| {
+                storage
+                    .get_string(WRF_PROCESS_STORAGE_KEY)
+                    .map(|value| deserialize_wrf_process_options(&value))
+            })
+            .unwrap_or_default()
+            .normalized();
+        let wrf_options_ui = WrfProcessSettingsUi::new(&wrf_options);
 
         Self {
             worker,
             ingest,
             store_root,
             cache_dir,
+            gdex: GdexBrowser::new(),
+            formula_lab: FormulaLabPanel::new(),
+            formula_store_source: None,
             tree: None,
             browser: RunBrowserPanel::new(),
             viewer: FieldViewerPanel::new(),
             plot_viewer,
             show_plot_viewer: true,
+            batch_render: BatchRenderPanel::new(),
+            show_batch_render: false,
+            color_tables,
+            show_color_tables: false,
             sounding: SoundingPanel::new(),
             download,
+            download_start_pending: false,
             show_download: false,
             sat,
             sat_panel,
@@ -1059,9 +1686,24 @@ impl App {
             recorded_texture_ms: None,
             recorded_plot_timings: None,
             recorded_sat_texture_ms: None,
+            local_import: None,
+            local_import_status: (!startup_errors.is_empty()).then(|| startup_errors.join("; ")),
+            pending_auto_imports: VecDeque::new(),
+            import_size_probe: None,
+            pending_heavy_import: None,
+            pending_light_import: None,
+            pending_wrf_paths: Vec::new(),
+            formula_raw_path: None,
+            wrf_process: None,
+            wrf_process_status: None,
+            wrf_options,
+            wrf_options_ui,
+            show_wrf_options: false,
             storage_ui,
             pending_persist: None,
             pending_domain_persist: None,
+            pending_style_persist: None,
+            pending_wrf_options_persist: None,
             #[cfg(feature = "profiling")]
             profiler: profiler::ProfilerPanel::default(),
             #[cfg(feature = "profiling")]
@@ -1069,6 +1711,717 @@ impl App {
             #[cfg(feature = "profiling")]
             _puffin_server: puffin_server,
         }
+    }
+
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("File", |ui| {
+            if ui.button("Open File(s)...").clicked() {
+                if let Some(paths) = rfd::FileDialog::new()
+                    .set_title("Open WRF file(s)")
+                    .pick_files()
+                {
+                    let supported = paths
+                        .into_iter()
+                        .filter(|path| wrf_process::is_supported_wrf_file(path))
+                        .collect::<Vec<_>>();
+                    self.stage_wrf_paths(supported);
+                }
+                ui.close();
+            }
+
+            if ui
+                .add_enabled(
+                    !self.pending_wrf_paths.is_empty()
+                        && self.wrf_process.is_none()
+                        && self.local_import.is_none()
+                        && self.import_size_probe.is_none()
+                        && !self.download.is_running()
+                        && !self.download_start_pending
+                        && !self.batch_render.is_running()
+                        && !self.formula_lab.busy()
+                        && self.pending_heavy_import.is_none()
+                        && self.pending_light_import.is_none(),
+                    egui::Button::new("Process Open WRF File(s)"),
+                )
+                .clicked()
+            {
+                self.start_wrf_process();
+                ui.close();
+            }
+
+            if ui.button("WRF Processing Settings...").clicked() {
+                self.show_wrf_options = true;
+                ui.close();
+            }
+
+            if ui.button("Open Folder...").clicked() {
+                if let Some(folder) = rfd::FileDialog::new()
+                    .set_title("Open store or WRF folder")
+                    .pick_folder()
+                {
+                    if looks_like_rw_store_root(&folder) {
+                        self.switch_store_root(folder, ui.ctx());
+                    } else {
+                        let files = wrf_process::wrf_files_in_folder(&folder);
+                        if files.is_empty() {
+                            self.wrf_process_status = Some(format!(
+                                "No supported WRF files found in {}",
+                                folder.display()
+                            ));
+                        } else {
+                            self.stage_wrf_paths(files);
+                        }
+                    }
+                }
+                ui.close();
+            }
+
+            ui.separator();
+
+            if ui.button("Color Tables...").clicked() {
+                self.show_color_tables = true;
+                ui.close();
+            }
+
+            ui.separator();
+
+            if ui.button("Import NetCDF/WRF/GRIB1 File(s)...").clicked() {
+                if let Some(paths) = rfd::FileDialog::new()
+                    .set_title("Import NetCDF, WRF, or GRIB1 file(s)")
+                    .pick_files()
+                {
+                    let supported = paths
+                        .into_iter()
+                        .filter(|path| local_import::is_supported_model_file(path))
+                        .collect::<Vec<_>>();
+                    if supported.is_empty() {
+                        self.local_import_status =
+                            Some("No supported WRF/NetCDF/GRIB1 files selected".to_string());
+                    } else {
+                        self.start_local_import(supported);
+                    }
+                }
+                ui.close();
+            }
+
+            if ui.button("Import NetCDF/WRF/GRIB1 Folder...").clicked() {
+                if let Some(folder) = rfd::FileDialog::new()
+                    .set_title("Import NetCDF, WRF, or GRIB1 folder")
+                    .pick_folder()
+                {
+                    let files = local_import::supported_files_in_folder(&folder);
+                    if files.is_empty() {
+                        self.local_import_status = Some(format!(
+                            "No supported WRF/NetCDF/GRIB1 files found in {}",
+                            folder.display()
+                        ));
+                    } else {
+                        self.start_local_import(files);
+                    }
+                }
+                ui.close();
+            }
+        });
+    }
+
+    fn switch_store_root(&mut self, store_root: PathBuf, ctx: &egui::Context) {
+        if self.local_import.is_some()
+            || self.wrf_process.is_some()
+            || self.import_size_probe.is_some()
+            || self.download.is_running()
+            || self.download_start_pending
+            || self.batch_render.is_running()
+            || self.formula_lab.busy()
+            || self.pending_heavy_import.is_some()
+            || self.pending_light_import.is_some()
+        {
+            self.local_import_status = Some(
+                "Wait for the active model download/import, Formula Lab evaluation, batch render, or confirmation before switching stores"
+                    .to_string(),
+            );
+            return;
+        }
+        if let Err(err) = std::fs::create_dir_all(&store_root) {
+            self.local_import_status = Some(format!("Open folder failed: {err}"));
+            return;
+        }
+        let repaint = ctx.clone();
+        self.worker = StoreWorker::spawn(StoreView::new(&store_root), move || {
+            repaint.request_repaint();
+        });
+        let mut startup_errors = self
+            .worker
+            .startup_error()
+            .map(str::to_string)
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.worker.send(StoreRequest::SetStyleOverrides(
+            self.color_tables.settings().clone(),
+        ));
+        self.worker.send(StoreRequest::Enumerate);
+
+        let repaint = ctx.clone();
+        self.ingest = IngestWorker::spawn(store_root.clone(), move || {
+            repaint.request_repaint();
+        });
+        if let Some(error) = self.ingest.startup_error() {
+            startup_errors.push(error.to_string());
+        }
+
+        self.sat.stop_follow();
+        let repaint = ctx.clone();
+        self.sat = SatWorker::spawn(store_root.join("sat"), move || {
+            repaint.request_repaint();
+        });
+        if let Some(error) = self.sat.startup_error() {
+            startup_errors.push(error.to_string());
+        }
+        self.sat.send(SatRequest::Scan);
+
+        self.store_root = store_root.clone();
+        self.tree = None;
+        self.browser = RunBrowserPanel::new();
+        self.formula_store_source = None;
+        self.viewer.clear();
+        self.plot_viewer.clear();
+        self.sounding.clear();
+        self.sat_player = SatPlayerPanel::new();
+        self.sat_initialized = false;
+        self.recorded_texture_ms = None;
+        self.recorded_plot_timings = None;
+        self.recorded_sat_texture_ms = None;
+        self.pending_wrf_paths.clear();
+        self.pending_auto_imports.clear();
+        self.import_size_probe = None;
+        self.download_start_pending = false;
+        self.pending_heavy_import = None;
+        self.pending_light_import = None;
+        self.wrf_process = None;
+        self.wrf_process_status = None;
+
+        self.storage_ui.store_root_edit = store_root.display().to_string();
+        self.storage_ui.store_root_source = PathSource::Saved;
+        self.storage_ui.store_size = dir_size_bytes(&store_root);
+        self.storage_ui.sizes_computed = true;
+        self.storage_ui.apply_error = None;
+        self.storage_ui.apply_status = Some("Opened for this session".to_string());
+
+        self.pending_persist = Some(serialize_persisted(&PersistedPaths {
+            store_root: Some(store_root.display().to_string()),
+            cache_dir: Some(self.cache_dir.display().to_string()),
+        }));
+        self.local_import_status = Some(if startup_errors.is_empty() {
+            format!("Opened {}", store_root.display())
+        } else {
+            startup_errors.join("; ")
+        });
+    }
+
+    fn stage_wrf_paths(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            self.wrf_process_status = Some("No supported WRF files selected".to_string());
+            return;
+        }
+        self.pending_heavy_import = None;
+        self.formula_raw_path = paths.first().cloned();
+        let count = paths.len();
+        let first = paths
+            .first()
+            .and_then(|path| path.file_name())
+            .and_then(|value| value.to_str())
+            .unwrap_or("WRF file")
+            .to_string();
+        self.pending_wrf_paths = paths;
+        self.wrf_process_status = if count == 1 {
+            Some(format!("Ready to process {first}"))
+        } else {
+            Some(format!(
+                "Ready to process {count} WRF files starting with {first}"
+            ))
+        };
+    }
+
+    fn start_wrf_process(&mut self) {
+        if self.wrf_process.is_some()
+            || self.local_import.is_some()
+            || self.import_size_probe.is_some()
+            || self.download.is_running()
+            || self.download_start_pending
+            || self.formula_lab.busy()
+            || self.batch_render.is_running()
+        {
+            self.wrf_process_status = Some(
+                "Another model import, Formula Lab evaluation, or batch render is active"
+                    .to_string(),
+            );
+            return;
+        }
+        if self.pending_wrf_paths.is_empty() {
+            self.wrf_process_status = Some("Open WRF file(s) first".to_string());
+            return;
+        }
+        if self.pending_heavy_import.is_some() || self.pending_light_import.is_some() {
+            self.wrf_process_status = Some("Finish the open import confirmation first".to_string());
+            return;
+        }
+        let files = self.pending_wrf_paths.clone();
+        self.start_import_size_probe(ImportProbeLaunch::wrf(files, self.wrf_options.clone()));
+    }
+
+    fn launch_wrf_process(&mut self, files: Vec<PathBuf>, options: WrfProcessOptions) {
+        if self.wrf_process.is_some()
+            || self.local_import.is_some()
+            || self.import_size_probe.is_some()
+            || self.download.is_running()
+            || self.download_start_pending
+            || self.formula_lab.busy()
+            || self.batch_render.is_running()
+            || self.pending_heavy_import.is_some()
+            || self.pending_light_import.is_some()
+        {
+            self.wrf_process_status = Some(
+                "Another model import, Formula Lab evaluation, or batch render is active"
+                    .to_string(),
+            );
+            return;
+        }
+        let task = wrf_process::spawn_process_paths(files, self.store_root.clone(), options);
+        self.wrf_process_status = Some(task.label.clone());
+        self.wrf_process = Some(task);
+    }
+
+    fn apply_color_table_changes(&mut self) {
+        let settings = self.color_tables.settings().clone().normalized();
+        self.worker
+            .send(StoreRequest::SetStyleOverrides(settings.clone()));
+        self.pending_style_persist = Some(serialize_style_settings(&settings));
+        self.plot_viewer.clear();
+        self.recorded_plot_timings = None;
+        if let Some(field) = self.viewer.wanted_field() {
+            if !self.viewer.restyle_generated_field(&settings) {
+                self.viewer.set_loading(&field.var);
+                self.worker.send(StoreRequest::LoadField(field));
+            }
+        }
+    }
+
+    fn persist_wrf_process_options(&mut self) {
+        self.wrf_options = self.wrf_options.clone().normalized();
+        self.wrf_options_ui.set_from_options(&self.wrf_options);
+        self.pending_wrf_options_persist = Some(serialize_wrf_process_options(&self.wrf_options));
+    }
+
+    fn start_local_import(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            self.local_import_status = Some("No supported model files selected".to_string());
+            return;
+        }
+        if self.local_import.is_some()
+            || self.wrf_process.is_some()
+            || self.import_size_probe.is_some()
+            || self.download.is_running()
+            || self.download_start_pending
+            || self.formula_lab.busy()
+            || self.batch_render.is_running()
+        {
+            self.local_import_status = Some(
+                "Another model import, Formula Lab evaluation, or batch render is active"
+                    .to_string(),
+            );
+            return;
+        }
+        if self.pending_heavy_import.is_some() || self.pending_light_import.is_some() {
+            self.local_import_status =
+                Some("Finish the open import confirmation first".to_string());
+            return;
+        }
+        self.start_import_size_probe(ImportProbeLaunch::local(paths));
+    }
+
+    fn launch_local_import(&mut self, paths: Vec<PathBuf>) {
+        if self.local_import.is_some()
+            || self.wrf_process.is_some()
+            || self.import_size_probe.is_some()
+            || self.download.is_running()
+            || self.download_start_pending
+            || self.formula_lab.busy()
+            || self.batch_render.is_running()
+            || self.pending_heavy_import.is_some()
+            || self.pending_light_import.is_some()
+        {
+            self.local_import_status = Some(
+                "Another model import, Formula Lab evaluation, or batch render is active"
+                    .to_string(),
+            );
+            return;
+        }
+        let task = local_import::spawn_import_paths(paths, self.store_root.clone());
+        self.local_import_status = Some(task.label.clone());
+        self.local_import = Some(task);
+    }
+
+    fn start_import_size_probe(&mut self, launch: ImportProbeLaunch) {
+        let is_wrf = matches!(&launch, ImportProbeLaunch::Wrf { .. });
+        match ImportSizeProbeTask::spawn(launch) {
+            Ok(task) => {
+                let label = task.label.clone();
+                self.import_size_probe = Some(task);
+                if is_wrf {
+                    self.wrf_process_status = Some(label);
+                } else {
+                    self.local_import_status = Some(label);
+                }
+            }
+            Err(error) => {
+                if is_wrf {
+                    self.wrf_process_status = Some(error);
+                } else {
+                    self.local_import_status = Some(error);
+                }
+            }
+        }
+    }
+
+    fn handle_import_size_probe_response(&mut self) {
+        let received = match self.import_size_probe.as_ref() {
+            Some(task) => task.rx.try_recv(),
+            None => return,
+        };
+        let outcome = match received {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                let Some(task) = self.import_size_probe.take() else {
+                    return;
+                };
+                let message = "Import size probe stopped before returning a result".to_string();
+                match task.launch {
+                    ImportProbeLaunch::Wrf { .. } => self.wrf_process_status = Some(message),
+                    ImportProbeLaunch::Local { .. } => self.local_import_status = Some(message),
+                }
+                return;
+            }
+        };
+        let Some(task) = self.import_size_probe.take() else {
+            return;
+        };
+        let file_count = task.launch.files().len();
+        let assessment = outcome.unwrap_or_else(|error| {
+            ImportSizeAssessment::failed(
+                file_count,
+                format!("background import size probe failed: {error}"),
+            )
+        });
+
+        if self.local_import.is_some()
+            || self.wrf_process.is_some()
+            || self.download.is_running()
+            || self.download_start_pending
+            || self.formula_lab.busy()
+            || self.batch_render.is_running()
+            || self.pending_heavy_import.is_some()
+            || self.pending_light_import.is_some()
+        {
+            let message =
+                "Import size probe finished after another import became active; start it again"
+                    .to_string();
+            match task.launch {
+                ImportProbeLaunch::Wrf { .. } => self.wrf_process_status = Some(message),
+                ImportProbeLaunch::Local { .. } => self.local_import_status = Some(message),
+            }
+            return;
+        }
+
+        match task.launch {
+            ImportProbeLaunch::Wrf { files, options } => {
+                if normalize_import_probe_files(self.pending_wrf_paths.clone()) != files {
+                    self.wrf_process_status = Some(
+                        "The staged WRF selection changed during size inspection; process it again"
+                            .to_string(),
+                    );
+                    return;
+                }
+                if let Some(warning) = heavy_import_size_warning(&assessment) {
+                    self.pending_heavy_import = Some(PendingWrfImport {
+                        files,
+                        warning,
+                        wrf_options: Some(options),
+                    });
+                    self.wrf_process_status = None;
+                } else {
+                    self.launch_wrf_process(files, options);
+                }
+            }
+            ImportProbeLaunch::Local { files } => {
+                if let Some(warning) = light_import_size_warning(&assessment) {
+                    self.pending_light_import = Some(PendingWrfImport {
+                        files,
+                        warning,
+                        wrf_options: None,
+                    });
+                    self.local_import_status = None;
+                } else {
+                    self.launch_local_import(files);
+                }
+            }
+        }
+    }
+
+    fn show_import_confirmations(&mut self, ctx: &egui::Context) {
+        if let Some(pending) = &self.pending_heavy_import {
+            let warning = pending.warning.clone();
+            let count = pending.files.len();
+            let mut action = 0u8;
+            egui::Window::new("Large WRF full-diagnostics import")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    ui.label(egui::RichText::new("Large WRF import").strong());
+                    ui.label(warning);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "The selection contains {count} file(s). Core-only keeps surface fields and sounding volumes while skipping severe diagnostics and raw extras."
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Start core-only").clicked() {
+                            action = 1;
+                        }
+                        if ui.button("Start full selection anyway").clicked() {
+                            action = 2;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            action = 3;
+                        }
+                    });
+                });
+            match action {
+                1 => {
+                    if let Some(pending) = self.pending_heavy_import.take() {
+                        self.launch_wrf_process(
+                            pending.files,
+                            WrfProcessOptions {
+                                core_fields: true,
+                                diagnostics: false,
+                                heavy_ecape: false,
+                                raw_extras: false,
+                                only: Vec::new(),
+                                skip: Vec::new(),
+                            },
+                        );
+                    }
+                }
+                2 => {
+                    if let Some(pending) = self.pending_heavy_import.take() {
+                        let options = pending
+                            .wrf_options
+                            .unwrap_or_else(|| self.wrf_options.clone());
+                        self.launch_wrf_process(pending.files, options);
+                    }
+                }
+                3 => {
+                    self.pending_heavy_import = None;
+                    self.wrf_process_status = Some("Large WRF import cancelled".to_string());
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(pending) = &self.pending_light_import {
+            let warning = pending.warning.clone();
+            let mut action = 0u8;
+            egui::Window::new("Large WRF/NetCDF import")
+                .collapsible(false)
+                .resizable(true)
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    ui.label(egui::RichText::new("Large model import").strong());
+                    ui.label(warning);
+                    ui.horizontal(|ui| {
+                        if ui.button("Import anyway").clicked() {
+                            action = 1;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            action = 2;
+                        }
+                    });
+                });
+            match action {
+                1 => {
+                    if let Some(pending) = self.pending_light_import.take() {
+                        self.launch_local_import(pending.files);
+                    }
+                }
+                2 => {
+                    self.pending_light_import = None;
+                    self.local_import_status = Some("Large model import cancelled".to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn handle_local_import_response(&mut self, ctx: &egui::Context) {
+        let Some(task) = self.local_import.take() else {
+            return;
+        };
+
+        let mut finished = false;
+        loop {
+            match task.rx.try_recv() {
+                Ok(LocalImportMessage::Progress(message)) => {
+                    self.local_import_status = Some(message);
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                }
+                Ok(LocalImportMessage::Done(Ok(summary))) => {
+                    self.local_import_status = Some(Self::local_import_summary_text(&summary));
+                    self.worker.send(StoreRequest::Enumerate);
+                    finished = true;
+                    break;
+                }
+                Ok(LocalImportMessage::Done(Err(message))) => {
+                    self.local_import_status = Some(format!("Import failed: {message}"));
+                    finished = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.local_import_status = Some("Import worker stopped".to_string());
+                    finished = true;
+                    break;
+                }
+            }
+        }
+
+        if !finished {
+            self.local_import = Some(task);
+        }
+    }
+
+    fn handle_wrf_process_response(&mut self, ctx: &egui::Context) {
+        let Some(task) = self.wrf_process.take() else {
+            return;
+        };
+
+        let mut finished = false;
+        loop {
+            match task.rx.try_recv() {
+                Ok(WrfProcessMessage::Progress(message)) => {
+                    self.wrf_process_status = Some(message);
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                }
+                Ok(WrfProcessMessage::Done(Ok(summary))) => {
+                    self.wrf_process_status = Some(Self::wrf_process_summary_text(&summary));
+                    self.pending_wrf_paths.clear();
+                    self.worker.send(StoreRequest::Enumerate);
+                    finished = true;
+                    break;
+                }
+                Ok(WrfProcessMessage::Done(Err(message))) => {
+                    self.wrf_process_status = Some(format!("WRF process failed: {message}"));
+                    finished = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.wrf_process_status = Some("WRF processor stopped".to_string());
+                    finished = true;
+                    break;
+                }
+            }
+        }
+
+        if !finished {
+            self.wrf_process = Some(task);
+        }
+    }
+
+    fn local_import_summary_text(summary: &LocalImportSummary) -> String {
+        let shown = summary
+            .variables
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let extra = summary.variables.len().saturating_sub(6);
+        let suffix = if extra == 0 {
+            String::new()
+        } else {
+            format!(", +{extra} more")
+        };
+        let notes = if summary.notes.is_empty() {
+            String::new()
+        } else {
+            let shown = summary
+                .notes
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let extra = summary.notes.len().saturating_sub(3);
+            let suffix = if extra == 0 {
+                String::new()
+            } else {
+                format!(" | +{extra} more")
+            };
+            format!("; {} warning(s): {shown}{suffix}", summary.notes.len())
+        };
+        format!(
+            "Imported {} timestep(s) from {} local file(s) into {}/{} under {} ({} vars: {}{}){}",
+            summary.hours_written,
+            summary.files_seen,
+            summary.model,
+            summary.run,
+            summary.store_root.display(),
+            summary.variables.len(),
+            shown,
+            suffix,
+            notes
+        )
+    }
+
+    fn wrf_process_summary_text(summary: &WrfProcessSummary) -> String {
+        let shown = summary
+            .variables
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let extra = summary.variables.len().saturating_sub(6);
+        let suffix = if extra == 0 {
+            String::new()
+        } else {
+            format!(", +{extra} more")
+        };
+        let note_suffix = if summary.notes.is_empty() {
+            String::new()
+        } else {
+            format!("; {} skipped/unavailable", summary.notes.len())
+        };
+        format!(
+            "Processed {} WRF timestep(s) from {} file(s) into {}/{} under {} ({} vars: {}{}{})",
+            summary.hours_written,
+            summary.files_seen,
+            summary.model,
+            summary.run,
+            summary.store_root.display(),
+            summary.variables.len(),
+            shown,
+            suffix,
+            note_suffix
+        )
     }
 
     /// Cycle list, source list, and hours hint follow the spec's model +
@@ -1111,9 +2464,22 @@ impl App {
     }
 
     fn select_hour(&mut self, key: HourKey) {
+        self.refresh_formula_store_source();
         self.plot_viewer.clear();
         self.recorded_plot_timings = None;
         self.worker.send(StoreRequest::LoadHour(key));
+    }
+
+    fn refresh_formula_store_source(&mut self) {
+        let source = self.browser.selected().cloned().map(|hour| {
+            let exact_times = formula_exact_store_times(self.tree.as_ref(), &hour);
+            StoreFormulaSource {
+                store_root: self.store_root.clone(),
+                hour,
+                exact_times,
+            }
+        });
+        self.formula_store_source = source;
     }
 
     /// Drain store-worker responses into panel state.
@@ -1121,44 +2487,54 @@ impl App {
         while let Some(response) = self.worker.try_recv() {
             match response {
                 StoreResponse::Tree(tree) => {
-                    // First scan: auto-select the first hour so a store with
-                    // data shows something immediately.
-                    if self.browser.selected().is_none() {
-                        let first = tree.models.first().and_then(|model| {
-                            model.runs.first().and_then(|run| {
-                                run.hours.first().map(|hour| HourKey {
-                                    model: model.model.clone(),
-                                    run: run.run.clone(),
-                                    hour: hour.hour,
-                                })
-                            })
-                        });
-                        if let Some(key) = first {
-                            self.browser.select(key.clone());
-                            self.select_hour(key);
-                        }
-                    }
+                    // Refresh exact timing for the stable model/run/slot key.
+                    // This also prevents a stale legacy selection from reaching
+                    // hour-based tools after the run is replaced by exact v2.
+                    let selection_changed = self.browser.reconcile(&tree);
                     self.tree = Some(tree);
+                    if selection_changed {
+                        self.viewer.clear();
+                        self.plot_viewer.clear();
+                        self.sounding.clear();
+                        self.recorded_texture_ms = None;
+                        self.recorded_plot_timings = None;
+                        if let Some(key) = self.browser.selected().cloned() {
+                            self.select_hour(key);
+                        } else {
+                            self.refresh_formula_store_source();
+                        }
+                    } else {
+                        // Adjacent exact times can change while the selected
+                        // slot remains stable; refresh the complete dt axis.
+                        self.refresh_formula_store_source();
+                    }
                 }
+                StoreResponse::StyleOverridesApplied => {}
                 StoreResponse::HourVars(key, Ok(vars)) => {
                     if self.browser.selected() == Some(&key) {
                         self.plot_viewer.clear();
                         self.recorded_plot_timings = None;
                         self.viewer.set_hour(key, vars);
                         if let Some(field) = self.viewer.wanted_field() {
-                            self.viewer.set_loading(&field.var);
-                            self.worker.send(StoreRequest::LoadField(field));
+                            if !self.viewer.restore_generated_field(&field.var) {
+                                self.viewer.set_loading(&field.var);
+                                self.worker.send(StoreRequest::LoadField(field));
+                            }
                         }
                     }
                 }
-                StoreResponse::HourVars(_, Err(message)) => {
-                    self.viewer.set_error(message);
+                StoreResponse::HourVars(key, Err(message)) => {
+                    if self.browser.selected() == Some(&key) {
+                        self.viewer.set_error(message);
+                    }
                 }
                 StoreResponse::Field(key, result) => match *result {
                     Ok(field) => {
-                        self.plot_viewer.clear();
-                        self.recorded_plot_timings = None;
-                        self.viewer.set_field(field);
+                        if self.viewer.wanted_field().as_ref() == Some(&key) {
+                            self.plot_viewer.clear();
+                            self.recorded_plot_timings = None;
+                            self.viewer.set_field(field);
+                        }
                     }
                     Err(message) => {
                         if self.viewer.wanted_field().as_ref() == Some(&key) {
@@ -1166,25 +2542,29 @@ impl App {
                         }
                     }
                 },
-                StoreResponse::Sounding(_, Ok(data)) => {
-                    self.worker.stats().record("sounding.read", data.read_ms);
-                    self.sounding.set_data(data);
-                    if let Some((read_ms, scene_ms)) = self.sounding.last_timings() {
-                        self.worker.stats().record("sounding.scene", scene_ms);
-                        self.worker
-                            .stats()
-                            .record("sounding.native_total", read_ms + scene_ms);
+                StoreResponse::Sounding(key, Ok(data)) => {
+                    if self.browser.selected() == Some(&key) && self.viewer.hour() == Some(&key) {
+                        self.worker.stats().record("sounding.read", data.read_ms);
+                        self.sounding.set_data(data);
+                        if let Some((read_ms, scene_ms)) = self.sounding.last_timings() {
+                            self.worker.stats().record("sounding.scene", scene_ms);
+                            self.worker
+                                .stats()
+                                .record("sounding.native_total", read_ms + scene_ms);
+                        }
                     }
                 }
-                StoreResponse::Sounding(_, Err(message)) => {
-                    self.sounding.set_error(message);
+                StoreResponse::Sounding(key, Err(message)) => {
+                    if self.browser.selected() == Some(&key) && self.viewer.hour() == Some(&key) {
+                        self.sounding.set_error(message);
+                    }
                 }
             }
         }
     }
 
     /// Drain ingest-worker responses into the download panel (and refresh
-    /// the run browser as hours land).
+    /// the run browser as timesteps land).
     fn handle_ingest_responses(&mut self) {
         while let Some(response) = self.ingest.try_recv() {
             match response {
@@ -1204,6 +2584,7 @@ impl App {
                     self.download.set_probing_failed(message);
                 }
                 IngestResponse::Started { hours } => {
+                    self.download_start_pending = false;
                     self.download.begin_run(&hours);
                 }
                 IngestResponse::StageStarted { hour, stage } => {
@@ -1225,14 +2606,17 @@ impl App {
                     self.worker.send(StoreRequest::Enumerate);
                 }
                 IngestResponse::Finished => {
+                    self.download_start_pending = false;
                     self.download.finish_run(Ok(()));
                     self.worker.send(StoreRequest::Enumerate);
                 }
                 IngestResponse::Cancelled => {
+                    self.download_start_pending = false;
                     self.download.finish_cancelled();
                     self.worker.send(StoreRequest::Enumerate);
                 }
                 IngestResponse::Failed(message) => {
+                    self.download_start_pending = false;
                     if self.download.is_running() {
                         self.download.finish_run(Err(message));
                     } else {
@@ -1362,8 +2746,25 @@ impl App {
                     self.ingest.send(IngestRequest::Latest(spec));
                 }
                 DownloadEvent::StartRequested(spec) => {
+                    if self.local_import.is_some()
+                        || self.wrf_process.is_some()
+                        || self.import_size_probe.is_some()
+                        || self.pending_heavy_import.is_some()
+                        || self.pending_light_import.is_some()
+                        || self.download.is_running()
+                        || self.download_start_pending
+                        || self.formula_lab.busy()
+                        || self.batch_render.is_running()
+                    {
+                        self.download.set_probing_failed(
+                            "Finish the active model import, size confirmation, Formula Lab evaluation, or batch render before starting a download"
+                                .to_string(),
+                        );
+                        continue;
+                    }
                     let spec = self.apply_normalized_download_spec(spec);
                     Self::sync_run_pickers(&mut self.download, &spec);
+                    self.download_start_pending = true;
                     self.ingest.send(IngestRequest::Start(spec));
                 }
                 DownloadEvent::CancelRequested => {
@@ -1385,6 +2786,12 @@ impl eframe::App for App {
         if let Some(json) = self.pending_domain_persist.take() {
             storage.set_string(DOMAIN_STORAGE_KEY, json);
         }
+        if let Some(json) = self.pending_style_persist.take() {
+            storage.set_string(STYLE_STORAGE_KEY, json);
+        }
+        if let Some(json) = self.pending_wrf_options_persist.take() {
+            storage.set_string(WRF_PROCESS_STORAGE_KEY, json);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1395,6 +2802,32 @@ impl eframe::App for App {
         self.handle_responses();
         self.handle_ingest_responses();
         self.handle_sat_responses();
+        self.handle_wrf_process_response(ui.ctx());
+        self.handle_local_import_response(ui.ctx());
+        self.handle_import_size_probe_response();
+        if let Some(path) = self.gdex.poll(ui.ctx()) {
+            self.pending_auto_imports.push_back(path);
+        }
+        if self.local_import.is_none()
+            && self.wrf_process.is_none()
+            && self.import_size_probe.is_none()
+            && !self.download.is_running()
+            && !self.download_start_pending
+            && !self.formula_lab.busy()
+            && !self.batch_render.is_running()
+            && self.pending_heavy_import.is_none()
+            && self.pending_light_import.is_none()
+        {
+            if let Some(path) = self.pending_auto_imports.pop_front() {
+                self.start_local_import(vec![path]);
+            }
+        }
+        if self.gdex.busy() {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+        if self.import_size_probe.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
 
         // Smooth progress while a download runs, even through long silent
         // stages (a 60 s heavy stage emits nothing between its events).
@@ -1411,8 +2844,33 @@ impl eframe::App for App {
 
         egui::Panel::top("rw-toolbar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
+                self.file_menu(ui);
+                ui.separator();
+                if !self.pending_wrf_paths.is_empty()
+                    && self.wrf_process.is_none()
+                    && self.local_import.is_none()
+                    && self.import_size_probe.is_none()
+                    && !self.download.is_running()
+                    && !self.download_start_pending
+                    && !self.formula_lab.busy()
+                    && !self.batch_render.is_running()
+                    && self.pending_heavy_import.is_none()
+                    && self.pending_light_import.is_none()
+                {
+                    if ui
+                        .button(format!("Process WRF ({})", self.pending_wrf_paths.len()))
+                        .clicked()
+                    {
+                        self.start_wrf_process();
+                    }
+                }
                 ui.toggle_value(&mut self.show_download, "⬇ Download");
                 ui.toggle_value(&mut self.show_satellite, "🛰 Satellite");
+                ui.toggle_value(&mut self.gdex.open, "GDEX");
+                ui.toggle_value(&mut self.formula_lab.open, "Formula Lab");
+                ui.toggle_value(&mut self.show_batch_render, "Batch render");
+                ui.toggle_value(&mut self.show_wrf_options, "WRF products");
+                ui.toggle_value(&mut self.show_color_tables, "Color tables");
                 #[cfg(feature = "profiling")]
                 ui.toggle_value(&mut self.show_profiler, "🔍 Profiler");
                 #[cfg(not(feature = "profiling"))]
@@ -1421,6 +2879,27 @@ impl eframe::App for App {
                         .small()
                         .weak(),
                 );
+                if let Some(task) = &self.import_size_probe {
+                    ui.spinner();
+                    ui.label(egui::RichText::new(&task.label).small().weak());
+                } else if self.download_start_pending {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("Starting model download")
+                            .small()
+                            .weak(),
+                    );
+                } else if let Some(task) = &self.wrf_process {
+                    ui.spinner();
+                    ui.label(egui::RichText::new(&task.label).small().weak());
+                } else if let Some(task) = &self.local_import {
+                    ui.spinner();
+                    ui.label(egui::RichText::new(&task.label).small().weak());
+                } else if let Some(status) = &self.wrf_process_status {
+                    ui.label(egui::RichText::new(status).small().weak());
+                } else if let Some(status) = &self.local_import_status {
+                    ui.label(egui::RichText::new(status).small().weak());
+                }
             });
         });
 
@@ -1519,6 +2998,14 @@ impl eframe::App for App {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.toggle_value(&mut self.show_plot_viewer, "Native plot");
+                let selected_store_hour = self.browser.selected().cloned();
+                if selected_store_hour.as_ref() != self.viewer.hour() {
+                    if let Some(hour) = selected_store_hour {
+                        if ui.button("Return to selected store hour").clicked() {
+                            self.select_hour(hour);
+                        }
+                    }
+                }
             });
             ui.separator();
 
@@ -1543,16 +3030,20 @@ impl eframe::App for App {
                 Some(FieldViewerEvent::VarSelected(var)) => {
                     self.plot_viewer.clear();
                     self.recorded_plot_timings = None;
-                    self.viewer.set_loading(&var);
-                    if let Some(field) = self.viewer.wanted_field() {
-                        self.worker.send(StoreRequest::LoadField(field));
+                    if !self.viewer.restore_generated_field(&var) {
+                        self.viewer.set_loading(&var);
+                        if let Some(field) = self.viewer.wanted_field() {
+                            self.worker.send(StoreRequest::LoadField(field));
+                        }
                     }
                 }
                 Some(FieldViewerEvent::PointClicked { fx, fy }) => {
                     if let Some(hour) = self.viewer.hour().cloned() {
-                        self.sounding.set_loading();
-                        self.worker
-                            .send(StoreRequest::LoadSounding { hour, fx, fy });
+                        if self.browser.selected() == Some(&hour) {
+                            self.sounding.set_loading();
+                            self.worker
+                                .send(StoreRequest::LoadSounding { hour, fx, fy });
+                        }
                     }
                 }
                 Some(FieldViewerEvent::DomainSelected(domain)) => {
@@ -1590,6 +3081,112 @@ impl eframe::App for App {
             self.show_download = open;
             self.handle_download_events(events);
         }
+
+        if self.show_batch_render {
+            let mut open = self.show_batch_render;
+            let batch_start_blocked = (self.local_import.is_some()
+                || self.wrf_process.is_some()
+                || self.import_size_probe.is_some()
+                || self.pending_heavy_import.is_some()
+                || self.pending_light_import.is_some()
+                || self.download.is_running()
+                || self.download_start_pending
+                || self.formula_lab.busy())
+                .then_some(
+                    "Finish the active import/download, size confirmation, or Formula Lab evaluation before rendering",
+                );
+            let current_hour = self.browser.selected().cloned();
+            let current_var = if self.viewer.hour() == current_hour.as_ref() {
+                self.viewer.selected_var().map(str::to_string)
+            } else {
+                None
+            };
+            egui::Window::new("Batch render")
+                .open(&mut open)
+                .default_width(720.0)
+                .default_height(680.0)
+                .resizable(true)
+                .show(ui.ctx(), |ui| {
+                    self.batch_render.ui(
+                        ui,
+                        &self.store_root,
+                        current_hour.as_ref(),
+                        current_var.as_deref(),
+                        batch_start_blocked,
+                    );
+                });
+            self.show_batch_render = open;
+        }
+
+        let store_formula_source = self.formula_store_source.as_ref();
+        let raw_formula_source = self.formula_raw_path.clone().map(|path| {
+            let display_hour = HourKey {
+                model: "raw-wrf".to_string(),
+                run: path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("raw_wrf")
+                    .to_string(),
+                hour: 0,
+                exact_time: None,
+            };
+            RawWrfFormulaSource {
+                path,
+                initial_time_index: 0,
+                display_hour,
+            }
+        });
+        let formula_evaluation_blocked = (self.local_import.is_some()
+            || self.wrf_process.is_some()
+            || self.import_size_probe.is_some()
+            || self.pending_heavy_import.is_some()
+            || self.pending_light_import.is_some()
+            || self.download.is_running()
+            || self.download_start_pending
+            || self.batch_render.is_running())
+        .then_some("a model import/download, its size confirmation, or a batch render is active");
+        if let Some(result) = self.formula_lab.show(
+            ui.ctx(),
+            FormulaLabSources {
+                store: store_formula_source,
+                raw_wrf: raw_formula_source.as_ref(),
+                evaluation_blocked: formula_evaluation_blocked,
+            },
+        ) {
+            let raw_result = matches!(&result.source, FormulaResultSource::RawWrf { .. });
+            let still_current = (match &result.source {
+                FormulaResultSource::Store { store_root, hour } => {
+                    self.formula_lab.source_kind() == FormulaSourceKind::Store
+                        && store_root == &self.store_root
+                        && self.browser.selected() == Some(hour)
+                }
+                FormulaResultSource::RawWrf {
+                    path, time_index, ..
+                } => {
+                    self.formula_lab.source_kind() == FormulaSourceKind::RawWrf
+                        && self.formula_raw_path.as_ref() == Some(path)
+                        && self.formula_lab.raw_time_index() == *time_index
+                }
+            }) && result.source.revision_is_current();
+            if still_current {
+                self.plot_viewer.clear();
+                self.recorded_plot_timings = None;
+                if raw_result {
+                    self.sounding.clear();
+                }
+                let settings = self.color_tables.settings().clone().normalized();
+                self.viewer.install_generated_field(result.field, &settings);
+            } else {
+                self.formula_lab
+                    .note_result_discarded("the selected data source changed while it ran");
+            }
+        }
+        if self.formula_lab.busy() {
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+
+        self.gdex.ui(ui, &self.cache_dir.join("gdex"));
 
         if self.show_satellite {
             if !self.sat_initialized {
@@ -1629,6 +3226,45 @@ impl eframe::App for App {
             }
         }
 
+        if self.show_color_tables {
+            let mut open = self.show_color_tables;
+            egui::Window::new("Color Tables")
+                .open(&mut open)
+                .default_width(760.0)
+                .default_height(680.0)
+                .resizable(true)
+                .show(ui.ctx(), |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("rw-color-tables-window-scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.color_tables.ui(ui, self.viewer.current_field());
+                        });
+                });
+            self.show_color_tables = open;
+            if self.color_tables.take_changed() {
+                self.apply_color_table_changes();
+            }
+        }
+
+        if self.show_wrf_options {
+            let mut open = self.show_wrf_options;
+            let mut changed = false;
+            egui::Window::new("WRF Products")
+                .open(&mut open)
+                .default_width(520.0)
+                .resizable(true)
+                .show(ui.ctx(), |ui| {
+                    changed = self.wrf_options_ui.ui(ui, &mut self.wrf_options);
+                });
+            self.show_wrf_options = open;
+            if changed {
+                self.persist_wrf_process_options();
+            }
+        }
+
+        self.show_import_confirmations(ui.ctx());
+
         #[cfg(feature = "profiling")]
         if self.show_profiler {
             let mut open = self.show_profiler;
@@ -1646,12 +3282,233 @@ impl eframe::App for App {
     }
 }
 
+/// Build the complete, caller-verified Formula Lab time axis for an exact-time
+/// run. Returning an empty map is deliberate fail-closed behavior: legacy v1,
+/// a stale selection, or any incomplete axis keeps `dt` disabled rather than
+/// inventing a cadence from ordinal storage slots.
+fn formula_exact_store_times(
+    tree: Option<&StoreTree>,
+    selected: &HourKey,
+) -> BTreeMap<u16, rw_formula::ExactStoreTime> {
+    let Some(run) = tree.and_then(|tree| tree.run(&selected.model, &selected.run)) else {
+        return BTreeMap::new();
+    };
+    let Some(times) = run.exact_times() else {
+        return BTreeMap::new();
+    };
+    if times.get(&selected.hour) != selected.exact_time.as_ref() {
+        return BTreeMap::new();
+    }
+    if times
+        .values()
+        .any(|exact| !lead_seconds_exact_in_f64(exact.lead_seconds))
+    {
+        return BTreeMap::new();
+    }
+    times
+        .into_iter()
+        .map(|(slot, exact)| {
+            let label = format!(
+                "{} · {}",
+                rw_ui::format_lead_seconds(exact.lead_seconds),
+                rw_ui::format_valid_unix(exact.valid_unix)
+            );
+            (
+                slot,
+                rw_formula::ExactStoreTime::new(exact.lead_seconds as f64, Some(label)),
+            )
+        })
+        .collect()
+}
+
+/// An integer is losslessly representable by binary64 when, after removing
+/// trailing zero bits, its significant part fits the 53-bit significand.
+fn lead_seconds_exact_in_f64(seconds: u64) -> bool {
+    if seconds == 0 {
+        return true;
+    }
+    let significant_bits = u64::BITS - seconds.leading_zeros() - seconds.trailing_zeros();
+    significant_bits <= f64::MANTISSA_DIGITS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn test_abs_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rw-ui-{name}"))
+    }
+
+    #[test]
+    fn formula_exact_axis_is_complete_and_uses_real_sixty_second_spacing() {
+        let first = rw_store::RwsExactTime {
+            lead_seconds: 31_680,
+            valid_unix: 134_243_280,
+        };
+        let second = rw_store::RwsExactTime {
+            lead_seconds: 31_740,
+            valid_unix: 134_243_340,
+        };
+        let tree = StoreTree {
+            models: vec![rw_ui::ModelEntry {
+                model: "wrf".to_string(),
+                runs: vec![rw_ui::RunEntry {
+                    run: "exact-run".to_string(),
+                    build: "test".to_string(),
+                    writer_version: "test".to_string(),
+                    nx: 2,
+                    ny: 2,
+                    exact_time_axis: true,
+                    hours: vec![
+                        rw_ui::HourEntry {
+                            hour: 0,
+                            file: "f000.rws".to_string(),
+                            variable_count: 1,
+                            written_unix: 1,
+                            exact_time: Some(first),
+                        },
+                        rw_ui::HourEntry {
+                            hour: 1,
+                            file: "f001.rws".to_string(),
+                            variable_count: 1,
+                            written_unix: 2,
+                            exact_time: Some(second),
+                        },
+                    ],
+                }],
+            }],
+            warnings: Vec::new(),
+        };
+        let selected = HourKey {
+            model: "wrf".to_string(),
+            run: "exact-run".to_string(),
+            hour: 0,
+            exact_time: Some(first),
+        };
+        let times = formula_exact_store_times(Some(&tree), &selected);
+        assert_eq!(times.len(), 2);
+        assert_eq!(times[&1].seconds - times[&0].seconds, 60.0);
+        assert!(
+            times[&0]
+                .label
+                .as_deref()
+                .is_some_and(|label| label.contains("+08:48:00"))
+        );
+        assert!(
+            times[&0]
+                .label
+                .as_deref()
+                .is_some_and(|label| label.contains("1974-04-03 17:48:00Z"))
+        );
+
+        let mut partial = tree.clone();
+        partial.models[0].runs[0].hours[1].exact_time = None;
+        assert!(formula_exact_store_times(Some(&partial), &selected).is_empty());
+
+        let mut stale = selected;
+        stale.exact_time = Some(second);
+        assert!(formula_exact_store_times(Some(&tree), &stale).is_empty());
+
+        assert!(lead_seconds_exact_in_f64(0));
+        assert!(lead_seconds_exact_in_f64(1_u64 << 63));
+        assert!(!lead_seconds_exact_in_f64(u64::MAX));
+    }
+
+    #[test]
+    fn import_probe_normalizes_duplicate_selected_paths() {
+        let a = PathBuf::from("a.nc");
+        let b = PathBuf::from("b.nc");
+        assert_eq!(
+            normalize_import_probe_files(vec![b.clone(), a.clone(), b]),
+            vec![a, PathBuf::from("b.nc")]
+        );
+    }
+
+    #[test]
+    fn import_probe_uses_largest_record_from_every_selected_file() {
+        let mut assessment = ImportSizeAssessment::new(2);
+        assessment.include_geometry(
+            Path::new("first-small.nc"),
+            ProbedFileGeometry {
+                shape: Some(vec![100, 100, 10]),
+                record_elements: Some(100_000),
+                records: 1,
+                records_exact: true,
+            },
+        );
+        assessment.include_geometry(
+            Path::new("second-large.nc"),
+            ProbedFileGeometry {
+                shape: Some(vec![500, 500, 50]),
+                record_elements: Some(12_500_000),
+                records: 3,
+                records_exact: true,
+            },
+        );
+
+        assert!(assessment.needs_confirmation());
+        assert_eq!(assessment.record_count, 4);
+        let description = assessment.description().expect("large record warns");
+        assert!(description.contains("second-large.nc"), "{description}");
+        assert!(
+            description.contains("4 distinct time record"),
+            "{description}"
+        );
+    }
+
+    #[test]
+    fn import_probe_failure_fails_closed_to_confirmation() {
+        let mut assessment = ImportSizeAssessment::new(1);
+        assessment.include_probe_failure(Path::new("malformed.nc"), "metadata panic".to_string());
+        assert!(assessment.needs_confirmation());
+        let warning = light_import_size_warning(&assessment).expect("unknown size warns");
+        assert!(warning.contains("could not be fully verified"), "{warning}");
+        assert!(warning.contains("malformed.nc"), "{warning}");
+    }
+
+    #[test]
+    fn import_probe_small_known_selection_launches_without_confirmation() {
+        let mut assessment = ImportSizeAssessment::new(1);
+        assessment.max_bytes = 64 * 1_024 * 1_024;
+        assessment.include_geometry(
+            Path::new("small.nc"),
+            ProbedFileGeometry {
+                shape: Some(vec![100, 100, 10]),
+                record_elements: Some(100_000),
+                records: 2,
+                records_exact: true,
+            },
+        );
+        assert!(!assessment.needs_confirmation());
+        assert!(heavy_import_size_warning(&assessment).is_none());
+        assert!(light_import_size_warning(&assessment).is_none());
+    }
+
+    #[test]
+    fn import_probe_counts_multi_time_record_work_conservatively() {
+        let mut assessment = ImportSizeAssessment::new(1);
+        assessment.include_geometry(
+            Path::new("many-times.nc"),
+            ProbedFileGeometry {
+                shape: Some(vec![200, 200, 50]),
+                record_elements: Some(2_000_000),
+                records: 6,
+                records_exact: true,
+            },
+        );
+        assert!(
+            assessment.needs_confirmation(),
+            "six individually-small records still represent a large processing workload"
+        );
+        let description = assessment.description().expect("total workload warns");
+        assert!(description.contains("12M grid elements"), "{description}");
+    }
+
+    #[test]
+    fn import_probe_shape_overflow_is_an_error() {
+        let error = checked_shape_elements(&[usize::MAX, 2], "test")
+            .expect_err("overflow must not wrap into a small selection");
+        assert!(error.contains("overflow"), "{error}");
     }
 
     // ------------------------------------------------------------------
@@ -1663,7 +3520,7 @@ mod tests {
     fn resolve_defaults_when_nothing_provided() {
         let paths = resolve_storage_paths(None, None, None);
         assert!(paths.store_root.ends_with(DEFAULT_STORE_ROOT));
-        assert!(paths.cache_dir.ends_with("cache"));
+        assert_eq!(paths.cache_dir, default_cache_dir());
         assert_eq!(paths.store_root_source, PathSource::Default);
         assert_eq!(paths.cache_dir_source, PathSource::Default);
     }
@@ -2070,6 +3927,7 @@ mod tests {
                 model: "gfs".to_string(),
                 run: "20260611_00z".to_string(),
                 hour: 0,
+                exact_time: None,
             },
             var: "temperature_2m".to_string(),
         };

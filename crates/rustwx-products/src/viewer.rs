@@ -32,6 +32,7 @@ use rustwx_render::{
     ColorScale, ColormapBuildOptions, DiscreteColorScale, ExtendMode, LegendControls, LegendMode,
     MapRenderRequest, ProductVisualMode, RenderDensity, StaticPlotStyle, WeatherProduct,
 };
+use std::collections::HashSet;
 
 use crate::direct::{
     direct_fill_unit_conversion, direct_recipe_render_controls, supported_direct_recipe_slugs,
@@ -117,6 +118,18 @@ pub struct StoreVariableStyle {
     pub legend_mode: LegendMode,
 }
 
+/// One operational color-table template a UI can clone into a user-editable
+/// table. The style is copied from the same production code path used by
+/// rendered products and the native viewer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoreVariableStyleTemplate {
+    pub id: String,
+    pub slug: String,
+    pub label: String,
+    pub category: String,
+    pub style: StoreVariableStyle,
+}
+
 /// Resolve the production styling for the stored variable `var_name`
 /// carrying `stored_selector` (the store's per-variable selector JSON:
 /// either a `FieldSelector` or a `{"derived": slug}` marker) and
@@ -130,7 +143,9 @@ pub fn operational_style_for_store_variable(
     model: ModelId,
 ) -> Option<StoreVariableStyle> {
     if let Some(slug) = stored_selector.get("derived").and_then(|v| v.as_str()) {
-        return derived_style(slug, stored_units);
+        let slug = normalize_wrf_store_slug(slug);
+        return derived_style(&slug, stored_units)
+            .or_else(|| weather_product_style(&slug, stored_units));
     }
     let selector: FieldSelector = serde_json::from_value(stored_selector.clone()).ok()?;
 
@@ -197,6 +212,156 @@ fn derived_style(slug: &str, stored_units: &str) -> Option<StoreVariableStyle> {
     })
 }
 
+/// Every production color table currently reachable through the operational
+/// render/style system, packaged as cloneable user-table templates.
+pub fn operational_style_templates(model: ModelId) -> Vec<StoreVariableStyleTemplate> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::<String>::new();
+
+    let supported = supported_direct_recipe_slugs(model);
+    for recipe in built_in_plot_recipes()
+        .iter()
+        .filter(|recipe| supported.iter().any(|slug| slug == recipe.slug))
+    {
+        let Some(selector) = recipe.filled.selector else {
+            continue;
+        };
+        if selector.field == CanonicalField::GeopotentialHeight
+            || selector.field == CanonicalField::PressureReducedToMeanSeaLevel
+        {
+            continue;
+        }
+        let Ok(selector_json) = serde_json::to_value(selector) else {
+            continue;
+        };
+        if let Some(mut style) = operational_style_for_store_variable(
+            recipe.slug,
+            &selector_json,
+            selector.native_units(),
+            model,
+        ) {
+            style.title = recipe.title.to_string();
+            push_template(
+                &mut out,
+                &mut seen,
+                "direct",
+                recipe.slug,
+                recipe.title,
+                style,
+            );
+        }
+    }
+
+    for entry in crate::derived::supported_derived_recipe_inventory() {
+        if let Some(mut style) = operational_style_for_store_variable(
+            entry.slug,
+            &serde_json::json!({ "derived": entry.slug }),
+            template_units_for_slug(entry.slug),
+            model,
+        ) {
+            style.title = entry.title.to_string();
+            push_template(
+                &mut out,
+                &mut seen,
+                if entry.heavy { "heavy" } else { "derived" },
+                entry.slug,
+                entry.title,
+                style,
+            );
+        }
+    }
+
+    for product in ALL_WEATHER_PRODUCTS {
+        if let Some(style) =
+            weather_product_style(product.slug(), template_units_for_slug(product.slug()))
+        {
+            push_template(
+                &mut out,
+                &mut seen,
+                "weather",
+                product.slug(),
+                product.display_title(),
+                style,
+            );
+        }
+    }
+
+    for &product in HrrrWindowedProduct::supported_products() {
+        if let Some(style) = windowed_product_style(product) {
+            push_template(
+                &mut out,
+                &mut seen,
+                "windowed",
+                product.slug(),
+                product.title(),
+                style,
+            );
+        }
+    }
+
+    out.sort_by(|a, b| {
+        a.category
+            .cmp(&b.category)
+            .then_with(|| a.label.cmp(&b.label))
+            .then_with(|| a.slug.cmp(&b.slug))
+    });
+    out
+}
+
+fn push_template(
+    out: &mut Vec<StoreVariableStyleTemplate>,
+    seen: &mut HashSet<String>,
+    category: &str,
+    slug: &str,
+    label: &str,
+    style: StoreVariableStyle,
+) {
+    let id = format!("{category}:{slug}");
+    if seen.insert(id.clone()) {
+        out.push(StoreVariableStyleTemplate {
+            id,
+            slug: slug.to_string(),
+            label: label.to_string(),
+            category: category.to_string(),
+            style,
+        });
+    }
+}
+
+/// Local WRF processing initially stored `wrf_*` derived markers, while the
+/// existing operational style catalog uses model-agnostic product slugs.
+/// Normalize those aliases before resolving a derived/weather palette.
+fn normalize_wrf_store_slug(slug: &str) -> String {
+    let slug = slug.strip_prefix("wrf_").unwrap_or(slug);
+    match slug {
+        "srh1" => "srh_0_1km".to_string(),
+        "srh3" => "srh_0_3km".to_string(),
+        "shear_0_1km" => "bulk_shear_0_1km".to_string(),
+        "shear_0_6km" => "bulk_shear_0_6km".to_string(),
+        "uhel" => "uhel".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// WRF-core exposes a few already-computed severe parameters that are not
+/// HRRR-derived recipe slugs but do have first-class WeatherProduct palettes
+/// (STP/SCP/EHI/LCL/LFC/EL/UH, etc.). Use the same weather request builder
+/// as the production weather lanes for those.
+fn weather_product_style(slug: &str, stored_units: &str) -> Option<StoreVariableStyle> {
+    let product = WeatherProduct::from_product_name(slug)?;
+    let mut request = MapRenderRequest::for_core_weather_product(probe_core_field(), product);
+    apply_probe_static_design(&mut request);
+    Some(StoreVariableStyle {
+        title: product.display_title().to_string(),
+        display_units: stored_units.to_string(),
+        convert: UnitConvert::None,
+        scale: request.scale,
+        colormap_options: filtered_options(request.render_density, request.legend),
+        cbar_tick_step: request.cbar_tick_step,
+        legend_mode: request.legend.mode,
+    })
+}
+
 /// `uh_2to5km_max_1h`: the windowed UH family request —
 /// `for_core_weather_product(WeatherProduct::Uh)` + static map design.
 fn windowed_uh_style(stored_units: &str) -> StoreVariableStyle {
@@ -254,12 +419,145 @@ fn windowed_qpf_1h_style() -> StoreVariableStyle {
 /// supported recipe whose `filled.selector` equals the stored selector —
 /// except `apcp_run_total`, whose store name pins the run-total window
 /// identity for the shared plain TotalPrecipitation selector.
+fn windowed_product_style(product: HrrrWindowedProduct) -> Option<StoreVariableStyle> {
+    let scale = crate::windowed_decoder::windowed_product_scale(product);
+    let mut request = MapRenderRequest::from_core_field(probe_core_field(), scale);
+    apply_probe_static_design(&mut request);
+    let (convert, display_units) = windowed_product_units(product);
+    Some(StoreVariableStyle {
+        title: product.title().to_string(),
+        display_units: display_units.to_string(),
+        convert,
+        scale: request.scale,
+        colormap_options: filtered_options(request.render_density, request.legend),
+        cbar_tick_step: request.cbar_tick_step,
+        legend_mode: request.legend.mode,
+    })
+}
+
+fn windowed_product_units(product: HrrrWindowedProduct) -> (UnitConvert, &'static str) {
+    let slug = product.slug();
+    if slug.starts_with("qpf_") {
+        (UnitConvert::MmToInches, "in")
+    } else if slug.starts_with("10m_wind_") {
+        (UnitConvert::MsToKnots, "kt")
+    } else if slug.starts_with("2m_temp_") || slug.starts_with("2m_dewpoint_") {
+        (UnitConvert::KelvinToFahrenheit, "degF")
+    } else if slug.starts_with("2m_rh_") {
+        (UnitConvert::None, "%")
+    } else if slug.starts_with("2m_vpd_") {
+        (UnitConvert::None, "hPa")
+    } else if slug.starts_with("uh_") {
+        (UnitConvert::None, "m^2/s^2")
+    } else {
+        (UnitConvert::None, "")
+    }
+}
+
+const ALL_WEATHER_PRODUCTS: &[WeatherProduct] = &[
+    WeatherProduct::Sbcape,
+    WeatherProduct::Mlcape,
+    WeatherProduct::Mucape,
+    WeatherProduct::Sbecape,
+    WeatherProduct::Mlecape,
+    WeatherProduct::Muecape,
+    WeatherProduct::SbEcapeDerivedCapeRatio,
+    WeatherProduct::MlEcapeDerivedCapeRatio,
+    WeatherProduct::MuEcapeDerivedCapeRatio,
+    WeatherProduct::SbEcapeNativeCapeRatio,
+    WeatherProduct::MlEcapeNativeCapeRatio,
+    WeatherProduct::MuEcapeNativeCapeRatio,
+    WeatherProduct::Sbncape,
+    WeatherProduct::Mlncape,
+    WeatherProduct::Muncape,
+    WeatherProduct::Sbcin,
+    WeatherProduct::Mlcin,
+    WeatherProduct::Mucin,
+    WeatherProduct::Sbecin,
+    WeatherProduct::Mlecin,
+    WeatherProduct::Muecin,
+    WeatherProduct::EcapeCape,
+    WeatherProduct::EcapeCin,
+    WeatherProduct::Lcl,
+    WeatherProduct::Lfc,
+    WeatherProduct::El,
+    WeatherProduct::EcapeLfc,
+    WeatherProduct::EcapeEl,
+    WeatherProduct::Srh01km,
+    WeatherProduct::Srh03km,
+    WeatherProduct::Stp,
+    WeatherProduct::StpFixed,
+    WeatherProduct::StpEffective,
+    WeatherProduct::Scp,
+    WeatherProduct::Ehi,
+    WeatherProduct::Tehi,
+    WeatherProduct::Tts,
+    WeatherProduct::VtpMod,
+    WeatherProduct::Uh,
+    WeatherProduct::EcapeScpExperimental,
+    WeatherProduct::EcapeEhi01kmExperimental,
+    WeatherProduct::EcapeEhi03kmExperimental,
+    WeatherProduct::EcapeStpExperimental,
+];
+
+fn template_units_for_slug(slug: &str) -> &'static str {
+    let slug = normalize_wrf_store_slug(slug);
+    if slug.contains("cape") || slug.contains("cin") || slug.contains("ncape") || slug == "dcape" {
+        "J/kg"
+    } else if slug.contains("lcl") || slug.contains("lfc") || slug == "el" {
+        "m"
+    } else if slug.contains("srh") || slug.contains("uhel") || slug == "uh" {
+        "m^2/s^2"
+    } else if slug.contains("shear") {
+        "kt"
+    } else if slug.contains("stp")
+        || slug.contains("scp")
+        || slug.contains("ehi")
+        || slug.contains("tts")
+        || slug.contains("vtp")
+        || slug.contains("ratio")
+    {
+        "dimensionless"
+    } else if slug.contains("temperature")
+        || slug.contains("apparent")
+        || slug.contains("heat_index")
+        || slug.contains("wind_chill")
+        || slug.contains("wetbulb")
+    {
+        "degF"
+    } else if slug.contains("vpd") {
+        "hPa"
+    } else {
+        ""
+    }
+}
+
 fn direct_recipe_for_selector(
     var_name: &str,
     selector: FieldSelector,
     model: ModelId,
 ) -> Option<&'static PlotRecipe> {
-    let supported = supported_direct_recipe_slugs(model);
+    direct_recipe_for_selector_with_supported(
+        var_name,
+        selector,
+        &supported_direct_recipe_slugs(model),
+    )
+    .or_else(|| {
+        (model == ModelId::WrfGdex).then(|| {
+            direct_recipe_for_selector_with_supported(
+                var_name,
+                selector,
+                &supported_direct_recipe_slugs(ModelId::Hrrr),
+            )
+        })?
+    })
+}
+
+fn direct_recipe_for_selector_with_supported(
+    var_name: &str,
+    selector: FieldSelector,
+    supported: &[String],
+) -> Option<&'static PlotRecipe> {
     let is_supported = |slug: &str| supported.iter().any(|s| s == slug);
     if var_name == "apcp_run_total" {
         if let Some(recipe) =
@@ -396,6 +694,73 @@ mod tests {
     }
 
     #[test]
+    fn wrf_prefixed_derived_markers_reuse_product_palettes() {
+        let sbcape = operational_style_for_store_variable(
+            "wrf_sbcape",
+            &derived_marker("wrf_sbcape"),
+            "J/kg",
+            ModelId::Hrrr,
+        )
+        .expect("legacy wrf_sbcape resolves");
+        assert_eq!(sbcape.title, "SBCAPE");
+        assert_eq!(
+            sbcape.scale.resolved_discrete().mask_below,
+            Some(250.0),
+            "wrf_sbcape must use the same CAPE masking as sbcape"
+        );
+
+        let srh = operational_style_for_store_variable(
+            "wrf_srh1",
+            &derived_marker("wrf_srh1"),
+            "m2/s2",
+            ModelId::Hrrr,
+        )
+        .expect("legacy wrf_srh1 resolves");
+        assert_eq!(srh.title, "0-1 km SRH");
+        assert_eq!(srh.cbar_tick_step, Some(50.0));
+
+        let shear = operational_style_for_store_variable(
+            "wrf_shear_0_6km",
+            &derived_marker("wrf_shear_0_6km"),
+            "m/s",
+            ModelId::Hrrr,
+        )
+        .expect("legacy wrf_shear_0_6km resolves");
+        assert_eq!(shear.title, "0-6 km Bulk Shear");
+
+        let stp = operational_style_for_store_variable(
+            "wrf_stp",
+            &derived_marker("wrf_stp"),
+            "dimensionless",
+            ModelId::Hrrr,
+        )
+        .expect("legacy wrf_stp resolves via WeatherProduct");
+        assert_eq!(stp.title, "STP");
+        assert!(matches!(stp.scale, ColorScale::Weather(_)));
+    }
+
+    #[test]
+    fn operational_template_catalog_exposes_common_starting_palettes() {
+        let templates = operational_style_templates(ModelId::Hrrr);
+        assert!(
+            templates
+                .iter()
+                .any(|template| template.slug == "2m_temperature"),
+            "template catalog must include the operational 2 m temperature palette"
+        );
+        assert!(
+            templates
+                .iter()
+                .any(|template| template.slug == "2m_dewpoint"),
+            "template catalog must include the operational dewpoint palette"
+        );
+        assert!(
+            templates.iter().any(|template| template.slug == "stp"),
+            "template catalog must include an STP palette"
+        );
+    }
+
+    #[test]
     fn heavy_slugs_use_the_weather_preset_lane_without_densification() {
         let style = operational_style_for_store_variable(
             "sbecape",
@@ -476,6 +841,20 @@ mod tests {
         assert_eq!(scale.levels.first().copied(), Some(10.0));
         assert_eq!(scale.levels.last().copied(), Some(70.0));
         assert_eq!(scale.mask_below, Some(10.0));
+    }
+
+    #[test]
+    fn wrf_gdex_direct_planes_resolve_standard_product_palettes() {
+        let temp = operational_style_for_store_variable(
+            "temperature_2m",
+            &serde_json::to_value(FieldSelector::height_agl(CanonicalField::Temperature, 2))
+                .expect("selector json"),
+            "K",
+            ModelId::WrfGdex,
+        )
+        .expect("WRF 2m temperature should use the standard temperature palette");
+        assert_eq!(temp.convert, UnitConvert::KelvinToFahrenheit);
+        assert_eq!(temp.display_units, "degF");
     }
 
     #[test]
