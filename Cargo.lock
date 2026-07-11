@@ -1331,7 +1331,7 @@ dependencies = [
 [[package]]
 name = "ecape-rs"
 version = "0.1.4"
-source = "git+https://github.com/FahrenheitResearch/ecape-rs?rev=414cac67ce1ce4bff64c7c74449ed4ccddb3ebc0#414cac67ce1ce4bff64c7c74449ed4ccddb3ebc0"
+source = "git+https://github.com/FahrenheitResearch/ecape-rs?rev=82922534c02a888e773c50463b5a49d535606276#82922534c02a888e773c50463b5a49d535606276"
 dependencies = [
  "metrust 0.3.9",
  "serde",
@@ -6740,9 +6740,9 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "wrf-core"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=f8df4b90da90ee7fbc847c4176dfe5ef0c8aa0fb#f8df4b90da90ee7fbc847c4176dfe5ef0c8aa0fb"
+source = "git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=2550d4e2f85c61a190cf639d59e713f553facd07#2550d4e2f85c61a190cf639d59e713f553facd07"
 dependencies = [
- "ecape-rs 0.1.4 (git+https://github.com/FahrenheitResearch/ecape-rs?rev=414cac67ce1ce4bff64c7c74449ed4ccddb3ebc0)",
+ "ecape-rs 0.1.4 (git+https://github.com/FahrenheitResearch/ecape-rs?rev=82922534c02a888e773c50463b5a49d535606276)",
  "flate2",
  "ndarray 0.16.1",
  "netcdf-reader 0.5.0",
@@ -6752,7 +6752,7 @@ dependencies = [
 [[package]]
 name = "wrf-formula"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=f8df4b90da90ee7fbc847c4176dfe5ef0c8aa0fb#f8df4b90da90ee7fbc847c4176dfe5ef0c8aa0fb"
+source = "git+https://github.com/FahrenheitResearch/wrf-rust.git?rev=2550d4e2f85c61a190cf639d59e713f553facd07#2550d4e2f85c61a190cf639d59e713f553facd07"
 dependencies = [
  "serde",
  "serde_json",
