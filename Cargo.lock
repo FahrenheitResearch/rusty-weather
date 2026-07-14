@@ -4702,7 +4702,7 @@ dependencies = [
  "image",
  "rustwx-render",
  "serde",
- "sharprs",
+ "sharprs 0.1.0",
  "thiserror 2.0.18",
 ]
 
@@ -4754,9 +4754,12 @@ dependencies = [
  "puffin_http",
  "rayon",
  "rfd",
+ "rustls",
+ "rustls-rustcrypto",
  "rustwx-core",
  "rustwx-io",
  "rustwx-models",
+ "rustwx-sounding",
  "rusty-weather",
  "rw-formula",
  "rw-gdex",
@@ -4767,7 +4770,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sharprs 0.1.0",
  "thiserror 2.0.18",
+ "ureq",
  "wrf-core",
 ]
 
@@ -4894,6 +4899,7 @@ dependencies = [
  "rw-store",
  "serde",
  "serde_json",
+ "sharppyrs",
 ]
 
 [[package]]
@@ -5059,8 +5065,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "sharppyrs"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "sharprs 0.1.0 (git+https://github.com/FahrenheitResearch/sharprs)",
+]
+
+[[package]]
 name = "sharprs"
 version = "0.1.0"
+dependencies = [
+ "image",
+ "rusttype",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "sharprs"
+version = "0.1.0"
+source = "git+https://github.com/FahrenheitResearch/sharprs#1601674e8be0a07eaa48a50ddf6b2cedc035324f"
 dependencies = [
  "image",
  "rusttype",

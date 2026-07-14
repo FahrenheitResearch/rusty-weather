@@ -47,6 +47,12 @@ pub use panels::{
     SoundingPanel, SoundingViewState, StageState, format_bytes, shift_date_yyyymmdd,
     today_yyyymmdd_utc,
 };
+
+/// Install the font families used by the native SHARPpy sounding widget.
+/// Hosts should call this once while configuring their egui context.
+pub fn install_sounding_fonts(ctx: &egui::Context) {
+    sharppyrs::install_fonts(ctx);
+}
 pub use store_view::{HourEntry, ModelEntry, RunEntry, StoreTree, StoreView};
 pub use style_overrides::{
     ProductStyleBinding, StyleOverrideSettings, UserColorTable, UserExtendMode, UserLegendMode,
