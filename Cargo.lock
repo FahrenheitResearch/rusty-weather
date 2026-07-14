@@ -4723,6 +4723,7 @@ name = "rusty-weather"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "ecape-rs 0.1.4",
  "image",
  "libmimalloc-sys",
  "mimalloc",
