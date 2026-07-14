@@ -650,6 +650,13 @@ fn ecape_inventory_entries_are_marked_heavy() {
         .expect("sbecape inventory entry should exist");
     assert!(sbecape.heavy);
     assert!(!sbecape.experimental);
+    assert_eq!(sbecape.title, "SB Analytic ECAPE");
+
+    let sbecin = supported_derived_recipe_inventory()
+        .iter()
+        .find(|recipe| recipe.slug == "sbecin")
+        .expect("sbecin inventory entry should exist");
+    assert_eq!(sbecin.title, "SB Entraining Parcel CIN");
 
     let ecape_scp = supported_derived_recipe_inventory()
         .iter()

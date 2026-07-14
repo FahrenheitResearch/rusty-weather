@@ -13,3 +13,4 @@ rustwx-render = { path = "../rustwx-render" }
 serde.workspace = true
 thiserror.workspace = true
 sharprs = { path = "../../vendor/sharprs" }
+wx-math = { path = "../../vendor/wx-math" }

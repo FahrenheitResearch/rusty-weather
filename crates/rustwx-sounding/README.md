@@ -8,7 +8,8 @@
 - conversion to `sharprs` profiles
 - native sounding rendering
 - rustwx-owned sounding table/title rendering with Source Sans text
-- verified SB/ML/MU ECAPE and NCAPE table values from the `ecape-rs` parcel path
+- verified SB/ML/MU analytic ECAPE and paired NCAPE table values from
+  `ecape_rs::calc_ecape_ncape`
 - optional external ECAPE annotation block that can be appended to the rendered product
 
 ## Input validation
@@ -22,7 +23,11 @@
 
 ## Important note
 
-`sharprs` is not being misrepresented here as an ECAPE engine. ECAPE and NCAPE values shown in the native table are computed by `rustwx-sounding` through the verified `ecape-rs` parcel path; `sharprs` remains the profile/legacy sounding calculation dependency.
+`sharprs` is not being misrepresented here as an ECAPE engine. Analytic ECAPE
+and paired NCAPE values shown in the native table are computed by
+`rustwx-sounding` through `ecape_rs::calc_ecape_ncape`; `sharprs` remains the
+profile/legacy sounding calculation dependency. The table does not publish the
+post-path `calc_ecape_parcel(...).ecape_jkg` field as standard ECAPE.
 
 ## Current limits
 

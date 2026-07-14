@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ecape_rs::{CapeType, ParcelOptions, StormMotionType, calc_ecape_ncape, calc_ecape_parcel};
 use image::ImageFormat;
 use rustwx_sounding::{
     EcapeIntegrationStatus, ExternalEcapeSummary, ExternalEcapeValue, NativeParcelContext,
@@ -193,6 +194,68 @@ fn native_sounding_populates_verified_ecape_table_params() {
     assert!(native.verified_ecape.surface_based.cape.is_finite());
     assert!(native.verified_ecape.mixed_layer.ecape.is_finite());
     assert!(native.verified_ecape.most_unstable.ecape.is_finite());
+}
+
+#[test]
+fn native_sounding_ecape_column_selects_the_analytic_quantity() {
+    let column = sample_column();
+    let native = NativeSounding::from_column(&column).expect("bridge should succeed");
+    let pressure_pa = column
+        .pressure_hpa
+        .iter()
+        .map(|pressure| pressure * 100.0)
+        .collect::<Vec<_>>();
+    let temperature_k = column
+        .temperature_c
+        .iter()
+        .map(|temperature| temperature + 273.15)
+        .collect::<Vec<_>>();
+    let dewpoint_k = column
+        .dewpoint_c
+        .iter()
+        .map(|dewpoint| dewpoint + 273.15)
+        .collect::<Vec<_>>();
+    let qv_kgkg = column
+        .pressure_hpa
+        .iter()
+        .zip(column.dewpoint_c.iter())
+        .map(|(&pressure, &dewpoint)| {
+            wx_math::thermo::specific_humidity_from_dewpoint(pressure, dewpoint)
+        })
+        .collect::<Vec<_>>();
+    let options = ParcelOptions {
+        cape_type: CapeType::SurfaceBased,
+        storm_motion_type: StormMotionType::RightMoving,
+        pseudoadiabatic: Some(true),
+        ..ParcelOptions::default()
+    };
+    let analytic = calc_ecape_ncape(
+        &column.height_m_msl,
+        &pressure_pa,
+        &temperature_k,
+        &qv_kgkg,
+        &column.u_ms,
+        &column.v_ms,
+        &options,
+    )
+    .expect("analytic ECAPE should solve");
+    let post_path = calc_ecape_parcel(
+        &column.height_m_msl,
+        &pressure_pa,
+        &temperature_k,
+        &dewpoint_k,
+        &column.u_ms,
+        &column.v_ms,
+        &options,
+    )
+    .expect("entraining parcel path should solve");
+
+    let displayed = native.verified_ecape.surface_based.ecape;
+    assert!((displayed - analytic.ecape_jkg).abs() < 1.0e-6);
+    assert!(
+        (displayed - post_path.ecape_jkg).abs() > 1.0,
+        "ECAPE column must not select calc_ecape_parcel().ecape_jkg"
+    );
 }
 
 #[test]

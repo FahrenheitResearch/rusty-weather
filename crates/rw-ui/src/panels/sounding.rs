@@ -1701,7 +1701,7 @@ fn draw_native_tables(
         ("LFC", 455.0),
         ("EL", 520.0),
         ("LI", 575.0),
-        ("ECAPE", 660.0),
+        ("A-ECAPE", 660.0),
         ("NCAPE", 735.0),
     ]
     .iter()

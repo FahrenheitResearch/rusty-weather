@@ -16,9 +16,11 @@ use crate::shared_context::{
     DomainSpec, ProjectedMap, WeatherPanelField, build_weather_map_request,
 };
 use rustwx_calc::{
-    EcapeTripletOptions, EcapeVolumeInputs, EffectiveStpInputs, ScpEhiInputs, SurfaceInputs,
-    WindGridInputs, compute_ecape_triplet_with_failure_mask_from_parts, compute_ehi,
-    compute_mlcape_cin, compute_scp_ehi, compute_stp_effective, compute_wind_diagnostics_bundle,
+    EcapeTripletFieldsWithFailureMask, EcapeTripletOptions, EcapeVolumeInputs, EffectiveStpInputs,
+    ScpEhiInputs, SurfaceInputs, WindGridInputs,
+    compute_analytic_ecape_triplet_with_failure_mask_from_parts,
+    compute_ecape_triplet_with_failure_mask_from_parts, compute_ehi, compute_mlcape_cin,
+    compute_scp_ehi, compute_stp_effective, compute_wind_diagnostics_bundle,
 };
 use rustwx_core::{ModelId, SourceId};
 use rustwx_render::{
@@ -374,9 +376,10 @@ fn render_ecape_ratio_display_group(
         let ecape = required_panel_field(fields, parcel.ecape_slug)?;
         let ratio = required_panel_field(fields, parcel.ratio_slug)?;
 
-        let mut ratio_fill = ratio
-            .clone()
-            .with_title_override(format!("{} ECAPE/CAPE Ratio + Contours", parcel.label));
+        let mut ratio_fill = ratio.clone().with_title_override(format!(
+            "{} Analytic ECAPE/Entraining Parcel CAPE Ratio + Contours",
+            parcel.label
+        ));
         ratio_fill.artifact_slug = Some(format!("{}_ratio_fill_contours", parcel.slug));
         render_ms += render_ecape_ratio_display_plot(
             out_dir,
@@ -396,7 +399,7 @@ fn render_ecape_ratio_display_group(
 
         let mut ecape_fill = ecape
             .clone()
-            .with_title_override(format!("{}ECAPE + Ratio Contours", parcel.label));
+            .with_title_override(format!("{} Analytic ECAPE + Ratio Contours", parcel.label));
         ecape_fill.artifact_slug = Some(format!("{}_ecape_fill_ratio_contours", parcel.slug));
         render_ms += render_ecape_ratio_display_plot(
             out_dir,
@@ -535,7 +538,7 @@ pub fn compute_ecape_map_fields(
 /// runs the exact same kernels in the exact same order.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct EcapeMapFieldsTiming {
-    /// The SB/ML/MU entraining-parcel ECAPE triplet (the dominant cost).
+    /// Analytic ECAPE plus explicit entraining parcel-path triplets.
     pub ecape_triplet_ms: u128,
     /// SRH 0-1/0-3 km + 0-6 km bulk shear for the experimental composites.
     pub wind_diagnostics_ms: u128,
@@ -562,28 +565,41 @@ pub fn compute_ecape_map_fields_with_prepared_volume_timed(
 ) -> Result<(Vec<WeatherPanelField>, usize, EcapeMapFieldsTiming), Box<dyn std::error::Error>> {
     let mut timing = EcapeMapFieldsTiming::default();
     let triplet_start = Instant::now();
-    let triplet = compute_ecape_triplet_with_failure_mask_from_parts(
+    let volume = EcapeVolumeInputs {
+        pressure_pa: prepared
+            .pressure_3d_pa
+            .as_deref()
+            .unwrap_or(&prepared.pressure_levels_pa),
+        temperature_c: &pressure.temperature_c_3d,
+        qvapor_kgkg: &pressure.qvapor_kgkg_3d,
+        height_agl_m: &prepared.height_agl_3d,
+        u_ms: &pressure.u_ms_3d,
+        v_ms: &pressure.v_ms_3d,
+        nz: prepared.shape.nz,
+    };
+    let surface_inputs = SurfaceInputs {
+        psfc_pa: &surface.psfc_pa,
+        t2_k: &surface.t2_k,
+        q2_kgkg: &surface.q2_kgkg,
+        u10_ms: &surface.u10_ms,
+        v10_ms: &surface.v10_ms,
+    };
+    let options = EcapeTripletOptions::new("right_moving");
+
+    // Standard SB/ML/MU ECAPE and NCAPE come only from the analytic API.
+    // The explicit parcel-path API is retained for entraining CIN; its
+    // post-path `.ecape_jkg` is intentionally not published.
+    let analytic = compute_analytic_ecape_triplet_with_failure_mask_from_parts(
         prepared.grid,
-        EcapeVolumeInputs {
-            pressure_pa: prepared
-                .pressure_3d_pa
-                .as_deref()
-                .unwrap_or(&prepared.pressure_levels_pa),
-            temperature_c: &pressure.temperature_c_3d,
-            qvapor_kgkg: &pressure.qvapor_kgkg_3d,
-            height_agl_m: &prepared.height_agl_3d,
-            u_ms: &pressure.u_ms_3d,
-            v_ms: &pressure.v_ms_3d,
-            nz: prepared.shape.nz,
-        },
-        SurfaceInputs {
-            psfc_pa: &surface.psfc_pa,
-            t2_k: &surface.t2_k,
-            q2_kgkg: &surface.q2_kgkg,
-            u10_ms: &surface.u10_ms,
-            v10_ms: &surface.v10_ms,
-        },
-        EcapeTripletOptions::new("right_moving"),
+        volume,
+        surface_inputs,
+        options,
+    )?;
+    let entraining_path = compute_ecape_triplet_with_failure_mask_from_parts(
+        prepared.grid,
+        volume,
+        surface_inputs,
+        options,
     )?;
     timing.ecape_triplet_ms = triplet_start.elapsed().as_millis();
     let wind_start = Instant::now();
@@ -598,15 +614,15 @@ pub fn compute_ecape_map_fields_with_prepared_volume_timed(
     let composites_start = Instant::now();
     let experimental = compute_scp_ehi(ScpEhiInputs {
         grid: prepared.grid,
-        scp_cape_jkg: &triplet.mu.fields.ecape_jkg,
+        scp_cape_jkg: &analytic.mu.fields.ecape_jkg,
         scp_srh_m2s2: &wind_diagnostics.srh_03km_m2s2,
         scp_bulk_wind_difference_ms: &wind_diagnostics.shear_06km_ms,
-        ehi_cape_jkg: &triplet.sb.fields.ecape_jkg,
+        ehi_cape_jkg: &analytic.sb.fields.ecape_jkg,
         ehi_srh_m2s2: &wind_diagnostics.srh_01km_m2s2,
     })?;
     let ecape_ehi_03km = compute_ehi(
         prepared.grid,
-        &triplet.sb.fields.ecape_jkg,
+        &analytic.sb.fields.ecape_jkg,
         &wind_diagnostics.srh_03km_m2s2,
     )?;
     timing.composites_ms += composites_start.elapsed().as_millis();
@@ -638,25 +654,46 @@ pub fn compute_ecape_map_fields_with_prepared_volume_timed(
     let tail_start = Instant::now();
     let ecape_stp = compute_stp_effective(EffectiveStpInputs {
         grid: prepared.grid,
-        mlcape_jkg: &triplet.ml.fields.ecape_jkg,
-        mlcin_jkg: &triplet.ml.fields.cin_jkg,
+        mlcape_jkg: &analytic.ml.fields.ecape_jkg,
+        mlcin_jkg: &entraining_path.ml.fields.cin_jkg,
         ml_lcl_m: &ml_classic.lcl_m,
         effective_srh_m2s2: &wind_diagnostics.srh_01km_m2s2,
         effective_bulk_wind_difference_ms: &wind_diagnostics.shear_06km_ms,
     })?;
-    let failure_count = triplet.total_failure_count();
+    let failure_count = combined_ecape_failure_count(&analytic, &entraining_path);
 
-    let sb_derived_ratio =
-        ecape_cape_ratio(&triplet.sb.fields.ecape_jkg, &triplet.sb.fields.cape_jkg);
-    let ml_derived_ratio =
-        ecape_cape_ratio(&triplet.ml.fields.ecape_jkg, &triplet.ml.fields.cape_jkg);
-    let mu_derived_ratio =
-        ecape_cape_ratio(&triplet.mu.fields.ecape_jkg, &triplet.mu.fields.cape_jkg);
+    // The stable `*_derived_cape_ratio` slugs historically referred to the
+    // CAPE derived by the explicit entraining parcel path. Keep that
+    // denominator, but pair it with the corrected analytic ECAPE numerator.
+    let sb_derived_ratio = ecape_cape_ratio(
+        &analytic.sb.fields.ecape_jkg,
+        &entraining_path.sb.fields.cape_jkg,
+    );
+    let ml_derived_ratio = ecape_cape_ratio(
+        &analytic.ml.fields.ecape_jkg,
+        &entraining_path.ml.fields.cape_jkg,
+    );
+    let mu_derived_ratio = ecape_cape_ratio(
+        &analytic.mu.fields.ecape_jkg,
+        &entraining_path.mu.fields.cape_jkg,
+    );
 
     let mut fields = vec![
-        WeatherPanelField::new(WeatherProduct::Sbecape, "J/kg", triplet.sb.fields.ecape_jkg),
-        WeatherPanelField::new(WeatherProduct::Mlecape, "J/kg", triplet.ml.fields.ecape_jkg),
-        WeatherPanelField::new(WeatherProduct::Muecape, "J/kg", triplet.mu.fields.ecape_jkg),
+        WeatherPanelField::new(
+            WeatherProduct::Sbecape,
+            "J/kg",
+            analytic.sb.fields.ecape_jkg,
+        ),
+        WeatherPanelField::new(
+            WeatherProduct::Mlecape,
+            "J/kg",
+            analytic.ml.fields.ecape_jkg,
+        ),
+        WeatherPanelField::new(
+            WeatherProduct::Muecape,
+            "J/kg",
+            analytic.mu.fields.ecape_jkg,
+        ),
         WeatherPanelField::new(
             WeatherProduct::SbEcapeDerivedCapeRatio,
             "ratio",
@@ -672,9 +709,21 @@ pub fn compute_ecape_map_fields_with_prepared_volume_timed(
             "ratio",
             mu_derived_ratio,
         ),
-        WeatherPanelField::new(WeatherProduct::Sbncape, "J/kg", triplet.sb.fields.ncape_jkg),
-        WeatherPanelField::new(WeatherProduct::Sbecin, "J/kg", triplet.sb.fields.cin_jkg),
-        WeatherPanelField::new(WeatherProduct::Mlecin, "J/kg", triplet.ml.fields.cin_jkg),
+        WeatherPanelField::new(
+            WeatherProduct::Sbncape,
+            "J/kg",
+            analytic.sb.fields.ncape_jkg,
+        ),
+        WeatherPanelField::new(
+            WeatherProduct::Sbecin,
+            "J/kg",
+            entraining_path.sb.fields.cin_jkg,
+        ),
+        WeatherPanelField::new(
+            WeatherProduct::Mlecin,
+            "J/kg",
+            entraining_path.ml.fields.cin_jkg,
+        ),
         WeatherPanelField::new(
             WeatherProduct::EcapeScpExperimental,
             "dimensionless",
@@ -719,6 +768,26 @@ pub fn compute_ecape_map_fields_with_prepared_volume_timed(
     }
     timing.composites_ms += tail_start.elapsed().as_millis();
     Ok((fields, failure_count, timing))
+}
+
+fn combined_ecape_failure_count(
+    analytic: &EcapeTripletFieldsWithFailureMask,
+    entraining_path: &EcapeTripletFieldsWithFailureMask,
+) -> usize {
+    [
+        (&analytic.sb.failure_mask, &entraining_path.sb.failure_mask),
+        (&analytic.ml.failure_mask, &entraining_path.ml.failure_mask),
+        (&analytic.mu.failure_mask, &entraining_path.mu.failure_mask),
+    ]
+    .into_iter()
+    .map(|(analytic_mask, path_mask)| {
+        analytic_mask
+            .iter()
+            .zip(path_mask.iter())
+            .filter(|(analytic_failed, path_failed)| **analytic_failed != 0 || **path_failed != 0)
+            .count()
+    })
+    .sum()
 }
 
 fn ecape_cape_ratio(ecape_jkg: &[f64], cape_jkg: &[f64]) -> Vec<f64> {

@@ -4704,6 +4704,7 @@ dependencies = [
  "serde",
  "sharprs",
  "thiserror 2.0.18",
+ "wx-math 0.3.6",
 ]
 
 [[package]]

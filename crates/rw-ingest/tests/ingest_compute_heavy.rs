@@ -1,6 +1,6 @@
 //! Wiring proof for the ingest heavy (ECAPE-class) precompute path:
 //! `sbecape` computed through `ingest_compute::compute_heavy_2d_from_inputs`
-//! must match calling the rustwx-calc ECAPE triplet kernel directly with
+//! must match calling the rustwx-calc analytic ECAPE triplet directly with
 //! identically prepared inputs, bit-exactly — same code path, same
 //! height-AGL assembly, same per-level pressure vector, same slug fan-out
 //! and native-CAPE plumbing, same final f64 -> f32 cast. Input decode no
@@ -12,6 +12,7 @@
 
 use rustwx_calc::{
     EcapeTripletOptions, EcapeVolumeInputs, GridShape as CalcGridShape, SurfaceInputs,
+    compute_analytic_ecape_triplet_with_failure_mask_from_parts,
     compute_ecape_triplet_with_failure_mask_from_parts,
 };
 use rustwx_products::derived::store_heavy_recipe_slugs;
@@ -279,29 +280,40 @@ fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
         .collect();
 
     let calc_grid = CalcGridShape::new(NX, NY).unwrap();
-    let triplet = compute_ecape_triplet_with_failure_mask_from_parts(
-        calc_grid,
-        EcapeVolumeInputs {
-            pressure_pa: &pressure_pa,
-            temperature_c: &temperature_c_3d,
-            qvapor_kgkg: &qvapor_kgkg_3d,
-            height_agl_m: &height_agl_3d,
-            u_ms: &u_3d,
-            v_ms: &v_3d,
-            nz: NZ,
-        },
-        SurfaceInputs {
-            psfc_pa: &synthetic.psfc_pa,
-            t2_k: &synthetic.t2_k,
-            q2_kgkg: &synthetic.q2_kgkg,
-            u10_ms: &synthetic.u10_ms,
-            v10_ms: &synthetic.v10_ms,
-        },
+    let volume = EcapeVolumeInputs {
+        pressure_pa: &pressure_pa,
+        temperature_c: &temperature_c_3d,
+        qvapor_kgkg: &qvapor_kgkg_3d,
+        height_agl_m: &height_agl_3d,
+        u_ms: &u_3d,
+        v_ms: &v_3d,
+        nz: NZ,
+    };
+    let surface_inputs = SurfaceInputs {
+        psfc_pa: &synthetic.psfc_pa,
+        t2_k: &synthetic.t2_k,
+        q2_kgkg: &synthetic.q2_kgkg,
+        u10_ms: &synthetic.u10_ms,
+        v10_ms: &synthetic.v10_ms,
+    };
+    let options =
         // The heavy lane pins right-moving storm motion (see
         // compute_ecape_map_fields_with_prepared_volume).
-        EcapeTripletOptions::new("right_moving"),
+        EcapeTripletOptions::new("right_moving");
+    let analytic = compute_analytic_ecape_triplet_with_failure_mask_from_parts(
+        calc_grid,
+        volume,
+        surface_inputs,
+        options,
     )
-    .expect("direct ECAPE triplet kernel");
+    .expect("direct analytic ECAPE triplet kernel");
+    let entraining_path = compute_ecape_triplet_with_failure_mask_from_parts(
+        calc_grid,
+        volume,
+        surface_inputs,
+        options,
+    )
+    .expect("direct entraining parcel-path triplet kernel");
 
     let take = |name: &str| {
         heavy
@@ -311,7 +323,7 @@ fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
             .unwrap_or_else(|| panic!("heavy output missing '{name}'"))
     };
 
-    let expected_sbecape: Vec<f32> = triplet
+    let expected_sbecape: Vec<f32> = analytic
         .sb
         .fields
         .ecape_jkg
@@ -326,8 +338,20 @@ fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
         "synthetic hour must produce at least one finite sbecape value, \
          or the comparison is NaN-trivial"
     );
+    assert!(
+        analytic
+            .sb
+            .fields
+            .ecape_jkg
+            .iter()
+            .zip(entraining_path.sb.fields.ecape_jkg.iter())
+            .any(|(analytic_ecape, post_path_ecape)| {
+                (analytic_ecape - post_path_ecape).abs() > 1.0
+            }),
+        "fixture must distinguish analytic ECAPE from the post-path analytic field"
+    );
 
-    let expected_sbecin: Vec<f32> = triplet
+    let expected_sbecin: Vec<f32> = entraining_path
         .sb
         .fields
         .cin_jkg
@@ -338,7 +362,7 @@ fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
     assert_eq!(sbecin.units, "J/kg", "sbecin units");
     assert_bits_eq(&sbecin.values, &expected_sbecin, "sbecin");
 
-    let expected_sbncape: Vec<f32> = triplet
+    let expected_sbncape: Vec<f32> = analytic
         .sb
         .fields
         .ncape_jkg
@@ -349,10 +373,26 @@ fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
     assert_eq!(sbncape.units, "J/kg", "sbncape units");
     assert_bits_eq(&sbncape.values, &expected_sbncape, "sbncape");
 
+    let derived_ratio = take("sb_ecape_derived_cape_ratio");
     assert_eq!(
-        heavy.ecape_failure_count,
-        triplet.total_failure_count(),
-        "failure count must ride through unchanged"
+        derived_ratio.units, "ratio",
+        "sb entraining parcel CAPE ratio units"
+    );
+    for ij in 0..NXY {
+        if derived_ratio.values[ij].is_finite() {
+            let expected =
+                (analytic.sb.fields.ecape_jkg[ij] / entraining_path.sb.fields.cape_jkg[ij]) as f32;
+            assert_eq!(
+                derived_ratio.values[ij].to_bits(),
+                expected.to_bits(),
+                "sb analytic ECAPE / entraining parcel CAPE ratio at index {ij}"
+            );
+        }
+    }
+
+    assert_eq!(
+        heavy.ecape_failure_count, 0,
+        "synthetic analytic and entraining parcel paths should both solve"
     );
 
     // Native ratio plumbing: stored ratio grid == stored ecape / native
@@ -366,7 +406,7 @@ fn ingest_heavy_sbecape_matches_direct_ecape_triplet_bit_exactly() {
     for ij in 0..NXY {
         let ecape = f64::from(sbecape.values[ij]);
         if ratio.values[ij].is_finite() && ecape.is_finite() {
-            let expected = (triplet.sb.fields.ecape_jkg[ij] / native_sb[ij]) as f32;
+            let expected = (analytic.sb.fields.ecape_jkg[ij] / native_sb[ij]) as f32;
             assert_eq!(
                 ratio.values[ij].to_bits(),
                 expected.to_bits(),

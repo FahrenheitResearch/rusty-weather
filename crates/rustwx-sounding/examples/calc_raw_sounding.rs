@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     line(
         &mut report,
         format_args!(
-            "Parcel             ECAPE  NCAPE   CAPE  3CAPE  6CAPE  CINH   LCL   LFC     EL"
+            "Parcel          ANALYTIC ECAPE  NCAPE   CAPE  3CAPE  6CAPE  CINH   LCL   LFC     EL"
         ),
     );
     append_parcel(

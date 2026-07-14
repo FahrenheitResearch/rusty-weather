@@ -270,31 +270,31 @@ impl WeatherProduct {
             Self::Sbcape => "SBCAPE",
             Self::Mlcape => "MLCAPE",
             Self::Mucape => "MUCAPE",
-            Self::Sbecape => "SBECAPE",
-            Self::Mlecape => "MLECAPE",
-            Self::Muecape => "MUECAPE",
-            Self::SbEcapeDerivedCapeRatio => "SB ECAPE/DERIVED CAPE RATIO",
-            Self::MlEcapeDerivedCapeRatio => "ML ECAPE/DERIVED CAPE RATIO",
-            Self::MuEcapeDerivedCapeRatio => "MU ECAPE/DERIVED CAPE RATIO",
-            Self::SbEcapeNativeCapeRatio => "SB ECAPE/NATIVE CAPE RATIO",
-            Self::MlEcapeNativeCapeRatio => "ML ECAPE/NATIVE CAPE RATIO",
-            Self::MuEcapeNativeCapeRatio => "MU ECAPE/NATIVE CAPE RATIO",
-            Self::Sbncape => "SBNCAPE",
+            Self::Sbecape => "SB ANALYTIC ECAPE",
+            Self::Mlecape => "ML ANALYTIC ECAPE",
+            Self::Muecape => "MU ANALYTIC ECAPE",
+            Self::SbEcapeDerivedCapeRatio => "SB ANALYTIC ECAPE/ENTRAINING PARCEL CAPE RATIO",
+            Self::MlEcapeDerivedCapeRatio => "ML ANALYTIC ECAPE/ENTRAINING PARCEL CAPE RATIO",
+            Self::MuEcapeDerivedCapeRatio => "MU ANALYTIC ECAPE/ENTRAINING PARCEL CAPE RATIO",
+            Self::SbEcapeNativeCapeRatio => "SB ANALYTIC ECAPE/NATIVE CAPE RATIO",
+            Self::MlEcapeNativeCapeRatio => "ML ANALYTIC ECAPE/NATIVE CAPE RATIO",
+            Self::MuEcapeNativeCapeRatio => "MU ANALYTIC ECAPE/NATIVE CAPE RATIO",
+            Self::Sbncape => "SBNCAPE (ANALYTIC)",
             Self::Mlncape => "MLNCAPE",
             Self::Muncape => "MUNCAPE",
             Self::Sbcin => "SBCIN",
             Self::Mlcin => "MLCIN",
             Self::Mucin => "MUCIN",
-            Self::Sbecin => "SBECIN",
-            Self::Mlecin => "MLECIN",
-            Self::Muecin => "MUECIN",
-            Self::EcapeCape => "ECAPE CAPE",
-            Self::EcapeCin => "ECAPE CIN",
+            Self::Sbecin => "SB ENTRAINING PARCEL CIN",
+            Self::Mlecin => "ML ENTRAINING PARCEL CIN",
+            Self::Muecin => "MU ENTRAINING PARCEL CIN",
+            Self::EcapeCape => "ENTRAINING PARCEL CAPE",
+            Self::EcapeCin => "ENTRAINING PARCEL CIN",
             Self::Lcl => "LCL",
             Self::Lfc => "LFC",
             Self::El => "EL",
-            Self::EcapeLfc => "ECAPE LFC",
-            Self::EcapeEl => "ECAPE EL",
+            Self::EcapeLfc => "ENTRAINING PARCEL LFC",
+            Self::EcapeEl => "ENTRAINING PARCEL EL",
             Self::Srh01km => "0-1 KM SRH",
             Self::Srh03km => "0-3 KM SRH",
             Self::Stp => "STP",
@@ -306,10 +306,10 @@ impl WeatherProduct {
             Self::Tts => "TTS",
             Self::VtpMod => "VTP MOD",
             Self::Uh => "UH",
-            Self::EcapeScpExperimental => "ECAPE SCP (EXP)",
-            Self::EcapeEhi01kmExperimental => "ECAPE EHI 0-1 KM (EXP)",
-            Self::EcapeEhi03kmExperimental => "ECAPE EHI 0-3 KM (EXP)",
-            Self::EcapeStpExperimental => "ECAPE STP (EXP)",
+            Self::EcapeScpExperimental => "ANALYTIC ECAPE SCP (EXP)",
+            Self::EcapeEhi01kmExperimental => "ANALYTIC ECAPE EHI 0-1 KM (EXP)",
+            Self::EcapeEhi03kmExperimental => "ANALYTIC ECAPE EHI 0-3 KM (EXP)",
+            Self::EcapeStpExperimental => "ANALYTIC ECAPE STP (EXP)",
         }
     }
 
@@ -1068,8 +1068,11 @@ mod tests {
 
     #[test]
     fn explicit_ecape_panel_products_have_expected_titles_and_experimental_flags() {
-        assert_eq!(WeatherProduct::Sbecape.display_title(), "SBECAPE");
-        assert_eq!(WeatherProduct::Mlecin.display_title(), "MLECIN");
+        assert_eq!(WeatherProduct::Sbecape.display_title(), "SB ANALYTIC ECAPE");
+        assert_eq!(
+            WeatherProduct::Mlecin.display_title(),
+            "ML ENTRAINING PARCEL CIN"
+        );
         assert!(WeatherProduct::EcapeScpExperimental.is_experimental());
         assert!(WeatherProduct::EcapeEhi01kmExperimental.is_experimental());
         assert!(WeatherProduct::EcapeEhi03kmExperimental.is_experimental());
