@@ -45,6 +45,7 @@ mod gdex_ui;
 mod grib_import;
 mod ingest_worker;
 mod local_import;
+mod obs_worker;
 mod postproc_severe;
 #[cfg(feature = "profiling")]
 mod profiler;
@@ -67,6 +68,7 @@ use formula_lab::{
 use gdex_ui::GdexBrowser;
 use ingest_worker::{IngestRequest, IngestResponse, IngestWorker};
 use local_import::{LocalImportMessage, LocalImportSummary, LocalImportTask};
+use obs_worker::{ObsKind, ObsRequest, ObsWorker};
 use rustwx_models::{model_summary, supported_forecast_hours, supported_models};
 use rw_ui::{
     ColorTableEditorPanel, CustomDomain, DownloadEvent, DownloadPanel, DownloadSpec,
@@ -97,6 +99,42 @@ const DEFAULT_STORE_ROOT: &str = "store";
 const DEFAULT_CACHE_DIR: &str = "out/cache";
 /// Stable app-data folder name used for installed/default storage.
 const APP_DATA_DIR_NAME: &str = "rusty-weather";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SoundingTab {
+    #[default]
+    Model,
+    Adjusted,
+    Raob,
+    File,
+}
+
+impl SoundingTab {
+    const ALL: [Self; 4] = [Self::Model, Self::Adjusted, Self::Raob, Self::File];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Model => "Model",
+            Self::Adjusted => "Obs adjusted",
+            Self::Raob => "RAOB",
+            Self::File => "File",
+        }
+    }
+}
+
+fn hour_valid_unix(hour: &HourKey) -> Option<i64> {
+    if let Some(exact) = hour.exact_time {
+        return Some(exact.valid_unix);
+    }
+    let run_label = hour.run.trim_end_matches(['z', 'Z']);
+    let (date, cycle) = run_label.split_once('_')?;
+    let date = chrono::NaiveDate::parse_from_str(date, "%Y%m%d").ok()?;
+    let cycle = cycle.parse::<u32>().ok()?;
+    let run = date.and_hms_opt(cycle, 0, 0)?;
+    run.and_utc()
+        .timestamp()
+        .checked_add(i64::from(hour.hour) * 3_600)
+}
 
 /// Where a resolved storage path came from — shown in the Settings UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1443,7 +1481,19 @@ struct App {
     show_batch_render: bool,
     color_tables: ColorTableEditorPanel,
     show_color_tables: bool,
+    /// Model point profile plus observed/file profiles, selected by the
+    /// sounding workspace tabs.
     sounding: SoundingPanel,
+    adjusted_sounding: SoundingPanel,
+    raob_sounding: SoundingPanel,
+    file_sounding: SoundingPanel,
+    sounding_tab: SoundingTab,
+    show_soundings: bool,
+    obs_worker: ObsWorker,
+    obs_time_input: String,
+    obs_lat_input: String,
+    obs_lon_input: String,
+    obs_status: Option<String>,
     download: DownloadPanel,
     /// A download-ingest Start request queued before its Started response.
     download_start_pending: bool,
@@ -1520,6 +1570,8 @@ impl App {
         cli_store: Option<String>,
         cli_cache: Option<String>,
     ) -> Self {
+        rw_ui::install_sounding_fonts(&cc.egui_ctx);
+
         // Belt and braces: pre-build the GLOBAL rayon pool small and
         // below-normal so any stray par_iter reached outside the ingest
         // worker's dedicated pool (e.g. a rustwx-products helper called
@@ -1563,6 +1615,9 @@ impl App {
         if let Some(error) = ingest.startup_error() {
             startup_errors.push(error.to_string());
         }
+
+        let ctx = cc.egui_ctx.clone();
+        let obs_worker = ObsWorker::spawn(move || ctx.request_repaint());
 
         // Satellite frames live under their own subroot so the model-run
         // browser stays free of sat runs.
@@ -1674,6 +1729,16 @@ impl App {
             color_tables,
             show_color_tables: false,
             sounding: SoundingPanel::new(),
+            adjusted_sounding: SoundingPanel::new(),
+            raob_sounding: SoundingPanel::new(),
+            file_sounding: SoundingPanel::new(),
+            sounding_tab: SoundingTab::Model,
+            show_soundings: false,
+            obs_worker,
+            obs_time_input: chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string(),
+            obs_lat_input: "35.22".into(),
+            obs_lon_input: "-97.44".into(),
+            obs_status: None,
             download,
             download_start_pending: false,
             show_download: false,
@@ -1726,6 +1791,11 @@ impl App {
                         .collect::<Vec<_>>();
                     self.stage_wrf_paths(supported);
                 }
+                ui.close();
+            }
+
+            if ui.button("Open Sounding Text/CSV...").clicked() {
+                self.pick_sounding_file();
                 ui.close();
             }
 
@@ -1822,6 +1892,157 @@ impl App {
                 ui.close();
             }
         });
+    }
+
+    fn pick_sounding_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Open sounding (SHARPpy, Wyoming, or CSV)")
+            .add_filter("Sounding text", &["txt", "csv"])
+            .pick_file()
+        else {
+            return;
+        };
+        match obs_worker::load_sounding_file(&path) {
+            Ok((column, heading, subheading)) => {
+                self.file_sounding
+                    .set_external_column(column, heading, subheading, 0.0);
+                self.sounding_tab = SoundingTab::File;
+                self.show_soundings = true;
+                self.obs_status = None;
+            }
+            Err(error) => {
+                self.file_sounding.set_error(error.clone());
+                self.sounding_tab = SoundingTab::File;
+                self.show_soundings = true;
+                self.obs_status = Some(error);
+            }
+        }
+    }
+
+    fn request_observation(&mut self, kind: ObsKind) {
+        let time_text = self.obs_time_input.trim().trim_end_matches(['Z', 'z']);
+        let time = chrono::NaiveDateTime::parse_from_str(time_text, "%Y-%m-%d %H:%M")
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(time_text, "%Y-%m-%d %H:%M:%S"));
+        let latitude = self.obs_lat_input.trim().parse::<f64>();
+        let longitude = self.obs_lon_input.trim().parse::<f64>();
+        let (Ok(time), Ok(latitude), Ok(longitude)) = (time, latitude, longitude) else {
+            self.obs_status =
+                Some("Use UTC time YYYY-MM-DD HH:MM and numeric latitude/longitude.".into());
+            return;
+        };
+        if !(-90.0..=90.0).contains(&latitude) || !(-180.0..=180.0).contains(&longitude) {
+            self.obs_status = Some("Latitude/longitude is outside the valid range.".into());
+            return;
+        }
+        let valid_unix =
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(time, chrono::Utc)
+                .timestamp();
+        match kind {
+            ObsKind::Raob => self.raob_sounding.set_loading(),
+            ObsKind::SurfaceAdjusted => self.adjusted_sounding.set_loading(),
+        }
+        self.obs_status = Some(match kind {
+            ObsKind::Raob => "Loading nearest RAOB…".into(),
+            ObsKind::SurfaceAdjusted => "Loading nearest timed RAOB and surface obs…".into(),
+        });
+        self.obs_worker.send(ObsRequest {
+            kind,
+            valid_unix,
+            latitude,
+            longitude,
+        });
+    }
+
+    fn handle_obs_responses(&mut self) {
+        while let Some(response) = self.obs_worker.try_recv() {
+            match response.result {
+                Ok(loaded) => {
+                    let status = format!("Loaded {} in {:.0} ms", loaded.heading, loaded.read_ms);
+                    let panel = match loaded.kind {
+                        ObsKind::Raob => &mut self.raob_sounding,
+                        ObsKind::SurfaceAdjusted => &mut self.adjusted_sounding,
+                    };
+                    panel.set_external_column(
+                        loaded.column,
+                        loaded.heading,
+                        loaded.subheading,
+                        loaded.read_ms,
+                    );
+                    self.obs_status = Some(status);
+                }
+                Err(error) => {
+                    match response.kind {
+                        ObsKind::Raob => self.raob_sounding.set_error(error.clone()),
+                        ObsKind::SurfaceAdjusted => self.adjusted_sounding.set_error(error.clone()),
+                    }
+                    self.obs_status = Some(error);
+                }
+            }
+        }
+    }
+
+    fn sounding_workspace_ui(&mut self, ui: &mut egui::Ui) {
+        let previous = self.sounding_tab;
+        ui.horizontal_wrapped(|ui| {
+            for tab in SoundingTab::ALL {
+                ui.selectable_value(&mut self.sounding_tab, tab, tab.label());
+            }
+            ui.separator();
+            if ui.button("Close").clicked() {
+                self.show_soundings = false;
+            }
+        });
+        ui.separator();
+
+        if matches!(self.sounding_tab, SoundingTab::Adjusted | SoundingTab::Raob) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("UTC");
+                ui.text_edit_singleline(&mut self.obs_time_input);
+                ui.label("lat");
+                ui.add(egui::TextEdit::singleline(&mut self.obs_lat_input).desired_width(74.0));
+                ui.label("lon");
+                ui.add(egui::TextEdit::singleline(&mut self.obs_lon_input).desired_width(82.0));
+                let kind = if self.sounding_tab == SoundingTab::Raob {
+                    ObsKind::Raob
+                } else {
+                    ObsKind::SurfaceAdjusted
+                };
+                if ui.button("Load nearest").clicked() {
+                    self.request_observation(kind);
+                }
+            });
+            if let Some(status) = &self.obs_status {
+                ui.label(egui::RichText::new(status).small().weak());
+            }
+            ui.separator();
+        } else if self.sounding_tab == SoundingTab::File {
+            if ui
+                .button("Open SHARPpy / Wyoming / CSV sounding…")
+                .clicked()
+            {
+                self.pick_sounding_file();
+            }
+            ui.separator();
+        }
+
+        if previous != self.sounding_tab {
+            match self.sounding_tab {
+                SoundingTab::Adjusted if !self.adjusted_sounding.has_content() => {
+                    self.request_observation(ObsKind::SurfaceAdjusted)
+                }
+                SoundingTab::Raob if !self.raob_sounding.has_content() => {
+                    self.request_observation(ObsKind::Raob)
+                }
+                _ => {}
+            }
+        }
+
+        match self.sounding_tab {
+            SoundingTab::Model => self.sounding.ui(ui),
+            SoundingTab::Adjusted => self.adjusted_sounding.ui(ui),
+            SoundingTab::Raob => self.raob_sounding.ui(ui),
+            SoundingTab::File => self.file_sounding.ui(ui),
+        }
     }
 
     fn switch_store_root(&mut self, store_root: PathBuf, ctx: &egui::Context) {
@@ -2545,7 +2766,24 @@ impl App {
                 StoreResponse::Sounding(key, Ok(data)) => {
                     if self.browser.selected() == Some(&key) && self.viewer.hour() == Some(&key) {
                         self.worker.stats().record("sounding.read", data.read_ms);
+                        if let (Some(valid_unix), Some(latitude), Some(longitude)) = (
+                            hour_valid_unix(&data.hour),
+                            data.lat.map(f64::from),
+                            data.lon.map(f64::from),
+                        ) {
+                            if let Some(time) =
+                                chrono::DateTime::<chrono::Utc>::from_timestamp(valid_unix, 0)
+                            {
+                                self.obs_time_input = time.format("%Y-%m-%d %H:%M").to_string();
+                            }
+                            self.obs_lat_input = format!("{latitude:.4}");
+                            self.obs_lon_input = format!("{longitude:.4}");
+                            self.adjusted_sounding.clear();
+                            self.raob_sounding.clear();
+                        }
                         self.sounding.set_data(data);
+                        self.sounding_tab = SoundingTab::Model;
+                        self.show_soundings = true;
                         if let Some((read_ms, scene_ms)) = self.sounding.last_timings() {
                             self.worker.stats().record("sounding.scene", scene_ms);
                             self.worker
@@ -2800,6 +3038,7 @@ impl eframe::App for App {
         let frame_started = Instant::now();
 
         self.handle_responses();
+        self.handle_obs_responses();
         self.handle_ingest_responses();
         self.handle_sat_responses();
         self.handle_wrf_process_response(ui.ctx());
@@ -2871,6 +3110,7 @@ impl eframe::App for App {
                 ui.toggle_value(&mut self.show_batch_render, "Batch render");
                 ui.toggle_value(&mut self.show_wrf_options, "WRF products");
                 ui.toggle_value(&mut self.show_color_tables, "Color tables");
+                ui.toggle_value(&mut self.show_soundings, "Soundings");
                 #[cfg(feature = "profiling")]
                 ui.toggle_value(&mut self.show_profiler, "🔍 Profiler");
                 #[cfg(not(feature = "profiling"))]
@@ -2978,20 +3218,18 @@ impl eframe::App for App {
                 }
             });
 
-        if self.sounding.has_content() {
+        if self.show_soundings {
             egui::Panel::right("rw-sounding")
                 .resizable(true)
-                .default_size(560.0)
+                // The complete SPC board is a desktop-width workspace. Give
+                // it enough room to show both edges at once; horizontal
+                // scrolling remains the fallback on smaller displays.
+                .default_size(1680.0)
+                .min_size(1660.0)
                 .show_inside(ui, |ui| {
                     ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.heading("Sounding");
-                        if ui.button("✕").on_hover_text("close").clicked() {
-                            self.sounding.clear();
-                        }
-                    });
-                    ui.separator();
-                    self.sounding.ui(ui);
+                    ui.heading("Soundings");
+                    self.sounding_workspace_ui(ui);
                 });
         }
 
@@ -3041,6 +3279,8 @@ impl eframe::App for App {
                     if let Some(hour) = self.viewer.hour().cloned() {
                         if self.browser.selected() == Some(&hour) {
                             self.sounding.set_loading();
+                            self.sounding_tab = SoundingTab::Model;
+                            self.show_soundings = true;
                             self.worker
                                 .send(StoreRequest::LoadSounding { hour, fx, fy });
                         }
@@ -3334,6 +3574,25 @@ fn lead_seconds_exact_in_f64(seconds: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sounding_observation_time_uses_exact_axis_or_legacy_run_plus_lead() {
+        let exact = HourKey {
+            model: "wrf".into(),
+            run: "opaque".into(),
+            hour: 42,
+            exact_time: Some(rw_store::RwsExactTime::new(60, 1_741_996_800)),
+        };
+        assert_eq!(hour_valid_unix(&exact), Some(1_741_996_800));
+
+        let legacy = HourKey {
+            model: "hrrr".into(),
+            run: "20250315_00z".into(),
+            hour: 3,
+            exact_time: None,
+        };
+        assert_eq!(hour_valid_unix(&legacy), Some(1_742_007_600));
+    }
 
     fn test_abs_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rw-ui-{name}"))
