@@ -1797,15 +1797,15 @@ fn build_render_artifact_with_contour_mode(
             ExtendMode::Max,
             Some(250.0),
         )?,
-        DerivedRecipe::ThetaE2m10mWinds => palette_request(
+        DerivedRecipe::ThetaE2m10mWinds => custom_scale_request(
             recipe,
             grid,
             "K",
             required_values(&computed.theta_e_2m_k, recipe, "theta_e_2m_k")?.clone(),
-            WeatherPalette::Temperature,
-            range_step(280.0, 381.0, 4.0),
+            range_step(230.0, 361.0, 10.0),
+            theta_e_scale_colors(),
             ExtendMode::Both,
-            Some(8.0),
+            Some(10.0),
         )?,
         DerivedRecipe::Vpd2m => custom_scale_request(
             recipe,
@@ -2068,6 +2068,9 @@ fn build_render_artifact_with_contour_mode(
         native_fill_level_multiplier,
     )?;
     if matches!(recipe, DerivedRecipe::ThetaE2m10mWinds) {
+        // The theta-e fill is banded in hard 10-K tiers; show the colorbar
+        // as the matching discrete steps rather than a smooth ramp.
+        request.legend.mode = rustwx_render::LegendMode::Stepped;
         let u_kt = computed_surface_u10(computed, recipe)?;
         let v_kt = computed_surface_v10(computed, recipe)?;
         request.wind_barbs.push(surface_wind_barb_layer(
@@ -2165,15 +2168,15 @@ fn build_render_artifact_with_contour_mode_profiled(
             ExtendMode::Max,
             Some(250.0),
         )?,
-        DerivedRecipe::ThetaE2m10mWinds => palette_request(
+        DerivedRecipe::ThetaE2m10mWinds => custom_scale_request(
             recipe,
             grid,
             "K",
             required_values(&computed.theta_e_2m_k, recipe, "theta_e_2m_k")?.clone(),
-            WeatherPalette::Temperature,
-            range_step(280.0, 381.0, 4.0),
+            range_step(230.0, 361.0, 10.0),
+            theta_e_scale_colors(),
             ExtendMode::Both,
-            Some(8.0),
+            Some(10.0),
         )?,
         DerivedRecipe::Vpd2m => custom_scale_request(
             recipe,
@@ -2440,6 +2443,9 @@ fn build_render_artifact_with_contour_mode_profiled(
 
     let mut wind_overlay_build_ms = 0;
     if matches!(recipe, DerivedRecipe::ThetaE2m10mWinds) {
+        // The theta-e fill is banded in hard 10-K tiers; show the colorbar
+        // as the matching discrete steps rather than a smooth ramp.
+        request.legend.mode = rustwx_render::LegendMode::Stepped;
         let wind_overlay_start = Instant::now();
         let u_kt = computed_surface_u10(computed, recipe)?;
         let v_kt = computed_surface_v10(computed, recipe)?;
@@ -3340,6 +3346,38 @@ fn dcape_scale_colors() -> Vec<Color> {
         Color::rgba(150, 42, 72, 255),
         Color::rgba(105, 31, 80, 255),
     ]
+}
+
+fn theta_e_scale_colors() -> Vec<Color> {
+    // Dedicated banded theta-e table: one color per 10-K tier from 230 K to
+    // 360 K (greys stepping up to white for 320-330 K, then greens), plus a
+    // dedicated >= 360 K color.
+    let bands = [
+        Color::rgba(77, 77, 77, 255),    // 230-240 K (also the under color)
+        Color::rgba(89, 89, 89, 255),    // 240-250 K
+        Color::rgba(103, 103, 103, 255), // 250-260 K
+        Color::rgba(118, 118, 118, 255), // 260-270 K
+        Color::rgba(135, 135, 135, 255), // 270-280 K
+        Color::rgba(153, 153, 153, 255), // 280-290 K
+        Color::rgba(172, 172, 172, 255), // 290-300 K
+        Color::rgba(192, 192, 192, 255), // 300-310 K
+        Color::rgba(212, 212, 212, 255), // 310-320 K
+        Color::rgba(255, 255, 255, 255), // 320-330 K
+        Color::rgba(102, 193, 108, 255), // 330-340 K
+        Color::rgba(46, 158, 65, 255),   // 340-350 K
+        Color::rgba(20, 122, 50, 255),   // 350-360 K
+    ];
+    // The renderer resamples fill colors from this list as a continuous
+    // palette (lerping between adjacent entries when densifying), so repeat
+    // each band color once per Kelvin of its tier to keep hard 10-K steps
+    // instead of a smooth ramp, and end on the >= 360 K color so
+    // ExtendMode::Both picks it up as the over color.
+    let mut colors: Vec<Color> = bands
+        .iter()
+        .flat_map(|color| std::iter::repeat(*color).take(10))
+        .collect();
+    colors.push(Color::rgba(0, 92, 36, 255)); // >= 360 K
+    colors
 }
 
 fn fire_weather_composite_scale_colors() -> Vec<Color> {

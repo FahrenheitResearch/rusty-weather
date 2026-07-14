@@ -959,3 +959,62 @@ fn pressure_level_slice_or_interp_interpolates_native_pressure_columns() {
     assert!((slice[0] - expected0).abs() < 1.0e-6);
     assert!((slice[1] - expected1).abs() < 1.0e-6);
 }
+
+#[test]
+fn theta_e_map_scale_keeps_hard_10k_bands() {
+    let scale = rustwx_render::ColorScale::Discrete(rustwx_render::DiscreteColorScale {
+        levels: range_step(230.0, 361.0, 10.0),
+        colors: theta_e_scale_colors(),
+        extend: ExtendMode::Both,
+        mask_below: None,
+    });
+
+    // The density combos the production paths build colormaps with: the
+    // regional static-map design (x4 fill / x4 palette), the global branch
+    // and default (x8 / x8), and the reference-discrete defaults (x1 / x1).
+    let densities = [
+        rustwx_render::RenderDensity {
+            fill: rustwx_render::LevelDensity {
+                multiplier: 4,
+                min_source_level_count: 2,
+            },
+            palette_multiplier: 4,
+        },
+        rustwx_render::RenderDensity::default(),
+        rustwx_render::RenderDensity {
+            fill: rustwx_render::LevelDensity::default(),
+            palette_multiplier: 1,
+        },
+    ];
+
+    let bands: Vec<rustwx_render::Rgba> = theta_e_scale_colors()
+        .iter()
+        .step_by(10)
+        .map(|color| rustwx_render::Rgba::new(color.r, color.g, color.b))
+        .take(13)
+        .collect();
+    let over = rustwx_render::Rgba::new(0, 92, 36);
+
+    for render_density in densities {
+        let cmap = rustwx_render::build_colormap(
+            &scale,
+            rustwx_render::ColormapBuildOptions {
+                render_density,
+                legend: rustwx_render::LegendControls::default(),
+            },
+        );
+        for (band, expected) in bands.iter().enumerate() {
+            let bottom = 230.0 + 10.0 * band as f64;
+            for value in [bottom, bottom + 0.1, bottom + 5.0, bottom + 9.9] {
+                assert_eq!(
+                    cmap.map(value),
+                    *expected,
+                    "value {value} should stay in the {bottom}+ band"
+                );
+            }
+        }
+        assert_eq!(cmap.map(215.0), bands[0], "under color");
+        assert_eq!(cmap.map(360.0), over, "over color at 360 K");
+        assert_eq!(cmap.map(400.0), over, "over color above 360 K");
+    }
+}
