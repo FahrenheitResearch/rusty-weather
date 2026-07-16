@@ -78,6 +78,7 @@ use rw_ui::{
 };
 use sat_worker::{SatRequest, SatResponse, SatWorker};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use wrf_process::{WrfProcessMessage, WrfProcessOptions, WrfProcessSummary, WrfProcessTask};
 
 // ---------------------------------------------------------------------------
@@ -92,6 +93,13 @@ const DOMAIN_STORAGE_KEY: &str = "rw.custom_domains";
 const STYLE_STORAGE_KEY: &str = "rw.style_overrides";
 /// eframe Storage key for local WRF processing options.
 const WRF_PROCESS_STORAGE_KEY: &str = "rw.wrf_process_options";
+/// eframe Storage key for the shared user-customizable sounding workspace.
+///
+/// The value is deliberately opaque to the app shell. `rw-ui` owns the
+/// serialized fields, so layout, sizing, fit/stretch, typography, and future
+/// sounding presentation controls can evolve without a parallel host schema.
+const SOUNDING_VIEW_STORAGE_KEY: &str = "rw.sounding_view_state";
+const SOUNDING_FLOAT_STORAGE_KEY: &str = "rw.sounding_floating";
 
 /// Legacy/default store leaf when neither CLI nor persisted settings provide one.
 const DEFAULT_STORE_ROOT: &str = "store";
@@ -223,6 +231,101 @@ fn deserialize_wrf_process_options(s: &str) -> WrfProcessOptions {
     serde_json::from_str::<WrfProcessOptions>(s)
         .unwrap_or_default()
         .normalized()
+}
+
+fn serialize_sounding_view_state(state: &serde_json::Value) -> String {
+    serde_json::to_string(state).unwrap_or_default()
+}
+
+fn deserialize_sounding_view_state(s: &str) -> Option<serde_json::Value> {
+    let value = serde_json::from_str::<serde_json::Value>(s).ok()?;
+    value.is_object().then_some(value)
+}
+
+/// Exact source contract retained beside the last Formula Lab field. A raw
+/// WRF result is intentionally never eligible for an rw-store sounding, even
+/// if a future display-key change happens to make their `HourKey`s equal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FormulaSoundingSourceContext {
+    Store { store_root: PathBuf, hour: HourKey },
+    RawWrf,
+}
+
+/// Content-aware identity and source ownership for the Formula Lab scalar
+/// offered to the configurable sounding tables.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FormulaSoundingContext {
+    stable_id: String,
+    label: String,
+    source: FormulaSoundingSourceContext,
+}
+
+impl FormulaSoundingContext {
+    fn from_result(
+        output_name: &str,
+        provenance: &rw_formula::FormulaProvenance,
+        source: &FormulaResultSource,
+    ) -> Self {
+        let source = match source {
+            FormulaResultSource::Store { store_root, hour } => {
+                FormulaSoundingSourceContext::Store {
+                    store_root: store_root.clone(),
+                    hour: hour.clone(),
+                }
+            }
+            FormulaResultSource::RawWrf { .. } => FormulaSoundingSourceContext::RawWrf,
+        };
+        Self {
+            stable_id: content_aware_formula_id(
+                output_name,
+                provenance.recipe_name.as_deref(),
+                provenance.recipe_version.as_deref(),
+                &provenance.canonical_source,
+            ),
+            label: output_name.to_owned(),
+            source,
+        }
+    }
+
+    fn matches_store_field(&self, active_store_root: &Path, hour: &HourKey) -> bool {
+        matches!(
+            &self.source,
+            FormulaSoundingSourceContext::Store { store_root, hour: source_hour }
+                if store_root == active_store_root && source_hour == hour
+        )
+    }
+}
+
+fn content_aware_formula_id(
+    output_name: &str,
+    recipe_name: Option<&str>,
+    recipe_version: Option<&str>,
+    canonical_source: &str,
+) -> String {
+    let source_hash = Sha256::digest(canonical_source.as_bytes());
+    format!(
+        "formula_lab:v1:{output_name}:{}:{}:{}",
+        encoded_optional_formula_identity(recipe_name),
+        encoded_optional_formula_identity(recipe_version),
+        hex_bytes(&source_hash[..16]),
+    )
+}
+
+fn encoded_optional_formula_identity(value: Option<&str>) -> String {
+    value.map_or_else(
+        || "n".to_owned(),
+        |value| format!("s{}", hex_bytes(value.as_bytes())),
+    )
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 /// Pure resolution function: merges CLI overrides + persisted settings +
@@ -1471,6 +1574,10 @@ struct App {
     /// minute-cadence run can contain thousands of labels, so rebuilding it
     /// every egui frame would be needless O(n) allocation churn.
     formula_store_source: Option<StoreFormulaSource>,
+    /// Provenance-derived identity and exact source ownership for the last
+    /// generated Formula Lab field. Kept outside the viewer because viewer
+    /// collision handling may rename its display variable.
+    formula_sounding_context: Option<FormulaSoundingContext>,
     /// `None` until the first scan lands.
     tree: Option<StoreTree>,
     browser: RunBrowserPanel,
@@ -1487,8 +1594,14 @@ struct App {
     adjusted_sounding: SoundingPanel,
     raob_sounding: SoundingPanel,
     file_sounding: SoundingPanel,
+    /// One presentation snapshot shared by every sounding data source.
+    /// Individual panels retain their own loaded profile, but changing the
+    /// board layout or view controls in one tab immediately updates the other
+    /// tabs and is saved across launches.
+    sounding_view_state: serde_json::Value,
     sounding_tab: SoundingTab,
     show_soundings: bool,
+    sounding_floating: bool,
     obs_worker: ObsWorker,
     obs_time_input: String,
     obs_lat_input: String,
@@ -1552,6 +1665,8 @@ struct App {
     pending_style_persist: Option<String>,
     /// Pending WRF processing options JSON.
     pending_wrf_options_persist: Option<String>,
+    /// Pending shared sounding workspace JSON.
+    pending_sounding_view_persist: Option<String>,
     #[cfg(feature = "profiling")]
     profiler: profiler::ProfilerPanel,
     #[cfg(feature = "profiling")]
@@ -1711,6 +1826,30 @@ impl App {
             .normalized();
         let wrf_options_ui = WrfProcessSettingsUi::new(&wrf_options);
 
+        // Model, adjusted, RAOB, and file soundings are distinct data
+        // pipelines but one presentation workspace. Restore the saved view
+        // into every panel up front so the first tab switch cannot flash or
+        // reset to defaults.
+        let saved_sounding_view_state = cc.storage.and_then(|storage| {
+            storage
+                .get_string(SOUNDING_VIEW_STORAGE_KEY)
+                .and_then(|value| deserialize_sounding_view_state(&value))
+        });
+        let mut sounding = SoundingPanel::new();
+        let mut adjusted_sounding = SoundingPanel::new();
+        let mut raob_sounding = SoundingPanel::new();
+        let mut file_sounding = SoundingPanel::new();
+        let sounding_view_state = saved_sounding_view_state
+            .filter(|state| sounding.apply_view_state_json(state))
+            .unwrap_or_else(|| sounding.view_state_json());
+        adjusted_sounding.apply_view_state_json(&sounding_view_state);
+        raob_sounding.apply_view_state_json(&sounding_view_state);
+        file_sounding.apply_view_state_json(&sounding_view_state);
+        let sounding_floating = cc
+            .storage
+            .and_then(|storage| storage.get_string(SOUNDING_FLOAT_STORAGE_KEY))
+            .is_some_and(|value| value == "true");
+
         Self {
             worker,
             ingest,
@@ -1719,6 +1858,7 @@ impl App {
             gdex: GdexBrowser::new(),
             formula_lab: FormulaLabPanel::new(),
             formula_store_source: None,
+            formula_sounding_context: None,
             tree: None,
             browser: RunBrowserPanel::new(),
             viewer: FieldViewerPanel::new(),
@@ -1728,12 +1868,14 @@ impl App {
             show_batch_render: false,
             color_tables,
             show_color_tables: false,
-            sounding: SoundingPanel::new(),
-            adjusted_sounding: SoundingPanel::new(),
-            raob_sounding: SoundingPanel::new(),
-            file_sounding: SoundingPanel::new(),
+            sounding,
+            adjusted_sounding,
+            raob_sounding,
+            file_sounding,
+            sounding_view_state,
             sounding_tab: SoundingTab::Model,
             show_soundings: false,
+            sounding_floating,
             obs_worker,
             obs_time_input: chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string(),
             obs_lat_input: "35.22".into(),
@@ -1769,6 +1911,7 @@ impl App {
             pending_domain_persist: None,
             pending_style_persist: None,
             pending_wrf_options_persist: None,
+            pending_sounding_view_persist: None,
             #[cfg(feature = "profiling")]
             profiler: profiler::ProfilerPanel::default(),
             #[cfg(feature = "profiling")]
@@ -1991,6 +2134,16 @@ impl App {
             if ui.button("Close").clicked() {
                 self.show_soundings = false;
             }
+            if ui
+                .button(if self.sounding_floating {
+                    "Dock"
+                } else {
+                    "Float"
+                })
+                .clicked()
+            {
+                self.sounding_floating = !self.sounding_floating;
+            }
         });
         ui.separator();
 
@@ -2043,6 +2196,58 @@ impl App {
             SoundingTab::Raob => self.raob_sounding.ui(ui),
             SoundingTab::File => self.file_sounding.ui(ui),
         }
+        self.synchronize_sounding_view_state();
+    }
+
+    /// Mirror presentation changes made in the active sounding tab to all
+    /// inactive sources and queue a durable snapshot. Data/loading state is
+    /// intentionally not shared: only `SoundingPanel`'s opaque view state
+    /// crosses the tab boundary.
+    fn synchronize_sounding_view_state(&mut self) {
+        let state = match self.sounding_tab {
+            SoundingTab::Model => self.sounding.view_state_json(),
+            SoundingTab::Adjusted => self.adjusted_sounding.view_state_json(),
+            SoundingTab::Raob => self.raob_sounding.view_state_json(),
+            SoundingTab::File => self.file_sounding.view_state_json(),
+        };
+        if state == self.sounding_view_state {
+            return;
+        }
+
+        self.sounding_view_state = state.clone();
+        if self.sounding_tab != SoundingTab::Model {
+            self.sounding.apply_view_state_json(&state);
+        }
+        if self.sounding_tab != SoundingTab::Adjusted {
+            self.adjusted_sounding.apply_view_state_json(&state);
+        }
+        if self.sounding_tab != SoundingTab::Raob {
+            self.raob_sounding.apply_view_state_json(&state);
+        }
+        if self.sounding_tab != SoundingTab::File {
+            self.file_sounding.apply_view_state_json(&state);
+        }
+        self.pending_sounding_view_persist = Some(serialize_sounding_view_state(&state));
+    }
+
+    /// Offer the retained Formula Lab field to the model sounding only when
+    /// both its exact rw-store source and hour still own the displayed field.
+    /// Raw-WRF results are deliberately ineligible.
+    fn install_current_formula_into_sounding(&mut self) -> bool {
+        let Some(field) = self.viewer.current_generated_field() else {
+            return false;
+        };
+        let Some(context) = self.formula_sounding_context.as_ref() else {
+            return false;
+        };
+        if !context.matches_store_field(&self.store_root, &field.key.hour) {
+            return false;
+        }
+        self.sounding.install_formula_field_with_id(
+            field,
+            context.stable_id.clone(),
+            context.label.clone(),
+        )
     }
 
     fn switch_store_root(&mut self, store_root: PathBuf, ctx: &egui::Context) {
@@ -2103,6 +2308,7 @@ impl App {
         self.tree = None;
         self.browser = RunBrowserPanel::new();
         self.formula_store_source = None;
+        self.formula_sounding_context = None;
         self.viewer.clear();
         self.plot_viewer.clear();
         self.sounding.clear();
@@ -2782,6 +2988,7 @@ impl App {
                             self.raob_sounding.clear();
                         }
                         self.sounding.set_data(data);
+                        self.install_current_formula_into_sounding();
                         self.sounding_tab = SoundingTab::Model;
                         self.show_soundings = true;
                         if let Some((read_ms, scene_ms)) = self.sounding.last_timings() {
@@ -3030,6 +3237,13 @@ impl eframe::App for App {
         if let Some(json) = self.pending_wrf_options_persist.take() {
             storage.set_string(WRF_PROCESS_STORAGE_KEY, json);
         }
+        if let Some(json) = self.pending_sounding_view_persist.take() {
+            storage.set_string(SOUNDING_VIEW_STORAGE_KEY, json);
+        }
+        storage.set_string(
+            SOUNDING_FLOAT_STORAGE_KEY,
+            self.sounding_floating.to_string(),
+        );
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -3218,14 +3432,22 @@ impl eframe::App for App {
                 }
             });
 
-        if self.show_soundings {
+        if self.show_soundings && self.sounding_floating {
+            let ctx = ui.ctx().clone();
+            let mut open = true;
+            egui::Window::new("Soundings")
+                .id(egui::Id::new("rw-sounding-floating"))
+                .open(&mut open)
+                .resizable(true)
+                .default_size([1_500.0, 900.0])
+                .min_size([520.0, 360.0])
+                .show(&ctx, |ui| self.sounding_workspace_ui(ui));
+            self.show_soundings &= open;
+        } else if self.show_soundings {
             egui::Panel::right("rw-sounding")
                 .resizable(true)
-                // The complete SPC board is a desktop-width workspace. Give
-                // it enough room to show both edges at once; horizontal
-                // scrolling remains the fallback on smaller displays.
-                .default_size(1680.0)
-                .min_size(1660.0)
+                .default_size(900.0)
+                .min_size(480.0)
                 .show_inside(ui, |ui| {
                     ui.add_space(4.0);
                     ui.heading("Soundings");
@@ -3410,6 +3632,11 @@ impl eframe::App for App {
                 }
             }) && result.source.revision_is_current();
             if still_current {
+                let formula_context = FormulaSoundingContext::from_result(
+                    &result.field.key.var,
+                    &result.provenance,
+                    &result.source,
+                );
                 self.plot_viewer.clear();
                 self.recorded_plot_timings = None;
                 if raw_result {
@@ -3417,6 +3644,11 @@ impl eframe::App for App {
                 }
                 let settings = self.color_tables.settings().clone().normalized();
                 self.viewer.install_generated_field(result.field, &settings);
+                // Install only after the viewer has resolved a possible name
+                // collision. The content-aware identity and original label
+                // remain stable even when the display variable is renamed.
+                self.formula_sounding_context = Some(formula_context);
+                self.install_current_formula_into_sounding();
             } else {
                 self.formula_lab
                     .note_result_discarded("the selected data source changed while it ran");
@@ -3890,6 +4122,77 @@ mod tests {
         let json = serialize_persisted(&original);
         let decoded = deserialize_persisted(&json);
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn sounding_view_state_round_trips_as_opaque_json() {
+        let original = serde_json::json!({
+            "sharppyrs_layout": "speed,advection|hodograph|slinky,thetae,srwinds,locationmap|indexboard,streamwiseness,hidden|180",
+            "future_fit_mode": "stretch",
+            "future_panel_weights": [0.5, 0.2, 0.3],
+        });
+        let json = serialize_sounding_view_state(&original);
+        assert_eq!(deserialize_sounding_view_state(&json), Some(original));
+    }
+
+    #[test]
+    fn sounding_view_state_rejects_garbled_or_non_object_storage() {
+        assert_eq!(deserialize_sounding_view_state("not json"), None);
+        assert_eq!(deserialize_sounding_view_state("[]"), None);
+        assert_eq!(deserialize_sounding_view_state("null"), None);
+    }
+
+    #[test]
+    fn formula_sounding_identity_changes_with_formula_science() {
+        let first = content_aware_formula_id(
+            "hail_signal",
+            Some("Severe recipe"),
+            Some("1.0.0"),
+            "sqrt(cape) * shear_0_6km",
+        );
+        let repeated = content_aware_formula_id(
+            "hail_signal",
+            Some("Severe recipe"),
+            Some("1.0.0"),
+            "sqrt(cape) * shear_0_6km",
+        );
+        let changed = content_aware_formula_id(
+            "hail_signal",
+            Some("Severe recipe"),
+            Some("1.0.0"),
+            "cape * shear_0_6km",
+        );
+        assert_eq!(first, repeated);
+        assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn formula_sounding_context_requires_exact_store_source() {
+        let hour = HourKey {
+            model: "hrrr".to_owned(),
+            run: "20260716_00z".to_owned(),
+            hour: 1,
+            exact_time: None,
+        };
+        let context = FormulaSoundingContext {
+            stable_id: "formula_lab:v1:test".to_owned(),
+            label: "test".to_owned(),
+            source: FormulaSoundingSourceContext::Store {
+                store_root: PathBuf::from("store-a"),
+                hour: hour.clone(),
+            },
+        };
+        assert!(context.matches_store_field(Path::new("store-a"), &hour));
+        assert!(!context.matches_store_field(Path::new("store-b"), &hour));
+        let mut other_hour = hour.clone();
+        other_hour.hour = 2;
+        assert!(!context.matches_store_field(Path::new("store-a"), &other_hour));
+
+        let raw = FormulaSoundingContext {
+            source: FormulaSoundingSourceContext::RawWrf,
+            ..context
+        };
+        assert!(!raw.matches_store_field(Path::new("store-a"), &hour));
     }
 
     #[test]

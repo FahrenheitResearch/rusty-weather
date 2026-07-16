@@ -12,7 +12,80 @@ use crate::profile_scope;
 use crate::skewt::build_sounding_column;
 use crate::worker::SoundingData;
 
+#[path = "sounding_table_config.rs"]
+mod sounding_table_config;
+
+use self::sounding_table_config::{
+    SoundingTableConfig, SoundingTableEditor, config_from_view_state, write_config_to_view_state,
+};
+
+#[path = "sounding_table_builtin.rs"]
+mod sounding_table_builtin;
+
 const MS_TO_KT: f64 = 1.943_844_492_440_604_6;
+const SHARPPY_CANVAS_MIN_WIDTH: f32 = 1_630.0;
+const SHARPPY_CANVAS_MIN_HEIGHT: f32 = 900.0;
+const SHARPPY_TEXT_SCALE_MIN: f32 = 0.5;
+const SHARPPY_TEXT_SCALE_MAX: f32 = 2.0;
+const SHARPPY_TEXT_SCALE_DEFAULT: f32 = 1.0;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SoundingFontChoice {
+    #[default]
+    SpaceGrotesk,
+    CleanSans,
+    TechnicalMono,
+}
+
+impl SoundingFontChoice {
+    const ALL: [Self; 3] = [Self::SpaceGrotesk, Self::CleanSans, Self::TechnicalMono];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::SpaceGrotesk => "space-grotesk",
+            Self::CleanSans => "clean-sans",
+            Self::TechnicalMono => "technical-mono",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        match key.trim().to_ascii_lowercase().as_str() {
+            "space-grotesk" | "space_grotesk" | "spacegrotesk" => Some(Self::SpaceGrotesk),
+            "clean-sans" | "clean_sans" | "proportional" => Some(Self::CleanSans),
+            "technical-mono" | "technical_mono" | "monospace" => Some(Self::TechnicalMono),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SpaceGrotesk => "Space Grotesk",
+            Self::CleanSans => "Clean Sans",
+            Self::TechnicalMono => "Technical Mono",
+        }
+    }
+
+    fn preset(self) -> sharppyrs::SoundingFontPreset {
+        match self {
+            Self::SpaceGrotesk => sharppyrs::SoundingFontPreset::SpaceGrotesk,
+            Self::CleanSans => sharppyrs::SoundingFontPreset::CleanProportional,
+            Self::TechnicalMono => sharppyrs::SoundingFontPreset::TechnicalMonospace,
+        }
+    }
+}
+
+/// A host-provided scalar that can be placed into any customizable sounding
+/// table cell. The host owns evaluation and source matching; the sounding
+/// panel only formats and renders the resolved value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SoundingFormulaDiagnostic {
+    pub id: String,
+    pub label: String,
+    pub units: String,
+    pub source_hour: crate::worker::HourKey,
+    pub value: Option<f64>,
+    pub unavailable_reason: Option<String>,
+}
 
 #[derive(Default)]
 enum SoundingState {
@@ -33,9 +106,13 @@ struct ReadySounding {
 
 struct SoundingScene {
     column: SoundingColumn,
-    profile: sharppyrs::Profile,
-    derived: sharppyrs::DerivedParams,
+    analysis: SharppyAnalysis,
     build_ms: f32,
+}
+
+struct SharppyAnalysis {
+    prof: sharppyrs::Profile,
+    derived: sharppyrs::DerivedParams,
 }
 
 /// Serializable host state for the user-editable sharppyrs panel layout.
@@ -43,6 +120,12 @@ struct SoundingScene {
 pub struct SoundingViewState {
     #[serde(default)]
     sharppyrs_layout: Option<String>,
+    #[serde(default)]
+    stretch: Option<bool>,
+    #[serde(default)]
+    font_preset: Option<String>,
+    #[serde(default)]
+    text_scale: Option<f32>,
 }
 
 /// Point-sounding inspector. Hosts push loading/data/error state into the
@@ -50,8 +133,18 @@ pub struct SoundingViewState {
 pub struct SoundingPanel {
     state: SoundingState,
     loading: bool,
+    /// JSON members not owned by this build. Keeping them beside the typed
+    /// state makes an older rw-ui a lossless pass-through for presentation
+    /// controls introduced by a newer release.
+    preserved_view_members: serde_json::Map<String, serde_json::Value>,
     layout_tokens: Option<String>,
     apply_layout_on_next_frame: bool,
+    stretch: bool,
+    font_choice: SoundingFontChoice,
+    text_scale: f32,
+    table_config: SoundingTableConfig,
+    table_editor: SoundingTableEditor,
+    formula_diagnostic: Option<SoundingFormulaDiagnostic>,
 }
 
 impl Default for SoundingPanel {
@@ -59,8 +152,15 @@ impl Default for SoundingPanel {
         Self {
             state: SoundingState::default(),
             loading: false,
+            preserved_view_members: serde_json::Map::new(),
             layout_tokens: None,
             apply_layout_on_next_frame: false,
+            stretch: true,
+            font_choice: SoundingFontChoice::default(),
+            text_scale: SHARPPY_TEXT_SCALE_DEFAULT,
+            table_config: SoundingTableConfig::default(),
+            table_editor: SoundingTableEditor::default(),
+            formula_diagnostic: None,
         }
     }
 }
@@ -86,6 +186,7 @@ impl SoundingPanel {
 
     pub fn set_data(&mut self, data: SoundingData) {
         profile_scope!("sharppyrs_build_scene");
+        self.retain_formula_for_hour(&data.hour);
         let build_started = std::time::Instant::now();
         let scene = build_sounding_column(&data)
             .and_then(|column| build_sounding_scene(column, build_started));
@@ -106,6 +207,7 @@ impl SoundingPanel {
     /// whose significant levels do not form a regular model isobaric grid.
     pub fn set_native_column(&mut self, data: SoundingData, column: SoundingColumn) {
         profile_scope!("sharppyrs_build_native_column");
+        self.retain_formula_for_hour(&data.hour);
         let scene = build_sounding_scene(column, std::time::Instant::now());
         self.loading = false;
         let heading = data.hour.to_string();
@@ -130,6 +232,7 @@ impl SoundingPanel {
         read_ms: f32,
     ) {
         profile_scope!("sharppyrs_build_external_column");
+        self.formula_diagnostic = None;
         let scene = build_sounding_scene(column, std::time::Instant::now());
         self.loading = false;
         self.state = SoundingState::Ready(Box::new(ReadySounding {
@@ -160,11 +263,87 @@ impl SoundingPanel {
     pub fn clear(&mut self) {
         self.loading = false;
         self.state = SoundingState::Empty;
+        self.formula_diagnostic = None;
+    }
+
+    /// Supply the latest Formula Lab scalar for this panel. Results belonging
+    /// to another model/run/hour are ignored, and all external observed/file
+    /// profiles reject formula rows rather than presenting stale values.
+    pub fn set_formula_diagnostic(&mut self, diagnostic: Option<SoundingFormulaDiagnostic>) {
+        self.formula_diagnostic = diagnostic.filter(|candidate| {
+            matches!(
+                &self.state,
+                SoundingState::Ready(ready)
+                    if ready.data.as_ref().is_some_and(|data| data.hour == candidate.source_hour)
+            )
+        });
+    }
+
+    /// Sample a completed Formula Lab field at the exact model-sounding
+    /// location and expose it to the table editor. This keeps formula values
+    /// in their scientific units and refuses stale results from another
+    /// timestep.
+    pub fn install_formula_field(
+        &mut self,
+        field: &crate::worker::FieldData,
+        label: impl Into<String>,
+    ) -> bool {
+        self.install_formula_field_with_id(
+            field,
+            format!("formula_lab:legacy:{}", field.key.var),
+            label,
+        )
+    }
+
+    /// Install a Formula Lab field using a host-provided, content-aware
+    /// identity. The identity must describe the formula science rather than
+    /// the viewer's mutable display-variable name, which may be renamed to
+    /// avoid a collision with a stored field.
+    pub fn install_formula_field_with_id(
+        &mut self,
+        field: &crate::worker::FieldData,
+        stable_id: impl Into<String>,
+        label: impl Into<String>,
+    ) -> bool {
+        let Some(data) = (match &self.state {
+            SoundingState::Ready(ready) => ready.data.as_ref(),
+            _ => None,
+        }) else {
+            return false;
+        };
+        if data.hour != field.key.hour {
+            return false;
+        }
+        let value = sample_field_at(field, data.fx, data.fy);
+        self.formula_diagnostic = Some(SoundingFormulaDiagnostic {
+            id: stable_id.into(),
+            label: label.into(),
+            units: field.units.clone(),
+            source_hour: data.hour.clone(),
+            value,
+            unavailable_reason: value
+                .is_none()
+                .then_some("Formula Lab returned no finite value at this sounding".to_owned()),
+        });
+        true
+    }
+
+    fn retain_formula_for_hour(&mut self, hour: &crate::worker::HourKey) {
+        if self
+            .formula_diagnostic
+            .as_ref()
+            .is_some_and(|formula| &formula.source_hour != hour)
+        {
+            self.formula_diagnostic = None;
+        }
     }
 
     pub fn view_state(&self) -> SoundingViewState {
         SoundingViewState {
             sharppyrs_layout: self.layout_tokens.clone(),
+            stretch: Some(self.stretch),
+            font_preset: Some(self.font_choice.key().to_owned()),
+            text_scale: Some(self.text_scale),
         }
     }
 
@@ -173,16 +352,40 @@ impl SoundingPanel {
             .sharppyrs_layout
             .filter(|tokens| sharppyrs::SoundingLayout::from_tokens(tokens).is_some());
         self.apply_layout_on_next_frame = self.layout_tokens.is_some();
+        if let Some(stretch) = state.stretch {
+            self.stretch = stretch;
+        }
+        if let Some(choice) = state
+            .font_preset
+            .as_deref()
+            .and_then(SoundingFontChoice::from_key)
+        {
+            self.font_choice = choice;
+        }
+        if let Some(scale) = state.text_scale.filter(|scale| scale.is_finite()) {
+            self.text_scale = scale.clamp(SHARPPY_TEXT_SCALE_MIN, SHARPPY_TEXT_SCALE_MAX);
+        }
     }
 
     pub fn view_state_json(&self) -> serde_json::Value {
-        serde_json::to_value(self.view_state()).unwrap_or(serde_json::Value::Null)
+        let mut object = self.preserved_view_members.clone();
+        if let Ok(serde_json::Value::Object(owned)) = serde_json::to_value(self.view_state()) {
+            object.extend(owned);
+        }
+        let mut value = serde_json::Value::Object(object);
+        let _ = write_config_to_view_state(&mut value, &self.table_config);
+        value
     }
 
     pub fn apply_view_state_json(&mut self, value: &serde_json::Value) -> bool {
         let Ok(state) = serde_json::from_value::<SoundingViewState>(value.clone()) else {
             return false;
         };
+        let Some(object) = value.as_object() else {
+            return false;
+        };
+        self.preserved_view_members = object.clone();
+        self.table_config = config_from_view_state(value).unwrap_or_default();
         self.apply_view_state(state);
         true
     }
@@ -217,6 +420,12 @@ impl SoundingPanel {
                 ready,
                 &mut self.layout_tokens,
                 &mut self.apply_layout_on_next_frame,
+                &mut self.stretch,
+                &mut self.font_choice,
+                &mut self.text_scale,
+                &mut self.table_config,
+                &mut self.table_editor,
+                self.formula_diagnostic.as_ref(),
             ),
         }
     }
@@ -257,8 +466,10 @@ fn build_sounding_scene(
 
     Ok(SoundingScene {
         column,
-        profile,
-        derived,
+        analysis: SharppyAnalysis {
+            prof: profile,
+            derived,
+        },
         build_ms: build_started.elapsed().as_secs_f32() * 1000.0,
     })
 }
@@ -268,25 +479,74 @@ fn show_sounding(
     ready: &mut ReadySounding,
     layout_tokens: &mut Option<String>,
     apply_layout_on_next_frame: &mut bool,
+    stretch: &mut bool,
+    font_choice: &mut SoundingFontChoice,
+    text_scale: &mut f32,
+    table_config: &mut SoundingTableConfig,
+    table_editor: &mut SoundingTableEditor,
+    formula: Option<&SoundingFormulaDiagnostic>,
 ) {
     ui.label(RichText::new(&ready.heading).strong());
     ui.label(RichText::new(&ready.subheading).small().weak());
 
-    // Size the plot against the actual viewport before entering the scroll
-    // area.  A fixed 1100 px canvas fits tall desktops, but on shorter
-    // ultrawide displays it leaves the diagnostics board below the visible
-    // edge.  Preserve the board's full desktop width while allowing a modest
-    // vertical compression; genuinely short windows still scroll.
-    let viewport_height = ui.available_height();
-    let canvas_height = (viewport_height - 24.0).clamp(900.0, 1100.0);
+    if ready.scene.is_ok() {
+        ui.horizontal_wrapped(|ui| {
+            ui.menu_button("Text", |ui| {
+                ui.set_min_width(230.0);
+                ui.label(RichText::new("FONT").small().strong());
+                for choice in SoundingFontChoice::ALL {
+                    ui.selectable_value(font_choice, choice, choice.label());
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Size");
+                    let mut percent = *text_scale * 100.0;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut percent, 50.0..=200.0)
+                                .suffix("%")
+                                .integer(),
+                        )
+                        .changed()
+                    {
+                        *text_scale =
+                            (percent / 100.0).clamp(SHARPPY_TEXT_SCALE_MIN, SHARPPY_TEXT_SCALE_MAX);
+                    }
+                    if ui
+                        .small_button("Reset")
+                        .on_hover_text("Reset size to 100%")
+                        .clicked()
+                    {
+                        *text_scale = SHARPPY_TEXT_SCALE_DEFAULT;
+                    }
+                });
+                ui.weak("Changes sounding text only; panel geometry stays independent.");
+            })
+            .response
+            .on_hover_text("Sounding font family and independent text size");
+            ui.separator();
+            table_editor.header_button(ui, table_config);
+            ui.separator();
+            ui.weak("Pane");
+            ui.selectable_value(stretch, true, "Stretch")
+                .on_hover_text("Fill the sounding workspace in both directions.");
+            ui.selectable_value(stretch, false, "Fit")
+                .on_hover_text("Preserve the desktop sounding-board aspect ratio.");
+        });
 
+        let catalog = sounding_table_builtin::catalog(formula);
+        let defaults = sounding_table_builtin::default_config();
+        table_editor.show(ui.ctx(), table_config, &defaults, &catalog);
+    }
+
+    let canvas_viewport = ui.available_size();
     egui::ScrollArea::both()
         .id_salt("rw-ui-sounding-scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             match &ready.scene {
                 Ok(scene) => {
-                    let layout_id = ui.id().with("rw-ui-sharppyrs-layout");
+                    let layout_id = egui::Id::new("rw-ui-sharppyrs-layout");
                     if *apply_layout_on_next_frame {
                         if let Some(layout) = layout_tokens
                             .as_deref()
@@ -297,23 +557,45 @@ fn show_sounding(
                         *apply_layout_on_next_frame = false;
                     }
 
-                    // Keep the complete diagnostics board in a desktop-width
-                    // coordinate system. Narrow hosts scroll it instead of
-                    // squeezing fixed text columns over the plot.
-                    let width = ui.available_width().max(1630.0);
-                    let height = canvas_height;
+                    let size = sounding_canvas_size(canvas_viewport, *stretch);
                     let title = format!(
                         "{}  {}",
                         scene.column.metadata.station_id, scene.column.metadata.valid_time
                     );
-                    ui.add(
-                        sharppyrs::SoundingView::new(&scene.profile, &scene.derived)
-                            .title(title)
-                            .brand("rusty-weather · sharppyrs")
-                            .style(sharppyrs::SkewTStyle::space_grotesk())
-                            .layout_memory_id(layout_id)
-                            .size(Vec2::new(width, height)),
-                    );
+                    let overrides =
+                        sounding_table_builtin::build_board(table_config, &scene.analysis, formula);
+                    let style = sharppyrs::SkewTStyle::space_grotesk()
+                        .with_font_preset(font_choice.preset())
+                        .with_text_scale(*text_scale);
+                    let view = || {
+                        let view = sharppyrs::SoundingView::new(
+                            &scene.analysis.prof,
+                            &scene.analysis.derived,
+                        )
+                        .title(title)
+                        .brand("rusty-weather / sharppyrs")
+                        .style(style)
+                        .layout_memory_id(layout_id)
+                        .size(size);
+                        let Some(overrides) = overrides.as_ref() else {
+                            return view;
+                        };
+                        let view = if overrides.generic.panels.is_empty() {
+                            view
+                        } else {
+                            view.diagnostic_tables(&overrides.generic)
+                        };
+                        if overrides.native_patches.patches.is_empty() {
+                            view
+                        } else {
+                            view.native_diagnostic_patches(&overrides.native_patches)
+                        }
+                    };
+                    egui::Frame::new()
+                        .fill(egui::Color32::BLACK)
+                        .show(ui, |ui| {
+                            ui.add(view());
+                        });
                     if let Some(layout) = sharppyrs::stored_layout(ui.ctx(), layout_id) {
                         *layout_tokens = Some(layout.to_tokens());
                     }
@@ -343,6 +625,60 @@ fn show_sounding(
                     .show(ui, |ui| show_level_table(ui, data));
             }
         });
+}
+
+fn fit_sounding_canvas_size(viewport: Vec2) -> Vec2 {
+    let width_scale = viewport.x.max(0.0) / SHARPPY_CANVAS_MIN_WIDTH;
+    let height_scale = viewport.y.max(0.0) / SHARPPY_CANVAS_MIN_HEIGHT;
+    let scale = width_scale.min(height_scale);
+    Vec2::new(
+        (SHARPPY_CANVAS_MIN_WIDTH * scale).min(viewport.x),
+        (SHARPPY_CANVAS_MIN_HEIGHT * scale).min(viewport.y),
+    )
+}
+
+fn sounding_canvas_size(viewport: Vec2, stretch: bool) -> Vec2 {
+    let viewport = Vec2::new(viewport.x.max(0.0), viewport.y.max(0.0));
+    if stretch {
+        viewport
+    } else {
+        fit_sounding_canvas_size(viewport)
+    }
+}
+
+fn sample_field_at(field: &crate::worker::FieldData, fx: f64, fy: f64) -> Option<f64> {
+    if field.nx == 0
+        || field.ny == 0
+        || field.values.len() != field.nx.saturating_mul(field.ny)
+        || !fx.is_finite()
+        || !fy.is_finite()
+    {
+        return None;
+    }
+    let x = fx.clamp(0.0, field.nx.saturating_sub(1) as f64);
+    let y = fy.clamp(0.0, field.ny.saturating_sub(1) as f64);
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let x1 = (x0 + 1).min(field.nx - 1);
+    let y1 = (y0 + 1).min(field.ny - 1);
+    let tx = x - x0 as f64;
+    let ty = y - y0 as f64;
+    let samples = [
+        (x0, y0, (1.0 - tx) * (1.0 - ty)),
+        (x1, y0, tx * (1.0 - ty)),
+        (x0, y1, (1.0 - tx) * ty),
+        (x1, y1, tx * ty),
+    ];
+    let mut weighted = 0.0;
+    let mut weight_sum = 0.0;
+    for (x, y, weight) in samples {
+        let value = f64::from(field.values[y * field.nx + x]);
+        if value.is_finite() && weight > 0.0 {
+            weighted += value * weight;
+            weight_sum += weight;
+        }
+    }
+    (weight_sum > 0.0).then_some(weighted / weight_sum)
 }
 
 fn sounding_place(data: &SoundingData) -> String {
@@ -430,12 +766,89 @@ mod tests {
     fn sounding_view_state_json_round_trips_sharppyrs_layout() {
         let mut panel = SoundingPanel::new();
         panel.layout_tokens = Some(sharppyrs::SoundingLayout::default().to_tokens());
+        panel.stretch = false;
+        panel.font_choice = SoundingFontChoice::TechnicalMono;
+        panel.text_scale = 1.4;
+        panel.table_config = sounding_table_builtin::default_config();
         let value = panel.view_state_json();
 
         let mut restored = SoundingPanel::new();
         assert!(restored.apply_view_state_json(&value));
         assert_eq!(restored.layout_tokens, panel.layout_tokens);
         assert!(restored.apply_layout_on_next_frame);
+        assert!(!restored.stretch);
+        assert_eq!(restored.font_choice, SoundingFontChoice::TechnicalMono);
+        assert!((restored.text_scale - 1.4).abs() < f32::EPSILON);
+        assert_eq!(restored.table_config, panel.table_config);
+    }
+
+    #[test]
+    fn sounding_view_state_preserves_unknown_future_members() {
+        let future = serde_json::json!({
+            "sharppyrs_layout": sharppyrs::SoundingLayout::default().to_tokens(),
+            "stretch": false,
+            "font_preset": "technical-mono",
+            "text_scale": 1.25,
+            "future_fit_mode": "adaptive",
+            "future_panel_weights": [0.5, 0.2, 0.3],
+            "future_nested": {"scene_zoom": 0.72, "locked": true},
+        });
+        let mut panel = SoundingPanel::new();
+        assert!(panel.apply_view_state_json(&future));
+
+        let encoded = panel.view_state_json();
+        assert_eq!(encoded["future_fit_mode"], future["future_fit_mode"]);
+        assert_eq!(
+            encoded["future_panel_weights"],
+            future["future_panel_weights"]
+        );
+        assert_eq!(encoded["future_nested"], future["future_nested"]);
+
+        let mut restored = SoundingPanel::new();
+        assert!(restored.apply_view_state_json(&encoded));
+        assert_eq!(
+            restored.view_state_json()["future_nested"],
+            future["future_nested"]
+        );
+    }
+
+    #[test]
+    fn formula_field_samples_the_current_sounding_and_rejects_other_hours() {
+        let mut data = empty_sounding();
+        data.fx = 0.5;
+        data.fy = 0.5;
+        let hour = data.hour.clone();
+        let mut panel = SoundingPanel::new();
+        panel.set_data(data);
+        let field = crate::worker::FieldData {
+            key: crate::worker::FieldKey {
+                hour: hour.clone(),
+                var: "custom_hail".to_owned(),
+            },
+            units: "widgets".to_owned(),
+            nx: 2,
+            ny: 2,
+            values: vec![0.0, 10.0, 20.0, 30.0],
+            range: Some((0.0, 30.0)),
+            grid: None,
+            lat_descending: false,
+            style: None,
+        };
+        assert!(panel.install_formula_field(&field, "Custom hail"));
+        let formula = panel.formula_diagnostic.as_ref().expect("formula");
+        assert_eq!(formula.source_hour, hour);
+        assert_eq!(formula.value, Some(15.0));
+
+        let mut stale = field;
+        stale.key.hour.hour = 1;
+        assert!(!panel.install_formula_field(&stale, "stale"));
+        assert_eq!(
+            panel
+                .formula_diagnostic
+                .as_ref()
+                .map(|formula| formula.label.as_str()),
+            Some("Custom hail")
+        );
     }
 
     #[test]
@@ -443,6 +856,7 @@ mod tests {
         let mut panel = SoundingPanel::new();
         panel.apply_view_state(SoundingViewState {
             sharppyrs_layout: Some("not-a-layout".into()),
+            ..Default::default()
         });
         assert_eq!(panel.layout_tokens, None);
         assert!(!panel.apply_layout_on_next_frame);
@@ -480,7 +894,7 @@ mod tests {
         )
         .expect("valid normalized columns should feed sharppyrs");
 
-        assert_eq!(scene.profile.inner.num_levels(), count);
+        assert_eq!(scene.analysis.prof.inner.num_levels(), count);
         assert!(scene.build_ms.is_finite());
     }
 

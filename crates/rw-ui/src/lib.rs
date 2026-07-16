@@ -44,8 +44,8 @@ pub use panels::{
     FieldViewerPanel, HourDoneView, ModelOption, PlotViewerPanel, RunBrowserPanel, SatDiskUsage,
     SatFollowSpec, SatFollowState, SatFrameImage, SatLayerOption, SatPlayerEvent, SatPlayerPanel,
     SatRunKey, SatRunListing, SatSatelliteOption, SatSectorOption, SatelliteEvent, SatellitePanel,
-    SoundingPanel, SoundingViewState, StageState, format_bytes, shift_date_yyyymmdd,
-    today_yyyymmdd_utc,
+    SoundingFormulaDiagnostic, SoundingPanel, SoundingViewState, StageState, format_bytes,
+    shift_date_yyyymmdd, today_yyyymmdd_utc,
 };
 
 /// Install the font families used by the native SHARPpy sounding widget.

@@ -828,6 +828,12 @@ impl FieldViewerPanel {
         self.field.as_ref()
     }
 
+    /// The unconverted scientific Formula Lab result retained for the
+    /// selected timestep, when one exists.
+    pub fn current_generated_field(&self) -> Option<&FieldData> {
+        self.generated_field.as_ref().map(|field| &field.raw)
+    }
+
     /// Render the variable picker + field image. Returns at most one event.
     pub fn ui(&mut self, ui: &mut Ui) -> Option<FieldViewerEvent> {
         let mut event = None;
