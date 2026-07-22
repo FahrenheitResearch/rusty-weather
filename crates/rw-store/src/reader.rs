@@ -437,6 +437,23 @@ pub struct Window2D {
     pub values: Vec<f32>,
 }
 
+/// Finite-value summary for one complete 2D field.
+///
+/// `finite_min` and `finite_max` are `None` when the field has no finite
+/// values. `missing_count` counts every non-finite source value represented
+/// by the store (normally NaN).
+///
+/// The summary is aggregated from the per-tile statistics in the validated
+/// chunk index, so obtaining it does not decompress field payloads. These are
+/// writer-recorded statistics, not a deep revalidation of the payload bytes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FieldStats2D {
+    pub finite_min: Option<f32>,
+    pub finite_max: Option<f32>,
+    pub finite_count: u64,
+    pub missing_count: u64,
+}
+
 /// Read-only handle to one rw-store hour file.
 ///
 /// Debug is implemented manually: deriving it would dump the entire mapped
@@ -605,6 +622,133 @@ impl HourReader {
     /// Metadata for the variable named `name`, if present.
     pub fn variable(&self, name: &str) -> Option<&RwsVariableMeta> {
         self.meta.variables.iter().find(|var| var.name == name)
+    }
+
+    /// Return finite-value statistics for the complete 2D field `name`
+    /// without decompressing any tile payloads.
+    ///
+    /// The per-tile min/max/count records are checked for the invariants that
+    /// can be established from the index alone before they are aggregated.
+    /// Use deep store validation when payload-to-index verification is
+    /// required.
+    pub fn stats_2d(&self, name: &str) -> RwResult<FieldStats2D> {
+        let var = self.lookup(name)?;
+        if var.kind != "surface2d" {
+            return Err(RwStoreError::Format(format!(
+                "variable '{name}' has kind '{}', expected 'surface2d'",
+                var.kind
+            )));
+        }
+
+        let tiles_y = self.meta.ny.div_ceil(TILE_Y);
+        let tiles_x = self.meta.nx.div_ceil(TILE_X);
+        let expected_records = tiles_y.checked_mul(tiles_x).ok_or_else(|| {
+            RwStoreError::Format(format!("variable '{name}': tile count overflows usize"))
+        })?;
+        let range = self.var_ranges.get(&var.id).ok_or_else(|| {
+            RwStoreError::Format(format!(
+                "variable '{}' (id {}) has no chunk index entries",
+                var.name, var.id
+            ))
+        })?;
+        if range.len() != expected_records {
+            return Err(RwStoreError::Format(format!(
+                "variable '{name}' has {} chunk index records, expected {expected_records}",
+                range.len()
+            )));
+        }
+
+        let mut finite_min: Option<f32> = None;
+        let mut finite_max: Option<f32> = None;
+        let mut finite_count = 0u64;
+
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                let record = self.chunk_record(var, KIND_TILE2D, ty, tx)?;
+                let (rows, cols) = self.tile_dims(ty, tx);
+                let tile_count = rows.checked_mul(cols).ok_or_else(|| {
+                    RwStoreError::Format(format!(
+                        "variable '{name}' tile ({ty},{tx}) cell count overflows usize"
+                    ))
+                })?;
+                let valid_count = record.valid_count as usize;
+                if valid_count > tile_count {
+                    return Err(RwStoreError::Format(format!(
+                        "variable '{name}' tile ({ty},{tx}) valid_count {valid_count} exceeds tile cell count {tile_count}"
+                    )));
+                }
+
+                let is_empty = record.flags & FLAG_EMPTY != 0;
+                let has_missing = record.flags & FLAG_HAS_MISSING != 0;
+                let is_constant = record.flags & FLAG_CONSTANT != 0;
+                if is_empty {
+                    if valid_count != 0 || !record.min.is_nan() || !record.max.is_nan() {
+                        return Err(RwStoreError::Format(format!(
+                            "variable '{name}' tile ({ty},{tx}) has inconsistent EMPTY statistics"
+                        )));
+                    }
+                    continue;
+                }
+
+                if valid_count == 0 {
+                    return Err(RwStoreError::Format(format!(
+                        "variable '{name}' tile ({ty},{tx}) has zero valid values without EMPTY"
+                    )));
+                }
+                if !record.min.is_finite() || !record.max.is_finite() || record.min > record.max {
+                    return Err(RwStoreError::Format(format!(
+                        "variable '{name}' tile ({ty},{tx}) has invalid finite range {} .. {}",
+                        record.min, record.max
+                    )));
+                }
+                if has_missing != (valid_count < tile_count) {
+                    return Err(RwStoreError::Format(format!(
+                        "variable '{name}' tile ({ty},{tx}) HAS_MISSING flag is inconsistent with valid_count {valid_count} of {tile_count}"
+                    )));
+                }
+                if is_constant
+                    && (!record.center.is_finite()
+                        || record.min != record.center
+                        || record.max != record.center)
+                {
+                    return Err(RwStoreError::Format(format!(
+                        "variable '{name}' tile ({ty},{tx}) has inconsistent CONSTANT statistics"
+                    )));
+                }
+
+                finite_min = Some(finite_min.map_or(record.min, |value| value.min(record.min)));
+                finite_max = Some(finite_max.map_or(record.max, |value| value.max(record.max)));
+                finite_count = finite_count
+                    .checked_add(u64::from(record.valid_count))
+                    .ok_or_else(|| {
+                        RwStoreError::Format(format!(
+                            "variable '{name}' finite value count overflows u64"
+                        ))
+                    })?;
+            }
+        }
+
+        let total_count =
+            u64::try_from(self.meta.nx.checked_mul(self.meta.ny).ok_or_else(|| {
+                RwStoreError::Format(format!("variable '{name}' grid cell count overflows usize"))
+            })?)
+            .map_err(|_| {
+                RwStoreError::Format(format!(
+                    "variable '{name}' grid cell count does not fit u64"
+                ))
+            })?;
+        let missing_count = total_count.checked_sub(finite_count).ok_or_else(|| {
+            RwStoreError::Format(format!(
+                "variable '{name}' finite value count {finite_count} exceeds grid cell count {total_count}"
+            ))
+        })?;
+
+        Ok(FieldStats2D {
+            finite_min,
+            finite_max,
+            finite_count,
+            missing_count,
+        })
     }
 
     /// Read the full `ny * nx` row-major field for `name`; positions inside

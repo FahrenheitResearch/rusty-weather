@@ -566,6 +566,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         model: args.model,
         date_yyyymmdd: args.date.clone(),
         cycle_utc: args.cycle,
+        exact_time: None,
         source: provenance_source,
         domain: domain.clone(),
         out_dir: args.out_dir.clone(),
@@ -725,6 +726,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     hour,
                     &request.direct,
                     &request.derived,
+                    &request.generic,
                     Some(&chunk_gate),
                 )
                 .map_err(|err| format!("f{hour:03}: render: {err}"))?;

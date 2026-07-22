@@ -34,6 +34,7 @@ pub use ingest::{
     write_hour_from_grid_with_derived_exact,
 };
 pub use lock::{LOCK_FILE_NAME, RunLock};
+pub use reader::FieldStats2D;
 pub use validate::{
     ValidateDepth, ValidationReport, ValidationStats, validate_hour_file, validate_run_dir,
 };

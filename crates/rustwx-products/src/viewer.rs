@@ -29,8 +29,9 @@
 use rustwx_core::{CanonicalField, FieldSelector, ModelId};
 use rustwx_models::{PlotRecipe, built_in_plot_recipes};
 use rustwx_render::{
-    ColorScale, ColormapBuildOptions, DiscreteColorScale, ExtendMode, LegendControls, LegendMode,
-    MapRenderRequest, ProductVisualMode, RenderDensity, StaticPlotStyle, WeatherProduct,
+    Color, ColorScale, ColormapBuildOptions, DiscreteColorScale, ExtendMode, LegendControls,
+    LegendMode, LevelDensity, MapRenderRequest, ProductVisualMode, RenderDensity, StaticPlotStyle,
+    WeatherProduct,
 };
 use std::collections::HashSet;
 
@@ -128,6 +129,76 @@ pub struct StoreVariableStyleTemplate {
     pub label: String,
     pub category: String,
     pub style: StoreVariableStyle,
+}
+
+/// Build a neutral full-range style for a stored 2-D variable without a
+/// production meteorological counterpart.
+///
+/// `finite_range` must be the minimum and maximum over finite samples only.
+/// A non-degenerate range is represented exactly, without percentile
+/// clipping. Constant fields receive display-only padding; absent or invalid
+/// ranges use an explicit 0..1 placeholder so renderers still have ordered
+/// levels. Raw values and units are never converted.
+pub fn generic_style_for_store_variable(
+    var_name: &str,
+    stored_units: &str,
+    finite_range: Option<(f32, f32)>,
+) -> StoreVariableStyle {
+    const COLORS: [[u8; 4]; 9] = [
+        [68, 1, 84, 255],
+        [72, 40, 120, 255],
+        [62, 74, 137, 255],
+        [49, 104, 142, 255],
+        [38, 130, 142, 255],
+        [31, 158, 137, 255],
+        [53, 183, 121, 255],
+        [109, 205, 89, 255],
+        [253, 231, 37, 255],
+    ];
+
+    let (range, range_note) = match finite_range {
+        Some((lo, hi)) if lo.is_finite() && hi.is_finite() && lo < hi => {
+            ((f64::from(lo), f64::from(hi)), "full finite range")
+        }
+        Some((value, other)) if value.is_finite() && other.is_finite() && value == other => {
+            let center = f64::from(value);
+            let padding = if center == 0.0 {
+                1.0
+            } else {
+                (center.abs() * 0.05).max(1.0e-6)
+            };
+            ((center - padding, center + padding), "constant field")
+        }
+        _ => ((0.0, 1.0), "no finite range"),
+    };
+    let levels = (0..=COLORS.len())
+        .map(|index| range.0 + (range.1 - range.0) * index as f64 / COLORS.len() as f64)
+        .collect();
+    let legend = LegendControls {
+        density: LevelDensity::default(),
+        mode: LegendMode::SmoothRamp,
+    };
+
+    StoreVariableStyle {
+        title: format!("{var_name} (generic, {range_note})"),
+        display_units: stored_units.to_string(),
+        convert: UnitConvert::None,
+        scale: ColorScale::Discrete(DiscreteColorScale {
+            levels,
+            colors: COLORS
+                .into_iter()
+                .map(|[r, g, b, a]| Color::rgba(r, g, b, a))
+                .collect(),
+            extend: ExtendMode::Neither,
+            mask_below: None,
+        }),
+        colormap_options: ColormapBuildOptions {
+            render_density: StaticPlotStyle::from_env().render_density(RenderDensity::default()),
+            legend,
+        },
+        cbar_tick_step: None,
+        legend_mode: legend.mode,
+    }
 }
 
 /// Resolve the production styling for the stored variable `var_name`
@@ -647,6 +718,48 @@ mod tests {
 
     fn derived_marker(slug: &str) -> serde_json::Value {
         serde_json::json!({ "derived": slug })
+    }
+
+    #[test]
+    fn generic_style_spans_the_exact_finite_range_with_neutral_units() {
+        let style = generic_style_for_store_variable("mystery_plane", "widgets", Some((-2.5, 7.5)));
+        assert_eq!(style.title, "mystery_plane (generic, full finite range)");
+        assert_eq!(style.display_units, "widgets");
+        assert_eq!(style.convert, UnitConvert::None);
+        assert_eq!(style.legend_mode, LegendMode::SmoothRamp);
+        assert_eq!(style.colormap_options.legend.mode, LegendMode::SmoothRamp);
+        assert_eq!(style.cbar_tick_step, None);
+
+        let scale = style.scale.resolved_discrete();
+        assert_eq!(scale.levels.first().copied(), Some(-2.5));
+        assert_eq!(scale.levels.last().copied(), Some(7.5));
+        assert_eq!(scale.levels.len(), 10);
+        assert_eq!(scale.colors.len(), 9);
+        assert!(scale.levels.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(scale.extend, ExtendMode::Neither);
+        assert_eq!(scale.mask_below, None);
+    }
+
+    #[test]
+    fn generic_style_handles_constant_and_absent_ranges_deterministically() {
+        let constant = generic_style_for_store_variable("constant", "K", Some((300.0, 300.0)));
+        let constant_scale = constant.scale.resolved_discrete();
+        assert_eq!(constant.title, "constant (generic, constant field)");
+        assert_eq!(constant_scale.levels.first().copied(), Some(285.0));
+        assert_eq!(constant_scale.levels.last().copied(), Some(315.0));
+
+        let zero = generic_style_for_store_variable("zero", "1", Some((0.0, 0.0)));
+        let zero_scale = zero.scale.resolved_discrete();
+        assert_eq!(zero_scale.levels.first().copied(), Some(-1.0));
+        assert_eq!(zero_scale.levels.last().copied(), Some(1.0));
+
+        for range in [None, Some((f32::NAN, 2.0)), Some((2.0, -2.0))] {
+            let missing = generic_style_for_store_variable("missing", "", range);
+            let missing_scale = missing.scale.resolved_discrete();
+            assert_eq!(missing.title, "missing (generic, no finite range)");
+            assert_eq!(missing_scale.levels.first().copied(), Some(0.0));
+            assert_eq!(missing_scale.levels.last().copied(), Some(1.0));
+        }
     }
 
     #[test]

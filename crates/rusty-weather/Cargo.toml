@@ -9,6 +9,7 @@ default-run = "rusty-weather"
 
 [dependencies]
 clap.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 image = { version = "0.25", default-features = false, features = ["png", "webp"] }
 # Global allocator for the ingest binary: the derived CAPE kernels allocate
 # per-column scratch across every rayon thread; mimalloc handles that churn

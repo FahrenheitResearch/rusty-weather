@@ -55,6 +55,7 @@ use std::path::{Path, PathBuf};
 
 use rustwx_products::windowed::HrrrWindowedProduct;
 use rw_store::error::RwStoreError;
+use rw_store::format::RwsExactTime;
 use rw_store::grid::GridFile;
 use rw_store::ingest::read_grid_2d;
 use rw_store::reader::HourReader;
@@ -62,6 +63,8 @@ use rw_store::run::{RwsRunManifest, validate_store_component};
 
 pub(crate) const MM_PER_INCH: f64 = 25.4;
 pub(crate) const MS_TO_KT: f64 = 1.943_844_5;
+
+pub type StoredRunTime = (u16, Option<RwsExactTime>);
 
 /// One realized windowed product grid: display values (already in display
 /// units) on the full run grid, plus the metadata the windowed render path
@@ -88,15 +91,36 @@ pub struct WindowedStoreOutcome {
     pub anchor_hour: u16,
 }
 
-/// Forecast hours registered in the run's `run.json` manifest, ascending.
+/// Storage slots registered in the run's `run.json` manifest, ascending.
+///
+/// Legacy v1 slots are whole forecast hours. Exact-time v2 slots are ordinal
+/// storage identities and carry their physical lead/valid pair separately via
+/// [`stored_run_times`]. Slot enumeration itself is safe for both schemas;
+/// only multi-time windowed science requires the legacy whole-hour axis.
 pub fn stored_run_hours(
     store_root: &Path,
     model_slug: &str,
     run_slug: &str,
 ) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
     let (_, manifest) = load_run_manifest(store_root, model_slug, run_slug)?;
-    reject_exact_time_axis(&manifest, model_slug, run_slug)?;
     Ok(manifest.hours.keys().copied().collect())
+}
+
+/// Registered storage slots and their optional exact physical times.
+///
+/// Every v2 slot returns `Some`; every v1 hour returns `None`. Manifest load
+/// validation already proves that a run cannot mix the two timing schemas.
+pub fn stored_run_times(
+    store_root: &Path,
+    model_slug: &str,
+    run_slug: &str,
+) -> Result<Vec<StoredRunTime>, Box<dyn std::error::Error>> {
+    let (_, manifest) = load_run_manifest(store_root, model_slug, run_slug)?;
+    Ok(manifest
+        .hours
+        .iter()
+        .map(|(&slot, entry)| (slot, entry.exact_time()))
+        .collect())
 }
 
 fn reject_exact_time_axis(
@@ -106,7 +130,7 @@ fn reject_exact_time_axis(
 ) -> Result<(), RwStoreError> {
     if manifest.is_exact_time_axis() {
         return Err(RwStoreError::Meta(format!(
-            "run {model_slug}/{run_slug} uses an exact-time ordinal axis; production batch/windowed rendering is disabled until render requests carry exact lead and valid times"
+            "run {model_slug}/{run_slug} uses an exact-time ordinal axis; windowed products require a legacy contiguous whole-hour forecast axis"
         )));
     }
     Ok(())
@@ -1793,7 +1817,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_time_runs_are_rejected_at_both_windowed_entry_points() {
+    fn exact_time_slots_enumerate_but_windowed_science_stays_unavailable() {
         let dir = test_dir("exact-time-guard");
         let run = "minute_loop";
         let temp = field(
@@ -1815,14 +1839,18 @@ mod tests {
         )
         .unwrap();
 
-        let hours_error = stored_run_hours(&dir, "hrrr", run).unwrap_err().to_string();
-        assert!(hours_error.contains("exact-time ordinal axis"));
+        assert_eq!(stored_run_hours(&dir, "hrrr", run).unwrap(), vec![0]);
+        assert_eq!(
+            stored_run_times(&dir, "hrrr", run).unwrap(),
+            vec![(0, Some(RwsExactTime::new(31_680, 134_000_000)))]
+        );
 
         let compute_error =
             compute_windowed_products(&dir, "hrrr", run, &[0], &["qpf_1h".to_string()])
                 .unwrap_err()
                 .to_string();
         assert!(compute_error.contains("exact-time ordinal axis"));
+        assert!(compute_error.contains("legacy contiguous whole-hour"));
         let _ = fs::remove_dir_all(&dir);
     }
 

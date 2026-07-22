@@ -426,12 +426,16 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let store = StoreFieldSource::open(&args.store_root, &model_slug, &args.run, args.hour)?;
     let open_ms = open_started.elapsed().as_millis();
     println!(
-        "rw_render build {} | store {} | {} products requested ({} direct, {} derived/heavy, {} windowed) | {} domain(s) | output {:?} | open {} ms",
+        "rw_render build {} | store {} | {} products requested ({} direct, {} derived/heavy, {} generic, {} windowed) | {} domain(s) | output {:?} | open {} ms",
         env!("RW_BUILD_SHA"),
         store.hour_path().display(),
-        request.direct.len() + request.derived.len() + request.windowed.len(),
+        request.direct.len()
+            + request.derived.len()
+            + request.generic.len()
+            + request.windowed.len(),
         request.direct.len(),
         request.derived.len(),
+        request.generic.len(),
         request.windowed.len(),
         regions.len(),
         args.output_format,
@@ -456,6 +460,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             model: args.model,
             date_yyyymmdd: date.clone(),
             cycle_utc: cycle,
+            exact_time: store.exact_time(),
             source,
             domain: domain.clone(),
             out_dir,
@@ -486,6 +491,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             args.hour,
             &request.direct,
             &request.derived,
+            &request.generic,
             // Solo render: nothing else competes for memory, no chunk gate.
             None,
         )?;

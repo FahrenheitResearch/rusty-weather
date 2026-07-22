@@ -81,7 +81,10 @@ pub use store::{
     compute_store_heavy_grids, compute_store_heavy_grids_f32, prepare_store_compute_inputs,
     store_derived_recipe_slugs, store_heavy_recipe_slugs,
 };
-pub use store_render::{StoreProductGrid, render_derived_recipes_from_store_grids};
+pub use store_render::{
+    StoreDerivedPresentationOverrides, StoreProductGrid, render_derived_recipes_from_store_grids,
+    render_derived_recipes_from_store_grids_with_presentation,
+};
 pub use types::{
     DerivedBatchReport, DerivedBatchRequest, DerivedMemoryProfile, DerivedRecipeBlocker,
     DerivedRecipeTiming, DerivedRenderedRecipe, DerivedSharedTiming, HrrrDerivedBatchReport,
