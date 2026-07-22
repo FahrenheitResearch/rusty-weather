@@ -4,9 +4,11 @@
 //! This is the interactive sibling of PNG export: the expensive PNG encode
 //! path is intentionally skipped for on-screen display.
 
+use std::time::{Duration, Instant};
+
 use egui::{
-    ColorImage, ComboBox, DragValue, Image, RichText, TextEdit, TextureFilter, TextureHandle,
-    TextureOptions, Ui, Vec2,
+    ColorImage, ComboBox, DragValue, Image, Label, RichText, TextEdit, TextureFilter,
+    TextureHandle, TextureOptions, Ui, Vec2,
 };
 use rustwx_core::{Field2D, GridShape, LatLonGrid, ProductKey};
 use rustwx_render::{DomainFrame, MapRenderRequest, ProductVisualMode, RgbaImage};
@@ -14,6 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::profile_scope;
 use crate::worker::{FieldData, FieldKey, HourKey};
+
+const RESIZE_SETTLE_TIME: Duration = Duration::from_millis(180);
+const ACTIVE_RESIZE_REPAINT: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlotCacheKey {
@@ -28,6 +33,59 @@ struct DomainCacheKey {
     name: String,
     bounds_microdeg: [i64; 4],
     rotation_millideg: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingRenderSize {
+    target: (u32, u32),
+    changed_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeRenderDecision {
+    Wait(Duration),
+    RenderNow,
+}
+
+#[derive(Debug, Default)]
+struct ResizeRenderDebounce {
+    pending: Option<PendingRenderSize>,
+}
+
+impl ResizeRenderDebounce {
+    fn clear(&mut self) {
+        self.pending = None;
+    }
+
+    fn decide(
+        &mut self,
+        target: (u32, u32),
+        interaction_active: bool,
+        now: Instant,
+    ) -> ResizeRenderDecision {
+        if self.pending.is_none_or(|pending| pending.target != target) {
+            self.pending = Some(PendingRenderSize {
+                target,
+                changed_at: now,
+            });
+        }
+
+        let pending = self.pending.expect("pending render size was just set");
+        let elapsed = now.saturating_duration_since(pending.changed_at);
+        if !interaction_active && elapsed >= RESIZE_SETTLE_TIME {
+            self.pending = None;
+            return ResizeRenderDecision::RenderNow;
+        }
+
+        let wait = if interaction_active {
+            ACTIVE_RESIZE_REPAINT
+        } else {
+            RESIZE_SETTLE_TIME
+                .saturating_sub(elapsed)
+                .max(Duration::from_millis(1))
+        };
+        ResizeRenderDecision::Wait(wait)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -89,6 +147,7 @@ pub struct PlotViewerPanel {
     saved_domains: Vec<CustomDomain>,
     domain_name_edit: String,
     saved_domains_dirty: bool,
+    resize_render_debounce: ResizeRenderDebounce,
 }
 
 impl PlotViewerPanel {
@@ -105,6 +164,7 @@ impl PlotViewerPanel {
         self.error = None;
         self.last_render_ms = None;
         self.last_upload_ms = None;
+        self.resize_render_debounce.clear();
     }
 
     pub fn set_active_domain(&mut self, domain: CustomDomain) {
@@ -128,6 +188,17 @@ impl PlotViewerPanel {
 
     pub fn active_domain(&self) -> Option<&CustomDomain> {
         self.active_domain.as_ref()
+    }
+
+    /// Return to the complete native grid and invalidate any domain render.
+    ///
+    /// This is the programmatic twin of the panel's `Full grid` button. Hosts
+    /// use it when a newly selected run must not inherit a custom or
+    /// auto-seeded domain from the previous run.
+    pub fn show_full_grid(&mut self) {
+        self.active_domain = None;
+        self.domain_name_edit.clear();
+        self.clear();
     }
 
     pub fn saved_domains(&self) -> &[CustomDomain] {
@@ -160,13 +231,22 @@ impl PlotViewerPanel {
                 return;
             };
 
+            // The plot must fit *inside* the remaining window. The old code
+            // made the image as tall as all remaining space and then appended
+            // the timing row below it. That made egui grow the window, which
+            // yielded a larger plot on the next frame and repeated until the
+            // screen edge. Reserving the footer breaks that feedback loop.
             let available = ui.available_size();
+            let footer_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+            let plot_available = Vec2::new(available.x, (available.y - footer_height).max(1.0));
             let target_aspect = self
                 .active_domain
                 .as_ref()
                 .map(|domain| domain_plot_aspect(domain.bounds, domain.rotation_deg))
                 .unwrap_or(16.0 / 9.0);
-            let (display_width, display_height) = quantized_plot_size(available, target_aspect);
+            let display_size = fitted_plot_size(plot_available, target_aspect);
+            let display_width = display_size.x.floor().max(1.0) as u32;
+            let display_height = display_size.y.floor().max(1.0) as u32;
             let (width, height) = render_plot_size(
                 display_width,
                 display_height,
@@ -180,7 +260,28 @@ impl PlotViewerPanel {
             };
 
             if self.cache_key.as_ref() != Some(&key) {
-                self.render(ui, field, self.active_domain.clone(), key);
+                let content_changed = self
+                    .cache_key
+                    .as_ref()
+                    .is_none_or(|cached| cached.field != key.field || cached.domain != key.domain);
+                let interaction_active = ui.input(|input| input.pointer.any_down());
+                let decision = if content_changed {
+                    ResizeRenderDecision::RenderNow
+                } else {
+                    self.resize_render_debounce.decide(
+                        (width, height),
+                        interaction_active,
+                        Instant::now(),
+                    )
+                };
+                match decision {
+                    ResizeRenderDecision::RenderNow => {
+                        self.render(ui, field, self.active_domain.clone(), key);
+                    }
+                    ResizeRenderDecision::Wait(wait) => ui.ctx().request_repaint_after(wait),
+                }
+            } else {
+                self.resize_render_debounce.clear();
             }
 
             if let Some(message) = &self.error {
@@ -193,18 +294,18 @@ impl PlotViewerPanel {
                 return;
             };
 
-            ui.add(
-                Image::new(texture)
-                    .fit_to_exact_size(Vec2::new(display_width as f32, display_height as f32)),
-            );
+            ui.add(Image::new(texture).fit_to_exact_size(display_size));
             if let Some((render_ms, upload_ms)) = self.last_timings() {
-                ui.label(
-                    RichText::new(format!(
-                        "native plot render {:.0} ms / upload {:.0} ms / {}x{}",
-                        render_ms, upload_ms, width, height
-                    ))
-                    .small()
-                    .weak(),
+                ui.add(
+                    Label::new(
+                        RichText::new(format!(
+                            "native plot render {:.0} ms / upload {:.0} ms / {}x{}",
+                            render_ms, upload_ms, width, height
+                        ))
+                        .small()
+                        .weak(),
+                    )
+                    .truncate(),
                 );
             }
         });
@@ -217,9 +318,7 @@ impl PlotViewerPanel {
                 .selectable_label(self.active_domain.is_none(), "Full grid")
                 .clicked()
             {
-                self.active_domain = None;
-                self.domain_name_edit.clear();
-                self.clear();
+                self.show_full_grid();
             }
 
             if !self.saved_domains.is_empty() {
@@ -383,6 +482,7 @@ impl PlotViewerPanel {
         key: PlotCacheKey,
     ) {
         profile_scope!("native_plot_render");
+        self.resize_render_debounce.clear();
         self.texture = None;
         self.error = None;
         self.cache_key = Some(key.clone());
@@ -555,20 +655,25 @@ fn quantized_dimension(value: f32, min: u32, max: u32) -> u32 {
     rounded.max(min).min(max)
 }
 
-fn quantized_plot_size(available: Vec2, aspect: f32) -> (u32, u32) {
+fn fitted_plot_size(available: Vec2, aspect: f32) -> Vec2 {
     let aspect = aspect.clamp(0.28, 3.4);
-    let max_w = available.x.max(640.0).min(2200.0);
-    let max_h = available.y.max(360.0).min(1400.0);
+    let max_w = if available.x.is_finite() {
+        available.x.clamp(1.0, 2200.0)
+    } else {
+        640.0
+    };
+    let max_h = if available.y.is_finite() {
+        available.y.clamp(1.0, 1400.0)
+    } else {
+        360.0
+    };
     let mut width = max_w;
     let mut height = width / aspect;
     if height > max_h {
         height = max_h;
         width = height * aspect;
     }
-    (
-        quantized_dimension(width, 320, 2200),
-        quantized_dimension(height, 240, 1400),
-    )
+    Vec2::new(width.floor().max(1.0), height.floor().max(1.0))
 }
 
 fn render_plot_size(display_width: u32, display_height: u32, scale: f32) -> (u32, u32) {
@@ -703,6 +808,69 @@ mod tests {
         assert_eq!(render_plot_size(960, 540, 1.0), (960, 544));
         assert_eq!(render_plot_size(960, 540, 2.0), (1920, 1088));
         assert_eq!(render_plot_size(2200, 1400, 3.0), (4800, 3200));
+    }
+
+    #[test]
+    fn fitted_plot_plus_footer_never_requests_more_than_the_window_has() {
+        let total = Vec2::new(520.0, 300.0);
+        let footer_height = 24.0;
+        let available = Vec2::new(total.x, total.y - footer_height);
+
+        for aspect in [16.0 / 9.0, 1.0, 0.3, 3.4] {
+            let fitted = fitted_plot_size(available, aspect);
+            assert!(fitted.x > 0.0 && fitted.y > 0.0);
+            assert!(fitted.x <= total.x);
+            assert!(fitted.y + footer_height <= total.y);
+        }
+    }
+
+    #[test]
+    fn resize_render_waits_for_settle_and_never_renders_while_dragging() {
+        let start = Instant::now();
+        let mut debounce = ResizeRenderDebounce::default();
+
+        assert_eq!(
+            debounce.decide((960, 544), false, start),
+            ResizeRenderDecision::Wait(RESIZE_SETTLE_TIME)
+        );
+        assert_eq!(
+            debounce.decide((960, 544), false, start + Duration::from_millis(100)),
+            ResizeRenderDecision::Wait(Duration::from_millis(80))
+        );
+        assert_eq!(
+            debounce.decide((960, 544), false, start + RESIZE_SETTLE_TIME),
+            ResizeRenderDecision::RenderNow
+        );
+
+        let drag_start = start + Duration::from_secs(1);
+        assert_eq!(
+            debounce.decide((1024, 576), true, drag_start),
+            ResizeRenderDecision::Wait(ACTIVE_RESIZE_REPAINT)
+        );
+        assert_eq!(
+            debounce.decide((1024, 576), true, drag_start + Duration::from_millis(500)),
+            ResizeRenderDecision::Wait(ACTIVE_RESIZE_REPAINT)
+        );
+        assert_eq!(
+            debounce.decide((1024, 576), false, drag_start + Duration::from_millis(500)),
+            ResizeRenderDecision::RenderNow
+        );
+    }
+
+    #[test]
+    fn show_full_grid_clears_domain_name_and_render_state() {
+        let mut panel = PlotViewerPanel::new();
+        panel.set_active_domain(CustomDomain::new("old d03", (-100.0, -99.0, 35.0, 36.0)));
+        panel.error = Some("stale domain render".to_string());
+        panel.last_render_ms = Some(123.0);
+
+        panel.show_full_grid();
+
+        assert!(panel.active_domain().is_none());
+        assert!(panel.domain_name_edit.is_empty());
+        assert!(panel.error.is_none());
+        assert!(panel.last_render_ms.is_none());
+        assert!(panel.resize_render_debounce.pending.is_none());
     }
 
     #[test]
