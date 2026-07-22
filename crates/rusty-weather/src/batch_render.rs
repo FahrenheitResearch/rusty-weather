@@ -1005,8 +1005,8 @@ fn resolve_cycle(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .or_else(|| inferred.as_ref().map(|(date, _)| date.clone()))
         .or_else(|| exact_origin.map(|time| time.format("%Y%m%d").to_string()))
+        .or_else(|| inferred.as_ref().map(|(date, _)| date.clone()))
         .ok_or_else(|| {
             format!(
                 "cannot infer an init date from run '{}'; provide YYYYMMDD",
@@ -1015,8 +1015,8 @@ fn resolve_cycle(
         })?;
     let hour = request
         .cycle_utc
-        .or_else(|| inferred.map(|(_, hour)| hour))
         .or_else(|| exact_origin.map(|time| time.hour() as u8))
+        .or_else(|| inferred.map(|(_, hour)| hour))
         .ok_or_else(|| {
             format!(
                 "cannot infer a cycle hour from run '{}'; provide 0-23",
@@ -1229,6 +1229,25 @@ mod tests {
             Some(("20110524".to_string(), 18))
         );
         assert_eq!(infer_run_cycle("local_wrf_no_time"), None);
+    }
+
+    #[test]
+    fn exact_origin_overrides_a_conflicting_parseable_run_slug() {
+        let request = BatchRenderRequest::conservative(
+            "store",
+            "wrf",
+            "20260608_00z",
+            0,
+            "2m_temperature",
+            "out",
+        );
+        let exact = RwsExactTime {
+            lead_seconds: 31_680,
+            valid_unix: 134_243_280,
+        };
+        let cycle = resolve_cycle(&request, Some(exact)).unwrap();
+        assert_eq!(cycle.date_yyyymmdd, "19740403");
+        assert_eq!(cycle.hour_utc, 9);
     }
 
     #[test]

@@ -608,7 +608,7 @@ impl BatchRenderPanel {
                     );
                 });
                 if let Some(key) = &self.catalog_key {
-                    if let Some((date, cycle)) = infer_run_cycle(&key.hour.run) {
+                    if let Some((date, cycle)) = inferred_cycle(&key.hour) {
                         ui.label(
                             egui::RichText::new(format!("Inferred: {date} {cycle:02}Z"))
                                 .small()
@@ -630,7 +630,7 @@ impl BatchRenderPanel {
         if self.output_dir.trim().is_empty() {
             return Err("Choose an output directory.".to_string());
         }
-        let inferred = infer_run_cycle(&hour.run).or_else(|| exact_time_cycle(hour));
+        let inferred = inferred_cycle(hour);
         let date = if self.date_override.trim().is_empty() {
             inferred
                 .as_ref()
@@ -1092,6 +1092,10 @@ fn exact_time_cycle(hour: &HourKey) -> Option<(String, u8)> {
     Some((origin.format("%Y%m%d").to_string(), origin.hour() as u8))
 }
 
+fn inferred_cycle(hour: &HourKey) -> Option<(String, u8)> {
+    exact_time_cycle(hour).or_else(|| infer_run_cycle(&hour.run))
+}
+
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -1126,7 +1130,7 @@ mod tests {
     fn exact_hour() -> HourKey {
         HourKey {
             model: "wrf".to_string(),
-            run: "exact-run".to_string(),
+            run: "20260608_00z".to_string(),
             hour: 7,
             exact_time: Some(rw_store::RwsExactTime {
                 lead_seconds: 31_680,
@@ -1139,6 +1143,7 @@ mod tests {
     fn exact_time_labels_and_cycle_use_physical_time_not_slot() {
         let hour = exact_hour();
         assert_eq!(exact_time_cycle(&hour), Some(("19740403".to_string(), 9)));
+        assert_eq!(inferred_cycle(&hour), Some(("19740403".to_string(), 9)));
         assert!(
             format_time(BatchRenderTime {
                 storage_slot: hour.hour,
