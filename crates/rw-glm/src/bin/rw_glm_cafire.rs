@@ -19,7 +19,7 @@
 //! (its fetch step works; only its render step fails), so this bin just reads
 //! that directory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -54,6 +54,16 @@ struct Args {
     satellite: String,
     #[arg(long, default_value = "noaa-goes18")]
     source: String,
+    /// Fetch granules from NOAA S3 directly instead of relying on the legacy
+    /// lightning worker's download step (lets that worker be retired).
+    #[arg(long, default_value_t = false)]
+    download: bool,
+    /// Size of the rolling granule window kept on disk when --download is set.
+    #[arg(long, default_value_t = 90)]
+    fetch_count: usize,
+    /// How many hourly S3 prefixes back to scan when --download is set.
+    #[arg(long, default_value_t = 2)]
+    lookback_hours: i64,
     /// Seconds between cycles when looping.
     #[arg(long, default_value_t = 30)]
     interval_sec: u64,
@@ -95,7 +105,122 @@ fn parse_bounds(raw: &str) -> Result<[f64; 4], String> {
     Ok([parts[0], parts[1], parts[2], parts[3]])
 }
 
+/// Outcome of one S3 refresh of the rolling granule window.
+#[derive(Default)]
+struct FetchReport {
+    listed: usize,
+    downloaded: usize,
+    reused: usize,
+    pruned: usize,
+    errors: Vec<String>,
+}
+
+/// Day-of-year (1-366) for a civil date.
+fn day_of_year(year: i64, month: u32, day: u32) -> u32 {
+    const CUMULATIVE: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let mut doy = CUMULATIVE[(month.max(1) - 1) as usize] + day;
+    if leap && month > 2 {
+        doy += 1;
+    }
+    doy
+}
+
+/// Refresh the rolling granule window from NOAA's open-data bucket. Downloads
+/// are atomic (temp + rename with a size check) so a reader never sees a
+/// partial granule and aborted transfers cannot leave orphans behind.
+fn fetch_granules(args: &Args) -> Result<FetchReport, String> {
+    let bucket = rw_glm::s3::bucket_for_satellite(&args.satellite).map_err(|e| e.to_string())?;
+    let agent = rw_glm::s3::build_agent();
+    let now = unix_ms_now();
+
+    let mut objects: Vec<rw_glm::s3::S3Object> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for back in 0..=args.lookback_hours.max(0) {
+        let (y, mo, d, h, _, _, _) = civil_from_unix_ms(now - back * 3_600_000);
+        let prefix = rw_glm::s3::glm_hour_prefix(y, day_of_year(y, mo, d), h);
+        match rw_glm::s3::list_s3_objects(&agent, &bucket, &prefix, None) {
+            Ok(mut listed) => objects.append(&mut listed),
+            // A just-rolled-over hour prefix may not exist yet; not fatal.
+            Err(e) => {
+                if errors.len() < 3 {
+                    errors.push(format!("list {prefix}: {e}"));
+                }
+            }
+        }
+    }
+    objects.retain(|o| o.key.ends_with(".nc"));
+    // Keys sort chronologically (…_s<start>_…), so the tail is the newest window.
+    objects.sort_by(|a, b| a.key.cmp(&b.key));
+    objects.dedup_by(|a, b| a.key == b.key);
+    let listed = objects.len();
+    if objects.len() > args.fetch_count {
+        objects.drain(..objects.len() - args.fetch_count);
+    }
+
+    fs::create_dir_all(&args.glm_dir)
+        .map_err(|e| format!("mkdir {}: {e}", args.glm_dir.display()))?;
+
+    let wanted: BTreeSet<String> = objects
+        .iter()
+        .map(|o| rw_glm::s3::object_filename(&o.key).to_string())
+        .collect();
+
+    let mut downloaded = 0usize;
+    let mut reused = 0usize;
+    for object in &objects {
+        let name = rw_glm::s3::object_filename(&object.key);
+        let dest = args.glm_dir.join(name);
+        if dest.is_file() {
+            reused += 1;
+            continue;
+        }
+        match rw_glm::s3::download_object_to(&agent, &bucket, object, &dest) {
+            Ok(()) => downloaded += 1,
+            Err(e) => {
+                if errors.len() < 3 {
+                    errors.push(format!("get {name}: {e}"));
+                }
+            }
+        }
+    }
+
+    // Prune anything outside the window, plus stray non-granule files (the
+    // legacy downloader leaked ~16.7k orphaned tmp* files here).
+    let mut pruned = 0usize;
+    if let Ok(entries) = fs::read_dir(&args.glm_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let is_granule = name.ends_with(".nc");
+            if (is_granule && !wanted.contains(name)) || (!is_granule && name.starts_with("tmp")) {
+                if fs::remove_file(&path).is_ok() {
+                    pruned += 1;
+                }
+            }
+        }
+    }
+
+    Ok(FetchReport {
+        listed,
+        downloaded,
+        reused,
+        pruned,
+        errors,
+    })
+}
+
 fn run_once(args: &Args, bounds: [f64; 4]) -> Result<String, String> {
+    let fetch = if args.download {
+        Some(fetch_granules(args)?)
+    } else {
+        None
+    };
     let mut granules: Vec<PathBuf> = fs::read_dir(&args.glm_dir)
         .map_err(|e| format!("read {}: {e}", args.glm_dir.display()))?
         .filter_map(|e| e.ok())
@@ -261,6 +386,18 @@ fn run_once(args: &Args, bounds: [f64; 4]) -> Result<String, String> {
     report.insert("flash_count_total", json!(flash_count_total));
     report.insert("flash_count_in_domain", json!(flashes_doc["flash_count_in_domain"]));
     report.insert("generated_at_utc", json!(generated_at));
+    if let Some(f) = fetch {
+        report.insert(
+            "fetch",
+            json!({
+                "listed": f.listed,
+                "downloaded": f.downloaded,
+                "reused": f.reused,
+                "pruned": f.pruned,
+                "errors": f.errors,
+            }),
+        );
+    }
     Ok(serde_json::to_string(&report).unwrap_or_default())
 }
 
