@@ -31,3 +31,11 @@ netcrust = { path = "../../vendor/netcrust" }
 [[bin]]
 name = "rw_glm_follow"
 path = "src/bin/rw_glm_follow.rs"
+
+# rw_glm_cafire: decode GLM granules with the pure-Rust reader and publish the
+# lightning artifacts the legacy CAFire API serves. Exists because NOAA's
+# 2026-07-09 switch to shuffle+deflate granules broke the legacy rustwx 0.4.4
+# reader.
+[[bin]]
+name = "rw_glm_cafire"
+path = "src/bin/rw_glm_cafire.rs"
