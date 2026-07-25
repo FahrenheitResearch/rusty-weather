@@ -508,6 +508,105 @@ fn windowed_product_spec(
                 HrrrWindowedProduct::SmokeColumn0to24hMax
                 | HrrrWindowedProduct::SmokeColumn24to48hMax
                 | HrrrWindowedProduct::SmokeColumn0to48hMax => Some("kg/m^2"),
+                HrrrWindowedProduct::Gust10m0to24hMax
+                | HrrrWindowedProduct::Gust10m24to48hMax
+                | HrrrWindowedProduct::Gust10m0to48hMax => Some("m/s"),
+                HrrrWindowedProduct::Hdw0to24hMax
+                | HrrrWindowedProduct::Hdw24to48hMax
+                | HrrrWindowedProduct::Hdw0to48hMax => Some("hPa*m/s"),
+                HrrrWindowedProduct::FireWxComposite0to24hMax
+                | HrrrWindowedProduct::FireWxComposite24to48hMax
+                | HrrrWindowedProduct::FireWxComposite0to48hMax => Some("index"),
+                HrrrWindowedProduct::Visibility0to24hMin
+                | HrrrWindowedProduct::Visibility24to48hMin
+                | HrrrWindowedProduct::Visibility0to48hMin
+                | HrrrWindowedProduct::Sblcl0to24hMin
+                | HrrrWindowedProduct::Sblcl24to48hMin
+                | HrrrWindowedProduct::Sblcl0to48hMin => Some("m"),
+                HrrrWindowedProduct::DewpointDepression2m0to24hMax
+                | HrrrWindowedProduct::DewpointDepression2m24to48hMax
+                | HrrrWindowedProduct::DewpointDepression2m0to48hMax
+                | HrrrWindowedProduct::HeatIndex2m0to24hMax
+                | HrrrWindowedProduct::HeatIndex2m24to48hMax
+                | HrrrWindowedProduct::HeatIndex2m0to48hMax
+                | HrrrWindowedProduct::ApparentTemp2m0to24hMax
+                | HrrrWindowedProduct::ApparentTemp2m24to48hMax
+                | HrrrWindowedProduct::ApparentTemp2m0to48hMax
+                | HrrrWindowedProduct::Wetbulb2m0to24hMax
+                | HrrrWindowedProduct::Wetbulb2m24to48hMax
+                | HrrrWindowedProduct::Wetbulb2m0to48hMax
+                | HrrrWindowedProduct::WindChill2m0to24hMin
+                | HrrrWindowedProduct::WindChill2m24to48hMin
+                | HrrrWindowedProduct::WindChill2m0to48hMin => Some("degC"),
+                HrrrWindowedProduct::CompositeReflectivity0to24hMax
+                | HrrrWindowedProduct::CompositeReflectivity24to48hMax
+                | HrrrWindowedProduct::CompositeReflectivity0to48hMax => Some("dBZ"),
+                HrrrWindowedProduct::Sbcape0to24hMax
+                | HrrrWindowedProduct::Sbcape24to48hMax
+                | HrrrWindowedProduct::Sbcape0to48hMax
+                | HrrrWindowedProduct::Mlcape0to24hMax
+                | HrrrWindowedProduct::Mlcape24to48hMax
+                | HrrrWindowedProduct::Mlcape0to48hMax
+                | HrrrWindowedProduct::Mucape0to24hMax
+                | HrrrWindowedProduct::Mucape24to48hMax
+                | HrrrWindowedProduct::Mucape0to48hMax
+                | HrrrWindowedProduct::Dcape0to24hMax
+                | HrrrWindowedProduct::Dcape24to48hMax
+                | HrrrWindowedProduct::Dcape0to48hMax => Some("J/kg"),
+                HrrrWindowedProduct::Pwat0to24hMax
+                | HrrrWindowedProduct::Pwat24to48hMax
+                | HrrrWindowedProduct::Pwat0to48hMax => Some("kg/m^2"),
+                HrrrWindowedProduct::ThetaE2m0to24hMax
+                | HrrrWindowedProduct::ThetaE2m24to48hMax
+                | HrrrWindowedProduct::ThetaE2m0to48hMax => Some("K"),
+                HrrrWindowedProduct::Srh01km0to24hMax
+                | HrrrWindowedProduct::Srh01km24to48hMax
+                | HrrrWindowedProduct::Srh01km0to48hMax
+                | HrrrWindowedProduct::Srh03km0to24hMax
+                | HrrrWindowedProduct::Srh03km24to48hMax
+                | HrrrWindowedProduct::Srh03km0to48hMax => Some("m^2/s^2"),
+                HrrrWindowedProduct::StpFixed0to24hMax
+                | HrrrWindowedProduct::StpFixed24to48hMax
+                | HrrrWindowedProduct::StpFixed0to48hMax
+                | HrrrWindowedProduct::Ehi01km0to24hMax
+                | HrrrWindowedProduct::Ehi01km24to48hMax
+                | HrrrWindowedProduct::Ehi01km0to48hMax
+                | HrrrWindowedProduct::Ehi03km0to24hMax
+                | HrrrWindowedProduct::Ehi03km24to48hMax
+                | HrrrWindowedProduct::Ehi03km0to48hMax
+                | HrrrWindowedProduct::ScpProxy0to24hMax
+                | HrrrWindowedProduct::ScpProxy24to48hMax
+                | HrrrWindowedProduct::ScpProxy0to48hMax => Some("dimensionless"),
+                HrrrWindowedProduct::BulkShear01km0to24hMax
+                | HrrrWindowedProduct::BulkShear01km24to48hMax
+                | HrrrWindowedProduct::BulkShear01km0to48hMax
+                | HrrrWindowedProduct::BulkShear06km0to24hMax
+                | HrrrWindowedProduct::BulkShear06km24to48hMax
+                | HrrrWindowedProduct::BulkShear06km0to48hMax => Some("kt"),
+                HrrrWindowedProduct::LapseRate03km0to24hMax
+                | HrrrWindowedProduct::LapseRate03km24to48hMax
+                | HrrrWindowedProduct::LapseRate03km0to48hMax
+                | HrrrWindowedProduct::LapseRate7005000to24hMax
+                | HrrrWindowedProduct::LapseRate70050024to48hMax
+                | HrrrWindowedProduct::LapseRate7005000to48hMax => Some("degC/km"),
+                HrrrWindowedProduct::CloudCoverTotalMaxField0to24hMax
+                | HrrrWindowedProduct::CloudCoverTotalMaxField24to48hMax
+                | HrrrWindowedProduct::CloudCoverTotalMaxField0to48hMax
+                | HrrrWindowedProduct::CloudCoverTotalMinField0to24hMin
+                | HrrrWindowedProduct::CloudCoverTotalMinField24to48hMin
+                | HrrrWindowedProduct::CloudCoverTotalMinField0to48hMin => Some("%"),
+                HrrrWindowedProduct::Mslp0to24hMin
+                | HrrrWindowedProduct::Mslp24to48hMin
+                | HrrrWindowedProduct::Mslp0to48hMin => Some("Pa"),
+                HrrrWindowedProduct::CategoricalRain0to24hMax
+                | HrrrWindowedProduct::CategoricalRain24to48hMax
+                | HrrrWindowedProduct::CategoricalRain0to48hMax
+                | HrrrWindowedProduct::CategoricalSnow0to24hMax
+                | HrrrWindowedProduct::CategoricalSnow24to48hMax
+                | HrrrWindowedProduct::CategoricalSnow0to48hMax
+                | HrrrWindowedProduct::CategoricalFreezingRain0to24hMax
+                | HrrrWindowedProduct::CategoricalFreezingRain24to48hMax
+                | HrrrWindowedProduct::CategoricalFreezingRain0to48hMax => Some("0/1"),
                 HrrrWindowedProduct::Temp2m0to24hMax
                 | HrrrWindowedProduct::Temp2m24to48hMax
                 | HrrrWindowedProduct::Temp2m0to48hMax

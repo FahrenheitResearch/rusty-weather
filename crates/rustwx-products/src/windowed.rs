@@ -82,6 +82,105 @@ pub enum HrrrWindowedProduct {
     SmokeColumn0to24hMax,
     SmokeColumn24to48hMax,
     SmokeColumn0to48hMax,
+    Gust10m0to24hMax,
+    Gust10m24to48hMax,
+    Gust10m0to48hMax,
+    Hdw0to24hMax,
+    Hdw24to48hMax,
+    Hdw0to48hMax,
+    FireWxComposite0to24hMax,
+    FireWxComposite24to48hMax,
+    FireWxComposite0to48hMax,
+    Visibility0to24hMin,
+    Visibility24to48hMin,
+    Visibility0to48hMin,
+    DewpointDepression2m0to24hMax,
+    DewpointDepression2m24to48hMax,
+    DewpointDepression2m0to48hMax,
+    HeatIndex2m0to24hMax,
+    HeatIndex2m24to48hMax,
+    HeatIndex2m0to48hMax,
+    ApparentTemp2m0to24hMax,
+    ApparentTemp2m24to48hMax,
+    ApparentTemp2m0to48hMax,
+    Wetbulb2m0to24hMax,
+    Wetbulb2m24to48hMax,
+    Wetbulb2m0to48hMax,
+    WindChill2m0to24hMin,
+    WindChill2m24to48hMin,
+    WindChill2m0to48hMin,
+    CompositeReflectivity0to24hMax,
+    CompositeReflectivity24to48hMax,
+    CompositeReflectivity0to48hMax,
+    Sbcape0to24hMax,
+    Sbcape24to48hMax,
+    Sbcape0to48hMax,
+    Mlcape0to24hMax,
+    Mlcape24to48hMax,
+    Mlcape0to48hMax,
+    Mucape0to24hMax,
+    Mucape24to48hMax,
+    Mucape0to48hMax,
+    Dcape0to24hMax,
+    Dcape24to48hMax,
+    Dcape0to48hMax,
+    Pwat0to24hMax,
+    Pwat24to48hMax,
+    Pwat0to48hMax,
+    ThetaE2m0to24hMax,
+    ThetaE2m24to48hMax,
+    ThetaE2m0to48hMax,
+    Srh01km0to24hMax,
+    Srh01km24to48hMax,
+    Srh01km0to48hMax,
+    Srh03km0to24hMax,
+    Srh03km24to48hMax,
+    Srh03km0to48hMax,
+    StpFixed0to24hMax,
+    StpFixed24to48hMax,
+    StpFixed0to48hMax,
+    Ehi01km0to24hMax,
+    Ehi01km24to48hMax,
+    Ehi01km0to48hMax,
+    Ehi03km0to24hMax,
+    Ehi03km24to48hMax,
+    Ehi03km0to48hMax,
+    ScpProxy0to24hMax,
+    ScpProxy24to48hMax,
+    ScpProxy0to48hMax,
+    BulkShear01km0to24hMax,
+    BulkShear01km24to48hMax,
+    BulkShear01km0to48hMax,
+    BulkShear06km0to24hMax,
+    BulkShear06km24to48hMax,
+    BulkShear06km0to48hMax,
+    LapseRate03km0to24hMax,
+    LapseRate03km24to48hMax,
+    LapseRate03km0to48hMax,
+    LapseRate7005000to24hMax,
+    LapseRate70050024to48hMax,
+    LapseRate7005000to48hMax,
+    Sblcl0to24hMin,
+    Sblcl24to48hMin,
+    Sblcl0to48hMin,
+    CloudCoverTotalMaxField0to24hMax,
+    CloudCoverTotalMaxField24to48hMax,
+    CloudCoverTotalMaxField0to48hMax,
+    CloudCoverTotalMinField0to24hMin,
+    CloudCoverTotalMinField24to48hMin,
+    CloudCoverTotalMinField0to48hMin,
+    Mslp0to24hMin,
+    Mslp24to48hMin,
+    Mslp0to48hMin,
+    CategoricalRain0to24hMax,
+    CategoricalRain24to48hMax,
+    CategoricalRain0to48hMax,
+    CategoricalSnow0to24hMax,
+    CategoricalSnow24to48hMax,
+    CategoricalSnow0to48hMax,
+    CategoricalFreezingRain0to24hMax,
+    CategoricalFreezingRain24to48hMax,
+    CategoricalFreezingRain0to48hMax,
     Temp2m0to24hMax,
     Temp2m24to48hMax,
     Temp2m0to48hMax,
@@ -156,6 +255,105 @@ impl HrrrWindowedProduct {
             Self::SmokeColumn0to24hMax => "smoke_column_0_24h_max",
             Self::SmokeColumn24to48hMax => "smoke_column_24_48h_max",
             Self::SmokeColumn0to48hMax => "smoke_column_0_48h_max",
+            Self::Gust10m0to24hMax => "wind_gust_10m_0_24h_max",
+            Self::Gust10m24to48hMax => "wind_gust_10m_24_48h_max",
+            Self::Gust10m0to48hMax => "wind_gust_10m_0_48h_max",
+            Self::Hdw0to24hMax => "hdw_0_24h_max",
+            Self::Hdw24to48hMax => "hdw_24_48h_max",
+            Self::Hdw0to48hMax => "hdw_0_48h_max",
+            Self::FireWxComposite0to24hMax => "fire_weather_composite_0_24h_max",
+            Self::FireWxComposite24to48hMax => "fire_weather_composite_24_48h_max",
+            Self::FireWxComposite0to48hMax => "fire_weather_composite_0_48h_max",
+            Self::Visibility0to24hMin => "visibility_0_24h_min",
+            Self::Visibility24to48hMin => "visibility_24_48h_min",
+            Self::Visibility0to48hMin => "visibility_0_48h_min",
+            Self::DewpointDepression2m0to24hMax => "dewpoint_depression_2m_0_24h_max",
+            Self::DewpointDepression2m24to48hMax => "dewpoint_depression_2m_24_48h_max",
+            Self::DewpointDepression2m0to48hMax => "dewpoint_depression_2m_0_48h_max",
+            Self::HeatIndex2m0to24hMax => "heat_index_2m_0_24h_max",
+            Self::HeatIndex2m24to48hMax => "heat_index_2m_24_48h_max",
+            Self::HeatIndex2m0to48hMax => "heat_index_2m_0_48h_max",
+            Self::ApparentTemp2m0to24hMax => "apparent_temperature_2m_0_24h_max",
+            Self::ApparentTemp2m24to48hMax => "apparent_temperature_2m_24_48h_max",
+            Self::ApparentTemp2m0to48hMax => "apparent_temperature_2m_0_48h_max",
+            Self::Wetbulb2m0to24hMax => "wetbulb_2m_0_24h_max",
+            Self::Wetbulb2m24to48hMax => "wetbulb_2m_24_48h_max",
+            Self::Wetbulb2m0to48hMax => "wetbulb_2m_0_48h_max",
+            Self::WindChill2m0to24hMin => "wind_chill_2m_0_24h_min",
+            Self::WindChill2m24to48hMin => "wind_chill_2m_24_48h_min",
+            Self::WindChill2m0to48hMin => "wind_chill_2m_0_48h_min",
+            Self::CompositeReflectivity0to24hMax => "composite_reflectivity_0_24h_max",
+            Self::CompositeReflectivity24to48hMax => "composite_reflectivity_24_48h_max",
+            Self::CompositeReflectivity0to48hMax => "composite_reflectivity_0_48h_max",
+            Self::Sbcape0to24hMax => "sbcape_0_24h_max",
+            Self::Sbcape24to48hMax => "sbcape_24_48h_max",
+            Self::Sbcape0to48hMax => "sbcape_0_48h_max",
+            Self::Mlcape0to24hMax => "mlcape_0_24h_max",
+            Self::Mlcape24to48hMax => "mlcape_24_48h_max",
+            Self::Mlcape0to48hMax => "mlcape_0_48h_max",
+            Self::Mucape0to24hMax => "mucape_0_24h_max",
+            Self::Mucape24to48hMax => "mucape_24_48h_max",
+            Self::Mucape0to48hMax => "mucape_0_48h_max",
+            Self::Dcape0to24hMax => "dcape_0_24h_max",
+            Self::Dcape24to48hMax => "dcape_24_48h_max",
+            Self::Dcape0to48hMax => "dcape_0_48h_max",
+            Self::Pwat0to24hMax => "pwat_0_24h_max",
+            Self::Pwat24to48hMax => "pwat_24_48h_max",
+            Self::Pwat0to48hMax => "pwat_0_48h_max",
+            Self::ThetaE2m0to24hMax => "theta_e_2m_10m_winds_0_24h_max",
+            Self::ThetaE2m24to48hMax => "theta_e_2m_10m_winds_24_48h_max",
+            Self::ThetaE2m0to48hMax => "theta_e_2m_10m_winds_0_48h_max",
+            Self::Srh01km0to24hMax => "srh_0_1km_0_24h_max",
+            Self::Srh01km24to48hMax => "srh_0_1km_24_48h_max",
+            Self::Srh01km0to48hMax => "srh_0_1km_0_48h_max",
+            Self::Srh03km0to24hMax => "srh_0_3km_0_24h_max",
+            Self::Srh03km24to48hMax => "srh_0_3km_24_48h_max",
+            Self::Srh03km0to48hMax => "srh_0_3km_0_48h_max",
+            Self::StpFixed0to24hMax => "stp_fixed_0_24h_max",
+            Self::StpFixed24to48hMax => "stp_fixed_24_48h_max",
+            Self::StpFixed0to48hMax => "stp_fixed_0_48h_max",
+            Self::Ehi01km0to24hMax => "ehi_0_1km_0_24h_max",
+            Self::Ehi01km24to48hMax => "ehi_0_1km_24_48h_max",
+            Self::Ehi01km0to48hMax => "ehi_0_1km_0_48h_max",
+            Self::Ehi03km0to24hMax => "ehi_0_3km_0_24h_max",
+            Self::Ehi03km24to48hMax => "ehi_0_3km_24_48h_max",
+            Self::Ehi03km0to48hMax => "ehi_0_3km_0_48h_max",
+            Self::ScpProxy0to24hMax => "scp_mu_0_3km_0_6km_proxy_0_24h_max",
+            Self::ScpProxy24to48hMax => "scp_mu_0_3km_0_6km_proxy_24_48h_max",
+            Self::ScpProxy0to48hMax => "scp_mu_0_3km_0_6km_proxy_0_48h_max",
+            Self::BulkShear01km0to24hMax => "bulk_shear_0_1km_0_24h_max",
+            Self::BulkShear01km24to48hMax => "bulk_shear_0_1km_24_48h_max",
+            Self::BulkShear01km0to48hMax => "bulk_shear_0_1km_0_48h_max",
+            Self::BulkShear06km0to24hMax => "bulk_shear_0_6km_0_24h_max",
+            Self::BulkShear06km24to48hMax => "bulk_shear_0_6km_24_48h_max",
+            Self::BulkShear06km0to48hMax => "bulk_shear_0_6km_0_48h_max",
+            Self::LapseRate03km0to24hMax => "lapse_rate_0_3km_0_24h_max",
+            Self::LapseRate03km24to48hMax => "lapse_rate_0_3km_24_48h_max",
+            Self::LapseRate03km0to48hMax => "lapse_rate_0_3km_0_48h_max",
+            Self::LapseRate7005000to24hMax => "lapse_rate_700_500_0_24h_max",
+            Self::LapseRate70050024to48hMax => "lapse_rate_700_500_24_48h_max",
+            Self::LapseRate7005000to48hMax => "lapse_rate_700_500_0_48h_max",
+            Self::Sblcl0to24hMin => "sblcl_0_24h_min",
+            Self::Sblcl24to48hMin => "sblcl_24_48h_min",
+            Self::Sblcl0to48hMin => "sblcl_0_48h_min",
+            Self::CloudCoverTotalMaxField0to24hMax => "cloud_cover_total_0_24h_max",
+            Self::CloudCoverTotalMaxField24to48hMax => "cloud_cover_total_24_48h_max",
+            Self::CloudCoverTotalMaxField0to48hMax => "cloud_cover_total_0_48h_max",
+            Self::CloudCoverTotalMinField0to24hMin => "cloud_cover_total_0_24h_min",
+            Self::CloudCoverTotalMinField24to48hMin => "cloud_cover_total_24_48h_min",
+            Self::CloudCoverTotalMinField0to48hMin => "cloud_cover_total_0_48h_min",
+            Self::Mslp0to24hMin => "mslp_0_24h_min",
+            Self::Mslp24to48hMin => "mslp_24_48h_min",
+            Self::Mslp0to48hMin => "mslp_0_48h_min",
+            Self::CategoricalRain0to24hMax => "categorical_rain_0_24h_max",
+            Self::CategoricalRain24to48hMax => "categorical_rain_24_48h_max",
+            Self::CategoricalRain0to48hMax => "categorical_rain_0_48h_max",
+            Self::CategoricalSnow0to24hMax => "categorical_snow_0_24h_max",
+            Self::CategoricalSnow24to48hMax => "categorical_snow_24_48h_max",
+            Self::CategoricalSnow0to48hMax => "categorical_snow_0_48h_max",
+            Self::CategoricalFreezingRain0to24hMax => "categorical_freezing_rain_0_24h_max",
+            Self::CategoricalFreezingRain24to48hMax => "categorical_freezing_rain_24_48h_max",
+            Self::CategoricalFreezingRain0to48hMax => "categorical_freezing_rain_0_48h_max",
             Self::Temp2m0to24hMax => "2m_temp_0_24h_max",
             Self::Temp2m24to48hMax => "2m_temp_24_48h_max",
             Self::Temp2m0to48hMax => "2m_temp_0_48h_max",
@@ -216,6 +414,105 @@ impl HrrrWindowedProduct {
             Self::SmokeColumn0to24hMax => "Column-Integrated Smoke (0-24 h max)",
             Self::SmokeColumn24to48hMax => "Column-Integrated Smoke (24-48 h max)",
             Self::SmokeColumn0to48hMax => "Column-Integrated Smoke (0-48 h max)",
+            Self::Gust10m0to24hMax => "10 m Wind Gust (0-24 h max)",
+            Self::Gust10m24to48hMax => "10 m Wind Gust (24-48 h max)",
+            Self::Gust10m0to48hMax => "10 m Wind Gust (0-48 h max)",
+            Self::Hdw0to24hMax => "Hot-Dry-Windy Index (0-24 h max)",
+            Self::Hdw24to48hMax => "Hot-Dry-Windy Index (24-48 h max)",
+            Self::Hdw0to48hMax => "Hot-Dry-Windy Index (0-48 h max)",
+            Self::FireWxComposite0to24hMax => "Fire Weather Composite (0-24 h max)",
+            Self::FireWxComposite24to48hMax => "Fire Weather Composite (24-48 h max)",
+            Self::FireWxComposite0to48hMax => "Fire Weather Composite (0-48 h max)",
+            Self::Visibility0to24hMin => "Visibility (0-24 h min)",
+            Self::Visibility24to48hMin => "Visibility (24-48 h min)",
+            Self::Visibility0to48hMin => "Visibility (0-48 h min)",
+            Self::DewpointDepression2m0to24hMax => "2 m Dewpoint Depression (0-24 h max)",
+            Self::DewpointDepression2m24to48hMax => "2 m Dewpoint Depression (24-48 h max)",
+            Self::DewpointDepression2m0to48hMax => "2 m Dewpoint Depression (0-48 h max)",
+            Self::HeatIndex2m0to24hMax => "2 m Heat Index (0-24 h max)",
+            Self::HeatIndex2m24to48hMax => "2 m Heat Index (24-48 h max)",
+            Self::HeatIndex2m0to48hMax => "2 m Heat Index (0-48 h max)",
+            Self::ApparentTemp2m0to24hMax => "2 m Apparent Temperature (0-24 h max)",
+            Self::ApparentTemp2m24to48hMax => "2 m Apparent Temperature (24-48 h max)",
+            Self::ApparentTemp2m0to48hMax => "2 m Apparent Temperature (0-48 h max)",
+            Self::Wetbulb2m0to24hMax => "2 m Wet-Bulb Temperature (0-24 h max)",
+            Self::Wetbulb2m24to48hMax => "2 m Wet-Bulb Temperature (24-48 h max)",
+            Self::Wetbulb2m0to48hMax => "2 m Wet-Bulb Temperature (0-48 h max)",
+            Self::WindChill2m0to24hMin => "2 m Wind Chill (0-24 h min)",
+            Self::WindChill2m24to48hMin => "2 m Wind Chill (24-48 h min)",
+            Self::WindChill2m0to48hMin => "2 m Wind Chill (0-48 h min)",
+            Self::CompositeReflectivity0to24hMax => "Composite Reflectivity (0-24 h max)",
+            Self::CompositeReflectivity24to48hMax => "Composite Reflectivity (24-48 h max)",
+            Self::CompositeReflectivity0to48hMax => "Composite Reflectivity (0-48 h max)",
+            Self::Sbcape0to24hMax => "Surface-Based CAPE (0-24 h max)",
+            Self::Sbcape24to48hMax => "Surface-Based CAPE (24-48 h max)",
+            Self::Sbcape0to48hMax => "Surface-Based CAPE (0-48 h max)",
+            Self::Mlcape0to24hMax => "Mixed-Layer CAPE (0-24 h max)",
+            Self::Mlcape24to48hMax => "Mixed-Layer CAPE (24-48 h max)",
+            Self::Mlcape0to48hMax => "Mixed-Layer CAPE (0-48 h max)",
+            Self::Mucape0to24hMax => "Most-Unstable CAPE (0-24 h max)",
+            Self::Mucape24to48hMax => "Most-Unstable CAPE (24-48 h max)",
+            Self::Mucape0to48hMax => "Most-Unstable CAPE (0-48 h max)",
+            Self::Dcape0to24hMax => "DCAPE (0-24 h max)",
+            Self::Dcape24to48hMax => "DCAPE (24-48 h max)",
+            Self::Dcape0to48hMax => "DCAPE (0-48 h max)",
+            Self::Pwat0to24hMax => "Precipitable Water (0-24 h max)",
+            Self::Pwat24to48hMax => "Precipitable Water (24-48 h max)",
+            Self::Pwat0to48hMax => "Precipitable Water (0-48 h max)",
+            Self::ThetaE2m0to24hMax => "2 m Equivalent Potential Temperature (0-24 h max)",
+            Self::ThetaE2m24to48hMax => "2 m Equivalent Potential Temperature (24-48 h max)",
+            Self::ThetaE2m0to48hMax => "2 m Equivalent Potential Temperature (0-48 h max)",
+            Self::Srh01km0to24hMax => "0-1 km Storm-Relative Helicity (0-24 h max)",
+            Self::Srh01km24to48hMax => "0-1 km Storm-Relative Helicity (24-48 h max)",
+            Self::Srh01km0to48hMax => "0-1 km Storm-Relative Helicity (0-48 h max)",
+            Self::Srh03km0to24hMax => "0-3 km Storm-Relative Helicity (0-24 h max)",
+            Self::Srh03km24to48hMax => "0-3 km Storm-Relative Helicity (24-48 h max)",
+            Self::Srh03km0to48hMax => "0-3 km Storm-Relative Helicity (0-48 h max)",
+            Self::StpFixed0to24hMax => "Significant Tornado Parameter (0-24 h max)",
+            Self::StpFixed24to48hMax => "Significant Tornado Parameter (24-48 h max)",
+            Self::StpFixed0to48hMax => "Significant Tornado Parameter (0-48 h max)",
+            Self::Ehi01km0to24hMax => "0-1 km Energy-Helicity Index (0-24 h max)",
+            Self::Ehi01km24to48hMax => "0-1 km Energy-Helicity Index (24-48 h max)",
+            Self::Ehi01km0to48hMax => "0-1 km Energy-Helicity Index (0-48 h max)",
+            Self::Ehi03km0to24hMax => "0-3 km Energy-Helicity Index (0-24 h max)",
+            Self::Ehi03km24to48hMax => "0-3 km Energy-Helicity Index (24-48 h max)",
+            Self::Ehi03km0to48hMax => "0-3 km Energy-Helicity Index (0-48 h max)",
+            Self::ScpProxy0to24hMax => "Supercell Composite (proxy) (0-24 h max)",
+            Self::ScpProxy24to48hMax => "Supercell Composite (proxy) (24-48 h max)",
+            Self::ScpProxy0to48hMax => "Supercell Composite (proxy) (0-48 h max)",
+            Self::BulkShear01km0to24hMax => "0-1 km Bulk Shear (0-24 h max)",
+            Self::BulkShear01km24to48hMax => "0-1 km Bulk Shear (24-48 h max)",
+            Self::BulkShear01km0to48hMax => "0-1 km Bulk Shear (0-48 h max)",
+            Self::BulkShear06km0to24hMax => "0-6 km Bulk Shear (0-24 h max)",
+            Self::BulkShear06km24to48hMax => "0-6 km Bulk Shear (24-48 h max)",
+            Self::BulkShear06km0to48hMax => "0-6 km Bulk Shear (0-48 h max)",
+            Self::LapseRate03km0to24hMax => "0-3 km Lapse Rate (0-24 h max)",
+            Self::LapseRate03km24to48hMax => "0-3 km Lapse Rate (24-48 h max)",
+            Self::LapseRate03km0to48hMax => "0-3 km Lapse Rate (0-48 h max)",
+            Self::LapseRate7005000to24hMax => "700-500 mb Lapse Rate (0-24 h max)",
+            Self::LapseRate70050024to48hMax => "700-500 mb Lapse Rate (24-48 h max)",
+            Self::LapseRate7005000to48hMax => "700-500 mb Lapse Rate (0-48 h max)",
+            Self::Sblcl0to24hMin => "Surface-Based LCL Height (0-24 h min)",
+            Self::Sblcl24to48hMin => "Surface-Based LCL Height (24-48 h min)",
+            Self::Sblcl0to48hMin => "Surface-Based LCL Height (0-48 h min)",
+            Self::CloudCoverTotalMaxField0to24hMax => "Total Cloud Cover (0-24 h max)",
+            Self::CloudCoverTotalMaxField24to48hMax => "Total Cloud Cover (24-48 h max)",
+            Self::CloudCoverTotalMaxField0to48hMax => "Total Cloud Cover (0-48 h max)",
+            Self::CloudCoverTotalMinField0to24hMin => "Total Cloud Cover (0-24 h min)",
+            Self::CloudCoverTotalMinField24to48hMin => "Total Cloud Cover (24-48 h min)",
+            Self::CloudCoverTotalMinField0to48hMin => "Total Cloud Cover (0-48 h min)",
+            Self::Mslp0to24hMin => "Mean Sea-Level Pressure (0-24 h min)",
+            Self::Mslp24to48hMin => "Mean Sea-Level Pressure (24-48 h min)",
+            Self::Mslp0to48hMin => "Mean Sea-Level Pressure (0-48 h min)",
+            Self::CategoricalRain0to24hMax => "Categorical Rain (any in window) (0-24 h max)",
+            Self::CategoricalRain24to48hMax => "Categorical Rain (any in window) (24-48 h max)",
+            Self::CategoricalRain0to48hMax => "Categorical Rain (any in window) (0-48 h max)",
+            Self::CategoricalSnow0to24hMax => "Categorical Snow (any in window) (0-24 h max)",
+            Self::CategoricalSnow24to48hMax => "Categorical Snow (any in window) (24-48 h max)",
+            Self::CategoricalSnow0to48hMax => "Categorical Snow (any in window) (0-48 h max)",
+            Self::CategoricalFreezingRain0to24hMax => "Categorical Freezing Rain (any in window) (0-24 h max)",
+            Self::CategoricalFreezingRain24to48hMax => "Categorical Freezing Rain (any in window) (24-48 h max)",
+            Self::CategoricalFreezingRain0to48hMax => "Categorical Freezing Rain (any in window) (0-48 h max)",
             Self::Temp2m0to24hMax => "2 m Temperature (0-24 h max)",
             Self::Temp2m24to48hMax => "2 m Temperature (24-48 h max)",
             Self::Temp2m0to48hMax => "2 m Temperature (0-48 h max)",
@@ -331,6 +628,39 @@ pub fn minimum_forecast_hour_for_windowed_product(product: HrrrWindowedProduct) 
         | Wind10m0to24hMax
         | Smoke8m0to24hMax
         | SmokeColumn0to24hMax
+        | Gust10m0to24hMax
+        | Hdw0to24hMax
+        | FireWxComposite0to24hMax
+        | Visibility0to24hMin
+        | DewpointDepression2m0to24hMax
+        | HeatIndex2m0to24hMax
+        | ApparentTemp2m0to24hMax
+        | Wetbulb2m0to24hMax
+        | WindChill2m0to24hMin
+        | CompositeReflectivity0to24hMax
+        | Sbcape0to24hMax
+        | Mlcape0to24hMax
+        | Mucape0to24hMax
+        | Dcape0to24hMax
+        | Pwat0to24hMax
+        | ThetaE2m0to24hMax
+        | Srh01km0to24hMax
+        | Srh03km0to24hMax
+        | StpFixed0to24hMax
+        | Ehi01km0to24hMax
+        | Ehi03km0to24hMax
+        | ScpProxy0to24hMax
+        | BulkShear01km0to24hMax
+        | BulkShear06km0to24hMax
+        | LapseRate03km0to24hMax
+        | LapseRate7005000to24hMax
+        | Sblcl0to24hMin
+        | CloudCoverTotalMaxField0to24hMax
+        | CloudCoverTotalMinField0to24hMin
+        | Mslp0to24hMin
+        | CategoricalRain0to24hMax
+        | CategoricalSnow0to24hMax
+        | CategoricalFreezingRain0to24hMax
         | Temp2m0to24hMax
         | Temp2m0to24hMin
         | Temp2m0to24hRange
@@ -349,6 +679,72 @@ pub fn minimum_forecast_hour_for_windowed_product(product: HrrrWindowedProduct) 
         | Smoke8m0to48hMax
         | SmokeColumn24to48hMax
         | SmokeColumn0to48hMax
+        | Gust10m24to48hMax
+        | Gust10m0to48hMax
+        | Hdw24to48hMax
+        | Hdw0to48hMax
+        | FireWxComposite24to48hMax
+        | FireWxComposite0to48hMax
+        | Visibility24to48hMin
+        | Visibility0to48hMin
+        | DewpointDepression2m24to48hMax
+        | DewpointDepression2m0to48hMax
+        | HeatIndex2m24to48hMax
+        | HeatIndex2m0to48hMax
+        | ApparentTemp2m24to48hMax
+        | ApparentTemp2m0to48hMax
+        | Wetbulb2m24to48hMax
+        | Wetbulb2m0to48hMax
+        | WindChill2m24to48hMin
+        | WindChill2m0to48hMin
+        | CompositeReflectivity24to48hMax
+        | CompositeReflectivity0to48hMax
+        | Sbcape24to48hMax
+        | Sbcape0to48hMax
+        | Mlcape24to48hMax
+        | Mlcape0to48hMax
+        | Mucape24to48hMax
+        | Mucape0to48hMax
+        | Dcape24to48hMax
+        | Dcape0to48hMax
+        | Pwat24to48hMax
+        | Pwat0to48hMax
+        | ThetaE2m24to48hMax
+        | ThetaE2m0to48hMax
+        | Srh01km24to48hMax
+        | Srh01km0to48hMax
+        | Srh03km24to48hMax
+        | Srh03km0to48hMax
+        | StpFixed24to48hMax
+        | StpFixed0to48hMax
+        | Ehi01km24to48hMax
+        | Ehi01km0to48hMax
+        | Ehi03km24to48hMax
+        | Ehi03km0to48hMax
+        | ScpProxy24to48hMax
+        | ScpProxy0to48hMax
+        | BulkShear01km24to48hMax
+        | BulkShear01km0to48hMax
+        | BulkShear06km24to48hMax
+        | BulkShear06km0to48hMax
+        | LapseRate03km24to48hMax
+        | LapseRate03km0to48hMax
+        | LapseRate70050024to48hMax
+        | LapseRate7005000to48hMax
+        | Sblcl24to48hMin
+        | Sblcl0to48hMin
+        | CloudCoverTotalMaxField24to48hMax
+        | CloudCoverTotalMaxField0to48hMax
+        | CloudCoverTotalMinField24to48hMin
+        | CloudCoverTotalMinField0to48hMin
+        | Mslp24to48hMin
+        | Mslp0to48hMin
+        | CategoricalRain24to48hMax
+        | CategoricalRain0to48hMax
+        | CategoricalSnow24to48hMax
+        | CategoricalSnow0to48hMax
+        | CategoricalFreezingRain24to48hMax
+        | CategoricalFreezingRain0to48hMax
         | Temp2m24to48hMax
         | Temp2m24to48hMin
         | Temp2m24to48hRange
@@ -403,6 +799,105 @@ pub static SUPPORTED_HRRR_WINDOWED_PRODUCTS: &[HrrrWindowedProduct] = &[
     HrrrWindowedProduct::SmokeColumn0to24hMax,
     HrrrWindowedProduct::SmokeColumn24to48hMax,
     HrrrWindowedProduct::SmokeColumn0to48hMax,
+    HrrrWindowedProduct::Gust10m0to24hMax,
+    HrrrWindowedProduct::Gust10m24to48hMax,
+    HrrrWindowedProduct::Gust10m0to48hMax,
+    HrrrWindowedProduct::Hdw0to24hMax,
+    HrrrWindowedProduct::Hdw24to48hMax,
+    HrrrWindowedProduct::Hdw0to48hMax,
+    HrrrWindowedProduct::FireWxComposite0to24hMax,
+    HrrrWindowedProduct::FireWxComposite24to48hMax,
+    HrrrWindowedProduct::FireWxComposite0to48hMax,
+    HrrrWindowedProduct::Visibility0to24hMin,
+    HrrrWindowedProduct::Visibility24to48hMin,
+    HrrrWindowedProduct::Visibility0to48hMin,
+    HrrrWindowedProduct::DewpointDepression2m0to24hMax,
+    HrrrWindowedProduct::DewpointDepression2m24to48hMax,
+    HrrrWindowedProduct::DewpointDepression2m0to48hMax,
+    HrrrWindowedProduct::HeatIndex2m0to24hMax,
+    HrrrWindowedProduct::HeatIndex2m24to48hMax,
+    HrrrWindowedProduct::HeatIndex2m0to48hMax,
+    HrrrWindowedProduct::ApparentTemp2m0to24hMax,
+    HrrrWindowedProduct::ApparentTemp2m24to48hMax,
+    HrrrWindowedProduct::ApparentTemp2m0to48hMax,
+    HrrrWindowedProduct::Wetbulb2m0to24hMax,
+    HrrrWindowedProduct::Wetbulb2m24to48hMax,
+    HrrrWindowedProduct::Wetbulb2m0to48hMax,
+    HrrrWindowedProduct::WindChill2m0to24hMin,
+    HrrrWindowedProduct::WindChill2m24to48hMin,
+    HrrrWindowedProduct::WindChill2m0to48hMin,
+    HrrrWindowedProduct::CompositeReflectivity0to24hMax,
+    HrrrWindowedProduct::CompositeReflectivity24to48hMax,
+    HrrrWindowedProduct::CompositeReflectivity0to48hMax,
+    HrrrWindowedProduct::Sbcape0to24hMax,
+    HrrrWindowedProduct::Sbcape24to48hMax,
+    HrrrWindowedProduct::Sbcape0to48hMax,
+    HrrrWindowedProduct::Mlcape0to24hMax,
+    HrrrWindowedProduct::Mlcape24to48hMax,
+    HrrrWindowedProduct::Mlcape0to48hMax,
+    HrrrWindowedProduct::Mucape0to24hMax,
+    HrrrWindowedProduct::Mucape24to48hMax,
+    HrrrWindowedProduct::Mucape0to48hMax,
+    HrrrWindowedProduct::Dcape0to24hMax,
+    HrrrWindowedProduct::Dcape24to48hMax,
+    HrrrWindowedProduct::Dcape0to48hMax,
+    HrrrWindowedProduct::Pwat0to24hMax,
+    HrrrWindowedProduct::Pwat24to48hMax,
+    HrrrWindowedProduct::Pwat0to48hMax,
+    HrrrWindowedProduct::ThetaE2m0to24hMax,
+    HrrrWindowedProduct::ThetaE2m24to48hMax,
+    HrrrWindowedProduct::ThetaE2m0to48hMax,
+    HrrrWindowedProduct::Srh01km0to24hMax,
+    HrrrWindowedProduct::Srh01km24to48hMax,
+    HrrrWindowedProduct::Srh01km0to48hMax,
+    HrrrWindowedProduct::Srh03km0to24hMax,
+    HrrrWindowedProduct::Srh03km24to48hMax,
+    HrrrWindowedProduct::Srh03km0to48hMax,
+    HrrrWindowedProduct::StpFixed0to24hMax,
+    HrrrWindowedProduct::StpFixed24to48hMax,
+    HrrrWindowedProduct::StpFixed0to48hMax,
+    HrrrWindowedProduct::Ehi01km0to24hMax,
+    HrrrWindowedProduct::Ehi01km24to48hMax,
+    HrrrWindowedProduct::Ehi01km0to48hMax,
+    HrrrWindowedProduct::Ehi03km0to24hMax,
+    HrrrWindowedProduct::Ehi03km24to48hMax,
+    HrrrWindowedProduct::Ehi03km0to48hMax,
+    HrrrWindowedProduct::ScpProxy0to24hMax,
+    HrrrWindowedProduct::ScpProxy24to48hMax,
+    HrrrWindowedProduct::ScpProxy0to48hMax,
+    HrrrWindowedProduct::BulkShear01km0to24hMax,
+    HrrrWindowedProduct::BulkShear01km24to48hMax,
+    HrrrWindowedProduct::BulkShear01km0to48hMax,
+    HrrrWindowedProduct::BulkShear06km0to24hMax,
+    HrrrWindowedProduct::BulkShear06km24to48hMax,
+    HrrrWindowedProduct::BulkShear06km0to48hMax,
+    HrrrWindowedProduct::LapseRate03km0to24hMax,
+    HrrrWindowedProduct::LapseRate03km24to48hMax,
+    HrrrWindowedProduct::LapseRate03km0to48hMax,
+    HrrrWindowedProduct::LapseRate7005000to24hMax,
+    HrrrWindowedProduct::LapseRate70050024to48hMax,
+    HrrrWindowedProduct::LapseRate7005000to48hMax,
+    HrrrWindowedProduct::Sblcl0to24hMin,
+    HrrrWindowedProduct::Sblcl24to48hMin,
+    HrrrWindowedProduct::Sblcl0to48hMin,
+    HrrrWindowedProduct::CloudCoverTotalMaxField0to24hMax,
+    HrrrWindowedProduct::CloudCoverTotalMaxField24to48hMax,
+    HrrrWindowedProduct::CloudCoverTotalMaxField0to48hMax,
+    HrrrWindowedProduct::CloudCoverTotalMinField0to24hMin,
+    HrrrWindowedProduct::CloudCoverTotalMinField24to48hMin,
+    HrrrWindowedProduct::CloudCoverTotalMinField0to48hMin,
+    HrrrWindowedProduct::Mslp0to24hMin,
+    HrrrWindowedProduct::Mslp24to48hMin,
+    HrrrWindowedProduct::Mslp0to48hMin,
+    HrrrWindowedProduct::CategoricalRain0to24hMax,
+    HrrrWindowedProduct::CategoricalRain24to48hMax,
+    HrrrWindowedProduct::CategoricalRain0to48hMax,
+    HrrrWindowedProduct::CategoricalSnow0to24hMax,
+    HrrrWindowedProduct::CategoricalSnow24to48hMax,
+    HrrrWindowedProduct::CategoricalSnow0to48hMax,
+    HrrrWindowedProduct::CategoricalFreezingRain0to24hMax,
+    HrrrWindowedProduct::CategoricalFreezingRain24to48hMax,
+    HrrrWindowedProduct::CategoricalFreezingRain0to48hMax,
     HrrrWindowedProduct::Temp2m0to24hMax,
     HrrrWindowedProduct::Temp2m24to48hMax,
     HrrrWindowedProduct::Temp2m0to48hMax,
@@ -1893,9 +2388,26 @@ fn windowed_temp_display(
         Temp2m0to24hMax | Temp2m24to48hMax | Temp2m0to48hMax | Temp2m0to24hMin
         | Temp2m24to48hMin | Temp2m0to48hMin | Dewpoint2m0to24hMax | Dewpoint2m24to48hMax
         | Dewpoint2m0to48hMax | Dewpoint2m0to24hMin | Dewpoint2m24to48hMin
-        | Dewpoint2m0to48hMin => Some(crate::temp_display::TempDisplay::AbsoluteCelsius),
+        | Dewpoint2m0to48hMin
+        // Day-window products over the derived °C temperature fields.
+        | HeatIndex2m0to24hMax
+        | HeatIndex2m24to48hMax
+        | HeatIndex2m0to48hMax
+        | ApparentTemp2m0to24hMax
+        | ApparentTemp2m24to48hMax
+        | ApparentTemp2m0to48hMax
+        | Wetbulb2m0to24hMax
+        | Wetbulb2m24to48hMax
+        | Wetbulb2m0to48hMax
+        | WindChill2m0to24hMin
+        | WindChill2m24to48hMin
+        | WindChill2m0to48hMin => Some(crate::temp_display::TempDisplay::AbsoluteCelsius),
         Temp2m0to24hRange | Temp2m24to48hRange | Temp2m0to48hRange | Dewpoint2m0to24hRange
-        | Dewpoint2m24to48hRange | Dewpoint2m0to48hRange => {
+        | Dewpoint2m24to48hRange | Dewpoint2m0to48hRange
+        // Dewpoint depression is a temperature DIFFERENCE (Δ°F = Δ°C × 9/5).
+        | DewpointDepression2m0to24hMax
+        | DewpointDepression2m24to48hMax
+        | DewpointDepression2m0to48hMax => {
             Some(crate::temp_display::TempDisplay::DeltaCelsius)
         }
         _ => None,
@@ -2082,7 +2594,19 @@ fn plan_windowed_products(
                 }
                 wind_hours.extend(1..=48);
             }
-            _ => unreachable!("surface snapshot window products are handled before match"),
+            // Store-only windowed products (peak smoke, and the wider
+            // single-variable day-window family) have no GRIB-fetch recipe:
+            // they fold planes that only exist in the rw-store. Block them
+            // honestly here instead of panicking — this arm used to be
+            // `unreachable!()`, which any store-only product would have hit.
+            other => {
+                blockers.push(blocker(
+                    other,
+                    "this windowed product renders from the rw-store lane only \
+                     (no GRIB-fetch path); request it against a stored run",
+                ));
+                continue;
+            }
         }
 
         planned.push(product);

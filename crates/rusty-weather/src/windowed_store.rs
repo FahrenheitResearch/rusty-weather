@@ -321,6 +321,70 @@ enum SourceKind {
     Smoke8m,
     /// `smoke_column` (kg/m^2), column-integrated smoke.
     SmokeColumn,
+    /// `wind_gust_10m` (m/s) — day-window source plane.
+    WinWindGust10m,
+    /// `hdw` (hPa*m/s) — day-window source plane.
+    WinHdw,
+    /// `fire_weather_composite` (index) — day-window source plane.
+    WinFireWeatherComposite,
+    /// `visibility` (m) — day-window source plane.
+    WinVisibility,
+    /// `dewpoint_depression_2m` (degC) — day-window source plane.
+    WinDewpointDepression2m,
+    /// `heat_index_2m` (degC) — day-window source plane.
+    WinHeatIndex2m,
+    /// `apparent_temperature_2m` (degC) — day-window source plane.
+    WinApparentTemperature2m,
+    /// `wetbulb_2m` (degC) — day-window source plane.
+    WinWetbulb2m,
+    /// `wind_chill_2m` (degC) — day-window source plane.
+    WinWindChill2m,
+    /// `composite_reflectivity` (dBZ) — day-window source plane.
+    WinCompositeReflectivity,
+    /// `sbcape` (J/kg) — day-window source plane.
+    WinSbcape,
+    /// `mlcape` (J/kg) — day-window source plane.
+    WinMlcape,
+    /// `mucape` (J/kg) — day-window source plane.
+    WinMucape,
+    /// `dcape` (J/kg) — day-window source plane.
+    WinDcape,
+    /// `pwat` (kg/m^2) — day-window source plane.
+    WinPwat,
+    /// `theta_e_2m_10m_winds` (K) — day-window source plane.
+    WinThetaE2m10mWinds,
+    /// `srh_0_1km` (m^2/s^2) — day-window source plane.
+    WinSrh01km,
+    /// `srh_0_3km` (m^2/s^2) — day-window source plane.
+    WinSrh03km,
+    /// `stp_fixed` (dimensionless) — day-window source plane.
+    WinStpFixed,
+    /// `ehi_0_1km` (dimensionless) — day-window source plane.
+    WinEhi01km,
+    /// `ehi_0_3km` (dimensionless) — day-window source plane.
+    WinEhi03km,
+    /// `scp_mu_0_3km_0_6km_proxy` (dimensionless) — day-window source plane.
+    WinScpMu03km06kmProxy,
+    /// `bulk_shear_0_1km` (kt) — day-window source plane.
+    WinBulkShear01km,
+    /// `bulk_shear_0_6km` (kt) — day-window source plane.
+    WinBulkShear06km,
+    /// `lapse_rate_0_3km` (degC/km) — day-window source plane.
+    WinLapseRate03km,
+    /// `lapse_rate_700_500` (degC/km) — day-window source plane.
+    WinLapseRate700500,
+    /// `sblcl` (m) — day-window source plane.
+    WinSblcl,
+    /// `cloud_cover_total` (%) — day-window source plane.
+    WinCloudCoverTotal,
+    /// `mslp` (Pa) — day-window source plane.
+    WinMslp,
+    /// `categorical_rain` (0/1) — day-window source plane.
+    WinCategoricalRain,
+    /// `categorical_snow` (0/1) — day-window source plane.
+    WinCategoricalSnow,
+    /// `categorical_freezing_rain` (0/1) — day-window source plane.
+    WinCategoricalFreezingRain,
 }
 
 /// How the per-hour planes reduce into the product grid.
@@ -348,6 +412,10 @@ enum Finish {
     /// Column smoke `kg/m^2 -> mg/m^2` (x1e6), matching
     /// `UnitConvert::KgM2ToMgM2`.
     KgM2ToMgM2,
+    /// Visibility `m -> miles`, matching `UnitConvert::MetersToMiles`.
+    MetersToMiles,
+    /// Pressure `Pa -> hPa`, matching `UnitConvert::PaToHpa`.
+    PaToHpa,
 }
 
 #[derive(Debug, Clone)]
@@ -629,6 +697,1392 @@ fn plan_product(product: HrrrWindowedProduct, end: u16) -> Result<ProductSpec, S
                 format!("pointwise max of stored hourly {field} across F{start:03}-F{stop:03}"),
             )
         }
+        Gust10m0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h 10 m wind gust max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "kt",
+                Finish::MsToKnots,
+                "pointwise max of stored hourly wind_gust_10m across F001-F024".to_string(),
+            )
+        }
+        Gust10m24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h 10 m wind gust max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "kt",
+                Finish::MsToKnots,
+                "pointwise max of stored hourly wind_gust_10m across F025-F048".to_string(),
+            )
+        }
+        Gust10m0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h 10 m wind gust max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "kt",
+                Finish::MsToKnots,
+                "pointwise max of stored hourly wind_gust_10m across F001-F048".to_string(),
+            )
+        }
+        Hdw0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h hot-dry-windy index max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHdw,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "hPa*m/s",
+                Finish::None,
+                "pointwise max of stored hourly hdw across F001-F024".to_string(),
+            )
+        }
+        Hdw24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h hot-dry-windy index max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHdw,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "hPa*m/s",
+                Finish::None,
+                "pointwise max of stored hourly hdw across F025-F048".to_string(),
+            )
+        }
+        Hdw0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h hot-dry-windy index max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHdw,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "hPa*m/s",
+                Finish::None,
+                "pointwise max of stored hourly hdw across F001-F048".to_string(),
+            )
+        }
+        FireWxComposite0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h fire weather composite max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinFireWeatherComposite,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "index",
+                Finish::None,
+                "pointwise max of stored hourly fire_weather_composite across F001-F024".to_string(),
+            )
+        }
+        FireWxComposite24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h fire weather composite max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinFireWeatherComposite,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "index",
+                Finish::None,
+                "pointwise max of stored hourly fire_weather_composite across F025-F048".to_string(),
+            )
+        }
+        FireWxComposite0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h fire weather composite max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinFireWeatherComposite,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "index",
+                Finish::None,
+                "pointwise max of stored hourly fire_weather_composite across F001-F048".to_string(),
+            )
+        }
+        Visibility0to24hMin => {
+            if end < 24 {
+                return Err("0-24 h visibility min requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinVisibility,
+                Reduce::Min,
+                (1..=24).collect(),
+                Some(24),
+                "mi",
+                Finish::MetersToMiles,
+                "pointwise min of stored hourly visibility across F001-F024".to_string(),
+            )
+        }
+        Visibility24to48hMin => {
+            if end < 48 {
+                return Err("24-48 h visibility min requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinVisibility,
+                Reduce::Min,
+                (25..=48).collect(),
+                Some(24),
+                "mi",
+                Finish::MetersToMiles,
+                "pointwise min of stored hourly visibility across F025-F048".to_string(),
+            )
+        }
+        Visibility0to48hMin => {
+            if end < 48 {
+                return Err("0-48 h visibility min requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinVisibility,
+                Reduce::Min,
+                (1..=48).collect(),
+                Some(48),
+                "mi",
+                Finish::MetersToMiles,
+                "pointwise min of stored hourly visibility across F001-F048".to_string(),
+            )
+        }
+        DewpointDepression2m0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h 2 m dewpoint depression max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinDewpointDepression2m,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "degC",
+                Finish::None,
+                "pointwise max of stored hourly dewpoint_depression_2m across F001-F024".to_string(),
+            )
+        }
+        DewpointDepression2m24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h 2 m dewpoint depression max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinDewpointDepression2m,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "degC",
+                Finish::None,
+                "pointwise max of stored hourly dewpoint_depression_2m across F025-F048".to_string(),
+            )
+        }
+        DewpointDepression2m0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h 2 m dewpoint depression max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinDewpointDepression2m,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "degC",
+                Finish::None,
+                "pointwise max of stored hourly dewpoint_depression_2m across F001-F048".to_string(),
+            )
+        }
+        HeatIndex2m0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h 2 m heat index max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHeatIndex2m,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "degC",
+                Finish::None,
+                "pointwise max of stored hourly heat_index_2m across F001-F024".to_string(),
+            )
+        }
+        HeatIndex2m24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h 2 m heat index max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHeatIndex2m,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "degC",
+                Finish::None,
+                "pointwise max of stored hourly heat_index_2m across F025-F048".to_string(),
+            )
+        }
+        HeatIndex2m0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h 2 m heat index max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHeatIndex2m,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "degC",
+                Finish::None,
+                "pointwise max of stored hourly heat_index_2m across F001-F048".to_string(),
+            )
+        }
+        ApparentTemp2m0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h 2 m apparent temperature max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinApparentTemperature2m,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "degC",
+                Finish::None,
+                "pointwise max of stored hourly apparent_temperature_2m across F001-F024".to_string(),
+            )
+        }
+        ApparentTemp2m24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h 2 m apparent temperature max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinApparentTemperature2m,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "degC",
+                Finish::None,
+                "pointwise max of stored hourly apparent_temperature_2m across F025-F048".to_string(),
+            )
+        }
+        ApparentTemp2m0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h 2 m apparent temperature max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinApparentTemperature2m,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "degC",
+                Finish::None,
+                "pointwise max of stored hourly apparent_temperature_2m across F001-F048".to_string(),
+            )
+        }
+        Wetbulb2m0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h 2 m wet-bulb temperature max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWetbulb2m,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "degC",
+                Finish::None,
+                "pointwise max of stored hourly wetbulb_2m across F001-F024".to_string(),
+            )
+        }
+        Wetbulb2m24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h 2 m wet-bulb temperature max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWetbulb2m,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "degC",
+                Finish::None,
+                "pointwise max of stored hourly wetbulb_2m across F025-F048".to_string(),
+            )
+        }
+        Wetbulb2m0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h 2 m wet-bulb temperature max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWetbulb2m,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "degC",
+                Finish::None,
+                "pointwise max of stored hourly wetbulb_2m across F001-F048".to_string(),
+            )
+        }
+        WindChill2m0to24hMin => {
+            if end < 24 {
+                return Err("0-24 h 2 m wind chill min requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindChill2m,
+                Reduce::Min,
+                (1..=24).collect(),
+                Some(24),
+                "degC",
+                Finish::None,
+                "pointwise min of stored hourly wind_chill_2m across F001-F024".to_string(),
+            )
+        }
+        WindChill2m24to48hMin => {
+            if end < 48 {
+                return Err("24-48 h 2 m wind chill min requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindChill2m,
+                Reduce::Min,
+                (25..=48).collect(),
+                Some(24),
+                "degC",
+                Finish::None,
+                "pointwise min of stored hourly wind_chill_2m across F025-F048".to_string(),
+            )
+        }
+        WindChill2m0to48hMin => {
+            if end < 48 {
+                return Err("0-48 h 2 m wind chill min requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindChill2m,
+                Reduce::Min,
+                (1..=48).collect(),
+                Some(48),
+                "degC",
+                Finish::None,
+                "pointwise min of stored hourly wind_chill_2m across F001-F048".to_string(),
+            )
+        }
+        CompositeReflectivity0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h composite reflectivity max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCompositeReflectivity,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "dBZ",
+                Finish::None,
+                "pointwise max of stored hourly composite_reflectivity across F001-F024".to_string(),
+            )
+        }
+        CompositeReflectivity24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h composite reflectivity max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCompositeReflectivity,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "dBZ",
+                Finish::None,
+                "pointwise max of stored hourly composite_reflectivity across F025-F048".to_string(),
+            )
+        }
+        CompositeReflectivity0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h composite reflectivity max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCompositeReflectivity,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "dBZ",
+                Finish::None,
+                "pointwise max of stored hourly composite_reflectivity across F001-F048".to_string(),
+            )
+        }
+        Sbcape0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h surface-based cape max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinSbcape,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "J/kg",
+                Finish::None,
+                "pointwise max of stored hourly sbcape across F001-F024".to_string(),
+            )
+        }
+        Sbcape24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h surface-based cape max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinSbcape,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "J/kg",
+                Finish::None,
+                "pointwise max of stored hourly sbcape across F025-F048".to_string(),
+            )
+        }
+        Sbcape0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h surface-based cape max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinSbcape,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "J/kg",
+                Finish::None,
+                "pointwise max of stored hourly sbcape across F001-F048".to_string(),
+            )
+        }
+        Mlcape0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h mixed-layer cape max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinMlcape,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "J/kg",
+                Finish::None,
+                "pointwise max of stored hourly mlcape across F001-F024".to_string(),
+            )
+        }
+        Mlcape24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h mixed-layer cape max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinMlcape,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "J/kg",
+                Finish::None,
+                "pointwise max of stored hourly mlcape across F025-F048".to_string(),
+            )
+        }
+        Mlcape0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h mixed-layer cape max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinMlcape,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "J/kg",
+                Finish::None,
+                "pointwise max of stored hourly mlcape across F001-F048".to_string(),
+            )
+        }
+        Mucape0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h most-unstable cape max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinMucape,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "J/kg",
+                Finish::None,
+                "pointwise max of stored hourly mucape across F001-F024".to_string(),
+            )
+        }
+        Mucape24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h most-unstable cape max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinMucape,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "J/kg",
+                Finish::None,
+                "pointwise max of stored hourly mucape across F025-F048".to_string(),
+            )
+        }
+        Mucape0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h most-unstable cape max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinMucape,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "J/kg",
+                Finish::None,
+                "pointwise max of stored hourly mucape across F001-F048".to_string(),
+            )
+        }
+        Dcape0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h dcape max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinDcape,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "J/kg",
+                Finish::None,
+                "pointwise max of stored hourly dcape across F001-F024".to_string(),
+            )
+        }
+        Dcape24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h dcape max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinDcape,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "J/kg",
+                Finish::None,
+                "pointwise max of stored hourly dcape across F025-F048".to_string(),
+            )
+        }
+        Dcape0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h dcape max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinDcape,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "J/kg",
+                Finish::None,
+                "pointwise max of stored hourly dcape across F001-F048".to_string(),
+            )
+        }
+        Pwat0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h precipitable water max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinPwat,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "kg/m^2",
+                Finish::None,
+                "pointwise max of stored hourly pwat across F001-F024".to_string(),
+            )
+        }
+        Pwat24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h precipitable water max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinPwat,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "kg/m^2",
+                Finish::None,
+                "pointwise max of stored hourly pwat across F025-F048".to_string(),
+            )
+        }
+        Pwat0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h precipitable water max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinPwat,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "kg/m^2",
+                Finish::None,
+                "pointwise max of stored hourly pwat across F001-F048".to_string(),
+            )
+        }
+        ThetaE2m0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h 2 m equivalent potential temperature max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinThetaE2m10mWinds,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "K",
+                Finish::None,
+                "pointwise max of stored hourly theta_e_2m_10m_winds across F001-F024".to_string(),
+            )
+        }
+        ThetaE2m24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h 2 m equivalent potential temperature max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinThetaE2m10mWinds,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "K",
+                Finish::None,
+                "pointwise max of stored hourly theta_e_2m_10m_winds across F025-F048".to_string(),
+            )
+        }
+        ThetaE2m0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h 2 m equivalent potential temperature max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinThetaE2m10mWinds,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "K",
+                Finish::None,
+                "pointwise max of stored hourly theta_e_2m_10m_winds across F001-F048".to_string(),
+            )
+        }
+        Srh01km0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h 0-1 km storm-relative helicity max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinSrh01km,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "m^2/s^2",
+                Finish::None,
+                "pointwise max of stored hourly srh_0_1km across F001-F024".to_string(),
+            )
+        }
+        Srh01km24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h 0-1 km storm-relative helicity max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinSrh01km,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "m^2/s^2",
+                Finish::None,
+                "pointwise max of stored hourly srh_0_1km across F025-F048".to_string(),
+            )
+        }
+        Srh01km0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h 0-1 km storm-relative helicity max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinSrh01km,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "m^2/s^2",
+                Finish::None,
+                "pointwise max of stored hourly srh_0_1km across F001-F048".to_string(),
+            )
+        }
+        Srh03km0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h 0-3 km storm-relative helicity max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinSrh03km,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "m^2/s^2",
+                Finish::None,
+                "pointwise max of stored hourly srh_0_3km across F001-F024".to_string(),
+            )
+        }
+        Srh03km24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h 0-3 km storm-relative helicity max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinSrh03km,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "m^2/s^2",
+                Finish::None,
+                "pointwise max of stored hourly srh_0_3km across F025-F048".to_string(),
+            )
+        }
+        Srh03km0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h 0-3 km storm-relative helicity max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinSrh03km,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "m^2/s^2",
+                Finish::None,
+                "pointwise max of stored hourly srh_0_3km across F001-F048".to_string(),
+            )
+        }
+        StpFixed0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h significant tornado parameter max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinStpFixed,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "dimensionless",
+                Finish::None,
+                "pointwise max of stored hourly stp_fixed across F001-F024".to_string(),
+            )
+        }
+        StpFixed24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h significant tornado parameter max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinStpFixed,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "dimensionless",
+                Finish::None,
+                "pointwise max of stored hourly stp_fixed across F025-F048".to_string(),
+            )
+        }
+        StpFixed0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h significant tornado parameter max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinStpFixed,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "dimensionless",
+                Finish::None,
+                "pointwise max of stored hourly stp_fixed across F001-F048".to_string(),
+            )
+        }
+        Ehi01km0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h 0-1 km energy-helicity index max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinEhi01km,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "dimensionless",
+                Finish::None,
+                "pointwise max of stored hourly ehi_0_1km across F001-F024".to_string(),
+            )
+        }
+        Ehi01km24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h 0-1 km energy-helicity index max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinEhi01km,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "dimensionless",
+                Finish::None,
+                "pointwise max of stored hourly ehi_0_1km across F025-F048".to_string(),
+            )
+        }
+        Ehi01km0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h 0-1 km energy-helicity index max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinEhi01km,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "dimensionless",
+                Finish::None,
+                "pointwise max of stored hourly ehi_0_1km across F001-F048".to_string(),
+            )
+        }
+        Ehi03km0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h 0-3 km energy-helicity index max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinEhi03km,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "dimensionless",
+                Finish::None,
+                "pointwise max of stored hourly ehi_0_3km across F001-F024".to_string(),
+            )
+        }
+        Ehi03km24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h 0-3 km energy-helicity index max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinEhi03km,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "dimensionless",
+                Finish::None,
+                "pointwise max of stored hourly ehi_0_3km across F025-F048".to_string(),
+            )
+        }
+        Ehi03km0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h 0-3 km energy-helicity index max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinEhi03km,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "dimensionless",
+                Finish::None,
+                "pointwise max of stored hourly ehi_0_3km across F001-F048".to_string(),
+            )
+        }
+        ScpProxy0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h supercell composite max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinScpMu03km06kmProxy,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "dimensionless",
+                Finish::None,
+                "pointwise max of stored hourly scp_mu_0_3km_0_6km_proxy across F001-F024".to_string(),
+            )
+        }
+        ScpProxy24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h supercell composite max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinScpMu03km06kmProxy,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "dimensionless",
+                Finish::None,
+                "pointwise max of stored hourly scp_mu_0_3km_0_6km_proxy across F025-F048".to_string(),
+            )
+        }
+        ScpProxy0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h supercell composite max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinScpMu03km06kmProxy,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "dimensionless",
+                Finish::None,
+                "pointwise max of stored hourly scp_mu_0_3km_0_6km_proxy across F001-F048".to_string(),
+            )
+        }
+        BulkShear01km0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h 0-1 km bulk shear max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinBulkShear01km,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "kt",
+                Finish::None,
+                "pointwise max of stored hourly bulk_shear_0_1km across F001-F024".to_string(),
+            )
+        }
+        BulkShear01km24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h 0-1 km bulk shear max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinBulkShear01km,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "kt",
+                Finish::None,
+                "pointwise max of stored hourly bulk_shear_0_1km across F025-F048".to_string(),
+            )
+        }
+        BulkShear01km0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h 0-1 km bulk shear max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinBulkShear01km,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "kt",
+                Finish::None,
+                "pointwise max of stored hourly bulk_shear_0_1km across F001-F048".to_string(),
+            )
+        }
+        BulkShear06km0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h 0-6 km bulk shear max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinBulkShear06km,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "kt",
+                Finish::None,
+                "pointwise max of stored hourly bulk_shear_0_6km across F001-F024".to_string(),
+            )
+        }
+        BulkShear06km24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h 0-6 km bulk shear max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinBulkShear06km,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "kt",
+                Finish::None,
+                "pointwise max of stored hourly bulk_shear_0_6km across F025-F048".to_string(),
+            )
+        }
+        BulkShear06km0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h 0-6 km bulk shear max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinBulkShear06km,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "kt",
+                Finish::None,
+                "pointwise max of stored hourly bulk_shear_0_6km across F001-F048".to_string(),
+            )
+        }
+        LapseRate03km0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h 0-3 km lapse rate max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinLapseRate03km,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "degC/km",
+                Finish::None,
+                "pointwise max of stored hourly lapse_rate_0_3km across F001-F024".to_string(),
+            )
+        }
+        LapseRate03km24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h 0-3 km lapse rate max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinLapseRate03km,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "degC/km",
+                Finish::None,
+                "pointwise max of stored hourly lapse_rate_0_3km across F025-F048".to_string(),
+            )
+        }
+        LapseRate03km0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h 0-3 km lapse rate max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinLapseRate03km,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "degC/km",
+                Finish::None,
+                "pointwise max of stored hourly lapse_rate_0_3km across F001-F048".to_string(),
+            )
+        }
+        LapseRate7005000to24hMax => {
+            if end < 24 {
+                return Err("0-24 h 700-500 mb lapse rate max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinLapseRate700500,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "degC/km",
+                Finish::None,
+                "pointwise max of stored hourly lapse_rate_700_500 across F001-F024".to_string(),
+            )
+        }
+        LapseRate70050024to48hMax => {
+            if end < 48 {
+                return Err("24-48 h 700-500 mb lapse rate max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinLapseRate700500,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "degC/km",
+                Finish::None,
+                "pointwise max of stored hourly lapse_rate_700_500 across F025-F048".to_string(),
+            )
+        }
+        LapseRate7005000to48hMax => {
+            if end < 48 {
+                return Err("0-48 h 700-500 mb lapse rate max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinLapseRate700500,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "degC/km",
+                Finish::None,
+                "pointwise max of stored hourly lapse_rate_700_500 across F001-F048".to_string(),
+            )
+        }
+        Sblcl0to24hMin => {
+            if end < 24 {
+                return Err("0-24 h surface-based lcl height min requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinSblcl,
+                Reduce::Min,
+                (1..=24).collect(),
+                Some(24),
+                "m",
+                Finish::None,
+                "pointwise min of stored hourly sblcl across F001-F024".to_string(),
+            )
+        }
+        Sblcl24to48hMin => {
+            if end < 48 {
+                return Err("24-48 h surface-based lcl height min requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinSblcl,
+                Reduce::Min,
+                (25..=48).collect(),
+                Some(24),
+                "m",
+                Finish::None,
+                "pointwise min of stored hourly sblcl across F025-F048".to_string(),
+            )
+        }
+        Sblcl0to48hMin => {
+            if end < 48 {
+                return Err("0-48 h surface-based lcl height min requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinSblcl,
+                Reduce::Min,
+                (1..=48).collect(),
+                Some(48),
+                "m",
+                Finish::None,
+                "pointwise min of stored hourly sblcl across F001-F048".to_string(),
+            )
+        }
+        CloudCoverTotalMaxField0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h total cloud cover max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCloudCoverTotal,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "%",
+                Finish::None,
+                "pointwise max of stored hourly cloud_cover_total across F001-F024".to_string(),
+            )
+        }
+        CloudCoverTotalMaxField24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h total cloud cover max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCloudCoverTotal,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "%",
+                Finish::None,
+                "pointwise max of stored hourly cloud_cover_total across F025-F048".to_string(),
+            )
+        }
+        CloudCoverTotalMaxField0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h total cloud cover max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCloudCoverTotal,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "%",
+                Finish::None,
+                "pointwise max of stored hourly cloud_cover_total across F001-F048".to_string(),
+            )
+        }
+        CloudCoverTotalMinField0to24hMin => {
+            if end < 24 {
+                return Err("0-24 h total cloud cover min requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCloudCoverTotal,
+                Reduce::Min,
+                (1..=24).collect(),
+                Some(24),
+                "%",
+                Finish::None,
+                "pointwise min of stored hourly cloud_cover_total across F001-F024".to_string(),
+            )
+        }
+        CloudCoverTotalMinField24to48hMin => {
+            if end < 48 {
+                return Err("24-48 h total cloud cover min requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCloudCoverTotal,
+                Reduce::Min,
+                (25..=48).collect(),
+                Some(24),
+                "%",
+                Finish::None,
+                "pointwise min of stored hourly cloud_cover_total across F025-F048".to_string(),
+            )
+        }
+        CloudCoverTotalMinField0to48hMin => {
+            if end < 48 {
+                return Err("0-48 h total cloud cover min requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCloudCoverTotal,
+                Reduce::Min,
+                (1..=48).collect(),
+                Some(48),
+                "%",
+                Finish::None,
+                "pointwise min of stored hourly cloud_cover_total across F001-F048".to_string(),
+            )
+        }
+        Mslp0to24hMin => {
+            if end < 24 {
+                return Err("0-24 h mean sea-level pressure min requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinMslp,
+                Reduce::Min,
+                (1..=24).collect(),
+                Some(24),
+                "hPa",
+                Finish::PaToHpa,
+                "pointwise min of stored hourly mslp across F001-F024".to_string(),
+            )
+        }
+        Mslp24to48hMin => {
+            if end < 48 {
+                return Err("24-48 h mean sea-level pressure min requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinMslp,
+                Reduce::Min,
+                (25..=48).collect(),
+                Some(24),
+                "hPa",
+                Finish::PaToHpa,
+                "pointwise min of stored hourly mslp across F025-F048".to_string(),
+            )
+        }
+        Mslp0to48hMin => {
+            if end < 48 {
+                return Err("0-48 h mean sea-level pressure min requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinMslp,
+                Reduce::Min,
+                (1..=48).collect(),
+                Some(48),
+                "hPa",
+                Finish::PaToHpa,
+                "pointwise min of stored hourly mslp across F001-F048".to_string(),
+            )
+        }
+        CategoricalRain0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h categorical rain max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalRain,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "0/1",
+                Finish::None,
+                "pointwise max of stored hourly categorical_rain across F001-F024".to_string(),
+            )
+        }
+        CategoricalRain24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h categorical rain max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalRain,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "0/1",
+                Finish::None,
+                "pointwise max of stored hourly categorical_rain across F025-F048".to_string(),
+            )
+        }
+        CategoricalRain0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h categorical rain max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalRain,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "0/1",
+                Finish::None,
+                "pointwise max of stored hourly categorical_rain across F001-F048".to_string(),
+            )
+        }
+        CategoricalSnow0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h categorical snow max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalSnow,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "0/1",
+                Finish::None,
+                "pointwise max of stored hourly categorical_snow across F001-F024".to_string(),
+            )
+        }
+        CategoricalSnow24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h categorical snow max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalSnow,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "0/1",
+                Finish::None,
+                "pointwise max of stored hourly categorical_snow across F025-F048".to_string(),
+            )
+        }
+        CategoricalSnow0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h categorical snow max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalSnow,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "0/1",
+                Finish::None,
+                "pointwise max of stored hourly categorical_snow across F001-F048".to_string(),
+            )
+        }
+        CategoricalFreezingRain0to24hMax => {
+            if end < 24 {
+                return Err("0-24 h categorical freezing rain max requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalFreezingRain,
+                Reduce::Max,
+                (1..=24).collect(),
+                Some(24),
+                "0/1",
+                Finish::None,
+                "pointwise max of stored hourly categorical_freezing_rain across F001-F024".to_string(),
+            )
+        }
+        CategoricalFreezingRain24to48hMax => {
+            if end < 48 {
+                return Err("24-48 h categorical freezing rain max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalFreezingRain,
+                Reduce::Max,
+                (25..=48).collect(),
+                Some(24),
+                "0/1",
+                Finish::None,
+                "pointwise max of stored hourly categorical_freezing_rain across F025-F048".to_string(),
+            )
+        }
+        CategoricalFreezingRain0to48hMax => {
+            if end < 48 {
+                return Err("0-48 h categorical freezing rain max requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalFreezingRain,
+                Reduce::Max,
+                (1..=48).collect(),
+                Some(48),
+                "0/1",
+                Finish::None,
+                "pointwise max of stored hourly categorical_freezing_rain across F001-F048".to_string(),
+            )
+        }
         _ => unreachable!("surface snapshot window products are handled before the match"),
     }
 }
@@ -675,6 +2129,105 @@ fn product_is_run_scoped(product: HrrrWindowedProduct) -> bool {
                 | SmokeColumn0to24hMax
                 | SmokeColumn24to48hMax
                 | SmokeColumn0to48hMax
+                | Gust10m0to24hMax
+                | Gust10m24to48hMax
+                | Gust10m0to48hMax
+                | Hdw0to24hMax
+                | Hdw24to48hMax
+                | Hdw0to48hMax
+                | FireWxComposite0to24hMax
+                | FireWxComposite24to48hMax
+                | FireWxComposite0to48hMax
+                | Visibility0to24hMin
+                | Visibility24to48hMin
+                | Visibility0to48hMin
+                | DewpointDepression2m0to24hMax
+                | DewpointDepression2m24to48hMax
+                | DewpointDepression2m0to48hMax
+                | HeatIndex2m0to24hMax
+                | HeatIndex2m24to48hMax
+                | HeatIndex2m0to48hMax
+                | ApparentTemp2m0to24hMax
+                | ApparentTemp2m24to48hMax
+                | ApparentTemp2m0to48hMax
+                | Wetbulb2m0to24hMax
+                | Wetbulb2m24to48hMax
+                | Wetbulb2m0to48hMax
+                | WindChill2m0to24hMin
+                | WindChill2m24to48hMin
+                | WindChill2m0to48hMin
+                | CompositeReflectivity0to24hMax
+                | CompositeReflectivity24to48hMax
+                | CompositeReflectivity0to48hMax
+                | Sbcape0to24hMax
+                | Sbcape24to48hMax
+                | Sbcape0to48hMax
+                | Mlcape0to24hMax
+                | Mlcape24to48hMax
+                | Mlcape0to48hMax
+                | Mucape0to24hMax
+                | Mucape24to48hMax
+                | Mucape0to48hMax
+                | Dcape0to24hMax
+                | Dcape24to48hMax
+                | Dcape0to48hMax
+                | Pwat0to24hMax
+                | Pwat24to48hMax
+                | Pwat0to48hMax
+                | ThetaE2m0to24hMax
+                | ThetaE2m24to48hMax
+                | ThetaE2m0to48hMax
+                | Srh01km0to24hMax
+                | Srh01km24to48hMax
+                | Srh01km0to48hMax
+                | Srh03km0to24hMax
+                | Srh03km24to48hMax
+                | Srh03km0to48hMax
+                | StpFixed0to24hMax
+                | StpFixed24to48hMax
+                | StpFixed0to48hMax
+                | Ehi01km0to24hMax
+                | Ehi01km24to48hMax
+                | Ehi01km0to48hMax
+                | Ehi03km0to24hMax
+                | Ehi03km24to48hMax
+                | Ehi03km0to48hMax
+                | ScpProxy0to24hMax
+                | ScpProxy24to48hMax
+                | ScpProxy0to48hMax
+                | BulkShear01km0to24hMax
+                | BulkShear01km24to48hMax
+                | BulkShear01km0to48hMax
+                | BulkShear06km0to24hMax
+                | BulkShear06km24to48hMax
+                | BulkShear06km0to48hMax
+                | LapseRate03km0to24hMax
+                | LapseRate03km24to48hMax
+                | LapseRate03km0to48hMax
+                | LapseRate7005000to24hMax
+                | LapseRate70050024to48hMax
+                | LapseRate7005000to48hMax
+                | Sblcl0to24hMin
+                | Sblcl24to48hMin
+                | Sblcl0to48hMin
+                | CloudCoverTotalMaxField0to24hMax
+                | CloudCoverTotalMaxField24to48hMax
+                | CloudCoverTotalMaxField0to48hMax
+                | CloudCoverTotalMinField0to24hMin
+                | CloudCoverTotalMinField24to48hMin
+                | CloudCoverTotalMinField0to48hMin
+                | Mslp0to24hMin
+                | Mslp24to48hMin
+                | Mslp0to48hMin
+                | CategoricalRain0to24hMax
+                | CategoricalRain24to48hMax
+                | CategoricalRain0to48hMax
+                | CategoricalSnow0to24hMax
+                | CategoricalSnow24to48hMax
+                | CategoricalSnow0to48hMax
+                | CategoricalFreezingRain0to24hMax
+                | CategoricalFreezingRain24to48hMax
+                | CategoricalFreezingRain0to48hMax
         )
 }
 
@@ -902,6 +2455,134 @@ fn read_source_plane(
             "smoke_column",
             "kg/m^2",
         ))?))),
+        SourceKind::WinWindGust10m => Ok(SourcePlane::exact(to_f64(plain(read(
+            "wind_gust_10m",
+            "m/s",
+        ))?))),
+        SourceKind::WinHdw => Ok(SourcePlane::exact(to_f64(plain(read(
+            "hdw",
+            "hPa*m/s",
+        ))?))),
+        SourceKind::WinFireWeatherComposite => Ok(SourcePlane::exact(to_f64(plain(read(
+            "fire_weather_composite",
+            "index",
+        ))?))),
+        SourceKind::WinVisibility => Ok(SourcePlane::exact(to_f64(plain(read(
+            "visibility",
+            "m",
+        ))?))),
+        SourceKind::WinDewpointDepression2m => Ok(SourcePlane::exact(to_f64(plain(read(
+            "dewpoint_depression_2m",
+            "degC",
+        ))?))),
+        SourceKind::WinHeatIndex2m => Ok(SourcePlane::exact(to_f64(plain(read(
+            "heat_index_2m",
+            "degC",
+        ))?))),
+        SourceKind::WinApparentTemperature2m => Ok(SourcePlane::exact(to_f64(plain(read(
+            "apparent_temperature_2m",
+            "degC",
+        ))?))),
+        SourceKind::WinWetbulb2m => Ok(SourcePlane::exact(to_f64(plain(read(
+            "wetbulb_2m",
+            "degC",
+        ))?))),
+        SourceKind::WinWindChill2m => Ok(SourcePlane::exact(to_f64(plain(read(
+            "wind_chill_2m",
+            "degC",
+        ))?))),
+        SourceKind::WinCompositeReflectivity => Ok(SourcePlane::exact(to_f64(plain(read(
+            "composite_reflectivity",
+            "dBZ",
+        ))?))),
+        SourceKind::WinSbcape => Ok(SourcePlane::exact(to_f64(plain(read(
+            "sbcape",
+            "J/kg",
+        ))?))),
+        SourceKind::WinMlcape => Ok(SourcePlane::exact(to_f64(plain(read(
+            "mlcape",
+            "J/kg",
+        ))?))),
+        SourceKind::WinMucape => Ok(SourcePlane::exact(to_f64(plain(read(
+            "mucape",
+            "J/kg",
+        ))?))),
+        SourceKind::WinDcape => Ok(SourcePlane::exact(to_f64(plain(read(
+            "dcape",
+            "J/kg",
+        ))?))),
+        SourceKind::WinPwat => Ok(SourcePlane::exact(to_f64(plain(read(
+            "pwat",
+            "kg/m^2",
+        ))?))),
+        SourceKind::WinThetaE2m10mWinds => Ok(SourcePlane::exact(to_f64(plain(read(
+            "theta_e_2m_10m_winds",
+            "K",
+        ))?))),
+        SourceKind::WinSrh01km => Ok(SourcePlane::exact(to_f64(plain(read(
+            "srh_0_1km",
+            "m^2/s^2",
+        ))?))),
+        SourceKind::WinSrh03km => Ok(SourcePlane::exact(to_f64(plain(read(
+            "srh_0_3km",
+            "m^2/s^2",
+        ))?))),
+        SourceKind::WinStpFixed => Ok(SourcePlane::exact(to_f64(plain(read(
+            "stp_fixed",
+            "dimensionless",
+        ))?))),
+        SourceKind::WinEhi01km => Ok(SourcePlane::exact(to_f64(plain(read(
+            "ehi_0_1km",
+            "dimensionless",
+        ))?))),
+        SourceKind::WinEhi03km => Ok(SourcePlane::exact(to_f64(plain(read(
+            "ehi_0_3km",
+            "dimensionless",
+        ))?))),
+        SourceKind::WinScpMu03km06kmProxy => Ok(SourcePlane::exact(to_f64(plain(read(
+            "scp_mu_0_3km_0_6km_proxy",
+            "dimensionless",
+        ))?))),
+        SourceKind::WinBulkShear01km => Ok(SourcePlane::exact(to_f64(plain(read(
+            "bulk_shear_0_1km",
+            "kt",
+        ))?))),
+        SourceKind::WinBulkShear06km => Ok(SourcePlane::exact(to_f64(plain(read(
+            "bulk_shear_0_6km",
+            "kt",
+        ))?))),
+        SourceKind::WinLapseRate03km => Ok(SourcePlane::exact(to_f64(plain(read(
+            "lapse_rate_0_3km",
+            "degC/km",
+        ))?))),
+        SourceKind::WinLapseRate700500 => Ok(SourcePlane::exact(to_f64(plain(read(
+            "lapse_rate_700_500",
+            "degC/km",
+        ))?))),
+        SourceKind::WinSblcl => Ok(SourcePlane::exact(to_f64(plain(read(
+            "sblcl",
+            "m",
+        ))?))),
+        SourceKind::WinCloudCoverTotal => Ok(SourcePlane::exact(to_f64(plain(read(
+            "cloud_cover_total",
+            "%",
+        ))?))),
+        SourceKind::WinMslp => Ok(SourcePlane::exact(to_f64(plain(read(
+            "mslp",
+            "Pa",
+        ))?))),
+        SourceKind::WinCategoricalRain => Ok(SourcePlane::exact(to_f64(plain(read(
+            "categorical_rain",
+            "0/1",
+        ))?))),
+        SourceKind::WinCategoricalSnow => Ok(SourcePlane::exact(to_f64(plain(read(
+            "categorical_snow",
+            "0/1",
+        ))?))),
+        SourceKind::WinCategoricalFreezingRain => Ok(SourcePlane::exact(to_f64(plain(read(
+            "categorical_freezing_rain",
+            "0/1",
+        ))?))),
     }
 }
 
@@ -1019,6 +2700,16 @@ impl Accum {
             Finish::KgM2ToMgM2 => {
                 for value in values.iter_mut() {
                     *value *= 1.0e6;
+                }
+            }
+            Finish::MetersToMiles => {
+                for value in values.iter_mut() {
+                    *value *= 0.000_621_371_2;
+                }
+            }
+            Finish::PaToHpa => {
+                for value in values.iter_mut() {
+                    *value *= 0.01;
                 }
             }
         }
