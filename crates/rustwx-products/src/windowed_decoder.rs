@@ -1246,9 +1246,34 @@ pub(crate) fn day_window_source_var(product: HrrrWindowedProduct) -> Option<&'st
 /// verbatim, so the window matches its hourly counterpart exactly.
 fn day_window_scale(product: HrrrWindowedProduct) -> Option<ColorScale> {
     let var = day_window_source_var(product)?;
-    if let Ok(lane) = crate::derived::derived_store_variable_style(var) {
-        return Some(lane.scale);
+    // Prefer the derived lane's own production scale so a window looks exactly
+    // like its hourly counterpart — EXCEPT for fields that also go through
+    // `windowed_temp_display`. Derived scales are in DISPLAY units, so letting
+    // temp_display convert those levels again double-converts them: wet-bulb's
+    // °F ramp turned into an 80..240 colorbar over 35..87 °F data. Those
+    // fields must use a STORED-units (°C) ramp and convert exactly once.
+    if !day_window_scale_needs_stored_units(var) {
+        if let Ok(lane) = crate::derived::derived_store_variable_style(var) {
+            return Some(lane.scale);
+        }
     }
+    day_window_scale_explicit(var)
+}
+
+/// Fields whose day-window fill is re-scaled by [`crate::temp_display`], so
+/// their color ramp must be expressed in the STORED unit (°C), not display °F.
+fn day_window_scale_needs_stored_units(var: &str) -> bool {
+    matches!(
+        var,
+        "wetbulb_2m"
+            | "heat_index_2m"
+            | "apparent_temperature_2m"
+            | "wind_chill_2m"
+            | "dewpoint_depression_2m"
+    )
+}
+
+fn day_window_scale_explicit(var: &str) -> Option<ColorScale> {
     let discrete = |scale| Some(ColorScale::Discrete(scale));
     let preset = |p: WeatherProduct| Some(ColorScale::Weather(p.scale_preset()));
     match var {
