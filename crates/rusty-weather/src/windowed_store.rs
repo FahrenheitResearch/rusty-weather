@@ -3056,46 +3056,139 @@ fn plan_product(product: HrrrWindowedProduct, end: u16) -> Result<ProductSpec, S
                 "Longest Run of Dangerous Heat [0-48 h] over F001-F048 of stored hourly heat_index_2m".to_string(),
             )
         }
-        HighWetbulbHours0to24h => {
+        WetbulbHoursGe70F0to24h => {
             if end < 24 {
-                return Err("Hours with Wet-Bulb >=28C [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+                return Err("Hours with Wet-Bulb >=70F [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
             }
             spec(
                 SourceKind::WinWetbulb2m,
-                Reduce::Count(Threshold::above(28.0)),
+                // Threshold tested against the STORED unit (degC): 70 degF.
+                Reduce::Count(Threshold::above(21.11)),
                 (1..=24).collect(),
                 Some(24),
                 "hours",
                 Finish::None,
-                "Hours with Wet-Bulb >=28C [0-24 h] over F001-F024 of stored hourly wetbulb_2m".to_string(),
+                "Hours with Wet-Bulb >=70F [0-24 h] over F001-F024 of stored hourly wetbulb_2m".to_string(),
             )
         }
-        HighWetbulbHours24to48h => {
+        WetbulbHoursGe70F24to48h => {
             if end < 48 {
-                return Err("Hours with Wet-Bulb >=28C [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+                return Err("Hours with Wet-Bulb >=70F [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
             }
             spec(
                 SourceKind::WinWetbulb2m,
-                Reduce::Count(Threshold::above(28.0)),
+                // Threshold tested against the STORED unit (degC): 70 degF.
+                Reduce::Count(Threshold::above(21.11)),
                 (25..=48).collect(),
-                Some(24),
+                Some(48),
                 "hours",
                 Finish::None,
-                "Hours with Wet-Bulb >=28C [24-48 h] over F025-F048 of stored hourly wetbulb_2m".to_string(),
+                "Hours with Wet-Bulb >=70F [24-48 h] over F025-F048 of stored hourly wetbulb_2m".to_string(),
             )
         }
-        HighWetbulbHours0to48h => {
+        WetbulbHoursGe70F0to48h => {
             if end < 48 {
-                return Err("Hours with Wet-Bulb >=28C [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+                return Err("Hours with Wet-Bulb >=70F [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
             }
             spec(
                 SourceKind::WinWetbulb2m,
-                Reduce::Count(Threshold::above(28.0)),
+                // Threshold tested against the STORED unit (degC): 70 degF.
+                Reduce::Count(Threshold::above(21.11)),
                 (1..=48).collect(),
                 Some(48),
                 "hours",
                 Finish::None,
-                "Hours with Wet-Bulb >=28C [0-48 h] over F001-F048 of stored hourly wetbulb_2m".to_string(),
+                "Hours with Wet-Bulb >=70F [0-48 h] over F001-F048 of stored hourly wetbulb_2m".to_string(),
+            )
+        }
+        WetbulbHoursGe75F0to24h => {
+            if end < 24 {
+                return Err("Hours with Wet-Bulb >=75F [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWetbulb2m,
+                // Threshold tested against the STORED unit (degC): 75 degF.
+                Reduce::Count(Threshold::above(23.89)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours with Wet-Bulb >=75F [0-24 h] over F001-F024 of stored hourly wetbulb_2m".to_string(),
+            )
+        }
+        WetbulbHoursGe75F24to48h => {
+            if end < 48 {
+                return Err("Hours with Wet-Bulb >=75F [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWetbulb2m,
+                // Threshold tested against the STORED unit (degC): 75 degF.
+                Reduce::Count(Threshold::above(23.89)),
+                (25..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours with Wet-Bulb >=75F [24-48 h] over F025-F048 of stored hourly wetbulb_2m".to_string(),
+            )
+        }
+        WetbulbHoursGe75F0to48h => {
+            if end < 48 {
+                return Err("Hours with Wet-Bulb >=75F [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWetbulb2m,
+                // Threshold tested against the STORED unit (degC): 75 degF.
+                Reduce::Count(Threshold::above(23.89)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours with Wet-Bulb >=75F [0-48 h] over F001-F048 of stored hourly wetbulb_2m".to_string(),
+            )
+        }
+        WetbulbHoursGe80F0to24h => {
+            if end < 24 {
+                return Err("Hours with Wet-Bulb >=80F [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWetbulb2m,
+                // Threshold tested against the STORED unit (degC): 80 degF.
+                Reduce::Count(Threshold::above(26.67)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours with Wet-Bulb >=80F [0-24 h] over F001-F024 of stored hourly wetbulb_2m".to_string(),
+            )
+        }
+        WetbulbHoursGe80F24to48h => {
+            if end < 48 {
+                return Err("Hours with Wet-Bulb >=80F [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWetbulb2m,
+                // Threshold tested against the STORED unit (degC): 80 degF.
+                Reduce::Count(Threshold::above(26.67)),
+                (25..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours with Wet-Bulb >=80F [24-48 h] over F025-F048 of stored hourly wetbulb_2m".to_string(),
+            )
+        }
+        WetbulbHoursGe80F0to48h => {
+            if end < 48 {
+                return Err("Hours with Wet-Bulb >=80F [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWetbulb2m,
+                // Threshold tested against the STORED unit (degC): 80 degF.
+                Reduce::Count(Threshold::above(26.67)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours with Wet-Bulb >=80F [0-48 h] over F001-F048 of stored hourly wetbulb_2m".to_string(),
             )
         }
         LowVisHours0to24h => {
@@ -3477,9 +3570,15 @@ fn product_is_run_scoped(product: HrrrWindowedProduct) -> bool {
                 | DangerHeatLongestRun0to24h
                 | DangerHeatLongestRun24to48h
                 | DangerHeatLongestRun0to48h
-                | HighWetbulbHours0to24h
-                | HighWetbulbHours24to48h
-                | HighWetbulbHours0to48h
+                | WetbulbHoursGe70F0to24h
+                | WetbulbHoursGe70F24to48h
+                | WetbulbHoursGe70F0to48h
+                | WetbulbHoursGe75F0to24h
+                | WetbulbHoursGe75F24to48h
+                | WetbulbHoursGe75F0to48h
+                | WetbulbHoursGe80F0to24h
+                | WetbulbHoursGe80F24to48h
+                | WetbulbHoursGe80F0to48h
                 | LowVisHours0to24h
                 | LowVisHours24to48h
                 | LowVisHours0to48h

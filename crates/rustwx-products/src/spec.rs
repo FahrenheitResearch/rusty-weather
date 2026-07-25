@@ -649,9 +649,15 @@ fn windowed_product_spec(
                 | HrrrWindowedProduct::DangerHeatLongestRun0to24h
                 | HrrrWindowedProduct::DangerHeatLongestRun24to48h
                 | HrrrWindowedProduct::DangerHeatLongestRun0to48h
-                | HrrrWindowedProduct::HighWetbulbHours0to24h
-                | HrrrWindowedProduct::HighWetbulbHours24to48h
-                | HrrrWindowedProduct::HighWetbulbHours0to48h
+                | HrrrWindowedProduct::WetbulbHoursGe70F0to24h
+                | HrrrWindowedProduct::WetbulbHoursGe70F24to48h
+                | HrrrWindowedProduct::WetbulbHoursGe70F0to48h
+                | HrrrWindowedProduct::WetbulbHoursGe75F0to24h
+                | HrrrWindowedProduct::WetbulbHoursGe75F24to48h
+                | HrrrWindowedProduct::WetbulbHoursGe75F0to48h
+                | HrrrWindowedProduct::WetbulbHoursGe80F0to24h
+                | HrrrWindowedProduct::WetbulbHoursGe80F24to48h
+                | HrrrWindowedProduct::WetbulbHoursGe80F0to48h
                 | HrrrWindowedProduct::LowVisHours0to24h
                 | HrrrWindowedProduct::LowVisHours24to48h
                 | HrrrWindowedProduct::LowVisHours0to48h

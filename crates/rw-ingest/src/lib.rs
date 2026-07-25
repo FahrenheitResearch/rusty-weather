@@ -167,11 +167,19 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
         // NBM core CONUS blend: the official forecast out to F264, one
         // 2.5 km surface file per hour serving both extraction roles
         // (NBM has no isobaric volumes worth ingesting).
+        //
+        // Subset-fetched. The files are ~160-200 MB each and only ~44%
+        // deterministic — the rest is percentile levels and probability
+        // thresholds we do not store. Whole-file fetching capped us at a
+        // 6-hourly cadence, which is why 1 h and 3 h outlook-card columns
+        // could not be served at all; the subset makes NBM's NATIVE cadence
+        // (hourly to F036, 3-hourly to F192) cost LESS than the 6-hourly
+        // whole-file ingest it replaces.
         ModelId::Nbm => Ok(vec![ProductFetch {
             product: "core/co",
             surface_source: true,
             pressure_source: true,
-            idx_patterns: &[],
+            idx_patterns: NBM_CORE_IDX_PATTERNS,
         }]),
         ModelId::Nam => Ok(vec![ProductFetch {
             product: "awip3d",
@@ -226,6 +234,39 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
 /// patterns can't express "≥100 mb"), so the realized subset is ~69% of the
 /// file (measured against the live f001 `.idx`, 2026-06-11) — the isobaric
 /// volumes ARE most of the pressure file.
+/// `.idx` message selection for NBM `core/co`.
+///
+/// Two groups. The first nine are the fields the store already carries (NBM has
+/// no UGRD/VGRD — `u_10m`/`v_10m` come from the WIND + WDIR pair). The rest are
+/// the high-value fields NBM publishes that we were throwing away by only ever
+/// reading nine: the smoke-dispersion set forecasters actually use
+/// (ventilation rate, mixing height, transport wind), convective and winter
+/// fields, aviation ceilings, and hub-height wind.
+///
+/// [`rustwx_io::IDX_DETERMINISTIC_ONLY`] is REQUIRED here, not optional: every
+/// pattern below also matches that variable's percentile and probability
+/// records, which are ~56% of each file. Without the directive this subset
+/// pulls ~70% of a 160-200 MB file instead of ~32%.
+const NBM_CORE_IDX_PATTERNS: &[&str] = &[
+    rustwx_io::IDX_DETERMINISTIC_ONLY,
+    // The nine fields the store carries today. NBM publishes no UGRD/VGRD —
+    // `u_10m`/`v_10m` come from the WIND + WDIR pair, so BOTH are required.
+    "TMP:2 m above ground",
+    "DPT:2 m above ground",
+    "RH:2 m above ground",
+    "GUST:10 m above ground",
+    "WIND:10 m above ground",
+    "WDIR:10 m above ground",
+    "APCP:surface",
+    "PWAT:entire atmosphere",
+    "VIS:surface",
+    // NOTE: NBM also publishes a large high-value set we do not yet store
+    // (ventilation rate, mixing height, transport wind, surface CAPE, ceilings,
+    // snow level/depth/ratio, ice accretion, 80 m wind, DSWRF, ...). Patterns
+    // for those land WITH their `CanonicalField` variants and `surface_plan`
+    // entries — fetching bytes no selector can decode would just be waste.
+];
+
 const RRFS_PRS_IDX_PATTERNS: &[&str] = &["TMP", "RH", "DPT", "UGRD", "VGRD", "HGT", "ABSV"];
 
 /// `.idx` message-selection patterns for the RRFS-A `nat-na` (surface) file: the

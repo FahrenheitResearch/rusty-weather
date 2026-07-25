@@ -1759,16 +1759,81 @@ fn should_use_idx_subset_fetch(source: SourceId) -> bool {
     matches!(source, SourceId::Aws | SourceId::Google)
 }
 
+/// Pattern-list directive: keep only DETERMINISTIC records, dropping the
+/// probabilistic companions that share a variable and level.
+///
+/// `find_entries` matches a variable exactly and a level by substring, with no
+/// way to express exclusion — so `TMP:2 m above ground` also selects that
+/// variable's ensemble-spread and percentile records. For NBM that matters a
+/// lot: its `core/co` file is only ~44% deterministic, the rest being
+/// percentile levels and probability thresholds. Asking for 31 deterministic
+/// NBM fields without this directive pulls ~70% of every file (measured), which
+/// is most of the point of subsetting gone.
+///
+/// Living in the pattern list rather than a separate flag means it is covered
+/// by the fetch cache key automatically (`variable_patterns_slug`), so flipping
+/// it re-fetches instead of serving a differently-shaped cached subset.
+pub const IDX_DETERMINISTIC_ONLY: &str = "!deterministic";
+
+/// Byte offsets of records that are a probabilistic PRODUCT of some variable
+/// rather than the deterministic field itself.
+///
+/// The marker lives in the `.idx` line's trailing fields ("ens std dev",
+/// "10% level", "prob >0.254"), which `parse_idx` discards apart from `ENS=`,
+/// so this reads the raw text. `ens mean` is deliberately NOT treated as
+/// probabilistic — for the ensemble models it IS the deterministic-equivalent
+/// field, selected explicitly via ensemble-mean selectors.
+fn probabilistic_idx_offsets(idx_text: &str) -> HashSet<u64> {
+    let mut offsets = HashSet::new();
+    for line in idx_text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(8, ':').collect();
+        if parts.len() < 7 {
+            continue;
+        }
+        let Ok(offset) = parts[1].parse::<u64>() else {
+            continue;
+        };
+        let tail = parts[6..].join(":").to_ascii_lowercase();
+        let probabilistic = tail.contains("% level")
+            || tail.contains("prob ")
+            || tail.contains("ens std dev")
+            || tail.contains("ens spread");
+        if probabilistic {
+            offsets.insert(offset);
+        }
+    }
+    offsets
+}
+
 fn idx_subset_ranges(idx_text: &str, patterns: &[&str]) -> Result<Option<Vec<(u64, u64)>>, String> {
     let entries = parse_idx(idx_text);
     if entries.is_empty() {
         return Ok(None);
     }
 
+    let deterministic_only = patterns
+        .iter()
+        .any(|pattern| pattern.trim() == IDX_DETERMINISTIC_ONLY);
+    let skip = if deterministic_only {
+        probabilistic_idx_offsets(idx_text)
+    } else {
+        HashSet::new()
+    };
+
     let mut selected = Vec::new();
     let mut seen_offsets = HashSet::new();
     for pattern in patterns {
+        if pattern.trim() == IDX_DETERMINISTIC_ONLY {
+            continue;
+        }
         for entry in find_entries(&entries, pattern) {
+            if skip.contains(&entry.byte_offset) {
+                continue;
+            }
             if seen_offsets.insert(entry.byte_offset) {
                 selected.push(entry);
             }

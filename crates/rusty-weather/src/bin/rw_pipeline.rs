@@ -107,8 +107,18 @@ fn target_max_hour(cycle: u8) -> u16 {
 fn target_hours(model: &str, cycle: u8) -> Vec<u16> {
     match model {
         "gfs" => (0..=384u16).step_by(6).collect(),
-        // NBM: 6-hourly through day 11 — the official-blend outlook span.
-        "nbm" => (6..=264u16).step_by(6).collect(),
+        // NBM at its NATIVE cadence: hourly through F036, 3-hourly to F192,
+        // 6-hourly to F264 (probed against the bucket — those are exactly the
+        // hours the blend publishes). This was 6-hourly throughout only because
+        // the ingest fetched whole 160-200 MB files; with the `.idx` subset
+        // (`NBM_CORE_IDX_PATTERNS`) all 100 hours cost LESS than the 44
+        // whole-file hours it replaces. 6-hourly is also why outlook cards
+        // could not offer 1 h or 3 h columns: a bucket finer than the stored
+        // cadence collapses to one value per stored hour.
+        "nbm" => (1..=36u16)
+            .chain((39..=192u16).step_by(3))
+            .chain((198..=264u16).step_by(6))
+            .collect(),
         _ => (0..=target_max_hour(cycle)).collect(),
     }
 }

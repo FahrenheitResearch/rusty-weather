@@ -1853,3 +1853,105 @@ fn normalize_and_rotate_longitude_rows_keeps_rows_monotone() {
     assert_eq!(lat[..4], [40.0, 40.0, 40.0, 40.0]);
     assert_eq!(lat[4..], [39.0, 39.0, 39.0, 39.0]);
 }
+
+/// A real NBM `core/co` `.idx` slice: the deterministic 2 m temperature and
+/// 2 m dewpoint records interleaved with the probabilistic companions that
+/// share their variable and level (ensemble spread, percentile levels,
+/// probability thresholds).
+const NBM_IDX_SAMPLE: &str = "\
+1:1000:d=2026072512:TMP:2 m above ground:9 hour fcst:
+2:2000:d=2026072512:TMP:2 m above ground:9 hour fcst:ens std dev
+3:3000:d=2026072512:DPT:2 m above ground:9 hour fcst:
+4:4000:d=2026072512:DPT:2 m above ground:9 hour fcst:ens std dev
+5:5000:d=2026072512:PWAT:entire atmosphere (considered as a single layer):9 hour fcst:
+6:6000:d=2026072512:PWAT:entire atmosphere (considered as a single layer):9 hour fcst:10% level
+7:7000:d=2026072512:PWAT:entire atmosphere (considered as a single layer):9 hour fcst:90% level
+8:8000:d=2026072512:APCP:surface:8-9 hour acc fcst:
+9:9000:d=2026072512:APCP:surface:8-9 hour acc fcst:prob >0.254:prob fcst 255/255
+10:10000:d=2026072512:VIS:surface:9 hour fcst:
+";
+
+/// Without the directive, a variable's probabilistic records ride along —
+/// `find_entries` matches variable-exact + level-substring and cannot express
+/// exclusion. That is the whole reason [`IDX_DETERMINISTIC_ONLY`] exists: for
+/// NBM those companions are ~56% of every file.
+#[test]
+fn idx_subset_without_directive_pulls_probabilistic_companions() {
+    let patterns = [
+        "TMP:2 m above ground",
+        "DPT:2 m above ground",
+        "PWAT:entire atmosphere",
+        "APCP:surface",
+        "VIS:surface",
+    ];
+    let ranges = idx_subset_ranges(NBM_IDX_SAMPLE, &patterns)
+        .expect("subset ok")
+        .expect("some ranges");
+    // Records 1..10 are contiguous, so they coalesce into one span covering
+    // every byte from the first selected record onward.
+    let covered: u64 = ranges.iter().map(|(start, end)| end - start + 1).sum();
+    assert!(
+        covered >= 9000,
+        "expected the probabilistic twins to be included, covered {covered} bytes"
+    );
+}
+
+/// With the directive, only the deterministic records are selected.
+#[test]
+fn idx_subset_deterministic_only_drops_spread_percentile_and_probability() {
+    let patterns = [
+        IDX_DETERMINISTIC_ONLY,
+        "TMP:2 m above ground",
+        "DPT:2 m above ground",
+        "PWAT:entire atmosphere",
+        "APCP:surface",
+        "VIS:surface",
+    ];
+    let ranges = idx_subset_ranges(NBM_IDX_SAMPLE, &patterns)
+        .expect("subset ok")
+        .expect("some ranges");
+    let starts: Vec<u64> = ranges.iter().map(|(start, _)| *start).collect();
+    // Deterministic records live at offsets 1000/3000/5000/8000/10000.
+    for offset in [1000u64, 3000, 5000, 8000, 10000] {
+        assert!(
+            ranges.iter().any(|(start, end)| *start <= offset && offset <= *end),
+            "deterministic record at {offset} must be fetched; ranges {ranges:?}"
+        );
+    }
+    // The spread/percentile/probability records at 2000/4000/6000/7000/9000 are
+    // not selected, so they cannot each start a range.
+    for offset in [2000u64, 4000, 6000, 7000, 9000] {
+        assert!(
+            !starts.contains(&offset),
+            "probabilistic record at {offset} must not be selected; starts {starts:?}"
+        );
+    }
+    let covered: u64 = ranges.iter().map(|(start, end)| end - start + 1).sum();
+    let loose = idx_subset_ranges(NBM_IDX_SAMPLE, &patterns[1..])
+        .expect("subset ok")
+        .expect("some ranges")
+        .iter()
+        .map(|(start, end)| end - start + 1)
+        .sum::<u64>();
+    assert!(
+        covered < loose,
+        "deterministic-only must fetch fewer bytes ({covered}) than loose ({loose})"
+    );
+}
+
+/// `ens mean` is a model's deterministic-equivalent field (GEFS/AIGEFS select it
+/// explicitly), so the directive must NOT discard it.
+#[test]
+fn idx_deterministic_only_keeps_ensemble_mean() {
+    let idx = "\
+1:1000:d=2026072512:TMP:2 m above ground:9 hour fcst:ens mean
+2:2000:d=2026072512:TMP:2 m above ground:9 hour fcst:ens std dev
+";
+    let ranges = idx_subset_ranges(idx, &[IDX_DETERMINISTIC_ONLY, "TMP:2 m above ground"])
+        .expect("subset ok")
+        .expect("some ranges");
+    assert!(
+        ranges.iter().any(|(start, _)| *start == 1000),
+        "ens mean must survive the deterministic filter: {ranges:?}"
+    );
+}

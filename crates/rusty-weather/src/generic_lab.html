@@ -154,10 +154,16 @@
             </div>
           </label>
         </div>
-        <label class="field" style="margin:0"><span>Counties</span>
+        <label class="field"><span>Counties</span>
           <div class="seg" id="countySeg">
             <button data-county="on" class="on">On</button>
             <button data-county="off">Off</button>
+          </div>
+        </label>
+        <label class="field" style="margin:0"><span>Temp units</span>
+          <div class="seg" id="tempUnitSeg">
+            <button data-tempunits="f" class="on">&deg;F</button>
+            <button data-tempunits="c">&deg;C</button>
           </div>
         </label>
       </div>
@@ -418,7 +424,9 @@
         ["hdw_peak_hour_0_24h", "HDW peak hour 0-24 h"],
         ["danger_heat_hours_0_24h", "Heat >=105F hours 0-24 h"],
         ["danger_heat_longest_run_0_24h", "Heat streak 0-24 h"],
-        ["high_wetbulb_hours_0_24h", "Wet-bulb hours 0-24 h"],
+        ["wetbulb_hours_ge70f_0_24h", "Wet-bulb hrs >=70F 0-24 h"],
+    ["wetbulb_hours_ge75f_0_24h", "Wet-bulb hrs >=75F 0-24 h"],
+    ["wetbulb_hours_ge80f_0_24h", "Wet-bulb hrs >=80F 0-24 h"],
         ["low_vis_hours_0_24h", "Low-vis hours 0-24 h"],
         ["low_vis_longest_run_0_24h", "Low-vis streak 0-24 h"],
         ["snow_hours_0_24h", "Snow hours 0-24 h"],
@@ -494,7 +502,9 @@
         ["hdw_peak_hour_24_48h", "HDW peak hour 24-48 h"],
         ["danger_heat_hours_24_48h", "Heat >=105F hours 24-48 h"],
         ["danger_heat_longest_run_24_48h", "Heat streak 24-48 h"],
-        ["high_wetbulb_hours_24_48h", "Wet-bulb hours 24-48 h"],
+        ["wetbulb_hours_ge70f_24_48h", "Wet-bulb hrs >=70F 24-48 h"],
+    ["wetbulb_hours_ge75f_24_48h", "Wet-bulb hrs >=75F 24-48 h"],
+    ["wetbulb_hours_ge80f_24_48h", "Wet-bulb hrs >=80F 24-48 h"],
         ["low_vis_hours_24_48h", "Low-vis hours 24-48 h"],
         ["low_vis_longest_run_24_48h", "Low-vis streak 24-48 h"],
         ["snow_hours_24_48h", "Snow hours 24-48 h"],
@@ -569,7 +579,9 @@
         ["hdw_peak_hour_0_48h", "HDW peak hour 0-48 h"],
         ["danger_heat_hours_0_48h", "Heat >=105F hours 0-48 h"],
         ["danger_heat_longest_run_0_48h", "Heat streak 0-48 h"],
-        ["high_wetbulb_hours_0_48h", "Wet-bulb hours 0-48 h"],
+        ["wetbulb_hours_ge70f_0_48h", "Wet-bulb hrs >=70F 0-48 h"],
+    ["wetbulb_hours_ge75f_0_48h", "Wet-bulb hrs >=75F 0-48 h"],
+    ["wetbulb_hours_ge80f_0_48h", "Wet-bulb hrs >=80F 0-48 h"],
         ["low_vis_hours_0_48h", "Low-vis hours 0-48 h"],
         ["low_vis_longest_run_0_48h", "Low-vis streak 0-48 h"],
         ["snow_hours_0_48h", "Snow hours 0-48 h"],
@@ -662,7 +674,7 @@
   var state = {
     fam: "weather",
     model: "hrrr", product: FAMS[0].products[0][0], hour: 6,
-    basemap: "topo", values: false, density: 2, counties: true,
+    basemap: "topo", values: false, density: 2, counties: true, tempUnits: "f",
     preset: "conus", bounds: DOMAINS[0][2], drawn: null,
     brand: "generic", brandTitle: "", brandCredit: "", logoDataUrl: null,
   };
@@ -826,6 +838,7 @@
   seg("valueSeg", "values", function (v) { state.values = v === "on"; });
   seg("densitySeg", "density", function (v) { state.density = Number(v); });
   seg("countySeg", "county", function (v) { state.counties = v === "on"; });
+  seg("tempUnitSeg", "tempunits", function (v) { state.tempUnits = v; });
 
   seg("brandSeg", "brand", function (v) {
     state.brand = v;
@@ -947,6 +960,9 @@
       place_label_size: 2, output_width: 1800, value_labels: state.values,
       domain_slug: "generic_" + (state.drawn ? "drawn" : state.preset),
       bounds: activeBounds(), brand: brandPayload(),
+      // degF is the server default: send only the degC opt-out so degF
+      // requests share the prewarm/pipeline cache key (same rule as the Lab).
+      temp_units: state.tempUnits === "c" ? "c" : undefined,
     };
   }
 

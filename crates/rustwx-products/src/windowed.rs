@@ -247,9 +247,15 @@ pub enum HrrrWindowedProduct {
     DangerHeatLongestRun0to24h,
     DangerHeatLongestRun24to48h,
     DangerHeatLongestRun0to48h,
-    HighWetbulbHours0to24h,
-    HighWetbulbHours24to48h,
-    HighWetbulbHours0to48h,
+    WetbulbHoursGe70F0to24h,
+    WetbulbHoursGe70F24to48h,
+    WetbulbHoursGe70F0to48h,
+    WetbulbHoursGe75F0to24h,
+    WetbulbHoursGe75F24to48h,
+    WetbulbHoursGe75F0to48h,
+    WetbulbHoursGe80F0to24h,
+    WetbulbHoursGe80F24to48h,
+    WetbulbHoursGe80F0to48h,
     LowVisHours0to24h,
     LowVisHours24to48h,
     LowVisHours0to48h,
@@ -501,9 +507,15 @@ impl HrrrWindowedProduct {
             Self::DangerHeatLongestRun0to24h => "danger_heat_longest_run_0_24h",
             Self::DangerHeatLongestRun24to48h => "danger_heat_longest_run_24_48h",
             Self::DangerHeatLongestRun0to48h => "danger_heat_longest_run_0_48h",
-            Self::HighWetbulbHours0to24h => "high_wetbulb_hours_0_24h",
-            Self::HighWetbulbHours24to48h => "high_wetbulb_hours_24_48h",
-            Self::HighWetbulbHours0to48h => "high_wetbulb_hours_0_48h",
+            Self::WetbulbHoursGe70F0to24h => "wetbulb_hours_ge70f_0_24h",
+            Self::WetbulbHoursGe70F24to48h => "wetbulb_hours_ge70f_24_48h",
+            Self::WetbulbHoursGe70F0to48h => "wetbulb_hours_ge70f_0_48h",
+            Self::WetbulbHoursGe75F0to24h => "wetbulb_hours_ge75f_0_24h",
+            Self::WetbulbHoursGe75F24to48h => "wetbulb_hours_ge75f_24_48h",
+            Self::WetbulbHoursGe75F0to48h => "wetbulb_hours_ge75f_0_48h",
+            Self::WetbulbHoursGe80F0to24h => "wetbulb_hours_ge80f_0_24h",
+            Self::WetbulbHoursGe80F24to48h => "wetbulb_hours_ge80f_24_48h",
+            Self::WetbulbHoursGe80F0to48h => "wetbulb_hours_ge80f_0_48h",
             Self::LowVisHours0to24h => "low_vis_hours_0_24h",
             Self::LowVisHours24to48h => "low_vis_hours_24_48h",
             Self::LowVisHours0to48h => "low_vis_hours_0_48h",
@@ -741,9 +753,15 @@ impl HrrrWindowedProduct {
             Self::DangerHeatLongestRun0to24h => "Longest Run of Dangerous Heat [0-24 h]",
             Self::DangerHeatLongestRun24to48h => "Longest Run of Dangerous Heat [24-48 h]",
             Self::DangerHeatLongestRun0to48h => "Longest Run of Dangerous Heat [0-48 h]",
-            Self::HighWetbulbHours0to24h => "Hours with Wet-Bulb >=28C [0-24 h]",
-            Self::HighWetbulbHours24to48h => "Hours with Wet-Bulb >=28C [24-48 h]",
-            Self::HighWetbulbHours0to48h => "Hours with Wet-Bulb >=28C [0-48 h]",
+            Self::WetbulbHoursGe70F0to24h => "Hours with Wet-Bulb >=70F [0-24 h]",
+            Self::WetbulbHoursGe70F24to48h => "Hours with Wet-Bulb >=70F [24-48 h]",
+            Self::WetbulbHoursGe70F0to48h => "Hours with Wet-Bulb >=70F [0-48 h]",
+            Self::WetbulbHoursGe75F0to24h => "Hours with Wet-Bulb >=75F [0-24 h]",
+            Self::WetbulbHoursGe75F24to48h => "Hours with Wet-Bulb >=75F [24-48 h]",
+            Self::WetbulbHoursGe75F0to48h => "Hours with Wet-Bulb >=75F [0-48 h]",
+            Self::WetbulbHoursGe80F0to24h => "Hours with Wet-Bulb >=80F [0-24 h]",
+            Self::WetbulbHoursGe80F24to48h => "Hours with Wet-Bulb >=80F [24-48 h]",
+            Self::WetbulbHoursGe80F0to48h => "Hours with Wet-Bulb >=80F [0-48 h]",
             Self::LowVisHours0to24h => "Hours of Visibility <=1 mile [0-24 h]",
             Self::LowVisHours24to48h => "Hours of Visibility <=1 mile [24-48 h]",
             Self::LowVisHours0to48h => "Hours of Visibility <=1 mile [0-48 h]",
@@ -926,7 +944,9 @@ pub fn minimum_forecast_hour_for_windowed_product(product: HrrrWindowedProduct) 
         | HdwPeakHour0to24h
         | DangerHeatHours0to24h
         | DangerHeatLongestRun0to24h
-        | HighWetbulbHours0to24h
+        | WetbulbHoursGe70F0to24h
+        | WetbulbHoursGe75F0to24h
+        | WetbulbHoursGe80F0to24h
         | LowVisHours0to24h
         | LowVisLongestRun0to24h
         | SnowHours0to24h
@@ -1059,8 +1079,12 @@ pub fn minimum_forecast_hour_for_windowed_product(product: HrrrWindowedProduct) 
         | DangerHeatHours0to48h
         | DangerHeatLongestRun24to48h
         | DangerHeatLongestRun0to48h
-        | HighWetbulbHours24to48h
-        | HighWetbulbHours0to48h
+        | WetbulbHoursGe70F24to48h
+        | WetbulbHoursGe70F0to48h
+        | WetbulbHoursGe75F24to48h
+        | WetbulbHoursGe75F0to48h
+        | WetbulbHoursGe80F24to48h
+        | WetbulbHoursGe80F0to48h
         | LowVisHours24to48h
         | LowVisHours0to48h
         | LowVisLongestRun24to48h
@@ -1288,9 +1312,15 @@ pub static SUPPORTED_HRRR_WINDOWED_PRODUCTS: &[HrrrWindowedProduct] = &[
     HrrrWindowedProduct::DangerHeatLongestRun0to24h,
     HrrrWindowedProduct::DangerHeatLongestRun24to48h,
     HrrrWindowedProduct::DangerHeatLongestRun0to48h,
-    HrrrWindowedProduct::HighWetbulbHours0to24h,
-    HrrrWindowedProduct::HighWetbulbHours24to48h,
-    HrrrWindowedProduct::HighWetbulbHours0to48h,
+    HrrrWindowedProduct::WetbulbHoursGe70F0to24h,
+    HrrrWindowedProduct::WetbulbHoursGe70F24to48h,
+    HrrrWindowedProduct::WetbulbHoursGe70F0to48h,
+    HrrrWindowedProduct::WetbulbHoursGe75F0to24h,
+    HrrrWindowedProduct::WetbulbHoursGe75F24to48h,
+    HrrrWindowedProduct::WetbulbHoursGe75F0to48h,
+    HrrrWindowedProduct::WetbulbHoursGe80F0to24h,
+    HrrrWindowedProduct::WetbulbHoursGe80F24to48h,
+    HrrrWindowedProduct::WetbulbHoursGe80F0to48h,
     HrrrWindowedProduct::LowVisHours0to24h,
     HrrrWindowedProduct::LowVisHours24to48h,
     HrrrWindowedProduct::LowVisHours0to48h,
