@@ -449,10 +449,28 @@ button { color: inherit; cursor: pointer; }
 const $ = id => document.getElementById(id);
 
 /* ---------- catalogs ---------- */
+/* Domain crops. HRRR is CONUS-wide, so anything inside the CONUS grid is
+   fair game — the CA-first presets stay at the front for CAFire's workflow.
+   NOTE: the RTMA anomaly/climatology packs were imported WIDE WEST ONLY, so
+   the anomaly + vs-record families are blank outside the wide-west box even
+   though every other family renders nationally. */
 const DOMAINS = {
   california: { slug: "cafire_california", bounds: [-126.0, -113.8, 31.9, 42.5], label: "California" },
   wide_west:  { slug: "cafire_wide_west",  bounds: [-125.7, -103.8, 31.9, 46.5], label: "Wide West" },
   sierra:     { slug: "sierra_front",      bounds: [-121.9, -117.6, 37.2, 41.2], label: "Sierra Front" },
+  socal:      { slug: "socal",             bounds: [-121.5, -114.1, 32.5, 36.0], label: "SoCal" },
+  norcal:     { slug: "norcal",            bounds: [-125.0, -119.0, 37.0, 42.2], label: "NorCal" },
+  bay_delta:  { slug: "bay_delta",         bounds: [-123.3, -120.5, 36.7, 39.0], label: "Bay / Delta" },
+  conus:      { slug: "conus",             bounds: [-125.0, -66.5, 24.0, 50.0],  label: "CONUS" },
+  pacnw:      { slug: "pacnw",             bounds: [-125.0, -110.5, 41.0, 49.2], label: "Pacific NW" },
+  great_basin:{ slug: "great_basin",       bounds: [-121.0, -110.0, 34.5, 43.5], label: "Great Basin" },
+  southwest:  { slug: "southwest",         bounds: [-120.0, -102.0, 30.5, 42.0], label: "Southwest" },
+  no_rockies: { slug: "northern_rockies",  bounds: [-117.0, -103.0, 41.5, 49.2], label: "N. Rockies" },
+  so_plains:  { slug: "southern_plains",   bounds: [-105.0, -91.0, 28.0, 40.0],  label: "S. Plains" },
+  no_plains:  { slug: "northern_plains",   bounds: [-105.0, -90.0, 39.0, 49.2],  label: "N. Plains" },
+  midwest:    { slug: "midwest",           bounds: [-97.0, -80.0, 36.0, 47.5],   label: "Midwest" },
+  southeast:  { slug: "southeast",         bounds: [-95.0, -75.0, 24.5, 37.0],   label: "Southeast" },
+  northeast:  { slug: "northeast",         bounds: [-82.0, -66.5, 37.0, 47.5],   label: "Northeast" },
 };
 const ANOMALY = [
   ["vpd_day_max_percentile", "Day-max VPD"],

@@ -322,6 +322,16 @@ fn windowed_product_scale_matches_the_kernel_families() {
                 "{}: snapshot windows use discrete scales",
                 product.slug()
             );
+        } else if crate::windowed_decoder::day_window_source_var(product).is_some() {
+            // Day-window products must carry a scale matched to their FIELD.
+            // Falling through to the UH preset is the bug this guards: every
+            // one of them rendered as a flat grey wash.
+            assert!(
+                !matches!(scale, ColorScale::Weather(preset) if preset == rustwx_render::WeatherProduct::Uh.scale_preset()),
+                "{}: day-window product fell back to the UH scale preset — add its field to \
+                 day_window_scale()",
+                product.slug()
+            );
         } else {
             assert!(
                 matches!(scale, ColorScale::Weather(_)),

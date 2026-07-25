@@ -432,7 +432,7 @@ pub(crate) fn mslp_pressure_fill_scale() -> DiscreteColorScale {
     }
 }
 
-fn reflectivity_dbz_scale() -> DiscreteColorScale {
+pub(crate) fn reflectivity_dbz_scale() -> DiscreteColorScale {
     DiscreteColorScale {
         levels: vec![
             10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 65.0, 70.0,
@@ -570,7 +570,7 @@ fn surface_relative_humidity_colors() -> Vec<Color> {
     ]
 }
 
-fn cloud_cover_scale() -> DiscreteColorScale {
+pub(crate) fn cloud_cover_scale() -> DiscreteColorScale {
     DiscreteColorScale {
         levels: range_step(10.0, 100.0, 10.0),
         colors: vec![
@@ -612,7 +612,7 @@ fn precipitable_water_inches_scale() -> DiscreteColorScale {
     }
 }
 
-fn smoke_scale_colors() -> Vec<Color> {
+pub(crate) fn smoke_scale_colors() -> Vec<Color> {
     vec![
         Color::rgba(82, 185, 226, 42),
         Color::rgba(84, 210, 238, 78),
@@ -630,7 +630,7 @@ fn smoke_scale_colors() -> Vec<Color> {
 /// Geometric (log-spaced) level ladder — fine steps for heavy-tailed fields
 /// like smoke, so the palette lerps into a fluid gradient instead of a few
 /// hard doublings. `factor` ~1.1 gives a smooth ramp.
-fn geometric_levels(start: f64, factor: f64, max: f64) -> Vec<f64> {
+pub(crate) fn geometric_levels(start: f64, factor: f64, max: f64) -> Vec<f64> {
     let mut out = Vec::new();
     let mut value = start;
     while value <= max + 1e-6 {

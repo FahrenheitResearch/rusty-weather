@@ -1210,8 +1210,162 @@ pub(crate) fn windowed_product_scale(product: HrrrWindowedProduct) -> ColorScale
         ColorScale::Discrete(wind10m_scale())
     } else if let Some(spec) = surface_snapshot_window_spec(product) {
         ColorScale::Discrete(spec.field.scale(spec.operation))
+    } else if let Some(scale) = day_window_scale(product) {
+        scale
     } else {
         ColorScale::Weather(WeatherProduct::Uh.scale_preset())
+    }
+}
+
+/// The source store variable behind a single-variable day-window product,
+/// recovered from its slug (`wetbulb_2m_0_24h_max` -> `wetbulb_2m`).
+///
+/// Only reached for the day-window family: QPF, 10 m wind and the 2 m surface
+/// snapshots are matched earlier in [`windowed_product_scale`], so their slugs
+/// never fall through here even though they share the suffix shape.
+pub(crate) fn day_window_source_var(product: HrrrWindowedProduct) -> Option<&'static str> {
+    let slug = product.slug();
+    [
+        "_0_24h_max",
+        "_24_48h_max",
+        "_0_48h_max",
+        "_0_24h_min",
+        "_24_48h_min",
+        "_0_48h_min",
+    ]
+    .iter()
+    .find_map(|suffix| slug.strip_suffix(suffix))
+}
+
+/// Fill scale for a day-window product, matched to its FIELD rather than to
+/// the windowed family — a peak wet-bulb map has to read like a temperature
+/// map, not like updraft helicity. Without this every day-window product fell
+/// through to the UH preset and rendered as a flat grey wash.
+///
+/// Where the field is a derived recipe the derived lane's own scale is reused
+/// verbatim, so the window matches its hourly counterpart exactly.
+fn day_window_scale(product: HrrrWindowedProduct) -> Option<ColorScale> {
+    let var = day_window_source_var(product)?;
+    if let Ok(lane) = crate::derived::derived_store_variable_style(var) {
+        return Some(lane.scale);
+    }
+    let discrete = |scale| Some(ColorScale::Discrete(scale));
+    let preset = |p: WeatherProduct| Some(ColorScale::Weather(p.scale_preset()));
+    match var {
+        // Gusts and shear both read as wind speeds (kt); gusts run well past
+        // the sustained-wind ceiling, so the ramp goes higher.
+        "wind_gust_10m" => discrete(palette_scale(
+            WeatherPalette::Winds,
+            (10..=100).map(f64::from).collect(),
+            ExtendMode::Both,
+            None,
+        )),
+        "bulk_shear_0_1km" | "bulk_shear_0_6km" => discrete(palette_scale(
+            WeatherPalette::Winds,
+            (5..=80).map(f64::from).collect(),
+            ExtendMode::Both,
+            None,
+        )),
+        // Absolute °C temperature fields share the 2 m temperature ramp so the
+        // °F display transform lands on the same colors as the hourly maps.
+        "wetbulb_2m" | "heat_index_2m" | "apparent_temperature_2m" | "wind_chill_2m" => {
+            discrete(temp2m_scale())
+        }
+        // A temperature DIFFERENCE, not an absolute — same ramp the 2 m range
+        // windows use.
+        "dewpoint_depression_2m" => discrete(temp2m_range_scale()),
+        "hdw" => discrete(palette_scale(
+            WeatherPalette::Cape,
+            crate::plot_design::geometric_levels(20.0, 1.10, 1200.0),
+            ExtendMode::Max,
+            Some(20.0),
+        )),
+        // Visibility: the RH palette already runs bad(brown) -> good(green),
+        // which is exactly how a worst-visibility map should read.
+        "visibility" => discrete(palette_scale(
+            WeatherPalette::Rh,
+            range_step(0.25, 10.0, 0.25),
+            ExtendMode::Max,
+            None,
+        )),
+        "composite_reflectivity" | "reflectivity_1km" => {
+            discrete(crate::plot_design::reflectivity_dbz_scale())
+        }
+        "cloud_cover_total" | "cloud_cover_low" | "cloud_cover_mid" | "cloud_cover_high" => {
+            discrete(crate::plot_design::cloud_cover_scale())
+        }
+        "sbcape" => preset(WeatherProduct::Sbcape),
+        "mlcape" => preset(WeatherProduct::Mlcape),
+        "mucape" => preset(WeatherProduct::Mucape),
+        // No dedicated DCAPE preset; downdraft CAPE shares the CAPE ramp.
+        "dcape" => preset(WeatherProduct::Sbcape),
+        "srh_0_1km" => preset(WeatherProduct::Srh01km),
+        "srh_0_3km" => preset(WeatherProduct::Srh03km),
+        "stp_fixed" => preset(WeatherProduct::StpFixed),
+        "ehi_0_1km" | "ehi_0_3km" => preset(WeatherProduct::Ehi),
+        "scp_mu_0_3km_0_6km_proxy" => preset(WeatherProduct::Scp),
+        "sblcl" => preset(WeatherProduct::Lcl),
+        "pwat" => discrete(palette_scale(
+            WeatherPalette::Precip,
+            range_step(2.0, 70.0, 2.0),
+            ExtendMode::Both,
+            None,
+        )),
+        "theta_e_2m_10m_winds" => discrete(palette_scale(
+            WeatherPalette::Temperature,
+            range_step(280.0, 350.0, 1.0),
+            ExtendMode::Both,
+            None,
+        )),
+        "lapse_rate_0_3km" | "lapse_rate_700_500" => discrete(palette_scale(
+            WeatherPalette::LapseRate,
+            range_step(3.0, 10.0, 0.25),
+            ExtendMode::Both,
+            None,
+        )),
+        // Pressure has no production fill scale; a diverging ramp about ~1013
+        // hPa at least reads as low/high rather than as a grey wash.
+        "mslp" => discrete(palette_scale(
+            WeatherPalette::GeopotAnomaly,
+            range_step(976.0, 1044.0, 2.0),
+            ExtendMode::Both,
+            None,
+        )),
+        // Smoke: the direct lane's geometric ramps + shared smoke palette.
+        "smoke_8m" => discrete(DiscreteColorScale {
+            levels: crate::plot_design::geometric_levels(10.0, 1.12, 560.0),
+            colors: crate::plot_design::smoke_scale_colors(),
+            extend: ExtendMode::Max,
+            mask_below: Some(10.0),
+        }),
+        "smoke_column" => discrete(DiscreteColorScale {
+            levels: crate::plot_design::geometric_levels(20.0, 1.12, 720.0),
+            colors: crate::plot_design::smoke_scale_colors(),
+            extend: ExtendMode::Max,
+            mask_below: Some(20.0),
+        }),
+        // Occurrence maps: one filled class meaning "happened at some hour in
+        // the window". mask_below hides the zeros so the map shows footprints.
+        "categorical_rain" => discrete(binary_occurrence_scale(Color::rgba(38, 132, 80, 235))),
+        "categorical_snow" => discrete(binary_occurrence_scale(Color::rgba(74, 130, 200, 235))),
+        "categorical_freezing_rain" => {
+            discrete(binary_occurrence_scale(Color::rgba(178, 74, 168, 235)))
+        }
+        "categorical_ice_pellets" => {
+            discrete(binary_occurrence_scale(Color::rgba(206, 126, 62, 235)))
+        }
+        _ => None,
+    }
+}
+
+/// A 0/1 occurrence field: everything below 0.5 is masked out, everything at
+/// or above it draws in one flat color.
+fn binary_occurrence_scale(color: Color) -> DiscreteColorScale {
+    DiscreteColorScale {
+        levels: vec![0.5, 1.0],
+        colors: vec![color, color],
+        extend: ExtendMode::Max,
+        mask_below: Some(0.5),
     }
 }
 
