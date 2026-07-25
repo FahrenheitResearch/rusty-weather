@@ -419,9 +419,13 @@ button { color: inherit; cursor: pointer; }
       <div class="map-head">
         <h2>Domain &amp; point picker</h2>
         <div class="tools">
-          <button class="tool-btn on" data-preset="california">California</button>
-          <button class="tool-btn" data-preset="wide_west">Wide West</button>
-          <button class="tool-btn" data-preset="sierra">Sierra Front</button>
+          <!-- Preset buttons + the "more regions" list are BOTH generated from
+               the DOMAINS catalog below, so a new crop can never be added to
+               one and missed by the other. -->
+          <span id="presetBtns"></span>
+          <select id="presetSel" class="tool-btn" style="max-width:180px" title="more domain crops">
+            <option value="">🗺 more regions…</option>
+          </select>
           <button class="tool-btn" id="drawBtn">✏ draw box</button>
           <button class="tool-btn" id="pointBtn">📍 point</button>
           <button class="tool-btn" id="lineBtn">📏 line</button>
@@ -472,6 +476,28 @@ const DOMAINS = {
   southeast:  { slug: "southeast",         bounds: [-95.0, -75.0, 24.5, 37.0],   label: "Southeast" },
   northeast:  { slug: "northeast",         bounds: [-82.0, -66.5, 37.0, 47.5],   label: "Northeast" },
 };
+/* Crops that get a one-click button; the rest live in the "more regions"
+   list. Both are built from DOMAINS so they stay in sync. */
+const QUICK_PRESETS = ["california", "wide_west", "sierra", "conus"];
+(function buildPresetControls() {
+  const btns = document.getElementById("presetBtns");
+  const sel = document.getElementById("presetSel");
+  if (!btns || !sel) return;
+  for (const [key, domain] of Object.entries(DOMAINS)) {
+    if (QUICK_PRESETS.includes(key)) {
+      const b = document.createElement("button");
+      b.className = "tool-btn" + (key === "california" ? " on" : "");
+      b.dataset.preset = key;
+      b.textContent = domain.label;
+      btns.appendChild(b);
+    } else {
+      const o = document.createElement("option");
+      o.value = key;
+      o.textContent = domain.label;
+      sel.appendChild(o);
+    }
+  }
+})();
 const ANOMALY = [
   ["vpd_day_max_percentile", "Day-max VPD"],
   ["min_rh_day_percentile", "Day-min RH"],
@@ -1053,21 +1079,33 @@ async function loadRuns() {
 loadRuns(); setInterval(loadRuns, 60_000);
 $("runSelect").addEventListener("change", () => { computeHours(); renderCurrent(); });
 
-function computeHours() {
-  // Hour ladder for the selected run: the API's per-run hour lists cover
-  // explicit picks; `latest` prefers the run it actually resolves to
-  // (complete_run), falling back to the manifest's in-progress hours.
+/* The run slug the CURRENT family actually renders against. `latest` fans out
+   per family (see currentRun(): day windows -> day_run, fuels -> fuel_run), so
+   the hour ladder has to follow it. Building the ladder from complete_run
+   (an hourly F0-18 cycle) while rendering against day_run (an extended F48
+   cycle) is what made `qpf_24h` unrequestable: the non-hourly families ask for
+   state.hours' last entry, which was 18, and a 24-h accumulation needs >= 24. */
+function resolvedRunForFam() {
   const sel = $("runSelect").value;
+  if (sel !== "latest") return sel;
+  if (!latestManifest) return null;
+  const fallback = latestManifest.complete_run || latestManifest.run || null;
+  if (dayFams.has(state.fam)) return latestManifest.day_run || fallback;
+  if (fuelFams.has(state.fam)) return latestManifest.fuel_run || fallback;
+  return fallback;
+}
+
+function computeHours() {
+  // Hour ladder for the run this family resolves to; the API's per-run hour
+  // lists cover explicit picks, with the manifest's in-progress hours as a
+  // last resort for `latest`.
+  const sel = $("runSelect").value;
+  const resolved = resolvedRunForFam();
   let hours = null;
-  if (sel === "latest") {
-    const resolved = latestManifest && (latestManifest.complete_run || latestManifest.run);
-    if (resolved && Array.isArray(runsHours[resolved]) && runsHours[resolved].length) {
-      hours = runsHours[resolved];
-    } else if (latestManifest && Array.isArray(latestManifest.stored_hours)) {
-      hours = latestManifest.stored_hours;
-    }
-  } else if (Array.isArray(runsHours[sel]) && runsHours[sel].length) {
-    hours = runsHours[sel];
+  if (resolved && Array.isArray(runsHours[resolved]) && runsHours[resolved].length) {
+    hours = runsHours[resolved];
+  } else if (sel === "latest" && latestManifest && Array.isArray(latestManifest.stored_hours)) {
+    hours = latestManifest.stored_hours;
   }
   state.hours = hours && hours.length ? hours : Array.from({ length: 19 }, (_, i) => i);
   if (!state.hours.includes(state.hour)) state.hour = state.hours[Math.min(6, state.hours.length - 1)];
@@ -1291,6 +1329,10 @@ function showPreset(name) {
   map.fitBounds(presetRect.getBounds().pad(0.12));
   $("mapReadout").textContent = `preset: ${DOMAINS[name].label}`;
   [...document.querySelectorAll(".tool-btn[data-preset]")].forEach(b => b.classList.toggle("on", b.dataset.preset === name));
+  // Keep the "more regions" list showing the active crop (blank when the
+  // active one has its own button).
+  const sel = $("presetSel");
+  if (sel) sel.value = QUICK_PRESETS.includes(name) ? "" : name;
 }
 function setMapMode(mode) {
   mapMode = mode;
@@ -1306,6 +1348,11 @@ function setMapMode(mode) {
 document.querySelectorAll(".tool-btn[data-preset]").forEach(btn => {
   btn.onclick = () => { setMapMode("view"); showPreset(btn.dataset.preset); renderCurrent(); };
 });
+$("presetSel").onchange = (event) => {
+  const key = event.target.value;
+  if (!key || !DOMAINS[key]) return;
+  setMapMode("view"); showPreset(key); renderCurrent();
+};
 $("drawBtn").onclick = () => setMapMode(mapMode === "draw" ? "view" : "draw");
 $("pointBtn").onclick = () => setMapMode(mapMode === "point" ? "view" : "point");
 $("lineBtn").onclick = () => setMapMode(mapMode === "line" ? "view" : "line");

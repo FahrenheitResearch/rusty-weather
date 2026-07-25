@@ -93,6 +93,9 @@
     <div class="sidebar">
       <div class="card">
         <h2>Model &amp; product</h2>
+        <label class="field"><span>Family</span>
+          <div class="seg" id="famSeg"></div>
+        </label>
         <label class="field"><span>Model</span>
           <div class="seg" id="modelSeg">
             <button data-model="hrrr" class="on">HRRR</button>
@@ -222,6 +225,56 @@
   };
   var HOUR_LIMITS = { hrrr: { max: 48, step: 1 }, gfs: { max: 384, step: 6 }, nbm: { max: 264, step: 6 } };
 
+  /* Product families. `hourly:false` families are windows over a whole
+     extended run: they resolve against `latest-day` and always request the
+     run's last hour, because a 24-48 h window needs F048 stored. Windowed and
+     smoke products are HRRR-only (the windowed lane is HRRR-specific and the
+     smoke fields come from HRRR-Smoke), so those families pin the model. */
+  var FAMS = [
+    { key: "weather", label: "Weather", hourly: true, run: "latest", models: null,
+      products: WEATHER },
+    { key: "precip", label: "Precip", hourly: true, run: "latest", models: ["hrrr"],
+      products: [
+        ["qpf_1h", "1-h precip"], ["qpf_6h", "6-h precip"],
+        ["qpf_12h", "12-h precip"], ["qpf_total", "Run-total precip"],
+        ["precipitation_type", "Precip type"], ["composite_reflectivity", "Reflectivity"],
+      ] },
+    { key: "smoke", label: "Smoke", hourly: true, run: "latest", models: ["hrrr"],
+      products: [
+        ["smoke_pm25_native", "Near-surface smoke (PM2.5)"],
+        ["smoke_column", "Column-integrated smoke"],
+      ] },
+    { key: "fire", label: "Fire Wx", hourly: true, run: "latest", models: ["hrrr"],
+      products: [
+        ["hdw", "Hot-Dry-Windy"], ["vpd_2m", "VPD"],
+        ["fire_weather_composite", "Fire Wx composite"],
+        ["10m_wind_gusts", "Wind gusts"],
+      ] },
+    { key: "windows", label: "Day Windows", hourly: false, run: "latest-day", models: ["hrrr"],
+      products: [
+        ["wind_gust_10m_0_24h_max", "Gust 0-24 h max"],
+        ["wind_gust_10m_24_48h_max", "Gust 24-48 h max"],
+        ["2m_temp_0_24h_max", "Temp 0-24 h max"],
+        ["2m_temp_24_48h_max", "Temp 24-48 h max"],
+        ["2m_rh_0_24h_min", "RH 0-24 h min"],
+        ["2m_rh_24_48h_min", "RH 24-48 h min"],
+        ["hdw_0_24h_max", "HDW 0-24 h max"],
+        ["hdw_24_48h_max", "HDW 24-48 h max"],
+        ["smoke_8m_0_24h_max", "Smoke 0-24 h max"],
+        ["smoke_8m_24_48h_max", "Smoke 24-48 h max"],
+        ["qpf_24h", "24-h precip"],
+        ["visibility_0_24h_min", "Visibility 0-24 h min"],
+        ["heat_index_2m_0_24h_max", "Heat index 0-24 h max"],
+        ["composite_reflectivity_0_24h_max", "Reflectivity 0-24 h max"],
+        ["categorical_rain_0_24h_max", "Any rain 0-24 h"],
+      ] },
+  ];
+  function famByKey(key) {
+    for (var i = 0; i < FAMS.length; i++) { if (FAMS[i].key === key) return FAMS[i]; }
+    return FAMS[0];
+  }
+  function activeFam() { return famByKey(state.fam); }
+
   var DOMAINS = [
     ["conus", "CONUS", [-125, -66.5, 24, 50]],
     ["california", "California", [-126, -113.8, 31.9, 42.5]],
@@ -234,6 +287,7 @@
   ];
 
   var state = {
+    fam: "weather",
     model: "hrrr", product: WEATHER[0][0], hour: 6,
     basemap: "topo", values: false, density: 2, counties: true,
     preset: "conus", bounds: DOMAINS[0][2], drawn: null,
@@ -253,14 +307,62 @@
     });
   }
 
+  /* Products for the active family, narrowed to the selected model. The
+     Weather family is the only one served by GFS/NBM. */
+  function famProducts() {
+    var fam = activeFam();
+    if (fam.key === "weather") return PRODUCTS[state.model] || WEATHER;
+    return fam.products;
+  }
+
+  function buildFamSeg() {
+    var el = $("famSeg"); el.innerHTML = "";
+    FAMS.forEach(function (f) {
+      var b = document.createElement("button");
+      b.setAttribute("data-fam", f.key);
+      b.textContent = f.label;
+      if (f.key === state.fam) b.classList.add("on");
+      el.appendChild(b);
+    });
+  }
+
+  /* Families other than Weather are HRRR-only; grey the other model buttons
+     so the UI never offers a combination the store can't serve. */
+  function syncModelAvailability() {
+    var fam = activeFam();
+    [].forEach.call($("modelSeg").querySelectorAll("button"), function (b) {
+      var m = b.getAttribute("data-model");
+      var ok = !fam.models || fam.models.indexOf(m) !== -1;
+      b.disabled = !ok;
+      b.style.opacity = ok ? "" : "0.4";
+    });
+    if (fam.models && fam.models.indexOf(state.model) === -1) {
+      state.model = fam.models[0];
+      [].forEach.call($("modelSeg").querySelectorAll("button"), function (b) {
+        b.classList.toggle("on", b.getAttribute("data-model") === state.model);
+      });
+    }
+  }
+
+  /* Window families span a whole extended run, so the hour picker doesn't
+     apply — they always render the run's last hour. */
+  function syncHourNav() {
+    var hourly = activeFam().hourly;
+    ["hour", "hourPrev", "hourNext"].forEach(function (id) {
+      var el = $(id); if (!el) return;
+      el.disabled = !hourly;
+      el.style.opacity = hourly ? "" : "0.35";
+    });
+    $("hourLabel").textContent = hourly ? String(state.hour) : "whole run";
+  }
+
   function fillProducts() {
+    var list = famProducts();
     var sel = $("product"); sel.innerHTML = "";
-    PRODUCTS[state.model].forEach(function (p) {
+    list.forEach(function (p) {
       var o = document.createElement("option"); o.value = p[0]; o.textContent = p[1]; sel.appendChild(o);
     });
-    if (!PRODUCTS[state.model].some(function (p) { return p[0] === state.product; })) {
-      state.product = PRODUCTS[state.model][0][0];
-    }
+    if (!list.some(function (p) { return p[0] === state.product; })) state.product = list[0][0];
     sel.value = state.product;
   }
 
@@ -285,7 +387,11 @@
     if (i === 0) b.classList.add("on"); $("domainSeg").appendChild(b);
   });
 
-  seg("modelSeg", "model", function (v) { state.model = v; fillProducts(); applyHourLimits(); });
+  seg("famSeg", "fam", function (v) {
+    state.fam = v;
+    syncModelAvailability(); fillProducts(); applyHourLimits(); syncHourNav();
+  });
+  seg("modelSeg", "model", function (v) { state.model = v; fillProducts(); applyHourLimits(); syncHourNav(); });
   $("product").addEventListener("change", function (e) { state.product = e.target.value; });
   $("hour").addEventListener("input", function (e) { state.hour = Number(e.target.value); $("hourLabel").textContent = state.hour; });
   $("hourPrev").addEventListener("click", function () { stepHour(-1); });
@@ -412,8 +518,12 @@
     return b;
   }
   function buildPayload() {
+    var fam = activeFam();
+    // Non-hourly families anchor on the extended run's last hour: a 24-48 h
+    // window is only satisfiable once F048 is stored.
+    var hour = fam.hourly ? state.hour : HOUR_LIMITS[state.model].max;
     return {
-      model: state.model, run: "latest", hour: state.hour, products: state.product,
+      model: state.model, run: fam.run, hour: hour, products: state.product,
       output_format: "webp", plot_style: "operational", basemap_style: state.basemap,
       county_linework: state.counties, place_label_density: state.density,
       place_label_size: 2, output_width: 1800, value_labels: state.values,
@@ -503,7 +613,8 @@
   }
 
   // ---- boot -----------------------------------------------------------------
-  fillProducts(); applyHourLimits(); applyDeepLink();
+  buildFamSeg(); syncModelAvailability(); syncHourNav();
+  fillProducts(); applyHourLimits(); applyDeepLink(); syncHourNav();
   initMap(); boundsLabel();
 })();
 </script>
