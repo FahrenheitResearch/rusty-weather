@@ -303,6 +303,13 @@ systemctl restart rusty-wx-api
   Then prove the new code is in the running binary before believing it:
   `strings /opt/rusty-weather/bin/<bin> | grep -c "<a string only the new code has>"`.
   Never conclude "deployed" from an exit code alone.
+- **ffmpeg is now a SERVER DEPENDENCY** (installed 2026-07-25, 6.1.1 with libx264
+  + libvpx-vp9). Loop video export (`/api/loops/<id>/animation.mp4|.webm`) shells
+  out to it; without it those endpoints 500 with "is ffmpeg installed?" while GIF
+  keeps working. Reinstall it if the box is ever rebuilt: `apt-get install -y ffmpeg`.
+  Video is the right default here, not a nicety — measured on a 13-frame CONUS
+  loop, MP4 is 336 KB against GIF's 3.6 MB, and GIF's 256 colors visibly band the
+  temperature ramps.
 - Run pointers in `latest.json` (`day_run`, `complete_run`, `fuel_run`) advance
   as soon as a cycle STARTS ingesting, so they can name a run that does not yet
   hold the hours a product needs — an extended HRRR cycle takes over an hour to
