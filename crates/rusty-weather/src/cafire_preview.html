@@ -298,6 +298,7 @@ button { color: inherit; cursor: pointer; }
         <button type="button" data-step="3">3 h</button>
         <button type="button" data-step="1">1 h</button>
       </div>
+      <div id="dailyStepNote" style="font-size:11px;color:#8b9698;margin-top:4px"></div>
       <span class="field-label">Variable</span>
       <div class="select-wrap">
         <select id="dailyVar"><option value="temperature_2m">temperature 2m</option></select>
@@ -1717,11 +1718,48 @@ $("dailyShare").onclick = () => $("shareBtn").onclick();
 let dailyStep = "day";
 $("dailyStep").addEventListener("click", ev => {
   const btn = ev.target.closest("button"); if (!btn) return;
+  if (btn.disabled) return;
   [...$("dailyStep").children].forEach(b => b.classList.remove("selected"));
   btn.classList.add("selected");
   dailyStep = btn.dataset.step;
   renderCurrent();
 });
+
+/* A column narrower than the model's stored cadence is not a column the data
+   can express: NBM/GFS land on 6-hourly hours, so 6h/3h/1h all used to render
+   the SAME 6-h card and the buttons looked broken. Gray out what the selected
+   model cannot deliver and say why, instead of silently serving a duplicate. */
+const MODEL_STEP_CADENCE_H = { hrrr: 1, gfs: 6, nbm: 6 };
+function syncDailySteps() {
+  const cadence = MODEL_STEP_CADENCE_H[chartModel] || 1;
+  let fellBack = false;
+  for (const btn of $("dailyStep").children) {
+    const step = btn.dataset.step;
+    const unsupported = step !== "day" && Number(step) < cadence;
+    btn.disabled = unsupported;
+    btn.style.opacity = unsupported ? "0.35" : "";
+    btn.style.cursor = unsupported ? "not-allowed" : "";
+    btn.title = unsupported
+      ? `${chartModel.toUpperCase()} is stored every ${cadence} h — ${step}-h columns need hourly data`
+      : "";
+    if (unsupported && btn.classList.contains("selected")) fellBack = true;
+  }
+  if (fellBack) {
+    // Selected step just became unreachable: fall back to the finest the
+    // model does support rather than render a mislabeled duplicate.
+    const fallback = [...$("dailyStep").children].find(b => !b.disabled && b.dataset.step !== "day")
+      || $("dailyStep").children[0];
+    [...$("dailyStep").children].forEach(b => b.classList.remove("selected"));
+    fallback.classList.add("selected");
+    dailyStep = fallback.dataset.step;
+  }
+  const note = $("dailyStepNote");
+  if (note) {
+    note.textContent = cadence > 1
+      ? `${chartModel.toUpperCase()} publishes every ${cadence} h — finer columns need an hourly model (HRRR).`
+      : "";
+  }
+}
 
 /* ECAPE renders route to the heavy-compute node through /node (reverse
    tunnel) — same request shape, different backend. */
@@ -1743,6 +1781,7 @@ function syncModelSegs() {
   for (const id of ["chartModel", "dailyModelSeg"]) {
     [...$(id).children].forEach(b => b.classList.toggle("selected", b.dataset.model === chartModel));
   }
+  syncDailySteps();
 }
 for (const id of ["chartModel", "dailyModelSeg"]) {
   $(id).addEventListener("click", ev => {
@@ -1753,6 +1792,9 @@ for (const id of ["chartModel", "dailyModelSeg"]) {
     loadVars().then(() => renderCurrent());
   });
 }
+// NBM is the default chart model and is 6-hourly, so sync the column widths
+// once at load rather than waiting for the first model click.
+syncDailySteps();
 /* Map-family model picker (weather / radar): HRRR / GFS / NBM surface maps. */
 function syncMapModelSeg() {
   [...$("mapModelSeg").children].forEach(b => b.classList.toggle("selected", b.dataset.model === state.mapModel));
@@ -1893,6 +1935,8 @@ async function renderCurrent() {
       const title = `${lat.toFixed(3)}, ${lon.toFixed(3)}`;
       let url = `/api/daily?lat=${lat}&lon=${lon}&model=${chartModel}&run=latest&var=${encodeURIComponent(variable)}&title=${encodeURIComponent(title)}`;
       if (dailyStep !== "day") url += `&step=${dailyStep}`;
+      // °F is the server default: send only the °C opt-out, same as the maps.
+      if (state.tempUnits === "c") url += "&temp_units=c";
       lastShareUrl = url;
       const resp = await fetch(url);
       if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || `HTTP ${resp.status}`);
@@ -1959,6 +2003,8 @@ async function renderCurrent() {
         const panels = [...$("mgPanels").querySelectorAll("input:checked")].map(c => c.value).join(",");
         url += `&panels=${encodeURIComponent(panels)}`;
       }
+      // °F is the server default: send only the °C opt-out, same as the maps.
+      if (state.tempUnits === "c") url += "&temp_units=c";
       lastShareUrl = url;
       const resp = await fetch(url);
       if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).error || `HTTP ${resp.status}`);

@@ -708,8 +708,19 @@ mod tests {
                 .contains("--hours")
         );
 
+        // NBM gained a fetch plan when the blend lane shipped, so it is no
+        // longer the example of an unsupported model — this assertion was left
+        // pointing at it and had been failing ever since.
+        let mut nbm = spec();
+        nbm.model = "nbm".to_string();
+        assert!(
+            resolve_spec(&nbm).is_ok(),
+            "NBM is ingest-supported: {:?}",
+            resolve_spec(&nbm).err()
+        );
+
         let mut bad = spec();
-        bad.model = "nbm".to_string();
+        bad.model = "sref".to_string();
         let message = resolve_spec(&bad).expect_err("unsupported model");
         assert!(message.contains("not ingest-supported"), "got: {message}");
         // The supported list is derived, so it names the models that DO have

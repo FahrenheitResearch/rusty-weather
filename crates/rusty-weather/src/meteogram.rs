@@ -151,6 +151,9 @@ pub struct MeteogramRequest {
     pub title: Option<String>,
     /// Hours to add to UTC for the local-time axis row (PDT = -7).
     pub utc_offset_hours: f64,
+    /// °F is the service default (mirrors the map lane's `temp_units`); false
+    /// is the °C opt-out.
+    pub fahrenheit: bool,
 }
 
 struct HourSample {
@@ -195,17 +198,76 @@ fn vpd_kpa(t_c: f64, td_c: f64) -> f64 {
     ((saturation_vapor_pressure_hpa(t_c) - saturation_vapor_pressure_hpa(td_c)).max(0.0)) * 0.1
 }
 
-fn to_c(value: f64, units: &str) -> f64 {
-    let lower = units.trim().to_ascii_lowercase();
-    if lower == "k" || lower.contains("kelvin") {
-        value - 273.15
-    } else {
-        value
-    }
-}
-
 pub(crate) fn c_to_f(c: f64) -> f64 {
     c * 9.0 / 5.0 + 32.0
+}
+
+/// How a stored variable expresses temperature, so cards and charts can honor
+/// the same °F default the MAP lane does (`rustwx_products::temp_display`).
+///
+/// Kelvin was the only case these endpoints handled, so every derived field the
+/// store keeps in °C — wet-bulb, heat index, apparent temperature, wind chill,
+/// dewpoint depression — leaked °C onto a °F card and ignored the F/C toggle
+/// entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoreTempKind {
+    /// Absolute temperature stored in kelvin.
+    Kelvin,
+    /// Absolute temperature stored in °C.
+    AbsoluteCelsius,
+    /// A temperature DIFFERENCE in °C (Δ°F = Δ°C × 9/5, no offset).
+    DeltaCelsius,
+    /// Not a temperature, or one held in °C by convention.
+    None,
+}
+
+/// Absolute temperatures the store keeps in °C (`/api/vars` units `degC`).
+const STORE_ABSOLUTE_CELSIUS_VARS: &[&str] = &[
+    "wetbulb_2m",
+    "apparent_temperature_2m",
+    "heat_index_2m",
+    "wind_chill_2m",
+];
+
+/// Temperature DIFFERENCES the store keeps in °C.
+const STORE_DELTA_CELSIUS_VARS: &[&str] = &["dewpoint_depression_2m"];
+
+pub(crate) fn store_temp_kind(name: &str, units: &str) -> StoreTempKind {
+    let lower_units = units.trim().to_ascii_lowercase();
+    if lower_units == "k" || lower_units.contains("kelvin") {
+        return StoreTempKind::Kelvin;
+    }
+    // `lifted_index` is also degC but stays °C by meteorological convention —
+    // it is a 500 mb stability index, not a temperature a reader converts. The
+    // map lane excludes it for the same reason. Rates (degC/hr, degC/km) never
+    // convert either, and are excluded by the exact-name match below.
+    if lower_units == "degc" || lower_units == "c" {
+        if STORE_ABSOLUTE_CELSIUS_VARS.contains(&name) {
+            return StoreTempKind::AbsoluteCelsius;
+        }
+        if STORE_DELTA_CELSIUS_VARS.contains(&name) {
+            return StoreTempKind::DeltaCelsius;
+        }
+    }
+    StoreTempKind::None
+}
+
+/// Apply the requested display unit, returning the converted value and the
+/// label to print. `fahrenheit` is the service-wide default.
+pub(crate) fn apply_store_temp_units(
+    kind: StoreTempKind,
+    value: f64,
+    fahrenheit: bool,
+) -> Option<(f64, &'static str)> {
+    match (kind, fahrenheit) {
+        (StoreTempKind::None, _) => None,
+        (StoreTempKind::Kelvin, true) => Some((c_to_f(value - 273.15), "°F")),
+        (StoreTempKind::Kelvin, false) => Some((value - 273.15, "°C")),
+        (StoreTempKind::AbsoluteCelsius, true) => Some((c_to_f(value), "°F")),
+        (StoreTempKind::AbsoluteCelsius, false) => Some((value, "°C")),
+        (StoreTempKind::DeltaCelsius, true) => Some((value * 9.0 / 5.0, "°F")),
+        (StoreTempKind::DeltaCelsius, false) => Some((value, "°C")),
+    }
 }
 
 // ---- civil-date math (Hinnant) for valid-time axis labels ----
@@ -543,23 +605,29 @@ pub fn render_meteogram_svg(
             if !raw.is_finite() {
                 continue;
             }
-            let is_kelvin = units.trim().eq_ignore_ascii_case("k")
-                || units.to_ascii_lowercase().contains("kelvin");
-            let value = if custom_mode {
-                // Generic: Kelvin reads as °F, everything else native.
-                if is_kelvin { c_to_f(raw - 273.15) } else { raw }
+            // Temperature fields follow the requested unit whether the store
+            // holds them in kelvin (temperature/dewpoint) or in °C (wet-bulb,
+            // heat index, apparent temperature, wind chill, dewpoint
+            // depression) — the °C family used to slip through untouched.
+            let temp_kind = store_temp_kind(name, &units);
+            let converted_temp = apply_store_temp_units(temp_kind, raw, request.fahrenheit);
+            let value = if let Some((value, _)) = converted_temp {
+                value
+            } else if custom_mode {
+                raw
             } else {
                 match name.as_str() {
-                    "temperature_2m" | "dewpoint_2m" => c_to_f(to_c(raw, &units)),
                     "u_10m" | "v_10m" | "wind_gust_10m" => raw * MS_TO_MPH,
                     // Store carries kg/m^3; the curated panel is ug/m3.
                     "smoke_8m" => raw * 1.0e9,
                     _ => raw,
                 }
             };
-            var_units
-                .entry(name.clone())
-                .or_insert_with(|| if is_kelvin { "F".to_string() } else { units });
+            var_units.entry(name.clone()).or_insert_with(|| {
+                converted_temp
+                    .map(|(_, label)| label.to_string())
+                    .unwrap_or(units)
+            });
             values.insert(name.clone(), value);
         }
         if elevation_ft.is_none() {
@@ -1174,6 +1242,9 @@ pub struct DailyRequest {
     /// Column bucket: None = local calendar days (the classic card);
     /// Some(1/3/6) = fixed-hour buckets (the HRRR-friendly hourly strip).
     pub step_hours: Option<u16>,
+    /// °F is the service default (mirrors the map lane's `temp_units`); false
+    /// is the °C opt-out.
+    pub fahrenheit: bool,
 }
 
 struct DayAgg {
@@ -1358,20 +1429,25 @@ pub fn render_daily_svg(
         prev_total = Some(last);
     }
 
-    // Unit conversions for readability.
+    // Unit conversions for readability. Temperatures honor the requested unit
+    // whether the store holds kelvin or °C — before this, only kelvin fields
+    // converted, so a wet-bulb card was stuck reading degC regardless of the
+    // F/C toggle.
     let lower_units = units.to_ascii_lowercase();
+    let temp_kind = store_temp_kind(&request.var, &units);
     let is_kelvin = lower_units == "k" || lower_units.contains("kelvin");
     let to_mph = lower_units.contains("m/s")
         && (request.var.contains("wind") || request.var.contains("gust"));
-    let convert = |v: f64| {
-        if is_kelvin { c_to_f(v - 273.15) } else if to_mph { v * MS_TO_MPH } else { v }
+    let fahrenheit = request.fahrenheit;
+    let convert = move |v: f64| match apply_store_temp_units(temp_kind, v, fahrenheit) {
+        Some((value, _)) => value,
+        None if to_mph => v * MS_TO_MPH,
+        None => v,
     };
-    let display_units = if is_kelvin {
-        "°F".to_string()
-    } else if to_mph {
-        "mph".to_string()
-    } else {
-        units.clone()
+    let display_units = match apply_store_temp_units(temp_kind, 0.0, fahrenheit) {
+        Some((_, label)) => label.to_string(),
+        None if to_mph => "mph".to_string(),
+        None => units.clone(),
     };
 
     // Drop partial buckets: require ~3/4 of the samples a full bucket
@@ -2021,6 +2097,75 @@ mod tests {
     fn thermo_matches_frozen_formulas() {
         assert!((vpd_kpa(30.0, 10.0) - 3.02).abs() < 0.02);
         assert_eq!(c_to_f(0.0), 32.0);
-        assert!((to_c(300.15, "K") - 27.0).abs() < 1e-9);
+    }
+
+    /// The card/chart lanes converted ONLY kelvin, so every degC field the
+    /// store keeps — wet-bulb, heat index, apparent temperature, wind chill —
+    /// printed °C on a °F card and ignored the F/C toggle outright.
+    #[test]
+    fn stored_celsius_temperatures_follow_the_requested_unit() {
+        for var in [
+            "wetbulb_2m",
+            "apparent_temperature_2m",
+            "heat_index_2m",
+            "wind_chill_2m",
+        ] {
+            assert_eq!(
+                store_temp_kind(var, "degC"),
+                StoreTempKind::AbsoluteCelsius,
+                "{var} is an absolute degC field"
+            );
+            let (f, label) =
+                apply_store_temp_units(StoreTempKind::AbsoluteCelsius, 25.0, true).unwrap();
+            assert!((f - 77.0).abs() < 1e-9, "{var}: 25 C is 77 F, got {f}");
+            assert_eq!(label, "°F");
+            let (c, label) =
+                apply_store_temp_units(StoreTempKind::AbsoluteCelsius, 25.0, false).unwrap();
+            assert!((c - 25.0).abs() < 1e-9);
+            assert_eq!(label, "°C");
+        }
+    }
+
+    /// Dewpoint depression is a DIFFERENCE: 10 degC of spread is 18 degF, not 50.
+    #[test]
+    fn dewpoint_depression_converts_as_a_delta() {
+        assert_eq!(
+            store_temp_kind("dewpoint_depression_2m", "degC"),
+            StoreTempKind::DeltaCelsius
+        );
+        let (f, _) = apply_store_temp_units(StoreTempKind::DeltaCelsius, 10.0, true).unwrap();
+        assert!((f - 18.0).abs() < 1e-9, "expected 18 degF of spread, got {f}");
+    }
+
+    #[test]
+    fn kelvin_fields_still_convert_and_honor_the_celsius_opt_out() {
+        assert_eq!(store_temp_kind("temperature_2m", "K"), StoreTempKind::Kelvin);
+        let (f, label) = apply_store_temp_units(StoreTempKind::Kelvin, 300.15, true).unwrap();
+        assert!((f - 80.6).abs() < 1e-6, "got {f}");
+        assert_eq!(label, "°F");
+        let (c, label) = apply_store_temp_units(StoreTempKind::Kelvin, 300.15, false).unwrap();
+        assert!((c - 27.0).abs() < 1e-9, "got {c}");
+        assert_eq!(label, "°C");
+    }
+
+    /// Indices and rates that merely carry a degC-ish unit must NOT convert:
+    /// lifted index is °C by meteorological convention (the map lane excludes
+    /// it too) and advection/lapse rates are per-hour / per-km rates.
+    #[test]
+    fn celsius_indices_and_rates_never_convert() {
+        for (var, units) in [
+            ("lifted_index", "degC"),
+            ("temperature_advection_850mb", "degC/hr"),
+            ("lapse_rate_700_500", "degC/km"),
+            ("rh_2m", "%"),
+            ("wind_gust_10m", "m/s"),
+        ] {
+            assert_eq!(
+                store_temp_kind(var, units),
+                StoreTempKind::None,
+                "{var} [{units}] must not be treated as a temperature"
+            );
+        }
+        assert!(apply_store_temp_units(StoreTempKind::None, 5.0, true).is_none());
     }
 }

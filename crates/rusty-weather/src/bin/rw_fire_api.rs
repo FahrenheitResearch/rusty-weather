@@ -728,7 +728,10 @@ fn run_rw_render(
         command.arg("--full-throttle");
     }
     command.env("RUSTWX_PROJECTED_FRAME_SOURCE", "requested");
-    command.env("RUSTWX_PROJECTION_VARIANT", "mercator");
+    command.env(
+        "RUSTWX_PROJECTION_VARIANT",
+        projection_variant_for_bounds(request.resolved_bounds()),
+    );
     command.env("RUSTWX_PLOT_STYLE", &request.plot_style);
     command.env("RUSTWX_BASEMAP_STYLE", &request.basemap_style);
     command.env(
@@ -1104,6 +1107,7 @@ fn daily_response(query: &str, state: &AppState) -> Vec<u8> {
             .get("step")
             .and_then(|v| v.parse::<u16>().ok())
             .filter(|v| matches!(v, 1 | 3 | 6 | 12)),
+        fahrenheit: query_wants_fahrenheit(&query),
     };
     // `?format=png` returns a rasterized copy so the card can be shared /
     // "open image in new tab" / copied as a picture. The in-page display stays SVG.
@@ -1587,6 +1591,7 @@ fn meteogram_response(path: &str, state: &AppState) -> Vec<u8> {
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| (-14.0..=14.0).contains(v))
             .unwrap_or(-7.0),
+        fahrenheit: query_wants_fahrenheit(&query),
     };
     match meteogram::render_meteogram_svg(&state.store_root, model, run, &date, cycle, &request) {
         Ok(output) => {
@@ -1897,6 +1902,34 @@ fn safe_model_slug(value: &str) -> String {
         .collect()
 }
 
+/// Longitude/latitude spans past which a domain is "continental" rather than
+/// regional. Mirrors the renderer's own wide-domain threshold
+/// (`full_domain_projected_frame_default`) so both agree on what CONUS-scale
+/// means.
+const CONTINENTAL_LAT_SPAN_DEG: f64 = 25.0;
+const CONTINENTAL_LON_SPAN_DEG: f64 = 45.0;
+
+/// Which presentation projection the render child should use.
+///
+/// Regional boxes get Mercator: north stays up, the aspect is honest at a
+/// single reference latitude, and every one of the Lab's state/region crops
+/// falls in this class. A CONUS-scale box does NOT — a regional Mercator's
+/// single reference latitude cannot describe 26 degrees of latitude, and the
+/// frame it produces disagreed with the projected grid badly enough that the
+/// raster was clipped: CONUS lost Texas, the Gulf and all of Florida below
+/// ~34 N and left a third of the canvas empty. `adaptive` picks the conic
+/// presentation (Lambert/Albers) that a continental map actually wants.
+fn projection_variant_for_bounds(bounds: [f64; 4]) -> &'static str {
+    let [west, east, south, north] = bounds;
+    let lat_span = (north - south).abs();
+    let lon_span = (east - west).abs();
+    if lat_span >= CONTINENTAL_LAT_SPAN_DEG || lon_span >= CONTINENTAL_LON_SPAN_DEG {
+        "adaptive"
+    } else {
+        "mercator"
+    }
+}
+
 /// On-screen aspect (width:height) of a lat/lon box as it is PROJECTED, not as
 /// raw degrees: a degree of longitude spans only `cos(latitude)` as much
 /// distance as a degree of latitude, so CONUS draws about 1.8:1, not the 2.25:1
@@ -2124,6 +2157,19 @@ fn default_place_label_size() -> u8 {
 
 fn default_domain_slug() -> String {
     "drawn_box".to_string()
+}
+
+/// `temp_units=c` opt-out for the SVG card/chart endpoints, matching the map
+/// lane's `temp_units` body field (°F default, `c`/`celsius` for Celsius).
+/// Anything else — including the explicit `f` the Lab may send — keeps °F.
+fn query_wants_fahrenheit(query: &HashMap<String, String>) -> bool {
+    !query
+        .get("temp_units")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            value == "c" || value == "celsius"
+        })
+        .unwrap_or(false)
 }
 
 fn default_temp_units() -> String {
@@ -2681,6 +2727,40 @@ mod tests {
         assert_ne!(render_cache_key(&base), render_cache_key(&padded));
         assert_ne!(render_cache_key(&base), render_cache_key(&extended));
         assert_ne!(render_cache_key(&base), render_cache_key(&no_overlay));
+    }
+
+    /// A regional Mercator cannot describe a continental box: forcing it on
+    /// CONUS produced a frame the projected grid overflowed, and the raster was
+    /// clipped at ~34 N — no Texas, no Gulf, no Florida — over a third of the
+    /// canvas left empty. Continental boxes must get the conic presentation.
+    #[test]
+    fn continental_domains_use_the_adaptive_conic_presentation() {
+        let conus = [-125.0, -66.5, 24.0, 50.0];
+        assert_eq!(projection_variant_for_bounds(conus), "adaptive");
+        // A tall-but-narrow box counts as continental on latitude alone.
+        assert_eq!(
+            projection_variant_for_bounds([-100.0, -80.0, 24.0, 50.0]),
+            "adaptive"
+        );
+    }
+
+    /// Every state/region crop stays on Mercator — the fix above must not
+    /// re-project the 70-odd regional domains that already render correctly.
+    #[test]
+    fn regional_domains_keep_mercator() {
+        for bounds in [
+            [-124.5, -114.0, 32.4, 42.1],   // california
+            [-107.0, -89.0, 40.0, 49.5],    // northern plains
+            [-125.0, -116.0, 41.9, 49.1],   // pacific northwest
+            [-106.7, -93.5, 25.8, 36.6],    // texas
+            [-85.7, -80.0, 24.3, 31.1],     // florida
+        ] {
+            assert_eq!(
+                projection_variant_for_bounds(bounds),
+                "mercator",
+                "regional domain {bounds:?} must stay on Mercator"
+            );
+        }
     }
 
     #[test]

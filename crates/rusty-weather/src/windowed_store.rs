@@ -4159,7 +4159,17 @@ mod tests {
             [10.0, 45.0, 5.0, 0.0], // F005
             [30.0, 20.0, 6.0, 0.0], // F006
         ];
-        by_hour[(hour as usize - 1) % by_hour.len()].to_vec()
+        by_hour[hour_row(hour, by_hour.len())].to_vec()
+    }
+
+    /// Row a forecast hour selects from a cyclic fixture table.
+    ///
+    /// F000 is a real stored hour (the analysis), and the 0-48 h regression
+    /// guard writes `(0..=48)` — so `hour - 1` underflowed on u16 and every
+    /// fixture panicked. Hour 0 takes the row cyclically BEFORE hour 1, which
+    /// keeps every hour>=1 expectation in this module unchanged.
+    fn hour_row(hour: u16, rows: usize) -> usize {
+        (hour as usize + rows - 1) % rows
     }
 
     /// Sub-hourly 1 h max UH planes (`uh_2to5km_max_1h`): the hourly plane
@@ -4179,7 +4189,7 @@ mod tests {
             ([20.0, 6.0, 0.0, 8.0], [21.0, 8.0, 5.0, 15.0]), // speeds 29 10 5 17
             ([5.0, 20.0, 3.0, 6.0], [12.0, 21.0, 4.0, 8.0]), // speeds 13 29 5 10
         ];
-        let (u, v) = &by_hour[(hour as usize - 1) % by_hour.len()];
+        let (u, v) = &by_hour[hour_row(hour, by_hour.len())];
         (u.to_vec(), v.to_vec())
     }
 
