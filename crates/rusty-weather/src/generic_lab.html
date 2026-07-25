@@ -117,7 +117,10 @@
 
       <div class="card">
         <h2>Domain</h2>
-        <div class="seg" id="domainSeg" style="margin-bottom:10px"></div>
+        <div class="seg" id="domainSeg" style="margin-bottom:6px"></div>
+        <select id="domainSel" style="margin-bottom:10px">
+          <option value="">more regions &amp; states…</option>
+        </select>
         <div id="map"></div>
         <div class="row" style="margin-top:8px">
           <button class="btn secondary" id="drawBtn" style="flex:1">✎ draw box</button>
@@ -276,15 +279,81 @@
   function activeFam() { return famByKey(state.fam); }
 
   var DOMAINS = [
-    ["conus", "CONUS", [-125, -66.5, 24, 50]],
-    ["california", "California", [-126, -113.8, 31.9, 42.5]],
-    ["pacnw", "Pacific NW", [-125, -110, 41, 49.5]],
-    ["southwest", "Southwest", [-120, -102, 30, 42]],
-    ["norockies", "N. Rockies", [-117, -103, 42, 49.5]],
-    ["plains", "Great Plains", [-105, -90, 32, 49]],
-    ["southeast", "Southeast", [-95, -75, 24.5, 37]],
-    ["northeast", "Northeast", [-82, -66.5, 37, 47.5]],
+    ["conus", "CONUS", [-125.0, -66.5, 24.0, 50.0]],
+    ["california", "California", [-126.0, -113.8, 31.9, 42.5]],
+    ["wide_west", "Wide West", [-125.7, -103.8, 31.9, 46.5]],
+    ["sierra", "Sierra Front", [-121.9, -117.6, 37.2, 41.2]],
+    ["socal", "SoCal", [-121.5, -114.1, 32.5, 36.0]],
+    ["norcal", "NorCal", [-125.0, -119.0, 37.0, 42.2]],
+    ["bay_delta", "Bay / Delta", [-123.3, -120.5, 36.7, 39.0]],
+    ["pacnw", "Pacific NW", [-125.0, -110.5, 41.0, 49.2]],
+    ["great_basin", "Great Basin", [-121.0, -110.0, 34.5, 43.5]],
+    ["southwest", "Southwest", [-120.0, -102.0, 30.5, 42.0]],
+    ["no_rockies", "N. Rockies", [-117.0, -103.0, 41.5, 49.2]],
+    ["so_rockies", "S. Rockies", [-110.5, -102.0, 34.5, 42.0]],
+    ["so_plains", "S. Plains", [-105.0, -91.0, 28.0, 40.0]],
+    ["no_plains", "N. Plains", [-105.0, -90.0, 39.0, 49.2]],
+    ["midwest", "Midwest", [-97.0, -80.0, 36.0, 47.5]],
+    ["great_lakes", "Great Lakes", [-93.0, -74.5, 40.0, 49.0]],
+    ["ohio_valley", "Ohio Valley", [-90.0, -77.5, 35.5, 42.5]],
+    ["mid_atlantic", "Mid-Atlantic", [-83.0, -73.5, 35.0, 41.5]],
+    ["southeast", "Southeast", [-95.0, -75.0, 24.5, 37.0]],
+    ["deep_south", "Deep South", [-95.0, -81.0, 29.0, 36.5]],
+    ["gulf_coast", "Gulf Coast", [-98.5, -81.0, 24.5, 33.0]],
+    ["northeast", "Northeast", [-82.0, -66.5, 37.0, 47.5]],
+    ["new_england", "New England", [-74.5, -66.5, 40.5, 47.5]],
+    ["appalachians", "Appalachians", [-87.0, -75.0, 33.5, 43.0]],
+    ["st_al", "Alabama", [-88.95, -84.45, 29.69, 35.51]],
+    ["st_az", "Arizona", [-115.47, -108.53, 30.84, 37.56]],
+    ["st_ar", "Arkansas", [-95.12, -89.18, 32.55, 36.85]],
+    ["st_ca", "California", [-125.24, -113.36, 31.82, 42.68]],
+    ["st_co", "Colorado", [-109.64, -101.46, 36.65, 41.35]],
+    ["st_ct", "Connecticut", [-74.05, -71.45, 40.65, 42.45]],
+    ["st_de", "Delaware", [-76.15, -74.65, 38.15, 40.15]],
+    ["st_dc", "Dist. of Columbia", [-77.45, -76.55, 38.45, 39.35]],
+    ["st_fl", "Florida", [-88.17, -79.43, 24.0, 31.5]],
+    ["st_ga", "Georgia", [-86.0, -80.4, 30.01, 35.39]],
+    ["st_id", "Idaho", [-117.68, -110.52, 41.47, 49.53]],
+    ["st_il", "Illinois", [-91.85, -87.15, 36.56, 42.94]],
+    ["st_in", "Indiana", [-88.45, -84.45, 37.45, 42.15]],
+    ["st_ia", "Iowa", [-97.1, -89.6, 40.05, 43.85]],
+    ["st_ks", "Kansas", [-102.66, -94.04, 36.65, 40.35]],
+    ["st_ky", "Kentucky", [-90.17, -81.43, 36.15, 39.45]],
+    ["st_la", "Louisiana", [-94.42, -88.38, 28.54, 33.36]],
+    ["st_me", "Maine", [-71.46, -66.54, 42.62, 47.88]],
+    ["st_md", "Maryland", [-79.88, -74.62, 37.55, 40.05]],
+    ["st_ma", "Massachusetts", [-73.85, -69.55, 40.95, 43.15]],
+    ["st_mi", "Michigan", [-91.0, -81.6, 41.2, 48.7]],
+    ["st_mn", "Minnesota", [-97.77, -88.93, 43.03, 49.87]],
+    ["st_ms", "Mississippi", [-91.95, -87.75, 29.8, 35.4]],
+    ["st_mo", "Missouri", [-96.31, -88.59, 35.61, 40.99]],
+    ["st_mt", "Montana", [-116.93, -103.27, 44.01, 49.39]],
+    ["st_ne", "Nebraska", [-104.74, -94.66, 39.65, 43.35]],
+    ["st_nv", "Nevada", [-120.47, -113.53, 34.47, 42.53]],
+    ["st_nh", "New Hampshire", [-72.95, -70.35, 42.35, 45.65]],
+    ["st_nj", "New Jersey", [-75.95, -73.55, 38.55, 41.65]],
+    ["st_nm", "New Mexico", [-109.58, -102.52, 30.85, 37.45]],
+    ["st_ny", "New York", [-80.39, -71.31, 40.12, 45.38]],
+    ["st_nc", "North Carolina", [-84.94, -74.86, 33.45, 36.95]],
+    ["st_nd", "North Dakota", [-104.66, -96.04, 45.55, 49.35]],
+    ["st_oh", "Ohio", [-85.28, -80.12, 38.05, 42.65]],
+    ["st_ok", "Oklahoma", [-103.62, -93.88, 33.25, 37.35]],
+    ["st_or", "Oregon", [-125.2, -115.9, 41.63, 46.67]],
+    ["st_pa", "Pennsylvania", [-80.96, -74.24, 39.35, 42.65]],
+    ["st_ri", "Rhode Island", [-72.15, -70.85, 40.85, 42.35]],
+    ["st_sc", "South Carolina", [-83.7, -78.1, 31.75, 35.55]],
+    ["st_sd", "South Dakota", [-104.67, -95.93, 42.15, 46.25]],
+    ["st_tn", "Tennessee", [-90.93, -81.07, 34.65, 37.05]],
+    ["st_tx", "Texas", [-107.6, -92.6, 25.05, 37.25]],
+    ["st_ut", "Utah", [-114.52, -108.58, 36.59, 42.41]],
+    ["st_vt", "Vermont", [-73.75, -71.15, 42.35, 45.35]],
+    ["st_va", "Virginia", [-84.32, -74.58, 36.15, 39.75]],
+    ["st_wa", "Washington", [-125.39, -116.31, 45.15, 49.35]],
+    ["st_wv", "West Virginia", [-83.01, -77.29, 36.85, 40.95]],
+    ["st_wi", "Wisconsin", [-93.38, -86.32, 42.11, 47.49]],
+    ["st_wy", "Wyoming", [-111.63, -103.57, 40.65, 45.35]],
   ];
+
 
   var state = {
     fam: "weather",
@@ -382,10 +451,24 @@
   function activeBounds() { return state.drawn || state.bounds; }
 
   // ---- wiring ---------------------------------------------------------------
-  DOMAINS.forEach(function (d, i) {
-    var b = document.createElement("button"); b.textContent = d[1]; b.setAttribute("data-domain", d[0]);
-    if (i === 0) b.classList.add("on"); $("domainSeg").appendChild(b);
-  });
+  var QUICK_DOMAINS = ["conus", "california", "wide_west", "southeast"];
+  (function buildDomainControls() {
+    var seg = $("domainSeg"), sel = $("domainSel");
+    var regions = document.createElement("optgroup"); regions.label = "Regions";
+    var states = document.createElement("optgroup"); states.label = "States";
+    DOMAINS.forEach(function (d) {
+      if (QUICK_DOMAINS.indexOf(d[0]) !== -1) {
+        var b = document.createElement("button");
+        b.textContent = d[1]; b.setAttribute("data-domain", d[0]);
+        if (d[0] === state.preset) b.classList.add("on");
+        seg.appendChild(b);
+        return;
+      }
+      var o = document.createElement("option"); o.value = d[0]; o.textContent = d[1];
+      (d[0].indexOf("st_") === 0 ? states : regions).appendChild(o);
+    });
+    sel.appendChild(regions); sel.appendChild(states);
+  })();
 
   seg("famSeg", "fam", function (v) {
     state.fam = v;
@@ -400,9 +483,19 @@
     state.hour = Math.min(lim.max, Math.max(0, state.hour + dir * lim.step));
     $("hour").value = state.hour; $("hourLabel").textContent = state.hour; }
 
-  seg("domainSeg", "domain", function (v) {
-    var d = DOMAINS.find(function (x) { return x[0] === v; });
-    state.preset = v; state.bounds = d[2]; state.drawn = null; syncMapToBounds(); boundsLabel();
+  function applyDomain(key) {
+    var d = DOMAINS.find(function (x) { return x[0] === key; });
+    if (!d) return;
+    state.preset = key; state.bounds = d[2]; state.drawn = null;
+    [].forEach.call($("domainSeg").querySelectorAll("button"), function (b) {
+      b.classList.toggle("on", b.getAttribute("data-domain") === key);
+    });
+    $("domainSel").value = QUICK_DOMAINS.indexOf(key) !== -1 ? "" : key;
+    syncMapToBounds(); boundsLabel();
+  }
+  seg("domainSeg", "domain", function (v) { applyDomain(v); });
+  $("domainSel").addEventListener("change", function (e) {
+    if (e.target.value) applyDomain(e.target.value);
   });
   seg("basemapSeg", "basemap", function (v) { state.basemap = v; });
   seg("valueSeg", "values", function (v) { state.values = v === "on"; });

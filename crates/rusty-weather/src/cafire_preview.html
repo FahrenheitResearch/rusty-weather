@@ -459,22 +459,79 @@ const $ = id => document.getElementById(id);
    the anomaly + vs-record families are blank outside the wide-west box even
    though every other family renders nationally. */
 const DOMAINS = {
-  california: { slug: "cafire_california", bounds: [-126.0, -113.8, 31.9, 42.5], label: "California" },
-  wide_west:  { slug: "cafire_wide_west",  bounds: [-125.7, -103.8, 31.9, 46.5], label: "Wide West" },
-  sierra:     { slug: "sierra_front",      bounds: [-121.9, -117.6, 37.2, 41.2], label: "Sierra Front" },
-  socal:      { slug: "socal",             bounds: [-121.5, -114.1, 32.5, 36.0], label: "SoCal" },
-  norcal:     { slug: "norcal",            bounds: [-125.0, -119.0, 37.0, 42.2], label: "NorCal" },
-  bay_delta:  { slug: "bay_delta",         bounds: [-123.3, -120.5, 36.7, 39.0], label: "Bay / Delta" },
-  conus:      { slug: "conus",             bounds: [-125.0, -66.5, 24.0, 50.0],  label: "CONUS" },
-  pacnw:      { slug: "pacnw",             bounds: [-125.0, -110.5, 41.0, 49.2], label: "Pacific NW" },
-  great_basin:{ slug: "great_basin",       bounds: [-121.0, -110.0, 34.5, 43.5], label: "Great Basin" },
-  southwest:  { slug: "southwest",         bounds: [-120.0, -102.0, 30.5, 42.0], label: "Southwest" },
-  no_rockies: { slug: "northern_rockies",  bounds: [-117.0, -103.0, 41.5, 49.2], label: "N. Rockies" },
-  so_plains:  { slug: "southern_plains",   bounds: [-105.0, -91.0, 28.0, 40.0],  label: "S. Plains" },
-  no_plains:  { slug: "northern_plains",   bounds: [-105.0, -90.0, 39.0, 49.2],  label: "N. Plains" },
-  midwest:    { slug: "midwest",           bounds: [-97.0, -80.0, 36.0, 47.5],   label: "Midwest" },
-  southeast:  { slug: "southeast",         bounds: [-95.0, -75.0, 24.5, 37.0],   label: "Southeast" },
-  northeast:  { slug: "northeast",         bounds: [-82.0, -66.5, 37.0, 47.5],   label: "Northeast" },
+  conus:          { slug: "conus", bounds: [-125.0, -66.5, 24.0, 50.0], label: "CONUS" },
+  california:     { slug: "california", bounds: [-126.0, -113.8, 31.9, 42.5], label: "California" },
+  wide_west:      { slug: "wide_west", bounds: [-125.7, -103.8, 31.9, 46.5], label: "Wide West" },
+  sierra:         { slug: "sierra", bounds: [-121.9, -117.6, 37.2, 41.2], label: "Sierra Front" },
+  socal:          { slug: "socal", bounds: [-121.5, -114.1, 32.5, 36.0], label: "SoCal" },
+  norcal:         { slug: "norcal", bounds: [-125.0, -119.0, 37.0, 42.2], label: "NorCal" },
+  bay_delta:      { slug: "bay_delta", bounds: [-123.3, -120.5, 36.7, 39.0], label: "Bay / Delta" },
+  pacnw:          { slug: "pacnw", bounds: [-125.0, -110.5, 41.0, 49.2], label: "Pacific NW" },
+  great_basin:    { slug: "great_basin", bounds: [-121.0, -110.0, 34.5, 43.5], label: "Great Basin" },
+  southwest:      { slug: "southwest", bounds: [-120.0, -102.0, 30.5, 42.0], label: "Southwest" },
+  no_rockies:     { slug: "no_rockies", bounds: [-117.0, -103.0, 41.5, 49.2], label: "N. Rockies" },
+  so_rockies:     { slug: "so_rockies", bounds: [-110.5, -102.0, 34.5, 42.0], label: "S. Rockies" },
+  so_plains:      { slug: "so_plains", bounds: [-105.0, -91.0, 28.0, 40.0], label: "S. Plains" },
+  no_plains:      { slug: "no_plains", bounds: [-105.0, -90.0, 39.0, 49.2], label: "N. Plains" },
+  midwest:        { slug: "midwest", bounds: [-97.0, -80.0, 36.0, 47.5], label: "Midwest" },
+  great_lakes:    { slug: "great_lakes", bounds: [-93.0, -74.5, 40.0, 49.0], label: "Great Lakes" },
+  ohio_valley:    { slug: "ohio_valley", bounds: [-90.0, -77.5, 35.5, 42.5], label: "Ohio Valley" },
+  mid_atlantic:   { slug: "mid_atlantic", bounds: [-83.0, -73.5, 35.0, 41.5], label: "Mid-Atlantic" },
+  southeast:      { slug: "southeast", bounds: [-95.0, -75.0, 24.5, 37.0], label: "Southeast" },
+  deep_south:     { slug: "deep_south", bounds: [-95.0, -81.0, 29.0, 36.5], label: "Deep South" },
+  gulf_coast:     { slug: "gulf_coast", bounds: [-98.5, -81.0, 24.5, 33.0], label: "Gulf Coast" },
+  northeast:      { slug: "northeast", bounds: [-82.0, -66.5, 37.0, 47.5], label: "Northeast" },
+  new_england:    { slug: "new_england", bounds: [-74.5, -66.5, 40.5, 47.5], label: "New England" },
+  appalachians:   { slug: "appalachians", bounds: [-87.0, -75.0, 33.5, 43.0], label: "Appalachians" },
+  st_al:          { slug: "st_al", bounds: [-88.95, -84.45, 29.69, 35.51], label: "Alabama" },
+  st_az:          { slug: "st_az", bounds: [-115.47, -108.53, 30.84, 37.56], label: "Arizona" },
+  st_ar:          { slug: "st_ar", bounds: [-95.12, -89.18, 32.55, 36.85], label: "Arkansas" },
+  st_ca:          { slug: "st_ca", bounds: [-125.24, -113.36, 31.82, 42.68], label: "California" },
+  st_co:          { slug: "st_co", bounds: [-109.64, -101.46, 36.65, 41.35], label: "Colorado" },
+  st_ct:          { slug: "st_ct", bounds: [-74.05, -71.45, 40.65, 42.45], label: "Connecticut" },
+  st_de:          { slug: "st_de", bounds: [-76.15, -74.65, 38.15, 40.15], label: "Delaware" },
+  st_dc:          { slug: "st_dc", bounds: [-77.45, -76.55, 38.45, 39.35], label: "Dist. of Columbia" },
+  st_fl:          { slug: "st_fl", bounds: [-88.17, -79.43, 24.0, 31.5], label: "Florida" },
+  st_ga:          { slug: "st_ga", bounds: [-86.0, -80.4, 30.01, 35.39], label: "Georgia" },
+  st_id:          { slug: "st_id", bounds: [-117.68, -110.52, 41.47, 49.53], label: "Idaho" },
+  st_il:          { slug: "st_il", bounds: [-91.85, -87.15, 36.56, 42.94], label: "Illinois" },
+  st_in:          { slug: "st_in", bounds: [-88.45, -84.45, 37.45, 42.15], label: "Indiana" },
+  st_ia:          { slug: "st_ia", bounds: [-97.1, -89.6, 40.05, 43.85], label: "Iowa" },
+  st_ks:          { slug: "st_ks", bounds: [-102.66, -94.04, 36.65, 40.35], label: "Kansas" },
+  st_ky:          { slug: "st_ky", bounds: [-90.17, -81.43, 36.15, 39.45], label: "Kentucky" },
+  st_la:          { slug: "st_la", bounds: [-94.42, -88.38, 28.54, 33.36], label: "Louisiana" },
+  st_me:          { slug: "st_me", bounds: [-71.46, -66.54, 42.62, 47.88], label: "Maine" },
+  st_md:          { slug: "st_md", bounds: [-79.88, -74.62, 37.55, 40.05], label: "Maryland" },
+  st_ma:          { slug: "st_ma", bounds: [-73.85, -69.55, 40.95, 43.15], label: "Massachusetts" },
+  st_mi:          { slug: "st_mi", bounds: [-91.0, -81.6, 41.2, 48.7], label: "Michigan" },
+  st_mn:          { slug: "st_mn", bounds: [-97.77, -88.93, 43.03, 49.87], label: "Minnesota" },
+  st_ms:          { slug: "st_ms", bounds: [-91.95, -87.75, 29.8, 35.4], label: "Mississippi" },
+  st_mo:          { slug: "st_mo", bounds: [-96.31, -88.59, 35.61, 40.99], label: "Missouri" },
+  st_mt:          { slug: "st_mt", bounds: [-116.93, -103.27, 44.01, 49.39], label: "Montana" },
+  st_ne:          { slug: "st_ne", bounds: [-104.74, -94.66, 39.65, 43.35], label: "Nebraska" },
+  st_nv:          { slug: "st_nv", bounds: [-120.47, -113.53, 34.47, 42.53], label: "Nevada" },
+  st_nh:          { slug: "st_nh", bounds: [-72.95, -70.35, 42.35, 45.65], label: "New Hampshire" },
+  st_nj:          { slug: "st_nj", bounds: [-75.95, -73.55, 38.55, 41.65], label: "New Jersey" },
+  st_nm:          { slug: "st_nm", bounds: [-109.58, -102.52, 30.85, 37.45], label: "New Mexico" },
+  st_ny:          { slug: "st_ny", bounds: [-80.39, -71.31, 40.12, 45.38], label: "New York" },
+  st_nc:          { slug: "st_nc", bounds: [-84.94, -74.86, 33.45, 36.95], label: "North Carolina" },
+  st_nd:          { slug: "st_nd", bounds: [-104.66, -96.04, 45.55, 49.35], label: "North Dakota" },
+  st_oh:          { slug: "st_oh", bounds: [-85.28, -80.12, 38.05, 42.65], label: "Ohio" },
+  st_ok:          { slug: "st_ok", bounds: [-103.62, -93.88, 33.25, 37.35], label: "Oklahoma" },
+  st_or:          { slug: "st_or", bounds: [-125.2, -115.9, 41.63, 46.67], label: "Oregon" },
+  st_pa:          { slug: "st_pa", bounds: [-80.96, -74.24, 39.35, 42.65], label: "Pennsylvania" },
+  st_ri:          { slug: "st_ri", bounds: [-72.15, -70.85, 40.85, 42.35], label: "Rhode Island" },
+  st_sc:          { slug: "st_sc", bounds: [-83.7, -78.1, 31.75, 35.55], label: "South Carolina" },
+  st_sd:          { slug: "st_sd", bounds: [-104.67, -95.93, 42.15, 46.25], label: "South Dakota" },
+  st_tn:          { slug: "st_tn", bounds: [-90.93, -81.07, 34.65, 37.05], label: "Tennessee" },
+  st_tx:          { slug: "st_tx", bounds: [-107.6, -92.6, 25.05, 37.25], label: "Texas" },
+  st_ut:          { slug: "st_ut", bounds: [-114.52, -108.58, 36.59, 42.41], label: "Utah" },
+  st_vt:          { slug: "st_vt", bounds: [-73.75, -71.15, 42.35, 45.35], label: "Vermont" },
+  st_va:          { slug: "st_va", bounds: [-84.32, -74.58, 36.15, 39.75], label: "Virginia" },
+  st_wa:          { slug: "st_wa", bounds: [-125.39, -116.31, 45.15, 49.35], label: "Washington" },
+  st_wv:          { slug: "st_wv", bounds: [-83.01, -77.29, 36.85, 40.95], label: "West Virginia" },
+  st_wi:          { slug: "st_wi", bounds: [-93.38, -86.32, 42.11, 47.49], label: "Wisconsin" },
+  st_wy:          { slug: "st_wy", bounds: [-111.63, -103.57, 40.65, 45.35], label: "Wyoming" },
 };
 /* Crops that get a one-click button; the rest live in the "more regions"
    list. Both are built from DOMAINS so they stay in sync. */
@@ -483,6 +540,10 @@ const QUICK_PRESETS = ["california", "wide_west", "sierra", "conus"];
   const btns = document.getElementById("presetBtns");
   const sel = document.getElementById("presetSel");
   if (!btns || !sel) return;
+  const regionGroup = document.createElement("optgroup");
+  regionGroup.label = "Regions";
+  const stateGroup = document.createElement("optgroup");
+  stateGroup.label = "States";
   for (const [key, domain] of Object.entries(DOMAINS)) {
     if (QUICK_PRESETS.includes(key)) {
       const b = document.createElement("button");
@@ -490,13 +551,15 @@ const QUICK_PRESETS = ["california", "wide_west", "sierra", "conus"];
       b.dataset.preset = key;
       b.textContent = domain.label;
       btns.appendChild(b);
-    } else {
-      const o = document.createElement("option");
-      o.value = key;
-      o.textContent = domain.label;
-      sel.appendChild(o);
+      continue;
     }
+    const o = document.createElement("option");
+    o.value = key;
+    o.textContent = domain.label;
+    (key.startsWith("st_") ? stateGroup : regionGroup).appendChild(o);
   }
+  sel.appendChild(regionGroup);
+  sel.appendChild(stateGroup);
 })();
 const ANOMALY = [
   ["vpd_day_max_percentile", "Day-max VPD"],
