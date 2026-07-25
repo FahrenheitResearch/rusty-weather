@@ -415,6 +415,7 @@ a.dl:hover{background:#1b2223;color:#ffa580}
       <div class="viewer-foot">
         <span id="footNote">HRRR × RTMA climatology 2019–2026 · rendered on demand</span>
         <a id="dlLink" href="#" download style="display:none; color: var(--muted)">download</a>
+        <button id="copyImgBtn" type="button" style="display:none; background:transparent; color:var(--muted); border:1px solid var(--muted); border-radius:6px; padding:3px 10px; font:inherit; font-size:12px; cursor:pointer; margin-right:6px">⧉ Copy image</button>
         <button id="savePngBtn" type="button" style="display:none; background:transparent; color:var(--muted); border:1px solid var(--muted); border-radius:6px; padding:3px 10px; font:inherit; font-size:12px; cursor:pointer">⬇ Save PNG</button>
         <span class="zoom-hint">click the map to open full resolution</span>
       </div>
@@ -2025,6 +2026,13 @@ async function requestPlot(productSlug, hour, quiet) {
 }
 
 async function renderCurrent() {
+  // A running loop owns viewImg.src on a timer. Without this, picking a new
+  // product renders it and the loop immediately paints over it — the viewer
+  // just keeps looping the OLD product. Any fresh render ends playback and
+  // drops the cached loop, since its frames belong to the previous settings.
+  stopPlay();
+  loopJob = null;
+  setLoopExports(null);
   const seq = ++state.seq;
   const spin = $("spin");
   try {
@@ -2153,15 +2161,79 @@ function showImage(url, title, run, file, pngUrl) {
   // saved/shared as an image (mobile falls back to a link). This fetches the
   // rasterized PNG and hands it to the native share sheet (mobile) or a
   // download (desktop).
+  const slugName = `${String(title).replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase() || "plot"}.png`;
+  // Copy image: available for anything with a real raster — maps (WebP) and the
+  // rasterized cards alike. Chrome's own "Copy image" hands Discord a WebP or a
+  // bare URL, neither of which it will paste, so this re-encodes to PNG.
+  const copy = $("copyImgBtn");
+  const copySource = pngUrl || (file ? url : null);
+  if (copySource) {
+    copy.style.display = "";
+    copy.onclick = () => copyPlotToClipboard(copySource, slugName);
+  } else {
+    copy.style.display = "none";
+    copy.onclick = null;
+  }
   const sp = $("savePngBtn");
   if (pngUrl) {
     sp.style.display = "";
-    const name = `${String(title).replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase() || "card"}.png`;
+    const name = slugName;
     sp.onclick = () => savePng(pngUrl, name, title);
   } else {
     sp.style.display = "none";
     sp.onclick = null;
   }
+}
+
+
+/* Copy the displayed plot to the clipboard as PNG.
+
+   Maps are served as WebP (smaller, and the renderer emits it natively). But
+   Chrome's own "Copy image" on a WebP hands the clipboard either WebP or just
+   the URL, and Discord's paste handler accepts neither — reported as "can't
+   copy-paste into Discord". Re-encoding through a canvas puts a real
+   image/png on the clipboard, which every paste target understands. Falls back
+   to a download when the Clipboard API is unavailable (Firefox, http origins).
+*/
+async function copyPlotToClipboard(url, filename) {
+  const supported = !!(navigator.clipboard && window.ClipboardItem);
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const blob = await resp.blob();
+    const png = await blobToPng(blob);
+    if (!supported) throw new Error("clipboard image write unsupported");
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+    log("image copied — paste it straight into Discord/Slack", "ok");
+  } catch (err) {
+    log(`copy failed (${err.message}); downloading instead`, "err");
+    try {
+      const resp = await fetch(url);
+      const png = await blobToPng(await resp.blob());
+      const obj = URL.createObjectURL(png);
+      const a = document.createElement("a");
+      a.href = obj; a.download = filename || "plot.png";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(obj), 5000);
+    } catch { window.open(url, "_blank"); }
+  }
+}
+
+/* Decode any image blob and re-encode as PNG via a canvas. */
+function blobToPng(blob) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+      canvas.getContext("2d").drawImage(img, 0, 0);
+      URL.revokeObjectURL(url);
+      canvas.toBlob(out => (out ? resolve(out) : reject(new Error("canvas encode failed"))), "image/png");
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("could not decode image")); };
+    img.src = url;
+  });
 }
 
 async function savePng(pngUrl, filename, title) {

@@ -136,8 +136,8 @@
         <h2>Style</h2>
         <label class="field"><span>Basemap</span>
           <div class="seg" id="basemapSeg">
-            <button data-basemap="topo" class="on">Topo</button>
-            <button data-basemap="filled">Filled</button>
+            <button data-basemap="topo">Topo</button>
+            <button data-basemap="filled" class="on">Filled</button>
             <button data-basemap="white">White</button>
           </div>
         </label>
@@ -204,6 +204,7 @@
         <button class="btn secondary" id="loopBtn" style="flex:0 0 auto">&#9654; Loop</button>
         <input id="loopMs" type="number" min="20" max="2000" step="20" value="200" title="ms per frame"
                style="width:70px" />
+        <button class="btn secondary" id="copyImgBtn" style="flex:0 0 auto;display:none">&#8681; Copy PNG</button>
         <span id="loopExports" style="font-size:11px"></span>
       </div>
     </div>
@@ -684,7 +685,7 @@
   var state = {
     fam: "weather",
     model: "hrrr", product: FAMS[0].products[0][0], hour: 6,
-    basemap: "topo", values: false, density: 2, counties: true, tempUnits: "f",
+    basemap: "filled", values: false, density: 2, counties: true, tempUnits: "f",
     preset: "conus", bounds: DOMAINS[0][2], drawn: null,
     brand: "generic", brandTitle: "", brandCredit: "", logoDataUrl: null,
   };
@@ -1064,6 +1065,11 @@
 
   async function render() {
     if (busy) return; busy = true; $("renderBtn").disabled = true;
+    // A running loop owns the viewer <img> on a timer; without this a new
+    // product renders and the loop immediately paints the OLD one back over it.
+    stopLoop();
+    loopJob = null;
+    setLoopExports(null);
     setStatus("busy", "Rendering…");
     $("renderMeta").textContent = ""; var t0 = performance.now();
     try {
@@ -1102,6 +1108,51 @@
     var img = new Image(); img.src = url; img.alt = name || "plot"; v.appendChild(img);
     var dl = $("downloadBtn"); dl.href = url; dl.setAttribute("download", name || "wxsection.webp");
     dl.style.pointerEvents = "auto"; dl.style.opacity = "1";
+    var copy = $("copyImgBtn");
+    if (copy) {
+      copy.style.display = "";
+      copy.onclick = function () { copyPlotToClipboard(url, (name || "plot").replace(/\.\w+$/, "") + ".png"); };
+    }
+  }
+
+  /* Copy the plot to the clipboard as PNG. Plots are served as WebP, and
+     Chrome's own "Copy image" gives Discord either WebP or a bare URL — neither
+     pastes. Re-encoding through a canvas puts a real image/png on the
+     clipboard. Falls back to a PNG download where the Clipboard API is absent. */
+  async function copyPlotToClipboard(url, filename) {
+    try {
+      var resp = await fetch(url);
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      var png = await blobToPng(await resp.blob());
+      if (!(navigator.clipboard && window.ClipboardItem)) throw new Error("clipboard unsupported");
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+      setStatus("ok", "Image copied — paste straight into Discord/Slack");
+    } catch (err) {
+      setStatus("err", "Copy failed (" + err.message + "); downloading PNG");
+      try {
+        var png2 = await blobToPng(await (await fetch(url)).blob());
+        var obj = URL.createObjectURL(png2);
+        var a = document.createElement("a");
+        a.href = obj; a.download = filename || "plot.png";
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function () { URL.revokeObjectURL(obj); }, 5000);
+      } catch (e) { window.open(url, "_blank"); }
+    }
+  }
+  function blobToPng(blob) {
+    return new Promise(function (resolve, reject) {
+      var url = URL.createObjectURL(blob);
+      var img = new Image();
+      img.onload = function () {
+        var c = document.createElement("canvas");
+        c.width = img.naturalWidth; c.height = img.naturalHeight;
+        c.getContext("2d").drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+        c.toBlob(function (out) { out ? resolve(out) : reject(new Error("canvas encode failed")); }, "image/png");
+      };
+      img.onerror = function () { URL.revokeObjectURL(url); reject(new Error("could not decode image")); };
+      img.src = url;
+    });
   }
 
   $("renderBtn").addEventListener("click", render);

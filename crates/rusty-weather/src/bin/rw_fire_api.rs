@@ -3212,6 +3212,15 @@ struct LoopJobRequest {
     /// the export downscales by default instead of shipping a ~100 MB file.
     #[serde(default)]
     gif_width: Option<u32>,
+    /// Width of the exported VIDEO. Defaults to 0 = keep the rendered frame's
+    /// native size: H.264 handles full-resolution maps in a few MB, so there is
+    /// no reason to throw away detail the way GIF forces us to.
+    #[serde(default)]
+    video_width: Option<u32>,
+    /// x264/VP9 quality (CRF). Lower is better; 18 is visually near-lossless for
+    /// flat map fills, 23 left visible mush in the colorbar and thin linework.
+    #[serde(default)]
+    video_crf: Option<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -3226,6 +3235,9 @@ struct LoopJob {
     frames: Vec<LoopFrame>,
     frame_ms: u16,
     gif_width: u32,
+    /// 0 = native frame size.
+    video_width: u32,
+    video_crf: u8,
     created_unix_ms: u128,
 }
 
@@ -3293,6 +3305,8 @@ fn start_loop_job(body: Vec<u8>, state: AppState) -> Vec<u8> {
         frames,
         frame_ms: parsed.frame_ms.unwrap_or(220).clamp(20, 2000),
         gif_width: parsed.gif_width.unwrap_or(1000).clamp(200, 2000),
+        video_width: parsed.video_width.map(|w| w.clamp(200, 4096)).unwrap_or(0),
+        video_crf: parsed.video_crf.unwrap_or(18).clamp(0, 51),
         created_unix_ms: unix_ms_now(),
     };
     state
@@ -3536,10 +3550,15 @@ fn loop_video_response(job: &LoopJob, state: &AppState, webm: bool) -> Vec<u8> {
         .arg("-i")
         .arg(work.join("%05d.png"))
         .arg("-vf")
-        .arg(format!(
-            "scale='min({width},iw)':-2:flags=lanczos,pad=ceil(iw/2)*2:ceil(ih/2)*2",
-            width = job.gif_width
-        ))
+        .arg(if job.video_width == 0 {
+            // Native size; only force even dimensions for yuv420p.
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2".to_string()
+        } else {
+            format!(
+                "scale='min({width},iw)':-2:flags=lanczos,pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                width = job.video_width
+            )
+        })
         .arg("-pix_fmt")
         .arg("yuv420p");
     if webm {
@@ -3549,15 +3568,25 @@ fn loop_video_response(job: &LoopJob, state: &AppState, webm: bool) -> Vec<u8> {
             .arg("-b:v")
             .arg("0")
             .arg("-crf")
-            .arg("32");
+            .arg(job.video_crf.to_string())
+            .arg("-row-mt")
+            .arg("1");
     } else {
         command
             .arg("-c:v")
             .arg("libx264")
+            // `slow` over `veryfast`: these are a handful of frames, the encode
+            // is not the bottleneck, and it buys real quality at the same CRF.
             .arg("-preset")
-            .arg("veryfast")
+            .arg("slow")
             .arg("-crf")
-            .arg("23")
+            .arg(job.video_crf.to_string())
+            // 4:2:0 chroma subsampling smears the saturated colorbar edges; the
+            // high profile keeps 8x8 transforms which helps thin linework.
+            .arg("-profile:v")
+            .arg("high")
+            .arg("-tune")
+            .arg("stillimage")
             .arg("-movflags")
             .arg("+faststart");
     }
