@@ -47,6 +47,9 @@
   .btn { background: var(--accent); color: var(--accent-ink); border: 0;
     border-radius: 9px; padding: 10px 14px; font: inherit; font-weight: 700;
     cursor: pointer; }
+  a.dl { color: var(--accent, #ff8a5c); text-decoration: none; border: 1px solid var(--line, #2a3335);
+         border-radius: 7px; padding: 2px 6px; margin-right: 2px; }
+  a.dl:hover { background: var(--panel-2); }
   .btn.secondary { background: var(--panel-2); color: var(--ink);
     border: 1px solid var(--line); font-weight: 500; }
   .btn:disabled { opacity: .5; cursor: default; }
@@ -197,6 +200,12 @@
       </div>
 
       <button class="btn" id="renderBtn">Render plot</button>
+      <div class="row" style="margin-top:8px;align-items:center;gap:6px">
+        <button class="btn secondary" id="loopBtn" style="flex:0 0 auto">&#9654; Loop</button>
+        <input id="loopMs" type="number" min="20" max="2000" step="20" value="200" title="ms per frame"
+               style="width:70px" />
+        <span id="loopExports" style="font-size:11px"></span>
+      </div>
     </div>
 
     <div class="stage">
@@ -931,6 +940,88 @@
     state.drawn = null; state.preset = "conus"; state.bounds = DOMAINS[0][2];
     [].forEach.call($("domainSeg").querySelectorAll("button"), function (x, i) { x.classList.toggle("on", i === 0); });
     syncMapToBounds(); boundsLabel();
+  });
+
+  /* Server-built loops. One POST /api/loop renders the whole hour range as a
+     unit -- reusing the per-frame render cache and the render gate -- then we
+     preload every frame and animate, so playback never waits on the network.
+     Export links (H.264 / VP9 / GIF) come from the same job. */
+  var loopJob = null;
+  var loopTimer = null;
+  function loopFrameMs() {
+    var raw = Number($("loopMs").value);
+    return isFinite(raw) && raw >= 20 ? Math.min(raw, 2000) : 200;
+  }
+  function stopLoop() {
+    if (loopTimer) { clearInterval(loopTimer); loopTimer = null; }
+    $("loopBtn").classList.remove("on");
+  }
+  function setLoopExports(job) {
+    var box = $("loopExports");
+    if (!job) { box.innerHTML = ""; return; }
+    var base = "/api/loops/" + job.id;
+    box.innerHTML =
+      '<a class="dl" href="' + base + '/animation.mp4">&darr; MP4</a> ' +
+      '<a class="dl" href="' + base + '/animation.webm">&darr; WebM</a> ' +
+      '<a class="dl" href="' + base + '/animation.gif">&darr; GIF</a>';
+  }
+  async function buildLoop() {
+    var fam = activeFam();
+    if (!fam.hourly) { setStatus("err", "this family has a single frame; nothing to loop"); return null; }
+    var lim = HOUR_LIMITS[state.model];
+    var hours = [];
+    for (var h = 0; h <= lim.max; h += lim.step) hours.push(h);
+    if (hours.length > 120) hours = hours.slice(0, 120);
+    var payload = buildPayload();
+    delete payload.hour;
+    payload.hours = hours;
+    payload.frame_ms = loopFrameMs();
+    payload.gif_width = 1100;
+    var started = await fetch("/api/loop", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    }).then(function (r) { return r.json(); });
+    if (started.error) { setStatus("err", "loop: " + started.error); return null; }
+    for (;;) {
+      var status = await fetch(started.status_url).then(function (r) { return r.json(); });
+      setStatus("busy", "Loop " + status.done + "/" + status.total);
+      if (status.state !== "running") {
+        var frames = status.frames.filter(function (f) { return f.url; });
+        if (!frames.length) { setStatus("err", "loop produced no frames"); return null; }
+        await Promise.all(frames.map(function (f) {
+          return new Promise(function (done) {
+            var img = new Image(); img.onload = img.onerror = done; img.src = f.url;
+          });
+        }));
+        setStatus("ok", "Loop ready (" + frames.length + " frames)");
+        return { id: status.id, frames: frames, frame_ms: status.frame_ms };
+      }
+      await sleep(700);
+    }
+  }
+  $("loopBtn").addEventListener("click", async function () {
+    if (loopTimer) return stopLoop();
+    var signature = JSON.stringify([state.product, state.model, activeBounds(), state.basemap,
+      state.counties, state.density, state.tempUnits, state.values, state.brand, loopFrameMs()]);
+    if (!loopJob || loopJob.signature !== signature) {
+      var built = await buildLoop();
+      if (!built) return;
+      built.signature = signature;
+      loopJob = built;
+      setLoopExports(loopJob);
+    }
+    $("loopBtn").classList.add("on");
+    var index = 0;
+    loopTimer = setInterval(function () {
+      var frame = loopJob.frames[index % loopJob.frames.length];
+      var viewer = $("viewer");
+      var img = viewer.querySelector("img");
+      if (!img) { img = new Image(); img.alt = "loop frame"; viewer.innerHTML = ""; viewer.appendChild(img); }
+      img.src = frame.url;
+      state.hour = frame.hour;
+      var label = $("hourLabel"); if (label) label.textContent = frame.hour;
+      index += 1;
+    }, loopJob.frame_ms);
   });
 
   // ---- status ---------------------------------------------------------------

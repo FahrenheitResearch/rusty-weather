@@ -116,6 +116,8 @@ button { color: inherit; cursor: pointer; }
 .hour-nav button:hover { border-color: rgba(255,91,36,0.5); }
 .hour-nav button:disabled { opacity: 0.35; cursor: default; }
 .hour-nav .hour-label { min-width: 118px; text-align: center; font-size: 13.5px; font-weight: 650; color: var(--orange-bright); font-variant-numeric: tabular-nums; background: var(--panel-2, #161c1d); border: 1px solid var(--line, #2a3233); border-radius: 9px; padding: 4px 8px; cursor: pointer; }
+a.dl{color:#ff8a5c;text-decoration:none;border:1px solid #3a2a22;border-radius:7px;padding:2px 6px;margin-right:2px}
+a.dl:hover{background:#1b2223;color:#ffa580}
 .prod-note { margin: 8px 0 2px; padding: 9px 12px; font-size: 12.5px; line-height: 1.5; color: var(--muted, #9ea6a5); background: var(--panel-2, #14191a); border: 1px solid var(--line, #232b2c); border-left: 3px solid var(--orange, #ff5b24); border-radius: 9px; }
 .hour-nav .play.on { background: var(--orange-soft); color: var(--orange-bright); border-color: rgba(255,91,36,0.5); }
 .viewport { position: relative; background: #0c0f10; height: clamp(480px, calc(100vh - 250px), 940px); display: grid; place-items: center; overflow: hidden; }
@@ -398,7 +400,10 @@ button { color: inherit; cursor: pointer; }
           <button id="hPrev" title="Earlier hour (←)">◀</button>
           <select class="hour-label" id="hourSelect" title="Jump to any forecast hour"></select>
           <button id="hNext" title="Later hour (→)">▶</button>
-          <button class="play" id="hPlay" title="Animate the run">▶ loop</button>
+          <button class="play" id="hPlay" title="Build the loop server-side, then play it">▶ loop</button>
+          <input id="loopMs" type="number" min="20" max="2000" step="20" value="200" title="ms per frame"
+                 style="width:64px;margin-left:6px;background:#111617;color:#e7edee;border:1px solid #23302f;border-radius:8px;padding:3px 6px;font-size:11px">
+          <span id="loopExports" style="margin-left:8px;font-size:11px"></span>
         </div>
       </div>
       <div class="prod-note" id="productNote" style="display:none"></div>
@@ -1503,18 +1508,93 @@ addEventListener("keydown", ev => {
   if (ev.key === "ArrowLeft") stepHour(-1);
   if (ev.key === "ArrowRight") stepHour(1);
 });
+/* Server-built loops.
+
+   The old behavior stepped the hour and re-rendered each frame on demand: with a
+   3-slot render gate that is N racing requests with no progress and visible
+   stalls. Now one POST /api/loop renders the whole range as a unit (reusing the
+   per-frame cache, so hours already on disk are instant), we show real
+   done/total progress, preload every frame, and only then animate -- so playback
+   is smooth instead of waiting on the network each tick. Export links come from
+   the same job. */
+let loopJob = null;
 function stopPlay() {
   if (state.playTimer) { clearInterval(state.playTimer); state.playTimer = null; $("hPlay").classList.remove("on"); }
 }
-$("hPlay").onclick = () => {
+function loopFrameMs() {
+  const raw = Number(($("loopMs") || {}).value);
+  return Number.isFinite(raw) && raw >= 20 ? Math.min(raw, 2000) : 200;
+}
+function setLoopExports(job) {
+  const box = $("loopExports");
+  if (!box) return;
+  if (!job) { box.innerHTML = ""; return; }
+  const base = apiBase() + "/api/loops/" + job.id;
+  box.innerHTML =
+    '<a class="dl" href="' + base + '/animation.mp4">↓ MP4</a> ' +
+    '<a class="dl" href="' + base + '/animation.webm">↓ WebM</a> ' +
+    '<a class="dl" href="' + base + '/animation.gif">↓ GIF</a>';
+}
+async function buildLoop() {
+  const slug = state.fam === "climoref" ? climoSlug() : state.product;
+  const hours = (state.hours || []).slice();
+  if (!FAMS[state.fam].hourly || hours.length < 2) {
+    log("this family has a single frame; nothing to loop", "err");
+    return null;
+  }
+  const payload = renderPayload(slug, hours[0]);
+  delete payload.hour;
+  payload.hours = hours;
+  payload.frame_ms = loopFrameMs();
+  payload.gif_width = 1100;
+  const started = await fetch(apiBase() + "/api/loop", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  }).then(r => r.json());
+  if (started.error) { log("loop: " + started.error, "err"); return null; }
+  log("loop " + started.id + " (" + started.frames + " frames)");
+  const spin = $("spin");
+  spin.classList.add("show");
+  for (;;) {
+    const status = await fetch(apiBase() + started.status_url).then(r => r.json());
+    $("spinText").textContent = "loop " + status.done + "/" + status.total;
+    if (status.state !== "running") {
+      spin.classList.remove("show");
+      if (status.failed) log("loop: " + status.failed + " frame(s) failed", "err");
+      const frames = status.frames.filter(f => f.url);
+      if (!frames.length) { log("loop produced no frames", "err"); return null; }
+      // Preload so playback never waits on the network.
+      await Promise.all(frames.map(f => new Promise(done => {
+        const img = new Image(); img.onload = img.onerror = done; img.src = f.url;
+      })));
+      log("loop ready (" + frames.length + " frames)", "ok");
+      return { id: status.id, frames, frame_ms: status.frame_ms };
+    }
+    await new Promise(r => setTimeout(r, 700));
+  }
+}
+$("hPlay").onclick = async () => {
   if (state.playTimer) return stopPlay();
+  const slug = state.fam === "climoref" ? climoSlug() : state.product;
+  const signature = JSON.stringify([slug, currentRun(), domainPayload(), state.basemap,
+    state.counties, state.density, state.tempUnits, state.valueLabels, activeMapModel(),
+    state.hours, loopFrameMs()]);
+  if (!loopJob || loopJob.signature !== signature) {
+    const built = await buildLoop();
+    if (!built) return;
+    loopJob = Object.assign(built, { signature });
+    setLoopExports(loopJob);
+  }
   $("hPlay").classList.add("on");
+  let index = 0;
+  const img = $("viewImg");
   state.playTimer = setInterval(() => {
-    const index = state.hours.indexOf(state.hour);
-    state.hour = state.hours[(index + 1) % state.hours.length];
+    const frame = loopJob.frames[index % loopJob.frames.length];
+    img.src = frame.url;
+    state.hour = frame.hour;
     updateHourLabel();
-    renderCurrent();
-  }, 900);
+    index += 1;
+  }, loopJob.frame_ms);
 };
 
 /* ---------- render options (the tech-demo knobs) ---------- */
@@ -1910,7 +1990,9 @@ function productLabel() {
   return hit ? hit[1] : state.product;
 }
 
-async function requestPlot(productSlug, hour, quiet) {
+/* The render options for the current UI state, shared by single renders and
+   loops so a loop cannot drift from what the viewer shows. */
+function renderPayload(productSlug, hour) {
   const payload = {
     run: currentRun(), hour, products: productSlug,
     output_format: "webp", plot_style: "operational", basemap_style: state.basemap,
@@ -1926,6 +2008,11 @@ async function requestPlot(productSlug, hour, quiet) {
   // HRRR is the server default: omit `model` so HRRR requests keep sharing the
   // prewarm/pipeline cache key; send it only for a non-HRRR map family.
   if (activeMapModel() !== "hrrr") payload.model = activeMapModel();
+  return payload;
+}
+
+async function requestPlot(productSlug, hour, quiet) {
+  const payload = renderPayload(productSlug, hour);
   const started = await fetch(apiBase() + "/api/render", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) }).then(r => r.json());
   if (started.error) throw new Error(started.error);
   if (!quiet) log(`job ${started.id} (${started.cache})`, started.cache === "hit" ? "ok" : "");
