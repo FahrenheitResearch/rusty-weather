@@ -1897,42 +1897,63 @@ fn safe_model_slug(value: &str) -> String {
         .collect()
 }
 
+/// On-screen aspect (width:height) of a lat/lon box as it is PROJECTED, not as
+/// raw degrees: a degree of longitude spans only `cos(latitude)` as much
+/// distance as a degree of latitude, so CONUS draws about 1.8:1, not the 2.25:1
+/// its degree extents suggest. Sizing the canvas from raw degrees made the
+/// canvas disagree with the map on every domain, and the renderer then
+/// letterboxed the map inside it — the dead bands above and below the plot.
+fn domain_display_aspect(bounds: [f64; 4]) -> f64 {
+    let [west, east, south, north] = bounds;
+    let lat_span = (north - south).abs().max(0.05);
+    let lon_span = (east - west).abs().max(0.05);
+    let mid_lat_cos = (f64::midpoint(south, north)).to_radians().cos().max(0.15);
+    ((lon_span * mid_lat_cos) / lat_span).clamp(0.3, 3.6)
+}
+
+/// Scale a canvas so both edges satisfy the minimums (and neither exceeds the
+/// maximum) WITHOUT changing its aspect. Clamping a single axis is what
+/// produced the "CONUS is a half strip" canvases: a 1200x545 CONUS frame had
+/// its height forced up to 900, leaving a 1.33 canvas around a 1.80 map.
+fn fit_render_dimensions(width: f64, height: f64) -> (u32, u32) {
+    let width = width.max(1.0);
+    let height = height.max(1.0);
+    let up = (f64::from(MIN_RENDER_WIDTH) / width)
+        .max(f64::from(MIN_RENDER_HEIGHT) / height)
+        .max(1.0);
+    let (width, height) = (width * up, height * up);
+    let down = (f64::from(MAX_RENDER_DIMENSION) / width.max(height)).min(1.0);
+    (
+        (width * down).round().max(1.0) as u32,
+        (height * down).round().max(1.0) as u32,
+    )
+}
+
 fn output_size(request: &RenderJobRequest) -> (u32, u32) {
-    let [west, east, south, north] = request.resolved_bounds();
-    let aspect = ((east - west).abs().max(0.1) / (north - south).abs().max(0.1)).clamp(0.45, 2.2);
-    match (
-        request
-            .output_width
-            .map(|width| width.clamp(MIN_RENDER_WIDTH, MAX_RENDER_DIMENSION)),
-        request
-            .output_height
-            .map(|height| height.clamp(MIN_RENDER_HEIGHT, MAX_RENDER_DIMENSION)),
-    ) {
-        (Some(width), Some(height)) => return (width, height),
+    let aspect = domain_display_aspect(request.resolved_bounds());
+    match (request.output_width, request.output_height) {
+        // Both given: the caller owns the frame exactly.
+        (Some(width), Some(height)) => (
+            width.clamp(MIN_RENDER_WIDTH, MAX_RENDER_DIMENSION),
+            height.clamp(MIN_RENDER_HEIGHT, MAX_RENDER_DIMENSION),
+        ),
         (Some(width), None) => {
-            let height = (f64::from(width) / aspect).round().clamp(
-                f64::from(MIN_RENDER_HEIGHT),
-                f64::from(MAX_RENDER_DIMENSION),
-            ) as u32;
-            return (width, height);
+            let width = f64::from(width);
+            fit_render_dimensions(width, width / aspect)
         }
         (None, Some(height)) => {
-            let width = (f64::from(height) * aspect)
-                .round()
-                .clamp(f64::from(MIN_RENDER_WIDTH), f64::from(MAX_RENDER_DIMENSION))
-                as u32;
-            return (width, height);
+            let height = f64::from(height);
+            fit_render_dimensions(height * aspect, height)
         }
-        (None, None) => {}
-    }
-    if aspect >= 1.0 {
-        let width = 1600u32;
-        let height = (f64::from(width) / aspect).round().clamp(900.0, 1600.0) as u32;
-        (width, height)
-    } else {
-        let height = 1500u32;
-        let width = (f64::from(height) * aspect).round().clamp(900.0, 1600.0) as u32;
-        (width, height)
+        // Default frame: hold the long edge near 1600 and let the domain's
+        // aspect set the other.
+        (None, None) => {
+            if aspect >= 1.0 {
+                fit_render_dimensions(1600.0, 1600.0 / aspect)
+            } else {
+                fit_render_dimensions(1500.0 * aspect, 1500.0)
+            }
+        }
     }
 }
 
@@ -2668,7 +2689,39 @@ mod tests {
             output_width: Some(1000),
             ..base_request()
         };
-        assert_eq!(output_size(&request), (1200, 1359));
+        // Height follows the PROJECTED aspect (cos-corrected), and the 1200
+        // minimum width scales the whole frame rather than squashing one axis.
+        assert_eq!(output_size(&request), (1200, 1752));
+    }
+
+    /// A wide domain must keep its projected aspect instead of being padded out
+    /// to the minimum height: CONUS used to come back 1200x900 (1.33) around a
+    /// 1.80 map, which rendered as a strip floating in dead space.
+    #[test]
+    fn output_size_keeps_wide_domain_aspect_instead_of_padding_height() {
+        let conus = [-125.0, -66.5, 24.0, 50.0];
+        let aspect = domain_display_aspect(conus);
+        assert!(
+            (1.7..1.9).contains(&aspect),
+            "CONUS projects near 1.8:1, got {aspect}"
+        );
+        for requested in [900u32, 1800u32] {
+            let request = RenderJobRequest {
+                output_width: Some(requested),
+                bounds: Some(conus),
+                ..base_request()
+            };
+            let (width, height) = output_size(&request);
+            assert!(
+                width >= MIN_RENDER_WIDTH && height >= MIN_RENDER_HEIGHT,
+                "{requested}: {width}x{height} under the minimum frame"
+            );
+            let rendered = f64::from(width) / f64::from(height);
+            assert!(
+                (rendered - aspect).abs() < 0.02,
+                "{requested}: canvas {width}x{height} is {rendered:.2}, domain is {aspect:.2}"
+            );
+        }
     }
 
     #[test]
