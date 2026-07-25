@@ -182,7 +182,7 @@ instant soundings) feeds the UI directly.
 
 ## Validation plan
 
-Stand rusty-weather up on node3/node4 (192.168.68.56/.57) beside existing rustwx binaries. For the same live cycle: compare per-stage timings (against the table above) and visually compare PNGs for a fixed product set (styles are ported unchanged, so diffs should be nil-to-trivial). Only after that comparison does rusty-weather become the thing the nodes run.
+Stand rusty-weather up on node3/node4 (<lan-host>/.57) beside existing rustwx binaries. For the same live cycle: compare per-stage timings (against the table above) and visually compare PNGs for a fixed product set (styles are ported unchanged, so diffs should be nil-to-trivial). Only after that comparison does rusty-weather become the thing the nodes run.
 
 ## Open questions deferred to the implementation plan
 

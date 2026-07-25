@@ -70,7 +70,11 @@ and soundings through a single HTTP API. It is the live backend for
 ## 4. The map — machines & services
 
 ### 4.1 Hetzner box
-`root@178.104.59.253` — 16-core AMD EPYC-Genoa, 30 GB RAM, ~230 GB disk.
+`root@$CAFIRE_BOX` — 16-core AMD EPYC-Genoa, 30 GB RAM, ~230 GB disk.
+
+> The address is deliberately NOT in this repo: it is public on GitHub. Get it
+> from your ssh config / password manager and export `CAFIRE_BOX=<host>` before
+> running anything below.
 Layout `/opt/rusty-weather/{bin,store,cache,out,src,logs}`.
 
 systemd units (all should be `active`):
@@ -203,7 +207,7 @@ Lab's `FAMS`); run slugs look like `20260706_12z`.
 ```
 # on Drew's PC, from the repo root — COMMIT FIRST, the server only ever
 # receives git archive snapshots; then PUSH
-git archive --format=tar HEAD | ssh root@178.104.59.253 "tar -x -C /opt/rusty-weather/src"
+git archive --format=tar HEAD | ssh root@$CAFIRE_BOX "tar -x -C /opt/rusty-weather/src"
 
 # on the server (cargo needs the env source in non-interactive ssh)
 source $HOME/.cargo/env && cd /opt/rusty-weather/src

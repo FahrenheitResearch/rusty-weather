@@ -38,7 +38,13 @@ plus legacy satellite + lightning imagery.
 
 - **Host:** `ubuntu-32gb-nbg1-1` — 16-core EPYC, 30 GB RAM, 600 GB disk,
   20 TB/mo bandwidth (current use ~12 TB/mo).
-- **Access:** `ssh root@178.104.59.253` (key auth already set up on
+> **This repo is PUBLIC.** The box address is not recorded here. Export
+> `CAFIRE_BOX=<host>` from your own notes before running these commands. The
+> address was in this file from 2026-07-02 to 2026-07-25, so treat it as known:
+> SSH is key-only (`PasswordAuthentication no`), fail2ban guards sshd, and the
+> API ports are ufw-restricted to the docker network.
+
+- **Access:** `ssh root@$CAFIRE_BOX` (key auth already set up on
   Drew's Windows machine and on weather-node-1).
 - **Public URL:** `https://cafire.wxsection.com` (TLS via the legacy
   stack's Caddy container; Cloudflare in front).
@@ -59,7 +65,7 @@ Two stacks coexist:
 ## 2. 60-second health check
 
 ```bash
-ssh root@178.104.59.253
+ssh root@$CAFIRE_BOX
 systemctl is-active rusty-wx-api rusty-wx-pipeline rusty-wx-pipeline-gfs rusty-wx-pipeline-nbm
 df -h /                                    # worry below ~40 GB free
 curl -s localhost:8788/api/health          # "ok": true
@@ -264,7 +270,7 @@ for every deploy so far:
 
 ```powershell
 # 1. ship the tree (from repo root; git archive respects the index)
-git archive --format=tar HEAD | ssh root@178.104.59.253 "tar -x -C /opt/rusty-weather/src"
+git archive --format=tar HEAD | ssh root@$CAFIRE_BOX "tar -x -C /opt/rusty-weather/src"
 ```
 
 ```bash
