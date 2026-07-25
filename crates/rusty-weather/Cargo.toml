@@ -10,7 +10,7 @@ default-run = "rusty-weather"
 [dependencies]
 base64 = "0.22"
 clap.workspace = true
-image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "webp", "gif"] }
 # Rasterize the daily-outlook / meteogram SVG cards to PNG for the shareable
 # `?format=png` endpoint (a raw SVG can't be copied/pasted as a picture).
 # Bundles usvg + tiny-skia + fontdb; renders with the system-installed

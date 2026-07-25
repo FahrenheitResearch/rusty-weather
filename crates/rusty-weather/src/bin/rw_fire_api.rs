@@ -91,6 +91,7 @@ struct AppState {
     full_throttle_render: bool,
     render_timeout: Duration,
     jobs: Arc<Mutex<HashMap<String, Job>>>,
+    loops: Arc<Mutex<HashMap<String, LoopJob>>>,
     render_cache: Arc<Mutex<HashMap<String, String>>>,
     counter: Arc<AtomicU64>,
     render_gate: Arc<RenderGate>,
@@ -390,6 +391,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         full_throttle_render: args.full_throttle_render,
         render_timeout: Duration::from_secs(args.render_timeout_secs.max(1)),
         jobs: Arc::new(Mutex::new(HashMap::new())),
+        loops: Arc::new(Mutex::new(HashMap::new())),
         render_cache: Arc::new(Mutex::new(HashMap::new())),
         counter: Arc::new(AtomicU64::new(1)),
         render_gate: Arc::new(RenderGate::new(args.max_render_jobs)),
@@ -452,6 +454,10 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
             "render_cache_entries": state.render_cache.lock().expect("render cache mutex").len(),
         })),
         ("POST", "/api/render") => start_render_job(request.body, state),
+        ("POST", "/api/loop") => start_loop_job(request.body, state),
+        _ if request.method == "GET" && request.path.starts_with("/api/loops/") => {
+            loop_response(request.path.trim_start_matches("/api/loops/"), &state)
+        }
         ("OPTIONS", _) => empty_response(204),
         _ if request.method == "GET" && request.path.starts_with("/api/meteogram") => {
             meteogram_response(&request.query, &state)
@@ -486,44 +492,35 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
     }
 }
 
-fn start_render_job(body: Vec<u8>, state: AppState) -> Vec<u8> {
-    let parsed = serde_json::from_slice::<RenderJobRequest>(&body)
-        .map_err(|err| format!("invalid JSON body: {err}"))
-        .and_then(validate_render_request);
-    let mut request = match parsed {
-        Ok(request) => request,
-        Err(message) => return json_status_response(400, &serde_json::json!({ "error": message })),
-    };
+/// Enqueue ONE render and return its job id, or `(status, message)`.
+///
+/// Extracted from the POST handler so loops queue frames through the exact same
+/// path: same validation, same alias resolution, same render cache (an hour
+/// already rendered returns its existing job id instead of re-rendering) and the
+/// same gate. A loop that duplicated this would drift from it.
+fn enqueue_render_job(
+    request: RenderJobRequest,
+    state: &AppState,
+) -> Result<String, (u16, String)> {
+    let mut request = validate_render_request(request).map_err(|message| (400u16, message))?;
     // Resolve `latest` BEFORE the cache key: alias entries must never
     // outlive the run they pointed at.
     let alias = request.run.trim().to_ascii_lowercase();
     if alias == "latest" || alias == "latest-day" || alias == "fuel-run" {
-        request.run = match resolve_latest_run_for_hour(
+        request.run = resolve_latest_run_for_hour(
             &state.store_root,
             &request.model,
             &alias,
             Some(request.hour),
-        ) {
-            Ok(run) => run,
-            Err(message) => {
-                return json_status_response(422, &serde_json::json!({ "error": message }));
-            }
-        };
+        )
+        .map_err(|message| (422u16, message))?;
     }
 
-    let id = next_job_id(&state);
     let cache_key = render_cache_key(&request);
-    if let Some(cached_id) = cached_render_job_id(&state, &cache_key) {
-        return json_status_response(
-            202,
-            &serde_json::json!({
-                "id": cached_id,
-                "status_url": format!("/api/jobs/{cached_id}"),
-                "cache": "hit",
-            }),
-        );
+    if let Some(cached_id) = cached_render_job_id(state, &cache_key) {
+        return Ok(cached_id);
     }
-
+    let id = next_job_id(state);
     state
         .render_cache
         .lock()
@@ -553,15 +550,44 @@ fn start_render_job(body: Vec<u8>, state: AppState) -> Vec<u8> {
     let worker_state = state.clone();
     let worker_id = id.clone();
     std::thread::spawn(move || run_job(worker_state, worker_id, request, output_dir, cache_key));
+    Ok(id)
+}
 
-    json_status_response(
-        202,
-        &serde_json::json!({
-            "id": id,
-            "status_url": format!("/api/jobs/{id}"),
-            "cache": "miss",
-        }),
-    )
+fn start_render_job(body: Vec<u8>, state: AppState) -> Vec<u8> {
+    let request = match serde_json::from_slice::<RenderJobRequest>(&body) {
+        Ok(request) => request,
+        Err(err) => {
+            return json_status_response(
+                400,
+                &serde_json::json!({ "error": format!("invalid JSON body: {err}") }),
+            );
+        }
+    };
+    // Report cache hit/miss the way callers already expect: a hit reuses an
+    // existing job id, so compare what we get back against a fresh id.
+    let existing: std::collections::HashSet<String> = state
+        .jobs
+        .lock()
+        .expect("job mutex")
+        .keys()
+        .cloned()
+        .collect();
+    match enqueue_render_job(request, &state) {
+        Ok(id) => {
+            let cache = if existing.contains(&id) { "hit" } else { "miss" };
+            json_status_response(
+                202,
+                &serde_json::json!({
+                    "id": id,
+                    "status_url": format!("/api/jobs/{id}"),
+                    "cache": cache,
+                }),
+            )
+        }
+        Err((status, message)) => {
+            json_status_response(status, &serde_json::json!({ "error": message }))
+        }
+    }
 }
 
 fn cached_render_job_id(state: &AppState, cache_key: &str) -> Option<String> {
@@ -3148,4 +3174,436 @@ mod run_alias_tests {
             .expect_err("F048 is not stored anywhere");
         assert!(err.contains("F048"), "unhelpful message: {err}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Loops: render an hour range as ONE job, then serve it back as frames or GIF.
+//
+// The Lab animated by firing one /api/render per hour from the browser. With a
+// 3-slot render gate a 48-hour loop is 48 racing requests: no shared progress,
+// no ordering, and no way to tell "still rendering" from "stuck". A loop is one
+// server-side unit instead. It reuses the SAME per-frame render cache (hours
+// already on disk are instant) and the SAME gate (a loop cannot starve
+// interactive renders), and reports done/total while it works.
+// ---------------------------------------------------------------------------
+
+/// Frames one loop may span. 48 h hourly is the HRRR ceiling; the cap stops a
+/// single request queueing unbounded render work.
+const LOOP_MAX_FRAMES: usize = 120;
+
+#[derive(Debug, Clone, Deserialize)]
+struct LoopJobRequest {
+    /// The per-frame render request; its `hour` is replaced by each frame's.
+    #[serde(flatten)]
+    base: RenderJobRequest,
+    /// Explicit hour list; takes precedence over start/end/step when non-empty.
+    #[serde(default)]
+    hours: Vec<u16>,
+    #[serde(default)]
+    hour_start: Option<u16>,
+    #[serde(default)]
+    hour_end: Option<u16>,
+    #[serde(default)]
+    hour_step: Option<u16>,
+    /// Milliseconds per frame in the exported GIF.
+    #[serde(default)]
+    frame_ms: Option<u16>,
+    /// Width of the exported GIF. GIF is palette-limited and grows with area, so
+    /// the export downscales by default instead of shipping a ~100 MB file.
+    #[serde(default)]
+    gif_width: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct LoopFrame {
+    hour: u16,
+    job_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct LoopJob {
+    id: String,
+    frames: Vec<LoopFrame>,
+    frame_ms: u16,
+    gif_width: u32,
+    created_unix_ms: u128,
+}
+
+fn loop_hours(request: &LoopJobRequest) -> Result<Vec<u16>, String> {
+    let mut hours: Vec<u16> = if !request.hours.is_empty() {
+        request.hours.clone()
+    } else {
+        let start = request.hour_start.unwrap_or(0);
+        let end = request
+            .hour_end
+            .ok_or("a loop needs `hours` or `hour_start`/`hour_end`")?;
+        if end < start {
+            return Err("hour_end must be >= hour_start".to_string());
+        }
+        let step = request.hour_step.unwrap_or(1).max(1);
+        (start..=end).step_by(usize::from(step)).collect()
+    };
+    hours.sort_unstable();
+    hours.dedup();
+    if hours.is_empty() {
+        return Err("a loop needs at least one hour".to_string());
+    }
+    if hours.len() > LOOP_MAX_FRAMES {
+        return Err(format!(
+            "a loop is capped at {LOOP_MAX_FRAMES} frames; asked for {}",
+            hours.len()
+        ));
+    }
+    Ok(hours)
+}
+
+fn start_loop_job(body: Vec<u8>, state: AppState) -> Vec<u8> {
+    let parsed = match serde_json::from_slice::<LoopJobRequest>(&body) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return json_status_response(
+                400,
+                &serde_json::json!({ "error": format!("invalid JSON body: {err}") }),
+            );
+        }
+    };
+    let hours = match loop_hours(&parsed) {
+        Ok(hours) => hours,
+        Err(message) => return json_status_response(400, &serde_json::json!({ "error": message })),
+    };
+
+    // Each frame goes through the ordinary render path, so a loop inherits
+    // validation, alias resolution, the render cache and the gate for free.
+    let mut frames = Vec::with_capacity(hours.len());
+    for hour in hours {
+        let mut per_frame = parsed.base.clone();
+        per_frame.hour = hour;
+        match enqueue_render_job(per_frame, &state) {
+            Ok(job_id) => frames.push(LoopFrame { hour, job_id }),
+            Err((status, message)) => {
+                return json_status_response(status, &serde_json::json!({ "error": message }));
+            }
+        }
+    }
+
+    let id = format!("loop-{}", next_job_id(&state));
+    let frame_count = frames.len();
+    let job = LoopJob {
+        id: id.clone(),
+        frames,
+        frame_ms: parsed.frame_ms.unwrap_or(220).clamp(20, 2000),
+        gif_width: parsed.gif_width.unwrap_or(1000).clamp(200, 2000),
+        created_unix_ms: unix_ms_now(),
+    };
+    state
+        .loops
+        .lock()
+        .expect("loop mutex")
+        .insert(id.clone(), job);
+
+    json_status_response(
+        202,
+        &serde_json::json!({
+            "id": id,
+            "frames": frame_count,
+            "status_url": format!("/api/loops/{id}"),
+            "gif_url": format!("/api/loops/{id}/animation.gif"),
+            "mp4_url": format!("/api/loops/{id}/animation.mp4"),
+            "webm_url": format!("/api/loops/{id}/animation.webm"),
+        }),
+    )
+}
+
+fn loop_response(tail: &str, state: &AppState) -> Vec<u8> {
+    enum Export {
+        Status,
+        Gif,
+        Mp4,
+        Webm,
+    }
+    let (id, export) = if let Some(id) = tail.strip_suffix("/animation.gif") {
+        (id, Export::Gif)
+    } else if let Some(id) = tail.strip_suffix("/animation.mp4") {
+        (id, Export::Mp4)
+    } else if let Some(id) = tail.strip_suffix("/animation.webm") {
+        (id, Export::Webm)
+    } else {
+        (tail.trim_end_matches('/'), Export::Status)
+    };
+    let job = {
+        let loops = state.loops.lock().expect("loop mutex");
+        match loops.get(id) {
+            Some(job) => job.clone(),
+            None => {
+                return json_status_response(
+                    404,
+                    &serde_json::json!({ "error": "unknown loop id" }),
+                );
+            }
+        }
+    };
+    match export {
+        Export::Gif => return loop_gif_response(&job, state),
+        Export::Mp4 => return loop_video_response(&job, state, false),
+        Export::Webm => return loop_video_response(&job, state, true),
+        Export::Status => {}
+    }
+
+    let jobs = state.jobs.lock().expect("job mutex");
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    let frames: Vec<serde_json::Value> = job
+        .frames
+        .iter()
+        .map(|frame| {
+            let child = jobs.get(&frame.job_id);
+            let child_state = child.map(|job| job.state.clone()).unwrap_or(JobState::Queued);
+            let url = child
+                .and_then(|job| job.files.first())
+                .map(|file| file.url.clone());
+            match child_state {
+                JobState::Succeeded => done += 1,
+                JobState::Failed => failed += 1,
+                _ => {}
+            }
+            serde_json::json!({
+                "hour": frame.hour,
+                "state": child_state,
+                "job_id": frame.job_id,
+                "url": url,
+            })
+        })
+        .collect();
+    let total = job.frames.len();
+    let state_word = if failed > 0 && done + failed == total {
+        "failed"
+    } else if done == total {
+        "succeeded"
+    } else {
+        "running"
+    };
+    json_response(&serde_json::json!({
+        "id": job.id,
+        "state": state_word,
+        "done": done,
+        "failed": failed,
+        "total": total,
+        "frame_ms": job.frame_ms,
+        "gif_url": format!("/api/loops/{}/animation.gif", job.id),
+        "mp4_url": format!("/api/loops/{}/animation.mp4", job.id),
+        "webm_url": format!("/api/loops/{}/animation.webm", job.id),
+        "created_unix_ms": job.created_unix_ms,
+        "frames": frames,
+    }))
+}
+
+/// Assemble the loop's finished frames into an animated GIF.
+///
+/// Only rendered frames are included, in hour order, so a partially finished
+/// loop still previews rather than 404ing.
+/// Rendered frame files in hour order. Unfinished frames are skipped, so a
+/// partially complete loop still exports what exists rather than failing.
+fn loop_frame_paths(job: &LoopJob, state: &AppState) -> Vec<PathBuf> {
+    let jobs = state.jobs.lock().expect("job mutex");
+    job.frames
+        .iter()
+        .filter_map(|frame| {
+            let child = jobs.get(&frame.job_id)?;
+            if child.state != JobState::Succeeded {
+                return None;
+            }
+            let file = child.files.first()?;
+            Some(PathBuf::from(&child.output_dir).join(&file.name))
+        })
+        .collect()
+}
+
+fn loop_gif_response(job: &LoopJob, state: &AppState) -> Vec<u8> {
+    let paths = loop_frame_paths(job, state);
+    if paths.is_empty() {
+        return json_status_response(
+            409,
+            &serde_json::json!({ "error": "no frames rendered yet; poll the status url first" }),
+        );
+    }
+
+    let mut buffer: Vec<u8> = Vec::new();
+    {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame};
+        let mut encoder = GifEncoder::new_with_speed(std::io::Cursor::new(&mut buffer), 12);
+        if encoder.set_repeat(Repeat::Infinite).is_err() {
+            return json_status_response(
+                500,
+                &serde_json::json!({ "error": "gif encoder rejected the repeat setting" }),
+            );
+        }
+        let delay = Delay::from_numer_denom_ms(u32::from(job.frame_ms), 1);
+        for path in &paths {
+            let Ok(image) = image::open(path) else {
+                continue;
+            };
+            let scaled = if image.width() > job.gif_width {
+                let height = (u64::from(image.height()) * u64::from(job.gif_width)
+                    / u64::from(image.width().max(1))) as u32;
+                image.resize_exact(
+                    job.gif_width,
+                    height.max(1),
+                    image::imageops::FilterType::Triangle,
+                )
+            } else {
+                image
+            };
+            if encoder
+                .encode_frame(Frame::from_parts(scaled.to_rgba8(), 0, 0, delay))
+                .is_err()
+            {
+                return json_status_response(
+                    500,
+                    &serde_json::json!({ "error": "gif frame encode failed" }),
+                );
+            }
+        }
+    }
+
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: image/gif\r\nContent-Length: {}\r\nCache-Control: public, max-age=300\r\nContent-Disposition: attachment; filename=\"{}.gif\"\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        buffer.len(),
+        job.id
+    );
+    let mut response = header.into_bytes();
+    response.extend_from_slice(&buffer);
+    response
+}
+
+/// Assemble the loop's finished frames into an H.264 MP4 via ffmpeg.
+///
+/// GIF is 256 colors and grows with area — a 48-frame CONUS loop is tens of MB
+/// and visibly bands the smooth temperature ramps. H.264 is a few MB for the
+/// same loop and keeps the gradients, so MP4 is the default export and GIF is
+/// the fallback for places that will only take an image.
+///
+/// Frames are symlink-free copies into a per-request temp dir named `%05d.png`
+/// because ffmpeg's image2 demuxer wants a numeric sequence, and the render job
+/// dirs are neither contiguous nor ordered.
+fn loop_video_response(job: &LoopJob, state: &AppState, webm: bool) -> Vec<u8> {
+    let paths = loop_frame_paths(job, state);
+    if paths.is_empty() {
+        return json_status_response(
+            409,
+            &serde_json::json!({ "error": "no frames rendered yet; poll the status url first" }),
+        );
+    }
+
+    let work = state.out_root.join(format!("{}-video", job.id));
+    let _ = std::fs::remove_dir_all(&work);
+    if let Err(err) = std::fs::create_dir_all(&work) {
+        return json_status_response(
+            500,
+            &serde_json::json!({ "error": format!("video workdir: {err}") }),
+        );
+    }
+    for (index, path) in paths.iter().enumerate() {
+        let target = work.join(format!("{index:05}.png"));
+        // Re-encode to PNG rather than copying: frames may be WebP, which the
+        // image2 demuxer will not read from a .png name.
+        match image::open(path) {
+            Ok(image) => {
+                if image.save(&target).is_err() {
+                    let _ = std::fs::remove_dir_all(&work);
+                    return json_status_response(
+                        500,
+                        &serde_json::json!({ "error": "could not stage a frame for encoding" }),
+                    );
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    let fps = (1000.0 / f64::from(job.frame_ms.max(20))).clamp(1.0, 30.0);
+    let out_name = if webm { "animation.webm" } else { "animation.mp4" };
+    let out_path = work.join(out_name);
+    // yuv420p needs even dimensions; the scale filter floors both axes to even.
+    let mut command = std::process::Command::new("ffmpeg");
+    command
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-framerate")
+        .arg(format!("{fps:.4}"))
+        .arg("-i")
+        .arg(work.join("%05d.png"))
+        .arg("-vf")
+        .arg(format!(
+            "scale='min({width},iw)':-2:flags=lanczos,pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            width = job.gif_width
+        ))
+        .arg("-pix_fmt")
+        .arg("yuv420p");
+    if webm {
+        command
+            .arg("-c:v")
+            .arg("libvpx-vp9")
+            .arg("-b:v")
+            .arg("0")
+            .arg("-crf")
+            .arg("32");
+    } else {
+        command
+            .arg("-c:v")
+            .arg("libx264")
+            .arg("-preset")
+            .arg("veryfast")
+            .arg("-crf")
+            .arg("23")
+            .arg("-movflags")
+            .arg("+faststart");
+    }
+    command.arg(&out_path);
+
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&work);
+            return json_status_response(
+                500,
+                &serde_json::json!({
+                    "error": format!("ffmpeg could not be started ({err}); is ffmpeg installed?")
+                }),
+            );
+        }
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: String = stderr.chars().rev().take(400).collect::<String>().chars().rev().collect();
+        let _ = std::fs::remove_dir_all(&work);
+        return json_status_response(
+            500,
+            &serde_json::json!({ "error": format!("ffmpeg failed: {tail}") }),
+        );
+    }
+    let bytes = match std::fs::read(&out_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&work);
+            return json_status_response(
+                500,
+                &serde_json::json!({ "error": format!("read encoded video: {err}") }),
+            );
+        }
+    };
+    let _ = std::fs::remove_dir_all(&work);
+
+    let mime = if webm { "video/webm" } else { "video/mp4" };
+    let ext = if webm { "webm" } else { "mp4" };
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: public, max-age=300\r\nContent-Disposition: attachment; filename=\"{}.{ext}\"\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        bytes.len(),
+        job.id
+    );
+    let mut response = header.into_bytes();
+    response.extend_from_slice(&bytes);
+    response
 }
