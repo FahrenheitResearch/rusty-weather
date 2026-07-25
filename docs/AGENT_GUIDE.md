@@ -287,6 +287,29 @@ systemctl restart rusty-wx-api
 - If the dev box crashes mid-build, `target/debug` metadata can be corrupted
   (`error[E0786] invalid metadata files for crate ...`). `rm -rf target/debug`
   and rebuild; release binaries already written are fine.
+- **`git archive` deploys can SILENTLY not rebuild.** `git archive` stamps
+  extracted files with the COMMIT time. If that is older than the existing
+  `target/` fingerprints, cargo decides nothing changed, skips the build, and
+  `install` copies a STALE binary — the deploy reports success, the source on the
+  box is right, and the running code is old. This burned a full debug cycle on
+  2026-07-25 (the run-alias fix "deployed" three times before it took). ALWAYS
+  touch the sources after extracting, and verify the binary, not the deploy:
+
+      git archive --format=tar HEAD | ssh $BOX 'tar -xf - -C /opt/rusty-weather/src
+        && cd /opt/rusty-weather/src
+        && find crates vendor -name "*.rs" -newermt "-1 day" -o -name "*.rs" -exec touch {} +
+        && cargo build --release --bin <bin>'
+
+  Then prove the new code is in the running binary before believing it:
+  `strings /opt/rusty-weather/bin/<bin> | grep -c "<a string only the new code has>"`.
+  Never conclude "deployed" from an exit code alone.
+- Run pointers in `latest.json` (`day_run`, `complete_run`, `fuel_run`) advance
+  as soon as a cycle STARTS ingesting, so they can name a run that does not yet
+  hold the hours a product needs — an extended HRRR cycle takes over an hour to
+  walk F000 to F048. The API resolves aliases against the requested hour
+  (`resolve_latest_run_for_hour`) and falls back to an older run that has it;
+  keep that behavior if you touch alias resolution, or every 0-48 h window
+  product breaks for an hour after each extended cycle, four times a day.
 
 ## 10. State snapshot (2026-07-06) & open items
 
