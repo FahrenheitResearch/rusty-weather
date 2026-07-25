@@ -1192,6 +1192,32 @@ fn draw_styled_text(
     }
 }
 
+/// Clear space kept between two place labels. Enough that names read as
+/// separate words rather than one run-together string.
+const PLACE_LABEL_DECLUTTER_PAD_PX: i32 = 3;
+
+/// Placements to try for a place label, preferred first.
+///
+/// `Center` is used by the Pivotal-style value labels, which sit ON the point
+/// by design and must not be nudged off it — only the corner/side placements
+/// have a meaningful alternative. Sides are tried before the opposite corner so
+/// a name stays as close to its dot as it can.
+fn placement_fallbacks(preferred: ProjectedLabelPlacement) -> Vec<ProjectedLabelPlacement> {
+    use ProjectedLabelPlacement::*;
+    if matches!(preferred, Center) {
+        return vec![Center];
+    }
+    let mut order = vec![preferred];
+    for candidate in [
+        AboveRight, BelowRight, AboveLeft, BelowLeft, Right, Left, Above, Below,
+    ] {
+        if !order.contains(&candidate) {
+            order.push(candidate);
+        }
+    }
+    order
+}
+
 fn label_top_left(
     placement: ProjectedLabelPlacement,
     anchor_x: i32,
@@ -1353,6 +1379,10 @@ fn scale_i32(value: i32, factor: f32) -> i32 {
     ((value as f32) * factor).round() as i32
 }
 
+/// Draws the place-label overlay and returns the pixel rect of each label whose
+/// TEXT was drawn, in draw order. The rects are what the declutter reserved, so
+/// a caller (and the tests) can assert the invariant directly: no two drawn
+/// labels overlap.
 fn draw_projected_place_labels(
     img: &mut RgbaImage,
     layout: &Layout,
@@ -1360,10 +1390,20 @@ fn draw_projected_place_labels(
     place_labels: &[ProjectedPlaceLabelOverlay],
     clip_mask: Option<&RgbaImage>,
     clip_rect: Option<LocalRect>,
-) {
+) -> Vec<LabelRect> {
     let (min_x, max_x, min_y, max_y) = label_bounds(layout, clip_rect);
     let available_width = max_x.saturating_sub(min_x).saturating_add(1) as u32;
     let available_height = max_y.saturating_sub(min_y).saturating_add(1) as u32;
+
+    // Pixel-space declutter. The upstream place selection declutters in
+    // KILOMETRES (`min_center_spacing_km`), which cannot know how wide a name
+    // renders: the spacing that reads cleanly on a California crop is a few
+    // pixels across CONUS, so the dense east piled "South Bend" over "Chisago"
+    // and "Myrtle Beach" over "Columbia" into mush. Labels are drawn in the
+    // selection's importance order, so reserving each drawn rect means a
+    // less important name yields to a more important one.
+    let mut occupied: Vec<LabelRect> = Vec::with_capacity(place_labels.len() * 2);
+    let mut drawn: Vec<LabelRect> = Vec::with_capacity(place_labels.len());
 
     for place_label in place_labels {
         let adjustments = place_label_render_adjustments(place_label.priority);
@@ -1455,17 +1495,47 @@ fn draw_projected_place_labels(
                 place_label.style.label_offset_y_px,
                 adjustments.offset_factor,
             );
-        let (mut text_x, mut text_y) = label_top_left(
-            place_label.style.label_placement,
-            anchor_x,
-            anchor_y,
-            label_width,
-            label_height,
-        );
         let max_label_x = max_x.saturating_sub(label_width as i32).saturating_add(1);
         let max_label_y = max_y.saturating_sub(label_height as i32).saturating_add(1);
-        text_x = text_x.clamp(min_x, max_label_x.max(min_x));
-        text_y = text_y.clamp(min_y, max_label_y.max(min_y));
+
+        // Try the style's own placement first, then the other quadrants: a name
+        // that would collide beside its dot is usually free above or below it,
+        // and moving it keeps the city on the map instead of dropping it.
+        let mut chosen: Option<(i32, i32)> = None;
+        for placement in placement_fallbacks(place_label.style.label_placement) {
+            let (candidate_x, candidate_y) =
+                label_top_left(placement, anchor_x, anchor_y, label_width, label_height);
+            let candidate_x = candidate_x.clamp(min_x, max_label_x.max(min_x));
+            let candidate_y = candidate_y.clamp(min_y, max_label_y.max(min_y));
+            let rect = LabelRect::from_xywh(candidate_x, candidate_y, label_width, label_height)
+                .padded(PLACE_LABEL_DECLUTTER_PAD_PX);
+            if !occupied.iter().any(|taken| rect.intersects(*taken)) {
+                chosen = Some((candidate_x, candidate_y));
+                occupied.push(rect);
+                drawn.push(LabelRect::from_xywh(
+                    candidate_x,
+                    candidate_y,
+                    label_width,
+                    label_height,
+                ));
+                break;
+            }
+        }
+        // Every placement collided with a more important name: drop the text.
+        // The marker dot is already drawn, so the city still reads as present.
+        let Some((text_x, text_y)) = chosen else {
+            continue;
+        };
+        // Keep other names off this dot as well.
+        if marker_radius > 0 {
+            let radius = marker_radius as i32;
+            occupied.push(LabelRect {
+                min_x: marker_x.round() as i32 - radius,
+                max_x: marker_x.round() as i32 + radius,
+                min_y: marker_y.round() as i32 - radius,
+                max_y: marker_y.round() as i32 + radius,
+            });
+        }
 
         draw_text_halo(
             img,
@@ -1483,6 +1553,8 @@ fn draw_projected_place_labels(
             bold,
         );
     }
+
+    drawn
 }
 
 fn projected_grid_to_pixels(
@@ -2581,6 +2653,15 @@ struct LabelRect {
 }
 
 impl LabelRect {
+    fn from_xywh(x: i32, y: i32, width: u32, height: u32) -> Self {
+        Self {
+            min_x: x,
+            max_x: x.saturating_add(width.max(1) as i32 - 1),
+            min_y: y,
+            max_y: y.saturating_add(height.max(1) as i32 - 1),
+        }
+    }
+
     fn padded(self, padding: i32) -> Self {
         Self {
             min_x: self.min_x.saturating_sub(padding),

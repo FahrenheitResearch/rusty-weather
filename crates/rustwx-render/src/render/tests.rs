@@ -439,6 +439,93 @@ fn projected_place_labels_clamp_text_inside_requested_clip_rect() {
     assert!(max_y <= layout.map_y + clip_rect.max_y);
 }
 
+/// Place labels are decluttered in PIXEL space. The upstream selection spaces
+/// places in kilometres, which cannot know how wide a name renders, so at
+/// continental scale names piled into each other ("South Bend" over "Chisago").
+/// The invariant: no two DRAWN labels overlap, and a name that cannot fit any
+/// placement yields to the more important one drawn before it.
+#[test]
+fn projected_place_labels_declutter_colliding_names() {
+    let presentation = RenderPresentation::for_mode(ProductVisualMode::FilledMeteorology);
+    let layout = compute_layout(480, 320, false, false, presentation, ChromeScale::default());
+    let extent = MapExtent { x_min: 0.0, x_max: 1.0, y_min: 0.0, y_max: 1.0 };
+    let label_at = |name: &str, x: f64, y: f64| {
+        let mut style = sample_place_label().style;
+        style.label_halo = Rgba::TRANSPARENT;
+        style.label_halo_width_px = 0;
+        ProjectedPlaceLabelOverlay {
+            x,
+            y,
+            label: Some(name.to_string()),
+            priority: ProjectedPlaceLabelPriority::Primary,
+            style,
+        }
+    };
+    let draw = |labels: &[ProjectedPlaceLabelOverlay]| {
+        let mut img = RgbaImage::from_pixel(480, 320, Rgba::WHITE.to_image_rgba());
+        draw_projected_place_labels(&mut img, &layout, &extent, labels, None, None)
+    };
+
+    // Four names crammed onto ONE point: at most one can legitimately show.
+    let coincident = draw(&[
+        label_at("Chisago", 0.5, 0.5),
+        label_at("South Bend", 0.5, 0.5),
+        label_at("Myrtle Beach", 0.5, 0.5),
+        label_at("Columbia", 0.5, 0.5),
+    ]);
+    assert!(
+        coincident.len() < 4,
+        "coincident names must not all overprint, drew {}",
+        coincident.len()
+    );
+    assert!(!coincident.is_empty(), "the first name must still draw");
+
+    // Names a few pixels apart -- the case that produced mush across CONUS.
+    // Whatever survives, none of it may overlap.
+    let crowded = draw(&[
+        label_at("Chisago", 0.50, 0.50),
+        label_at("South Bend", 0.52, 0.51),
+        label_at("Myrtle Beach", 0.51, 0.53),
+        label_at("Columbia", 0.53, 0.52),
+        label_at("Greensboro", 0.49, 0.52),
+    ]);
+    for (i, a) in crowded.iter().enumerate() {
+        for b in crowded.iter().skip(i + 1) {
+            assert!(
+                !a.intersects(*b),
+                "drawn place labels must not overlap: {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    // Well-separated names all survive -- declutter must not be trigger-happy.
+    let separated = draw(&[
+        label_at("Chisago", 0.15, 0.20),
+        label_at("South Bend", 0.15, 0.55),
+        label_at("Myrtle Beach", 0.15, 0.85),
+        label_at("Columbia", 0.70, 0.20),
+    ]);
+    assert_eq!(
+        separated.len(),
+        4,
+        "separated names must all draw, drew {}",
+        separated.len()
+    );
+}
+
+/// The Pivotal-style value labels sit ON their point deliberately, so they must
+/// keep `Center` rather than being nudged into a corner.
+#[test]
+fn center_placement_has_no_fallbacks() {
+    assert_eq!(
+        placement_fallbacks(ProjectedLabelPlacement::Center),
+        vec![ProjectedLabelPlacement::Center]
+    );
+    let order = placement_fallbacks(ProjectedLabelPlacement::BelowLeft);
+    assert_eq!(order[0], ProjectedLabelPlacement::BelowLeft);
+    assert_eq!(order.len(), 8, "every side/corner should be reachable: {order:?}");
+}
+
 #[test]
 fn projected_place_labels_skip_marker_and_text_outside_requested_clip_mask() {
     let presentation = RenderPresentation::for_mode(ProductVisualMode::FilledMeteorology);
