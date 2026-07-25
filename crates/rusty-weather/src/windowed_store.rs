@@ -591,14 +591,23 @@ struct SnapshotPlan {
 /// Decompose a 2 m snapshot-window product into its field, window, and
 /// reduction — `None` for QPF/UH/wind products.
 /// True when a product describes the whole RUN rather than a window ending at
-/// a requested hour: the fixed 0-24/24-48/0-48 h snapshot windows and the
-/// `*_run_max` products. These always anchor at the max stored hour so they
-/// neither block nor truncate when a caller asks for an earlier hour.
+/// a requested hour: the fixed 0-24/24-48/0-48 h windows and the `*_run_max`
+/// products. These always anchor at the max stored hour so they neither block
+/// nor truncate when a caller asks for an earlier hour.
+///
+/// Covers the 2 m snapshot windows (via [`snapshot_plan`]) AND the 10 m wind
+/// windows, which are planned inline in [`plan_product`] rather than through
+/// `snapshot_plan` but are just as fixed (`(1..=24)`, `(25..=48)`, `(1..=48)`).
 fn product_is_run_scoped(product: HrrrWindowedProduct) -> bool {
+    use HrrrWindowedProduct::*;
     snapshot_plan(product).is_some()
         || matches!(
             product,
-            HrrrWindowedProduct::Uh25kmRunMax | HrrrWindowedProduct::Wind10mRunMax
+            Uh25kmRunMax
+                | Wind10mRunMax
+                | Wind10m0to24hMax
+                | Wind10m24to48hMax
+                | Wind10m0to48hMax
         )
 }
 
@@ -1695,6 +1704,29 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Structural guard for the dbd322f class of bug: any product whose planned
+    /// window is the SAME at two different anchors is a fixed window and must be
+    /// classified run-scoped, or the interactive anchor override will block it.
+    /// This is what caught `10m_wind_0_24h_max` and friends being planned inline
+    /// in `plan_product` instead of through `snapshot_plan`.
+    #[test]
+    fn every_fixed_window_product_is_classified_run_scoped() {
+        for &product in HrrrWindowedProduct::supported_products() {
+            let (Ok(high), Ok(low)) = (plan_product(product, 48), plan_product(product, 47)) else {
+                continue;
+            };
+            if high.hours == low.hours {
+                assert!(
+                    product_is_run_scoped(product),
+                    "'{}' has an anchor-independent window {:?} but is not run-scoped, so an \
+                     interactive request below its window end would block it",
+                    product.slug(),
+                    high.hours.first().zip(high.hours.last()),
+                );
+            }
+        }
+    }
+
     #[test]
     fn anchor_override_ends_window_at_requested_hour() {
         let dir = test_dir("anchor-override");
@@ -1738,6 +1770,9 @@ mod tests {
             &[
                 "2m_temp_0_24h_max".to_string(),
                 "2m_temp_24_48h_max".to_string(),
+                "10m_wind_0_24h_max".to_string(),
+                "10m_wind_24_48h_max".to_string(),
+                "10m_wind_0_48h_max".to_string(),
                 "10m_wind_run_max".to_string(),
                 "qpf_1h".to_string(),
             ],
@@ -1756,6 +1791,16 @@ mod tests {
         );
         assert_eq!(
             grid_named(&scoped, "2m_temp_24_48h_max").hours_used,
+            (25..=48).collect::<Vec<u16>>()
+        );
+        // The 10 m wind windows are fixed too (planned inline, not via
+        // snapshot_plan) and must survive an earlier requested hour.
+        assert_eq!(
+            grid_named(&scoped, "10m_wind_0_24h_max").hours_used,
+            (1..=24).collect::<Vec<u16>>()
+        );
+        assert_eq!(
+            grid_named(&scoped, "10m_wind_24_48h_max").hours_used,
             (25..=48).collect::<Vec<u16>>()
         );
         // Run-max spans the whole run, not 0..requested.
