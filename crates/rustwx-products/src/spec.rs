@@ -607,6 +607,87 @@ fn windowed_product_spec(
                 | HrrrWindowedProduct::CategoricalFreezingRain0to24hMax
                 | HrrrWindowedProduct::CategoricalFreezingRain24to48hMax
                 | HrrrWindowedProduct::CategoricalFreezingRain0to48hMax => Some("0/1"),
+                HrrrWindowedProduct::HeavyRainHours0to24h
+                | HrrrWindowedProduct::HeavyRainHours24to48h
+                | HrrrWindowedProduct::HeavyRainHours0to48h
+                | HrrrWindowedProduct::VeryHeavyRainHours0to24h
+                | HrrrWindowedProduct::VeryHeavyRainHours24to48h
+                | HrrrWindowedProduct::VeryHeavyRainHours0to48h
+                | HrrrWindowedProduct::HeavyRainLongestRun0to24h
+                | HrrrWindowedProduct::HeavyRainLongestRun24to48h
+                | HrrrWindowedProduct::HeavyRainLongestRun0to48h
+                | HrrrWindowedProduct::GustHours34kt0to24h
+                | HrrrWindowedProduct::GustHours34kt24to48h
+                | HrrrWindowedProduct::GustHours34kt0to48h
+                | HrrrWindowedProduct::GustHours50kt0to24h
+                | HrrrWindowedProduct::GustHours50kt24to48h
+                | HrrrWindowedProduct::GustHours50kt0to48h
+                | HrrrWindowedProduct::GustHours64kt0to24h
+                | HrrrWindowedProduct::GustHours64kt24to48h
+                | HrrrWindowedProduct::GustHours64kt0to48h
+                | HrrrWindowedProduct::RotationHours0to24h
+                | HrrrWindowedProduct::RotationHours24to48h
+                | HrrrWindowedProduct::RotationHours0to48h
+                | HrrrWindowedProduct::StormHours0to24h
+                | HrrrWindowedProduct::StormHours24to48h
+                | HrrrWindowedProduct::StormHours0to48h
+                | HrrrWindowedProduct::SigTorEnvHours0to24h
+                | HrrrWindowedProduct::SigTorEnvHours24to48h
+                | HrrrWindowedProduct::SigTorEnvHours0to48h
+                | HrrrWindowedProduct::BigCapeHours0to24h
+                | HrrrWindowedProduct::BigCapeHours24to48h
+                | HrrrWindowedProduct::BigCapeHours0to48h
+                | HrrrWindowedProduct::CriticalRhHours0to24h
+                | HrrrWindowedProduct::CriticalRhHours24to48h
+                | HrrrWindowedProduct::CriticalRhHours0to48h
+                | HrrrWindowedProduct::CriticalRhLongestRun0to24h
+                | HrrrWindowedProduct::CriticalRhLongestRun24to48h
+                | HrrrWindowedProduct::CriticalRhLongestRun0to48h
+                | HrrrWindowedProduct::DangerHeatHours0to24h
+                | HrrrWindowedProduct::DangerHeatHours24to48h
+                | HrrrWindowedProduct::DangerHeatHours0to48h
+                | HrrrWindowedProduct::DangerHeatLongestRun0to24h
+                | HrrrWindowedProduct::DangerHeatLongestRun24to48h
+                | HrrrWindowedProduct::DangerHeatLongestRun0to48h
+                | HrrrWindowedProduct::HighWetbulbHours0to24h
+                | HrrrWindowedProduct::HighWetbulbHours24to48h
+                | HrrrWindowedProduct::HighWetbulbHours0to48h
+                | HrrrWindowedProduct::LowVisHours0to24h
+                | HrrrWindowedProduct::LowVisHours24to48h
+                | HrrrWindowedProduct::LowVisHours0to48h
+                | HrrrWindowedProduct::LowVisLongestRun0to24h
+                | HrrrWindowedProduct::LowVisLongestRun24to48h
+                | HrrrWindowedProduct::LowVisLongestRun0to48h
+                | HrrrWindowedProduct::SnowHours0to24h
+                | HrrrWindowedProduct::SnowHours24to48h
+                | HrrrWindowedProduct::SnowHours0to48h
+                | HrrrWindowedProduct::FreezingRainHours0to24h
+                | HrrrWindowedProduct::FreezingRainHours24to48h
+                | HrrrWindowedProduct::FreezingRainHours0to48h => Some("hours"),
+                HrrrWindowedProduct::RainOnsetHour0to24h
+                | HrrrWindowedProduct::RainOnsetHour24to48h
+                | HrrrWindowedProduct::RainOnsetHour0to48h
+                | HrrrWindowedProduct::RainEndHour0to24h
+                | HrrrWindowedProduct::RainEndHour24to48h
+                | HrrrWindowedProduct::RainEndHour0to48h
+                | HrrrWindowedProduct::RainPeakHour0to24h
+                | HrrrWindowedProduct::RainPeakHour24to48h
+                | HrrrWindowedProduct::RainPeakHour0to48h
+                | HrrrWindowedProduct::GustOnsetHour34kt0to24h
+                | HrrrWindowedProduct::GustOnsetHour34kt24to48h
+                | HrrrWindowedProduct::GustOnsetHour34kt0to48h
+                | HrrrWindowedProduct::GustPeakHour0to24h
+                | HrrrWindowedProduct::GustPeakHour24to48h
+                | HrrrWindowedProduct::GustPeakHour0to48h
+                | HrrrWindowedProduct::RotationPeakHour0to24h
+                | HrrrWindowedProduct::RotationPeakHour24to48h
+                | HrrrWindowedProduct::RotationPeakHour0to48h
+                | HrrrWindowedProduct::StormOnsetHour0to24h
+                | HrrrWindowedProduct::StormOnsetHour24to48h
+                | HrrrWindowedProduct::StormOnsetHour0to48h
+                | HrrrWindowedProduct::HdwPeakHour0to24h
+                | HrrrWindowedProduct::HdwPeakHour24to48h
+                | HrrrWindowedProduct::HdwPeakHour0to48h => Some("forecast hour"),
                 HrrrWindowedProduct::Temp2m0to24hMax
                 | HrrrWindowedProduct::Temp2m24to48hMax
                 | HrrrWindowedProduct::Temp2m0to48hMax

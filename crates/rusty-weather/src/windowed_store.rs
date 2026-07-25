@@ -257,7 +257,7 @@ pub fn compute_windowed_products(
                 Ok(plane) => {
                     for accum in accums.iter_mut() {
                         if needs(accum, kind) {
-                            accum.fold(&plane.values);
+                            accum.fold(&plane.values, hour);
                             if plane.instantaneous_fallback {
                                 accum.fallback_hours.push(hour);
                             }
@@ -388,7 +388,7 @@ enum SourceKind {
 }
 
 /// How the per-hour planes reduce into the product grid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Reduce {
     /// Single stored plane (1 h / run-total accumulations, 1 h UH/wind).
     Direct,
@@ -397,6 +397,55 @@ enum Reduce {
     Min,
     /// Pointwise max - min over the window.
     Range,
+    /// Number of hours in the window that meet a threshold. This is a COUNT of
+    /// hours in ONE deterministic run — it is never a probability.
+    Count(Threshold),
+    /// Longest run of CONSECUTIVE hours meeting a threshold. Separates one long
+    /// event from the same number of scattered hours, which a count cannot.
+    LongestRun(Threshold),
+    /// Earliest hour meeting a threshold (onset); NaN where never met.
+    FirstHour(Threshold),
+    /// Latest hour meeting a threshold (end); NaN where never met.
+    LastHour(Threshold),
+    /// Hour at which the window maximum occurs, gated by a floor so noise
+    /// near zero does not produce a confetti map. First hour wins ties.
+    PeakHour(Threshold),
+}
+
+/// A threshold test against the STORED plane values (before `Finish`
+/// conversion), so thresholds are expressed in the store's units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Threshold {
+    value: f64,
+    /// `true` counts hours at or above `value`; `false` at or below.
+    at_or_above: bool,
+}
+
+impl Threshold {
+    const fn above(value: f64) -> Self {
+        Self {
+            value,
+            at_or_above: true,
+        }
+    }
+
+    const fn below(value: f64) -> Self {
+        Self {
+            value,
+            at_or_above: false,
+        }
+    }
+
+    fn met(self, value: f64) -> bool {
+        if !value.is_finite() {
+            return false;
+        }
+        if self.at_or_above {
+            value >= self.value
+        } else {
+            value <= self.value
+        }
+    }
 }
 
 /// Display-unit conversion applied AFTER the fold (the GRIB lane's order:
@@ -2083,6 +2132,1140 @@ fn plan_product(product: HrrrWindowedProduct, end: u16) -> Result<ProductSpec, S
                 "pointwise max of stored hourly categorical_freezing_rain across F001-F048".to_string(),
             )
         }
+        HeavyRainHours0to24h => {
+            if end < 24 {
+                return Err("Hours of Heavy Rain (>=0.5 in/h) [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::Count(Threshold::above(12.7)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Heavy Rain (>=0.5 in/h) [0-24 h] over F001-F024 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        HeavyRainHours24to48h => {
+            if end < 48 {
+                return Err("Hours of Heavy Rain (>=0.5 in/h) [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::Count(Threshold::above(12.7)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Heavy Rain (>=0.5 in/h) [24-48 h] over F025-F048 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        HeavyRainHours0to48h => {
+            if end < 48 {
+                return Err("Hours of Heavy Rain (>=0.5 in/h) [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::Count(Threshold::above(12.7)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours of Heavy Rain (>=0.5 in/h) [0-48 h] over F001-F048 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        VeryHeavyRainHours0to24h => {
+            if end < 24 {
+                return Err("Hours of Very Heavy Rain (>=1 in/h) [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::Count(Threshold::above(25.4)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Very Heavy Rain (>=1 in/h) [0-24 h] over F001-F024 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        VeryHeavyRainHours24to48h => {
+            if end < 48 {
+                return Err("Hours of Very Heavy Rain (>=1 in/h) [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::Count(Threshold::above(25.4)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Very Heavy Rain (>=1 in/h) [24-48 h] over F025-F048 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        VeryHeavyRainHours0to48h => {
+            if end < 48 {
+                return Err("Hours of Very Heavy Rain (>=1 in/h) [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::Count(Threshold::above(25.4)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours of Very Heavy Rain (>=1 in/h) [0-48 h] over F001-F048 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        HeavyRainLongestRun0to24h => {
+            if end < 24 {
+                return Err("Longest Run of Heavy Rain [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::LongestRun(Threshold::above(12.7)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Longest Run of Heavy Rain [0-24 h] over F001-F024 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        HeavyRainLongestRun24to48h => {
+            if end < 48 {
+                return Err("Longest Run of Heavy Rain [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::LongestRun(Threshold::above(12.7)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Longest Run of Heavy Rain [24-48 h] over F025-F048 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        HeavyRainLongestRun0to48h => {
+            if end < 48 {
+                return Err("Longest Run of Heavy Rain [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::LongestRun(Threshold::above(12.7)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Longest Run of Heavy Rain [0-48 h] over F001-F048 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        RainOnsetHour0to24h => {
+            if end < 24 {
+                return Err("Heavy Rain Onset Hour [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::FirstHour(Threshold::above(12.7)),
+                (1..=24).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Heavy Rain Onset Hour [0-24 h] over F001-F024 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        RainOnsetHour24to48h => {
+            if end < 48 {
+                return Err("Heavy Rain Onset Hour [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::FirstHour(Threshold::above(12.7)),
+                (25..=48).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Heavy Rain Onset Hour [24-48 h] over F025-F048 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        RainOnsetHour0to48h => {
+            if end < 48 {
+                return Err("Heavy Rain Onset Hour [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::FirstHour(Threshold::above(12.7)),
+                (1..=48).collect(),
+                Some(48),
+                "forecast hour",
+                Finish::None,
+                "Heavy Rain Onset Hour [0-48 h] over F001-F048 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        RainEndHour0to24h => {
+            if end < 24 {
+                return Err("Heavy Rain End Hour [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::LastHour(Threshold::above(12.7)),
+                (1..=24).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Heavy Rain End Hour [0-24 h] over F001-F024 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        RainEndHour24to48h => {
+            if end < 48 {
+                return Err("Heavy Rain End Hour [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::LastHour(Threshold::above(12.7)),
+                (25..=48).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Heavy Rain End Hour [24-48 h] over F025-F048 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        RainEndHour0to48h => {
+            if end < 48 {
+                return Err("Heavy Rain End Hour [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::LastHour(Threshold::above(12.7)),
+                (1..=48).collect(),
+                Some(48),
+                "forecast hour",
+                Finish::None,
+                "Heavy Rain End Hour [0-48 h] over F001-F048 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        RainPeakHour0to24h => {
+            if end < 24 {
+                return Err("Hour of Heaviest Rain [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::PeakHour(Threshold::above(2.5)),
+                (1..=24).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Hour of Heaviest Rain [0-24 h] over F001-F024 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        RainPeakHour24to48h => {
+            if end < 48 {
+                return Err("Hour of Heaviest Rain [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::PeakHour(Threshold::above(2.5)),
+                (25..=48).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Hour of Heaviest Rain [24-48 h] over F025-F048 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        RainPeakHour0to48h => {
+            if end < 48 {
+                return Err("Hour of Heaviest Rain [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Apcp1h,
+                Reduce::PeakHour(Threshold::above(2.5)),
+                (1..=48).collect(),
+                Some(48),
+                "forecast hour",
+                Finish::None,
+                "Hour of Heaviest Rain [0-48 h] over F001-F048 of stored hourly apcp_1h".to_string(),
+            )
+        }
+        GustHours34kt0to24h => {
+            if end < 24 {
+                return Err("Hours of Gusts >=34 kt [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::Count(Threshold::above(17.491)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Gusts >=34 kt [0-24 h] over F001-F024 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        GustHours34kt24to48h => {
+            if end < 48 {
+                return Err("Hours of Gusts >=34 kt [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::Count(Threshold::above(17.491)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Gusts >=34 kt [24-48 h] over F025-F048 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        GustHours34kt0to48h => {
+            if end < 48 {
+                return Err("Hours of Gusts >=34 kt [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::Count(Threshold::above(17.491)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours of Gusts >=34 kt [0-48 h] over F001-F048 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        GustHours50kt0to24h => {
+            if end < 24 {
+                return Err("Hours of Gusts >=50 kt [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::Count(Threshold::above(25.722)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Gusts >=50 kt [0-24 h] over F001-F024 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        GustHours50kt24to48h => {
+            if end < 48 {
+                return Err("Hours of Gusts >=50 kt [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::Count(Threshold::above(25.722)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Gusts >=50 kt [24-48 h] over F025-F048 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        GustHours50kt0to48h => {
+            if end < 48 {
+                return Err("Hours of Gusts >=50 kt [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::Count(Threshold::above(25.722)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours of Gusts >=50 kt [0-48 h] over F001-F048 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        GustHours64kt0to24h => {
+            if end < 24 {
+                return Err("Hours of Gusts >=64 kt [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::Count(Threshold::above(32.924)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Gusts >=64 kt [0-24 h] over F001-F024 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        GustHours64kt24to48h => {
+            if end < 48 {
+                return Err("Hours of Gusts >=64 kt [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::Count(Threshold::above(32.924)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Gusts >=64 kt [24-48 h] over F025-F048 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        GustHours64kt0to48h => {
+            if end < 48 {
+                return Err("Hours of Gusts >=64 kt [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::Count(Threshold::above(32.924)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours of Gusts >=64 kt [0-48 h] over F001-F048 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        GustOnsetHour34kt0to24h => {
+            if end < 24 {
+                return Err("Onset Hour of 34 kt Gusts [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::FirstHour(Threshold::above(17.491)),
+                (1..=24).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Onset Hour of 34 kt Gusts [0-24 h] over F001-F024 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        GustOnsetHour34kt24to48h => {
+            if end < 48 {
+                return Err("Onset Hour of 34 kt Gusts [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::FirstHour(Threshold::above(17.491)),
+                (25..=48).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Onset Hour of 34 kt Gusts [24-48 h] over F025-F048 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        GustOnsetHour34kt0to48h => {
+            if end < 48 {
+                return Err("Onset Hour of 34 kt Gusts [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::FirstHour(Threshold::above(17.491)),
+                (1..=48).collect(),
+                Some(48),
+                "forecast hour",
+                Finish::None,
+                "Onset Hour of 34 kt Gusts [0-48 h] over F001-F048 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        GustPeakHour0to24h => {
+            if end < 24 {
+                return Err("Hour of Peak Gust [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::PeakHour(Threshold::above(10.0)),
+                (1..=24).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Hour of Peak Gust [0-24 h] over F001-F024 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        GustPeakHour24to48h => {
+            if end < 48 {
+                return Err("Hour of Peak Gust [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::PeakHour(Threshold::above(10.0)),
+                (25..=48).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Hour of Peak Gust [24-48 h] over F025-F048 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        GustPeakHour0to48h => {
+            if end < 48 {
+                return Err("Hour of Peak Gust [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWindGust10m,
+                Reduce::PeakHour(Threshold::above(10.0)),
+                (1..=48).collect(),
+                Some(48),
+                "forecast hour",
+                Finish::None,
+                "Hour of Peak Gust [0-48 h] over F001-F048 of stored hourly wind_gust_10m".to_string(),
+            )
+        }
+        RotationHours0to24h => {
+            if end < 24 {
+                return Err("Hours of Storm Rotation (UH >=75) [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Uh2to5km,
+                Reduce::Count(Threshold::above(75.0)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Storm Rotation (UH >=75) [0-24 h] over F001-F024 of stored hourly uh_2to5km_max_1h".to_string(),
+            )
+        }
+        RotationHours24to48h => {
+            if end < 48 {
+                return Err("Hours of Storm Rotation (UH >=75) [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Uh2to5km,
+                Reduce::Count(Threshold::above(75.0)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Storm Rotation (UH >=75) [24-48 h] over F025-F048 of stored hourly uh_2to5km_max_1h".to_string(),
+            )
+        }
+        RotationHours0to48h => {
+            if end < 48 {
+                return Err("Hours of Storm Rotation (UH >=75) [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Uh2to5km,
+                Reduce::Count(Threshold::above(75.0)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours of Storm Rotation (UH >=75) [0-48 h] over F001-F048 of stored hourly uh_2to5km_max_1h".to_string(),
+            )
+        }
+        RotationPeakHour0to24h => {
+            if end < 24 {
+                return Err("Hour of Peak Rotation [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Uh2to5km,
+                Reduce::PeakHour(Threshold::above(25.0)),
+                (1..=24).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Hour of Peak Rotation [0-24 h] over F001-F024 of stored hourly uh_2to5km_max_1h".to_string(),
+            )
+        }
+        RotationPeakHour24to48h => {
+            if end < 48 {
+                return Err("Hour of Peak Rotation [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Uh2to5km,
+                Reduce::PeakHour(Threshold::above(25.0)),
+                (25..=48).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Hour of Peak Rotation [24-48 h] over F025-F048 of stored hourly uh_2to5km_max_1h".to_string(),
+            )
+        }
+        RotationPeakHour0to48h => {
+            if end < 48 {
+                return Err("Hour of Peak Rotation [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Uh2to5km,
+                Reduce::PeakHour(Threshold::above(25.0)),
+                (1..=48).collect(),
+                Some(48),
+                "forecast hour",
+                Finish::None,
+                "Hour of Peak Rotation [0-48 h] over F001-F048 of stored hourly uh_2to5km_max_1h".to_string(),
+            )
+        }
+        StormHours0to24h => {
+            if end < 24 {
+                return Err("Hours with a Storm Overhead (>=40 dBZ) [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCompositeReflectivity,
+                Reduce::Count(Threshold::above(40.0)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours with a Storm Overhead (>=40 dBZ) [0-24 h] over F001-F024 of stored hourly composite_reflectivity".to_string(),
+            )
+        }
+        StormHours24to48h => {
+            if end < 48 {
+                return Err("Hours with a Storm Overhead (>=40 dBZ) [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCompositeReflectivity,
+                Reduce::Count(Threshold::above(40.0)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours with a Storm Overhead (>=40 dBZ) [24-48 h] over F025-F048 of stored hourly composite_reflectivity".to_string(),
+            )
+        }
+        StormHours0to48h => {
+            if end < 48 {
+                return Err("Hours with a Storm Overhead (>=40 dBZ) [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCompositeReflectivity,
+                Reduce::Count(Threshold::above(40.0)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours with a Storm Overhead (>=40 dBZ) [0-48 h] over F001-F048 of stored hourly composite_reflectivity".to_string(),
+            )
+        }
+        StormOnsetHour0to24h => {
+            if end < 24 {
+                return Err("Convective Onset Hour [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCompositeReflectivity,
+                Reduce::FirstHour(Threshold::above(40.0)),
+                (1..=24).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Convective Onset Hour [0-24 h] over F001-F024 of stored hourly composite_reflectivity".to_string(),
+            )
+        }
+        StormOnsetHour24to48h => {
+            if end < 48 {
+                return Err("Convective Onset Hour [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCompositeReflectivity,
+                Reduce::FirstHour(Threshold::above(40.0)),
+                (25..=48).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Convective Onset Hour [24-48 h] over F025-F048 of stored hourly composite_reflectivity".to_string(),
+            )
+        }
+        StormOnsetHour0to48h => {
+            if end < 48 {
+                return Err("Convective Onset Hour [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCompositeReflectivity,
+                Reduce::FirstHour(Threshold::above(40.0)),
+                (1..=48).collect(),
+                Some(48),
+                "forecast hour",
+                Finish::None,
+                "Convective Onset Hour [0-48 h] over F001-F048 of stored hourly composite_reflectivity".to_string(),
+            )
+        }
+        SigTorEnvHours0to24h => {
+            if end < 24 {
+                return Err("Hours in a Significant-Tornado Environment (STP >=1) [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinStpFixed,
+                Reduce::Count(Threshold::above(1.0)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours in a Significant-Tornado Environment (STP >=1) [0-24 h] over F001-F024 of stored hourly stp_fixed".to_string(),
+            )
+        }
+        SigTorEnvHours24to48h => {
+            if end < 48 {
+                return Err("Hours in a Significant-Tornado Environment (STP >=1) [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinStpFixed,
+                Reduce::Count(Threshold::above(1.0)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours in a Significant-Tornado Environment (STP >=1) [24-48 h] over F025-F048 of stored hourly stp_fixed".to_string(),
+            )
+        }
+        SigTorEnvHours0to48h => {
+            if end < 48 {
+                return Err("Hours in a Significant-Tornado Environment (STP >=1) [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinStpFixed,
+                Reduce::Count(Threshold::above(1.0)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours in a Significant-Tornado Environment (STP >=1) [0-48 h] over F001-F048 of stored hourly stp_fixed".to_string(),
+            )
+        }
+        BigCapeHours0to24h => {
+            if end < 24 {
+                return Err("Hours with MUCAPE >=1000 J/kg [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinMucape,
+                Reduce::Count(Threshold::above(1000.0)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours with MUCAPE >=1000 J/kg [0-24 h] over F001-F024 of stored hourly mucape".to_string(),
+            )
+        }
+        BigCapeHours24to48h => {
+            if end < 48 {
+                return Err("Hours with MUCAPE >=1000 J/kg [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinMucape,
+                Reduce::Count(Threshold::above(1000.0)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours with MUCAPE >=1000 J/kg [24-48 h] over F025-F048 of stored hourly mucape".to_string(),
+            )
+        }
+        BigCapeHours0to48h => {
+            if end < 48 {
+                return Err("Hours with MUCAPE >=1000 J/kg [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinMucape,
+                Reduce::Count(Threshold::above(1000.0)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours with MUCAPE >=1000 J/kg [0-48 h] over F001-F048 of stored hourly mucape".to_string(),
+            )
+        }
+        CriticalRhHours0to24h => {
+            if end < 24 {
+                return Err("Hours of Critical Low RH (<=15%) [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Rh2mPct,
+                Reduce::Count(Threshold::below(15.0)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Critical Low RH (<=15%) [0-24 h] over F001-F024 of stored hourly rh_2m".to_string(),
+            )
+        }
+        CriticalRhHours24to48h => {
+            if end < 48 {
+                return Err("Hours of Critical Low RH (<=15%) [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Rh2mPct,
+                Reduce::Count(Threshold::below(15.0)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Critical Low RH (<=15%) [24-48 h] over F025-F048 of stored hourly rh_2m".to_string(),
+            )
+        }
+        CriticalRhHours0to48h => {
+            if end < 48 {
+                return Err("Hours of Critical Low RH (<=15%) [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Rh2mPct,
+                Reduce::Count(Threshold::below(15.0)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours of Critical Low RH (<=15%) [0-48 h] over F001-F048 of stored hourly rh_2m".to_string(),
+            )
+        }
+        CriticalRhLongestRun0to24h => {
+            if end < 24 {
+                return Err("Longest Run of Critical Low RH [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Rh2mPct,
+                Reduce::LongestRun(Threshold::below(15.0)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Longest Run of Critical Low RH [0-24 h] over F001-F024 of stored hourly rh_2m".to_string(),
+            )
+        }
+        CriticalRhLongestRun24to48h => {
+            if end < 48 {
+                return Err("Longest Run of Critical Low RH [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Rh2mPct,
+                Reduce::LongestRun(Threshold::below(15.0)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Longest Run of Critical Low RH [24-48 h] over F025-F048 of stored hourly rh_2m".to_string(),
+            )
+        }
+        CriticalRhLongestRun0to48h => {
+            if end < 48 {
+                return Err("Longest Run of Critical Low RH [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::Rh2mPct,
+                Reduce::LongestRun(Threshold::below(15.0)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Longest Run of Critical Low RH [0-48 h] over F001-F048 of stored hourly rh_2m".to_string(),
+            )
+        }
+        HdwPeakHour0to24h => {
+            if end < 24 {
+                return Err("Hour of Peak Hot-Dry-Windy [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHdw,
+                Reduce::PeakHour(Threshold::above(50.0)),
+                (1..=24).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Hour of Peak Hot-Dry-Windy [0-24 h] over F001-F024 of stored hourly hdw".to_string(),
+            )
+        }
+        HdwPeakHour24to48h => {
+            if end < 48 {
+                return Err("Hour of Peak Hot-Dry-Windy [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHdw,
+                Reduce::PeakHour(Threshold::above(50.0)),
+                (25..=48).collect(),
+                Some(24),
+                "forecast hour",
+                Finish::None,
+                "Hour of Peak Hot-Dry-Windy [24-48 h] over F025-F048 of stored hourly hdw".to_string(),
+            )
+        }
+        HdwPeakHour0to48h => {
+            if end < 48 {
+                return Err("Hour of Peak Hot-Dry-Windy [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHdw,
+                Reduce::PeakHour(Threshold::above(50.0)),
+                (1..=48).collect(),
+                Some(48),
+                "forecast hour",
+                Finish::None,
+                "Hour of Peak Hot-Dry-Windy [0-48 h] over F001-F048 of stored hourly hdw".to_string(),
+            )
+        }
+        DangerHeatHours0to24h => {
+            if end < 24 {
+                return Err("Hours of Dangerous Heat (HI >=105F) [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHeatIndex2m,
+                Reduce::Count(Threshold::above(40.56)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Dangerous Heat (HI >=105F) [0-24 h] over F001-F024 of stored hourly heat_index_2m".to_string(),
+            )
+        }
+        DangerHeatHours24to48h => {
+            if end < 48 {
+                return Err("Hours of Dangerous Heat (HI >=105F) [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHeatIndex2m,
+                Reduce::Count(Threshold::above(40.56)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Dangerous Heat (HI >=105F) [24-48 h] over F025-F048 of stored hourly heat_index_2m".to_string(),
+            )
+        }
+        DangerHeatHours0to48h => {
+            if end < 48 {
+                return Err("Hours of Dangerous Heat (HI >=105F) [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHeatIndex2m,
+                Reduce::Count(Threshold::above(40.56)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours of Dangerous Heat (HI >=105F) [0-48 h] over F001-F048 of stored hourly heat_index_2m".to_string(),
+            )
+        }
+        DangerHeatLongestRun0to24h => {
+            if end < 24 {
+                return Err("Longest Run of Dangerous Heat [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHeatIndex2m,
+                Reduce::LongestRun(Threshold::above(40.56)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Longest Run of Dangerous Heat [0-24 h] over F001-F024 of stored hourly heat_index_2m".to_string(),
+            )
+        }
+        DangerHeatLongestRun24to48h => {
+            if end < 48 {
+                return Err("Longest Run of Dangerous Heat [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHeatIndex2m,
+                Reduce::LongestRun(Threshold::above(40.56)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Longest Run of Dangerous Heat [24-48 h] over F025-F048 of stored hourly heat_index_2m".to_string(),
+            )
+        }
+        DangerHeatLongestRun0to48h => {
+            if end < 48 {
+                return Err("Longest Run of Dangerous Heat [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinHeatIndex2m,
+                Reduce::LongestRun(Threshold::above(40.56)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Longest Run of Dangerous Heat [0-48 h] over F001-F048 of stored hourly heat_index_2m".to_string(),
+            )
+        }
+        HighWetbulbHours0to24h => {
+            if end < 24 {
+                return Err("Hours with Wet-Bulb >=28C [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWetbulb2m,
+                Reduce::Count(Threshold::above(28.0)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours with Wet-Bulb >=28C [0-24 h] over F001-F024 of stored hourly wetbulb_2m".to_string(),
+            )
+        }
+        HighWetbulbHours24to48h => {
+            if end < 48 {
+                return Err("Hours with Wet-Bulb >=28C [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWetbulb2m,
+                Reduce::Count(Threshold::above(28.0)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours with Wet-Bulb >=28C [24-48 h] over F025-F048 of stored hourly wetbulb_2m".to_string(),
+            )
+        }
+        HighWetbulbHours0to48h => {
+            if end < 48 {
+                return Err("Hours with Wet-Bulb >=28C [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinWetbulb2m,
+                Reduce::Count(Threshold::above(28.0)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours with Wet-Bulb >=28C [0-48 h] over F001-F048 of stored hourly wetbulb_2m".to_string(),
+            )
+        }
+        LowVisHours0to24h => {
+            if end < 24 {
+                return Err("Hours of Visibility <=1 mile [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinVisibility,
+                Reduce::Count(Threshold::below(1609.0)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Visibility <=1 mile [0-24 h] over F001-F024 of stored hourly visibility".to_string(),
+            )
+        }
+        LowVisHours24to48h => {
+            if end < 48 {
+                return Err("Hours of Visibility <=1 mile [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinVisibility,
+                Reduce::Count(Threshold::below(1609.0)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Visibility <=1 mile [24-48 h] over F025-F048 of stored hourly visibility".to_string(),
+            )
+        }
+        LowVisHours0to48h => {
+            if end < 48 {
+                return Err("Hours of Visibility <=1 mile [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinVisibility,
+                Reduce::Count(Threshold::below(1609.0)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours of Visibility <=1 mile [0-48 h] over F001-F048 of stored hourly visibility".to_string(),
+            )
+        }
+        LowVisLongestRun0to24h => {
+            if end < 24 {
+                return Err("Longest Run of Visibility <=1 mile [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinVisibility,
+                Reduce::LongestRun(Threshold::below(1609.0)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Longest Run of Visibility <=1 mile [0-24 h] over F001-F024 of stored hourly visibility".to_string(),
+            )
+        }
+        LowVisLongestRun24to48h => {
+            if end < 48 {
+                return Err("Longest Run of Visibility <=1 mile [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinVisibility,
+                Reduce::LongestRun(Threshold::below(1609.0)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Longest Run of Visibility <=1 mile [24-48 h] over F025-F048 of stored hourly visibility".to_string(),
+            )
+        }
+        LowVisLongestRun0to48h => {
+            if end < 48 {
+                return Err("Longest Run of Visibility <=1 mile [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinVisibility,
+                Reduce::LongestRun(Threshold::below(1609.0)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Longest Run of Visibility <=1 mile [0-48 h] over F001-F048 of stored hourly visibility".to_string(),
+            )
+        }
+        SnowHours0to24h => {
+            if end < 24 {
+                return Err("Hours of Snow [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalSnow,
+                Reduce::Count(Threshold::above(0.5)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Snow [0-24 h] over F001-F024 of stored hourly categorical_snow".to_string(),
+            )
+        }
+        SnowHours24to48h => {
+            if end < 48 {
+                return Err("Hours of Snow [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalSnow,
+                Reduce::Count(Threshold::above(0.5)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Snow [24-48 h] over F025-F048 of stored hourly categorical_snow".to_string(),
+            )
+        }
+        SnowHours0to48h => {
+            if end < 48 {
+                return Err("Hours of Snow [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalSnow,
+                Reduce::Count(Threshold::above(0.5)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours of Snow [0-48 h] over F001-F048 of stored hourly categorical_snow".to_string(),
+            )
+        }
+        FreezingRainHours0to24h => {
+            if end < 24 {
+                return Err("Hours of Freezing Rain [0-24 h] requires forecast hour >= 24; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalFreezingRain,
+                Reduce::Count(Threshold::above(0.5)),
+                (1..=24).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Freezing Rain [0-24 h] over F001-F024 of stored hourly categorical_freezing_rain".to_string(),
+            )
+        }
+        FreezingRainHours24to48h => {
+            if end < 48 {
+                return Err("Hours of Freezing Rain [24-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalFreezingRain,
+                Reduce::Count(Threshold::above(0.5)),
+                (25..=48).collect(),
+                Some(24),
+                "hours",
+                Finish::None,
+                "Hours of Freezing Rain [24-48 h] over F025-F048 of stored hourly categorical_freezing_rain".to_string(),
+            )
+        }
+        FreezingRainHours0to48h => {
+            if end < 48 {
+                return Err("Hours of Freezing Rain [0-48 h] requires forecast hour >= 48; use a HRRR extended cycle for 24-48 h products".to_string());
+            }
+            spec(
+                SourceKind::WinCategoricalFreezingRain,
+                Reduce::Count(Threshold::above(0.5)),
+                (1..=48).collect(),
+                Some(48),
+                "hours",
+                Finish::None,
+                "Hours of Freezing Rain [0-48 h] over F001-F048 of stored hourly categorical_freezing_rain".to_string(),
+            )
+        }
         _ => unreachable!("surface snapshot window products are handled before the match"),
     }
 }
@@ -2228,6 +3411,87 @@ fn product_is_run_scoped(product: HrrrWindowedProduct) -> bool {
                 | CategoricalFreezingRain0to24hMax
                 | CategoricalFreezingRain24to48hMax
                 | CategoricalFreezingRain0to48hMax
+                | HeavyRainHours0to24h
+                | HeavyRainHours24to48h
+                | HeavyRainHours0to48h
+                | VeryHeavyRainHours0to24h
+                | VeryHeavyRainHours24to48h
+                | VeryHeavyRainHours0to48h
+                | HeavyRainLongestRun0to24h
+                | HeavyRainLongestRun24to48h
+                | HeavyRainLongestRun0to48h
+                | RainOnsetHour0to24h
+                | RainOnsetHour24to48h
+                | RainOnsetHour0to48h
+                | RainEndHour0to24h
+                | RainEndHour24to48h
+                | RainEndHour0to48h
+                | RainPeakHour0to24h
+                | RainPeakHour24to48h
+                | RainPeakHour0to48h
+                | GustHours34kt0to24h
+                | GustHours34kt24to48h
+                | GustHours34kt0to48h
+                | GustHours50kt0to24h
+                | GustHours50kt24to48h
+                | GustHours50kt0to48h
+                | GustHours64kt0to24h
+                | GustHours64kt24to48h
+                | GustHours64kt0to48h
+                | GustOnsetHour34kt0to24h
+                | GustOnsetHour34kt24to48h
+                | GustOnsetHour34kt0to48h
+                | GustPeakHour0to24h
+                | GustPeakHour24to48h
+                | GustPeakHour0to48h
+                | RotationHours0to24h
+                | RotationHours24to48h
+                | RotationHours0to48h
+                | RotationPeakHour0to24h
+                | RotationPeakHour24to48h
+                | RotationPeakHour0to48h
+                | StormHours0to24h
+                | StormHours24to48h
+                | StormHours0to48h
+                | StormOnsetHour0to24h
+                | StormOnsetHour24to48h
+                | StormOnsetHour0to48h
+                | SigTorEnvHours0to24h
+                | SigTorEnvHours24to48h
+                | SigTorEnvHours0to48h
+                | BigCapeHours0to24h
+                | BigCapeHours24to48h
+                | BigCapeHours0to48h
+                | CriticalRhHours0to24h
+                | CriticalRhHours24to48h
+                | CriticalRhHours0to48h
+                | CriticalRhLongestRun0to24h
+                | CriticalRhLongestRun24to48h
+                | CriticalRhLongestRun0to48h
+                | HdwPeakHour0to24h
+                | HdwPeakHour24to48h
+                | HdwPeakHour0to48h
+                | DangerHeatHours0to24h
+                | DangerHeatHours24to48h
+                | DangerHeatHours0to48h
+                | DangerHeatLongestRun0to24h
+                | DangerHeatLongestRun24to48h
+                | DangerHeatLongestRun0to48h
+                | HighWetbulbHours0to24h
+                | HighWetbulbHours24to48h
+                | HighWetbulbHours0to48h
+                | LowVisHours0to24h
+                | LowVisHours24to48h
+                | LowVisHours0to48h
+                | LowVisLongestRun0to24h
+                | LowVisLongestRun24to48h
+                | LowVisLongestRun0to48h
+                | SnowHours0to24h
+                | SnowHours24to48h
+                | SnowHours0to48h
+                | FreezingRainHours0to24h
+                | FreezingRainHours24to48h
+                | FreezingRainHours0to48h
         )
 }
 
@@ -2609,6 +3873,14 @@ enum AccumState {
     Min(Vec<f64>),
     Range { max: Vec<f64>, min: Vec<f64> },
     Direct(Vec<f64>),
+    /// Hours meeting the threshold (a COUNT, never a probability).
+    Count(Vec<f64>),
+    /// Longest consecutive streak of hours meeting the threshold.
+    LongestRun { best: Vec<f64>, current: Vec<f64> },
+    /// First / last hour meeting the threshold; NaN where never met.
+    EdgeHour(Vec<f64>),
+    /// Hour of the window maximum, with the running max to compare against.
+    PeakHour { hour: Vec<f64>, best: Vec<f64> },
 }
 
 impl Accum {
@@ -2621,7 +3893,34 @@ impl Accum {
         }
     }
 
-    fn fold(&mut self, values: &[f64]) {
+    fn fold(&mut self, values: &[f64], hour: u16) {
+        let hour_f = f64::from(hour);
+        // Threshold reductions start from an empty accumulator and then take
+        // the same per-hour path as every later hour, so hour one is not a
+        // special case that silently skips the test.
+        if let Reduce::Count(_)
+        | Reduce::LongestRun(_)
+        | Reduce::FirstHour(_)
+        | Reduce::LastHour(_)
+        | Reduce::PeakHour(_) = self.spec.reduce
+        {
+            if self.state.is_none() {
+                self.state = Some(match self.spec.reduce {
+                    Reduce::Count(_) => AccumState::Count(vec![0.0; values.len()]),
+                    Reduce::LongestRun(_) => AccumState::LongestRun {
+                        best: vec![0.0; values.len()],
+                        current: vec![0.0; values.len()],
+                    },
+                    Reduce::FirstHour(_) | Reduce::LastHour(_) => {
+                        AccumState::EdgeHour(vec![f64::NAN; values.len()])
+                    }
+                    _ => AccumState::PeakHour {
+                        hour: vec![f64::NAN; values.len()],
+                        best: vec![f64::NEG_INFINITY; values.len()],
+                    },
+                });
+            }
+        }
         match &mut self.state {
             None => {
                 self.state = Some(match self.spec.reduce {
@@ -2633,7 +3932,55 @@ impl Accum {
                         max: values.to_vec(),
                         min: values.to_vec(),
                     },
+                    _ => unreachable!("threshold reductions are initialized above"),
                 });
+            }
+            Some(AccumState::Count(acc)) => {
+                let Reduce::Count(threshold) = self.spec.reduce else {
+                    return;
+                };
+                for (target, value) in acc.iter_mut().zip(values) {
+                    if threshold.met(*value) {
+                        *target += 1.0;
+                    }
+                }
+            }
+            Some(AccumState::LongestRun { best, current }) => {
+                let Reduce::LongestRun(threshold) = self.spec.reduce else {
+                    return;
+                };
+                for ((best, current), value) in best.iter_mut().zip(current.iter_mut()).zip(values) {
+                    if threshold.met(*value) {
+                        *current += 1.0;
+                        *best = best.max(*current);
+                    } else {
+                        *current = 0.0;
+                    }
+                }
+            }
+            Some(AccumState::EdgeHour(acc)) => {
+                let keep_last = matches!(self.spec.reduce, Reduce::LastHour(_));
+                let threshold = match self.spec.reduce {
+                    Reduce::FirstHour(threshold) | Reduce::LastHour(threshold) => threshold,
+                    _ => return,
+                };
+                for (target, value) in acc.iter_mut().zip(values) {
+                    if threshold.met(*value) && (keep_last || target.is_nan()) {
+                        *target = hour_f;
+                    }
+                }
+            }
+            Some(AccumState::PeakHour { hour: hours, best }) => {
+                let Reduce::PeakHour(threshold) = self.spec.reduce else {
+                    return;
+                };
+                for ((slot, best), value) in hours.iter_mut().zip(best.iter_mut()).zip(values) {
+                    // Strictly greater => the FIRST hour reaching the peak wins.
+                    if threshold.met(*value) && *value > *best {
+                        *best = *value;
+                        *slot = hour_f;
+                    }
+                }
             }
             Some(AccumState::Direct(_)) => {
                 unreachable!("direct windowed products fold exactly one hour")
@@ -2673,14 +4020,25 @@ impl Accum {
             Some(AccumState::Direct(values))
             | Some(AccumState::Sum(values))
             | Some(AccumState::Max(values))
-            | Some(AccumState::Min(values)) => values,
+            | Some(AccumState::Min(values))
+            | Some(AccumState::Count(values))
+            | Some(AccumState::EdgeHour(values)) => values,
             Some(AccumState::Range { max, min }) => max
                 .into_iter()
                 .zip(min)
                 .map(|(max, min)| max - min)
                 .collect(),
+            Some(AccumState::LongestRun { best, .. }) => best,
+            Some(AccumState::PeakHour { hour, .. }) => hour,
         };
-        match self.spec.finish {
+        // Count / timing reductions output HOURS, not the source variable, so a
+        // display-unit conversion would corrupt them (e.g. multiplying an hour
+        // count by 1.94 "knots"). Only value-valued reductions convert.
+        let converts_units = matches!(
+            self.spec.reduce,
+            Reduce::Direct | Reduce::Sum | Reduce::Max | Reduce::Min | Reduce::Range
+        );
+        match if converts_units { self.spec.finish } else { Finish::None } {
             Finish::None => {}
             Finish::MmToInches => {
                 for value in values.iter_mut() {

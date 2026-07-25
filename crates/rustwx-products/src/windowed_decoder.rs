@@ -1210,11 +1210,51 @@ pub(crate) fn windowed_product_scale(product: HrrrWindowedProduct) -> ColorScale
         ColorScale::Discrete(wind10m_scale())
     } else if let Some(spec) = surface_snapshot_window_spec(product) {
         ColorScale::Discrete(spec.field.scale(spec.operation))
+    } else if let Some(scale) = temporal_product_scale(product) {
+        scale
     } else if let Some(scale) = day_window_scale(product) {
         scale
     } else {
         ColorScale::Weather(WeatherProduct::Uh.scale_preset())
     }
+}
+
+/// Scale for the temporal-reduction family (hour counts, streak lengths and
+/// onset/peak hours). Their values are HOURS, not the source variable, so they
+/// need their own ramps — the field-matched day-window scales would be
+/// meaningless (a "wind gust" ramp over an hour count).
+///
+/// Counts mask out zero so "never happened" reads as blank rather than as the
+/// bottom color, which is the difference between an honest footprint and a map
+/// that looks like wall-to-wall coverage.
+fn temporal_product_scale(product: HrrrWindowedProduct) -> Option<ColorScale> {
+    let slug = product.slug();
+    let window_hours = if slug.ends_with("_0_48h") { 48.0 } else { 24.0 };
+    // Timing fields: which hour it happened. A sequential ramp across the
+    // window reads as a clock; NaN (never) renders blank.
+    if slug.contains("_onset_hour") || slug.contains("_peak_hour") || slug.ends_with("_end_hour") {
+        let (lo, hi) = if slug.ends_with("_24_48h") {
+            (25.0, 48.0)
+        } else {
+            (1.0, window_hours)
+        };
+        return Some(ColorScale::Discrete(palette_scale(
+            WeatherPalette::Temperature,
+            range_step(lo, hi, 1.0),
+            ExtendMode::Neither,
+            None,
+        )));
+    }
+    // Duration fields: hours, or longest consecutive run of hours.
+    if slug.contains("_hours") || slug.ends_with("_longest_run") {
+        return Some(ColorScale::Discrete(palette_scale(
+            WeatherPalette::Cape,
+            range_step(1.0, window_hours, 1.0),
+            ExtendMode::Max,
+            Some(0.5),
+        )));
+    }
+    None
 }
 
 /// The source store variable behind a single-variable day-window product,

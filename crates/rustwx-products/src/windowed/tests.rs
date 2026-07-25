@@ -332,6 +332,15 @@ fn windowed_product_scale_matches_the_kernel_families() {
                  day_window_scale()",
                 product.slug()
             );
+        } else if is_temporal_reduction_slug(product.slug()) {
+            // Hour counts / streak lengths / onset+peak hours are measured in
+            // HOURS, so they need their own discrete ramps. Falling through to
+            // the UH preset is the grey-wash bug this guards.
+            assert!(
+                matches!(scale, ColorScale::Discrete(_)),
+                "{}: temporal reduction must carry an hours/timing scale, not the UH preset",
+                product.slug()
+            );
         } else {
             assert!(
                 matches!(scale, ColorScale::Weather(_)),
@@ -340,4 +349,14 @@ fn windowed_product_scale_matches_the_kernel_families() {
             );
         }
     }
+}
+
+/// Slugs of the duration/timing family (hour counts, longest runs, onset and
+/// peak hours), which are expressed in hours rather than the source variable.
+fn is_temporal_reduction_slug(slug: &str) -> bool {
+    slug.contains("_hours")
+        || slug.ends_with("_longest_run")
+        || slug.contains("_onset_hour")
+        || slug.contains("_peak_hour")
+        || slug.ends_with("_end_hour")
 }

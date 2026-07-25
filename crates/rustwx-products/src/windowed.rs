@@ -181,6 +181,87 @@ pub enum HrrrWindowedProduct {
     CategoricalFreezingRain0to24hMax,
     CategoricalFreezingRain24to48hMax,
     CategoricalFreezingRain0to48hMax,
+    HeavyRainHours0to24h,
+    HeavyRainHours24to48h,
+    HeavyRainHours0to48h,
+    VeryHeavyRainHours0to24h,
+    VeryHeavyRainHours24to48h,
+    VeryHeavyRainHours0to48h,
+    HeavyRainLongestRun0to24h,
+    HeavyRainLongestRun24to48h,
+    HeavyRainLongestRun0to48h,
+    RainOnsetHour0to24h,
+    RainOnsetHour24to48h,
+    RainOnsetHour0to48h,
+    RainEndHour0to24h,
+    RainEndHour24to48h,
+    RainEndHour0to48h,
+    RainPeakHour0to24h,
+    RainPeakHour24to48h,
+    RainPeakHour0to48h,
+    GustHours34kt0to24h,
+    GustHours34kt24to48h,
+    GustHours34kt0to48h,
+    GustHours50kt0to24h,
+    GustHours50kt24to48h,
+    GustHours50kt0to48h,
+    GustHours64kt0to24h,
+    GustHours64kt24to48h,
+    GustHours64kt0to48h,
+    GustOnsetHour34kt0to24h,
+    GustOnsetHour34kt24to48h,
+    GustOnsetHour34kt0to48h,
+    GustPeakHour0to24h,
+    GustPeakHour24to48h,
+    GustPeakHour0to48h,
+    RotationHours0to24h,
+    RotationHours24to48h,
+    RotationHours0to48h,
+    RotationPeakHour0to24h,
+    RotationPeakHour24to48h,
+    RotationPeakHour0to48h,
+    StormHours0to24h,
+    StormHours24to48h,
+    StormHours0to48h,
+    StormOnsetHour0to24h,
+    StormOnsetHour24to48h,
+    StormOnsetHour0to48h,
+    SigTorEnvHours0to24h,
+    SigTorEnvHours24to48h,
+    SigTorEnvHours0to48h,
+    BigCapeHours0to24h,
+    BigCapeHours24to48h,
+    BigCapeHours0to48h,
+    CriticalRhHours0to24h,
+    CriticalRhHours24to48h,
+    CriticalRhHours0to48h,
+    CriticalRhLongestRun0to24h,
+    CriticalRhLongestRun24to48h,
+    CriticalRhLongestRun0to48h,
+    HdwPeakHour0to24h,
+    HdwPeakHour24to48h,
+    HdwPeakHour0to48h,
+    DangerHeatHours0to24h,
+    DangerHeatHours24to48h,
+    DangerHeatHours0to48h,
+    DangerHeatLongestRun0to24h,
+    DangerHeatLongestRun24to48h,
+    DangerHeatLongestRun0to48h,
+    HighWetbulbHours0to24h,
+    HighWetbulbHours24to48h,
+    HighWetbulbHours0to48h,
+    LowVisHours0to24h,
+    LowVisHours24to48h,
+    LowVisHours0to48h,
+    LowVisLongestRun0to24h,
+    LowVisLongestRun24to48h,
+    LowVisLongestRun0to48h,
+    SnowHours0to24h,
+    SnowHours24to48h,
+    SnowHours0to48h,
+    FreezingRainHours0to24h,
+    FreezingRainHours24to48h,
+    FreezingRainHours0to48h,
     Temp2m0to24hMax,
     Temp2m24to48hMax,
     Temp2m0to48hMax,
@@ -354,6 +435,87 @@ impl HrrrWindowedProduct {
             Self::CategoricalFreezingRain0to24hMax => "categorical_freezing_rain_0_24h_max",
             Self::CategoricalFreezingRain24to48hMax => "categorical_freezing_rain_24_48h_max",
             Self::CategoricalFreezingRain0to48hMax => "categorical_freezing_rain_0_48h_max",
+            Self::HeavyRainHours0to24h => "heavy_rain_hours_0_24h",
+            Self::HeavyRainHours24to48h => "heavy_rain_hours_24_48h",
+            Self::HeavyRainHours0to48h => "heavy_rain_hours_0_48h",
+            Self::VeryHeavyRainHours0to24h => "very_heavy_rain_hours_0_24h",
+            Self::VeryHeavyRainHours24to48h => "very_heavy_rain_hours_24_48h",
+            Self::VeryHeavyRainHours0to48h => "very_heavy_rain_hours_0_48h",
+            Self::HeavyRainLongestRun0to24h => "heavy_rain_longest_run_0_24h",
+            Self::HeavyRainLongestRun24to48h => "heavy_rain_longest_run_24_48h",
+            Self::HeavyRainLongestRun0to48h => "heavy_rain_longest_run_0_48h",
+            Self::RainOnsetHour0to24h => "rain_onset_hour_0_24h",
+            Self::RainOnsetHour24to48h => "rain_onset_hour_24_48h",
+            Self::RainOnsetHour0to48h => "rain_onset_hour_0_48h",
+            Self::RainEndHour0to24h => "rain_end_hour_0_24h",
+            Self::RainEndHour24to48h => "rain_end_hour_24_48h",
+            Self::RainEndHour0to48h => "rain_end_hour_0_48h",
+            Self::RainPeakHour0to24h => "rain_peak_hour_0_24h",
+            Self::RainPeakHour24to48h => "rain_peak_hour_24_48h",
+            Self::RainPeakHour0to48h => "rain_peak_hour_0_48h",
+            Self::GustHours34kt0to24h => "gust_hours_ge34kt_0_24h",
+            Self::GustHours34kt24to48h => "gust_hours_ge34kt_24_48h",
+            Self::GustHours34kt0to48h => "gust_hours_ge34kt_0_48h",
+            Self::GustHours50kt0to24h => "gust_hours_ge50kt_0_24h",
+            Self::GustHours50kt24to48h => "gust_hours_ge50kt_24_48h",
+            Self::GustHours50kt0to48h => "gust_hours_ge50kt_0_48h",
+            Self::GustHours64kt0to24h => "gust_hours_ge64kt_0_24h",
+            Self::GustHours64kt24to48h => "gust_hours_ge64kt_24_48h",
+            Self::GustHours64kt0to48h => "gust_hours_ge64kt_0_48h",
+            Self::GustOnsetHour34kt0to24h => "gust_onset_hour_ge34kt_0_24h",
+            Self::GustOnsetHour34kt24to48h => "gust_onset_hour_ge34kt_24_48h",
+            Self::GustOnsetHour34kt0to48h => "gust_onset_hour_ge34kt_0_48h",
+            Self::GustPeakHour0to24h => "gust_peak_hour_0_24h",
+            Self::GustPeakHour24to48h => "gust_peak_hour_24_48h",
+            Self::GustPeakHour0to48h => "gust_peak_hour_0_48h",
+            Self::RotationHours0to24h => "rotation_hours_ge75_0_24h",
+            Self::RotationHours24to48h => "rotation_hours_ge75_24_48h",
+            Self::RotationHours0to48h => "rotation_hours_ge75_0_48h",
+            Self::RotationPeakHour0to24h => "rotation_peak_hour_0_24h",
+            Self::RotationPeakHour24to48h => "rotation_peak_hour_24_48h",
+            Self::RotationPeakHour0to48h => "rotation_peak_hour_0_48h",
+            Self::StormHours0to24h => "storm_hours_ge40dbz_0_24h",
+            Self::StormHours24to48h => "storm_hours_ge40dbz_24_48h",
+            Self::StormHours0to48h => "storm_hours_ge40dbz_0_48h",
+            Self::StormOnsetHour0to24h => "storm_onset_hour_0_24h",
+            Self::StormOnsetHour24to48h => "storm_onset_hour_24_48h",
+            Self::StormOnsetHour0to48h => "storm_onset_hour_0_48h",
+            Self::SigTorEnvHours0to24h => "sig_tor_env_hours_0_24h",
+            Self::SigTorEnvHours24to48h => "sig_tor_env_hours_24_48h",
+            Self::SigTorEnvHours0to48h => "sig_tor_env_hours_0_48h",
+            Self::BigCapeHours0to24h => "big_cape_hours_0_24h",
+            Self::BigCapeHours24to48h => "big_cape_hours_24_48h",
+            Self::BigCapeHours0to48h => "big_cape_hours_0_48h",
+            Self::CriticalRhHours0to24h => "critical_rh_hours_0_24h",
+            Self::CriticalRhHours24to48h => "critical_rh_hours_24_48h",
+            Self::CriticalRhHours0to48h => "critical_rh_hours_0_48h",
+            Self::CriticalRhLongestRun0to24h => "critical_rh_longest_run_0_24h",
+            Self::CriticalRhLongestRun24to48h => "critical_rh_longest_run_24_48h",
+            Self::CriticalRhLongestRun0to48h => "critical_rh_longest_run_0_48h",
+            Self::HdwPeakHour0to24h => "hdw_peak_hour_0_24h",
+            Self::HdwPeakHour24to48h => "hdw_peak_hour_24_48h",
+            Self::HdwPeakHour0to48h => "hdw_peak_hour_0_48h",
+            Self::DangerHeatHours0to24h => "danger_heat_hours_0_24h",
+            Self::DangerHeatHours24to48h => "danger_heat_hours_24_48h",
+            Self::DangerHeatHours0to48h => "danger_heat_hours_0_48h",
+            Self::DangerHeatLongestRun0to24h => "danger_heat_longest_run_0_24h",
+            Self::DangerHeatLongestRun24to48h => "danger_heat_longest_run_24_48h",
+            Self::DangerHeatLongestRun0to48h => "danger_heat_longest_run_0_48h",
+            Self::HighWetbulbHours0to24h => "high_wetbulb_hours_0_24h",
+            Self::HighWetbulbHours24to48h => "high_wetbulb_hours_24_48h",
+            Self::HighWetbulbHours0to48h => "high_wetbulb_hours_0_48h",
+            Self::LowVisHours0to24h => "low_vis_hours_0_24h",
+            Self::LowVisHours24to48h => "low_vis_hours_24_48h",
+            Self::LowVisHours0to48h => "low_vis_hours_0_48h",
+            Self::LowVisLongestRun0to24h => "low_vis_longest_run_0_24h",
+            Self::LowVisLongestRun24to48h => "low_vis_longest_run_24_48h",
+            Self::LowVisLongestRun0to48h => "low_vis_longest_run_0_48h",
+            Self::SnowHours0to24h => "snow_hours_0_24h",
+            Self::SnowHours24to48h => "snow_hours_24_48h",
+            Self::SnowHours0to48h => "snow_hours_0_48h",
+            Self::FreezingRainHours0to24h => "freezing_rain_hours_0_24h",
+            Self::FreezingRainHours24to48h => "freezing_rain_hours_24_48h",
+            Self::FreezingRainHours0to48h => "freezing_rain_hours_0_48h",
             Self::Temp2m0to24hMax => "2m_temp_0_24h_max",
             Self::Temp2m24to48hMax => "2m_temp_24_48h_max",
             Self::Temp2m0to48hMax => "2m_temp_0_48h_max",
@@ -513,6 +675,87 @@ impl HrrrWindowedProduct {
             Self::CategoricalFreezingRain0to24hMax => "Categorical Freezing Rain (any in window) (0-24 h max)",
             Self::CategoricalFreezingRain24to48hMax => "Categorical Freezing Rain (any in window) (24-48 h max)",
             Self::CategoricalFreezingRain0to48hMax => "Categorical Freezing Rain (any in window) (0-48 h max)",
+            Self::HeavyRainHours0to24h => "Hours of Heavy Rain (>=0.5 in/h) [0-24 h]",
+            Self::HeavyRainHours24to48h => "Hours of Heavy Rain (>=0.5 in/h) [24-48 h]",
+            Self::HeavyRainHours0to48h => "Hours of Heavy Rain (>=0.5 in/h) [0-48 h]",
+            Self::VeryHeavyRainHours0to24h => "Hours of Very Heavy Rain (>=1 in/h) [0-24 h]",
+            Self::VeryHeavyRainHours24to48h => "Hours of Very Heavy Rain (>=1 in/h) [24-48 h]",
+            Self::VeryHeavyRainHours0to48h => "Hours of Very Heavy Rain (>=1 in/h) [0-48 h]",
+            Self::HeavyRainLongestRun0to24h => "Longest Run of Heavy Rain [0-24 h]",
+            Self::HeavyRainLongestRun24to48h => "Longest Run of Heavy Rain [24-48 h]",
+            Self::HeavyRainLongestRun0to48h => "Longest Run of Heavy Rain [0-48 h]",
+            Self::RainOnsetHour0to24h => "Heavy Rain Onset Hour [0-24 h]",
+            Self::RainOnsetHour24to48h => "Heavy Rain Onset Hour [24-48 h]",
+            Self::RainOnsetHour0to48h => "Heavy Rain Onset Hour [0-48 h]",
+            Self::RainEndHour0to24h => "Heavy Rain End Hour [0-24 h]",
+            Self::RainEndHour24to48h => "Heavy Rain End Hour [24-48 h]",
+            Self::RainEndHour0to48h => "Heavy Rain End Hour [0-48 h]",
+            Self::RainPeakHour0to24h => "Hour of Heaviest Rain [0-24 h]",
+            Self::RainPeakHour24to48h => "Hour of Heaviest Rain [24-48 h]",
+            Self::RainPeakHour0to48h => "Hour of Heaviest Rain [0-48 h]",
+            Self::GustHours34kt0to24h => "Hours of Gusts >=34 kt [0-24 h]",
+            Self::GustHours34kt24to48h => "Hours of Gusts >=34 kt [24-48 h]",
+            Self::GustHours34kt0to48h => "Hours of Gusts >=34 kt [0-48 h]",
+            Self::GustHours50kt0to24h => "Hours of Gusts >=50 kt [0-24 h]",
+            Self::GustHours50kt24to48h => "Hours of Gusts >=50 kt [24-48 h]",
+            Self::GustHours50kt0to48h => "Hours of Gusts >=50 kt [0-48 h]",
+            Self::GustHours64kt0to24h => "Hours of Gusts >=64 kt [0-24 h]",
+            Self::GustHours64kt24to48h => "Hours of Gusts >=64 kt [24-48 h]",
+            Self::GustHours64kt0to48h => "Hours of Gusts >=64 kt [0-48 h]",
+            Self::GustOnsetHour34kt0to24h => "Onset Hour of 34 kt Gusts [0-24 h]",
+            Self::GustOnsetHour34kt24to48h => "Onset Hour of 34 kt Gusts [24-48 h]",
+            Self::GustOnsetHour34kt0to48h => "Onset Hour of 34 kt Gusts [0-48 h]",
+            Self::GustPeakHour0to24h => "Hour of Peak Gust [0-24 h]",
+            Self::GustPeakHour24to48h => "Hour of Peak Gust [24-48 h]",
+            Self::GustPeakHour0to48h => "Hour of Peak Gust [0-48 h]",
+            Self::RotationHours0to24h => "Hours of Storm Rotation (UH >=75) [0-24 h]",
+            Self::RotationHours24to48h => "Hours of Storm Rotation (UH >=75) [24-48 h]",
+            Self::RotationHours0to48h => "Hours of Storm Rotation (UH >=75) [0-48 h]",
+            Self::RotationPeakHour0to24h => "Hour of Peak Rotation [0-24 h]",
+            Self::RotationPeakHour24to48h => "Hour of Peak Rotation [24-48 h]",
+            Self::RotationPeakHour0to48h => "Hour of Peak Rotation [0-48 h]",
+            Self::StormHours0to24h => "Hours with a Storm Overhead (>=40 dBZ) [0-24 h]",
+            Self::StormHours24to48h => "Hours with a Storm Overhead (>=40 dBZ) [24-48 h]",
+            Self::StormHours0to48h => "Hours with a Storm Overhead (>=40 dBZ) [0-48 h]",
+            Self::StormOnsetHour0to24h => "Convective Onset Hour [0-24 h]",
+            Self::StormOnsetHour24to48h => "Convective Onset Hour [24-48 h]",
+            Self::StormOnsetHour0to48h => "Convective Onset Hour [0-48 h]",
+            Self::SigTorEnvHours0to24h => "Hours in a Significant-Tornado Environment (STP >=1) [0-24 h]",
+            Self::SigTorEnvHours24to48h => "Hours in a Significant-Tornado Environment (STP >=1) [24-48 h]",
+            Self::SigTorEnvHours0to48h => "Hours in a Significant-Tornado Environment (STP >=1) [0-48 h]",
+            Self::BigCapeHours0to24h => "Hours with MUCAPE >=1000 J/kg [0-24 h]",
+            Self::BigCapeHours24to48h => "Hours with MUCAPE >=1000 J/kg [24-48 h]",
+            Self::BigCapeHours0to48h => "Hours with MUCAPE >=1000 J/kg [0-48 h]",
+            Self::CriticalRhHours0to24h => "Hours of Critical Low RH (<=15%) [0-24 h]",
+            Self::CriticalRhHours24to48h => "Hours of Critical Low RH (<=15%) [24-48 h]",
+            Self::CriticalRhHours0to48h => "Hours of Critical Low RH (<=15%) [0-48 h]",
+            Self::CriticalRhLongestRun0to24h => "Longest Run of Critical Low RH [0-24 h]",
+            Self::CriticalRhLongestRun24to48h => "Longest Run of Critical Low RH [24-48 h]",
+            Self::CriticalRhLongestRun0to48h => "Longest Run of Critical Low RH [0-48 h]",
+            Self::HdwPeakHour0to24h => "Hour of Peak Hot-Dry-Windy [0-24 h]",
+            Self::HdwPeakHour24to48h => "Hour of Peak Hot-Dry-Windy [24-48 h]",
+            Self::HdwPeakHour0to48h => "Hour of Peak Hot-Dry-Windy [0-48 h]",
+            Self::DangerHeatHours0to24h => "Hours of Dangerous Heat (HI >=105F) [0-24 h]",
+            Self::DangerHeatHours24to48h => "Hours of Dangerous Heat (HI >=105F) [24-48 h]",
+            Self::DangerHeatHours0to48h => "Hours of Dangerous Heat (HI >=105F) [0-48 h]",
+            Self::DangerHeatLongestRun0to24h => "Longest Run of Dangerous Heat [0-24 h]",
+            Self::DangerHeatLongestRun24to48h => "Longest Run of Dangerous Heat [24-48 h]",
+            Self::DangerHeatLongestRun0to48h => "Longest Run of Dangerous Heat [0-48 h]",
+            Self::HighWetbulbHours0to24h => "Hours with Wet-Bulb >=28C [0-24 h]",
+            Self::HighWetbulbHours24to48h => "Hours with Wet-Bulb >=28C [24-48 h]",
+            Self::HighWetbulbHours0to48h => "Hours with Wet-Bulb >=28C [0-48 h]",
+            Self::LowVisHours0to24h => "Hours of Visibility <=1 mile [0-24 h]",
+            Self::LowVisHours24to48h => "Hours of Visibility <=1 mile [24-48 h]",
+            Self::LowVisHours0to48h => "Hours of Visibility <=1 mile [0-48 h]",
+            Self::LowVisLongestRun0to24h => "Longest Run of Visibility <=1 mile [0-24 h]",
+            Self::LowVisLongestRun24to48h => "Longest Run of Visibility <=1 mile [24-48 h]",
+            Self::LowVisLongestRun0to48h => "Longest Run of Visibility <=1 mile [0-48 h]",
+            Self::SnowHours0to24h => "Hours of Snow [0-24 h]",
+            Self::SnowHours24to48h => "Hours of Snow [24-48 h]",
+            Self::SnowHours0to48h => "Hours of Snow [0-48 h]",
+            Self::FreezingRainHours0to24h => "Hours of Freezing Rain [0-24 h]",
+            Self::FreezingRainHours24to48h => "Hours of Freezing Rain [24-48 h]",
+            Self::FreezingRainHours0to48h => "Hours of Freezing Rain [0-48 h]",
             Self::Temp2m0to24hMax => "2 m Temperature (0-24 h max)",
             Self::Temp2m24to48hMax => "2 m Temperature (24-48 h max)",
             Self::Temp2m0to48hMax => "2 m Temperature (0-48 h max)",
@@ -661,6 +904,33 @@ pub fn minimum_forecast_hour_for_windowed_product(product: HrrrWindowedProduct) 
         | CategoricalRain0to24hMax
         | CategoricalSnow0to24hMax
         | CategoricalFreezingRain0to24hMax
+        | HeavyRainHours0to24h
+        | VeryHeavyRainHours0to24h
+        | HeavyRainLongestRun0to24h
+        | RainOnsetHour0to24h
+        | RainEndHour0to24h
+        | RainPeakHour0to24h
+        | GustHours34kt0to24h
+        | GustHours50kt0to24h
+        | GustHours64kt0to24h
+        | GustOnsetHour34kt0to24h
+        | GustPeakHour0to24h
+        | RotationHours0to24h
+        | RotationPeakHour0to24h
+        | StormHours0to24h
+        | StormOnsetHour0to24h
+        | SigTorEnvHours0to24h
+        | BigCapeHours0to24h
+        | CriticalRhHours0to24h
+        | CriticalRhLongestRun0to24h
+        | HdwPeakHour0to24h
+        | DangerHeatHours0to24h
+        | DangerHeatLongestRun0to24h
+        | HighWetbulbHours0to24h
+        | LowVisHours0to24h
+        | LowVisLongestRun0to24h
+        | SnowHours0to24h
+        | FreezingRainHours0to24h
         | Temp2m0to24hMax
         | Temp2m0to24hMin
         | Temp2m0to24hRange
@@ -745,6 +1015,60 @@ pub fn minimum_forecast_hour_for_windowed_product(product: HrrrWindowedProduct) 
         | CategoricalSnow0to48hMax
         | CategoricalFreezingRain24to48hMax
         | CategoricalFreezingRain0to48hMax
+        | HeavyRainHours24to48h
+        | HeavyRainHours0to48h
+        | VeryHeavyRainHours24to48h
+        | VeryHeavyRainHours0to48h
+        | HeavyRainLongestRun24to48h
+        | HeavyRainLongestRun0to48h
+        | RainOnsetHour24to48h
+        | RainOnsetHour0to48h
+        | RainEndHour24to48h
+        | RainEndHour0to48h
+        | RainPeakHour24to48h
+        | RainPeakHour0to48h
+        | GustHours34kt24to48h
+        | GustHours34kt0to48h
+        | GustHours50kt24to48h
+        | GustHours50kt0to48h
+        | GustHours64kt24to48h
+        | GustHours64kt0to48h
+        | GustOnsetHour34kt24to48h
+        | GustOnsetHour34kt0to48h
+        | GustPeakHour24to48h
+        | GustPeakHour0to48h
+        | RotationHours24to48h
+        | RotationHours0to48h
+        | RotationPeakHour24to48h
+        | RotationPeakHour0to48h
+        | StormHours24to48h
+        | StormHours0to48h
+        | StormOnsetHour24to48h
+        | StormOnsetHour0to48h
+        | SigTorEnvHours24to48h
+        | SigTorEnvHours0to48h
+        | BigCapeHours24to48h
+        | BigCapeHours0to48h
+        | CriticalRhHours24to48h
+        | CriticalRhHours0to48h
+        | CriticalRhLongestRun24to48h
+        | CriticalRhLongestRun0to48h
+        | HdwPeakHour24to48h
+        | HdwPeakHour0to48h
+        | DangerHeatHours24to48h
+        | DangerHeatHours0to48h
+        | DangerHeatLongestRun24to48h
+        | DangerHeatLongestRun0to48h
+        | HighWetbulbHours24to48h
+        | HighWetbulbHours0to48h
+        | LowVisHours24to48h
+        | LowVisHours0to48h
+        | LowVisLongestRun24to48h
+        | LowVisLongestRun0to48h
+        | SnowHours24to48h
+        | SnowHours0to48h
+        | FreezingRainHours24to48h
+        | FreezingRainHours0to48h
         | Temp2m24to48hMax
         | Temp2m24to48hMin
         | Temp2m24to48hRange
@@ -898,6 +1222,87 @@ pub static SUPPORTED_HRRR_WINDOWED_PRODUCTS: &[HrrrWindowedProduct] = &[
     HrrrWindowedProduct::CategoricalFreezingRain0to24hMax,
     HrrrWindowedProduct::CategoricalFreezingRain24to48hMax,
     HrrrWindowedProduct::CategoricalFreezingRain0to48hMax,
+    HrrrWindowedProduct::HeavyRainHours0to24h,
+    HrrrWindowedProduct::HeavyRainHours24to48h,
+    HrrrWindowedProduct::HeavyRainHours0to48h,
+    HrrrWindowedProduct::VeryHeavyRainHours0to24h,
+    HrrrWindowedProduct::VeryHeavyRainHours24to48h,
+    HrrrWindowedProduct::VeryHeavyRainHours0to48h,
+    HrrrWindowedProduct::HeavyRainLongestRun0to24h,
+    HrrrWindowedProduct::HeavyRainLongestRun24to48h,
+    HrrrWindowedProduct::HeavyRainLongestRun0to48h,
+    HrrrWindowedProduct::RainOnsetHour0to24h,
+    HrrrWindowedProduct::RainOnsetHour24to48h,
+    HrrrWindowedProduct::RainOnsetHour0to48h,
+    HrrrWindowedProduct::RainEndHour0to24h,
+    HrrrWindowedProduct::RainEndHour24to48h,
+    HrrrWindowedProduct::RainEndHour0to48h,
+    HrrrWindowedProduct::RainPeakHour0to24h,
+    HrrrWindowedProduct::RainPeakHour24to48h,
+    HrrrWindowedProduct::RainPeakHour0to48h,
+    HrrrWindowedProduct::GustHours34kt0to24h,
+    HrrrWindowedProduct::GustHours34kt24to48h,
+    HrrrWindowedProduct::GustHours34kt0to48h,
+    HrrrWindowedProduct::GustHours50kt0to24h,
+    HrrrWindowedProduct::GustHours50kt24to48h,
+    HrrrWindowedProduct::GustHours50kt0to48h,
+    HrrrWindowedProduct::GustHours64kt0to24h,
+    HrrrWindowedProduct::GustHours64kt24to48h,
+    HrrrWindowedProduct::GustHours64kt0to48h,
+    HrrrWindowedProduct::GustOnsetHour34kt0to24h,
+    HrrrWindowedProduct::GustOnsetHour34kt24to48h,
+    HrrrWindowedProduct::GustOnsetHour34kt0to48h,
+    HrrrWindowedProduct::GustPeakHour0to24h,
+    HrrrWindowedProduct::GustPeakHour24to48h,
+    HrrrWindowedProduct::GustPeakHour0to48h,
+    HrrrWindowedProduct::RotationHours0to24h,
+    HrrrWindowedProduct::RotationHours24to48h,
+    HrrrWindowedProduct::RotationHours0to48h,
+    HrrrWindowedProduct::RotationPeakHour0to24h,
+    HrrrWindowedProduct::RotationPeakHour24to48h,
+    HrrrWindowedProduct::RotationPeakHour0to48h,
+    HrrrWindowedProduct::StormHours0to24h,
+    HrrrWindowedProduct::StormHours24to48h,
+    HrrrWindowedProduct::StormHours0to48h,
+    HrrrWindowedProduct::StormOnsetHour0to24h,
+    HrrrWindowedProduct::StormOnsetHour24to48h,
+    HrrrWindowedProduct::StormOnsetHour0to48h,
+    HrrrWindowedProduct::SigTorEnvHours0to24h,
+    HrrrWindowedProduct::SigTorEnvHours24to48h,
+    HrrrWindowedProduct::SigTorEnvHours0to48h,
+    HrrrWindowedProduct::BigCapeHours0to24h,
+    HrrrWindowedProduct::BigCapeHours24to48h,
+    HrrrWindowedProduct::BigCapeHours0to48h,
+    HrrrWindowedProduct::CriticalRhHours0to24h,
+    HrrrWindowedProduct::CriticalRhHours24to48h,
+    HrrrWindowedProduct::CriticalRhHours0to48h,
+    HrrrWindowedProduct::CriticalRhLongestRun0to24h,
+    HrrrWindowedProduct::CriticalRhLongestRun24to48h,
+    HrrrWindowedProduct::CriticalRhLongestRun0to48h,
+    HrrrWindowedProduct::HdwPeakHour0to24h,
+    HrrrWindowedProduct::HdwPeakHour24to48h,
+    HrrrWindowedProduct::HdwPeakHour0to48h,
+    HrrrWindowedProduct::DangerHeatHours0to24h,
+    HrrrWindowedProduct::DangerHeatHours24to48h,
+    HrrrWindowedProduct::DangerHeatHours0to48h,
+    HrrrWindowedProduct::DangerHeatLongestRun0to24h,
+    HrrrWindowedProduct::DangerHeatLongestRun24to48h,
+    HrrrWindowedProduct::DangerHeatLongestRun0to48h,
+    HrrrWindowedProduct::HighWetbulbHours0to24h,
+    HrrrWindowedProduct::HighWetbulbHours24to48h,
+    HrrrWindowedProduct::HighWetbulbHours0to48h,
+    HrrrWindowedProduct::LowVisHours0to24h,
+    HrrrWindowedProduct::LowVisHours24to48h,
+    HrrrWindowedProduct::LowVisHours0to48h,
+    HrrrWindowedProduct::LowVisLongestRun0to24h,
+    HrrrWindowedProduct::LowVisLongestRun24to48h,
+    HrrrWindowedProduct::LowVisLongestRun0to48h,
+    HrrrWindowedProduct::SnowHours0to24h,
+    HrrrWindowedProduct::SnowHours24to48h,
+    HrrrWindowedProduct::SnowHours0to48h,
+    HrrrWindowedProduct::FreezingRainHours0to24h,
+    HrrrWindowedProduct::FreezingRainHours24to48h,
+    HrrrWindowedProduct::FreezingRainHours0to48h,
     HrrrWindowedProduct::Temp2m0to24hMax,
     HrrrWindowedProduct::Temp2m24to48hMax,
     HrrrWindowedProduct::Temp2m0to48hMax,
