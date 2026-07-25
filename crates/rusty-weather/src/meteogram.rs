@@ -1194,6 +1194,7 @@ pub fn render_meteogram_svg(
             (key.to_string(), serde_json::Value::Array(values))
         })
         .collect();
+    let temp_unit_label = if request.fahrenheit { "F" } else { "C" };
     let data = serde_json::json!({
         "model": model_slug,
         "run": run_slug,
@@ -1205,8 +1206,11 @@ pub fn render_meteogram_svg(
             "description": n.describe(),
         })),
         "cell": { "lat": cell_lat, "lon": cell_lon, "elevation_ft": elevation_ft },
+        // The temperature entries follow the requested unit: this map was a
+        // hardcoded "F" and kept claiming Fahrenheit while `series` carried
+        // converted °C values.
         "units": {
-            "temperature_2m": "F", "dewpoint_2m": "F", "rh_2m": "%",
+            "temperature_2m": temp_unit_label, "dewpoint_2m": temp_unit_label, "rh_2m": "%",
             "u_10m": "mph", "v_10m": "mph", "wind": "mph", "wind_gust_10m": "mph",
             "vpd": "kPa", "hdw_wind": "kPa*m/s", "hdw_gust": "kPa*m/s",
             "precip_in": "in", "erc": "index", "dead_fuel_moisture_10h": "%",
