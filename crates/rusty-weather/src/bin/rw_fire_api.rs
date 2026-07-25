@@ -498,7 +498,12 @@ fn start_render_job(body: Vec<u8>, state: AppState) -> Vec<u8> {
     // outlive the run they pointed at.
     let alias = request.run.trim().to_ascii_lowercase();
     if alias == "latest" || alias == "latest-day" || alias == "fuel-run" {
-        request.run = match resolve_latest_run(&state.store_root, &request.model, &alias) {
+        request.run = match resolve_latest_run_for_hour(
+            &state.store_root,
+            &request.model,
+            &alias,
+            Some(request.hour),
+        ) {
             Ok(run) => run,
             Err(message) => {
                 return json_status_response(422, &serde_json::json!({ "error": message }));
@@ -1310,22 +1315,92 @@ fn runs_response(query: &str, state: &AppState) -> Vec<u8> {
 /// are imported (fuel products, so they never error on `latest` during a
 /// fresh run's gridMET-import lag). Unknown aliases resolve as `latest`.
 fn resolve_latest_run(store_root: &Path, model: &str, alias: &str) -> Result<String, String> {
+    resolve_latest_run_for_hour(store_root, model, alias, None)
+}
+
+/// Whether a stored run actually holds the hour a request needs.
+fn run_has_hour(store_root: &Path, model: &str, run: &str, hour: u16) -> bool {
+    store_root
+        .join(model)
+        .join(run)
+        .join(format!("f{hour:03}.rws"))
+        .is_file()
+}
+
+/// Stored run slugs for a model, newest first (slugs sort chronologically).
+fn stored_runs_newest_first(store_root: &Path, model: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(store_root.join(model)) else {
+        return Vec::new();
+    };
+    let mut runs: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.len() == 12 && name.as_bytes()[8] == b'_' && name.ends_with('z'))
+        .collect();
+    runs.sort_unstable();
+    runs.reverse();
+    runs
+}
+
+/// Resolve a run alias, requiring the chosen run to actually contain
+/// `required_hour` when one is given.
+///
+/// The pointers in `latest.json` advance as soon as a cycle STARTS ingesting. An
+/// extended HRRR cycle takes a while to walk F000 -> F048, so `day_run` pointed
+/// at a run holding only F040 while every 0-48 h window product asks for F048 --
+/// the render died on `f048.rws: No such file or directory`, which reached the
+/// Lab as a bare "rw_render exited with exit status: 1". That broke all 227
+/// window products for an hour-plus, four times a day.
+///
+/// The alias now takes its preferred pointer only if that run can serve the
+/// request, else walks back to the newest stored run that can. With no
+/// `required_hour` the behavior is exactly as before.
+fn resolve_latest_run_for_hour(
+    store_root: &Path,
+    model: &str,
+    alias: &str,
+    required_hour: Option<u16>,
+) -> Result<String, String> {
     let path = store_root.join(model).join("latest.json");
     let text = std::fs::read_to_string(&path)
         .map_err(|_| format!("no latest-run manifest for model '{model}' (daemon not running?)"))?;
     let manifest: serde_json::Value =
         serde_json::from_str(&text).map_err(|err| format!("latest.json: {err}"))?;
     let field = |name: &str| manifest.get(name).and_then(|value| value.as_str());
-    let run = match alias {
-        "latest-day" => {
-            field("day_run").or_else(|| field("complete_run")).or_else(|| field("run"))
-        }
-        "fuel-run" => {
-            field("fuel_run").or_else(|| field("complete_run")).or_else(|| field("run"))
-        }
-        _ => field("complete_run").or_else(|| field("run")),
+    let preferred: &[&str] = match alias {
+        "latest-day" => &["day_run", "complete_run", "run"],
+        "fuel-run" => &["fuel_run", "complete_run", "run"],
+        _ => &["complete_run", "run"],
+    };
+    let mut candidates: Vec<String> = preferred
+        .iter()
+        .filter_map(|name| field(name))
+        .map(str::to_string)
+        .collect();
+    if candidates.is_empty() {
+        return Err("latest.json has no run field".to_string());
     }
-    .ok_or("latest.json has no run field")?;
+    if let Some(hour) = required_hour {
+        for run in stored_runs_newest_first(store_root, model) {
+            if !candidates.contains(&run) {
+                candidates.push(run);
+            }
+        }
+        if let Some(run) = candidates
+            .iter()
+            .find(|run| run_has_hour(store_root, model, run, hour))
+        {
+            return validated_run_slug(run);
+        }
+        return Err(format!(
+            "no stored {model} run holds F{hour:03} yet (the newest extended cycle is still ingesting)"
+        ));
+    }
+    validated_run_slug(&candidates[0])
+}
+
+fn validated_run_slug(run: &str) -> Result<String, String> {
     if run.len() > 40 || run.contains(['/', '\\', '.']) {
         return Err("latest.json run slug is not valid".to_string());
     }
@@ -2994,5 +3069,83 @@ mod tests {
             waited < Duration::from_secs(10),
             "kill took too long: {waited:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod run_alias_tests {
+    use super::*;
+
+    /// Same pattern the windowed-store tests use: a pid-scoped temp dir, no
+    /// extra dev-dependency.
+    fn store_with(name: &str, runs: &[(&str, &[u16])]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rw-run-alias-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let model_dir = dir.join("hrrr");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        for (run, hours) in runs {
+            let run_dir = model_dir.join(run);
+            std::fs::create_dir_all(&run_dir).unwrap();
+            for hour in *hours {
+                std::fs::write(run_dir.join(format!("f{hour:03}.rws")), b"x").unwrap();
+            }
+        }
+        dir
+    }
+
+    fn write_manifest(dir: &std::path::Path, day_run: &str, complete_run: &str, run: &str) {
+        std::fs::write(
+            dir.join("hrrr").join("latest.json"),
+            serde_json::json!({
+                "day_run": day_run,
+                "complete_run": complete_run,
+                "run": run,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// The reported outage: `day_run` advanced to an extended cycle still
+    /// mid-ingest (F040), so every 0-48 h window product asked for F048 and got
+    /// `f048.rws: No such file or directory` -> "rw_render exited with exit
+    /// status: 1". Resolution must fall back to the newest run that HAS F048.
+    #[test]
+    fn latest_day_falls_back_when_the_pointer_run_lacks_the_hour() {
+        let hours_48: Vec<u16> = (0..=48).collect();
+        let hours_40: Vec<u16> = (0..=40).collect();
+        let store = store_with(
+            "fallback",
+            &[("20260725_12z", &hours_48), ("20260725_18z", &hours_40)],
+        );
+        write_manifest(&store, "20260725_18z", "20260725_17z", "20260725_18z");
+
+        // F048 cannot come from the mid-ingest 18z run.
+        assert_eq!(
+            resolve_latest_run_for_hour(&store, "hrrr", "latest-day", Some(48)).unwrap(),
+            "20260725_12z"
+        );
+        // A low hour the pointer CAN serve still uses the pointer.
+        assert_eq!(
+            resolve_latest_run_for_hour(&store, "hrrr", "latest-day", Some(6)).unwrap(),
+            "20260725_18z"
+        );
+        // No required hour = unchanged historical behavior.
+        assert_eq!(
+            resolve_latest_run(&store, "hrrr", "latest-day").unwrap(),
+            "20260725_18z"
+        );
+    }
+
+    /// When nothing on disk holds the hour, say so instead of letting rw_render
+    /// die on a missing file.
+    #[test]
+    fn missing_hour_everywhere_is_an_honest_error() {
+        let hours_18: Vec<u16> = (0..=18).collect();
+        let store = store_with("missing", &[("20260725_18z", &hours_18)]);
+        write_manifest(&store, "20260725_18z", "20260725_18z", "20260725_18z");
+        let err = resolve_latest_run_for_hour(&store, "hrrr", "latest-day", Some(48))
+            .expect_err("F048 is not stored anywhere");
+        assert!(err.contains("F048"), "unhelpful message: {err}");
     }
 }
