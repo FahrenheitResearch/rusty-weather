@@ -502,6 +502,12 @@ fn windowed_product_spec(
                 | HrrrWindowedProduct::Wind10m0to24hMax
                 | HrrrWindowedProduct::Wind10m24to48hMax
                 | HrrrWindowedProduct::Wind10m0to48hMax => Some("m/s"),
+                HrrrWindowedProduct::Smoke8m0to24hMax
+                | HrrrWindowedProduct::Smoke8m24to48hMax
+                | HrrrWindowedProduct::Smoke8m0to48hMax => Some("kg/m^3"),
+                HrrrWindowedProduct::SmokeColumn0to24hMax
+                | HrrrWindowedProduct::SmokeColumn24to48hMax
+                | HrrrWindowedProduct::SmokeColumn0to48hMax => Some("kg/m^2"),
                 HrrrWindowedProduct::Temp2m0to24hMax
                 | HrrrWindowedProduct::Temp2m24to48hMax
                 | HrrrWindowedProduct::Temp2m0to48hMax

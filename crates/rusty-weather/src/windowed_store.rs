@@ -317,6 +317,10 @@ enum SourceKind {
     Dewpoint2mC,
     /// `vpd_2m` (hPa), the ingest-computed derived grid.
     Vpd2mHpa,
+    /// `smoke_8m` (kg/m^3), near-surface smoke mass density.
+    Smoke8m,
+    /// `smoke_column` (kg/m^2), column-integrated smoke.
+    SmokeColumn,
 }
 
 /// How the per-hour planes reduce into the product grid.
@@ -338,6 +342,12 @@ enum Finish {
     None,
     MmToInches,
     MsToKnots,
+    /// Near-surface smoke `kg/m^3 -> ug/m^3` (x1e9), matching the direct
+    /// lane's `UnitConvert::KgM3ToUgM3` so the shared smoke palette lines up.
+    KgM3ToUgM3,
+    /// Column smoke `kg/m^2 -> mg/m^2` (x1e6), matching
+    /// `UnitConvert::KgM2ToMgM2`.
+    KgM2ToMgM2,
 }
 
 #[derive(Debug, Clone)]
@@ -568,6 +578,57 @@ fn plan_product(product: HrrrWindowedProduct, end: u16) -> Result<ProductSpec, S
                 "max of stored sub-hourly 1 h max 10 m wind speeds across F001-F048".to_string(),
             )
         }
+        // Peak smoke over a fixed window. Planned inline rather than through
+        // `snapshot_plan` because smoke carries a display-unit conversion
+        // (snapshot plans are all Finish::None). Max only — smoke is
+        // heavy-tailed and ~0 over most of the domain, so min/range say nothing.
+        Smoke8m0to24hMax | Smoke8m24to48hMax | Smoke8m0to48hMax
+        | SmokeColumn0to24hMax | SmokeColumn24to48hMax | SmokeColumn0to48hMax => {
+            let (start, stop, window_hours) = match product {
+                Smoke8m0to24hMax | SmokeColumn0to24hMax => (1u16, 24u16, 24u16),
+                Smoke8m24to48hMax | SmokeColumn24to48hMax => (25, 48, 24),
+                _ => (1, 48, 48),
+            };
+            let column = matches!(
+                product,
+                SmokeColumn0to24hMax | SmokeColumn24to48hMax | SmokeColumn0to48hMax
+            );
+            let label = if window_hours == 48 {
+                "0-48 h"
+            } else if start == 1 {
+                "0-24 h"
+            } else {
+                "24-48 h"
+            };
+            let field = if column {
+                "column-integrated smoke"
+            } else {
+                "near-surface smoke"
+            };
+            if end < stop {
+                return Err(format!(
+                    "{label} {field} max requires forecast hour >= {stop}; \
+                     use a HRRR extended cycle for 24-48 h products"
+                ));
+            }
+            spec(
+                if column {
+                    SourceKind::SmokeColumn
+                } else {
+                    SourceKind::Smoke8m
+                },
+                Reduce::Max,
+                (start..=stop).collect(),
+                Some(window_hours),
+                if column { "mg/m^2" } else { "ug/m^3" },
+                if column {
+                    Finish::KgM2ToMgM2
+                } else {
+                    Finish::KgM3ToUgM3
+                },
+                format!("pointwise max of stored hourly {field} across F{start:03}-F{stop:03}"),
+            )
+        }
         _ => unreachable!("surface snapshot window products are handled before the match"),
     }
 }
@@ -608,6 +669,12 @@ fn product_is_run_scoped(product: HrrrWindowedProduct) -> bool {
                 | Wind10m0to24hMax
                 | Wind10m24to48hMax
                 | Wind10m0to48hMax
+                | Smoke8m0to24hMax
+                | Smoke8m24to48hMax
+                | Smoke8m0to48hMax
+                | SmokeColumn0to24hMax
+                | SmokeColumn24to48hMax
+                | SmokeColumn0to48hMax
         )
 }
 
@@ -828,6 +895,13 @@ fn read_source_plane(
                 .collect(),
         )),
         SourceKind::Vpd2mHpa => Ok(SourcePlane::exact(to_f64(plain(read("vpd_2m", "hPa"))?))),
+        SourceKind::Smoke8m => Ok(SourcePlane::exact(to_f64(plain(read(
+            "smoke_8m", "kg/m^3",
+        ))?))),
+        SourceKind::SmokeColumn => Ok(SourcePlane::exact(to_f64(plain(read(
+            "smoke_column",
+            "kg/m^2",
+        ))?))),
     }
 }
 
@@ -935,6 +1009,16 @@ impl Accum {
             Finish::MsToKnots => {
                 for value in values.iter_mut() {
                     *value *= MS_TO_KT;
+                }
+            }
+            Finish::KgM3ToUgM3 => {
+                for value in values.iter_mut() {
+                    *value *= 1.0e9;
+                }
+            }
+            Finish::KgM2ToMgM2 => {
+                for value in values.iter_mut() {
+                    *value *= 1.0e6;
                 }
             }
         }

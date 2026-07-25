@@ -72,6 +72,16 @@ pub enum HrrrWindowedProduct {
     Wind10m0to24hMax,
     Wind10m24to48hMax,
     Wind10m0to48hMax,
+    /// Peak near-surface (8 m) smoke over the window. Max only: smoke is
+    /// heavy-tailed and near zero over most of the domain, so min/range carry
+    /// no signal.
+    Smoke8m0to24hMax,
+    Smoke8m24to48hMax,
+    Smoke8m0to48hMax,
+    /// Peak column-integrated smoke over the window.
+    SmokeColumn0to24hMax,
+    SmokeColumn24to48hMax,
+    SmokeColumn0to48hMax,
     Temp2m0to24hMax,
     Temp2m24to48hMax,
     Temp2m0to48hMax,
@@ -140,6 +150,12 @@ impl HrrrWindowedProduct {
             Self::Wind10m0to24hMax => "10m_wind_0_24h_max",
             Self::Wind10m24to48hMax => "10m_wind_24_48h_max",
             Self::Wind10m0to48hMax => "10m_wind_0_48h_max",
+            Self::Smoke8m0to24hMax => "smoke_8m_0_24h_max",
+            Self::Smoke8m24to48hMax => "smoke_8m_24_48h_max",
+            Self::Smoke8m0to48hMax => "smoke_8m_0_48h_max",
+            Self::SmokeColumn0to24hMax => "smoke_column_0_24h_max",
+            Self::SmokeColumn24to48hMax => "smoke_column_24_48h_max",
+            Self::SmokeColumn0to48hMax => "smoke_column_0_48h_max",
             Self::Temp2m0to24hMax => "2m_temp_0_24h_max",
             Self::Temp2m24to48hMax => "2m_temp_24_48h_max",
             Self::Temp2m0to48hMax => "2m_temp_0_48h_max",
@@ -194,6 +210,12 @@ impl HrrrWindowedProduct {
             Self::Wind10m0to24hMax => "10 m Wind Speed (0-24 h max)",
             Self::Wind10m24to48hMax => "10 m Wind Speed (24-48 h max)",
             Self::Wind10m0to48hMax => "10 m Wind Speed (0-48 h max)",
+            Self::Smoke8m0to24hMax => "Near-Surface Smoke (0-24 h max)",
+            Self::Smoke8m24to48hMax => "Near-Surface Smoke (24-48 h max)",
+            Self::Smoke8m0to48hMax => "Near-Surface Smoke (0-48 h max)",
+            Self::SmokeColumn0to24hMax => "Column-Integrated Smoke (0-24 h max)",
+            Self::SmokeColumn24to48hMax => "Column-Integrated Smoke (24-48 h max)",
+            Self::SmokeColumn0to48hMax => "Column-Integrated Smoke (0-48 h max)",
             Self::Temp2m0to24hMax => "2 m Temperature (0-24 h max)",
             Self::Temp2m24to48hMax => "2 m Temperature (24-48 h max)",
             Self::Temp2m0to48hMax => "2 m Temperature (0-48 h max)",
@@ -307,6 +329,8 @@ pub fn minimum_forecast_hour_for_windowed_product(product: HrrrWindowedProduct) 
         Qpf12h => 12,
         Qpf24h
         | Wind10m0to24hMax
+        | Smoke8m0to24hMax
+        | SmokeColumn0to24hMax
         | Temp2m0to24hMax
         | Temp2m0to24hMin
         | Temp2m0to24hRange
@@ -321,6 +345,10 @@ pub fn minimum_forecast_hour_for_windowed_product(product: HrrrWindowedProduct) 
         | Vpd2m0to24hRange => 24,
         Wind10m24to48hMax
         | Wind10m0to48hMax
+        | Smoke8m24to48hMax
+        | Smoke8m0to48hMax
+        | SmokeColumn24to48hMax
+        | SmokeColumn0to48hMax
         | Temp2m24to48hMax
         | Temp2m24to48hMin
         | Temp2m24to48hRange
@@ -369,6 +397,12 @@ pub static SUPPORTED_HRRR_WINDOWED_PRODUCTS: &[HrrrWindowedProduct] = &[
     HrrrWindowedProduct::Wind10m0to24hMax,
     HrrrWindowedProduct::Wind10m24to48hMax,
     HrrrWindowedProduct::Wind10m0to48hMax,
+    HrrrWindowedProduct::Smoke8m0to24hMax,
+    HrrrWindowedProduct::Smoke8m24to48hMax,
+    HrrrWindowedProduct::Smoke8m0to48hMax,
+    HrrrWindowedProduct::SmokeColumn0to24hMax,
+    HrrrWindowedProduct::SmokeColumn24to48hMax,
+    HrrrWindowedProduct::SmokeColumn0to48hMax,
     HrrrWindowedProduct::Temp2m0to24hMax,
     HrrrWindowedProduct::Temp2m24to48hMax,
     HrrrWindowedProduct::Temp2m0to48hMax,
