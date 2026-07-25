@@ -639,6 +639,16 @@ pub fn render_windowed_products(
 mod tests {
     use super::*;
 
+    /// Trailing sub-daily windows both labs omit on purpose: the run-max and
+    /// 0-24 h products already answer "how bad did it get", and a 1 h/3 h
+    /// trailing window anchored at the requested hour reads as a duplicate.
+    /// Shared so the two catalog tests below cannot disagree about them.
+    const TRAILING_WINDOW_EXCLUSIONS: [(&str, &str); 3] = [
+        ("10m_wind_1h_max", "trailing 1h window; run-max + 0-24h cover the use"),
+        ("uh_2to5km_1h_max", "trailing 1h window; run-max covers the use"),
+        ("uh_2to5km_3h_max", "trailing 3h window; run-max covers the use"),
+    ];
+
     /// The public preview site must expose every renderable product as an
     /// option. Compares the site's HTML against the live catalogs so a new
     /// recipe slug fails this test until it is either added to the page or
@@ -649,9 +659,9 @@ mod tests {
         // Intentionally not on the preview site (reason pinned):
         let excluded: &[(&str, &str)] = &[
             ("total_qpf", "alias of qpf_total"),
-            ("10m_wind_1h_max", "trailing 1h window; run-max + 0-24h cover the use"),
-            ("uh_2to5km_1h_max", "trailing 1h window; run-max covers the use"),
-            ("uh_2to5km_3h_max", "trailing 3h window; run-max covers the use"),
+            TRAILING_WINDOW_EXCLUSIONS[0],
+            TRAILING_WINDOW_EXCLUSIONS[1],
+            TRAILING_WINDOW_EXCLUSIONS[2],
             ("sblcl", "sounding-adjacent; meteogram territory"),
             ("mucin", "CIN pair covered by mlcin"),
             ("sbcin", "CIN pair covered by mlcin"),
@@ -696,6 +706,45 @@ mod tests {
         assert!(
             missing.is_empty(),
             "preview site is missing {} product option(s): {missing:#?}",
+            missing.len()
+        );
+    }
+
+    /// The generic (unbranded) lab serves the SAME data store as the CAFire
+    /// Lab, so it must offer the same MAP products. It was hand-maintained and
+    /// silently drifted to a 105-slug subset while the Lab grew to 359 — the
+    /// day-window, smoke-window and duration/timing families were simply
+    /// absent. Only the Lab was covered by
+    /// `preview_site_exposes_the_full_catalog`, so nothing caught it.
+    ///
+    /// The generic lab is maps-only by design: the point/card families
+    /// (meteogram, custom chart, outlook cards, sounding, cross-section), the
+    /// climatology families (which need the climo store plus date+stat
+    /// controls that page does not have) and the node-routed ECAPE lane are
+    /// deliberately absent, so this compares the MAP catalog only.
+    #[test]
+    fn generic_lab_mirrors_the_lab_map_catalog() {
+        let generic = include_str!("generic_lab.html");
+        let mut missing: Vec<String> = Vec::new();
+        let mut check = |slug: &str| {
+            let excluded = TRAILING_WINDOW_EXCLUSIONS
+                .iter()
+                .any(|(excluded_slug, _)| *excluded_slug == slug);
+            if !excluded && !generic.contains(&format!("\"{slug}\"")) {
+                missing.push(slug.to_string());
+            }
+        };
+        // Every windowed product: the families that had gone missing.
+        for product in HrrrWindowedProduct::supported_products() {
+            check(product.slug());
+        }
+        // Every fuel product.
+        for slug in fuel_products::supported_fuel_product_slugs() {
+            check(&slug);
+        }
+        assert!(
+            missing.is_empty(),
+            "generic lab is missing {} product option(s) the Lab offers: {missing:#?}",
             missing.len()
         );
     }
