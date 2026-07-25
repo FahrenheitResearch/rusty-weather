@@ -110,11 +110,22 @@ pub fn stored_run_hours(
 }
 
 /// Compute the requested windowed products from the stored hour files of
-/// `<store_root>/<model_slug>/<run_slug>/`. The accumulation window ends at
-/// `anchor_override` when given (the interactive render path passes the
-/// requested forecast hour so a user can scrub QPF hour-by-hour), otherwise
-/// at the max hour in `available_hours` (the batch/pipeline default). Unknown
-/// slugs are an error (the caller validates requests against
+/// `<store_root>/<model_slug>/<run_slug>/`.
+///
+/// Two anchoring rules, because the windowed family mixes two window shapes:
+///
+/// * **Trailing windows** (`qpf_1h`/`6h`/`12h`/`24h`, `qpf_total`, the 1 h/3 h
+///   UH and wind maxima) mean "the window ENDING at hour N", so they honor
+///   `anchor_override` — the interactive path passes the requested forecast
+///   hour so a user can scrub precip hour-by-hour.
+/// * **Run-scoped windows** — the fixed 0-24/24-48/0-48 h snapshot windows and
+///   the `*_run_max` products — describe the RUN, not a requested hour. They
+///   always anchor at the max stored hour. Anchoring these to the requested
+///   hour is what regression `dbd322f` did: it blocked every 0-24/24-48/0-48 h
+///   product unless the caller happened to ask for an hour past the window end,
+///   and silently truncated `*_run_max` at the requested hour.
+///
+/// Unknown slugs are an error (the caller validates requests against
 /// `HrrrWindowedProduct::supported_products()`); windows that do not fit the
 /// available hours come back as blockers, never as silently shortened windows.
 pub fn compute_windowed_products(
@@ -126,7 +137,10 @@ pub fn compute_windowed_products(
     anchor_override: Option<u16>,
 ) -> Result<WindowedStoreOutcome, Box<dyn std::error::Error>> {
     let available: BTreeSet<u16> = available_hours.iter().copied().collect();
-    let anchor_hour = match anchor_override {
+    let Some(&run_anchor) = available.iter().next_back() else {
+        return Err("windowed compute needs at least one stored hour".into());
+    };
+    let trailing_anchor = match anchor_override {
         Some(hour) => {
             if !available.contains(&hour) {
                 return Err(format!(
@@ -136,10 +150,7 @@ pub fn compute_windowed_products(
             }
             hour
         }
-        None => match available.iter().next_back() {
-            Some(&hour) => hour,
-            None => return Err("windowed compute needs at least one stored hour".into()),
-        },
+        None => run_anchor,
     };
     let run_dir = store_root.join(model_slug).join(run_slug);
     let grid_path = run_dir.join("grid.rwg");
@@ -151,12 +162,22 @@ pub fn compute_windowed_products(
     let mut blockers: Vec<(String, String)> = Vec::new();
     let mut accums: Vec<Accum> = Vec::new();
     let mut seen = BTreeSet::new();
+    // Effective anchor across realized products, used for the reported
+    // `anchor_hour` (output naming / render `forecast_hour`): a lone trailing
+    // product names itself after the requested hour, while any run-scoped
+    // product pulls it back to the run anchor as before.
+    let mut effective_anchor = 0u16;
     for slug in requested {
         if !seen.insert(slug.as_str()) {
             continue;
         }
         let product = HrrrWindowedProduct::from_slug(slug)
             .ok_or_else(|| format!("'{slug}' is not a windowed product slug"))?;
+        let anchor_hour = if product_is_run_scoped(product) {
+            run_anchor
+        } else {
+            trailing_anchor
+        };
         let spec = match plan_product(product, anchor_hour) {
             Ok(spec) => spec,
             Err(reason) => {
@@ -164,6 +185,7 @@ pub fn compute_windowed_products(
                 continue;
             }
         };
+        effective_anchor = effective_anchor.max(anchor_hour);
         let missing: Vec<u16> = spec
             .hours
             .iter()
@@ -264,7 +286,12 @@ pub fn compute_windowed_products(
     Ok(WindowedStoreOutcome {
         grids,
         blockers,
-        anchor_hour,
+        // Nothing realized (every product blocked) -> report the run anchor.
+        anchor_hour: if effective_anchor == 0 {
+            run_anchor
+        } else {
+            effective_anchor
+        },
     })
 }
 
@@ -563,6 +590,18 @@ struct SnapshotPlan {
 
 /// Decompose a 2 m snapshot-window product into its field, window, and
 /// reduction — `None` for QPF/UH/wind products.
+/// True when a product describes the whole RUN rather than a window ending at
+/// a requested hour: the fixed 0-24/24-48/0-48 h snapshot windows and the
+/// `*_run_max` products. These always anchor at the max stored hour so they
+/// neither block nor truncate when a caller asks for an earlier hour.
+fn product_is_run_scoped(product: HrrrWindowedProduct) -> bool {
+    snapshot_plan(product).is_some()
+        || matches!(
+            product,
+            HrrrWindowedProduct::Uh25kmRunMax | HrrrWindowedProduct::Wind10mRunMax
+        )
+}
+
 fn snapshot_plan(product: HrrrWindowedProduct) -> Option<SnapshotPlan> {
     use HrrrWindowedProduct::*;
     let (source, field_label, units) = match product {
@@ -1684,6 +1723,51 @@ mod tests {
             grid_named(&anchored, "qpf_6h").hours_used,
             (1..=6).collect::<Vec<u16>>()
         );
+
+        // Run-scoped products IGNORE the override: the fixed 0-24 h snapshot
+        // window and `*_run_max` describe the run, not the requested hour.
+        // Regression guard for dbd322f, which blocked every 0-24/24-48/0-48 h
+        // product and truncated run-max whenever an earlier hour was asked for.
+        let hours48: Vec<u16> = (0..=48).collect();
+        write_test_run(&dir, "20260608_06z", &hours48);
+        let scoped = compute_windowed_products(
+            &dir,
+            "hrrr",
+            "20260608_06z",
+            &hours48,
+            &[
+                "2m_temp_0_24h_max".to_string(),
+                "2m_temp_24_48h_max".to_string(),
+                "10m_wind_run_max".to_string(),
+                "qpf_1h".to_string(),
+            ],
+            Some(6),
+        )
+        .unwrap();
+        assert!(
+            scoped.blockers.is_empty(),
+            "run-scoped windows must not block on an earlier requested hour: {:?}",
+            scoped.blockers
+        );
+        // Snapshot windows are F001-F024 / F025-F048 (hour 0 is the analysis).
+        assert_eq!(
+            grid_named(&scoped, "2m_temp_0_24h_max").hours_used,
+            (1..=24).collect::<Vec<u16>>()
+        );
+        assert_eq!(
+            grid_named(&scoped, "2m_temp_24_48h_max").hours_used,
+            (25..=48).collect::<Vec<u16>>()
+        );
+        // Run-max spans the whole run, not 0..requested.
+        assert_eq!(
+            *grid_named(&scoped, "10m_wind_run_max")
+                .hours_used
+                .last()
+                .expect("run max has hours"),
+            48
+        );
+        // The trailing product in the same batch still honors the override.
+        assert_eq!(grid_named(&scoped, "qpf_1h").hours_used, vec![6]);
 
         // An anchor that is not a stored hour errors, never silently snaps.
         let err = compute_windowed_products(
