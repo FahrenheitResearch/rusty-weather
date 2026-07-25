@@ -1238,18 +1238,27 @@ fn temporal_product_scale(product: HrrrWindowedProduct) -> Option<ColorScale> {
         } else {
             (1.0, window_hours)
         };
+        // Reflectivity's blue->green->yellow->red ramp reads as a sequence and
+        // stays legible over the topo basemap; the temperature ramp washed out.
         return Some(ColorScale::Discrete(palette_scale(
-            WeatherPalette::Temperature,
+            WeatherPalette::Reflectivity,
             range_step(lo, hi, 1.0),
             ExtendMode::Neither,
             None,
         )));
     }
-    // Duration fields: hours, or longest consecutive run of hours.
+    // Duration fields: hours, or longest consecutive run of hours. Real hour
+    // counts cluster low (most points see a few hours, not dozens), so a linear
+    // 1..48 ramp buries every value in the palest two colors. These compressed
+    // levels put the contrast where the data actually lives.
     if slug.contains("_hours") || slug.ends_with("_longest_run") {
+        let mut levels = vec![0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0];
+        if window_hours > 24.0 {
+            levels.extend_from_slice(&[30.0, 36.0, 42.0, 48.0]);
+        }
         return Some(ColorScale::Discrete(palette_scale(
-            WeatherPalette::Cape,
-            range_step(1.0, window_hours, 1.0),
+            WeatherPalette::Reflectivity,
+            levels,
             ExtendMode::Max,
             Some(0.5),
         )));
