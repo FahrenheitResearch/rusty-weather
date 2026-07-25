@@ -1955,3 +1955,73 @@ fn idx_deterministic_only_keeps_ensemble_mean() {
         "ens mean must survive the deterministic filter: {ranges:?}"
     );
 }
+
+/// A subset request must try the subset-capable source FIRST. NBM's source list
+/// is NOMADS-then-AWS, and NOMADS always returns whole files — so before this,
+/// NBM's `idx_patterns` were silently ignored and every hour pulled ~192 MB.
+#[test]
+fn subset_requests_prefer_subset_capable_sources() {
+    let fetch = FetchRequest {
+        request: rustwx_core::ModelRunRequest::new(
+            rustwx_core::ModelId::Nbm,
+            rustwx_core::CycleSpec::new("20260725".to_string(), 12).unwrap(),
+            12,
+            "core/co",
+        )
+        .unwrap(),
+        source_override: None,
+        variable_patterns: vec!["TMP:2 m above ground".to_string()],
+    };
+    let urls = filtered_urls(&fetch).expect("resolve");
+    assert!(urls.len() >= 2, "NBM should resolve NOMADS + AWS: {urls:?}");
+    assert!(
+        should_use_idx_subset_fetch(urls[0].source),
+        "first source must support .idx subsetting, got {:?}",
+        urls[0].source
+    );
+    // Reordered, NOT filtered: NOMADS stays as a whole-file fallback.
+    assert!(
+        urls.iter().any(|url| url.source == SourceId::Nomads),
+        "NOMADS must remain a fallback: {urls:?}"
+    );
+}
+
+/// A whole-file fetch keeps its historical source order untouched.
+#[test]
+fn whole_file_requests_keep_their_source_order() {
+    let plain = FetchRequest {
+        request: rustwx_core::ModelRunRequest::new(
+            rustwx_core::ModelId::Nbm,
+            rustwx_core::CycleSpec::new("20260725".to_string(), 12).unwrap(),
+            12,
+            "core/co",
+        )
+        .unwrap(),
+        source_override: None,
+        variable_patterns: Vec::new(),
+    };
+    let ordered = filtered_urls(&plain).expect("resolve");
+    let baseline = resolve_urls(&plain.request).expect("resolve baseline");
+    assert_eq!(
+        ordered.iter().map(|u| u.source).collect::<Vec<_>>(),
+        baseline.iter().map(|u| u.source).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn probe_nbm_resolved_urls() {
+    let fetch = FetchRequest {
+        request: rustwx_core::ModelRunRequest::new(
+            rustwx_core::ModelId::Nbm,
+            rustwx_core::CycleSpec::new("20260725".to_string(), 12).unwrap(),
+            12,
+            "core/co",
+        )
+        .unwrap(),
+        source_override: None,
+        variable_patterns: vec!["TMP:2 m above ground".to_string()],
+    };
+    for u in filtered_urls(&fetch).expect("resolve") {
+        println!("source={:?}\n  grib={}\n  idx={:?}", u.source, u.grib_url, u.idx_url);
+    }
+}

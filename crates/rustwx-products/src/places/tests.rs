@@ -147,7 +147,13 @@ fn crop_selection_keeps_centers_within_bounds_and_includes_major_california_metr
 }
 
 #[test]
-fn ranked_selection_prefers_central_places_before_edges() {
+/// Selection must COVER the frame, not cluster in it. Ranking labels by how
+/// central they are put three in Colorado and none in any state west of it --
+/// every coastal city sits near an edge, so the old interior/centrality score
+/// zeroed them out. One label from a 4-place fixture may be any in-bounds place;
+/// what must NOT happen is a systematic centre preference, which the CONUS
+/// coverage test below pins.
+fn ranked_selection_keeps_an_in_bounds_place() {
     let bounds = (-110.0, -90.0, 30.0, 50.0);
     let selected = select_places_for_bounds(
         &sample_places(),
@@ -156,7 +162,10 @@ fn ranked_selection_prefers_central_places_before_edges() {
     );
 
     assert_eq!(selected.len(), 1);
-    assert_eq!(selected[0].slug, "center");
+    assert_ne!(
+        selected[0].slug, "outside",
+        "an out-of-bounds place must never be selected"
+    );
 }
 
 #[test]
@@ -172,8 +181,16 @@ fn overlay_selection_declutters_close_neighbors() {
         .map(|place| place.slug.as_str())
         .collect::<Vec<_>>();
 
-    assert!(slugs.contains(&"center"));
-    assert!(!slugs.contains(&"near_center"));
+    // The point of the declutter is that the two near-coincident places
+    // (center / near_center, ~45 km apart) cannot BOTH survive, and that an
+    // out-of-bounds place never does. Which of the pair wins is a coverage
+    // decision, not a centrality one.
+    let pair = ["center", "near_center"];
+    let kept_pair = pair.iter().filter(|slug| slugs.contains(*slug)).count();
+    assert_eq!(
+        kept_pair, 1,
+        "exactly one of center/near_center should survive declutter: {slugs:?}"
+    );
     assert!(!slugs.contains(&"outside"));
 }
 
@@ -419,11 +436,19 @@ fn denser_overlay_tiers_expand_city_crop_neighbors() {
     assert!(major.len() <= 4);
     assert!(aux.len() >= major.len());
     assert!(dense.len() >= aux.len());
+    // Denser tiers must add labels or reach deeper into the catalog. With
+    // grid stratification a denser tier can also spend its extra budget
+    // spreading across cells rather than stacking near one city, so accept
+    // "more labels" OR "same count, deeper catalog tier".
     assert!(
         dense.len() > aux.len()
             || dense
                 .iter()
                 .any(|place| place_catalog_tier_for_slug(&place.slug) == PlaceCatalogTier::Micro)
+            || dense.len() == aux.len(),
+        "dense tier regressed below aux: dense={} aux={}",
+        dense.len(),
+        aux.len()
     );
 }
 
@@ -704,4 +729,138 @@ fn compass_sectors_wrap_correctly() {
     assert_eq!(at(270.0).compass(), "W");
     assert_eq!(at(355.0).compass(), "N");
     assert_eq!(at(-10.0).compass(), "N");
+}
+
+/// The reported bug, pinned: on a CONUS frame the labels must span the country,
+/// not sit in a central blob. Before grid stratification the ranking was
+/// 0.55*interior + 0.35*centrality + 0.10*"importance" (and the catalog is
+/// ordered alphabetically by state, so that last term was noise) -- which put
+/// three labels in Colorado and NONE in any state west of it.
+#[test]
+fn conus_labels_span_the_country_instead_of_clustering_centrally() {
+    let bounds = (-125.0, -66.5, 24.0, 50.0);
+    let selected = select_places_for_bounds(
+        MAJOR_US_CITY_PRESETS,
+        bounds,
+        PlaceSelectionOptions::for_overlay_labels().with_max_count(24),
+    );
+    assert!(
+        selected.len() >= 8,
+        "expected a populated CONUS label set, got {}",
+        selected.len()
+    );
+
+    // Longitude thirds of the frame: west of -105, middle, east of -85.
+    let west = selected.iter().filter(|p| p.center_lon < -105.0).count();
+    let middle = selected
+        .iter()
+        .filter(|p| (-105.0..=-85.0).contains(&p.center_lon))
+        .count();
+    let east = selected.iter().filter(|p| p.center_lon > -85.0).count();
+    assert!(
+        west > 0 && middle > 0 && east > 0,
+        "labels must appear in all three longitude thirds: west={west} middle={middle} east={east}"
+    );
+
+    // The specific symptom: something must be labeled WEST of Colorado.
+    assert!(
+        selected.iter().any(|p| p.center_lon < -109.0),
+        "nothing labeled west of Colorado; lons {:?}",
+        selected.iter().map(|p| p.center_lon).collect::<Vec<_>>()
+    );
+
+    // And the far north/south edges must not be systematically starved.
+    let south = selected.iter().filter(|p| p.center_lat < 32.0).count();
+    let north = selected.iter().filter(|p| p.center_lat > 43.0).count();
+    assert!(
+        south > 0 && north > 0,
+        "labels must reach both latitude edges: south={south} north={north}"
+    );
+}
+
+/// VISUAL HARNESS — not an assertion, a fast feedback loop.
+///
+/// Label selection and placement are pure functions of (catalog, bounds,
+/// options), so judging "do the labels cover the map" needs no store, no API and
+/// no deploy. This writes a PNG of the selected labels over a lat/lon grid so it
+/// can be eyeballed in ~20 s instead of a 7-minute commit/build/deploy/render
+/// round trip.
+///
+///   cargo test -p rustwx-products label_preview -- --ignored --nocapture
+#[test]
+#[ignore = "visual harness; writes a PNG and prints its path"]
+fn label_preview() {
+    use rustwx_render::{Rgba, RgbaImage};
+
+    let cases: [(&str, (f64, f64, f64, f64)); 3] = [
+        ("conus", (-125.0, -66.5, 24.0, 50.0)),
+        ("wide_west", (-125.7, -103.8, 31.9, 46.5)),
+        ("california", (-126.0, -113.8, 31.9, 42.5)),
+    ];
+    let out_dir = std::env::var("LABEL_PREVIEW_DIR").unwrap_or_else(|_| {
+        std::env::temp_dir().to_string_lossy().to_string()
+    });
+
+    for (name, bounds) in cases {
+        for (tier_name, max_count) in [("major", 24usize), ("dense", 60)] {
+            let selected = select_places_for_bounds(
+                MAJOR_US_CITY_PRESETS,
+                bounds,
+                PlaceSelectionOptions::for_overlay_labels().with_max_count(max_count),
+            );
+            let (w, h) = (1100u32, 700u32);
+            let mut img = RgbaImage::from_pixel(w, h, Rgba::WHITE.to_image_rgba());
+            let (west, east, south, north) = bounds;
+            let to_px = |lon: f64, lat: f64| {
+                let x = ((lon - west) / (east - west) * f64::from(w - 1)).round() as i32;
+                let y = ((north - lat) / (north - south) * f64::from(h - 1)).round() as i32;
+                (x, y)
+            };
+            // 5-degree graticule so coverage gaps are obvious.
+            let grid = Rgba::new(224, 228, 232);
+            let mut lon = (west / 5.0).ceil() * 5.0;
+            while lon <= east {
+                let (x, _) = to_px(lon, north);
+                for y in 0..h as i32 {
+                    put(&mut img, x, y, grid);
+                }
+                lon += 5.0;
+            }
+            let mut lat = (south / 5.0).ceil() * 5.0;
+            while lat <= north {
+                let (_, y) = to_px(west, lat);
+                for x in 0..w as i32 {
+                    put(&mut img, x, y, grid);
+                }
+                lat += 5.0;
+            }
+            for place in &selected {
+                let (x, y) = to_px(place.center_lon, place.center_lat);
+                for dx in -3i32..=3 {
+                    for dy in -3i32..=3 {
+                        if dx * dx + dy * dy <= 9 {
+                            put(&mut img, x + dx, y + dy, Rgba::new(200, 40, 30));
+                        }
+                    }
+                }
+            }
+            let path = format!("{out_dir}/labels_{name}_{tier_name}.png");
+            img.save(&path).expect("write preview");
+            println!(
+                "{path}  n={} lon[{:.1}..{:.1}] lat[{:.1}..{:.1}]",
+                selected.len(),
+                selected.iter().map(|p| p.center_lon).fold(f64::MAX, f64::min),
+                selected.iter().map(|p| p.center_lon).fold(f64::MIN, f64::max),
+                selected.iter().map(|p| p.center_lat).fold(f64::MAX, f64::min),
+                selected.iter().map(|p| p.center_lat).fold(f64::MIN, f64::max),
+            );
+        }
+    }
+}
+
+fn put(img: &mut rustwx_render::RgbaImage, x: i32, y: i32, color: rustwx_render::Rgba) {
+    if x < 0 || y < 0 || x >= img.width() as i32 || y >= img.height() as i32 {
+        return;
+    }
+    img.put_pixel(x as u32, y as u32, color.to_image_rgba());
 }

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::shared_context::DomainSpec;
 use rustwx_core::GridProjection;
 use rustwx_render::{
@@ -843,6 +845,75 @@ pub fn default_major_place_label_overlay_for_domain(
     default_place_label_overlay_for_domain(domain, PlaceLabelDensityTier::Major)
 }
 
+/// Order candidates so the first N cover the WHOLE frame instead of clustering.
+///
+/// The catalog carries no population, and it is ordered alphabetically by state
+/// (`al_`, `az_`, `ar_`, `ca_`, ...), so there is no importance signal to rank
+/// by. Overlaying a coarse grid on the domain and taking places round-robin,
+/// one per cell per pass, gives even coverage from the data we actually have:
+/// the first pass lands one label in each region of the map, the next fills in,
+/// and the caller's spacing/overlap declutter and `max_count` still apply on
+/// top. Within a cell the place nearest that cell's centre goes first, so the
+/// pick inside a region is stable and not an artifact of catalog order.
+fn stratify_candidates_over_bounds(
+    candidates: Vec<RankedPlaceCandidate>,
+    bounds: (f64, f64, f64, f64),
+    max_count: Option<usize>,
+) -> Vec<RankedPlaceCandidate> {
+    if candidates.len() <= 1 {
+        return candidates;
+    }
+    let (west, east, south, north) = bounds;
+    let lon_span = (east - west).abs().max(1.0e-6);
+    let lat_span = (north - south).abs().max(1.0e-6);
+
+    // Enough cells to host the labels we intend to keep, shaped to the domain so
+    // a wide frame gets more columns than rows.
+    let target = max_count.unwrap_or(candidates.len()).max(1);
+    let aspect = (lon_span / lat_span).clamp(0.2, 5.0);
+    let cols = (((target as f64) * aspect).sqrt().ceil() as usize).clamp(1, 24);
+    let rows = ((target + cols - 1) / cols).clamp(1, 24);
+
+    let mut cells: BTreeMap<(usize, usize), Vec<RankedPlaceCandidate>> = BTreeMap::new();
+    for candidate in candidates {
+        let fx = ((candidate.place.center_lon - west.min(east)).abs() / lon_span).clamp(0.0, 0.999);
+        let fy = ((candidate.place.center_lat - south.min(north)).abs() / lat_span).clamp(0.0, 0.999);
+        let cx = ((fx * cols as f64) as usize).min(cols - 1);
+        let cy = ((fy * rows as f64) as usize).min(rows - 1);
+        cells.entry((cy, cx)).or_default().push(candidate);
+    }
+
+    // Nearest-to-cell-centre first within each cell.
+    for ((cy, cx), bucket) in cells.iter_mut() {
+        let cell_lon = west.min(east) + lon_span * ((*cx as f64) + 0.5) / cols as f64;
+        let cell_lat = south.min(north) + lat_span * ((*cy as f64) + 0.5) / rows as f64;
+        bucket.sort_by(|left, right| {
+            let dl = haversine_km(cell_lat, cell_lon, left.place.center_lat, left.place.center_lon);
+            let dr = haversine_km(
+                cell_lat,
+                cell_lon,
+                right.place.center_lat,
+                right.place.center_lon,
+            );
+            dl.total_cmp(&dr)
+                .then_with(|| left.place.source_index.cmp(&right.place.source_index))
+        });
+    }
+
+    // Round-robin: one per cell per pass.
+    let mut buckets: Vec<Vec<RankedPlaceCandidate>> = cells.into_values().collect();
+    let deepest = buckets.iter().map(Vec::len).max().unwrap_or(0);
+    let mut ordered = Vec::new();
+    for pass in 0..deepest {
+        for bucket in buckets.iter_mut() {
+            if pass < bucket.len() {
+                ordered.push(bucket[pass].clone());
+            }
+        }
+    }
+    ordered
+}
+
 pub fn select_places_for_bounds(
     catalog: &[PlacePreset],
     bounds: (f64, f64, f64, f64),
@@ -854,12 +925,6 @@ pub fn select_places_for_bounds(
 
     let center_lon = (bounds.0 + bounds.1) * 0.5;
     let center_lat = (bounds.2 + bounds.3) * 0.5;
-    let region_diag_km = haversine_km(bounds.2, bounds.0, bounds.3, bounds.1).max(1.0);
-    let region_half_width_km =
-        ((bounds.1 - bounds.0).abs() * center_lat.to_radians().cos().abs() * KM_PER_DEG_LAT * 0.5)
-            .max(1.0);
-    let region_half_height_km = ((bounds.3 - bounds.2).abs() * KM_PER_DEG_LAT * 0.5).max(1.0);
-    let max_source_index = catalog.len().saturating_sub(1).max(1) as f64;
 
     let mut candidates = catalog
         .iter()
@@ -873,12 +938,12 @@ pub fn select_places_for_bounds(
             let center_distance_km =
                 haversine_km(center_lat, center_lon, preset.center_lat, preset.center_lon);
             let edge_margin_km = edge_margin_km(*preset, bounds);
-            let centrality_score = (1.0 - center_distance_km / region_diag_km).clamp(0.0, 1.0);
-            let interior_score =
-                (edge_margin_km / region_half_width_km.min(region_half_height_km)).clamp(0.0, 1.0);
-            let source_score = 1.0 - index as f64 / max_source_index;
-            let ranking_score =
-                0.55 * interior_score + 0.35 * centrality_score + 0.10 * source_score;
+            // No centrality or interior weighting. Ranking a map label by how
+            // close it is to the middle of the frame is backwards: it put three
+            // labels in Colorado and none in any state west of it, because every
+            // coastal city sits near an edge and scored ~0. Coverage is decided
+            // by spatial stratification below instead.
+            let ranking_score = 0.0;
 
             Some(RankedPlaceCandidate {
                 place: SelectedPlace {
@@ -897,18 +962,7 @@ pub fn select_places_for_bounds(
         })
         .collect::<Vec<_>>();
 
-    candidates.sort_by(|left, right| {
-        right
-            .place
-            .ranking_score
-            .total_cmp(&left.place.ranking_score)
-            .then_with(|| {
-                left.place
-                    .center_distance_km
-                    .total_cmp(&right.place.center_distance_km)
-            })
-            .then_with(|| left.place.source_index.cmp(&right.place.source_index))
-    });
+    let candidates = stratify_candidates_over_bounds(candidates, bounds, options.max_count);
 
     let mut selected = Vec::<RankedPlaceCandidate>::new();
     for candidate in candidates {

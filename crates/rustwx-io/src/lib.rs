@@ -1652,13 +1652,38 @@ fn build_hybrid_level_volume(
 
 fn filtered_urls(fetch: &FetchRequest) -> Result<Vec<ResolvedUrl>, IoError> {
     let urls = resolve_urls(&fetch.request)?;
-    Ok(match fetch.source_override {
+    let urls = match fetch.source_override {
         Some(source) => urls
             .into_iter()
             .filter(|url| url.source == source)
             .collect(),
         None => urls,
-    })
+    };
+    Ok(prefer_subset_capable_sources(fetch, urls))
+}
+
+/// When a fetch asks for a MESSAGE SUBSET, try the sources that can serve one
+/// first.
+///
+/// [`should_use_idx_subset_fetch`] only allows ranged `.idx` subsetting on
+/// AWS/Google; NOMADS always returns the whole file. Models whose source list
+/// puts NOMADS first therefore silently ignored their `idx_patterns` — NBM asked
+/// for 9 of 159 messages and downloaded all 192 MB anyway, because NOMADS
+/// answered first and `try_fetch_one` short-circuits for it. RRFS-A never hit
+/// this only because its sources are AWS-only.
+///
+/// This reorders rather than filters, so a subset-capable source being down
+/// still falls back to NOMADS with a whole-file fetch instead of failing the
+/// hour. An explicit `source_override` is honored as-is — the filter above has
+/// already reduced the list to that one source.
+fn prefer_subset_capable_sources(fetch: &FetchRequest, urls: Vec<ResolvedUrl>) -> Vec<ResolvedUrl> {
+    if fetch.variable_patterns.is_empty() || urls.len() < 2 {
+        return urls;
+    }
+    let (subset_capable, rest): (Vec<_>, Vec<_>) = urls
+        .into_iter()
+        .partition(|url| should_use_idx_subset_fetch(url.source));
+    subset_capable.into_iter().chain(rest).collect()
 }
 
 fn fetch_request_is_available(
