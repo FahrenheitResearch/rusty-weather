@@ -4569,6 +4569,24 @@ fn draw_chrome_and_colorbar(
             );
         }
         let subtitle_available = row_width.saturating_sub(18u32.saturating_mul(layout.text_scale));
+        // Measure the centered slot FIRST so the flanking columns can reserve
+        // room for it. Without this a long left subtitle overlaps the centered
+        // min/max readout — window products carry "F001-F048" and overflowed.
+        let center_text = opts
+            .subtitle_center
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        let center_reserved = center_text
+            .map(|text| {
+                measure_text_width(text, layout.text_scale, false)
+                    .saturating_add(16u32.saturating_mul(layout.text_scale))
+            })
+            .unwrap_or(0);
+        // Each side gets half of whatever the centered slot leaves behind.
+        let side_available = subtitle_available
+            .saturating_sub(center_reserved)
+            .max(layout.text_scale.saturating_mul(8));
         if let Some(left) = opts
             .subtitle_left
             .as_deref()
@@ -4576,9 +4594,9 @@ fn draw_chrome_and_colorbar(
             .filter(|text| !text.is_empty())
         {
             let left_width = if opts.subtitle_right.is_some() {
-                subtitle_available / 2
+                side_available / 2
             } else {
-                subtitle_available
+                side_available
             };
             let fitted = ellipsize_text_to_width(left, left_width.max(1), layout.text_scale, false);
             text::draw_text(
@@ -4590,12 +4608,7 @@ fn draw_chrome_and_colorbar(
                 layout.text_scale,
             );
         }
-        if let Some(center) = opts
-            .subtitle_center
-            .as_deref()
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        {
+        if let Some(center) = center_text {
             let fitted =
                 ellipsize_text_to_width(center, subtitle_available, layout.text_scale, false);
             text::draw_text(
@@ -4614,9 +4627,9 @@ fn draw_chrome_and_colorbar(
             .filter(|text| !text.is_empty())
         {
             let right_width = if opts.subtitle_left.is_some() {
-                subtitle_available / 2
+                side_available / 2
             } else {
-                subtitle_available
+                side_available
             };
             let fitted =
                 ellipsize_text_to_width(right, right_width.max(1), layout.text_scale, false);
