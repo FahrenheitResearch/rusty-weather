@@ -257,6 +257,36 @@ systemctl restart rusty-wx-api
   and say cafire.org/weather only.
 - gridMET lags ~1–2 days; "day index N not published yet" in logs is
   benign; fuel import falls back day −1/−2/−3.
+- **`rw_fire_api` FORCES projection env on the rw_render child** (~line 730):
+  `RUSTWX_PROJECTED_FRAME_SOURCE=requested` and
+  `RUSTWX_PROJECTION_VARIANT=<projection_variant_for_bounds()>`. A local repro
+  that ignores these exercises a DIFFERENT branch and will disagree with
+  production — that cost an hour on the 2026-07-25 CONUS clipping bug. When a
+  faithful local probe contradicts the live service, check what env the parent
+  sets on the child. Continental boxes (lat_span ≥ 25 or lon_span ≥ 45) MUST get
+  `adaptive`: a regional Mercator has one reference latitude and cannot describe
+  26° of it, and the mismatched frame gets the raster CLIPPED (CONUS lost Texas,
+  the Gulf and Florida). `MapExtent::from_bounds` only ever PADS, never crops.
+- **Both labs must be updated together.** `generic_lab.html` is a separate
+  hand-maintained page; it silently drifted to 105 slugs while
+  `cafire_preview.html` grew to 359, because
+  `preview_site_exposes_the_full_catalog` only reads the CAFire page.
+  `generic_lab_mirrors_the_lab_map_catalog` now fails the build on drift. The
+  generic page's script is wrapped, so `FAMS` is NOT a window global — inspect
+  the DOM when driving it with CDP.
+- **Place labels declutter in PIXEL space** (`draw_projected_place_labels`
+  reserves each drawn rect and tries other quadrants). The upstream place
+  SELECTION declutters in kilometres, which cannot know rendered text width —
+  that is why continental maps used to pile names on top of each other. Any new
+  label overlay must go through the same reservation or it will overprint.
+- **`cargo test --workspace` STOPS at the first failing test binary.** Use
+  `--no-fail-fast` or you will believe there is only one failure. Known
+  pre-existing failures (2026-07-25): 2× `rw-ingest size_estimate` (stale table,
+  121 builtin variables vs 116 covered) and
+  `ingest_derived_matches_direct_calc_kernels_bit_exactly`.
+- If the dev box crashes mid-build, `target/debug` metadata can be corrupted
+  (`error[E0786] invalid metadata files for crate ...`). `rm -rf target/debug`
+  and rebuild; release binaries already written are fine.
 
 ## 10. State snapshot (2026-07-06) & open items
 
