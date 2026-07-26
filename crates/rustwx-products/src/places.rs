@@ -634,6 +634,9 @@ struct GazetteerPlace {
     /// that are treated as points. When set, `lat`/`lon` are that table's anchor
     /// rather than the Census internal point.
     footprint_km: f32,
+    /// Population, world rows only (the Census file carries none). Used to rank
+    /// MAP LABELS outside the curated US catalogs; never used for naming a point.
+    population: u32,
 }
 
 /// Cities big enough that one reference point does not locate them, with the
@@ -830,6 +833,10 @@ fn gazetteer() -> &'static [GazetteerPlace] {
                     .next()
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(0.0);
+                let population: u32 = fields
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
                 // A curated footprint city uses its own anchor as its position:
                 // the Census internal point can be offshore (see CITY_FOOTPRINTS).
                 let (footprint_km, lat, lon) = match footprints.get(&(name, state)) {
@@ -842,6 +849,7 @@ fn gazetteer() -> &'static [GazetteerPlace] {
                     lat,
                     lon,
                     footprint_km,
+                    population,
                 })
             })
             .collect()
@@ -1340,6 +1348,105 @@ fn custom_domain_place_label_plan(domain: &DomainSpec) -> Option<PlaceLabelPlan>
     })
 }
 
+/// Smallest city worth a map label. Below this the world file is village-dense
+/// and a wide domain would be noise; the curated US catalogs cover small US
+/// towns for close-in domains.
+const WORLD_LABEL_MIN_POPULATION: u32 = 40_000;
+
+/// International label candidates, biggest city first.
+///
+/// The three US catalogs are hand-tiered, which is why a CONUS map reads well.
+/// Outside them there was NOTHING: a Europe map came back with zero labels
+/// because every candidate was a US preset that fell outside the frame. These
+/// come from the world gazetteer instead, ranked by population so a domain gets
+/// its most recognizable cities first — the same thing the curated tiers encode
+/// by hand.
+///
+/// `label`/`slug` borrow the gazetteer's own 'static text, so building this
+/// allocates nothing per name and it is built once per process.
+fn world_label_candidates() -> &'static [PlacePreset] {
+    use std::sync::OnceLock;
+    static CELL: OnceLock<Vec<PlacePreset>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut candidates: Vec<(u32, PlacePreset)> = gazetteer()
+            .iter()
+            .filter(|place| place.population >= WORLD_LABEL_MIN_POPULATION)
+            .map(|place| {
+                (
+                    place.population,
+                    PlacePreset {
+                        slug: place.name,
+                        label: place.name,
+                        center_lon: f64::from(place.lon),
+                        center_lat: f64::from(place.lat),
+                        half_height_deg: DEFAULT_PLACE_HALF_HEIGHT_DEG,
+                    },
+                )
+            })
+            .collect();
+        // Descending population; selection treats earlier entries as more
+        // important, so this is the ranking.
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.label.cmp(b.1.label)));
+        candidates.into_iter().map(|(_, preset)| preset).collect()
+    })
+}
+
+/// Fall back to the world gazetteer only for domains the curated US catalogs
+/// cannot label AT ALL.
+///
+/// The first cut of this filled any unused label budget from the world list, and
+/// the regression test caught what that costs: a California domain reaches into
+/// Baja, so it gained "Mexicali", and an explicit `included_place_slugs`
+/// allowlist was quietly overridden. Hand-tuned US output must not move, so the
+/// rule is now the narrowest one that fixes the reported gap:
+///
+///   * an explicit allowlist means ONLY those places — never top up;
+///   * if any curated preset is in frame, that is the answer, unchanged;
+///   * otherwise fall back to the world list.
+///
+/// This is safe for every US domain by construction: the world file carries no US
+/// rows (the Census file covers the US), so a domain inside the US finds nothing
+/// to add even when the curated catalogs come up empty — which is exactly what
+/// `dense_overlay_can_select_micro_only_places_beyond_major_and_aux` relies on.
+/// The trade is that a border domain keeps only its US labels; naming Tijuana on
+/// a San Diego map would mean merging the two catalogs, which is what moved the
+/// California output.
+/// Returns the slug to force-include, if any: the biggest city in frame.
+fn label_candidates_from_the_world(
+    catalog: &mut Vec<PlacePreset>,
+    bounds: (f64, f64, f64, f64),
+    max_count: usize,
+    overlay: &PlaceLabelOverlay,
+) -> Option<&'static str> {
+    if !overlay.included_place_slugs.is_empty() {
+        return None;
+    }
+    let curated_in_frame = catalog
+        .iter()
+        .any(|preset| contains_point(bounds, preset.center_lon, preset.center_lat));
+    if curated_in_frame {
+        return None;
+    }
+    let in_frame: Vec<PlacePreset> = world_label_candidates()
+        .iter()
+        .copied()
+        .filter(|preset| contains_point(bounds, preset.center_lon, preset.center_lat))
+        // Hand over roughly twice the budget, NOT everything in frame. Selection
+        // stratifies over a grid and prefers whatever sits nearest each cell's
+        // centre, so a deep candidate list filled a Europe map with Safi,
+        // Bechar and Ghardaia while London, Paris and Madrid lost their cells.
+        // Capping the list to the most populous keeps that spread-out coverage
+        // while making every label a city a reader recognizes.
+        .take(max_count.saturating_mul(2).max(16))
+        .collect();
+    // The list is population-ordered, so the first is the headline city of this
+    // frame. Anchor it: a map of Kanto that does not say Tokyo is wrong however
+    // well the rest is spread out.
+    let anchor = in_frame.first().map(|preset| preset.slug);
+    catalog.extend(in_frame);
+    anchor
+}
+
 fn select_places_for_label_plan(
     domain: &DomainSpec,
     plan: PlaceLabelPlan,
@@ -1362,9 +1469,13 @@ fn select_places_for_label_plan(
             .with_max_crop_overlap_fraction(plan.max_crop_overlap_fraction),
     };
 
-    let catalog = overlay.filtered_catalog();
+    let mut catalog = overlay.filtered_catalog();
+    let world_anchor =
+        label_candidates_from_the_world(&mut catalog, domain.bounds, plan.max_count, overlay);
     let mut selected = select_places_for_bounds(&catalog, domain.bounds, options);
-    if let Some(anchor_slug) = plan.anchor_slug {
+    // A curated anchor (city crops) always wins; the world anchor only fills in
+    // for the domains that had no labels at all.
+    if let Some(anchor_slug) = plan.anchor_slug.or(world_anchor) {
         if let Some(anchor) = catalog
             .iter()
             .copied()

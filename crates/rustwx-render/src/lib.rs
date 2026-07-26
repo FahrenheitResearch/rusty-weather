@@ -476,16 +476,47 @@ fn fmt_extent_value(v: f64, span: f64) -> String {
     }
 }
 
-/// "max 110 / min 63 °F" over the domain's finite values — `None` when the
-/// field is empty/all-NaN (nothing to summarize).
-fn data_extent_subtitle(values: &[f32], units: &str) -> Option<String> {
+/// "max 110 / min 63 °F" over the finite values **inside the plotted frame** —
+/// `None` when nothing finite is in view.
+///
+/// Restricting to the frame is the whole point of the projected domain here. The
+/// field is the model's whole grid, and GFS's grid is the PLANET, so summarizing
+/// every value printed "max 111 / min -97 °F" on every GFS map whatever the
+/// domain — that minimum is the July Antarctic plateau, reported on a map of
+/// Europe or CONUS. It went unnoticed because HRRR's grid is barely larger than
+/// the CONUS frame, so its readout looked right.
+///
+/// `projected.x`/`y` are index-parallel to the field values (both come from the
+/// same grid), so a cell is in view when its projected position is inside the
+/// extent. Cells with no projected position are kept rather than dropped: a
+/// partial projection should not silently empty the readout.
+fn data_extent_subtitle(
+    values: &[f32],
+    units: &str,
+    projected: Option<&ProjectedDomain>,
+) -> Option<String> {
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for &value in values {
+    for (index, &value) in values.iter().enumerate() {
         let value = value as f64;
-        if value.is_finite() {
-            lo = lo.min(value);
-            hi = hi.max(value);
+        if !value.is_finite() {
+            continue;
         }
+        if let Some(domain) = projected {
+            if let (Some(&x), Some(&y)) = (domain.x.get(index), domain.y.get(index)) {
+                let extent = &domain.extent;
+                let visible = x.is_finite()
+                    && y.is_finite()
+                    && x >= extent.x_min
+                    && x <= extent.x_max
+                    && y >= extent.y_min
+                    && y <= extent.y_max;
+                if !visible {
+                    continue;
+                }
+            }
+        }
+        lo = lo.min(value);
+        hi = hi.max(value);
     }
     if !lo.is_finite() || !hi.is_finite() {
         return None;
@@ -752,7 +783,11 @@ fn with_render_state_profile_with_style<T>(
             // the SAME values the colorbar uses so units already match.
             subtitle_center: request.subtitle_center.clone().or_else(|| {
                 if request.colorbar && !overlay_only {
-                    data_extent_subtitle(&request.field.values, &request.field.units)
+                    data_extent_subtitle(
+                        &request.field.values,
+                        &request.field.units,
+                        projected_domain,
+                    )
                 } else {
                     None
                 }

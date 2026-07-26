@@ -280,3 +280,53 @@ fn contour_only_map_with_height_contours_and_barbs_renders_visible_overlays() {
         "overlay-only render should remain visible"
     );
 }
+
+/// The reported bug: every GFS map printed "max 111 / min -97 °F" whatever the
+/// domain, because the readout summarized the whole FIELD and GFS's field is the
+/// planet — that minimum is the July Antarctic plateau, shown on a map of
+/// Europe, and on CONUS. It survived because HRRR's grid is barely bigger than
+/// its frame, so the same code looked correct there.
+#[test]
+fn the_extent_readout_only_summarizes_what_is_in_the_frame() {
+    let values = [70.0f32, 80.0, -97.0, 111.0];
+    let domain = ProjectedDomain {
+        // The last two cells project far outside the frame.
+        x: vec![0.25, 0.75, 40.0, -40.0],
+        y: vec![0.25, 0.75, 40.0, -40.0],
+        extent: ProjectedExtent {
+            x_min: 0.0,
+            x_max: 1.0,
+            y_min: 0.0,
+            y_max: 1.0,
+        },
+    };
+    let in_frame = data_extent_subtitle(&values, "degF", Some(&domain))
+        .expect("two cells are in view");
+    assert!(in_frame.contains("max 80"), "{in_frame}");
+    assert!(in_frame.contains("min 70"), "{in_frame}");
+    assert!(!in_frame.contains("-97"), "off-frame minimum leaked: {in_frame}");
+    assert!(!in_frame.contains("111"), "off-frame maximum leaked: {in_frame}");
+
+    // No projection (legacy/unprojected callers): summarize everything, as before.
+    let unprojected = data_extent_subtitle(&values, "degF", None).expect("finite values");
+    assert!(unprojected.contains("-97"), "{unprojected}");
+    assert!(unprojected.contains("111"), "{unprojected}");
+
+    // A cell with no projected position is kept, so a partial projection cannot
+    // silently empty the readout.
+    let short = ProjectedDomain {
+        x: vec![0.25],
+        y: vec![0.25],
+        extent: domain.extent.clone(),
+    };
+    let partial = data_extent_subtitle(&values, "degF", Some(&short)).expect("finite values");
+    assert!(partial.contains("111"), "unprojected cells must still count: {partial}");
+
+    // All out of view: nothing to summarize.
+    let elsewhere = ProjectedDomain {
+        x: vec![9.0, 9.0, 9.0, 9.0],
+        y: vec![9.0, 9.0, 9.0, 9.0],
+        extent: domain.extent.clone(),
+    };
+    assert!(data_extent_subtitle(&values, "degF", Some(&elsewhere)).is_none());
+}

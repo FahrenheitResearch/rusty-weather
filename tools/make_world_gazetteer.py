@@ -78,8 +78,9 @@ with open(SRC, encoding="utf-8") as handle:
         else:
             radius = 0.0
         key = (label, region, round(lat_f, 4), round(lon_f, 4))
-        # Keep the largest radius when a city appears more than once.
-        rows[key] = max(rows.get(key, 0.0), round(radius, 1))
+        # Keep the largest radius/population when a city appears more than once.
+        prev = rows.get(key, (0.0, 0))
+        rows[key] = (max(prev[0], round(radius, 1)), max(prev[1], pop))
 
 records = sorted(rows.items(), key=lambda kv: (kv[0][1], kv[0][0], kv[0][2], kv[0][3]))
 with open(OUT, "w", encoding="utf-8", newline="\n") as out:
@@ -94,13 +95,13 @@ with open(OUT, "w", encoding="utf-8", newline="\n") as out:
     out.write("# missing from the card fonts. Sections of cities (PPLX) and\n")
     out.write("# historical/abandoned places are excluded.\n")
     out.write("# Regenerate: see docs/AGENT_GUIDE.md gotcha ledger.\n")
-    for (label, country, lat_f, lon_f), radius in records:
-        out.write(f"{label}\t{country}\t{lat_f:.4f}\t{lon_f:.4f}\t{radius:.1f}\n")
+    for (label, country, lat_f, lon_f), (radius, pop) in records:
+        out.write(f"{label}\t{country}\t{lat_f:.4f}\t{lon_f:.4f}\t{radius:.1f}\t{pop}\n")
 
 print(f"wrote {len(records)} rows to {OUT}")
 print(f"skipped: {skipped_us} US, {skipped_code} by feature code, {skipped_name} unnamed")
 countries = len({k[1] for k, _ in records})
 print(f"countries/territories: {countries}")
 for probe in ("London", "Tokyo", "Sydney", "Paris", "Brasilia", "Reykjavik", "Ushuaia"):
-    hits = [(k, v) for k, v in records if k[0] == probe]
+    hits = [(k[0], k[1], v) for k, v in records if k[0] == probe]
     print(f"  {probe}: {hits[:2]}")

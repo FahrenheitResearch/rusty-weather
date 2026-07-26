@@ -1109,3 +1109,121 @@ fn put(img: &mut rustwx_render::RgbaImage, x: i32, y: i32, color: rustwx_render:
     }
     img.put_pixel(x as u32, y as u32, color.to_image_rgba());
 }
+
+/// The reported gap: a map outside the US came back with NO city labels, because
+/// every candidate was a curated US preset and none fell inside the frame.
+#[test]
+fn maps_outside_the_us_get_labels_from_the_world_gazetteer() {
+    let europe = DomainSpec::new("generic_europe", (-11.0, 35.0, 30.0, 60.0));
+    let overlay = PlaceLabelOverlay {
+        density: PlaceLabelDensityTier::Dense,
+        included_place_slugs: Vec::new(),
+    };
+    let selected = overlay.selected_places_for_domain(&europe);
+    assert!(
+        selected.len() >= 8,
+        "a Europe domain should be labelled, got {:?}",
+        place_slugs(&selected)
+    );
+    let labels: Vec<&str> = selected.iter().map(|place| place.label.as_str()).collect();
+    // The biggest cities in frame should be among them.
+    let expected_some_of = ["London", "Paris", "Madrid", "Berlin", "Rome", "Istanbul", "Kyiv"];
+    let hits = expected_some_of
+        .iter()
+        .filter(|city| labels.iter().any(|label: &&str| label.contains(**city)))
+        .count();
+    assert!(
+        hits >= 3,
+        "expected several European capitals, got {labels:?}"
+    );
+    // Every label must be inside the frame.
+    for place in &selected {
+        assert!(
+            contains_point(europe.bounds, place.center_lon, place.center_lat),
+            "{} is outside the domain",
+            place.label
+        );
+    }
+}
+
+/// Japan, to prove it is not Europe-specific, and that a small domain still gets
+/// the big city rather than a village.
+#[test]
+fn a_japan_domain_is_labelled_tokyo_first() {
+    let japan = DomainSpec::new("generic_kanto", (138.0, 141.0, 34.5, 36.5));
+    let overlay = PlaceLabelOverlay {
+        density: PlaceLabelDensityTier::MajorAndAux,
+        included_place_slugs: Vec::new(),
+    };
+    let selected = overlay.selected_places_for_domain(&japan);
+    let labels: Vec<&str> = selected.iter().map(|place| place.label.as_str()).collect();
+    assert!(!labels.is_empty(), "Kanto should be labelled");
+    assert!(
+        labels.iter().any(|label| *label == "Tokyo"),
+        "Tokyo should be labelled: {labels:?}"
+    );
+}
+
+/// The top-up must not touch domains the curated catalogs already cover: those
+/// tiers are hand-tuned and a CONUS map's labels are Drew-approved.
+#[test]
+fn us_domains_keep_exactly_their_curated_labels() {
+    for (slug, bounds) in [
+        ("conus", (-125.0, -66.5, 24.0, 50.0)),
+        ("california", (-126.0, -113.8, 31.9, 42.5)),
+        ("wide_west", (-125.7, -103.8, 31.9, 46.5)),
+    ] {
+        let domain = DomainSpec::new(slug, bounds);
+        for tier in [
+            PlaceLabelDensityTier::Major,
+            PlaceLabelDensityTier::MajorAndAux,
+            PlaceLabelDensityTier::Dense,
+        ] {
+            let overlay = PlaceLabelOverlay {
+                density: tier,
+                included_place_slugs: Vec::new(),
+            };
+            let selected = overlay.selected_places_for_domain(&domain);
+            let curated: Vec<&str> = MAJOR_US_CITY_PRESETS
+                .iter()
+                .chain(AUX_US_CITY_PRESETS.iter())
+                .chain(MICRO_US_PLACE_PRESETS.iter())
+                .map(|preset| preset.slug)
+                .collect();
+            for place in &selected {
+                assert!(
+                    curated.contains(&place.slug.as_str()),
+                    "{slug} gained a non-curated label {:?}",
+                    place.slug
+                );
+            }
+        }
+    }
+}
+
+/// What the world fallback actually picks, for eyeballing without a deploy:
+/// `cargo test -p rustwx-products world_label_preview -- --ignored --nocapture`
+#[test]
+#[ignore = "prints the label selection for several international domains"]
+fn world_label_preview() {
+    for (name, bounds) in [
+        ("Europe", (-11.0, 35.0, 30.0, 60.0)),
+        ("British Isles", (-11.0, 2.0, 49.5, 59.0)),
+        ("Kanto", (138.0, 141.0, 34.5, 36.5)),
+        ("SE Australia", (140.0, 154.0, -39.0, -28.0)),
+        ("Brazil SE", (-52.0, -39.0, -25.0, -14.0)),
+        ("India north", (72.0, 89.0, 20.0, 32.0)),
+        ("Sahara", (-5.0, 25.0, 18.0, 30.0)),
+    ] {
+        let domain = DomainSpec::new("generic_preview", bounds);
+        for tier in [PlaceLabelDensityTier::Major, PlaceLabelDensityTier::Dense] {
+            let overlay = PlaceLabelOverlay {
+                density: tier,
+                included_place_slugs: Vec::new(),
+            };
+            let selected = overlay.selected_places_for_domain(&domain);
+            let labels: Vec<&str> = selected.iter().map(|p| p.label.as_str()).collect();
+            println!("{name} [{tier:?}] {} labels: {labels:?}", labels.len());
+        }
+    }
+}
