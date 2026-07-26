@@ -739,6 +739,9 @@
     preset: "conus", bounds: DOMAINS[0][2], drawn: null,
     brand: "generic", brandTitle: "", brandCredit: "", logoDataUrl: null,
     cardStep: "day", cardTheme: "slate", cardAccent: null,
+    // Cards reference an uploaded logo by id (see ensureCardLogo); logoCardKey
+    // is the data URL that id was minted from, so a new upload re-uploads.
+    cardLogoId: null, cardLogoKey: null,
   };
 
   var $ = function (id) { return document.getElementById(id); };
@@ -1016,7 +1019,7 @@
     state.brand = v;
     $("customBrand").style.display = v === "custom" ? "block" : "none";
     var help = { generic: "Generic: small <code>wxsection.com</code> credit, no title. Cards use the theme's own credit.",
-      custom: "Custom: your title, credit, and optional logo in the banner strip. On a card the title becomes the headline prefix and the credit the top-right line (the logo is map-only).",
+      custom: "Custom: your title, credit, and optional logo in the banner strip. On a card the title becomes the headline prefix, the credit the top-right line, and the logo sits at the header's left edge.",
       none: "None: blank banner strip (still croppable); a card gets no credit line at all." };
     $("brandHelp").innerHTML = help[v];
   });
@@ -1051,8 +1054,17 @@
   /* The card's grid point. Declared with the map because a click sets it, but
      the inputs stay authoritative so it works with the map absent. */
   var cardMarker = null;
+  /* Leaflet keeps counting longitude past the antimeridian, so panning east
+     hands back 200 or 560 instead of -160. Every stored grid is indexed
+     -180..180, so an unwrapped value missed every cell and the server answered
+     "point is outside the model grid" even for global GFS. (The server wraps
+     too — this keeps the boxes readable.) */
+  function wrapLon(lon) {
+    return ((((lon + 180) % 360) + 360) % 360) - 180;
+  }
   function setCardPoint(lat, lon) {
     if (!isFinite(lat) || !isFinite(lon)) return;
+    lon = wrapLon(lon);
     $("cardLat").value = lat.toFixed(4); $("cardLon").value = lon.toFixed(4);
     if (!map || !window.L) return;
     if (cardMarker) map.removeLayer(cardMarker);
@@ -1228,8 +1240,25 @@
      title becomes the headline prefix, a custom credit the top-right line, and
      "None" clears both. Sending an EMPTY value is how the API is told to clear
      one — omitting the parameter inherits the theme's own. */
+  /* A card is a GET, which is what makes it shareable, downloadable and
+     copyable by URL — so the logo can't ride along as base64. It is uploaded
+     once to /api/card-logo, which content-addresses it, and the card then
+     references the id. Re-uploading the same image returns the same id. */
+  async function ensureCardLogo() {
+    if (state.brand !== "custom" || !state.logoDataUrl) {
+      state.cardLogoId = null;
+      return;
+    }
+    if (state.cardLogoId && state.cardLogoKey === state.logoDataUrl) return;
+    var resp = await fetch(API + "/api/card-logo", { method: "POST", body: state.logoDataUrl });
+    var json = await resp.json().catch(function () { return {}; });
+    if (!resp.ok || !json.id) throw new Error(json.error || "logo upload failed");
+    state.cardLogoId = json.id;
+    state.cardLogoKey = state.logoDataUrl;
+  }
+
   function cardUrl(format) {
-    var lat = Number($("cardLat").value), lon = Number($("cardLon").value);
+    var lat = Number($("cardLat").value), lon = wrapLon(Number($("cardLon").value));
     var title = ($("cardTitle").value || "").trim() || (lat.toFixed(3) + ", " + lon.toFixed(3));
     var qs = new URLSearchParams({
       lat: lat.toFixed(4), lon: lon.toFixed(4), model: state.model, run: "latest",
@@ -1242,6 +1271,7 @@
     else if (state.brand === "custom") {
       qs.set("brand", state.brandTitle.trim());
       qs.set("credit", state.brandCredit.trim());
+      if (state.cardLogoId) qs.set("logo", state.cardLogoId);
     }
     if (format) qs.set("format", format);
     return API + "/api/daily?" + qs.toString();
@@ -1249,6 +1279,7 @@
 
   async function renderCard(t0) {
     if (!state.product) throw new Error("still loading the variable list — try again in a moment");
+    await ensureCardLogo();
     var resp = await fetch(cardUrl(null));
     if (!resp.ok) {
       var body = await resp.json().catch(function () { return {}; });

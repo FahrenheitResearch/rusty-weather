@@ -455,6 +455,7 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
         })),
         ("POST", "/api/render") => start_render_job(request.body, state),
         ("POST", "/api/loop") => start_loop_job(request.body, state),
+        ("POST", "/api/card-logo") => store_card_logo(request.body, &state),
         _ if request.method == "GET" && request.path.starts_with("/api/loops/") => {
             loop_response(request.path.trim_start_matches("/api/loops/"), &state)
         }
@@ -1094,7 +1095,7 @@ fn daily_response(query: &str, state: &AppState) -> Vec<u8> {
     let Some(lat) = query.get("lat").and_then(|v| v.parse::<f64>().ok()) else {
         return bad("lat is required");
     };
-    let Some(lon) = query.get("lon").and_then(|v| v.parse::<f64>().ok()) else {
+    let Some(lon) = query.get("lon").and_then(|v| v.parse::<f64>().ok()).map(wrap_longitude) else {
         return bad("lon is required");
     };
     let Some(var) = query.get("var").cloned().filter(|v| {
@@ -1139,7 +1140,13 @@ fn daily_response(query: &str, state: &AppState) -> Vec<u8> {
             .and_then(|v| v.parse::<u16>().ok())
             .filter(|v| matches!(v, 1 | 3 | 6 | 12)),
         fahrenheit: query_wants_fahrenheit(&query),
-        theme: card_theme_from_query(&query),
+        theme: {
+            let mut theme = card_theme_from_query(&query);
+            // An unknown id draws the card without a logo rather than failing:
+            // a stale shared link should still show the forecast.
+            theme.logo = query.get("logo").and_then(|id| load_card_logo(id, state));
+            theme
+        },
     };
     // `?format=png` returns a rasterized copy so the card can be shared /
     // "open image in new tab" / copied as a picture. The in-page display stays SVG.
@@ -1627,7 +1634,7 @@ fn meteogram_response(path: &str, state: &AppState) -> Vec<u8> {
     let Some(lat) = query.get("lat").and_then(|v| v.parse::<f64>().ok()) else {
         return bad("lat is required");
     };
-    let Some(lon) = query.get("lon").and_then(|v| v.parse::<f64>().ok()) else {
+    let Some(lon) = query.get("lon").and_then(|v| v.parse::<f64>().ok()).map(wrap_longitude) else {
         return bad("lon is required");
     };
     let Some(run) = query.get("run").map(String::as_str) else {
@@ -1732,6 +1739,8 @@ fn xsection_response(path: &str, state: &AppState) -> Vec<u8> {
     if !((-360.0..=360.0).contains(&lon0) && (-360.0..=360.0).contains(&lon1)) {
         return bad("longitudes must be within -360..360");
     }
+    // A panned web map hands back unwrapped longitudes; the grids are -180..180.
+    let (lon0, lon1) = (wrap_longitude(lon0), wrap_longitude(lon1));
     let Some(run) = query.get("run").map(String::as_str) else {
         return bad("run is required (e.g. 20260702_22z or latest)");
     };
@@ -1821,7 +1830,11 @@ fn sounding_response(path: &str, state: &AppState) -> Vec<u8> {
     else {
         return bad("lat is required");
     };
-    let Some(lon) = query.get("lon").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite())
+    let Some(lon) = query
+        .get("lon")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .map(wrap_longitude)
     else {
         return bad("lon is required");
     };
@@ -2274,6 +2287,29 @@ fn query_wants_fahrenheit(query: &HashMap<String, String>) -> bool {
         .unwrap_or(false)
 }
 
+/// Wrap a longitude into the [-180, 180] range every stored grid is indexed on.
+///
+/// A web map's longitude is unbounded: Leaflet's `mouseEventToLatLng` hands back
+/// -186 or +200 once the user pans past the antimeridian, and it keeps counting
+/// on each further wrap. Our grids — including the GLOBAL GFS grid — run
+/// -180..180, so an unwrapped click missed every cell and the point products
+/// answered "point is outside the model grid" for a place the model plainly
+/// covers. Wrapping is the honest fix: the click names a real location either
+/// way, and rejecting it would only move the confusion.
+fn wrap_longitude(lon: f64) -> f64 {
+    if !lon.is_finite() {
+        return lon;
+    }
+    let wrapped = (lon + 180.0).rem_euclid(360.0) - 180.0;
+    // rem_euclid sends an exact +180 to -180; the antimeridian is the same
+    // meridian either way, so keep the sign the caller asked for.
+    if wrapped == -180.0 && lon > 0.0 {
+        180.0
+    } else {
+        wrapped
+    }
+}
+
 /// A short piece of caller-supplied card text (brand, credit, footer).
 ///
 /// Present-but-empty is meaningful and must survive: `?credit=` is how a caller
@@ -2287,6 +2323,156 @@ fn card_text_override(query: &HashMap<String, String>, key: &str) -> Option<Stri
             .filter(|c| !c.is_control())
             .take(48)
             .collect::<String>()
+    })
+}
+
+/// Where uploaded card logos live. Content-addressed, so the same logo uploaded
+/// twice is one file and one stable URL.
+fn card_logo_dir(state: &AppState) -> PathBuf {
+    state.out_root.join("card-logos")
+}
+
+/// Content address for an uploaded logo: FNV-1a over the re-encoded PNG.
+///
+/// A cache key, not a security boundary — nothing is authenticated by it. What
+/// it buys is stability: the same logo always yields the same id, so a shared
+/// card link keeps working and repeated uploads don't pile up files.
+fn logo_content_id(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Largest edge an embedded logo keeps. A card header shows it 44 px tall, so
+/// 512 px is generous for 2x rasterization and still small enough that the
+/// base64 copy inside every SVG stays a few tens of KB.
+const CARD_LOGO_MAX_EDGE: u32 = 512;
+/// Upload ceiling. Well above any real logo, far below memory pressure.
+const CARD_LOGO_MAX_BYTES: usize = 1024 * 1024;
+
+/// POST /api/card-logo — store a logo for `/api/daily?...&logo=<id>`.
+///
+/// Cards are GETs, which is what makes them shareable, downloadable and
+/// copyable by URL; a base64 logo in the query string would blow past request
+/// line limits. So the bytes are uploaded once and referenced by id.
+///
+/// Anything that decodes as an image is re-encoded to PNG, which both
+/// normalizes the format and drops whatever else was in the container.
+fn store_card_logo(body: Vec<u8>, state: &AppState) -> Vec<u8> {
+    let bad = |message: &str| json_status_response(400, &serde_json::json!({ "error": message }));
+    // Accept either raw bytes or the `data:image/png;base64,...` URL a browser
+    // canvas produces, since the labs already build the latter for map banners.
+    let bytes = if body.starts_with(b"data:") {
+        let text = String::from_utf8_lossy(&body);
+        let Some((_, encoded)) = text.split_once("base64,") else {
+            return bad("data URL must be base64 (data:image/png;base64,...)");
+        };
+        use base64::Engine;
+        match base64::engine::general_purpose::STANDARD.decode(encoded.trim()) {
+            Ok(bytes) => bytes,
+            Err(err) => return bad(&format!("data URL is not valid base64: {err}")),
+        }
+    } else {
+        body
+    };
+    if bytes.is_empty() {
+        return bad("empty upload; POST the image bytes or a data: URL");
+    }
+    if bytes.len() > CARD_LOGO_MAX_BYTES {
+        return bad("logo is larger than 1 MB; downscale it first");
+    }
+
+    // Bounded decode: a small highly-compressed PNG can declare enormous
+    // dimensions, and this endpoint is unauthenticated.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    let reader = match image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format() {
+        Ok(reader) => reader,
+        Err(err) => return bad(&format!("could not read the upload: {err}")),
+    };
+    let mut reader = reader;
+    reader.limits(limits);
+    let decoded = match reader.decode() {
+        Ok(image) => image,
+        Err(err) => {
+            return bad(&format!(
+                "could not decode the image ({err}); PNG, WebP and GIF are supported"
+            ));
+        }
+    };
+
+    let scaled = if decoded.width().max(decoded.height()) > CARD_LOGO_MAX_EDGE {
+        decoded.resize(
+            CARD_LOGO_MAX_EDGE,
+            CARD_LOGO_MAX_EDGE,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        decoded
+    };
+    let mut png: Vec<u8> = Vec::new();
+    if let Err(err) = scaled.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png) {
+        return json_status_response(
+            500,
+            &serde_json::json!({ "error": format!("could not re-encode the logo: {err}") }),
+        );
+    }
+
+    let id = logo_content_id(&png);
+    let dir = card_logo_dir(state);
+    if let Err(err) = fs::create_dir_all(&dir) {
+        return json_status_response(
+            500,
+            &serde_json::json!({ "error": format!("logo dir: {err}") }),
+        );
+    }
+    let path = dir.join(format!("{id}.png"));
+    if !path.exists() {
+        if let Err(err) = fs::write(&path, &png) {
+            return json_status_response(
+                500,
+                &serde_json::json!({ "error": format!("store logo: {err}") }),
+            );
+        }
+    }
+    json_response(&serde_json::json!({
+        "id": id,
+        "width": scaled.width(),
+        "height": scaled.height(),
+        "bytes": png.len(),
+        "usage": format!("/api/daily?...&logo={id}"),
+    }))
+}
+
+/// Resolve a logo id to its file, rejecting anything that is not one of our own
+/// hex hashes.
+///
+/// This is the only thing standing between a query parameter and the
+/// filesystem, so it is deliberately a separate, strict, testable function
+/// rather than a check buried in the I/O path.
+fn card_logo_path(id: &str, dir: &Path) -> Option<PathBuf> {
+    if id.is_empty() || id.len() > 32 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(dir.join(format!("{id}.png")))
+}
+
+/// Load an uploaded logo for embedding, or None when the id is unknown.
+fn load_card_logo(id: &str, state: &AppState) -> Option<meteogram::CardLogo> {
+    let path = card_logo_path(id, &card_logo_dir(state))?;
+    let bytes = fs::read(&path).ok()?;
+    let (width, height) = image::image_dimensions(&path).ok()?;
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(meteogram::CardLogo {
+        data_uri: format!("data:image/png;base64,{encoded}"),
+        width,
+        height,
     })
 }
 
@@ -3278,6 +3464,66 @@ mod card_theme_tests {
                 "{junk} must not reach a fill attribute"
             );
         }
+    }
+
+    /// The reported bug: GFS is GLOBAL, yet a point picked after panning a web
+    /// map past the antimeridian answered "point is outside the model grid",
+    /// because Leaflet keeps counting longitude (-186, +200, +560) while every
+    /// stored grid is indexed -180..180.
+    #[test]
+    fn longitudes_from_a_panned_map_wrap_onto_the_grid() {
+        for (input, expected) in [
+            (-73.97, -73.97),
+            (-186.03, 173.97),
+            (-433.97, -73.97),
+            (200.5, -159.5),
+            (560.5, -159.5),
+            (0.0, 0.0),
+            (-180.0, -180.0),
+            (179.9, 179.9),
+        ] {
+            let got = wrap_longitude(input);
+            assert!(
+                (got - expected).abs() < 1e-9,
+                "wrap_longitude({input}) = {got}, expected {expected}"
+            );
+        }
+        // The antimeridian is one meridian; keep the sign the caller used.
+        assert_eq!(wrap_longitude(180.0), 180.0);
+        assert!(wrap_longitude(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn a_logo_id_can_never_escape_the_logo_directory() {
+        let dir = std::path::Path::new("C:/rw/out/card-logos");
+        for hostile in [
+            "../../etc/passwd",
+            "..",
+            "a/b",
+            "a\\b",
+            "zz",
+            "",
+            "%2e%2e",
+            &"f".repeat(64),
+        ] {
+            assert!(
+                card_logo_path(hostile, dir).is_none(),
+                "{hostile:?} must not resolve to a file"
+            );
+        }
+        // A real id resolves, and only inside the logo directory.
+        let ok = card_logo_path("b79ab8698c6a29f9", dir).expect("valid hex id");
+        assert_eq!(ok, dir.join("b79ab8698c6a29f9.png"));
+    }
+
+    /// Content addressing has to be stable (same bytes → same id) and it has to
+    /// separate different logos, or one upload would serve another's card.
+    #[test]
+    fn logo_ids_are_stable_and_distinct() {
+        assert_eq!(logo_content_id(b"one"), logo_content_id(b"one"));
+        assert_ne!(logo_content_id(b"one"), logo_content_id(b"two"));
+        assert_eq!(logo_content_id(b"one").len(), 16);
+        assert!(logo_content_id(b"one").chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     /// Card text lands inside SVG `<text>`, so control characters are dropped

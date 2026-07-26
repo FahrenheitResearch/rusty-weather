@@ -653,11 +653,13 @@ fn region_and_city_labels_use_compact_names() {
 
 #[test]
 fn nearest_place_finds_the_hosting_town() {
-    // The Census internal point of Sacramento city.
+    // The Census internal point of Sacramento city. Sacramento carries a
+    // footprint, so a point inside it now describes as the city itself rather
+    // than "near" it — you are not near Sacramento, you are in it.
     let near = nearest_place(38.5677, -121.4682).expect("gazetteer is nonempty");
     assert_eq!(near.label, "Sacramento, CA");
     assert!(near.distance_km < 1.0, "distance {}", near.distance_km);
-    assert_eq!(near.describe(), "near Sacramento, CA");
+    assert_eq!(near.describe(), "Sacramento, CA");
 
     // Ukiah, CA — and the gazetteer also knows Ukiah, OR as a distinct place.
     let near = nearest_place(39.15, -123.21).expect("gazetteer is nonempty");
@@ -694,9 +696,13 @@ fn remote_points_resolve_to_local_communities_not_metros() {
 
 #[test]
 fn describe_shapes_are_wellformed() {
-    // On a town: the sub-two-mile "near" form.
+    // Inside a city with a footprint: the bare city name.
     let near = nearest_place(38.5677, -121.4682).expect("gazetteer is nonempty");
-    assert_eq!(near.describe(), "near Sacramento, CA");
+    assert_eq!(near.describe(), "Sacramento, CA");
+
+    // On a small town, which has no footprint: still the "near" form.
+    let small = nearest_place(39.15, -123.21).expect("gazetteer is nonempty");
+    assert_eq!(small.describe(), "near Ukiah, CA");
 
     // Between towns: either form, but always naming the resolved label.
     let off = nearest_place(38.75, -121.47).expect("gazetteer is nonempty");
@@ -714,12 +720,101 @@ fn nearest_place_rejects_non_finite_points() {
     assert_eq!(nearest_place(39.0, f64::INFINITY), None);
 }
 
+/// The reported bug: a point on Manhattan came back "Hoboken, NJ". The
+/// gazetteer holds one Census internal point per place and New York City's is
+/// in BROOKLYN (40.6627, -73.9387), 13 km from midtown, while Hoboken's is 6 km
+/// away across the Hudson — so a pure nearest-point search names the small town.
+#[test]
+fn a_point_in_a_big_city_is_named_after_the_city() {
+    for (lat, lon, expected, label) in [
+        (40.7580, -73.9855, "New York, NY", "Times Square"),
+        (40.7484, -73.9857, "New York, NY", "Empire State Building"),
+        (40.7061, -74.0087, "New York, NY", "Wall Street"),
+        (40.7794, -73.9632, "New York, NY", "Upper East Side"),
+        (34.0522, -118.2437, "Los Angeles, CA", "downtown LA"),
+        (34.1016, -118.3267, "Los Angeles, CA", "Hollywood"),
+        (29.7604, -95.3698, "Houston, TX", "downtown Houston"),
+        (41.8781, -87.6298, "Chicago, IL", "the Loop"),
+    ] {
+        let near = nearest_place(lat, lon).expect("gazetteer is nonempty");
+        assert_eq!(near.label, expected, "{label} ({lat}, {lon})");
+        assert!(near.inside_footprint, "{label} should read as inside the city");
+        // Inside the footprint the card says the city, not "8 mi N of" it.
+        assert_eq!(near.describe(), expected, "{label}");
+    }
+}
+
+/// The other half of the same fix: a footprint must not swallow the towns
+/// around it. Each of these is a real, separately incorporated place whose own
+/// reference point is close by, and it has to keep its name.
+#[test]
+fn a_footprint_does_not_swallow_its_neighbors() {
+    for (lat, lon, expected) in [
+        (40.7453, -74.0279, "Hoboken, NJ"),
+        (40.7114, -74.0648, "Jersey City, NJ"),
+        (40.7242, -74.1726, "Newark, NJ"),
+        (34.0195, -118.4912, "Santa Monica, CA"),
+        (34.1478, -118.1445, "Pasadena, CA"),
+        (42.0451, -87.6877, "Evanston, IL"),
+        (29.7244, -95.4316, "West University Place, TX"),
+    ] {
+        let near = nearest_place(lat, lon).expect("gazetteer is nonempty");
+        assert_eq!(near.label, expected, "({lat}, {lon}) lost its own name");
+    }
+    // Where it flips, stated on purpose: an enclave entirely surrounded by
+    // Houston holds its name within ~1.5 km of its own reference point, and out
+    // toward the enclave's edge the surrounding city wins. That is the intended
+    // trade — 3 km from the middle of West University Place you are ringed by
+    // Houston, so "Houston, TX" is a defensible answer for a weather card.
+    let edge = nearest_place(29.7180, -95.4018).expect("gazetteer is nonempty");
+    assert_eq!(edge.label, "Houston, TX");
+}
+
+/// Every footprint entry must match a gazetteer row, or it is silently dead
+/// weight — the name has to be spelled the way the Census file spells it
+/// ("Nashville-Davidson", "Urban Honolulu").
+#[test]
+fn every_city_footprint_matches_a_gazetteer_row() {
+    let mut missing: Vec<String> = Vec::new();
+    for (name, state, radius) in CITY_FOOTPRINT_KM {
+        let hits = gazetteer()
+            .iter()
+            .filter(|place| place.name == *name && place.state == *state)
+            .count();
+        if hits == 0 {
+            missing.push(format!("{name}, {state}"));
+        }
+        assert!(
+            *radius > 0.0 && *radius < 60.0,
+            "{name}, {state}: {radius} km is not a plausible city radius"
+        );
+    }
+    assert!(missing.is_empty(), "footprints with no gazetteer row: {missing:#?}");
+}
+
+/// Ordinary places keep the old behavior: distance to the single point, and the
+/// honest offset phrasing when the point is out of town.
+#[test]
+fn places_without_a_footprint_are_still_points() {
+    let near = nearest_place(38.5677, -121.4682).expect("gazetteer is nonempty");
+    assert_eq!(near.label, "Sacramento, CA");
+    // Well outside any footprint: the phrasing keeps the offset.
+    let remote = nearest_place(41.5, -119.9).expect("gazetteer is nonempty");
+    assert!(!remote.inside_footprint);
+    assert!(
+        remote.describe().contains(" mi ") || remote.describe().starts_with("near "),
+        "{}",
+        remote.describe()
+    );
+}
+
 #[test]
 fn compass_sectors_wrap_correctly() {
     let at = |bearing_deg: f64| NearestPlace {
         label: "x".to_string(),
         distance_km: 10.0,
         bearing_deg,
+        inside_footprint: false,
     };
     assert_eq!(at(0.0).compass(), "N");
     assert_eq!(at(22.5).compass(), "NNE");

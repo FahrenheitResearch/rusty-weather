@@ -628,22 +628,107 @@ struct GazetteerPlace {
     state: &'static str,
     lat: f32,
     lon: f32,
+    /// Footprint radius in km from `CITY_FOOTPRINT_KM`; 0 for the ordinary
+    /// places that are treated as points.
+    footprint_km: f32,
 }
+
+/// Footprint radius (km) for cities large enough that the gazetteer's single
+/// reference point is nowhere near much of the city.
+///
+/// The gazetteer stores one Census "internal point" per place, so a pure
+/// nearest-point search answers Manhattan with **Hoboken**: New York City's
+/// internal point sits in BROOKLYN, 13 km from midtown, while Hoboken's is 6 km
+/// away across the Hudson. Nothing in the data says how big a city is, so this
+/// table says it.
+///
+/// Each radius is about 0.9·sqrt(land_area/π) — deliberately UNDER the true
+/// extent, because over-claiming (labelling Newark as New York) is worse than
+/// under-claiming (falling back to today's nearest-point answer). Cities are
+/// not discs, so this is an approximation on purpose; it only has to be good
+/// enough to beat a small town on the other side of a river.
+const CITY_FOOTPRINT_KM: &[(&str, &str, f32)] = &[
+    ("New York", "NY", 14.0),
+    ("Los Angeles", "CA", 18.0),
+    ("Chicago", "IL", 13.0),
+    ("Houston", "TX", 21.0),
+    ("Phoenix", "AZ", 19.0),
+    ("San Antonio", "TX", 18.0),
+    ("San Diego", "CA", 15.0),
+    ("Dallas", "TX", 15.0),
+    ("Jacksonville", "FL", 22.0),
+    ("Austin", "TX", 15.0),
+    ("Fort Worth", "TX", 15.0),
+    ("Indianapolis", "IN", 16.0),
+    ("Columbus", "OH", 12.0),
+    ("Charlotte", "NC", 14.0),
+    ("Oklahoma City", "OK", 20.0),
+    ("Nashville-Davidson", "TN", 19.0),
+    ("Denver", "CO", 10.0),
+    ("Seattle", "WA", 8.0),
+    ("Portland", "OR", 10.0),
+    ("Las Vegas", "NV", 10.0),
+    ("Memphis", "TN", 14.0),
+    ("Louisville", "KY", 15.0),
+    ("Kansas City", "MO", 15.0),
+    ("Atlanta", "GA", 10.0),
+    ("Miami", "FL", 5.0),
+    ("Philadelphia", "PA", 10.0),
+    ("Tucson", "AZ", 13.0),
+    ("Albuquerque", "NM", 11.0),
+    ("Fresno", "CA", 9.0),
+    ("Sacramento", "CA", 8.0),
+    ("San Jose", "CA", 11.0),
+    ("Anchorage", "AK", 25.0),
+    ("Boston", "MA", 6.0),
+    ("Detroit", "MI", 10.0),
+    ("Baltimore", "MD", 8.0),
+    ("Milwaukee", "WI", 8.0),
+    ("Minneapolis", "MN", 6.0),
+    ("Tampa", "FL", 11.0),
+    ("New Orleans", "LA", 11.0),
+    ("Tulsa", "OK", 11.0),
+    ("Wichita", "KS", 10.0),
+    ("El Paso", "TX", 13.0),
+    ("Colorado Springs", "CO", 11.0),
+    ("Omaha", "NE", 9.0),
+    ("Raleigh", "NC", 10.0),
+    ("Virginia Beach", "VA", 13.0),
+    ("Cleveland", "OH", 7.0),
+    ("Salt Lake City", "UT", 9.0),
+    ("St. Louis", "MO", 7.0),
+    ("Pittsburgh", "PA", 6.0),
+    ("Cincinnati", "OH", 7.0),
+    ("Orlando", "FL", 9.0),
+    ("Urban Honolulu", "HI", 8.0),
+];
+
+/// How much being inside a city's footprint discounts its distance: 5×. Enough
+/// that midtown Manhattan reads as New York rather than Hoboken; small enough
+/// that standing in downtown Hoboken still reads as Hoboken.
+const INSIDE_FOOTPRINT_DISCOUNT: f64 = 0.2;
 
 fn gazetteer() -> &'static [GazetteerPlace] {
     use std::sync::OnceLock;
     static CELL: OnceLock<Vec<GazetteerPlace>> = OnceLock::new();
     CELL.get_or_init(|| {
+        let footprints: BTreeMap<(&str, &str), f32> = CITY_FOOTPRINT_KM
+            .iter()
+            .map(|(name, state, radius)| ((*name, *state), *radius))
+            .collect();
         GAZETTEER_TSV
             .lines()
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .filter_map(|line| {
                 let mut fields = line.split('\t');
+                let name = fields.next()?;
+                let state = fields.next()?;
                 Some(GazetteerPlace {
-                    name: fields.next()?,
-                    state: fields.next()?,
+                    name,
+                    state,
                     lat: fields.next()?.parse().ok()?,
                     lon: fields.next()?.parse().ok()?,
+                    footprint_km: footprints.get(&(name, state)).copied().unwrap_or(0.0),
                 })
             })
             .collect()
@@ -659,6 +744,10 @@ pub struct NearestPlace {
     pub distance_km: f64,
     /// Initial great-circle bearing from the town to the point.
     pub bearing_deg: f64,
+    /// The point lies within this city's footprint, so it is IN the city even
+    /// though it may be miles from the gazetteer's single reference point.
+    /// Callers should say "New York, NY", not "8 mi N of New York, NY".
+    pub inside_footprint: bool,
 }
 
 impl NearestPlace {
@@ -674,10 +763,14 @@ impl NearestPlace {
         POINTS[((self.bearing_deg.rem_euclid(360.0) + 11.25) / 22.5) as usize % 16]
     }
 
-    /// "12 mi NE of Ukiah, CA" — or "near Ukiah, CA" inside two miles.
+    /// "12 mi NE of Ukiah, CA" — or "near Ukiah, CA" inside two miles. A point
+    /// inside a big city's footprint is simply in it, however far the city's
+    /// single gazetteer point happens to be.
     pub fn describe(&self) -> String {
         let miles = self.distance_mi();
-        if miles < 2.0 {
+        if self.inside_footprint {
+            self.label.clone()
+        } else if miles < 2.0 {
             format!("near {}", self.label)
         } else {
             format!("{} mi {} of {}", miles.round() as i64, self.compass(), self.label)
@@ -694,8 +787,8 @@ pub fn nearest_place(lat: f64, lon: f64) -> Option<NearestPlace> {
     // haversine + bearing for the winner only.
     let coslat = lat.to_radians().cos().max(0.05);
     let best = gazetteer().iter().min_by(|a, b| {
-        let da = equirect_d2(a, lat, lon, coslat);
-        let db = equirect_d2(b, lat, lon, coslat);
+        let da = scored_d2(a, lat, lon, coslat);
+        let db = scored_d2(b, lat, lon, coslat);
         da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
     })?;
     let (place_lat, place_lon) = (f64::from(best.lat), f64::from(best.lon));
@@ -703,7 +796,29 @@ pub fn nearest_place(lat: f64, lon: f64) -> Option<NearestPlace> {
         label: format!("{}, {}", best.name, best.state),
         distance_km: haversine_km(place_lat, place_lon, lat, lon),
         bearing_deg: initial_bearing_deg(place_lat, place_lon, lat, lon),
+        inside_footprint: within_footprint(best, lat, lon, coslat),
     })
+}
+
+/// True when the point is inside this place's footprint (see
+/// `CITY_FOOTPRINT_KM`). Places without a footprint are points, so never.
+fn within_footprint(place: &GazetteerPlace, lat: f64, lon: f64, coslat: f64) -> bool {
+    if place.footprint_km <= 0.0 {
+        return false;
+    }
+    let radius_deg = f64::from(place.footprint_km) / KM_PER_DEG_LAT;
+    equirect_d2(place, lat, lon, coslat) <= radius_deg * radius_deg
+}
+
+/// Distance a place is ranked on: true distance, discounted while the point is
+/// inside the place's footprint so a city beats the small town across the river
+/// from it. Squared, because the argmin compares squared distances.
+fn scored_d2(place: &GazetteerPlace, lat: f64, lon: f64, coslat: f64) -> f64 {
+    let d2 = equirect_d2(place, lat, lon, coslat);
+    if within_footprint(place, lat, lon, coslat) {
+        return d2 * INSIDE_FOOTPRINT_DISCOUNT * INSIDE_FOOTPRINT_DISCOUNT;
+    }
+    d2
 }
 
 fn equirect_d2(place: &GazetteerPlace, lat: f64, lon: f64, coslat: f64) -> f64 {

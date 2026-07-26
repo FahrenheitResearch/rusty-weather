@@ -156,6 +156,10 @@ host (holds the 201 GB CONUS climo pack; wide-west is what's deployed).
    HRRR: hourly runs to F18; extended 00/06/12/18z runs to F48 (the daemon
    finishes extended runs across ticks — freshest cycle first, then
    backfill). GFS: 6-hourly to F384. NBM: to F264.
+   **Domains:** HRRR is CONUS and NBM is CONUS, but **GFS is GLOBAL** — the
+   0.25° file is stored whole (~197 MB/hour, 1440×721), so point products work
+   anywhere on Earth (verified: London, Tokyo, Sydney, mid-Pacific, Brasília).
+   Nothing subsets it to CONUS.
 2. `latest.json` per model carries **run pointers**, written atomically:
    - `run` — newest touched (may be mid-ingest)
    - `complete_run` — newest fully-ingested → alias **`latest`**
@@ -194,7 +198,8 @@ host (holds the 201 GB CONUS climo pack; wide-west is what's deployed).
 · `GET /api/vars` · `POST /api/render` (async job → `/outputs/...` WebP)
 · `GET /api/meteogram?lat&lon&run[&model][&vars=a,b,c][&format=json|png]`
 · `GET /api/daily?lat&lon&var[&model][&run][&step=1|3|6][&format=png]`
-  `[&theme=cafire|slate|midnight|paper|ember|mono][&brand=][&credit=][&footer=][&accent=#rrggbb]`
+  `[&theme=cafire|slate|midnight|paper|ember|mono][&brand=][&credit=][&footer=][&accent=#rrggbb][&logo=<id>]`
+· `POST /api/card-logo` (image bytes or a `data:` URL → `{id}` for `&logo=`)
 · `GET /api/xsection?lat0&lon0&lat1&lon1&run[&hour][&field=temperature|rh|wind][&format=json|png]`
 · `GET /api/sounding?lat&lon&run&hour` (native PNG) · `GET /api/fires` (WFIGS)
 · `GET /api/ecape/...` (frozen static gallery while node 1 is paused).
@@ -335,6 +340,31 @@ systemctl restart rusty-wx-api
   `brand=`/`credit=`/`footer=` override the attribution, and a PRESENT-but-EMPTY
   value clears a line while an ABSENT one inherits the theme's own — the generic
   lab relies on that distinction to honor its "Branding: None" button.
+- **A web map's longitude is unbounded; every stored grid is -180..180.**
+  Leaflet's `mouseEventToLatLng` keeps counting past the antimeridian (-186,
+  +200, +560), so a point picked after panning missed every grid cell and the
+  point products answered "point is outside the model grid" — for GLOBAL GFS,
+  which plainly covers it. `wrap_longitude` normalizes at the API boundary
+  (daily, meteogram, sounding, xsection) and the labs wrap before filling the
+  boxes. Keep both: the server one is the guarantee, the client one keeps the
+  displayed numbers sane.
+- **Card logos are uploaded, not inlined.** Cards are GETs — that is what makes
+  them shareable/downloadable/copyable by URL — so a base64 logo in the query
+  string would blow past request-line limits. `POST /api/card-logo` re-encodes
+  to PNG, caps the long edge at 512 px, content-addresses it (FNV-1a, a cache
+  key and NOT a security boundary) and stores `<out_root>/card-logos/<id>.png`;
+  the card then references `&logo=<id>` and embeds it as a `data:` URI so the
+  SVG stays one self-contained document. `card_logo_path` is the only thing
+  between that query parameter and the filesystem — keep it strict.
+- **Place naming knows how big a city is** (`CITY_FOOTPRINT_KM` in places.rs).
+  The gazetteer holds ONE Census internal point per place and New York City's is
+  in **Brooklyn**, so a Manhattan point used to resolve to "Hoboken, NJ" — 6 km
+  away across the Hudson versus 13 km to the city's own point. Cities in that
+  table get a footprint radius; a point inside one has its distance discounted
+  5×, and `NearestPlace::inside_footprint` tells callers to say "New York, NY"
+  rather than "8 mi N of New York, NY". Radii are deliberately UNDER the true
+  extent — over-claiming (Newark reading as New York) is worse than falling back
+  to the old nearest-point answer.
 - **Fast card iteration without a deploy or a full store:** hardlink one stored
   hour into a throwaway store so the card has hours to walk, and point a local
   API at it — no copy, no disk cost.

@@ -1277,6 +1277,39 @@ pub struct CardTheme {
     pub credit: String,
     /// Trailing clause of the footnote; empty drops it.
     pub footer: String,
+    /// Logo for the header's left edge, when the caller uploaded one.
+    pub logo: Option<CardLogo>,
+}
+
+/// An uploaded logo, ready to embed.
+///
+/// Carried as a base64 `data:` URI rather than a path or URL so the card stays
+/// ONE self-contained document: the SVG can be saved, mailed or pasted and
+/// still show the logo, and the PNG rasterizer needs no network or filesystem
+/// access to draw it. The pixel size travels along because the header has to
+/// reserve the logo's width before it can lay out the headline.
+#[derive(Debug, Clone)]
+pub struct CardLogo {
+    pub data_uri: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Logo height in the header, matching the two-line title block.
+const LOGO_HEIGHT_PX: f64 = 44.0;
+/// Gap between the logo and the headline.
+const LOGO_GAP_PX: f64 = 14.0;
+/// Widest a logo may be: a long banner logo must not push the title off.
+const LOGO_MAX_WIDTH_PX: f64 = 200.0;
+
+impl CardTheme {
+    /// Width the logo occupies at `LOGO_HEIGHT_PX`, or None without a logo.
+    fn logo_width_px(&self) -> Option<f64> {
+        self.logo.as_ref().map(|logo| {
+            let aspect = f64::from(logo.width.max(1)) / f64::from(logo.height.max(1));
+            (LOGO_HEIGHT_PX * aspect).clamp(16.0, LOGO_MAX_WIDTH_PX)
+        })
+    }
 }
 
 impl CardTheme {
@@ -1313,6 +1346,8 @@ impl CardTheme {
             brand: brand.to_string(),
             credit: credit.to_string(),
             footer: footer.to_string(),
+            // Logos are per-request uploads, never part of a named palette.
+            logo: None,
         };
         match name.trim().to_ascii_lowercase().as_str() {
             // Unbranded cool dark — matches the generic lab's own UI.
@@ -1735,6 +1770,10 @@ pub fn render_daily_svg(
     // full offset beyond that).
     let place = match (custom_title, &near) {
         (Some(t), _) => t.to_string(),
+        // Inside a city's footprint the point IS the city, however far the
+        // gazetteer's single reference point happens to be (New York's sits in
+        // Brooklyn, so midtown is 8 mi from it).
+        (None, Some(n)) if n.inside_footprint => n.label.clone(),
         (None, Some(n)) if n.distance_mi() < 3.0 => n.label.clone(),
         (None, Some(n)) if n.distance_mi() <= 12.0 => format!("near {}", n.label),
         (None, Some(n)) => format!(
@@ -1777,7 +1816,12 @@ pub fn render_daily_svg(
     };
     let heading_w = (brand_chars + heading.chars().count()) as f64 * 21.0 * 0.60;
     let place_w = place_chars as f64 * place_font * 0.68;
-    let text_need = 24.0 + heading_w + 24.0 + place_w + 26.0;
+    // A logo sits at the header's left edge and pushes the title right, so it
+    // has to be part of the width the header needs — otherwise a long title
+    // would collide with the place name instead of widening the card.
+    let logo_w = request.theme.logo_width_px();
+    let header_x = 24.0 + logo_w.map_or(0.0, |width| width + LOGO_GAP_PX);
+    let text_need = header_x + heading_w + 24.0 + place_w + 26.0;
     let width = (ml + base_col * n as f64 + 28.0)
         .max(880.0)
         .max(text_need.ceil());
@@ -1834,6 +1878,15 @@ pub fn render_daily_svg(
         r##"<rect width="{width}" height="{height}" fill="{}"/>"##,
         th.paper
     ));
+    // Logo first, so the title's shifted origin is obviously tied to it. The
+    // href is a self-contained data URI: browsers and the PNG rasterizer both
+    // read it without fetching anything.
+    if let (Some(logo), Some(logo_w)) = (th.logo.as_ref(), logo_w) {
+        svg.push_str(&format!(
+            r##"<image x="24" y="22" width="{logo_w:.1}" height="{LOGO_HEIGHT_PX}" preserveAspectRatio="xMinYMid meet" href="{}"/>"##,
+            logo.data_uri
+        ));
+    }
     // Header. An unbranded theme drops the prefix outright rather than leaving
     // a dangling separator.
     let headline = if th.brand.is_empty() {
@@ -1842,11 +1895,11 @@ pub fn render_daily_svg(
         format!("{} | {}", xml_escape(&th.brand), xml_escape(&heading))
     };
     svg.push_str(&format!(
-        r##"<text x="24" y="40" fill="{}" font-size="21" font-weight="800">{headline}</text>"##,
+        r##"<text x="{header_x:.1}" y="40" fill="{}" font-size="21" font-weight="800">{headline}</text>"##,
         th.ink
     ));
     svg.push_str(&format!(
-        r##"<text x="24" y="64" fill="{}" font-size="13">{} {} {:02}Z | {}</text>"##,
+        r##"<text x="{header_x:.1}" y="64" fill="{}" font-size="13">{} {} {:02}Z | {}</text>"##,
         th.muted,
         model_slug.to_uppercase(),
         date_yyyymmdd,
