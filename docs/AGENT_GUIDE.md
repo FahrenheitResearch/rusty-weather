@@ -194,6 +194,7 @@ host (holds the 201 GB CONUS climo pack; wide-west is what's deployed).
 · `GET /api/vars` · `POST /api/render` (async job → `/outputs/...` WebP)
 · `GET /api/meteogram?lat&lon&run[&model][&vars=a,b,c][&format=json|png]`
 · `GET /api/daily?lat&lon&var[&model][&run][&step=1|3|6][&format=png]`
+  `[&theme=cafire|slate|midnight|paper|ember|mono][&brand=][&credit=][&footer=][&accent=#rrggbb]`
 · `GET /api/xsection?lat0&lon0&lat1&lon1&run[&hour][&field=temperature|rh|wind][&format=json|png]`
 · `GET /api/sounding?lat&lon&run&hour` (native PNG) · `GET /api/fires` (WFIGS)
 · `GET /api/ecape/...` (frozen static gallery while node 1 is paused).
@@ -321,6 +322,33 @@ systemctl restart rusty-wx-api
   (`resolve_latest_run_for_hour`) and falls back to an older run that has it;
   keep that behavior if you touch alias resolution, or every 0-48 h window
   product breaks for an hour after each extended cycle, four times a day.
+
+- **Both lab pages are `include_str!`d into `rw_fire_api`**, so an HTML-only
+  change is still a Rust rebuild — editing `generic_lab.html` and reloading the
+  browser serves the OLD page from the running binary, silently. Rebuild
+  `rw_fire_api` (locally too) before believing a UI change didn't work.
+- Outlook-card **theming lives in `CardTheme` (`meteogram.rs`)**, and only the
+  card CHROME is themed — paper, text, gridlines, accent, attribution. The data
+  colors (absolute temperature ramp, precip blues, the 15/30 mph wind
+  thresholds) are deliberately identical in every theme: recolor those and two
+  cards of the same forecast stop being comparable. `theme=` picks a palette,
+  `brand=`/`credit=`/`footer=` override the attribution, and a PRESENT-but-EMPTY
+  value clears a line while an ABSENT one inherits the theme's own — the generic
+  lab relies on that distinction to honor its "Branding: None" button.
+- **Fast card iteration without a deploy or a full store:** hardlink one stored
+  hour into a throwaway store so the card has hours to walk, and point a local
+  API at it — no copy, no disk cost.
+
+      $s="C:\rw\store\hrrr\20260725_18z"; $d="C:\rw\preview-store\hrrr\20260725_18z"
+      # link grid.rwg, copy run.json, then f000..f047 -> the one real hour
+      0..47 | % { New-Item -ItemType HardLink -Path ("$d\f{0:d3}.rws" -f $_) -Target "$s\f006.rws" }
+      # run=latest needs a pointer the daemon would normally write
+      '{"day_run":"20260725_18z","complete_run":"20260725_18z","run":"20260725_18z"}' > C:\rw\preview-store\hrrr\latest.json
+      cargo run --bin rw_fire_api -- --port 8799 --store-root C:/rw/preview-store --out-root C:/rw/cache
+
+  Every column carries the same values (one real hour), so this proves layout,
+  palette and plumbing — not the data. Kill the binary before `cargo build` or
+  the link step fails with "Access is denied".
 
 ## 10. State snapshot (2026-07-06) & open items
 

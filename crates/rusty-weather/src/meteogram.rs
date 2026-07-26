@@ -1236,6 +1236,143 @@ pub fn render_meteogram_svg(
 // Works for any stored 2D variable on any model (temperature gets the
 // classic absolute color scale; everything else auto-normalizes).
 
+/// The card's chrome palette and attribution.
+///
+/// Only the frame around the data is themed. The DATA colors — the absolute
+/// temperature ramp, the precip blues, the wind speed thresholds — encode
+/// values, so they are identical in every theme; recoloring them would make two
+/// cards of the same forecast unreadable side by side. What changes is the
+/// paper, the text, the gridlines, the accent, and whose name is on it, which
+/// is what a card needs to sit on a dark site, in a light document, or under
+/// somebody else's brand.
+#[derive(Debug, Clone)]
+pub struct CardTheme {
+    /// Page background; also the gutter between value cells.
+    pub paper: String,
+    /// Headline and the values that sit over paper.
+    pub ink: String,
+    /// Subtitle and row labels.
+    pub muted: String,
+    /// Axis numbers and the footnote.
+    pub faint: String,
+    /// The "no data" dash.
+    pub dim: String,
+    /// The "no data" cell fill.
+    pub empty: String,
+    /// Chart interior.
+    pub plot: String,
+    /// Chart border.
+    pub frame: String,
+    /// Chart gridlines.
+    pub grid: String,
+    /// Place name and the extended-range divider.
+    pub accent: String,
+    /// Extended-range caption.
+    pub accent_soft: String,
+    /// The LO number, which is drawn ON its colored bar rather than on paper.
+    pub bar_ink: String,
+    /// Headline prefix (`"CWT"` → `CWT | Temperature`); empty drops it.
+    pub brand: String,
+    /// Top-right attribution; empty drops the line.
+    pub credit: String,
+    /// Trailing clause of the footnote; empty drops it.
+    pub footer: String,
+}
+
+impl CardTheme {
+    /// Named theme, falling back to the branded default for anything unknown so
+    /// a typo in a shared link still renders a card.
+    pub fn named(name: &str) -> Self {
+        let theme = |paper: &str,
+                     ink: &str,
+                     muted: &str,
+                     faint: &str,
+                     dim: &str,
+                     empty: &str,
+                     plot: &str,
+                     frame: &str,
+                     grid: &str,
+                     accent: &str,
+                     accent_soft: &str,
+                     bar_ink: &str,
+                     brand: &str,
+                     credit: &str,
+                     footer: &str| CardTheme {
+            paper: paper.to_string(),
+            ink: ink.to_string(),
+            muted: muted.to_string(),
+            faint: faint.to_string(),
+            dim: dim.to_string(),
+            empty: empty.to_string(),
+            plot: plot.to_string(),
+            frame: frame.to_string(),
+            grid: grid.to_string(),
+            accent: accent.to_string(),
+            accent_soft: accent_soft.to_string(),
+            bar_ink: bar_ink.to_string(),
+            brand: brand.to_string(),
+            credit: credit.to_string(),
+            footer: footer.to_string(),
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            // Unbranded cool dark — matches the generic lab's own UI.
+            "slate" => theme(
+                "#0b0d0f", "#e8edf1", "#9aa4ad", "#78838c", "#4d565e", "#171b1f", "#12161a",
+                "#2b3238", "#232a30", "#4ea1ff", "#8cc6ff", "#0b0d0f", "", "wxsection.com", "",
+            ),
+            // Near-black with a violet accent, for slide decks.
+            "midnight" => theme(
+                "#07080d", "#eceaf6", "#9c9ab4", "#7a7893", "#4b4a5e", "#12131c", "#0e1018",
+                "#272a3a", "#1e2130", "#a78bfa", "#c9b8ff", "#07080d", "", "", "",
+            ),
+            // Light, for print and for pasting into a white-background document.
+            "paper" => theme(
+                "#f7f5f0", "#16191c", "#4c555c", "#6b747b", "#a8b0b6", "#e6e3dc", "#fffdf9",
+                "#cdc8bd", "#ded9cf", "#c2410c", "#9a3412", "#16191c", "", "", "",
+            ),
+            // Warm dark; the same parchment palette the meteogram uses.
+            "ember" => theme(
+                "#14100c", "#f2e7d5", "#b0a695", "#8d8171", "#6f6455", "#1b1611", "#1a1510",
+                "#3a3128", "#2a231b", "#ff8a00", "#ffb454", "#14100c", "", "", "",
+            ),
+            // Grayscale chrome: nothing but the data carries color.
+            "mono" => theme(
+                "#ffffff", "#111111", "#444444", "#666666", "#999999", "#eeeeee", "#fbfbfb",
+                "#c9c9c9", "#dddddd", "#111111", "#555555", "#111111", "", "", "",
+            ),
+            // CAFire house style, and the default so existing links are unchanged.
+            _ => theme(
+                "#0d1112",
+                "#f6f5f1",
+                "#9ea6a5",
+                "#737c7b",
+                "#4a4f50",
+                "#161c1d",
+                "#111617",
+                "#2a2f30",
+                "#22282a",
+                "#ff6a36",
+                "#ff8a5c",
+                "#0d1112",
+                "CWT",
+                "cafire.org/weather",
+                "California Wildfire Tracking — Weather Lab",
+            ),
+        }
+    }
+
+    /// Theme names offered to callers, in menu order.
+    pub fn names() -> &'static [&'static str] {
+        &["cafire", "slate", "midnight", "paper", "ember", "mono"]
+    }
+}
+
+impl Default for CardTheme {
+    fn default() -> Self {
+        Self::named("cafire")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DailyRequest {
     pub lat: f64,
@@ -1249,6 +1386,8 @@ pub struct DailyRequest {
     /// °F is the service default (mirrors the map lane's `temp_units`); false
     /// is the °C opt-out.
     pub fahrenheit: bool,
+    /// Chrome palette and attribution. Defaults to the CAFire house style.
+    pub theme: CardTheme,
 }
 
 struct DayAgg {
@@ -1628,7 +1767,15 @@ pub fn render_daily_svg(
     // heading (both are anchored to opposite edges).
     let place_chars = place.chars().count();
     let place_font: f64 = if place_chars > 30 { 19.0 } else { 24.0 };
-    let heading_w = (6 + heading.chars().count()) as f64 * 21.0 * 0.60;
+    // The brand prefix ("CWT | ") is part of the headline, and a theme may
+    // lengthen it, shorten it, or drop it — so the width estimate reads the
+    // theme rather than assuming six characters.
+    let brand_chars = if request.theme.brand.is_empty() {
+        0
+    } else {
+        request.theme.brand.chars().count() + 3
+    };
+    let heading_w = (brand_chars + heading.chars().count()) as f64 * 21.0 * 0.60;
     let place_w = place_chars as f64 * place_font * 0.68;
     let text_need = 24.0 + heading_w + 24.0 + place_w + 26.0;
     let width = (ml + base_col * n as f64 + 28.0)
@@ -1682,28 +1829,44 @@ pub fn render_daily_svg(
     svg.push_str(&format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" font-family="Inter,'Segoe UI',Helvetica,Arial,sans-serif">"##
     ));
-    svg.push_str(&format!(r##"<rect width="{width}" height="{height}" fill="#0d1112"/>"##));
-    // Header.
+    let th = &request.theme;
     svg.push_str(&format!(
-        r##"<text x="24" y="40" fill="#f6f5f1" font-size="21" font-weight="800">CWT | {}</text>"##,
+        r##"<rect width="{width}" height="{height}" fill="{}"/>"##,
+        th.paper
+    ));
+    // Header. An unbranded theme drops the prefix outright rather than leaving
+    // a dangling separator.
+    let headline = if th.brand.is_empty() {
         xml_escape(&heading)
+    } else {
+        format!("{} | {}", xml_escape(&th.brand), xml_escape(&heading))
+    };
+    svg.push_str(&format!(
+        r##"<text x="24" y="40" fill="{}" font-size="21" font-weight="800">{headline}</text>"##,
+        th.ink
     ));
     svg.push_str(&format!(
-        r##"<text x="24" y="64" fill="#9ea6a5" font-size="13">{} {} {:02}Z | {}</text>"##,
+        r##"<text x="24" y="64" fill="{}" font-size="13">{} {} {:02}Z | {}</text>"##,
+        th.muted,
         model_slug.to_uppercase(),
         date_yyyymmdd,
         cycle_utc,
         xml_escape(&point_line),
     ));
     svg.push_str(&format!(
-        r##"<text x="{:.0}" y="44" fill="#ff6a36" font-size="{place_font:.0}" font-weight="800" text-anchor="end">{}</text>"##,
+        r##"<text x="{:.0}" y="44" fill="{}" font-size="{place_font:.0}" font-weight="800" text-anchor="end">{}</text>"##,
         width - 26.0,
+        th.accent,
         xml_escape(&place.to_uppercase())
     ));
-    svg.push_str(&format!(
-        r##"<text x="{:.0}" y="64" fill="#9ea6a5" font-size="12" text-anchor="end">cafire.org/weather</text>"##,
-        width - 26.0
-    ));
+    if !th.credit.is_empty() {
+        svg.push_str(&format!(
+            r##"<text x="{:.0}" y="64" fill="{}" font-size="12" text-anchor="end">{}</text>"##,
+            width - 26.0,
+            th.muted,
+            xml_escape(&th.credit)
+        ));
+    }
 
     // Value strips: HI/LO pair, or one row for single-value buckets.
     let strip_rows: &[(&str, bool)] = if single { &[("VAL", true)] } else { &[("HI", true), ("LO", false)] };
@@ -1711,9 +1874,10 @@ pub fn render_daily_svg(
     for (row, (label, is_hi)) in strip_rows.iter().enumerate() {
         let y = 86.0 + row as f64 * (strip_h + 6.0);
         svg.push_str(&format!(
-            r##"<text x="{:.0}" y="{:.0}" fill="#9ea6a5" font-size="13" font-weight="700" text-anchor="end">{label}</text>"##,
+            r##"<text x="{:.0}" y="{:.0}" fill="{}" font-size="13" font-weight="700" text-anchor="end">{label}</text>"##,
             ml - 10.0,
             y + strip_h / 2.0 + 5.0,
+            th.muted,
         ));
         for (index, day) in days.iter().enumerate() {
             let x = ml + index as f64 * col_w;
@@ -1728,7 +1892,8 @@ pub fn render_daily_svg(
                     Some(v) => {
                         let color = cell_color(v);
                         svg.push_str(&format!(
-                            r##"<rect x="{cell_x:.0}" y="{y:.0}" width="{cell_w:.0}" height="{strip_h}" fill="{color}" stroke="#0d1112" stroke-width="2"/>"##
+                            r##"<rect x="{cell_x:.0}" y="{y:.0}" width="{cell_w:.0}" height="{strip_h}" fill="{color}" stroke="{}" stroke-width="2"/>"##,
+                            th.paper
                         ));
                         svg.push_str(&format!(
                             r##"<text x="{:.0}" y="{:.0}" fill="{}" font-size="{value_font}" font-weight="800" text-anchor="middle">{}</text>"##,
@@ -1740,12 +1905,14 @@ pub fn render_daily_svg(
                     }
                     None => {
                         svg.push_str(&format!(
-                            r##"<rect x="{cell_x:.0}" y="{y:.0}" width="{cell_w:.0}" height="{strip_h}" fill="#161c1d" stroke="#0d1112" stroke-width="2"/>"##
+                            r##"<rect x="{cell_x:.0}" y="{y:.0}" width="{cell_w:.0}" height="{strip_h}" fill="{}" stroke="{}" stroke-width="2"/>"##,
+                            th.empty, th.paper
                         ));
                         svg.push_str(&format!(
-                            r##"<text x="{:.0}" y="{:.0}" fill="#4a4f50" font-size="14" text-anchor="middle">—</text>"##,
+                            r##"<text x="{:.0}" y="{:.0}" fill="{}" font-size="14" text-anchor="middle">—</text>"##,
                             cell_x + cell_w / 2.0,
                             y + strip_h / 2.0 + 5.0,
+                            th.dim,
                         ));
                     }
                 }
@@ -1754,8 +1921,8 @@ pub fn render_daily_svg(
             let v = if *is_hi { day.hi } else { day.lo };
             let color = cell_color(v);
             svg.push_str(&format!(
-                r##"<rect x="{x:.0}" y="{y:.0}" width="{:.0}" height="{strip_h}" fill="{color}" stroke="#0d1112" stroke-width="2"/>"##,
-                col_w
+                r##"<rect x="{x:.0}" y="{y:.0}" width="{:.0}" height="{strip_h}" fill="{color}" stroke="{}" stroke-width="2"/>"##,
+                col_w, th.paper
             ));
             svg.push_str(&format!(
                 r##"<text x="{:.0}" y="{:.0}" fill="{}" font-size="{value_font}" font-weight="800" text-anchor="middle">{}</text>"##,
@@ -1773,15 +1940,19 @@ pub fn render_daily_svg(
     // convention) — both in mph. The legend line spells this out.
     let wind_y = 86.0 + n_strips * (strip_h + 6.0);
     svg.push_str(&format!(
-        r##"<text x="{:.0}" y="{:.0}" fill="#9ea6a5" font-size="13" font-weight="700" text-anchor="end">WIND</text>"##,
+        r##"<text x="{:.0}" y="{:.0}" fill="{}" font-size="13" font-weight="700" text-anchor="end">WIND</text>"##,
         ml - 10.0,
         wind_y + wind_row_h / 2.0 + 5.0,
+        th.muted,
     ));
     for (index, day) in days.iter().enumerate() {
         let x_center = ml + index as f64 * col_w + col_w / 2.0;
         match (day.wind_dir_from_deg, day.wind_max_mph) {
             (Some(dir), Some(speed)) => {
-                let speed_color = if speed >= 30.0 { "#ff5b24" } else if speed >= 15.0 { "#f5b53c" } else { "#9ea6a5" };
+                // The two speed tiers are thresholds, not decoration, so they
+                // keep their colors in every theme; only calm falls back to the
+                // theme's own text color.
+                let speed_color = if speed >= 30.0 { "#ff5b24" } else if speed >= 15.0 { "#f5b53c" } else { th.muted.as_str() };
                 svg.push_str(&wind_barb_svg(x_center, wind_y + 16.0, dir, speed, speed_color));
                 let sust = speed.round() as i64;
                 let label = match day.wind_gust_max_mph {
@@ -1796,8 +1967,9 @@ pub fn render_daily_svg(
                 ));
             }
             _ => svg.push_str(&format!(
-                r##"<text x="{x_center:.1}" y="{:.1}" fill="#4a4f50" font-size="13" text-anchor="middle">—</text>"##,
-                wind_y + wind_row_h / 2.0 + 4.0
+                r##"<text x="{x_center:.1}" y="{:.1}" fill="{}" font-size="13" text-anchor="middle">—</text>"##,
+                wind_y + wind_row_h / 2.0 + 4.0,
+                th.dim
             )),
         }
     }
@@ -1805,9 +1977,10 @@ pub fn render_daily_svg(
     // PCPN row: bucket precipitation in inches, blue-scaled.
     let pcpn_y = wind_y + wind_row_h + 4.0;
     svg.push_str(&format!(
-        r##"<text x="{:.0}" y="{:.0}" fill="#9ea6a5" font-size="13" font-weight="700" text-anchor="end">PCPN</text>"##,
+        r##"<text x="{:.0}" y="{:.0}" fill="{}" font-size="13" font-weight="700" text-anchor="end">PCPN</text>"##,
         ml - 10.0,
         pcpn_y + pcpn_row_h / 2.0 + 5.0,
+        th.muted,
     ));
     for (index, day) in days.iter().enumerate() {
         let x = ml + index as f64 * col_w;
@@ -1816,12 +1989,12 @@ pub fn render_daily_svg(
                 let cell = if p >= 1.0 { "#b3e0ff" } else if p >= 0.5 { "#7cc0e8" } else if p >= 0.25 { "#4fa3d1" } else if p >= 0.1 { "#3b82b8" } else { "#2b5f7e" };
                 (cell, format!("{p:.2}"), text_on(cell))
             }
-            Some(_) => ("#161c1d", "0".to_string(), "#4a4f50"),
-            None => ("#161c1d", "—".to_string(), "#4a4f50"),
+            Some(_) => (th.empty.as_str(), "0".to_string(), th.dim.as_str()),
+            None => (th.empty.as_str(), "—".to_string(), th.dim.as_str()),
         };
         svg.push_str(&format!(
-            r##"<rect x="{x:.0}" y="{pcpn_y:.0}" width="{:.0}" height="{pcpn_row_h}" fill="{cell}" stroke="#0d1112" stroke-width="2"/>"##,
-            col_w
+            r##"<rect x="{x:.0}" y="{pcpn_y:.0}" width="{:.0}" height="{pcpn_row_h}" fill="{cell}" stroke="{}" stroke-width="2"/>"##,
+            col_w, th.paper
         ));
         svg.push_str(&format!(
             r##"<text x="{:.0}" y="{:.0}" fill="{text_color}" font-size="14" font-weight="700" text-anchor="middle">{text}</text>"##,
@@ -1832,21 +2005,25 @@ pub fn render_daily_svg(
 
     // Chart area + gridlines.
     svg.push_str(&format!(
-        r##"<rect x="{ml:.0}" y="{chart_top:.0}" width="{:.0}" height="{chart_h:.0}" fill="#111617" stroke="#2a2f30"/>"##,
-        col_w * n as f64
+        r##"<rect x="{ml:.0}" y="{chart_top:.0}" width="{:.0}" height="{chart_h:.0}" fill="{}" stroke="{}"/>"##,
+        col_w * n as f64,
+        th.plot,
+        th.frame
     ));
     let step = nice_step(axis_hi - axis_lo, 7);
     let mut tick = (axis_lo / step).ceil() * step;
     while tick <= axis_hi {
         let y = y_of(tick);
         svg.push_str(&format!(
-            r##"<line x1="{ml:.0}" y1="{y:.1}" x2="{:.1}" y2="{y:.1}" stroke="#22282a" stroke-width="1" stroke-dasharray="4,5"/>"##,
-            ml + col_w * n as f64
+            r##"<line x1="{ml:.0}" y1="{y:.1}" x2="{:.1}" y2="{y:.1}" stroke="{}" stroke-width="1" stroke-dasharray="4,5"/>"##,
+            ml + col_w * n as f64,
+            th.grid
         ));
         svg.push_str(&format!(
-            r##"<text x="{:.0}" y="{:.1}" fill="#737c7b" font-size="12" text-anchor="end">{}</text>"##,
+            r##"<text x="{:.0}" y="{:.1}" fill="{}" font-size="12" text-anchor="end">{}</text>"##,
             ml - 8.0,
             y + 4.0,
+            th.faint,
             fmt_val(tick)
         ));
         tick += step;
@@ -1877,14 +2054,16 @@ pub fn render_daily_svg(
                 let lo_x = x + col_w * 0.63;
                 let lo_y = y_of(lo);
                 svg.push_str(&format!(
-                    r##"<rect x="{lo_x:.1}" y="{lo_y:.1}" width="{lo_w:.1}" height="{:.1}" fill="{}" rx="3" stroke="#0d1112" stroke-width="1.5"/>"##,
+                    r##"<rect x="{lo_x:.1}" y="{lo_y:.1}" width="{lo_w:.1}" height="{:.1}" fill="{}" rx="3" stroke="{}" stroke-width="1.5"/>"##,
                     (base - lo_y).max(1.0),
-                    cell_color(lo)
+                    cell_color(lo),
+                    th.paper
                 ));
                 svg.push_str(&format!(
-                    r##"<text x="{:.1}" y="{:.1}" fill="#f6f5f1" font-size="{}" font-weight="800" text-anchor="middle">{}</text>"##,
+                    r##"<text x="{:.1}" y="{:.1}" fill="{}" font-size="{}" font-weight="800" text-anchor="middle">{}</text>"##,
                     lo_x + lo_w / 2.0,
                     lo_y - 7.0,
+                    th.ink,
                     if col_w < 100.0 { 12.0 } else { 14.0 },
                     fmt_val(lo)
                 ));
@@ -1894,14 +2073,18 @@ pub fn render_daily_svg(
             let lo_x = x + (col_w - lo_w) / 2.0;
             let lo_y = y_of(day.lo);
             svg.push_str(&format!(
-                r##"<rect x="{lo_x:.1}" y="{lo_y:.1}" width="{lo_w:.1}" height="{:.1}" fill="{}" rx="3" stroke="#0d1112" stroke-width="1.5"/>"##,
+                r##"<rect x="{lo_x:.1}" y="{lo_y:.1}" width="{lo_w:.1}" height="{:.1}" fill="{}" rx="3" stroke="{}" stroke-width="1.5"/>"##,
                 (base - lo_y).max(1.0),
-                cell_color(day.lo)
+                cell_color(day.lo),
+                th.paper
             ));
+            // This number sits ON the LO bar, so it contrasts against the data
+            // color rather than the paper — hence its own theme slot.
             svg.push_str(&format!(
-                r##"<text x="{:.1}" y="{:.1}" fill="#0d1112" font-size="14" font-weight="800" text-anchor="middle">{}</text>"##,
+                r##"<text x="{:.1}" y="{:.1}" fill="{}" font-size="14" font-weight="800" text-anchor="middle">{}</text>"##,
                 x + col_w / 2.0,
                 (lo_y + 17.0).min(base - 6.0),
+                th.bar_ink,
                 fmt_val(day.lo)
             ));
         }
@@ -1909,20 +2092,23 @@ pub fn render_daily_svg(
         // column in classic mode).
         let label_x = bar_x + bar_w / 2.0;
         svg.push_str(&format!(
-            r##"<text x="{label_x:.1}" y="{:.1}" fill="#f6f5f1" font-size="{}" font-weight="800" text-anchor="middle">{}</text>"##,
+            r##"<text x="{label_x:.1}" y="{:.1}" fill="{}" font-size="{}" font-weight="800" text-anchor="middle">{}</text>"##,
             hi_y - 8.0,
+            th.ink,
             if col_w < 100.0 { 13.5 } else { 17.0 },
             fmt_val(day.hi)
         ));
         // Day labels.
         svg.push_str(&format!(
-            r##"<text x="{label_x:.1}" y="{:.1}" fill="#f6f5f1" font-size="13.5" font-weight="700" text-anchor="middle">{}</text>"##,
+            r##"<text x="{label_x:.1}" y="{:.1}" fill="{}" font-size="13.5" font-weight="700" text-anchor="middle">{}</text>"##,
             chart_top + chart_h + 24.0,
+            th.ink,
             day.label_date
         ));
         svg.push_str(&format!(
-            r##"<text x="{label_x:.1}" y="{:.1}" fill="#9ea6a5" font-size="12.5" text-anchor="middle">{}</text>"##,
+            r##"<text x="{label_x:.1}" y="{:.1}" fill="{}" font-size="12.5" text-anchor="middle">{}</text>"##,
             chart_top + chart_h + 42.0,
+            th.muted,
             day.label_dow
         ));
     }
@@ -1939,9 +2125,15 @@ pub fn render_daily_svg(
     } else {
         "local time"
     };
+    let footer_note = if th.footer.is_empty() {
+        String::new()
+    } else {
+        format!(" | {}", xml_escape(&th.footer))
+    };
     svg.push_str(&format!(
-        r##"<text x="24" y="{:.0}" fill="#737c7b" font-size="11">{axis_note} (UTC{:+.0}) | {window_note} | WIND = max sustained, G = max gust (mph) | California Wildfire Tracking — Weather Lab</text>"##,
+        r##"<text x="24" y="{:.0}" fill="{}" font-size="11">{axis_note} (UTC{:+.0}) | {window_note} | WIND = max sustained, G = max gust (mph){footer_note}</text>"##,
         height - 14.0,
+        th.faint,
         request.utc_offset_hours
     ));
     // Extended range: gently dim and mark the columns >=8 days out, where
@@ -1954,16 +2146,19 @@ pub fn render_daily_svg(
             let top_y = 80.0;
             let bot_y = chart_top + chart_h;
             svg.push_str(&format!(
-                r##"<rect x="{bx:.1}" y="{top_y:.1}" width="{:.1}" height="{:.1}" fill="#0d1112" opacity="0.26"/>"##,
+                r##"<rect x="{bx:.1}" y="{top_y:.1}" width="{:.1}" height="{:.1}" fill="{}" opacity="0.26"/>"##,
                 rx - bx,
-                bot_y - top_y
+                bot_y - top_y,
+                th.paper
             ));
             svg.push_str(&format!(
-                r##"<line x1="{bx:.1}" y1="{top_y:.1}" x2="{bx:.1}" y2="{bot_y:.1}" stroke="#ff6a36" stroke-width="1.4" stroke-dasharray="5 4" opacity="0.7"/>"##
+                r##"<line x1="{bx:.1}" y1="{top_y:.1}" x2="{bx:.1}" y2="{bot_y:.1}" stroke="{}" stroke-width="1.4" stroke-dasharray="5 4" opacity="0.7"/>"##,
+                th.accent
             ));
             svg.push_str(&format!(
-                r##"<text x="{:.1}" y="78" fill="#ff8a5c" font-size="11" font-weight="700">▸ EXTENDED RANGE · LOWER CONFIDENCE</text>"##,
-                bx + 6.0
+                r##"<text x="{:.1}" y="78" fill="{}" font-size="11" font-weight="700">▸ EXTENDED RANGE · LOWER CONFIDENCE</text>"##,
+                bx + 6.0,
+                th.accent_soft
             ));
         }
     }
@@ -2171,5 +2366,64 @@ mod tests {
             );
         }
         assert!(apply_store_temp_units(StoreTempKind::None, 5.0, true).is_none());
+    }
+
+    #[test]
+    fn every_card_theme_is_distinct_and_complete() {
+        let mut papers: Vec<String> = Vec::new();
+        for name in CardTheme::names() {
+            let theme = CardTheme::named(name);
+            for (slot, value) in [
+                ("paper", &theme.paper),
+                ("ink", &theme.ink),
+                ("muted", &theme.muted),
+                ("faint", &theme.faint),
+                ("dim", &theme.dim),
+                ("empty", &theme.empty),
+                ("plot", &theme.plot),
+                ("frame", &theme.frame),
+                ("grid", &theme.grid),
+                ("accent", &theme.accent),
+                ("accent_soft", &theme.accent_soft),
+                ("bar_ink", &theme.bar_ink),
+            ] {
+                assert!(
+                    value.len() == 7
+                        && value.starts_with('#')
+                        && value[1..].chars().all(|c| c.is_ascii_hexdigit()),
+                    "theme {name} slot {slot} is not #rrggbb: {value}"
+                );
+            }
+            assert!(
+                !papers.contains(&theme.paper),
+                "theme {name} reuses another theme's paper color"
+            );
+            papers.push(theme.paper);
+        }
+        // Only the house style carries branding; an unbranded theme that leaked
+        // "CWT" or cafire.org onto someone else's card would be the whole point
+        // of the feature, missed.
+        for name in CardTheme::names().iter().filter(|n| **n != "cafire") {
+            let theme = CardTheme::named(name);
+            assert!(theme.brand.is_empty(), "{name} must not carry a brand prefix");
+            assert!(
+                !theme.credit.contains("cafire") && !theme.footer.contains("California"),
+                "{name} must not carry CAFire attribution"
+            );
+        }
+        // A typo in a shared link renders the default card rather than nothing.
+        assert_eq!(CardTheme::named("nonsense").brand, "CWT");
+        assert_eq!(CardTheme::default().paper, CardTheme::named("cafire").paper);
+    }
+
+    #[test]
+    fn the_generic_lab_offers_every_card_theme() {
+        let generic = include_str!("generic_lab.html");
+        for name in CardTheme::names() {
+            assert!(
+                generic.contains(&format!("value=\"{name}\"")),
+                "generic lab is missing the {name} card theme"
+            );
+        }
     }
 }

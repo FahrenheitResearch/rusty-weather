@@ -132,7 +132,7 @@
         <div class="bounds" id="boundsLabel" style="margin-top:6px"></div>
       </div>
 
-      <div class="card">
+      <div class="card" id="styleCard">
         <h2>Style</h2>
         <label class="field"><span>Basemap</span>
           <div class="seg" id="basemapSeg">
@@ -170,6 +170,50 @@
             <button data-tempunits="c">&deg;C</button>
           </div>
         </label>
+      </div>
+
+      <div class="card" id="cardBox" style="display:none">
+        <h2>Outlook card</h2>
+        <div class="row" style="margin-bottom:10px">
+          <label class="field" style="flex:1;margin:0"><span>lat</span>
+            <input type="number" id="cardLat" step="0.0001" value="38.5816" />
+          </label>
+          <label class="field" style="flex:1;margin:0"><span>lon</span>
+            <input type="number" id="cardLon" step="0.0001" value="-121.4944" />
+          </label>
+        </div>
+        <label class="field"><span>Place name (top right)</span>
+          <input type="text" id="cardTitle" placeholder="blank = the coordinates" maxlength="48" />
+        </label>
+        <label class="field"><span>Columns</span>
+          <div class="seg" id="cardStepSeg">
+            <button data-cardstep="day" class="on">Daily</button>
+            <button data-cardstep="6">6 h</button>
+            <button data-cardstep="3">3 h</button>
+            <button data-cardstep="1">1 h</button>
+          </div>
+        </label>
+        <div class="muted" id="cardStepNote" style="margin:-6px 0 10px"></div>
+        <label class="field"><span>Theme</span>
+          <select id="cardTheme">
+            <option value="slate">Slate — unbranded dark</option>
+            <option value="midnight">Midnight — violet accent</option>
+            <option value="paper">Paper — light</option>
+            <option value="ember">Ember — warm dark</option>
+            <option value="mono">Mono — grayscale chrome</option>
+            <option value="cafire">CAFire house style</option>
+          </select>
+        </label>
+        <label class="field" style="margin:0"><span>Accent</span>
+          <div class="row">
+            <input type="color" id="cardAccent" value="#4ea1ff"
+                   style="flex:0 0 52px;height:36px;padding:2px" />
+            <button class="btn secondary" id="cardAccentReset" style="flex:0 0 auto">theme default</button>
+          </div>
+        </label>
+        <p class="muted" style="margin:8px 0 0">The forecast colors never change —
+          they encode values. Theme sets the paper, text and accent. Day span
+          follows the model: HRRR ≈ 2 d, GFS ≈ 8 d, NBM ≈ 10 d.</p>
       </div>
 
       <div class="card">
@@ -598,6 +642,12 @@
         ["snow_hours_0_48h", "Snow hours 0-48 h"],
         ["freezing_rain_hours_0_48h", "Freezing-rain hours 0-48 h"],
       ] },
+    /* Point cards rather than maps: one column per local day (or per N-hour
+       bucket) for a single grid point, from /api/daily. The "products" here are
+       whatever 2-D variables the store actually holds, so the list is fetched
+       per model instead of being catalogued above. */
+    { key: "cards", label: "Outlook Cards", hourly: false, run: "latest", models: null,
+      card: true, products: [] },
   ];
   function famByKey(key) {
     for (var i = 0; i < FAMS.length; i++) { if (FAMS[i].key === key) return FAMS[i]; }
@@ -688,6 +738,7 @@
     basemap: "filled", values: false, density: 2, counties: true, tempUnits: "f",
     preset: "conus", bounds: DOMAINS[0][2], drawn: null,
     brand: "generic", brandTitle: "", brandCredit: "", logoDataUrl: null,
+    cardStep: "day", cardTheme: "slate", cardAccent: null,
   };
 
   var $ = function (id) { return document.getElementById(id); };
@@ -720,10 +771,32 @@
       radar: ["qpf_total"],
     },
   };
+  /* The card family's "products" are the store's own variables, so they can't
+     be catalogued at build time: fetch them per model, once, and refill the
+     picker when they land. */
+  var cardVars = {}, cardVarsPending = {};
+  async function loadCardVars(model) {
+    if (cardVars[model] || cardVarsPending[model]) return;
+    cardVarsPending[model] = true;
+    try {
+      var data = await fetch(API + "/api/vars?model=" + encodeURIComponent(model) + "&run=latest")
+        .then(function (r) { return r.json(); });
+      cardVars[model] = (data.vars || []).map(function (v) {
+        return [v.name, v.name.replace(/_/g, " ") + (v.units ? "  (" + v.units + ")" : "")];
+      });
+    } catch (err) {
+      cardVars[model] = [];
+      setStatus("err", "could not list " + model.toUpperCase() + " variables");
+    }
+    cardVarsPending[model] = false;
+    if (activeFam().card && state.model === model) fillProducts();
+  }
+
   /* Products for the active family, narrowed to the selected model. Families
      that pin `models` are HRRR-only by construction. */
   function famProducts() {
     var fam = activeFam();
+    if (fam.card) return cardVars[state.model] || [];
     if (state.model === "hrrr") return fam.products;
     var perModel = MODEL_PRODUCTS[state.model];
     if (!perModel || !(fam.key in perModel)) return [];
@@ -770,16 +843,81 @@
       el.disabled = !hourly;
       el.style.opacity = hourly ? "" : "0.35";
     });
-    $("hourLabel").textContent = hourly ? String(state.hour) : "whole run";
+    $("hourLabel").textContent = hourly ? String(state.hour)
+      : (activeFam().card ? "every hour in the run" : "whole run");
+  }
+
+  /* Cards are a point graphic, not a map: basemap, labels, counties and the
+     loop have nothing to act on, so hide/disable them rather than offering
+     controls that do nothing. */
+  function syncFamPanels() {
+    var fam = activeFam();
+    $("cardBox").style.display = fam.card ? "" : "none";
+    $("styleCard").style.display = fam.card ? "none" : "";
+    $("renderBtn").textContent = fam.card ? "Render card" : "Render plot";
+    var loop = $("loopBtn");
+    loop.disabled = !fam.hourly;
+    loop.style.opacity = fam.hourly ? "" : "0.4";
+    loop.title = fam.hourly ? "" : "this family renders a single frame";
+    if (fam.card) {
+      loadCardVars(state.model);
+      syncCardSteps();
+      setCardPoint(Number($("cardLat").value), Number($("cardLon").value));
+    } else if (cardMarker && map) {
+      map.removeLayer(cardMarker); cardMarker = null;
+    }
+  }
+
+  /* Column width can't be finer than the model's own storage cadence: GFS and
+     NBM land every 6 h, so 1-h and 3-h buckets would be empty. Same gating the
+     CAFire Lab uses. */
+  var MODEL_STEP_CADENCE_H = { hrrr: 1, gfs: 6, nbm: 6 };
+  function syncCardSteps() {
+    var cadence = MODEL_STEP_CADENCE_H[state.model] || 1;
+    var buttons = $("cardStepSeg").querySelectorAll("button");
+    var fellBack = false;
+    [].forEach.call(buttons, function (b) {
+      var step = b.getAttribute("data-cardstep");
+      var tooFine = step !== "day" && Number(step) < cadence;
+      b.disabled = tooFine;
+      b.style.opacity = tooFine ? "0.4" : "";
+      b.title = tooFine
+        ? state.model.toUpperCase() + " is stored every " + cadence + " h — " + step + "-h columns need hourly data"
+        : "";
+      if (tooFine && state.cardStep === step) fellBack = true;
+    });
+    if (fellBack) {
+      state.cardStep = "day";
+      [].forEach.call(buttons, function (b) {
+        b.classList.toggle("on", b.getAttribute("data-cardstep") === "day");
+      });
+    }
+    $("cardStepNote").textContent = cadence > 1
+      ? state.model.toUpperCase() + " publishes every " + cadence + " h — finer columns need an hourly model (HRRR)."
+      : "";
   }
 
   function fillProducts() {
+    var fam = activeFam();
     var list = famProducts();
     var sel = $("product"); sel.innerHTML = "";
+    // The card family's list arrives asynchronously, so an empty picker is a
+    // normal transient state here rather than a bug.
+    if (!list.length) {
+      var wait = document.createElement("option");
+      wait.value = ""; wait.textContent = fam.card ? "loading variables…" : "nothing available";
+      sel.appendChild(wait);
+      return;
+    }
     list.forEach(function (p) {
       var o = document.createElement("option"); o.value = p[0]; o.textContent = p[1]; sel.appendChild(o);
     });
-    if (!list.some(function (p) { return p[0] === state.product; })) state.product = list[0][0];
+    if (!list.some(function (p) { return p[0] === state.product; })) {
+      // Temperature is the card everyone wants first.
+      var prefer = fam.card && list.some(function (p) { return p[0] === "temperature_2m"; })
+        ? "temperature_2m" : list[0][0];
+      state.product = prefer;
+    }
     sel.value = state.product;
   }
 
@@ -820,9 +958,13 @@
 
   seg("famSeg", "fam", function (v) {
     state.fam = v;
-    syncModelAvailability(); fillProducts(); applyHourLimits(); syncHourNav();
+    syncModelAvailability(); syncFamPanels(); fillProducts(); applyHourLimits(); syncHourNav();
   });
-  seg("modelSeg", "model", function (v) { state.model = v; fillProducts(); applyHourLimits(); syncHourNav(); });
+  seg("modelSeg", "model", function (v) {
+    state.model = v;
+    if (activeFam().card) { loadCardVars(v); syncCardSteps(); }
+    fillProducts(); applyHourLimits(); syncHourNav();
+  });
   $("product").addEventListener("change", function (e) { state.product = e.target.value; });
   $("hour").addEventListener("input", function (e) { state.hour = Number(e.target.value); $("hourLabel").textContent = state.hour; });
   $("hourPrev").addEventListener("click", function () { stepHour(-1); });
@@ -851,12 +993,31 @@
   seg("countySeg", "county", function (v) { state.counties = v === "on"; });
   seg("tempUnitSeg", "tempunits", function (v) { state.tempUnits = v; });
 
+  // ---- outlook card controls ------------------------------------------------
+  seg("cardStepSeg", "cardstep", function (v) { state.cardStep = v; });
+  $("cardTheme").addEventListener("change", function (e) {
+    state.cardTheme = e.target.value;
+    // A theme's own accent is the sensible starting point after a switch, so
+    // drop any override rather than carrying the last theme's color over.
+    state.cardAccent = null;
+  });
+  $("cardAccent").addEventListener("input", function (e) { state.cardAccent = e.target.value; });
+  $("cardAccentReset").addEventListener("click", function () {
+    state.cardAccent = null;
+    setStatus("ok", "accent back to the theme default");
+  });
+  ["cardLat", "cardLon"].forEach(function (id) {
+    $(id).addEventListener("change", function () {
+      setCardPoint(Number($("cardLat").value), Number($("cardLon").value));
+    });
+  });
+
   seg("brandSeg", "brand", function (v) {
     state.brand = v;
     $("customBrand").style.display = v === "custom" ? "block" : "none";
-    var help = { generic: "Generic: small <code>wxsection.com</code> credit, no title.",
-      custom: "Custom: your title, credit, and optional logo in the banner strip.",
-      none: "None: blank banner strip (still croppable)." };
+    var help = { generic: "Generic: small <code>wxsection.com</code> credit, no title. Cards use the theme's own credit.",
+      custom: "Custom: your title, credit, and optional logo in the banner strip. On a card the title becomes the headline prefix and the credit the top-right line (the logo is map-only).",
+      none: "None: blank banner strip (still croppable); a card gets no credit line at all." };
     $("brandHelp").innerHTML = help[v];
   });
   $("brandTitle").addEventListener("input", function (e) { state.brandTitle = e.target.value; });
@@ -887,6 +1048,17 @@
 
   // ---- Leaflet map + draw ---------------------------------------------------
   var map = null, rectLayer = null, drawing = false, drawStart = null, tempRect = null;
+  /* The card's grid point. Declared with the map because a click sets it, but
+     the inputs stay authoritative so it works with the map absent. */
+  var cardMarker = null;
+  function setCardPoint(lat, lon) {
+    if (!isFinite(lat) || !isFinite(lon)) return;
+    $("cardLat").value = lat.toFixed(4); $("cardLon").value = lon.toFixed(4);
+    if (!map || !window.L) return;
+    if (cardMarker) map.removeLayer(cardMarker);
+    cardMarker = L.circleMarker([lat, lon], { radius: 6, color: "#4ea1ff", weight: 2,
+      fillColor: "#4ea1ff", fillOpacity: 0.55 }).addTo(map);
+  }
   function initMap() {
     if (!window.L) { $("drawBtn").disabled = true; return; }
     map = L.map("map", { zoomControl: true, scrollWheelZoom: false }).setView([39, -96], 4);
@@ -910,6 +1082,14 @@
       if (!drawing || !drawStart) return;
       var p = map.mouseEventToLatLng(ev);
       finishDraw(L.latLngBounds(drawStart, p)); drawStart = null;
+    });
+    // Cards are a point product: a click moves the point and re-renders, the
+    // same gesture the CAFire Lab uses. Box drawing still owns the map while
+    // it's armed.
+    map.on("click", function (ev) {
+      if (drawing || !activeFam().card) return;
+      setCardPoint(ev.latlng.lat, ev.latlng.lng);
+      render();
     });
     window.addEventListener("resize", function () { setTimeout(function () { map.invalidateSize(); }, 50); });
     setTimeout(function () { map.invalidateSize(); }, 200);
@@ -1041,6 +1221,48 @@
     if (state.logoDataUrl) b.logo_b64 = state.logoDataUrl;
     return b;
   }
+  /* /api/daily URL for the current card state. `format` is null for the SVG the
+     page displays, "png" for the copy/download raster.
+
+     The Branding card drives the card's byline as well as the maps': a custom
+     title becomes the headline prefix, a custom credit the top-right line, and
+     "None" clears both. Sending an EMPTY value is how the API is told to clear
+     one — omitting the parameter inherits the theme's own. */
+  function cardUrl(format) {
+    var lat = Number($("cardLat").value), lon = Number($("cardLon").value);
+    var title = ($("cardTitle").value || "").trim() || (lat.toFixed(3) + ", " + lon.toFixed(3));
+    var qs = new URLSearchParams({
+      lat: lat.toFixed(4), lon: lon.toFixed(4), model: state.model, run: "latest",
+      var: state.product, title: title, theme: state.cardTheme,
+    });
+    if (state.cardStep !== "day") qs.set("step", state.cardStep);
+    if (state.tempUnits === "c") qs.set("temp_units", "c");
+    if (state.cardAccent) qs.set("accent", state.cardAccent);
+    if (state.brand === "none") { qs.set("brand", ""); qs.set("credit", ""); qs.set("footer", ""); }
+    else if (state.brand === "custom") {
+      qs.set("brand", state.brandTitle.trim());
+      qs.set("credit", state.brandCredit.trim());
+    }
+    if (format) qs.set("format", format);
+    return API + "/api/daily?" + qs.toString();
+  }
+
+  async function renderCard(t0) {
+    if (!state.product) throw new Error("still loading the variable list — try again in a moment");
+    var resp = await fetch(cardUrl(null));
+    if (!resp.ok) {
+      var body = await resp.json().catch(function () { return {}; });
+      throw new Error(body.error || ("card request failed (" + resp.status + ")"));
+    }
+    var svg = await resp.text();
+    // Display the SVG (crisp at any zoom); copy and download take the server's
+    // PNG, which is what chat clients and documents accept.
+    var blobUrl = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
+    showImage(blobUrl, "outlook-" + state.product + ".png", cardUrl("png"));
+    setStatus("ok", "Card ready in " + ((performance.now() - t0) / 1000).toFixed(1) + "s");
+    $("renderMeta").textContent = state.model.toUpperCase() + " latest run";
+  }
+
   function buildPayload() {
     var fam = activeFam();
     // Non-hourly families anchor on the extended run's last hour: a 24-48 h
@@ -1073,6 +1295,7 @@
     setStatus("busy", "Rendering…");
     $("renderMeta").textContent = ""; var t0 = performance.now();
     try {
+      if (activeFam().card) return await renderCard(t0);
       var payload = buildPayload();
       var started = await fetch(API + "/api/render", {
         method: "POST", headers: { "content-type": "application/json" },
@@ -1103,15 +1326,18 @@
     } finally { busy = false; $("renderBtn").disabled = false; }
   }
 
-  function showImage(url, name) {
+  /* `rasterUrl` is what Download and Copy use when the displayed image isn't
+     itself a raster — cards display as SVG but must copy as PNG. */
+  function showImage(url, name, rasterUrl) {
     var v = $("viewer"); v.innerHTML = "";
     var img = new Image(); img.src = url; img.alt = name || "plot"; v.appendChild(img);
-    var dl = $("downloadBtn"); dl.href = url; dl.setAttribute("download", name || "wxsection.webp");
+    var grab = rasterUrl || url;
+    var dl = $("downloadBtn"); dl.href = grab; dl.setAttribute("download", name || "wxsection.webp");
     dl.style.pointerEvents = "auto"; dl.style.opacity = "1";
     var copy = $("copyImgBtn");
     if (copy) {
       copy.style.display = "";
-      copy.onclick = function () { copyPlotToClipboard(url, (name || "plot").replace(/\.\w+$/, "") + ".png"); };
+      copy.onclick = function () { copyPlotToClipboard(grab, (name || "plot").replace(/\.\w+$/, "") + ".png"); };
     }
   }
 
@@ -1157,8 +1383,17 @@
 
   $("renderBtn").addEventListener("click", render);
   $("copyLink").addEventListener("click", function () {
-    var qs = new URLSearchParams({ model: state.model, product: state.product, hour: state.hour,
-      domain: state.drawn ? state.drawn.join(",") : state.preset, brand: state.brand }).toString();
+    var params = { fam: state.fam, model: state.model, product: state.product, hour: state.hour,
+      domain: state.drawn ? state.drawn.join(",") : state.preset, brand: state.brand };
+    if (activeFam().card) {
+      params.lat = Number($("cardLat").value).toFixed(4);
+      params.lon = Number($("cardLon").value).toFixed(4);
+      params.step = state.cardStep;
+      params.theme = state.cardTheme;
+      if (state.cardAccent) params.accent = state.cardAccent;
+      if ($("cardTitle").value.trim()) params.ctitle = $("cardTitle").value.trim();
+    }
+    var qs = new URLSearchParams(params).toString();
     var link = location.origin + location.pathname + "?" + qs;
     navigator.clipboard && navigator.clipboard.writeText(link);
     setStatus("ok", "Share link copied.");
@@ -1167,6 +1402,11 @@
   // ---- deep link ------------------------------------------------------------
   function applyDeepLink() {
     var qs = new URLSearchParams(location.search);
+    var famKey = qs.get("fam");
+    if (famKey && FAMS.some(function (f) { return f.key === famKey; })) {
+      state.fam = famKey;
+      buildFamSeg(); syncModelAvailability();
+    }
     if (qs.get("model") && HOUR_LIMITS[qs.get("model")]) {
       state.model = qs.get("model");
       [].forEach.call($("modelSeg").querySelectorAll("button"), function (b) {
@@ -1187,12 +1427,29 @@
       [].forEach.call($("brandSeg").querySelectorAll("button"), function (b) {
         b.classList.toggle("on", b.getAttribute("data-brand") === state.brand); });
       $("customBrand").style.display = state.brand === "custom" ? "block" : "none"; }
+    // Card state. Harmless when the link isn't a card link.
+    if (isFinite(Number(qs.get("lat"))) && qs.get("lat") !== null) $("cardLat").value = Number(qs.get("lat")).toFixed(4);
+    if (isFinite(Number(qs.get("lon"))) && qs.get("lon") !== null) $("cardLon").value = Number(qs.get("lon")).toFixed(4);
+    if (qs.get("ctitle")) $("cardTitle").value = qs.get("ctitle");
+    var step = qs.get("step");
+    if (step && ["day", "1", "3", "6"].indexOf(step) !== -1) {
+      state.cardStep = step;
+      [].forEach.call($("cardStepSeg").querySelectorAll("button"), function (b) {
+        b.classList.toggle("on", b.getAttribute("data-cardstep") === step); });
+    }
+    var theme = qs.get("theme");
+    if (theme && [].some.call($("cardTheme").options, function (o) { return o.value === theme; })) {
+      state.cardTheme = theme; $("cardTheme").value = theme;
+    }
+    if (/^#[0-9a-fA-F]{6}$/.test(qs.get("accent") || "")) {
+      state.cardAccent = qs.get("accent"); $("cardAccent").value = state.cardAccent;
+    }
   }
 
   // ---- boot -----------------------------------------------------------------
   buildFamSeg(); syncModelAvailability(); syncHourNav();
   fillProducts(); applyHourLimits(); applyDeepLink(); syncHourNav();
-  initMap(); boundsLabel();
+  initMap(); boundsLabel(); syncFamPanels();
 })();
 </script>
 </body>

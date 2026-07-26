@@ -1139,6 +1139,7 @@ fn daily_response(query: &str, state: &AppState) -> Vec<u8> {
             .and_then(|v| v.parse::<u16>().ok())
             .filter(|v| matches!(v, 1 | 3 | 6 | 12)),
         fahrenheit: query_wants_fahrenheit(&query),
+        theme: card_theme_from_query(&query),
     };
     // `?format=png` returns a rasterized copy so the card can be shared /
     // "open image in new tab" / copied as a picture. The in-page display stays SVG.
@@ -2273,6 +2274,49 @@ fn query_wants_fahrenheit(query: &HashMap<String, String>) -> bool {
         .unwrap_or(false)
 }
 
+/// A short piece of caller-supplied card text (brand, credit, footer).
+///
+/// Present-but-empty is meaningful and must survive: `?credit=` is how a caller
+/// says "no attribution line", which is different from omitting the parameter
+/// and inheriting the theme's own. Control characters are dropped because the
+/// value is interpolated into SVG text.
+fn card_text_override(query: &HashMap<String, String>, key: &str) -> Option<String> {
+    query.get(key).map(|raw| {
+        raw.trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(48)
+            .collect::<String>()
+    })
+}
+
+/// Card chrome from the query: a named theme, then optional per-request
+/// overrides. Unknown theme names fall back to the branded default inside
+/// `CardTheme::named`, so a stale shared link still renders.
+fn card_theme_from_query(query: &HashMap<String, String>) -> meteogram::CardTheme {
+    let mut theme = meteogram::CardTheme::named(query.get("theme").map(String::as_str).unwrap_or(""));
+    if let Some(brand) = card_text_override(query, "brand") {
+        theme.brand = brand;
+    }
+    if let Some(credit) = card_text_override(query, "credit") {
+        theme.credit = credit;
+    }
+    if let Some(footer) = card_text_override(query, "footer") {
+        theme.footer = footer;
+    }
+    // A single accent drives both the place name and the extended-range marker;
+    // only `#rrggbb` is accepted so nothing can inject markup into a fill.
+    if let Some(accent) = query.get("accent").map(|raw| raw.trim()).filter(|raw| {
+        raw.len() == 7
+            && raw.starts_with('#')
+            && raw[1..].chars().all(|c| c.is_ascii_hexdigit())
+    }) {
+        theme.accent = accent.to_string();
+        theme.accent_soft = accent.to_string();
+    }
+    theme
+}
+
 fn default_temp_units() -> String {
     "f".to_string()
 }
@@ -3173,6 +3217,79 @@ mod run_alias_tests {
         let err = resolve_latest_run_for_hour(&store, "hrrr", "latest-day", Some(48))
             .expect_err("F048 is not stored anywhere");
         assert!(err.contains("F048"), "unhelpful message: {err}");
+    }
+}
+
+#[cfg(test)]
+mod card_theme_tests {
+    use super::*;
+
+    fn query(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn an_absent_theme_keeps_the_house_style() {
+        let theme = card_theme_from_query(&query(&[]));
+        assert_eq!(theme.brand, "CWT");
+        assert_eq!(theme.credit, "cafire.org/weather");
+        assert_eq!(theme.paper, "#0d1112");
+    }
+
+    #[test]
+    fn a_named_theme_replaces_the_palette_and_the_branding() {
+        let theme = card_theme_from_query(&query(&[("theme", "paper")]));
+        assert_eq!(theme.paper, "#f7f5f0");
+        assert!(theme.brand.is_empty(), "an unbranded theme carries no prefix");
+        assert!(theme.credit.is_empty());
+    }
+
+    /// Present-but-empty is how a caller says "drop this line"; omitting the
+    /// parameter has to keep inheriting the theme's own text, so the two cases
+    /// must not collapse into one.
+    #[test]
+    fn empty_overrides_clear_and_absent_ones_inherit() {
+        let cleared = card_theme_from_query(&query(&[("credit", ""), ("brand", "")]));
+        assert!(cleared.credit.is_empty() && cleared.brand.is_empty());
+        let inherited = card_theme_from_query(&query(&[("theme", "cafire")]));
+        assert_eq!(inherited.credit, "cafire.org/weather");
+        let replaced = card_theme_from_query(&query(&[
+            ("theme", "slate"),
+            ("brand", "ACME FIRE OPS"),
+            ("credit", "acme.example.com"),
+        ]));
+        assert_eq!(replaced.brand, "ACME FIRE OPS");
+        assert_eq!(replaced.credit, "acme.example.com");
+    }
+
+    #[test]
+    fn only_a_real_hex_accent_is_accepted() {
+        let good = card_theme_from_query(&query(&[("theme", "slate"), ("accent", "#ff00aa")]));
+        assert_eq!(good.accent, "#ff00aa");
+        assert_eq!(good.accent_soft, "#ff00aa");
+        for junk in ["red", "#ff0", "#gggggg", "\"/><script>", "#ff00aa11"] {
+            let theme = card_theme_from_query(&query(&[("theme", "slate"), ("accent", junk)]));
+            assert_eq!(
+                theme.accent,
+                meteogram::CardTheme::named("slate").accent,
+                "{junk} must not reach a fill attribute"
+            );
+        }
+    }
+
+    /// Card text lands inside SVG `<text>`, so control characters are dropped
+    /// and the length is bounded.
+    #[test]
+    fn card_text_is_sanitized_and_bounded() {
+        let theme = card_theme_from_query(&query(&[
+            ("brand", "  AC\nME\t  "),
+            ("credit", &"x".repeat(200)),
+        ]));
+        assert_eq!(theme.brand, "ACME");
+        assert_eq!(theme.credit.chars().count(), 48);
     }
 }
 
