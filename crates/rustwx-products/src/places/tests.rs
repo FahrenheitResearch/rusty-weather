@@ -655,10 +655,13 @@ fn region_and_city_labels_use_compact_names() {
 fn nearest_place_finds_the_hosting_town() {
     // The Census internal point of Sacramento city. Sacramento carries a
     // footprint, so a point inside it now describes as the city itself rather
-    // than "near" it — you are not near Sacramento, you are in it.
+    // than "near" it — you are not near Sacramento, you are in it. Its position
+    // is the footprint anchor (downtown), a few km from the Census point, which
+    // is the whole reason the anchor exists.
     let near = nearest_place(38.5677, -121.4682).expect("gazetteer is nonempty");
     assert_eq!(near.label, "Sacramento, CA");
-    assert!(near.distance_km < 1.0, "distance {}", near.distance_km);
+    assert!(near.inside_footprint, "the point is inside Sacramento");
+    assert!(near.distance_km < 5.0, "distance {}", near.distance_km);
     assert_eq!(near.describe(), "Sacramento, CA");
 
     // Ukiah, CA — and the gazetteer also knows Ukiah, OR as a distinct place.
@@ -776,7 +779,7 @@ fn a_footprint_does_not_swallow_its_neighbors() {
 #[test]
 fn every_city_footprint_matches_a_gazetteer_row() {
     let mut missing: Vec<String> = Vec::new();
-    for (name, state, radius) in CITY_FOOTPRINT_KM {
+    for (name, state, radius, anchor_lat, anchor_lon) in CITY_FOOTPRINTS {
         let hits = gazetteer()
             .iter()
             .filter(|place| place.name == *name && place.state == *state)
@@ -788,8 +791,155 @@ fn every_city_footprint_matches_a_gazetteer_row() {
             *radius > 0.0 && *radius < 60.0,
             "{name}, {state}: {radius} km is not a plausible city radius"
         );
+        // A transposed or mistyped anchor would silently relocate a city.
+        assert!(
+            (-90.0..=90.0).contains(anchor_lat) && (-180.0..=180.0).contains(anchor_lon),
+            "{name}, {state}: anchor ({anchor_lat}, {anchor_lon}) is not a coordinate"
+        );
     }
     assert!(missing.is_empty(), "footprints with no gazetteer row: {missing:#?}");
+}
+
+/// A footprint city takes its anchor as its position, so the anchor has to be in
+/// the right place: San Francisco's Census point is 50 km out among the
+/// Farallones, and using it made downtown resolve to "Daly City, CA".
+#[test]
+fn footprint_cities_are_anchored_on_themselves() {
+    for (name, state, _, anchor_lat, anchor_lon) in CITY_FOOTPRINTS {
+        let near = nearest_place(f64::from(*anchor_lat), f64::from(*anchor_lon))
+            .expect("gazetteer is nonempty");
+        assert_eq!(
+            near.label,
+            format!("{name}, {state}"),
+            "the anchor of {name}, {state} resolves to somewhere else"
+        );
+    }
+}
+
+/// The reported bug: a point on San Francisco read "Daly City, CA", because San
+/// Francisco city-county includes the Farallon Islands and its Census internal
+/// point (37.7272, -123.0322) is therefore 50 km out in the Pacific — 54 km from
+/// downtown, while Daly City's point is 8 km away.
+#[test]
+fn san_francisco_is_not_daly_city() {
+    for (lat, lon, label) in [
+        (37.7749, -122.4194, "downtown"),
+        (37.7599, -122.4148, "the Mission"),
+        (37.8020, -122.4180, "North Beach"),
+        (37.7694, -122.4862, "Golden Gate Park"),
+    ] {
+        let near = nearest_place(lat, lon).expect("gazetteer is nonempty");
+        assert_eq!(near.label, "San Francisco, CA", "{label} ({lat}, {lon})");
+    }
+    // And the neighbors still keep their own names.
+    for (lat, lon, expected) in [
+        (37.7017, -122.4650, "Daly City, CA"),
+        (37.6551, -122.3762, "South San Francisco, CA"),
+        (37.8044, -122.2712, "Oakland, CA"),
+        (37.8716, -122.2727, "Berkeley, CA"),
+        (37.7749, -122.4194 - 0.65, "Farallon Islands is open ocean"),
+    ] {
+        let near = nearest_place(lat, lon).expect("gazetteer is nonempty");
+        if expected.starts_with("Farallon") {
+            // 57 km offshore: whatever it resolves to must be honest about the
+            // distance rather than claiming the point is in a city.
+            assert!(!near.inside_footprint, "an offshore point is in no city");
+            continue;
+        }
+        assert_eq!(near.label, expected, "({lat}, {lon})");
+    }
+}
+
+/// GFS is global, so a point card can be raised anywhere — with a US-only
+/// gazetteer a London point read "3005 mi ENE of Lubec, ME".
+#[test]
+fn international_points_resolve_to_international_cities() {
+    for (lat, lon, expected) in [
+        (51.5072, -0.1276, "London, United Kingdom"),
+        (35.6895, 139.6917, "Tokyo, Japan"),
+        (48.8566, 2.3522, "Paris, France"),
+        (-33.8688, 151.2093, "Sydney, Australia"),
+        (64.1466, -21.9426, "Reykjavik, Iceland"),
+        (19.4326, -99.1332, "Mexico City, Mexico"),
+        (43.6532, -79.3832, "Toronto, Canada"),
+        (-1.2921, 36.8219, "Nairobi, Kenya"),
+        (28.6139, 77.2090, "New Delhi, India"),
+    ] {
+        let near = nearest_place(lat, lon).expect("gazetteer is nonempty");
+        assert_eq!(near.label, expected, "({lat}, {lon})");
+        assert!(
+            near.distance_km < 30.0,
+            "{} is {:.0} km away — the anchor is wrong",
+            near.label,
+            near.distance_km
+        );
+    }
+}
+
+/// The known limit, asserted so nobody "fixes" it by accident.
+///
+/// A district of a city is stored as an ordinary populated place with its own
+/// population, and telling one apart from an independent neighboring town needs
+/// boundary polygons the gazetteer does not carry. Big-city footprints beat the
+/// districts they contain (Paris over "Paris 04 Hotel-de-Ville") whenever the
+/// district's own point is not almost exactly under the query, but central
+/// Brasilia sits ~1 km from "Plano Piloto" and 5 km from Brasilia's anchor, so
+/// the district wins. That is a real name for that spot, and the alternative
+/// rules all break a case that matters more: a point 2 km from downtown Hoboken
+/// has to stay Hoboken rather than becoming New York.
+#[test]
+fn a_city_district_can_still_win_over_its_metro() {
+    let near = nearest_place(-15.7939, -47.8828).expect("gazetteer is nonempty");
+    assert!(
+        near.label.ends_with(", Brazil"),
+        "should at least be in the right country: {}",
+        near.label
+    );
+    assert!(near.distance_km < 5.0, "and genuinely local: {}", near.distance_km);
+    // Brasilia itself still resolves from its own anchor.
+    let city = nearest_place(-15.7797, -47.9297).expect("gazetteer is nonempty");
+    assert_eq!(city.label, "Brasilia, Brazil");
+}
+
+/// The second column is a country name for international rows, never a
+/// two-letter code: "London, CA" would read as California when it means Ontario,
+/// and CA/MO/MD/ME/LA/DE/IN/AL/PA/MT/NE/IL/VA all collide with USPS states.
+#[test]
+fn international_rows_are_labelled_with_country_names() {
+    let ambiguous = ["CA", "MO", "MD", "ME", "LA", "DE", "IN", "AL", "PA", "MT", "NE", "IL", "VA"];
+    let london_ontario = nearest_place(42.9834, -81.2330).expect("gazetteer is nonempty");
+    assert_eq!(london_ontario.label, "London, Canada");
+    // Nothing in the world file may use a bare two-letter code as its region.
+    let bad: Vec<&str> = WORLD_GAZETTEER_TSV
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split('\t').nth(1))
+        .filter(|region| ambiguous.contains(region))
+        .collect();
+    assert!(bad.is_empty(), "world rows using a state-like code: {bad:?}");
+}
+
+/// US answers must not drift now that 57k international places share the search.
+#[test]
+fn adding_the_world_does_not_move_us_answers() {
+    for (lat, lon, expected) in [
+        (38.5677, -121.4682, "Sacramento, CA"),
+        (39.15, -123.21, "Ukiah, CA"),
+        (40.7580, -73.9855, "New York, NY"),
+        (34.0522, -118.2437, "Los Angeles, CA"),
+        (41.8781, -87.6298, "Chicago, IL"),
+        (47.6062, -122.3321, "Seattle, WA"),
+    ] {
+        let near = nearest_place(lat, lon).expect("gazetteer is nonempty");
+        assert_eq!(near.label, expected, "({lat}, {lon})");
+    }
+    // A border point resolves across the border when that is genuinely nearer:
+    // Tijuana is a real answer for a point in Tijuana.
+    let tijuana = nearest_place(32.5149, -117.0382).expect("gazetteer is nonempty");
+    assert_eq!(tijuana.label, "Tijuana, Mexico");
+    // ...while San Diego proper stays San Diego.
+    let san_diego = nearest_place(32.7157, -117.1647).expect("gazetteer is nonempty");
+    assert_eq!(san_diego.label, "San Diego, CA");
 }
 
 /// Ordinary places keep the old behavior: distance to the single point, and the

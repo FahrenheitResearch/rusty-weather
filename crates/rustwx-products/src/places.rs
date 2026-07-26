@@ -622,85 +622,170 @@ pub fn micro_us_place_presets() -> &'static [PlacePreset] {
 /// point-product "nearest town" readouts; the curated preset tiers
 /// above remain the map-label catalog (label density, not coverage).
 const GAZETTEER_TSV: &str = include_str!("places/us_places_gazetteer.tsv");
+/// International cities, from GeoNames (CC BY 4.0 — see the file header).
+const WORLD_GAZETTEER_TSV: &str = include_str!("places/world_cities_gazetteer.tsv");
 
 struct GazetteerPlace {
     name: &'static str,
     state: &'static str,
     lat: f32,
     lon: f32,
-    /// Footprint radius in km from `CITY_FOOTPRINT_KM`; 0 for the ordinary
-    /// places that are treated as points.
+    /// Footprint radius in km from `CITY_FOOTPRINTS`; 0 for the ordinary places
+    /// that are treated as points. When set, `lat`/`lon` are that table's anchor
+    /// rather than the Census internal point.
     footprint_km: f32,
 }
 
-/// Footprint radius (km) for cities large enough that the gazetteer's single
-/// reference point is nowhere near much of the city.
+/// Cities big enough that one reference point does not locate them, with the
+/// radius of the disc used to decide "is this point in that city" and the anchor
+/// that disc is centered on: `(name, state, radius_km, anchor_lat, anchor_lon)`.
 ///
-/// The gazetteer stores one Census "internal point" per place, so a pure
-/// nearest-point search answers Manhattan with **Hoboken**: New York City's
-/// internal point sits in BROOKLYN, 13 km from midtown, while Hoboken's is 6 km
-/// away across the Hudson. Nothing in the data says how big a city is, so this
-/// table says it.
+/// TWO separate problems live here.
 ///
-/// Each radius is about 0.9·sqrt(land_area/π) — deliberately UNDER the true
-/// extent, because over-claiming (labelling Newark as New York) is worse than
-/// under-claiming (falling back to today's nearest-point answer). Cities are
-/// not discs, so this is an approximation on purpose; it only has to be good
-/// enough to beat a small town on the other side of a river.
-const CITY_FOOTPRINT_KM: &[(&str, &str, f32)] = &[
-    ("New York", "NY", 14.0),
-    ("Los Angeles", "CA", 18.0),
-    ("Chicago", "IL", 13.0),
-    ("Houston", "TX", 21.0),
-    ("Phoenix", "AZ", 19.0),
-    ("San Antonio", "TX", 18.0),
-    ("San Diego", "CA", 15.0),
-    ("Dallas", "TX", 15.0),
-    ("Jacksonville", "FL", 22.0),
-    ("Austin", "TX", 15.0),
-    ("Fort Worth", "TX", 15.0),
-    ("Indianapolis", "IN", 16.0),
-    ("Columbus", "OH", 12.0),
-    ("Charlotte", "NC", 14.0),
-    ("Oklahoma City", "OK", 20.0),
-    ("Nashville-Davidson", "TN", 19.0),
-    ("Denver", "CO", 10.0),
-    ("Seattle", "WA", 8.0),
-    ("Portland", "OR", 10.0),
-    ("Las Vegas", "NV", 10.0),
-    ("Memphis", "TN", 14.0),
-    ("Louisville", "KY", 15.0),
-    ("Kansas City", "MO", 15.0),
-    ("Atlanta", "GA", 10.0),
-    ("Miami", "FL", 5.0),
-    ("Philadelphia", "PA", 10.0),
-    ("Tucson", "AZ", 13.0),
-    ("Albuquerque", "NM", 11.0),
-    ("Fresno", "CA", 9.0),
-    ("Sacramento", "CA", 8.0),
-    ("San Jose", "CA", 11.0),
-    ("Anchorage", "AK", 25.0),
-    ("Boston", "MA", 6.0),
-    ("Detroit", "MI", 10.0),
-    ("Baltimore", "MD", 8.0),
-    ("Milwaukee", "WI", 8.0),
-    ("Minneapolis", "MN", 6.0),
-    ("Tampa", "FL", 11.0),
-    ("New Orleans", "LA", 11.0),
-    ("Tulsa", "OK", 11.0),
-    ("Wichita", "KS", 10.0),
-    ("El Paso", "TX", 13.0),
-    ("Colorado Springs", "CO", 11.0),
-    ("Omaha", "NE", 9.0),
-    ("Raleigh", "NC", 10.0),
-    ("Virginia Beach", "VA", 13.0),
-    ("Cleveland", "OH", 7.0),
-    ("Salt Lake City", "UT", 9.0),
-    ("St. Louis", "MO", 7.0),
-    ("Pittsburgh", "PA", 6.0),
-    ("Cincinnati", "OH", 7.0),
-    ("Orlando", "FL", 9.0),
-    ("Urban Honolulu", "HI", 8.0),
+/// 1. The gazetteer holds ONE Census "internal point" per place, and a point
+///    only has to fall inside the polygon. New York City's lands in BROOKLYN,
+///    13 km from midtown, so a Manhattan click resolved to "Hoboken, NJ" — 6 km
+///    away across the Hudson. A radius fixes that.
+///
+/// 2. The internal point can be nowhere near the city at all. San Francisco's is
+///    50 km out in the PACIFIC, among the Farallon Islands the city-county takes
+///    in, so downtown resolved to "Daly City, CA" and no radius centered on that
+///    point could ever have contained the city. Anchorage's is 33 km off, Corpus
+///    Christi's 22, New Orleans' 17. So the disc is centered on its own anchor —
+///    GeoNames' populated-place point, i.e. downtown — not on the Census point,
+///    and that anchor also replaces the row's coordinates so reported distances
+///    and bearings refer to the city rather than to an offshore rock.
+///
+/// Radii are about 0.9·sqrt(land_area/π): deliberately UNDER the true extent,
+/// because over-claiming (Newark reading as New York) is worse than falling back
+/// to the plain nearest-point answer. Cities are not discs; this only has to
+/// beat a small town on the other side of a river.
+///
+/// Generated by `tools/make_city_footprints.py` (radii are hand-set there);
+/// `every_city_footprint_matches_a_gazetteer_row` fails the build if a name
+/// stops matching the Census spelling.
+const CITY_FOOTPRINTS: &[(&str, &str, f32, f32, f32)] = &[
+    ("Anchorage", "AK", 25.0, 61.2181, -149.9003),
+    ("Birmingham", "AL", 14.0, 33.5207, -86.8025),
+    ("Huntsville", "AL", 14.0, 34.7304, -86.5859),
+    ("Mobile", "AL", 11.0, 30.6944, -88.0430),
+    ("Little Rock", "AR", 12.0, 34.7465, -92.2896),
+    ("Chandler", "AZ", 9.0, 33.3062, -111.8413),
+    ("Flagstaff", "AZ", 8.0, 35.1981, -111.6513),
+    ("Mesa", "AZ", 11.0, 33.4223, -111.8226),
+    ("Phoenix", "AZ", 19.0, 33.4484, -112.0740),
+    ("Tucson", "AZ", 13.0, 32.2217, -110.9265),
+    ("Anaheim", "CA", 8.0, 33.8353, -117.9145),
+    ("Bakersfield", "CA", 11.0, 35.3733, -119.0187),
+    ("Chico", "CA", 7.0, 39.7285, -121.8375),
+    ("Fresno", "CA", 9.0, 36.7477, -119.7724),
+    ("Long Beach", "CA", 8.0, 33.7670, -118.1892),
+    ("Los Angeles", "CA", 18.0, 34.0522, -118.2437),
+    ("Oakland", "CA", 7.0, 37.8044, -122.2708),
+    ("Redding", "CA", 8.0, 40.5865, -122.3917),
+    ("Riverside", "CA", 9.0, 33.9534, -117.3962),
+    ("Sacramento", "CA", 8.0, 38.5816, -121.4944),
+    ("San Diego", "CA", 15.0, 32.7157, -117.1647),
+    ("San Francisco", "CA", 6.0, 37.7749, -122.4194),
+    ("San Jose", "CA", 11.0, 37.3394, -121.8950),
+    ("Santa Ana", "CA", 6.0, 33.7456, -117.8678),
+    ("Stockton", "CA", 8.0, 37.9577, -121.2908),
+    ("Aurora", "CO", 12.0, 39.7294, -104.8319),
+    ("Colorado Springs", "CO", 11.0, 38.8339, -104.8214),
+    ("Denver", "CO", 10.0, 39.7392, -104.9847),
+    ("Fort Collins", "CO", 9.0, 40.5853, -105.0844),
+    ("Grand Junction", "CO", 6.0, 39.0639, -108.5507),
+    ("Washington", "DC", 8.0, 38.8951, -77.0364),
+    ("Jacksonville", "FL", 22.0, 30.3322, -81.6556),
+    ("Miami", "FL", 5.0, 25.7743, -80.1937),
+    ("Orlando", "FL", 9.0, 28.5383, -81.3792),
+    ("Tampa", "FL", 11.0, 27.9475, -82.4584),
+    ("Atlanta", "GA", 10.0, 33.7490, -84.3880),
+    ("Augusta-Richmond County", "GA", 15.0, 33.4710, -81.9748),
+    ("Columbus", "GA", 14.0, 32.4610, -84.9877),
+    ("Savannah", "GA", 9.0, 32.0835, -81.0998),
+    ("Urban Honolulu", "HI", 8.0, 21.3069, -157.8583),
+    ("Des Moines", "IA", 9.0, 41.6005, -93.6091),
+    ("Boise City", "ID", 9.0, 43.6135, -116.2035),
+    ("Chicago", "IL", 13.0, 41.8500, -87.6500),
+    ("Fort Wayne", "IN", 10.0, 41.1306, -85.1289),
+    ("Indianapolis", "IN", 16.0, 39.7684, -86.1580),
+    ("Wichita", "KS", 10.0, 37.6922, -97.3375),
+    ("Lexington-Fayette", "KY", 17.0, 37.9887, -84.4777),
+    ("Louisville", "KY", 15.0, 38.2542, -85.7594),
+    ("Baton Rouge", "LA", 10.0, 30.4433, -91.1875),
+    ("New Orleans", "LA", 11.0, 29.9547, -90.0751),
+    ("Shreveport", "LA", 11.0, 32.5251, -93.7502),
+    ("Boston", "MA", 6.0, 42.3584, -71.0598),
+    ("Baltimore", "MD", 8.0, 39.2904, -76.6122),
+    ("Detroit", "MI", 10.0, 42.3314, -83.0457),
+    ("Minneapolis", "MN", 6.0, 44.9800, -93.2638),
+    ("St. Paul", "MN", 6.0, 44.9444, -93.0933),
+    ("Kansas City", "MO", 15.0, 39.0997, -94.5786),
+    ("Springfield", "MO", 9.0, 37.2153, -93.2982),
+    ("St. Louis", "MO", 7.0, 38.6273, -90.1979),
+    ("Jackson", "MS", 12.0, 32.2988, -90.1848),
+    ("Billings", "MT", 8.0, 45.7833, -108.5007),
+    ("Missoula", "MT", 7.0, 46.8721, -113.9940),
+    ("Charlotte", "NC", 14.0, 35.2271, -80.8431),
+    ("Fayetteville", "NC", 11.0, 35.0527, -78.8784),
+    ("Greensboro", "NC", 11.0, 36.0726, -79.7920),
+    ("Raleigh", "NC", 10.0, 35.7721, -78.6386),
+    ("Bismarck", "ND", 7.0, 46.8083, -100.7837),
+    ("Fargo", "ND", 9.0, 46.8772, -96.7898),
+    ("Lincoln", "NE", 9.0, 40.8000, -96.6670),
+    ("Omaha", "NE", 9.0, 41.2563, -95.9404),
+    ("Newark", "NJ", 5.0, 40.7357, -74.1724),
+    ("Albuquerque", "NM", 11.0, 35.0845, -106.6511),
+    ("Santa Fe", "NM", 8.0, 35.6870, -105.9378),
+    ("Las Vegas", "NV", 10.0, 36.1750, -115.1372),
+    ("Reno", "NV", 9.0, 39.5296, -119.8138),
+    ("Buffalo", "NY", 6.0, 42.8865, -78.8784),
+    ("New York", "NY", 14.0, 40.7143, -74.0060),
+    ("Rochester", "NY", 6.0, 43.1548, -77.6156),
+    ("Cincinnati", "OH", 7.0, 39.1271, -84.5144),
+    ("Cleveland", "OH", 7.0, 41.4995, -81.6954),
+    ("Columbus", "OH", 12.0, 39.9612, -82.9988),
+    ("Toledo", "OH", 9.0, 41.6639, -83.5552),
+    ("Oklahoma City", "OK", 20.0, 35.4676, -97.5164),
+    ("Tulsa", "OK", 11.0, 36.1540, -95.9928),
+    ("Bend", "OR", 7.0, 44.0582, -121.3153),
+    ("Eugene", "OR", 8.0, 44.0521, -123.0867),
+    ("Medford", "OR", 6.0, 42.3265, -122.8756),
+    ("Portland", "OR", 10.0, 45.5234, -122.6762),
+    ("Salem", "OR", 8.0, 44.9429, -123.0351),
+    ("Philadelphia", "PA", 10.0, 39.9524, -75.1636),
+    ("Pittsburgh", "PA", 6.0, 40.4406, -79.9959),
+    ("Charleston", "SC", 10.0, 32.7763, -79.9327),
+    ("Sioux Falls", "SD", 9.0, 43.5437, -96.7280),
+    ("Chattanooga", "TN", 11.0, 35.0456, -85.3097),
+    ("Knoxville", "TN", 10.0, 35.9606, -83.9207),
+    ("Memphis", "TN", 14.0, 35.1495, -90.0490),
+    ("Nashville-Davidson", "TN", 19.0, 36.1659, -86.7844),
+    ("Arlington", "TX", 8.0, 32.7357, -97.1081),
+    ("Austin", "TX", 15.0, 30.2672, -97.7431),
+    ("Corpus Christi", "TX", 11.0, 27.8006, -97.3964),
+    ("Dallas", "TX", 15.0, 32.7831, -96.8067),
+    ("El Paso", "TX", 13.0, 31.7587, -106.4869),
+    ("Fort Worth", "TX", 15.0, 32.7254, -97.3208),
+    ("Houston", "TX", 21.0, 29.7633, -95.3633),
+    ("Laredo", "TX", 10.0, 27.5064, -99.5075),
+    ("Lubbock", "TX", 9.0, 33.5779, -101.8552),
+    ("San Antonio", "TX", 18.0, 29.4241, -98.4936),
+    ("Provo", "UT", 7.0, 40.2338, -111.6585),
+    ("Salt Lake City", "UT", 9.0, 40.7608, -111.8911),
+    ("Chesapeake", "VA", 17.0, 36.8190, -76.2749),
+    ("Newport News", "VA", 9.0, 36.9804, -76.4297),
+    ("Norfolk", "VA", 8.0, 36.8468, -76.2852),
+    ("Richmond", "VA", 8.0, 37.5538, -77.4603),
+    ("Suffolk", "VA", 19.0, 36.7284, -76.5850),
+    ("Virginia Beach", "VA", 13.0, 36.8529, -75.9780),
+    ("Seattle", "WA", 8.0, 47.6062, -122.3321),
+    ("Spokane", "WA", 8.0, 47.6597, -117.4291),
+    ("Tacoma", "WA", 8.0, 47.2529, -122.4443),
+    ("Madison", "WI", 9.0, 43.0731, -89.4012),
+    ("Milwaukee", "WI", 8.0, 43.0389, -87.9065),
+    ("Cheyenne", "WY", 7.0, 41.1400, -104.8203),
 ];
 
 /// How much being inside a city's footprint discounts its distance: 5×. Enough
@@ -708,27 +793,55 @@ const CITY_FOOTPRINT_KM: &[(&str, &str, f32)] = &[
 /// that standing in downtown Hoboken still reads as Hoboken.
 const INSIDE_FOOTPRINT_DISCOUNT: f64 = 0.2;
 
+/// Every place the renderer can name, US and international.
+///
+/// Two source files, one list: the Census file for the US (every incorporated
+/// place and CDP, ~32k) and GeoNames for the rest of the world (~57k cities of
+/// 5,000+). GFS is global, so a point card can be raised anywhere on Earth — and
+/// with only the US file a London point read "3005 mi ENE of Lubec, ME", which is
+/// technically true and completely useless.
+///
+/// The second column is a USPS state for US rows and a COUNTRY NAME for the
+/// rest, so labels read "Sacramento, CA" and "London, United Kingdom". Country
+/// names rather than ISO2 codes because half the codes collide with state
+/// abbreviations — "London, CA" would read as California when it means Ontario.
 fn gazetteer() -> &'static [GazetteerPlace] {
     use std::sync::OnceLock;
     static CELL: OnceLock<Vec<GazetteerPlace>> = OnceLock::new();
     CELL.get_or_init(|| {
-        let footprints: BTreeMap<(&str, &str), f32> = CITY_FOOTPRINT_KM
+        let footprints: BTreeMap<(&str, &str), (f32, f32, f32)> = CITY_FOOTPRINTS
             .iter()
-            .map(|(name, state, radius)| ((*name, *state), *radius))
+            .map(|(name, state, radius, lat, lon)| ((*name, *state), (*radius, *lat, *lon)))
             .collect();
-        GAZETTEER_TSV
-            .lines()
+        [GAZETTEER_TSV, WORLD_GAZETTEER_TSV]
+            .iter()
+            .flat_map(|text| text.lines())
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .filter_map(|line| {
                 let mut fields = line.split('\t');
                 let name = fields.next()?;
                 let state = fields.next()?;
+                let lat: f32 = fields.next()?.parse().ok()?;
+                let lon: f32 = fields.next()?.parse().ok()?;
+                // Optional 5th column: the world file carries a footprint radius
+                // for big cities (derived from population, see its header); the
+                // US file has four columns and relies on CITY_FOOTPRINTS below.
+                let file_footprint_km: f32 = fields
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0.0);
+                // A curated footprint city uses its own anchor as its position:
+                // the Census internal point can be offshore (see CITY_FOOTPRINTS).
+                let (footprint_km, lat, lon) = match footprints.get(&(name, state)) {
+                    Some((radius, anchor_lat, anchor_lon)) => (*radius, *anchor_lat, *anchor_lon),
+                    None => (file_footprint_km, lat, lon),
+                };
                 Some(GazetteerPlace {
                     name,
                     state,
-                    lat: fields.next()?.parse().ok()?,
-                    lon: fields.next()?.parse().ok()?,
-                    footprint_km: footprints.get(&(name, state)).copied().unwrap_or(0.0),
+                    lat,
+                    lon,
+                    footprint_km,
                 })
             })
             .collect()
@@ -801,7 +914,7 @@ pub fn nearest_place(lat: f64, lon: f64) -> Option<NearestPlace> {
 }
 
 /// True when the point is inside this place's footprint (see
-/// `CITY_FOOTPRINT_KM`). Places without a footprint are points, so never.
+/// `CITY_FOOTPRINTS`). Places without a footprint are points, so never.
 fn within_footprint(place: &GazetteerPlace, lat: f64, lon: f64, coslat: f64) -> bool {
     if place.footprint_km <= 0.0 {
         return false;

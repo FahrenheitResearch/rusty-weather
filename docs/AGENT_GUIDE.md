@@ -356,7 +356,20 @@ systemctl restart rusty-wx-api
   the card then references `&logo=<id>` and embeds it as a `data:` URI so the
   SVG stays one self-contained document. `card_logo_path` is the only thing
   between that query parameter and the filesystem — keep it strict.
-- **Place naming knows how big a city is** (`CITY_FOOTPRINT_KM` in places.rs).
+- **Place naming is global, from two files.** `us_places_gazetteer.tsv` (Census,
+  public domain, ~32k places) plus `world_cities_gazetteer.tsv` (GeoNames
+  cities5000, **CC BY 4.0 — keep the attribution in the file header**, ~57k
+  cities in 244 countries). GFS is global, so a card can be raised anywhere, and
+  with only the US file a London point read "3005 mi ENE of Lubec, ME". The
+  second column is a USPS state for US rows and a COUNTRY NAME for the rest —
+  never an ISO2 code, because CA/MO/MD/ME/LA/DE/IN/AL/PA/MT/NE/IL/VA all collide
+  with state abbreviations and "London, CA" would read as California. Regenerate
+  with `tools/make_world_gazetteer.py` (needs the GeoNames zip + countryInfo.txt).
+  Known limit, pinned by `a_city_district_can_still_win_over_its_metro`: a
+  district of a city is just another populated place in the data, so central
+  Brasilia resolves to "Plano Piloto" — separating a district from an
+  independent neighbor needs boundary polygons we do not carry.
+- **Place naming knows how big a city is** (`CITY_FOOTPRINTS` in places.rs).
   The gazetteer holds ONE Census internal point per place and New York City's is
   in **Brooklyn**, so a Manhattan point used to resolve to "Hoboken, NJ" — 6 km
   away across the Hudson versus 13 km to the city's own point. Cities in that
@@ -365,6 +378,17 @@ systemctl restart rusty-wx-api
   rather than "8 mi N of New York, NY". Radii are deliberately UNDER the true
   extent — over-claiming (Newark reading as New York) is worse than falling back
   to the old nearest-point answer.
+  **The anchor matters as much as the radius.** A Census internal point only has
+  to fall inside the polygon: San Francisco's is 50 km out in the Pacific among
+  the Farallon Islands the city-county takes in, so downtown resolved to "Daly
+  City, CA" and no radius centered there could have helped. Anchorage's is 33 km
+  off, Corpus Christi's 22, New Orleans' 17. Each table row therefore carries its
+  own anchor (GeoNames' downtown point), which also REPLACES the row's
+  coordinates so distances and bearings refer to the city. Regenerate with
+  `tools/make_city_footprints.py`; radii are hand-set in that script and
+  `footprint_cities_are_anchored_on_themselves` fails the build if an anchor ever
+  resolves to a different place. The world file carries its own footprint column,
+  derived from population, so a big city beats its own subdivisions.
 - **Fast card iteration without a deploy or a full store:** hardlink one stored
   hour into a throwaway store so the card has hours to walk, and point a local
   API at it — no copy, no disk cost.
