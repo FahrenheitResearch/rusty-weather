@@ -664,6 +664,12 @@
        per model instead of being catalogued above. */
     { key: "cards", label: "Outlook Cards", hourly: false, run: "latest", models: null,
       card: true, products: [] },
+    /* Skew-T soundings: a point product like the cards, but hourly, and the
+       only family that needs the stored isobaric VOLUMES rather than 2-D
+       fields -- GFS and NBM answer "this hour predates vertical-volume
+       storage", so it is pinned to HRRR the way Fire Wx and Severe are. */
+    { key: "sounding", label: "Sounding", hourly: true, run: "latest", models: ["hrrr"],
+      point: true, products: [["skewt", "Skew-T + hodograph + indices"]] },
   ];
   function famByKey(key) {
     for (var i = 0; i < FAMS.length; i++) { if (FAMS[i].key === key) return FAMS[i]; }
@@ -871,16 +877,32 @@
      controls that do nothing. */
   function syncFamPanels() {
     var fam = activeFam();
-    $("cardBox").style.display = fam.card ? "" : "none";
-    $("styleCard").style.display = fam.card ? "none" : "";
-    $("renderBtn").textContent = fam.card ? "Render card" : "Render plot";
+    // Cards and soundings are both POINT products and share the same point.
+    var pointy = !!(fam.card || fam.point);
+    $("cardBox").style.display = pointy ? "" : "none";
+    $("styleCard").style.display = pointy ? "none" : "";
+    $("renderBtn").textContent = fam.card ? "Render card"
+      : (fam.point ? "Render sounding" : "Render plot");
+    // Card-only controls: a sounding has no columns, theme or variable list.
+    ["cardStepSeg", "cardStepNote", "cardTheme", "cardAccent", "cardAccentReset", "cardTitle"]
+      .forEach(function (id) {
+        var el = $(id);
+        if (!el) return;
+        var row = el.closest("label.field") || el.closest(".row") || el;
+        row.style.display = fam.card ? "" : "none";
+      });
     var loop = $("loopBtn");
-    loop.disabled = !fam.hourly;
-    loop.style.opacity = fam.hourly ? "" : "0.4";
-    loop.title = fam.hourly ? "" : "this family renders a single frame";
+    // The loop builder drives /api/render (map jobs), so a point product cannot
+    // use it even when its hours are steppable.
+    var loopable = fam.hourly && !fam.point;
+    loop.disabled = !loopable;
+    loop.style.opacity = loopable ? "" : "0.4";
+    loop.title = loopable ? "" : "loops cover map products only";
     if (fam.card) {
       loadCardVars(state.model);
       syncCardSteps();
+    }
+    if (pointy) {
       setCardPoint(Number($("cardLat").value), Number($("cardLon").value));
     } else if (cardMarker && map) {
       map.removeLayer(cardMarker); cardMarker = null;
@@ -925,6 +947,7 @@
     if (!list.length) {
       var wait = document.createElement("option");
       wait.value = ""; wait.textContent = fam.card ? "loading variables…" : "nothing available";
+      state.product = "";
       sel.appendChild(wait);
       return;
     }
@@ -1116,7 +1139,8 @@
     // same gesture the CAFire Lab uses. Box drawing still owns the map while
     // it's armed.
     map.on("click", function (ev) {
-      if (drawing || !activeFam().card) return;
+      var fam = activeFam();
+      if (drawing || !(fam.card || fam.point)) return;
       setCardPoint(ev.latlng.lat, ev.latlng.lng);
       render();
     });
@@ -1344,6 +1368,39 @@
     return API + "/api/daily?" + qs.toString();
   }
 
+  /* Skew-T for the picked point. The endpoint returns PNG natively, so the
+     viewer, Download and Copy all use one URL. Errors from the store are
+     specific and worth surfacing verbatim ("hour F030 is not stored for this
+     run (stored: F000-F018)") rather than flattened into "render failed". */
+  function soundingUrl() {
+    var lat = Number($("cardLat").value), lon = wrapLon(Number($("cardLon").value));
+    var qs = new URLSearchParams({
+      lat: lat.toFixed(4), lon: lon.toFixed(4), model: state.model,
+      run: "latest", hour: String(state.hour),
+    });
+    // Credit follows the Branding card, same rule as the cards: absent keeps
+    // the house credit, empty draws none.
+    if (state.brand === "none") qs.set("brand", "");
+    else if (state.brand === "custom" && state.brandCredit.trim()) qs.set("brand", state.brandCredit.trim());
+    else qs.set("brand", "wxsection.com");
+    return API + "/api/sounding?" + qs.toString();
+  }
+
+  async function renderSounding(t0) {
+    var url = soundingUrl();
+    var resp = await fetch(url);
+    if (!resp.ok) {
+      var body = await resp.json().catch(function () { return {}; });
+      throw new Error(body.error || ("sounding request failed (" + resp.status + ")"));
+    }
+    var blob = await resp.blob();
+    var lat = Number($("cardLat").value).toFixed(3), lon = wrapLon(Number($("cardLon").value)).toFixed(3);
+    showImage(URL.createObjectURL(blob), "sounding-" + lat + "_" + lon + ".png", url);
+    setStatus("ok", "Sounding ready in " + ((performance.now() - t0) / 1000).toFixed(1) + "s");
+    $("renderMeta").textContent = state.model.toUpperCase() + " latest · F"
+      + String(state.hour).padStart(3, "0");
+  }
+
   async function renderCard(t0) {
     if (!state.product) throw new Error("still loading the variable list — try again in a moment");
     await ensureCardLogo();
@@ -1394,6 +1451,7 @@
     $("renderMeta").textContent = ""; var t0 = performance.now();
     try {
       if (activeFam().card) return await renderCard(t0);
+      if (activeFam().point) return await renderSounding(t0);
       var payload = buildPayload();
       var started = await fetch(API + "/api/render", {
         method: "POST", headers: { "content-type": "application/json" },

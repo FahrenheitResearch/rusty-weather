@@ -1890,6 +1890,10 @@ fn sounding_response(path: &str, state: &AppState) -> Vec<u8> {
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| (-14.0..=14.0).contains(v))
             .unwrap_or(-7.0),
+        // Same contract as the outlook cards: an ABSENT `brand` keeps the house
+        // credit, a present-but-EMPTY one draws none.
+        brand: card_text_override(&query, "brand")
+            .unwrap_or_else(|| "cafire.org/weather".to_string()),
     };
     match sounding::render_sounding(&state.store_root, model, run, &date, cycle, &request) {
         Ok(output) => {

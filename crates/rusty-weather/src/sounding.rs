@@ -44,6 +44,11 @@ pub struct SoundingRequest {
     pub hour: Option<u16>,
     /// Hours to add to UTC for the local-time note (PDT = -7).
     pub utc_offset_hours: f64,
+    /// Credit drawn on the image. Defaults to the CAFire house credit; the
+    /// unbranded lab passes its own, and an empty string draws none — the same
+    /// rule the outlook cards follow, so one sounding can be shared from either
+    /// site without the wrong name on it.
+    pub brand: String,
 }
 
 #[derive(Debug)]
@@ -325,7 +330,7 @@ pub fn render_sounding(
             lat = request.lat,
             lon = request.lon,
         ),
-        brand: "cafire.org/weather".to_string(),
+        brand: request.brand.clone(),
     };
     let png = native
         .render_cwt_png(&header)
@@ -630,6 +635,21 @@ mod tests {
             lon: -121.5,
             hour: Some(6),
             utc_offset_hours: -7.0,
+            brand: "cafire.org/weather".to_string(),
+        }
+    }
+
+    /// The credit is per-request so one renderer can serve both sites: the
+    /// branded Lab and the unbranded one. Both must produce a real image.
+    #[test]
+    fn the_credit_is_per_request() {
+        let root = test_store("brand", true);
+        for brand in ["cafire.org/weather", "wxsection.com", ""] {
+            let mut req = request();
+            req.brand = brand.to_string();
+            let out = render_sounding(&root, "synthetic", "20260702_00z", "20260702", 0, &req)
+                .unwrap_or_else(|err| panic!("render with brand {brand:?}: {err}"));
+            assert_eq!(&out.png[..4], &[0x89, 0x50, 0x4E, 0x47], "brand {brand:?}");
         }
     }
 
