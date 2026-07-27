@@ -34,10 +34,12 @@ const WINDOW_H: f32 = 1100.0;
 /// * **No effective-layer STP bar** — upstream already moved off the STP default,
 ///   and BowEcho migrates old saves away from it.
 ///
-/// Streamwiseness moves up to share the third column with the severe indices, and
-/// the two trailing bottom columns are hidden, so the reclaimed width goes to the
-/// parcel and kinematics tables. That widening is also what un-squishes the
-/// NCAPE/ECAPE line.
+/// Streamwiseness takes the small inset the location map used to hold, and the
+/// minimap moves down to share the third bottom column with the severe indices —
+/// a map needs the room to be legible, a streamwiseness trace does not. The two
+/// trailing bottom columns stay hidden, so the reclaimed width goes to the parcel
+/// and kinematics tables; that widening is also what un-squishes the NCAPE/ECAPE
+/// line.
 ///
 /// Bottom slots in order: two full-height columns, two sharing the third column
 /// vertically, then two more full-height columns.
@@ -50,8 +52,8 @@ const WINDOW_H: f32 = 1100.0;
 /// * "The el stp plot is kinda usefull" meant marginal, not useful. Reading it the
 ///   other way put STP in a full column here for one deploy.
 pub const DEFAULT_LAYOUT_TOKENS: &str = "speed,advection|hodograph|\
-     slinky,thetae,srwinds,locationmap|\
-     convectiveindices,kinematics,streamwiseness,severeindices,hidden,hidden|250";
+     slinky,thetae,srwinds,streamwiseness|\
+     convectiveindices,kinematics,locationmap,severeindices,hidden,hidden|250";
 
 /// Resolve a layout from caller tokens, falling back to our default.
 ///
@@ -233,8 +235,13 @@ mod tests {
         }
         assert_eq!(
             layout.insets[3],
+            sharppyrs::PanelKind::Streamwiseness,
+            "streamwiseness is the panel that survives being small"
+        );
+        assert_eq!(
+            layout.bottom[2],
             sharppyrs::PanelKind::LocationMap,
-            "the location map belongs in the small inset"
+            "the minimap needs the bigger bottom cell to be legible"
         );
         // Hidden slots must be the TRAILING ones: hiding a middle slot hands its
         // space to the panel sharing its column, whose text then scales past its

@@ -2333,14 +2333,22 @@ fn wrap_longitude(lon: f64) -> f64 {
 /// and inheriting the theme's own. Control characters are dropped because the
 /// value is interpolated into SVG text.
 fn card_text_override(query: &HashMap<String, String>, key: &str) -> Option<String> {
+    // The credit doubles as a note line — a sentence of context under the
+    // header — so it gets room for one, while brand and footer stay short
+    // labels. Still bounded: this is drawn into an SVG served to anyone.
+    let limit = if key == "credit" { CARD_CREDIT_MAX_CHARS } else { 48 };
     query.get(key).map(|raw| {
         raw.trim()
             .chars()
             .filter(|c| !c.is_control())
-            .take(48)
+            .take(limit)
             .collect::<String>()
     })
 }
+
+/// Characters a credit may carry. Triple the old 48-char label limit, which is
+/// about a sentence — enough to use the credit line as a note.
+const CARD_CREDIT_MAX_CHARS: usize = 144;
 
 /// Where uploaded card logos live. Content-addressed, so the same logo uploaded
 /// twice is one file and one stable URL.
@@ -3645,7 +3653,33 @@ mod card_theme_tests {
             ("credit", &"x".repeat(200)),
         ]));
         assert_eq!(theme.brand, "ACME");
-        assert_eq!(theme.credit.chars().count(), 48);
+        // The credit doubles as a note line, so it gets room for a sentence,
+        // while brand and footer stay short labels.
+        assert_eq!(theme.credit.chars().count(), CARD_CREDIT_MAX_CHARS);
+        assert_eq!(
+            card_theme_from_query(&query(&[("footer", &"y".repeat(200))]))
+                .footer
+                .chars()
+                .count(),
+            48
+        );
+    }
+
+    /// Emoji and kaomoji have to survive: they are not control characters, and a
+    /// multi-byte glyph must count as ONE character against the limit, or a note
+    /// written in them would be cut to a fraction of its length.
+    #[test]
+    fn a_note_can_carry_emoji_and_kaomoji() {
+        let theme = card_theme_from_query(&query(&[(
+            "credit",
+            "burn scar watch \u{1F525} shrug \u{30C4} ok",
+        )]));
+        assert!(theme.credit.contains('\u{1F525}'), "{}", theme.credit);
+        assert!(theme.credit.contains('\u{30C4}'), "{}", theme.credit);
+        // A note of nothing but emoji keeps all of them, up to the char limit.
+        let all_emoji = "\u{1F525}".repeat(200);
+        let theme = card_theme_from_query(&query(&[("credit", &all_emoji)]));
+        assert_eq!(theme.credit.chars().count(), CARD_CREDIT_MAX_CHARS);
     }
 }
 

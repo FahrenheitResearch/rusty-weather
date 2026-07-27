@@ -1295,6 +1295,11 @@ pub struct CardLogo {
     pub height: u32,
 }
 
+/// Credit type size. A tenth larger than the 12 px it used to be: the credit
+/// doubles as a note line, the one piece of text on the card its author wrote,
+/// and a sentence of it read as fine print at 12.
+const CREDIT_FONT_PX: f64 = 13.2;
+
 /// Logo height in the header, matching the two-line title block.
 const LOGO_HEIGHT_PX: f64 = 44.0;
 /// Gap between the logo and the headline.
@@ -1821,7 +1826,14 @@ pub fn render_daily_svg(
     // would collide with the place name instead of widening the card.
     let logo_w = request.theme.logo_width_px();
     let header_x = 24.0 + logo_w.map_or(0.0, |width| width + LOGO_GAP_PX);
-    let text_need = header_x + heading_w + 24.0 + place_w + 26.0;
+    // Row two: subtitle on the left, credit right-aligned. The credit can run to
+    // a sentence, and being right-anchored it grows LEFTWARD — so the card has to
+    // be wide enough for both, or the note runs under the subtitle and reads as
+    // clipped instead of shifting further left.
+    let credit_w = request.theme.credit.chars().count() as f64 * CREDIT_FONT_PX * 0.52;
+    let subtitle_w = 190.0 + point_line.chars().count() as f64 * 13.0 * 0.55;
+    let text_need = (header_x + heading_w + 24.0 + place_w + 26.0)
+        .max(header_x + subtitle_w + 26.0 + credit_w + 26.0);
     let width = (ml + base_col * n as f64 + 28.0)
         .max(880.0)
         .max(text_need.ceil());
@@ -1914,7 +1926,7 @@ pub fn render_daily_svg(
     ));
     if !th.credit.is_empty() {
         svg.push_str(&format!(
-            r##"<text x="{:.0}" y="64" fill="{}" font-size="12" text-anchor="end">{}</text>"##,
+            r##"<text x="{:.0}" y="64" fill="{}" font-size="{CREDIT_FONT_PX}" text-anchor="end">{}</text>"##,
             width - 26.0,
             th.muted,
             xml_escape(&th.credit)
