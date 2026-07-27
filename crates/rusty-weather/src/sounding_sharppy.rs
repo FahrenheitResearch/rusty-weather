@@ -490,6 +490,18 @@ pub fn render_png(
                     ui.add(
                         sharppyrs::SoundingView::new(&profile, &derived)
                             .layout_memory_id(layout_id)
+                            // No interactive chrome in a PNG. This gates the
+                            // hover readout, scroll-to-zoom and the hodograph
+                            // cursor marker — all of which need a pointer
+                            // position we never have — and the LAYOUT EDITOR
+                            // GEAR, which is the one that actually drew: a button
+                            // nobody can press, sitting on the streamwiseness
+                            // panel looking like part of the product. The cyan
+                            // drag borders live behind the gear's own toggle, so
+                            // nothing else visible is lost. Turn this back on for
+                            // the interactive WASM build, which is where it means
+                            // something.
+                            .interactive(false)
                             .title(&title)
                             .brand(&upper_right)
                             .style(header_style.clone()),

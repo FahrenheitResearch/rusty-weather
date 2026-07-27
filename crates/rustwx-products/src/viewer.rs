@@ -94,7 +94,8 @@ impl UnitConvert {
 /// `rustwx_render::build_colormap(&style.scale, style.colormap_options)`,
 /// color CONVERTED values with `cmap.map(...)` (NaN and masked values map
 /// to transparent), and label ticks from
-/// `rustwx_render::colorbar_ticks(&cmap, style.cbar_tick_step)` +
+/// `style.cbar_ticks` when present, else
+/// `rustwx_render::colorbar_ticks(&cmap, style.cbar_tick_step)`, formatted with
 /// `rustwx_render::format_tick`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoreVariableStyle {
@@ -112,6 +113,10 @@ pub struct StoreVariableStyle {
     pub colormap_options: ColormapBuildOptions,
     /// The production colorbar tick step (`None` = auto "nice" ticks).
     pub cbar_tick_step: Option<f64>,
+    /// Explicit production tick VALUES, where an even step would label the
+    /// wrong numbers — near-surface smoke labels the EPA AQI thresholds, which
+    /// are not evenly spaced. Takes precedence over `cbar_tick_step`.
+    pub cbar_ticks: Option<Vec<f64>>,
     /// Stepped vs smooth-ramp colorbar painting (also carried inside
     /// `colormap_options.legend.mode`).
     pub legend_mode: LegendMode,
@@ -177,6 +182,7 @@ pub fn operational_style_for_store_variable(
         scale,
         colormap_options: filtered_options(render_density, legend),
         cbar_tick_step,
+        cbar_ticks: crate::direct::direct_recipe_colorbar_ticks(selector),
         legend_mode: legend.mode,
     })
 }
@@ -193,6 +199,7 @@ fn derived_style(slug: &str, stored_units: &str) -> Option<StoreVariableStyle> {
         scale: lane.scale,
         colormap_options: filtered_options(lane.render_density, lane.legend),
         cbar_tick_step: lane.cbar_tick_step,
+        cbar_ticks: None,
         legend_mode: lane.legend.mode,
     })
 }
@@ -210,6 +217,7 @@ fn windowed_uh_style(stored_units: &str) -> StoreVariableStyle {
         scale: request.scale,
         colormap_options: filtered_options(request.render_density, request.legend),
         cbar_tick_step: request.cbar_tick_step,
+        cbar_ticks: None,
         legend_mode: request.legend.mode,
     }
 }
@@ -228,6 +236,7 @@ fn windowed_wind10m_style() -> StoreVariableStyle {
         scale: request.scale,
         colormap_options: filtered_options(request.render_density, request.legend),
         cbar_tick_step: request.cbar_tick_step,
+        cbar_ticks: None,
         legend_mode: request.legend.mode,
     }
 }
@@ -246,6 +255,7 @@ fn windowed_qpf_1h_style() -> StoreVariableStyle {
         scale: request.scale,
         colormap_options: filtered_options(request.render_density, request.legend),
         cbar_tick_step: request.cbar_tick_step,
+        cbar_ticks: None,
         legend_mode: request.legend.mode,
     }
 }

@@ -51,9 +51,29 @@ pub(crate) fn direct_recipe_render_controls(
         )
     {
         (Some(LegendMode::Stepped), Some(25.0))
+    } else if filled_selector.field == CanonicalField::SmokeMassDensity {
+        // Near-surface smoke carries the EPA AQI categories, so the bar has to
+        // draw them as CLASSES. A smooth ramp interpolates across the category
+        // boundaries, blurring the one thing the bar is there to show — and the
+        // static operational preset turns SmoothRamp on for everything, so this
+        // override is what puts it back. Ticks come from
+        // `direct_recipe_colorbar_ticks`; an even tick STEP would label
+        // arbitrary concentrations instead of the thresholds.
+        (Some(LegendMode::Stepped), None)
     } else {
         (None, None)
     }
+}
+
+/// Explicit colorbar tick VALUES, for scales where evenly spaced ticks would
+/// label the wrong numbers. Separate from [`direct_recipe_render_controls`]
+/// because that carries a tick STEP, and the EPA thresholds are not evenly
+/// spaced.
+pub(crate) fn direct_recipe_colorbar_ticks(
+    filled_selector: FieldSelector,
+) -> Option<Vec<f64>> {
+    (filled_selector.field == CanonicalField::SmokeMassDensity)
+        .then(crate::plot_design::epa_pm25_colorbar_ticks)
 }
 
 fn apply_direct_recipe_render_controls(
@@ -67,6 +87,12 @@ fn apply_direct_recipe_render_controls(
     }
     if let Some(step) = tick_step {
         request.cbar_tick_step = Some(step);
+    }
+    if let Some(ticks) = direct_recipe_colorbar_ticks(filled_selector) {
+        // Explicit values win over a step: the renderer prefers `cbar_ticks`,
+        // but leaving a step behind would survive into any later re-anchoring.
+        request.cbar_tick_step = None;
+        request.cbar_ticks = Some(ticks);
     }
 }
 

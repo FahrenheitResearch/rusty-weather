@@ -156,28 +156,26 @@ pub fn operational_fill_scale_for_recipe(
     }
 
     if filled_selector.field == CanonicalField::SmokeMassDensity {
-        return ColorScale::Discrete(DiscreteColorScale {
-            // Fine geometric ramp (was 8 coarse steps) so the 10-stop palette
-            // lerps into a fluid gradient instead of hard bands.
-            //
-            // The floor is 2 ug/m^3, not 10: light smoke is the difference
-            // between a clear day and a hazy one, and masking everything under
-            // 10 erased the whole leading edge of a plume. Paired with the
-            // stronger low-end alphas in `smoke_scale_colors`, a thin veil now
-            // reads as smoke instead of as a barely-there wash.
-            // Ceiling 560 -> 250 ug/m^3 for the same reason the column came down
-            // from 3000: ten stops stretch across whatever range they are given,
-            // and on the Idaho/Montana frame nearly all the smoke area sat under
-            // 100 while the ramp reserved half its colors for 250-560. Above 250
-            // extends into deep purple, so genuinely dangerous air still reads as
-            // the top of the scale.
-            levels: geometric_levels(2.0, 1.12, 250.0),
-            colors: smoke_scale_colors(),
-            extend: ExtendMode::Max,
-            mask_below: Some(2.0),
-        });
+        // Near-surface smoke is PM2.5 in ug/m^3 (see `direct_fill_unit_conversion`),
+        // which is exactly what the EPA AQI breakpoints are defined on — so the
+        // scale is those categories rather than a tuned ramp. Requested by an NWS
+        // met who could not tell from the old smooth gradient which side of a
+        // threshold he was looking at.
+        //
+        // What the previous empirical ramp learned is kept: the 2 ug/m^3 floor so
+        // a plume's leading edge still draws, and a ceiling near observed values
+        // rather than far above them. Both are now pinned to published numbers
+        // instead of to a frame someone looked at once.
+        //
+        // Column smoke below deliberately does NOT get this treatment.
+        return ColorScale::Discrete(epa_pm25_surface_scale());
     }
     if filled_selector.field == CanonicalField::ColumnIntegratedSmoke {
+        // NOT the EPA scale, on purpose. This is mg/m^2 integrated through the
+        // whole column — a different quantity from what anyone breathes. AQI
+        // colors here would assert a health category the number cannot support:
+        // a dense plume aloft that never reaches the ground would read
+        // "Hazardous" while the surface air is clean. It keeps the tuned ramp.
         return ColorScale::Discrete(DiscreteColorScale {
             // Fine geometric ramp (was 5 coarse doublings → blocky) so the
             // palette lerps smoothly across smoke's heavy-tailed range.
@@ -664,6 +662,210 @@ pub(crate) fn smoke_scale_colors() -> Vec<Color> {
     ]
 }
 
+/// EPA PM2.5 AQI category boundaries, µg/m³, **2024 revision**.
+///
+/// Requested by an NWS forecaster: "apply the EPA thresholds to that color scale
+/// so I can tell what I'm looking at". These are the numbers on the AirNow map
+/// open next to ours. The 2024 PM NAAQS reconsideration moved Good/Moderate from
+/// 12.0 down to 9.0 (effective May 2024), so a scale built on the older table
+/// would disagree with every other AQI product a met has in front of them.
+///
+/// EPA publishes each category's UPPER edge (9.0, 35.4, …) because it reports
+/// concentrations rounded to 0.1 µg/m³, which leaves 9.0–9.1 undefined. A model
+/// field is continuous and has no such gap, so here a boundary is the number
+/// itself and the bands are half-open: below 9.0 is Good, 9.0 and up is
+/// Moderate. Everything in this file depends on that convention.
+const EPA_PM25_BOUNDARIES: [f64; 5] = [9.0, 35.4, 55.4, 125.4, 225.4];
+
+/// Where the surface-smoke ladder starts drawing. Below this is transparent.
+///
+/// Kept at the value the earlier empirical tuning landed on: light smoke is the
+/// difference between a clear day and a hazy one, and masking at 10 erased the
+/// whole leading edge of a plume. It sits INSIDE the Good band, so the visible
+/// Good class is 2–9, not 0–9 — otherwise every clean pixel in the domain would
+/// be painted EPA green.
+const EPA_PM25_FLOOR: f64 = 2.0;
+
+/// Top of the ladder: EPA's AQI-400 break.
+///
+/// Above this everything is the deepest maroon anyway (EPA colors AQI 301–400
+/// and 401–500 identically), so carrying the ladder higher buys no information
+/// and costs real width — the colorbar is drawn LINEAR in concentration, so a
+/// top of 500 would spend over half the bar on air that is essentially never
+/// observed and squeeze Good/Moderate/Sensitive into a tenth of it. 325.4 is
+/// both a published break and close to the 250 the old empirical ceiling found.
+const EPA_PM25_LADDER_TOP: f64 = 325.4;
+
+/// Band edges, lowest first, closed with [`EPA_PM25_LADDER_TOP`].
+fn epa_pm25_band_edges() -> [f64; 7] {
+    let [b1, b2, b3, b4, b5] = EPA_PM25_BOUNDARIES;
+    [0.0, b1, b2, b3, b4, b5, EPA_PM25_LADDER_TOP]
+}
+
+/// The official AirNow AQI category colors, Good → Hazardous.
+///
+/// **Not our choices, and that is the point.** A forecaster who has read ten
+/// thousand AQI maps knows what orange means without consulting a legend, so
+/// matching EPA's published RGB exactly is worth more than any palette we could
+/// tune. Alpha is ours: these sit over a terrain basemap that EPA's flat
+/// category maps do not have, and they ramp up with severity so a thin veil of
+/// Good smoke lets the ground show through while a Hazardous core does not.
+fn epa_pm25_category_colors() -> [Color; 6] {
+    [
+        Color::rgba(0, 228, 0, 132),
+        Color::rgba(255, 255, 0, 178),
+        Color::rgba(255, 126, 0, 208),
+        Color::rgba(255, 0, 0, 230),
+        Color::rgba(143, 63, 151, 245),
+        Color::rgba(126, 0, 35, 255),
+    ]
+}
+
+/// Deepen a band's color as concentration rises through it.
+///
+/// Within-band shading is what keeps a plume from going flat: a 60 and a 120 are
+/// both Unhealthy, but they are not the same air. Two constraints shaped it.
+///
+/// **It must not drift toward a neighbouring anchor.** The first attempt mixed
+/// 22% white into each band's foot, which DESATURATES — and on a dark anchor that
+/// travels a long way. The foot of Hazardous came out (154, 56, 83), measurably
+/// closer to the Very Unhealthy purple (143, 63, 151) than to its own maroon;
+/// `every_epa_threshold_changes_category_exactly_where_it_should` caught it.
+/// Scaling brightness leaves the channel RATIOS alone, so a hue cannot wander
+/// into its neighbour's.
+///
+/// **It must stay quieter than the hue step between bands**, or it becomes a
+/// second signal saying the same thing badly — a reader cannot tell "darker
+/// orange" from "a new category" at a glance. Hence darkening ONLY, which also
+/// means the lightest shade in every band is EPA's exact published color: the one
+/// a forecaster is matching against the AirNow legend.
+fn epa_pm25_shade_within_band(anchor: Color, position: f64) -> Color {
+    /// Brightness at the top of a band, relative to its anchor.
+    ///
+    /// Bounded below by the SAME requirement, and not by taste: darken yellow
+    /// far enough and it becomes olive, which is nearer EPA's orange than its own
+    /// yellow. Solving that for the Moderate/Sensitive pair — the tightest of the
+    /// six, since yellow sits between orange and nothing — gives a floor of
+    /// 0.747. 0.80 clears it with margin and still moves 255 to 204, which is a
+    /// visible amount of structure.
+    const DEEPEST: f64 = 0.80;
+    let position = position.clamp(0.0, 1.0);
+    let factor = 1.0 - (1.0 - DEEPEST) * position;
+    let channel = |value: u8| (f64::from(value) * factor).round().clamp(0.0, 255.0) as u8;
+    Color::rgba(
+        channel(anchor.r),
+        channel(anchor.g),
+        channel(anchor.b),
+        anchor.a,
+    )
+}
+
+/// The EPA category color for one concentration, shaded by depth into its band.
+fn epa_pm25_color_at(value: f64) -> Color {
+    let edges = epa_pm25_band_edges();
+    // Half-open bands: a value AT a boundary belongs to the band ABOVE it.
+    let band = EPA_PM25_BOUNDARIES
+        .iter()
+        .filter(|boundary| value >= **boundary)
+        .count();
+    let anchor = epa_pm25_category_colors()[band];
+    let (lo, hi) = (edges[band], edges[band + 1]);
+    let position = if hi > lo { (value - lo) / (hi - lo) } else { 0.0 };
+    epa_pm25_shade_within_band(anchor, position)
+}
+
+/// Palette entries used to express the category step function.
+///
+/// The renderer picks a bin's color by NUMERIC POSITION across the level span —
+/// `floor(t * palette.len())` — not by bin index (see
+/// `rustwx_render::colormap::sample_palette_for_levels`). So a palette listed one
+/// color per band does NOT put one color per band on a nonlinear ladder; it
+/// smears them across it, and Good would share a color with Moderate. Expressing
+/// the step function as a fine lookup table over the same numeric axis makes
+/// every bin land on its own category color however the levels are spaced.
+const EPA_PM25_PALETTE_RESOLUTION: usize = 4096;
+
+/// The category step function as a numeric-position lookup table over
+/// `lo..=hi`.
+fn epa_pm25_palette(lo: f64, hi: f64) -> Vec<Color> {
+    let span = hi - lo;
+    (0..EPA_PM25_PALETTE_RESOLUTION)
+        .map(|index| {
+            // Each cell is classified by its UPPER edge, which is what puts a
+            // threshold exactly on a bin edge. A bin whose lower edge IS a
+            // boundary lands in the cell straddling that boundary, and that
+            // cell's upper edge is strictly above the boundary — so the bin gets
+            // the band above the threshold, per the half-open convention.
+            // Classifying by the centre or the lower edge instead colors the
+            // 9.0 bin Good, and the transition the met asked for lands one bin
+            // late.
+            let upper = lo + span * (index + 1) as f64 / EPA_PM25_PALETTE_RESOLUTION as f64;
+            epa_pm25_color_at(upper)
+        })
+        .collect()
+}
+
+/// The surface-smoke level ladder: every EPA boundary an exact bin edge, with
+/// sub-steps inside each band.
+///
+/// The boundaries MUST be exact edges. A bin straddling 55.4 would draw the
+/// Unhealthy transition wherever that bin happened to start, which is the one
+/// thing this scale exists to get right.
+fn epa_pm25_levels() -> Vec<f64> {
+    /// Bins per band. Three is enough for a plume to show structure and few
+    /// enough that the hue steps stay the loudest thing on the map.
+    const SUB_STEPS: usize = 3;
+    let edges = epa_pm25_band_edges();
+    let mut levels = vec![EPA_PM25_FLOOR];
+    for pair in edges.windows(2) {
+        let (lo, hi) = (pair[0].max(EPA_PM25_FLOOR), pair[1]);
+        if hi <= lo {
+            continue;
+        }
+        for step in 1..=SUB_STEPS {
+            if step == SUB_STEPS {
+                // The band edge goes in VERBATIM. A geometric round-trip lands
+                // a hair off 35.4, and "a hair off" is a threshold in the wrong
+                // place.
+                levels.push(hi);
+            } else {
+                // Geometric inside the band: smoke is heavy-tailed, so equal
+                // ratios read more evenly than equal differences across a band
+                // as wide as 55.4–125.4.
+                let t = step as f64 / SUB_STEPS as f64;
+                let value = lo * (hi / lo).powf(t);
+                levels.push((value * 10.0).round() / 10.0);
+            }
+        }
+    }
+    levels.dedup();
+    levels
+}
+
+/// The near-surface smoke scale: EPA PM2.5 AQI categories.
+///
+/// Shared with the windowed lane so the 0–24/24–48/0–48 h maxima cannot drift
+/// away from the hourly map the way the hand-copied geometric ladders once did.
+pub(crate) fn epa_pm25_surface_scale() -> DiscreteColorScale {
+    DiscreteColorScale {
+        levels: epa_pm25_levels(),
+        colors: epa_pm25_palette(EPA_PM25_FLOOR, EPA_PM25_LADDER_TOP),
+        extend: ExtendMode::Max,
+        mask_below: Some(EPA_PM25_FLOOR),
+    }
+}
+
+/// Colorbar ticks for the EPA smoke scale: the thresholds, and nothing else.
+///
+/// Evenly spaced ticks on this ladder would label arbitrary concentrations and
+/// leave the reader to guess where a category changed. These are the only
+/// numbers on the bar that mean anything.
+pub(crate) fn epa_pm25_colorbar_ticks() -> Vec<f64> {
+    let mut ticks = vec![EPA_PM25_FLOOR];
+    ticks.extend_from_slice(&EPA_PM25_BOUNDARIES);
+    ticks
+}
+
 /// Geometric (log-spaced) level ladder — fine steps for heavy-tailed fields
 /// like smoke, so the palette lerps into a fluid gradient instead of a few
 /// hard doublings. `factor` ~1.1 gives a smooth ramp.
@@ -952,5 +1154,114 @@ mod tests {
             column_smoke_scale.levels.last()
         );
         assert!(column_smoke_scale.colors[0].a >= 100);
+    }
+
+    /// Which EPA category a rendered color belongs to, by nearest published
+    /// anchor.
+    ///
+    /// Deliberately does NOT compare against `epa_pm25_color_at` — that would
+    /// only prove the palette agrees with itself. Nearest-anchor asks the
+    /// question a reader asks ("what color is that?"), and it survives the
+    /// within-band shading: the light and dark ends of a band both stay far
+    /// closer to their own anchor than to any neighbour.
+    fn epa_category_of(color: rustwx_render::Rgba) -> usize {
+        epa_pm25_category_colors()
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                let distance = |c: &Color| {
+                    let d = |x: u8, y: u8| (f64::from(x) - f64::from(y)).powi(2);
+                    d(c.r, color.r) + d(c.g, color.g) + d(c.b, color.b)
+                };
+                distance(a).total_cmp(&distance(b))
+            })
+            .map(|(index, _)| index)
+            .expect("six anchors")
+    }
+
+    /// The whole point of the scale: crossing an EPA threshold must change the
+    /// category, ON THE RIGHT SIDE of the number.
+    ///
+    /// Asserted through `LeveledColormap::map`, which is the exact path the
+    /// renderer colors pixels with — including the numeric-position palette
+    /// sampling that makes a naive one-color-per-band palette wrong. A unit test
+    /// of the level ladder alone would have passed while the map drew Good smoke
+    /// in Moderate yellow.
+    #[test]
+    fn every_epa_threshold_changes_category_exactly_where_it_should() {
+        let scale = epa_pm25_surface_scale();
+        let cmap = rustwx_render::build_colormap(
+            &ColorScale::Discrete(scale.clone()),
+            rustwx_render::ColormapBuildOptions::default(),
+        );
+        for (index, boundary) in EPA_PM25_BOUNDARIES.iter().enumerate() {
+            // Half-open bands: AT the boundary is the category ABOVE it.
+            let above = epa_category_of(cmap.map(*boundary));
+            let below = epa_category_of(cmap.map(boundary - 0.05));
+            assert_eq!(
+                above,
+                index + 1,
+                "{boundary} ug/m^3 should read as category {} but reads as {above}",
+                index + 1
+            );
+            assert_eq!(
+                below,
+                index,
+                "just under {boundary} should still read as category {index}, got {below}"
+            );
+        }
+        // The extremes: a visible wisp is Good, and a core past the ladder top
+        // is still Hazardous rather than wrapping or clipping to purple.
+        assert_eq!(epa_category_of(cmap.map(EPA_PM25_FLOOR)), 0);
+        assert_eq!(epa_category_of(cmap.map(2_000.0)), 5);
+        // Below the floor draws nothing at all — a clean domain must not be
+        // painted EPA green.
+        assert_eq!(cmap.map(EPA_PM25_FLOOR - 0.01).a, 0);
+    }
+
+    #[test]
+    fn the_epa_thresholds_are_exact_bin_edges() {
+        let scale = epa_pm25_surface_scale();
+        for boundary in EPA_PM25_BOUNDARIES {
+            assert!(
+                scale.levels.contains(&boundary),
+                "{boundary} is not a bin edge, so its transition lands wherever \
+                 the surrounding bin happens to start; levels: {:?}",
+                scale.levels
+            );
+        }
+        // Sub-steps inside each band, or a plume core goes flat.
+        assert!(
+            scale.levels.len() > EPA_PM25_BOUNDARIES.len() * 2,
+            "no within-band structure: {:?}",
+            scale.levels
+        );
+        // Monotone, and starting at the visible floor.
+        assert_eq!(scale.levels.first().copied(), Some(EPA_PM25_FLOOR));
+        assert!(scale.levels.windows(2).all(|pair| pair[1] > pair[0]));
+        // Ticks label the thresholds and nothing else.
+        assert_eq!(
+            epa_pm25_colorbar_ticks(),
+            vec![EPA_PM25_FLOOR, 9.0, 35.4, 55.4, 125.4, 225.4]
+        );
+    }
+
+    /// Column smoke is mg/m^2 through the whole atmosphere, not what anyone
+    /// breathes, so it must NOT wear AQI colors — a plume aloft would claim a
+    /// health category the number cannot support.
+    #[test]
+    fn column_smoke_keeps_its_own_ramp() {
+        let recipe = rustwx_models::plot_recipe("smoke_column").unwrap();
+        let ColorScale::Discrete(column) = operational_fill_scale_for_recipe(
+            recipe,
+            FieldSelector::entire_atmosphere(CanonicalField::ColumnIntegratedSmoke),
+        ) else {
+            panic!("expected a discrete scale");
+        };
+        assert_eq!(column.colors, smoke_scale_colors());
+        assert!(
+            !column.levels.contains(&35.4),
+            "column ladder picked up an AQI boundary"
+        );
     }
 }

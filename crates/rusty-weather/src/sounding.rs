@@ -900,6 +900,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// No interactive chrome in a static image.
+    ///
+    /// sharppyrs draws a layout-editor GEAR at the top-right of its bottom band,
+    /// which in a PNG is a button nobody can press — it just sits on the
+    /// streamwiseness panel looking like part of the product. Everything else the
+    /// widget gates behind `interactive` needs `hover_pos()`, which is always
+    /// None headless, so the gear is the only thing that actually drew.
+    ///
+    /// The gear is an egui Button: a NEUTRAL grey rounded rect. That is what this
+    /// looks for, because the panel underneath is dark maroon (r far above g and
+    /// b) and its labels are near-white, so neither trips a mid-grey test. The
+    /// rect mirrors sharppyrs' own `gear_rect`; if upstream moves it this test
+    /// goes quiet rather than failing wrongly, which is the safe direction for a
+    /// guard.
+    #[test]
+    fn the_layout_editor_gear_is_not_drawn_into_the_png() {
+        let root = test_store("no-gear", true);
+        let mut req = request();
+        req.sharppy_layout = true;
+        let out = render_sounding(&root, "synthetic", "20260702_00z", "20260702", 0, &req)
+            .expect("renders");
+        let image = image::load_from_memory(&out.png).expect("decodes").to_rgba8();
+
+        let layout = crate::sounding_sharppy::layout_or_default(None);
+        let zoom = f64::from(crate::sounding_sharppy::DEFAULT_ZOOM);
+        let scale = f64::from(crate::sounding_sharppy::DEFAULT_PIXELS_PER_POINT) * zoom;
+        let width_pt = 1630.0 / zoom;
+        let band_top_pt = (1100.0 / zoom) * f64::from(layout.top_height_fraction);
+        let (x0, x1) = (
+            ((width_pt - 24.0) * scale) as u32,
+            ((width_pt - 2.0) * scale) as u32,
+        );
+        let (y0, y1) = (
+            ((band_top_pt - 22.0) * scale) as u32,
+            ((band_top_pt - 2.0) * scale) as u32,
+        );
+        let mut grey = 0usize;
+        for y in y0..y1.min(image.height()) {
+            for x in x0..x1.min(image.width()) {
+                let [r, g, b, _] = image.get_pixel(x, y).0;
+                let (r, g, b) = (i32::from(r), i32::from(g), i32::from(b));
+                let neutral = (r - g).abs() <= 12 && (g - b).abs() <= 12 && (r - b).abs() <= 12;
+                if neutral && (70..=170).contains(&r) {
+                    grey += 1;
+                }
+            }
+        }
+        assert_eq!(
+            grey, 0,
+            "{grey} button-grey pixels in the gear's rect ({x0}..{x1}, {y0}..{y1}) — \
+             the layout editor is being rendered into the image"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A note long enough to need eliding must still render, and must not change
     /// the image's size — the fitting happens in the header band, not by growing
     /// the window. The look of the cut is a judgement call verified by eye; what

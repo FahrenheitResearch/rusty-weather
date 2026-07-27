@@ -1405,21 +1405,18 @@ fn day_window_scale_explicit(var: &str) -> Option<ColorScale> {
             ExtendMode::Both,
             None,
         )),
-        // Smoke: the direct lane's geometric ramps + shared smoke palette.
+        // Smoke: the direct lane's own scales.
         //
-        // These ladders are DUPLICATED from the direct lane on purpose (the
-        // windowed decoder keys on a base name, not a CanonicalField), so they
-        // must be changed in lockstep with `operational_fill_scale_for_recipe`.
-        // They were not, once: the surface floor and column ceiling moved in the
-        // direct lane while the 0-24/24-48/0-48 h maxima kept the old ladder and
-        // looked untouched. `windowed_smoke_matches_the_direct_lane` now fails
-        // the build if they drift apart again.
-        "smoke_8m" => discrete(DiscreteColorScale {
-            levels: crate::plot_design::geometric_levels(2.0, 1.12, 250.0),
-            colors: crate::plot_design::smoke_scale_colors(),
-            extend: ExtendMode::Max,
-            mask_below: Some(2.0),
-        }),
+        // The windowed decoder keys on a base NAME, not a CanonicalField, so it
+        // cannot reach `operational_fill_scale_for_recipe` and once carried
+        // hand-copied ladders instead. They drifted: the surface floor and column
+        // ceiling moved in the direct lane while the 0-24/24-48/0-48 h maxima kept
+        // the old numbers and looked untouched.
+        // `windowed_smoke_matches_the_direct_lane` fails the build if that
+        // happens again — and the surface scale is now a shared FUNCTION, so
+        // there is nothing left to copy wrongly. The peak-smoke maxima carry the
+        // same EPA AQI categories as the hourly map.
+        "smoke_8m" => discrete(crate::plot_design::epa_pm25_surface_scale()),
         "smoke_column" => discrete(DiscreteColorScale {
             levels: crate::plot_design::geometric_levels(20.0, 1.12, 1500.0),
             colors: crate::plot_design::smoke_scale_colors(),

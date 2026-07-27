@@ -223,6 +223,27 @@ host (holds the 201 GB CONUS climo pack; wide-west is what's deployed).
 · `GET /api/fires` (WFIGS)
 · `GET /api/ecape/...` (frozen static gallery while node 1 is paused).
 
+**Near-surface smoke wears the EPA PM2.5 AQI categories** (`smoke_pm25_native`
+and the `smoke_8m_*` windowed maxima). Boundaries are the 2024-revised
+breakpoints — `9.0 / 35.4 / 55.4 / 125.4 / 225.4` µg/m³ — and they are EXACT bin
+edges, with the official AirNow RGB per band and three darkening steps inside
+each. Three traps if you touch `epa_pm25_*` in `plot_design.rs`:
+
+- The renderer picks a bin's color by **numeric position** across the level span,
+  not by bin index, so a palette listing one color per band does NOT produce one
+  color per band on a nonlinear ladder. The palette is a fine lookup table of the
+  step function for that reason.
+- Within-band shading **darkens only**, and the factor has a floor near `0.747`:
+  darken yellow past that and it becomes olive, which is nearer EPA's orange than
+  its own yellow. A test enforces this.
+- **Column smoke is deliberately NOT on this scale** — mg/m² through the column
+  is not what anyone breathes, and a plume aloft would claim a health category
+  the number cannot support.
+
+The categories are a proxy, and say so in user-facing copy: AQI breakpoints are
+defined on a 24-hour average, these fields are hourly, and HRRR-Smoke carries
+smoke only (no background aerosol), so it reads low where other pollution exists.
+
 Gotchas: surface RH variable is **`rh_2m`** (not relative_humidity_2m);
 window-product slugs look like **`2m_temp_24_48h_max`** (full list in the
 Lab's `FAMS`); run slugs look like `20260706_12z`.
