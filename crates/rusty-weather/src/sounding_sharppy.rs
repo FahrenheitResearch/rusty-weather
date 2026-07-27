@@ -47,8 +47,10 @@ pub const DEFAULT_TEXT_SCALE: f32 = 1.0;
 /// [`DEFAULT_TEXT_SCALE`] cannot do.
 ///
 /// The cost is real but different: panels are narrower in points, so a label
-/// that only just fitted can still truncate. That is the thing to look at when
-/// raising this.
+/// that only just fitted can still truncate. Measured on live renders, the
+/// binding one is the TITLE — a single fixed band that elides — so the header
+/// string is kept short (see `render_sounding`) to leave this room. At 1.45 even
+/// `@Sacramento, CA` loses its state.
 pub const DEFAULT_ZOOM: f32 = 1.25;
 
 /// Bounds on the zoom. Above ~1.6 the parameter tables start eliding words,
