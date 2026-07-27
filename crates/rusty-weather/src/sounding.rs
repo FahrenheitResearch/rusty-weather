@@ -49,6 +49,14 @@ pub struct SoundingRequest {
     /// rule the outlook cards follow, so one sounding can be shared from either
     /// site without the wrong name on it.
     pub brand: String,
+    /// Why the poster thinks this sounding is worth a look — "NC for tomorrow,
+    /// mainly looking at the shear profile". Drawn ahead of [`Self::brand`] on
+    /// the same header line, so a note does not cost the credit.
+    ///
+    /// The line is fitted to its band by the renderer, which is what keeps a long
+    /// note off the title; a cap here would only decide where the cut lands, and
+    /// it landed mid-word.
+    pub note: String,
     /// Draw the vendored SHARPpy compositor's own panel arrangement — the SPC
     /// window BowEcho draws — rather than the older CWT composite (house header,
     /// locator map, ECAPE block, rustwx table).
@@ -184,6 +192,7 @@ fn finite_json(value: f64, scale: f64) -> serde_json::Value {
         serde_json::Value::Null
     }
 }
+
 
 pub fn render_sounding(
     store_root: &Path,
@@ -382,9 +391,7 @@ pub fn render_sounding(
         // every sounding is at a grid cell near the request, so the word carried
         // no information the subtitle does not already give. That buys ~14
         // characters, which is a long California town plus its state.
-        let place_short = place
-            .strip_prefix("near ")
-            .unwrap_or(place.as_str());
+        let place_short = place.strip_prefix("near ").unwrap_or(place.as_str());
         let title = format!(
             "{model} {month}/{day} {cycle:02}z F{hour:03}  Valid {day_label} {hod:02}z @{place_short}",
             model = model_slug.to_uppercase(),
@@ -396,8 +403,11 @@ pub fn render_sounding(
             crate::sounding_sharppy::layout_or_default(request.layout_tokens.as_deref());
         crate::sounding_sharppy::render_png(
             data,
-            &title,
-            &request.brand,
+            crate::sounding_sharppy::HeaderText {
+                title: &title,
+                note: &request.note,
+                credit: &request.brand,
+            },
             layout,
             request.text_scale,
             request.pixels_per_point,
@@ -709,6 +719,7 @@ mod tests {
             hour: Some(6),
             utc_offset_hours: -7.0,
             brand: "cafire.org/weather".to_string(),
+            note: String::new(),
             sharppy_layout: false,
             text_scale: crate::sounding_sharppy::DEFAULT_TEXT_SCALE,
             pixels_per_point: crate::sounding_sharppy::DEFAULT_PIXELS_PER_POINT,
@@ -886,6 +897,32 @@ mod tests {
         let err = render_sounding(&root, "synthetic", "20260702_00z", "20260702", 0, &req)
             .expect_err("far outside the grid");
         assert!(err.contains("outside the model grid"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A note long enough to need eliding must still render, and must not change
+    /// the image's size — the fitting happens in the header band, not by growing
+    /// the window. The look of the cut is a judgement call verified by eye; what
+    /// this pins is that the path runs at all, since a panic in the text fitting
+    /// would only ever show up here.
+    #[test]
+    fn a_note_too_long_for_the_band_still_renders() {
+        let root = test_store("long-note", true);
+        let mut req = request();
+        req.sharppy_layout = true;
+        let plain = render_sounding(&root, "synthetic", "20260702_00z", "20260702", 0, &req)
+            .expect("renders with no note");
+        req.note = "NC for tomorrow, mainly looking at the shear profile ahead of the \
+             pre-frontal trough, with a marginal severe risk near the Triad and a \
+             strong low-level jet arriving after dark across the Piedmont."
+            .to_string();
+        let noted = render_sounding(&root, "synthetic", "20260702_00z", "20260702", 0, &req)
+            .expect("renders with a long note");
+        let size = |png: &[u8]| {
+            let image = image::load_from_memory(png).expect("decodes");
+            (image.width(), image.height())
+        };
+        assert_eq!(size(&noted.png), size(&plain.png), "a note must not resize the window");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -208,9 +208,18 @@ host (holds the 201 GB CONUS climo pack; wide-west is what's deployed).
   `[&theme=cafire|slate|midnight|paper|ember|mono][&brand=][&credit=][&footer=][&accent=#rrggbb][&logo=<id>]`
 · `POST /api/card-logo` (image bytes or a `data:` URL → `{id}` for `&logo=`)
 · `GET /api/xsection?lat0&lon0&lat1&lon1&run[&hour][&field=temperature|rh|wind][&format=json|png]`
-· `GET /api/sounding?lat&lon&run&hour[&style=cwt][&layout=<tokens>][&brand=][&format=json]`
+· `GET /api/sounding?lat&lon&run&hour[&style=cwt][&layout=<tokens>][&brand=][&note=][&zoom=][&dpi=][&text_scale=][&format=json]`
   Default is the sharppyrs SPC window (BowEcho's), branded `cafire.org/weather`
   unless `brand=` says otherwise; `style=cwt` serves the older house composite.
+  `note=` is the poster's context ("why I am posting this"), drawn on the
+  upper-right line AHEAD of the credit so saying something does not drop it.
+  **That line is fitted, not capped.** sharppyrs draws it right-aligned and
+  unclipped, so anything wider than its band runs leftward across the title
+  instead of eliding — `sounding_sharppy::fit_header` reserves the credit's
+  width, then elides the note at a word boundary with `…`. Two consequences
+  worth knowing: the band is a fraction of the window width, so a bigger
+  `zoom=` costs header characters; and `HEADER_FONT_PT`/`HEADER_RIGHT_PAD_PT`
+  mirror literals inside sharppyrs, so bumping its rev means checking them.
 · `GET /api/fires` (WFIGS)
 · `GET /api/ecape/...` (frozen static gallery while node 1 is paused).
 

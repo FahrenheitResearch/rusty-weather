@@ -238,9 +238,9 @@
           <label class="field"><span>Credit (right)</span>
             <input type="text" id="brandCredit" placeholder="e.g. acme.example.com" maxlength="144" />
           </label>
-          <label class="field"><span>Note / discussion (wraps under the header)</span>
+          <label class="field"><span>Note / discussion (why you are posting this)</span>
             <textarea id="brandNote" rows="3" maxlength="700"
-              placeholder="A paragraph of context. Wraps to the card width and pushes the plot down, so long text stays readable."
+              placeholder="Why this one is worth a look. On a card it wraps into its own block under the header; on a sounding it is one line in the upper right, ahead of the credit, and is elided to fit."
               style="width:100%;background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;resize:vertical"></textarea>
             <span class="muted" id="noteCount"></span>
           </label>
@@ -1455,6 +1455,11 @@
     if (state.brand === "none") qs.set("brand", "");
     else if (state.brand === "custom" && state.brandCredit.trim()) qs.set("brand", state.brandCredit.trim());
     else qs.set("brand", "wxsection.com");
+    // The Note / discussion box reaches the sounding too, as its own parameter:
+    // it lands ahead of the credit on the upper-right line instead of replacing
+    // it, and the renderer elides it to the band rather than running it across
+    // the title.
+    if (state.brandNote.trim()) qs.set("note", state.brandNote.trim());
     return API + "/api/sounding?" + qs.toString();
   }
 

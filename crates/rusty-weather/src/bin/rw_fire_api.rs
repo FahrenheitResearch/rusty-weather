@@ -1986,8 +1986,12 @@ fn sounding_response(path: &str, state: &AppState) -> Vec<u8> {
             .unwrap_or(-7.0),
         // Same contract as the outlook cards: an ABSENT `brand` keeps the house
         // credit, a present-but-EMPTY one draws none.
-        brand: card_text_override(&query, "brand")
+        brand: sounding_header_override(&query, "brand")
             .unwrap_or_else(|| "cafire.org/weather".to_string()),
+        // Why this sounding is worth looking at, in the poster's words. Its own
+        // parameter rather than an override of `brand`, so saying something does
+        // not silently drop the credit.
+        note: sounding_header_override(&query, "note").unwrap_or_default(),
         sharppy_layout: sharppy_layout_for_style(query.get("style").map(String::as_str)),
         // `layout=` takes sharppyrs panel tokens, so an arrangement can be
         // retuned from a URL rather than a deploy; malformed tokens fall back.
@@ -2459,6 +2463,32 @@ fn card_text_override(query: &HashMap<String, String>, key: &str) -> Option<Stri
 /// Characters a credit may carry. Triple the old 48-char label limit, which is
 /// about a sentence — enough to use the credit line as a note.
 const CARD_CREDIT_MAX_CHARS: usize = 144;
+
+/// A sounding's upper-right header text: the forecaster's note and the credit.
+///
+/// Separate from [`card_text_override`] because that function's default is a
+/// 48-character CARD BADGE cap, and a sounding note is a sentence — "why I am
+/// posting this". Borrowing the badge cap is the bug this fixes: a real 123-char
+/// note came back cut mid-word at `...why you are postin`.
+///
+/// The cap is not what makes the line fit. `sounding_sharppy` measures the text
+/// against the band it is drawn in and elides it there, which is the only place
+/// the font metrics and the zoom are both known. This is a bound on what a
+/// stranger can post into an image the box renders, nothing more.
+fn sounding_header_override(query: &HashMap<String, String>, key: &str) -> Option<String> {
+    query.get(key).map(|raw| {
+        raw.trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(SOUNDING_HEADER_MAX_CHARS)
+            .collect()
+    })
+}
+
+/// Characters a sounding note or credit may carry. Roughly twice what the widest
+/// band can show, so the renderer's ellipsis is what a reader sees when a note
+/// runs long — a hard cut here would land mid-word again.
+const SOUNDING_HEADER_MAX_CHARS: usize = 240;
 
 /// Characters a NOTE may carry. The credit is an attribution that shares a row
 /// with the subtitle, so it can only ever be a sentence; a note is its own
@@ -3069,6 +3099,49 @@ mod tests {
         assert!(!sharppy_layout_for_style(Some("cwt")));
         assert!(!sharppy_layout_for_style(Some("CWT")));
         assert!(!sharppy_layout_for_style(Some(" composite ")));
+    }
+
+    /// A sounding's header text is a SENTENCE of context — "why I am posting
+    /// this" — not a card badge. It used to borrow `card_text_override`'s
+    /// 48-character label cap, which cut a real note mid-word ("...why you are
+    /// postin"); the reported case is 123 characters and must arrive whole.
+    /// The renderer fits it to the band it is drawn in, so the cap here is only
+    /// a bound on what a stranger can post, not a layout constraint.
+    #[test]
+    fn a_sounding_note_arrives_as_a_whole_sentence() {
+        let query = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        };
+        let reported = "This is where you can explain why you are posting this sounding \
+             like \"NC for tomorrow, mainly looking at the shear profile\"";
+        assert_eq!(reported.chars().count(), 123, "the reported string");
+        let kept = sounding_header_override(&query(&[("note", reported)]), "note")
+            .expect("a note that was sent is a note that is kept");
+        assert_eq!(kept, reported, "no truncation before the renderer sees it");
+
+        // Present-but-empty still means "draw none", the same as everywhere else.
+        assert_eq!(
+            sounding_header_override(&query(&[("brand", "")]), "brand").as_deref(),
+            Some("")
+        );
+        assert_eq!(sounding_header_override(&query(&[]), "brand"), None);
+
+        // Bounded, and control characters cannot reach the text layout.
+        let huge = "x".repeat(SOUNDING_HEADER_MAX_CHARS * 3);
+        assert_eq!(
+            sounding_header_override(&query(&[("note", &huge)]), "note")
+                .unwrap()
+                .chars()
+                .count(),
+            SOUNDING_HEADER_MAX_CHARS
+        );
+        assert_eq!(
+            sounding_header_override(&query(&[("note", "one\u{7}two")]), "note").as_deref(),
+            Some("onetwo")
+        );
     }
 
     #[test]

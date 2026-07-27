@@ -132,6 +132,142 @@ pub fn layout_or_default(tokens: Option<&str>) -> sharppyrs::SoundingLayout {
         .unwrap_or_default()
 }
 
+/// Point size sharppyrs draws its upper-right header text at, and the padding it
+/// leaves between that text and the right edge of the window.
+///
+/// Both mirror literals inside `sharppyrs::SoundingView::ui`. They are here
+/// because that text is right-aligned and **not clipped**: the widget reserves a
+/// 16 pt band for it and then paints whatever string it was handed, growing
+/// leftward. A string wider than the band therefore runs across the skew-T's
+/// title — measured on a live render, 144 characters puts the note through
+/// `Freeport, CA` and 196 makes the whole title unreadable. So the fitting has to
+/// happen on this side, before the string is handed over, which means agreeing
+/// with these two numbers.
+const HEADER_FONT_PT: f32 = 11.0;
+const HEADER_RIGHT_PAD_PT: f32 = 4.0;
+
+/// Clear space kept between the end of the header text and the skew-T title.
+/// The title is drawn by a different panel and sized off the plot height, so the
+/// two cannot be laid out against each other; a gutter is what keeps them from
+/// touching when both happen to be long.
+const HEADER_GUTTER_PT: f32 = 10.0;
+
+/// Room the upper-right header text has, in POINTS.
+///
+/// The band is everything right of the skew-T, whose share of the width is
+/// `skew_width_fraction`. Zoom divides the window's logical size, so it shrinks
+/// this while leaving the font alone — which is the one interaction between the
+/// two features worth remembering: zooming in costs header characters.
+pub fn header_band_width_pt(layout: &sharppyrs::SoundingLayout, zoom: f32) -> f32 {
+    let window_w = WINDOW_W / clamp_zoom(zoom);
+    let band = (1.0 - layout.skew_width_fraction) * window_w;
+    (band - HEADER_RIGHT_PAD_PT - HEADER_GUTTER_PT).max(0.0)
+}
+
+/// Text sharppyrs draws around the window: one title line across the top of the
+/// skew-T, and one line in the upper right carrying the poster's note and the
+/// credit.
+///
+/// A struct because these are three adjacent strings, and handing them over in
+/// the wrong order would put the credit where the title goes and still compile.
+pub struct HeaderText<'a> {
+    pub title: &'a str,
+    /// Why this sounding is worth a look, in the poster's words. Empty draws none.
+    pub note: &'a str,
+    /// The house credit. Empty draws none.
+    pub credit: &'a str,
+}
+
+/// Separator between the note and the credit on the upper-right line.
+const HEADER_SEPARATOR: &str = "  ·  ";
+
+/// Fit the note and the credit into the upper-right band, note first.
+///
+/// The credit's room is reserved BEFORE the note is fitted. That ordering is the
+/// whole point: the credit is the one thing on this line that was asked for by
+/// name, and fitting the composed string as a unit ate it from the right and
+/// left a dangling `·…` behind — measured on a render, not guessed.
+fn fit_header(note: &str, credit: &str, max_width: f32, width_of: impl Fn(&str) -> f32) -> String {
+    let (note, credit) = (note.trim(), credit.trim());
+    if credit.is_empty() {
+        return elide_to_width(note, max_width, width_of);
+    }
+    if note.is_empty() {
+        return elide_to_width(credit, max_width, width_of);
+    }
+    let tail = format!("{HEADER_SEPARATOR}{credit}");
+    let fitted = elide_to_width(note, max_width - width_of(&tail), &width_of);
+    if fitted.is_empty() {
+        // Not even one word of the note fits beside the credit. Keep the credit
+        // alone rather than draw a bare ellipsis in front of it.
+        return elide_to_width(credit, max_width, width_of);
+    }
+    format!("{fitted}{tail}")
+}
+
+/// The longest leading part of `text` that measures no wider than `max_width`,
+/// ellipsised when something had to be dropped.
+///
+/// `width_of` is injected because the only measurement that agrees with what
+/// sharppyrs will draw is egui's own text layout, which needs a live context —
+/// and the interesting behaviour here (where the cut lands) deserves a test that
+/// does not need a GPU.
+///
+/// The cut prefers a word boundary. That is the actual complaint this fixes: a
+/// line that stops after a whole word and an ellipsis reads as deliberate, where
+/// `...why you are postin` reads as broken software.
+fn elide_to_width(text: &str, max_width: f32, width_of: impl Fn(&str) -> f32) -> String {
+    const ELLIPSIS: char = '…';
+    let text = text.trim();
+    if text.is_empty() || max_width <= 0.0 {
+        return String::new();
+    }
+    if width_of(text) <= max_width {
+        return text.to_string();
+    }
+    // Candidate cuts are char boundaries — never byte offsets, or a multi-byte
+    // place name would panic the render.
+    let bounds: Vec<usize> = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let fits = |end: usize| {
+        let mut candidate = text[..end].trim_end().to_string();
+        candidate.push(ELLIPSIS);
+        width_of(&candidate) <= max_width
+    };
+    // Invariant: `lo` fits (the empty prefix always does), `hi` does not (the
+    // whole string was checked above).
+    let (mut lo, mut hi) = (0usize, bounds.len() - 1);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(bounds[mid]) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let end = bounds[lo];
+    if end == 0 {
+        // Not even one character plus an ellipsis fits: say nothing rather than
+        // draw a stray mark over the plot.
+        return String::new();
+    }
+    // Only step back to a word boundary when the cut actually landed inside a
+    // word. A single unbroken word longer than the band keeps its blunt cut —
+    // better a chopped word than an empty header.
+    let lands_mid_word = text[end..].chars().next().is_some_and(|c| !c.is_whitespace());
+    let cut = if lands_mid_word {
+        text[..end].rfind(char::is_whitespace).unwrap_or(end)
+    } else {
+        end
+    };
+    let mut fitted = text[..cut].trim_end().to_string();
+    fitted.push(ELLIPSIS);
+    fitted
+}
+
 const MS_TO_KNOTS: f64 = 1.943_844;
 
 /// Wind as `SoundingData` wants it: direction the wind blows FROM in degrees
@@ -284,13 +420,14 @@ fn render_permit() -> MutexGuard<'static, ()> {
 
 /// Render the SPC-style window to PNG bytes.
 ///
-/// `title` is the single header line sharppyrs draws across the top; `brand` is
-/// the small credit in its corner, following the same rule as everything else
-/// here — an empty string draws none.
+/// [`HeaderText`] carries the title and the upper-right line; an empty string in
+/// any of it draws nothing, the same rule as everything else here. The
+/// upper-right line is FITTED to its band before sharppyrs sees it — see
+/// [`fit_header`] — because the widget draws that text right-aligned and
+/// unclipped, so an over-long string does not elide, it overwrites the title.
 pub fn render_png(
     data: sharppyrs::SoundingData,
-    title: &str,
-    brand: &str,
+    header: HeaderText<'_>,
     layout: sharppyrs::SoundingLayout,
     text_scale: f32,
     pixels_per_point: f32,
@@ -303,8 +440,8 @@ pub fn render_png(
     let derived = sharppyrs::DerivedParams::compute(&profile);
 
     let _permit = render_permit();
-    let title = title.to_string();
-    let brand = brand.to_string();
+    let title = header.title.to_string();
+    let (note, credit) = (header.note.to_string(), header.credit.to_string());
     // The first pass installs the bundled Space Grotesk face and asks for a
     // repaint; fonts must be in the context before any text is laid out, or the
     // window renders in egui's default face.
@@ -317,6 +454,10 @@ pub fn render_png(
     // size does not depend on the zoom — only how much of it the type occupies.
     let zoom = clamp_zoom(zoom);
     let ratio = clamp_pixels_per_point(pixels_per_point);
+    // Fit the header text to its band. Done here rather than by the caller
+    // because it takes the real font metrics, and the band depends on the zoom.
+    let header_width = header_band_width_pt(&layout, zoom);
+    let header_style = sharppyrs::SkewTStyle::space_grotesk().with_text_scale(text_scale);
     let mut harness = egui_kittest::Harness::builder()
         .with_size(egui::Vec2::new(WINDOW_W / zoom, WINDOW_H / zoom))
         .with_pixels_per_point(ratio * zoom)
@@ -328,6 +469,20 @@ pub fn render_png(
                 return;
             }
             sharppyrs::store_layout(ui.ctx(), layout_id, &layout);
+            let header_font = header_style.regular_font(HEADER_FONT_PT);
+            let upper_right = {
+                let painter = ui.painter();
+                fit_header(&note, &credit, header_width, |candidate| {
+                    painter
+                        .layout_no_wrap(
+                            candidate.to_string(),
+                            header_font.clone(),
+                            egui::Color32::WHITE,
+                        )
+                        .size()
+                        .x
+                })
+            };
             egui::Frame::new()
                 .fill(egui::Color32::BLACK)
                 .show(ui, |ui| {
@@ -336,11 +491,8 @@ pub fn render_png(
                         sharppyrs::SoundingView::new(&profile, &derived)
                             .layout_memory_id(layout_id)
                             .title(&title)
-                            .brand(&brand)
-                            .style(
-                                sharppyrs::SkewTStyle::space_grotesk()
-                                    .with_text_scale(text_scale),
-                            ),
+                            .brand(&upper_right)
+                            .style(header_style.clone()),
                     );
                 });
         });
@@ -359,6 +511,120 @@ pub fn render_png(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in for egui's text layout: every glyph 6 pt wide. The real
+    /// measurement is proportional, but where the cut LANDS is what this file
+    /// decides, and that logic is the same either way.
+    fn monospace_width(text: &str) -> f32 {
+        text.chars().count() as f32 * 6.0
+    }
+
+    /// The reported bug, at the far end: the header text is right-aligned and
+    /// unclipped, so a note wider than its band does not elide — it runs left
+    /// across the title. Nothing may leave here wider than the band.
+    #[test]
+    fn a_header_too_wide_for_its_band_is_elided_not_left_to_overlap_the_title() {
+        let note = "NC for tomorrow, mainly looking at the shear profile ahead of the trough";
+        // Comfortably wide: untouched, and no ellipsis invented.
+        assert_eq!(elide_to_width(note, 1_000.0, monospace_width), note);
+
+        // Too narrow: cut, marked, and inside the band.
+        let fitted = elide_to_width(note, 200.0, monospace_width);
+        assert!(fitted.ends_with('…'), "a cut must be visible: {fitted:?}");
+        assert!(
+            monospace_width(&fitted) <= 200.0,
+            "{fitted:?} is {} wide, band is 200",
+            monospace_width(&fitted)
+        );
+        assert!(note.starts_with(fitted.trim_end_matches('…')), "prefix only");
+
+        // The complaint was the cut landing mid-word ("...why you are postin").
+        // Whatever survives ends on a whole word.
+        let kept = fitted.trim_end_matches('…');
+        assert!(
+            note[kept.len()..].starts_with(char::is_whitespace),
+            "cut inside a word: {kept:?}"
+        );
+    }
+
+    /// The credit is the one thing on this line that was asked for by name, so a
+    /// long note must cost the NOTE its tail, never the credit. Fitting the
+    /// composed string as one unit ate the credit from the right and left a
+    /// dangling `·…` — this is that regression.
+    #[test]
+    fn a_long_note_never_costs_the_credit() {
+        let credit = "cafire.org/weather";
+        let note = "This is where you can explain why you are posting this sounding like \
+             \"NC for tomorrow, mainly looking at the shear profile\"";
+        // A band that cannot hold both: 123 chars of note plus separator and credit.
+        let band = 146.0 * 6.0 - 60.0;
+        let fitted = fit_header(note, credit, band, monospace_width);
+        assert!(monospace_width(&fitted) <= band, "{fitted:?} overflows");
+        assert!(fitted.ends_with(credit), "the credit must survive: {fitted:?}");
+        assert!(fitted.contains('…'), "the note is what got shortened: {fitted:?}");
+        assert!(
+            !fitted.contains("·…") && !fitted.contains("… ·"),
+            "no dangling separator: {fitted:?}"
+        );
+
+        // Both fit: nothing is marked as cut.
+        let roomy = fit_header("short note", credit, 1_000.0, monospace_width);
+        assert_eq!(roomy, format!("short note{HEADER_SEPARATOR}{credit}"));
+
+        // Either side alone stands alone, with no stray separator.
+        assert_eq!(fit_header("", credit, 1_000.0, monospace_width), credit);
+        assert_eq!(fit_header("just a note", "", 1_000.0, monospace_width), "just a note");
+        assert_eq!(fit_header("", "", 1_000.0, monospace_width), "");
+
+        // Too narrow for a word of the note beside the credit: keep the credit
+        // rather than draw a bare ellipsis in front of it.
+        let cramped = fit_header(note, credit, monospace_width(credit) + 12.0, monospace_width);
+        assert_eq!(cramped, credit, "credit alone, not an orphaned ellipsis");
+    }
+
+    #[test]
+    fn header_fitting_survives_the_awkward_inputs() {
+        // A single word longer than the band keeps a blunt cut: better a chopped
+        // word than an empty header.
+        let fitted = elide_to_width("Supercalifragilistic", 60.0, monospace_width);
+        assert!(fitted.ends_with('…') && monospace_width(&fitted) <= 60.0, "{fitted:?}");
+        assert!(fitted.chars().count() > 1, "must keep something: {fitted:?}");
+
+        // No room at all, and nothing to say, both draw nothing.
+        assert_eq!(elide_to_width("anything", 0.0, monospace_width), "");
+        assert_eq!(elide_to_width("   ", 500.0, monospace_width), "");
+        assert_eq!(elide_to_width("", 500.0, monospace_width), "");
+
+        // Multi-byte text is cut on char boundaries, not byte offsets — a
+        // sounding is titled after a real place name.
+        let accented = "Cañón City ahead of the dryline, näher am Föhn";
+        for width in [12.0, 30.0, 66.0, 120.0, 260.0] {
+            let fitted = elide_to_width(accented, width, monospace_width);
+            assert!(
+                monospace_width(&fitted) <= width,
+                "{fitted:?} exceeds {width}"
+            );
+        }
+    }
+
+    /// The band is a fraction of the window width, so zooming in — which
+    /// divides that width — costs header room. Worth pinning: it is the only
+    /// place the two features touch.
+    #[test]
+    fn the_header_band_narrows_as_the_window_zooms_in() {
+        let layout = layout_or_default(None);
+        let wide = header_band_width_pt(&layout, 1.0);
+        let zoomed = header_band_width_pt(&layout, MAX_ZOOM);
+        assert!(wide > zoomed, "zoom must cost room: {wide} vs {zoomed}");
+        // Sanity against the geometry it mirrors: just over half the window,
+        // less the padding.
+        let expected = (1.0 - layout.skew_width_fraction) * WINDOW_W
+            - HEADER_RIGHT_PAD_PT
+            - HEADER_GUTTER_PT;
+        assert!((wide - expected).abs() < 0.001, "{wide} vs {expected}");
+        // Never negative, whatever the zoom clamp does.
+        assert!(header_band_width_pt(&layout, f32::NAN) > 0.0);
+    }
 
     /// Meteorological direction is the one thing here that can be silently
     /// wrong: every barb would point the wrong way and the hodograph would be
