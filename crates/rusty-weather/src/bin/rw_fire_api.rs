@@ -2007,6 +2007,11 @@ fn sounding_response(path: &str, state: &AppState) -> Vec<u8> {
             .and_then(|value| value.parse::<f32>().ok())
             .map(sounding_sharppy::clamp_pixels_per_point)
             .unwrap_or(sounding_sharppy::DEFAULT_PIXELS_PER_POINT),
+        zoom: query
+            .get("zoom")
+            .and_then(|value| value.parse::<f32>().ok())
+            .map(sounding_sharppy::clamp_zoom)
+            .unwrap_or(sounding_sharppy::DEFAULT_ZOOM),
     };
     match sounding::render_sounding(&state.store_root, model, run, &date, cycle, &request) {
         Ok(output) => {

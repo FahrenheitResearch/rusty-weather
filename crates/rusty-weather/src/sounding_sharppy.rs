@@ -24,16 +24,46 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 const WINDOW_W: f32 = 1630.0;
 const WINDOW_H: f32 = 1100.0;
 
-/// Multiplier on every font in the window. sharppyrs scales the type while
-/// leaving panel and line geometry in their original coordinate system, which is
-/// what makes this the right knob: the labels grow, the plot does not move.
+/// Multiplier on every font in the window, leaving panel and line geometry in
+/// their original coordinate system.
 ///
-/// Type sized for a desktop window read at 1:1 comes out small in a browser,
-/// because the page fits the image to the viewport (`max-width: 100%`) — a
-/// 1630 px window shown in a 900 px panel is 55% type. Rendering more PIXELS
-/// does not fix that; only bigger type relative to the frame does.
-/// sharppyrs clamps to 0.5..=2.0.
-pub const DEFAULT_TEXT_SCALE: f32 = 1.25;
+/// **Kept at 1.0 on purpose.** This looks like the knob for "make the text
+/// bigger" and it is a trap past about 1.05: sharppyrs' title band is a FIXED
+/// height in points, so the type grows into it and stops. Measured on a live
+/// render — at 1.12 the bottoms of the title glyphs are sliced by the plot
+/// frame, at 1.25 `Inf. Temp.` truncates to `Inf. Tem`, and at 1.4 the title
+/// loses `, CA`. Use [`DEFAULT_ZOOM`] instead, which grows the band and its
+/// font together. This stays exposed for deliberate per-panel tuning.
+pub const DEFAULT_TEXT_SCALE: f32 = 1.0;
+
+/// How much bigger the whole window is drawn, type and chrome together.
+///
+/// The window is laid out in POINTS, so zooming means dividing the logical size
+/// by this and multiplying the pixel ratio by it. Type keeps its point size and
+/// therefore lands on more pixels; the plot keeps the same pixel size, because
+/// it is a fraction of a frame whose pixel dimensions do not change; and
+/// anything sized in absolute points — the title band, padding, line widths —
+/// scales in lockstep with the type inside it, which is exactly what
+/// [`DEFAULT_TEXT_SCALE`] cannot do.
+///
+/// The cost is real but different: panels are narrower in points, so a label
+/// that only just fitted can still truncate. That is the thing to look at when
+/// raising this.
+pub const DEFAULT_ZOOM: f32 = 1.25;
+
+/// Bounds on the zoom. Above ~1.6 the parameter tables start eliding words,
+/// which loses information rather than presenting it larger.
+pub const MIN_ZOOM: f32 = 0.75;
+pub const MAX_ZOOM: f32 = 1.6;
+
+/// Clamp a caller-supplied zoom, falling back to the default for nonsense.
+pub fn clamp_zoom(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(MIN_ZOOM, MAX_ZOOM)
+    } else {
+        DEFAULT_ZOOM
+    }
+}
 
 /// Device pixel ratio for the offscreen render. The window is laid out in
 /// POINTS, so this multiplies the PNG's pixel dimensions without moving
@@ -262,6 +292,7 @@ pub fn render_png(
     layout: sharppyrs::SoundingLayout,
     text_scale: f32,
     pixels_per_point: f32,
+    zoom: f32,
 ) -> Result<Vec<u8>, String> {
     // Profile::new returns None when the arrays cannot make a sounding at all
     // (too few levels, non-monotonic pressure); say so rather than unwrapping.
@@ -279,12 +310,14 @@ pub fn render_png(
     // The widget reads its layout from egui memory — that is how the in-app gear
     // button edits it — so store ours under an id and hand the widget that id.
     let layout_id = egui::Id::new("rustwx_sharppy_layout");
+    // Zoom is a change of units, not of layout: fewer points across the same
+    // number of pixels. The product below is held constant so the PNG's pixel
+    // size does not depend on the zoom — only how much of it the type occupies.
+    let zoom = clamp_zoom(zoom);
+    let ratio = clamp_pixels_per_point(pixels_per_point);
     let mut harness = egui_kittest::Harness::builder()
-        .with_size(egui::Vec2::new(WINDOW_W, WINDOW_H))
-        // Points, not pixels: the layout is unchanged and the raster gets
-        // denser. `with_size` above stays in the coordinate system sharppyrs
-        // was tuned for whatever this is set to.
-        .with_pixels_per_point(clamp_pixels_per_point(pixels_per_point))
+        .with_size(egui::Vec2::new(WINDOW_W / zoom, WINDOW_H / zoom))
+        .with_pixels_per_point(ratio * zoom)
         .build_ui(move |ui| {
             if !fonts_installed {
                 install_fonts_with_fallbacks(ui.ctx());

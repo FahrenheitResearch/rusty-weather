@@ -68,6 +68,9 @@ pub struct SoundingRequest {
     /// Device pixel ratio for the offscreen render: more pixels for the same
     /// layout, so the image survives being clicked to full size.
     pub pixels_per_point: f32,
+    /// How much bigger the window is drawn, type and chrome together, at a
+    /// fixed output pixel size. This is the "make the text bigger" control.
+    pub zoom: f32,
 }
 
 #[derive(Debug)]
@@ -382,6 +385,7 @@ pub fn render_sounding(
             layout,
             request.text_scale,
             request.pixels_per_point,
+            request.zoom,
         )?
     } else {
         native
@@ -692,6 +696,7 @@ mod tests {
             sharppy_layout: false,
             text_scale: crate::sounding_sharppy::DEFAULT_TEXT_SCALE,
             pixels_per_point: crate::sounding_sharppy::DEFAULT_PIXELS_PER_POINT,
+            zoom: crate::sounding_sharppy::DEFAULT_ZOOM,
             layout_tokens: None,
         }
     }
@@ -732,6 +737,23 @@ mod tests {
             expected(crate::sounding_sharppy::DEFAULT_PIXELS_PER_POINT),
             "default render is the window size times the default pixel ratio"
         );
+
+        // Zoom must NOT change the output pixel size — that is what makes it a
+        // change of units rather than of layout. A window drawn at 1.6x zoom is
+        // the same PNG dimensions with bigger type in it.
+        let mut zoomed = request();
+        zoomed.sharppy_layout = true;
+        zoomed.zoom = 1.6;
+        let outz = render_sounding(&root, "synthetic", "20260702_00z", "20260702", 0, &zoomed)
+            .expect("sharppy layout renders zoomed");
+        let decodedz = image::load_from_memory(&outz.png).expect("decodes as an image");
+        assert_eq!(
+            (decodedz.width(), decodedz.height()),
+            (decoded.width(), decoded.height()),
+            "zoom must hold the output pixel size and grow the type instead"
+        );
+        assert_eq!(crate::sounding_sharppy::clamp_zoom(f32::NAN), crate::sounding_sharppy::DEFAULT_ZOOM);
+        assert_eq!(crate::sounding_sharppy::clamp_zoom(9.0), crate::sounding_sharppy::MAX_ZOOM);
 
         // A caller-supplied ratio changes pixels only: same aspect, so the panel
         // arrangement is untouched.
