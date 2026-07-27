@@ -106,6 +106,9 @@
             <button data-model="nbm">NBM</button>
           </div>
         </label>
+        <label class="field"><span>Run</span>
+          <select id="runSelect"><option value="latest">Latest (auto)</option></select>
+        </label>
         <label class="field"><span>Product</span>
           <select id="product"></select>
         </label>
@@ -761,6 +764,9 @@
     preset: "conus", bounds: DOMAINS[0][2], drawn: null,
     brand: "generic", brandTitle: "", brandCredit: "", logoDataUrl: null,
     cardStep: "day", cardTheme: "slate", cardAccent: null,
+    // "latest" keeps each family's own alias (windows need latest-day); anything
+    // else is an explicit run slug that overrides it.
+    run: "latest",
     // Cards reference an uploaded logo by id (see ensureCardLogo); logoCardKey
     // is the data URL that id was minted from, so a new upload re-uploads.
     cardLogoId: null, cardLogoKey: null,
@@ -796,6 +802,50 @@
       radar: ["qpf_total"],
     },
   };
+  /* Stored runs for the selected model, newest first, so a plot can be pinned to
+     an older cycle instead of always following `latest`. "Latest (auto)" keeps
+     the per-family alias: window products resolve against `latest-day`, which is
+     the extended run that actually holds F048. */
+  var runsByModel = {};
+  function activeRun(fam) {
+    return state.run === "latest" ? fam.run : state.run;
+  }
+  async function loadRuns(model) {
+    var sel = $("runSelect");
+    try {
+      var data = await fetch(API + "/api/runs?model=" + encodeURIComponent(model))
+        .then(function (r) { return r.json(); });
+      runsByModel[model] = data.runs || [];
+      manifestByModel[model] = { latest: data.latest || {} };
+    } catch (err) {
+      runsByModel[model] = [];
+      manifestByModel[model] = {};
+    }
+    var complete = ((data_or_empty(model).latest || {}).complete_run) || "";
+    sel.innerHTML = "";
+    var auto = document.createElement("option");
+    auto.value = "latest";
+    auto.textContent = complete ? "Latest (auto) \u2014 " + complete : "Latest (auto)";
+    sel.appendChild(auto);
+    (runsByModel[model] || []).forEach(function (run) {
+      var o = document.createElement("option");
+      o.value = run; o.textContent = run;
+      sel.appendChild(o);
+    });
+    // Keep an explicit pick if this model still has that run; otherwise fall back
+    // to auto rather than silently requesting a run the model never had.
+    if (state.run !== "latest" && (runsByModel[model] || []).indexOf(state.run) === -1) {
+      state.run = "latest";
+    }
+    sel.value = state.run;
+  }
+  /* /api/runs also returns the manifest under `latest`; keep the last one so the
+     auto option can name the run it resolves to. */
+  var manifestByModel = {};
+  function data_or_empty(model) {
+    return manifestByModel[model] || {};
+  }
+
   /* The card family's "products" are the store's own variables, so they can't
      be catalogued at build time: fetch them per model, once, and refill the
      picker when they land. */
@@ -1003,8 +1053,14 @@
     syncModelAvailability(); syncFamPanels(); fillProducts(); applyHourLimits(); syncHourNav();
     syncLoopRange();
   });
+  $("runSelect").addEventListener("change", function (e) {
+    state.run = e.target.value || "latest";
+    // A pinned run changes what the loop's frames mean, so drop a built loop.
+    stopLoop(); loopJob = null; setLoopExports(null); syncLoopRange();
+  });
   seg("modelSeg", "model", function (v) {
     state.model = v;
+    loadRuns(v);
     if (activeFam().card) { loadCardVars(v); syncCardSteps(); }
     fillProducts(); applyHourLimits(); syncHourNav(); syncLoopRange();
   });
@@ -1352,7 +1408,8 @@
     var lat = Number($("cardLat").value), lon = wrapLon(Number($("cardLon").value));
     var title = ($("cardTitle").value || "").trim() || (lat.toFixed(3) + ", " + lon.toFixed(3));
     var qs = new URLSearchParams({
-      lat: lat.toFixed(4), lon: lon.toFixed(4), model: state.model, run: "latest",
+      lat: lat.toFixed(4), lon: lon.toFixed(4), model: state.model,
+      run: activeRun(activeFam()),
       var: state.product, title: title, theme: state.cardTheme,
     });
     if (state.cardStep !== "day") qs.set("step", state.cardStep);
@@ -1376,7 +1433,7 @@
     var lat = Number($("cardLat").value), lon = wrapLon(Number($("cardLon").value));
     var qs = new URLSearchParams({
       lat: lat.toFixed(4), lon: lon.toFixed(4), model: state.model,
-      run: "latest", hour: String(state.hour),
+      run: activeRun(activeFam()), hour: String(state.hour),
       // The vendored SHARPpy layout, not the CAFire composite.
       style: "sharppy",
     });
@@ -1426,7 +1483,7 @@
     // window is only satisfiable once F048 is stored.
     var hour = fam.hourly ? state.hour : HOUR_LIMITS[state.model].max;
     return {
-      model: state.model, run: fam.run, hour: hour, products: state.product,
+      model: state.model, run: activeRun(fam), hour: hour, products: state.product,
       output_format: "webp", plot_style: "operational", basemap_style: state.basemap,
       county_linework: state.counties, place_label_density: state.density,
       place_label_size: 2, output_width: 1800, value_labels: state.values,
@@ -1542,7 +1599,8 @@
   $("renderBtn").addEventListener("click", render);
   $("copyLink").addEventListener("click", function () {
     var params = { fam: state.fam, model: state.model, product: state.product, hour: state.hour,
-      domain: state.drawn ? state.drawn.join(",") : state.preset, brand: state.brand };
+      domain: state.drawn ? state.drawn.join(",") : state.preset, brand: state.brand,
+      run: state.run };
     if (activeFam().card) {
       params.lat = Number($("cardLat").value).toFixed(4);
       params.lon = Number($("cardLon").value).toFixed(4);
@@ -1581,6 +1639,7 @@
       if (d) { state.preset = dom; state.bounds = d[2];
         [].forEach.call($("domainSeg").querySelectorAll("button"), function (x) {
           x.classList.toggle("on", x.getAttribute("data-domain") === dom); }); } }
+    if (qs.get("run")) state.run = qs.get("run");
     if (qs.get("brand")) { state.brand = qs.get("brand");
       [].forEach.call($("brandSeg").querySelectorAll("button"), function (b) {
         b.classList.toggle("on", b.getAttribute("data-brand") === state.brand); });
@@ -1607,7 +1666,7 @@
   // ---- boot -----------------------------------------------------------------
   buildFamSeg(); syncModelAvailability(); syncHourNav();
   fillProducts(); applyHourLimits(); applyDeepLink(); syncHourNav();
-  initMap(); boundsLabel(); syncFamPanels(); syncLoopRange();
+  initMap(); boundsLabel(); syncFamPanels(); syncLoopRange(); loadRuns(state.model);
   ["loopFrom", "loopTo", "loopStep", "loopMs"].forEach(function (id) {
     $(id).addEventListener("input", syncLoopRange);
   });
