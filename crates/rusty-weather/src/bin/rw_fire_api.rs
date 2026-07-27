@@ -1903,6 +1903,9 @@ fn sounding_response(path: &str, state: &AppState) -> Vec<u8> {
         sharppy_layout: query
             .get("style")
             .is_some_and(|value| value.eq_ignore_ascii_case("sharppy")),
+        // `layout=` takes sharppyrs panel tokens, so an arrangement can be
+        // retuned from a URL rather than a deploy; malformed tokens fall back.
+        layout_tokens: query.get("layout").cloned(),
     };
     match sounding::render_sounding(&state.store_root, model, run, &date, cycle, &request) {
         Ok(output) => {

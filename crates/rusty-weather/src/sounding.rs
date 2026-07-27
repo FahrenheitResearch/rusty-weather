@@ -53,6 +53,9 @@ pub struct SoundingRequest {
     /// the CWT composite (house header, locator map, ECAPE block, rustwx table).
     /// The CAFire Lab keeps the composite; the unbranded lab asks for this one.
     pub sharppy_layout: bool,
+    /// sharppyrs layout tokens for callers who want a different arrangement.
+    /// `None` uses [`crate::sounding_sharppy::DEFAULT_LAYOUT_TOKENS`].
+    pub layout_tokens: Option<String>,
 }
 
 #[derive(Debug)]
@@ -358,7 +361,9 @@ pub fn render_sounding(
             date = date_yyyymmdd,
             cycle = cycle_utc,
         );
-        crate::sounding_sharppy::render_png(data, &title, &request.brand)?
+        let layout =
+            crate::sounding_sharppy::layout_or_default(request.layout_tokens.as_deref());
+        crate::sounding_sharppy::render_png(data, &title, &request.brand, layout)?
     } else {
         native
             .render_cwt_png(&header)
@@ -666,6 +671,7 @@ mod tests {
             utc_offset_hours: -7.0,
             brand: "cafire.org/weather".to_string(),
             sharppy_layout: false,
+            layout_tokens: None,
         }
     }
 

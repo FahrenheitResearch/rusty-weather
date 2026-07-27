@@ -14,7 +14,13 @@ clap.workspace = true
 # egui widget, so serving it as a PNG means running egui offscreen. egui_kittest
 # is the harness sharppyrs' own snapshot test uses for exactly that; its wgpu
 # backend takes the box's render node, or Mesa's lavapipe software Vulkan.
-sharppyrs = { git = "https://github.com/FahrenheitResearch/sharppyrs" }
+# Pinned to the rev BOWECHO uses (branch codex/vrust032-integration), not main:
+# main has a 3-cell bottom band, while this rev splits the index board into
+# movable panels, reclaims a hidden panel's space for its neighbour, and bounds
+# the ECAPE/NCAPE saturation work at the EL. Those are what the better default
+# layout below depends on. Bump this together with BowEcho so both draw the same
+# plot.
+sharppyrs = { git = "https://github.com/FahrenheitResearch/sharppyrs", rev = "5d66575a0ad1ab9d740945b7a8bbd4ec8e8eed54" }
 egui = "0.34.3"
 egui_kittest = { version = "0.34", features = ["wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png", "webp", "gif"] }

@@ -24,6 +24,36 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 const WINDOW_W: f32 = 1630.0;
 const WINDOW_H: f32 = 1100.0;
 
+/// Our default panel arrangement, as sharppyrs layout tokens.
+///
+/// Three deliberate changes from the upstream default, which is
+/// `...|slinky,thetae,srwinds,locationmap|convectiveindices,kinematics,ship,severeindices,streamwiseness,hidden|250`:
+///
+/// * **Effective-layer STP takes the location map inset.** The STP box plots get
+///   read; a map of where you clicked does not, on a site where you clicked it.
+/// * **SHIP is hidden.** On this rev a hidden panel gives its space back to its
+///   neighbour, so dropping the SHIP box widens the severe-index column, which is
+///   also what un-squishes the NCAPE/ECAPE line.
+/// * **The location map moves to the bottom band free sixth slot**, where it can
+///   still confirm the point without spending prime space.
+///
+/// Bottom slots in order: two full-height columns, two sharing the third column
+/// vertically, then two more full-height columns.
+pub const DEFAULT_LAYOUT_TOKENS: &str = "speed,advection|hodograph|\
+     slinky,thetae,srwinds,stp|\
+     convectiveindices,kinematics,hidden,severeindices,streamwiseness,locationmap|250";
+
+/// Resolve a layout from caller tokens, falling back to our default.
+///
+/// Malformed tokens fall back rather than erroring: a stale shared link should
+/// still draw a sounding.
+pub fn layout_or_default(tokens: Option<&str>) -> sharppyrs::SoundingLayout {
+    tokens
+        .and_then(sharppyrs::SoundingLayout::from_tokens)
+        .or_else(|| sharppyrs::SoundingLayout::from_tokens(DEFAULT_LAYOUT_TOKENS))
+        .unwrap_or_default()
+}
+
 const MS_TO_KNOTS: f64 = 1.943_844;
 
 /// Wind as `SoundingData` wants it: direction the wind blows FROM in degrees
@@ -98,6 +128,7 @@ pub fn render_png(
     data: sharppyrs::SoundingData,
     title: &str,
     brand: &str,
+    layout: sharppyrs::SoundingLayout,
 ) -> Result<Vec<u8>, String> {
     // Profile::new returns None when the arrays cannot make a sounding at all
     // (too few levels, non-monotonic pressure); say so rather than unwrapping.
@@ -112,6 +143,9 @@ pub fn render_png(
     // repaint; fonts must be in the context before any text is laid out, or the
     // window renders in egui's default face.
     let mut fonts_installed = false;
+    // The widget reads its layout from egui memory — that is how the in-app gear
+    // button edits it — so store ours under an id and hand the widget that id.
+    let layout_id = egui::Id::new("rustwx_sharppy_layout");
     let mut harness = egui_kittest::Harness::builder()
         .with_size(egui::Vec2::new(WINDOW_W, WINDOW_H))
         .build_ui(move |ui| {
@@ -121,12 +155,14 @@ pub fn render_png(
                 ui.ctx().request_repaint();
                 return;
             }
+            sharppyrs::store_layout(ui.ctx(), layout_id, &layout);
             egui::Frame::new()
                 .fill(egui::Color32::BLACK)
                 .show(ui, |ui| {
                     ui.set_min_size(ui.available_size());
                     ui.add(
                         sharppyrs::SoundingView::new(&profile, &derived)
+                            .layout_memory_id(layout_id)
                             .title(&title)
                             .brand(&brand)
                             .style(sharppyrs::SkewTStyle::space_grotesk()),
@@ -169,6 +205,44 @@ mod tests {
         assert!(dir.abs() < 1.0e-6 || (dir - 360.0).abs() < 1.0e-6, "dir {dir}");
         // Calm stays calm instead of inventing a shaft direction.
         assert_eq!(wind_dir_speed(0.0, 0.0), (0.0, 0.0));
+    }
+
+    /// The default layout is a token string, so a typo would silently fall back
+    /// to the upstream default and quietly undo all three changes.
+    #[test]
+    fn our_default_layout_parses_and_makes_the_intended_swaps() {
+        let layout = sharppyrs::SoundingLayout::from_tokens(DEFAULT_LAYOUT_TOKENS)
+            .expect("default layout tokens must parse");
+        assert_eq!(
+            layout.insets[3],
+            sharppyrs::PanelKind::Stp,
+            "effective-layer STP should take the location map inset"
+        );
+        assert!(
+            !layout.bottom.contains(&sharppyrs::PanelKind::Ship),
+            "SHIP should be gone: {:?}",
+            layout.bottom
+        );
+        assert!(
+            layout.bottom.contains(&sharppyrs::PanelKind::LocationMap),
+            "the location map should move to the bottom band: {:?}",
+            layout.bottom
+        );
+        assert_eq!(
+            sharppyrs::SoundingLayout::from_tokens(&layout.to_tokens()),
+            Some(layout)
+        );
+    }
+
+    #[test]
+    fn a_bad_layout_falls_back_instead_of_failing() {
+        let ours = layout_or_default(None);
+        assert_eq!(ours.insets[3], sharppyrs::PanelKind::Stp);
+        assert_eq!(layout_or_default(Some("not-a-layout")), ours);
+        let upstream = layout_or_default(Some(
+            "speed,advection|hodograph|slinky,thetae,srwinds,locationmap|convectiveindices,kinematics,ship,severeindices,streamwiseness,hidden|250",
+        ));
+        assert_eq!(upstream.insets[3], sharppyrs::PanelKind::LocationMap);
     }
 
     #[test]
