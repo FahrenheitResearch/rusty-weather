@@ -1377,6 +1377,8 @@
     var qs = new URLSearchParams({
       lat: lat.toFixed(4), lon: lon.toFixed(4), model: state.model,
       run: "latest", hour: String(state.hour),
+      // The vendored SHARPpy layout, not the CAFire composite.
+      style: "sharppy",
     });
     // Credit follows the Branding card, same rule as the cards: absent keeps
     // the house credit, empty draws none.

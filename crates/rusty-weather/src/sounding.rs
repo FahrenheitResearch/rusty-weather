@@ -49,6 +49,10 @@ pub struct SoundingRequest {
     /// rule the outlook cards follow, so one sounding can be shared from either
     /// site without the wrong name on it.
     pub brand: String,
+    /// Draw the vendored SHARPpy compositor's own panel arrangement instead of
+    /// the CWT composite (house header, locator map, ECAPE block, rustwx table).
+    /// The CAFire Lab keeps the composite; the unbranded lab asks for this one.
+    pub sharppy_layout: bool,
 }
 
 #[derive(Debug)]
@@ -332,9 +336,15 @@ pub fn render_sounding(
         ),
         brand: request.brand.clone(),
     };
-    let png = native
-        .render_cwt_png(&header)
-        .map_err(|err| format!("render failed: {err}"))?;
+    let png = if request.sharppy_layout {
+        // The vendored compositor draws its own title block, so the CWT header
+        // strings are simply unused here.
+        native.render_sharppy_png()
+    } else {
+        native
+            .render_cwt_png(&header)
+            .map_err(|err| format!("render failed: {err}"))?
+    };
 
     // ---- format=json payload: profile arrays + flat indices ----
     let params = &native.params;
@@ -636,6 +646,7 @@ mod tests {
             hour: Some(6),
             utc_offset_hours: -7.0,
             brand: "cafire.org/weather".to_string(),
+            sharppy_layout: false,
         }
     }
 

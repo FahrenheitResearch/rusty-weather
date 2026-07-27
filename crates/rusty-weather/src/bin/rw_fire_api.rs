@@ -1894,6 +1894,12 @@ fn sounding_response(path: &str, state: &AppState) -> Vec<u8> {
         // credit, a present-but-EMPTY one draws none.
         brand: card_text_override(&query, "brand")
             .unwrap_or_else(|| "cafire.org/weather".to_string()),
+        // `style=sharppy` = the vendored SHARPpy panel arrangement; anything
+        // else (including absent) keeps the CWT composite the Lab has always
+        // served, so existing links are unchanged.
+        sharppy_layout: query
+            .get("style")
+            .is_some_and(|value| value.eq_ignore_ascii_case("sharppy")),
     };
     match sounding::render_sounding(&state.store_root, model, run, &date, cycle, &request) {
         Ok(output) => {
