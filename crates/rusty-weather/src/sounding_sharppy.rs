@@ -26,22 +26,28 @@ const WINDOW_H: f32 = 1100.0;
 
 /// Our default panel arrangement, as sharppyrs layout tokens.
 ///
-/// Three deliberate changes from the upstream default, which is
+/// Two changes from the upstream default, which is
 /// `...|slinky,thetae,srwinds,locationmap|convectiveindices,kinematics,ship,severeindices,streamwiseness,hidden|250`:
 ///
-/// * **Effective-layer STP takes the location map inset.** The STP box plots get
-///   read; a map of where you clicked does not, on a site where you clicked it.
-/// * **SHIP is hidden.** On this rev a hidden panel gives its space back to its
-///   neighbour, so dropping the SHIP box widens the severe-index column, which is
-///   also what un-squishes the NCAPE/ECAPE line.
-/// * **The location map moves to the bottom band free sixth slot**, where it can
-///   still confirm the point without spending prime space.
+/// * **SHIP is dropped** — the box plot nobody reads.
+/// * **Effective-layer STP takes a full-height bottom column** (slot 4), with
+///   streamwiseness moving up to share the third column with the severe indices.
+///   STP gets read, so it gets a cell it can be read in.
 ///
 /// Bottom slots in order: two full-height columns, two sharing the third column
 /// vertically, then two more full-height columns.
+///
+/// Arrived at by rendering the alternatives rather than reasoning about them. The
+/// first attempt took "swap the location map and STP" literally: STP went into
+/// the location map's INSET, far too small for box plots, and the map took a full
+/// bottom column it has no use for. Worse, hiding SHIP in a MIDDLE slot handed
+/// its reclaimed space to the severe-index panel, whose text then scaled past its
+/// box and overlapped into unreadable garbage — replacing a squished NCAPE/ECAPE
+/// line with something worse. Giving STP a real column, leaving the map in its
+/// inset, and keeping the hidden slot at the END fixes all three complaints.
 pub const DEFAULT_LAYOUT_TOKENS: &str = "speed,advection|hodograph|\
-     slinky,thetae,srwinds,stp|\
-     convectiveindices,kinematics,hidden,severeindices,streamwiseness,locationmap|250";
+     slinky,thetae,srwinds,locationmap|\
+     convectiveindices,kinematics,streamwiseness,severeindices,stp,hidden|250";
 
 /// Resolve a layout from caller tokens, falling back to our default.
 ///
@@ -214,20 +220,24 @@ mod tests {
         let layout = sharppyrs::SoundingLayout::from_tokens(DEFAULT_LAYOUT_TOKENS)
             .expect("default layout tokens must parse");
         assert_eq!(
-            layout.insets[3],
+            layout.bottom[4],
             sharppyrs::PanelKind::Stp,
-            "effective-layer STP should take the location map inset"
+            "effective-layer STP needs a full-height bottom column, not an inset"
         );
         assert!(
             !layout.bottom.contains(&sharppyrs::PanelKind::Ship),
             "SHIP should be gone: {:?}",
             layout.bottom
         );
-        assert!(
-            layout.bottom.contains(&sharppyrs::PanelKind::LocationMap),
-            "the location map should move to the bottom band: {:?}",
-            layout.bottom
+        assert_eq!(
+            layout.insets[3],
+            sharppyrs::PanelKind::LocationMap,
+            "the location map belongs in the small inset"
         );
+        // The hidden slot stays LAST, as upstream leaves it: hiding a middle slot
+        // hands its space to the severe-index panel, whose text then scales past
+        // its box and overlaps.
+        assert_eq!(layout.bottom[5], sharppyrs::PanelKind::Hidden);
         assert_eq!(
             sharppyrs::SoundingLayout::from_tokens(&layout.to_tokens()),
             Some(layout)
@@ -237,12 +247,12 @@ mod tests {
     #[test]
     fn a_bad_layout_falls_back_instead_of_failing() {
         let ours = layout_or_default(None);
-        assert_eq!(ours.insets[3], sharppyrs::PanelKind::Stp);
+        assert_eq!(ours.bottom[4], sharppyrs::PanelKind::Stp);
         assert_eq!(layout_or_default(Some("not-a-layout")), ours);
         let upstream = layout_or_default(Some(
             "speed,advection|hodograph|slinky,thetae,srwinds,locationmap|convectiveindices,kinematics,ship,severeindices,streamwiseness,hidden|250",
         ));
-        assert_eq!(upstream.insets[3], sharppyrs::PanelKind::LocationMap);
+        assert!(upstream.bottom.contains(&sharppyrs::PanelKind::Ship));
     }
 
     #[test]
