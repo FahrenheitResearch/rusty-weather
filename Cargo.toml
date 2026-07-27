@@ -54,6 +54,13 @@ ureq = { version = "3", default-features = false, features = ["rustls-no-provide
 [patch.crates-io]
 hdf5-reader = { path = "vendor/netcrust/vendor/hdf5-reader" }
 
+# sharppyrs pulls sharprs from its own standalone repo; point that at the copy
+# vendored here so there is ONE sharprs in the graph. Without this the profile
+# our engine builds and the profile the widget wants are different types with
+# the same name, and nothing can be passed between them. BowEcho does the same.
+[patch."https://github.com/FahrenheitResearch/sharprs"]
+sharprs = { path = "vendor/sharprs" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -30,6 +30,9 @@ mod xsection;
 #[path = "../sounding.rs"]
 mod sounding;
 
+#[path = "../sounding_sharppy.rs"]
+mod sounding_sharppy;
+
 #[path = "../svg_raster.rs"]
 mod svg_raster;
 

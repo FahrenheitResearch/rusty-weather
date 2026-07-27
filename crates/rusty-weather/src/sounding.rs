@@ -337,9 +337,28 @@ pub fn render_sounding(
         brand: request.brand.clone(),
     };
     let png = if request.sharppy_layout {
-        // The vendored compositor draws its own title block, so the CWT header
-        // strings are simply unused here.
-        native.render_sharppy_png()
+        // The SPC-style window from sharppyrs, rendered offscreen. It takes the
+        // raw profile rather than our computed params: sharppyrs runs the same
+        // sharprs engine (one copy in the graph, patched in the workspace root),
+        // so handing it the arrays keeps a single source of truth for the numbers
+        // on the plot.
+        let data = crate::sounding_sharppy::sounding_data(
+            &assembled.pressure_hpa,
+            &assembled.height_m,
+            &assembled.temperature_c,
+            &assembled.dewpoint_c,
+            &assembled.u_ms,
+            &assembled.v_ms,
+            cell_lat,
+            cell_lon,
+        );
+        let title = format!(
+            "{model} {date} {cycle:02}z F{hour:03}  Valid: {day_label} {hod:02}z @{place}",
+            model = model_slug.to_uppercase(),
+            date = date_yyyymmdd,
+            cycle = cycle_utc,
+        );
+        crate::sounding_sharppy::render_png(data, &title, &request.brand)?
     } else {
         native
             .render_cwt_png(&header)
@@ -648,6 +667,34 @@ mod tests {
             brand: "cafire.org/weather".to_string(),
             sharppy_layout: false,
         }
+    }
+
+    /// The SPC-style window (sharppyrs, rendered offscreen through egui) must
+    /// actually produce an image from a real store column, not just compile.
+    /// This is the whole point of the port, and it exercises the wgpu path — so
+    /// if the box has no usable Vulkan driver, this is the test that says so.
+    #[test]
+    fn the_sharppy_layout_renders_from_the_store() {
+        let root = test_store("sharppy", true);
+        let mut req = request();
+        req.sharppy_layout = true;
+        req.brand = "wxsection.com".to_string();
+        let out = render_sounding(&root, "synthetic", "20260702_00z", "20260702", 0, &req)
+            .expect("sharppy layout renders");
+        assert_eq!(&out.png[..4], &[0x89, 0x50, 0x4E, 0x47], "not a PNG");
+        // The window is 1630x1100; anything much smaller means the harness drew
+        // an empty frame rather than the sounding.
+        assert!(
+            out.png.len() > 40_000,
+            "suspiciously small render: {} bytes",
+            out.png.len()
+        );
+        let decoded = image::load_from_memory(&out.png).expect("decodes as an image");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (1630, 1100),
+            "window size changed"
+        );
     }
 
     /// The credit is per-request so one renderer can serve both sites: the
