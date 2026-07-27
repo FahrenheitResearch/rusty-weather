@@ -403,6 +403,15 @@ a.dl:hover{background:#1b2223;color:#ffa580}
           <button class="play" id="hPlay" title="Build the loop server-side, then play it">▶ loop</button>
           <input id="loopMs" type="number" min="20" max="2000" step="20" value="200" title="ms per frame"
                  style="width:64px;margin-left:6px;background:#111617;color:#e7edee;border:1px solid #23302f;border-radius:8px;padding:3px 6px;font-size:11px">
+          <span style="margin-left:8px;font-size:11px;color:#8b9698">F</span>
+          <input id="loopFrom" type="number" min="0" value="0" title="loop: first forecast hour"
+                 style="width:52px;background:#111617;color:#e7edee;border:1px solid #23302f;border-radius:8px;padding:3px 6px;font-size:11px">
+          <span style="font-size:11px;color:#8b9698">→F</span>
+          <input id="loopTo" type="number" min="0" title="loop: last forecast hour"
+                 style="width:52px;background:#111617;color:#e7edee;border:1px solid #23302f;border-radius:8px;padding:3px 6px;font-size:11px">
+          <input id="loopStep" type="number" min="1" value="1" title="loop: hours between frames"
+                 style="width:44px;background:#111617;color:#e7edee;border:1px solid #23302f;border-radius:8px;padding:3px 6px;font-size:11px">
+          <span id="loopCount" style="margin-left:6px;font-size:11px;color:#8b9698"></span>
           <span id="loopExports" style="margin-left:8px;font-size:11px"></span>
         </div>
       </div>
@@ -1353,6 +1362,7 @@ function computeHours() {
     hours = latestManifest.stored_hours;
   }
   state.hours = hours && hours.length ? hours : Array.from({ length: 19 }, (_, i) => i);
+  syncLoopRange();
   if (!state.hours.includes(state.hour)) state.hour = state.hours[Math.min(6, state.hours.length - 1)];
   rebuildHourSelect();
 }
@@ -1526,6 +1536,42 @@ function loopFrameMs() {
   const raw = Number(($("loopMs") || {}).value);
   return Number.isFinite(raw) && raw >= 20 ? Math.min(raw, 2000) : 200;
 }
+
+/* Custom loop length: any sub-range of the run at any stride, rather than
+   always animating every stored hour. The candidate list is state.hours -- the
+   hours this run ACTUALLY holds, from /api/runs -- so a range never asks for a
+   frame the store cannot serve, and gaps in an in-progress cycle are skipped
+   rather than failing. LOOP_MAX_FRAMES mirrors the server's own cap. */
+const LOOP_MAX_FRAMES = 120;
+function loopHours() {
+  const ladder = (state.hours || []).slice().sort((a, b) => a - b);
+  if (!ladder.length) return [];
+  const last = ladder[ladder.length - 1];
+  const from = Math.max(ladder[0], Math.min(Number($("loopFrom").value) || 0, last));
+  const toRaw = Number($("loopTo").value);
+  const to = Math.max(from, Math.min(Number.isFinite(toRaw) && toRaw > 0 ? toRaw : last, last));
+  const step = Math.max(1, Math.round(Number($("loopStep").value) || 1));
+  return ladder
+    .filter(h => h >= from && h <= to && (h - from) % step === 0)
+    .slice(0, LOOP_MAX_FRAMES);
+}
+/* Show what the settings will produce: frames AND playback seconds, since
+   "length" means both. Also seeds the range when a new run's ladder arrives. */
+function syncLoopRange() {
+  const ladder = (state.hours || []).slice().sort((a, b) => a - b);
+  const box = $("loopCount");
+  if (!box || !ladder.length) return;
+  const last = ladder[ladder.length - 1];
+  $("loopFrom").max = last;
+  $("loopTo").max = last;
+  if (!$("loopTo").value || Number($("loopTo").value) > last) $("loopTo").value = last;
+  if (Number($("loopFrom").value) > last) $("loopFrom").value = ladder[0];
+  const hours = loopHours();
+  const secs = (hours.length * loopFrameMs()) / 1000;
+  box.textContent = hours.length
+    ? `${hours.length} frames · ${secs.toFixed(1)}s${hours.length >= LOOP_MAX_FRAMES ? " (capped)" : ""}`
+    : "no hours in range";
+}
 function setLoopExports(job) {
   const box = $("loopExports");
   if (!box) return;
@@ -1538,9 +1584,13 @@ function setLoopExports(job) {
 }
 async function buildLoop() {
   const slug = state.fam === "climoref" ? climoSlug() : state.product;
-  const hours = (state.hours || []).slice();
-  if (!FAMS[state.fam].hourly || hours.length < 2) {
+  if (!FAMS[state.fam].hourly || (state.hours || []).length < 2) {
     log("this family has a single frame; nothing to loop", "err");
+    return null;
+  }
+  const hours = loopHours();
+  if (hours.length < 2) {
+    log("that loop range has fewer than two stored hours", "err");
     return null;
   }
   const payload = renderPayload(slug, hours[0]);
@@ -1574,12 +1624,16 @@ async function buildLoop() {
     await new Promise(r => setTimeout(r, 700));
   }
 }
+for (const id of ["loopFrom", "loopTo", "loopStep", "loopMs"]) {
+  const el = $(id);
+  if (el) el.addEventListener("input", syncLoopRange);
+}
 $("hPlay").onclick = async () => {
   if (state.playTimer) return stopPlay();
   const slug = state.fam === "climoref" ? climoSlug() : state.product;
   const signature = JSON.stringify([slug, currentRun(), domainPayload(), state.basemap,
     state.counties, state.density, state.tempUnits, state.valueLabels, activeMapModel(),
-    state.hours, loopFrameMs()]);
+    loopHours(), loopFrameMs()]);
   if (!loopJob || loopJob.signature !== signature) {
     const built = await buildLoop();
     if (!built) return;

@@ -254,6 +254,19 @@
         <button class="btn secondary" id="copyImgBtn" style="flex:0 0 auto;display:none">&#8681; Copy PNG</button>
         <span id="loopExports" style="font-size:11px"></span>
       </div>
+      <div class="row" id="loopRange" style="margin-top:6px;align-items:center;gap:6px;flex-wrap:wrap">
+        <span class="muted" style="flex:0 0 auto">F</span>
+        <input id="loopFrom" type="number" min="0" value="0" title="first forecast hour"
+               style="width:62px;flex:0 0 auto" />
+        <span class="muted" style="flex:0 0 auto">&rarr; F</span>
+        <input id="loopTo" type="number" min="0" value="48" title="last forecast hour"
+               style="width:62px;flex:0 0 auto" />
+        <span class="muted" style="flex:0 0 auto">every</span>
+        <input id="loopStep" type="number" min="1" value="1" title="hours between frames"
+               style="width:52px;flex:0 0 auto" />
+        <span class="muted" style="flex:0 0 auto">h</span>
+        <span class="muted" id="loopCount" style="flex:1 1 auto;text-align:right"></span>
+      </div>
     </div>
 
     <div class="stage">
@@ -965,11 +978,12 @@
   seg("famSeg", "fam", function (v) {
     state.fam = v;
     syncModelAvailability(); syncFamPanels(); fillProducts(); applyHourLimits(); syncHourNav();
+    syncLoopRange();
   });
   seg("modelSeg", "model", function (v) {
     state.model = v;
     if (activeFam().card) { loadCardVars(v); syncCardSteps(); }
-    fillProducts(); applyHourLimits(); syncHourNav();
+    fillProducts(); applyHourLimits(); syncHourNav(); syncLoopRange();
   });
   $("product").addEventListener("change", function (e) { state.product = e.target.value; });
   $("hour").addEventListener("input", function (e) { state.hour = Number(e.target.value); $("hourLabel").textContent = state.hour; });
@@ -1148,6 +1162,57 @@
     var raw = Number($("loopMs").value);
     return isFinite(raw) && raw >= 20 ? Math.min(raw, 2000) : 200;
   }
+
+  /* Custom loop length: any sub-range of the run at any stride, instead of
+     always animating the model's entire ladder. Mirrors the server's own cap
+     (LOOP_MAX_FRAMES in rw_fire_api) so the UI never asks for a job the API
+     will reject. */
+  var LOOP_MAX_FRAMES = 120;
+  /* The forecast hours this model actually stores; a stride finer than the
+     cadence would ask for hours that do not exist. */
+  function loopLadder() {
+    var lim = HOUR_LIMITS[state.model];
+    var out = [];
+    for (var h = 0; h <= lim.max; h += lim.step) out.push(h);
+    return out;
+  }
+  function loopHours() {
+    var lim = HOUR_LIMITS[state.model];
+    var from = Math.max(0, Math.min(Number($("loopFrom").value) || 0, lim.max));
+    var to = Math.max(from, Math.min(Number($("loopTo").value) || lim.max, lim.max));
+    var wanted = Number($("loopStep").value) || lim.step;
+    // Snap the stride up to a whole number of stored steps.
+    var step = Math.max(lim.step, Math.round(wanted / lim.step) * lim.step);
+    var hours = loopLadder().filter(function (h) {
+      return h >= from && h <= to && (h - from) % step === 0;
+    });
+    return hours.slice(0, LOOP_MAX_FRAMES);
+  }
+  /* Keep the inputs inside what the selected model can serve, and show what the
+     current settings will actually produce -- frames AND how long it plays,
+     since "length" means both. */
+  function syncLoopRange() {
+    var lim = HOUR_LIMITS[state.model];
+    var hourly = activeFam().hourly;
+    ["loopFrom", "loopTo", "loopStep"].forEach(function (id) {
+      var el = $(id);
+      el.disabled = !hourly;
+      el.style.opacity = hourly ? "" : "0.4";
+      if (id !== "loopStep") { el.max = lim.max; el.step = lim.step; }
+    });
+    if (Number($("loopTo").value) > lim.max) $("loopTo").value = lim.max;
+    if (Number($("loopFrom").value) > lim.max) $("loopFrom").value = 0;
+    $("loopStep").step = lim.step;
+    if (Number($("loopStep").value) < lim.step) $("loopStep").value = lim.step;
+    var box = $("loopCount");
+    if (!hourly) { box.textContent = "single frame"; return; }
+    var hours = loopHours();
+    var secs = (hours.length * loopFrameMs()) / 1000;
+    var capped = hours.length >= LOOP_MAX_FRAMES ? " (capped)" : "";
+    box.textContent = hours.length
+      ? hours.length + " frames · " + secs.toFixed(1) + "s" + capped
+      : "no hours in range";
+  }
   function stopLoop() {
     if (loopTimer) { clearInterval(loopTimer); loopTimer = null; }
     $("loopBtn").classList.remove("on");
@@ -1164,10 +1229,8 @@
   async function buildLoop() {
     var fam = activeFam();
     if (!fam.hourly) { setStatus("err", "this family has a single frame; nothing to loop"); return null; }
-    var lim = HOUR_LIMITS[state.model];
-    var hours = [];
-    for (var h = 0; h <= lim.max; h += lim.step) hours.push(h);
-    if (hours.length > 120) hours = hours.slice(0, 120);
+    var hours = loopHours();
+    if (!hours.length) { setStatus("err", "no forecast hours in that loop range"); return null; }
     var payload = buildPayload();
     delete payload.hour;
     payload.hours = hours;
@@ -1198,7 +1261,8 @@
   $("loopBtn").addEventListener("click", async function () {
     if (loopTimer) return stopLoop();
     var signature = JSON.stringify([state.product, state.model, activeBounds(), state.basemap,
-      state.counties, state.density, state.tempUnits, state.values, state.brand, loopFrameMs()]);
+      state.counties, state.density, state.tempUnits, state.values, state.brand, loopFrameMs(),
+      loopHours()]);
     if (!loopJob || loopJob.signature !== signature) {
       var built = await buildLoop();
       if (!built) return;
@@ -1483,7 +1547,10 @@
   // ---- boot -----------------------------------------------------------------
   buildFamSeg(); syncModelAvailability(); syncHourNav();
   fillProducts(); applyHourLimits(); applyDeepLink(); syncHourNav();
-  initMap(); boundsLabel(); syncFamPanels();
+  initMap(); boundsLabel(); syncFamPanels(); syncLoopRange();
+  ["loopFrom", "loopTo", "loopStep", "loopMs"].forEach(function (id) {
+    $(id).addEventListener("input", syncLoopRange);
+  });
 })();
 </script>
 </body>

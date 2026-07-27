@@ -3407,6 +3407,100 @@ mod run_alias_tests {
 }
 
 #[cfg(test)]
+mod loop_range_tests {
+    use super::*;
+
+    fn request(hours: Vec<u16>, start: Option<u16>, end: Option<u16>, step: Option<u16>) -> LoopJobRequest {
+        let base: RenderJobRequest = serde_json::from_str(
+            r#"{"run":"20260726_00z","hour":0,"products":"2m_temperature_10m_winds",
+                "bounds":[-125.0,-66.5,24.0,50.0]}"#,
+        )
+        .expect("a minimal render request parses");
+        LoopJobRequest {
+            base,
+            hours,
+            hour_start: start,
+            hour_end: end,
+            hour_step: step,
+            frame_ms: None,
+            gif_width: None,
+            video_width: None,
+            video_crf: None,
+        }
+    }
+
+    /// Custom loop length: the labs send an explicit hour list (they know which
+    /// hours the run actually holds), and API callers can give a range instead.
+    #[test]
+    fn a_range_expands_at_the_requested_stride() {
+        assert_eq!(
+            loop_hours(&request(vec![], Some(6), Some(18), Some(3))).unwrap(),
+            vec![6, 9, 12, 15, 18]
+        );
+        // A stride that overshoots the end still yields the start.
+        assert_eq!(
+            loop_hours(&request(vec![], Some(12), Some(14), Some(9))).unwrap(),
+            vec![12]
+        );
+        // Default stride is hourly.
+        assert_eq!(
+            loop_hours(&request(vec![], Some(0), Some(3), None)).unwrap(),
+            vec![0, 1, 2, 3]
+        );
+        // Zero is treated as 1 rather than dividing by zero.
+        assert_eq!(
+            loop_hours(&request(vec![], Some(0), Some(2), Some(0))).unwrap(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn an_explicit_list_wins_and_is_normalized() {
+        // Out of order and duplicated: sorted and deduped, since frames are
+        // assembled in hour order and a repeat would stutter the animation.
+        assert_eq!(
+            loop_hours(&request(vec![12, 6, 6, 0], None, None, None)).unwrap(),
+            vec![0, 6, 12]
+        );
+        // The list takes precedence over any range fields.
+        assert_eq!(
+            loop_hours(&request(vec![7], Some(0), Some(48), Some(1))).unwrap(),
+            vec![7]
+        );
+    }
+
+    #[test]
+    fn bad_ranges_are_named_not_guessed() {
+        let err = loop_hours(&request(vec![], Some(12), Some(6), None)).expect_err("inverted");
+        assert!(err.contains("hour_end"), "{err}");
+        let err = loop_hours(&request(vec![], Some(6), None, None)).expect_err("no end");
+        assert!(err.contains("hour_start"), "{err}");
+        let err = loop_hours(&request(vec![], None, None, None)).expect_err("nothing at all");
+        assert!(err.contains("hours"), "{err}");
+    }
+
+    /// The cap protects the render gate: one request must not be able to queue
+    /// unbounded work. The labs mirror this number so the UI never asks for a
+    /// job the API will refuse.
+    #[test]
+    fn the_frame_cap_is_enforced_and_reported() {
+        let at_cap: Vec<u16> = (0..LOOP_MAX_FRAMES as u16).collect();
+        assert_eq!(
+            loop_hours(&request(at_cap, None, None, None)).unwrap().len(),
+            LOOP_MAX_FRAMES
+        );
+        let over: Vec<u16> = (0..=LOOP_MAX_FRAMES as u16).collect();
+        let err = loop_hours(&request(over, None, None, None)).expect_err("over the cap");
+        assert!(err.contains(&LOOP_MAX_FRAMES.to_string()), "{err}");
+        // A wide range at a coarse stride stays legal: 0-384 every 6 h is 65.
+        assert_eq!(
+            loop_hours(&request(vec![], Some(0), Some(384), Some(6))).unwrap().len(),
+            65
+        );
+    }
+}
+
+#[cfg(test)]
 mod card_theme_tests {
     use super::*;
 
