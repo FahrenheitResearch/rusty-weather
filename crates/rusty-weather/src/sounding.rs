@@ -61,6 +61,13 @@ pub struct SoundingRequest {
     /// sharppyrs layout tokens for callers who want a different arrangement.
     /// `None` uses [`crate::sounding_sharppy::DEFAULT_LAYOUT_TOKENS`].
     pub layout_tokens: Option<String>,
+    /// Type size multiplier for the sharppyrs window. Grows the labels without
+    /// moving any geometry — the fix for a window whose type was sized to be
+    /// read at 1:1 but which a browser fits into a smaller panel.
+    pub text_scale: f32,
+    /// Device pixel ratio for the offscreen render: more pixels for the same
+    /// layout, so the image survives being clicked to full size.
+    pub pixels_per_point: f32,
 }
 
 #[derive(Debug)]
@@ -368,7 +375,14 @@ pub fn render_sounding(
         );
         let layout =
             crate::sounding_sharppy::layout_or_default(request.layout_tokens.as_deref());
-        crate::sounding_sharppy::render_png(data, &title, &request.brand, layout)?
+        crate::sounding_sharppy::render_png(
+            data,
+            &title,
+            &request.brand,
+            layout,
+            request.text_scale,
+            request.pixels_per_point,
+        )?
     } else {
         native
             .render_cwt_png(&header)
@@ -676,6 +690,8 @@ mod tests {
             utc_offset_hours: -7.0,
             brand: "cafire.org/weather".to_string(),
             sharppy_layout: false,
+            text_scale: crate::sounding_sharppy::DEFAULT_TEXT_SCALE,
+            pixels_per_point: crate::sounding_sharppy::DEFAULT_PIXELS_PER_POINT,
             layout_tokens: None,
         }
     }
@@ -700,11 +716,52 @@ mod tests {
             "suspiciously small render: {} bytes",
             out.png.len()
         );
+        // The window is laid out in POINTS and rasterised at a device pixel
+        // ratio, so the pixel size is the layout size times that ratio. Asserting
+        // the product (rather than a fixed 1630x1100) is what keeps the two
+        // independent: the type can be scaled up without the layout moving.
         let decoded = image::load_from_memory(&out.png).expect("decodes as an image");
+        let expected = |ratio: f32| {
+            (
+                (1630.0 * ratio).round() as u32,
+                (1100.0 * ratio).round() as u32,
+            )
+        };
         assert_eq!(
             (decoded.width(), decoded.height()),
-            (1630, 1100),
-            "window size changed"
+            expected(crate::sounding_sharppy::DEFAULT_PIXELS_PER_POINT),
+            "default render is the window size times the default pixel ratio"
+        );
+
+        // A caller-supplied ratio changes pixels only: same aspect, so the panel
+        // arrangement is untouched.
+        let mut dense = request();
+        dense.sharppy_layout = true;
+        dense.pixels_per_point = 2.0;
+        let out2 = render_sounding(&root, "synthetic", "20260702_00z", "20260702", 0, &dense)
+            .expect("sharppy layout renders at 2x");
+        let decoded2 = image::load_from_memory(&out2.png).expect("decodes as an image");
+        assert_eq!((decoded2.width(), decoded2.height()), expected(2.0));
+        let aspect = |w: u32, h: u32| (w as f64 / h as f64 * 1000.0).round();
+        assert_eq!(
+            aspect(decoded.width(), decoded.height()),
+            aspect(decoded2.width(), decoded2.height()),
+            "pixel ratio must not change the layout's aspect"
+        );
+
+        // Nonsense ratios fall back or clamp rather than producing a 40000px
+        // image or a 1px one; a shared link should still draw.
+        assert_eq!(
+            crate::sounding_sharppy::clamp_pixels_per_point(f32::NAN),
+            crate::sounding_sharppy::DEFAULT_PIXELS_PER_POINT
+        );
+        assert_eq!(
+            crate::sounding_sharppy::clamp_pixels_per_point(50.0),
+            crate::sounding_sharppy::MAX_PIXELS_PER_POINT
+        );
+        assert_eq!(
+            crate::sounding_sharppy::clamp_pixels_per_point(0.01),
+            crate::sounding_sharppy::MIN_PIXELS_PER_POINT
         );
     }
 

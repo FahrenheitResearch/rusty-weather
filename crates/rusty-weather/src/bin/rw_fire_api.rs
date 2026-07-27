@@ -1992,6 +1992,21 @@ fn sounding_response(path: &str, state: &AppState) -> Vec<u8> {
         // `layout=` takes sharppyrs panel tokens, so an arrangement can be
         // retuned from a URL rather than a deploy; malformed tokens fall back.
         layout_tokens: query.get("layout").cloned(),
+        // Both scales are URL-tunable for the same reason as `layout`: judging
+        // type size needs a render to look at, and a rebuild per guess is a
+        // slow way to find the right number. Out-of-range or unparseable values
+        // fall back to the default rather than erroring — a shared link should
+        // still draw.
+        text_scale: query
+            .get("text_scale")
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|value| value.is_finite())
+            .unwrap_or(sounding_sharppy::DEFAULT_TEXT_SCALE),
+        pixels_per_point: query
+            .get("dpi")
+            .and_then(|value| value.parse::<f32>().ok())
+            .map(sounding_sharppy::clamp_pixels_per_point)
+            .unwrap_or(sounding_sharppy::DEFAULT_PIXELS_PER_POINT),
     };
     match sounding::render_sounding(&state.store_root, model, run, &date, cycle, &request) {
         Ok(output) => {

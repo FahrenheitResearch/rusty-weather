@@ -24,6 +24,40 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 const WINDOW_W: f32 = 1630.0;
 const WINDOW_H: f32 = 1100.0;
 
+/// Multiplier on every font in the window. sharppyrs scales the type while
+/// leaving panel and line geometry in their original coordinate system, which is
+/// what makes this the right knob: the labels grow, the plot does not move.
+///
+/// Type sized for a desktop window read at 1:1 comes out small in a browser,
+/// because the page fits the image to the viewport (`max-width: 100%`) — a
+/// 1630 px window shown in a 900 px panel is 55% type. Rendering more PIXELS
+/// does not fix that; only bigger type relative to the frame does.
+/// sharppyrs clamps to 0.5..=2.0.
+pub const DEFAULT_TEXT_SCALE: f32 = 1.25;
+
+/// Device pixel ratio for the offscreen render. The window is laid out in
+/// POINTS, so this multiplies the PNG's pixel dimensions without moving
+/// anything: 1630x1100 points at 1.5 is 2445x1650 px. Costs ~ratio² in render
+/// time and memory, and buys a sounding that stays sharp when it is clicked to
+/// full size, zoomed, or shared.
+pub const DEFAULT_PIXELS_PER_POINT: f32 = 1.5;
+
+/// Bounds for the render scale. The floor keeps a legible image; the ceiling
+/// keeps one render from monopolising the box — the whole window is rasterised
+/// under a single permit, and 2.5 is already 3.5x the pixels of 1.3.
+pub const MIN_PIXELS_PER_POINT: f32 = 1.0;
+pub const MAX_PIXELS_PER_POINT: f32 = 2.5;
+
+/// Clamp a caller-supplied device pixel ratio into [`MIN_PIXELS_PER_POINT`]..=
+/// [`MAX_PIXELS_PER_POINT`], falling back to the default for nonsense.
+pub fn clamp_pixels_per_point(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(MIN_PIXELS_PER_POINT, MAX_PIXELS_PER_POINT)
+    } else {
+        DEFAULT_PIXELS_PER_POINT
+    }
+}
+
 /// Our default panel arrangement, as sharppyrs layout tokens.
 ///
 /// Both marginal box plots are dropped, which is the whole change from the
@@ -226,6 +260,8 @@ pub fn render_png(
     title: &str,
     brand: &str,
     layout: sharppyrs::SoundingLayout,
+    text_scale: f32,
+    pixels_per_point: f32,
 ) -> Result<Vec<u8>, String> {
     // Profile::new returns None when the arrays cannot make a sounding at all
     // (too few levels, non-monotonic pressure); say so rather than unwrapping.
@@ -245,6 +281,10 @@ pub fn render_png(
     let layout_id = egui::Id::new("rustwx_sharppy_layout");
     let mut harness = egui_kittest::Harness::builder()
         .with_size(egui::Vec2::new(WINDOW_W, WINDOW_H))
+        // Points, not pixels: the layout is unchanged and the raster gets
+        // denser. `with_size` above stays in the coordinate system sharppyrs
+        // was tuned for whatever this is set to.
+        .with_pixels_per_point(clamp_pixels_per_point(pixels_per_point))
         .build_ui(move |ui| {
             if !fonts_installed {
                 install_fonts_with_fallbacks(ui.ctx());
@@ -262,7 +302,10 @@ pub fn render_png(
                             .layout_memory_id(layout_id)
                             .title(&title)
                             .brand(&brand)
-                            .style(sharppyrs::SkewTStyle::space_grotesk()),
+                            .style(
+                                sharppyrs::SkewTStyle::space_grotesk()
+                                    .with_text_scale(text_scale),
+                            ),
                     );
                 });
         });
