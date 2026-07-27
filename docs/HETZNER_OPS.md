@@ -228,11 +228,47 @@ reference client — served from the binary, baked in at build time from
 | `/api/v1/*` and everything else | legacy `api:8000` (satellite/lightning + old site) |
 | `/wxstore/*` | wxstore:8899 — **stopped**, so this 502s; expected |
 
-Two Caddy gotchas, both learned the hard way: (1) the Caddyfile is
-bind-mounted — after editing it you **must** `docker compose restart caddy`
-(sed/scp create a new inode the container can't see); (2) you almost
-never need to edit it — the `/api/*` matcher already routes any *new*
-API endpoint to the new stack with zero config change.
+**Second host: `generic.wxsection.com`** (added 2026-07-27) serves the
+unbranded plot lab. rusty-weather already serves that page at `/generic`, so
+only the root is rewritten; nothing else is exposed, because the API's own `/`
+is the CAFire-BRANDED Lab (as are `/ops` and `/legacy`) and that must not
+appear on the neutral domain:
+
+```
+generic.wxsection.com {
+  encode zstd gzip
+  @root path /
+  rewrite @root /generic
+  @lab path /generic /generic/* /api/* /outputs/*
+  handle @lab {
+    reverse_proxy 172.18.0.1:8788
+  }
+  handle {
+    redir * /generic 302
+  }
+}
+```
+
+DNS is a **proxied CNAME `generic` → `cafire.wxsection.com`** in the
+wxsection.com zone, so the box's address is never in DNS and follows the
+origin if it moves. `cafire.wxsection.com/lab/generic` still works.
+
+Caddy gotchas, all learned the hard way:
+
+1. The Caddyfile is bind-mounted as a **single file**, so the mount is pinned
+   to an INODE. `sed -i`, `scp` and editors that write-then-rename replace the
+   inode and the container keeps reading the ORPHANED old file. Write in place
+   (`cat new > Caddyfile`) — and if the inode has already been broken, only
+   `docker restart cafire-weather-service-caddy-1` re-resolves the mount.
+   **`caddy reload` happily succeeds against the stale file and exits 0**, so
+   the reload's exit code proves nothing: diff what the container sees
+   (`docker exec … grep … /etc/caddy/Caddyfile`) or read the live config
+   (`docker exec … curl -s localhost:2019/config/`) before believing it.
+2. `redir` takes an optional matcher FIRST: `redir /generic 302` parses as
+   "matcher `/generic`, target `302`" and emits `Location: 302`. Write
+   `redir * /generic 302`.
+3. You almost never need to edit it — the `/api/*` matcher already routes any
+   *new* API endpoint to the new stack with zero config change.
 
 ---
 

@@ -114,6 +114,13 @@ CAFire's satellite/lightning pages via the Caddy fallback),
   endpoints need **no** Caddyfile change).
 - `/outputs/*` → `:8788`; `handle_path /node/*` → `:8790` (node-1 tunnel,
   paused); fallback `handle` → `api:8000` (legacy stack).
+- **`generic.wxsection.com`** is a second host serving the unbranded lab:
+  root rewrites to `/generic`, only `/generic`, `/api/*` and `/outputs/*` are
+  exposed, everything else 302s to `/generic` so the CAFire-branded `/`, `/ops`
+  and `/legacy` never appear there. Full block + the bind-mount inode trap:
+  HETZNER_OPS §5. Note `wxsection.com` itself is NOT this box — it is a
+  Cloudflare Tunnel from Drew's PC (`.cloudflared/config.yml`), so never
+  repoint the apex here without checking that config.
 
 ### 4.4 Home nodes (see also HETZNER_OPS)
 4 Ubuntu boxes on Drew's LAN, mDNS `.local` names (IPs drift — use mDNS).
