@@ -33,6 +33,9 @@ mod sounding;
 #[path = "../sounding_sharppy.rs"]
 mod sounding_sharppy;
 
+#[path = "../analysis.rs"]
+mod analysis;
+
 #[path = "../svg_raster.rs"]
 mod svg_raster;
 
@@ -471,6 +474,9 @@ fn route(request: HttpRequest, state: AppState) -> Vec<u8> {
         }
         _ if request.method == "GET" && request.path.starts_with("/api/sounding") => {
             sounding_response(&request.query, &state)
+        }
+        _ if request.method == "GET" && request.path.starts_with("/api/analysis") => {
+            analysis_response(&request.query, &state)
         }
         _ if request.method == "GET" && request.path.starts_with("/api/runs") => {
             runs_response(&request.query, &state)
@@ -1826,6 +1832,76 @@ fn xsection_response(path: &str, state: &AppState) -> Vec<u8> {
 /// sounding for the nearest grid cell, composed from the stored isobaric
 /// volumes + surface fields, as PNG (or the profile arrays and computed
 /// indices with format=json).
+/// GET /api/analysis?lat=..&lon=..&run=..[&model=..][&hour=..][&llm_model=..]
+/// — the numbers-only briefing a language model would be given, plus the exact
+/// request body that would be sent.
+///
+/// **The provider call is deliberately not wired up.** This serves the inputs so
+/// the prompt and the reduction can be judged by hand — paste the briefing into a
+/// model and read what comes back — before anything automatic is turned on. No
+/// page requests this endpoint, so nothing machine-written can reach a public
+/// plot by accident.
+fn analysis_response(path: &str, state: &AppState) -> Vec<u8> {
+    let query = parse_query(path);
+    // The briefing is a reduction of the sounding payload, so this asks the
+    // sounding endpoint for its own JSON rather than reading the store a second
+    // way — one source of truth for the numbers on the plot and in the prose.
+    let mut json_query = path.to_string();
+    if !json_query.contains("format=") {
+        json_query.push_str("&format=json");
+    }
+    let response = sounding_response(&json_query, state);
+    let Some(body_start) = find_body_start(&response) else {
+        return json_status_response(
+            500,
+            &serde_json::json!({ "error": "sounding response had no body" }),
+        );
+    };
+    let data: serde_json::Value = match serde_json::from_slice(&response[body_start..]) {
+        Ok(value) => value,
+        // The sounding endpoint's own error JSON is the honest answer here
+        // (unstored hour, no volumes, point off-grid), so pass it through.
+        Err(_) => return response,
+    };
+    if data.get("profile").is_none() {
+        return response;
+    }
+    let briefing = analysis::briefing_from_sounding(&data);
+    let llm_model = query
+        .get("llm_model")
+        .map(String::as_str)
+        .filter(|model| {
+            !model.is_empty()
+                && model.len() <= 64
+                && model
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':'))
+        })
+        .unwrap_or(analysis::DEFAULT_MODEL);
+    json_response(&serde_json::json!({
+        "enabled": false,
+        "reason": "the provider call is not wired up yet; this returns inputs only",
+        "key_configured": analysis::key_configured(),
+        "llm_model": llm_model,
+        "briefing": briefing,
+        "request_preview": analysis::chat_request(llm_model, &briefing, 3),
+        "source": {
+            "model": data.get("model").cloned().unwrap_or(serde_json::Value::Null),
+            "run": data.get("run").cloned().unwrap_or(serde_json::Value::Null),
+            "hour": data.get("hour").cloned().unwrap_or(serde_json::Value::Null),
+            "nearest_place": data.get("nearest_place").cloned().unwrap_or(serde_json::Value::Null),
+        },
+    }))
+}
+
+/// Byte offset of the body in one of our hand-rolled HTTP responses.
+fn find_body_start(response: &[u8]) -> Option<usize> {
+    response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+}
+
 fn sounding_response(path: &str, state: &AppState) -> Vec<u8> {
     let query = parse_query(path);
     let bad = |message: &str| json_status_response(400, &serde_json::json!({ "error": message }));
@@ -2336,7 +2412,11 @@ fn card_text_override(query: &HashMap<String, String>, key: &str) -> Option<Stri
     // The credit doubles as a note line — a sentence of context under the
     // header — so it gets room for one, while brand and footer stay short
     // labels. Still bounded: this is drawn into an SVG served to anyone.
-    let limit = if key == "credit" { CARD_CREDIT_MAX_CHARS } else { 48 };
+    let limit = match key {
+        "credit" => CARD_CREDIT_MAX_CHARS,
+        "note" => CARD_NOTE_MAX_CHARS,
+        _ => 48,
+    };
     query.get(key).map(|raw| {
         raw.trim()
             .chars()
@@ -2349,6 +2429,12 @@ fn card_text_override(query: &HashMap<String, String>, key: &str) -> Option<Stri
 /// Characters a credit may carry. Triple the old 48-char label limit, which is
 /// about a sentence — enough to use the credit line as a note.
 const CARD_CREDIT_MAX_CHARS: usize = 144;
+
+/// Characters a NOTE may carry. The credit is an attribution that shares a row
+/// with the subtitle, so it can only ever be a sentence; a note is its own
+/// wrapped block under the header and can hold a paragraph — which is what
+/// machine-written discussion needs.
+const CARD_NOTE_MAX_CHARS: usize = 700;
 
 /// Where uploaded card logos live. Content-addressed, so the same logo uploaded
 /// twice is one file and one stable URL.
@@ -2513,6 +2599,9 @@ fn card_theme_from_query(query: &HashMap<String, String>) -> meteogram::CardThem
     }
     if let Some(footer) = card_text_override(query, "footer") {
         theme.footer = footer;
+    }
+    if let Some(note) = card_text_override(query, "note") {
+        theme.note = note;
     }
     // A single accent drives both the place name and the extended-range marker;
     // only `#rrggbb` is accepted so nothing can inject markup into a fill.

@@ -1277,6 +1277,11 @@ pub struct CardTheme {
     pub credit: String,
     /// Trailing clause of the footnote; empty drops it.
     pub footer: String,
+    /// Free text under the header, wrapped across as many lines as it needs.
+    /// Where a paragraph goes — a hand-written note, or a machine-written
+    /// discussion — as opposed to `credit`, which is a one-line attribution
+    /// sharing a row with the subtitle.
+    pub note: String,
     /// Logo for the header's left edge, when the caller uploaded one.
     pub logo: Option<CardLogo>,
 }
@@ -1295,10 +1300,47 @@ pub struct CardLogo {
     pub height: u32,
 }
 
-/// Credit type size. A tenth larger than the 12 px it used to be: the credit
-/// doubles as a note line, the one piece of text on the card its author wrote,
-/// and a sentence of it read as fine print at 12.
+/// Credit type size. A tenth larger than the 12 px it used to be: the credit is
+/// an attribution the author wrote, and at 12 it read as fine print.
 const CREDIT_FONT_PX: f64 = 13.2;
+
+/// Note type size, and the line spacing that goes with it.
+const NOTE_FONT_PX: f64 = 13.2;
+const NOTE_LINE_PX: f64 = NOTE_FONT_PX + 4.0;
+
+/// Wrap text to a pixel width at a given font size, breaking on words.
+///
+/// A single token longer than the line (a URL) is left whole rather than
+/// hyphenated. Empty in, nothing out: an empty note must add no lines at all,
+/// not one blank line that still shifts the layout down.
+fn wrap_to_width(text: &str, font_px: f64, max_px: f64) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() || max_px <= 0.0 {
+        return Vec::new();
+    }
+    // 0.52 em per character matches the header widths used elsewhere here; the
+    // face is proportional, so this is an estimate on purpose — it only has to
+    // keep the block inside the card.
+    let per_char = font_px * 0.52;
+    let max_chars = ((max_px / per_char).floor() as usize).max(8);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() <= max_chars {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
 
 /// Logo height in the header, matching the two-line title block.
 const LOGO_HEIGHT_PX: f64 = 44.0;
@@ -1351,6 +1393,8 @@ impl CardTheme {
             brand: brand.to_string(),
             credit: credit.to_string(),
             footer: footer.to_string(),
+            // A note is per-request text, never part of a named palette.
+            note: String::new(),
             // Logos are per-request uploads, never part of a named palette.
             logo: None,
         };
@@ -1842,6 +1886,16 @@ pub fn render_daily_svg(
     let col_w = ((width - ml - 28.0) / n as f64)
         .clamp(84.0, if n <= 4 { 240.0 } else { 150.0 });
     ml += ((width - 28.0 - ml) - col_w * n as f64) / 2.0;
+    // The note wraps to the card's own width and pushes the body DOWN, rather
+    // than stretching the card sideways the way a long credit does: a paragraph
+    // of machine-written discussion would otherwise produce a card several
+    // thousand pixels wide to hold one block of prose.
+    let note_lines = wrap_to_width(&request.theme.note, NOTE_FONT_PX, width - 24.0 - 26.0);
+    let note_block_h = if note_lines.is_empty() {
+        0.0
+    } else {
+        note_lines.len() as f64 * NOTE_LINE_PX + 10.0
+    };
     let strip_h = 46.0;
     let n_strips: f64 = if single { 1.0 } else { 2.0 };
     let wind_row_h = 46.0;
@@ -1930,6 +1984,16 @@ pub fn render_daily_svg(
             width - 26.0,
             th.muted,
             xml_escape(&th.credit)
+        ));
+    }
+
+    // Note block: left-aligned under the header, above the value strips.
+    for (index, line) in note_lines.iter().enumerate() {
+        svg.push_str(&format!(
+            r##"<text x="{header_x:.1}" y="{:.1}" fill="{}" font-size="{NOTE_FONT_PX}">{}</text>"##,
+            80.0 + (index as f64 + 1.0) * NOTE_LINE_PX,
+            th.muted,
+            xml_escape(line)
         ));
     }
 

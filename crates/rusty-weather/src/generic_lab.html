@@ -236,7 +236,13 @@
             <input type="text" id="brandTitle" placeholder="e.g. ACME FIRE OPS" maxlength="80" />
           </label>
           <label class="field"><span>Credit (right)</span>
-            <input type="text" id="brandCredit" placeholder="e.g. acme.example.com" maxlength="80" />
+            <input type="text" id="brandCredit" placeholder="e.g. acme.example.com" maxlength="144" />
+          </label>
+          <label class="field"><span>Note / discussion (wraps under the header)</span>
+            <textarea id="brandNote" rows="3" maxlength="700"
+              placeholder="A paragraph of context. Wraps to the card width and pushes the plot down, so long text stays readable."
+              style="width:100%;background:var(--panel-2);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;resize:vertical"></textarea>
+            <span class="muted" id="noteCount"></span>
           </label>
           <label class="field" style="margin:0"><span>Logo (PNG, optional)</span>
             <input type="file" id="brandLogo" accept="image/*" />
@@ -762,7 +768,7 @@
     model: "hrrr", product: FAMS[0].products[0][0], hour: 6,
     basemap: "filled", values: false, density: 2, counties: true, tempUnits: "f",
     preset: "conus", bounds: DOMAINS[0][2], drawn: null,
-    brand: "generic", brandTitle: "", brandCredit: "", logoDataUrl: null,
+    brand: "generic", brandTitle: "", brandCredit: "", brandNote: "", logoDataUrl: null,
     cardStep: "day", cardTheme: "slate", cardAccent: null,
     // "latest" keeps each family's own alias (windows need latest-day); anything
     // else is an explicit run slug that overrides it.
@@ -1121,6 +1127,12 @@
   });
   $("brandTitle").addEventListener("input", function (e) { state.brandTitle = e.target.value; });
   $("brandCredit").addEventListener("input", function (e) { state.brandCredit = e.target.value; });
+  $("brandNote").addEventListener("input", function (e) {
+    state.brandNote = e.target.value;
+    $("noteCount").textContent = state.brandNote.length
+      ? state.brandNote.length + " / 700 characters"
+      : "";
+  });
 
   // ---- logo upload -> downscaled PNG dataURL --------------------------------
   $("brandLogo").addEventListener("change", function (e) {
@@ -1415,6 +1427,7 @@
     if (state.cardStep !== "day") qs.set("step", state.cardStep);
     if (state.tempUnits === "c") qs.set("temp_units", "c");
     if (state.cardAccent) qs.set("accent", state.cardAccent);
+    if (state.brandNote.trim()) qs.set("note", state.brandNote.trim());
     if (state.brand === "none") { qs.set("brand", ""); qs.set("credit", ""); qs.set("footer", ""); }
     else if (state.brand === "custom") {
       qs.set("brand", state.brandTitle.trim());
