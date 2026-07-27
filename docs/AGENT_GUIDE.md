@@ -220,6 +220,17 @@ host (holds the 201 GB CONUS climo pack; wide-west is what's deployed).
   worth knowing: the band is a fraction of the window width, so a bigger
   `zoom=` costs header characters; and `HEADER_FONT_PT`/`HEADER_RIGHT_PAD_PT`
   mirror literals inside sharppyrs, so bumping its rev means checking them.
+  **The hodograph draws into a centered SQUARE**, so its axes span equal knots.
+  Its kt-per-pixel is one isotropic scalar taken from the panel width, which in
+  a cell wider than it is tall (ours is 1.4:1) leaves the vertical axis short —
+  it read 120 across and 80 down before. Squaring it letterboxes the cell; the
+  alternative, stretching to fill, would make isotachs elliptical and misstate
+  every shear vector, so it is not on the table. The trailing `layout=` token is
+  the window in knots; **195 is what puts 90 kt as the outermost labeled ring on
+  all four axes**, and only rings whose labels fit whole get labeled at all
+  (rings past that still draw, unlabeled). Both live upstream in
+  `panels::hodo` — bumping the rev means re-checking them, and BowEcho shares
+  the pin, so its hodograph letterboxes too the moment it bumps.
 · `GET /api/fires` (WFIGS)
 · `GET /api/ecape/...` (frozen static gallery while node 1 is paused).
 

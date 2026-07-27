@@ -117,9 +117,18 @@ pub fn clamp_pixels_per_point(value: f32) -> f32 {
 ///   and overlaps into unreadable garbage.
 /// * "The el stp plot is kinda usefull" meant marginal, not useful. Reading it the
 ///   other way put STP in a full column here for one deploy.
+///
+/// The trailing number is the hodograph window in knots. 195 puts **90 kt as the
+/// outermost labeled ring on all four axes**, which is only possible because
+/// sharppyrs draws the hodograph into a centered square (`Geom::plot_rect`): the
+/// kt-per-pixel scale is one isotropic scalar, so in this layout's 576x409 pt cell
+/// the upstream 250 gave +/-125 kt across and only +/-89 kt vertically — the 90
+/// ring was drawn but its labels fell ~2 px outside the clip rect, so the vertical
+/// axis appeared to stop at 80. Anything in ~187..207 labels 90 and not 100; below
+/// ~187 the 100 ring reappears, above ~207 the 90 label clips again.
 pub const DEFAULT_LAYOUT_TOKENS: &str = "speed,advection|hodograph|\
      slinky,thetae,srwinds,streamwiseness|\
-     convectiveindices,kinematics,locationmap,severeindices,hidden,hidden|250";
+     convectiveindices,kinematics,locationmap,severeindices,hidden,hidden|195";
 
 /// Resolve a layout from caller tokens, falling back to our default.
 ///
@@ -691,6 +700,10 @@ mod tests {
             [layout.bottom[4], layout.bottom[5]],
             [sharppyrs::PanelKind::Hidden, sharppyrs::PanelKind::Hidden]
         );
+        // The trailing token is the hodograph window. 195 is what puts 90 kt as
+        // the outermost labeled ring on all four axes; see the constant's docs
+        // for why it is a range and not a free choice.
+        assert_eq!(layout.hodo_zoom_kts, 195.0);
         assert_eq!(
             sharppyrs::SoundingLayout::from_tokens(&layout.to_tokens()),
             Some(layout)
