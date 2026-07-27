@@ -402,6 +402,51 @@ pub(crate) fn valid_label(date_yyyymmdd: &str, cycle_utc: u8, forecast_hour: u16
     (hod, format!("{weekday} {m}/{d}"))
 }
 
+/// `valid_label` shifted into a local zone: ("8 pm", "Mon 7/27").
+///
+/// The DATE has to move with the hour. A 03Z valid time at UTC-7 is 8 pm the
+/// day BEFORE, so pairing a locally-shifted hour with the UTC day label names
+/// the wrong day — off by one on a forecast valid time, which is the kind of
+/// error a forecaster acts on. Minutes are carried too, for the half-hour zones.
+///
+/// Returns a preformatted 12-hour clock string because that is the only reason
+/// to want local time at all; a caller wanting arithmetic should use the UTC
+/// hour from [`valid_label`].
+pub(crate) fn local_valid_label(
+    date_yyyymmdd: &str,
+    cycle_utc: u8,
+    forecast_hour: u16,
+    utc_offset_hours: f64,
+) -> (String, String) {
+    let year: i64 = date_yyyymmdd[0..4].parse().unwrap_or(2000);
+    let month: u32 = date_yyyymmdd[4..6].parse().unwrap_or(1);
+    let day: u32 = date_yyyymmdd[6..8].parse().unwrap_or(1);
+    let offset_minutes = if utc_offset_hours.is_finite() {
+        (utc_offset_hours * 60.0).round() as i64
+    } else {
+        0
+    };
+    let total_minutes =
+        (i64::from(cycle_utc) + i64::from(forecast_hour)) * 60 + offset_minutes;
+    let days = days_from_civil(year, month, day) + total_minutes.div_euclid(1440);
+    let minute_of_day = total_minutes.rem_euclid(1440);
+    let (hour24, minute) = (minute_of_day / 60, minute_of_day % 60);
+    let (_, m, d) = civil_from_days(days);
+    let weekday = WEEKDAYS[(days + 4).rem_euclid(7) as usize];
+
+    let suffix = if hour24 < 12 { "am" } else { "pm" };
+    let hour12 = match hour24 % 12 {
+        0 => 12,
+        h => h,
+    };
+    let clock = if minute == 0 {
+        format!("{hour12}{suffix}")
+    } else {
+        format!("{hour12}:{minute:02}{suffix}")
+    };
+    (clock, format!("{weekday} {m}/{d}"))
+}
+
 /// Round tick step to a 1/2/2.5/5 decade multiple covering the range.
 pub(crate) fn nice_step(range: f64, target: usize) -> f64 {
     if !(range.is_finite()) || range <= 0.0 {
@@ -2367,6 +2412,37 @@ mod tests {
         let (hod, label) = valid_label("20261231", 12, 13);
         assert_eq!(hod, 1);
         assert_eq!(label, "Fri 1/1");
+    }
+
+    /// The local DAY has to move with the hour. This is the case that makes the
+    /// helper worth having: reusing the UTC day label with a shifted hour puts a
+    /// forecast valid time on the wrong date, which is an error a forecaster acts
+    /// on rather than notices.
+    #[test]
+    fn local_valid_labels_roll_backwards_across_midnight() {
+        // 21Z Mon Jul 27 + F006 = 03Z TUESDAY the 28th in UTC...
+        let (hod, utc_label) = valid_label("20260727", 21, 6);
+        assert_eq!(hod, 3);
+        assert_eq!(utc_label, "Tue 7/28");
+
+        // ...but the same instant at UTC-7 is 8 pm MONDAY the 27th.
+        let (clock, label) = local_valid_label("20260727", 21, 6, -7.0);
+        assert_eq!(clock, "8pm");
+        assert_eq!(label, "Mon 7/27");
+    }
+
+    #[test]
+    fn local_valid_labels_read_as_a_twelve_hour_clock() {
+        assert_eq!(
+            local_valid_label("20260702", 6, 6, -7.0),
+            ("5am".to_string(), "Thu 7/2".to_string())
+        );
+        // Midnight and noon read as 12, not 0.
+        assert_eq!(local_valid_label("20260702", 7, 0, -7.0).0, "12am");
+        assert_eq!(local_valid_label("20260702", 19, 0, -7.0).0, "12pm");
+        // A half-hour zone keeps its minutes; a whole hour drops ":00".
+        assert_eq!(local_valid_label("20260702", 6, 0, 5.5).0, "11:30am");
+        assert_eq!(local_valid_label("20260702", 6, 0, 0.0).0, "6am");
     }
 
     #[test]

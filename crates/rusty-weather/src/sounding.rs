@@ -21,7 +21,7 @@ use rustwx_sounding::{CwtHeader, NativeSounding, SoundingColumn, SoundingMetadat
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
 
-use super::meteogram::{nearest_cell, valid_label};
+use super::meteogram::{local_valid_label, nearest_cell, valid_label};
 use super::xsection::NO_VOLUME_MESSAGE;
 
 /// Isobaric volumes the profile needs; absent on hours ingested before the
@@ -379,21 +379,30 @@ pub fn render_sounding(
             cell_lat,
             cell_lon,
         );
-        // sharppyrs draws the title in a single fixed band and ELIDES what does
-        // not fit, and `zoom` makes the type larger against that band's width —
-        // so the header has to be short enough that a long place name still
-        // lands. Measured: at zoom 1.25 a ~66 character title fits, and
-        // "HRRR 20260727 06z F006  Valid: Mon 7/27 12z @near South Lake Tahoe,
-        // CA" is 70 and lost its ", CA".
+        // sharppyrs draws the title left-aligned in the skew-T's top band and
+        // CLIPS at that panel's edge — it does not elide, so an over-long title
+        // is cut mid-glyph and the place name loses its state ("Winslow West, A").
+        // Upstream now shrinks the title's type to fit and only elides at a word
+        // boundary as a last resort, so length costs size rather than characters;
+        // this still keeps it short, because smaller type is also a cost.
         //
         // The init date compacts to MM/DD (the year is in the run slug, the
         // share URL, and the JSON), and the place drops the "near " hedge —
         // every sounding is at a grid cell near the request, so the word carried
         // no information the subtitle does not already give. That buys ~14
         // characters, which is a long California town plus its state.
+        //
+        // The valid time reads LOCAL, with the Z hour kept in parentheses: local
+        // is what a poster and their audience actually think in, and Z is the
+        // reference a forecaster cross-checks against. `local_valid_label` rolls
+        // the day, which matters — 03Z at UTC-7 is 8 pm the day BEFORE, so the
+        // UTC `day_label` cannot be reused here.
         let place_short = place.strip_prefix("near ").unwrap_or(place.as_str());
+        let (local_clock, local_day) =
+            local_valid_label(date_yyyymmdd, cycle_utc, hour, request.utc_offset_hours);
         let title = format!(
-            "{model} {month}/{day} {cycle:02}z F{hour:03}  Valid {day_label} {hod:02}z @{place_short}",
+            "{model} {month}/{day} {cycle:02}z F{hour:03}  Valid {local_day} {local_clock} \
+             ({hod:02}z) @{place_short}",
             model = model_slug.to_uppercase(),
             month = &date_yyyymmdd[4..6],
             day = &date_yyyymmdd[6..8],

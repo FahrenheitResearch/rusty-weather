@@ -4795,7 +4795,7 @@ dependencies = [
 [[package]]
 name = "sharppyrs"
 version = "0.1.0"
-source = "git+https://github.com/FahrenheitResearch/sharppyrs?rev=13cb24af767377aefc0af912bc74eb472f3395c8#13cb24af767377aefc0af912bc74eb472f3395c8"
+source = "git+https://github.com/FahrenheitResearch/sharppyrs?rev=9908de7fd9389e7e9865fe21d8f5cd3f2693d770#9908de7fd9389e7e9865fe21d8f5cd3f2693d770"
 dependencies = [
  "egui",
  "sharprs",

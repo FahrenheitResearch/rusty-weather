@@ -20,7 +20,7 @@ clap.workspace = true
 # the ECAPE/NCAPE saturation work at the EL. Those are what the better default
 # layout below depends on. Bump this together with BowEcho so both draw the same
 # plot.
-sharppyrs = { git = "https://github.com/FahrenheitResearch/sharppyrs", rev = "13cb24af767377aefc0af912bc74eb472f3395c8" }
+sharppyrs = { git = "https://github.com/FahrenheitResearch/sharppyrs", rev = "9908de7fd9389e7e9865fe21d8f5cd3f2693d770" }
 egui = "0.34.3"
 egui_kittest = { version = "0.34", features = ["wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png", "webp", "gif"] }
