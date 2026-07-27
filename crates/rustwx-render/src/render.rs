@@ -1503,10 +1503,20 @@ fn draw_projected_place_labels(
         // and moving it keeps the city on the map instead of dropping it.
         let mut chosen: Option<(i32, i32)> = None;
         for placement in placement_fallbacks(place_label.style.label_placement) {
-            let (candidate_x, candidate_y) =
+            let (raw_x, raw_y) =
                 label_top_left(placement, anchor_x, anchor_y, label_width, label_height);
-            let candidate_x = candidate_x.clamp(min_x, max_label_x.max(min_x));
-            let candidate_y = candidate_y.clamp(min_y, max_label_y.max(min_y));
+            let candidate_x = raw_x.clamp(min_x, max_label_x.max(min_x));
+            let candidate_y = raw_y.clamp(min_y, max_label_y.max(min_y));
+            // A `Center` label means "this reading belongs to THIS point" —
+            // a value label with no dot to tie it back. Sliding it into the
+            // frame the way a name can be slid would silently reattach the
+            // number to somewhere else, so a value that will not fit where it
+            // belongs is dropped instead.
+            if matches!(placement, ProjectedLabelPlacement::Center)
+                && (candidate_x != raw_x || candidate_y != raw_y)
+            {
+                continue;
+            }
             let rect = LabelRect::from_xywh(candidate_x, candidate_y, label_width, label_height)
                 .padded(PLACE_LABEL_DECLUTTER_PAD_PX);
             if !occupied.iter().any(|taken| rect.intersects(*taken)) {

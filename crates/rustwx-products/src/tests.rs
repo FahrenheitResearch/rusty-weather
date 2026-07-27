@@ -234,3 +234,97 @@ fn dense_place_label_glue_pushes_lower_rank_auxiliary_entries_to_micro() {
             })
     );
 }
+
+/// City value labels are one uniform, readable size.
+///
+/// Name labels are a deliberate hierarchy — a big city is set larger and darker
+/// than a hamlet — and the value pass used to inherit it, so a map of bare
+/// numbers came out with three sizes and three opacities for no difference a
+/// reader can decode: a value is just a number, and 82% size at 72% alpha is
+/// simply harder to read. Reported as "also the font size" on a GFS temperature
+/// map where most values landed on Auxiliary/Micro.
+#[test]
+fn city_value_labels_are_one_uniform_readable_size() {
+    let grid = rustwx_render::LatLonGrid::new(
+        rustwx_render::GridShape::new(2, 2).unwrap(),
+        vec![34.0, 34.0, 38.0, 38.0],
+        vec![-122.0, -118.0, -122.0, -118.0],
+    )
+    .unwrap();
+    let field = rustwx_render::Field2D::new(
+        rustwx_render::ProductKey::named("value_label_test"),
+        "degF",
+        grid,
+        vec![73.0, 96.0, 111.0, f32::NAN],
+    )
+    .unwrap();
+    let mut request = rustwx_render::MapRenderRequest::contour_only(field);
+    let place = |slug: &str, lat: f64, lon: f64| crate::places::SelectedPlace {
+        slug: slug.to_string(),
+        label: slug.to_string(),
+        center_lon: lon,
+        center_lat: lat,
+        bounds: (lon - 0.1, lon + 0.1, lat - 0.1, lat + 0.1),
+        source_index: 0,
+        center_distance_km: 0.0,
+        edge_margin_km: 0.0,
+        ranking_score: 0.0,
+    };
+    let selected = vec![
+        place("southwest", 34.0, -122.0),
+        place("southeast", 34.0, -118.0),
+        place("northwest", 38.0, -122.0),
+        place("northeast", 38.0, -118.0),
+    ];
+    for (index, item) in selected.iter().enumerate() {
+        let mut label = rustwx_render::ProjectedPlaceLabel::new(index as f64, 0.0)
+            .with_label(item.slug.clone());
+        // What the name pass leaves behind: shrunk, faded, offset off the dot.
+        label.priority = rustwx_render::ProjectedPlaceLabelPriority::Micro;
+        label.style.label_scale = 1;
+        label.style.label_offset_x_px = 6;
+        label.style.label_offset_y_px = -2;
+        label.style.label_placement = rustwx_render::ProjectedLabelPlacement::AboveRight;
+        request.projected_place_labels.push(label);
+    }
+
+    apply_value_labels(
+        &mut request,
+        &selected,
+        &[34.0, 34.0, 38.0, 38.0],
+        &[-122.0, -118.0, -122.0, -118.0],
+        0,
+    );
+
+    let drawn: Vec<Option<&str>> = request
+        .projected_place_labels
+        .iter()
+        .map(|label| label.label.as_deref())
+        .collect();
+    assert_eq!(
+        drawn,
+        vec![Some("73"), Some("96"), Some("111"), None],
+        "each city takes the field value at its own grid cell, and the cell with \
+         no finite value is dropped rather than labelled"
+    );
+
+    for label in request.projected_place_labels.iter().take(3) {
+        assert_eq!(
+            label.priority,
+            rustwx_render::ProjectedPlaceLabelPriority::Primary,
+            "values opt out of the name-label priority tiers"
+        );
+        assert_eq!(label.style.label_scale, VALUE_LABEL_SCALE);
+        assert!(label.style.label_bold);
+        assert_eq!(label.style.label_color.a, 255);
+        assert!(label.style.label_halo_width_px >= 2, "numbers need a halo to sit on a filled field");
+        assert_eq!(
+            label.style.label_placement,
+            rustwx_render::ProjectedLabelPlacement::Center,
+            "a value belongs ON its point, not offset beside a dot"
+        );
+        assert_eq!(label.style.label_offset_x_px, 0);
+        assert_eq!(label.style.label_offset_y_px, 0);
+        assert_eq!(label.style.marker_radius_px, 0);
+    }
+}

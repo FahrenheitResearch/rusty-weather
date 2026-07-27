@@ -60,7 +60,13 @@ struct PlaceLabelPlan {
 #[derive(Debug, Clone)]
 struct RankedPlaceCandidate {
     place: SelectedPlace,
+    /// Footprint used to decide whether this place is IN the frame.
     selection_bounds: (f64, f64, f64, f64),
+    /// Footprint used to decide whether two kept places are too close. Separate
+    /// from `selection_bounds` because a city's crop footprint scales with its
+    /// importance, which is the wrong measure for a keep-away zone — see
+    /// [`overlap_bounds_for_options`].
+    overlap_bounds: (f64, f64, f64, f64),
 }
 
 impl PlacePreset {
@@ -188,7 +194,9 @@ pub enum PlaceLabelDensityTier {
     MaxLocal,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Catalog importance, ordered most important first: derived `Ord` is the
+/// ranking, so `Major < Aux < Micro` sorts a big city ahead of a hamlet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PlaceCatalogTier {
     Major,
@@ -1150,6 +1158,64 @@ fn stratify_candidates_over_bounds(
     ordered
 }
 
+/// Offer the big cities to the declutter first, keeping the stratified order
+/// within each group.
+///
+/// The declutter below is greedy and first-come: whoever claims an area rejects
+/// everything whose crop overlaps it. Ordered on geometry alone, a small
+/// neighbour could arrive first and evict the city — a California frame kept
+/// Santa Barbara and dropped Los Angeles, and a dense one named Lovelock,
+/// Quincy and Hawthorne while Sacramento, San Francisco, Reno and Las Vegas had
+/// no label at all. That is bad for a name and fatal for a value: a bare number
+/// is decoded only by recognising the place under it.
+///
+/// This costs no coverage. Majors are few and already spaced, so the aux and
+/// micro fill still arrives in stratified order and the dense tiers keep
+/// reaching into the small-town catalog. Places from the world gazetteer all
+/// report as `Major`, so an international frame is left exactly as it was.
+fn major_cities_first(candidates: Vec<RankedPlaceCandidate>) -> Vec<RankedPlaceCandidate> {
+    let (majors, rest): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|candidate| {
+        place_catalog_tier_for_slug(&candidate.place.slug) == PlaceCatalogTier::Major
+    });
+    majors.into_iter().chain(rest).collect()
+}
+
+/// Keep-away footprint for the declutter, which is NOT the same thing as the
+/// footprint that decides whether a place is in frame.
+///
+/// A preset's footprint sizes the map you get when you zoom to that place, so it
+/// scales with importance: 1.9° for a major city, 0.58° for a hamlet. Reused as
+/// a "two labels too close together" test, that scaling is backwards — it makes
+/// a big city suppress its neighbours over ~500 km while two hamlets 60 km apart
+/// both pass. On a California frame it deleted Sacramento (68% overlap with the
+/// San Francisco Bay crop) and San Diego (with Los Angeles), which is why those
+/// cities had no value stamped on them.
+///
+/// A drawn label occupies the same few hundred pixels whatever the place's
+/// population, so for OVERLAY LABELS every place gets the same small box here
+/// and `min_center_spacing_km` — which is tier-independent and tuned per
+/// density — is left to do the real spacing work. Choosing city CROPS is the
+/// other job, and there the footprint means what it says, so it is kept.
+fn overlap_bounds_for_options(
+    preset: PlacePreset,
+    options: PlaceSelectionOptions,
+) -> (f64, f64, f64, f64) {
+    match options.containment {
+        // How overlay labels ask the question.
+        PlaceContainmentMode::CropIntersectsBounds => centered_bounds(
+            preset.center_lon,
+            preset.center_lat,
+            MICRO_PLACE_HALF_HEIGHT_DEG,
+            PLACE_OUTPUT_ASPECT_RATIO,
+        ),
+        // Both crop modes are choosing map extents, where the footprint is the
+        // subject rather than a proxy.
+        PlaceContainmentMode::CenterWithinBounds | PlaceContainmentMode::CropWithinBounds => {
+            effective_place_bounds(preset)
+        }
+    }
+}
+
 pub fn select_places_for_bounds(
     catalog: &[PlacePreset],
     bounds: (f64, f64, f64, f64),
@@ -1162,7 +1228,7 @@ pub fn select_places_for_bounds(
     let center_lon = (bounds.0 + bounds.1) * 0.5;
     let center_lat = (bounds.2 + bounds.3) * 0.5;
 
-    let mut candidates = catalog
+    let candidates = catalog
         .iter()
         .enumerate()
         .filter_map(|(index, preset)| {
@@ -1194,11 +1260,13 @@ pub fn select_places_for_bounds(
                     ranking_score,
                 },
                 selection_bounds,
+                overlap_bounds: overlap_bounds_for_options(*preset, options),
             })
         })
         .collect::<Vec<_>>();
 
     let candidates = stratify_candidates_over_bounds(candidates, bounds, options.max_count);
+    let candidates = major_cities_first(candidates);
 
     let mut selected = Vec::<RankedPlaceCandidate>::new();
     for candidate in candidates {
@@ -1210,7 +1278,7 @@ pub fn select_places_for_bounds(
                 kept.place.center_lon,
             ) >= options.min_center_spacing_km.max(0.0);
             let crop_overlap_ok =
-                crop_overlap_fraction(candidate.selection_bounds, kept.selection_bounds)
+                crop_overlap_fraction(candidate.overlap_bounds, kept.overlap_bounds)
                     <= options.max_crop_overlap_fraction.clamp(0.0, 1.0);
             center_spacing_ok && crop_overlap_ok
         });

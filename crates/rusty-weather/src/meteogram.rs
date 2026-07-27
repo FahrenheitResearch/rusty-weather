@@ -1896,11 +1896,15 @@ pub fn render_daily_svg(
     } else {
         note_lines.len() as f64 * NOTE_LINE_PX + 10.0
     };
+    // Top of the body. Every row below the header hangs off this, so a note
+    // moves the whole plot down as one block and the card grows taller by
+    // exactly the height of the prose.
+    let body_top = 86.0 + note_block_h;
     let strip_h = 46.0;
     let n_strips: f64 = if single { 1.0 } else { 2.0 };
     let wind_row_h = 46.0;
     let pcpn_row_h = 38.0;
-    let chart_top = 86.0 + n_strips * (strip_h + 6.0) + wind_row_h + pcpn_row_h + 14.0;
+    let chart_top = body_top + n_strips * (strip_h + 6.0) + wind_row_h + pcpn_row_h + 14.0;
     let chart_h = 320.0;
     let height = chart_top + chart_h + 74.0;
 
@@ -2001,7 +2005,7 @@ pub fn render_daily_svg(
     let strip_rows: &[(&str, bool)] = if single { &[("VAL", true)] } else { &[("HI", true), ("LO", false)] };
     let value_font = if col_w < 100.0 { 19.0 } else { 26.0 };
     for (row, (label, is_hi)) in strip_rows.iter().enumerate() {
-        let y = 86.0 + row as f64 * (strip_h + 6.0);
+        let y = body_top + row as f64 * (strip_h + 6.0);
         svg.push_str(&format!(
             r##"<text x="{:.0}" y="{:.0}" fill="{}" font-size="13" font-weight="700" text-anchor="end">{label}</text>"##,
             ml - 10.0,
@@ -2067,7 +2071,7 @@ pub fn render_daily_svg(
     // source; half = 5 kt, full = 10 kt, pennant = 50 kt) + the bucket-max
     // sustained speed and, beside it, the bucket-max gust ("12 G18", METAR
     // convention) — both in mph. The legend line spells this out.
-    let wind_y = 86.0 + n_strips * (strip_h + 6.0);
+    let wind_y = body_top + n_strips * (strip_h + 6.0);
     svg.push_str(&format!(
         r##"<text x="{:.0}" y="{:.0}" fill="{}" font-size="13" font-weight="700" text-anchor="end">WIND</text>"##,
         ml - 10.0,

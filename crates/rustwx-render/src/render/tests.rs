@@ -1513,3 +1513,62 @@ fn crates_do_not_reintroduce_legacy_credit_footers() {
         "legacy credit/footer strings remain in crates/: {offenders:?}"
     );
 }
+
+/// A `Center` label carries no dot tying it to a point — it IS the point, which
+/// is how the Pivotal-style city VALUE labels work. So it may never be nudged:
+/// clamping a number into the frame the way a name can be clamped silently
+/// reattaches that reading to a different place, and near the frame edge that
+/// put values on the wrong side of a state line. It draws where it belongs or
+/// not at all.
+#[test]
+fn centered_value_labels_are_dropped_rather_than_slid_into_the_frame() {
+    let presentation = RenderPresentation::for_mode(ProductVisualMode::FilledMeteorology);
+    let layout = compute_layout(320, 240, false, false, presentation, ChromeScale::default());
+    let extent = MapExtent { x_min: 0.0, x_max: 1.0, y_min: 0.0, y_max: 1.0 };
+    let centered_at = |x: f64, y: f64| {
+        let mut style = sample_place_label().style;
+        style.marker_radius_px = 0;
+        style.marker_outline_width = 0;
+        style.label_placement = ProjectedLabelPlacement::Center;
+        style.label_offset_x_px = 0;
+        style.label_offset_y_px = 0;
+        ProjectedPlaceLabelOverlay {
+            x,
+            y,
+            label: Some("116".into()),
+            priority: ProjectedPlaceLabelPriority::Primary,
+            style,
+        }
+    };
+    let draw = |label: ProjectedPlaceLabelOverlay| {
+        let mut img = RgbaImage::from_pixel(320, 240, Rgba::WHITE.to_image_rgba());
+        draw_projected_place_labels(&mut img, &layout, &extent, &[label], None, None)
+    };
+
+    let middle = draw(centered_at(0.5, 0.5));
+    assert_eq!(middle.len(), 1, "a value with room draws on its point");
+    let drawn = middle[0];
+    let anchor_x =
+        layout.map_x as i32 + (0.5 * layout.map_w.saturating_sub(1) as f64).round() as i32;
+    let anchor_y =
+        layout.map_y as i32 + (0.5 * layout.map_h.saturating_sub(1) as f64).round() as i32;
+    // The rect is the glyph box, so allow a pixel of rounding either way.
+    assert!(
+        ((drawn.min_x + drawn.max_x) / 2 - anchor_x).abs() <= 1,
+        "value should be centered on its own point: {drawn:?} vs x={anchor_x}"
+    );
+    assert!(
+        ((drawn.min_y + drawn.max_y) / 2 - anchor_y).abs() <= 1,
+        "value should be centered on its own point: {drawn:?} vs y={anchor_y}"
+    );
+
+    // Hard against the frame edge, where half the number would fall outside.
+    assert!(
+        draw(centered_at(0.0, 0.5)).is_empty(),
+        "a value that cannot sit on its point must be dropped, not moved"
+    );
+    assert!(
+        draw(centered_at(1.0, 0.5)).is_empty(),
+        "a value that cannot sit on its point must be dropped, not moved"
+    );
+}

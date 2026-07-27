@@ -77,6 +77,11 @@ fn value_labels_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Type scale for every city value label. Bold scale 2 is ~24 px at the
+/// default label size, which puts a number on par with the contour labels it
+/// competes with; the name-label scale of 1 read as fine print next to them.
+const VALUE_LABEL_SCALE: u32 = 2;
+
 /// Compact number for a city value label: integer for typical magnitudes
 /// (temp/RH/wind), one decimal for small-range fields (e.g. VPD in hPa).
 fn format_value_label(value: f64) -> String {
@@ -129,6 +134,17 @@ fn apply_value_labels(
                 // No name marker dot — Pivotal-style bare numbers.
                 label.style.marker_radius_px = 0;
                 label.style.marker_outline_width = 0;
+                // One size for every number, and a size a reader can actually
+                // read. Name labels are deliberately a hierarchy — a big city
+                // is set larger than a hamlet — but a bare number carries no
+                // hierarchy to express: three digits at 82% opacity and 82%
+                // size just look like a smaller number. Values therefore opt
+                // out of the priority tiers entirely.
+                label.style.label_scale = VALUE_LABEL_SCALE;
+                label.style.label_color = rustwx_render::Color::rgba(17, 22, 28, 255);
+                label.style.label_halo = rustwx_render::Color::rgba(255, 255, 255, 235);
+                label.style.label_halo_width_px = 2;
+                label.priority = rustwx_render::ProjectedPlaceLabelPriority::Primary;
             }
             // City has no finite value here (off-grid / masked) — drop it.
             None => {

@@ -1227,3 +1227,63 @@ fn world_label_preview() {
         }
     }
 }
+
+/// A number stamped on a map is anonymous: a reader decodes it only by
+/// recognising the place under it, so the big cities cannot be the ones that go
+/// missing. Reported from a GFS temperature map of California whose city values
+/// named Lovelock, Quincy, Hawthorne and Nevada City while Los Angeles,
+/// San Francisco, Sacramento, Reno and Las Vegas had no value at all: the
+/// stratification picked each cell's most CENTRAL place, and a hamlet nearer a
+/// cell centre both took the slot and blocked the city via the spacing rule.
+#[test]
+fn every_major_city_in_frame_keeps_its_label_at_dense_density() {
+    let domain = DomainSpec::new("california", (-126.0, -113.8, 31.9, 42.5));
+    for tier in [
+        PlaceLabelDensityTier::Major,
+        PlaceLabelDensityTier::MajorAndAux,
+        PlaceLabelDensityTier::Dense,
+        PlaceLabelDensityTier::MaxLocal,
+    ] {
+        let selected = PlaceLabelOverlay::major_us_cities()
+            .with_density(tier)
+            .selected_places_for_domain(&domain);
+        let slugs = place_slugs(&selected);
+        for expected in [
+            "ca_los_angeles",
+            "ca_san_francisco_bay",
+            "ca_sacramento",
+            "ca_san_diego",
+            "nv_reno",
+            "nv_las_vegas",
+        ] {
+            // Major density is capped at 7 labels for the region, so only the
+            // tiers with room for them owe us every city.
+            if tier == PlaceLabelDensityTier::Major {
+                continue;
+            }
+            assert!(
+                slugs.contains(&expected),
+                "{tier:?} California labels should include {expected}; got {slugs:?}"
+            );
+        }
+    }
+}
+
+/// The flip side of the rule above: majors winning their cells must not crowd
+/// out the deep catalog, or the dense tiers stop meaning anything. Aux vs micro
+/// therefore stays ranked on distance to the cell centre.
+#[test]
+fn majors_winning_their_cell_still_leaves_room_for_small_towns() {
+    let domain = DomainSpec::new("california", (-126.0, -113.8, 31.9, 42.5));
+    let dense = PlaceLabelOverlay::major_us_cities()
+        .with_density(PlaceLabelDensityTier::Dense)
+        .selected_places_for_domain(&domain);
+    let slugs = place_slugs(&dense);
+    assert!(
+        dense
+            .iter()
+            .any(|place| place_catalog_tier_for_slug(&place.slug) == PlaceCatalogTier::Micro),
+        "dense California should still reach the micro catalog; got {slugs:?}"
+    );
+}
+

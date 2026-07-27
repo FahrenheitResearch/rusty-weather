@@ -208,7 +208,10 @@ host (holds the 201 GB CONUS climo pack; wide-west is what's deployed).
   `[&theme=cafire|slate|midnight|paper|ember|mono][&brand=][&credit=][&footer=][&accent=#rrggbb][&logo=<id>]`
 · `POST /api/card-logo` (image bytes or a `data:` URL → `{id}` for `&logo=`)
 · `GET /api/xsection?lat0&lon0&lat1&lon1&run[&hour][&field=temperature|rh|wind][&format=json|png]`
-· `GET /api/sounding?lat&lon&run&hour` (native PNG) · `GET /api/fires` (WFIGS)
+· `GET /api/sounding?lat&lon&run&hour[&style=cwt][&layout=<tokens>][&brand=][&format=json]`
+  Default is the sharppyrs SPC window (BowEcho's), branded `cafire.org/weather`
+  unless `brand=` says otherwise; `style=cwt` serves the older house composite.
+· `GET /api/fires` (WFIGS)
 · `GET /api/ecape/...` (frozen static gallery while node 1 is paused).
 
 Gotchas: surface RH variable is **`rh_2m`** (not relative_humidity_2m);
@@ -296,6 +299,26 @@ systemctl restart rusty-wx-api
   SELECTION declutters in kilometres, which cannot know rendered text width —
   that is why continental maps used to pile names on top of each other. Any new
   label overlay must go through the same reservation or it will overprint.
+  A `Center` label is the exception to the quadrant search: it means "this
+  reading belongs to THIS point", so it draws where it belongs or is dropped —
+  never slid inside the frame, which would silently reattach a value to another
+  place.
+- **Place SELECTION: majors are offered to the declutter first**
+  (`major_cities_first`), because the declutter is greedy and first-come. It also
+  keeps TWO footprints per candidate: `selection_bounds` (is this place in
+  frame?) uses the preset's real footprint, while `overlap_bounds` (are these two
+  labels too close?) is a uniform small box for overlay labels. A preset's
+  footprint scales with importance — 1.9° for a major, 0.58° for a hamlet — so
+  reusing it as a keep-away zone made big cities suppress their neighbours over
+  ~500 km while two hamlets 60 km apart both passed. That is what deleted
+  Los Angeles, Sacramento, San Diego and Reno from a dense California map.
+  `min_center_spacing_km` is the real spacing control; city CROP selection still
+  uses the true footprint, where it means what it says.
+- **City value labels** (`value_labels: true` → `RUSTWX_VALUE_LABELS=1`) stamp
+  the plotted value at each selected place instead of its name. They opt OUT of
+  the priority tiers: names are a size/opacity hierarchy, but a bare number has
+  no hierarchy to express, so every value renders at one bold size
+  (`VALUE_LABEL_SCALE`) with a white halo, centred on its point, no dot.
 - **`cargo test --workspace` STOPS at the first failing test binary.** Use
   `--no-fail-fast` or you will believe there is only one failure. Known
   pre-existing failures (2026-07-25): 2× `rw-ingest size_estimate` (stale table,
