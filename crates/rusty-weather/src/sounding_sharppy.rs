@@ -132,9 +132,11 @@ pub fn sounding_data(
 ///
 /// Monochrome emoji, not color: egui rasterizes glyph outlines, so a CBDT/COLR
 /// color font contributes nothing. The card lane keeps color emoji.
+/// Collections (.ttc) are skipped: egui's `FontData` takes a single face, so a
+/// collection contributes no glyphs at all. Debian ships every Noto CJK font as
+/// a .ttc, which is why kana needs Droid Sans Fallback here.
 const EGUI_FALLBACK_FAMILIES: &[&str] = &[
-    "Noto Sans CJK JP",
-    "Noto Serif CJK JP",
+    "Droid Sans Fallback",
     "Noto Sans Symbols 2",
     "Noto Emoji",
     "DejaVu Sans",
@@ -158,14 +160,21 @@ fn fallback_faces() -> &'static [(String, std::sync::Arc<Vec<u8>>)] {
                     .any(|(name, _)| name.eq_ignore_ascii_case(wanted))
             });
             let Some(face) = face else { continue };
+            // egui cannot read a font COLLECTION, and inserting one yields a
+            // family that silently renders nothing.
+            let is_collection = match &face.source {
+                resvg::usvg::fontdb::Source::File(path) => path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("ttc")),
+                _ => false,
+            };
+            if is_collection || face.index != 0 {
+                continue;
+            }
             let id = face.id;
-            let index = face.index;
             let Some(source_bytes) = db.with_face_data(id, |data, _| data.to_vec()) else {
                 continue;
             };
-            // A .ttc carries several faces; egui wants one, so take the index the
-            // database recorded for this family.
-            let _ = index;
             out.push(((*wanted).to_string(), std::sync::Arc::new(source_bytes)));
         }
         out
@@ -184,12 +193,15 @@ fn install_fonts_with_fallbacks(ctx: &egui::Context) {
         );
         added.push(name.clone());
     }
-    // Append to every family's chain so the fallbacks are searched after the
-    // face sharppyrs chose, never instead of it.
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        let chain = fonts.families.entry(family).or_default();
+    // Append to EVERY family, including sharppyrs' named ones. Extending only
+    // Proportional and Monospace did nothing visible: the widget draws its text
+    // in a named family (`SpaceGrotesk`), so that was the one chain that needed
+    // the fallbacks.
+    for chain in fonts.families.values_mut() {
         for name in &added {
-            chain.push(name.clone());
+            if !chain.contains(name) {
+                chain.push(name.clone());
+            }
         }
     }
     ctx.set_fonts(fonts);
