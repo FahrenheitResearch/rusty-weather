@@ -1,5 +1,7 @@
 use std::error::Error;
 
+use serde::{Deserialize, Serialize};
+
 use crate::MapExtent;
 use crate::features::{
     BasemapDetail, BasemapStyle, load_styled_basemap_features_for_detail,
@@ -144,7 +146,7 @@ fn rotated_extent(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GeographicBounds {
     pub west_deg: f64,
     pub east_deg: f64,

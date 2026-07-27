@@ -1,6 +1,6 @@
 use crate::color::Rgba;
 use crate::presentation::{LineworkRole, PolygonRole};
-use crate::projection::ProjectionProjector;
+use crate::projection::{ProjectionProjector, ProjectionSpec};
 use crate::request::{
     GeographicClipBounds, ProjectedLabelPlacement, ProjectedMarkerShape,
     ProjectedPlaceLabelPriority,
@@ -25,6 +25,13 @@ pub struct ProjectedGrid {
 #[derive(Clone, Debug)]
 pub(crate) struct InverseProjectedGrid {
     pub projector: ProjectionProjector,
+    /// The request metadata `projector` was built from, carried alongside it so
+    /// the renderer can STATE the projection it drew with (see
+    /// `render::PlotGeometry`) and not merely evaluate it. A `ProjectionProjector`
+    /// holds only precomputed constants, so the spec cannot be read back out.
+    pub projection: ProjectionSpec,
+    pub reference_latitude_deg: Option<f64>,
+    pub reference_longitude_deg: Option<f64>,
     pub clip_bounds: Option<GeographicClipBounds>,
     pub lat_deg: Vec<f64>,
     pub lon_deg: Vec<f64>,

@@ -604,6 +604,9 @@ fn with_render_state_profile_with_style<T>(
                         .ok()?;
                     Some(InverseProjectedGrid {
                         projector,
+                        projection: inverse.projection.clone(),
+                        reference_latitude_deg: inverse.reference_latitude_deg,
+                        reference_longitude_deg: inverse.reference_longitude_deg,
                         clip_bounds: inverse.clip_bounds,
                         lat_deg: scratch.fill_f64_from_f32(&request.field.grid.lat_deg),
                         lon_deg: scratch.fill_f64_from_f32(&request.field.grid.lon_deg),

@@ -5,7 +5,10 @@ use rustwx_core as core;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
-const R_EARTH: f64 = 6_370_000.0;
+/// Sphere radius every projection here uses. Deliberately the NCEP/WRF sphere,
+/// NOT a WGS84 ellipsoid — `render::PlotGeometry` republishes it because a
+/// client that assumes EPSG:3857 lands kilometres off.
+pub(crate) const R_EARTH: f64 = 6_370_000.0;
 const DEG2RAD: f64 = PI / 180.0;
 const RAD2DEG: f64 = 180.0 / PI;
 const GEOGRAPHIC_INFERENCE_MIN_LAT_SPAN_DEG: f64 = 100.0;
@@ -836,7 +839,7 @@ fn stabilize_reference_latitude(lat_deg: f64) -> f64 {
     }
 }
 
-fn normalize_longitude_deg(lon_deg: f64) -> f64 {
+pub(crate) fn normalize_longitude_deg(lon_deg: f64) -> f64 {
     let mut lon = lon_deg % 360.0;
     if lon > 180.0 {
         lon -= 360.0;

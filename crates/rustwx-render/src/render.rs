@@ -10,10 +10,12 @@ use crate::overlay::{
 use crate::presentation::{
     ColorbarOrientation, ProductVisualMode, RenderPresentation, TitleAnchor,
 };
+use crate::projected_map::GeographicBounds;
+use crate::projection::{ProjectionProjector, ProjectionSpec, R_EARTH, normalize_longitude_deg};
 use crate::rasterize;
 use crate::request::{
-    ChromeScale, DomainFrame, DomainFrameSource, ProjectedLabelPlacement, ProjectedMarkerShape,
-    ProjectedPlaceLabelPriority, RasterSampleMode,
+    ChromeScale, DomainFrame, DomainFrameSource, ProjectedExtent, ProjectedLabelPlacement,
+    ProjectedMarkerShape, ProjectedPlaceLabelPriority, RasterSampleMode,
 };
 use crate::text;
 use image::ExtendedColorType;
@@ -124,6 +126,122 @@ pub struct RenderPngTiming {
     #[serde(default)]
     pub png_write_ms: u128,
     pub total_ms: u128,
+}
+
+/// Where the map plot rect landed in the FINAL image, and what coordinates it
+/// covers — the renderer STATING the answer to "which lat/lon is under this
+/// pixel?" instead of leaving a client to reverse-engineer it from the raster.
+///
+/// The mapping is exactly the one the renderer draws with
+/// ([`MapExtent::to_pixel`] offset by the plot origin):
+///
+/// ```text
+/// image_x = plot_x + (X - x_min) / (x_max - x_min) * (plot_w - 1)
+/// image_y = plot_y + (1 - (Y - y_min) / (y_max - y_min)) * (plot_h - 1)
+/// ```
+///
+/// Note `plot_w - 1`, not `plot_w`: the extent edges land on the FIRST and LAST
+/// pixel centre of the rect, not on its outer boundary. At domain scale a pixel
+/// is roughly a kilometre, so that is not a cosmetic difference.
+///
+/// Going from `(X, Y)` to lat/lon needs [`Self::projection`] plus
+/// [`Self::earth_radius_m`] and the reference lat/lon — everything the renderer
+/// itself was handed. A `PlotGeometry` is only emitted when those values
+/// provably rebuild the projector that was actually drawn with, so a client
+/// that reimplements the same formulas gets the same answer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlotGeometry {
+    pub image_w: u32,
+    pub image_h: u32,
+    pub plot_x: u32,
+    pub plot_y: u32,
+    pub plot_w: u32,
+    pub plot_h: u32,
+    pub projected: ProjectedExtent,
+    pub projection: ProjectionSpec,
+    /// The reference latitude/longitude handed to the projector. Not redundant
+    /// with `projection`: a Lambert conformal spec omits the latitude of origin
+    /// (which sets the y datum) and a geographic spec carries no central
+    /// meridian at all, so the spec on its own does not invert.
+    pub reference_latitude_deg: Option<f64>,
+    pub reference_longitude_deg: Option<f64>,
+    /// Sphere radius the projection math uses. It is the NCEP/WRF sphere, not
+    /// WGS84 — a client that assumes EPSG:3857 lands kilometres off.
+    pub earth_radius_m: f64,
+    /// Lat/lon bounding box of the four plot corners. A hint for fitting a
+    /// client map, NOT the frame's true lat/lon extremes: under a conic
+    /// projection the frame edges bow between their corners.
+    pub geographic: GeographicBounds,
+}
+
+impl PlotGeometry {
+    /// Scale a rect captured from a supersampled render down to output pixels.
+    ///
+    /// The Lanczos resize maps hi-res pixel index `p` to output index
+    /// `(p + 0.5) / factor - 0.5`, so this scales the FIRST and LAST drawn
+    /// pixel rather than dividing origin and size independently — truncating
+    /// both can push the far edge a whole pixel off the drawn frame.
+    fn downsampled(mut self, factor: u32, image_w: u32, image_h: u32) -> Self {
+        let factor = factor.max(1);
+        if factor == 1 {
+            return self;
+        }
+        let scale = |p: u32| (((p as f64 + 0.5) / factor as f64) - 0.5).round().max(0.0) as u32;
+        let plot_x = scale(self.plot_x);
+        let plot_y = scale(self.plot_y);
+        let plot_right = scale(self.plot_x + self.plot_w.saturating_sub(1));
+        let plot_bottom = scale(self.plot_y + self.plot_h.saturating_sub(1));
+        self.plot_x = plot_x;
+        self.plot_y = plot_y;
+        self.plot_w = plot_right.saturating_sub(plot_x).saturating_add(1);
+        self.plot_h = plot_bottom.saturating_sub(plot_y).saturating_add(1);
+        self.image_w = image_w;
+        self.image_h = image_h;
+        self
+    }
+
+    /// Follow the plot rect through a post-draw canvas fixup.
+    ///
+    /// `None` when the fixup cut INTO the plot: a rect that no longer describes
+    /// where the data was drawn is worse than no rect at all.
+    fn adjusted(mut self, adjust: CanvasAdjustment) -> Option<Self> {
+        let plot_x = i64::from(self.plot_x) + i64::from(adjust.dx);
+        let plot_y = i64::from(self.plot_y) + i64::from(adjust.dy);
+        if plot_x < 0
+            || plot_y < 0
+            || plot_x + i64::from(self.plot_w) > i64::from(adjust.width)
+            || plot_y + i64::from(self.plot_h) > i64::from(adjust.height)
+        {
+            return None;
+        }
+        self.plot_x = plot_x as u32;
+        self.plot_y = plot_y as u32;
+        self.image_w = adjust.width;
+        self.image_h = adjust.height;
+        Some(self)
+    }
+}
+
+/// How a post-draw canvas fixup moved the pixels: content shifted by
+/// `(dx, dy)` and the canvas is now `width` by `height`. Reported so a captured
+/// plot rect can follow the pixels instead of describing where they used to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CanvasAdjustment {
+    pub dx: i32,
+    pub dy: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl CanvasAdjustment {
+    fn unchanged(img: &RgbaImage) -> Self {
+        Self {
+            dx: 0,
+            dy: 0,
+            width: img.width(),
+            height: img.height(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
