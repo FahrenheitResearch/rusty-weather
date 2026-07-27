@@ -49,9 +49,14 @@ pub struct SoundingRequest {
     /// rule the outlook cards follow, so one sounding can be shared from either
     /// site without the wrong name on it.
     pub brand: String,
-    /// Draw the vendored SHARPpy compositor's own panel arrangement instead of
-    /// the CWT composite (house header, locator map, ECAPE block, rustwx table).
-    /// The CAFire Lab keeps the composite; the unbranded lab asks for this one.
+    /// Draw the vendored SHARPpy compositor's own panel arrangement — the SPC
+    /// window BowEcho draws — rather than the older CWT composite (house header,
+    /// locator map, ECAPE block, rustwx table).
+    ///
+    /// This is the DEFAULT for every site now: it is the sounding a forecaster
+    /// actually reads, and it carries `brand` in its own header, so the CAFire
+    /// credit rides along with no extra compositing. `style=cwt` still serves
+    /// the composite.
     pub sharppy_layout: bool,
     /// sharppyrs layout tokens for callers who want a different arrangement.
     /// `None` uses [`crate::sounding_sharppy::DEFAULT_LAYOUT_TOKENS`].

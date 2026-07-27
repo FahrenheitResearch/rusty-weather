@@ -1196,10 +1196,12 @@ const RIBBONS = {
     HRRR isobaric volumes (25 hPa steps): fill = temperature / RH / wind speed, dark silhouette =
     terrain from surface pressure, true wind barbs in knots. Add <code>&amp;format=json</code> to the
     share link for the raw sampled arrays.`,
-  sounding: `<b>Skew-T sounding</b> — the stored HRRR isobaric volumes above one point, drawn as a full
-    skew-T with hodograph, wind barbs, parameter table, and single-column ECAPE (entrainment-adjusted,
+  sounding: `<b>Skew-T sounding</b> — the stored HRRR isobaric volumes above one point, drawn as the
+    SPC-style SHARPpy window: skew-T, hodograph with storm motions, the convective and kinematic
+    parameter blocks, thetae and storm-relative wind profiles, and ECAPE (entrainment-adjusted,
     experimental). Only volume-carrying hours appear in the ladder; add <code>&amp;format=json</code>
-    to the share link for the raw profile + indices.`,
+    to the share link for the raw profile + indices, or <code>&amp;style=cwt</code> for the older
+    house composite.`,
   ecape: `<b>Entrainment CAPE suite</b> — rendered live on the CWT 24-core compute node (full HRRR
     volumes; too heavy for the serving box) through a secure tunnel. Full features: any hour, any
     domain, draw-a-box, fire framing. The pyroCb-relevant signal is how much CAPE survives

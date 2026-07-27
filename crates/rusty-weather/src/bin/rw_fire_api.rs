@@ -1894,6 +1894,21 @@ fn analysis_response(path: &str, state: &AppState) -> Vec<u8> {
     }))
 }
 
+/// Which sounding renderer `?style=` asks for.
+///
+/// The SHARPpy panel arrangement — the SPC window BowEcho draws — is the
+/// DEFAULT on every site, including CAFire: it is the sounding a forecaster
+/// actually reads, and it draws the `brand` credit in its own header, so
+/// cafire.org/weather rides along with no extra compositing step. The older
+/// house composite (locator map, ECAPE block, rustwx table) stays reachable as
+/// `style=cwt` or `style=composite` so a saved link still resolves to it.
+fn sharppy_layout_for_style(style: Option<&str>) -> bool {
+    !style.is_some_and(|value| {
+        let value = value.trim();
+        value.eq_ignore_ascii_case("cwt") || value.eq_ignore_ascii_case("composite")
+    })
+}
+
 /// Byte offset of the body in one of our hand-rolled HTTP responses.
 fn find_body_start(response: &[u8]) -> Option<usize> {
     response
@@ -1973,12 +1988,7 @@ fn sounding_response(path: &str, state: &AppState) -> Vec<u8> {
         // credit, a present-but-EMPTY one draws none.
         brand: card_text_override(&query, "brand")
             .unwrap_or_else(|| "cafire.org/weather".to_string()),
-        // `style=sharppy` = the vendored SHARPpy panel arrangement; anything
-        // else (including absent) keeps the CWT composite the Lab has always
-        // served, so existing links are unchanged.
-        sharppy_layout: query
-            .get("style")
-            .is_some_and(|value| value.eq_ignore_ascii_case("sharppy")),
+        sharppy_layout: sharppy_layout_for_style(query.get("style").map(String::as_str)),
         // `layout=` takes sharppyrs panel tokens, so an arrangement can be
         // retuned from a URL rather than a deploy; malformed tokens fall back.
         layout_tokens: query.get("layout").cloned(),
@@ -3025,6 +3035,20 @@ mod tests {
             [-121.4, 39.5],
             [-121.6, 39.4],
         ]
+    }
+
+    #[test]
+    fn the_sharppy_window_is_the_default_sounding_everywhere() {
+        // The CAFire page asks for /api/sounding with no style at all.
+        assert!(sharppy_layout_for_style(None));
+        assert!(sharppy_layout_for_style(Some("sharppy")));
+        assert!(sharppy_layout_for_style(Some("")));
+        // ...and an unknown style is not a reason to serve the old composite.
+        assert!(sharppy_layout_for_style(Some("spc")));
+        // Only an explicit opt-out gets the house composite back.
+        assert!(!sharppy_layout_for_style(Some("cwt")));
+        assert!(!sharppy_layout_for_style(Some("CWT")));
+        assert!(!sharppy_layout_for_style(Some(" composite ")));
     }
 
     #[test]
