@@ -122,6 +122,79 @@ pub fn sounding_data(
     }
 }
 
+/// System font families appended to egui's fallback chain, in order.
+///
+/// egui only knows the fonts you hand it — there is no OS fallback — and its
+/// missing-glyph character is a literal `?`. sharppyrs installs Space Grotesk,
+/// which is Latin, so a credit like `(づ｡◕‿◕｡)づ 🔥` came out as `(??????)? ?`
+/// while the same text rendered correctly on the SVG cards (resvg does fall back
+/// through the system database).
+///
+/// Monochrome emoji, not color: egui rasterizes glyph outlines, so a CBDT/COLR
+/// color font contributes nothing. The card lane keeps color emoji.
+const EGUI_FALLBACK_FAMILIES: &[&str] = &[
+    "Noto Sans CJK JP",
+    "Noto Serif CJK JP",
+    "Noto Sans Symbols 2",
+    "Noto Emoji",
+    "DejaVu Sans",
+];
+
+/// Load fallback font faces from the system, once per process.
+///
+/// Missing faces are simply skipped: a box without CJK fonts still renders the
+/// sounding, it just cannot draw kaomoji — which is strictly better than failing
+/// the request over a decoration in the credit line.
+fn fallback_faces() -> &'static [(String, std::sync::Arc<Vec<u8>>)] {
+    static CELL: OnceLock<Vec<(String, std::sync::Arc<Vec<u8>>)>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let mut db = resvg::usvg::fontdb::Database::new();
+        db.load_system_fonts();
+        let mut out: Vec<(String, std::sync::Arc<Vec<u8>>)> = Vec::new();
+        for wanted in EGUI_FALLBACK_FAMILIES {
+            let face = db.faces().find(|face| {
+                face.families
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(wanted))
+            });
+            let Some(face) = face else { continue };
+            let id = face.id;
+            let index = face.index;
+            let Some(source_bytes) = db.with_face_data(id, |data, _| data.to_vec()) else {
+                continue;
+            };
+            // A .ttc carries several faces; egui wants one, so take the index the
+            // database recorded for this family.
+            let _ = index;
+            out.push(((*wanted).to_string(), std::sync::Arc::new(source_bytes)));
+        }
+        out
+    })
+}
+
+/// Install sharppyrs' own face plus the system fallbacks.
+fn install_fonts_with_fallbacks(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    sharppyrs::add_fonts(&mut fonts);
+    let mut added: Vec<String> = Vec::new();
+    for (name, bytes) in fallback_faces() {
+        fonts.font_data.insert(
+            name.clone(),
+            std::sync::Arc::new(egui::FontData::from_owned(bytes.as_ref().clone())),
+        );
+        added.push(name.clone());
+    }
+    // Append to every family's chain so the fallbacks are searched after the
+    // face sharppyrs chose, never instead of it.
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let chain = fonts.families.entry(family).or_default();
+        for name in &added {
+            chain.push(name.clone());
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
 /// One render at a time: a wgpu device per render is costly, and several at once
 /// on a box that may be falling back to software Vulkan is worse.
 fn render_permit() -> MutexGuard<'static, ()> {
@@ -162,7 +235,7 @@ pub fn render_png(
         .with_size(egui::Vec2::new(WINDOW_W, WINDOW_H))
         .build_ui(move |ui| {
             if !fonts_installed {
-                sharppyrs::install_fonts(ui.ctx());
+                install_fonts_with_fallbacks(ui.ctx());
                 fonts_installed = true;
                 ui.ctx().request_repaint();
                 return;
