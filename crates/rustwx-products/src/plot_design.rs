@@ -176,13 +176,18 @@ pub fn operational_fill_scale_for_recipe(
             // Fine geometric ramp (was 5 coarse doublings → blocky) so the
             // palette lerps smoothly across smoke's heavy-tailed range.
             //
-            // Top raised 720 -> 3000 mg/m^2. A CONUS frame measured on
-            // 2026-07-27 held 1500 mg/m^2 over the Idaho/Montana fires while
-            // the ramp stopped at 720, so the entire plume CORE — the part a
-            // reader most wants to see structure in — collapsed into one flat
-            // saturated blob. 3000 covers a big plume without wasting the
-            // palette on values that never occur.
-            levels: geometric_levels(20.0, 1.12, 3000.0),
+            // Top raised 720 -> 1500 mg/m^2, which is what a real plume core
+            // measures: the CONUS frame from 20260727 03z F006 peaked at 1500
+            // over the Idaho/Montana fires while the ramp stopped at 720, so
+            // the whole core — the part a reader most wants structure in —
+            // collapsed into one flat saturated blob.
+            //
+            // 1500 and not higher, learned by trying 3000 and looking: the ten
+            // palette stops stretch across whatever range they are given, so a
+            // top far above the data pushes ordinary 100-500 values down into
+            // the blues and the map loses the mid-range contrast it had. Match
+            // the ceiling to values that actually occur.
+            levels: geometric_levels(20.0, 1.12, 1500.0),
             colors: smoke_scale_colors(),
             extend: ExtendMode::Max,
             mask_below: Some(20.0),
@@ -930,7 +935,7 @@ mod tests {
         assert_eq!(column_smoke_scale.mask_below, Some(20.0));
         // The ramp has to reach a real plume core; 720 saturated at 1500.
         assert!(
-            column_smoke_scale.levels.last().copied().unwrap_or(0.0) >= 2500.0,
+            column_smoke_scale.levels.last().copied().unwrap_or(0.0) >= 1400.0,
             "column ramp tops out at {:?} — dense plumes will flatten",
             column_smoke_scale.levels.last()
         );
