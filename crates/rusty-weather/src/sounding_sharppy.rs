@@ -26,28 +26,32 @@ const WINDOW_H: f32 = 1100.0;
 
 /// Our default panel arrangement, as sharppyrs layout tokens.
 ///
-/// Two changes from the upstream default, which is
-/// `...|slinky,thetae,srwinds,locationmap|convectiveindices,kinematics,ship,severeindices,streamwiseness,hidden|250`:
+/// Both marginal box plots are dropped, which is the whole change from the
+/// upstream default
+/// (`...|slinky,thetae,srwinds,locationmap|convectiveindices,kinematics,ship,severeindices,streamwiseness,hidden|250`):
 ///
-/// * **SHIP is dropped** — the box plot nobody reads.
-/// * **Effective-layer STP takes a full-height bottom column** (slot 4), with
-///   streamwiseness moving up to share the third column with the severe indices.
-///   STP gets read, so it gets a cell it can be read in.
+/// * **No SHIP box.**
+/// * **No effective-layer STP bar** — upstream already moved off the STP default,
+///   and BowEcho migrates old saves away from it.
+///
+/// Streamwiseness moves up to share the third column with the severe indices, and
+/// the two trailing bottom columns are hidden, so the reclaimed width goes to the
+/// parcel and kinematics tables. That widening is also what un-squishes the
+/// NCAPE/ECAPE line.
 ///
 /// Bottom slots in order: two full-height columns, two sharing the third column
 /// vertically, then two more full-height columns.
 ///
-/// Arrived at by rendering the alternatives rather than reasoning about them. The
-/// first attempt took "swap the location map and STP" literally: STP went into
-/// the location map's INSET, far too small for box plots, and the map took a full
-/// bottom column it has no use for. Worse, hiding SHIP in a MIDDLE slot handed
-/// its reclaimed space to the severe-index panel, whose text then scaled past its
-/// box and overlapped into unreadable garbage — replacing a squished NCAPE/ECAPE
-/// line with something worse. Giving STP a real column, leaving the map in its
-/// inset, and keeping the hidden slot at the END fixes all three complaints.
+/// Two things learned by rendering rather than reasoning, both worth keeping:
+///
+/// * The hidden slots must be the TRAILING ones. Hiding a middle slot hands its
+///   space to the panel sharing its column, whose text then scales past its box
+///   and overlaps into unreadable garbage.
+/// * "The el stp plot is kinda usefull" meant marginal, not useful. Reading it the
+///   other way put STP in a full column here for one deploy.
 pub const DEFAULT_LAYOUT_TOKENS: &str = "speed,advection|hodograph|\
      slinky,thetae,srwinds,locationmap|\
-     convectiveindices,kinematics,streamwiseness,severeindices,stp,hidden|250";
+     convectiveindices,kinematics,streamwiseness,severeindices,hidden,hidden|250";
 
 /// Resolve a layout from caller tokens, falling back to our default.
 ///
@@ -219,25 +223,26 @@ mod tests {
     fn our_default_layout_parses_and_makes_the_intended_swaps() {
         let layout = sharppyrs::SoundingLayout::from_tokens(DEFAULT_LAYOUT_TOKENS)
             .expect("default layout tokens must parse");
-        assert_eq!(
-            layout.bottom[4],
-            sharppyrs::PanelKind::Stp,
-            "effective-layer STP needs a full-height bottom column, not an inset"
-        );
-        assert!(
-            !layout.bottom.contains(&sharppyrs::PanelKind::Ship),
-            "SHIP should be gone: {:?}",
-            layout.bottom
-        );
+        for marginal in [sharppyrs::PanelKind::Ship, sharppyrs::PanelKind::Stp] {
+            assert!(
+                !layout.bottom.contains(&marginal) && !layout.insets.contains(&marginal),
+                "{marginal:?} should be gone: bottom {:?} insets {:?}",
+                layout.bottom,
+                layout.insets
+            );
+        }
         assert_eq!(
             layout.insets[3],
             sharppyrs::PanelKind::LocationMap,
             "the location map belongs in the small inset"
         );
-        // The hidden slot stays LAST, as upstream leaves it: hiding a middle slot
-        // hands its space to the severe-index panel, whose text then scales past
-        // its box and overlaps.
-        assert_eq!(layout.bottom[5], sharppyrs::PanelKind::Hidden);
+        // Hidden slots must be the TRAILING ones: hiding a middle slot hands its
+        // space to the panel sharing its column, whose text then scales past its
+        // box and overlaps.
+        assert_eq!(
+            [layout.bottom[4], layout.bottom[5]],
+            [sharppyrs::PanelKind::Hidden, sharppyrs::PanelKind::Hidden]
+        );
         assert_eq!(
             sharppyrs::SoundingLayout::from_tokens(&layout.to_tokens()),
             Some(layout)
@@ -247,7 +252,7 @@ mod tests {
     #[test]
     fn a_bad_layout_falls_back_instead_of_failing() {
         let ours = layout_or_default(None);
-        assert_eq!(ours.bottom[4], sharppyrs::PanelKind::Stp);
+        assert!(!ours.bottom.contains(&sharppyrs::PanelKind::Stp));
         assert_eq!(layout_or_default(Some("not-a-layout")), ours);
         let upstream = layout_or_default(Some(
             "speed,advection|hodograph|slinky,thetae,srwinds,locationmap|convectiveindices,kinematics,ship,severeindices,streamwiseness,hidden|250",
