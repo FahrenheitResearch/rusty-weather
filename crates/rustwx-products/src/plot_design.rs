@@ -159,17 +159,30 @@ pub fn operational_fill_scale_for_recipe(
         return ColorScale::Discrete(DiscreteColorScale {
             // Fine geometric ramp (was 8 coarse steps) so the 10-stop palette
             // lerps into a fluid gradient instead of hard bands.
-            levels: geometric_levels(10.0, 1.12, 560.0),
+            //
+            // The floor is 2 ug/m^3, not 10: light smoke is the difference
+            // between a clear day and a hazy one, and masking everything under
+            // 10 erased the whole leading edge of a plume. Paired with the
+            // stronger low-end alphas in `smoke_scale_colors`, a thin veil now
+            // reads as smoke instead of as a barely-there wash.
+            levels: geometric_levels(2.0, 1.12, 560.0),
             colors: smoke_scale_colors(),
             extend: ExtendMode::Max,
-            mask_below: Some(10.0),
+            mask_below: Some(2.0),
         });
     }
     if filled_selector.field == CanonicalField::ColumnIntegratedSmoke {
         return ColorScale::Discrete(DiscreteColorScale {
             // Fine geometric ramp (was 5 coarse doublings → blocky) so the
             // palette lerps smoothly across smoke's heavy-tailed range.
-            levels: geometric_levels(20.0, 1.12, 720.0),
+            //
+            // Top raised 720 -> 3000 mg/m^2. A CONUS frame measured on
+            // 2026-07-27 held 1500 mg/m^2 over the Idaho/Montana fires while
+            // the ramp stopped at 720, so the entire plume CORE — the part a
+            // reader most wants to see structure in — collapsed into one flat
+            // saturated blob. 3000 covers a big plume without wasting the
+            // palette on values that never occur.
+            levels: geometric_levels(20.0, 1.12, 3000.0),
             colors: smoke_scale_colors(),
             extend: ExtendMode::Max,
             mask_below: Some(20.0),
@@ -612,16 +625,23 @@ fn precipitable_water_inches_scale() -> DiscreteColorScale {
     }
 }
 
+/// Smoke palette, low end deliberately opaque enough to see.
+///
+/// The first stops used to be alpha 42/78 — over a light basemap that is almost
+/// nothing, so the thin leading edge of a plume, which is exactly where a reader
+/// looks to judge whether smoke is arriving, was invisible. The low end now
+/// starts at alpha 110 and climbs quickly; the top of the ramp is unchanged, so
+/// dense smoke looks the same as it always did.
 pub(crate) fn smoke_scale_colors() -> Vec<Color> {
     vec![
-        Color::rgba(82, 185, 226, 42),
-        Color::rgba(84, 210, 238, 78),
-        Color::rgba(116, 230, 140, 116),
-        Color::rgba(247, 232, 65, 160),
-        Color::rgba(255, 169, 42, 200),
-        Color::rgba(244, 76, 31, 226),
-        Color::rgba(218, 10, 36, 238),
-        Color::rgba(135, 0, 150, 246),
+        Color::rgba(82, 185, 226, 110),
+        Color::rgba(84, 210, 238, 150),
+        Color::rgba(116, 230, 140, 182),
+        Color::rgba(247, 232, 65, 206),
+        Color::rgba(255, 169, 42, 224),
+        Color::rgba(244, 76, 31, 236),
+        Color::rgba(218, 10, 36, 243),
+        Color::rgba(135, 0, 150, 248),
         Color::rgba(78, 0, 138, 252),
         Color::rgba(48, 0, 112, 255),
     ]
@@ -889,9 +909,15 @@ mod tests {
         ) else {
             panic!("expected surface smoke discrete scale");
         };
-        assert_eq!(surface_smoke_scale.levels.first().copied(), Some(10.0));
-        assert_eq!(surface_smoke_scale.mask_below, Some(10.0));
-        assert!(surface_smoke_scale.colors[0].a < 80);
+        // Light smoke must be BOTH unmasked and actually visible: a 2 ug/m^3
+        // floor, and a first stop opaque enough to see over a light basemap.
+        assert_eq!(surface_smoke_scale.levels.first().copied(), Some(2.0));
+        assert_eq!(surface_smoke_scale.mask_below, Some(2.0));
+        assert!(
+            surface_smoke_scale.colors[0].a >= 100,
+            "the faintest smoke stop is invisible again: alpha {}",
+            surface_smoke_scale.colors[0].a
+        );
 
         let column_smoke = rustwx_models::plot_recipe("smoke_column").unwrap();
         let ColorScale::Discrete(column_smoke_scale) = operational_fill_scale_for_recipe(
@@ -902,6 +928,12 @@ mod tests {
         };
         assert_eq!(column_smoke_scale.levels.first().copied(), Some(20.0));
         assert_eq!(column_smoke_scale.mask_below, Some(20.0));
-        assert!(column_smoke_scale.colors[0].a < 80);
+        // The ramp has to reach a real plume core; 720 saturated at 1500.
+        assert!(
+            column_smoke_scale.levels.last().copied().unwrap_or(0.0) >= 2500.0,
+            "column ramp tops out at {:?} — dense plumes will flatten",
+            column_smoke_scale.levels.last()
+        );
+        assert!(column_smoke_scale.colors[0].a >= 100);
     }
 }
