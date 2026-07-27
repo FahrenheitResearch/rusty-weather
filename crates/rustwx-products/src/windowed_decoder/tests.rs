@@ -279,3 +279,48 @@ fn compute_surface_snapshot_diurnal_windows_cover_rh_dewpoint_and_vpd() {
     assert!(vpd_max.field.values[0] > vpd_max.field.values[1]);
     assert!(vpd_max.metadata.strategy.contains("vapor pressure deficit"));
 }
+
+/// The windowed smoke ladders are duplicated from the direct lane, so they can
+/// drift — and did: the surface floor and column ceiling moved for the hourly
+/// products while the 0-24/24-48/0-48 h maxima kept the old ramp and looked
+/// unchanged on the site. Pin them together.
+#[test]
+fn windowed_smoke_matches_the_direct_lane() {
+    use crate::plot_design::operational_fill_scale_for_recipe;
+    use rustwx_core::{CanonicalField, FieldSelector};
+
+    let cases: [(HrrrWindowedProduct, FieldSelector); 2] = [
+        (
+            HrrrWindowedProduct::Smoke8m0to24hMax,
+            FieldSelector::height_agl(CanonicalField::SmokeMassDensity, 8),
+        ),
+        (
+            HrrrWindowedProduct::SmokeColumn0to24hMax,
+            FieldSelector::entire_atmosphere(CanonicalField::ColumnIntegratedSmoke),
+        ),
+    ];
+    for (product, selector) in cases {
+        let ColorScale::Discrete(windowed) = windowed_product_scale(product) else {
+            panic!("{} should be a discrete scale", product.slug());
+        };
+        let recipe = rustwx_models::plot_recipe(match selector.field {
+            CanonicalField::SmokeMassDensity => "smoke_pm25_native",
+            _ => "smoke_column",
+        })
+        .expect("direct recipe exists");
+        let ColorScale::Discrete(direct) = operational_fill_scale_for_recipe(recipe, selector)
+        else {
+            panic!("direct lane should be a discrete scale");
+        };
+        assert_eq!(
+            windowed.levels, direct.levels,
+            "{}: windowed ladder drifted from the direct lane",
+            product.slug()
+        );
+        assert_eq!(
+            windowed.mask_below, direct.mask_below,
+            "{}: windowed floor drifted from the direct lane",
+            product.slug()
+        );
+    }
+}

@@ -165,7 +165,13 @@ pub fn operational_fill_scale_for_recipe(
             // 10 erased the whole leading edge of a plume. Paired with the
             // stronger low-end alphas in `smoke_scale_colors`, a thin veil now
             // reads as smoke instead of as a barely-there wash.
-            levels: geometric_levels(2.0, 1.12, 560.0),
+            // Ceiling 560 -> 250 ug/m^3 for the same reason the column came down
+            // from 3000: ten stops stretch across whatever range they are given,
+            // and on the Idaho/Montana frame nearly all the smoke area sat under
+            // 100 while the ramp reserved half its colors for 250-560. Above 250
+            // extends into deep purple, so genuinely dangerous air still reads as
+            // the top of the scale.
+            levels: geometric_levels(2.0, 1.12, 250.0),
             colors: smoke_scale_colors(),
             extend: ExtendMode::Max,
             mask_below: Some(2.0),
@@ -630,25 +636,31 @@ fn precipitable_water_inches_scale() -> DiscreteColorScale {
     }
 }
 
-/// Smoke palette, low end deliberately opaque enough to see.
+/// Smoke palette: ten stops, every one a different HUE.
 ///
-/// The first stops used to be alpha 42/78 — over a light basemap that is almost
-/// nothing, so the thin leading edge of a plume, which is exactly where a reader
-/// looks to judge whether smoke is arriving, was invisible. The low end now
-/// starts at alpha 110 and climbs quickly; the top of the ramp is unchanged, so
-/// dense smoke looks the same as it always did.
+/// Two rounds of getting this wrong, both worth recording. The original low end
+/// was alpha 42/78 — over a light basemap that is nearly invisible, so the thin
+/// leading edge of a plume did not read at all. Raising the alpha alone then made
+/// it worse: stops 1 and 2 were both light blue (82,185,226) and (84,210,238), so
+/// a wider, more opaque low end painted a big flat BLUE BLANKET over half the
+/// map with no gradation in it.
+///
+/// Opacity was never the problem — hue resolution was. The low half now moves
+/// pale steel → blue → cyan-teal → green, so light haze, noticeable smoke and
+/// unhealthy smoke are different COLORS rather than shades of one, and the top
+/// half keeps the familiar amber → orange → red → purple escalation.
 pub(crate) fn smoke_scale_colors() -> Vec<Color> {
     vec![
-        Color::rgba(82, 185, 226, 110),
-        Color::rgba(84, 210, 238, 150),
-        Color::rgba(116, 230, 140, 182),
-        Color::rgba(247, 232, 65, 206),
-        Color::rgba(255, 169, 42, 224),
-        Color::rgba(244, 76, 31, 236),
-        Color::rgba(218, 10, 36, 243),
-        Color::rgba(135, 0, 150, 248),
-        Color::rgba(78, 0, 138, 252),
-        Color::rgba(48, 0, 112, 255),
+        Color::rgba(170, 212, 238, 105),
+        Color::rgba(96, 178, 232, 148),
+        Color::rgba(56, 196, 206, 182),
+        Color::rgba(96, 214, 130, 205),
+        Color::rgba(196, 228, 74, 222),
+        Color::rgba(252, 205, 52, 234),
+        Color::rgba(248, 141, 35, 242),
+        Color::rgba(232, 58, 40, 248),
+        Color::rgba(158, 12, 128, 252),
+        Color::rgba(74, 0, 112, 255),
     ]
 }
 

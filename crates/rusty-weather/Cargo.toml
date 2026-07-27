@@ -10,6 +10,13 @@ default-run = "rusty-weather"
 [dependencies]
 base64 = "0.22"
 clap.workspace = true
+# The SPC-style sounding window (the one BowEcho draws) lives in sharppyrs as an
+# egui widget, so serving it as a PNG means running egui offscreen. egui_kittest
+# is the harness sharppyrs' own snapshot test uses for exactly that; its wgpu
+# backend takes the box's render node, or Mesa's lavapipe software Vulkan.
+sharppyrs = { git = "https://github.com/FahrenheitResearch/sharppyrs" }
+egui = "0.34.3"
+egui_kittest = { version = "0.34", features = ["wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png", "webp", "gif"] }
 # Rasterize the daily-outlook / meteogram SVG cards to PNG for the shareable
 # `?format=png` endpoint (a raw SVG can't be copied/pasted as a picture).

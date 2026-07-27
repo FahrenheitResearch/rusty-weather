@@ -1406,14 +1406,22 @@ fn day_window_scale_explicit(var: &str) -> Option<ColorScale> {
             None,
         )),
         // Smoke: the direct lane's geometric ramps + shared smoke palette.
+        //
+        // These ladders are DUPLICATED from the direct lane on purpose (the
+        // windowed decoder keys on a base name, not a CanonicalField), so they
+        // must be changed in lockstep with `operational_fill_scale_for_recipe`.
+        // They were not, once: the surface floor and column ceiling moved in the
+        // direct lane while the 0-24/24-48/0-48 h maxima kept the old ladder and
+        // looked untouched. `windowed_smoke_matches_the_direct_lane` now fails
+        // the build if they drift apart again.
         "smoke_8m" => discrete(DiscreteColorScale {
-            levels: crate::plot_design::geometric_levels(10.0, 1.12, 560.0),
+            levels: crate::plot_design::geometric_levels(2.0, 1.12, 250.0),
             colors: crate::plot_design::smoke_scale_colors(),
             extend: ExtendMode::Max,
-            mask_below: Some(10.0),
+            mask_below: Some(2.0),
         }),
         "smoke_column" => discrete(DiscreteColorScale {
-            levels: crate::plot_design::geometric_levels(20.0, 1.12, 720.0),
+            levels: crate::plot_design::geometric_levels(20.0, 1.12, 1500.0),
             colors: crate::plot_design::smoke_scale_colors(),
             extend: ExtendMode::Max,
             mask_below: Some(20.0),
