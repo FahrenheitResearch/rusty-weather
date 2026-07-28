@@ -12,3 +12,7 @@ crates/rustwx-render/verify/Cargo.lock
 .cargo/
 Thumbs.db
 desktop.ini
+
+# Render scratch: rw_render/rw_batch write here. Never committed — a stray
+# `git add -A` put 29 of these in once, which is what this line prevents.
+outputs/
