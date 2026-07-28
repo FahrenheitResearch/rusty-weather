@@ -1641,6 +1641,33 @@ pub fn render_daily_svg(
     // First sampled local-hour per bucket: single-value columns are
     // labeled with the sample's actual valid hour, not the bucket start.
     let mut per_day_first_lh: BTreeMap<i64, i64> = BTreeMap::new();
+    let bucket_of = |local_hours: i64| -> i64 {
+        match request.step_hours {
+            Some(step) => local_hours.div_euclid(i64::from(step.max(1))),
+            None => local_hours.div_euclid(24),
+        }
+    };
+    let local_hours_of = |hour: u16| -> i64 {
+        run_days * 24 + i64::from(cycle_utc) + i64::from(hour) + request.utc_offset_hours as i64
+    };
+    // What the STORE offers per bucket, independent of whether a read succeeds.
+    //
+    // The partial-bucket guard below needs this because a model's cadence can
+    // COARSEN with lead time: NBM is hourly early and 3-hourly later. A single
+    // run-wide cadence then puts the bar at 24 samples a day, which every
+    // 3-hourly day fails with eight — so those days were dropped as "partial" and
+    // an NBM card showed two of the four and a half days it had stored, whatever
+    // the caller asked for.
+    let mut offered: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    for &hour in &hours {
+        offered
+            .entry(bucket_of(local_hours_of(hour)))
+            .or_default()
+            .push(local_hours_of(hour));
+    }
+    // Sorted, since BTreeMap orders the buckets and `hours` ascends within one.
+    let offered_local: Vec<i64> = offered.values().flatten().copied().collect();
+
     for &hour in &hours {
         let Ok(reader) = HourReader::open(&run_dir.join(format!("f{hour:03}.rws"))) else {
             continue;
@@ -1658,12 +1685,8 @@ pub fn render_daily_svg(
             value.is_finite().then_some(value)
         };
         let Some(raw) = point(&request.var) else { continue };
-        let local_hours =
-            run_days * 24 + i64::from(cycle_utc) + i64::from(hour) + request.utc_offset_hours as i64;
-        let bucket = match request.step_hours {
-            Some(step) => local_hours.div_euclid(i64::from(step.max(1))),
-            None => local_hours.div_euclid(24),
-        };
+        let local_hours = local_hours_of(hour);
+        let bucket = bucket_of(local_hours);
         per_day.entry(bucket).or_default().push(raw);
         per_day_first_lh.entry(bucket).or_insert(local_hours);
         if let Some((night, dawn)) = night_key(local_hours) {
@@ -1732,8 +1755,27 @@ pub fn render_daily_svg(
         .unwrap_or(1)
         .max(1);
     let bucket_hours = i64::from(request.step_hours.unwrap_or(24).max(1));
-    let expected = (bucket_hours as usize / cadence as usize).max(1);
-    let min_samples = ((expected * 3) / 4).max(1);
+    // Samples a FULL bucket would hold at the cadence in force AROUND IT, not at
+    // the run's finest cadence anywhere in it.
+    let expected_for = |bucket: i64| -> usize {
+        let Some(local) = offered.get(&bucket) else {
+            return 1;
+        };
+        let gap = if local.len() >= 2 {
+            local.windows(2).map(|pair| pair[1] - pair[0]).min().unwrap_or(1)
+        } else {
+            // A lone sample's spacing has to come from its neighbours, or a
+            // legitimately coarse tail column reads as a stub and is dropped.
+            let at = local[0];
+            offered_local
+                .iter()
+                .filter(|&&other| other != at)
+                .map(|&other| (other - at).abs())
+                .min()
+                .unwrap_or_else(|| i64::from(cadence))
+        };
+        (bucket_hours / gap.max(1)).max(1) as usize
+    };
     // A bucket no finer than the model cadence holds one value: single-
     // value mode (one strip row, no inner LO bar).
     let single = bucket_hours <= i64::from(cadence);
@@ -1744,7 +1786,17 @@ pub fn render_daily_svg(
     let mut last_day: i64 = i64::MIN;
     let days: Vec<DayAgg> = per_day
         .iter()
-        .filter(|(_, values)| values.len() >= min_samples)
+        // Two separate conditions, and both matter. The store must offer most of a
+        // full bucket, which is what drops the evening stub at a run's start and
+        // the truncated tail at its end; and the reads must have produced most of
+        // what it offered, which is what drops a day riddled with gaps.
+        .filter(|(bucket, values)| {
+            let bucket = **bucket;
+            let offered_n = offered.get(&bucket).map_or(0, Vec::len);
+            !values.is_empty()
+                && offered_n * 4 >= expected_for(bucket) * 3
+                && values.len() * 4 >= offered_n * 3
+        })
         .map(|(&bucket, values)| {
             let start_hours = bucket * bucket_hours;
             let local_day = start_hours.div_euclid(24);
