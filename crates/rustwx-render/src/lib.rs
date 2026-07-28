@@ -51,18 +51,18 @@ pub use projected_map::{
 };
 pub use projection::{LambertConformal, ProjectionSpec};
 pub use render::{
-    PngCompressionMode, PngWriteOptions, RenderImageTiming, RenderPngTiming,
+    PlotGeometry, PngCompressionMode, PngWriteOptions, RenderImageTiming, RenderPngTiming,
     map_frame_aspect_ratio, map_frame_aspect_ratio_for_mode,
     map_frame_aspect_ratio_for_mode_with_chrome_scale,
     map_frame_aspect_ratio_for_mode_with_domain_frame,
     map_frame_aspect_ratio_for_mode_with_domain_frame_and_chrome_scale, render_to_image_profile,
-    render_to_png_profile as profile_render_to_png,
+    render_to_image_profile_with_geometry, render_to_png_profile as profile_render_to_png,
 };
 pub use request::{
     ChromeScale, Color, ColorScale, ContourLayer, ContourLinePattern, ContourStyle,
     DiscreteColorScale, DomainFrame, DomainFrameSource, ExtendMode, Field2D, GeographicClipBounds,
-    GridShape, InverseRasterProjection, LatLonGrid, MapRenderRequest, ProductKey, ProductMaturity,
-    ProductSemanticFlag, ProductSemantics, ProjectedDomain, ProjectedExtent,
+    GridShape, InverseRasterProjection, LatLonGrid, MapRenderRequest, MeshProjection, ProductKey,
+    ProductMaturity, ProductSemanticFlag, ProductSemantics, ProjectedDomain, ProjectedExtent,
     ProjectedLabelPlacement, ProjectedLineOverlay, ProjectedMarkerShape, ProjectedPlaceLabel,
     ProjectedPlaceLabelPriority, ProjectedPlaceLabelStyle, ProjectedPointOverlay,
     ProjectedPolygonFill, RasterSampleMode, RgbaGridField, WindBarbLayer, WindBarbStyle,
@@ -90,7 +90,7 @@ use crate::overlay::{
     ProjectedPolygon, ProjectedPolyline,
 };
 use crate::render::{
-    RenderOpts, center_horizontal_canvas_content, crop_canvas_whitespace,
+    CanvasAdjustment, RenderOpts, center_horizontal_canvas_content, crop_canvas_whitespace,
     encode_rgba_png_profile_with_options, render_to_image as native_render_to_image, render_to_png,
     trim_vertical_canvas_whitespace,
 };
@@ -206,6 +206,10 @@ impl RenderScratch {
             self.reclaim_f64_buffer(grid.lat_deg);
             self.reclaim_f64_buffer(grid.lon_deg);
         }
+        if let Some(grid) = opts.mesh_projected_grid.take() {
+            self.reclaim_f64_buffer(grid.lat_deg);
+            self.reclaim_f64_buffer(grid.lon_deg);
+        }
 
         for line in opts.projected_lines.drain(..) {
             self.reclaim_point_buffer(line.points);
@@ -295,6 +299,23 @@ impl RustRenderer {
         )
     }
 
+    /// [`Self::save_png_profile_with_options`] that also reports where the map
+    /// plot rect landed. Same env-resolved plot style, so a caller can move to
+    /// this without changing a single pixel.
+    pub fn save_png_profile_with_options_and_geometry<P: AsRef<Path>>(
+        self,
+        request: &MapRenderRequest,
+        output_path: P,
+        png_options: &PngWriteOptions,
+    ) -> Result<(RenderSaveTiming, Option<PlotGeometry>), RustwxRenderError> {
+        self.save_png_profile_with_geometry(
+            request,
+            output_path,
+            png_options,
+            StaticPlotStyle::from_env(),
+        )
+    }
+
     pub fn save_png_profile_with_options_and_style<P: AsRef<Path>>(
         self,
         request: &MapRenderRequest,
@@ -302,12 +323,31 @@ impl RustRenderer {
         png_options: &PngWriteOptions,
         plot_style: StaticPlotStyle,
     ) -> Result<RenderSaveTiming, RustwxRenderError> {
+        self.save_png_profile_with_geometry(request, output_path, png_options, plot_style)
+            .map(|(timing, _)| timing)
+    }
+
+    /// [`Self::save_png_profile_with_options_and_style`] that also reports where
+    /// the map plot rect landed in the file it just wrote.
+    ///
+    /// This is the seam a hover-to-lat/lon client wants: the geometry describes
+    /// the ENCODED image, after the supersample resize and after the post-draw
+    /// crop or re-centre have moved the pixels around. `None` when the answer
+    /// cannot be stated exactly — see [`PlotGeometry`].
+    pub fn save_png_profile_with_geometry<P: AsRef<Path>>(
+        self,
+        request: &MapRenderRequest,
+        output_path: P,
+        png_options: &PngWriteOptions,
+        plot_style: StaticPlotStyle,
+    ) -> Result<(RenderSaveTiming, Option<PlotGeometry>), RustwxRenderError> {
         let total_start = Instant::now();
-        let (bytes, state_timing, png_timing) =
+        let ((bytes, geometry), state_timing, png_timing) =
             with_render_state_profile_with_style(request, plot_style, |data, ny, nx, opts| {
-                let (image, mut image_timing) = render_to_image_profile(data, ny, nx, opts);
+                let (image, mut image_timing, geometry) =
+                    render_to_image_profile_with_geometry(data, ny, nx, opts);
                 let trim_start = Instant::now();
-                let image = match opts.domain_frame {
+                let (image, adjustment) = match opts.domain_frame {
                     Some(frame) if matches!(frame.source, DomainFrameSource::MapViewport) => {
                         crop_canvas_whitespace(&image, opts.presentation.canvas_background, 8)
                     }
@@ -315,13 +355,19 @@ impl RustRenderer {
                         &image,
                         opts.presentation.canvas_background,
                     ),
-                    None => image,
+                    None => {
+                        let adjustment = CanvasAdjustment::unchanged(&image);
+                        (image, adjustment)
+                    }
                 };
-                let trimmed = if trim_vertical_canvas_whitespace_enabled() {
+                let geometry = geometry.and_then(|geometry| geometry.adjusted(adjustment));
+                let (trimmed, trim_adjustment) = if trim_vertical_canvas_whitespace_enabled() {
                     trim_vertical_canvas_whitespace(&image, opts.presentation.canvas_background)
                 } else {
-                    image
+                    let adjustment = CanvasAdjustment::unchanged(&image);
+                    (image, adjustment)
                 };
+                let geometry = geometry.and_then(|geometry| geometry.adjusted(trim_adjustment));
                 let trim_ms = trim_start.elapsed().as_millis();
                 image_timing.postprocess_ms = image_timing.postprocess_ms.saturating_add(trim_ms);
                 image_timing.total_ms = image_timing.total_ms.saturating_add(trim_ms);
@@ -329,7 +375,7 @@ impl RustRenderer {
                 let (bytes, png_encode_ms) =
                     encode_rgba_png_profile_with_options(&trimmed, png_options);
                 Ok((
-                    bytes,
+                    (bytes, geometry),
                     RenderPngTiming {
                         image_timing,
                         render_to_image_ms,
@@ -348,12 +394,15 @@ impl RustRenderer {
         let file_write_ms = write_start.elapsed().as_millis();
         let mut png_timing = png_timing;
         png_timing.png_write_ms = file_write_ms;
-        Ok(RenderSaveTiming {
-            state_timing,
-            png_timing,
-            file_write_ms,
-            total_ms: total_start.elapsed().as_millis(),
-        })
+        Ok((
+            RenderSaveTiming {
+                state_timing,
+                png_timing,
+                file_write_ms,
+                total_ms: total_start.elapsed().as_millis(),
+            },
+            geometry,
+        ))
     }
 }
 
@@ -406,6 +455,29 @@ pub fn save_png_profile_with_options_and_style<P: AsRef<Path>>(
         png_options,
         plot_style,
     )
+}
+
+/// [`save_png_profile_with_options`] that also reports where the map plot rect
+/// landed — the drop-in every product lane wants, since it resolves the plot
+/// style from the environment exactly as that function does.
+pub fn save_png_profile_with_options_and_geometry<P: AsRef<Path>>(
+    request: &MapRenderRequest,
+    output_path: P,
+    png_options: &PngWriteOptions,
+) -> Result<(RenderSaveTiming, Option<PlotGeometry>), RustwxRenderError> {
+    RustRenderer.save_png_profile_with_options_and_geometry(request, output_path, png_options)
+}
+
+/// Save the PNG and report where the map plot rect landed in it, so a client can
+/// map a cursor pixel to lat/lon instead of measuring the black axes rectangle
+/// and applying an empirical pad. See [`PlotGeometry`].
+pub fn save_png_profile_with_geometry<P: AsRef<Path>>(
+    request: &MapRenderRequest,
+    output_path: P,
+    png_options: &PngWriteOptions,
+    plot_style: StaticPlotStyle,
+) -> Result<(RenderSaveTiming, Option<PlotGeometry>), RustwxRenderError> {
+    RustRenderer.save_png_profile_with_geometry(request, output_path, png_options, plot_style)
 }
 
 pub fn save_rgba_png_profile_with_options<P: AsRef<Path>>(
@@ -605,13 +677,38 @@ fn with_render_state_profile_with_style<T>(
                     Some(InverseProjectedGrid {
                         projector,
                         projection: inverse.projection.clone(),
-                        reference_latitude_deg: inverse.reference_latitude_deg,
-                        reference_longitude_deg: inverse.reference_longitude_deg,
                         clip_bounds: inverse.clip_bounds,
                         lat_deg: scratch.fill_f64_from_f32(&request.field.grid.lat_deg),
                         lon_deg: scratch.fill_f64_from_f32(&request.field.grid.lon_deg),
                     })
                 });
+
+        // The metadata-only twin: same shape, but built ONLY when the
+        // inverse-raster path is absent, and never handed to the rasterizer. It
+        // exists so a native-projection mesh (Lambert HRRR, polar stereographic)
+        // can still be described in a `PlotGeometry`.
+        let mesh_projected_grid = if inverse_projected_grid.is_some() {
+            None
+        } else {
+            request.mesh_projection.as_ref().and_then(|mesh| {
+                let projector = mesh
+                    .projection
+                    .build_projector(
+                        mesh.reference_latitude_deg,
+                        mesh.reference_longitude_deg,
+                        &request.field.grid.lat_deg,
+                        &request.field.grid.lon_deg,
+                    )
+                    .ok()?;
+                Some(InverseProjectedGrid {
+                    projector,
+                    projection: mesh.projection.clone(),
+                    clip_bounds: None,
+                    lat_deg: scratch.fill_f64_from_f32(&request.field.grid.lat_deg),
+                    lon_deg: scratch.fill_f64_from_f32(&request.field.grid.lon_deg),
+                })
+            })
+        };
 
         let rgba_grid = request.rgba_grid.as_ref().map(|field| {
             field
@@ -812,6 +909,7 @@ fn with_render_state_profile_with_style<T>(
             }),
             projected_grid,
             inverse_projected_grid,
+            mesh_projected_grid,
             terrain_rgba_grid,
             rgba_grid,
             projected_polygons,

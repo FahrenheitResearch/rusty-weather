@@ -60,6 +60,12 @@ pub struct RenderOpts {
     pub map_extent: Option<MapExtent>,
     pub projected_grid: Option<ProjectedGrid>,
     pub(crate) inverse_projected_grid: Option<InverseProjectedGrid>,
+    /// Which projection produced `projected_grid`, for [`capture_plot_geometry`]
+    /// ONLY. Never consulted by the draw path: `inverse_projected_grid` is what
+    /// selects the inverse-raster rasterizer, and this exists precisely so a mesh
+    /// that rasterizer cannot handle can still be DESCRIBED. Set only when
+    /// `inverse_projected_grid` is absent, so the two never disagree.
+    pub(crate) mesh_projected_grid: Option<InverseProjectedGrid>,
     pub terrain_rgba_grid: Option<Vec<Rgba>>,
     pub rgba_grid: Option<Vec<Rgba>>,
     /// Filled polygons (lat/lon-derived). Drawn BEFORE the data raster so the
@@ -171,7 +177,11 @@ pub struct PlotGeometry {
     /// Lat/lon bounding box of the four plot corners. A hint for fitting a
     /// client map, NOT the frame's true lat/lon extremes: under a conic
     /// projection the frame edges bow between their corners.
-    pub geographic: GeographicBounds,
+    ///
+    /// `None` when a corner does not invert — a padded global frame can sit past
+    /// the antimeridian. The rect and the projection above are still exact then;
+    /// only this convenience box is unavailable.
+    pub geographic: Option<GeographicBounds>,
 }
 
 impl PlotGeometry {
@@ -204,7 +214,7 @@ impl PlotGeometry {
     ///
     /// `None` when the fixup cut INTO the plot: a rect that no longer describes
     /// where the data was drawn is worse than no rect at all.
-    fn adjusted(mut self, adjust: CanvasAdjustment) -> Option<Self> {
+    pub(crate) fn adjusted(mut self, adjust: CanvasAdjustment) -> Option<Self> {
         let plot_x = i64::from(self.plot_x) + i64::from(adjust.dx);
         let plot_y = i64::from(self.plot_y) + i64::from(adjust.dy);
         if plot_x < 0
@@ -220,6 +230,67 @@ impl PlotGeometry {
         self.image_h = adjust.height;
         Some(self)
     }
+
+    /// Where a projected `(x, y)` lands in the final image — the published
+    /// mapping, evaluated here so a caller does not have to retype it.
+    pub fn pixel_at_projected(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        let (span_x, span_y) = self.projected_spans()?;
+        let rel_x = (x - self.projected.x_min) / span_x;
+        let rel_y = 1.0 - (y - self.projected.y_min) / span_y;
+        Some((
+            f64::from(self.plot_x) + rel_x * f64::from(self.plot_w.saturating_sub(1)),
+            f64::from(self.plot_y) + rel_y * f64::from(self.plot_h.saturating_sub(1)),
+        ))
+    }
+
+    /// The projected `(x, y)` under an image pixel. Accepts pixels outside the
+    /// plot rect and extrapolates: a cursor one pixel past the frame is a
+    /// legitimate question, and clamping would answer a different one.
+    pub fn projected_at_pixel(&self, image_x: f64, image_y: f64) -> Option<(f64, f64)> {
+        let (span_x, span_y) = self.projected_spans()?;
+        let last_x = f64::from(self.plot_w.saturating_sub(1));
+        let last_y = f64::from(self.plot_h.saturating_sub(1));
+        if last_x <= 0.0 || last_y <= 0.0 {
+            return None;
+        }
+        let rel_x = (image_x - f64::from(self.plot_x)) / last_x;
+        let rel_y = (image_y - f64::from(self.plot_y)) / last_y;
+        Some((
+            self.projected.x_min + rel_x * span_x,
+            self.projected.y_min + (1.0 - rel_y) * span_y,
+        ))
+    }
+
+    /// Lat/lon under an image pixel: the question the whole struct exists to
+    /// answer. `None` when the pixel unprojects to nothing real.
+    pub fn lat_lon_at_pixel(&self, image_x: f64, image_y: f64) -> Option<(f64, f64)> {
+        let (x, y) = self.projected_at_pixel(image_x, image_y)?;
+        self.projector()?.unproject(x, y)
+    }
+
+    /// Rebuild the projector from the published fields alone — no grid to fall
+    /// back on, because a client will not have one either. The capture refuses
+    /// to publish a geometry whose fields cannot do this.
+    fn projector(&self) -> Option<ProjectionProjector> {
+        self.projection
+            .build_projector(
+                self.reference_latitude_deg,
+                self.reference_longitude_deg,
+                &[],
+                &[],
+            )
+            .ok()
+    }
+
+    fn projected_spans(&self) -> Option<(f64, f64)> {
+        let span_x = self.projected.x_max - self.projected.x_min;
+        let span_y = self.projected.y_max - self.projected.y_min;
+        let usable = span_x.is_finite()
+            && span_y.is_finite()
+            && span_x.abs() > 1.0e-12
+            && span_y.abs() > 1.0e-12;
+        usable.then_some((span_x, span_y))
+    }
 }
 
 /// How a post-draw canvas fixup moved the pixels: content shifted by
@@ -234,7 +305,7 @@ pub(crate) struct CanvasAdjustment {
 }
 
 impl CanvasAdjustment {
-    fn unchanged(img: &RgbaImage) -> Self {
+    pub(crate) fn unchanged(img: &RgbaImage) -> Self {
         Self {
             dx: 0,
             dy: 0,
@@ -242,6 +313,207 @@ impl CanvasAdjustment {
             height: img.height(),
         }
     }
+
+    /// A crop whose top-left corner was `(origin_x, origin_y)` in the old
+    /// canvas: every surviving pixel moved by minus that origin.
+    fn cropped(origin_x: u32, origin_y: u32, cropped: &RgbaImage) -> Self {
+        Self {
+            dx: -clamp_u32_to_i32(origin_x),
+            dy: -clamp_u32_to_i32(origin_y),
+            width: cropped.width(),
+            height: cropped.height(),
+        }
+    }
+
+    /// A pure horizontal slide on a canvas that kept its size.
+    fn shifted_x(shift: i64, img: &RgbaImage) -> Self {
+        Self {
+            dx: shift.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            dy: 0,
+            width: img.width(),
+            height: img.height(),
+        }
+    }
+}
+
+fn clamp_u32_to_i32(value: u32) -> i32 {
+    value.min(i32::MAX as u32) as i32
+}
+
+/// Grid samples the capture cross-checks before it will publish a
+/// [`PlotGeometry`]. Enough to catch a rotated or mismatched mesh anywhere in
+/// the frame, few enough to disappear next to the render itself.
+const PLOT_GEOMETRY_VERIFY_SAMPLES: usize = 64;
+
+/// Agreement demanded between the projector we are about to publish and the mesh
+/// the render actually drew, as a fraction of the extent span. Both sides
+/// evaluate the same doubles through the same code, so this is ~1e-4 of a pixel
+/// at domain scale: loose enough to survive benign float noise, far tighter than
+/// any error worth reporting.
+const PLOT_GEOMETRY_VERIFY_REL_TOLERANCE: f64 = 1.0e-7;
+
+/// Capture where the map plot rect landed and what it covers.
+///
+/// Call this only once `layout` is FINAL — `reserve_domain_frame_legend_space`
+/// and `fit_map_viewport_layout_to_extent` both rewrite `map_*` after
+/// `compute_layout`, and a rect captured before them describes a plot that was
+/// never drawn.
+///
+/// `None` whenever the answer cannot be stated exactly. The load-bearing check
+/// is the last one: the published projection is verified to reproduce the
+/// projected mesh the renderer drew. That is what rules out a mesh put through
+/// [`crate::ProjectedMap::rotated_degrees`] (whose rotation breaks the
+/// axis-aligned mapping) and a domain built with a different projector than the
+/// inverse-raster spec advertises, without either case needing to be enumerated.
+fn capture_plot_geometry(opts: &RenderOpts, layout: &Layout) -> Option<PlotGeometry> {
+    let extent = opts.map_extent.as_ref()?;
+    let grid = opts.projected_grid.as_ref()?;
+    // Either statement of which projection produced the mesh will do; without one
+    // there is nothing to publish but a guess, and a guess is what this whole
+    // exercise is replacing. The inverse-raster metadata comes first because when
+    // it is present it is also what the rasterizer used.
+    let inverse = opts
+        .inverse_projected_grid
+        .as_ref()
+        .or(opts.mesh_projected_grid.as_ref())?;
+
+    // The mapping divides by (w - 1), so a one-pixel-wide plot has no span to
+    // interpolate across.
+    if layout.map_w < 2 || layout.map_h < 2 {
+        return None;
+    }
+    if layout.map_x.saturating_add(layout.map_w) > opts.width
+        || layout.map_y.saturating_add(layout.map_h) > opts.height
+    {
+        return None;
+    }
+
+    let span_x = extent.x_max - extent.x_min;
+    let span_y = extent.y_max - extent.y_min;
+    if !span_x.is_finite()
+        || !span_y.is_finite()
+        || span_x.abs() < 1.0e-12
+        || span_y.abs() < 1.0e-12
+    {
+        return None;
+    }
+
+    let (reference_latitude_deg, reference_longitude_deg) =
+        inverse.projector.resolved_reference_lat_lon_deg();
+    // Rebuild from exactly the numbers about to be published, with no grid to
+    // fall back on — the same position a client is in.
+    let projector = inverse
+        .projection
+        .build_projector(reference_latitude_deg, reference_longitude_deg, &[], &[])
+        .ok()?;
+    let span = span_x.abs().max(span_y.abs());
+    if !projector_reproduces_projected_grid(projector, inverse, grid, span) {
+        return None;
+    }
+    // A forward-only projection (polar stereographic here) cannot answer the
+    // hover question at all, so say nothing rather than ship a one-way rect.
+    projector.unproject(extent.x_min + span_x / 2.0, extent.y_min + span_y / 2.0)?;
+
+    Some(PlotGeometry {
+        image_w: opts.width,
+        image_h: opts.height,
+        plot_x: layout.map_x,
+        plot_y: layout.map_y,
+        plot_w: layout.map_w,
+        plot_h: layout.map_h,
+        projected: ProjectedExtent {
+            x_min: extent.x_min,
+            x_max: extent.x_max,
+            y_min: extent.y_min,
+            y_max: extent.y_max,
+        },
+        projection: inverse.projection.clone(),
+        reference_latitude_deg,
+        reference_longitude_deg,
+        earth_radius_m: R_EARTH,
+        geographic: plot_corner_geographic_bounds(projector, extent),
+    })
+}
+
+/// Does `projector` put the grid's lat/lon back on the very coordinates the
+/// render rasterized? Sampled across the whole mesh, because a rotation leaves
+/// the centre roughly in place while throwing the corners kilometres off.
+fn projector_reproduces_projected_grid(
+    projector: ProjectionProjector,
+    inverse: &InverseProjectedGrid,
+    grid: &ProjectedGrid,
+    span: f64,
+) -> bool {
+    let len = grid
+        .x
+        .len()
+        .min(grid.y.len())
+        .min(inverse.lat_deg.len())
+        .min(inverse.lon_deg.len());
+    if len == 0 || !span.is_finite() || span <= 0.0 {
+        return false;
+    }
+
+    let tolerance = span * PLOT_GEOMETRY_VERIFY_REL_TOLERANCE;
+    let step = (len / PLOT_GEOMETRY_VERIFY_SAMPLES).max(1);
+    let mut compared = 0usize;
+    for index in (0..len).step_by(step) {
+        let (lat, lon) = (inverse.lat_deg[index], inverse.lon_deg[index]);
+        let (x, y) = (grid.x[index], grid.y[index]);
+        if !lat.is_finite() || !lon.is_finite() || !x.is_finite() || !y.is_finite() {
+            continue;
+        }
+        let (projected_x, projected_y) = projector.project(lat, lon);
+        if !projected_x.is_finite() || !projected_y.is_finite() {
+            return false;
+        }
+        if (projected_x - x).abs() > tolerance || (projected_y - y).abs() > tolerance {
+            return false;
+        }
+        compared += 1;
+    }
+
+    // A handful of agreeing samples is proof; zero is only silence.
+    compared >= 4
+}
+
+/// Lat/lon box of the four plot corners. Longitudes are unwrapped against the
+/// first corner so a frame straddling the antimeridian reports a continuous
+/// span instead of the full -180..180.
+fn plot_corner_geographic_bounds(
+    projector: ProjectionProjector,
+    extent: &MapExtent,
+) -> Option<GeographicBounds> {
+    let corners = [
+        (extent.x_min, extent.y_min),
+        (extent.x_max, extent.y_min),
+        (extent.x_max, extent.y_max),
+        (extent.x_min, extent.y_max),
+    ];
+    let mut west = f64::INFINITY;
+    let mut east = f64::NEG_INFINITY;
+    let mut south = f64::INFINITY;
+    let mut north = f64::NEG_INFINITY;
+    let mut reference_lon: Option<f64> = None;
+    for (x, y) in corners {
+        let (lat, lon) = projector.unproject(x, y)?;
+        if !lat.is_finite() || !lon.is_finite() {
+            return None;
+        }
+        let lon = match reference_lon {
+            Some(reference) => reference + normalize_longitude_deg(lon - reference),
+            None => {
+                reference_lon = Some(lon);
+                lon
+            }
+        };
+        west = west.min(lon);
+        east = east.max(lon);
+        south = south.min(lat);
+        north = north.max(lat);
+    }
+
+    Some(GeographicBounds::new(west, east, south, north))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -298,6 +570,7 @@ impl Default for RenderOpts {
             map_extent: None,
             projected_grid: None,
             inverse_projected_grid: None,
+            mesh_projected_grid: None,
             terrain_rgba_grid: None,
             rgba_grid: None,
             projected_polygons: vec![],
@@ -5109,7 +5382,7 @@ fn render_to_image_profile_inner(
     ny: usize,
     nx: usize,
     opts: &RenderOpts,
-) -> (RgbaImage, RenderImageTiming) {
+) -> (RgbaImage, RenderImageTiming, Option<PlotGeometry>) {
     let total_start = Instant::now();
     let layout_start = Instant::now();
     let has_title = opts.title.is_some()
@@ -5133,6 +5406,10 @@ fn render_to_image_profile_inner(
         opts.domain_frame,
         opts.map_extent.as_ref(),
     );
+    // Both layout rewrites are behind us, so `layout.map_*` is now what the draw
+    // code will actually use. Capturing anywhere earlier reports a rect that the
+    // legend reservation or the aspect fit has since moved.
+    let plot_geometry = capture_plot_geometry(opts, &layout);
     let layout_ms = layout_start.elapsed().as_millis();
 
     let projected_pixel_start = Instant::now();
@@ -5264,7 +5541,7 @@ fn render_to_image_profile_inner(
             .map(|rect| [rect.min_x, rect.max_x, rect.min_y, rect.max_y]),
     };
 
-    (img, timing)
+    (img, timing, plot_geometry)
 }
 
 pub fn render_to_image_profile(
@@ -5273,6 +5550,24 @@ pub fn render_to_image_profile(
     nx: usize,
     opts: &RenderOpts,
 ) -> (RgbaImage, RenderImageTiming) {
+    let (image, timing, _) = render_to_image_profile_with_geometry(data, ny, nx, opts);
+    (image, timing)
+}
+
+/// [`render_to_image_profile`] that also reports where the map plot rect landed
+/// in the returned image, when that can be stated exactly.
+///
+/// The rect is in the coordinates of the image this function returns — already
+/// divided down out of the supersampled render. Anything the CALLER does to the
+/// canvas afterwards (see [`crop_canvas_whitespace`],
+/// [`center_horizontal_canvas_content`], [`trim_vertical_canvas_whitespace`])
+/// still has to be followed with [`PlotGeometry::adjusted`].
+pub fn render_to_image_profile_with_geometry(
+    data: &[f64],
+    ny: usize,
+    nx: usize,
+    opts: &RenderOpts,
+) -> (RgbaImage, RenderImageTiming, Option<PlotGeometry>) {
     let factor = opts.supersample_factor.max(1);
     if factor == 1 {
         return render_to_image_profile_inner(data, ny, nx, opts);
@@ -5280,7 +5575,7 @@ pub fn render_to_image_profile(
 
     let total_start = Instant::now();
     let scaled_opts = scale_render_opts_for_supersample(opts, factor);
-    let (hires, mut timing) = render_to_image_profile_inner(data, ny, nx, &scaled_opts);
+    let (hires, mut timing, geometry) = render_to_image_profile_inner(data, ny, nx, &scaled_opts);
     let downsample_start = Instant::now();
 
     // Upstream gates a cuda downsample+sharpen fast-path here; this port
@@ -5309,7 +5604,8 @@ pub fn render_to_image_profile(
             *value /= factor;
         }
     }
-    (image, timing)
+    let geometry = geometry.map(|geometry| geometry.downsampled(factor, opts.width, opts.height));
+    (image, timing, geometry)
 }
 
 fn sharpen_downsampled_image(image: &RgbaImage) -> RgbaImage {
@@ -5335,16 +5631,21 @@ fn row_is_canvas_background(img: &RgbaImage, y: u32, background: Rgba) -> bool {
     })
 }
 
-pub(crate) fn trim_vertical_canvas_whitespace(img: &RgbaImage, background: Rgba) -> RgbaImage {
+/// Trim blank rows off the top and bottom, reporting how far the content moved
+/// so a captured [`PlotGeometry`] can follow it.
+pub(crate) fn trim_vertical_canvas_whitespace(
+    img: &RgbaImage,
+    background: Rgba,
+) -> (RgbaImage, CanvasAdjustment) {
     if img.height() <= 2 {
-        return img.clone();
+        return (img.clone(), CanvasAdjustment::unchanged(img));
     }
 
     let first_non_bg = (0..img.height()).find(|&y| !row_is_canvas_background(img, y, background));
     let last_non_bg = (0..img.height()).rfind(|&y| !row_is_canvas_background(img, y, background));
 
     let (Some(first), Some(last)) = (first_non_bg, last_non_bg) else {
-        return img.clone();
+        return (img.clone(), CanvasAdjustment::unchanged(img));
     };
 
     let top_pad = 2u32;
@@ -5353,15 +5654,23 @@ pub(crate) fn trim_vertical_canvas_whitespace(img: &RgbaImage, background: Rgba)
     let crop_bottom = (last.saturating_add(bottom_pad)).min(img.height().saturating_sub(1));
     let crop_h = crop_bottom.saturating_sub(crop_top).saturating_add(1);
     if crop_top == 0 && crop_h == img.height() {
-        return img.clone();
+        return (img.clone(), CanvasAdjustment::unchanged(img));
     }
 
-    crop_imm(img, 0, crop_top, img.width(), crop_h).to_image()
+    let cropped = crop_imm(img, 0, crop_top, img.width(), crop_h).to_image();
+    let adjustment = CanvasAdjustment::cropped(0, crop_top, &cropped);
+    (cropped, adjustment)
 }
 
-pub(crate) fn crop_canvas_whitespace(img: &RgbaImage, background: Rgba, pad: u32) -> RgbaImage {
+/// Crop the blank border away, reporting the crop origin and the new size so a
+/// captured [`PlotGeometry`] can follow the content.
+pub(crate) fn crop_canvas_whitespace(
+    img: &RgbaImage,
+    background: Rgba,
+    pad: u32,
+) -> (RgbaImage, CanvasAdjustment) {
     if img.width() <= 2 || img.height() <= 2 {
-        return img.clone();
+        return (img.clone(), CanvasAdjustment::unchanged(img));
     }
 
     let mut min_x = img.width();
@@ -5380,7 +5689,7 @@ pub(crate) fn crop_canvas_whitespace(img: &RgbaImage, background: Rgba, pad: u32
     }
 
     if min_x > max_x || min_y > max_y {
-        return img.clone();
+        return (img.clone(), CanvasAdjustment::unchanged(img));
     }
 
     let crop_x = min_x.saturating_sub(pad);
@@ -5392,10 +5701,12 @@ pub(crate) fn crop_canvas_whitespace(img: &RgbaImage, background: Rgba, pad: u32
     let crop_w = crop_right.saturating_sub(crop_x).saturating_add(1);
     let crop_h = crop_bottom.saturating_sub(crop_y).saturating_add(1);
     if crop_x == 0 && crop_y == 0 && crop_w == img.width() && crop_h == img.height() {
-        return img.clone();
+        return (img.clone(), CanvasAdjustment::unchanged(img));
     }
 
-    crop_imm(img, crop_x, crop_y, crop_w, crop_h).to_image()
+    let cropped = crop_imm(img, crop_x, crop_y, crop_w, crop_h).to_image();
+    let adjustment = CanvasAdjustment::cropped(crop_x, crop_y, &cropped);
+    (cropped, adjustment)
 }
 
 fn pixel_matches_background(px: image::Rgba<u8>, background: Rgba) -> bool {
@@ -5411,9 +5722,14 @@ fn pixel_matches_background(px: image::Rgba<u8>, background: Rgba) -> bool {
     diff <= 6
 }
 
-pub(crate) fn center_horizontal_canvas_content(img: &RgbaImage, background: Rgba) -> RgbaImage {
+/// Re-centre the content horizontally, reporting the slide so a captured
+/// [`PlotGeometry`] can follow it.
+pub(crate) fn center_horizontal_canvas_content(
+    img: &RgbaImage,
+    background: Rgba,
+) -> (RgbaImage, CanvasAdjustment) {
     if img.width() <= 2 {
-        return img.clone();
+        return (img.clone(), CanvasAdjustment::unchanged(img));
     }
 
     let mut min_x = img.width();
@@ -5428,14 +5744,14 @@ pub(crate) fn center_horizontal_canvas_content(img: &RgbaImage, background: Rgba
     }
 
     if min_x > max_x {
-        return img.clone();
+        return (img.clone(), CanvasAdjustment::unchanged(img));
     }
 
     let left_margin = min_x;
     let right_margin = img.width().saturating_sub(max_x).saturating_sub(1);
     let shift = (right_margin as i64 - left_margin as i64) / 2;
     if shift == 0 {
-        return img.clone();
+        return (img.clone(), CanvasAdjustment::unchanged(img));
     }
 
     let mut centered = RgbaImage::from_pixel(img.width(), img.height(), background.to_image_rgba());
@@ -5453,7 +5769,8 @@ pub(crate) fn center_horizontal_canvas_content(img: &RgbaImage, background: Rgba
         }
     }
 
-    centered
+    let adjustment = CanvasAdjustment::shifted_x(shift, &centered);
+    (centered, adjustment)
 }
 
 pub fn encode_rgba_png_profile_with_options(

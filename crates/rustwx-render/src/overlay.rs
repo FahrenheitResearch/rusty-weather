@@ -29,9 +29,12 @@ pub(crate) struct InverseProjectedGrid {
     /// the renderer can STATE the projection it drew with (see
     /// `render::PlotGeometry`) and not merely evaluate it. A `ProjectionProjector`
     /// holds only precomputed constants, so the spec cannot be read back out.
+    ///
+    /// The reference lat/lon deliberately are NOT carried here: the request's
+    /// copies are `Option`s that the projector may have defaulted from the grid,
+    /// so `ProjectionProjector::resolved_reference_lat_lon_deg` is asked for the
+    /// values it settled on instead.
     pub projection: ProjectionSpec,
-    pub reference_latitude_deg: Option<f64>,
-    pub reference_longitude_deg: Option<f64>,
     pub clip_bounds: Option<GeographicClipBounds>,
     pub lat_deg: Vec<f64>,
     pub lon_deg: Vec<f64>,

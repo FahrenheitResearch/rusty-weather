@@ -162,6 +162,7 @@ fn windowed_render_request_uses_modern_map_chrome() {
         lines: Vec::new(),
         polygons: Vec::new(),
         inverse_raster_projection: None,
+        mesh_projection: None,
     };
 
     let render_request = build_windowed_render_request(
@@ -257,6 +258,7 @@ fn windowed_render_request_labels_fixed_window_instead_of_requested_end_hour() {
         lines: Vec::new(),
         polygons: Vec::new(),
         inverse_raster_projection: None,
+        mesh_projection: None,
     };
 
     let render_request = build_windowed_render_request(

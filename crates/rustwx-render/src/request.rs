@@ -384,6 +384,28 @@ pub struct InverseRasterProjection {
     pub clip_bounds: Option<GeographicClipBounds>,
 }
 
+/// Which projection produced [`ProjectedDomain::x`]/`y`, stated as metadata.
+///
+/// METADATA ONLY. Nothing in the draw path reads this: it exists so the renderer
+/// can NAME the projection it drew with when it reports a
+/// [`crate::PlotGeometry`]. `inverse_raster_projection` carries the same facts
+/// but is also the switch that selects the inverse-raster rasterizer, so it can
+/// only be set for the rectilinear lat/lon meshes that path can invert —
+/// borrowing it to describe a native Lambert mesh would change pixels.
+///
+/// The renderer does not take this on trust: it rebuilds the projector from these
+/// fields alone and checks it reproduces the projected mesh it actually
+/// rasterized, so a statement that does not match the mesh (wrong frame bounds,
+/// wrong variant, a rotated mesh) makes the geometry go silent rather than wrong.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeshProjection {
+    pub projection: ProjectionSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_latitude_deg: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_longitude_deg: Option<f64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GeographicClipBounds {
     pub west_deg: f64,
@@ -842,6 +864,12 @@ pub struct MapRenderRequest {
     pub projected_data_polygons: Vec<ProjectedPolygonFill>,
     #[serde(default)]
     pub inverse_raster_projection: Option<InverseRasterProjection>,
+    /// Which projection produced `projected_domain`. Metadata only — see
+    /// [`MeshProjection`]. Set it for EVERY projected mesh, including the native
+    /// Lambert/polar grids `inverse_raster_projection` cannot describe; that is
+    /// the only thing standing between those domains and a reported plot rect.
+    #[serde(default)]
+    pub mesh_projection: Option<MeshProjection>,
     #[serde(default)]
     pub projected_place_labels: Vec<ProjectedPlaceLabel>,
     #[serde(default)]
@@ -892,6 +920,7 @@ impl MapRenderRequest {
             projected_polygons: Vec::new(),
             projected_data_polygons: Vec::new(),
             inverse_raster_projection: None,
+            mesh_projection: None,
             projected_place_labels: Vec::new(),
             projected_points: Vec::new(),
             projected_lines: Vec::new(),
@@ -1052,6 +1081,7 @@ impl MapRenderRequest {
         self.projected_lines = projected.lines.clone();
         self.projected_polygons = projected.polygons.clone();
         self.inverse_raster_projection = projected.inverse_raster_projection.clone();
+        self.mesh_projection = projected.mesh_projection.clone();
         self
     }
 
@@ -1505,6 +1535,7 @@ mod tests {
                 role: PolygonRole::Generic,
             }],
             inverse_raster_projection: None,
+            mesh_projection: None,
         };
 
         let request =

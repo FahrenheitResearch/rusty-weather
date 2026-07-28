@@ -18,8 +18,9 @@ use rustwx_products::plot_design::StaticPlotDesign;
 use rustwx_products::shared_context::{DomainSpec, model_time_subtitle, source_subtitle};
 use rustwx_render::{
     ChromeScale, Color, ColorScale, DiscreteColorScale, ExtendMode, Field2D, GridShape, LatLonGrid,
-    MapRenderRequest, PngWriteOptions, ProductKey, ProductVisualMode, ProjectedDomain,
-    ProjectedMap, map_frame_aspect_ratio, save_png_profile_with_options,
+    MapRenderRequest, PlotGeometry, PngWriteOptions, ProductKey, ProductVisualMode,
+    ProjectedDomain, ProjectedMap, map_frame_aspect_ratio,
+    save_png_profile_with_options_and_geometry,
 };
 use rw_store::error::RwStoreError;
 
@@ -336,10 +337,11 @@ pub fn render_fuel_products_from_store(
         .map(|prepared| {
             let started = Instant::now();
             render_one_fuel_product(config, &context, hour, prepared.product, prepared.plane)
-                .map(|output_path| RenderedProduct {
+                .map(|(output_path, plot_geometry)| RenderedProduct {
                     slug: prepared.product.slug().to_string(),
                     total_ms: prepared.resolve_ms + started.elapsed().as_millis(),
                     output_path,
+                    plot_geometry,
                 })
                 .map_err(|err| err.to_string())
         })
@@ -607,7 +609,7 @@ fn render_one_fuel_product(
     hour: u16,
     product: FuelProduct,
     plane: FuelPlane,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+) -> Result<(PathBuf, Option<PlotGeometry>), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&config.out_dir)?;
     let render_grid = LatLonGrid::new(
         GridShape::new(context.nx, context.ny)?,
@@ -647,6 +649,9 @@ fn render_one_fuel_product(
     request.projected_lines = context.projected.lines.clone();
     request.projected_polygons = context.projected.polygons.clone();
     request.inverse_raster_projection = context.projected.inverse_raster_projection.clone();
+    // Metadata only (see `rustwx_render::MeshProjection`) — the statement the
+    // renderer needs to report this map's plot rect. Not a rasterizer input.
+    request.mesh_projection = context.projected.mesh_projection.clone();
     if let Some(orography) = context.orography.as_ref() {
         rustwx_products::topo::apply_orography_topo_overlay(&mut request, orography)?;
     }
@@ -668,14 +673,14 @@ fn render_one_fuel_product(
         &config.domain,
         product,
     ));
-    save_png_profile_with_options(
+    let (_, plot_geometry) = save_png_profile_with_options_and_geometry(
         &request,
         &output_path,
         &PngWriteOptions {
             compression: config.png_compression,
         },
     )?;
-    Ok(output_path)
+    Ok((output_path, plot_geometry))
 }
 
 fn fuel_subtitle_right(product: FuelProduct, source: SourceId) -> String {

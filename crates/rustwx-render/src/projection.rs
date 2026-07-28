@@ -598,6 +598,30 @@ impl ProjectionProjector {
         }
     }
 
+    /// The reference latitude/longitude this projector actually RESOLVED to, in
+    /// the exact form [`ProjectionSpec::build_projector`] consumes them.
+    ///
+    /// Only the two values a [`ProjectionSpec`] cannot carry are reported: the
+    /// Lambert reference latitude (which sets the y datum through `rho0`) and
+    /// the geographic central meridian (defaulted from the grid's circular mean
+    /// longitude when the caller left it unset). Everything else already lives
+    /// in the spec, and restating it here would only invite the two copies to
+    /// disagree.
+    ///
+    /// Reading the resolved value back — rather than echoing the caller's
+    /// `Option` — is what lets `render::PlotGeometry` promise that spec plus
+    /// references rebuild this projector with no grid in hand.
+    pub(crate) fn resolved_reference_lat_lon_deg(self) -> (Option<f64>, Option<f64>) {
+        match self {
+            Self::Geographic(projector) => (None, Some(projector.central_meridian_deg)),
+            Self::LambertConformal(projector) => (Some(projector.ref_lat_deg), None),
+            Self::Robinson(_)
+            | Self::AlbersEqualArea(_)
+            | Self::PolarStereographic(_)
+            | Self::Mercator(_) => (None, None),
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn inverse_kernel_params(self) -> Option<InverseProjectionKernelParams> {
         let params = match self {

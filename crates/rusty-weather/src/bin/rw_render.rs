@@ -16,6 +16,8 @@ use std::time::Instant;
 
 #[path = "../contour_mode.rs"]
 mod contour_mode;
+#[path = "../plot_geo.rs"]
+mod plot_geo;
 #[path = "../region.rs"]
 mod region;
 #[path = "../render_all.rs"]
@@ -24,6 +26,7 @@ use rw_ingest::throttle;
 
 use clap::{Parser, ValueEnum};
 use contour_mode::ContourModeArg;
+use plot_geo::{Geo, GeoProjection};
 use rayon::prelude::*;
 use region::RegionPreset;
 use render_all::{StoreFieldSource, StoreRenderConfig, StoreRenderSkip};
@@ -309,6 +312,12 @@ struct ApiDomainManifest {
     bounds: [f64; 4],
     product_count: usize,
     total_webp_bytes: u64,
+    /// The projection every product in this domain was drawn in, as the renderer
+    /// resolved it. Domain-level because one domain is one projected mesh — the
+    /// per-product `geo` blocks below repeat it, since each also carries the plot
+    /// rect, which a vertical colorbar or a missing title moves per image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projection: Option<GeoProjection>,
     products: Vec<ApiProductManifest>,
 }
 
@@ -319,6 +328,11 @@ struct ApiProductManifest {
     bytes: u64,
     source_png_bytes: u64,
     encode_ms: u128,
+    /// Omitted when the renderer could not state the mapping exactly (panels,
+    /// and any lane that never told it which projection made the mesh), so a
+    /// client keeps its measurement fallback exactly where it needs one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    geo: Option<Geo>,
 }
 
 fn webp_path_for_png(path: &Path) -> PathBuf {
@@ -433,27 +447,70 @@ fn print_webp_summary(domain_slug: &str, published: &[PublishedWebp]) {
     );
 }
 
-fn webp_domain_manifest(
+/// One domain's manifest entry, built from what was RENDERED rather than from
+/// what was published as webp.
+///
+/// It used to be built from the webp list alone, which meant an
+/// `--output-format png` run wrote no manifest at all and the API had no
+/// georeferencing to hand back for the exact format the site's PNG mode asks
+/// for. The webp publish result is now a join: present, it names the served file
+/// and its encode cost; absent, the rendered PNG is the served file.
+fn domain_manifest(
     domain_slug: &str,
     bounds: (f64, f64, f64, f64),
     output_root: &Path,
+    rendered: &[render_all::RenderedProduct],
     published: &[PublishedWebp],
 ) -> ApiDomainManifest {
-    let products: Vec<ApiProductManifest> = published
+    let products: Vec<ApiProductManifest> = rendered
         .iter()
-        .map(|item| ApiProductManifest {
-            slug: item.slug.clone(),
-            file: api_relative_path(output_root, &item.webp_path),
-            bytes: item.webp_bytes,
-            source_png_bytes: item.png_bytes,
-            encode_ms: item.encode_ms,
+        .map(|product| {
+            let webp = published.iter().find(|item| item.slug == product.slug);
+            let geo = product
+                .plot_geometry
+                .as_ref()
+                .map(|geometry| Geo::from_plot_geometry(geometry, bounds));
+            match webp {
+                Some(webp) => ApiProductManifest {
+                    slug: product.slug.clone(),
+                    file: api_relative_path(output_root, &webp.webp_path),
+                    bytes: webp.webp_bytes,
+                    source_png_bytes: webp.png_bytes,
+                    encode_ms: webp.encode_ms,
+                    geo,
+                },
+                None => {
+                    // No webp leg, so the PNG is what gets served. Its size is
+                    // read here rather than tracked through the render lanes.
+                    let bytes = fs::metadata(&product.output_path)
+                        .map(|meta| meta.len())
+                        .unwrap_or(0);
+                    ApiProductManifest {
+                        slug: product.slug.clone(),
+                        file: api_relative_path(output_root, &product.output_path),
+                        bytes,
+                        source_png_bytes: bytes,
+                        encode_ms: 0,
+                        geo,
+                    }
+                }
+            }
         })
         .collect();
+    let mut products = products;
+    // Slug order, not render order: the manifest is a document a client diffs.
+    products.sort_by(|left, right| left.slug.cmp(&right.slug));
+    let projection = products
+        .iter()
+        .filter_map(|product| product.geo.as_ref())
+        .map(|geo| geo.projection.clone())
+        .next();
     ApiDomainManifest {
         slug: domain_slug.to_string(),
         bounds: [bounds.0, bounds.1, bounds.2, bounds.3],
         product_count: products.len(),
-        total_webp_bytes: products.iter().map(|item| item.bytes).sum(),
+        total_webp_bytes: published.iter().map(|item| item.webp_bytes).sum(),
+        projection,
         products,
     }
 }
@@ -706,11 +763,12 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
         let published = publish_webp_outputs(&domain_rendered, args.output_format)?;
         print_webp_summary(domain_slug, &published);
-        if !published.is_empty() {
-            api_domains.push(webp_domain_manifest(
+        if !domain_rendered.is_empty() {
+            api_domains.push(domain_manifest(
                 domain_slug,
                 bounds,
                 &args.out_dir,
+                &domain_rendered,
                 &published,
             ));
         }
@@ -737,6 +795,9 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("rendered 0 products | total wall {total_ms} ms");
     }
+    // Any domain that rendered anything, in ANY output format. This used to
+    // depend on the webp publish step, so `--output-format png` wrote no
+    // manifest and the API had nothing to georeference PNG jobs with.
     if !api_domains.is_empty() {
         let manifest = ApiRenderManifest {
             build: env!("RW_BUILD_SHA"),
@@ -841,6 +902,139 @@ mod tests {
             "cafire_box_12_napa"
         );
         assert_eq!(sanitize_domain_slug(" "), "custom");
+    }
+
+    fn geometry_fixture() -> rustwx_render::PlotGeometry {
+        rustwx_render::PlotGeometry {
+            image_w: 1600,
+            image_h: 889,
+            plot_x: 16,
+            plot_y: 74,
+            plot_w: 1568,
+            plot_h: 742,
+            projected: rustwx_render::ProjectedExtent {
+                x_min: -467_281.5,
+                x_max: 467_281.5,
+                y_min: -546_733.6,
+                y_max: 552_466.0,
+            },
+            projection: rustwx_render::ProjectionSpec::Mercator {
+                latitude_of_true_scale_deg: 37.2,
+                central_meridian_deg: -119.75,
+            },
+            reference_latitude_deg: None,
+            reference_longitude_deg: Some(-119.75),
+            earth_radius_m: 6_370_000.0,
+            geographic: None,
+        }
+    }
+
+    fn rendered(slug: &str, path: &Path, geometry: bool) -> render_all::RenderedProduct {
+        render_all::RenderedProduct {
+            slug: slug.to_string(),
+            total_ms: 12,
+            output_path: path.to_path_buf(),
+            plot_geometry: geometry.then(geometry_fixture),
+        }
+    }
+
+    /// The bug this fixes: the manifest was built from the webp publish result,
+    /// so `--output-format png` produced no manifest at all and the API had no
+    /// georeferencing for PNG jobs. A png-only domain must still describe every
+    /// rendered file — naming the PNG, since that is what gets served.
+    #[test]
+    fn a_png_only_domain_still_gets_a_manifest_naming_its_png_files() {
+        let root = Path::new("out").join("api");
+        let png = root.join("rustwx_hrrr_20260726_12z_f006_california_vpd_2m.png");
+        let manifest = domain_manifest(
+            "california",
+            (-124.5, -113.5, 32.0, 42.0),
+            &root,
+            &[rendered("vpd_2m", &png, true)],
+            &[],
+        );
+        assert_eq!(manifest.product_count, 1);
+        assert_eq!(manifest.total_webp_bytes, 0);
+        assert_eq!(
+            manifest.products[0].file,
+            "rustwx_hrrr_20260726_12z_f006_california_vpd_2m.png"
+        );
+        let geo = manifest.products[0]
+            .geo
+            .as_ref()
+            .expect("a georeferenced product must publish geo in png mode too");
+        assert_eq!(geo.plot_px.width, 1568);
+        assert_eq!(geo.requested_bounds.west, -124.5);
+        assert_eq!(geo.requested_bounds.north, 42.0);
+        // The domain block repeats the projection once for the whole mesh.
+        assert_eq!(
+            manifest.projection.as_ref().map(|proj| proj.earth_radius_m),
+            Some(6_370_000.0)
+        );
+    }
+
+    /// A product the renderer could not georeference (a composite panel, or any
+    /// lane that never stated its projection) must be listed WITHOUT `geo` so the
+    /// client keeps its measurement fallback exactly there.
+    #[test]
+    fn products_without_geometry_are_listed_without_a_geo_block() {
+        let root = Path::new("out").join("api");
+        let panel = root.join("rustwx_hrrr_20260726_12z_f006_california_cloud_cover_levels.png");
+        let manifest = domain_manifest(
+            "california",
+            (-124.5, -113.5, 32.0, 42.0),
+            &root,
+            &[rendered("cloud_cover_levels", &panel, false)],
+            &[],
+        );
+        assert!(manifest.products[0].geo.is_none());
+        assert!(
+            manifest.projection.is_none(),
+            "a domain with nothing georeferenced states no projection"
+        );
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert!(
+            json["products"][0].get("geo").is_none(),
+            "geo must be omitted, not null: {json}"
+        );
+    }
+
+    /// With a webp leg the served file is the webp, and its geo is the same rect:
+    /// the webp is a lossless re-encode of those exact pixels.
+    #[test]
+    fn a_published_webp_is_the_named_file_and_keeps_the_same_rect() {
+        let root = Path::new("out").join("api");
+        let png = root.join("rustwx_hrrr_20260726_12z_f006_california_hdw.png");
+        let manifest = domain_manifest(
+            "california",
+            (-124.5, -113.5, 32.0, 42.0),
+            &root,
+            &[rendered("hdw", &png, true)],
+            &[PublishedWebp {
+                slug: "hdw".to_string(),
+                webp_path: webp_path_for_png(&png),
+                png_bytes: 900_000,
+                webp_bytes: 400_000,
+                encode_ms: 7,
+                removed_png: true,
+            }],
+        );
+        assert_eq!(
+            manifest.products[0].file,
+            "rustwx_hrrr_20260726_12z_f006_california_hdw.webp"
+        );
+        assert_eq!(manifest.products[0].bytes, 400_000);
+        assert_eq!(manifest.products[0].source_png_bytes, 900_000);
+        assert_eq!(manifest.total_webp_bytes, 400_000);
+        assert_eq!(
+            manifest.products[0].geo.as_ref().map(|geo| geo.plot_px),
+            Some(plot_geo::RectPx {
+                x: 16,
+                y: 74,
+                width: 1568,
+                height: 742
+            })
+        );
     }
 
     #[test]

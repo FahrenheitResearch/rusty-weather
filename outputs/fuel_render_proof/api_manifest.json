@@ -1,0 +1,116 @@
+{
+  "build": "1e0e64cede13-dirty",
+  "model": "hrrr",
+  "run": "20260629_03z",
+  "hour": 3,
+  "output_format": "webp",
+  "output_width": 1400,
+  "output_height": 1586,
+  "plot_style": "operational-fast",
+  "domains": [
+    {
+      "slug": "drawn_box",
+      "bounds": [
+        -123.21,
+        -119.67,
+        37.13,
+        41.14
+      ],
+      "product_count": 13,
+      "total_webp_bytes": 5388434,
+      "products": [
+        {
+          "slug": "burning_index",
+          "file": "rustwx_hrrr_20260629_3z_f003_drawn_box_burning_index.webp",
+          "bytes": 292816,
+          "source_png_bytes": 7010363,
+          "encode_ms": 22
+        },
+        {
+          "slug": "daily_precip_fuel_context",
+          "file": "rustwx_hrrr_20260629_3z_f003_drawn_box_daily_precip_fuel_context.webp",
+          "bytes": 62132,
+          "source_png_bytes": 4419870,
+          "encode_ms": 24
+        },
+        {
+          "slug": "dead_fuel_moisture_1000h",
+          "file": "rustwx_hrrr_20260629_3z_f003_drawn_box_dead_fuel_moisture_1000h.webp",
+          "bytes": 257204,
+          "source_png_bytes": 6953591,
+          "encode_ms": 23
+        },
+        {
+          "slug": "dead_fuel_moisture_100h",
+          "file": "rustwx_hrrr_20260629_3z_f003_drawn_box_dead_fuel_moisture_100h.webp",
+          "bytes": 294446,
+          "source_png_bytes": 6953591,
+          "encode_ms": 19
+        },
+        {
+          "slug": "dead_fuel_moisture_10h",
+          "file": "rustwx_hrrr_20260629_3z_f003_drawn_box_dead_fuel_moisture_10h.webp",
+          "bytes": 298296,
+          "source_png_bytes": 6911191,
+          "encode_ms": 35
+        },
+        {
+          "slug": "dead_fuel_moisture_1h",
+          "file": "rustwx_hrrr_20260629_3z_f003_drawn_box_dead_fuel_moisture_1h.webp",
+          "bytes": 195302,
+          "source_png_bytes": 6929459,
+          "encode_ms": 31
+        },
+        {
+          "slug": "erc",
+          "file": "rustwx_hrrr_20260629_3z_f003_drawn_box_erc.webp",
+          "bytes": 471640,
+          "source_png_bytes": 7010363,
+          "encode_ms": 25
+        },
+        {
+          "slug": "erc_hdw_composite",
+          "file": "rustwx_hrrr_20260629_3z_f003_drawn_box_erc_hdw_composite.webp",
+          "bytes": 614022,
+          "source_png_bytes": 7010363,
+          "encode_ms": 30
+        },
+        {
+          "slug": "fire_potential_composite",
+          "file": "rustwx_hrrr_20260629_3z_f003_drawn_box_fire_potential_composite.webp",
+          "bytes": 885652,
+          "source_png_bytes": 7010363,
+          "encode_ms": 25
+        },
+        {
+          "slug": "fuel_receptiveness",
+          "file": "rustwx_hrrr_20260629_3z_f003_drawn_box_fuel_receptiveness.webp",
+          "bytes": 359606,
+          "source_png_bytes": 7010363,
+          "encode_ms": 27
+        },
+        {
+          "slug": "hdw_fuel_receptive",
+          "file": "rustwx_hrrr_20260629_3z_f003_drawn_box_hdw_fuel_receptive.webp",
+          "bytes": 637838,
+          "source_png_bytes": 7010363,
+          "encode_ms": 28
+        },
+        {
+          "slug": "kbdi",
+          "file": "rustwx_hrrr_20260629_3z_f003_drawn_box_kbdi.webp",
+          "bytes": 482384,
+          "source_png_bytes": 7010363,
+          "encode_ms": 21
+        },
+        {
+          "slug": "vpd_fuel_receptive",
+          "file": "rustwx_hrrr_20260629_3z_f003_drawn_box_vpd_fuel_receptive.webp",
+          "bytes": 537096,
+          "source_png_bytes": 7010363,
+          "encode_ms": 29
+        }
+      ]
+    }
+  ]
+}

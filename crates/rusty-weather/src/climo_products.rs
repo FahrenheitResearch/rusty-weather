@@ -22,9 +22,9 @@ use std::time::Instant;
 use rustwx_products::places;
 use rustwx_products::plot_design::StaticPlotDesign;
 use rustwx_render::{
-    ChromeScale, Color, ColorScale, DiscreteColorScale, ExtendMode, Field2D, GridShape,
-    LatLonGrid, MapRenderRequest, PngWriteOptions, ProductKey, ProductVisualMode,
-    ProjectedDomain, map_frame_aspect_ratio, save_png_profile_with_options,
+    ChromeScale, Color, ColorScale, DiscreteColorScale, ExtendMode, Field2D, GridShape, LatLonGrid,
+    MapRenderRequest, PlotGeometry, PngWriteOptions, ProductKey, ProductVisualMode,
+    ProjectedDomain, map_frame_aspect_ratio, save_png_profile_with_options_and_geometry,
 };
 use rw_store::error::RwStoreError;
 use serde::Deserialize;
@@ -719,6 +719,9 @@ pub fn render_climo_reference_maps(
         render_request.projected_lines = projected.lines.clone();
         render_request.projected_polygons = projected.polygons.clone();
         render_request.inverse_raster_projection = projected.inverse_raster_projection.clone();
+        // Metadata only (see `rustwx_render::MeshProjection`) — what the renderer
+        // needs to report this map's plot rect. Not a rasterizer input.
+        render_request.mesh_projection = projected.mesh_projection.clone();
         if let Some(overlay) = config.place_label_overlay.as_ref() {
             places::apply_place_label_overlay(
                 &mut render_request,
@@ -737,7 +740,7 @@ pub fn render_climo_reference_maps(
             config.domain.slug,
             request.file_slug(),
         ));
-        save_png_profile_with_options(
+        let (_, plot_geometry) = save_png_profile_with_options_and_geometry(
             &render_request,
             &output_path,
             &PngWriteOptions {
@@ -748,6 +751,7 @@ pub fn render_climo_reference_maps(
             slug: request.file_slug(),
             total_ms: started.elapsed().as_millis(),
             output_path,
+            plot_geometry,
         });
     }
     Ok((rendered, skipped))
@@ -1250,7 +1254,7 @@ pub fn render_climo_products_from_store(
                     if let Some(mask) = &land_mask {
                         apply_land_mask(&mut ranks, mask);
                     }
-                    let output_path = render_rank_map(
+                    let (output_path, plot_geometry) = render_rank_map(
                         config, &subgrid, &projected, climo.projection().cloned(),
                         product, baseline, ranks, anchor_hour, fold, doy, f32::NAN,
                     )?;
@@ -1258,6 +1262,7 @@ pub fn render_climo_products_from_store(
                         slug: request_slug(product, baseline),
                         total_ms: started.elapsed().as_millis(),
                         output_path,
+                        plot_geometry,
                     });
                 }
                 Err(reason) => skipped.push(StoreRenderSkip {
@@ -1300,7 +1305,7 @@ pub fn render_climo_products_from_store(
             apply_land_mask(&mut ranks, mask);
         }
 
-        let output_path = render_rank_map(
+        let (output_path, plot_geometry) = render_rank_map(
             config,
             &subgrid,
             &projected,
@@ -1317,6 +1322,7 @@ pub fn render_climo_products_from_store(
             slug: request_slug(product, baseline),
             total_ms: started.elapsed().as_millis(),
             output_path,
+            plot_geometry,
         });
     }
 
@@ -1341,7 +1347,7 @@ fn render_rank_map(
     fold: &DayFold,
     doy: u16,
     sample_n: f32,
-) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+) -> Result<(std::path::PathBuf, Option<PlotGeometry>), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&config.out_dir)?;
     let slug = request_slug(product, baseline);
     let render_grid = LatLonGrid::new(
@@ -1412,6 +1418,9 @@ fn render_rank_map(
     request.projected_lines = projected.lines.clone();
     request.projected_polygons = projected.polygons.clone();
     request.inverse_raster_projection = projected.inverse_raster_projection.clone();
+    // Metadata only (see `rustwx_render::MeshProjection`) — what the renderer
+    // needs to report this map's plot rect. Not a rasterizer input.
+    request.mesh_projection = projected.mesh_projection.clone();
     if let Some(overlay) = config.place_label_overlay.as_ref() {
         places::apply_place_label_overlay(
             &mut request,
@@ -1431,14 +1440,14 @@ fn render_rank_map(
         config.domain.slug,
         slug,
     ));
-    save_png_profile_with_options(
+    let (_, plot_geometry) = save_png_profile_with_options_and_geometry(
         &request,
         &output_path,
         &PngWriteOptions {
             compression: config.png_compression,
         },
     )?;
-    Ok(output_path)
+    Ok((output_path, plot_geometry))
 }
 
 /// surface_fire_weather_potential_v1: weighted severity-percentile blend.

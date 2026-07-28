@@ -27,8 +27,8 @@ use rustwx_core::{
 use rustwx_models::{LatestRun, resolve_canonical_bundle_product};
 use rustwx_render::map_frame_aspect_ratio;
 use rustwx_render::{
-    LegendMode, MapRenderRequest, PngCompressionMode, PngWriteOptions, ProductVisualMode,
-    WeatherProduct, save_png_profile_with_options,
+    LegendMode, MapRenderRequest, PlotGeometry, PngCompressionMode, PngWriteOptions,
+    ProductVisualMode, WeatherProduct, save_png_profile_with_options_and_geometry,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1473,6 +1473,14 @@ pub struct HrrrWindowedProductMetadata {
 pub struct HrrrWindowedRenderedProduct {
     pub product: HrrrWindowedProduct,
     pub output_path: PathBuf,
+    /// Where the map plot rect landed, when the renderer could state it exactly.
+    /// Always `None` today: [`build_windowed_render_request`] never sets
+    /// `inverse_raster_projection`, and that field is the renderer's only
+    /// statement of which projection produced the mesh — see
+    /// [`rustwx_render::PlotGeometry`]. Wired so the day it is set, the answer
+    /// reaches the API without another plumbing change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plot_geometry: Option<PlotGeometry>,
     pub timing: HrrrWindowedProductTiming,
     pub metadata: HrrrWindowedProductMetadata,
 }
@@ -2552,7 +2560,7 @@ fn run_hrrr_windowed_batch_from_prepared_with_total_start(
                         )
                         .map_err(thread_windowed_error)?;
                     }
-                    save_png_profile_with_options(
+                    let (_, plot_geometry) = save_png_profile_with_options_and_geometry(
                         &render_request,
                         &output_path,
                         &request.png_write_options(),
@@ -2565,6 +2573,7 @@ fn run_hrrr_windowed_batch_from_prepared_with_total_start(
                         rendered: HrrrWindowedRenderedProduct {
                             product,
                             output_path,
+                            plot_geometry,
                             timing: HrrrWindowedProductTiming {
                                 compute_ms: 0,
                                 render_ms,
@@ -2807,6 +2816,9 @@ fn build_windowed_render_request(
     });
     render_request.projected_lines = projected.lines.clone();
     render_request.projected_polygons = projected.polygons.clone();
+    // Metadata only (see `rustwx_render::MeshProjection`): what makes the plot
+    // rect reportable for this lane, including on native-projection meshes.
+    render_request.mesh_projection = projected.mesh_projection.clone();
     render_request
 }
 

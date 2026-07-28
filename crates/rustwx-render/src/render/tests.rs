@@ -56,6 +56,7 @@ fn sample_projected_opts() -> RenderOpts {
         }),
         projected_grid: Some(sample_projected_grid()),
         inverse_projected_grid: None,
+        mesh_projected_grid: None,
         terrain_rgba_grid: None,
         rgba_grid: None,
         projected_polygons: Vec::new(),
@@ -344,6 +345,101 @@ fn render_to_image_supersample_can_skip_sharpen_pass() {
     assert_eq!(image.width(), opts.width);
     assert_eq!(image.height(), opts.height);
     assert!(timing.downsample_ms <= timing.total_ms);
+}
+
+/// Where a hi-res pixel index lands after the Lanczos resize: the filter maps
+/// output index `j` to input `(j + 0.5) * factor - 0.5`, so this is that
+/// relation solved for `j`.
+fn resized_pixel_index(hires: u32, factor: u32) -> u32 {
+    (((f64::from(hires) + 0.5) / f64::from(factor)) - 0.5)
+        .round()
+        .max(0.0) as u32
+}
+
+#[test]
+fn downsampled_plot_rect_keeps_the_far_edge_on_the_drawn_frame() {
+    let geometry = PlotGeometry {
+        image_w: 400,
+        image_h: 300,
+        plot_x: 21,
+        plot_y: 9,
+        plot_w: 100,
+        plot_h: 60,
+        projected: ProjectedExtent {
+            x_min: 0.0,
+            x_max: 1.0,
+            y_min: 0.0,
+            y_max: 1.0,
+        },
+        projection: ProjectionSpec::Geographic,
+        reference_latitude_deg: None,
+        reference_longitude_deg: Some(0.0),
+        earth_radius_m: 6_370_000.0,
+        geographic: None,
+    };
+
+    let scaled = geometry.clone().downsampled(2, 200, 150);
+
+    assert_eq!((scaled.image_w, scaled.image_h), (200, 150));
+    assert_eq!((scaled.plot_x, scaled.plot_y), (10, 4));
+    // Dividing origin and SIZE independently would say 50 x 30 and leave the far
+    // edge a whole pixel inside the frame that was actually drawn.
+    assert_eq!((scaled.plot_w, scaled.plot_h), (51, 31));
+    assert_eq!(
+        scaled.plot_x + scaled.plot_w - 1,
+        resized_pixel_index(geometry.plot_x + geometry.plot_w - 1, 2)
+    );
+}
+
+#[test]
+fn reported_plot_rect_scales_down_by_the_supersample_factor() {
+    let mut fixture = georeferenced_fixture();
+    fixture.opts.supersample_factor = 3;
+    let (image, geometry) = fixture.render();
+
+    assert_eq!(
+        (geometry.image_w, geometry.image_h),
+        (fixture.opts.width, fixture.opts.height)
+    );
+    assert_eq!(
+        (geometry.image_w, geometry.image_h),
+        (image.width(), image.height())
+    );
+
+    // The layout the supersampled pass really drew, at 3x with 3x chrome.
+    let scaled_opts = scale_render_opts_for_supersample(&fixture.opts, 3);
+    let mut hires = compute_effective_layout(
+        scaled_opts.width,
+        scaled_opts.height,
+        scaled_opts.colorbar,
+        true,
+        scaled_opts.presentation,
+        scaled_opts.chrome_scale,
+        true,
+    );
+    fit_map_viewport_layout_to_extent(
+        &mut hires,
+        scaled_opts.width,
+        scaled_opts.colorbar,
+        scaled_opts.presentation.colorbar.orientation,
+        scaled_opts.domain_frame,
+        scaled_opts.map_extent.as_ref(),
+    );
+
+    assert_eq!(geometry.plot_x, resized_pixel_index(hires.map_x, 3));
+    assert_eq!(geometry.plot_y, resized_pixel_index(hires.map_y, 3));
+    assert_eq!(
+        geometry.plot_x + geometry.plot_w - 1,
+        resized_pixel_index(hires.map_x + hires.map_w - 1, 3)
+    );
+    assert_eq!(
+        geometry.plot_y + geometry.plot_h - 1,
+        resized_pixel_index(hires.map_y + hires.map_h - 1, 3)
+    );
+    assert!(
+        geometry.plot_x + geometry.plot_w <= geometry.image_w
+            && geometry.plot_y + geometry.plot_h <= geometry.image_h
+    );
 }
 
 #[test]
@@ -944,6 +1040,423 @@ fn domain_frame_text_rows_anchor_just_above_rect() {
     assert!(frame_top.saturating_sub(title_y) <= max_gap);
 }
 
+/// Lambert conformal, because it is the case a `ProjectionSpec` alone cannot
+/// invert: the spec carries the standard parallels and the central meridian but
+/// NOT the reference latitude that sets the y datum through `rho0`.
+const FIXTURE_PROJECTION: ProjectionSpec = ProjectionSpec::LambertConformal {
+    standard_parallel_1_deg: 30.0,
+    standard_parallel_2_deg: 60.0,
+    central_meridian_deg: -119.0,
+};
+const FIXTURE_REFERENCE_LATITUDE_DEG: f64 = 37.0;
+const FIXTURE_FRAME_COLOR: crate::request::Color = crate::request::Color {
+    r: 255,
+    g: 0,
+    b: 255,
+    a: 255,
+};
+
+/// A synthetic California-sized domain wired the way production wires one: ONE
+/// projector builds the mesh, the extent, and the inverse-raster metadata the
+/// renderer is handed. The fill palette is deliberately all blue so a magenta
+/// frame and a green marker stay findable in the output pixels.
+struct GeoreferencedFixture {
+    opts: RenderOpts,
+    projector: ProjectionProjector,
+    lat_deg: Vec<f32>,
+    lon_deg: Vec<f32>,
+    data: Vec<f64>,
+    ny: usize,
+    nx: usize,
+}
+
+fn georeferenced_fixture() -> GeoreferencedFixture {
+    let (ny, nx) = (9usize, 11usize);
+    let mut lat_deg = Vec::with_capacity(ny * nx);
+    let mut lon_deg = Vec::with_capacity(ny * nx);
+    for j in 0..ny {
+        for i in 0..nx {
+            lat_deg.push(32.0 + 10.0 * (j as f32) / (ny as f32 - 1.0));
+            lon_deg.push(-124.0 + 10.0 * (i as f32) / (nx as f32 - 1.0));
+        }
+    }
+
+    let projector = FIXTURE_PROJECTION
+        .build_projector(
+            Some(FIXTURE_REFERENCE_LATITUDE_DEG),
+            None,
+            &lat_deg,
+            &lon_deg,
+        )
+        .expect("fixture projection builds a projector");
+
+    let mut x = Vec::with_capacity(lat_deg.len());
+    let mut y = Vec::with_capacity(lat_deg.len());
+    let mut extent = MapExtent {
+        x_min: f64::INFINITY,
+        x_max: f64::NEG_INFINITY,
+        y_min: f64::INFINITY,
+        y_max: f64::NEG_INFINITY,
+    };
+    for (&lat, &lon) in lat_deg.iter().zip(lon_deg.iter()) {
+        let (px, py) = projector.project(lat as f64, lon as f64);
+        extent.x_min = extent.x_min.min(px);
+        extent.x_max = extent.x_max.max(px);
+        extent.y_min = extent.y_min.min(py);
+        extent.y_max = extent.y_max.max(py);
+        x.push(px);
+        y.push(py);
+    }
+
+    let data = (0..ny * nx)
+        .map(|index| (index % 3) as f64 * 0.75)
+        .collect::<Vec<_>>();
+
+    let opts = RenderOpts {
+        width: 480,
+        height: 360,
+        cmap: LeveledColormap::from_palette(
+            &[Rgba::new(40, 70, 190), Rgba::new(90, 130, 220)],
+            &[0.0, 1.0, 2.0],
+            Extend::Both,
+            None,
+        ),
+        colorbar: true,
+        title: Some("Georeferenced".into()),
+        chrome_scale: ChromeScale::Fixed(1.0),
+        presentation: RenderPresentation::for_mode(ProductVisualMode::FilledMeteorology),
+        domain_frame: Some(DomainFrame {
+            inset_px: 5,
+            outline_color: FIXTURE_FRAME_COLOR,
+            outline_width: 2,
+            clear_outside: true,
+            legend_follows_frame: true,
+            chrome_follows_frame: true,
+            source: DomainFrameSource::MapViewport,
+        }),
+        map_extent: Some(extent),
+        projected_grid: Some(ProjectedGrid { x, y, ny, nx }),
+        inverse_projected_grid: Some(InverseProjectedGrid {
+            projector,
+            projection: FIXTURE_PROJECTION,
+            clip_bounds: None,
+            lat_deg: lat_deg.iter().map(|&value| value as f64).collect(),
+            lon_deg: lon_deg.iter().map(|&value| value as f64).collect(),
+        }),
+        ..RenderOpts::default()
+    };
+
+    GeoreferencedFixture {
+        opts,
+        projector,
+        lat_deg,
+        lon_deg,
+        data,
+        ny,
+        nx,
+    }
+}
+
+impl GeoreferencedFixture {
+    fn render(&self) -> (RgbaImage, PlotGeometry) {
+        let (image, _, geometry) =
+            render_to_image_profile_with_geometry(&self.data, self.ny, self.nx, &self.opts);
+        let geometry = geometry.expect("a stated projection yields a geometry");
+        (image, geometry)
+    }
+
+    fn extent(&self) -> &MapExtent {
+        self.opts
+            .map_extent
+            .as_ref()
+            .expect("fixture has an extent")
+    }
+
+    fn frame(&self) -> DomainFrame {
+        self.opts.domain_frame.expect("fixture frames the viewport")
+    }
+
+    /// The FINAL layout the renderer draws with: `compute_layout` plus both of
+    /// the rewrites that follow it.
+    fn final_layout(&self) -> Layout {
+        let mut layout = compute_effective_layout(
+            self.opts.width,
+            self.opts.height,
+            self.opts.colorbar,
+            true,
+            self.opts.presentation,
+            self.opts.chrome_scale,
+            self.opts.domain_frame.is_some(),
+        );
+        fit_map_viewport_layout_to_extent(
+            &mut layout,
+            self.opts.width,
+            self.opts.colorbar,
+            self.opts.presentation.colorbar.orientation,
+            self.opts.domain_frame,
+            self.opts.map_extent.as_ref(),
+        );
+        layout
+    }
+}
+
+/// Bounding box of the pixels `matches` accepts, as (min_x, max_x, min_y, max_y).
+fn color_bounds(
+    img: &RgbaImage,
+    matches: impl Fn([u8; 4]) -> bool,
+) -> Option<(u32, u32, u32, u32)> {
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    for (x, y, pixel) in img.enumerate_pixels() {
+        if !matches(pixel.0) {
+            continue;
+        }
+        bounds = Some(match bounds {
+            None => (x, x, y, y),
+            Some((min_x, max_x, min_y, max_y)) => {
+                (min_x.min(x), max_x.max(x), min_y.min(y), max_y.max(y))
+            }
+        });
+    }
+    bounds
+}
+
+fn is_fixture_frame_pixel(px: [u8; 4]) -> bool {
+    px[0] > 180 && px[2] > 180 && px[1] < 90
+}
+
+#[test]
+fn reported_plot_rect_is_the_map_rect_the_draw_code_offsets_by() {
+    let fixture = georeferenced_fixture();
+    let (image, geometry) = fixture.render();
+    let layout = fixture.final_layout();
+    let extent = fixture.extent();
+
+    // The aspect fit has to have actually fired, or this test would be checking
+    // the easy case.
+    let pre_fit = compute_effective_layout(
+        fixture.opts.width,
+        fixture.opts.height,
+        fixture.opts.colorbar,
+        true,
+        fixture.opts.presentation,
+        fixture.opts.chrome_scale,
+        true,
+    );
+    assert!(
+        layout.map_w < pre_fit.map_w,
+        "fixture must exercise the viewport aspect fit"
+    );
+
+    assert_eq!(
+        (
+            geometry.plot_x,
+            geometry.plot_y,
+            geometry.plot_w,
+            geometry.plot_h
+        ),
+        (layout.map_x, layout.map_y, layout.map_w, layout.map_h)
+    );
+    assert_eq!(
+        (geometry.image_w, geometry.image_h),
+        (image.width(), image.height())
+    );
+
+    // The published mapping is the mapping the draw code uses, `- 1` and all:
+    // the extent edges land on the FIRST and LAST pixel of the rect.
+    for (x, y) in [
+        (extent.x_min, extent.y_min),
+        (extent.x_max, extent.y_max),
+        (
+            (extent.x_min + extent.x_max) / 2.0,
+            (extent.y_min + extent.y_max) / 2.0,
+        ),
+    ] {
+        let (local_x, local_y) = extent
+            .to_pixel(x, y, layout.map_w, layout.map_h)
+            .expect("extent corner projects into the map rect");
+        let (reported_x, reported_y) = geometry
+            .pixel_at_projected(x, y)
+            .expect("published mapping evaluates");
+        assert!((reported_x - (layout.map_x as f64 + local_x)).abs() < 1.0e-9);
+        assert!((reported_y - (layout.map_y as f64 + local_y)).abs() < 1.0e-9);
+    }
+
+    let (right_x, _) = geometry
+        .pixel_at_projected(extent.x_max, extent.y_min)
+        .expect("published mapping evaluates");
+    assert!(
+        (right_x - f64::from(geometry.plot_x + geometry.plot_w - 1)).abs() < 1.0e-9,
+        "x_max must land on the last pixel of the rect, not one past it"
+    );
+}
+
+#[test]
+fn reported_plot_geometry_states_the_sphere_and_the_reference_latitude() {
+    let fixture = georeferenced_fixture();
+    let (_, geometry) = fixture.render();
+
+    // Not WGS84: a client reaching for EPSG:3857 is wrong from the first pixel.
+    assert_eq!(geometry.earth_radius_m, 6_370_000.0);
+    assert_eq!(geometry.projection, FIXTURE_PROJECTION);
+    assert_eq!(
+        geometry.reference_latitude_deg,
+        Some(FIXTURE_REFERENCE_LATITUDE_DEG)
+    );
+
+    // The corner box is a hint, so it only has to bracket the domain.
+    let geographic = geometry.geographic.expect("conic corners invert");
+    assert!(geographic.south_deg < 33.0 && geographic.north_deg > 41.0);
+    assert!(geographic.west_deg < -123.0 && geographic.east_deg > -115.0);
+}
+
+#[test]
+fn reported_plot_rect_brackets_the_drawn_domain_frame() {
+    let fixture = georeferenced_fixture();
+    let (image, geometry) = fixture.render();
+    let frame = fixture.frame();
+    let inset = f64::from(frame.inset_px);
+    let slack = f64::from(frame.outline_width);
+
+    let (min_x, max_x, min_y, max_y) =
+        color_bounds(&image, is_fixture_frame_pixel).expect("the domain frame is drawn");
+
+    // The frame is the map rect inset by `inset_px`, so the reported rect has to
+    // bracket it by exactly that much, give or take the stroke width.
+    for (drawn, expected) in [
+        (f64::from(min_x), f64::from(geometry.plot_x) + inset),
+        (
+            f64::from(max_x),
+            f64::from(geometry.plot_x + geometry.plot_w - 1) - inset,
+        ),
+        (f64::from(min_y), f64::from(geometry.plot_y) + inset),
+        (
+            f64::from(max_y),
+            f64::from(geometry.plot_y + geometry.plot_h - 1) - inset,
+        ),
+    ] {
+        assert!(
+            (drawn - expected).abs() <= slack,
+            "drawn frame edge {drawn} is not within {slack} of {expected}"
+        );
+    }
+}
+
+#[test]
+fn plot_geometry_is_withheld_when_the_projection_was_never_stated() {
+    let mut fixture = georeferenced_fixture();
+    // The renderer is handed a projected mesh but told nothing about which
+    // projection made it. Reverse-engineering one is the failure mode this whole
+    // struct exists to end, so it must say nothing.
+    fixture.opts.inverse_projected_grid = None;
+
+    let (_, _, geometry) =
+        render_to_image_profile_with_geometry(&fixture.data, fixture.ny, fixture.nx, &fixture.opts);
+
+    assert!(geometry.is_none());
+}
+
+#[test]
+fn plot_geometry_is_withheld_when_the_mesh_was_rotated_out_from_under_the_projection() {
+    let mut fixture = georeferenced_fixture();
+    // `ProjectedMap::rotated_degrees` spins the mesh about the frame centre,
+    // which breaks the axis-aligned mapping the rect describes. That path also
+    // nulls its own inverse-raster metadata, so production is covered twice over;
+    // this pins the check that catches a rotation arriving any other way, rather
+    // than leaning on that one line staying where it is.
+    let grid = fixture
+        .opts
+        .projected_grid
+        .as_mut()
+        .expect("fixture has a mesh");
+    let (sin, cos) = 30.0_f64.to_radians().sin_cos();
+    for (x, y) in grid.x.iter_mut().zip(grid.y.iter_mut()) {
+        let (rotated_x, rotated_y) = (*x * cos - *y * sin, *x * sin + *y * cos);
+        *x = rotated_x;
+        *y = rotated_y;
+    }
+
+    let (_, _, geometry) =
+        render_to_image_profile_with_geometry(&fixture.data, fixture.ny, fixture.nx, &fixture.opts);
+
+    assert!(geometry.is_none());
+}
+
+/// The seam that reaches native-projection meshes (Lambert HRRR): the projection
+/// statement arrives as METADATA instead of as inverse-raster input, and the rect
+/// must come out identical. Without this, a domain whose mesh the inverse-raster
+/// rasterizer cannot invert reports nothing at all.
+#[test]
+fn plot_geometry_is_reported_from_the_metadata_only_projection_statement() {
+    let fixture = georeferenced_fixture();
+    let (_, _, expected) =
+        render_to_image_profile_with_geometry(&fixture.data, fixture.ny, fixture.nx, &fixture.opts);
+    let expected = expected.expect("the inverse-raster fixture reports geometry");
+
+    let mut moved = georeferenced_fixture();
+    moved.opts.mesh_projected_grid = moved.opts.inverse_projected_grid.take();
+
+    let (_, _, geometry) =
+        render_to_image_profile_with_geometry(&moved.data, moved.ny, moved.nx, &moved.opts);
+
+    assert_eq!(
+        geometry.expect("the metadata statement must report the same geometry"),
+        expected
+    );
+}
+
+/// The metadata statement must be inert in the draw path — that is the whole
+/// reason it exists as a separate field instead of reusing
+/// `inverse_projected_grid`, which also SELECTS the inverse-raster rasterizer.
+/// Compares the rendered pixels with and without it.
+#[test]
+fn the_metadata_only_projection_statement_changes_no_pixels() {
+    let mut without = georeferenced_fixture();
+    without.opts.inverse_projected_grid = None;
+    let (plain, _, plain_geometry) =
+        render_to_image_profile_with_geometry(&without.data, without.ny, without.nx, &without.opts);
+    assert!(
+        plain_geometry.is_none(),
+        "the baseline must state no projection at all"
+    );
+
+    let mut with = georeferenced_fixture();
+    with.opts.mesh_projected_grid = with.opts.inverse_projected_grid.take();
+    let (stated, _, stated_geometry) =
+        render_to_image_profile_with_geometry(&with.data, with.ny, with.nx, &with.opts);
+
+    assert!(stated_geometry.is_some(), "the statement must be published");
+    assert_eq!(plain.dimensions(), stated.dimensions());
+    assert!(
+        plain.as_raw() == stated.as_raw(),
+        "stating the projection must not move a single pixel"
+    );
+}
+
+/// A statement that does not describe the mesh must be refused through the
+/// metadata path too — the honesty gate is what makes it safe to have a second
+/// way in, since a lane could hand over the projector for the wrong frame.
+#[test]
+fn a_metadata_statement_that_does_not_match_the_mesh_is_refused() {
+    let mut fixture = georeferenced_fixture();
+    fixture.opts.mesh_projected_grid = fixture.opts.inverse_projected_grid.take();
+    let grid = fixture
+        .opts
+        .projected_grid
+        .as_mut()
+        .expect("fixture has a mesh");
+    let (sin, cos) = 30.0_f64.to_radians().sin_cos();
+    for (x, y) in grid.x.iter_mut().zip(grid.y.iter_mut()) {
+        let (rotated_x, rotated_y) = (*x * cos - *y * sin, *x * sin + *y * cos);
+        *x = rotated_x;
+        *y = rotated_y;
+    }
+
+    let (_, _, geometry) =
+        render_to_image_profile_with_geometry(&fixture.data, fixture.ny, fixture.nx, &fixture.opts);
+
+    assert!(geometry.is_none());
+}
+
 #[test]
 fn chrome_metadata_uses_space_left_by_short_title() {
     let metadata = "Init 05/04 11Z | F008 | Valid 05/04 19Z | HRRR | source: nomads";
@@ -1002,7 +1515,7 @@ fn trim_vertical_canvas_whitespace_crops_outer_blank_rows() {
         }
     }
 
-    let trimmed = trim_vertical_canvas_whitespace(
+    let (trimmed, adjustment) = trim_vertical_canvas_whitespace(
         &img,
         RenderPresentation::for_mode(ProductVisualMode::FilledMeteorology).canvas_background,
     );
@@ -1010,6 +1523,12 @@ fn trim_vertical_canvas_whitespace_crops_outer_blank_rows() {
     assert_eq!(trimmed.width(), 6);
     assert!(trimmed.height() < 10);
     assert!(trimmed.height() >= 4);
+    // Content starts on row 3 and the trim keeps 2 rows of padding, so it moved
+    // up by exactly one row; the reported offset has to say so.
+    assert_eq!(adjustment.dx, 0);
+    assert_eq!(adjustment.dy, -1);
+    assert_eq!(adjustment.width, trimmed.width());
+    assert_eq!(adjustment.height, trimmed.height());
 }
 
 #[test]
@@ -1020,7 +1539,7 @@ fn center_horizontal_canvas_content_balances_outer_margins() {
         img.put_pixel(x, 1, Rgba::BLACK.to_image_rgba());
     }
 
-    let centered = center_horizontal_canvas_content(&img, bg);
+    let (centered, adjustment) = center_horizontal_canvas_content(&img, bg);
     let mut min_x = centered.width();
     let mut max_x = 0;
     for y in 0..centered.height() {
@@ -1035,6 +1554,17 @@ fn center_horizontal_canvas_content_balances_outer_margins() {
     let right_margin = centered.width().saturating_sub(max_x).saturating_sub(1);
 
     assert!(left_margin.abs_diff(right_margin) <= 1);
+    // Content sat at x=1..6 on a 12-wide canvas, so it slid right by
+    // (5 - 1) / 2 = 2 and the canvas kept its size.
+    assert_eq!(adjustment.dx, 2);
+    assert_eq!(adjustment.dy, 0);
+    assert_eq!(adjustment.width, img.width());
+    assert_eq!(adjustment.height, img.height());
+    let reported_min_x = 1 + adjustment.dx as u32;
+    assert_eq!(
+        min_x, reported_min_x,
+        "reported shift must be the applied shift"
+    );
 }
 
 #[test]
@@ -1047,10 +1577,172 @@ fn crop_canvas_whitespace_removes_blank_border() {
         }
     }
 
-    let cropped = crop_canvas_whitespace(&img, bg, 1);
+    let (cropped, adjustment) = crop_canvas_whitespace(&img, bg, 1);
 
     assert_eq!(cropped.width(), 7);
     assert_eq!(cropped.height(), 6);
+    // Content spans x=4..8, y=3..6, so the 1px pad crops from (3, 2) and every
+    // surviving pixel moved by minus that origin.
+    assert_eq!(adjustment.dx, -3);
+    assert_eq!(adjustment.dy, -2);
+    assert_eq!(adjustment.width, 7);
+    assert_eq!(adjustment.height, 6);
+}
+
+/// THE ONE THAT PROVES IT.
+///
+/// A marker is drawn at a lat/lon we chose. The saved PNG comes back, the marker
+/// is found in its pixels, and the published `PlotGeometry` is asked what lat/lon
+/// is under that pixel. Nothing weaker catches the crop x supersample x
+/// aspect-fit interaction: each of the three is individually plausible while the
+/// composition is a kilometre off.
+#[test]
+fn a_marker_pixel_inverts_back_to_the_lat_lon_it_was_drawn_at() {
+    // Off-centre on purpose: a mistake in the far-edge scaling is nearly
+    // invisible at the middle of the frame.
+    const MARKER_LAT_DEG: f64 = 40.5;
+    const MARKER_LON_DEG: f64 = -116.5;
+    let marker_color = crate::request::Color::rgba(0, 220, 0, 255);
+
+    let fixture = georeferenced_fixture();
+    let shape = crate::request::GridShape::new(fixture.nx, fixture.ny).expect("valid shape");
+    let (lat_deg, lon_deg) = (fixture.lat_deg.clone(), fixture.lon_deg.clone());
+    let grid = crate::request::LatLonGrid::new(shape, lat_deg, lon_deg).expect("valid mesh");
+    let field = crate::request::Field2D::new(
+        crate::request::ProductKey::named("georeference_probe"),
+        "1",
+        grid,
+        fixture.data.iter().map(|&value| value as f32).collect(),
+    )
+    .expect("valid field");
+
+    let extent = fixture.extent();
+    let projected_grid = fixture.opts.projected_grid.as_ref().expect("fixture mesh");
+    let (marker_x, marker_y) = fixture.projector.project(MARKER_LAT_DEG, MARKER_LON_DEG);
+    let marker_rel_x = (marker_x - extent.x_min) / (extent.x_max - extent.x_min);
+    let marker_rel_y = (marker_y - extent.y_min) / (extent.y_max - extent.y_min);
+    assert!(
+        marker_rel_x > 0.6 && marker_rel_y > 0.6,
+        "marker must sit well off-centre ({marker_rel_x:.2}, {marker_rel_y:.2})"
+    );
+
+    let mut request = crate::MapRenderRequest::new(
+        field,
+        crate::request::ColorScale::Discrete(crate::request::DiscreteColorScale {
+            levels: vec![0.0, 1.0, 2.0],
+            colors: vec![
+                crate::request::Color::rgba(40, 70, 190, 255),
+                crate::request::Color::rgba(90, 130, 220, 255),
+            ],
+            extend: crate::request::ExtendMode::Both,
+            mask_below: None,
+        }),
+    );
+    request.width = fixture.opts.width;
+    request.height = fixture.opts.height;
+    request.title = Some("Georeferenced".into());
+    request.colorbar = true;
+    request.chrome_scale = ChromeScale::Fixed(1.0);
+    request.visual_mode = ProductVisualMode::FilledMeteorology;
+    // Every post-draw transform at once: 2x supersample, the viewport aspect fit,
+    // and the whitespace crop that MapViewport frames trigger.
+    request.supersample_factor = 2;
+    request.domain_frame = fixture.opts.domain_frame;
+    request.projected_domain = Some(crate::request::ProjectedDomain {
+        x: projected_grid.x.clone(),
+        y: projected_grid.y.clone(),
+        extent: ProjectedExtent {
+            x_min: extent.x_min,
+            x_max: extent.x_max,
+            y_min: extent.y_min,
+            y_max: extent.y_max,
+        },
+    });
+    request.inverse_raster_projection = Some(crate::request::InverseRasterProjection {
+        projection: FIXTURE_PROJECTION,
+        reference_latitude_deg: Some(FIXTURE_REFERENCE_LATITUDE_DEG),
+        reference_longitude_deg: None,
+        clip_bounds: None,
+    });
+    request.projected_points = vec![crate::request::ProjectedPointOverlay {
+        x: marker_x,
+        y: marker_y,
+        color: marker_color,
+        radius_px: 7,
+        width_px: 2,
+        shape: ProjectedMarkerShape::Plus,
+    }];
+
+    let path = std::env::temp_dir().join(format!(
+        "rustwx-render-georeference-{}.png",
+        std::process::id()
+    ));
+    let (_, geometry) = crate::save_png_profile_with_geometry(
+        &request,
+        &path,
+        &PngWriteOptions::default(),
+        StaticPlotStyle::Default,
+    )
+    .expect("save succeeds");
+    let bytes = std::fs::read(&path).expect("saved file is readable");
+    let _ = std::fs::remove_file(&path);
+    let saved = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+        .expect("saved file decodes")
+        .to_rgba8();
+
+    let geometry = geometry.expect("the save path must publish a geometry");
+    assert_eq!(
+        (geometry.image_w, geometry.image_h),
+        (saved.width(), saved.height()),
+        "the geometry must describe the ENCODED image, after the crop resized it"
+    );
+    assert!(
+        saved.width() != request.width || saved.height() != request.height,
+        "the MapViewport crop must actually have resized the canvas, \
+         or this test never exercises it"
+    );
+
+    // Centroid of the marker in the file. The plus is symmetric, so its centroid
+    // survives the Lanczos resize and the sharpen pass.
+    let mut weight = 0.0f64;
+    let mut sum_x = 0.0f64;
+    let mut sum_y = 0.0f64;
+    for (x, y, pixel) in saved.enumerate_pixels() {
+        let [r, g, b, _] = pixel.0;
+        if g < 150 || r > 120 || b > 120 {
+            continue;
+        }
+        let green = f64::from(g) - f64::from(r).max(f64::from(b));
+        weight += green;
+        sum_x += green * f64::from(x);
+        sum_y += green * f64::from(y);
+    }
+    assert!(weight > 0.0, "the marker must be visible in the saved file");
+    let (found_x, found_y) = (sum_x / weight, sum_y / weight);
+
+    // Where the published geometry says the marker's lat/lon lands.
+    let (expected_x, expected_y) = geometry
+        .pixel_at_projected(marker_x, marker_y)
+        .expect("published mapping evaluates");
+    assert!(
+        (found_x - expected_x).hypot(found_y - expected_y) < 1.0,
+        "reported geometry puts the marker at ({expected_x:.3}, {expected_y:.3}) \
+         but it was drawn at ({found_x:.3}, {found_y:.3})"
+    );
+
+    // The round trip: invert the marker's own pixel back to lat/lon.
+    let (recovered_lat, recovered_lon) = geometry
+        .lat_lon_at_pixel(found_x, found_y)
+        .expect("the published fields rebuild an invertible projector");
+    let (recovered_x, recovered_y) = fixture.projector.project(recovered_lat, recovered_lon);
+    let (recovered_px, recovered_py) = geometry
+        .pixel_at_projected(recovered_x, recovered_y)
+        .expect("published mapping evaluates");
+    assert!(
+        (recovered_px - expected_x).hypot(recovered_py - expected_y) < 1.0,
+        "round trip drifted: {MARKER_LAT_DEG}/{MARKER_LON_DEG} came back as \
+         {recovered_lat:.5}/{recovered_lon:.5}"
+    );
 }
 
 #[test]

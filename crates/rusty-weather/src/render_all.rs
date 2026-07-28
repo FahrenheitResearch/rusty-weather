@@ -26,7 +26,7 @@ use rustwx_products::windowed::{
     HrrrWindowedBatchRequest, HrrrWindowedProduct, StoreWindowedGrid,
     render_windowed_products_from_store_grids,
 };
-use rustwx_render::PngCompressionMode;
+use rustwx_render::{PlotGeometry, PngCompressionMode};
 
 #[path = "climo_products.rs"]
 pub mod climo_products;
@@ -404,6 +404,12 @@ pub struct RenderedProduct {
     pub slug: String,
     pub total_ms: u128,
     pub output_path: PathBuf,
+    /// Where the map plot rect landed in that file, when the renderer could
+    /// state it exactly. `None` is a normal answer, not an error — panels and
+    /// any lane that never told the renderer which projection made its mesh get
+    /// nothing here, and a client must keep whatever fallback it has. See
+    /// [`rustwx_render::PlotGeometry`].
+    pub plot_geometry: Option<PlotGeometry>,
 }
 
 /// Outcome of one hour's direct + derived/heavy render pass.
@@ -472,6 +478,7 @@ pub fn render_hour_products(
             slug: recipe.recipe_slug,
             total_ms: recipe.timing.total_ms,
             output_path: recipe.output_path,
+            plot_geometry: recipe.plot_geometry,
         }));
         skipped.extend(outcome.skipped);
     }
@@ -520,6 +527,7 @@ pub fn render_hour_products(
             slug: recipe.recipe_slug,
             total_ms: recipe.timing.total_ms,
             output_path: recipe.output_path,
+            plot_geometry: recipe.plot_geometry,
         }));
         skipped.extend(outcome.skipped);
     }
@@ -622,6 +630,7 @@ pub fn render_windowed_products(
                 slug: product.product.slug().to_string(),
                 total_ms: product.timing.total_ms,
                 output_path: product.output_path,
+                plot_geometry: product.plot_geometry,
             })
             .collect(),
         blocked: outcome

@@ -282,6 +282,9 @@ pub fn build_weather_map_request(
     });
     request.projected_lines = projected.lines.clone();
     request.projected_polygons = projected.polygons.clone();
+    // Metadata only (see `rustwx_render::MeshProjection`) — it lets the renderer
+    // state where this map's plot rect landed. Never the rasterizer's input.
+    request.mesh_projection = projected.mesh_projection.clone();
     Ok(request)
 }
 
@@ -361,6 +364,7 @@ mod tests {
                 lines: Vec::<ProjectedLineOverlay>::new(),
                 polygons: Vec::<ProjectedPolygonFill>::new(),
                 inverse_raster_projection: None,
+                mesh_projection: None,
             },
         );
         assert!(context.contains_size(700, 520));

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use rustwx_core::{ModelId, SelectedField2D, SourceId};
-use rustwx_render::{PngCompressionMode, RenderImageTiming, RenderStateTiming};
+use rustwx_render::{PlotGeometry, PngCompressionMode, RenderImageTiming, RenderStateTiming};
 use serde::{Deserialize, Serialize};
 
 use crate::gridded::SharedTiming as GenericSharedTiming;
@@ -170,6 +170,11 @@ pub struct DerivedRenderedRecipe {
     pub output_path: PathBuf,
     pub content_identity: ArtifactContentIdentity,
     pub input_fetch_keys: Vec<String>,
+    /// Where the map plot rect landed in the written image, when the renderer
+    /// could state it exactly — see [`rustwx_render::PlotGeometry`]. Absent from
+    /// serialized reports so older consumers read them unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plot_geometry: Option<PlotGeometry>,
     pub timing: DerivedRecipeTiming,
 }
 

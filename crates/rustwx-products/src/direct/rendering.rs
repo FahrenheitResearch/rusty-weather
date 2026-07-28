@@ -165,6 +165,10 @@ pub(super) fn build_render_request(
     request.projected_lines = projected.lines;
     request.projected_polygons = projected.polygons;
     request.inverse_raster_projection = projected.inverse_raster_projection;
+    // Metadata only, and the only way a native-projection mesh (Lambert HRRR)
+    // gets a reported plot rect: `inverse_raster_projection` above is set for
+    // rectilinear lat/lon meshes alone, because it also selects the rasterizer.
+    request.mesh_projection = projected.mesh_projection;
     let contour_prepare_start = Instant::now();
     if overlay_only {
         request

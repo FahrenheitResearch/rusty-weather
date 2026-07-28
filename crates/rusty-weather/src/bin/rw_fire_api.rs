@@ -39,6 +39,12 @@ mod analysis;
 #[path = "../svg_raster.rs"]
 mod svg_raster;
 
+// The `geo` payload definition is shared with `rw_render`, which writes it into
+// the job dir's manifest; this bin reads that manifest back and republishes it
+// per file. One definition so writer and reader cannot drift.
+#[path = "../plot_geo.rs"]
+mod plot_geo;
+
 const MIN_RENDER_WIDTH: u32 = 1200;
 const MIN_RENDER_HEIGHT: u32 = 900;
 const MAX_RENDER_DIMENSION: u32 = 2400;
@@ -371,6 +377,17 @@ struct RenderedFile {
     name: String,
     url: String,
     bytes: u64,
+    /// Where the map plot rect landed in THIS image, so a client can invert a
+    /// cursor pixel to lat/lon instead of measuring the plotted frame.
+    ///
+    /// Per file rather than per job because the rect varies per product image: a
+    /// vertical colorbar steals width from the map, and whether a title is drawn
+    /// moves the map's top edge. Omitted entirely when the renderer could not
+    /// state it exactly — panels, soundings, meteograms and any lane that never
+    /// told the renderer which projection made its mesh — so a client keeps its
+    /// existing measurement fallback exactly where it still needs one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    geo: Option<plot_geo::Geo>,
 }
 
 #[derive(Debug)]
@@ -912,7 +929,13 @@ fn write_perimeter_overlay_spec(
 /// It is NOT a render artifact, so it must be excluded from the served files.
 const BRAND_LOGO_FILENAME: &str = "brand_logo.png";
 
+/// Georeferencing sidecar `rw_render` writes beside the images it rendered.
+/// Read here and folded into the served file list; never served itself (it is
+/// not a `.png`/`.webp`, so [`is_served_image_extension`] already refuses it).
+const API_MANIFEST_FILENAME: &str = "api_manifest.json";
+
 fn collect_rendered_files(output_dir: &Path, job_id: &str) -> std::io::Result<Vec<RenderedFile>> {
+    let geo_by_stem = read_manifest_geo_by_stem(output_dir);
     let mut files = Vec::new();
     for entry in fs::read_dir(output_dir)? {
         let entry = entry?;
@@ -932,10 +955,73 @@ fn collect_rendered_files(output_dir: &Path, job_id: &str) -> std::io::Result<Ve
             name: name.to_string(),
             url: format!("/outputs/{job_id}/{name}"),
             bytes,
+            geo: manifest_geo_for_file(&geo_by_stem, name),
         });
     }
     files.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(files)
+}
+
+/// The manifest's `geo` blocks, keyed by output file STEM.
+///
+/// Stem and not full filename because `--output-format png-webp` writes both
+/// `<stem>.png` and `<stem>.webp` for one product while the manifest names only
+/// the served one. The webp is a lossless re-encode of the same pixels, so one
+/// geo describes both — and a stem is unique inside a job dir, since every
+/// filename carries the model, run, hour, domain and product slug.
+fn read_manifest_geo_by_stem(output_dir: &Path) -> HashMap<String, plot_geo::Geo> {
+    // A job whose render wrote no manifest (an older rw_render, or a product set
+    // with nothing georeferenceable) is normal, not an error: every file simply
+    // comes back without `geo` and the client falls back as it always has.
+    let Ok(bytes) = fs::read(output_dir.join(API_MANIFEST_FILENAME)) else {
+        return HashMap::new();
+    };
+    let Ok(manifest) = serde_json::from_slice::<ApiManifestGeoView>(&bytes) else {
+        return HashMap::new();
+    };
+    manifest
+        .domains
+        .into_iter()
+        .flat_map(|domain| domain.products)
+        .filter_map(|product| {
+            let geo = product.geo?;
+            let stem = Path::new(&product.file)
+                .file_stem()
+                .and_then(|stem| stem.to_str())?
+                .to_string();
+            Some((stem, geo))
+        })
+        .collect()
+}
+
+fn manifest_geo_for_file(
+    geo_by_stem: &HashMap<String, plot_geo::Geo>,
+    name: &str,
+) -> Option<plot_geo::Geo> {
+    let stem = Path::new(name).file_stem().and_then(|stem| stem.to_str())?;
+    geo_by_stem.get(stem).cloned()
+}
+
+/// The only part of `api_manifest.json` this bin reads. Deliberately a narrow
+/// view: rw_render owns that document's shape, and everything else in it
+/// (timings, byte counts, the domain block) is already reported elsewhere.
+#[derive(Debug, Deserialize)]
+struct ApiManifestGeoView {
+    #[serde(default)]
+    domains: Vec<ApiManifestDomainGeoView>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiManifestDomainGeoView {
+    #[serde(default)]
+    products: Vec<ApiManifestProductGeoView>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiManifestProductGeoView {
+    file: String,
+    #[serde(default)]
+    geo: Option<plot_geo::Geo>,
 }
 
 fn is_served_image_extension(path: &Path) -> bool {
@@ -2464,17 +2550,18 @@ fn card_text_override(query: &HashMap<String, String>, key: &str) -> Option<Stri
 /// about a sentence — enough to use the credit line as a note.
 const CARD_CREDIT_MAX_CHARS: usize = 144;
 
-/// A sounding's upper-right header text: the forecaster's note and the credit.
+/// A sounding's `note=` and `brand=` text.
 ///
 /// Separate from [`card_text_override`] because that function's default is a
 /// 48-character CARD BADGE cap, and a sounding note is a sentence — "why I am
 /// posting this". Borrowing the badge cap is the bug this fixes: a real 123-char
 /// note came back cut mid-word at `...why you are postin`.
 ///
-/// The cap is not what makes the line fit. `sounding_sharppy` measures the text
-/// against the band it is drawn in and elides it there, which is the only place
-/// the font metrics and the zoom are both known. This is a bound on what a
-/// stranger can post into an image the box renders, nothing more.
+/// The cap is not what makes either fit. `sounding_sharppy` measures the credit
+/// against the header band, and the notes panel wraps the note into its cell and
+/// elides what is left — both places where the font metrics and the zoom are
+/// known, and this one is neither. It is a bound on what a stranger can post into
+/// an image the box renders, nothing more.
 fn sounding_header_override(query: &HashMap<String, String>, key: &str) -> Option<String> {
     query.get(key).map(|raw| {
         raw.trim()
@@ -2485,9 +2572,15 @@ fn sounding_header_override(query: &HashMap<String, String>, key: &str) -> Optio
     })
 }
 
-/// Characters a sounding note or credit may carry. Roughly twice what the widest
-/// band can show, so the renderer's ellipsis is what a reader sees when a note
-/// runs long — a hard cut here would land mid-word again.
+/// Characters a sounding note or credit may carry.
+///
+/// It was roughly twice what the header band could show, so that the renderer's
+/// word-boundary ellipsis was what a reader saw rather than a hard cut landing
+/// mid-word. Now that the note has its own panel the relationship inverted: that
+/// cell holds ~500 characters at 11 pt, so 240 is the BINDING limit and a note
+/// inside it is never elided at all. Left where it is deliberately — it is the
+/// abuse bound on text a stranger can put in an image this box renders, and
+/// raising it is a product call, not a layout one.
 const SOUNDING_HEADER_MAX_CHARS: usize = 240;
 
 /// Characters a NOTE may carry. The credit is an attribution that shares a row
@@ -4348,4 +4441,140 @@ fn loop_video_response(job: &LoopJob, state: &AppState, webm: bool) -> Vec<u8> {
     let mut response = header.into_bytes();
     response.extend_from_slice(&bytes);
     response
+}
+
+#[cfg(test)]
+mod rendered_file_geo_tests {
+    use super::*;
+
+    /// Same pid-scoped temp dir pattern the run-alias tests use, no extra
+    /// dev-dependency.
+    fn job_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rw-file-geo-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn geo_json(file: &str) -> serde_json::Value {
+        serde_json::json!({
+            "file": file,
+            "bytes": 812_345,
+            "geo": {
+                "schema": 1,
+                "image_px": { "width": 1600, "height": 889 },
+                "plot_px": { "x": 16, "y": 74, "width": 1568, "height": 742 },
+                "projected_bounds": {
+                    "x_min": -467_281.5, "x_max": 467_281.5,
+                    "y_min": -546_733.6, "y_max": 552_466.0
+                },
+                "projection": {
+                    "kind": "mercator",
+                    "earth_radius_m": 6_370_000.0,
+                    "latitude_of_true_scale_deg": 37.2,
+                    "central_meridian_deg": -119.75
+                },
+                "geographic_bounds": {
+                    "west": -124.846, "east": -113.154, "south": 31.868, "north": 41.957
+                },
+                "requested_bounds": {
+                    "west": -124.5, "east": -113.5, "south": 32.0, "north": 42.0
+                },
+                "pixel_convention": "edge_pixels_are_centers"
+            }
+        })
+    }
+
+    /// The whole seam: a manifest written beside the images puts `geo` on the
+    /// files it names, leaves it off the ones it does not, and never becomes a
+    /// served file itself.
+    #[test]
+    fn manifest_geo_lands_on_the_files_it_names_and_nowhere_else() {
+        let dir = job_dir("join");
+        let named = "rustwx_hrrr_20260726_12z_f006_california_2m_temperature";
+        let unnamed = "rustwx_hrrr_20260726_12z_f006_california_cloud_cover_levels";
+        for stem in [named, unnamed] {
+            fs::write(dir.join(format!("{stem}.webp")), b"webp").unwrap();
+            fs::write(dir.join(format!("{stem}.png")), b"png").unwrap();
+        }
+        fs::write(
+            dir.join(API_MANIFEST_FILENAME),
+            serde_json::json!({
+                "domains": [{
+                    "slug": "california",
+                    "products": [geo_json(&format!("{named}.webp"))],
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let files = collect_rendered_files(&dir, "job-1").unwrap();
+        assert_eq!(files.len(), 4, "manifest must not be served: {files:#?}");
+        assert!(
+            files.iter().all(|file| file.name != API_MANIFEST_FILENAME),
+            "manifest leaked into the served files: {files:#?}"
+        );
+        for file in &files {
+            let expected_geo = file.name.starts_with(named);
+            assert_eq!(
+                file.geo.is_some(),
+                expected_geo,
+                "{} geo presence is wrong",
+                file.name
+            );
+        }
+        // Both encodings of one product are the same pixels, so both carry it.
+        let geo = files
+            .iter()
+            .find(|file| file.name == format!("{named}.png"))
+            .and_then(|file| file.geo.clone())
+            .expect("the png twin of a manifested webp must carry the same geo");
+        assert_eq!(geo.plot_px.x, 16);
+        assert_eq!(geo.plot_px.width, 1568);
+        assert_eq!(geo.image_px.height, 889);
+        assert_eq!(geo.projection.earth_radius_m, 6_370_000.0);
+        assert_eq!(
+            geo.projection.spec,
+            rustwx_render::ProjectionSpec::Mercator {
+                latitude_of_true_scale_deg: 37.2,
+                central_meridian_deg: -119.75,
+            },
+            "the projection must survive the manifest round trip verbatim"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A job rendered by an older `rw_render` (or one whose products are all
+    /// panels) has no manifest. That is a normal outcome, not a failure: the
+    /// files still come back, just without `geo`, and the field is absent from
+    /// the JSON rather than serialized as null.
+    #[test]
+    fn files_without_a_manifest_serialize_without_the_geo_key() {
+        let dir = job_dir("no-manifest");
+        fs::write(dir.join("rustwx_hrrr_panel.webp"), b"webp").unwrap();
+        let files = collect_rendered_files(&dir, "job-2").unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].geo.is_none());
+        let json = serde_json::to_value(&files[0]).unwrap();
+        assert!(
+            json.get("geo").is_none(),
+            "geo must be omitted, not null, so a client can feature-detect it: {json}"
+        );
+        assert_eq!(json["url"], "/outputs/job-2/rustwx_hrrr_panel.webp");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A malformed manifest must not fail the job or drop the file list — the
+    /// images rendered fine; only the georeferencing is unavailable.
+    #[test]
+    fn an_unparsable_manifest_degrades_to_no_geo_instead_of_failing() {
+        let dir = job_dir("bad-manifest");
+        fs::write(dir.join("rustwx_hrrr_hdw.webp"), b"webp").unwrap();
+        fs::write(dir.join(API_MANIFEST_FILENAME), b"{ not json").unwrap();
+        let files = collect_rendered_files(&dir, "job-3").unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].geo.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

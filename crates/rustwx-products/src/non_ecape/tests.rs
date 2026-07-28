@@ -322,6 +322,7 @@ fn summary_flattens_outputs_across_all_runners() {
             output_path: PathBuf::from("C:\\proof\\direct.png"),
             content_identity: crate::publication::artifact_identity_from_bytes(b"direct"),
             input_fetch_keys: vec!["direct:nat->sfc".into()],
+            plot_geometry: None,
             timing: HrrrDirectRecipeTiming {
                 project_ms: 1,
                 field_prepare_ms: 0,
@@ -396,6 +397,7 @@ fn summary_flattens_outputs_across_all_runners() {
             output_path: PathBuf::from("C:\\proof\\derived.png"),
             content_identity: crate::publication::artifact_identity_from_bytes(b"derived"),
             input_fetch_keys: vec!["derived:sfc".into(), "derived:prs".into()],
+            plot_geometry: None,
             timing: HrrrDerivedRecipeTiming {
                 render_to_image_ms: 0,
                 data_layer_draw_ms: 0,
@@ -474,6 +476,7 @@ fn summary_flattens_outputs_across_all_runners() {
         products: vec![HrrrWindowedRenderedProduct {
             product: HrrrWindowedProduct::Qpf6h,
             output_path: PathBuf::from("C:\\proof\\windowed.png"),
+            plot_geometry: None,
             timing: HrrrWindowedProductTiming {
                 compute_ms: 7,
                 render_ms: 8,
@@ -550,6 +553,7 @@ fn run_manifest_tracks_planned_complete_and_blocked_artifacts() {
             ),
             content_identity: crate::publication::artifact_identity_from_bytes(b"direct-run"),
             input_fetch_keys: vec!["direct:prs".into()],
+            plot_geometry: None,
             timing: HrrrDirectRecipeTiming {
                 project_ms: 1,
                 field_prepare_ms: 0,
@@ -626,6 +630,7 @@ fn run_manifest_tracks_planned_complete_and_blocked_artifacts() {
             ),
             content_identity: crate::publication::artifact_identity_from_bytes(b"derived-run"),
             input_fetch_keys: vec!["derived:sfc".into(), "derived:prs".into()],
+            plot_geometry: None,
             timing: HrrrDerivedRecipeTiming {
                 render_to_image_ms: 0,
                 data_layer_draw_ms: 0,
@@ -706,6 +711,7 @@ fn run_manifest_tracks_planned_complete_and_blocked_artifacts() {
             output_path: PathBuf::from(
                 "C:\\proof\\run\\rustwx_hrrr_20260415_12z_f006_conus_qpf_6h.png",
             ),
+            plot_geometry: None,
             timing: HrrrWindowedProductTiming {
                 compute_ms: 1,
                 render_ms: 1,
@@ -771,6 +777,7 @@ fn windowed_input_fetch_keys_follow_contributing_hours_without_cache() {
     let product = HrrrWindowedRenderedProduct {
         product: HrrrWindowedProduct::Qpf1h,
         output_path: PathBuf::from("C:\\proof\\qpf_1h.png"),
+        plot_geometry: None,
         timing: HrrrWindowedProductTiming {
             compute_ms: 1,
             render_ms: 1,

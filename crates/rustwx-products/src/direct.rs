@@ -6,10 +6,10 @@ use rustwx_models::{LatestRun, PlotRecipe, plot_recipe};
 #[cfg(test)]
 use rustwx_models::{PlotRecipeFetchMode, plot_recipe_fetch_plan};
 use rustwx_render::{
-    Color, ContourLayer, PanelGridLayout, PanelPadding, PngCompressionMode, PngWriteOptions,
-    ProductVisualMode, ProjectedMap, RenderImageTiming, RenderStateTiming, WindBarbLayer,
-    WindStreamlineLayer, draw_centered_text_line, render_panel_grid, save_png_profile_with_options,
-    save_rgba_png_profile_with_options,
+    Color, ContourLayer, PanelGridLayout, PanelPadding, PlotGeometry, PngCompressionMode,
+    PngWriteOptions, ProductVisualMode, ProjectedMap, RenderImageTiming, RenderStateTiming,
+    WindBarbLayer, WindStreamlineLayer, draw_centered_text_line, render_panel_grid,
+    save_png_profile_with_options_and_geometry, save_rgba_png_profile_with_options,
 };
 #[cfg(test)]
 use rustwx_render::{ColorScale, ExtendMode, MapRenderRequest, RasterSampleMode};
@@ -834,6 +834,9 @@ fn render_direct_recipe(
                 canonical_product
             )
         })?;
+    // A composite panel composes several sub-maps onto one canvas, so there is no
+    // single plot rect to report and this stays None on that branch.
+    let mut plot_geometry: Option<PlotGeometry> = None;
     let (
         project_ms,
         field_prepare_ms,
@@ -972,11 +975,12 @@ fn render_direct_recipe(
                 filled.projection.as_ref(),
             )?;
         }
-        let save_timing = save_png_profile_with_options(
+        let (save_timing, geometry) = save_png_profile_with_options_and_geometry(
             &render_request,
             &output_path,
             &request.png_write_options(),
         )?;
+        plot_geometry = geometry;
         (
             project_ms,
             build_timing.field_prepare_ms,
@@ -1014,6 +1018,7 @@ fn render_direct_recipe(
         output_path,
         content_identity,
         input_fetch_keys: vec![runtime_fetch.fetch_key.clone()],
+        plot_geometry,
         timing: DirectRecipeTiming {
             render_to_image_ms: image_timing.total_ms,
             data_layer_draw_ms: direct_data_layer_draw_ms(&image_timing),

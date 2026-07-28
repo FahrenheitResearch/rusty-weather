@@ -8,7 +8,8 @@ use rustwx_render::{
     MapRenderRequest, PngWriteOptions, ProjectedContourLineStyle, ProjectedDomain, ProjectedExtent,
     ProjectedMap, RasterSampleMode, RenderImageTiming, WeatherPalette, WeatherProduct,
     WindBarbLayer, build_projected_contour_geometry_profile, densify_discrete_scale,
-    map_frame_aspect_ratio, save_png_profile_with_options, weather::temperature_palette_cropped_f,
+    map_frame_aspect_ratio, save_png_profile_with_options_and_geometry,
+    weather::temperature_palette_cropped_f,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -928,7 +929,7 @@ fn run_derived_batch_from_loaded_bundles_with_precomputed(
                 None,
             )?;
         }
-        let save_timing = save_png_profile_with_options(
+        let (save_timing, plot_geometry) = save_png_profile_with_options_and_geometry(
             &render_request,
             &output_path,
             &request.png_write_options(),
@@ -944,6 +945,7 @@ fn run_derived_batch_from_loaded_bundles_with_precomputed(
                 output_path,
                 content_identity,
                 input_fetch_keys: input_fetch_keys.clone(),
+                plot_geometry,
                 timing: DerivedRecipeTiming {
                     render_to_image_ms: save_timing.png_timing.render_to_image_ms,
                     data_layer_draw_ms: derived_data_layer_draw_ms(
@@ -2094,6 +2096,9 @@ fn build_render_artifact_with_contour_mode(
     });
     request.projected_lines = projected.lines.clone();
     request.projected_polygons = projected.polygons.clone();
+    // Metadata only (see `rustwx_render::MeshProjection`): it is what lets the
+    // renderer report this map's plot rect, on native-projection meshes too.
+    request.mesh_projection = projected.mesh_projection.clone();
     apply_source_raster_policy(source, &mut request);
     if let Some(temp_display) = derived_temp_display(recipe) {
         crate::temp_display::apply_temp_units_display(&mut request, temp_display);
@@ -2479,6 +2484,9 @@ fn build_render_artifact_with_contour_mode_profiled(
     });
     request.projected_lines = projected.lines.clone();
     request.projected_polygons = projected.polygons.clone();
+    // Metadata only (see `rustwx_render::MeshProjection`): it is what lets the
+    // renderer report this map's plot rect, on native-projection meshes too.
+    request.mesh_projection = projected.mesh_projection.clone();
     apply_source_raster_policy(source, &mut request);
     if let Some(temp_display) = derived_temp_display(recipe) {
         crate::temp_display::apply_temp_units_display(&mut request, temp_display);
@@ -2878,8 +2886,11 @@ fn render_derived_heavy_recipe(
             projection,
         )?;
     }
-    let save_timing =
-        save_png_profile_with_options(&render_request, &output_path, &request.png_write_options())?;
+    let (save_timing, plot_geometry) = save_png_profile_with_options_and_geometry(
+        &render_request,
+        &output_path,
+        &request.png_write_options(),
+    )?;
     let render_ms = render_start.elapsed().as_millis();
     let content_identity = artifact_identity_from_path(&output_path)?;
     Ok(DerivedRenderedRecipe {
@@ -2889,6 +2900,7 @@ fn render_derived_heavy_recipe(
         output_path,
         content_identity,
         input_fetch_keys,
+        plot_geometry,
         timing: DerivedRecipeTiming {
             render_to_image_ms: save_timing.png_timing.render_to_image_ms,
             data_layer_draw_ms: derived_data_layer_draw_ms(&save_timing.png_timing.image_timing),
@@ -3543,9 +3555,12 @@ fn render_derived_output_recipe(
         )
         .map_err(thread_render_error)?;
     }
-    let save_timing =
-        save_png_profile_with_options(&render_request, &output_path, &request.png_write_options())
-            .map_err(thread_render_error)?;
+    let (save_timing, plot_geometry) = save_png_profile_with_options_and_geometry(
+        &render_request,
+        &output_path,
+        &request.png_write_options(),
+    )
+    .map_err(thread_render_error)?;
     let render_ms = render_start.elapsed().as_millis();
     let content_identity =
         artifact_identity_from_path(&output_path).map_err(thread_render_error)?;
@@ -3563,6 +3578,7 @@ fn render_derived_output_recipe(
         output_path,
         content_identity,
         input_fetch_keys: lane_fetch_keys,
+        plot_geometry,
         timing: DerivedRecipeTiming {
             render_to_image_ms: save_timing.png_timing.render_to_image_ms,
             data_layer_draw_ms: derived_data_layer_draw_ms(&save_timing.png_timing.image_timing),
@@ -3655,6 +3671,8 @@ pub(crate) fn derived_store_variable_style(
         lines: Vec::new(),
         polygons: Vec::new(),
         inverse_raster_projection: None,
+        // A style probe, not a render: it never asks where the plot rect landed.
+        mesh_projection: None,
     };
     let values = vec![0.0_f64; grid.shape.len()];
 

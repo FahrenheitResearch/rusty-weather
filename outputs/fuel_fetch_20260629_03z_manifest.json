@@ -1,0 +1,298 @@
+{
+  "build": "1e0e64cede13-dirty",
+  "date": "2026-06-29",
+  "day_index": 179,
+  "downloads": [
+    {
+      "bytes": 32918985,
+      "cache_hit": true,
+      "download_ms": 0,
+      "file_stem": "bi",
+      "path": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\bi_2026.nc",
+      "url": "https://www.northwestknowledge.net/metdata/data/bi_2026.nc"
+    },
+    {
+      "bytes": 43079877,
+      "cache_hit": true,
+      "download_ms": 0,
+      "file_stem": "erc",
+      "path": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\erc_2026.nc",
+      "url": "https://www.northwestknowledge.net/metdata/data/erc_2026.nc"
+    },
+    {
+      "bytes": 54111643,
+      "cache_hit": true,
+      "download_ms": 0,
+      "file_stem": "fm1",
+      "path": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\fm1_2026.nc",
+      "url": "https://www.northwestknowledge.net/metdata/data/fm1_2026.nc"
+    },
+    {
+      "bytes": 42386107,
+      "cache_hit": true,
+      "download_ms": 0,
+      "file_stem": "fm10",
+      "path": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\fm10_2026.nc",
+      "url": "https://www.northwestknowledge.net/metdata/data/fm10_2026.nc"
+    },
+    {
+      "bytes": 66587500,
+      "cache_hit": true,
+      "download_ms": 0,
+      "file_stem": "fm100",
+      "path": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\fm100_2026.nc",
+      "url": "https://www.northwestknowledge.net/metdata/data/fm100_2026.nc"
+    },
+    {
+      "bytes": 66149098,
+      "cache_hit": true,
+      "download_ms": 0,
+      "file_stem": "fm1000",
+      "path": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\fm1000_2026.nc",
+      "url": "https://www.northwestknowledge.net/metdata/data/fm1000_2026.nc"
+    },
+    {
+      "bytes": 26568956,
+      "cache_hit": true,
+      "download_ms": 0,
+      "file_stem": "pr",
+      "path": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\pr_2026.nc",
+      "url": "https://www.northwestknowledge.net/metdata/data/pr_2026.nc"
+    },
+    {
+      "bytes": 75852064,
+      "cache_hit": true,
+      "download_ms": 0,
+      "file_stem": "tmmx",
+      "path": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\tmmx_2026.nc",
+      "url": "https://www.northwestknowledge.net/metdata/data/tmmx_2026.nc"
+    }
+  ],
+  "dry_run": false,
+  "extrapolate": false,
+  "gridmet_base_url": "https://www.northwestknowledge.net/metdata/data",
+  "hours": "1-3",
+  "hours_rewritten": [
+    {
+      "added": [
+        "erc",
+        "burning_index",
+        "dead_fuel_moisture_1h",
+        "dead_fuel_moisture_10h",
+        "dead_fuel_moisture_100h",
+        "dead_fuel_moisture_1000h",
+        "daily_precip_fuel_context",
+        "kbdi"
+      ],
+      "bytes": 270589430,
+      "encode_ms": 697,
+      "hour_path": "C:\\Users\\drew\\rusty-weather\\store\\hrrr\\20260629_03z\\f001.rws",
+      "replaced": [],
+      "variables_after": 103,
+      "variables_before": 95,
+      "wall_ms": 1098
+    },
+    {
+      "added": [
+        "erc",
+        "burning_index",
+        "dead_fuel_moisture_1h",
+        "dead_fuel_moisture_10h",
+        "dead_fuel_moisture_100h",
+        "dead_fuel_moisture_1000h",
+        "daily_precip_fuel_context",
+        "kbdi"
+      ],
+      "bytes": 270411888,
+      "encode_ms": 572,
+      "hour_path": "C:\\Users\\drew\\rusty-weather\\store\\hrrr\\20260629_03z\\f002.rws",
+      "replaced": [],
+      "variables_after": 103,
+      "variables_before": 95,
+      "wall_ms": 902
+    },
+    {
+      "added": [
+        "erc",
+        "burning_index",
+        "dead_fuel_moisture_1h",
+        "dead_fuel_moisture_10h",
+        "dead_fuel_moisture_100h",
+        "dead_fuel_moisture_1000h",
+        "daily_precip_fuel_context",
+        "kbdi"
+      ],
+      "bytes": 269856215,
+      "encode_ms": 564,
+      "hour_path": "C:\\Users\\drew\\rusty-weather\\store\\hrrr\\20260629_03z\\f003.rws",
+      "replaced": [],
+      "variables_after": 103,
+      "variables_before": 95,
+      "wall_ms": 884
+    }
+  ],
+  "kbdi": {
+    "annual_rain_in": 20.0,
+    "enabled": true,
+    "note": "KBDI is computed from gridMET Tmax and precip with a scalar annual-rainfall parameter; replace with gridded climatology when available.",
+    "spinup_days": 180
+  },
+  "layers": [
+    {
+      "day_index": 179,
+      "finite_count": 902087,
+      "max": 113.89144134521484,
+      "min": 0.0,
+      "output_units": "index",
+      "read_ms": 220,
+      "regrid_ms": 103,
+      "slug": "erc",
+      "source_file": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\erc_2026.nc",
+      "source_geometry": "regular-lat-lon",
+      "source_shape": [
+        1386,
+        585
+      ],
+      "source_units": "index",
+      "source_variable": "energy_release_component-g"
+    },
+    {
+      "day_index": 179,
+      "finite_count": 902087,
+      "max": 118.30818176269531,
+      "min": 0.0,
+      "output_units": "index",
+      "read_ms": 179,
+      "regrid_ms": 104,
+      "slug": "burning_index",
+      "source_file": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\bi_2026.nc",
+      "source_geometry": "regular-lat-lon",
+      "source_shape": [
+        1386,
+        585
+      ],
+      "source_units": "index",
+      "source_variable": "burning_index_g"
+    },
+    {
+      "day_index": 179,
+      "finite_count": 902087,
+      "max": 28.952634811401367,
+      "min": 1.5,
+      "output_units": "%",
+      "read_ms": 268,
+      "regrid_ms": 101,
+      "slug": "dead_fuel_moisture_1h",
+      "source_file": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\fm1_2026.nc",
+      "source_geometry": "regular-lat-lon",
+      "source_shape": [
+        1386,
+        585
+      ],
+      "source_units": "%",
+      "source_variable": "dead_fuel_moisture_1hr"
+    },
+    {
+      "day_index": 179,
+      "finite_count": 902087,
+      "max": 35.400001525878906,
+      "min": 0.6000000238418579,
+      "output_units": "%",
+      "read_ms": 221,
+      "regrid_ms": 103,
+      "slug": "dead_fuel_moisture_10h",
+      "source_file": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\fm10_2026.nc",
+      "source_geometry": "regular-lat-lon",
+      "source_shape": [
+        1386,
+        585
+      ],
+      "source_units": "%",
+      "source_variable": "dead_fuel_moisture_10hr"
+    },
+    {
+      "day_index": 179,
+      "finite_count": 902087,
+      "max": 28.0102481842041,
+      "min": 2.7003936767578125,
+      "output_units": "%",
+      "read_ms": 326,
+      "regrid_ms": 103,
+      "slug": "dead_fuel_moisture_100h",
+      "source_file": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\fm100_2026.nc",
+      "source_geometry": "regular-lat-lon",
+      "source_shape": [
+        1386,
+        585
+      ],
+      "source_units": "%",
+      "source_variable": "dead_fuel_moisture_100hr"
+    },
+    {
+      "day_index": 179,
+      "finite_count": 902087,
+      "max": 26.220386505126953,
+      "min": 2.412668228149414,
+      "output_units": "%",
+      "read_ms": 319,
+      "regrid_ms": 104,
+      "slug": "dead_fuel_moisture_1000h",
+      "source_file": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\fm1000_2026.nc",
+      "source_geometry": "regular-lat-lon",
+      "source_shape": [
+        1386,
+        585
+      ],
+      "source_units": "%",
+      "source_variable": "dead_fuel_moisture_1000hr"
+    },
+    {
+      "day_index": 179,
+      "finite_count": 902087,
+      "max": 4.544316291809082,
+      "min": 0.0,
+      "output_units": "in",
+      "read_ms": 161,
+      "regrid_ms": 104,
+      "slug": "daily_precip_fuel_context",
+      "source_file": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\pr_2026.nc",
+      "source_geometry": "regular-lat-lon",
+      "source_shape": [
+        1386,
+        585
+      ],
+      "source_units": "in",
+      "source_variable": "precipitation_amount"
+    },
+    {
+      "day_index": 179,
+      "finite_count": 902087,
+      "max": 770.678955078125,
+      "min": 0.0,
+      "output_units": "index",
+      "read_ms": 2926,
+      "regrid_ms": 104,
+      "slug": "kbdi",
+      "source_file": "C:\\Users\\drew\\rusty-weather\\cache\\fuel\\gridmet\\2026\\tmmx_2026.nc",
+      "source_geometry": "regular-lat-lon",
+      "source_shape": [
+        1386,
+        585
+      ],
+      "source_units": "index",
+      "source_variable": "kbdi(tmmx,pr)"
+    }
+  ],
+  "method": "Bilinear",
+  "missing_policy": "Renormalize",
+  "model": "hrrr",
+  "overwrite": true,
+  "provider": "gridmet",
+  "run": "20260629_03z",
+  "schema": "rw-fuel-fetch-manifest-v1",
+  "target_grid": {
+    "nx": 1799,
+    "ny": 1059
+  },
+  "total_wall_ms": 8478
+}

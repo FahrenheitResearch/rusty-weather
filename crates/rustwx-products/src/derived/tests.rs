@@ -63,6 +63,7 @@ fn sample_projected_map() -> ProjectedMap {
         lines: Vec::new(),
         polygons: Vec::new(),
         inverse_raster_projection: None,
+        mesh_projection: None,
     }
 }
 

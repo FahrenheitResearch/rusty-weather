@@ -10,8 +10,8 @@ use crate::features::{
 use crate::presentation::LineworkRole;
 use crate::projection::{ProjectionProjector, ProjectionSpec};
 use crate::request::{
-    Color, InverseRasterProjection, ProjectedDomain, ProjectedExtent, ProjectedLineOverlay,
-    ProjectedPolygonFill,
+    Color, InverseRasterProjection, MeshProjection, ProjectedDomain, ProjectedExtent,
+    ProjectedLineOverlay, ProjectedPolygonFill,
 };
 
 const DEFAULT_BASEMAP_GRATICULE: bool = false;
@@ -24,6 +24,12 @@ pub struct ProjectedMap {
     pub lines: Vec<ProjectedLineOverlay>,
     pub polygons: Vec<ProjectedPolygonFill>,
     pub inverse_raster_projection: Option<InverseRasterProjection>,
+    /// The projection `projected_x`/`projected_y` were built with, as the builder
+    /// RESOLVED it (inferred spec, defaulted reference latitude and all). Filled
+    /// in by [`build_projected_map_with_options`] for every mesh it projects, so
+    /// a caller never has to restate what it asked for. Metadata only — see
+    /// [`MeshProjection`].
+    pub mesh_projection: Option<MeshProjection>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -90,6 +96,9 @@ impl ProjectedMap {
         }
         self.extent = rotated_extent(self.extent, center, sin, cos);
         self.inverse_raster_projection = None;
+        // The mesh no longer lies where the projection alone would put it, so any
+        // statement about which projection produced it is now false.
+        self.mesh_projection = None;
         self
     }
 }
@@ -430,7 +439,7 @@ pub fn build_projected_map_with_options(
     options: &ProjectedMapBuildOptions,
 ) -> Result<ProjectedMap, Box<dyn Error>> {
     validate_lat_lon_mesh(lat_deg, lon_deg)?;
-    let projector = resolved_projector(lat_deg, lon_deg, &options.domain)?;
+    let (projector, projection) = resolved_projector_and_spec(lat_deg, lon_deg, &options.domain)?;
     let (projected_x, projected_y, extent) = project_domain(
         lat_deg,
         lon_deg,
@@ -460,6 +469,11 @@ pub fn build_projected_map_with_options(
         ));
     }
 
+    // Read the reference lat/lon back out of the BUILT projector, not out of the
+    // options: `build_projector` defaults an unset reference latitude from the
+    // mesh, so echoing the request would publish something that does not rebuild.
+    let (reference_latitude_deg, reference_longitude_deg) =
+        projector.resolved_reference_lat_lon_deg();
     Ok(ProjectedMap {
         projected_x,
         projected_y,
@@ -467,6 +481,11 @@ pub fn build_projected_map_with_options(
         lines: basemap.lines,
         polygons: basemap.polygons,
         inverse_raster_projection: None,
+        mesh_projection: Some(MeshProjection {
+            projection,
+            reference_latitude_deg,
+            reference_longitude_deg,
+        }),
     })
 }
 
@@ -488,6 +507,19 @@ fn resolved_projector(
     lon_deg: &[f32],
     options: &ProjectedDomainBuildOptions,
 ) -> Result<ProjectionProjector, Box<dyn Error>> {
+    resolved_projector_and_spec(lat_deg, lon_deg, options).map(|(projector, _)| projector)
+}
+
+/// The projector the mesh is projected with, and the spec it came from.
+///
+/// The spec is returned as well because it cannot be read back out of a built
+/// `ProjectionProjector` (which holds only precomputed constants), and it may not
+/// be the caller's: an absent projection is INFERRED from the mesh here.
+fn resolved_projector_and_spec(
+    lat_deg: &[f32],
+    lon_deg: &[f32],
+    options: &ProjectedDomainBuildOptions,
+) -> Result<(ProjectionProjector, ProjectionSpec), Box<dyn Error>> {
     let projection = options
         .projection
         .clone()
@@ -499,14 +531,13 @@ fn resolved_projector(
             .map(GeographicBounds::center_longitude),
         _ => None,
     };
-    projection
-        .build_projector(
-            options.reference_latitude_deg,
-            reference_longitude_deg,
-            lat_deg,
-            lon_deg,
-        )
-        .map_err(Into::into)
+    let projector = projection.build_projector(
+        options.reference_latitude_deg,
+        reference_longitude_deg,
+        lat_deg,
+        lon_deg,
+    )?;
+    Ok((projector, projection))
 }
 
 fn validate_lat_lon_mesh(lat_deg: &[f32], lon_deg: &[f32]) -> Result<(), Box<dyn Error>> {
@@ -1492,6 +1523,58 @@ mod tests {
         assert!(projected.polygons.is_empty());
     }
 
+    /// The builder must STATE the projection it projected the mesh with, resolved
+    /// exactly as the projector settled on it: a Lambert reference latitude the
+    /// caller left unset is defaulted from the mesh, and echoing the caller's
+    /// `None` would publish something that cannot be rebuilt. This statement is
+    /// the only route to a reported plot rect on a native-projection grid.
+    #[test]
+    fn the_builder_states_the_projection_the_mesh_was_projected_with() {
+        let (lat, lon) = sample_lat_lon();
+        let projection = ProjectionSpec::LambertConformal {
+            standard_parallel_1_deg: 30.0,
+            standard_parallel_2_deg: 60.0,
+            central_meridian_deg: -97.5,
+        };
+        let projected = build_projected_map_with_options(
+            &lat,
+            &lon,
+            &ProjectedMapBuildOptions::full_domain(1.4)
+                .with_projection(projection.clone())
+                .without_basemap(),
+        )
+        .expect("projected map");
+
+        let stated = projected
+            .mesh_projection
+            .as_ref()
+            .expect("every projected mesh states its projection");
+        assert_eq!(stated.projection, projection);
+        let reference_latitude = stated
+            .reference_latitude_deg
+            .expect("a Lambert statement must carry the resolved reference latitude");
+
+        // Rebuild from the published fields ALONE — no mesh to default from,
+        // which is the position a client is in — and reproduce the mesh.
+        let rebuilt = stated
+            .projection
+            .build_projector(
+                Some(reference_latitude),
+                stated.reference_longitude_deg,
+                &[],
+                &[],
+            )
+            .expect("the statement rebuilds a projector");
+        for (index, (&point_lat, &point_lon)) in lat.iter().zip(lon.iter()).enumerate() {
+            let (x, y) = rebuilt.project(f64::from(point_lat), f64::from(point_lon));
+            assert!(
+                (x - projected.projected_x[index]).abs() < 1.0e-6
+                    && (y - projected.projected_y[index]).abs() < 1.0e-6,
+                "restated projector missed mesh point {index}"
+            );
+        }
+    }
+
     #[test]
     fn projected_map_rotation_transforms_domain_and_basemap_together() {
         let projected = ProjectedMap {
@@ -1515,8 +1598,20 @@ mod tests {
                 role: crate::presentation::PolygonRole::Generic,
             }],
             inverse_raster_projection: None,
+            // Set so the rotation is proven to DROP it: after a rotation the mesh
+            // no longer lies where this projection would put it, and a stale
+            // statement would publish a plot rect for a map nobody drew.
+            mesh_projection: Some(MeshProjection {
+                projection: ProjectionSpec::Geographic,
+                reference_latitude_deg: None,
+                reference_longitude_deg: Some(0.0),
+            }),
         }
         .rotated_degrees(90.0);
+        assert!(
+            projected.mesh_projection.is_none(),
+            "a rotated mesh must retract its projection statement"
+        );
 
         assert!((projected.projected_x[0] - 2.0).abs() < 1.0e-9);
         assert!((projected.projected_y[0] - 0.0).abs() < 1.0e-9);
@@ -1575,6 +1670,7 @@ mod tests {
                 role: crate::presentation::PolygonRole::Generic,
             }],
             inverse_raster_projection: None,
+            mesh_projection: None,
         };
 
         let (domain, basemap) = projected.split();
