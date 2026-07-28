@@ -90,22 +90,47 @@ pub fn clamp_pixels_per_point(value: f32) -> f32 {
     }
 }
 
+/// Outer margin `egui_kittest`'s central panel leaves around the board.
+///
+/// The harness wraps our closure's `Ui` in a frame with this margin, so the board
+/// is INSET from the image on all four sides rather than flush to it — at the
+/// defaults, `(8,8)..(1296,872)` inside a 1304x880 screen. Anything deriving a
+/// panel's position from the window size has to subtract it, and code that did not
+/// has been ~8 pt out twice now: once in the header band's width, once in the gear
+/// guard's probe rect. Hence [`board_rect_pt`], so there is one place to be wrong.
+pub const HARNESS_OUTER_MARGIN_PT: f32 = 8.0;
+
+/// The board's rect in POINTS — what [`sharppyrs::panel_rects`] expects.
+///
+/// Note this depends on `zoom` even though the output image's pixel size does not:
+/// the margin is in points, and zoom changes how many points the window is.
+pub fn board_rect_pt(zoom: f32) -> egui::Rect {
+    let zoom = clamp_zoom(zoom);
+    let margin = HARNESS_OUTER_MARGIN_PT;
+    egui::Rect::from_min_max(
+        egui::pos2(margin, margin),
+        egui::pos2(WINDOW_W / zoom - margin, WINDOW_H / zoom - margin),
+    )
+}
+
 /// Our default panel arrangement, as sharppyrs layout tokens.
 ///
-/// Both marginal box plots are dropped, which is the whole change from the
-/// upstream default
+/// Three departures from the upstream default
 /// (`...|slinky,thetae,srwinds,locationmap|convectiveindices,kinematics,ship,severeindices,streamwiseness,hidden|250`):
+/// both marginal box plots are dropped, the large upper-right cell is SHARED by
+/// the hodograph and the location map, and the poster's note gets a cell of its
+/// own.
 ///
 /// * **No SHIP box.**
 /// * **No effective-layer STP bar** — upstream already moved off the STP default,
 ///   and BowEcho migrates old saves away from it.
 ///
-/// Streamwiseness takes the small inset the location map used to hold, and the
-/// minimap moves down to share the third bottom column with the severe indices —
-/// a map needs the room to be legible, a streamwiseness trace does not. The two
-/// trailing bottom columns stay hidden, so the reclaimed width goes to the parcel
-/// and kinematics tables; that widening is also what un-squishes the NCAPE/ECAPE
-/// line.
+/// Streamwiseness takes the small inset the location map used to hold. The map
+/// itself moves up beside the hodograph (the arithmetic is below), and the bottom
+/// slot it used to occupy — index 2, the upper half of the shared third column —
+/// becomes the NOTES panel, which is where `note=` is drawn now. The two trailing
+/// bottom columns stay hidden, so the reclaimed width goes to the parcel and
+/// kinematics tables; that widening is also what un-squishes the NCAPE/ECAPE line.
 ///
 /// Bottom slots in order: two full-height columns, two sharing the third column
 /// vertically, then two more full-height columns.
@@ -118,27 +143,87 @@ pub fn clamp_pixels_per_point(value: f32) -> f32 {
 /// * "The el stp plot is kinda usefull" meant marginal, not useful. Reading it the
 ///   other way put STP in a full column here for one deploy.
 ///
-/// The trailing number is the hodograph window in knots. 195 puts **90 kt as the
-/// outermost labeled ring on all four axes**, which is only possible because
-/// sharppyrs draws the hodograph into a centered square (`Geom::plot_rect`): the
-/// kt-per-pixel scale is one isotropic scalar, so in this layout's 576x409 pt cell
-/// the upstream 250 gave +/-125 kt across and only +/-89 kt vertically — the 90
-/// ring was drawn but its labels fell ~2 px outside the clip rect, so the vertical
-/// axis appeared to stop at 80. Anything in ~187..207 labels 90 and not 100; below
-/// ~187 the 100 ring reappears, above ~207 the 90 label clips again.
-pub const DEFAULT_LAYOUT_TOKENS: &str = "speed,advection|hodograph|\
+/// **The main cell is split because the hodograph was never using all of it.**
+/// sharppyrs plots the hodograph into a centered SQUARE (`Geom::plot_rect`), so in
+/// a cell 1.4:1 wide the leftover ~166 pt was background. Cutting the cell at the
+/// fraction that squares the hodograph's share therefore costs the plot nothing
+/// and hands that width to the map. Worked from the real cell rather than copied,
+/// in points, at [`DEFAULT_ZOOM`]:
+///
+/// ```text
+/// board        1630/1.25 - 16 = 1288 wide, 1100/1.25 - 16 = 864 high
+///                (the harness insets the board 8 pt on every side)
+/// main cell w  1288 * (1 - 0.46)  * 24/29  = 575.60   skew_width, right column
+/// main cell h  (864 * 0.67 - 16)  *  8/11  = 409.37   top_height, brand band,
+///                                                     right_main_height
+/// square at    409.37 / 575.60             = 0.7112
+/// ```
+///
+/// which is sharppyrs' own default split, 0.711 — so the token string carries no
+/// geometry section at all. That default leaves the hodograph 409.25 x 409.37 pt,
+/// square to a tenth of a point (0.17 px at [`DEFAULT_PIXELS_PER_POINT`]), and
+/// gives the map the other 166.35 pt. Spelling the fraction out would mean
+/// emitting a `g3:` section, which freezes every OTHER geometry fraction into our
+/// string and stops upstream board tweaks from reaching us; a test asserts the
+/// sub-cell is square instead, so an upstream retune fails loudly rather than
+/// silently letterboxing again.
+///
+/// To trade the two off, append `|g3:...;<fraction>` (see
+/// `SoundingLayout::to_tokens` for the full section) and move the last number:
+/// LOWER for a wider map and a smaller hodograph, and that is the only useful
+/// direction — above 0.7112 the hodograph is height-bound, so the extra width is
+/// letterbox again. The clamp is 0.20..=0.80.
+///
+/// The map does not mind the portrait cell: `locator::map_extent` takes its
+/// geographic window from the cell's aspect, so 166x409 shows +/-4 deg of latitude
+/// and ~+/-2 deg of longitude — a tall slice, which is the shape California is.
+///
+/// The trailing number is the hodograph window in knots, and the split leaves it
+/// alone: 195 still puts **90 kt as the outermost labeled ring on all four axes**,
+/// because the drawn square only lost 0.11 pt of side. That the four axes agree at
+/// all is down to `Geom::plot_rect`: kt-per-pixel is one isotropic scalar, so
+/// taking it from the WIDTH of the 576x409 cell this layout used to hand over gave
+/// +/-125 kt across and only +/-89 kt vertically — the 90 ring was drawn but its
+/// labels fell ~2 px outside the clip rect, so the vertical axis appeared to stop
+/// at 80. Anything in ~187..207 labels 90 and not 100; below ~187 the 100 ring
+/// reappears, above ~207 the 90 label clips again.
+pub const DEFAULT_LAYOUT_TOKENS: &str = "speed,advection|hodograph,locationmap|\
      slinky,thetae,srwinds,streamwiseness|\
-     convectiveindices,kinematics,locationmap,severeindices,hidden,hidden|195";
+     convectiveindices,kinematics,notes,severeindices,hidden,hidden|195";
 
 /// Resolve a layout from caller tokens, falling back to our default.
 ///
 /// Malformed tokens fall back rather than erroring: a stale shared link should
 /// still draw a sounding.
+///
+/// The notes cell stays in the default whether or not a note was supplied, and
+/// the panel draws its own frame and title when empty. Hiding the cell instead
+/// looks like the tidier answer and is not: its share lands on the severe-indices
+/// table sharing that column, whose type auto-scales to the taller cell and then
+/// collides with itself ("Peskov Index" over "LRGHAIL", "NCAPE" over "ECAPE",
+/// text past the right edge). That is a latent upstream bug in the diagnostic
+/// table's scaling — it fits height without checking width — and worth fixing,
+/// but until it is, an empty labelled cell is the honest arrangement.
 pub fn layout_or_default(tokens: Option<&str>) -> sharppyrs::SoundingLayout {
     tokens
         .and_then(sharppyrs::SoundingLayout::from_tokens)
         .or_else(|| sharppyrs::SoundingLayout::from_tokens(DEFAULT_LAYOUT_TOKENS))
         .unwrap_or_default()
+}
+
+/// Whether `layout` has a cell to draw the poster's note in.
+///
+/// The note's home is the notes PANEL, but `layout=` is caller-supplied, so a
+/// caller can ask for an arrangement with nowhere to put it. Answering that here
+/// is what lets [`render_png`] keep the note on the old header line in exactly
+/// that case, rather than dropping the one string on the image its poster typed.
+fn layout_draws_notes(layout: &sharppyrs::SoundingLayout) -> bool {
+    [layout.main, layout.main_side]
+        .into_iter()
+        .chain(layout.strips)
+        .chain(layout.insets)
+        .chain(layout.bottom)
+        .any(|kind| kind == sharppyrs::PanelKind::Notes)
 }
 
 /// Point size sharppyrs draws its upper-right header text at, and the padding it
@@ -182,6 +267,9 @@ pub fn header_band_width_pt(layout: &sharppyrs::SoundingLayout, zoom: f32) -> f3
 pub struct HeaderText<'a> {
     pub title: &'a str,
     /// Why this sounding is worth a look, in the poster's words. Empty draws none.
+    ///
+    /// Drawn in the NOTES PANEL when the layout has one — which the default does
+    /// — and only on the header line when it does not. See [`render_png`].
     pub note: &'a str,
     /// The house credit. Empty draws none.
     pub credit: &'a str,
@@ -275,6 +363,27 @@ fn elide_to_width(text: &str, max_width: f32, width_of: impl Fn(&str) -> f32) ->
     let mut fitted = text[..cut].trim_end().to_string();
     fitted.push(ELLIPSIS);
     fitted
+}
+
+/// The board sharppyrs lays out into at the default zoom, in POINTS: the window
+/// size divided by the zoom, less the 8 pt the `egui_kittest` harness insets on
+/// every side (an `outer_margin` on its central panel, which neither crate
+/// exposes).
+///
+/// A mirror of somebody else's private geometry, so it is test-only and the tests
+/// using it assert PROPERTIES — "the hodograph's share is square", "these two
+/// renders agree inside the header band" — never coordinates. Points times
+/// [`DEFAULT_PIXELS_PER_POINT`] times [`DEFAULT_ZOOM`] are pixels in the PNG.
+#[cfg(test)]
+pub(crate) fn default_board() -> egui::Rect {
+    const HARNESS_INSET_PT: f32 = 8.0;
+    egui::Rect::from_min_size(
+        egui::pos2(HARNESS_INSET_PT, HARNESS_INSET_PT),
+        egui::vec2(
+            WINDOW_W / DEFAULT_ZOOM - 2.0 * HARNESS_INSET_PT,
+            WINDOW_H / DEFAULT_ZOOM - 2.0 * HARNESS_INSET_PT,
+        ),
+    )
 }
 
 const MS_TO_KNOTS: f64 = 1.943_844;
@@ -434,6 +543,15 @@ fn render_permit() -> MutexGuard<'static, ()> {
 /// upper-right line is FITTED to its band before sharppyrs sees it — see
 /// [`fit_header`] — because the widget draws that text right-aligned and
 /// unclipped, so an over-long string does not elide, it overwrites the title.
+///
+/// The NOTE goes to the notes panel, not that line. It is a judgement call, and
+/// the reason is that the two would say the same thing twice: the header line
+/// already carries the credit and now fits rather than clips, so a note beside it
+/// is a clause of prose competing with the credit for a strip 16 pt tall, while
+/// the panel holds the whole paragraph at the same 11 pt. So the line is left to
+/// the credit alone, and the note is drawn where it can be read. A layout with no
+/// notes cell keeps the old behaviour (note ahead of the credit, fitted), because
+/// silently dropping the poster's own words would be worse than crowding them.
 pub fn render_png(
     data: sharppyrs::SoundingData,
     header: HeaderText<'_>,
@@ -451,6 +569,9 @@ pub fn render_png(
     let _permit = render_permit();
     let title = header.title.to_string();
     let (note, credit) = (header.note.to_string(), header.credit.to_string());
+    // Decided before the closure: the header line's content depends on whether
+    // the note has a panel to go to, and the closure runs once per pass.
+    let note_has_a_panel = layout_draws_notes(&layout);
     // The first pass installs the bundled Space Grotesk face and asks for a
     // repaint; fonts must be in the context before any text is laid out, or the
     // window renders in egui's default face.
@@ -479,9 +600,10 @@ pub fn render_png(
             }
             sharppyrs::store_layout(ui.ctx(), layout_id, &layout);
             let header_font = header_style.regular_font(HEADER_FONT_PT);
+            let header_note = if note_has_a_panel { "" } else { note.as_str() };
             let upper_right = {
                 let painter = ui.painter();
-                fit_header(&note, &credit, header_width, |candidate| {
+                fit_header(header_note, &credit, header_width, |candidate| {
                     painter
                         .layout_no_wrap(
                             candidate.to_string(),
@@ -513,6 +635,7 @@ pub fn render_png(
                             .interactive(false)
                             .title(&title)
                             .brand(&upper_right)
+                            .notes(note.as_str())
                             .style(header_style.clone()),
                     );
                 });
@@ -670,11 +793,19 @@ mod tests {
     }
 
     /// The default layout is a token string, so a typo would silently fall back
-    /// to the upstream default and quietly undo all three changes.
+    /// to the upstream default and quietly undo every change.
     #[test]
     fn our_default_layout_parses_and_makes_the_intended_swaps() {
         let layout = sharppyrs::SoundingLayout::from_tokens(DEFAULT_LAYOUT_TOKENS)
             .expect("default layout tokens must parse");
+        // A typo cannot end up drawn: `layout_or_default` swallows an unparseable
+        // string, so what it resolves to has to BE this layout and not upstream's.
+        assert_eq!(layout_or_default(None), layout, "the fallback chain must land here");
+        assert_ne!(
+            layout,
+            sharppyrs::SoundingLayout::default(),
+            "a fall back to the upstream default would undo all of this silently"
+        );
         for marginal in [sharppyrs::PanelKind::Ship, sharppyrs::PanelKind::Stp] {
             assert!(
                 !layout.bottom.contains(&marginal) && !layout.insets.contains(&marginal),
@@ -688,11 +819,25 @@ mod tests {
             sharppyrs::PanelKind::Streamwiseness,
             "streamwiseness is the panel that survives being small"
         );
+        // The map shares the main cell now, and shares it with the hodograph in
+        // that order — swapping them would put the hodograph in the narrow half.
+        assert_eq!(
+            [layout.main, layout.main_side],
+            [sharppyrs::PanelKind::Hodograph, sharppyrs::PanelKind::LocationMap]
+        );
+        assert!(
+            !layout.bottom.contains(&sharppyrs::PanelKind::LocationMap)
+                && !layout.insets.contains(&sharppyrs::PanelKind::LocationMap),
+            "one map, beside the hodograph: bottom {:?} insets {:?}",
+            layout.bottom,
+            layout.insets
+        );
         assert_eq!(
             layout.bottom[2],
-            sharppyrs::PanelKind::LocationMap,
-            "the minimap needs the bigger bottom cell to be legible"
+            sharppyrs::PanelKind::Notes,
+            "the note takes the slot the map vacated"
         );
+        assert!(layout_draws_notes(&layout), "otherwise `note=` goes nowhere");
         // Hidden slots must be the TRAILING ones: hiding a middle slot hands its
         // space to the panel sharing its column, whose text then scales past its
         // box and overlaps.
@@ -706,7 +851,68 @@ mod tests {
         assert_eq!(layout.hodo_zoom_kts, 195.0);
         assert_eq!(
             sharppyrs::SoundingLayout::from_tokens(&layout.to_tokens()),
-            Some(layout)
+            Some(layout.clone())
+        );
+
+        // The whole argument for splitting here is that it costs the hodograph
+        // nothing: its plot is a centered square, so the cut has to land where
+        // that square already ended. Asserted against the real cell, so an
+        // upstream retune of the split (or of the board fractions it came from)
+        // fails here instead of quietly letterboxing the plot again.
+        let rects = sharppyrs::panel_rects(default_board(), &layout);
+        let (hodo, map) = (rects.main, rects.main_side);
+        assert!(
+            (hodo.width() - hodo.height()).abs() < 1.0,
+            "the hodograph's share must be square, got {} x {}",
+            hodo.width(),
+            hodo.height()
+        );
+        assert!(
+            map.width() > 150.0,
+            "the map should get the letterbox width, got {}",
+            map.width()
+        );
+        assert_eq!(
+            map.height(),
+            hodo.height(),
+            "a side-by-side split leaves both full height"
+        );
+    }
+
+    /// The note has a panel now, so the header line is the credit's alone — but
+    /// `layout=` can ask for an arrangement with no notes cell, and in that case
+    /// the poster's words have to go back on the line rather than nowhere.
+    #[test]
+    fn a_notes_cell_is_found_wherever_the_layout_puts_it() {
+        assert!(layout_draws_notes(&layout_or_default(None)));
+
+        // Every section is searched, because the panel is legal in all of them:
+        // a strip, either half of the main cell, an inset, a bottom slot.
+        for tokens in [
+            "notes,advection|hodograph|slinky,thetae,srwinds,streamwiseness|convectiveindices,kinematics,hidden,severeindices,hidden,hidden|195",
+            "speed,advection|notes|slinky,thetae,srwinds,streamwiseness|convectiveindices,kinematics,hidden,severeindices,hidden,hidden|195",
+            "speed,advection|hodograph,notes|slinky,thetae,srwinds,streamwiseness|convectiveindices,kinematics,hidden,severeindices,hidden,hidden|195",
+            "speed,advection|hodograph|slinky,thetae,srwinds,notes|convectiveindices,kinematics,hidden,severeindices,hidden,hidden|195",
+            "speed,advection|hodograph|slinky,thetae,srwinds,streamwiseness|convectiveindices,kinematics,hidden,severeindices,notes,hidden|195",
+        ] {
+            let layout = sharppyrs::SoundingLayout::from_tokens(tokens).expect("parses");
+            assert!(layout_draws_notes(&layout), "notes missed in {tokens}");
+        }
+
+        // The pre-change arrangement, which is exactly the fallback case.
+        let no_cell = layout_or_default(Some(
+            "speed,advection|hodograph|slinky,thetae,srwinds,streamwiseness|convectiveindices,kinematics,locationmap,severeindices,hidden,hidden|195",
+        ));
+        assert!(!layout_draws_notes(&no_cell));
+
+        // What the two branches hand the header line. With a cell, the credit
+        // stands alone; without one, it is the old note-then-credit line.
+        let credit = "cafire.org/weather";
+        let note = "NC for tomorrow, mainly looking at the shear profile";
+        assert_eq!(fit_header("", credit, 1_000.0, monospace_width), credit);
+        assert_eq!(
+            fit_header(note, credit, 1_000.0, monospace_width),
+            format!("{note}{HEADER_SEPARATOR}{credit}")
         );
     }
 

@@ -211,26 +211,78 @@ host (holds the 201 GB CONUS climo pack; wide-west is what's deployed).
 · `GET /api/sounding?lat&lon&run&hour[&style=cwt][&layout=<tokens>][&brand=][&note=][&zoom=][&dpi=][&text_scale=][&format=json]`
   Default is the sharppyrs SPC window (BowEcho's), branded `cafire.org/weather`
   unless `brand=` says otherwise; `style=cwt` serves the older house composite.
-  `note=` is the poster's context ("why I am posting this"), drawn on the
-  upper-right line AHEAD of the credit so saying something does not drop it.
+  `note=` is the poster's context ("why I am posting this"), and it is drawn in
+  the **NOTES PANEL**, not on the header line — see the token grammar below for
+  where that panel sits. The panel wraps the note with egui's own text layout and
+  elides what does not fit with a trailing `…`; ~500 characters fit its default
+  cell, and `SOUNDING_HEADER_MAX_CHARS` caps `note=` at 240 before that, so in
+  practice a note is never cut. The header line is left to the credit alone,
+  because repeating the note there would be the same sentence twice. **A `layout=`
+  with no `notes` cell falls back to the old line** (note ahead of the credit) so
+  the note cannot vanish silently.
   **That line is fitted, not capped.** sharppyrs draws it right-aligned and
   unclipped, so anything wider than its band runs leftward across the title
   instead of eliding — `sounding_sharppy::fit_header` reserves the credit's
-  width, then elides the note at a word boundary with `…`. Two consequences
-  worth knowing: the band is a fraction of the window width, so a bigger
-  `zoom=` costs header characters; and `HEADER_FONT_PT`/`HEADER_RIGHT_PAD_PT`
-  mirror literals inside sharppyrs, so bumping its rev means checking them.
+  width, then elides at a word boundary with `…`. Two consequences worth
+  knowing: the band is a fraction of the window width, so a bigger `zoom=` costs
+  header characters; and `HEADER_FONT_PT`/`HEADER_RIGHT_PAD_PT` mirror literals
+  inside sharppyrs, so bumping its rev means checking them.
   **The hodograph draws into a centered SQUARE**, so its axes span equal knots.
-  Its kt-per-pixel is one isotropic scalar taken from the panel width, which in
-  a cell wider than it is tall (ours is 1.4:1) leaves the vertical axis short —
-  it read 120 across and 80 down before. Squaring it letterboxes the cell; the
-  alternative, stretching to fill, would make isotachs elliptical and misstate
-  every shear vector, so it is not on the table. The trailing `layout=` token is
-  the window in knots; **195 is what puts 90 kt as the outermost labeled ring on
-  all four axes**, and only rings whose labels fit whole get labeled at all
-  (rings past that still draw, unlabeled). Both live upstream in
-  `panels::hodo` — bumping the rev means re-checking them, and BowEcho shares
-  the pin, so its hodograph letterboxes too the moment it bumps.
+  Its kt-per-pixel is one isotropic scalar, and taking it from the WIDTH of a cell
+  wider than it is tall left the vertical axis short — it read 120 across and 80
+  down before. Squaring the drawn area letterboxed the cell; the alternative,
+  stretching to fill, would make isotachs elliptical and misstate every shear
+  vector, so it is not on the table. **That letterbox is now the
+  location map**: the default `layout=` splits the big upper-right cell at the
+  fraction that squares the hodograph's share (409.25 x 409.37 pt on the stock
+  board), so the plot lost nothing and the map got the 166 pt that used to be
+  background. The trailing `layout=` token is the window in knots; **195 is what
+  puts 90 kt as the outermost labeled ring on all four axes**, and only rings
+  whose labels fit whole get labeled at all (rings past that still draw,
+  unlabeled). Both live upstream in `panels::hodo` — bumping the rev means
+  re-checking them, and BowEcho shares the pin.
+
+  **`layout=` token grammar** (`sounding_sharppy::DEFAULT_LAYOUT_TOKENS` has the
+  arithmetic; malformed tokens fall back to it rather than erroring). Five
+  `|`-separated sections plus an optional sixth, panel tokens comma-separated
+  inside a section:
+
+  ```text
+  strips(2) | main(1 or 2) | insets(4) | bottom(6) | hodo_zoom_kts [ | g3:<geometry> ]
+  ```
+
+  Our default, which is also the string to copy and edit:
+
+  ```text
+  layout=speed,advection|hodograph,locationmap|slinky,thetae,srwinds,streamwiseness|convectiveindices,kinematics,notes,severeindices,hidden,hidden|195
+  ```
+
+  - Panel tokens: `speed` `advection` `hodograph` `slinky` `thetae` `srwinds`
+    `locationmap` `hazardtype` `convectiveindices` `kinematics` `severeindices`
+    `indexboard` `ship` `streamwiseness` `stp` `notes` `hidden`. Any token is
+    legal in any cell.
+  - **main takes ONE or TWO cells.** One (`hodograph`) gives the whole cell to
+    that panel — every pre-split string still parses and still lays out
+    identically. Two (`hodograph,locationmap`) splits it SIDE BY SIDE, the first
+    panel keeping the left share.
+  - **bottom takes 6:** slots 0 and 1 are full-height columns, slots 2 and 3
+    share the third column vertically (2 on top — that is the notes slot), slots
+    4 and 5 are full-height columns again. Hidden slots must be the TRAILING
+    ones; hiding a middle one hands its space to the panel sharing its column,
+    whose text then scales past its box. A legacy 3-cell bottom section is
+    migrated.
+  - `hodo_zoom_kts` is a plain decimal, clamped to 80..=500.
+  - The optional `g3:` section is six `;`-separated groups:
+    `top_height,skew_width,right_main_height` `;` `right_col(3)` `;`
+    `inset_col(4)` `;` `bottom_col(5)` `;` `bottom_split` `;` `main_split`.
+    `main_split` is the fraction of the main cell's WIDTH the first panel keeps,
+    clamped to 0.20..=0.80, default 0.711. **Lower it for a wider map and a
+    smaller hodograph; raising it above ~0.7112 does not grow the hodograph** —
+    the plot is height-bound past that, so the extra width is letterbox again.
+    Legacy `g1:` (4 groups) and `g2:` (5 groups) still parse and leave the main
+    cell unsplit. Omitting the section entirely — which our default does — keeps
+    every fraction at sharppyrs' own defaults, so upstream board tweaks still
+    reach us.
 · `GET /api/fires` (WFIGS)
 · `GET /api/ecape/...` (frozen static gallery while node 1 is paused).
 
@@ -460,6 +512,16 @@ systemctl restart rusty-wx-api
   `footprint_cities_are_anchored_on_themselves` fails the build if an anchor ever
   resolves to a different place. The world file carries its own footprint column,
   derived from population, so a big city beats its own subdivisions.
+- **A locally-shifted HOUR needs a locally-rolled DAY.** Both sounding headers
+  print the valid time twice, Z and local. The CWT subtitle built its local half
+  by adding the offset to the UTC hour and printing that against the UTC day
+  label, so at UTC-7 an 03Z valid time read `Tue 7/28 03Z (20 local)` when 8 pm
+  is MONDAY — an off-by-one on a forecast valid time, which a forecaster acts on
+  rather than notices. `meteogram::local_valid_label` rolls the date with the hour
+  and hands back both, and `sounding::cwt_valid_clause` is the only place that
+  clause is composed, so the halves cannot disagree. The sharppyrs title had the
+  same bug and the same fix; a third caller should take the helper, not the
+  arithmetic.
 - **Fast card iteration without a deploy or a full store:** hardlink one stored
   hour into a throwaway store so the card has hours to walk, and point a local
   API at it — no copy, no disk cost.

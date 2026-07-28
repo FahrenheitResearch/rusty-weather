@@ -50,12 +50,15 @@ pub struct SoundingRequest {
     /// site without the wrong name on it.
     pub brand: String,
     /// Why the poster thinks this sounding is worth a look — "NC for tomorrow,
-    /// mainly looking at the shear profile". Drawn ahead of [`Self::brand`] on
-    /// the same header line, so a note does not cost the credit.
+    /// mainly looking at the shear profile".
     ///
-    /// The line is fitted to its band by the renderer, which is what keeps a long
-    /// note off the title; a cap here would only decide where the cut lands, and
-    /// it landed mid-word.
+    /// Drawn in the sharppyrs NOTES PANEL, which the default layout gives the
+    /// bottom band's third column: a paragraph of room instead of the clause the
+    /// header line held, and it leaves that line to [`Self::brand`] alone. A
+    /// `layout_tokens` arrangement with no notes cell falls back to the old
+    /// header line, fitted — see `sounding_sharppy::render_png`. Not capped
+    /// here: the panel wraps and elides, and a cap would only decide where the
+    /// cut lands.
     pub note: String,
     /// Draw the vendored SHARPpy compositor's own panel arrangement — the SPC
     /// window BowEcho draws — rather than the older CWT composite (house header,
@@ -193,6 +196,29 @@ fn finite_json(value: f64, scale: f64) -> serde_json::Value {
     }
 }
 
+/// The valid-time clause of the CWT header's subtitle: the Z time on the UTC day,
+/// then the same instant on the local clock and the LOCAL day — e.g.
+/// `"Tue 7/28 03Z (8pm Mon 7/27)"`.
+///
+/// A function, taking the run rather than the pieces, because the bug it replaces
+/// was a mismatched pair: a locally-shifted HOUR printed against the UTC DAY
+/// label, so at UTC-7 that same 03Z valid time read `"Tue 7/28 03Z (20 local)"` —
+/// 8 pm, on the wrong day, on a forecast valid time. There is no way to hand this
+/// two halves that disagree.
+///
+/// The word "local" is dropped to pay for the day: a 12-hour clock beside an
+/// explicit Z hour can only be the local one, and the header band is nearly full.
+fn cwt_valid_clause(
+    date_yyyymmdd: &str,
+    cycle_utc: u8,
+    forecast_hour: u16,
+    utc_offset_hours: f64,
+) -> String {
+    let (hod, utc_day) = valid_label(date_yyyymmdd, cycle_utc, forecast_hour);
+    let (clock, local_day) =
+        local_valid_label(date_yyyymmdd, cycle_utc, forecast_hour, utc_offset_hours);
+    format!("{utc_day} {hod:02}Z ({clock} {local_day})")
+}
 
 pub fn render_sounding(
     store_root: &Path,
@@ -324,7 +350,6 @@ pub fn render_sounding(
         None => format!("{:.2}, {:.2}", request.lat, request.lon),
     };
     let (hod, day_label) = valid_label(date_yyyymmdd, cycle_utc, hour);
-    let local = (f64::from(hod) + request.utc_offset_hours).rem_euclid(24.0) as u32;
     let elevation_ft = (orog_m * M_TO_FT).round() as i64;
 
     let column = SoundingColumn {
@@ -352,12 +377,13 @@ pub fn render_sounding(
     let header = CwtHeader {
         title: format!("SOUNDING — {place}"),
         subtitle: format!(
-            "{model} {date} {cycle:02}Z | F{hour:03} | valid {day_label} {hod:02}Z ({local:02} local) | \
+            "{model} {date} {cycle:02}Z | F{hour:03} | valid {valid} | \
              point {lat:.3}, {lon:.3} | cell {cell_lat:.3}, {cell_lon:.3} | {elevation_ft} ft | \
              ECAPE = entrainment-adjusted (experimental)",
             model = model_slug.to_uppercase(),
             date = date_yyyymmdd,
             cycle = cycle_utc,
+            valid = cwt_valid_clause(date_yyyymmdd, cycle_utc, hour, request.utc_offset_hours),
             lat = request.lat,
             lon = request.lon,
         ),
@@ -837,6 +863,72 @@ mod tests {
         }
     }
 
+    /// The reported bug: the local half of the CWT valid time was a shifted HOUR
+    /// printed against the UTC DAY, so any shift that crossed midnight named a day
+    /// the forecast is not valid on. Both halves come out of one shift now.
+    #[test]
+    fn the_cwt_valid_clause_puts_the_local_clock_on_the_local_day() {
+        // The case from the report: 21Z Monday + F006 is 03Z TUESDAY in UTC, and
+        // 8 pm MONDAY at UTC-7. The old line read "Tue 7/28 03Z (20 local)".
+        assert_eq!(
+            cwt_valid_clause("20260727", 21, 6, -7.0),
+            "Tue 7/28 03Z (8pm Mon 7/27)"
+        );
+        // Forwards over midnight too, minutes and all, for the half-hour zones.
+        assert_eq!(
+            cwt_valid_clause("20260702", 23, 0, 5.5),
+            "Thu 7/2 23Z (4:30am Fri 7/3)"
+        );
+        // No roll: the day is repeated rather than omitted, so the clause reads
+        // the same shape whichever it is.
+        assert_eq!(
+            cwt_valid_clause("20260702", 6, 6, -7.0),
+            "Thu 7/2 12Z (5am Thu 7/2)"
+        );
+        assert_eq!(
+            cwt_valid_clause("20260702", 6, 6, 0.0),
+            "Thu 7/2 12Z (12pm Thu 7/2)"
+        );
+    }
+
+    /// The CWT header is a fixed 2400 px wide and `draw_text_line` does not elide,
+    /// so naming the local day costs room on a line that was already long. Checked
+    /// on the render: the subtitle's ink has to stop inside the same 24 px the
+    /// brand keeps clear at the other end. The test's model slug is `SYNTHETIC`,
+    /// five characters longer than the `HRRR` production draws, so this is the
+    /// pessimistic case.
+    #[test]
+    fn the_cwt_subtitle_fits_its_header_band() {
+        let root = test_store("cwt-subtitle", true);
+        let out = render_sounding(&root, "synthetic", "20260702_00z", "20260702", 0, &request())
+            .expect("the cwt card renders");
+        let image = image::load_from_memory(&out.png).expect("decodes").to_rgba8();
+        // The header's own background (#14100c), and the rows that carry only the
+        // subtitle: the title (y 10 at scale 4) and the brand (y 18 at scale 2)
+        // are both clear of 56 px, and the house accent bar of x 12.
+        const HEADER_BG: [u8; 4] = [20, 16, 12, 255];
+        let (mut leftmost, mut rightmost) = (u32::MAX, 0u32);
+        for y in 56..93 {
+            for x in 12..image.width() {
+                if image.get_pixel(x, y).0 != HEADER_BG {
+                    leftmost = leftmost.min(x);
+                    rightmost = rightmost.max(x);
+                }
+            }
+        }
+        assert!(leftmost < 60, "the subtitle should start at the left inset, got {leftmost}");
+        assert!(
+            rightmost > 1_000,
+            "only {rightmost} px of subtitle — the band scan is looking at the wrong rows"
+        );
+        assert!(
+            rightmost < image.width() - 24,
+            "subtitle ink reaches {rightmost} of {} — it is running out of its band",
+            image.width()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn renders_a_sounding_with_sane_indices() {
         let root = test_store("happy", true);
@@ -932,21 +1024,38 @@ mod tests {
             .expect("renders");
         let image = image::load_from_memory(&out.png).expect("decodes").to_rgba8();
 
+        // Take the rect from sharppyrs' own geometry rather than re-deriving it.
+        // The arithmetic that used to be here assumed the board sat flush at the
+        // image origin at full window size; the harness insets it 8 pt on every
+        // side, so the rect was ~8 pt out. That was harmless while the area beside
+        // the gear was bare background, and stopped being harmless the moment the
+        // notes cell arrived next to it: the strayed rect clipped that cell's grey
+        // FRAME and the test failed reporting a gear that was never drawn.
         let layout = crate::sounding_sharppy::layout_or_default(None);
-        let zoom = f64::from(crate::sounding_sharppy::DEFAULT_ZOOM);
-        let scale = f64::from(crate::sounding_sharppy::DEFAULT_PIXELS_PER_POINT) * zoom;
-        let width_pt = 1630.0 / zoom;
-        let band_top_pt = (1100.0 / zoom) * f64::from(layout.top_height_fraction);
-        let (x0, x1) = (
-            ((width_pt - 24.0) * scale) as u32,
-            ((width_pt - 2.0) * scale) as u32,
+        let board = crate::sounding_sharppy::board_rect_pt(
+            crate::sounding_sharppy::DEFAULT_ZOOM,
         );
+        let rects = sharppyrs::panel_rects(board, &layout);
+        let scale = f64::from(crate::sounding_sharppy::DEFAULT_PIXELS_PER_POINT)
+            * f64::from(crate::sounding_sharppy::DEFAULT_ZOOM);
+        // The gear is a small button tucked into the top-right corner of the
+        // bottom band; keep the probe inside that corner so it cannot reach a
+        // neighbouring panel's chrome.
+        let band_top = f64::from(rects.bottom[0].min.y);
+        let right = f64::from(board.max.x);
+        let (x0, x1) = (((right - 22.0) * scale) as u32, ((right - 2.0) * scale) as u32);
         let (y0, y1) = (
-            ((band_top_pt - 22.0) * scale) as u32,
-            ((band_top_pt - 2.0) * scale) as u32,
+            ((band_top + 2.0) * scale) as u32,
+            ((band_top + 20.0) * scale) as u32,
         );
-        let mut grey = 0usize;
+        // Count grey ROWS, not grey pixels. The notes cell owns this corner now and
+        // draws its frame and a rule under its title in the same neutral grey a
+        // button uses, so "any grey here" reports a gear that was never drawn. What
+        // separates them is shape: the gear is a FILLED rounded rect about 18 px
+        // square, so it greys ~18 consecutive rows, where a 1-2 px rule greys two.
+        let mut wide_grey_rows = 0usize;
         for y in y0..y1.min(image.height()) {
+            let mut grey = 0usize;
             for x in x0..x1.min(image.width()) {
                 let [r, g, b, _] = image.get_pixel(x, y).0;
                 let (r, g, b) = (i32::from(r), i32::from(g), i32::from(b));
@@ -955,22 +1064,27 @@ mod tests {
                     grey += 1;
                 }
             }
+            if grey >= 10 {
+                wide_grey_rows += 1;
+            }
         }
-        assert_eq!(
-            grey, 0,
-            "{grey} button-grey pixels in the gear's rect ({x0}..{x1}, {y0}..{y1}) — \
-             the layout editor is being rendered into the image"
+        assert!(
+            wide_grey_rows < 6,
+            "{wide_grey_rows} rows of button-grey fill in the gear's rect \
+             ({x0}..{x1}, {y0}..{y1}) — the layout editor is being rendered into \
+             the image (a panel frame or rule greys at most two rows)"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A note long enough to need eliding must still render, and must not change
-    /// the image's size — the fitting happens in the header band, not by growing
-    /// the window. The look of the cut is a judgement call verified by eye; what
-    /// this pins is that the path runs at all, since a panic in the text fitting
-    /// would only ever show up here.
+    /// The note moved from the header line to a panel, and both halves of that are
+    /// pinned here in pixels: rendering the same sounding with and without a note
+    /// must leave the header band IDENTICAL — nothing of the note lands there any
+    /// more, so the credit keeps the line to itself — and must NOT leave the notes
+    /// cell identical. A note long enough to need eliding is the interesting one,
+    /// because a panic in the wrapping would only ever show up in a render.
     #[test]
-    fn a_note_too_long_for_the_band_still_renders() {
+    fn a_long_note_is_drawn_in_its_panel_and_off_the_header_line() {
         let root = test_store("long-note", true);
         let mut req = request();
         req.sharppy_layout = true;
@@ -982,11 +1096,46 @@ mod tests {
             .to_string();
         let noted = render_sounding(&root, "synthetic", "20260702_00z", "20260702", 0, &req)
             .expect("renders with a long note");
-        let size = |png: &[u8]| {
-            let image = image::load_from_memory(png).expect("decodes");
-            (image.width(), image.height())
+
+        let decode = |png: &[u8]| image::load_from_memory(png).expect("decodes").to_rgba8();
+        let (plain_png, noted_png) = (decode(&plain.png), decode(&noted.png));
+        assert_eq!(
+            noted_png.dimensions(),
+            plain_png.dimensions(),
+            "a note must not resize the window"
+        );
+
+        // Cell coordinates come from sharppyrs' own layout pass, so this cannot
+        // drift from what was drawn; points become pixels through the pixel ratio
+        // times the zoom.
+        let layout = crate::sounding_sharppy::layout_or_default(None);
+        let rects = sharppyrs::panel_rects(crate::sounding_sharppy::default_board(), &layout);
+        let scale = crate::sounding_sharppy::DEFAULT_PIXELS_PER_POINT
+            * crate::sounding_sharppy::DEFAULT_ZOOM;
+        let differing = |cell: egui::Rect| {
+            let px = |value: f32| (value * scale).round() as u32;
+            let (x0, x1) = (px(cell.min.x), px(cell.max.x).min(plain_png.width()));
+            let (y0, y1) = (px(cell.min.y), px(cell.max.y).min(plain_png.height()));
+            let mut count = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    if plain_png.get_pixel(x, y) != noted_png.get_pixel(x, y) {
+                        count += 1;
+                    }
+                }
+            }
+            count
         };
-        assert_eq!(size(&noted.png), size(&plain.png), "a note must not resize the window");
+        assert_eq!(
+            differing(rects.header_band),
+            0,
+            "the note is still being drawn on the header line"
+        );
+        assert!(
+            differing(rects.bottom[2]) > 1_000,
+            "the notes cell gained only {} pixels — the panel is not getting the note",
+            differing(rects.bottom[2])
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
