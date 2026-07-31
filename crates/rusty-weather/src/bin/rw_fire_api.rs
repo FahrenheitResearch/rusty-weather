@@ -1046,6 +1046,10 @@ fn update_job(state: &AppState, id: &str, f: impl FnOnce(&mut Job)) {
 // carry the state). No state filter — a big Colorado fire matters too.
 const WFIGS_URL: &str = "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query?where=poly_GISAcres%3E300&outFields=poly_IncidentName,poly_GISAcres,attr_POOState,poly_DateCurrent&orderByFields=poly_GISAcres+DESC&resultRecordCount=60&geometryPrecision=4&outSR=4326&f=geojson";
 const FIRES_CACHE_SECS: u64 = 600;
+/// How long a cached feed may be served after the upstream starts failing. Past
+/// this the endpoint reports the outage instead, because perimeters this old
+/// should not be drawn as if they were current.
+const FIRES_MAX_STALE_SECS: u64 = 6 * 3600;
 const FIRE_RING_MAX_POINTS: usize = 240;
 
 fn fires_agent() -> ureq::Agent {
@@ -1102,17 +1106,46 @@ fn fetch_fires() -> Result<Vec<u8>, String> {
         .get(WFIGS_URL)
         .call()
         .map_err(|err| format!("WFIGS fetch: {err}"))?;
+    let status = response.status();
     let text = response
         .body_mut()
         .read_to_string()
         .map_err(|err| format!("WFIGS body: {err}"))?;
+    fires_payload(&text, status.is_success(), &status.to_string())
+}
+
+/// Turn a WFIGS response body into our payload, or say why it is not one.
+///
+/// Split out from the fetch so the failure shapes are testable without a network:
+/// they are the whole point of this function. ArcGIS reports a refused query — a
+/// quota trip, a bad `where`, a service outage — as a body carrying an `error`
+/// object and NO `features` key. That is perfectly well-formed JSON, so reading
+/// straight through to `features` turned "the feed refused us" into "nothing is
+/// burning": an empty fire picker, HTTP 200, no error logged anywhere, on a safety
+/// product. Status alone is not enough either, because these bodies do not always
+/// arrive with a failing status.
+fn fires_payload(text: &str, status_ok: bool, status_label: &str) -> Result<Vec<u8>, String> {
     let geojson: serde_json::Value =
-        serde_json::from_str(&text).map_err(|err| format!("WFIGS parse: {err}"))?;
-    let fires: Vec<serde_json::Value> = geojson
-        .get("features")
-        .and_then(|value| value.as_array())
-        .into_iter()
-        .flatten()
+        serde_json::from_str(text).map_err(|err| format!("WFIGS parse: {err}"))?;
+    if let Some(error) = geojson.get("error") {
+        let detail = error
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unspecified");
+        return Err(format!("WFIGS refused the query ({status_label}): {detail}"));
+    }
+    if !status_ok {
+        return Err(format!("WFIGS returned {status_label}"));
+    }
+    // An absent `features` is a malformed response, NOT zero fires. Only a present
+    // and empty array means the feed genuinely has nothing over the acreage floor.
+    let Some(features) = geojson.get("features").and_then(|value| value.as_array()) else {
+        return Err(format!(
+            "WFIGS response carried no `features` array ({status_label})"
+        ));
+    };
+    let fires: Vec<serde_json::Value> = features
+        .iter()
         .filter_map(|feature| {
             let props = feature.get("properties")?;
             let ring = largest_ring(feature.get("geometry")?)?;
@@ -1127,6 +1160,18 @@ fn fetch_fires() -> Result<Vec<u8>, String> {
         .collect();
     serde_json::to_vec(&serde_json::json!({ "source": "WFIGS current perimeters", "fires": fires }))
         .map_err(|err| err.to_string())
+}
+
+/// Tag a cached body as stale so a consumer can label it rather than trust it.
+fn annotate_stale(body: &[u8], age_secs: u64, reason: &str) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.to_vec();
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert("stale_secs".to_string(), age_secs.into());
+        object.insert("stale_reason".to_string(), reason.into());
+    }
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
 }
 
 fn fires_response(state: &AppState) -> Vec<u8> {
@@ -1145,10 +1190,21 @@ fn fires_response(state: &AppState) -> Vec<u8> {
             response(200, "application/json; charset=utf-8", body)
         }
         Err(message) => {
-            // Serve stale data over an error when the upstream hiccups.
+            // Serve stale over an error when the upstream hiccups, but SAY it is
+            // stale, and stop serving it eventually. Perimeters are a safety
+            // product: presenting hours-old rings as current is worse than saying
+            // the feed is down, and an unbounded stale window is how a feed that
+            // died stays invisible.
             let cache = state.fires_cache.lock().expect("fires cache mutex");
-            if let Some((_, body)) = cache.as_ref() {
-                return response(200, "application/json; charset=utf-8", body.clone());
+            if let Some((fetched, body)) = cache.as_ref() {
+                let age = fetched.elapsed().as_secs();
+                if age <= FIRES_MAX_STALE_SECS {
+                    return response(
+                        200,
+                        "application/json; charset=utf-8",
+                        annotate_stale(body, age, &message),
+                    );
+                }
             }
             json_status_response(502, &serde_json::json!({ "error": message }))
         }
@@ -3137,6 +3193,53 @@ draw();
 </body>
 </html>
 "#;
+
+#[cfg(test)]
+mod fires_feed_tests {
+    use super::*;
+
+    /// Verbatim from the live feed on 2026-07-30, which is what took the fire
+    /// picker to zero. It is well-formed JSON with no `features`, so the old code
+    /// read it as an empty feature list and reported "no active fires" at HTTP 200.
+    const QUOTA_BODY: &str = r#"{"error":{"code":429,"message":"Unable to perform query. Too many requests.","details":["API calls quota exceeded (68427 request units)! maximum allowed request units (57600) per Minute. Retry after 60 sec."]}}"#;
+
+    #[test]
+    fn a_refused_query_is_an_error_not_an_empty_fire_list() {
+        let failed = fires_payload(QUOTA_BODY, false, "429 Too Many Requests")
+            .expect_err("a quota trip must not read as zero fires");
+        assert!(failed.contains("Too many requests"), "{failed}");
+
+        // The same body has been observed with a 200, so the shape alone must fail.
+        assert!(fires_payload(QUOTA_BODY, true, "200 OK").is_err());
+    }
+
+    #[test]
+    fn a_body_without_features_is_an_error() {
+        let failed = fires_payload(r#"{"type":"FeatureCollection"}"#, true, "200 OK")
+            .expect_err("a missing features array is malformed, not empty");
+        assert!(failed.contains("features"), "{failed}");
+    }
+
+    /// The distinction that matters: an explicitly EMPTY array is a real answer —
+    /// nothing over the acreage floor is burning — and must still serve.
+    #[test]
+    fn an_explicitly_empty_feature_array_is_a_valid_answer() {
+        let body = fires_payload(r#"{"features":[]}"#, true, "200 OK").expect("valid");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(value["fires"].as_array().expect("fires").len(), 0);
+    }
+
+    #[test]
+    fn stale_cached_fires_are_labelled_so_they_cannot_pass_as_current() {
+        let cached = br#"{"source":"WFIGS current perimeters","fires":[]}"#;
+        let tagged = annotate_stale(cached, 900, "WFIGS refused the query");
+        let value: serde_json::Value = serde_json::from_slice(&tagged).expect("json");
+
+        assert_eq!(value["stale_secs"], 900);
+        assert!(value["stale_reason"].as_str().expect("reason").contains("refused"));
+        assert!(value["fires"].is_array(), "the payload itself still serves");
+    }
+}
 
 #[cfg(test)]
 mod tests {
