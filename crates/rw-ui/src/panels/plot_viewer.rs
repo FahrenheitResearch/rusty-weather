@@ -170,7 +170,7 @@ impl NativePlotMapDetail {
             Self::Global => "Global",
             Self::Broad => "Broad",
             Self::Regional => "Regional",
-            Self::Counties => "Counties",
+            Self::Counties => "Counties (US)",
         }
     }
 
@@ -706,7 +706,7 @@ impl PlotViewerPanel {
                     let previous_detail = self.draft_settings.map_detail;
                     ComboBox::from_id_salt("rw-ui-native-plot-map-detail")
                         .selected_text(self.draft_settings.map_detail.label())
-                        .width(104.0)
+                        .width(128.0)
                         .show_ui(ui, |ui| {
                             for detail in NativePlotMapDetail::ALL {
                                 ui.selectable_value(
@@ -730,8 +730,14 @@ impl PlotViewerPanel {
 
                     ui.checkbox(&mut self.draft_settings.show_coastlines, "Coasts");
                     ui.checkbox(&mut self.draft_settings.show_countries, "Countries");
-                    ui.checkbox(&mut self.draft_settings.show_states, "States");
-                    ui.checkbox(&mut self.draft_settings.show_counties, "Counties");
+                    ui.checkbox(
+                        &mut self.draft_settings.show_states,
+                        "States / provinces",
+                    );
+                    ui.checkbox(&mut self.draft_settings.show_counties, "Counties (US)")
+                        .on_hover_text(
+                            "County boundaries are available over the United States; use States / provinces for worldwide first-order subdivisions",
+                        );
                     ui.checkbox(&mut self.draft_settings.show_lakes, "Lakes");
                 });
 
