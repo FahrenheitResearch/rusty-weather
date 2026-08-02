@@ -316,14 +316,46 @@ pub fn fill_polygon(
         return;
     }
 
+    // A NaN has no direction, so there is no honest coordinate to stand in for it;
+    // skip the whole polygon rather than fill from a guess. Parity stays consistent
+    // because nothing is drawn at all.
+    if rings
+        .iter()
+        .flatten()
+        .any(|&(x, y)| x.is_nan() || y.is_nan())
+    {
+        return;
+    }
+
+    // Infinities are CLAMPED, never dropped. Even-odd filling needs its crossings
+    // in pairs, so omitting an edge because an endpoint is non-finite inverts the
+    // parity for every scanline that edge spanned — the fill runs on to the next
+    // real edge instead of closing, and paints horizontal slabs of this polygon's
+    // colour across ground it never covered. Mercator reaches this with no bad
+    // input anywhere: y = R*k0*ln(tan(pi/4 + phi/2)) is -inf at the south pole and
+    // the Natural Earth ocean ring goes to the pole, so coastal domains grew
+    // translucent blue bands while inland ones looked perfect.
+    //
+    // A pole really is outside the frame, so a coordinate far beyond the image
+    // keeps both the parity and the geometry's intent; the scanline clips anyway.
+    const FAR_OUTSIDE_IMAGE: f64 = 1.0e7;
+    let finite = |value: f64| {
+        if value.is_finite() {
+            value.clamp(-FAR_OUTSIDE_IMAGE, FAR_OUTSIDE_IMAGE)
+        } else if value < 0.0 {
+            -FAR_OUTSIDE_IMAGE
+        } else {
+            FAR_OUTSIDE_IMAGE
+        }
+    };
+
     let mut y_min = f64::INFINITY;
     let mut y_max = f64::NEG_INFINITY;
     for ring in rings {
         for &(_, y) in ring {
-            if y.is_finite() {
-                y_min = y_min.min(y);
-                y_max = y_max.max(y);
-            }
+            let y = finite(y);
+            y_min = y_min.min(y);
+            y_max = y_max.max(y);
         }
     }
     if !y_min.is_finite() || !y_max.is_finite() || y_max < cy0 as f64 {
@@ -353,9 +385,8 @@ pub fn fill_polygon(
         for i in 0..n {
             let (ax, ay) = ring[i];
             let (bx, by) = ring[(i + 1) % n];
-            if !ax.is_finite() || !ay.is_finite() || !bx.is_finite() || !by.is_finite() {
-                continue;
-            }
+            let (ax, ay) = (finite(ax), finite(ay));
+            let (bx, by) = (finite(bx), finite(by));
             if (ay - by).abs() < 1e-9 {
                 continue; // horizontal edges contribute nothing to even-odd
             }
@@ -516,6 +547,73 @@ pub fn draw_wind_barb(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Even-odd filling needs its crossings in PAIRS, so silently dropping an
+    /// edge inverts the parity for every scanline that edge spanned: the fill then
+    /// runs from a real edge across to the next one instead of closing, painting
+    /// horizontal slabs of the polygon's own colour across ground it never covered.
+    ///
+    /// Mercator reaches this with no bad input data anywhere. `y = R*k0*ln(tan(pi/4
+    /// + phi/2))` is -inf at the south pole and the Natural Earth ocean ring goes
+    /// to the pole, so a coastal domain grew translucent blue bands right across
+    /// the map while an inland one looked perfect.
+    ///
+    /// So the invariant is that an infinity behaves like "very far away", which is
+    /// what it means geometrically — the pole IS off the frame — and not like
+    /// "delete this edge". Comparing the two renders pins that directly, and is
+    /// stronger than asserting some region stays empty: clamping legitimately
+    /// changes what a spike to the pole covers, whereas dropping edges produces a
+    /// shape that is not any interpretation of the input.
+    #[test]
+    fn an_infinite_vertex_fills_the_same_as_a_very_distant_one() {
+        let render = |inner_y: f64| {
+            let ring = vec![
+                (5.0, 5.0),
+                (15.0, 5.0),
+                (15.0, inner_y),
+                (45.0, 30.0),
+                (45.0, 5.0),
+                (55.0, 5.0),
+                (55.0, 35.0),
+                (5.0, 35.0),
+            ];
+            let mut img = RgbaImage::from_pixel(60, 40, image::Rgba([0, 0, 0, 255]));
+            fill_polygon(
+                &mut img,
+                &[ring],
+                Rgba { r: 255, g: 0, b: 0, a: 255 },
+                None,
+            );
+            img
+        };
+
+        let distant = render(-1.0e7);
+        let infinite = render(f64::NEG_INFINITY);
+        let differing = (0..60)
+            .flat_map(|x| (0..40).map(move |y| (x, y)))
+            .filter(|&(x, y)| distant.get_pixel(x, y) != infinite.get_pixel(x, y))
+            .count();
+
+        assert_eq!(
+            differing, 0,
+            "{differing} pixels differ between an infinite vertex and a distant one"
+        );
+    }
+
+    /// A NaN has no direction, so there is no honest place to put it; the polygon
+    /// is skipped rather than filled from a guessed coordinate.
+    #[test]
+    fn a_nan_vertex_skips_the_polygon_rather_than_guessing() {
+        let mut img = RgbaImage::from_pixel(30, 30, image::Rgba([0, 0, 0, 255]));
+        let ring = vec![(5.0, 5.0), (25.0, 5.0), (25.0, f64::NAN), (5.0, 25.0)];
+        fill_polygon(&mut img, &[ring], Rgba { r: 255, g: 0, b: 0, a: 255 }, None);
+
+        let painted = (0..30)
+            .flat_map(|x| (0..30).map(move |y| (x, y)))
+            .filter(|&(x, y)| img.get_pixel(x, y).0[0] > 128)
+            .count();
+        assert_eq!(painted, 0, "{painted} pixels drawn from a ring holding a NaN");
+    }
 
     #[test]
     fn anti_aliased_line_blends_neighbor_pixels() {
