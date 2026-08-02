@@ -801,7 +801,11 @@ fn build_projected_basemap(
                         .map(|bounds| ring.iter().any(|&(lon, lat)| bounds.contains(lat, lon)))
                         .unwrap_or(true)
                 })
-                .map(|ring| project_densified_ring(projector, &ring, polygon_densify_step_deg))
+                .filter_map(|ring| {
+                    let projected =
+                        project_densified_ring(projector, &ring, polygon_densify_step_deg);
+                    (!ring_torn_by_longitude_wrap(&ring, &projected)).then_some(projected)
+                })
                 .filter(|ring| ring_overlaps_bbox(ring, polygon_bbox))
                 .collect();
             if !rings.is_empty() {
@@ -815,6 +819,72 @@ fn build_projected_basemap(
     }
 
     Ok(ProjectedBasemap { lines, polygons })
+}
+
+/// Did per-vertex longitude normalization tear this ring in half?
+///
+/// `ProjectionSpec::project` normalizes `lon - central_meridian` into +/-180 ONE
+/// VERTEX AT A TIME, so a compact feature sitting on the wrap meridian comes back
+/// with its vertices thrown to opposite ends of the projected width. Its bbox then
+/// spans the whole map, so `ring_overlaps_bbox` keeps it, and even-odd filling
+/// paints it as a band at that feature's latitude.
+///
+/// That is not hypothetical: the Aral Sea's eastern basin sits at 60.0-61.5E and
+/// 46.1-46.8N. A domain centred near -119 puts the wrap at ~61E, straddling it, so
+/// it drew a pale blue LAKE-coloured stripe clean across Washington at 46N on every
+/// product. California domains never showed it because they stop at 42N, north of
+/// which the stripe lands.
+///
+/// A ring this happens to cannot be in view: it is geographically compact and
+/// centred half a world from the frame, so dropping it is exact rather than
+/// approximate. The compactness test is what protects genuinely world-spanning
+/// rings — the ocean legitimately reaches both edges and must keep doing so.
+fn ring_torn_by_longitude_wrap(geographic: &[(f64, f64)], projected: &[(f64, f64)]) -> bool {
+    if geographic.len() < 3 || geographic.len() != projected.len() {
+        return false;
+    }
+    let (mut west, mut east) = (f64::MAX, f64::MIN);
+    for &(lon, _) in geographic {
+        west = west.min(lon);
+        east = east.max(lon);
+    }
+    // Only compact features can be torn by mistake. 90 degrees is far wider than
+    // any lake and far narrower than the ocean ring.
+    if !(east - west).is_finite() || east - west > 90.0 {
+        return false;
+    }
+
+    // Projected x is linear in longitude for the cylindrical projections that
+    // normalize this way, so the per-degree scale recovered from the ring itself
+    // gives the width of a full turn. Use the MEDIAN so the torn pair — one pair
+    // out of hundreds — cannot skew it.
+    let mut ratios: Vec<f64> = projected
+        .windows(2)
+        .zip(geographic.windows(2))
+        .filter_map(|(xy, ll)| {
+            let d_lon = (ll[1].0 - ll[0].0).abs();
+            let d_x = (xy[1].0 - xy[0].0).abs();
+            (d_lon > 1.0e-9 && d_x.is_finite()).then(|| d_x / d_lon)
+        })
+        .collect();
+    if ratios.is_empty() {
+        return false;
+    }
+    ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let scale = ratios[ratios.len() / 2];
+    if !(scale > 0.0) {
+        return false;
+    }
+
+    let (mut min_x, mut max_x) = (f64::MAX, f64::MIN);
+    for &(x, _) in projected {
+        if x.is_finite() {
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+        }
+    }
+    // A compact ring cannot honestly cover half a turn.
+    max_x - min_x > 0.5 * 360.0 * scale
 }
 
 fn basemap_line_geographic_clip(_frame_source: ProjectedFrameSource) -> Option<GeographicBounds> {
@@ -1677,5 +1747,84 @@ mod tests {
         assert_eq!(domain.x, vec![0.0, 1.0]);
         assert_eq!(basemap.lines.len(), 1);
         assert_eq!(basemap.polygons.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod wrap_tear_tests {
+    use super::*;
+
+    /// Simulate what `ProjectionSpec::project` does: normalize each vertex's
+    /// longitude offset into +/-180 independently, then scale it linearly.
+    fn projected_about(central_meridian: f64, ring: &[(f64, f64)]) -> Vec<(f64, f64)> {
+        const SCALE: f64 = 1.0e5;
+        ring.iter()
+            .map(|&(lon, lat)| {
+                let mut d = lon - central_meridian;
+                while d > 180.0 {
+                    d -= 360.0;
+                }
+                while d < -180.0 {
+                    d += 360.0;
+                }
+                (d * SCALE, lat * SCALE)
+            })
+            .collect()
+    }
+
+    fn ring_between(west: f64, east: f64, south: f64, north: f64) -> Vec<(f64, f64)> {
+        let mut ring = Vec::new();
+        let steps = 40;
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            ring.push((west + (east - west) * t, south));
+        }
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            ring.push((east + (west - east) * t, north));
+        }
+        ring
+    }
+
+    /// The Aral Sea's eastern basin against a domain centred near -119, which puts
+    /// the wrap meridian at ~61E right through it. This is the ring that drew a
+    /// pale blue stripe across Washington at 46N.
+    #[test]
+    fn a_lake_straddling_the_wrap_meridian_is_recognised_as_torn() {
+        let aral = ring_between(59.98, 61.53, 46.086, 46.784);
+        let projected = projected_about(-118.9, &aral);
+
+        assert!(
+            ring_torn_by_longitude_wrap(&aral, &projected),
+            "the wrap tore this ring across the whole projected width"
+        );
+    }
+
+    /// The same lake with the wrap somewhere else must be left alone: it is only
+    /// ever a problem for the domains whose centre happens to split it.
+    #[test]
+    fn the_same_lake_is_untouched_when_the_wrap_falls_elsewhere() {
+        let aral = ring_between(59.98, 61.53, 46.086, 46.784);
+        let projected = projected_about(0.0, &aral);
+
+        assert!(!ring_torn_by_longitude_wrap(&aral, &projected));
+    }
+
+    /// The ocean ring genuinely reaches both edges and MUST keep doing so — this is
+    /// the case the compactness test exists to protect.
+    #[test]
+    fn a_world_spanning_ring_is_not_mistaken_for_a_tear() {
+        let ocean = ring_between(-180.0, 180.0, -85.0, 85.0);
+        let projected = projected_about(-118.9, &ocean);
+
+        assert!(!ring_torn_by_longitude_wrap(&ocean, &projected));
+    }
+
+    #[test]
+    fn a_lake_inside_the_view_is_not_flagged() {
+        let coeur_dalene = ring_between(-117.0, -116.5, 47.4, 47.9);
+        let projected = projected_about(-118.9, &coeur_dalene);
+
+        assert!(!ring_torn_by_longitude_wrap(&coeur_dalene, &projected));
     }
 }
