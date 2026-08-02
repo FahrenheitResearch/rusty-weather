@@ -567,23 +567,11 @@ fn build_broad_polygons(style: BasemapStyle) -> Vec<StyledLonLatPolygonLayer> {
 }
 
 fn build_global_polygons(style: BasemapStyle) -> Vec<StyledLonLatPolygonLayer> {
-    let (land_fill, _, _) = match style {
-        BasemapStyle::Filled => (BASEMAP_LAND_FILL, BASEMAP_OCEAN_FILL, BASEMAP_OCEAN_FILL),
-        BasemapStyle::White => (WHITE_LAND_FILL, WHITE_OCEAN_FILL, WHITE_LAKES_FILL),
-    };
-
-    if let Some(root) = checked_in_natural_earth_110m_root() {
-        let countries = load_polygons_from_shapefile(&root.join("ne_110m_admin_0_countries.shp"))
-            .unwrap_or_default();
-        if !countries.is_empty() {
-            return vec![StyledLonLatPolygonLayer {
-                polygons: countries,
-                color: land_fill,
-                role: PolygonRole::Land,
-            }];
-        }
-    }
-
+    // A configured 10m runtime basemap is authoritative for global plots too.
+    // The old global-only 110m preference silently bypassed a host's detailed
+    // `RUSTWX_BASEMAP_DIR` assets whenever the build machine's checkout still
+    // existed at its compiled path. Broad already implements the desired
+    // 10m -> 110m -> fallback order for the same world polygon roles.
     build_broad_polygons(style)
 }
 
@@ -661,13 +649,17 @@ fn load_styled_global_features_for(style: BasemapStyle) -> Vec<StyledLonLatLayer
 }
 
 fn build_global_features(style: BasemapStyle) -> Vec<StyledLonLatLayer> {
-    let Some((root, tag)) = checked_in_natural_earth_110m_root()
-        .map(|root| (root, "110m"))
-        .or_else(|| checked_in_natural_earth_10m_root().map(|root| (root, "10m")))
+    // Prefer a host-supplied detailed runtime set. Besides producing visibly
+    // better world plots, this keeps `RUSTWX_BASEMAP_DIR` authoritative on a
+    // developer machine where the compiled cargo checkout (and its 110m
+    // assets) may still happen to exist.
+    let Some((root, tag)) = checked_in_natural_earth_10m_root()
+        .map(|root| (root, "10m"))
+        .or_else(|| checked_in_natural_earth_110m_root().map(|root| (root, "110m")))
     else {
         return build_broad_features(style)
             .into_iter()
-            .filter(|layer| !matches!(layer.role, LineworkRole::County | LineworkRole::State))
+            .filter(|layer| !matches!(layer.role, LineworkRole::County))
             .collect();
     };
 
@@ -678,14 +670,26 @@ fn build_global_features(style: BasemapStyle) -> Vec<StyledLonLatLayer> {
     let nat =
         load_lines_from_shapefile(&root.join(format!("ne_{tag}_admin_0_boundary_lines_land.shp")))
             .unwrap_or_default();
+    let state = load_lines_from_shapefile(
+        &root.join(format!("ne_{tag}_admin_1_states_provinces_lines.shp")),
+    )
+    .unwrap_or_default();
     let colors = feature_colors(style);
-    let mut layers = Vec::with_capacity(3);
+    let mut layers = Vec::with_capacity(4);
     if !lakes.is_empty() {
         layers.push(StyledLonLatLayer {
             lines: lakes,
             color: Rgba::with_alpha(colors.lake.r, colors.lake.g, colors.lake.b, 42),
             width: 1,
             role: LineworkRole::Lake,
+        });
+    }
+    if !state.is_empty() {
+        layers.push(StyledLonLatLayer {
+            lines: state,
+            color: Rgba::with_alpha(colors.state.r, colors.state.g, colors.state.b, 150),
+            width: 1,
+            role: LineworkRole::State,
         });
     }
     if !nat.is_empty() {
@@ -897,5 +901,18 @@ mod tests {
         if let (Some(lake), Some(coast)) = (lake, coast) {
             assert!(lake < coast);
         }
+    }
+
+    #[test]
+    fn global_linework_includes_admin1_context_below_country_and_coast() {
+        let layers = build_global_features(BasemapStyle::Filled);
+        let state =
+            role_index(&layers, LineworkRole::State).expect("state/province lines should load");
+        let international =
+            role_index(&layers, LineworkRole::International).expect("country lines should load");
+        let coast = role_index(&layers, LineworkRole::Coast).expect("coasts should load");
+
+        assert!(state < international);
+        assert!(state < coast);
     }
 }

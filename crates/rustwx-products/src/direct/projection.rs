@@ -26,6 +26,45 @@ pub fn build_projected_map_with_projection(
     bounds: (f64, f64, f64, f64),
     target_ratio: f64,
 ) -> Result<ProjectedMap, Box<dyn std::error::Error>> {
+    build_projected_map_with_projection_inner(
+        lat_deg,
+        lon_deg,
+        projection,
+        bounds,
+        target_ratio,
+        None,
+    )
+}
+
+/// Build the normal projected map while explicitly choosing the basemap
+/// source detail. Raster projection and frame selection remain identical to
+/// [`build_projected_map_with_projection`].
+pub fn build_projected_map_with_projection_and_basemap_detail(
+    lat_deg: &[f32],
+    lon_deg: &[f32],
+    projection: Option<&GridProjection>,
+    bounds: (f64, f64, f64, f64),
+    target_ratio: f64,
+    basemap_detail: BasemapDetail,
+) -> Result<ProjectedMap, Box<dyn std::error::Error>> {
+    build_projected_map_with_projection_inner(
+        lat_deg,
+        lon_deg,
+        projection,
+        bounds,
+        target_ratio,
+        Some(basemap_detail),
+    )
+}
+
+fn build_projected_map_with_projection_inner(
+    lat_deg: &[f32],
+    lon_deg: &[f32],
+    projection: Option<&GridProjection>,
+    bounds: (f64, f64, f64, f64),
+    target_ratio: f64,
+    basemap_detail: Option<BasemapDetail>,
+) -> Result<ProjectedMap, Box<dyn std::error::Error>> {
     if full_domain_projected_frame_enabled(projection, bounds) {
         return build_full_domain_projected_map_with_projection(
             lat_deg,
@@ -33,6 +72,7 @@ pub fn build_projected_map_with_projection(
             projection,
             bounds,
             target_ratio,
+            basemap_detail,
         );
     }
 
@@ -57,7 +97,7 @@ pub fn build_projected_map_with_projection(
             options.domain.reference_latitude_deg = Some(reference_latitude);
         }
     }
-    options = options.with_basemap_detail(basemap_detail_for_bounds(frame_bounds));
+    options = options.with_basemap_detail(resolve_basemap_detail(frame_bounds, basemap_detail));
     options.domain.pad_fraction = presentation_pad_fraction_for_bounds(frame_bounds);
     let mut projected =
         rustwx_render::build_projected_map_with_options(lat_deg, lon_deg, &options)?;
@@ -117,6 +157,28 @@ pub fn build_natural_projected_map_with_projection(
         bounds,
         target_ratio,
         None,
+        None,
+    )
+}
+
+/// Build a natural-aspect projected map with an explicit basemap detail while
+/// retaining the ordinary map-frame and projection decisions.
+pub fn build_natural_projected_map_with_projection_and_basemap_detail(
+    lat_deg: &[f32],
+    lon_deg: &[f32],
+    projection: Option<&GridProjection>,
+    bounds: (f64, f64, f64, f64),
+    target_ratio: f64,
+    basemap_detail: BasemapDetail,
+) -> Result<ProjectedMap, Box<dyn std::error::Error>> {
+    build_natural_projected_map_with_projection_inner(
+        lat_deg,
+        lon_deg,
+        projection,
+        bounds,
+        target_ratio,
+        None,
+        Some(basemap_detail),
     )
 }
 
@@ -136,6 +198,30 @@ pub fn build_natural_projected_map_with_projection_and_basemap_padding(
         bounds,
         target_ratio,
         Some((line_pad_fraction, polygon_pad_fraction)),
+        None,
+    )
+}
+
+/// Padded natural-aspect variant with an explicit basemap detail.
+#[allow(clippy::too_many_arguments)]
+pub fn build_natural_projected_map_with_projection_and_basemap_padding_and_detail(
+    lat_deg: &[f32],
+    lon_deg: &[f32],
+    projection: Option<&GridProjection>,
+    bounds: (f64, f64, f64, f64),
+    target_ratio: f64,
+    line_pad_fraction: f64,
+    polygon_pad_fraction: f64,
+    basemap_detail: BasemapDetail,
+) -> Result<ProjectedMap, Box<dyn std::error::Error>> {
+    build_natural_projected_map_with_projection_inner(
+        lat_deg,
+        lon_deg,
+        projection,
+        bounds,
+        target_ratio,
+        Some((line_pad_fraction, polygon_pad_fraction)),
+        Some(basemap_detail),
     )
 }
 
@@ -146,6 +232,7 @@ fn build_natural_projected_map_with_projection_inner(
     bounds: (f64, f64, f64, f64),
     target_ratio: f64,
     basemap_padding: Option<(f64, f64)>,
+    basemap_detail: Option<BasemapDetail>,
 ) -> Result<ProjectedMap, Box<dyn std::error::Error>> {
     let variant = projection_presentation_variant();
     let presentation_projection = presentation_projection_for_bounds(projection, bounds, variant);
@@ -161,7 +248,7 @@ fn build_natural_projected_map_with_projection_inner(
             options.domain.reference_latitude_deg = Some(reference_latitude);
         }
     }
-    options = options.with_basemap_detail(basemap_detail_for_bounds(frame_bounds));
+    options = options.with_basemap_detail(resolve_basemap_detail(frame_bounds, basemap_detail));
     if let Some((line_pad_fraction, polygon_pad_fraction)) = basemap_padding {
         options = options.with_basemap_padding(line_pad_fraction, polygon_pad_fraction);
     }
@@ -179,13 +266,14 @@ fn build_full_domain_projected_map_with_projection(
     projection: Option<&GridProjection>,
     bounds: (f64, f64, f64, f64),
     target_ratio: f64,
+    basemap_detail: Option<BasemapDetail>,
 ) -> Result<ProjectedMap, Box<dyn std::error::Error>> {
     let mut options = ProjectedMapBuildOptions::full_domain(target_ratio);
     if let Some(projection) = projection {
         options = options.with_projection(projection.clone());
     }
     let basemap_bounds = latlon_mesh_bounds(lat_deg, lon_deg).unwrap_or(bounds);
-    options = options.with_basemap_detail(basemap_detail_for_bounds(basemap_bounds));
+    options = options.with_basemap_detail(resolve_basemap_detail(basemap_bounds, basemap_detail));
     options.domain.pad_fraction = full_domain_projected_frame_pad_fraction();
     let mut projected =
         rustwx_render::build_projected_map_with_options(lat_deg, lon_deg, &options)?;
@@ -411,6 +499,13 @@ fn basemap_detail_for_bounds(bounds: (f64, f64, f64, f64)) -> BasemapDetail {
     } else {
         BasemapDetail::Regional
     }
+}
+
+fn resolve_basemap_detail(
+    bounds: (f64, f64, f64, f64),
+    requested: Option<BasemapDetail>,
+) -> BasemapDetail {
+    requested.unwrap_or_else(|| basemap_detail_for_bounds(bounds))
 }
 
 fn presentation_pad_fraction_for_bounds(bounds: (f64, f64, f64, f64)) -> f64 {
@@ -811,6 +906,19 @@ mod tests {
         assert_eq!(
             basemap_detail_for_bounds((-170.0, -50.0, 5.0, 84.0)),
             BasemapDetail::Broad
+        );
+    }
+
+    #[test]
+    fn explicit_basemap_detail_wins_over_domain_auto_selection() {
+        let global_bounds = (-180.0, 180.0, -90.0, 90.0);
+        assert_eq!(
+            resolve_basemap_detail(global_bounds, Some(BasemapDetail::Regional)),
+            BasemapDetail::Regional
+        );
+        assert_eq!(
+            resolve_basemap_detail(global_bounds, None),
+            BasemapDetail::Global
         );
     }
 }

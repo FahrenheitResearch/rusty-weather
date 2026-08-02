@@ -141,7 +141,7 @@ impl RawBasemapMode {
     fn includes_role(self, role: LineworkRole) -> bool {
         match self {
             Self::Off => false,
-            Self::Global => !matches!(role, LineworkRole::County | LineworkRole::State),
+            Self::Global => !matches!(role, LineworkRole::County),
             Self::Broad | Self::Regional => !matches!(role, LineworkRole::County),
             Self::Counties => true,
         }
@@ -2212,6 +2212,12 @@ mod tests {
             hour,
             exact_time: None,
         }
+    }
+
+    #[test]
+    fn global_raw_basemap_keeps_state_and_province_linework() {
+        assert!(RawBasemapMode::Global.includes_role(LineworkRole::State));
+        assert!(!RawBasemapMode::Global.includes_role(LineworkRole::County));
     }
 
     #[test]

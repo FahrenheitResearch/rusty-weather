@@ -18,7 +18,10 @@ pub use download::{
     today_yyyymmdd_utc,
 };
 pub use field_viewer::{FieldViewerEvent, FieldViewerPanel};
-pub use plot_viewer::{CustomDomain, PlotViewerPanel};
+pub use plot_viewer::{
+    CustomDomain, NativePlotMapDetail, NativePlotRenderScale, NativePlotSampling,
+    NativePlotSettings, NativePlotStyle, PlotViewerPanel,
+};
 pub use run_browser::RunBrowserPanel;
 pub use sat_player::{SatFrameImage, SatPlayerEvent, SatPlayerPanel, SatRunKey, SatRunListing};
 pub use satellite::{

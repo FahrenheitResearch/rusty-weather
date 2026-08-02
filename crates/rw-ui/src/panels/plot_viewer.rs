@@ -11,7 +11,10 @@ use egui::{
     TextureHandle, TextureOptions, Ui, Vec2,
 };
 use rustwx_core::{Field2D, GridShape, LatLonGrid, ProductKey};
-use rustwx_render::{DomainFrame, MapRenderRequest, ProductVisualMode, RgbaImage};
+use rustwx_render::{
+    BasemapDetail, DomainFrame, LineworkRole, MapRenderRequest, PolygonRole, ProductVisualMode,
+    RasterSampleMode, RenderPresentation, RgbaImage, StaticPlotStyle,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::profile_scope;
@@ -26,6 +29,7 @@ struct PlotCacheKey {
     width: u32,
     height: u32,
     domain: Option<DomainCacheKey>,
+    settings: NativePlotSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +139,228 @@ impl From<&CustomDomain> for DomainCacheKey {
     }
 }
 
+/// Source-detail override for the native plot basemap.
+///
+/// `Counties` uses the regional source and enables county linework when it is
+/// selected in the UI. Keeping it distinct makes the expensive/dense choice
+/// discoverable without expanding rustwx-render's three source tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePlotMapDetail {
+    #[default]
+    Auto,
+    Global,
+    Broad,
+    Regional,
+    Counties,
+}
+
+impl NativePlotMapDetail {
+    const ALL: [Self; 5] = [
+        Self::Auto,
+        Self::Global,
+        Self::Broad,
+        Self::Regional,
+        Self::Counties,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Global => "Global",
+            Self::Broad => "Broad",
+            Self::Regional => "Regional",
+            Self::Counties => "Counties",
+        }
+    }
+
+    fn basemap_detail(self) -> Option<BasemapDetail> {
+        match self {
+            Self::Auto => None,
+            Self::Global => Some(BasemapDetail::Global),
+            Self::Broad => Some(BasemapDetail::Broad),
+            Self::Regional | Self::Counties => Some(BasemapDetail::Regional),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePlotStyle {
+    Default,
+    CleanAtlas,
+    CleanAtlasFast,
+    CleanAtlasQuality2x,
+    CleanAtlasCombined,
+    Operational,
+    #[default]
+    OperationalFast,
+    OperationalQuality2x,
+    OperationalBudget30s,
+}
+
+impl NativePlotStyle {
+    const ALL: [Self; 9] = [
+        Self::OperationalFast,
+        Self::Operational,
+        Self::OperationalQuality2x,
+        Self::OperationalBudget30s,
+        Self::CleanAtlasFast,
+        Self::CleanAtlas,
+        Self::CleanAtlasQuality2x,
+        Self::CleanAtlasCombined,
+        Self::Default,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Classic",
+            Self::CleanAtlas => "Atlas",
+            Self::CleanAtlasFast => "Atlas fast",
+            Self::CleanAtlasQuality2x => "Atlas quality 2x",
+            Self::CleanAtlasCombined => "Atlas best",
+            Self::Operational => "Operational",
+            Self::OperationalFast => "Operational fast",
+            Self::OperationalQuality2x => "Operational quality 2x",
+            Self::OperationalBudget30s => "Operational best",
+        }
+    }
+
+    fn render_style(self) -> StaticPlotStyle {
+        match self {
+            Self::Default => StaticPlotStyle::Default,
+            Self::CleanAtlas => StaticPlotStyle::CleanAtlas,
+            Self::CleanAtlasFast => StaticPlotStyle::CleanAtlasFast,
+            Self::CleanAtlasQuality2x => StaticPlotStyle::CleanAtlasQuality2x,
+            Self::CleanAtlasCombined => StaticPlotStyle::CleanAtlasCombined,
+            Self::Operational => StaticPlotStyle::Operational,
+            Self::OperationalFast => StaticPlotStyle::OperationalFast,
+            Self::OperationalQuality2x => StaticPlotStyle::OperationalQuality2x,
+            Self::OperationalBudget30s => StaticPlotStyle::OperationalBudget30s,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePlotSampling {
+    #[default]
+    Smooth,
+    PixelExact,
+}
+
+impl NativePlotSampling {
+    const ALL: [Self; 2] = [Self::Smooth, Self::PixelExact];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Smooth => "Smooth",
+            Self::PixelExact => "Pixel exact",
+        }
+    }
+
+    fn raster_sample_mode(self) -> RasterSampleMode {
+        match self {
+            Self::Smooth => RasterSampleMode::Linear,
+            Self::PixelExact => RasterSampleMode::Nearest,
+        }
+    }
+
+    fn texture_filter(self) -> TextureFilter {
+        match self {
+            Self::Smooth => TextureFilter::Linear,
+            Self::PixelExact => TextureFilter::Nearest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePlotRenderScale {
+    One,
+    #[default]
+    OnePointFive,
+    Two,
+    Three,
+}
+
+impl NativePlotRenderScale {
+    const ALL: [Self; 4] = [Self::One, Self::OnePointFive, Self::Two, Self::Three];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::One => "1x",
+            Self::OnePointFive => "1.5x",
+            Self::Two => "2x",
+            Self::Three => "3x",
+        }
+    }
+
+    fn factor(self) -> f32 {
+        match self {
+            Self::One => 1.0,
+            Self::OnePointFive => 1.5,
+            Self::Two => 2.0,
+            Self::Three => 3.0,
+        }
+    }
+}
+
+/// Serializable native-map presentation state. The panel edits a staged copy;
+/// pressing `Rerender` atomically applies the whole snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NativePlotSettings {
+    pub map_detail: NativePlotMapDetail,
+    pub show_coastlines: bool,
+    pub show_countries: bool,
+    pub show_states: bool,
+    pub show_counties: bool,
+    pub show_lakes: bool,
+    pub line_width_percent: u16,
+    pub line_opacity_percent: u16,
+    pub sampling: NativePlotSampling,
+    pub plot_style: NativePlotStyle,
+    pub render_scale: NativePlotRenderScale,
+}
+
+impl Default for NativePlotSettings {
+    fn default() -> Self {
+        Self {
+            map_detail: NativePlotMapDetail::Auto,
+            show_coastlines: true,
+            show_countries: true,
+            show_states: true,
+            show_counties: true,
+            show_lakes: true,
+            line_width_percent: 100,
+            line_opacity_percent: 100,
+            sampling: NativePlotSampling::Smooth,
+            plot_style: NativePlotStyle::OperationalFast,
+            render_scale: NativePlotRenderScale::OnePointFive,
+        }
+    }
+}
+
+impl NativePlotSettings {
+    fn normalized(mut self) -> Self {
+        self.line_width_percent = self.line_width_percent.clamp(50, 300);
+        self.line_opacity_percent = self.line_opacity_percent.min(200);
+        self
+    }
+
+    fn linework_visible(&self, role: LineworkRole) -> bool {
+        match role {
+            LineworkRole::Coast => self.show_coastlines,
+            LineworkRole::Lake => self.show_lakes,
+            LineworkRole::International => self.show_countries,
+            LineworkRole::State => self.show_states,
+            LineworkRole::County => self.show_counties,
+            LineworkRole::Generic => true,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct PlotViewerPanel {
     texture: Option<TextureHandle>,
@@ -142,7 +368,9 @@ pub struct PlotViewerPanel {
     error: Option<String>,
     last_render_ms: Option<f32>,
     last_upload_ms: Option<f32>,
-    quality_scale: f32,
+    draft_settings: NativePlotSettings,
+    applied_settings: NativePlotSettings,
+    settings_dirty: bool,
     active_domain: Option<CustomDomain>,
     saved_domains: Vec<CustomDomain>,
     domain_name_edit: String,
@@ -152,10 +380,7 @@ pub struct PlotViewerPanel {
 
 impl PlotViewerPanel {
     pub fn new() -> Self {
-        Self {
-            quality_scale: 1.5,
-            ..Self::default()
-        }
+        Self::default()
     }
 
     pub fn clear(&mut self) {
@@ -165,6 +390,58 @@ impl PlotViewerPanel {
         self.last_render_ms = None;
         self.last_upload_ms = None;
         self.resize_render_debounce.clear();
+    }
+
+    /// Currently applied native-map settings. UI edits remain staged until
+    /// [`Self::rerender`] is called (the popout's button calls the same API).
+    pub fn settings(&self) -> &NativePlotSettings {
+        &self.applied_settings
+    }
+
+    pub fn has_pending_settings(&self) -> bool {
+        self.draft_settings != self.applied_settings
+    }
+
+    /// Replace both staged and applied settings, as used by a host restoring a
+    /// persisted session. Invalid numeric fields are clamped at this boundary.
+    pub fn set_settings(&mut self, settings: NativePlotSettings) {
+        let settings = settings.normalized();
+        self.draft_settings = settings.clone();
+        self.applied_settings = settings;
+        self.settings_dirty = false;
+        self.clear();
+    }
+
+    pub fn settings_json(&self) -> serde_json::Value {
+        serde_json::to_value(&self.applied_settings).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Restore a serialized settings snapshot. Malformed/newer data leaves the
+    /// current settings untouched and reports `false` to the host.
+    pub fn apply_settings_json(&mut self, value: &serde_json::Value) -> bool {
+        match serde_json::from_value::<NativePlotSettings>(value.clone()) {
+            Ok(settings) => {
+                self.set_settings(settings);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub fn take_settings_changed(&mut self) -> bool {
+        let changed = self.settings_dirty;
+        self.settings_dirty = false;
+        changed
+    }
+
+    /// Atomically apply every staged control and force a fresh image even when
+    /// the resulting snapshot equals the previous one.
+    pub fn rerender(&mut self) {
+        let settings = self.draft_settings.clone().normalized();
+        self.draft_settings = settings.clone();
+        self.applied_settings = settings;
+        self.settings_dirty = true;
+        self.clear();
     }
 
     pub fn set_active_domain(&mut self, domain: CustomDomain) {
@@ -224,6 +501,7 @@ impl PlotViewerPanel {
     pub fn ui(&mut self, ui: &mut Ui, field: Option<&FieldData>) {
         ui.vertical(|ui| {
             self.domain_controls(ui);
+            self.settings_controls(ui);
 
             let Some(field) = field else {
                 self.clear();
@@ -250,20 +528,22 @@ impl PlotViewerPanel {
             let (width, height) = render_plot_size(
                 display_width,
                 display_height,
-                self.effective_quality_scale(),
+                self.applied_settings.render_scale.factor(),
             );
             let key = PlotCacheKey {
                 field: field.key.clone(),
                 width,
                 height,
                 domain: self.active_domain.as_ref().map(DomainCacheKey::from),
+                settings: self.applied_settings.clone(),
             };
 
             if self.cache_key.as_ref() != Some(&key) {
-                let content_changed = self
-                    .cache_key
-                    .as_ref()
-                    .is_none_or(|cached| cached.field != key.field || cached.domain != key.domain);
+                let content_changed = self.cache_key.as_ref().is_none_or(|cached| {
+                    cached.field != key.field
+                        || cached.domain != key.domain
+                        || cached.settings != key.settings
+                });
                 let interaction_active = ui.input(|input| input.pointer.any_down());
                 let decision = if content_changed {
                     ResizeRenderDecision::RenderNow
@@ -414,27 +694,119 @@ impl PlotViewerPanel {
             } else {
                 ui.label(RichText::new("full model grid").small().weak());
             }
-            ui.separator();
-            ui.label(RichText::new("Resolution").small().strong());
-            for (label, scale) in [("1x", 1.0), ("1.5x", 1.5), ("2x", 2.0), ("3x", 3.0)] {
-                if ui
-                    .selectable_label((self.effective_quality_scale() - scale).abs() < 0.01, label)
-                    .on_hover_text("native plot render scale")
-                    .clicked()
-                {
-                    self.quality_scale = scale;
-                    self.clear();
-                }
-            }
         });
     }
 
-    fn effective_quality_scale(&self) -> f32 {
-        if self.quality_scale.is_finite() && self.quality_scale >= 0.95 {
-            self.quality_scale.clamp(1.0, 3.0)
-        } else {
-            1.5
-        }
+    fn settings_controls(&mut self, ui: &mut Ui) {
+        egui::CollapsingHeader::new("Map & render settings")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Detail").small().strong());
+                    let previous_detail = self.draft_settings.map_detail;
+                    ComboBox::from_id_salt("rw-ui-native-plot-map-detail")
+                        .selected_text(self.draft_settings.map_detail.label())
+                        .width(104.0)
+                        .show_ui(ui, |ui| {
+                            for detail in NativePlotMapDetail::ALL {
+                                ui.selectable_value(
+                                    &mut self.draft_settings.map_detail,
+                                    detail,
+                                    detail.label(),
+                                );
+                            }
+                        });
+                    if self.draft_settings.map_detail != previous_detail {
+                        match self.draft_settings.map_detail {
+                            NativePlotMapDetail::Counties => {
+                                self.draft_settings.show_counties = true;
+                            }
+                            NativePlotMapDetail::Regional => {
+                                self.draft_settings.show_counties = false;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    ui.checkbox(&mut self.draft_settings.show_coastlines, "Coasts");
+                    ui.checkbox(&mut self.draft_settings.show_countries, "Countries");
+                    ui.checkbox(&mut self.draft_settings.show_states, "States");
+                    ui.checkbox(&mut self.draft_settings.show_counties, "Counties");
+                    ui.checkbox(&mut self.draft_settings.show_lakes, "Lakes");
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Lines").small().strong());
+                    ui.add(
+                        egui::Slider::new(&mut self.draft_settings.line_width_percent, 50..=300)
+                            .text("Width")
+                            .suffix("%"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.draft_settings.line_opacity_percent, 0..=200)
+                            .text("Opacity")
+                            .suffix("%"),
+                    );
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Render").small().strong());
+                    ComboBox::from_id_salt("rw-ui-native-plot-style")
+                        .selected_text(self.draft_settings.plot_style.label())
+                        .width(164.0)
+                        .show_ui(ui, |ui| {
+                            for style in NativePlotStyle::ALL {
+                                ui.selectable_value(
+                                    &mut self.draft_settings.plot_style,
+                                    style,
+                                    style.label(),
+                                );
+                            }
+                        });
+                    ComboBox::from_id_salt("rw-ui-native-plot-sampling")
+                        .selected_text(self.draft_settings.sampling.label())
+                        .width(104.0)
+                        .show_ui(ui, |ui| {
+                            for sampling in NativePlotSampling::ALL {
+                                ui.selectable_value(
+                                    &mut self.draft_settings.sampling,
+                                    sampling,
+                                    sampling.label(),
+                                );
+                            }
+                        });
+                    ui.label(RichText::new("Resolution").small().strong());
+                    for scale in NativePlotRenderScale::ALL {
+                        ui.selectable_value(
+                            &mut self.draft_settings.render_scale,
+                            scale,
+                            scale.label(),
+                        )
+                        .on_hover_text("native plot render scale");
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button("Defaults")
+                        .on_hover_text("stage the default native map settings")
+                        .clicked()
+                    {
+                        self.draft_settings = NativePlotSettings::default();
+                    }
+                    let pending = self.has_pending_settings();
+                    if ui
+                        .button(if pending { "Rerender *" } else { "Rerender" })
+                        .on_hover_text("apply every staged setting and rebuild the native plot")
+                        .clicked()
+                    {
+                        self.rerender();
+                    }
+                    if self.has_pending_settings() {
+                        ui.label(RichText::new("changes pending").small().weak());
+                    }
+                });
+            });
     }
 
     fn save_active_domain(&mut self) {
@@ -488,24 +860,26 @@ impl PlotViewerPanel {
         self.cache_key = Some(key.clone());
 
         let render_start = std::time::Instant::now();
-        let image = match render_field_plot(field, key.width, key.height, domain.as_ref()) {
-            Ok(image) => image,
-            Err(err) => {
-                self.error = Some(err);
-                self.last_render_ms = None;
-                self.last_upload_ms = None;
-                return;
-            }
-        };
+        let image =
+            match render_field_plot(field, key.width, key.height, domain.as_ref(), &key.settings) {
+                Ok(image) => image,
+                Err(err) => {
+                    self.error = Some(err);
+                    self.last_render_ms = None;
+                    self.last_upload_ms = None;
+                    return;
+                }
+            };
         self.last_render_ms = Some(render_start.elapsed().as_secs_f32() * 1000.0);
 
         let upload_start = std::time::Instant::now();
+        let texture_filter = key.settings.sampling.texture_filter();
         self.texture = Some(ui.ctx().load_texture(
             "rw-ui-native-plot",
             rgba_to_color_image(&image),
             TextureOptions {
-                magnification: TextureFilter::Linear,
-                minification: TextureFilter::Linear,
+                magnification: texture_filter,
+                minification: texture_filter,
                 ..Default::default()
             },
         ));
@@ -518,6 +892,7 @@ fn render_field_plot(
     width: u32,
     height: u32,
     domain: Option<&CustomDomain>,
+    settings: &NativePlotSettings,
 ) -> Result<RgbaImage, String> {
     let style = field
         .style
@@ -553,40 +928,72 @@ fn render_field_plot(
     let bounds = geographic_bounds(&grid_file.lat, &grid_file.lon)
         .ok_or_else(|| "grid has no finite lat/lon bounds".to_string())?;
     let render_bounds = domain.map(|domain| domain.bounds).unwrap_or(bounds);
+    let target_ratio = width as f64 / height as f64;
+    let basemap_detail = settings.map_detail.basemap_detail();
     let projected = if let Some(domain) = domain {
-        if rotated_domain_needs_basemap_padding(domain.rotation_deg) {
-            rustwx_products::direct::build_natural_projected_map_with_projection_and_basemap_padding(
+        match (
+            rotated_domain_needs_basemap_padding(domain.rotation_deg),
+            basemap_detail,
+        ) {
+            (true, Some(detail)) => rustwx_products::direct::build_natural_projected_map_with_projection_and_basemap_padding_and_detail(
                 &grid_file.lat,
                 &grid_file.lon,
                 grid_file.projection.as_ref(),
                 render_bounds,
-                width as f64 / height as f64,
+                target_ratio,
                 1.35,
                 1.10,
-            )
-        } else {
-            rustwx_products::direct::build_natural_projected_map_with_projection(
+                detail,
+            ),
+            (true, None) => rustwx_products::direct::build_natural_projected_map_with_projection_and_basemap_padding(
                 &grid_file.lat,
                 &grid_file.lon,
                 grid_file.projection.as_ref(),
                 render_bounds,
-                width as f64 / height as f64,
-            )
+                target_ratio,
+                1.35,
+                1.10,
+            ),
+            (false, Some(detail)) => rustwx_products::direct::build_natural_projected_map_with_projection_and_basemap_detail(
+                &grid_file.lat,
+                &grid_file.lon,
+                grid_file.projection.as_ref(),
+                render_bounds,
+                target_ratio,
+                detail,
+            ),
+            (false, None) => rustwx_products::direct::build_natural_projected_map_with_projection(
+                &grid_file.lat,
+                &grid_file.lon,
+                grid_file.projection.as_ref(),
+                render_bounds,
+                target_ratio,
+            ),
         }
+    } else if let Some(detail) = basemap_detail {
+        rustwx_products::direct::build_projected_map_with_projection_and_basemap_detail(
+            &grid_file.lat,
+            &grid_file.lon,
+            grid_file.projection.as_ref(),
+            render_bounds,
+            target_ratio,
+            detail,
+        )
     } else {
         rustwx_products::direct::build_projected_map_with_projection(
             &grid_file.lat,
             &grid_file.lon,
             grid_file.projection.as_ref(),
             render_bounds,
-            width as f64 / height as f64,
+            target_ratio,
         )
     }
     .map_err(|err| err.to_string())?;
-    let projected = match domain {
+    let mut projected = match domain {
         Some(domain) => projected.rotated_degrees(domain.rotation_deg),
         None => projected,
     };
+    apply_native_map_settings(&mut projected, settings);
 
     let mut request = MapRenderRequest::from_core_field(core_field, style.scale.clone());
     rustwx_products::plot_design::StaticPlotDesign::new(
@@ -615,8 +1022,53 @@ fn render_field_plot(
     request.legend.mode = style.legend_mode;
     request.cbar_tick_step = style.cbar_tick_step;
     request.supersample_factor = 1;
+    request.raster_sample_mode = settings.sampling.raster_sample_mode();
 
-    rustwx_render::render_image(&request).map_err(|err| err.to_string())
+    rustwx_render::render_image_with_style(&request, settings.plot_style.render_style())
+        .map_err(|err| err.to_string())
+}
+
+fn apply_native_map_settings(
+    projected: &mut rustwx_render::ProjectedMap,
+    settings: &NativePlotSettings,
+) {
+    projected
+        .lines
+        .retain(|line| settings.linework_visible(line.role));
+    if !settings.show_lakes {
+        projected
+            .polygons
+            .retain(|polygon| polygon.role != PolygonRole::Lake);
+    }
+
+    if settings.line_opacity_percent == 0 {
+        projected.lines.clear();
+        return;
+    }
+
+    let width_percent = u32::from(settings.line_width_percent);
+    let opacity_percent = u32::from(settings.line_opacity_percent);
+    let presentation = RenderPresentation::for_mode_with_style(
+        ProductVisualMode::FilledMeteorology,
+        settings.plot_style.render_style(),
+    );
+    for line in &mut projected.lines {
+        // Resolve the selected plot style first, then mark the line as generic
+        // so the renderer does not restyle/clamp it a second time. This makes
+        // the panel's width and opacity controls authoritative per request,
+        // without mutating process-wide linework environment variables.
+        let styled = presentation.linework_style(line.role, line.color.into(), line.width);
+        line.color = styled.color.into();
+        line.width = styled.width;
+        line.role = LineworkRole::Generic;
+        line.width =
+            (line.width.saturating_mul(width_percent).saturating_add(50) / 100).clamp(1, 16);
+        line.color.a = (u32::from(line.color.a)
+            .saturating_mul(opacity_percent)
+            .saturating_add(50)
+            / 100)
+            .min(255) as u8;
+    }
 }
 
 fn plot_time_subtitle(hour: &HourKey) -> String {
@@ -916,5 +1368,137 @@ mod tests {
         assert!(subtitle.contains("+08:48:00"));
         assert!(subtitle.contains("1974-04-03 17:48:00Z"));
         assert!(!subtitle.contains("f000"));
+    }
+
+    #[test]
+    fn native_plot_settings_are_staged_until_explicit_rerender() {
+        let mut panel = PlotViewerPanel::new();
+        assert!(panel.settings().show_states);
+        panel.draft_settings.show_states = false;
+        panel.draft_settings.line_width_percent = 175;
+
+        assert!(panel.has_pending_settings());
+        assert!(panel.settings().show_states);
+
+        panel.rerender();
+
+        assert!(!panel.has_pending_settings());
+        assert!(!panel.settings().show_states);
+        assert_eq!(panel.settings().line_width_percent, 175);
+        assert!(panel.take_settings_changed());
+        assert!(!panel.take_settings_changed());
+    }
+
+    #[test]
+    fn native_plot_settings_json_round_trip_and_clamp_numeric_fields() {
+        let mut settings = NativePlotSettings {
+            map_detail: NativePlotMapDetail::Broad,
+            show_states: false,
+            line_width_percent: 900,
+            line_opacity_percent: 900,
+            sampling: NativePlotSampling::PixelExact,
+            ..NativePlotSettings::default()
+        };
+        let value = serde_json::to_value(&settings).unwrap();
+        let mut panel = PlotViewerPanel::new();
+
+        assert!(panel.apply_settings_json(&value));
+        settings.line_width_percent = 300;
+        settings.line_opacity_percent = 200;
+        assert_eq!(panel.settings(), &settings);
+        assert_eq!(
+            panel.settings_json(),
+            serde_json::to_value(settings).unwrap()
+        );
+    }
+
+    #[test]
+    fn native_map_layer_controls_filter_and_scale_projected_linework() {
+        fn line(role: LineworkRole) -> rustwx_render::ProjectedLineOverlay {
+            rustwx_render::ProjectedLineOverlay {
+                points: vec![(0.0, 0.0), (1.0, 1.0)],
+                color: rustwx_render::Color::rgba(10, 20, 30, 100),
+                width: 2,
+                role,
+            }
+        }
+
+        let mut projected = rustwx_render::ProjectedMap {
+            projected_x: vec![0.0],
+            projected_y: vec![0.0],
+            extent: rustwx_render::ProjectedExtent {
+                x_min: 0.0,
+                x_max: 1.0,
+                y_min: 0.0,
+                y_max: 1.0,
+            },
+            lines: vec![
+                line(LineworkRole::Coast),
+                line(LineworkRole::State),
+                line(LineworkRole::County),
+                line(LineworkRole::Lake),
+            ],
+            polygons: vec![
+                rustwx_render::ProjectedPolygonFill {
+                    rings: vec![],
+                    color: rustwx_render::Color::BLACK,
+                    role: PolygonRole::Land,
+                },
+                rustwx_render::ProjectedPolygonFill {
+                    rings: vec![],
+                    color: rustwx_render::Color::BLACK,
+                    role: PolygonRole::Lake,
+                },
+            ],
+            inverse_raster_projection: None,
+        };
+        let settings = NativePlotSettings {
+            show_states: false,
+            show_counties: false,
+            show_lakes: false,
+            line_width_percent: 150,
+            line_opacity_percent: 50,
+            ..NativePlotSettings::default()
+        };
+
+        apply_native_map_settings(&mut projected, &settings);
+
+        assert_eq!(projected.lines.len(), 1);
+        assert_eq!(projected.lines[0].role, LineworkRole::Generic);
+        assert_eq!(projected.lines[0].width, 3);
+        assert_eq!(projected.lines[0].color.a, 50);
+        assert_eq!(projected.polygons.len(), 1);
+        assert_eq!(projected.polygons[0].role, PolygonRole::Land);
+    }
+
+    #[test]
+    fn complete_settings_snapshot_participates_in_plot_cache_identity() {
+        let field = FieldKey {
+            hour: HourKey {
+                model: "gfs".to_string(),
+                run: "2026080200".to_string(),
+                hour: 0,
+                exact_time: None,
+            },
+            var: "tmp2m".to_string(),
+        };
+        let mut changed = NativePlotSettings::default();
+        changed.show_states = false;
+        let base = PlotCacheKey {
+            field: field.clone(),
+            width: 800,
+            height: 600,
+            domain: None,
+            settings: NativePlotSettings::default(),
+        };
+        let changed = PlotCacheKey {
+            field,
+            width: 800,
+            height: 600,
+            domain: None,
+            settings: changed,
+        };
+
+        assert_ne!(base, changed);
     }
 }
