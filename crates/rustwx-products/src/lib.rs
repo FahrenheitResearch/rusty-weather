@@ -19,6 +19,7 @@ pub mod places;
 pub mod planner;
 pub mod plot_design;
 pub mod point_timeseries;
+pub mod ptype;
 pub mod publication;
 pub(crate) mod qpf;
 pub mod runtime;

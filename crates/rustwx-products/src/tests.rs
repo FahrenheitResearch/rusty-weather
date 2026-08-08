@@ -30,6 +30,7 @@ const PRODUCT_MODULE_SURFACE: &[(&str, ProductModuleSurfaceKind)] = &[
     ("plot_design", InternalCandidatePublic),
     ("point_timeseries", OperationalPublic),
     ("publication", OperationalPublic),
+    ("ptype", OperationalPublic),
     ("qpf", CratePrivate),
     ("runtime", CompatibilityPublic),
     ("sampling", StablePublic),

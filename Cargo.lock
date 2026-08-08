@@ -4665,10 +4665,12 @@ dependencies = [
  "rustwx-core",
  "rustwx-io",
  "rustwx-models",
+ "rustwx-regrid",
  "rustwx-render",
  "serde",
  "serde_json",
  "shapefile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
