@@ -2,6 +2,7 @@ mod derived;
 mod ecape;
 mod error;
 mod mesoanalysis;
+mod ptype;
 mod severe;
 mod windowed;
 
@@ -32,6 +33,13 @@ pub use mesoanalysis::{
     MesoObservation, MesoanalysisConfig, MesoanalysisCovarianceKernel, MesoanalysisFields,
     MesoanalysisMethod, MesoanalysisVariableDiagnostics, SurfaceMesoBackground,
     compute_surface_mesoanalysis,
+};
+pub use ptype::{
+    PrecipType, PtypeDiagnostics, PtypeFractions, PtypeGridDiagnostics, PtypeGridFields,
+    PtypeGridInputs, PtypeGridOutput, PtypeOptions, PtypePointResult, PtypeQc, PtypeScores,
+    PtypeThermoLevel, PtypeWetBulbLevel, classify_modified_bourgouin_profile,
+    classify_modified_bourgouin_wet_bulb_profile, compute_modified_bourgouin_ptype,
+    mixing_ratio_from_specific_humidity, probability_ice_from_temperature,
 };
 pub use rustwx_core::GridShape;
 pub use severe::{
