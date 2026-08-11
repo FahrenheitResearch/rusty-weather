@@ -377,6 +377,109 @@ fn ieee_f32_message(
 }
 
 #[test]
+fn parsed_model_grib_repeated_passes_match_fresh_parse_results() {
+    use wx_core::grib2::{
+        Grib2Writer, GridDefinition as WxGridDefinition, MessageBuilder, PackingMethod,
+        ProductDefinition as WxProductDefinition,
+    };
+
+    let grid = WxGridDefinition {
+        template: 0,
+        nx: 2,
+        ny: 2,
+        lat1: 40.0,
+        lon1: -105.0,
+        lat2: 39.0,
+        lon2: -104.0,
+        dx: 1.0,
+        dy: 1.0,
+        scan_mode: 0,
+        ..WxGridDefinition::default()
+    };
+    let message = |category, number, values| {
+        MessageBuilder::new(0, values)
+            .grid(grid.clone())
+            .product(WxProductDefinition {
+                template: 0,
+                parameter_category: category,
+                parameter_number: number,
+                generating_process: 2,
+                forecast_time: 6,
+                time_range_unit: 1,
+                level_type: 100,
+                level_value: 50_000.0,
+            })
+            .packing(PackingMethod::Simple { bits_per_value: 16 })
+    };
+    let bytes = Grib2Writer::new()
+        .add_message(message(0, 0, vec![250.0, 251.0, 252.0, 253.0]))
+        .add_message(message(1, 1, vec![40.0, 50.0, 60.0, 70.0]))
+        .to_bytes()
+        .unwrap();
+    let primary = [
+        FieldSelector::isobaric(CanonicalField::Temperature, 500),
+        FieldSelector::isobaric(CanonicalField::Temperature, 700),
+    ];
+    let alternate = [FieldSelector::isobaric(
+        CanonicalField::RelativeHumidity,
+        500,
+    )];
+
+    let fresh_primary = extract_field_values_partial_from_model_bytes_at_forecast_hour(
+        ModelId::Hrrr,
+        &bytes,
+        None,
+        &primary,
+        Some(6),
+    )
+    .unwrap();
+    let fresh_alternate = extract_field_values_partial_from_model_bytes_at_forecast_hour(
+        ModelId::Hrrr,
+        &bytes,
+        None,
+        &alternate,
+        Some(6),
+    )
+    .unwrap();
+    let parsed = ParsedModelGrib::from_model_bytes(ModelId::Hrrr, &bytes).unwrap();
+    let reused_primary = parsed
+        .extract_field_values_partial_at_forecast_hour(&primary, Some(6))
+        .unwrap();
+    let reused_alternate = parsed
+        .extract_field_values_partial_at_forecast_hour(&alternate, Some(6))
+        .unwrap();
+
+    let assert_same = |actual: &PartialValuesExtraction, expected: &PartialValuesExtraction| {
+        assert_eq!(actual.missing, expected.missing);
+        assert_eq!(actual.grids.len(), expected.grids.len());
+        for (actual, expected) in actual.grids.iter().zip(&expected.grids) {
+            assert_eq!(actual.grid, expected.grid);
+            assert_eq!(actual.projection, expected.projection);
+        }
+        assert_eq!(actual.extracted.len(), expected.extracted.len());
+        for (actual, expected) in actual.extracted.iter().zip(&expected.extracted) {
+            assert_eq!(actual.selector, expected.selector);
+            assert_eq!(actual.units, expected.units);
+            assert_eq!(actual.grid_index, expected.grid_index);
+            assert_eq!(
+                actual
+                    .values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+    };
+    assert_same(&reused_primary, &fresh_primary);
+    assert_same(&reused_alternate, &fresh_alternate);
+}
+
+#[test]
 fn projection_metadata_is_inferred_from_grib_grid_templates() {
     let lambert = GridDefinition {
         template: 30,

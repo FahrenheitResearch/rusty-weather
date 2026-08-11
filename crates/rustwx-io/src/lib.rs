@@ -1224,6 +1224,76 @@ pub struct PartialValuesExtraction {
     pub grids: Vec<SharedExtractionGrid>,
 }
 
+/// One parsed GRIB source file for a bounded group of adjacent selector
+/// passes. This owns no cache or global state: construct it from the current
+/// file's bytes, reuse it for that file only, then drop it before advancing
+/// to another product or forecast hour.
+///
+/// Parsing copies the messages' packed payloads, so this is deliberately not
+/// `Clone` and should not be retained beyond those adjacent extraction passes.
+pub struct ParsedModelGrib {
+    model: ModelId,
+    grib: Grib2File,
+}
+
+impl ParsedModelGrib {
+    /// Parse one model GRIB file once. WRF/GDEX remains on its NetCDF path and
+    /// is rejected exactly as by the values-only byte entry point.
+    pub fn from_model_bytes(model: ModelId, bytes: &[u8]) -> Result<Self, IoError> {
+        if model == ModelId::WrfGdex {
+            return Err(IoError::Wrf(
+                "WRF/GDEX NetCDF support is not available in this build".to_string(),
+            ));
+        }
+        let grib = Grib2File::from_bytes(bytes).map_err(|err| IoError::Grib(err.to_string()))?;
+        Ok(Self { model, grib })
+    }
+
+    /// Run one values-only selector pass against this file using the same
+    /// matching, scoring, normalization, and NBM synthesis as the byte API.
+    pub fn extract_field_values_partial_at_forecast_hour(
+        &self,
+        selectors: &[FieldSelector],
+        forecast_hour: Option<u16>,
+    ) -> Result<PartialValuesExtraction, IoError> {
+        let mut extracted = Vec::new();
+        let mut missing = Vec::new();
+        let mut grid_memo = GridMemo::new();
+        if !selectors.is_empty() {
+            let prepared = selectors
+                .iter()
+                .copied()
+                .map(PreparedSelector::new)
+                .collect::<Result<Vec<_>, _>>()?;
+            let matched = match_prepared_selectors(&self.grib, &prepared, forecast_hour);
+            for (prepared_selector, message) in prepared.iter().zip(matched.into_iter()) {
+                match message {
+                    Some((message, _)) => extracted.push(build_field_values(
+                        message,
+                        prepared_selector.selector,
+                        prepared_selector.selector.native_units(),
+                        &mut grid_memo,
+                    )?),
+                    None => missing.push(prepared_selector.selector),
+                }
+            }
+        }
+        if self.model == ModelId::Nbm {
+            synthesize_nbm_10m_wind_component_values_from_speed_direction(
+                &self.grib,
+                &mut extracted,
+                &mut missing,
+                &mut grid_memo,
+            )?;
+        }
+        Ok(PartialValuesExtraction {
+            extracted,
+            missing,
+            grids: grid_memo.into_shared_grids(),
+        })
+    }
+}
+
 pub fn extract_fields_partial_from_model_bytes(
     model: ModelId,
     bytes: &[u8],
@@ -1277,50 +1347,8 @@ pub fn extract_field_values_partial_from_model_bytes_at_forecast_hour(
     selectors: &[FieldSelector],
     forecast_hour: Option<u16>,
 ) -> Result<PartialValuesExtraction, IoError> {
-    match model {
-        ModelId::WrfGdex => Err(IoError::Wrf(
-            "WRF/GDEX NetCDF support is not available in this build".to_string(),
-        )),
-        _ => {
-            let grib =
-                Grib2File::from_bytes(bytes).map_err(|err| IoError::Grib(err.to_string()))?;
-            let mut extracted = Vec::new();
-            let mut missing = Vec::new();
-            let mut grid_memo = GridMemo::new();
-            if !selectors.is_empty() {
-                let prepared = selectors
-                    .iter()
-                    .copied()
-                    .map(PreparedSelector::new)
-                    .collect::<Result<Vec<_>, _>>()?;
-                let matched = match_prepared_selectors(&grib, &prepared, forecast_hour);
-                for (prepared_selector, message) in prepared.iter().zip(matched.into_iter()) {
-                    match message {
-                        Some((message, _)) => extracted.push(build_field_values(
-                            message,
-                            prepared_selector.selector,
-                            prepared_selector.selector.native_units(),
-                            &mut grid_memo,
-                        )?),
-                        None => missing.push(prepared_selector.selector),
-                    }
-                }
-            }
-            if model == ModelId::Nbm {
-                synthesize_nbm_10m_wind_component_values_from_speed_direction(
-                    &grib,
-                    &mut extracted,
-                    &mut missing,
-                    &mut grid_memo,
-                )?;
-            }
-            Ok(PartialValuesExtraction {
-                extracted,
-                missing,
-                grids: grid_memo.into_shared_grids(),
-            })
-        }
-    }
+    ParsedModelGrib::from_model_bytes(model, bytes)?
+        .extract_field_values_partial_at_forecast_hour(selectors, forecast_hour)
 }
 
 /// Values-lane twin of

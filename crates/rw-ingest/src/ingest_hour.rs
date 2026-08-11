@@ -60,8 +60,7 @@ use rustwx_core::{
     CanonicalField, CycleSpec, FieldSelector, ModelId, ModelRunRequest, SourceId, VerticalSelector,
 };
 use rustwx_io::{
-    CachedFetchResult, FetchRequest, SharedExtractionGrid,
-    extract_field_values_partial_from_model_bytes_at_forecast_hour, fetch_bytes_with_cache,
+    CachedFetchResult, FetchRequest, ParsedModelGrib, SharedExtractionGrid, fetch_bytes_with_cache,
 };
 use rustwx_models::plot_recipe_fetch_plan;
 use rustwx_products::derived::{store_derived_recipe_slugs, store_heavy_recipe_slugs};
@@ -720,16 +719,18 @@ pub fn process_fetched_hour(
         .collect();
     let mut prs_fields_2d: Vec<(String, FieldPlane2D)> = Vec::new();
     let mut prs_grids: Vec<SharedExtractionGrid> = Vec::new();
+    let prs_grib = if prs_selectors.is_empty() {
+        None
+    } else {
+        Some(ParsedModelGrib::from_model_bytes(config.model, &prs.result.bytes).map_err(other)?)
+    };
     if !prs_selectors.is_empty() {
         profile_scope!("ingest_extract_prs");
-        let prs_extraction = extract_field_values_partial_from_model_bytes_at_forecast_hour(
-            config.model,
-            &prs.result.bytes,
-            Some(&prs.bytes_path),
-            &prs_selectors,
-            Some(hour),
-        )
-        .map_err(other)?;
+        let prs_extraction = prs_grib
+            .as_ref()
+            .expect("non-empty prs selector pass has a parsed GRIB")
+            .extract_field_values_partial_at_forecast_hour(&prs_selectors, Some(hour))
+            .map_err(other)?;
         prs_extract_ms = extract_started.elapsed().as_millis();
         prs_grids = prs_extraction.grids;
         for extracted in prs_extraction.extracted {
@@ -800,8 +801,7 @@ pub fn process_fetched_hour(
 
     // Dewpoint fallback: when the profile stores a dewpoint volume but the
     // prs file realizes < 2 dewpoint levels, re-select RelativeHumidity
-    // from the already-fetched bytes (the GRIB index re-parses, but only
-    // the RH messages decode).
+    // from the same per-file parsed GRIB (only the RH messages decode).
     let dewpoint_planned = volumes_data
         .iter()
         .any(|volume| volume.field == CanonicalField::Dewpoint);
@@ -823,14 +823,11 @@ pub fn process_fetched_hour(
             .map(|&level| FieldSelector::isobaric(CanonicalField::RelativeHumidity, level))
             .collect();
         let rh_started = Instant::now();
-        let rh_extraction = extract_field_values_partial_from_model_bytes_at_forecast_hour(
-            config.model,
-            &prs.result.bytes,
-            Some(&prs.bytes_path),
-            &rh_selectors,
-            Some(hour),
-        )
-        .map_err(other)?;
+        let rh_extraction = prs_grib
+            .as_ref()
+            .expect("dewpoint fallback follows a non-empty prs selector pass")
+            .extract_field_values_partial_at_forecast_hour(&rh_selectors, Some(hour))
+            .map_err(other)?;
         prs_extract_ms += rh_started.elapsed().as_millis();
         let dewpoint = volumes_data
             .iter_mut()
@@ -847,6 +844,9 @@ pub fn process_fetched_hour(
             }
         }
     }
+    // The parsed owner is strictly per-file/per-hour. Release its packed
+    // message copies before the surface phase and the products f64 decoder.
+    drop(prs_grib);
     // `prs` stays alive: the derived/heavy compute stage decodes the
     // thermo pair from the raw prs + sfc bytes below.
     config.emit(IngestEvent::StageDone {
@@ -870,16 +870,13 @@ pub fn process_fetched_hour(
     let sfc_selectors: Vec<FieldSelector> =
         surface_plan.iter().map(|(_, selector)| *selector).collect();
     let extract_started = Instant::now();
+    let sfc_grib =
+        ParsedModelGrib::from_model_bytes(config.model, &sfc.result.bytes).map_err(other)?;
     let mut sfc_extraction = {
         profile_scope!("ingest_extract_sfc");
-        extract_field_values_partial_from_model_bytes_at_forecast_hour(
-            config.model,
-            &sfc.result.bytes,
-            Some(&sfc.bytes_path),
-            &sfc_selectors,
-            Some(hour),
-        )
-        .map_err(other)?
+        sfc_grib
+            .extract_field_values_partial_at_forecast_hour(&sfc_selectors, Some(hour))
+            .map_err(other)?
     };
     let mut sfc_extract_ms = extract_started.elapsed().as_millis();
     let sfc_grids = std::mem::take(&mut sfc_extraction.grids);
@@ -914,8 +911,8 @@ pub fn process_fetched_hour(
     }
 
     // Trailing (h-1)->h window fields, all selected at `hour - 1` in ONE
-    // re-select pass (the GRIB index re-parses, but only these three
-    // messages decode):
+    // re-select pass against the same per-file parsed GRIB (only these
+    // three messages decode):
     //
     // * apcp_1h — both sfc APCP accumulations end at hour h and tie on
     //   match score at hour h, where the run total wins as first in file
@@ -966,14 +963,8 @@ pub fn process_fetched_hour(
             .map(|(_, selector)| *selector)
             .collect();
         let trailing_started = Instant::now();
-        let mut trailing_extraction =
-            extract_field_values_partial_from_model_bytes_at_forecast_hour(
-                config.model,
-                &sfc.result.bytes,
-                Some(&sfc.bytes_path),
-                &trailing_selectors,
-                Some(hour - 1),
-            )
+        let mut trailing_extraction = sfc_grib
+            .extract_field_values_partial_at_forecast_hour(&trailing_selectors, Some(hour - 1))
             .map_err(other)?;
         sfc_extract_ms += trailing_started.elapsed().as_millis();
         trailing_grids = std::mem::take(&mut trailing_extraction.grids);
@@ -1014,6 +1005,8 @@ pub fn process_fetched_hour(
             ),
         });
     }
+    // Never retain parsed inventories across products or forecast hours.
+    drop(sfc_grib);
 
     config.emit(IngestEvent::StageDone {
         hour,
