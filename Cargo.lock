@@ -4872,10 +4872,12 @@ dependencies = [
 name = "rw-store"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "fs4",
  "memmap2",
  "rayon",
  "rustwx-core",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",

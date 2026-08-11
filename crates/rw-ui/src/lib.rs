@@ -48,7 +48,11 @@ pub use panels::{
     SatellitePanel, SoundingPanel, SoundingViewState, StageState, format_bytes,
     shift_date_yyyymmdd, today_yyyymmdd_utc,
 };
-pub use store_view::{HourEntry, ModelEntry, RunEntry, StoreTree, StoreView};
+pub use store_view::{
+    DEFAULT_POOLED_READER_TILE_CACHE_BYTES, HourEntry, MAX_READER_POOL_READERS,
+    MAX_READER_POOL_TILE_CACHE_BYTES, ModelEntry, ReaderPoolLimits, ReaderPoolStats, RunEntry,
+    StoreTree, StoreView,
+};
 pub use style_overrides::{
     ProductStyleBinding, StyleOverrideSettings, UserColorTable, UserExtendMode, UserLegendMode,
     UserUnitConvert, normalize_product_key,
