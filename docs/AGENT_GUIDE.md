@@ -311,6 +311,14 @@ Gotchas: surface RH variable is **`rh_2m`** (not relative_humidity_2m);
 window-product slugs look like **`2m_temp_24_48h_max`** (full list in the
 Lab's `FAMS`); run slugs look like `20260706_12z`.
 
+**RW Store small reads cache decoded 2-D tiles.** Each `HourReader` lazily
+retains at most 8 MiB of dense tiles by default, shared by point and window
+reads. `read_full_2d` bypasses the cache so day reductions do not retain entire
+hours. High-fanout callers can use `open_with_tile_cache_bytes` (including
+zero to disable it), and `tile_cache_stats` exposes hits, misses, and memory.
+The reported byte count covers cached f32 payloads, not allocator metadata,
+outstanding `Arc` handles, or per-thread zstd contexts.
+
 ## 8. Deploying (condensed — full detail in HETZNER_OPS §7)
 
 ```

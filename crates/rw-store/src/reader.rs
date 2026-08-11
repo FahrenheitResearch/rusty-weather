@@ -1,16 +1,22 @@
 //! Hour-file reader: mmap-backed (RAM fallback) access to one rw-store hour
 //! file with true windowed 2D reads — only the tiles intersecting a requested
-//! window are ever decompressed.
+//! window are ever decompressed. Repeated point/window reads share a bounded
+//! decoded-tile cache; `read_full_2d` deliberately bypasses it.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
+use std::mem::size_of;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use memmap2::Mmap;
 use rayon::prelude::*;
 
-use crate::codec::{decode_affine_i16, decode_f32_tile};
+use crate::codec::decode_affine_i16;
+#[cfg(target_endian = "big")]
+use crate::codec::decode_f32_tile;
 use crate::error::{RwResult, RwStoreError};
 use crate::format::{
     COL_X, COL_Y, FLAG_CONSTANT, FLAG_EMPTY, HEADER_LEN, INDEX_RECORD_LEN, KIND_COLUMN3D,
@@ -21,6 +27,148 @@ use crate::index::ChunkRecord;
 
 /// Above this many tiles, `read_full_2d` decodes them in parallel.
 const PARALLEL_TILE_THRESHOLD: usize = 8;
+
+/// Default upper bound for dense 2D tiles retained by one open hour.
+pub const DEFAULT_TILE_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+thread_local! {
+    static ZSTD_DECOMPRESSOR: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { RefCell::new(None) };
+}
+
+fn with_zstd_decompressor<T>(
+    operation: impl FnOnce(&mut zstd::bulk::Decompressor<'static>) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    ZSTD_DECOMPRESSOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(zstd::bulk::Decompressor::new()?);
+        }
+        operation(slot.as_mut().expect("zstd decompressor initialized"))
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TileCacheKey {
+    kind: u8,
+    var_id: u16,
+    tile_y: u32,
+    tile_x: u32,
+}
+
+#[derive(Debug)]
+struct CachedTile {
+    values: Arc<Vec<f32>>,
+    bytes: usize,
+    last_used: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TileCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub insertions: u64,
+    pub evictions: u64,
+    pub entries: usize,
+    pub bytes: usize,
+    pub capacity_bytes: usize,
+}
+
+#[derive(Debug)]
+struct DecodedTileCache {
+    capacity_bytes: usize,
+    bytes: usize,
+    clock: u64,
+    hits: u64,
+    misses: u64,
+    insertions: u64,
+    evictions: u64,
+    entries: HashMap<TileCacheKey, CachedTile>,
+}
+
+impl DecodedTileCache {
+    fn new(capacity_bytes: usize) -> Self {
+        Self {
+            capacity_bytes,
+            bytes: 0,
+            clock: 0,
+            hits: 0,
+            misses: 0,
+            insertions: 0,
+            evictions: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn next_stamp(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    fn get(&mut self, key: TileCacheKey) -> Option<Arc<Vec<f32>>> {
+        let stamp = self.next_stamp();
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.last_used = stamp;
+            self.hits += 1;
+            return Some(Arc::clone(&entry.values));
+        }
+        self.misses += 1;
+        None
+    }
+
+    fn insert(&mut self, key: TileCacheKey, values: Arc<Vec<f32>>) -> Arc<Vec<f32>> {
+        let last_used = self.next_stamp();
+        if let Some(existing) = self.entries.get_mut(&key) {
+            existing.last_used = last_used;
+            return Arc::clone(&existing.values);
+        }
+        let bytes = values.len().saturating_mul(size_of::<f32>());
+        if self.capacity_bytes == 0 || bytes > self.capacity_bytes {
+            return values;
+        }
+        while self.bytes.saturating_add(bytes) > self.capacity_bytes {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(removed.bytes);
+                self.evictions += 1;
+            }
+        }
+        self.bytes += bytes;
+        self.insertions += 1;
+        self.entries.insert(
+            key,
+            CachedTile {
+                values: Arc::clone(&values),
+                bytes,
+                last_used,
+            },
+        );
+        values
+    }
+
+    fn clear(&mut self) {
+        *self = Self::new(self.capacity_bytes);
+    }
+
+    fn stats(&self) -> TileCacheStats {
+        TileCacheStats {
+            hits: self.hits,
+            misses: self.misses,
+            insertions: self.insertions,
+            evictions: self.evictions,
+            entries: self.entries.len(),
+            bytes: self.bytes,
+            capacity_bytes: self.capacity_bytes,
+        }
+    }
+}
 
 /// File bytes, mmap-first with a read-to-RAM fallback (same strategy as the
 /// rustwx volume_store payload reader: if the OS refuses the map, fall back
@@ -61,6 +209,7 @@ pub struct HourReader {
     /// Per-variable contiguous slice of `records`, built once at open so
     /// per-tile lookups binary-search only that variable's records.
     var_ranges: BTreeMap<u16, Range<usize>>,
+    tile_cache: Mutex<DecodedTileCache>,
 }
 
 impl std::fmt::Debug for HourReader {
@@ -84,6 +233,12 @@ impl HourReader {
     /// Open and validate an hour file: header, meta JSON, full chunk index
     /// (including sort order — trust nothing on disk).
     pub fn open(path: &Path) -> RwResult<Self> {
+        Self::open_with_tile_cache_bytes(path, DEFAULT_TILE_CACHE_BYTES)
+    }
+
+    /// Open with a caller-selected decoded dense-2D cache bound.
+    /// A zero-byte bound disables caching; allocation remains lazy.
+    pub fn open_with_tile_cache_bytes(path: &Path, tile_cache_bytes: usize) -> RwResult<Self> {
         let bytes = Self::open_bytes(path)?;
         let data = bytes.as_slice();
 
@@ -151,6 +306,7 @@ impl HourReader {
             meta,
             records,
             var_ranges,
+            tile_cache: Mutex::new(DecodedTileCache::new(tile_cache_bytes)),
         })
     }
 
@@ -178,12 +334,28 @@ impl HourReader {
         self.meta.variables.iter().find(|var| var.name == name)
     }
 
+    /// Current decoded dense-2D cache counters and occupancy.
+    pub fn tile_cache_stats(&self) -> TileCacheStats {
+        self.tile_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stats()
+    }
+
+    /// Drop every cached dense-2D tile and reset its counters.
+    pub fn clear_tile_cache(&self) {
+        self.tile_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
     /// Read the full `ny * nx` row-major field for `name`; positions inside
     /// EMPTY tiles come back as NaN. Tiles decode in parallel when the
     /// variable has more than [`PARALLEL_TILE_THRESHOLD`] of them; results
     /// are placed serially so output is deterministic either way.
     pub fn read_full_2d(&self, name: &str) -> RwResult<Vec<f32>> {
-        let var = self.lookup(name)?;
+        let var = self.lookup_2d(name)?;
         let (nx, ny) = (self.meta.nx, self.meta.ny);
         let tiles_y = ny.div_ceil(TILE_Y);
         let tiles_x = nx.div_ceil(TILE_X);
@@ -217,6 +389,34 @@ impl HourReader {
         Ok(values)
     }
 
+    /// Read one bit-exact 2D value without allocating a one-cell window.
+    ///
+    /// Dense tiles use the same bounded cache as window reads; EMPTY and
+    /// payload-free CONSTANT tiles return directly from the index.
+    pub fn read_point_2d(&self, name: &str, ix: usize, iy: usize) -> RwResult<f32> {
+        let var = self.lookup_2d(name)?;
+        let (nx, ny) = (self.meta.nx, self.meta.ny);
+        if ix >= nx || iy >= ny {
+            return Err(RwStoreError::Format(format!(
+                "point ({ix},{iy}) out of bounds for grid {nx} x {ny}"
+            )));
+        }
+
+        let (ty, tx) = (iy / TILE_Y, ix / TILE_X);
+        let record = self.chunk_record(var, KIND_TILE2D, ty, tx)?;
+        if record.flags & FLAG_EMPTY != 0 {
+            return Ok(f32::NAN);
+        }
+        if record.flags & FLAG_CONSTANT != 0 && record.len == 0 {
+            return Ok(record.center);
+        }
+
+        let (rows, cols) = self.tile_dims(ty, tx);
+        let tile = self.decode_tile_cached(var, record, rows * cols)?;
+        let offset = (iy - ty * TILE_Y) * cols + (ix - tx * TILE_X);
+        Ok(tile[offset])
+    }
+
     /// Read the half-open window `[x0,x1) x [y0,y1)` of `name`, clamped to
     /// the grid. Only tiles intersecting the window are touched: EMPTY tiles
     /// fill NaN and CONSTANT tiles fill their center without reading any
@@ -232,7 +432,7 @@ impl HourReader {
         x1: usize,
         y1: usize,
     ) -> RwResult<Window2D> {
-        let var = self.lookup(name)?;
+        let var = self.lookup_2d(name)?;
         let (nx, ny) = (self.meta.nx, self.meta.ny);
         let x1 = x1.min(nx);
         let y1 = y1.min(ny);
@@ -243,6 +443,15 @@ impl HourReader {
         }
         let wnx = x1 - x0;
         let wny = y1 - y0;
+        if wnx == 1 && wny == 1 {
+            return Ok(Window2D {
+                x0,
+                y0,
+                nx: 1,
+                ny: 1,
+                values: vec![self.read_point_2d(name, x0, y0)?],
+            });
+        }
         let mut values = vec![f32::NAN; wny * wnx];
 
         // Resolve every intersecting tile's record up front so index
@@ -261,9 +470,9 @@ impl HourReader {
                 return Ok(None);
             }
             let (rows, cols) = self.tile_dims(ty, tx);
-            Ok(Some(self.decode_tile(&var.name, record, rows * cols)?))
+            Ok(Some(self.decode_tile_cached(var, record, rows * cols)?))
         };
-        let decoded: Vec<Option<Vec<f32>>> = if jobs.len() > PARALLEL_TILE_THRESHOLD {
+        let decoded: Vec<Option<Arc<Vec<f32>>>> = if jobs.len() > PARALLEL_TILE_THRESHOLD {
             jobs.par_iter().map(decode).collect::<RwResult<_>>()?
         } else {
             jobs.iter().map(decode).collect::<RwResult<_>>()?
@@ -465,6 +674,18 @@ impl HourReader {
             .ok_or_else(|| RwStoreError::UnknownVariable(name.to_string()))
     }
 
+    /// Like [`Self::lookup`], but additionally require a 2D surface variable.
+    fn lookup_2d(&self, name: &str) -> RwResult<&RwsVariableMeta> {
+        let var = self.lookup(name)?;
+        if var.kind != "surface2d" {
+            return Err(RwStoreError::Format(format!(
+                "variable '{name}' has kind '{}', expected 'surface2d'",
+                var.kind
+            )));
+        }
+        Ok(var)
+    }
+
     /// Like [`Self::lookup`], but additionally require a 3D pressure-level
     /// variable.
     fn lookup_3d(&self, name: &str) -> RwResult<&RwsVariableMeta> {
@@ -541,7 +762,10 @@ impl HourReader {
         let compressed = self.payload_slice(var_name, record)?;
         // bulk::decompress caps the output at raw_len — a crafted chunk cannot
         // balloon past the size the index promised.
-        let raw = zstd::bulk::decompress(compressed, record.raw_len as usize).map_err(|err| {
+        let raw = with_zstd_decompressor(|decompressor| {
+            decompressor.decompress(compressed, record.raw_len as usize)
+        })
+        .map_err(|err| {
             RwStoreError::Chunk(format!(
                 "zstd decode failed for variable '{var_name}' column chunk ({},{}): {err}",
                 record.tile_y, record.tile_x
@@ -575,24 +799,95 @@ impl HourReader {
             return Ok(vec![record.center; value_count]);
         }
         let compressed = self.payload_slice(var_name, record)?;
-        // bulk::decompress caps the output at raw_len — a crafted chunk cannot
-        // balloon past the size the index promised.
-        let raw = zstd::bulk::decompress(compressed, record.raw_len as usize).map_err(|err| {
+        let expected_len = value_count.checked_mul(size_of::<f32>()).ok_or_else(|| {
             RwStoreError::Chunk(format!(
-                "zstd decode failed for variable '{var_name}' tile ({},{}): {err}",
+                "variable '{var_name}' tile ({},{}): value count {value_count} overflows",
                 record.tile_y, record.tile_x
             ))
         })?;
-        if raw.len() != record.raw_len as usize {
+        if record.raw_len as usize != expected_len {
             return Err(RwStoreError::Chunk(format!(
-                "variable '{var_name}' tile ({},{}): decompressed {} bytes, index says raw_len {}",
-                record.tile_y,
-                record.tile_x,
-                raw.len(),
-                record.raw_len
+                "variable '{var_name}' tile ({},{}): raw_len {} does not match \
+                 {value_count} f32 values ({expected_len} bytes)",
+                record.tile_y, record.tile_x, record.raw_len
             )));
         }
-        decode_f32_tile(record.flags, record.center, &raw, value_count)
+
+        #[cfg(target_endian = "little")]
+        {
+            let mut values = vec![0.0f32; value_count];
+            let destination: &mut [u8] = bytemuck::cast_slice_mut(&mut values);
+            let written = with_zstd_decompressor(|decompressor| {
+                decompressor.decompress_to_buffer(compressed, destination)
+            })
+            .map_err(|err| {
+                RwStoreError::Chunk(format!(
+                    "zstd decode failed for variable '{var_name}' tile ({},{}): {err}",
+                    record.tile_y, record.tile_x
+                ))
+            })?;
+            if written != expected_len {
+                return Err(RwStoreError::Chunk(format!(
+                    "variable '{var_name}' tile ({},{}): decompressed {written} bytes, \
+                     index says raw_len {}",
+                    record.tile_y, record.tile_x, record.raw_len
+                )));
+            }
+            Ok(values)
+        }
+
+        #[cfg(target_endian = "big")]
+        {
+            let raw = with_zstd_decompressor(|decompressor| {
+                decompressor.decompress(compressed, record.raw_len as usize)
+            })
+            .map_err(|err| {
+                RwStoreError::Chunk(format!(
+                    "zstd decode failed for variable '{var_name}' tile ({},{}): {err}",
+                    record.tile_y, record.tile_x
+                ))
+            })?;
+            if raw.len() != record.raw_len as usize {
+                return Err(RwStoreError::Chunk(format!(
+                    "variable '{var_name}' tile ({},{}): decompressed {} bytes, \
+                     index says raw_len {}",
+                    record.tile_y,
+                    record.tile_x,
+                    raw.len(),
+                    record.raw_len
+                )));
+            }
+            decode_f32_tile(record.flags, record.center, &raw, value_count)
+        }
+    }
+
+    fn decode_tile_cached(
+        &self,
+        var: &RwsVariableMeta,
+        record: &ChunkRecord,
+        value_count: usize,
+    ) -> RwResult<Arc<Vec<f32>>> {
+        let key = TileCacheKey {
+            var_id: var.id,
+            kind: record.kind,
+            tile_y: record.tile_y,
+            tile_x: record.tile_x,
+        };
+        if let Some(tile) = self
+            .tile_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+        {
+            return Ok(tile);
+        }
+
+        let decoded = Arc::new(self.decode_tile(&var.name, record, value_count)?);
+        Ok(self
+            .tile_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, decoded))
     }
 
     /// Bounds-checked payload slice for `record` — validated against the
@@ -1042,6 +1337,10 @@ mod tests {
             ok.values.iter().all(|v| v.is_nan()),
             "temp_2m tile (0,0) is EMPTY"
         );
+        // A failed frame must not poison the reusable thread-local zstd
+        // context: another dense tile on the same thread still decodes.
+        let recovered = reader.read_point_2d("dewpoint_2m", 300, 300).unwrap();
+        assert_eq!(recovered.to_bits(), grid_b()[300 * NX + 300].to_bits());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1067,6 +1366,154 @@ mod tests {
             "expected UnknownVariable, got {err:?}"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn point_reads_are_bit_exact_and_share_the_window_cache() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<HourReader>();
+
+        let dir = test_dir("point-cache");
+        let path = dir.join("hour.rws");
+        write_sample(&path);
+        let reader = HourReader::open_with_tile_cache_bytes(&path, 1024 * 1024).unwrap();
+        let expected = grid_b();
+        let (x, y) = (300usize, 300usize);
+
+        let point = reader.read_point_2d("dewpoint_2m", x, y).unwrap();
+        assert_eq!(point.to_bits(), expected[y * NX + x].to_bits());
+        let after_miss = reader.tile_cache_stats();
+        assert_eq!((after_miss.hits, after_miss.misses), (0, 1));
+        assert_eq!(after_miss.entries, 1);
+
+        let repeated = reader.read_point_2d("dewpoint_2m", x, y).unwrap();
+        assert_eq!(repeated.to_bits(), point.to_bits());
+        let one_cell = reader
+            .read_window_2d("dewpoint_2m", x, y, x + 1, y + 1)
+            .unwrap();
+        assert_eq!(one_cell.values[0].to_bits(), point.to_bits());
+        let hot = reader.tile_cache_stats();
+        assert_eq!((hot.hits, hot.misses), (2, 1));
+
+        assert!(reader.read_point_2d("temp_2m", 10, 10).unwrap().is_nan());
+        assert_eq!(
+            reader.read_point_2d("temp_2m", 300, 10).unwrap().to_bits(),
+            42.0f32.to_bits()
+        );
+        let edge = reader.read_point_2d("dewpoint_2m", NX - 1, NY - 1).unwrap();
+        assert_eq!(edge.to_bits(), expected[(NY - 1) * NX + NX - 1].to_bits());
+
+        let err = reader.read_point_2d("dewpoint_2m", NX, 0).unwrap_err();
+        assert!(matches!(err, RwStoreError::Format(_)));
+        let err = reader.read_point_2d("no_such_var", 0, 0).unwrap_err();
+        assert!(matches!(err, RwStoreError::UnknownVariable(_)));
+
+        drop(reader);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dense_special_f32_values_remain_bit_exact() {
+        let dir = test_dir("special-f32-bits");
+        let path = dir.join("hour.rws");
+        let expected = vec![-0.0, f32::from_bits(1), f32::from_bits(0x7fc0_1234), 7.25];
+        let mut writer = HourWriter::new(
+            "hrrr",
+            "2026-06-09T12:00:00Z",
+            0,
+            2,
+            2,
+            "gridhash-special-bits",
+            "test-build",
+        );
+        writer
+            .add_surface2d("special", "1", serde_json::Value::Null, &expected)
+            .unwrap();
+        writer.finish(&path).unwrap();
+
+        let reader = HourReader::open(&path).unwrap();
+        let full = reader.read_full_2d("special").unwrap();
+        assert_bits_eq(&full, &expected, "special f32 full read");
+        for (index, expected_value) in expected.iter().enumerate() {
+            let actual = reader
+                .read_point_2d("special", index % 2, index / 2)
+                .unwrap();
+            assert_eq!(actual.to_bits(), expected_value.to_bits());
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tile_cache_key_includes_variable_and_lru_stays_bounded() {
+        let dir = test_dir("cache-key-lru");
+        let path = dir.join("hour.rws");
+        write_sample(&path);
+        let tile_bytes = TILE_X * TILE_Y * std::mem::size_of::<f32>();
+        let reader = HourReader::open_with_tile_cache_bytes(&path, tile_bytes).unwrap();
+
+        let a = reader.read_point_2d("temp_2m", 10, 300).unwrap();
+        let b = reader.read_point_2d("dewpoint_2m", 10, 300).unwrap();
+        assert_eq!(a.to_bits(), grid_a()[300 * NX + 10].to_bits());
+        assert_eq!(b.to_bits(), grid_b()[300 * NX + 10].to_bits());
+
+        let _ = reader.read_point_2d("dewpoint_2m", 10, 10).unwrap();
+        let _ = reader.read_point_2d("dewpoint_2m", 300, 10).unwrap();
+        let _ = reader.read_point_2d("dewpoint_2m", 10, 10).unwrap();
+        let stats = reader.tile_cache_stats();
+        assert!(stats.evictions >= 3, "stats: {stats:?}");
+        assert_eq!(stats.entries, 1);
+        assert!(stats.bytes <= stats.capacity_bytes);
+
+        reader.clear_tile_cache();
+        assert_eq!(
+            reader.tile_cache_stats(),
+            TileCacheStats {
+                capacity_bytes: tile_bytes,
+                ..TileCacheStats::default()
+            }
+        );
+        drop(reader);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disabled_cache_redecodes_and_shared_reader_is_thread_safe() {
+        let dir = test_dir("cache-concurrency");
+        let path = dir.join("hour.rws");
+        write_sample(&path);
+
+        let uncached = HourReader::open_with_tile_cache_bytes(&path, 0).unwrap();
+        let _ = uncached.read_point_2d("dewpoint_2m", 300, 300).unwrap();
+        let _ = uncached.read_point_2d("dewpoint_2m", 300, 300).unwrap();
+        let stats = uncached.tile_cache_stats();
+        assert_eq!((stats.hits, stats.misses, stats.entries), (0, 2, 0));
+
+        let reader = Arc::new(HourReader::open_with_tile_cache_bytes(&path, 1024 * 1024).unwrap());
+        let expected = grid_b()[300 * NX + 300].to_bits();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let reader = Arc::clone(&reader);
+                scope.spawn(move || {
+                    for _ in 0..500 {
+                        assert_eq!(
+                            reader
+                                .read_point_2d("dewpoint_2m", 300, 300)
+                                .unwrap()
+                                .to_bits(),
+                            expected
+                        );
+                    }
+                });
+            }
+        });
+        let stats = reader.tile_cache_stats();
+        assert_eq!(stats.hits + stats.misses, 8 * 500);
+        assert_eq!(stats.entries, 1);
+
+        drop(reader);
+        drop(uncached);
         let _ = fs::remove_dir_all(&dir);
     }
 
