@@ -18,6 +18,13 @@ implemented service. The current contracts are
 [`docs/MODEL_SUPPORT.md`](docs/MODEL_SUPPORT.md), and
 [`docs/REDUCTIONS.md`](docs/REDUCTIONS.md).
 
+BowEcho's opt-in Community Cache is specified separately in
+[`docs/COMMUNITY_CACHE_PROTOCOL.md`](docs/COMMUNITY_CACHE_PROTOCOL.md) and its
+mandatory pre-transport
+[`docs/COMMUNITY_CACHE_THREAT_MODEL.md`](docs/COMMUNITY_CACHE_THREAT_MODEL.md).
+The design permits only relay-mediated peer assistance; direct user-to-user
+connectivity is permanently out of scope.
+
 ## Self-hosted data service
 
 `rw-server` exposes bounded catalog, point, profile, and temporal analytics over

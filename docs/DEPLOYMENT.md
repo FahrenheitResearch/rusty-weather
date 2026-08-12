@@ -120,6 +120,51 @@ full-domain reductions before allocation. The defaults cover HRRR's
 limits together with heavy concurrency and available memory; the serialized
 artifact must still fit `job_result_bytes`.
 
+### Optional Community Cache Phase 1
+
+Leave `[community].enabled = false` for the normal self-hosted service. Enabling
+it requires a service-readable Ed25519 signing-key file containing exactly 32
+base64-encoded secret bytes. The private key never belongs in TOML, environment
+output, R2, logs, or a client bundle. Distribute the corresponding public key
+to clients through a separately authenticated release/configuration path.
+Enablement also requires `community.capacity_audit_completed = true`. Set it
+only after the target origin host's disk and concurrency audit supplies the
+deployment-specific quota values.
+
+Give `community.root` its own real, writable, quota-limited directory; do not
+nest it inside `store_root` or expose it as a static directory. Its durable
+objects and signed manifests are an expendable cache, not a substitute for the
+model store or backups. Capacity values in the example are non-production
+parsing examples, not recommendations; replace them with audited values.
+
+`community.hot_store` supports a filesystem test/local provider or an
+R2-compatible authenticated HTTPS gateway with immutable keys. The gateway
+must expose exact GET/PUT semantics at `<base_url>/<bucket>/v1/...`, enforce
+TLS, keep its bearer token in `token_file`, and reject replacement of existing
+keys with different bytes. Deterministic keys are:
+
+- `v1/manifests/{request_sha256}.json`
+- `v1/objects/{object_sha256}`
+
+Configure `community.origin_base_url` only as an absolute HTTPS URL. It is the
+authoritative Hetzner Rusty Weather dynamic resolve/object API and manifest
+signer, not a mutable run alias. It is conventional HTTPS and is never reached
+through TURN. The Phase 1 order is local CAS, R2, then Hetzner origin; a
+successful origin result fills the local CAS and may be promoted to R2. The
+Phase 1 server contains no relay or direct-peer transport.
+
+Keep `community.promotion.enabled = false` until the hot gateway and cost
+alerts are verified. `community.quotas.promoted_bytes_per_month` is the global
+promotion cost ceiling; crossing it pauses promotion without disabling local
+cache or origin queries. `RW_COMMUNITY_KILL_SWITCH=true` likewise stops hot
+promotion and case publication while retaining signed normal-origin fallback.
+Case publication has its own `[community.cases].enabled` gate.
+Set `community.quotas.maximum_principals` to bound the durable monthly
+accounting file. Bound case retention independently with
+`community.cases.maximum_cases`, `community.cases.storage_bytes`, and
+`community.cases.default_retention_seconds`; expired cases are removed rather
+than accumulating indefinitely.
+
 ## Docker Compose
 
 The source-checkout example at `deploy/docker/compose.yaml` builds the

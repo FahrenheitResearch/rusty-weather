@@ -87,7 +87,7 @@ impl TokenSet {
     }
 
     pub fn verify(&self, token: &str) -> bool {
-        if token.as_bytes().len() < MIN_TOKEN_BYTES {
+        if token.len() < MIN_TOKEN_BYTES {
             return false;
         }
         let candidate = hash_token(token.as_bytes());
@@ -99,13 +99,18 @@ impl TokenSet {
     }
 
     pub fn verify_authorization_header(&self, value: Option<&HeaderValue>) -> bool {
-        let Some(value) = value.and_then(|value| value.to_str().ok()) else {
-            return false;
-        };
-        let Some(token) = value.strip_prefix("Bearer ") else {
-            return false;
-        };
-        !token.is_empty() && token.trim() == token && self.verify(token)
+        self.authorization_principal(value).is_some()
+    }
+
+    /// Return a stable, non-secret SHA-256 principal for quota accounting.
+    /// The bearer token itself is never retained, logged, or exposed.
+    pub fn authorization_principal(&self, value: Option<&HeaderValue>) -> Option<String> {
+        let value = value.and_then(|value| value.to_str().ok())?;
+        let token = value.strip_prefix("Bearer ")?;
+        if token.is_empty() || token.trim() != token || !self.verify(token) {
+            return None;
+        }
+        Some(format!("{:x}", Sha256::digest(token.as_bytes())))
     }
 }
 
@@ -146,7 +151,7 @@ fn validate_private_permissions(_metadata: &fs::Metadata) -> Result<(), AuthErro
 }
 
 fn validate_token(token: &str) -> Result<(), AuthError> {
-    if token.as_bytes().len() < MIN_TOKEN_BYTES {
+    if token.len() < MIN_TOKEN_BYTES {
         return Err(AuthError::TokenTooShort);
     }
     if token.chars().any(char::is_control) {

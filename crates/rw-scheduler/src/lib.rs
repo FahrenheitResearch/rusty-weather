@@ -14,6 +14,7 @@ pub mod coverage;
 pub mod error;
 pub mod executor;
 pub mod limits;
+pub mod origin;
 pub mod plan;
 pub mod retention;
 pub mod state;
@@ -26,6 +27,10 @@ pub use executor::{
     ProviderCycleDiscovery, SchedulerHost, StatusReport, deterministic_jittered_delay,
 };
 pub use limits::{AdmissionDecision, SchedulerLimits};
+pub use origin::{
+    CapacityAuditStatus, OriginCatalogPlanConfig, OriginCatalogPreset, OriginLane, OriginLanePlan,
+    OriginLaneSelector, OriginProfileRequirement, OriginPublicationPlan,
+};
 pub use plan::{
     ExpectedValidTime, IngestProductPlan, JOB_PLAN_SCHEMA, JobPlan, PersistedIngestProfile,
     canonical_job_id, canonical_run_id, cycle_origin_unix,

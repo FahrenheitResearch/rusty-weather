@@ -5,6 +5,8 @@
 //! control, observability, HTTP problem responses, and process lifecycle.
 
 pub mod auth;
+pub mod community;
+pub mod community_store;
 pub mod config;
 pub mod jobs;
 pub mod metrics;

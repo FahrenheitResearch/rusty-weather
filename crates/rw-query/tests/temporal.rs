@@ -4,12 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustwx_core::{GridShape, LatLonGrid};
 use rw_query::{
-    IndexWindow2DRequest, IntervalSupport, MissingPolicy, QueryError, QueryLimits, RunSnapshot,
-    SpatialStatsSeriesRequest, TemporalGridRequest, TemporalGridResult, TemporalReducer,
-    TemporalReductionLimits, TemporalSemantics, TemporalVerticalSelection, TemporalWindow,
-    TimeExpectation, TimeRange, query_spatial_stats_series, query_window_2d, reduce_temporal_grid,
-    reduce_temporal_grid_with_cancel, reduce_temporal_grid_with_cancel_and_limits,
-    resolve_temporal_window, temporal_semantics_capability,
+    IndexWindow2DRequest, IndexWindow3DRequest, IntervalSupport, MissingPolicy, QueryError,
+    QueryLimits, RunSnapshot, SpatialStatsSeriesRequest, TemporalGridRequest, TemporalGridResult,
+    TemporalReducer, TemporalReductionLimits, TemporalSemantics, TemporalVerticalSelection,
+    TemporalWindow, TimeExpectation, TimeRange, query_spatial_stats_series, query_window_2d,
+    query_window_3d, reduce_temporal_grid, reduce_temporal_grid_with_cancel,
+    reduce_temporal_grid_with_cancel_and_limits, resolve_temporal_window,
+    temporal_semantics_capability,
 };
 use rw_store::RwsExactTime;
 use rw_store::ingest::{
@@ -141,6 +142,24 @@ fn temporal_store() -> (TestDir, PathBuf) {
                 values: &interval_maximum,
             },
         ];
+        let pressure_850 = [
+            850.0 + slot as f32,
+            851.0 + slot as f32,
+            852.0 + slot as f32,
+            853.0 + slot as f32,
+        ];
+        let pressure_500 = [
+            500.0 + slot as f32,
+            f32::NAN,
+            502.0 + slot as f32,
+            503.0 + slot as f32,
+        ];
+        let volumes = [PressureVolumeInput {
+            name: "temperature_iso",
+            units: "K",
+            selector_template: serde_json::json!({"fixture": "temperature_iso"}),
+            levels: vec![(850, &pressure_850), (500, &pressure_500)],
+        }];
         write_hour_from_grid_with_derived_exact(
             &root,
             MODEL,
@@ -151,7 +170,7 @@ fn temporal_store() -> (TestDir, PathBuf) {
             None,
             &[],
             &fields,
-            &[],
+            &volumes,
             "rw-query-temporal-test",
             1_800_000_000 + u64::from(slot),
         )
@@ -840,6 +859,29 @@ fn spatial_stats_and_native_index_windows_are_bounded_and_exact() {
         )
         .is_err()
     );
+
+    let pressure_window = query_window_3d(
+        &snapshot,
+        &IndexWindow3DRequest {
+            storage_slot: 1,
+            variable: "temperature_iso".into(),
+            levels_hpa: vec![500, 850],
+            x0: 1,
+            y0: 0,
+            x1: 2,
+            y1: 2,
+        },
+    )
+    .unwrap();
+    assert_eq!(pressure_window.levels_hpa, vec![500, 850]);
+    assert_eq!((pressure_window.nx, pressure_window.ny), (1, 2));
+    assert_eq!(pressure_window.values[0], None);
+    for (actual, expected) in pressure_window.values[1..]
+        .iter()
+        .zip([504.0f32, 852.0, 854.0])
+    {
+        assert!((actual.unwrap() - expected).abs() < 0.01);
+    }
 }
 
 #[test]

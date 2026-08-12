@@ -12,6 +12,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use rustwx_core::{ModelId, SourceId};
+use rw_community_protocol::{CaseRoomManifest, ResolveObjectRequest};
 use rw_ingest::{IngestCapabilityLimitation, IngestSupportStatus, model_ingest_capability};
 use rw_query::{
     IndexWindow2DRequest, IntervalSupport, MissingPolicy, PointSeriesRequest, PointSeriesResult,
@@ -35,6 +36,7 @@ use tracing::error;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+use crate::community::CommunityError;
 use crate::config::ConfigError;
 use crate::problem::ProblemDetails;
 use crate::{AppState, CancellationToken, ExecutionError, JobError, JobStatus};
@@ -45,6 +47,9 @@ const RETIRED_VARIABLE_NAME: &str = "fire_weather_composite";
 
 #[derive(Debug, Clone, Copy)]
 struct RequestId(Uuid);
+
+#[derive(Debug, Clone)]
+struct AuthPrincipal(String);
 
 fn is_retired_model_slug(model: &str) -> bool {
     model
@@ -324,17 +329,12 @@ impl From<TemporalOperation> for ApiTemporalOperation {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiMissingPolicy {
+    #[default]
     Strict,
     Partial,
-}
-
-impl Default for ApiMissingPolicy {
-    fn default() -> Self {
-        Self::Strict
-    }
 }
 
 impl From<ApiMissingPolicy> for MissingPolicy {
@@ -414,20 +414,15 @@ impl From<&ApiTemporalWindow> for TemporalWindow {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, ToSchema)]
 #[serde(tag = "basis", rename_all = "snake_case")]
 pub enum ApiTimeExpectation {
+    #[default]
     ManifestAxis,
     FixedCadence {
         step_seconds: u64,
         anchor_unix: Option<i64>,
     },
-}
-
-impl Default for ApiTimeExpectation {
-    fn default() -> Self {
-        Self::ManifestAxis
-    }
 }
 
 impl From<&ApiTimeExpectation> for TimeExpectation {
@@ -776,6 +771,16 @@ struct ArtifactPath {
     file: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CommunityObjectPath {
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommunityCasePath {
+    case_id: String,
+}
+
 #[derive(Debug)]
 enum JobWorkError {
     Query(QueryError),
@@ -825,6 +830,16 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
         .route("/v1/analytics/spatial-series", post(spatial_series))
         .route("/v1/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/v1/artifacts/{hash}/{file}", get(artifact))
+        .route(
+            rw_community_protocol::RESOLVE_OBJECT_PATH,
+            post(resolve_community_object),
+        )
+        .route("/v1/community/objects/{sha256}", get(community_object))
+        .route(
+            rw_community_protocol::CREATE_CASE_PATH,
+            post(publish_community_case),
+        )
+        .route("/v1/community/cases/{case_id}", get(community_case))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_authentication,
@@ -958,14 +973,20 @@ fn normalize_framework_error(response: Response, request_id: Uuid) -> Response {
 
 async fn require_authentication(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    if state.tokens.is_empty()
-        || state
-            .tokens
-            .verify_authorization_header(request.headers().get(header::AUTHORIZATION))
+    if state.tokens.is_empty() {
+        request
+            .extensions_mut()
+            .insert(AuthPrincipal("local-unauthenticated".into()));
+        return next.run(request).await;
+    }
+    if let Some(principal) = state
+        .tokens
+        .authorization_principal(request.headers().get(header::AUTHORIZATION))
     {
+        request.extensions_mut().insert(AuthPrincipal(principal));
         return next.run(request).await;
     }
     let request_id = request
@@ -1774,6 +1795,100 @@ async fn cancel_job(
     }
 }
 
+async fn resolve_community_object(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(request): Json<ResolveObjectRequest>,
+) -> Response {
+    let is_heavy = matches!(
+        &request.request.query,
+        rw_community_protocol::ShareQuery::TemporalGrid { .. }
+    );
+    let community = state.community.clone();
+    let catalog = state.catalog.clone();
+    let result = if is_heavy {
+        state
+            .run_heavy_sync(move || community.resolve(&principal.0, &request, &catalog))
+            .await
+    } else {
+        state
+            .run_light(move || community.resolve(&principal.0, &request, &catalog))
+            .await
+    };
+    match result {
+        Ok(Ok((resolved, _object))) => json_with_etag(StatusCode::OK, &resolved, request_id.0),
+        Ok(Err(error)) => community_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn community_object(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(path): Path<CommunityObjectPath>,
+) -> Response {
+    let community = state.community.clone();
+    let hash = path.sha256.clone();
+    match state
+        .run_light(move || community.object(&principal.0, &hash))
+        .await
+    {
+        Ok(Ok(bytes)) => {
+            let mut response = Response::new(Body::from(bytes));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, max-age=31536000, immutable"),
+            );
+            if let Ok(value) = HeaderValue::from_str(&format!("\"{}\"", path.sha256)) {
+                response.headers_mut().insert(header::ETAG, value);
+            }
+            response
+        }
+        Ok(Err(error)) => community_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn publish_community_case(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(manifest): Json<CaseRoomManifest>,
+) -> Response {
+    let community = state.community.clone();
+    match state
+        .run_light(move || community.publish_case(&principal.0, manifest))
+        .await
+    {
+        Ok(Ok(signed)) => json_with_etag(StatusCode::CREATED, &signed, request_id.0),
+        Ok(Err(error)) => community_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn community_case(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(path): Path<CommunityCasePath>,
+) -> Response {
+    let community = state.community.clone();
+    match state
+        .run_light(move || community.case(&principal.0, &path.case_id))
+        .await
+    {
+        Ok(Ok(signed)) => json_with_etag(StatusCode::OK, &signed, request_id.0),
+        Ok(Err(error)) => community_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
 async fn artifact(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
@@ -2006,6 +2121,102 @@ fn response_work_problem(error: ResponseWorkError, request_id: Uuid) -> ProblemD
         ResponseWorkError::Query(error) => query_problem(error, request_id),
         ResponseWorkError::Json(error) => {
             error!(%request_id, %error, "cached response serialization failed");
+            ProblemDetails::internal(request_id)
+        }
+    }
+}
+
+fn community_problem(error: CommunityError, request_id: Uuid) -> ProblemDetails {
+    match error {
+        CommunityError::Disabled | CommunityError::Killed => ProblemDetails::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "COMMUNITY_CACHE_DISABLED",
+            "Community Cache is unavailable",
+            "Use the normal Rusty Weather origin API or retry after the feature is enabled.",
+            request_id,
+        ),
+        CommunityError::NotFound => ProblemDetails::new(
+            StatusCode::NOT_FOUND,
+            "COMMUNITY_OBJECT_NOT_FOUND",
+            "Community object was not found",
+            "Resolve the immutable request again; the origin remains the fallback.",
+            request_id,
+        ),
+        CommunityError::Unsupported => ProblemDetails::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "COMMUNITY_QUERY_UNSUPPORTED",
+            "Community object type is not available",
+            "Use the normal Rusty Weather query endpoint for this object type.",
+            request_id,
+        ),
+        CommunityError::Cas(crate::community_store::CommunityStoreError::Quota) => {
+            ProblemDetails::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "COMMUNITY_QUOTA",
+                "Community Cache quota reached",
+                "Retry after the quota window resets or use the normal origin API.",
+                request_id,
+            )
+        }
+        CommunityError::Cas(crate::community_store::CommunityStoreError::TooLarge)
+        | CommunityError::Cas(crate::community_store::CommunityStoreError::HashMismatch)
+        | CommunityError::Cas(crate::community_store::CommunityStoreError::Invalid(_))
+        | CommunityError::Protocol(_) => ProblemDetails::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "COMMUNITY_OBJECT_REJECTED",
+            "Community object failed validation",
+            "The request, signature, hash, schema, attribution, or size contract is invalid.",
+            request_id,
+        ),
+        CommunityError::Query(error) => query_problem(error, request_id),
+        CommunityError::Upstream(detail) => {
+            error!(%request_id, %detail, "Community Cache upstream failed");
+            ProblemDetails::new(
+                StatusCode::BAD_GATEWAY,
+                "COMMUNITY_UPSTREAM_FAILED",
+                "Community origin is unavailable",
+                "Retry the normal Rusty Weather origin request.",
+                request_id,
+            )
+        }
+        CommunityError::Invalid(detail) => {
+            error!(%request_id, %detail, "Community Cache state is invalid");
+            ProblemDetails::new(
+                StatusCode::BAD_REQUEST,
+                "COMMUNITY_REQUEST_INVALID",
+                "Community request is invalid",
+                "Correct the request identity and try again.",
+                request_id,
+            )
+        }
+        CommunityError::Io(error) => {
+            error!(%request_id, %error, "Community Cache I/O failed");
+            ProblemDetails::internal(request_id)
+        }
+        CommunityError::Json(error) => {
+            error!(%request_id, %error, "Community Cache JSON failed");
+            ProblemDetails::internal(request_id)
+        }
+        CommunityError::Store(error)
+        | CommunityError::Cas(crate::community_store::CommunityStoreError::Store(error)) => {
+            error!(%request_id, %error, "Community Cache publication failed");
+            ProblemDetails::internal(request_id)
+        }
+        CommunityError::Cas(crate::community_store::CommunityStoreError::Killed) => {
+            ProblemDetails::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "COMMUNITY_CACHE_DISABLED",
+                "Community Cache is unavailable",
+                "Use the normal Rusty Weather origin API.",
+                request_id,
+            )
+        }
+        CommunityError::Cas(crate::community_store::CommunityStoreError::Io(error)) => {
+            error!(%request_id, %error, "Community CAS I/O failed");
+            ProblemDetails::internal(request_id)
+        }
+        CommunityError::Cas(crate::community_store::CommunityStoreError::Json(error)) => {
+            error!(%request_id, %error, "Community CAS metadata failed");
             ProblemDetails::internal(request_id)
         }
     }

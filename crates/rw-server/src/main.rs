@@ -112,6 +112,12 @@ async fn serve(config_path: Option<&Path>) -> Result<(), AnyError> {
     ensure_real_directory(&config.server.store_root, "store_root")?;
     ensure_real_directory(&config.server.artifact_root, "artifact_root")?;
     ensure_distinct_roots(&config.server.store_root, &config.server.artifact_root)?;
+    if config.community.enabled {
+        fs::create_dir_all(&config.community.root)?;
+        ensure_real_directory(&config.community.root, "community.root")?;
+        ensure_distinct_roots(&config.server.store_root, &config.community.root)?;
+        ensure_distinct_roots(&config.server.artifact_root, &config.community.root)?;
+    }
 
     if tokens.is_empty() {
         warn!(
@@ -173,6 +179,33 @@ fn doctor(config_path: Option<&Path>) -> Result<(), AnyError> {
             "store and artifact roots are distinct",
         )),
         Err(error) => checks.push(fail("root_isolation", error.to_string())),
+    }
+    if config.community.enabled {
+        checks.push(check_directory("community.root", &config.community.root));
+        for (name, first, second) in [
+            (
+                "community_store_isolation",
+                config.server.store_root.as_path(),
+                config.community.root.as_path(),
+            ),
+            (
+                "community_artifact_isolation",
+                config.server.artifact_root.as_path(),
+                config.community.root.as_path(),
+            ),
+        ] {
+            match ensure_distinct_roots(first, second) {
+                Ok(()) => checks.push(ok(name, "Community Cache root is isolated")),
+                Err(error) => checks.push(fail(name, error.to_string())),
+            }
+        }
+        match rw_server::community::CommunityService::open(&config.community) {
+            Ok(_) => checks.push(ok(
+                "community_security",
+                "signing key, providers, quotas, and cache root validated",
+            )),
+            Err(error) => checks.push(fail("community_security", error.to_string())),
+        }
     }
 
     if config.server.store_root.is_dir() {

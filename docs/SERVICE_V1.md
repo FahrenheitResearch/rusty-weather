@@ -38,6 +38,10 @@ versioned API.
 - `GET /v1/jobs/{id}`
 - `DELETE /v1/jobs/{id}`
 - `GET /v1/artifacts/{hash}/{file}`
+- `POST /v1/community/objects/resolve` (feature-gated Phase 1)
+- `GET /v1/community/objects/{sha256}` (feature-gated Phase 1)
+- `POST /v1/community/cases` (explicit publication; separately gated)
+- `GET /v1/community/cases/{case_id}`
 - `GET /v1/openapi.json`
 - `GET /metrics`
 
@@ -75,3 +79,36 @@ verified merely because a URL template exists.
 Local valid stores are queryable even when their model identifier is not built
 into the registry. This keeps private WRF, ArWen, and other compatible output
 first-class.
+
+## Community Cache Phase 1
+
+Community Cache is disabled by default and adds no peer transport. It admits
+only the closed query-object categories in `rw-community-protocol`: sounding
+profiles with exact-time surface anchors, point series, native surface or
+selected-pressure windows, temporal/diurnal grids, and deliberately published
+case artifacts. There is no arbitrary-file, directory, raw-WRF, or full-run
+endpoint.
+
+Every accepted object is SHA-256 content-addressed and described by an
+origin-signed, self-contained `rw.community.object.v1` manifest binding the
+model, immutable run and snapshot, grid, variables, exact valid time/window,
+recipe, source provenance, sizes, compression, and attribution. The server
+checks the same contract before accepting an R2-compatible hot object or HTTPS
+origin response. Local CAS publication is atomic and bounded by byte/object
+limits with least-recently-used eviction.
+
+Phase 1 resolution is strictly local CAS, optional R2-compatible hot storage,
+then the authoritative Hetzner Rusty Weather dynamic HTTPS origin. Hetzner
+signs manifests and is never reached through TURN. A hot-store miss or outage
+is not fatal. Successful origin results are stored locally and popular objects
+may be promoted under a hit window and global
+monthly promotion ceiling. The global kill switch disables promotion and case
+publication while preserving a signed normal-origin response. Final origin
+disk/concurrency/retention values remain conservative configuration inputs
+until the deployment node is audited.
+
+The wire contract and threat model are in `COMMUNITY_CACHE_PROTOCOL.md` and
+`COMMUNITY_CACHE_THREAT_MODEL.md`. Relay-mediated peer-assisted transfers come
+afterward; direct connectivity is permanently out of scope. Phase 1 contains
+no STUN, direct ICE, candidate gathering, peer-address exchange, or direct
+fallback code.

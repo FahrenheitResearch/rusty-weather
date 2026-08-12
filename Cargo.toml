@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/rw-community-protocol",
     "crates/rw-glm",
     "crates/rw-gdex",
     "crates/rw-formula",

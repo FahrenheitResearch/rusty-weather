@@ -461,6 +461,23 @@ fn config_bounds_provider_discovery_timeouts() {
 }
 
 #[test]
+fn scheduler_config_validates_the_planning_only_origin_subset() {
+    let mut config = scheduler_config("origin-plan", &["hrrr", "gfs", "nbm"]);
+    config.origin_catalog_plan = Some(crate::origin::OriginCatalogPlanConfig::default());
+    assert!(config.validate().is_ok());
+
+    let mut missing_lane_model = scheduler_config("origin-plan-missing", &["hrrr", "gfs"]);
+    missing_lane_model.origin_catalog_plan =
+        Some(crate::origin::OriginCatalogPlanConfig::default());
+    assert!(missing_lane_model.validate().is_err());
+
+    config
+        .model_profiles
+        .insert("nbm".to_string(), "analysis".to_string());
+    assert!(config.validate().is_err());
+}
+
+#[test]
 fn state_store_removes_only_terminal_records() {
     let dir = test_dir("remove-terminal-state");
     let store = JobStateStore::new(&dir);

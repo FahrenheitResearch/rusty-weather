@@ -16,6 +16,49 @@
         "response_cache_seconds": 300
       }
     },
+    "community": {
+      "description": "Optional, privacy-preserving Community Cache. This is disabled unless\nan operator explicitly enables it and supplies signing material.",
+      "$ref": "#/$defs/CommunityConfig",
+      "default": {
+        "capacity_audit_completed": false,
+        "cases": {
+          "default_retention_seconds": 2592000,
+          "enabled": false,
+          "maximum_cases": 1000,
+          "maximum_manifest_bytes": 262144,
+          "maximum_objects_per_case": 512,
+          "storage_bytes": 268435456
+        },
+        "enabled": false,
+        "hot_store": {
+          "provider": "disabled"
+        },
+        "kill_switch": false,
+        "origin_base_url": null,
+        "origin_token_file": null,
+        "promotion": {
+          "enabled": false,
+          "maximum_object_bytes": 67108864,
+          "minimum_hits": 3,
+          "window_seconds": 300
+        },
+        "quotas": {
+          "concurrent_transfers": 4,
+          "download_bytes_per_month": 107374182400,
+          "maximum_decompressed_bytes": 268435456,
+          "maximum_manifest_bytes": 262144,
+          "maximum_object_bytes": 67108864,
+          "maximum_objects": 100000,
+          "maximum_principals": 10000,
+          "promoted_bytes_per_month": 107374182400,
+          "storage_bytes": 10737418240,
+          "upload_bytes_per_month": 107374182400
+        },
+        "root": "./community-cache",
+        "signing_key_file": null,
+        "trusted_public_keys": []
+      }
+    },
     "limits": {
       "$ref": "#/$defs/LimitsConfig",
       "default": {
@@ -77,6 +120,49 @@
       },
       "additionalProperties": false
     },
+    "CaseRoomConfig": {
+      "type": "object",
+      "properties": {
+        "default_retention_seconds": {
+          "description": "Maximum requested retention interval for a published case.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 2592000,
+          "minimum": 0
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "maximum_cases": {
+          "description": "Total number of unexpired case manifests retained locally.",
+          "type": "integer",
+          "format": "uint",
+          "default": 1000,
+          "minimum": 0
+        },
+        "maximum_manifest_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 262144,
+          "minimum": 0
+        },
+        "maximum_objects_per_case": {
+          "type": "integer",
+          "format": "uint",
+          "default": 512,
+          "minimum": 0
+        },
+        "storage_bytes": {
+          "description": "Total encoded bytes available to unexpired case manifests.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 268435456,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
     "CatalogConfig": {
       "type": "object",
       "properties": {
@@ -88,6 +174,229 @@
         }
       },
       "additionalProperties": false
+    },
+    "CommunityConfig": {
+      "description": "Phase-one Community Cache configuration. Capacity values intentionally\nremain conservative and operator-configurable until the deployment host is\naudited. Enabling this does not enable any peer transport.",
+      "type": "object",
+      "properties": {
+        "capacity_audit_completed": {
+          "description": "Explicit acknowledgement that deployment-specific disk/concurrency\ncapacity values came from the completed origin-host audit.",
+          "type": "boolean",
+          "default": false
+        },
+        "cases": {
+          "$ref": "#/$defs/CaseRoomConfig",
+          "default": {
+            "default_retention_seconds": 2592000,
+            "enabled": false,
+            "maximum_cases": 1000,
+            "maximum_manifest_bytes": 262144,
+            "maximum_objects_per_case": 512,
+            "storage_bytes": 268435456
+          }
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "hot_store": {
+          "$ref": "#/$defs/HotStoreConfig",
+          "default": {
+            "provider": "disabled"
+          }
+        },
+        "kill_switch": {
+          "description": "Immediate server-side stop for assisted cache reads, publication, and\npromotion. Signed conventional HTTPS-origin resolution remains live.",
+          "type": "boolean",
+          "default": false
+        },
+        "origin_base_url": {
+          "description": "Normal HTTPS Hetzner/origin fallback. Mutable aliases are not allowed.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "origin_token_file": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "promotion": {
+          "$ref": "#/$defs/PromotionConfig",
+          "default": {
+            "enabled": false,
+            "maximum_object_bytes": 67108864,
+            "minimum_hits": 3,
+            "window_seconds": 300
+          }
+        },
+        "quotas": {
+          "$ref": "#/$defs/CommunityQuotasConfig",
+          "default": {
+            "concurrent_transfers": 4,
+            "download_bytes_per_month": 107374182400,
+            "maximum_decompressed_bytes": 268435456,
+            "maximum_manifest_bytes": 262144,
+            "maximum_object_bytes": 67108864,
+            "maximum_objects": 100000,
+            "maximum_principals": 10000,
+            "promoted_bytes_per_month": 107374182400,
+            "storage_bytes": 10737418240,
+            "upload_bytes_per_month": 107374182400
+          }
+        },
+        "root": {
+          "type": "string",
+          "default": "./community-cache"
+        },
+        "signing_key_file": {
+          "description": "File containing a private manifest-signing key. Never accepted inline.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "trusted_public_keys": {
+          "description": "Public verification keys accepted for origin and hot-store manifests.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "CommunityQuotasConfig": {
+      "type": "object",
+      "properties": {
+        "concurrent_transfers": {
+          "type": "integer",
+          "format": "uint",
+          "default": 4,
+          "minimum": 0
+        },
+        "download_bytes_per_month": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 107374182400,
+          "minimum": 0
+        },
+        "maximum_decompressed_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 268435456,
+          "minimum": 0
+        },
+        "maximum_manifest_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 262144,
+          "minimum": 0
+        },
+        "maximum_object_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 67108864,
+          "minimum": 0
+        },
+        "maximum_objects": {
+          "type": "integer",
+          "format": "uint",
+          "default": 100000,
+          "minimum": 0
+        },
+        "maximum_principals": {
+          "description": "Maximum distinct authenticated principals retained in the durable\nmonthly accounting file. A new principal fails closed at this bound.",
+          "type": "integer",
+          "format": "uint",
+          "default": 10000,
+          "minimum": 0
+        },
+        "promoted_bytes_per_month": {
+          "description": "Global cost ceiling for bytes promoted to the hot-object provider.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 107374182400,
+          "minimum": 0
+        },
+        "storage_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 10737418240,
+          "minimum": 0
+        },
+        "upload_bytes_per_month": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 107374182400,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "HotStoreConfig": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "provider": {
+              "type": "string",
+              "const": "disabled"
+            }
+          },
+          "required": [
+            "provider"
+          ]
+        },
+        {
+          "description": "Test/local provider using the same immutable key layout as R2.",
+          "type": "object",
+          "properties": {
+            "provider": {
+              "type": "string",
+              "const": "filesystem"
+            },
+            "root": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "root"
+          ]
+        },
+        {
+          "description": "R2-compatible HTTPS object gateway. Credentials are loaded from a file,\nnever serialized in configuration or logs.",
+          "type": "object",
+          "properties": {
+            "base_url": {
+              "type": "string"
+            },
+            "bucket": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string",
+              "const": "r2"
+            },
+            "token_file": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "base_url",
+            "bucket",
+            "token_file"
+          ]
+        }
+      ]
     },
     "LimitsConfig": {
       "type": "object",
@@ -228,6 +537,34 @@
         "format": {
           "$ref": "#/$defs/LogFormat",
           "default": "json"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PromotionConfig": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "maximum_object_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 67108864,
+          "minimum": 0
+        },
+        "minimum_hits": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 3,
+          "minimum": 0
+        },
+        "window_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 300,
+          "minimum": 0
         }
       },
       "additionalProperties": false

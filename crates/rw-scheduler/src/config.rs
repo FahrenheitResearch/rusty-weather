@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{SchedulerError, SchedulerResult};
 use crate::limits::SchedulerLimits;
+use crate::origin::OriginCatalogPlanConfig;
 use crate::state::RetryPolicy;
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
@@ -44,6 +45,9 @@ pub struct SchedulerConfig {
     pub free_space_reserve_bytes: u64,
     pub retry: RetryConfig,
     pub retention: RetentionConfig,
+    /// Declarative public-origin lane policy. The current executor validates
+    /// and exposes this plan but intentionally does not execute multiple lanes.
+    pub origin_catalog_plan: Option<OriginCatalogPlanConfig>,
 }
 
 impl Default for SchedulerConfig {
@@ -72,6 +76,7 @@ impl Default for SchedulerConfig {
             free_space_reserve_bytes: 10 * 1024 * 1024 * 1024,
             retry: RetryConfig::default(),
             retention: RetentionConfig::default(),
+            origin_catalog_plan: None,
         }
     }
 }
@@ -241,6 +246,12 @@ impl SchedulerConfig {
             )));
         }
         let allowed = expanded.iter().copied().collect::<BTreeSet<_>>();
+        if let Some(origin) = &self.origin_catalog_plan {
+            origin.validate_for_models(&allowed)?;
+            for lane in origin.lanes() {
+                lane.validate_profile(&self.profile_for(lane.model)?)?;
+            }
+        }
         for key in self.model_profiles.keys().chain(self.model_sources.keys()) {
             let model = key.parse::<ModelId>()?;
             if key != model.as_str() || !allowed.contains(&model) {

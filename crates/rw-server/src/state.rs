@@ -8,6 +8,7 @@ use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinError;
 
+use crate::community::CommunityService;
 use crate::{AppConfig, JobError, JobManager, Metrics, TokenSet};
 
 #[derive(Clone)]
@@ -17,6 +18,7 @@ pub struct AppState {
     pub catalog: Arc<StoreCatalog>,
     pub metrics: Arc<Metrics>,
     pub jobs: JobManager,
+    pub community: CommunityService,
     pub response_cache: Cache<String, Bytes>,
     pub started_at: Instant,
     light: Arc<Semaphore>,
@@ -65,12 +67,16 @@ impl AppState {
             .time_to_live(Duration::from_secs(config.catalog.response_cache_seconds))
             .weigher(|_key: &String, value: &Bytes| u32::try_from(value.len()).unwrap_or(u32::MAX))
             .build();
+        let community = CommunityService::open(&config.community).map_err(|error| {
+            JobError::Invalid(format!("failed to initialize Community Cache: {error}"))
+        })?;
         Ok(Self {
             config: Arc::new(config),
             tokens: Arc::new(tokens),
             catalog: Arc::new(catalog),
             metrics: Arc::new(Metrics::new()),
             jobs,
+            community,
             response_cache,
             started_at: Instant::now(),
             light,

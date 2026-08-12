@@ -315,6 +315,40 @@ enum TemporalGridResponse {
     Categorical(CategoricalSummaryGridResponse),
 }
 
+// Community Cache uses a separately versioned canonical protocol crate. Keep
+// the OpenAPI boundary self-describing without duplicating that crate's many
+// closed tagged unions here; the runtime still deserializes the exact DTOs.
+#[derive(utoipa::ToSchema)]
+struct CommunityResolveRequestDoc {
+    schema: String,
+    request: serde_json::Value,
+}
+
+#[derive(utoipa::ToSchema)]
+struct CommunityResolveResponseDoc {
+    schema: String,
+    request_sha256: String,
+    signed_manifest: Option<serde_json::Value>,
+    delivery_order: Vec<String>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct CommunityCaseManifestDoc {
+    schema: String,
+    case_id: String,
+    title: String,
+    event_start_unix: i64,
+    event_end_unix: i64,
+    retain_until_unix: i64,
+    artifacts: Vec<serde_json::Value>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct SignedCommunityCaseManifestDoc {
+    manifest: CommunityCaseManifestDoc,
+    signature: serde_json::Value,
+}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -341,6 +375,10 @@ enum TemporalGridResponse {
         job_doc,
         cancel_job_doc,
         artifact_doc,
+        community_resolve_doc,
+        community_object_doc,
+        community_create_case_doc,
+        community_case_doc,
         metrics_doc,
     ),
     components(schemas(
@@ -399,6 +437,10 @@ enum TemporalGridResponse {
         CategoryDurationResponse,
         CategoricalSummaryGridResponse,
         TemporalGridResponse,
+        CommunityResolveRequestDoc,
+        CommunityResolveResponseDoc,
+        CommunityCaseManifestDoc,
+        SignedCommunityCaseManifestDoc,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -407,6 +449,7 @@ enum TemporalGridResponse {
         (name = "query", description = "Bounded synchronous queries"),
         (name = "analytics", description = "Exact-time and diurnal analytics"),
         (name = "jobs", description = "Bounded asynchronous work and immutable artifacts"),
+        (name = "community", description = "Opt-in signed Community Cache objects and deliberate case publication"),
         (name = "operations", description = "Operator metrics")
     )
 )]
@@ -768,6 +811,92 @@ fn cancel_job_doc() {}
 fn artifact_doc() {}
 
 #[utoipa::path(
+    post,
+    path = "/v1/community/objects/resolve",
+    tag = "community",
+    description = "Resolve one canonical allowed query artifact in strict Phase 1 order: local CAS, R2-compatible hot storage, then the authoritative Hetzner dynamic HTTPS origin, with optional R2 promotion after origin success. Hetzner signs manifests and is never reached through TURN. Community Cache is disabled by default; there is no direct peer-connectivity code in Phase 1.",
+    security(("bearer_auth" = [])),
+    request_body = CommunityResolveRequestDoc,
+    responses(
+        (status = 200, description = "Origin-signed immutable object manifest", body = CommunityResolveResponseDoc),
+        (status = 400, description = "Canonical identity or origin snapshot is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Requested immutable source data was not found", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 413, description = "Request exceeds the configured byte limit", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 415, description = "Request is not application/json", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Signature, hash, schema, size, attribution, or private-publication policy failed closed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 429, description = "Community transfer quota reached", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Origin query or durable publication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Feature disabled, service busy, or shutdown in progress", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Origin computation exceeded its deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn community_resolve_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/community/objects/{sha256}",
+    tag = "community",
+    security(("bearer_auth" = [])),
+    params(("sha256" = String, Path, description = "Exact object SHA-256 from its signed manifest")),
+    responses(
+        (status = 200, description = "Immutable encoded object bytes", content_type = "application/octet-stream", body = Vec<u8>),
+        (status = 400, description = "Object identity is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Object was not found", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Object failed content-address verification", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 429, description = "Community download quota reached", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Object could not be read", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Feature disabled or service busy", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Object read exceeded its deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn community_object_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/community/cases",
+    tag = "community",
+    description = "Deliberately publish one case room. Passive searches are never published. Private WRF/ArWen requires explicit owner publication and confirmed redistribution rights.",
+    security(("bearer_auth" = [])),
+    request_body = CommunityCaseManifestDoc,
+    responses(
+        (status = 201, description = "Signed case-room manifest", body = SignedCommunityCaseManifestDoc),
+        (status = 400, description = "Case manifest is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "A referenced immutable artifact is absent", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 413, description = "Request exceeds the configured byte limit", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 415, description = "Request is not application/json", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Signature, rights, attribution, schema, or size policy failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 429, description = "Community upload quota reached", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Case signing or durable publication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Case publication disabled, killed, or service busy", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Case publication exceeded its deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn community_create_case_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/community/cases/{case_id}",
+    tag = "community",
+    security(("bearer_auth" = [])),
+    params(("case_id" = String, Path, description = "Opaque case-room id")),
+    responses(
+        (status = 200, description = "Signed case-room manifest", body = SignedCommunityCaseManifestDoc),
+        (status = 400, description = "Case id is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Case room was not found", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Stored case signature or schema failed verification", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 429, description = "Community download quota reached", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Case metadata could not be read", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Feature disabled or service busy", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Case read exceeded its deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn community_case_doc() {}
+
+#[utoipa::path(
     get,
     path = "/metrics",
     tag = "operations",
@@ -875,6 +1004,30 @@ mod tests {
                 "job submission must document runtime status {status}"
             );
         }
+    }
+
+    #[test]
+    fn community_cache_paths_are_explicitly_documented_and_protected() {
+        let value = serde_json::to_value(document()).unwrap();
+        for (path, method) in [
+            ("/v1/community/objects/resolve", "post"),
+            ("/v1/community/objects/{sha256}", "get"),
+            ("/v1/community/cases", "post"),
+            ("/v1/community/cases/{case_id}", "get"),
+        ] {
+            let operation = operation(&value, path, method);
+            assert_eq!(
+                operation["security"][0]["bearer_auth"],
+                serde_json::json!([])
+            );
+            assert!(operation["responses"]["401"].is_object());
+            assert!(operation["responses"]["422"].is_object());
+            assert!(operation["responses"]["429"].is_object());
+        }
+        let description = operation(&value, "/v1/community/objects/resolve", "post")["description"]
+            .as_str()
+            .unwrap();
+        assert!(description.contains("no direct peer-connectivity"));
     }
 
     #[test]

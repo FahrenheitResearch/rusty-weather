@@ -51,10 +51,23 @@ enabled = false
 dry_run = true
 keep_latest_per_model = 3
 
+# Optional planning-only policy for a bounded, trusted conventional HTTPS
+# origin/signer. This is never a relay. The current scheduler executor does not
+# execute these independent lanes or promote objects to R2. Uncomment only with
+# models = ["hrrr", "gfs", "nbm"] and an exact NBM `surface` profile.
+# Capacity remains deliberately unset until the target host is audited.
+# [origin_catalog_plan]
+# preset = "initial_public_subset"
+# capacity_audit = "pending"
+# previous_generations = 1
+# disk_budget_bytes = <set only from the completed capacity audit>
+# max_concurrent_jobs = <set only from the completed capacity audit>
+
 # Optional canonical per-model overrides:
 # [model_profiles]
 # hrrr = "view"
 # rtma = "analysis"
+# nbm = "surface"
 #
 # [model_sources]
 # hrrr = "aws"

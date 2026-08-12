@@ -436,6 +436,33 @@ pub struct IndexWindow2DResult {
     pub values: Vec<Option<f32>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexWindow3DRequest {
+    pub storage_slot: u16,
+    pub variable: String,
+    /// Explicit caller order, preserved in the returned level axis.
+    pub levels_hpa: Vec<u16>,
+    pub x0: usize,
+    pub y0: usize,
+    pub x1: usize,
+    pub y1: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexWindow3DResult {
+    pub run: RunDescriptor,
+    pub time: TimePoint,
+    pub variable: String,
+    pub units: String,
+    pub levels_hpa: Vec<u16>,
+    pub x0: usize,
+    pub y0: usize,
+    pub nx: usize,
+    pub ny: usize,
+    /// Flat `[level][y][x]` values in the explicit requested level order.
+    pub values: Vec<Option<f32>>,
+}
+
 /// Resolve a UTC interval or IANA local civil day without assuming that every
 /// day is 24 hours long.
 pub fn resolve_temporal_window(request: &TemporalWindow) -> QueryResult<ResolvedTemporalWindow> {
@@ -3001,5 +3028,145 @@ pub fn query_window_2d(
             .into_iter()
             .map(|value| value.is_finite().then_some(value))
             .collect(),
+    })
+}
+
+/// Read an explicit pressure-level selection from one bounded half-open native
+/// index rectangle. Only overlapping column chunks are decoded; a small tile
+/// never materializes a complete pressure plane or volume.
+pub fn query_window_3d(
+    snapshot: &RunSnapshot,
+    request: &IndexWindow3DRequest,
+) -> QueryResult<IndexWindow3DResult> {
+    if request.variable.trim().is_empty() || request.levels_hpa.is_empty() {
+        return Err(QueryError::InvalidRequest(
+            "a pressure-window variable and at least one pressure level are required".into(),
+        ));
+    }
+    if request.x0 >= request.x1 || request.y0 >= request.y1 {
+        return Err(QueryError::InvalidRequest(
+            "index window must be non-empty and half-open".into(),
+        ));
+    }
+    if request.x1 > snapshot.grid().nx || request.y1 > snapshot.grid().ny {
+        return Err(QueryError::InvalidRequest(format!(
+            "index window [{},{}) x [{},{}) exceeds grid {} x {}",
+            request.x0,
+            request.x1,
+            request.y0,
+            request.y1,
+            snapshot.grid().nx,
+            snapshot.grid().ny
+        )));
+    }
+    let width = request.x1 - request.x0;
+    let height = request.y1 - request.y0;
+    let cells = width
+        .checked_mul(height)
+        .and_then(|cells| cells.checked_mul(request.levels_hpa.len()))
+        .ok_or(QueryError::LimitExceeded {
+            what: "pressure window values",
+            requested: usize::MAX,
+            limit: snapshot.limits().max_reduction_cells,
+        })?;
+    let limit = snapshot
+        .limits()
+        .max_reduction_cells
+        .min(snapshot.limits().max_point_values);
+    if cells > limit {
+        return Err(QueryError::LimitExceeded {
+            what: "pressure window values",
+            requested: cells,
+            limit,
+        });
+    }
+
+    let time = snapshot.timepoint(request.storage_slot)?;
+    let (reader, path) = snapshot.open_reader(&time)?;
+    let meta = reader
+        .variable(&request.variable)
+        .ok_or_else(|| QueryError::UnknownVariable(request.variable.clone()))?;
+    if meta.kind != "pressure3d" {
+        return Err(QueryError::WrongVariableKind {
+            variable: request.variable.clone(),
+            expected: "pressure3d",
+            actual: meta.kind.clone(),
+        });
+    }
+    let mut unique = BTreeSet::new();
+    if request
+        .levels_hpa
+        .iter()
+        .any(|level| !unique.insert(*level))
+    {
+        return Err(QueryError::InvalidRequest(
+            "pressure-window levels must be unique".into(),
+        ));
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(cells)
+        .map_err(|error| QueryError::Allocation {
+            what: "pressure window values",
+            detail: error.to_string(),
+        })?;
+    values.resize(cells, None);
+
+    let chunk_width = reader.meta().chunking.col_x;
+    let chunk_height = reader.meta().chunking.col_y;
+    if chunk_width == 0 || chunk_height == 0 {
+        return Err(QueryError::InconsistentVariable {
+            variable: request.variable.clone(),
+            detail: "pressure chunk dimensions are zero".into(),
+        });
+    }
+    let first_chunk_x = request.x0 / chunk_width;
+    let last_chunk_x = (request.x1 - 1) / chunk_width;
+    let first_chunk_y = request.y0 / chunk_height;
+    let last_chunk_y = (request.y1 - 1) / chunk_height;
+    for chunk_y in first_chunk_y..=last_chunk_y {
+        for chunk_x in first_chunk_x..=last_chunk_x {
+            let chunk = reader.read_selected_pressure_level_chunk_3d(
+                &request.variable,
+                &request.levels_hpa,
+                chunk_y,
+                chunk_x,
+            )?;
+            let geometry = chunk.geometry();
+            let overlap_x0 = request.x0.max(geometry.x0());
+            let overlap_y0 = request.y0.max(geometry.y0());
+            let overlap_x1 = request.x1.min(geometry.x0() + geometry.width());
+            let overlap_y1 = request.y1.min(geometry.y0() + geometry.height());
+            for level_index in 0..request.levels_hpa.len() {
+                for y in overlap_y0..overlap_y1 {
+                    for x in overlap_x0..overlap_x1 {
+                        let value = chunk
+                            .get(level_index, y - geometry.y0(), x - geometry.x0())
+                            .ok_or_else(|| QueryError::InconsistentVariable {
+                                variable: request.variable.clone(),
+                                detail: "pressure chunk omitted an overlapping cell".into(),
+                            })?;
+                        let output = level_index * width * height
+                            + (y - request.y0) * width
+                            + (x - request.x0);
+                        values[output] = value.is_finite().then_some(value);
+                    }
+                }
+            }
+        }
+    }
+    snapshot.ensure_source(&reader, &path, time.storage_slot)?;
+    snapshot.ensure_manifest_current()?;
+    Ok(IndexWindow3DResult {
+        run: snapshot.descriptor().clone(),
+        time,
+        variable: request.variable.clone(),
+        units: meta.units.clone(),
+        levels_hpa: request.levels_hpa.clone(),
+        x0: request.x0,
+        y0: request.y0,
+        nx: width,
+        ny: height,
+        values,
     })
 }

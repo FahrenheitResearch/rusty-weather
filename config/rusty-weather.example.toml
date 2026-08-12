@@ -39,6 +39,59 @@ response_cache_bytes = 134217728
 [catalog]
 response_cache_seconds = 300
 
+# Community Cache is a phase-one, server-mediated immutable-object cache. It
+# is fully disabled by default and contains no direct peer-connectivity code.
+[community]
+enabled = false
+# This example is intentionally not production-approved. Set true only after
+# the target origin host's disk/concurrency audit supplies every quota below.
+capacity_audit_completed = false
+kill_switch = false
+root = "./community-cache"
+# signing_key_file = "/etc/rusty-weather/community-ed25519.key"
+trusted_public_keys = []
+# origin_base_url = "https://weather.example.com"
+# origin_token_file = "/etc/rusty-weather/community-origin-token"
+
+[community.hot_store]
+provider = "disabled"
+# R2-compatible gateway example (credentials are read from token_file):
+# provider = "r2"
+# base_url = "https://objects.example.com"
+# bucket = "rusty-weather-hot"
+# token_file = "/etc/rusty-weather/r2-gateway-token"
+
+[community.promotion]
+enabled = false
+minimum_hits = 3
+window_seconds = 300
+maximum_object_bytes = 67108864
+
+# Non-production parsing examples only; they are not chosen capacity values.
+# Enabling Community Cache requires replacing them with audited values and
+# setting capacity_audit_completed = true.
+[community.quotas]
+maximum_object_bytes = 67108864
+maximum_decompressed_bytes = 268435456
+maximum_manifest_bytes = 262144
+storage_bytes = 10737418240
+upload_bytes_per_month = 107374182400
+download_bytes_per_month = 107374182400
+# Global hot-provider promotion cost ceiling. Crossing it pauses promotion;
+# normal local-cache and HTTPS-origin fallback remain available.
+promoted_bytes_per_month = 107374182400
+concurrent_transfers = 4
+maximum_principals = 10000
+maximum_objects = 100000
+
+[community.cases]
+enabled = false
+maximum_manifest_bytes = 262144
+maximum_objects_per_case = 512
+maximum_cases = 1000
+storage_bytes = 268435456
+default_retention_seconds = 2592000
+
 [logging]
 filter = "rw_server=info,tower_http=info"
 format = "json"

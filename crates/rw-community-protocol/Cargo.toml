@@ -1,0 +1,16 @@
+[package]
+name = "rw-community-protocol"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Transport-neutral signed object contract for BowEcho Community Cache"
+
+[dependencies]
+base64 = "0.22"
+ed25519-dalek = "2.2"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true

@@ -90,6 +90,63 @@ non-queryable ownership shell marked `.rw-scheduler-purged.json`. Applied
 retention also removes the matching terminal scheduler-state record, so bounded
 run retention does not leave state files accumulating indefinitely.
 
+## Public-origin catalog planning
+
+`origin_catalog_plan` is an optional, declarative policy seam for a bounded
+public origin. In this architecture, the origin host is a trusted conventional
+HTTPS fallback and canonical-manifest signer. It is not a relay and this module
+contains no peer or relay transport. The plan does not activate downloads,
+aliases, signing, publication, or deletion. The current executor discovers only
+one cycle per model, so it cannot honestly maintain the independent
+newest-HRRR and complete-extended-HRRR lanes; multi-cycle execution must be
+added separately.
+
+The initial preset is intentionally exact and capability-driven:
+
+- newest available HRRR cycle;
+- newest complete HRRR cycle with the longest horizon declared by the model
+  registry (currently the extended cycle family);
+- newest available GFS cycle; and
+- newest available NBM cycle using the complete `surface` ingest profile.
+
+The two HRRR entries are intentionally distinct aliases: `hrrr-hourly` follows
+the newest queryable hourly generation, while `hrrr-extended` advances only to
+the newest fully complete cycle in the capability registry's longest-horizon
+family. GFS and NBM each expose their newest queryable generation. Candidate
+storage must have passed the normal store/query validation before it is handed
+to this publication planner.
+
+R2 is the separate hot-object tier for origin-signed canonical manifests,
+common immutable objects, promoted popular results, and explicitly published
+case artifacts. This scheduler seam only identifies origin generations; it
+does not upload to R2. A cache miss ultimately falls back over normal HTTPS to
+the origin.
+
+Each lane protects its active generation and exactly one previous generation.
+Overlapping lane generations are deduplicated. Callers may pass the plan's
+`protected` set to the existing retention planner as its alias/protection set;
+the origin planner never mutates storage itself.
+
+```toml
+models = ["hrrr", "gfs", "nbm"]
+
+[model_profiles]
+nbm = "surface"
+
+[origin_catalog_plan]
+preset = "initial_public_subset"
+capacity_audit = "pending"
+previous_generations = 1
+# Keep both values absent until the target host's direct capacity audit.
+# disk_budget_bytes = <audited value>
+# max_concurrent_jobs = <audited value>
+```
+
+Pending audit configuration rejects either capacity value if supplied. Once
+the audit is explicitly marked `complete`, both values become required and
+must be nonzero. The scheduler's general example concurrency and free-space
+reserve are not approved public-origin capacity values.
+
 ## Intentional v1 boundaries
 
 - An in-flight provider availability HTTP probe is not cancelled immediately;
@@ -98,5 +155,7 @@ run retention does not leave state files accumulating indefinitely.
 - The executable has no service-alias state source. The retention library can
   protect caller-supplied aliases, while the executable protects active jobs
   and the configured newest-run count.
+- `origin_catalog_plan` is validated and exposed by the library but is not
+  consumed by the one-cycle-per-model executor yet.
 - Provider integration tests are deliberately absent. Scheduler tests use an
   injected local discovery implementation and never contact the network.

@@ -108,6 +108,52 @@ unresolved path.
 - Report security issues using `SECURITY.md`; do not open a public issue with
   credentials, private URLs, or user data.
 
+## Community Cache operations
+
+Community Cache is off by default. Before enabling it, verify the signing-key
+file permissions, pinned public key, separate cache filesystem quota,
+R2-compatible gateway token, HTTPS origin fallback, and all configured monthly
+thresholds. Never enable case publication merely to enable response caching.
+The server rejects `community.enabled = true` until
+`community.capacity_audit_completed = true` records that the origin-host disk
+and concurrency values came from the completed capacity audit.
+The Phase 1 origin is the authoritative Hetzner Rusty Weather HTTPS service and
+manifest signer; it is never a TURN destination. Operational lookup order is
+local CAS, R2, then Hetzner dynamic origin, followed by optional R2 promotion.
+
+During a cost, abuse, privacy, or hot-provider incident set
+`RW_COMMUNITY_KILL_SWITCH=true` and restart the service. This stops case
+publication and hot-object promotion. It intentionally does not disable signed
+normal HTTPS origin resolution, so BowEcho remains useful when community assist
+is unavailable. Disable the whole feature with `RW_COMMUNITY_ENABLED=false`
+only when the Community Cache HTTP surface itself must be closed.
+
+Monitor the separate `community.root` filesystem and the configured per-token
+download/upload/concurrency quotas. The CAS evicts least-recently-used request
+identities within its byte/object limits; immutable objects referenced by
+multiple requests are removed only after the last local reference is evicted.
+The global `promoted_bytes_per_month` ceiling pauses further hot promotion but
+does not turn an otherwise successful query into an error.
+Monthly transfer and promotion accounting is atomically persisted in
+`community.root/accounting.json` and survives service restarts. Case manifests
+are separately bounded by `community.cases.maximum_cases` and
+`community.cases.storage_bytes`; expired cases are removed during startup and
+on case access/publication. Requested retention cannot exceed
+`community.cases.default_retention_seconds`.
+
+Treat any signature, embedded-request hash, object hash, decoded-size,
+decompression-ratio, schema, expiry, or ECMWF-notice failure as untrusted
+content. Preserve the bounded request ID and coarse failure code; do not log
+object bodies, signatures, bearer tokens, private source paths, or future relay
+metadata. A hot-store failure should fall through to origin. Repeated hot-store
+failure is an operator alert, not a reason to weaken validation.
+
+Private WRF and ArWen content is non-shareable by default. A case/object may be
+published only after the owner deliberately supplies both explicit-publication
+and redistribution-rights confirmations. Passive searches, local cache fills,
+and opening a run are never publication events. Relay-mediated peer-assisted
+transfers are a later phase; direct-IP sharing is not a recovery mode.
+
 ## Scheduler operations
 
 The scheduler is a separate optional writer. These commands are safe for

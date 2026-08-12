@@ -411,6 +411,515 @@
         ]
       }
     },
+    "/v1/community/cases": {
+      "post": {
+        "tags": [
+          "community"
+        ],
+        "description": "Deliberately publish one case room. Passive searches are never published. Private WRF/ArWen requires explicit owner publication and confirmed redistribution rights.",
+        "operationId": "community_create_case_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommunityCaseManifestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Signed case-room manifest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignedCommunityCaseManifestDoc"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Case manifest is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A referenced immutable artifact is absent",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request exceeds the configured byte limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request is not application/json",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Signature, rights, attribution, schema, or size policy failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Community upload quota reached",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Case signing or durable publication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Case publication disabled, killed, or service busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Case publication exceeded its deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/cases/{case_id}": {
+      "get": {
+        "tags": [
+          "community"
+        ],
+        "operationId": "community_case_doc",
+        "parameters": [
+          {
+            "name": "case_id",
+            "in": "path",
+            "description": "Opaque case-room id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Signed case-room manifest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignedCommunityCaseManifestDoc"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Case id is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Case room was not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Stored case signature or schema failed verification",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Community download quota reached",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Case metadata could not be read",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Feature disabled or service busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Case read exceeded its deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/objects/resolve": {
+      "post": {
+        "tags": [
+          "community"
+        ],
+        "description": "Resolve one canonical allowed query artifact in strict Phase 1 order: local CAS, R2-compatible hot storage, then the authoritative Hetzner dynamic HTTPS origin, with optional R2 promotion after origin success. Hetzner signs manifests and is never reached through TURN. Community Cache is disabled by default; there is no direct peer-connectivity code in Phase 1.",
+        "operationId": "community_resolve_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommunityResolveRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Origin-signed immutable object manifest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommunityResolveResponseDoc"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Canonical identity or origin snapshot is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Requested immutable source data was not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request exceeds the configured byte limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request is not application/json",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Signature, hash, schema, size, attribution, or private-publication policy failed closed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Community transfer quota reached",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Origin query or durable publication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Feature disabled, service busy, or shutdown in progress",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Origin computation exceeded its deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/objects/{sha256}": {
+      "get": {
+        "tags": [
+          "community"
+        ],
+        "operationId": "community_object_doc",
+        "parameters": [
+          {
+            "name": "sha256",
+            "in": "path",
+            "description": "Exact object SHA-256 from its signed manifest",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Immutable encoded object bytes",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Object identity is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Object was not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Object failed content-address verification",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Community download quota reached",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Object could not be read",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Feature disabled or service busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Object read exceeded its deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/v1/health/live": {
       "get": {
         "tags": [
@@ -2510,6 +3019,81 @@
           }
         }
       },
+      "CommunityCaseManifestDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "case_id",
+          "title",
+          "event_start_unix",
+          "event_end_unix",
+          "retain_until_unix",
+          "artifacts"
+        ],
+        "properties": {
+          "artifacts": {
+            "type": "array",
+            "items": {}
+          },
+          "case_id": {
+            "type": "string"
+          },
+          "event_end_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "event_start_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "retain_until_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "CommunityResolveRequestDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "request"
+        ],
+        "properties": {
+          "request": {},
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "CommunityResolveResponseDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "request_sha256",
+          "delivery_order"
+        ],
+        "properties": {
+          "delivery_order": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "request_sha256": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "signed_manifest": {}
+        }
+      },
       "CoordinateRequest": {
         "type": "object",
         "required": [
@@ -3822,6 +4406,19 @@
           }
         }
       },
+      "SignedCommunityCaseManifestDoc": {
+        "type": "object",
+        "required": [
+          "manifest",
+          "signature"
+        ],
+        "properties": {
+          "manifest": {
+            "$ref": "#/components/schemas/CommunityCaseManifestDoc"
+          },
+          "signature": {}
+        }
+      },
       "SourceProvenanceResponse": {
         "type": "object",
         "description": "Sanitized union of resolved providers represented in a run.",
@@ -4717,6 +5314,10 @@
     {
       "name": "jobs",
       "description": "Bounded asynchronous work and immutable artifacts"
+    },
+    {
+      "name": "community",
+      "description": "Opt-in signed Community Cache objects and deliberate case publication"
     },
     {
       "name": "operations",
