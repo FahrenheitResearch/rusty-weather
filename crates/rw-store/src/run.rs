@@ -29,6 +29,100 @@ pub const MAX_RUN_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 /// coordinate array. Reject impossible manifest geometry before a consumer
 /// uses it to size work or compares it with an hour/grid file.
 const MAX_GRID_COORD_RAW_BYTES: u64 = 1 << 31;
+pub(crate) const MAX_SOURCE_PROVENANCE_PER_HOUR: usize = 8;
+const MAX_SOURCE_ROLES: usize = 8;
+const MAX_SOURCE_PRODUCTS: usize = 16;
+const MAX_SOURCE_TOKEN_BYTES: usize = 96;
+
+/// Sanitized acquisition provenance for one resolved provider.
+///
+/// Values are bounded identifier tokens, never request URLs, object paths,
+/// query strings, headers, or credentials. Roles and products are optional
+/// coarse labels such as pressure, surface, or pgrb2.0p25.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RwsSourceProvenance {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub products: Vec<String>,
+}
+
+impl RwsSourceProvenance {
+    pub fn new(
+        provider: impl Into<String>,
+        roles: Vec<String>,
+        products: Vec<String>,
+    ) -> RwResult<Self> {
+        normalize_source_entry(Self {
+            provider: provider.into(),
+            roles,
+            products,
+        })
+    }
+}
+
+fn normalize_source_entry(mut entry: RwsSourceProvenance) -> RwResult<RwsSourceProvenance> {
+    entry.provider = normalize_source_token("provider", &entry.provider)?;
+    entry.roles = normalize_source_tokens("role", entry.roles, MAX_SOURCE_ROLES)?;
+    entry.products = normalize_source_tokens("product", entry.products, MAX_SOURCE_PRODUCTS)?;
+    Ok(entry)
+}
+
+fn normalize_source_tokens(
+    label: &str,
+    values: Vec<String>,
+    limit: usize,
+) -> RwResult<Vec<String>> {
+    if values.len() > limit {
+        return Err(RwStoreError::Meta(format!(
+            "source provenance contains {} {label} labels; limit is {limit}",
+            values.len()
+        )));
+    }
+    let mut normalized = values
+        .into_iter()
+        .map(|value| normalize_source_token(label, &value))
+        .collect::<RwResult<Vec<_>>>()?;
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn normalize_source_token(label: &str, value: &str) -> RwResult<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty()
+        || value.len() > MAX_SOURCE_TOKEN_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(RwStoreError::Meta(format!(
+            "source provenance {label} must be a 1..={MAX_SOURCE_TOKEN_BYTES} byte ASCII identifier using only letters, digits, '-', '_', or '.'"
+        )));
+    }
+    Ok(value)
+}
+
+pub(crate) fn normalize_source_provenance(
+    entries: Vec<RwsSourceProvenance>,
+) -> RwResult<Vec<RwsSourceProvenance>> {
+    let mut merged: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
+    for entry in entries {
+        let entry = normalize_source_entry(entry)?;
+        let (roles, products) = merged.entry(entry.provider).or_default();
+        roles.extend(entry.roles);
+        products.extend(entry.products);
+    }
+    Ok(merged
+        .into_iter()
+        .map(|(provider, (roles, products))| RwsSourceProvenance {
+            provider,
+            roles: roles.into_iter().collect(),
+            products: products.into_iter().collect(),
+        })
+        .collect())
+}
 
 /// Require a store identity or persisted child filename to be exactly one
 /// relative path component. The explicit backslash check keeps serialized
@@ -79,7 +173,8 @@ fn is_windows_device_name(value: &str) -> bool {
 /// One registered v1 forecast hour or v2 ordinal storage slot: the hour file,
 /// optional exact physical timing, and write provenance.
 /// `written_unix` is supplied by the caller (the library never reads the
-/// clock), so tests and replays stay deterministic.
+/// clock), so tests and replays stay deterministic. It records local
+/// processing/publication time, not when an upstream object was retrieved.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct RwsHourEntry {
     pub file: String,
@@ -91,6 +186,8 @@ pub struct RwsHourEntry {
     pub written_unix: u64,
     pub encode_ms: u64,
     pub variables: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_provenance: Vec<RwsSourceProvenance>,
 }
 
 impl RwsHourEntry {
@@ -219,6 +316,17 @@ impl RwsRunManifest {
             .filter_map(|(&slot, entry)| entry.exact_time().map(|time| (slot, time)))
     }
 
+    /// Deduplicated union of the sanitized providers, roles, and products
+    /// recorded by all hours in this run.
+    pub fn source_provenance(&self) -> RwResult<Vec<RwsSourceProvenance>> {
+        normalize_source_provenance(
+            self.hours
+                .values()
+                .flat_map(|entry| entry.source_provenance.iter().cloned())
+                .collect(),
+        )
+    }
+
     /// Validate one registered hour file's metadata against this manifest,
     /// including the ordinal slot and exact-time pair. This is the shared seam
     /// for store browsers, import recovery, and diagnostic validation.
@@ -336,6 +444,18 @@ impl RwsRunManifest {
         let mut origin_unix = None;
         for (&slot, entry) in &self.hours {
             validate_store_component(&format!("manifest slot {slot} file"), &entry.file)?;
+            if entry.source_provenance.len() > MAX_SOURCE_PROVENANCE_PER_HOUR {
+                return Err(RwStoreError::Meta(format!(
+                    "manifest slot {slot} has {} source provenance entries; limit is {MAX_SOURCE_PROVENANCE_PER_HOUR}",
+                    entry.source_provenance.len()
+                )));
+            }
+            let normalized_sources = normalize_source_provenance(entry.source_provenance.clone())?;
+            if normalized_sources != entry.source_provenance {
+                return Err(RwStoreError::Meta(format!(
+                    "manifest slot {slot} source provenance must be normalized, sorted, and deduplicated"
+                )));
+            }
             if !files.insert(entry.file.as_str()) {
                 return Err(RwStoreError::Meta(format!(
                     "manifest slot {slot} reuses file '{}' already registered to another slot",
@@ -522,6 +642,7 @@ mod tests {
             written_unix,
             encode_ms,
             variables: variables.iter().map(|v| v.to_string()).collect(),
+            source_provenance: Vec::new(),
         }
     }
 
@@ -533,6 +654,7 @@ mod tests {
             written_unix: 1_770_000_000,
             encode_ms: 10,
             variables: vec!["temp_2m".to_string()],
+            source_provenance: Vec::new(),
         }
     }
 
@@ -550,6 +672,65 @@ mod tests {
             ]),
             writer: writer_info(),
         }
+    }
+
+    #[test]
+    fn legacy_hour_entries_default_to_empty_source_provenance() {
+        let legacy = serde_json::json!({
+            "file": "f000.rws",
+            "written_unix": 1_770_000_000u64,
+            "encode_ms": 4,
+            "variables": ["temp_2m"]
+        });
+        let entry: RwsHourEntry = serde_json::from_value(legacy).unwrap();
+        assert!(entry.source_provenance.is_empty());
+        assert!(
+            serde_json::to_value(entry)
+                .unwrap()
+                .get("source_provenance")
+                .is_none(),
+            "empty provenance must preserve the legacy wire shape"
+        );
+    }
+
+    #[test]
+    fn source_provenance_is_safe_and_unioned_across_hours() {
+        assert!(
+            RwsSourceProvenance::new(
+                "https://user:secret@example.invalid/data",
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_err(),
+            "URLs and credentials must not be accepted as provider identities"
+        );
+
+        let mut manifest = exact_manifest();
+        manifest.hours.get_mut(&0).unwrap().source_provenance = vec![
+            RwsSourceProvenance::new(
+                "ECMWF-OPEN-DATA",
+                vec!["surface".into()],
+                vec!["oper".into()],
+            )
+            .unwrap(),
+        ];
+        manifest.hours.get_mut(&1).unwrap().source_provenance = vec![
+            RwsSourceProvenance::new(
+                "ecmwf-open-data",
+                vec!["pressure".into()],
+                vec!["oper".into()],
+            )
+            .unwrap(),
+        ];
+        manifest.validate_contents().unwrap();
+        assert_eq!(
+            manifest.source_provenance().unwrap(),
+            vec![RwsSourceProvenance {
+                provider: "ecmwf-open-data".into(),
+                roles: vec!["pressure".into(), "surface".into()],
+                products: vec!["oper".into()],
+            }]
+        );
     }
 
     #[test]

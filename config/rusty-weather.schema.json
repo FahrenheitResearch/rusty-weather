@@ -1,0 +1,265 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppConfig",
+  "type": "object",
+  "properties": {
+    "auth": {
+      "$ref": "#/$defs/AuthConfig",
+      "default": {
+        "protect_metrics": true,
+        "token_file": null
+      }
+    },
+    "catalog": {
+      "$ref": "#/$defs/CatalogConfig",
+      "default": {
+        "response_cache_seconds": 300
+      }
+    },
+    "limits": {
+      "$ref": "#/$defs/LimitsConfig",
+      "default": {
+        "catalog_time_points": 10000,
+        "heavy_concurrency": 2,
+        "job_history_records": 10000,
+        "job_result_bytes": 536870912,
+        "job_retention_seconds": 604800,
+        "job_timeout_seconds": 300,
+        "json_grid_values": 250000,
+        "light_concurrency": 32,
+        "points_per_query": 100,
+        "queued_jobs": 64,
+        "reader_cache_bytes": 268435456,
+        "request_body_bytes": 2097152,
+        "response_cache_bytes": 134217728,
+        "sync_result_values": 2000000,
+        "sync_timeout_seconds": 10,
+        "temporal_frames": 120,
+        "temporal_output_values": 32000000,
+        "temporal_reduction_cells": 4000000,
+        "variables_per_query": 32
+      }
+    },
+    "logging": {
+      "$ref": "#/$defs/LoggingConfig",
+      "default": {
+        "filter": "rw_server=info,tower_http=info",
+        "format": "json"
+      }
+    },
+    "server": {
+      "$ref": "#/$defs/ServerConfig",
+      "default": {
+        "allow_unauthenticated_public_bind": false,
+        "artifact_root": "./artifacts",
+        "cors_origins": [],
+        "listen": "127.0.0.1:8788",
+        "store_root": "./store"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "AuthConfig": {
+      "type": "object",
+      "properties": {
+        "protect_metrics": {
+          "type": "boolean",
+          "default": true
+        },
+        "token_file": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "CatalogConfig": {
+      "type": "object",
+      "properties": {
+        "response_cache_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 300,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "LimitsConfig": {
+      "type": "object",
+      "properties": {
+        "catalog_time_points": {
+          "type": "integer",
+          "format": "uint",
+          "default": 10000,
+          "minimum": 0
+        },
+        "heavy_concurrency": {
+          "type": "integer",
+          "format": "uint",
+          "default": 2,
+          "minimum": 0
+        },
+        "job_history_records": {
+          "type": "integer",
+          "format": "uint",
+          "default": 10000,
+          "minimum": 0
+        },
+        "job_result_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 536870912,
+          "minimum": 0
+        },
+        "job_retention_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 604800,
+          "minimum": 0
+        },
+        "job_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 300,
+          "minimum": 0
+        },
+        "json_grid_values": {
+          "type": "integer",
+          "format": "uint",
+          "default": 250000,
+          "minimum": 0
+        },
+        "light_concurrency": {
+          "type": "integer",
+          "format": "uint",
+          "default": 32,
+          "minimum": 0
+        },
+        "points_per_query": {
+          "type": "integer",
+          "format": "uint",
+          "default": 100,
+          "minimum": 0
+        },
+        "queued_jobs": {
+          "type": "integer",
+          "format": "uint",
+          "default": 64,
+          "minimum": 0
+        },
+        "reader_cache_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 268435456,
+          "minimum": 0
+        },
+        "request_body_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "default": 2097152,
+          "minimum": 0
+        },
+        "response_cache_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 134217728,
+          "minimum": 0
+        },
+        "sync_result_values": {
+          "type": "integer",
+          "format": "uint",
+          "default": 2000000,
+          "minimum": 0
+        },
+        "sync_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 10,
+          "minimum": 0
+        },
+        "temporal_frames": {
+          "type": "integer",
+          "format": "uint",
+          "default": 120,
+          "minimum": 0
+        },
+        "temporal_output_values": {
+          "description": "Fixed and dynamic values allowed in an asynchronous temporal result.",
+          "type": "integer",
+          "format": "uint",
+          "default": 32000000,
+          "minimum": 0
+        },
+        "temporal_reduction_cells": {
+          "description": "Native-domain cells allowed for an asynchronous temporal reduction.",
+          "type": "integer",
+          "format": "uint",
+          "default": 4000000,
+          "minimum": 0
+        },
+        "variables_per_query": {
+          "type": "integer",
+          "format": "uint",
+          "default": 32,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "LogFormat": {
+      "type": "string",
+      "enum": [
+        "json",
+        "pretty"
+      ]
+    },
+    "LoggingConfig": {
+      "type": "object",
+      "properties": {
+        "filter": {
+          "type": "string",
+          "default": "rw_server=info,tower_http=info"
+        },
+        "format": {
+          "$ref": "#/$defs/LogFormat",
+          "default": "json"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ServerConfig": {
+      "type": "object",
+      "properties": {
+        "allow_unauthenticated_public_bind": {
+          "type": "boolean",
+          "default": false
+        },
+        "artifact_root": {
+          "type": "string",
+          "default": "./artifacts"
+        },
+        "cors_origins": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "listen": {
+          "type": "string",
+          "default": "127.0.0.1:8788"
+        },
+        "store_root": {
+          "type": "string",
+          "default": "./store"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

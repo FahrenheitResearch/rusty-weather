@@ -5,6 +5,8 @@
 /live-store
 /live-cache
 /cache
+/artifacts/
+/work/
 vendor/*/target/
 vendor/*/Cargo.lock
 crates/rustwx-render/verify/Cargo.lock
@@ -12,3 +14,6 @@ crates/rustwx-render/verify/Cargo.lock
 .cargo/
 Thumbs.db
 desktop.ini
+*.cdx.json
+deploy/docker/data/
+deploy/docker/secrets/

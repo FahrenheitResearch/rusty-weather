@@ -4,7 +4,7 @@
 
 **Goal:** Port rustwx's proven fast path into the new `rusty-weather` workspace so it compiles clean, passes the ported test suites, and renders real HRRR map PNGs end to end — with all out-of-scope code (radar, satellite, WRF, lightning, wxstore, agent platform, AIFS/Earth2) left behind.
 
-**Architecture:** Mechanical extraction from the read-only worktree at `C:\Users\drew\rustwx-fastplots-wt` (branch `review/grib-wxa-fast-plots-20260605`). Nine workspace crates + seven vendored crates copy over with names unchanged; pruning happens at module boundaries (`rustwx-products`, `rustwx-io`) guided by an explicit drop list plus the compiler. Two smoke binaries adapted from rustwx's proven `direct_batch`/`derived_batch` drivers prove the extraction renders identical plots. The new store, scheduler/daemon, and web UI are **later plans** — nothing in this plan builds them.
+**Architecture:** Mechanical extraction from the read-only worktree at `C:\work\rustwx-fastplots-wt` (branch `review/grib-wxa-fast-plots-20260605`). Nine workspace crates + seven vendored crates copy over with names unchanged; pruning happens at module boundaries (`rustwx-products`, `rustwx-io`) guided by an explicit drop list plus the compiler. Two smoke binaries adapted from rustwx's proven `direct_batch`/`derived_batch` drivers prove the extraction renders identical plots. The new store, scheduler/daemon, and web UI are **later plans** — nothing in this plan builds them.
 
 **Tech Stack:** Rust (edition 2024, rust-version 1.85), cargo workspace, existing deps only (image, rayon, serde, zstd, ureq/rustls, shapefile, rusttype). No new dependencies in this plan.
 
@@ -14,8 +14,8 @@
 
 ## Ground rules for every task
 
-- **Source of truth:** `C:\Users\drew\rustwx-fastplots-wt` — read-only. Never edit files there.
-- **Destination:** `C:\Users\drew\rusty-weather` — all work happens here. Shell commands below are PowerShell and assume this as the working directory.
+- **Source of truth:** `C:\work\rustwx-fastplots-wt` — read-only. Never edit files there.
+- **Destination:** `C:\work\rusty-weather` — all work happens here. Shell commands below are PowerShell and assume this as the working directory.
 - **Copy method:** `Copy-Item -Recurse` (the worktree is a fresh checkout; there are no `target/` dirs to exclude).
 - **No stubs, ever.** Never satisfy the compiler with `todo!()`, `unimplemented!()`, empty fn bodies, or commented-out code. Deletion or honest port only.
 - **Rule R1 — slop-reference removal.** When `cargo check` fails on a reference to dropped code:
@@ -142,7 +142,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - [x] **Step 1: Copy the seven vendor crates**
 
 ```powershell
-$src = 'C:\Users\drew\rustwx-fastplots-wt\vendor'
+$src = 'C:\work\rustwx-fastplots-wt\vendor'
 New-Item -ItemType Directory -Force vendor | Out-Null
 foreach ($c in 'wx-core','wx-math','wx-field','wx-radar','grib-core','metrust','ecape-rs','sharprs') {
   Copy-Item -Recurse "$src\$c" "vendor\$c"
@@ -184,7 +184,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - [x] **Step 1: Copy the three crates**
 
 ```powershell
-$src = 'C:\Users\drew\rustwx-fastplots-wt\crates'
+$src = 'C:\work\rustwx-fastplots-wt\crates'
 New-Item -ItemType Directory -Force crates | Out-Null
 foreach ($c in 'rustwx-core','rustwx-contour','rustwx-regrid') { Copy-Item -Recurse "$src\$c" "crates\$c" }
 ```
@@ -228,7 +228,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - [x] **Step 1: Copy, add member**
 
 ```powershell
-Copy-Item -Recurse 'C:\Users\drew\rustwx-fastplots-wt\crates\rustwx-models' 'crates\rustwx-models'
+Copy-Item -Recurse 'C:\work\rustwx-fastplots-wt\crates\rustwx-models' 'crates\rustwx-models'
 ```
 
 Add `"crates/rustwx-models",` to `members` (keep the list alphabetized).
@@ -260,7 +260,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - [x] **Step 1: Copy and delete the Earth2 module**
 
 ```powershell
-Copy-Item -Recurse 'C:\Users\drew\rustwx-fastplots-wt\crates\rustwx-io' 'crates\rustwx-io'
+Copy-Item -Recurse 'C:\work\rustwx-fastplots-wt\crates\rustwx-io' 'crates\rustwx-io'
 Remove-Item 'crates\rustwx-io\src\earth2_archive.rs'
 ```
 
@@ -332,15 +332,15 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ```powershell
 New-Item -ItemType Directory -Force assets | Out-Null
-Copy-Item -Recurse 'C:\Users\drew\rustwx-fastplots-wt\assets\basemap' 'assets\basemap'
-Copy-Item -Recurse 'C:\Users\drew\rustwx-fastplots-wt\crates\rustwx-render' 'crates\rustwx-render'
+Copy-Item -Recurse 'C:\work\rustwx-fastplots-wt\assets\basemap' 'assets\basemap'
+Copy-Item -Recurse 'C:\work\rustwx-fastplots-wt\crates\rustwx-render' 'crates\rustwx-render'
 ```
 
 Basemap resolution in `features.rs` searches `<workspace_root>/assets/basemap` (with an env-var override), so the same relative layout preserves behavior. Shapefiles are binary — confirm sizes match the source after copy:
 
 ```powershell
 (Get-ChildItem -Recurse assets\basemap | Measure-Object Length -Sum).Sum
-(Get-ChildItem -Recurse C:\Users\drew\rustwx-fastplots-wt\assets\basemap | Measure-Object Length -Sum).Sum
+(Get-ChildItem -Recurse C:\work\rustwx-fastplots-wt\assets\basemap | Measure-Object Length -Sum).Sum
 ```
 
 Expected: identical byte totals.
@@ -386,7 +386,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 
 ```powershell
 foreach ($c in 'rustwx-calc','rustwx-sounding') {
-  Copy-Item -Recurse "C:\Users\drew\rustwx-fastplots-wt\crates\$c" "crates\$c"
+  Copy-Item -Recurse "C:\work\rustwx-fastplots-wt\crates\$c" "crates\$c"
 }
 ```
 
@@ -429,7 +429,7 @@ This is the heart of the extraction. 24 modules drop; the direct/derived/gridded
 - [x] **Step 1: Copy, then delete the drop-list modules**
 
 ```powershell
-Copy-Item -Recurse 'C:\Users\drew\rustwx-fastplots-wt\crates\rustwx-products' 'crates\rustwx-products'
+Copy-Item -Recurse 'C:\work\rustwx-fastplots-wt\crates\rustwx-products' 'crates\rustwx-products'
 $drop = @(
   'agent_backend','artifact_bundle','comparison','cross_section','custom_poi',
   'dataset_export','gallery','grib_ensemble','intelligence','lightning',
@@ -607,7 +607,7 @@ fn main() {
 - [x] **Step 3: Copy the shared CLI helper modules and the two drivers**
 
 ```powershell
-$cli = 'C:\Users\drew\rustwx-fastplots-wt\crates\rustwx-cli\src'
+$cli = 'C:\work\rustwx-fastplots-wt\crates\rustwx-cli\src'
 foreach ($f in 'contour_mode.rs','domain.rs','region.rs') { Copy-Item "$cli\$f" "crates\rusty-weather\src\$f" }
 New-Item -ItemType Directory -Force 'crates\rusty-weather\src\bin' | Out-Null
 Copy-Item "$cli\bin\direct_batch.rs"  'crates\rusty-weather\src\bin\smoke_direct.rs'
@@ -624,7 +624,7 @@ In `smoke_direct.rs`, known Earth2 items (from the source read): the import `use
 Select-String -Path 'crates\rusty-weather\src\bin\*.rs','crates\rusty-weather\src\*.rs' -Pattern 'earth2' -CaseSensitive:$false
 ```
 
-Delete each item whole (R1.2 — AIFS-only by name). Also change the hardcoded default output dir in both bins from `C:\\Users\\drew\\rustwx\\proof` to `out`.
+Delete each item whole (R1.2 — AIFS-only by name). Also change the hardcoded default output dir in both bins from `C:\\work\\rustwx\\proof` to `out`.
 
 - [x] **Step 5: Build, applying R1 to any further driver-level slop references**
 

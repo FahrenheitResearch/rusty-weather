@@ -62,8 +62,7 @@ const WRF_XTIME_SECOND_ROUNDING_TOLERANCE: f64 = 0.25;
 /// Two independently rounded `XTIME` records can carry opposite-sign errors.
 /// Their floating-point origins may therefore differ by twice the per-record
 /// tolerance, but their integral-second origins must still match exactly.
-const WRF_XTIME_ORIGIN_AGREEMENT_TOLERANCE: f64 =
-    2.0 * WRF_XTIME_SECOND_ROUNDING_TOLERANCE;
+const WRF_XTIME_ORIGIN_AGREEMENT_TOLERANCE: f64 = 2.0 * WRF_XTIME_SECOND_ROUNDING_TOLERANCE;
 const SOURCE_ID_READ_BUFFER_BYTES: usize = 1_024 * 1_024;
 /// Bump whenever a scientific formula, unit normalization, grid convention,
 /// or field-selection meaning changes. It is embedded in every imported run
@@ -2384,9 +2383,7 @@ fn parse_matching_wrf_reference_attributes(
     let mut malformed = Vec::new();
     for (name, value) in attributes {
         let Some(parsed) = parse_utc_timestamp(value) else {
-            malformed.push(format!(
-                "{name}={value:?} is not a valid UTC timestamp"
-            ));
+            malformed.push(format!("{name}={value:?} is not a valid UTC timestamp"));
             continue;
         };
         if let Some((prior_name, prior)) = &found {
@@ -4982,17 +4979,13 @@ mod tests {
             ("START_DATE", "1974-04-03_23:00:00".to_string()),
             ("SIMULATION_START_DATE", "1".to_string()),
         ];
-        let (reference, malformed) =
-            parse_matching_wrf_reference_attributes(&attributes).unwrap();
+        let (reference, malformed) = parse_matching_wrf_reference_attributes(&attributes).unwrap();
         assert_eq!(reference, Some(expected));
         assert_eq!(malformed.len(), 1);
 
         let conflicting = vec![
             ("START_DATE", "1974-04-03_23:00:00".to_string()),
-            (
-                "SIMULATION_START_DATE",
-                "1974-04-03_23:01:00".to_string(),
-            ),
+            ("SIMULATION_START_DATE", "1974-04-03_23:01:00".to_string()),
         ];
         let error = parse_matching_wrf_reference_attributes(&conflicting).unwrap_err();
         assert!(error.contains("conflicting WRF references"), "{error}");
@@ -5004,7 +4997,10 @@ mod tests {
         let records = test_time_axis(Some(origin), &[2_220, 2_280]).records;
 
         let error = wrf_reference_from_xtime(&records, &[37.0]).unwrap_err();
-        assert!(error.contains("1 values for 2 WRF Times records"), "{error}");
+        assert!(
+            error.contains("1 values for 2 WRF Times records"),
+            "{error}"
+        );
 
         let error = wrf_reference_from_xtime(&records, &[37.0, f64::NAN]).unwrap_err();
         assert!(error.contains("finite and nonnegative"), "{error}");
@@ -5013,7 +5009,10 @@ mod tests {
         assert!(error.contains("finite and nonnegative"), "{error}");
 
         let error = wrf_reference_from_xtime(&records, &[37.005, 38.0]).unwrap_err();
-        assert!(error.contains("whole-second WRF Times precision"), "{error}");
+        assert!(
+            error.contains("whole-second WRF Times precision"),
+            "{error}"
+        );
 
         let error = wrf_reference_from_xtime(&records, &[37.0, 39.0]).unwrap_err();
         assert!(error.contains("origins disagree"), "{error}");
@@ -5512,7 +5511,7 @@ mod tests {
             assert!(
                 publisher
                     .transaction_root
-                    .starts_with(root.join(STAGING_DIR_NAME)),
+                    .starts_with(&publisher.staging_root),
                 "staging must stay under the hidden non-model subtree"
             );
             assert!(

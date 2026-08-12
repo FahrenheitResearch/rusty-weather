@@ -452,7 +452,14 @@ far for the run:
       "file": "f000.rws",          // plain filename, no path components
       "written_unix": 1770000000,  // caller-supplied epoch seconds
       "encode_ms": 850,            // informational wall-clock; not reproducible
-      "variables": ["t2m", "mask_demo", "const_demo", "temp_iso"]
+      "variables": ["t2m", "mask_demo", "const_demo", "temp_iso"],
+      "source_provenance": [
+        {
+          "provider": "noaa-nomads",
+          "roles": ["pressure", "surface"],
+          "products": ["pgrb2.0p25"]
+        }
+      ]
     }
   },
   "writer": { "name": "rw-store", "version": "0.1.0", "build": "<git sha>" }
@@ -504,6 +511,12 @@ Rules:
 - `encode_ms` is informational encode wall-clock and is **not** reproducible
   run-to-run; conformance tooling excludes it from byte/value comparison
   (the golden test strips it, `golden.rs::strip_encode_ms`).
+- written_unix is the caller-supplied local processing/publication time. It is
+  not an upstream retrieval timestamp.
+- source_provenance is optional for backward compatibility. When present it is
+  a bounded, sorted union of safe provider identifiers and coarse role/product
+  tokens. Full URLs, paths, query strings, headers, and credentials are not
+  permitted.
 - An existing manifest must agree with the run's `model`, `run`, and
   `grid_hash`; a mismatch means the directory holds a different run's data
   (`run.rs::load_or_new`, lines 67–73).

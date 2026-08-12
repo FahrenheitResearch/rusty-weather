@@ -12,7 +12,7 @@ use super::cache::DiskCache;
 
 /// HTTP client for downloading GRIB2 data with byte-range support.
 ///
-/// Uses ureq (blocking HTTP) with rustls + rustcrypto for TLS.
+/// Uses ureq (blocking HTTP) with rustls and its portable ring provider.
 /// Supports configurable timeouts, retry with exponential backoff,
 /// parallel chunk downloads, and optional disk caching.
 pub struct DownloadClient {
@@ -28,7 +28,10 @@ pub struct DownloadClient {
 /// Full HRRR/RRFS family files can exceed the older subset-oriented 500 MB cap,
 /// especially `wrfnat`. Keep the cap comfortably above current operational
 /// artifacts while still guarding against obviously runaway downloads.
-const MAX_BODY_SIZE: u64 = 8 * 1024 * 1024 * 1024;
+pub const MAX_BODY_SIZE: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Maximum number of requests accepted by one multi-range operation.
+const MAX_RANGE_COUNT: usize = 4_096;
 
 /// Chunk size for whole-file parallel range downloads.
 const FULL_FILE_RANGE_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
@@ -358,12 +361,13 @@ fn pace_request(url: &str) {
     }
 }
 
-/// Build a ureq agent with TLS configured via rustls-rustcrypto.
+/// Build a ureq agent with TLS configured via rustls' ring provider.
 fn build_agent(config: &DownloadConfig) -> ureq::Agent {
-    // Install the rustcrypto provider as the process-wide default.
-    rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider()).ok();
+    // Install the same provider as the process-wide default for any rustls
+    // consumer that does not receive this agent's explicit provider.
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
 
-    let crypto = Arc::new(rustls_rustcrypto::provider());
+    let crypto = Arc::new(rustls::crypto::ring::default_provider());
 
     ureq::Agent::config_builder()
         .tls_config(
@@ -537,9 +541,9 @@ impl DownloadClient {
         false
     }
 
-    /// Create a new download client with TLS configured via rustls-rustcrypto.
+    /// Create a new download client with TLS configured via rustls' ring provider.
     ///
-    /// Uses ureq's built-in TlsConfig with the rustcrypto provider and
+    /// Uses ureq's built-in TlsConfig with the ring provider and
     /// webpki root certificates (Mozilla's CA bundle). No caching.
     pub fn new() -> crate::error::Result<Self> {
         Self::new_with_config(DownloadConfig::default())
@@ -733,6 +737,7 @@ impl DownloadClient {
             Ok(Some(total_len)) if total_len > 0 => total_len,
             _ => return self.get_bytes(url),
         };
+        let total_len = validate_remote_total_length(total_len)?;
         let ranges = full_file_ranges(total_len, FULL_FILE_RANGE_CHUNK_BYTES);
         if ranges.len() <= 1 {
             return self.get_bytes(url);
@@ -785,11 +790,18 @@ impl DownloadClient {
     /// If caching is enabled, the result is keyed by URL + byte range.
     /// Cache failures are silently ignored.
     pub fn get_range(&self, url: &str, start: u64, end: u64) -> crate::error::Result<Vec<u8>> {
+        let expected_len = if end == u64::MAX {
+            None
+        } else {
+            Some(finite_range_len(start, end)?)
+        };
+        let body_limit = expected_len.unwrap_or(MAX_BODY_SIZE);
         let key = DiskCache::cache_key(url, Some((start, end)));
 
         // Try cache first
         if let Some(cache) = &self.cache {
             if let Some(data) = cache.get(&key) {
+                validate_range_body_length(url, start, end, expected_len, data.len())?;
                 return Ok(data);
             }
         }
@@ -804,9 +816,10 @@ impl DownloadClient {
         let data = response
             .body_mut()
             .with_config()
-            .limit(MAX_BODY_SIZE)
+            .limit(body_limit)
             .read_to_vec()
             .map_err(|err| crate::RustmetError::Http(format!("failed to read {}: {}", url, err)))?;
+        validate_range_body_length(url, start, end, expected_len, data.len())?;
 
         // Store in cache (errors silently ignored)
         if let Some(cache) = &self.cache {
@@ -826,15 +839,40 @@ impl DownloadClient {
     /// `get_range`, so partial overlaps with future requests benefit from the
     /// cache too.
     pub fn get_ranges(&self, url: &str, ranges: &[(u64, u64)]) -> crate::error::Result<Vec<u8>> {
-        let total = ranges.len();
-        if total == 0 {
+        let needs_total = validate_range_request_shape(ranges)?;
+        if ranges.is_empty() {
             return Ok(Vec::new());
         }
+        let probed_total = if needs_total {
+            Some(self.probe_range_total_length(url)?.ok_or_else(|| {
+                crate::RustmetError::Http(format!(
+                    "range request for {} ends at EOF, but the server did not provide a usable Content-Range total",
+                    url
+                ))
+            })?)
+        } else {
+            None
+        };
+        let plan = prepare_range_plan(ranges, probed_total)?;
+        let total = plan.ranges.len();
 
-        // Check for the combined result in cache
-        let combined_key = DiskCache::cache_key_ranges(url, ranges);
+        // Check for the combined result in cache. Open-ended ranges use their
+        // resolved finite end so a changed remote object cannot reuse an old key.
+        let combined_key = DiskCache::cache_key_ranges(url, &plan.ranges);
         if let Some(cache) = &self.cache {
             if let Some(data) = cache.get(&combined_key) {
+                let actual = u64::try_from(data.len()).map_err(|_| {
+                    crate::RustmetError::Http(format!(
+                        "cached multi-range response for {} cannot fit in the byte-count type",
+                        url
+                    ))
+                })?;
+                if actual != plan.total_bytes {
+                    return Err(crate::RustmetError::Http(format!(
+                        "cached multi-range response for {} has {} bytes, expected {}",
+                        url, actual, plan.total_bytes
+                    )));
+                }
                 return Ok(data);
             }
         }
@@ -842,7 +880,7 @@ impl DownloadClient {
         let completed = AtomicUsize::new(0);
 
         let results: Vec<crate::error::Result<Vec<u8>>> = if is_nomads_url(url) {
-            ranges
+            plan.ranges
                 .iter()
                 .map(|&(start, end)| {
                     let data = self.get_range(url, start, end)?;
@@ -854,7 +892,7 @@ impl DownloadClient {
         } else {
             // Download all chunks in parallel, preserving order.
             // Each chunk is individually cached via get_range.
-            ranges
+            plan.ranges
                 .par_iter()
                 .map(|&(start, end)| {
                     let data = self.get_range(url, start, end)?;
@@ -865,10 +903,45 @@ impl DownloadClient {
                 .collect()
         };
 
-        // Concatenate results in order, propagating the first error.
+        // Concatenate results in order, re-checking every chunk and the running
+        // total before growing the aggregation buffer.
         let mut combined = Vec::new();
-        for result in results {
-            combined.extend_from_slice(&result?);
+        let mut actual_total = 0u64;
+        for (result, &(start, end)) in results.into_iter().zip(plan.ranges.iter()) {
+            let data = result?;
+            let expected_len = finite_range_len(start, end)?;
+            validate_range_body_length(url, start, end, Some(expected_len), data.len())?;
+            let chunk_len = u64::try_from(data.len()).map_err(|_| {
+                crate::RustmetError::Http(format!(
+                    "range response for {} cannot fit in the byte-count type",
+                    url
+                ))
+            })?;
+            actual_total = actual_total.checked_add(chunk_len).ok_or_else(|| {
+                crate::RustmetError::Http(format!(
+                    "multi-range response byte count overflow for {}",
+                    url
+                ))
+            })?;
+            if actual_total > plan.total_bytes || actual_total > MAX_BODY_SIZE {
+                return Err(crate::RustmetError::Http(format!(
+                    "multi-range response for {} exceeded its {} byte plan",
+                    url, plan.total_bytes
+                )));
+            }
+            combined.try_reserve(data.len()).map_err(|err| {
+                crate::RustmetError::Http(format!(
+                    "failed to reserve multi-range response buffer for {}: {}",
+                    url, err
+                ))
+            })?;
+            combined.extend_from_slice(&data);
+        }
+        if actual_total != plan.total_bytes {
+            return Err(crate::RustmetError::Http(format!(
+                "multi-range response for {} returned {} bytes, expected {}",
+                url, actual_total, plan.total_bytes
+            )));
         }
 
         eprintln!(
@@ -884,6 +957,152 @@ impl DownloadClient {
 
         Ok(combined)
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RangePlan {
+    ranges: Vec<(u64, u64)>,
+    total_bytes: u64,
+}
+
+fn validate_remote_total_length(total_len: u64) -> crate::error::Result<u64> {
+    if total_len > MAX_BODY_SIZE {
+        return Err(crate::RustmetError::Http(format!(
+            "remote object declares {total_len} bytes, exceeding the {MAX_BODY_SIZE} byte limit"
+        )));
+    }
+    Ok(total_len)
+}
+
+fn finite_range_len(start: u64, end: u64) -> crate::error::Result<u64> {
+    let len = end
+        .checked_sub(start)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| {
+            crate::RustmetError::InvalidArgument(format!(
+                "invalid inclusive byte range {start}-{end}"
+            ))
+        })?;
+    if len > MAX_BODY_SIZE {
+        return Err(crate::RustmetError::InvalidArgument(format!(
+            "byte range {start}-{end} requests {len} bytes, exceeding the {MAX_BODY_SIZE} byte limit"
+        )));
+    }
+    Ok(len)
+}
+
+fn validate_range_request_shape(ranges: &[(u64, u64)]) -> crate::error::Result<bool> {
+    if ranges.len() > MAX_RANGE_COUNT {
+        return Err(crate::RustmetError::InvalidArgument(format!(
+            "multi-range request has {} ranges, exceeding the {MAX_RANGE_COUNT} range limit",
+            ranges.len()
+        )));
+    }
+
+    let final_index = ranges.len().saturating_sub(1);
+    let mut needs_total = false;
+    for (index, &(start, end)) in ranges.iter().enumerate() {
+        if end == u64::MAX {
+            if index != final_index {
+                return Err(crate::RustmetError::InvalidArgument(
+                    "only the final byte range may use an open-ended EOF marker".to_string(),
+                ));
+            }
+            needs_total = true;
+        } else {
+            let _ = finite_range_len(start, end)?;
+        }
+    }
+    Ok(needs_total)
+}
+
+fn prepare_range_plan(
+    ranges: &[(u64, u64)],
+    probed_total: Option<u64>,
+) -> crate::error::Result<RangePlan> {
+    let needs_total = validate_range_request_shape(ranges)?;
+    let probed_total = match (needs_total, probed_total) {
+        (true, Some(total)) => Some(validate_remote_total_length(total)?),
+        (true, None) => {
+            return Err(crate::RustmetError::InvalidArgument(
+                "an open-ended final byte range requires a probed total length".to_string(),
+            ));
+        }
+        (false, Some(total)) => Some(validate_remote_total_length(total)?),
+        (false, None) => None,
+    };
+
+    let mut normalized = Vec::new();
+    normalized.try_reserve(ranges.len()).map_err(|err| {
+        crate::RustmetError::InvalidArgument(format!(
+            "failed to reserve normalized byte ranges: {err}"
+        ))
+    })?;
+    let mut total_bytes = 0u64;
+    for &(start, requested_end) in ranges {
+        let end = if requested_end == u64::MAX {
+            let total = probed_total.expect("open-ended range total checked above");
+            if start >= total {
+                return Err(crate::RustmetError::InvalidArgument(format!(
+                    "open-ended byte range starts at {start}, outside the {total} byte object"
+                )));
+            }
+            total - 1
+        } else {
+            requested_end
+        };
+        if let Some(total) = probed_total {
+            if end >= total {
+                return Err(crate::RustmetError::InvalidArgument(format!(
+                    "byte range {start}-{end} exceeds the probed {total} byte object"
+                )));
+            }
+        }
+        let len = finite_range_len(start, end)?;
+        total_bytes = total_bytes.checked_add(len).ok_or_else(|| {
+            crate::RustmetError::InvalidArgument(
+                "multi-range planned byte count overflow".to_string(),
+            )
+        })?;
+        if total_bytes > MAX_BODY_SIZE {
+            return Err(crate::RustmetError::InvalidArgument(format!(
+                "multi-range request plans {total_bytes} bytes, exceeding the {MAX_BODY_SIZE} byte limit"
+            )));
+        }
+        normalized.push((start, end));
+    }
+
+    Ok(RangePlan {
+        ranges: normalized,
+        total_bytes,
+    })
+}
+
+fn validate_range_body_length(
+    url: &str,
+    start: u64,
+    end: u64,
+    expected_len: Option<u64>,
+    actual_len: usize,
+) -> crate::error::Result<()> {
+    let actual_len = u64::try_from(actual_len).map_err(|_| {
+        crate::RustmetError::Http(format!(
+            "range response for {url} cannot fit in the byte-count type"
+        ))
+    })?;
+    if actual_len > MAX_BODY_SIZE {
+        return Err(crate::RustmetError::Http(format!(
+            "range response for {url} returned {actual_len} bytes, exceeding the {MAX_BODY_SIZE} byte limit"
+        )));
+    }
+    if let Some(expected_len) = expected_len {
+        if actual_len != expected_len {
+            return Err(crate::RustmetError::Http(format!(
+                "range response for {url} bytes={start}-{end} returned {actual_len} bytes, expected {expected_len}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_content_range_total(value: &str) -> Option<u64> {
@@ -911,7 +1130,11 @@ fn full_file_ranges(total_len: u64, chunk_size: u64) -> Vec<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{full_file_ranges, parse_content_range_total, DownloadClient, DownloadConfig};
+    use super::{
+        full_file_ranges, parse_content_range_total, prepare_range_plan,
+        validate_remote_total_length, DownloadClient, DownloadConfig, MAX_BODY_SIZE,
+        MAX_RANGE_COUNT,
+    };
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -980,5 +1203,33 @@ mod tests {
         assert_eq!(full_file_ranges(0, 4), Vec::<(u64, u64)>::new());
         assert_eq!(full_file_ranges(1, 4), vec![(0, 0)]);
         assert_eq!(full_file_ranges(10, 4), vec![(0, 3), (4, 7), (8, 9)]);
+    }
+
+    #[test]
+    fn download_oom_guard_rejects_oversized_probed_total() {
+        assert!(validate_remote_total_length(MAX_BODY_SIZE + 1).is_err());
+        assert!(prepare_range_plan(&[(0, u64::MAX)], Some(MAX_BODY_SIZE + 1)).is_err());
+    }
+
+    #[test]
+    fn download_oom_guard_rejects_oversized_aggregate() {
+        let first_end = MAX_BODY_SIZE / 2;
+        let ranges = [(0, first_end), (first_end + 1, MAX_BODY_SIZE)];
+        assert!(prepare_range_plan(&ranges, None).is_err());
+    }
+
+    #[test]
+    fn download_oom_guard_rejects_excessive_range_count() {
+        let ranges = vec![(0, 0); MAX_RANGE_COUNT + 1];
+        assert!(prepare_range_plan(&ranges, None).is_err());
+    }
+
+    #[test]
+    fn download_oom_guard_resolves_only_the_final_open_ended_range() {
+        let plan = prepare_range_plan(&[(10, 19), (20, u64::MAX)], Some(50)).unwrap();
+        assert_eq!(plan.ranges, vec![(10, 19), (20, 49)]);
+        assert_eq!(plan.total_bytes, 40);
+        assert!(prepare_range_plan(&[(20, u64::MAX)], None).is_err());
+        assert!(prepare_range_plan(&[(0, u64::MAX), (10, 19)], Some(50)).is_err());
     }
 }

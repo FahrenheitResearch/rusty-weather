@@ -9,7 +9,8 @@
 //!   [`fetch_hour`] / [`process_fetched_hour`] / [`ingest_hour()`],
 //!   [`IngestConfig`], [`planned_store_variables`], [`parse_hours`].
 //! - [`ingest_profile`]: what one run fetches/extracts/computes/stores
-//!   (`full` / `sounding` / `view` presets + overrides + validation).
+//!   (`full` / `sounding` / `view` / `surface` / `analysis` presets + overrides +
+//!   validation).
 //! - [`ingest_compute`]: the derived/heavy precompute over the products
 //!   decode lane.
 //! - [`size_estimate`]: exact (`walk_hour_sizes`) and predictive
@@ -48,7 +49,8 @@ pub fn build_sha() -> &'static str {
 /// 3D isobaric volumes + render-grade isobaric planes + the prs-side thermo
 /// decode) and a surface-source file (the 2D surface set + the surface-side
 /// thermo decode). HRRR splits them across two physical files (`prs`/`sfc`);
-/// GFS's single `pgrb2.0p25` carries both, so one entry sets both roles.
+/// GFS's single `pgrb2.0p25` carries both, so one entry sets both roles;
+/// RTMA/URMA and HIRESW set only the surface role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProductFetch {
     /// Product token passed to [`rustwx_core::ModelRunRequest::new`].
@@ -70,11 +72,109 @@ pub struct ProductFetch {
     pub idx_patterns: &'static [&'static str],
 }
 
+/// Whether this build has a complete fetch/extract plan for a model.
+///
+/// This is intentionally an ingest-only status rather than a query or HTTP
+/// contract. Service layers can expose it without duplicating the fetch-plan
+/// truth, while retaining freedom to define their own public response schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestSupportStatus {
+    Ready,
+    Unsupported,
+}
+
+/// Evidence level for an ingest adapter, independent of whether its fetch
+/// plan is enabled. This is the machine-readable source of truth for service
+/// capability responses; consumers must not infer verification from model
+/// names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestVerificationLevel {
+    /// A real provider payload has completed the download -> ingest -> store
+    /// validation path for this adapter.
+    LiveVerified,
+    /// URL/cadence and captured provider-inventory fixtures are verified, but
+    /// a full real-payload store round trip is not yet part of this evidence.
+    FixtureVerified,
+    /// The adapter is implemented and test-covered without a pinned live
+    /// provider inventory/round trip at the current contract level.
+    ImplementedUnverified,
+    /// No complete ingest adapter exists.
+    Unsupported,
+}
+
+impl IngestVerificationLevel {
+    /// Stable wire/config spelling. Prefer this over formatting the debug
+    /// representation in service adapters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LiveVerified => "live_verified",
+            Self::FixtureVerified => "fixture_verified",
+            Self::ImplementedUnverified => "implemented_unverified",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// Honest restrictions on an otherwise ready ingest lane. Callers can use
+/// these typed values to constrain controls without maintaining a second
+/// model-name allowlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestCapabilityLimitation {
+    /// The model publishes analyses, not positive forecast leads.
+    AnalysisOnly,
+    /// The product has no pressure-level/isobaric payload.
+    SurfaceOnly,
+    /// Only the post-processed ensemble mean is ingested, not individual
+    /// members, spread, probability, PMM/LPMM, or other statistics.
+    EnsembleMeanOnly,
+    /// The post-processed product publishes only a documented subset of
+    /// pressure levels; manifests report the levels actually realized.
+    SparsePressureLevels,
+    /// Derived/heavy diagnostics are disabled because the published source
+    /// either has incompatible aggregation semantics or omits a required
+    /// native input.
+    DerivedProductsDisabled,
+    /// This fetch plan is pinned to the CONUS product/domain.
+    ConusOnly,
+    /// The upstream provider labels this feed preliminary/pre-operational.
+    PreOperationalFeed,
+}
+
+impl IngestCapabilityLimitation {
+    /// Stable wire/config spelling. Prefer this over formatting the debug
+    /// representation in service adapters.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AnalysisOnly => "analysis_only",
+            Self::SurfaceOnly => "surface_only",
+            Self::EnsembleMeanOnly => "ensemble_mean_only",
+            Self::SparsePressureLevels => "sparse_pressure_levels",
+            Self::DerivedProductsDisabled => "derived_products_disabled",
+            Self::ConusOnly => "conus_only",
+            Self::PreOperationalFeed => "pre_operational_feed",
+        }
+    }
+}
+
+/// Typed, brand-neutral description of a model's ingest availability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelIngestCapability {
+    pub model: rustwx_core::ModelId,
+    pub status: IngestSupportStatus,
+    pub verification: IngestVerificationLevel,
+    /// Empty when [`status`](Self::status) is [`IngestSupportStatus::Unsupported`].
+    pub products: Vec<ProductFetch>,
+    /// Empty for an unrestricted full-profile ingest lane.
+    pub limitations: Vec<IngestCapabilityLimitation>,
+}
+
 /// The per-model fetch plan: which product file(s) one hour downloads and
 /// which extraction roles each serves. HRRR keeps its historical two-file
 /// pair (pressure = `prs`, surface = `sfc`) in that exact order so its
-/// fetch URLs and extraction sequence stay byte-identical; single-file
-/// analysis products fetch once and serve both roles from the same bytes.
+/// fetch URLs and extraction sequence stay byte-identical. RRFS Public also
+/// uses a two-file pair, but both files are already on the same CONUS grid. A
+/// one-file plan may serve both roles (GFS and the supported ensemble-mean
+/// products) or only the surface role (RTMA/URMA/HIRESW).
 ///
 /// Models that are not ingest-supported (see [`ingest_supported`]) return an
 /// error rather than a plan — callers gate on `ingest_supported` first, so
@@ -156,6 +256,16 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
             pressure_source: true,
             idx_patterns: &[],
         }]),
+        // AIFS Single v2 publishes one atmospheric `oper` GRIB2 file per
+        // six-hour lead. ECMWF's line-delimited JSON `.index` provides exact
+        // byte ranges, so fetch only the surface and pressure parameters the
+        // store can normalize instead of downloading the ~86 MB whole file.
+        ModelId::Aifs => Ok(vec![ProductFetch {
+            product: "oper",
+            surface_source: true,
+            pressure_source: true,
+            idx_patterns: AIFS_OPER_IDX_PATTERNS,
+        }]),
         ModelId::Rap => Ok(vec![ProductFetch {
             product: "awp130pgrb",
             surface_source: true,
@@ -163,6 +273,58 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
             // Keep RAP whole-file for now: the shared gridded fetch path
             // documents old subset attempts missing pressure-level winds.
             idx_patterns: &[],
+        }]),
+        // HIRESW's operational CONUS ARW 2.5 km product is a rich 2-D
+        // surface/native file, not a pressure-volume product. Keep it on the
+        // surface role only; the analysis profile stores the fields it can
+        // represent without fabricating an isobaric source.
+        ModelId::Hiresw => Ok(vec![ProductFetch {
+            product: "arw_2p5km/conus",
+            surface_source: true,
+            pressure_source: false,
+            idx_patterns: HIRESW_CONUS_IDX_PATTERNS,
+        }]),
+        // HREF/SREF/REFS post-processed means are single-file products that
+        // carry both 2-D fields and a sparse, explicitly published set of
+        // isobaric levels. The same bytes serve both extraction roles. Do not
+        // substitute spread/probability/PMM products: their semantics differ.
+        ModelId::Href => Ok(vec![ProductFetch {
+            product: "ensprod/conus/mean",
+            surface_source: true,
+            pressure_source: true,
+            idx_patterns: HREF_MEAN_IDX_PATTERNS,
+        }]),
+        ModelId::Sref => Ok(vec![ProductFetch {
+            product: "ensprod/pgrb212/mean_3hrly",
+            surface_source: true,
+            pressure_source: true,
+            idx_patterns: SREF_MEAN_IDX_PATTERNS,
+        }]),
+        ModelId::Refs => Ok(vec![ProductFetch {
+            product: "mean-conus",
+            surface_source: true,
+            pressure_source: true,
+            idx_patterns: REFS_MEAN_IDX_PATTERNS,
+        }]),
+        // RTMA/URMA CONUS analyses are surface-only. Their dedicated NOAA
+        // public S3 buckets carry `.idx` sidecars, so this plan range-fetches
+        // only the fields represented by `IngestProfile::analysis()` and
+        // never aliases the surface bytes into a pressure role.
+        ModelId::Rtma | ModelId::Urma => Ok(vec![ProductFetch {
+            product: "2dvaranl_ndfd",
+            surface_source: true,
+            pressure_source: false,
+            idx_patterns: SURFACE_ANALYSIS_IDX_PATTERNS,
+        }]),
+        // NBM core CONUS blend: one 2.5 km surface file per native forecast
+        // step. The files are ~160-200 MB and
+        // mostly deterministic fields interleaved with probabilistic
+        // companions, so range-subset the exact fields the store can decode.
+        ModelId::Nbm => Ok(vec![ProductFetch {
+            product: "core/co",
+            surface_source: true,
+            pressure_source: false,
+            idx_patterns: NBM_CORE_IDX_PATTERNS,
         }]),
         ModelId::Nam => Ok(vec![ProductFetch {
             product: "awip3d",
@@ -191,11 +353,145 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
                 idx_patterns: RRFS_NAT_IDX_PATTERNS,
             },
         ]),
+        // RRFS Public's preliminary 3 km CONUS feed publishes a conventional
+        // pressure-level file plus a separate 2-D file on the same 1799x1059
+        // grid. The inventories use the same field/level spellings as the
+        // RRFS-A subset selectors, including honest trailing one-hour APCP,
+        // UH, and wind maxima. Keep this adapter distinct from RRFS-A: its
+        // provider prefix, grid, cycle cadence, and operational status differ.
+        ModelId::RrfsPublic => Ok(vec![
+            ProductFetch {
+                product: "prs-conus",
+                surface_source: false,
+                pressure_source: true,
+                idx_patterns: RRFS_PRS_IDX_PATTERNS,
+            },
+            ProductFetch {
+                product: "2dfld-conus",
+                surface_source: true,
+                pressure_source: false,
+                idx_patterns: RRFS_NAT_IDX_PATTERNS,
+            },
+        ]),
         other => Err(events::other(format!(
             "model '{other}' has no ingest fetch plan (not ingest-supported)"
         ))),
     }
 }
+
+/// ECMWF AIFS Single v2 `oper` parameter selection.
+///
+/// These exact `param=...` predicates are interpreted against ECMWF's
+/// newline-delimited JSON index by rustwx-io. The inventory is pinned by the
+/// focused provider fixture under `tests/fixtures`. AIFS pressure moisture is
+/// specific humidity (`q`); rustwx-io converts it to the canonical dewpoint
+/// volume, while the derived decoder consumes it directly.
+const AIFS_OPER_IDX_PATTERNS: &[&str] = &[
+    "param=2t",
+    "param=2d",
+    "param=10u",
+    "param=10v",
+    "param=msl",
+    "param=sp",
+    "param=tp",
+    "param=tcc",
+    "param=lcc",
+    "param=mcc",
+    "param=hcc",
+    "param=t",
+    "param=q",
+    "param=u",
+    "param=v",
+    "param=gh",
+];
+
+/// `.idx` message selection for the RTMA/URMA CONUS
+/// `2dvaranl_ndfd` surface analysis.
+///
+/// Field and level strings are pinned to NOAA's current operational index
+/// inventory (verified 2026-08-10). SPFH, WDIR/WIND, CEIL, and URMA's HTSGW
+/// are intentionally omitted because the store already receives U/V winds
+/// and has no matching surface-plan selector for the other records.
+const SURFACE_ANALYSIS_IDX_PATTERNS: &[&str] = &[
+    "HGT:surface",
+    "PRES:surface",
+    "TMP:2 m above ground",
+    "DPT:2 m above ground",
+    "UGRD:10 m above ground",
+    "VGRD:10 m above ground",
+    "GUST:10 m above ground",
+    "VIS:surface",
+    "TCDC:entire atmosphere",
+];
+
+/// Operational HIRESW CONUS ARW 2.5 km surface/native inventory.
+///
+/// Captured from NOAA NOMADS `hiresw.t00z.arw_2p5km.f24.conus.grib2.idx`
+/// on 2026-08-11. This intentionally contains no isobaric selectors: the
+/// file publishes no pressure-level volume. Extra native surface fields are
+/// retained so explicitly named surface profiles can use them later without
+/// changing the acquisition contract.
+const HIRESW_CONUS_IDX_PATTERNS: &[&str] = &[
+    "MSLET",
+    "RH:2 m above ground",
+    "PWAT:entire atmosphere",
+    "APCP:surface",
+    "REFD:1000 m above ground",
+    "MXUPHL:5000-2000 m above ground",
+    "TCDC:entire atmosphere",
+    "TMP:2 m above ground",
+    "DPT:2 m above ground",
+    "UGRD:10 m above ground",
+    "VGRD:10 m above ground",
+    "PRES:surface",
+    "HGT:surface",
+    "GUST:surface",
+    "CRAIN:surface",
+    "REFC:entire atmosphere",
+    "VIS:surface",
+];
+
+/// HREF CONUS weighted-ensemble-mean messages used by the sparse sounding
+/// and 2-D store lanes. The source file itself contains only mean records.
+const HREF_MEAN_IDX_PATTERNS: &[&str] = &[
+    "MSLET", "HGT", "UGRD", "VGRD", "TMP", "DPT", "RH", "PWAT", "VIS", "LCDC", "MCDC", "HCDC",
+    "TCDC", "APCP", "CRAIN", "CFRZR", "CICEP", "CSNOW",
+];
+
+/// SREF grid-212 three-hourly weighted-ensemble-mean messages. The upstream
+/// file is one run-wide GRIB containing every native forecast step, so a warm
+/// fetch-cache entry is reused while forecast-hour-aware extraction selects
+/// one valid time.
+const SREF_MEAN_IDX_PATTERNS: &[&str] = &[
+    "PRMSL", "HGT", "UGRD", "VGRD", "ABSV", "TMP", "DPT", "RH", "CAPE", "CIN", "PWAT", "VIS",
+    "APCP", "CRAIN", "CFRZR", "CICEP", "CSNOW",
+];
+
+/// REFS CONUS post-processed weighted-ensemble-mean messages. Individual
+/// members and alternate statistics deliberately remain outside this plan.
+const REFS_MEAN_IDX_PATTERNS: &[&str] = &[
+    "MSLET", "HGT", "UGRD", "VGRD", "TMP", "DPT", "RH", "PWAT", "VIS", "LCDC", "MCDC", "HCDC",
+    "TCDC", "APCP", "CRAIN", "CFRZR", "CICEP", "CSNOW",
+];
+
+/// `.idx` message selection for NBM `core/co`.
+///
+/// NBM publishes wind speed/direction rather than U/V components; the I/O
+/// layer synthesizes `u_10m`/`v_10m`, so both WIND and WDIR are required.
+/// The deterministic directive drops percentile, probability, and spread
+/// records sharing the same variable/level tokens.
+const NBM_CORE_IDX_PATTERNS: &[&str] = &[
+    rustwx_io::IDX_DETERMINISTIC_ONLY,
+    "TMP:2 m above ground",
+    "DPT:2 m above ground",
+    "RH:2 m above ground",
+    "GUST:10 m above ground",
+    "WIND:10 m above ground",
+    "WDIR:10 m above ground",
+    "APCP:surface",
+    "PWAT:entire atmosphere",
+    "VIS:surface",
+];
 
 /// `.idx` message-selection patterns for the RRFS-A `prs-na` (pressure) file:
 /// the isobaric volume field types the ingest plan decodes (T/RH/DPT for the
@@ -273,6 +569,48 @@ const RRFS_NAT_IDX_PATTERNS: &[&str] = &[
     "HCDC",
 ];
 
+/// Validate that a profile's required extraction roles exist in a model's
+/// fetch plan. This is the model-aware counterpart to
+/// [`ingest_profile::IngestProfile::validate`], which validates only the
+/// profile's internal shape.
+pub fn validate_ingest_profile_for_model(
+    model: rustwx_core::ModelId,
+    profile: &ingest_profile::IngestProfile,
+) -> Result<(), IngestError> {
+    profile.validate().map_err(events::other)?;
+    let plan = fetch_plan(model)?;
+    if !plan.iter().any(|product| product.surface_source) {
+        return Err(events::other(format!(
+            "model '{model}' has no surface-source product in its ingest plan"
+        )));
+    }
+    if profile.needs_prs() && !plan.iter().any(|product| product.pressure_source) {
+        return Err(events::other(format!(
+            "model '{model}' is surface-only, but profile '{}' requests pressure-level or derived inputs; use --profile surface for forecast fields or --profile analysis for analysis products",
+            profile.describe()
+        )));
+    }
+    if matches!(
+        model,
+        rustwx_core::ModelId::Aigefs
+            | rustwx_core::ModelId::Hgefs
+            | rustwx_core::ModelId::Href
+            | rustwx_core::ModelId::Sref
+            | rustwx_core::ModelId::Refs
+    ) && (profile.derived || profile.heavy)
+    {
+        return Err(events::other(format!(
+            "model '{model}' ingests a post-processed ensemble mean; derived/heavy diagnostics from mean state fields are not ensemble-mean diagnostics; use --profile sounding or disable both derived and heavy",
+        )));
+    }
+    if model == rustwx_core::ModelId::Aifs && (profile.derived || profile.heavy) {
+        return Err(events::other(format!(
+            "model '{model}' Open Data does not publish native surface orography in each forecast file; derived/heavy diagnostics remain disabled until a verified static-field join exists; use --profile sounding or disable both derived and heavy",
+        )));
+    }
+    Ok(())
+}
+
 /// The geographic CONUS crop box for a model whose native ingest domain is
 /// larger than CONUS (RRFS-A's North America rotated-pole grid), as
 /// `(west, east, south, north)` degrees. `None` = no crop (HRRR, GFS — the
@@ -306,6 +644,116 @@ pub fn ingest_supported(model: rustwx_core::ModelId) -> bool {
     fetch_plan(model).is_ok()
 }
 
+/// Whether the remote ingest path can acquire `model` from `source`.
+///
+/// The model registry also describes local archive adapters. Those are useful
+/// to other callers but are not interchangeable with the GRIB acquisition path
+/// used by the scheduler.
+pub fn model_source_ingest_supported(
+    model: rustwx_core::ModelId,
+    source: rustwx_core::SourceId,
+) -> bool {
+    ingest_supported(model)
+        && rustwx_models::model_summary(model)
+            .sources
+            .iter()
+            .any(|candidate| candidate.id == source)
+        && (model != rustwx_core::ModelId::Aifs || source == rustwx_core::SourceId::Ecmwf)
+}
+
+/// Return the authoritative ingest capability for one model.
+///
+/// Service and query layers should consume this seam instead of maintaining a
+/// second hard-coded support list. Forecast-hour cadence remains authoritative
+/// in `rustwx_models::supported_forecast_hours` because it is cycle-dependent.
+pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapability {
+    let limitations = match model {
+        rustwx_core::ModelId::Rtma | rustwx_core::ModelId::Urma => vec![
+            IngestCapabilityLimitation::AnalysisOnly,
+            IngestCapabilityLimitation::SurfaceOnly,
+        ],
+        rustwx_core::ModelId::Hiresw => vec![
+            IngestCapabilityLimitation::SurfaceOnly,
+            IngestCapabilityLimitation::ConusOnly,
+        ],
+        rustwx_core::ModelId::Nbm => vec![
+            IngestCapabilityLimitation::SurfaceOnly,
+            IngestCapabilityLimitation::ConusOnly,
+        ],
+        rustwx_core::ModelId::Aigefs | rustwx_core::ModelId::Hgefs => vec![
+            IngestCapabilityLimitation::EnsembleMeanOnly,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+        ],
+        rustwx_core::ModelId::Href | rustwx_core::ModelId::Sref => vec![
+            IngestCapabilityLimitation::EnsembleMeanOnly,
+            IngestCapabilityLimitation::SparsePressureLevels,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+            IngestCapabilityLimitation::ConusOnly,
+        ],
+        rustwx_core::ModelId::Refs => vec![
+            IngestCapabilityLimitation::EnsembleMeanOnly,
+            IngestCapabilityLimitation::SparsePressureLevels,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+            IngestCapabilityLimitation::ConusOnly,
+            IngestCapabilityLimitation::PreOperationalFeed,
+        ],
+        rustwx_core::ModelId::RrfsPublic => vec![
+            IngestCapabilityLimitation::ConusOnly,
+            IngestCapabilityLimitation::PreOperationalFeed,
+        ],
+        rustwx_core::ModelId::Aifs => vec![
+            IngestCapabilityLimitation::SparsePressureLevels,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+        ],
+        _ => Vec::new(),
+    };
+    match fetch_plan(model) {
+        Ok(products) => {
+            let verification = match model {
+                rustwx_core::ModelId::Hrrr
+                | rustwx_core::ModelId::Gfs
+                | rustwx_core::ModelId::RrfsA => IngestVerificationLevel::LiveVerified,
+                rustwx_core::ModelId::Nbm
+                | rustwx_core::ModelId::Rtma
+                | rustwx_core::ModelId::Urma
+                | rustwx_core::ModelId::Hiresw
+                | rustwx_core::ModelId::Href
+                | rustwx_core::ModelId::Sref
+                | rustwx_core::ModelId::Refs
+                | rustwx_core::ModelId::RrfsPublic
+                | rustwx_core::ModelId::Aifs => IngestVerificationLevel::FixtureVerified,
+                _ => IngestVerificationLevel::ImplementedUnverified,
+            };
+            ModelIngestCapability {
+                model,
+                status: IngestSupportStatus::Ready,
+                verification,
+                products,
+                limitations,
+            }
+        }
+        Err(_) => ModelIngestCapability {
+            model,
+            status: IngestSupportStatus::Unsupported,
+            verification: IngestVerificationLevel::Unsupported,
+            products: Vec::new(),
+            limitations,
+        },
+    }
+}
+
+/// Return one capability row for every built-in model, in registry order.
+///
+/// This is the complete ingest support table for service/UI consumers. It
+/// includes unsupported rows deliberately, so callers can explain a gated
+/// model without maintaining a separate allowlist.
+pub fn model_ingest_capabilities() -> Vec<ModelIngestCapability> {
+    rustwx_models::built_in_models()
+        .iter()
+        .map(|summary| model_ingest_capability(summary.id))
+        .collect()
+}
+
 /// Crate-local profiling scope: expands to `puffin::profile_scope!` under
 /// the `profiling` feature and to nothing otherwise, so call sites stay
 /// clean and headless bins compile puffin out entirely.
@@ -331,6 +779,23 @@ mod tests {
     }
 
     #[test]
+    fn ingest_verification_level_has_stable_wire_names() {
+        assert_eq!(
+            IngestVerificationLevel::LiveVerified.as_str(),
+            "live_verified"
+        );
+        assert_eq!(
+            IngestVerificationLevel::FixtureVerified.as_str(),
+            "fixture_verified"
+        );
+        assert_eq!(
+            IngestVerificationLevel::ImplementedUnverified.as_str(),
+            "implemented_unverified"
+        );
+        assert_eq!(IngestVerificationLevel::Unsupported.as_str(), "unsupported");
+    }
+
+    #[test]
     fn fetch_plan_models_are_ingest_supported() {
         use rustwx_core::ModelId;
         let enabled = [
@@ -344,8 +809,17 @@ mod tests {
             ModelId::Aigefs,
             ModelId::Hgefs,
             ModelId::EcmwfOpenData,
+            ModelId::Aifs,
             ModelId::Nam,
+            ModelId::Hiresw,
+            ModelId::Href,
+            ModelId::Sref,
             ModelId::RrfsA,
+            ModelId::RrfsPublic,
+            ModelId::Refs,
+            ModelId::Nbm,
+            ModelId::Rtma,
+            ModelId::Urma,
         ];
         for model in enabled {
             assert!(
@@ -362,8 +836,178 @@ mod tests {
                 );
             }
         }
-        // A model with no plan (e.g. NBM) is explicitly unsupported.
-        assert!(!ingest_supported(ModelId::Nbm));
+    }
+
+    #[test]
+    fn model_ingest_capability_reports_ready_and_unsupported_models() {
+        use rustwx_core::ModelId;
+
+        let nbm = model_ingest_capability(ModelId::Nbm);
+        assert_eq!(nbm.model, ModelId::Nbm);
+        assert_eq!(nbm.status, IngestSupportStatus::Ready);
+        assert_eq!(nbm.verification, IngestVerificationLevel::FixtureVerified);
+        assert_eq!(nbm.products.len(), 1);
+        assert_eq!(
+            nbm.limitations,
+            vec![
+                IngestCapabilityLimitation::SurfaceOnly,
+                IngestCapabilityLimitation::ConusOnly,
+            ]
+        );
+
+        for model in [ModelId::Aigefs, ModelId::Hgefs] {
+            let capability = model_ingest_capability(model);
+            assert!(
+                capability
+                    .limitations
+                    .contains(&IngestCapabilityLimitation::EnsembleMeanOnly)
+            );
+            assert!(
+                capability
+                    .limitations
+                    .contains(&IngestCapabilityLimitation::DerivedProductsDisabled)
+            );
+        }
+
+        let rtma = model_ingest_capability(ModelId::Rtma);
+        assert_eq!(rtma.model, ModelId::Rtma);
+        assert_eq!(rtma.status, IngestSupportStatus::Ready);
+        assert_eq!(rtma.verification, IngestVerificationLevel::FixtureVerified);
+        assert_eq!(rtma.products.len(), 1);
+        assert_eq!(
+            rtma.limitations,
+            vec![
+                IngestCapabilityLimitation::AnalysisOnly,
+                IngestCapabilityLimitation::SurfaceOnly,
+            ]
+        );
+
+        let hiresw = model_ingest_capability(ModelId::Hiresw);
+        assert_eq!(hiresw.status, IngestSupportStatus::Ready);
+        assert_eq!(
+            hiresw.limitations,
+            vec![
+                IngestCapabilityLimitation::SurfaceOnly,
+                IngestCapabilityLimitation::ConusOnly,
+            ]
+        );
+
+        let href = model_ingest_capability(ModelId::Href);
+        assert_eq!(href.status, IngestSupportStatus::Ready);
+        assert_eq!(href.verification, IngestVerificationLevel::FixtureVerified);
+        assert!(
+            href.limitations
+                .contains(&IngestCapabilityLimitation::EnsembleMeanOnly)
+        );
+        assert!(
+            href.limitations
+                .contains(&IngestCapabilityLimitation::SparsePressureLevels)
+        );
+        assert!(
+            href.limitations
+                .contains(&IngestCapabilityLimitation::DerivedProductsDisabled)
+        );
+
+        let refs = model_ingest_capability(ModelId::Refs);
+        assert_eq!(refs.status, IngestSupportStatus::Ready);
+        assert!(
+            refs.limitations
+                .contains(&IngestCapabilityLimitation::PreOperationalFeed)
+        );
+
+        let rrfs_public = model_ingest_capability(ModelId::RrfsPublic);
+        assert_eq!(rrfs_public.status, IngestSupportStatus::Ready);
+        assert_eq!(
+            rrfs_public.verification,
+            IngestVerificationLevel::FixtureVerified
+        );
+
+        let aifs = model_ingest_capability(ModelId::Aifs);
+        assert_eq!(aifs.status, IngestSupportStatus::Ready);
+        assert_eq!(aifs.verification, IngestVerificationLevel::FixtureVerified);
+        assert_eq!(
+            aifs.limitations,
+            vec![
+                IngestCapabilityLimitation::SparsePressureLevels,
+                IngestCapabilityLimitation::DerivedProductsDisabled,
+            ]
+        );
+        assert_eq!(
+            rrfs_public.limitations,
+            vec![
+                IngestCapabilityLimitation::ConusOnly,
+                IngestCapabilityLimitation::PreOperationalFeed,
+            ]
+        );
+
+        let unsupported = model_ingest_capability(ModelId::WrfGdex);
+        assert_eq!(unsupported.status, IngestSupportStatus::Unsupported);
+        assert_eq!(
+            unsupported.verification,
+            IngestVerificationLevel::Unsupported
+        );
+        assert!(unsupported.products.is_empty());
+        assert!(unsupported.limitations.is_empty());
+    }
+
+    #[test]
+    fn model_ingest_capability_table_is_complete_and_exact() {
+        use rustwx_core::ModelId;
+
+        let table = model_ingest_capabilities();
+        assert_eq!(table.len(), rustwx_models::built_in_models().len());
+        assert_eq!(
+            table.iter().map(|row| row.model).collect::<Vec<_>>(),
+            rustwx_models::built_in_models()
+                .iter()
+                .map(|summary| summary.id)
+                .collect::<Vec<_>>()
+        );
+
+        let ready = table
+            .iter()
+            .filter(|row| row.status == IngestSupportStatus::Ready)
+            .map(|row| row.model)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ready,
+            vec![
+                ModelId::Hrrr,
+                ModelId::HrrrAk,
+                ModelId::Gfs,
+                ModelId::Gdas,
+                ModelId::Gefs,
+                ModelId::Aigfs,
+                ModelId::Aigefs,
+                ModelId::Hgefs,
+                ModelId::EcmwfOpenData,
+                ModelId::Aifs,
+                ModelId::Rap,
+                ModelId::Nam,
+                ModelId::Hiresw,
+                ModelId::Href,
+                ModelId::Sref,
+                ModelId::Rtma,
+                ModelId::Urma,
+                ModelId::Nbm,
+                ModelId::RrfsA,
+                ModelId::RrfsPublic,
+                ModelId::Refs,
+            ]
+        );
+
+        let unsupported = table
+            .iter()
+            .filter(|row| row.status == IngestSupportStatus::Unsupported)
+            .map(|row| row.model)
+            .collect::<Vec<_>>();
+        assert_eq!(unsupported, vec![ModelId::RrfsFireWx, ModelId::WrfGdex]);
+        assert!(table.iter().all(|row| {
+            (row.status == IngestSupportStatus::Ready && !row.products.is_empty())
+                || (row.status == IngestSupportStatus::Unsupported
+                    && row.products.is_empty()
+                    && row.verification == IngestVerificationLevel::Unsupported)
+        }));
     }
 
     #[test]
@@ -427,6 +1071,240 @@ mod tests {
         for need in ["TMP", "RH", "UGRD", "VGRD", "HGT"] {
             assert!(prs.contains(&need), "prs subset missing {need}");
         }
+    }
+
+    #[test]
+    fn fetch_plan_nbm_uses_deterministic_indexed_core_conus() {
+        use rustwx_core::ModelId;
+
+        let plan = fetch_plan(ModelId::Nbm).expect("NBM plan");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].product, "core/co");
+        assert!(plan[0].surface_source);
+        assert!(!plan[0].pressure_source);
+        assert_eq!(
+            plan[0].idx_patterns.first().copied(),
+            Some(rustwx_io::IDX_DETERMINISTIC_ONLY)
+        );
+        assert!(plan[0].idx_patterns.contains(&"WIND:10 m above ground"));
+        assert!(plan[0].idx_patterns.contains(&"WDIR:10 m above ground"));
+        assert!(plan[0].idx_patterns.contains(&"APCP:surface"));
+    }
+
+    #[test]
+    fn fetch_plan_rtma_urma_is_surface_only_and_matches_operational_indexes() {
+        use rustwx_core::ModelId;
+
+        let cases = [
+            (
+                ModelId::Rtma,
+                include_str!("../tests/fixtures/rtma2p5_2dvaranl_ndfd.idx"),
+            ),
+            (
+                ModelId::Urma,
+                include_str!("../tests/fixtures/urma2p5_2dvaranl_ndfd.idx"),
+            ),
+        ];
+        for (model, idx) in cases {
+            let plan = fetch_plan(model).expect("analysis fetch plan");
+            assert_eq!(plan.len(), 1);
+            assert_eq!(plan[0].product, "2dvaranl_ndfd");
+            assert!(plan[0].surface_source);
+            assert!(!plan[0].pressure_source);
+            assert_eq!(plan[0].idx_patterns, SURFACE_ANALYSIS_IDX_PATTERNS);
+            for pattern in plan[0].idx_patterns {
+                let matched = idx.lines().any(|line| {
+                    let parts = line.split(':').collect::<Vec<_>>();
+                    parts.len() >= 5 && idx_line_matches(pattern, parts[3], parts[4])
+                });
+                assert!(matched, "{model} index has no row for {pattern}");
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_plan_hiresw_is_surface_only_and_matches_operational_index() {
+        use rustwx_core::ModelId;
+
+        let idx = include_str!("../tests/fixtures/hiresw.t00z.arw_2p5km.f24.conus.grib2.idx");
+        let plan = fetch_plan(ModelId::Hiresw).expect("HIRESW fetch plan");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].product, "arw_2p5km/conus");
+        assert!(plan[0].surface_source);
+        assert!(!plan[0].pressure_source);
+        assert_eq!(plan[0].idx_patterns, HIRESW_CONUS_IDX_PATTERNS);
+        assert_patterns_match_index("HIRESW", plan[0].idx_patterns, idx);
+        assert!(
+            !idx.lines().any(|line| line.contains(":TMP:500 mb:")),
+            "the supported HIRESW file must not be represented as a pressure volume"
+        );
+    }
+
+    #[test]
+    fn ensemble_mean_fetch_plans_match_captured_operational_indexes() {
+        use rustwx_core::ModelId;
+
+        let cases = [
+            (
+                ModelId::Href,
+                "ensprod/conus/mean",
+                HREF_MEAN_IDX_PATTERNS,
+                include_str!("../tests/fixtures/href.t00z.conus.mean.f24.grib2.idx"),
+            ),
+            (
+                ModelId::Sref,
+                "ensprod/pgrb212/mean_3hrly",
+                SREF_MEAN_IDX_PATTERNS,
+                include_str!("../tests/fixtures/sref.t03z.pgrb212.mean_3hrly.excerpt.idx"),
+            ),
+            (
+                ModelId::Refs,
+                "mean-conus",
+                REFS_MEAN_IDX_PATTERNS,
+                include_str!("../tests/fixtures/refs.t00z.mean.f24.conus.grib2.idx"),
+            ),
+        ];
+        for (model, product, patterns, idx) in cases {
+            let plan = fetch_plan(model).expect("ensemble-mean fetch plan");
+            assert_eq!(plan.len(), 1);
+            assert_eq!(plan[0].product, product);
+            assert!(plan[0].surface_source && plan[0].pressure_source);
+            assert_eq!(plan[0].idx_patterns, patterns);
+            assert_patterns_match_index(&model.to_string(), patterns, idx);
+            assert!(
+                idx.lines().all(|line| line.contains(":wt ens mean")),
+                "{model} fixture must contain only weighted-ensemble-mean records"
+            );
+        }
+    }
+
+    #[test]
+    fn rrfs_public_fetch_plan_matches_captured_provider_indexes() {
+        use rustwx_core::ModelId;
+
+        let pressure =
+            include_str!("../tests/fixtures/rrfs.t00z.prslev.3km.f024.conus.grib2.excerpt.idx");
+        let surface =
+            include_str!("../tests/fixtures/rrfs.t00z.2dfld.3km.f024.conus.grib2.excerpt.idx");
+        let plan = fetch_plan(ModelId::RrfsPublic).expect("RRFS Public fetch plan");
+        assert_eq!(plan.len(), 2);
+
+        assert_eq!(plan[0].product, "prs-conus");
+        assert!(plan[0].pressure_source && !plan[0].surface_source);
+        assert_eq!(plan[0].idx_patterns, RRFS_PRS_IDX_PATTERNS);
+        assert_patterns_match_index("RRFS Public pressure", plan[0].idx_patterns, pressure);
+
+        assert_eq!(plan[1].product, "2dfld-conus");
+        assert!(plan[1].surface_source && !plan[1].pressure_source);
+        assert_eq!(plan[1].idx_patterns, RRFS_NAT_IDX_PATTERNS);
+        assert_patterns_match_index("RRFS Public surface", plan[1].idx_patterns, surface);
+
+        for evidence in [
+            ":APCP:surface:23-24 hour acc fcst:",
+            ":MXUPHL:5000-2000 m above ground:23-24 hour max fcst:",
+            ":WIND:10 m above ground:23-24 hour max fcst:",
+        ] {
+            assert!(
+                surface.contains(evidence),
+                "missing native window: {evidence}"
+            );
+        }
+    }
+
+    fn assert_patterns_match_index(label: &str, patterns: &[&str], idx: &str) {
+        for pattern in patterns {
+            let matched = idx.lines().any(|line| {
+                let parts = line.split(':').collect::<Vec<_>>();
+                parts.len() >= 5 && idx_line_matches(pattern, parts[3], parts[4])
+            });
+            assert!(matched, "{label} index has no row for {pattern}");
+        }
+    }
+
+    #[test]
+    fn surface_only_models_require_the_analysis_profile() {
+        use rustwx_core::ModelId;
+
+        for model in [ModelId::Rtma, ModelId::Urma] {
+            validate_ingest_profile_for_model(model, &ingest_profile::IngestProfile::analysis())
+                .expect("analysis profile is compatible");
+            let message =
+                validate_ingest_profile_for_model(model, &ingest_profile::IngestProfile::full())
+                    .expect_err("full profile requires a pressure product")
+                    .to_string();
+            assert!(message.contains("surface-only"), "got: {message}");
+            assert!(message.contains("--profile analysis"), "got: {message}");
+        }
+
+        validate_ingest_profile_for_model(ModelId::Nbm, &ingest_profile::IngestProfile::surface())
+            .expect("NBM accepts the complete direct surface profile");
+        let message =
+            validate_ingest_profile_for_model(ModelId::Nbm, &ingest_profile::IngestProfile::view())
+                .expect_err("NBM view requires a pressure product")
+                .to_string();
+        assert!(message.contains("surface-only"), "got: {message}");
+
+        validate_ingest_profile_for_model(
+            ModelId::Hiresw,
+            &ingest_profile::IngestProfile::analysis(),
+        )
+        .expect("HIRESW accepts the surface-only analysis profile");
+        let message = validate_ingest_profile_for_model(
+            ModelId::Hiresw,
+            &ingest_profile::IngestProfile::sounding(),
+        )
+        .expect_err("HIRESW has no isobaric source")
+        .to_string();
+        assert!(message.contains("surface-only"), "got: {message}");
+    }
+
+    #[test]
+    fn ensemble_mean_models_reject_nonlinear_derived_stages() {
+        use rustwx_core::ModelId;
+
+        for model in [
+            ModelId::Aigefs,
+            ModelId::Hgefs,
+            ModelId::Href,
+            ModelId::Sref,
+            ModelId::Refs,
+        ] {
+            validate_ingest_profile_for_model(model, &ingest_profile::IngestProfile::sounding())
+                .expect("sparse ensemble-mean soundings are supported");
+
+            let message =
+                validate_ingest_profile_for_model(model, &ingest_profile::IngestProfile::full())
+                    .expect_err("derived diagnostics from mean state must be rejected")
+                    .to_string();
+            assert!(message.contains("post-processed ensemble mean"));
+            assert!(message.contains("not ensemble-mean diagnostics"));
+
+            let mut raw_fields = ingest_profile::IngestProfile::full();
+            raw_fields.derived = false;
+            raw_fields.heavy = false;
+            validate_ingest_profile_for_model(model, &raw_fields)
+                .expect("raw mean fields and sparse pressure levels are supported");
+        }
+    }
+
+    #[test]
+    fn aifs_accepts_raw_soundings_but_rejects_unverified_terrain_derived_stages() {
+        use rustwx_core::ModelId;
+
+        validate_ingest_profile_for_model(
+            ModelId::Aifs,
+            &ingest_profile::IngestProfile::sounding(),
+        )
+        .expect("AIFS sparse pressure volumes and surface state are supported");
+
+        let message = validate_ingest_profile_for_model(
+            ModelId::Aifs,
+            &ingest_profile::IngestProfile::full(),
+        )
+        .expect_err("AIFS derived/heavy stages need a verified static-orography join")
+        .to_string();
+        assert!(message.contains("surface orography"), "got: {message}");
+        assert!(message.contains("--profile sounding"), "got: {message}");
     }
 
     #[test]
@@ -569,7 +1447,11 @@ mod tests {
             (ModelId::Gdas, "pgrb2.0p25"),
             (ModelId::Gefs, "pgrb2ap5/gec00"),
             (ModelId::EcmwfOpenData, "oper"),
+            (ModelId::Aifs, "oper"),
             (ModelId::Nam, "awip3d"),
+            (ModelId::Href, "ensprod/conus/mean"),
+            (ModelId::Sref, "ensprod/pgrb212/mean_3hrly"),
+            (ModelId::Refs, "mean-conus"),
         ] {
             let plan = fetch_plan(model).expect("single-file plan");
             assert_eq!(plan.len(), 1, "{model} fetches one product file");
@@ -595,9 +1477,69 @@ mod tests {
     }
 
     #[test]
+    fn fetch_plan_aifs_uses_the_verified_ecmwf_json_index_inventory() {
+        use rustwx_core::ModelId;
+
+        let plan = fetch_plan(ModelId::Aifs).expect("AIFS plan");
+        assert_eq!(plan.len(), 1);
+        let oper = &plan[0];
+        assert_eq!(oper.product, "oper");
+        assert!(oper.surface_source && oper.pressure_source);
+        assert_eq!(
+            oper.idx_patterns,
+            &[
+                "param=2t",
+                "param=2d",
+                "param=10u",
+                "param=10v",
+                "param=msl",
+                "param=sp",
+                "param=tp",
+                "param=tcc",
+                "param=lcc",
+                "param=mcc",
+                "param=hcc",
+                "param=t",
+                "param=q",
+                "param=u",
+                "param=v",
+                "param=gh",
+            ]
+        );
+
+        let fixture = include_str!("../tests/fixtures/aifs-single.20260810T0000.f024.oper.index");
+        let rows = fixture
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSON row"))
+            .collect::<Vec<_>>();
+        for pattern in oper.idx_patterns {
+            let param = pattern
+                .strip_prefix("param=")
+                .expect("AIFS patterns are exact param predicates");
+            assert!(
+                rows.iter().any(|row| row["param"] == param),
+                "fixture must contain an official row for {pattern}"
+            );
+        }
+        let pressure_levels = rows
+            .iter()
+            .filter(|row| row["param"] == "q")
+            .filter_map(|row| row["levelist"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pressure_levels,
+            vec![
+                "925", "1000", "250", "50", "700", "150", "300", "500", "100", "850", "200", "400",
+                "600",
+            ]
+        );
+    }
+
+    #[test]
     fn fetch_plan_rejects_unsupported_model() {
         use rustwx_core::ModelId;
-        let err = fetch_plan(ModelId::Nbm).expect_err("NBM has no fetch plan");
+        let err = fetch_plan(ModelId::WrfGdex).expect_err("WRF GDEX has no fetch plan");
         assert!(!err.is_cancelled());
         assert!(
             err.to_string().contains("no ingest fetch plan"),

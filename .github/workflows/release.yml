@@ -7,25 +7,17 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RW_BUILD_SHA: ${{ github.sha }}
   GUI_BIN: rusty-weather-ui
+  SERVER_BIN: rw-server
+  SCHEDULER_BIN: rw-scheduler
   APP_NAME: Rusty Weather
   PACKAGE_NAME: rusty-weather
-  TOOL_BINS: rw_ingest rw_batch rw_render rw_render_bench rw_bench rw_store_diff rws rw_sat rw_glm_follow rusty_sat_check
-  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-  AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-  AZURE_TS_ENDPOINT: ${{ secrets.AZURE_TS_ENDPOINT }}
-  AZURE_TS_ACCOUNT: ${{ secrets.AZURE_TS_ACCOUNT }}
-  AZURE_TS_PROFILE: ${{ secrets.AZURE_TS_PROFILE }}
-  MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
-  MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
-  ASC_API_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
-  ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
-  ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+  TOOL_BINS: rw_ingest rw_batch rw_render rw_render_bench rw_bench rw_store_diff rws rw_sat rw_glm_follow rusty_sat_check rw-server rw-scheduler
 
 jobs:
   preflight-signing:
@@ -33,6 +25,18 @@ jobs:
     steps:
       - name: Require signing secrets for tagged releases
         shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TS_ENDPOINT: ${{ secrets.AZURE_TS_ENDPOINT }}
+          AZURE_TS_ACCOUNT: ${{ secrets.AZURE_TS_ACCOUNT }}
+          AZURE_TS_PROFILE: ${{ secrets.AZURE_TS_PROFILE }}
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          ASC_API_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
           set -euo pipefail
           if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
@@ -41,7 +45,10 @@ jobs:
           fi
           missing=0
           for name in \
-            MACOS_CERTIFICATE_BASE64 MACOS_CERTIFICATE_PWD ASC_API_KEY_BASE64 ASC_KEY_ID ASC_ISSUER_ID
+            AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET \
+            AZURE_TS_ENDPOINT AZURE_TS_ACCOUNT AZURE_TS_PROFILE \
+            MACOS_CERTIFICATE_BASE64 MACOS_CERTIFICATE_PWD \
+            ASC_API_KEY_BASE64 ASC_KEY_ID ASC_ISSUER_ID
           do
             if [[ -z "${!name:-}" ]]; then
               echo "::error::Missing required release signing secret: ${name}"
@@ -49,58 +56,146 @@ jobs:
             fi
           done
           if [[ "${missing}" -ne 0 ]]; then
-            echo "Refusing to create a public release without signed/notarized macOS artifacts."
+            echo "Refusing to create a public release without signed Windows and signed/notarized macOS artifacts."
             exit 1
           fi
-          echo "macOS signing secrets are present; release may proceed. Windows signing remains optional."
+          echo "Windows and macOS signing secrets are present; release may proceed."
 
-  create-release:
+  source-verification:
+    name: Verify tagged source and generated contracts
     needs: preflight-signing
-    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxi-dev \
+            libxkbcommon-dev
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt
+
+      - name: Require one product version and a matching release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.92.0 metadata --locked --no-deps --format-version 1 > cargo-metadata.json
+          python3 - <<'PY'
+          import json
+          import os
+
+          product_packages = {
+              "rusty-weather-ui",
+              "rusty-weather",
+              "rw-server",
+              "rw-scheduler",
+          }
+          with open("cargo-metadata.json", encoding="utf-8") as handle:
+              packages = json.load(handle)["packages"]
+          versions = {
+              package["name"]: package["version"]
+              for package in packages
+              if package["name"] in product_packages
+          }
+          missing = sorted(product_packages - versions.keys())
+          if missing:
+              raise SystemExit(f"missing product packages: {', '.join(missing)}")
+          distinct = sorted(set(versions.values()))
+          if len(distinct) != 1:
+              raise SystemExit(f"product package versions disagree: {versions}")
+          version = distinct[0]
+          ref = os.environ["GITHUB_REF"]
+          if ref.startswith("refs/tags/v"):
+              tag_version = ref.removeprefix("refs/tags/v")
+              if tag_version != version:
+                  raise SystemExit(
+                      f"release tag v{tag_version} does not match product version {version}"
+                  )
+          print(f"verified product version {version}")
+          PY
+
+      - name: Verify formatting
+        run: cargo +1.92.0 fmt --all -- --check
+
+      - name: Check the full workspace and every target
+        run: cargo +1.92.0 check --locked --workspace --all-targets
+
+      - name: Run every workspace test target
+        run: cargo +1.92.0 test --locked --workspace --all-targets
+
+      - name: Verify checked-in generated contracts
+        run: cargo +1.92.0 test --locked -p rw-server --test generated_contracts
+
+  dependency-policy:
+    name: Full packaged-workspace dependency policy
+    needs: [preflight-signing, source-verification]
     runs-on: ubuntu-24.04
     steps:
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            echo "Release ${GITHUB_REF_NAME} already exists."
-          else
-            gh release create "${GITHUB_REF_NAME}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "Rusty Weather ${GITHUB_REF_NAME}" \
-              --generate-notes
-          fi
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Block vulnerable, unlicensed, or unapproved dependencies
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: "1.92.0"
+          command: check advisories bans licenses sources
+          arguments: --workspace --all-features --locked
 
   build:
-    needs: create-release
-    if: ${{ always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') }}
+    needs: [preflight-signing, source-verification, dependency-policy, sbom]
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
             artifact_name: rusty-weather-windows-x64
+            service_artifact_name: rusty-weather-server-windows-x64
             package: windows
           - os: windows-11-arm
             artifact_name: rusty-weather-windows-arm64
+            service_artifact_name: rusty-weather-server-windows-arm64
             package: windows
           - os: ubuntu-24.04
             artifact_name: rusty-weather-linux-x64
+            service_artifact_name: rusty-weather-server-linux-x64
             package: linux
           - os: ubuntu-24.04-arm
             artifact_name: rusty-weather-linux-arm64
+            service_artifact_name: rusty-weather-server-linux-arm64
             package: linux
           - os: macos-15-intel
             artifact_name: rusty-weather-macos-intel
+            service_artifact_name: rusty-weather-server-macos-intel
             package: macos
           - os: macos-15
             artifact_name: rusty-weather-macos-apple-silicon
+            service_artifact_name: rusty-weather-server-macos-apple-silicon
             package: macos
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Download generated third-party license notice
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rusty-weather-service-sboms
+          path: release-metadata
 
       - name: Install Linux desktop build dependencies
         if: runner.os == 'Linux'
@@ -113,25 +208,105 @@ jobs:
             libxi-dev \
             libxkbcommon-dev
 
-      - name: Use stable Rust
+      - name: Use Rust 1.92
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.92.0 --profile minimal
+          rustup default 1.92.0
 
       - name: Build release binaries
         run: >
-          cargo build --release
+          cargo build --locked --release
           -p rusty-weather-ui --bin rusty-weather-ui
           -p rusty-weather --bin rw_ingest --bin rw_batch --bin rw_render --bin rw_render_bench --bin rw_bench --bin rw_store_diff --bin rws
           -p rw-sat --bin rw_sat
           -p rw-glm --bin rw_glm_follow
           -p rw-sat-check --bin rusty_sat_check
+          -p rw-server --bin rw-server
+          -p rw-scheduler --bin rw-scheduler
 
-      # Signs every packaged Windows executable via Azure Trusted Signing
-      # when the BowEcho/Rusty Weather signing secrets exist.
+      - name: Generate authoritative service contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          server="target/release/${SERVER_BIN}"
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            server="${server}.exe"
+          fi
+          "${server}" config-schema > config/rusty-weather.schema.json
+          "${server}" openapi > config/rusty-weather.openapi.json
+
+      - name: Generate machine-readable build manifest
+        shell: bash
+        env:
+          RW_ARTIFACT_NAME: ${{ matrix.artifact_name }}
+          RW_SERVICE_ARTIFACT_NAME: ${{ matrix.service_artifact_name }}
+          RW_PACKAGE_KIND: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-metadata
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          rustc = subprocess.run(
+              ["rustc", "-Vv"], check=True, text=True, capture_output=True
+          ).stdout.strip().splitlines()
+          version = next(
+              line.split('"')[1]
+              for line in open("crates/rw-server/Cargo.toml", encoding="utf-8")
+              if line.startswith("version =")
+          )
+          manifest = {
+              "schema": "rusty-weather.build.v1",
+              "product_version": version,
+              "source_commit": os.environ["GITHUB_SHA"],
+              "source_ref": os.environ["GITHUB_REF"],
+              "runner_os": os.environ["RUNNER_OS"],
+              "runner_arch": os.environ["RUNNER_ARCH"],
+              "package_kind": os.environ["RW_PACKAGE_KIND"],
+              "desktop_asset": os.environ["RW_ARTIFACT_NAME"],
+              "service_asset": os.environ["RW_SERVICE_ARTIFACT_NAME"],
+              "rustc": rustc,
+          }
+          with open("release-metadata/BUILD-MANIFEST.json", "w", encoding="utf-8") as handle:
+              json.dump(manifest, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          PY
+
+      # Signs every packaged Windows executable via Azure Trusted Signing.
+      # Tagged public releases fail in preflight if these secrets are absent.
+      - name: Check Windows signing configuration
+        id: windows-signing
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TS_ENDPOINT: ${{ secrets.AZURE_TS_ENDPOINT }}
+          AZURE_TS_ACCOUNT: ${{ secrets.AZURE_TS_ACCOUNT }}
+          AZURE_TS_PROFILE: ${{ secrets.AZURE_TS_PROFILE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $names = @(
+            'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET',
+            'AZURE_TS_ENDPOINT', 'AZURE_TS_ACCOUNT', 'AZURE_TS_PROFILE'
+          )
+          $present = @(
+            $names | Where-Object {
+              -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
+            }
+          )
+          if ($present.Count -ne 0 -and $present.Count -ne $names.Count) {
+            throw 'Windows signing configuration is incomplete.'
+          }
+          $configured = ($present.Count -eq $names.Count).ToString().ToLowerInvariant()
+          "configured=$configured" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Sign Windows binaries (Azure Trusted Signing)
-        if: runner.os == 'Windows' && env.AZURE_TENANT_ID != ''
-        uses: azure/trusted-signing-action@v0
+        if: runner.os == 'Windows' && steps.windows-signing.outputs.configured == 'true'
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0.5.11
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -145,27 +320,92 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
+      - name: Verify Windows Authenticode signatures
+        if: runner.os == 'Windows' && steps.windows-signing.outputs.configured == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binaries = @($env:GUI_BIN) + ($env:TOOL_BINS -split ' ')
+          foreach ($bin in $binaries | Select-Object -Unique) {
+            $path = "target\release\$bin.exe"
+            $signature = Get-AuthenticodeSignature -LiteralPath $path
+            if ($signature.Status -ne 'Valid') {
+              throw "Authenticode verification failed for $path`: $($signature.Status) $($signature.StatusMessage)"
+            }
+          }
+
       - name: Package Windows binaries
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force dist | Out-Null
           New-Item -ItemType Directory -Force package\tools | Out-Null
+          New-Item -ItemType Directory -Force package\docs | Out-Null
+          New-Item -ItemType Directory -Force package\third-party-licenses | Out-Null
           Copy-Item target\release\${env:GUI_BIN}.exe package\${env:GUI_BIN}.exe
           foreach ($bin in $env:TOOL_BINS -split ' ') {
             Copy-Item "target\release\$bin.exe" "package\tools\$bin.exe"
           }
           Copy-Item assets package\assets -Recurse
           Copy-Item README.md package\README.md
+          Copy-Item SECURITY.md package\SECURITY.md
           Copy-Item LICENSE package\LICENSE
+          Copy-Item THIRD_PARTY_NOTICES.md package\THIRD_PARTY_NOTICES.md
+          Copy-Item release-metadata\THIRD_PARTY_LICENSES.html package\THIRD_PARTY_LICENSES.html
+          Copy-Item release-metadata\BUILD-MANIFEST.json package\BUILD-MANIFEST.json
+          Copy-Item docs\DATA_SOURCES.md package\docs\DATA_SOURCES.md
+          Copy-Item crates\rustwx-render\assets\fonts\SourceSans3-LICENSE.md package\third-party-licenses\SourceSans3-LICENSE.md
+          Copy-Item vendor\ecape-rs\LICENSE package\third-party-licenses\ecape-rs-LICENSE
+          Copy-Item vendor\sharprs\LICENSE package\third-party-licenses\sharprs-LICENSE
+          Copy-Item vendor\sharprs\PROVENANCE.md package\third-party-licenses\sharprs-PROVENANCE.md
+          Copy-Item vendor\netcrust\LICENSE-MIT package\third-party-licenses\netcrust-LICENSE-MIT
+          Copy-Item vendor\netcrust\LICENSE-APACHE package\third-party-licenses\netcrust-LICENSE-APACHE
+          Copy-Item vendor\wrf-rust\LICENSE package\third-party-licenses\wrf-rust-LICENSE
+          Copy-Item vendor\wrf-rust\PROVENANCE.md package\third-party-licenses\wrf-rust-PROVENANCE.md
           Compress-Archive -Path package\* -DestinationPath "dist\${{ matrix.artifact_name }}.zip" -Force
+
+          $serviceDir = 'service-package\rusty-weather-server'
+          New-Item -ItemType Directory -Force "$serviceDir\config" | Out-Null
+          New-Item -ItemType Directory -Force "$serviceDir\docs" | Out-Null
+          New-Item -ItemType Directory -Force "$serviceDir\deploy" | Out-Null
+          Copy-Item target\release\${env:SERVER_BIN}.exe "$serviceDir\${env:SERVER_BIN}.exe"
+          Copy-Item target\release\${env:SCHEDULER_BIN}.exe "$serviceDir\${env:SCHEDULER_BIN}.exe"
+          Copy-Item config\rusty-weather.example.toml "$serviceDir\config\rusty-weather.example.toml"
+          Copy-Item config\rusty-weather-scheduler.example.toml "$serviceDir\config\rusty-weather-scheduler.example.toml"
+          Copy-Item config\rusty-weather.schema.json "$serviceDir\config\rusty-weather.schema.json"
+          Copy-Item deploy\systemd "$serviceDir\deploy\systemd" -Recurse
+          Copy-Item deploy\windows "$serviceDir\deploy\windows" -Recurse
+          Copy-Item docs\DEPLOYMENT.md "$serviceDir\docs\DEPLOYMENT.md"
+          Copy-Item docs\OPERATIONS.md "$serviceDir\docs\OPERATIONS.md"
+          Copy-Item docs\SERVICE_V1.md "$serviceDir\docs\SERVICE_V1.md"
+          Copy-Item docs\DATA_SOURCES.md "$serviceDir\docs\DATA_SOURCES.md"
+          Copy-Item docs\MODEL_SUPPORT.md "$serviceDir\docs\MODEL_SUPPORT.md"
+          Copy-Item docs\REDUCTIONS.md "$serviceDir\docs\REDUCTIONS.md"
+          Copy-Item config\rusty-weather.openapi.json "$serviceDir\docs\openapi.json"
+          Copy-Item crates\rw-scheduler\README.md "$serviceDir\docs\RW_SCHEDULER.md"
+          Copy-Item -Path README.md, SECURITY.md, LICENSE, THIRD_PARTY_NOTICES.md -Destination $serviceDir
+          Copy-Item release-metadata\THIRD_PARTY_LICENSES.html "$serviceDir\THIRD_PARTY_LICENSES.html"
+          Copy-Item release-metadata\BUILD-MANIFEST.json "$serviceDir\BUILD-MANIFEST.json"
+          Copy-Item package\third-party-licenses "$serviceDir\third-party-licenses" -Recurse
+          $serviceBase = (Resolve-Path $serviceDir).Path
+          $manifestEntries = Get-ChildItem -LiteralPath $serviceBase -Recurse -File | ForEach-Object {
+            [pscustomobject]@{
+              Path = $_.FullName.Substring($serviceBase.Length + 1).Replace('\', '/')
+              Hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
+            }
+          }
+          $manifestEntries | Sort-Object Path | ForEach-Object {
+            "$($_.Hash)  $($_.Path)"
+          } | Set-Content -LiteralPath "$serviceDir\SHA256SUMS.txt" -Encoding ascii
+          Compress-Archive -Path $serviceDir -DestinationPath "dist\${{ matrix.service_artifact_name }}.zip" -Force
 
       - name: Prepare macOS bundle
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist "bundle/${APP_NAME}/tools"
+          mkdir -p dist "bundle/${APP_NAME}/tools" "bundle/${APP_NAME}/docs"
           app="bundle/${APP_NAME}/${APP_NAME}.app"
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
           cp "target/release/${GUI_BIN}" "$app/Contents/MacOS/${GUI_BIN}"
@@ -177,7 +417,21 @@ jobs:
             chmod +x "bundle/${APP_NAME}/tools/${bin}"
           done
           cp README.md "bundle/${APP_NAME}/README.md"
+          cp SECURITY.md "bundle/${APP_NAME}/SECURITY.md"
           cp LICENSE "bundle/${APP_NAME}/LICENSE"
+          cp THIRD_PARTY_NOTICES.md "bundle/${APP_NAME}/THIRD_PARTY_NOTICES.md"
+          cp release-metadata/THIRD_PARTY_LICENSES.html "bundle/${APP_NAME}/THIRD_PARTY_LICENSES.html"
+          cp release-metadata/BUILD-MANIFEST.json "bundle/${APP_NAME}/BUILD-MANIFEST.json"
+          cp docs/DATA_SOURCES.md "bundle/${APP_NAME}/docs/DATA_SOURCES.md"
+          mkdir -p "bundle/${APP_NAME}/third-party-licenses"
+          cp crates/rustwx-render/assets/fonts/SourceSans3-LICENSE.md "bundle/${APP_NAME}/third-party-licenses/SourceSans3-LICENSE.md"
+          cp vendor/ecape-rs/LICENSE "bundle/${APP_NAME}/third-party-licenses/ecape-rs-LICENSE"
+          cp vendor/sharprs/LICENSE "bundle/${APP_NAME}/third-party-licenses/sharprs-LICENSE"
+          cp vendor/sharprs/PROVENANCE.md "bundle/${APP_NAME}/third-party-licenses/sharprs-PROVENANCE.md"
+          cp vendor/netcrust/LICENSE-MIT "bundle/${APP_NAME}/third-party-licenses/netcrust-LICENSE-MIT"
+          cp vendor/netcrust/LICENSE-APACHE "bundle/${APP_NAME}/third-party-licenses/netcrust-LICENSE-APACHE"
+          cp vendor/wrf-rust/LICENSE "bundle/${APP_NAME}/third-party-licenses/wrf-rust-LICENSE"
+          cp vendor/wrf-rust/PROVENANCE.md "bundle/${APP_NAME}/third-party-licenses/wrf-rust-PROVENANCE.md"
           if [[ "${GITHUB_REF_NAME:-}" =~ ^v[0-9] ]]; then
             version="${GITHUB_REF_NAME#v}"
           else
@@ -217,8 +471,39 @@ jobs:
       # Signs + notarizes the app bundle when the Apple Developer ID /
       # App Store Connect secrets exist. The CLI tools are signed too; the
       # app is stapled so the common double-click path is Gatekeeper-clean.
+      - name: Check macOS signing configuration
+        id: macos-signing
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          ASC_API_KEY_BASE64: ${{ secrets.ASC_API_KEY_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          present=0
+          total=5
+          for name in \
+            MACOS_CERTIFICATE_BASE64 MACOS_CERTIFICATE_PWD ASC_API_KEY_BASE64 ASC_KEY_ID ASC_ISSUER_ID
+          do
+            if [[ -n "${!name:-}" ]]; then
+              present=$((present + 1))
+            fi
+          done
+          if [[ "$present" -ne 0 && "$present" -ne "$total" ]]; then
+            echo "::error::macOS signing configuration is incomplete."
+            exit 1
+          fi
+          if [[ "$present" -eq "$total" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Sign and notarize macOS bundle
-        if: runner.os == 'macOS' && env.MACOS_CERTIFICATE_BASE64 != ''
+        if: runner.os == 'macOS' && steps.macos-signing.outputs.configured == 'true'
         shell: bash
         env:
           MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
@@ -230,6 +515,11 @@ jobs:
           set -euo pipefail
           app="bundle/${APP_NAME}/${APP_NAME}.app"
           keychain="$RUNNER_TEMP/signing.keychain-db"
+          cleanup_signing_material() {
+            rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/notarize.zip"
+            security delete-keychain "$keychain" >/dev/null 2>&1 || true
+          }
+          trap cleanup_signing_material EXIT
           keychain_password="$(openssl rand -base64 24)"
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 1800 "$keychain"
@@ -249,6 +539,7 @@ jobs:
           echo "Signing with: $identity"
           for bin in "bundle/${APP_NAME}/tools/"*; do
             codesign --force --options runtime --timestamp --sign "$identity" "$bin"
+            codesign --verify --strict "$bin"
           done
           codesign --force --deep --options runtime --timestamp --sign "$identity" "$app"
           codesign --verify --deep --strict "$app"
@@ -258,8 +549,8 @@ jobs:
             --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$ASC_KEY_ID" \
             --issuer "$ASC_ISSUER_ID" --wait
           xcrun stapler staple "$app"
-          spctl --assess --type execute --verbose "$app" || true
-          security delete-keychain "$keychain"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose "$app"
 
       - name: Zip macOS bundle
         if: runner.os == 'macOS'
@@ -267,13 +558,44 @@ jobs:
         run: |
           set -euo pipefail
           ditto -c -k --sequesterRsrc --keepParent "bundle/${APP_NAME}" "dist/${{ matrix.artifact_name }}.zip"
+          service_dir="service-package/${PACKAGE_NAME}-server"
+          mkdir -p "${service_dir}/config" "${service_dir}/docs"
+          cp "bundle/${APP_NAME}/tools/${SERVER_BIN}" "${service_dir}/${SERVER_BIN}"
+          cp "bundle/${APP_NAME}/tools/${SCHEDULER_BIN}" "${service_dir}/${SCHEDULER_BIN}"
+          chmod +x "${service_dir}/${SCHEDULER_BIN}"
+          chmod +x "${service_dir}/${SERVER_BIN}"
+          cp config/rusty-weather.example.toml "${service_dir}/config/"
+          cp config/rusty-weather-scheduler.example.toml "${service_dir}/config/"
+          cp config/rusty-weather.schema.json "${service_dir}/config/"
+          mkdir -p "${service_dir}/deploy"
+          cp -R deploy/systemd deploy/windows "${service_dir}/deploy/"
+          cp docs/DEPLOYMENT.md docs/OPERATIONS.md docs/SERVICE_V1.md docs/DATA_SOURCES.md docs/MODEL_SUPPORT.md docs/REDUCTIONS.md "${service_dir}/docs/"
+          cp config/rusty-weather.openapi.json "${service_dir}/docs/openapi.json"
+          cp crates/rw-scheduler/README.md "${service_dir}/docs/RW_SCHEDULER.md"
+          cp README.md SECURITY.md LICENSE THIRD_PARTY_NOTICES.md "${service_dir}/"
+          cp release-metadata/THIRD_PARTY_LICENSES.html "${service_dir}/"
+          cp release-metadata/BUILD-MANIFEST.json "${service_dir}/"
+          cp -R "bundle/${APP_NAME}/third-party-licenses" "${service_dir}/third-party-licenses"
+          (
+            cd "${service_dir}"
+            find . -type f ! -name SHA256SUMS.txt | LC_ALL=C sort |
+              while IFS= read -r file; do
+                if command -v sha256sum >/dev/null 2>&1; then
+                  hash="$(sha256sum "$file" | awk '{print $1}')"
+                else
+                  hash="$(shasum -a 256 "$file" | awk '{print $1}')"
+                fi
+                printf '%s  %s\n' "$hash" "${file#./}"
+              done > SHA256SUMS.txt
+          )
+          tar -C service-package -czf "dist/${{ matrix.service_artifact_name }}.tar.gz" "${PACKAGE_NAME}-server"
 
       - name: Package Linux binaries
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "dist" "package/${PACKAGE_NAME}/tools"
+          mkdir -p "dist" "package/${PACKAGE_NAME}/tools" "package/${PACKAGE_NAME}/docs" "package/${PACKAGE_NAME}/third-party-licenses"
           cp "target/release/${GUI_BIN}" "package/${PACKAGE_NAME}/${GUI_BIN}"
           chmod +x "package/${PACKAGE_NAME}/${GUI_BIN}"
           for bin in ${TOOL_BINS}; do
@@ -282,8 +604,49 @@ jobs:
           done
           cp -R assets "package/${PACKAGE_NAME}/assets"
           cp README.md "package/${PACKAGE_NAME}/README.md"
+          cp SECURITY.md "package/${PACKAGE_NAME}/SECURITY.md"
           cp LICENSE "package/${PACKAGE_NAME}/LICENSE"
+          cp THIRD_PARTY_NOTICES.md "package/${PACKAGE_NAME}/THIRD_PARTY_NOTICES.md"
+          cp release-metadata/THIRD_PARTY_LICENSES.html "package/${PACKAGE_NAME}/THIRD_PARTY_LICENSES.html"
+          cp release-metadata/BUILD-MANIFEST.json "package/${PACKAGE_NAME}/BUILD-MANIFEST.json"
+          cp docs/DATA_SOURCES.md "package/${PACKAGE_NAME}/docs/DATA_SOURCES.md"
+          cp crates/rustwx-render/assets/fonts/SourceSans3-LICENSE.md "package/${PACKAGE_NAME}/third-party-licenses/SourceSans3-LICENSE.md"
+          cp vendor/ecape-rs/LICENSE "package/${PACKAGE_NAME}/third-party-licenses/ecape-rs-LICENSE"
+          cp vendor/sharprs/LICENSE "package/${PACKAGE_NAME}/third-party-licenses/sharprs-LICENSE"
+          cp vendor/sharprs/PROVENANCE.md "package/${PACKAGE_NAME}/third-party-licenses/sharprs-PROVENANCE.md"
+          cp vendor/netcrust/LICENSE-MIT "package/${PACKAGE_NAME}/third-party-licenses/netcrust-LICENSE-MIT"
+          cp vendor/netcrust/LICENSE-APACHE "package/${PACKAGE_NAME}/third-party-licenses/netcrust-LICENSE-APACHE"
+          cp vendor/wrf-rust/LICENSE "package/${PACKAGE_NAME}/third-party-licenses/wrf-rust-LICENSE"
+          cp vendor/wrf-rust/PROVENANCE.md "package/${PACKAGE_NAME}/third-party-licenses/wrf-rust-PROVENANCE.md"
           tar -C package -czf "dist/${{ matrix.artifact_name }}.tar.gz" "${PACKAGE_NAME}"
+
+          service_dir="service-package/${PACKAGE_NAME}-server"
+          mkdir -p "${service_dir}/config" "${service_dir}/docs"
+          cp "target/release/${SERVER_BIN}" "${service_dir}/${SERVER_BIN}"
+          cp "target/release/${SCHEDULER_BIN}" "${service_dir}/${SCHEDULER_BIN}"
+          chmod +x "${service_dir}/${SCHEDULER_BIN}"
+          chmod +x "${service_dir}/${SERVER_BIN}"
+          cp config/rusty-weather.example.toml "${service_dir}/config/"
+          cp config/rusty-weather.schema.json "${service_dir}/config/"
+          cp config/rusty-weather-scheduler.example.toml "${service_dir}/config/"
+          mkdir -p "${service_dir}/deploy"
+          cp -R deploy/systemd deploy/windows "${service_dir}/deploy/"
+          cp docs/DEPLOYMENT.md docs/OPERATIONS.md docs/SERVICE_V1.md docs/DATA_SOURCES.md docs/MODEL_SUPPORT.md docs/REDUCTIONS.md "${service_dir}/docs/"
+          cp config/rusty-weather.openapi.json "${service_dir}/docs/openapi.json"
+          cp README.md SECURITY.md LICENSE THIRD_PARTY_NOTICES.md "${service_dir}/"
+          cp release-metadata/THIRD_PARTY_LICENSES.html "${service_dir}/"
+          cp release-metadata/BUILD-MANIFEST.json "${service_dir}/"
+          cp crates/rw-scheduler/README.md "${service_dir}/docs/RW_SCHEDULER.md"
+          cp -R "package/${PACKAGE_NAME}/third-party-licenses" "${service_dir}/third-party-licenses"
+          (
+            cd "${service_dir}"
+            find . -type f ! -name SHA256SUMS.txt | LC_ALL=C sort |
+              while IFS= read -r file; do
+                hash="$(sha256sum "$file" | awk '{print $1}')"
+                printf '%s  %s\n' "$hash" "${file#./}"
+              done > SHA256SUMS.txt
+          )
+          tar -C service-package -czf "dist/${{ matrix.service_artifact_name }}.tar.gz" "${PACKAGE_NAME}-server"
 
       - name: Generate SHA-256 checksums
         shell: bash
@@ -291,19 +654,223 @@ jobs:
           set -euo pipefail
           cd dist
           for f in *; do
-            sha256sum "$f" > "$f.sha256"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$f" > "$f.sha256"
+            else
+              shasum -a 256 "$f" > "$f.sha256"
+            fi
           done
 
+      - name: Verify extracted Windows service package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "dist\${{ matrix.service_artifact_name }}.zip"
+          $root = Join-Path $env:RUNNER_TEMP 'rw-service-package-check'
+          Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $archive -DestinationPath $root
+          $package = Join-Path $root 'rusty-weather-server'
+          if (-not (Test-Path -LiteralPath $package -PathType Container)) {
+            throw 'Service archive has no rusty-weather-server root.'
+          }
+          Get-Content (Join-Path $package 'SHA256SUMS.txt') | ForEach-Object {
+            if ($_ -notmatch '^([0-9a-f]{64})  (.+)$') { throw "Malformed checksum: $_" }
+            $path = Join-Path $package $Matches[2].Replace('/', '\')
+            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash
+            if ($actual -ine $Matches[1]) { throw "Checksum mismatch: $path" }
+          }
+          & (Join-Path $package 'rw-server.exe') --version
+          & (Join-Path $package 'rw-scheduler.exe') --version
+          $manifest = Get-Content (Join-Path $package 'BUILD-MANIFEST.json') -Raw | ConvertFrom-Json
+          if ($manifest.source_commit -ne $env:GITHUB_SHA) { throw 'Build manifest commit mismatch.' }
+
+      - name: Verify extracted Unix service package
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/rw-service-package-check"
+          rm -rf "$root"
+          mkdir -p "$root"
+          tar -xzf "dist/${{ matrix.service_artifact_name }}.tar.gz" -C "$root"
+          package="$root/${PACKAGE_NAME}-server"
+          test -d "$package"
+          (
+            cd "$package"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum --check SHA256SUMS.txt
+            else
+              shasum -a 256 --check SHA256SUMS.txt
+            fi
+          )
+          "$package/${SERVER_BIN}" --version
+          "$package/${SCHEDULER_BIN}" --version
+          python3 - "$package/BUILD-MANIFEST.json" <<'PY'
+          import json
+          import os
+          import sys
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              manifest = json.load(handle)
+          if manifest["source_commit"] != os.environ["GITHUB_SHA"]:
+              raise SystemExit("build manifest commit mismatch")
+          PY
+
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/*
           if-no-files-found: error
 
-      - name: Upload release assets
-        if: startsWith(github.ref, 'refs/tags/')
+  sbom:
+    name: Service SBOMs and third-party licenses
+    needs: [preflight-signing, source-verification, dependency-policy]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Use Rust 1.92
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal
+          rustup default 1.92.0
+
+      - name: Install pinned metadata generators
+        run: |
+          cargo install --locked --version 0.5.9 cargo-cyclonedx
+          cargo install --locked --version 0.8.4 cargo-about
+
+      - name: Generate service SBOMs
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          lock_before="$(sha256sum Cargo.lock | awk '{print $1}')"
+          cargo metadata --locked --format-version 1 --no-deps > /dev/null
+          cargo cyclonedx --manifest-path crates/rw-server/Cargo.toml \
+            --format json --spec-version 1.5 --describe binaries --target all
+          server_sbom=crates/rw-server/rw-server_bin.cdx.json
+          test -s "$server_sbom"
+          cargo cyclonedx --manifest-path crates/rw-scheduler/Cargo.toml \
+            --format json --spec-version 1.5 --describe binaries --target all
+          scheduler_sbom=crates/rw-scheduler/rw-scheduler_bin.cdx.json
+          test -s "$scheduler_sbom"
+          lock_after="$(sha256sum Cargo.lock | awk '{print $1}')"
+          test "$lock_before" = "$lock_after"
+          cargo about generate --locked --workspace --all-features --fail --output-file THIRD_PARTY_LICENSES.html about.hbs
+          test -s THIRD_PARTY_LICENSES.html
+          mkdir -p dist
+          cp "$server_sbom" dist/rusty-weather-rw-server.cdx.json
+          cp "$scheduler_sbom" dist/rusty-weather-rw-scheduler.cdx.json
+          cp Cargo.lock LICENSE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html dist/
+          cd dist
+          for file in *; do
+            sha256sum "${file}" > "${file}.sha256"
+          done
+
+      - name: Upload SBOM workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rusty-weather-service-sboms
+          path: dist/*
+          if-no-files-found: error
+
+  attest-release-assets:
+    name: Attest release assets to the source workflow
+    needs: [build, sbom]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate signed build-provenance attestations
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: release-assets/*
+
+  publish-release:
+    name: Publish verified release
+    needs: [build, sbom, attest-release-assets]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified build and SBOM artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify assets and publish atomically
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+        run: |
+          set -euo pipefail
+          expected=(
+            rusty-weather-windows-x64.zip
+            rusty-weather-windows-arm64.zip
+            rusty-weather-linux-x64.tar.gz
+            rusty-weather-linux-arm64.tar.gz
+            rusty-weather-macos-intel.zip
+            rusty-weather-macos-apple-silicon.zip
+            rusty-weather-server-windows-x64.zip
+            rusty-weather-server-windows-arm64.zip
+            rusty-weather-server-linux-x64.tar.gz
+            rusty-weather-server-linux-arm64.tar.gz
+            rusty-weather-server-macos-intel.tar.gz
+            rusty-weather-server-macos-apple-silicon.tar.gz
+            rusty-weather-rw-server.cdx.json
+            rusty-weather-rw-scheduler.cdx.json
+            Cargo.lock
+            LICENSE
+            THIRD_PARTY_NOTICES.md
+            THIRD_PARTY_LICENSES.html
+          )
+          expected_inventory="$(mktemp)"
+          actual_inventory="$(mktemp)"
+          remote_inventory="$(mktemp)"
+          for file in "${expected[@]}"; do
+            test -f "release-assets/$file"
+            test -f "release-assets/$file.sha256"
+            printf '%s\n%s\n' "$file" "$file.sha256" >> "$expected_inventory"
+            (cd release-assets && sha256sum --check "$file.sha256")
+          done
+          sort -o "$expected_inventory" "$expected_inventory"
+          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > "$actual_inventory"
+          diff -u "$expected_inventory" "$actual_inventory"
+
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            draft="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
+              --jq .draft)"
+            if [[ "$draft" != true ]]; then
+              echo "::error::Refusing to modify an already-public release."
+              exit 1
+            fi
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Rusty Weather ${GITHUB_REF_NAME}" \
+              --verify-tag --generate-notes --draft
+          fi
+          gh release upload "${GITHUB_REF_NAME}" release-assets/* \
+            --clobber --repo "${GITHUB_REPOSITORY}"
+          gh release view "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" --json assets \
+            --jq '.assets[].name' | sort > "$remote_inventory"
+          diff -u "$expected_inventory" "$remote_inventory"
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" --draft=false

@@ -9,7 +9,7 @@ description = "Reusable NSF NCAR GDEX/THREDDS catalog, subset, and resumable-dow
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-quick-xml = { version = "0.39", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -12,14 +12,13 @@ authors = ["Fahrenheit Research"]
 
 [features]
 default = ["network", "jpeg2000"]
-network = ["ureq", "rustls", "rustls-rustcrypto", "webpki-roots"]
+network = ["ureq", "rustls", "webpki-roots"]
 jpeg2000 = ["openjp2"]
 
 [dependencies]
 # HTTP - blocking, pure Rust TLS (optional, not available in WASM)
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots", "gzip"], optional = true }
-rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
-rustls-rustcrypto = { version = "0.0.2-alpha", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 webpki-roots = { version = "0.26", optional = true }
 
 # Compression (GRIB2 deflate)
@@ -41,7 +40,7 @@ png = "0.17"
 rayon = "1"
 
 # Shared field types and projections
-wx-field = { path = "../wx-field" }
+wx-field = { version = "0.3.6", path = "../wx-field" }
 
 # Meteorological computations
-wx-math = { path = "../wx-math" }
+wx-math = { version = "0.3.6", path = "../wx-math" }

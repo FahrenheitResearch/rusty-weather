@@ -1,0 +1,24 @@
+[package]
+name = "rw-scheduler"
+version = "0.5.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Brand-neutral durable scheduler and daemon for rw-store model ingestion"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+clap = { workspace = true, features = ["env"] }
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+toml = "0.8.23"
+ureq.workspace = true
+rustwx-core = { path = "../rustwx-core" }
+rustwx-models = { path = "../rustwx-models" }
+rw-ingest = { path = "../rw-ingest" }
+rw-store = { path = "../rw-store" }

@@ -201,4 +201,6 @@ src/
 
 ## License
 
-MIT. See [LICENSE](LICENSE) for details.
+MIT AND BSD-3-Clause. The Rust implementation is MIT-licensed; portions that
+port or derive from SHARPpy remain subject to SHARPpy's BSD-3-Clause notice.
+See [LICENSE](LICENSE) for both notices.

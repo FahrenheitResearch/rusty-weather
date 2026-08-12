@@ -3,7 +3,7 @@
 //! `src/ingest_hour.rs` for the full fetch/extract/derive/write story —
 //! `rw_batch` pipelines the same flow across hours).
 //!
-//! Profiles (`--profile full|sounding|view` plus the composable
+//! Profiles (`--profile full|sounding|view|analysis` plus the composable
 //! `--level-step/--no-derived/--heavy/--no-heavy` overrides) choose what
 //! each hour fetches, extracts, computes, and stores; `--estimate` prices
 //! the planned ingest (per-variable breakdown + store/download totals)
@@ -13,7 +13,6 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use rustwx_core::{CycleSpec, ModelId, SourceId};
-use rustwx_models::model_summary;
 use rustwx_products::cache::{default_proof_cache_dir, ensure_dir};
 
 use rw_ingest::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile};
@@ -98,7 +97,8 @@ struct Args {
         long,
         default_value = "full",
         help = "Ingest profile: full (everything, today's default), sounding (5 volumes + 7 \
-                surface fields, no compute stages), view (all 2D incl. derived, no volumes)"
+                surface fields, no compute stages), view (all 2D incl. derived, no volumes), \
+                analysis (RTMA/URMA surface fields only)"
     )]
     profile: String,
     #[arg(
@@ -258,13 +258,18 @@ fn print_estimate(
         println!("{name:<36} {:>9.2} MB", mb(*bytes));
     }
     println!();
-    // Download detail depends on the fetch plan: single-file models (GFS) fetch
-    // one pgrb2 that serves both roles; HRRR-style models fetch prs + sfc separately.
-    let download_detail = match rw_ingest::fetch_plan(args.model) {
-        Ok(plan) if plan.len() == 1 => format!(
+    // Download detail depends on the physical fetch plan and its roles.
+    let fetch_plan = rw_ingest::fetch_plan(args.model);
+    let download_detail = match fetch_plan.as_deref() {
+        Ok([single]) if single.pressure_source && single.surface_source => format!(
             "{} {:.1} MB, single file (both roles)",
-            plan[0].product,
+            single.product,
             mb(calibration.prs_file_bytes),
+        ),
+        Ok([single]) => format!(
+            "{} {:.1} MB, single surface-only file",
+            single.product,
+            mb(calibration.sfc_file_bytes),
         ),
         _ => {
             if profile.needs_prs() {
@@ -294,10 +299,15 @@ fn print_estimate(
         mb(estimate.grid_file_bytes),
         mb(estimate.download_bytes),
     );
-    println!(
-        "note: downloads price the full prs/sfc family files (cache-cold); an .idx-driven \
-         byte-range subset fetch would shrink small profiles and is a future refinement"
-    );
+    if fetch_plan
+        .as_ref()
+        .is_ok_and(|plan| plan.iter().any(|product| !product.idx_patterns.is_empty()))
+    {
+        println!(
+            "note: this model uses .idx byte-range subsetting on capable sources; an explicit \
+             NOMADS source override falls back to the whole GRIB file"
+        );
+    }
     Ok(())
 }
 
@@ -316,9 +326,10 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     if !args.no_cache {
         ensure_dir(&cache_root)?;
     }
-    let source = args
+    let source_label = args
         .source
-        .unwrap_or(model_summary(args.model).sources[0].id);
+        .map(|source| source.to_string())
+        .unwrap_or_else(|| "auto".to_string());
     let cycle = CycleSpec::new(args.date.clone(), args.cycle)?;
     let run_slug = format!("{}_{:02}z", args.date, args.cycle);
 
@@ -329,14 +340,14 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         run_slug,
         args.profile,
         profile.describe(),
-        source,
+        source_label,
         args.store_root.display(),
         cache_root.display(),
     );
     let config = IngestConfig {
         model: args.model,
         cycle: &cycle,
-        source_override: Some(source),
+        source_override: args.source,
         cache_root: &cache_root,
         use_cache: !args.no_cache,
         store_root: &args.store_root,
@@ -355,6 +366,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 ingested.prs_fetch_ms,
                 cache_state(ingested.prs_cache_hit),
                 ingested.prs_mb,
+            )
+        } else if !ingested.has_pressure_source {
+            format!(
+                "sfc fetch {} ms ({}, {:.1} MB, surface-only)",
+                ingested.sfc_fetch_ms,
+                cache_state(ingested.sfc_cache_hit),
+                ingested.sfc_mb,
             )
         } else {
             format!(

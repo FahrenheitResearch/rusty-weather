@@ -1,0 +1,68 @@
+[graph]
+all-features = true
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 is retained only for the existing versioned on-disk cache encoding; the advisory reports project discontinuation, not a vulnerability, and readers already reject invalid cache payloads" },
+    { id = "RUSTSEC-2021-0140", reason = "rusttype is retained for deterministic raster-label compatibility; the advisory reports unmaintained status rather than a vulnerability, fonts are bundled or operator-selected, and no untrusted remote font input is accepted" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser 0.15 is reachable only through the retained rusttype renderer; the advisory reports unmaintained status rather than a vulnerability and the service does not parse remote font files" },
+]
+
+[licenses]
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "OFL-1.1",
+    "OpenSSL",
+    "Ubuntu-font-1.0",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/FahrenheitResearch/ecape-rs"]
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

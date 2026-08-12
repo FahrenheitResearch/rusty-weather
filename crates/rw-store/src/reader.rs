@@ -16,9 +16,9 @@ use rayon::prelude::*;
 use rustwx_core::{MAX_GRID_CELLS, MAX_VOLUME_ELEMENTS};
 use same_file::Handle;
 
-use crate::codec::decode_affine_i16;
 #[cfg(target_endian = "big")]
 use crate::codec::decode_f32_tile;
+use crate::codec::{MISSING_Q, decode_affine_i16};
 use crate::error::{RwResult, RwStoreError};
 use crate::format::{
     CODEC_2D, CODEC_3D, COL_X, COL_Y, FLAG_CONSTANT, FLAG_EMPTY, FLAG_HAS_MISSING, HEADER_LEN,
@@ -581,6 +581,526 @@ pub struct Window2D {
     pub values: Vec<f32>,
 }
 
+/// Grid placement and shape of one 2D surface tile.
+///
+/// Tile indices are zero-based. `x0`/`y0` are the tile's origin in the full
+/// grid, while `nx`/`ny` are clipped at the right and bottom grid edges.
+/// Values inside a tile are row-major, `ny` rows of `nx` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TileGeometry2D {
+    tile_y: usize,
+    tile_x: usize,
+    x0: usize,
+    y0: usize,
+    nx: usize,
+    ny: usize,
+}
+
+impl TileGeometry2D {
+    pub const fn tile_y(self) -> usize {
+        self.tile_y
+    }
+
+    pub const fn tile_x(self) -> usize {
+        self.tile_x
+    }
+
+    pub const fn x0(self) -> usize {
+        self.x0
+    }
+
+    pub const fn y0(self) -> usize {
+        self.y0
+    }
+
+    pub const fn nx(self) -> usize {
+        self.nx
+    }
+
+    pub const fn ny(self) -> usize {
+        self.ny
+    }
+
+    /// Number of row-major values represented by this tile.
+    pub const fn cell_count(self) -> usize {
+        // Instances are only constructed after HourReader's checked grid
+        // validation, where the complete grid is bounded by MAX_GRID_CELLS.
+        self.nx * self.ny
+    }
+}
+
+/// Storage-aware values for one 2D surface tile.
+///
+/// Keeping payload-free tiles typed avoids allocating 256x256 temporary
+/// planes for all-missing or constant regions. `Dense` values are bit-exact
+/// decoded f32s shared with the reader's bounded tile cache.
+#[derive(Debug, Clone)]
+pub enum TileData2D {
+    /// Every cell is represented by `f32::NAN`.
+    Empty,
+    /// Every cell has the same finite value.
+    Constant(f32),
+    /// Row-major decoded values, including their original f32/NaN bits.
+    Dense(Arc<Vec<f32>>),
+}
+
+/// One decoded or storage-specialized 2D surface tile.
+#[derive(Debug, Clone)]
+pub struct Tile2D {
+    geometry: TileGeometry2D,
+    data: TileData2D,
+}
+
+impl Tile2D {
+    pub const fn geometry(&self) -> TileGeometry2D {
+        self.geometry
+    }
+
+    pub const fn data(&self) -> &TileData2D {
+        &self.data
+    }
+
+    pub const fn cell_count(&self) -> usize {
+        self.geometry.cell_count()
+    }
+
+    /// Read one tile-local `(row, column)` value without materializing sparse
+    /// tile encodings. Returns `None` when either coordinate is out of bounds.
+    pub fn get(&self, row: usize, column: usize) -> Option<f32> {
+        if row >= self.geometry.ny || column >= self.geometry.nx {
+            return None;
+        }
+        let index = row * self.geometry.nx + column;
+        match &self.data {
+            TileData2D::Empty => Some(f32::NAN),
+            TileData2D::Constant(value) => Some(*value),
+            TileData2D::Dense(values) => values.get(index).copied(),
+        }
+    }
+}
+
+/// Allocation-free, row-major enumeration of a surface variable's tiles.
+#[derive(Debug, Clone)]
+pub struct Tiles2D {
+    grid_nx: usize,
+    grid_ny: usize,
+    tiles_x: usize,
+    tiles_y: usize,
+    next: usize,
+    tile_count: usize,
+}
+
+impl Tiles2D {
+    pub const fn tiles_x(&self) -> usize {
+        self.tiles_x
+    }
+
+    pub const fn tiles_y(&self) -> usize {
+        self.tiles_y
+    }
+}
+
+impl Iterator for Tiles2D {
+    type Item = TileGeometry2D;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.tile_count {
+            return None;
+        }
+        let ordinal = self.next;
+        self.next += 1;
+        let tile_y = ordinal / self.tiles_x;
+        let tile_x = ordinal % self.tiles_x;
+        let y0 = tile_y * TILE_Y;
+        let x0 = tile_x * TILE_X;
+        Some(TileGeometry2D {
+            tile_y,
+            tile_x,
+            x0,
+            y0,
+            nx: (self.grid_nx - x0).min(TILE_X),
+            ny: (self.grid_ny - y0).min(TILE_Y),
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.tile_count - self.next;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for Tiles2D {}
+impl std::iter::FusedIterator for Tiles2D {}
+
+/// Grid placement and shape of one pressure-level column chunk.
+///
+/// Chunk indices are zero-based. `x0`/`y0` are the chunk's origin in the
+/// full grid, while `width`/`height` are clipped at the right and bottom
+/// grid edges. Values inside a chunk plane are row-major.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PressureLevelChunkGeometry3D {
+    chunk_y: usize,
+    chunk_x: usize,
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+    level_hpa: u16,
+}
+
+impl PressureLevelChunkGeometry3D {
+    pub const fn chunk_y(self) -> usize {
+        self.chunk_y
+    }
+
+    pub const fn chunk_x(self) -> usize {
+        self.chunk_x
+    }
+
+    pub const fn x0(self) -> usize {
+        self.x0
+    }
+
+    pub const fn y0(self) -> usize {
+        self.y0
+    }
+
+    pub const fn width(self) -> usize {
+        self.width
+    }
+
+    pub const fn height(self) -> usize {
+        self.height
+    }
+
+    pub const fn level_hpa(self) -> u16 {
+        self.level_hpa
+    }
+
+    /// Number of row-major values represented by this chunk plane.
+    pub const fn cell_count(self) -> usize {
+        // Instances are only constructed after HourReader's checked grid
+        // validation, where the complete grid is bounded by MAX_GRID_CELLS.
+        self.width * self.height
+    }
+}
+
+/// Storage-aware values for one pressure-level column-chunk plane.
+///
+/// EMPTY and payload-free CONSTANT chunks remain allocation-free. Dense
+/// planes contain at most `COL_Y * COL_X` row-major values and retain the
+/// exact decoded f32/NaN bits produced by the pressure-volume codec.
+#[derive(Debug, Clone)]
+pub enum PressureLevelChunkData3D {
+    /// Every cell is represented by `f32::NAN`.
+    Empty,
+    /// Every cell has the same finite value.
+    Constant(f32),
+    /// Row-major decoded values for only the requested pressure level.
+    Dense(Arc<Vec<f32>>),
+}
+
+/// One decoded or storage-specialized pressure-level column-chunk plane.
+#[derive(Debug, Clone)]
+pub struct PressureLevelChunk3D {
+    geometry: PressureLevelChunkGeometry3D,
+    data: PressureLevelChunkData3D,
+}
+
+impl PressureLevelChunk3D {
+    pub const fn geometry(&self) -> PressureLevelChunkGeometry3D {
+        self.geometry
+    }
+
+    pub const fn data(&self) -> &PressureLevelChunkData3D {
+        &self.data
+    }
+
+    pub const fn cell_count(&self) -> usize {
+        self.geometry.cell_count()
+    }
+
+    /// Read one chunk-local `(row, column)` value without materializing
+    /// sparse chunk encodings. Returns `None` when either coordinate is out
+    /// of bounds.
+    pub fn get(&self, row: usize, column: usize) -> Option<f32> {
+        if row >= self.geometry.height || column >= self.geometry.width {
+            return None;
+        }
+        let index = row * self.geometry.width + column;
+        match &self.data {
+            PressureLevelChunkData3D::Empty => Some(f32::NAN),
+            PressureLevelChunkData3D::Constant(value) => Some(*value),
+            PressureLevelChunkData3D::Dense(values) => values.get(index).copied(),
+        }
+    }
+}
+
+/// Grid placement and shape of one column chunk for an explicit pressure
+/// level selection.
+///
+/// Unlike [`PressureLevelChunkGeometry3D`], this geometry is independent of
+/// any one level. The selected levels and their caller-defined order live on
+/// [`SelectedPressureLevelChunk3D`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SelectedPressureLevelChunkGeometry3D {
+    chunk_y: usize,
+    chunk_x: usize,
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+}
+
+impl SelectedPressureLevelChunkGeometry3D {
+    pub const fn chunk_y(self) -> usize {
+        self.chunk_y
+    }
+
+    pub const fn chunk_x(self) -> usize {
+        self.chunk_x
+    }
+
+    pub const fn x0(self) -> usize {
+        self.x0
+    }
+
+    pub const fn y0(self) -> usize {
+        self.y0
+    }
+
+    pub const fn width(self) -> usize {
+        self.width
+    }
+
+    pub const fn height(self) -> usize {
+        self.height
+    }
+
+    /// Number of cells in each selected pressure-level plane.
+    pub const fn cell_count(self) -> usize {
+        // Instances are only constructed after HourReader's checked grid
+        // validation, where the complete grid is bounded by MAX_GRID_CELLS.
+        self.width * self.height
+    }
+}
+
+/// Storage-aware values for all explicitly selected levels in one column
+/// chunk.
+///
+/// Dense values are laid out `[selected_level][row][column]`; the outer level
+/// order is exactly the caller's requested order. A dense allocation is
+/// bounded by `selected_level_count * COL_Y * COL_X`. Payload-free EMPTY and
+/// CONSTANT source chunks retain their allocation-free representation.
+#[derive(Debug, Clone)]
+pub enum SelectedPressureLevelChunkData3D {
+    /// Every cell at every selected level is represented by `f32::NAN`.
+    Empty,
+    /// Every cell at every selected level has the same finite value.
+    Constant(f32),
+    /// Selected planes only, in `[selected_level][row][column]` order.
+    Dense(Arc<Vec<f32>>),
+}
+
+/// Borrowed view of one selected pressure-level plane.
+#[derive(Debug, Clone, Copy)]
+pub enum SelectedPressureLevelPlane3D<'a> {
+    Empty,
+    Constant(f32),
+    Dense(&'a [f32]),
+}
+
+/// One decoded or storage-specialized column chunk for an explicit, ordered
+/// pressure-level selection.
+#[derive(Debug, Clone)]
+pub struct SelectedPressureLevelChunk3D {
+    geometry: SelectedPressureLevelChunkGeometry3D,
+    levels_hpa: Arc<[u16]>,
+    data: SelectedPressureLevelChunkData3D,
+}
+
+impl SelectedPressureLevelChunk3D {
+    pub const fn geometry(&self) -> SelectedPressureLevelChunkGeometry3D {
+        self.geometry
+    }
+
+    /// Explicit pressure levels in the exact order requested by the caller.
+    pub fn levels_hpa(&self) -> &[u16] {
+        &self.levels_hpa
+    }
+
+    pub const fn data(&self) -> &SelectedPressureLevelChunkData3D {
+        &self.data
+    }
+
+    pub const fn cell_count(&self) -> usize {
+        self.geometry.cell_count()
+    }
+
+    pub fn value_count(&self) -> usize {
+        // Construction checks this multiplication before allocating dense
+        // values; metadata validation also caps the level count.
+        self.cell_count() * self.levels_hpa.len()
+    }
+
+    /// Borrow one selected plane by its index in [`Self::levels_hpa`].
+    pub fn plane(&self, selected_level_index: usize) -> Option<SelectedPressureLevelPlane3D<'_>> {
+        if selected_level_index >= self.levels_hpa.len() {
+            return None;
+        }
+        Some(match &self.data {
+            SelectedPressureLevelChunkData3D::Empty => SelectedPressureLevelPlane3D::Empty,
+            SelectedPressureLevelChunkData3D::Constant(value) => {
+                SelectedPressureLevelPlane3D::Constant(*value)
+            }
+            SelectedPressureLevelChunkData3D::Dense(values) => {
+                let start = selected_level_index * self.cell_count();
+                SelectedPressureLevelPlane3D::Dense(&values[start..start + self.cell_count()])
+            }
+        })
+    }
+
+    /// Read one selected-level, chunk-local `(row, column)` value without
+    /// materializing sparse chunk encodings. Returns `None` when the level or
+    /// either coordinate is out of bounds.
+    pub fn get(&self, selected_level_index: usize, row: usize, column: usize) -> Option<f32> {
+        if selected_level_index >= self.levels_hpa.len()
+            || row >= self.geometry.height
+            || column >= self.geometry.width
+        {
+            return None;
+        }
+        let plane_index = row * self.geometry.width + column;
+        match &self.data {
+            SelectedPressureLevelChunkData3D::Empty => Some(f32::NAN),
+            SelectedPressureLevelChunkData3D::Constant(value) => Some(*value),
+            SelectedPressureLevelChunkData3D::Dense(values) => values
+                .get(selected_level_index * self.cell_count() + plane_index)
+                .copied(),
+        }
+    }
+}
+
+/// Allocation-bounded, row-major enumeration of a pressure variable's
+/// column chunks for an explicit ordered level selection.
+#[derive(Debug, Clone)]
+pub struct SelectedPressureLevelChunks3D {
+    grid_nx: usize,
+    grid_ny: usize,
+    chunks_x: usize,
+    chunks_y: usize,
+    levels_hpa: Arc<[u16]>,
+    next: usize,
+    chunk_count: usize,
+}
+
+impl SelectedPressureLevelChunks3D {
+    pub const fn chunks_x(&self) -> usize {
+        self.chunks_x
+    }
+
+    pub const fn chunks_y(&self) -> usize {
+        self.chunks_y
+    }
+
+    /// Explicit pressure levels in the exact order requested by the caller.
+    pub fn levels_hpa(&self) -> &[u16] {
+        &self.levels_hpa
+    }
+}
+
+impl Iterator for SelectedPressureLevelChunks3D {
+    type Item = SelectedPressureLevelChunkGeometry3D;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.chunk_count {
+            return None;
+        }
+        let ordinal = self.next;
+        self.next += 1;
+        let chunk_y = ordinal / self.chunks_x;
+        let chunk_x = ordinal % self.chunks_x;
+        let y0 = chunk_y * COL_Y;
+        let x0 = chunk_x * COL_X;
+        Some(SelectedPressureLevelChunkGeometry3D {
+            chunk_y,
+            chunk_x,
+            x0,
+            y0,
+            width: (self.grid_nx - x0).min(COL_X),
+            height: (self.grid_ny - y0).min(COL_Y),
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.chunk_count - self.next;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for SelectedPressureLevelChunks3D {}
+impl std::iter::FusedIterator for SelectedPressureLevelChunks3D {}
+
+/// Allocation-free, row-major enumeration of a pressure variable's column
+/// chunks for one exact pressure level.
+#[derive(Debug, Clone)]
+pub struct PressureLevelChunks3D {
+    grid_nx: usize,
+    grid_ny: usize,
+    chunks_x: usize,
+    chunks_y: usize,
+    level_hpa: u16,
+    next: usize,
+    chunk_count: usize,
+}
+
+impl PressureLevelChunks3D {
+    pub const fn chunks_x(&self) -> usize {
+        self.chunks_x
+    }
+
+    pub const fn chunks_y(&self) -> usize {
+        self.chunks_y
+    }
+
+    pub const fn level_hpa(&self) -> u16 {
+        self.level_hpa
+    }
+}
+
+impl Iterator for PressureLevelChunks3D {
+    type Item = PressureLevelChunkGeometry3D;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.chunk_count {
+            return None;
+        }
+        let ordinal = self.next;
+        self.next += 1;
+        let chunk_y = ordinal / self.chunks_x;
+        let chunk_x = ordinal % self.chunks_x;
+        let y0 = chunk_y * COL_Y;
+        let x0 = chunk_x * COL_X;
+        Some(PressureLevelChunkGeometry3D {
+            chunk_y,
+            chunk_x,
+            x0,
+            y0,
+            width: (self.grid_nx - x0).min(COL_X),
+            height: (self.grid_ny - y0).min(COL_Y),
+            level_hpa: self.level_hpa,
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.chunk_count - self.next;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for PressureLevelChunks3D {}
+impl std::iter::FusedIterator for PressureLevelChunks3D {}
+
 /// Finite-value summary for one complete 2D field.
 ///
 /// `finite_min` and `finite_max` are `None` when the field has no finite
@@ -815,6 +1335,11 @@ impl HourReader {
     /// can be established from the index alone before they are aggregated.
     /// Use deep store validation when payload-to-index verification is
     /// required.
+    ///
+    /// There is intentionally no index-only `stats_window_2d`: index
+    /// statistics describe complete tiles, so an arbitrary window's boundary
+    /// tiles must be decoded to obtain exact results. Use [`Self::tiles_2d`]
+    /// with [`Self::read_tile_2d`] or [`Self::read_window_2d`] for that case.
     pub fn stats_2d(&self, name: &str) -> RwResult<FieldStats2D> {
         let var = self.lookup(name)?;
         if var.kind != "surface2d" {
@@ -987,6 +1512,46 @@ impl HourReader {
             }
         }
         Ok(values)
+    }
+
+    /// Enumerate the complete tile layout of 2D surface variable `name` in
+    /// row-major tile order without allocating a geometry list or decoding
+    /// payloads.
+    pub fn tiles_2d(&self, name: &str) -> RwResult<Tiles2D> {
+        let var = self.lookup_2d(name)?;
+        self.tiles_2d_for_var(var)
+    }
+
+    /// Read one tile of 2D surface variable `name`.
+    ///
+    /// The tile indices come from [`Self::tiles_2d`]. Out-of-range indices are
+    /// rejected before offset arithmetic. EMPTY and payload-free CONSTANT
+    /// tiles remain allocation-free; dense tiles use the same validated
+    /// decoder and bounded cache as point/window reads.
+    pub fn read_tile_2d(&self, name: &str, tile_y: usize, tile_x: usize) -> RwResult<Tile2D> {
+        let var = self.lookup_2d(name)?;
+        let geometry = self.tile_geometry_2d(&var.name, tile_y, tile_x)?;
+        self.read_tile_2d_for_var(var, geometry)
+    }
+
+    /// Visit a 2D surface variable one tile at a time in row-major tile order.
+    ///
+    /// The visitor receives a borrowed tile which is dropped before the next
+    /// tile is read. Apart from data a visitor deliberately clones, memory is
+    /// bounded by one current tile plus this reader's configured tile cache;
+    /// no full-plane allocation is made. The first read or visitor error stops
+    /// iteration and is returned unchanged.
+    pub fn visit_tiles_2d<F>(&self, name: &str, mut visitor: F) -> RwResult<()>
+    where
+        F: FnMut(&Tile2D) -> RwResult<()>,
+    {
+        let var = self.lookup_2d(name)?;
+        let tiles = self.tiles_2d_for_var(var)?;
+        for geometry in tiles {
+            let tile = self.read_tile_2d_for_var(var, geometry)?;
+            visitor(&tile)?;
+        }
+        Ok(())
     }
 
     /// Read one bit-exact 2D value without allocating a one-cell window.
@@ -1241,13 +1806,7 @@ impl HourReader {
     /// when a map viewer needs one isobaric surface.
     pub fn read_level_3d(&self, name: &str, level_hpa: u16) -> RwResult<Vec<f32>> {
         let var = self.lookup_3d(name)?;
-        let level_index = var
-            .levels_hpa
-            .iter()
-            .position(|level| *level == level_hpa)
-            .ok_or_else(|| {
-                RwStoreError::Meta(format!("variable '{name}' has no {level_hpa} hPa level"))
-            })?;
+        let level_index = Self::pressure_level_index(var, level_hpa)?;
         let (nx, ny) = (self.meta.nx, self.meta.ny);
         let cells = nx.checked_mul(ny).ok_or_else(|| {
             RwStoreError::Format(format!(
@@ -1282,6 +1841,143 @@ impl HourReader {
         }
 
         Ok(output)
+    }
+
+    /// Enumerate a pressure variable's 16x16 column chunks for one exact
+    /// pressure level, in row-major chunk order. This validates the variable
+    /// kind, requested level, and exact chunk-index cardinality without
+    /// decoding payloads or allocating a geometry list.
+    pub fn pressure_level_chunks_3d(
+        &self,
+        name: &str,
+        level_hpa: u16,
+    ) -> RwResult<PressureLevelChunks3D> {
+        let var = self.lookup_3d(name)?;
+        Self::pressure_level_index(var, level_hpa)?;
+        self.pressure_level_chunks_3d_for_var(var, level_hpa)
+    }
+
+    /// Read one 16x16 (edge-clipped) column-chunk plane for an exact pressure
+    /// level. The underlying `[y][x][level]` column chunk is decoded once and
+    /// only the requested level is retained; no full level plane or pressure
+    /// volume is allocated. EMPTY and payload-free CONSTANT chunks remain
+    /// allocation-free in the returned representation.
+    pub fn read_pressure_level_chunk_3d(
+        &self,
+        name: &str,
+        level_hpa: u16,
+        chunk_y: usize,
+        chunk_x: usize,
+    ) -> RwResult<PressureLevelChunk3D> {
+        let var = self.lookup_3d(name)?;
+        let level_index = Self::pressure_level_index(var, level_hpa)?;
+        let geometry =
+            self.pressure_level_chunk_geometry_3d(&var.name, level_hpa, chunk_y, chunk_x)?;
+        self.read_pressure_level_chunk_3d_for_var(var, level_index, geometry)
+    }
+
+    /// Visit one exact pressure level a column chunk at a time in row-major
+    /// chunk order. The callback returns before the next chunk is decoded, so
+    /// callers can implement cancellation or early termination between
+    /// chunks by returning an error. No full plane or volume is allocated.
+    pub fn visit_pressure_level_chunks_3d<F>(
+        &self,
+        name: &str,
+        level_hpa: u16,
+        mut visitor: F,
+    ) -> RwResult<()>
+    where
+        F: FnMut(&PressureLevelChunk3D) -> RwResult<()>,
+    {
+        let var = self.lookup_3d(name)?;
+        let level_index = Self::pressure_level_index(var, level_hpa)?;
+        let chunks = self.pressure_level_chunks_3d_for_var(var, level_hpa)?;
+        for geometry in chunks {
+            let chunk = self.read_pressure_level_chunk_3d_for_var(var, level_index, geometry)?;
+            visitor(&chunk)?;
+        }
+        Ok(())
+    }
+
+    /// Enumerate a pressure variable's 16x16 column chunks for a nonempty,
+    /// unique list of exact pressure levels, in row-major chunk order.
+    ///
+    /// The requested level order is preserved. Validation rejects duplicate
+    /// or absent levels before any payload is decoded. Geometry enumeration
+    /// allocates only the bounded level selection, not a chunk list, plane,
+    /// or pressure volume.
+    pub fn selected_pressure_level_chunks_3d(
+        &self,
+        name: &str,
+        levels_hpa: &[u16],
+    ) -> RwResult<SelectedPressureLevelChunks3D> {
+        let var = self.lookup_3d(name)?;
+        Self::selected_pressure_level_indices(var, levels_hpa)?;
+        self.selected_pressure_level_chunks_3d_for_var(var, Arc::from(levels_hpa))
+    }
+
+    /// Read one 16x16 (edge-clipped) column chunk for a nonempty, unique,
+    /// explicitly ordered pressure-level selection.
+    ///
+    /// The underlying `[y][x][all_levels]` chunk is decompressed once, and
+    /// only the selected planes are decoded into the result. Dense output is
+    /// bounded by `selected_levels * 16 * 16`; no full grid plane or volume
+    /// is allocated. Payload-free EMPTY and CONSTANT chunks remain
+    /// allocation-free in the returned data representation.
+    pub fn read_selected_pressure_level_chunk_3d(
+        &self,
+        name: &str,
+        levels_hpa: &[u16],
+        chunk_y: usize,
+        chunk_x: usize,
+    ) -> RwResult<SelectedPressureLevelChunk3D> {
+        let var = self.lookup_3d(name)?;
+        let level_indices = Self::selected_pressure_level_indices(var, levels_hpa)?;
+        let geometry =
+            self.selected_pressure_level_chunk_geometry_3d(&var.name, chunk_y, chunk_x)?;
+        let data =
+            self.read_selected_pressure_level_chunk_data_3d_for_var(var, &level_indices, geometry)?;
+        Ok(SelectedPressureLevelChunk3D {
+            geometry,
+            levels_hpa: Arc::from(levels_hpa),
+            data,
+        })
+    }
+
+    /// Visit an explicit ordered pressure-level selection one column chunk
+    /// at a time in row-major chunk order.
+    ///
+    /// Every source chunk is decompressed at most once. The callback returns
+    /// before the next chunk is decoded, so returning an error provides an
+    /// immediate cancellation/early-termination checkpoint. No full grid
+    /// plane or pressure volume is allocated.
+    pub fn visit_selected_pressure_level_chunks_3d<F>(
+        &self,
+        name: &str,
+        levels_hpa: &[u16],
+        mut visitor: F,
+    ) -> RwResult<()>
+    where
+        F: FnMut(&SelectedPressureLevelChunk3D) -> RwResult<()>,
+    {
+        let var = self.lookup_3d(name)?;
+        let level_indices = Self::selected_pressure_level_indices(var, levels_hpa)?;
+        let levels_hpa: Arc<[u16]> = Arc::from(levels_hpa);
+        let chunks =
+            self.selected_pressure_level_chunks_3d_for_var(var, Arc::clone(&levels_hpa))?;
+        for geometry in chunks {
+            let data = self.read_selected_pressure_level_chunk_data_3d_for_var(
+                var,
+                &level_indices,
+                geometry,
+            )?;
+            visitor(&SelectedPressureLevelChunk3D {
+                geometry,
+                levels_hpa: Arc::clone(&levels_hpa),
+                data,
+            })?;
+        }
+        Ok(())
     }
 
     /// Read a bilinearly interpolated pressure profile of 3D variable
@@ -1384,6 +2080,384 @@ impl HourReader {
             )));
         }
         Ok(var)
+    }
+
+    fn pressure_level_index(var: &RwsVariableMeta, level_hpa: u16) -> RwResult<usize> {
+        var.levels_hpa
+            .iter()
+            .position(|level| *level == level_hpa)
+            .ok_or_else(|| {
+                RwStoreError::Meta(format!(
+                    "variable '{}' has no {level_hpa} hPa level",
+                    var.name
+                ))
+            })
+    }
+
+    fn selected_pressure_level_indices(
+        var: &RwsVariableMeta,
+        levels_hpa: &[u16],
+    ) -> RwResult<Vec<usize>> {
+        if levels_hpa.is_empty() {
+            return Err(RwStoreError::Format(format!(
+                "variable '{}': selected pressure levels must not be empty",
+                var.name
+            )));
+        }
+        if levels_hpa.len() > MAX_PRESSURE_LEVELS {
+            return Err(RwStoreError::Format(format!(
+                "variable '{}': selected pressure level count {} exceeds limit {MAX_PRESSURE_LEVELS}",
+                var.name,
+                levels_hpa.len()
+            )));
+        }
+
+        let mut seen = BTreeSet::new();
+        for &level_hpa in levels_hpa {
+            if !seen.insert(level_hpa) {
+                return Err(RwStoreError::Format(format!(
+                    "variable '{}': selected pressure level {level_hpa} hPa is duplicated",
+                    var.name
+                )));
+            }
+        }
+
+        let mut indices = Vec::new();
+        indices.try_reserve_exact(levels_hpa.len()).map_err(|err| {
+            RwStoreError::Format(format!(
+                "variable '{}': cannot allocate {} selected pressure-level indices: {err}",
+                var.name,
+                levels_hpa.len()
+            ))
+        })?;
+        for &level_hpa in levels_hpa {
+            indices.push(Self::pressure_level_index(var, level_hpa)?);
+        }
+        Ok(indices)
+    }
+
+    fn pressure_level_chunks_3d_for_var(
+        &self,
+        var: &RwsVariableMeta,
+        level_hpa: u16,
+    ) -> RwResult<PressureLevelChunks3D> {
+        let chunks_y = self.meta.ny.div_ceil(COL_Y);
+        let chunks_x = self.meta.nx.div_ceil(COL_X);
+        let chunk_count = chunks_y.checked_mul(chunks_x).ok_or_else(|| {
+            RwStoreError::Format(format!(
+                "variable '{}': column chunk count overflows usize",
+                var.name
+            ))
+        })?;
+        let range = self.var_ranges.get(&var.id).ok_or_else(|| {
+            RwStoreError::Format(format!(
+                "variable '{}' (id {}) has no chunk index entries",
+                var.name, var.id
+            ))
+        })?;
+        if range.len() != chunk_count {
+            return Err(RwStoreError::Format(format!(
+                "variable '{}' has {} chunk index records, expected {chunk_count}",
+                var.name,
+                range.len()
+            )));
+        }
+        Ok(PressureLevelChunks3D {
+            grid_nx: self.meta.nx,
+            grid_ny: self.meta.ny,
+            chunks_x,
+            chunks_y,
+            level_hpa,
+            next: 0,
+            chunk_count,
+        })
+    }
+
+    fn selected_pressure_level_chunks_3d_for_var(
+        &self,
+        var: &RwsVariableMeta,
+        levels_hpa: Arc<[u16]>,
+    ) -> RwResult<SelectedPressureLevelChunks3D> {
+        // The public callers validate a nonempty selection before reaching
+        // this helper. Reuse the single-level cardinality/index validation so
+        // both seams reject malformed stores identically.
+        let chunks = self.pressure_level_chunks_3d_for_var(var, levels_hpa[0])?;
+        Ok(SelectedPressureLevelChunks3D {
+            grid_nx: chunks.grid_nx,
+            grid_ny: chunks.grid_ny,
+            chunks_x: chunks.chunks_x,
+            chunks_y: chunks.chunks_y,
+            levels_hpa,
+            next: 0,
+            chunk_count: chunks.chunk_count,
+        })
+    }
+
+    fn pressure_level_chunk_geometry_3d(
+        &self,
+        var_name: &str,
+        level_hpa: u16,
+        chunk_y: usize,
+        chunk_x: usize,
+    ) -> RwResult<PressureLevelChunkGeometry3D> {
+        let chunks_y = self.meta.ny.div_ceil(COL_Y);
+        let chunks_x = self.meta.nx.div_ceil(COL_X);
+        if chunk_y >= chunks_y || chunk_x >= chunks_x {
+            return Err(RwStoreError::Format(format!(
+                "column chunk ({chunk_y},{chunk_x}) for variable '{var_name}' at {level_hpa} hPa is outside chunk grid {chunks_y}x{chunks_x}"
+            )));
+        }
+        let y0 = chunk_y.checked_mul(COL_Y).ok_or_else(|| {
+            RwStoreError::Format(format!(
+                "column chunk y offset overflows for variable '{var_name}'"
+            ))
+        })?;
+        let x0 = chunk_x.checked_mul(COL_X).ok_or_else(|| {
+            RwStoreError::Format(format!(
+                "column chunk x offset overflows for variable '{var_name}'"
+            ))
+        })?;
+        Ok(PressureLevelChunkGeometry3D {
+            chunk_y,
+            chunk_x,
+            x0,
+            y0,
+            width: (self.meta.nx - x0).min(COL_X),
+            height: (self.meta.ny - y0).min(COL_Y),
+            level_hpa,
+        })
+    }
+
+    fn selected_pressure_level_chunk_geometry_3d(
+        &self,
+        var_name: &str,
+        chunk_y: usize,
+        chunk_x: usize,
+    ) -> RwResult<SelectedPressureLevelChunkGeometry3D> {
+        let chunks_y = self.meta.ny.div_ceil(COL_Y);
+        let chunks_x = self.meta.nx.div_ceil(COL_X);
+        if chunk_y >= chunks_y || chunk_x >= chunks_x {
+            return Err(RwStoreError::Format(format!(
+                "column chunk ({chunk_y},{chunk_x}) for variable '{var_name}' is outside chunk grid {chunks_y}x{chunks_x}"
+            )));
+        }
+        let y0 = chunk_y.checked_mul(COL_Y).ok_or_else(|| {
+            RwStoreError::Format(format!(
+                "column chunk y offset overflows for variable '{var_name}'"
+            ))
+        })?;
+        let x0 = chunk_x.checked_mul(COL_X).ok_or_else(|| {
+            RwStoreError::Format(format!(
+                "column chunk x offset overflows for variable '{var_name}'"
+            ))
+        })?;
+        Ok(SelectedPressureLevelChunkGeometry3D {
+            chunk_y,
+            chunk_x,
+            x0,
+            y0,
+            width: (self.meta.nx - x0).min(COL_X),
+            height: (self.meta.ny - y0).min(COL_Y),
+        })
+    }
+
+    fn read_pressure_level_chunk_3d_for_var(
+        &self,
+        var: &RwsVariableMeta,
+        level_index: usize,
+        geometry: PressureLevelChunkGeometry3D,
+    ) -> RwResult<PressureLevelChunk3D> {
+        let selected_geometry = SelectedPressureLevelChunkGeometry3D {
+            chunk_y: geometry.chunk_y,
+            chunk_x: geometry.chunk_x,
+            x0: geometry.x0,
+            y0: geometry.y0,
+            width: geometry.width,
+            height: geometry.height,
+        };
+        let selected_data = self.read_selected_pressure_level_chunk_data_3d_for_var(
+            var,
+            &[level_index],
+            selected_geometry,
+        )?;
+        let data = match selected_data {
+            SelectedPressureLevelChunkData3D::Empty => PressureLevelChunkData3D::Empty,
+            SelectedPressureLevelChunkData3D::Constant(value) => {
+                PressureLevelChunkData3D::Constant(value)
+            }
+            SelectedPressureLevelChunkData3D::Dense(values) => {
+                PressureLevelChunkData3D::Dense(values)
+            }
+        };
+        Ok(PressureLevelChunk3D { geometry, data })
+    }
+
+    fn read_selected_pressure_level_chunk_data_3d_for_var(
+        &self,
+        var: &RwsVariableMeta,
+        selected_level_indices: &[usize],
+        geometry: SelectedPressureLevelChunkGeometry3D,
+    ) -> RwResult<SelectedPressureLevelChunkData3D> {
+        debug_assert!(!selected_level_indices.is_empty());
+        let record = self.chunk_record(var, KIND_COLUMN3D, geometry.chunk_y, geometry.chunk_x)?;
+        if record.flags & FLAG_EMPTY != 0 {
+            return Ok(SelectedPressureLevelChunkData3D::Empty);
+        }
+        if record.flags & FLAG_CONSTANT != 0 && record.len == 0 {
+            return Ok(SelectedPressureLevelChunkData3D::Constant(record.center));
+        }
+
+        let all_level_count = var.levels_hpa.len();
+        let all_value_count = geometry
+            .cell_count()
+            .checked_mul(all_level_count)
+            .ok_or_else(|| {
+                RwStoreError::Format(format!(
+                    "variable '{}': column chunk value count overflows usize",
+                    var.name
+                ))
+            })?;
+        let expected_raw_len = all_value_count
+            .checked_mul(size_of::<i16>())
+            .ok_or_else(|| {
+                RwStoreError::Chunk(format!(
+                    "variable '{}': column chunk raw byte count overflows usize",
+                    var.name
+                ))
+            })?;
+        let raw_len = usize::try_from(record.raw_len).map_err(|_| {
+            RwStoreError::Chunk(format!(
+                "variable '{}' column chunk ({},{}): raw_len {} does not fit usize",
+                var.name, record.tile_y, record.tile_x, record.raw_len
+            ))
+        })?;
+        if raw_len != expected_raw_len {
+            return Err(RwStoreError::Chunk(format!(
+                "variable '{}' column chunk ({},{}): raw_len {} does not match {all_value_count} i16 values ({expected_raw_len} bytes)",
+                var.name, record.tile_y, record.tile_x, record.raw_len
+            )));
+        }
+
+        let compressed = self.payload_slice(&var.name, record)?;
+        let context = format!(
+            "variable '{}' column chunk ({},{})",
+            var.name, record.tile_y, record.tile_x
+        );
+        let raw = decompress_chunk(compressed, raw_len, &context)?;
+        let selected_value_count = geometry
+            .cell_count()
+            .checked_mul(selected_level_indices.len())
+            .ok_or_else(|| {
+                RwStoreError::Format(format!(
+                    "variable '{}': selected column chunk value count overflows usize",
+                    var.name
+                ))
+            })?;
+        let mut selected = try_filled_f32(
+            selected_value_count,
+            f32::NAN,
+            &format!("variable '{}' selected pressure-level chunk", var.name),
+        )?;
+
+        // Decode directly from the one decompressed [cell][all_level] i16
+        // chunk into a bounded [selected_level][cell] result. This avoids the
+        // transient all-level f32 chunk allocation used by whole-volume APIs.
+        for (selected_index, &source_level_index) in selected_level_indices.iter().enumerate() {
+            debug_assert!(source_level_index < all_level_count);
+            let output_plane = &mut selected[selected_index * geometry.cell_count()
+                ..(selected_index + 1) * geometry.cell_count()];
+            for (cell, value) in output_plane.iter_mut().enumerate() {
+                let raw_value_index = cell * all_level_count + source_level_index;
+                let raw_byte_index = raw_value_index * size_of::<i16>();
+                let q = i16::from_le_bytes([raw[raw_byte_index], raw[raw_byte_index + 1]]);
+                *value = if q == MISSING_Q {
+                    f32::NAN
+                } else if record.flags & FLAG_CONSTANT != 0 {
+                    record.center
+                } else {
+                    record.center + record.scale * f32::from(q)
+                };
+            }
+        }
+
+        Ok(SelectedPressureLevelChunkData3D::Dense(Arc::new(selected)))
+    }
+
+    fn tiles_2d_for_var(&self, var: &RwsVariableMeta) -> RwResult<Tiles2D> {
+        let tiles_y = self.meta.ny.div_ceil(TILE_Y);
+        let tiles_x = self.meta.nx.div_ceil(TILE_X);
+        let tile_count = tiles_y.checked_mul(tiles_x).ok_or_else(|| {
+            RwStoreError::Format(format!(
+                "variable '{}': tile count overflows usize",
+                var.name
+            ))
+        })?;
+        let range = self.var_ranges.get(&var.id).ok_or_else(|| {
+            RwStoreError::Format(format!(
+                "variable '{}' (id {}) has no chunk index entries",
+                var.name, var.id
+            ))
+        })?;
+        if range.len() != tile_count {
+            return Err(RwStoreError::Format(format!(
+                "variable '{}' has {} chunk index records, expected {tile_count}",
+                var.name,
+                range.len()
+            )));
+        }
+        Ok(Tiles2D {
+            grid_nx: self.meta.nx,
+            grid_ny: self.meta.ny,
+            tiles_x,
+            tiles_y,
+            next: 0,
+            tile_count,
+        })
+    }
+
+    fn tile_geometry_2d(
+        &self,
+        var_name: &str,
+        tile_y: usize,
+        tile_x: usize,
+    ) -> RwResult<TileGeometry2D> {
+        let tiles_y = self.meta.ny.div_ceil(TILE_Y);
+        let tiles_x = self.meta.nx.div_ceil(TILE_X);
+        if tile_y >= tiles_y || tile_x >= tiles_x {
+            return Err(RwStoreError::Format(format!(
+                "tile ({tile_y},{tile_x}) for variable '{var_name}' is outside tile grid {tiles_y}x{tiles_x}"
+            )));
+        }
+        let y0 = tile_y.checked_mul(TILE_Y).ok_or_else(|| {
+            RwStoreError::Format(format!("tile y offset overflows for variable '{var_name}'"))
+        })?;
+        let x0 = tile_x.checked_mul(TILE_X).ok_or_else(|| {
+            RwStoreError::Format(format!("tile x offset overflows for variable '{var_name}'"))
+        })?;
+        Ok(TileGeometry2D {
+            tile_y,
+            tile_x,
+            x0,
+            y0,
+            nx: (self.meta.nx - x0).min(TILE_X),
+            ny: (self.meta.ny - y0).min(TILE_Y),
+        })
+    }
+
+    fn read_tile_2d_for_var(
+        &self,
+        var: &RwsVariableMeta,
+        geometry: TileGeometry2D,
+    ) -> RwResult<Tile2D> {
+        let record = self.chunk_record(var, KIND_TILE2D, geometry.tile_y, geometry.tile_x)?;
+        let data = if record.flags & FLAG_EMPTY != 0 {
+            TileData2D::Empty
+        } else if record.flags & FLAG_CONSTANT != 0 && record.len == 0 {
+            TileData2D::Constant(record.center)
+        } else {
+            TileData2D::Dense(self.decode_tile_cached(var, record, geometry.cell_count())?)
+        };
+        Ok(Tile2D { geometry, data })
     }
 
     /// Find the index record for `var`'s chunk (`ty`, `tx`) of `kind`:
@@ -1836,6 +2910,199 @@ mod tests {
         let big_reader = HourReader::open(&big_path).unwrap();
         let big_full = big_reader.read_full_2d("gust_10m").unwrap();
         assert_bits_eq(&big_full, &big, "gust_10m parallel full read");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tile_api_enumerates_edge_geometry_and_preserves_full_read_bits() {
+        let dir = test_dir("tile-api-layout");
+        let path = dir.join("hour.rws");
+        write_sample(&path);
+        let reader = HourReader::open(&path).unwrap();
+
+        let tiles = reader.tiles_2d("temp_2m").unwrap();
+        assert_eq!((tiles.tiles_y(), tiles.tiles_x(), tiles.len()), (2, 3, 6));
+        let geometries: Vec<_> = tiles.collect();
+        assert_eq!(
+            geometries
+                .iter()
+                .map(|geometry| (
+                    geometry.tile_y(),
+                    geometry.tile_x(),
+                    geometry.y0(),
+                    geometry.x0(),
+                    geometry.ny(),
+                    geometry.nx(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 0, 0, 0, 256, 256),
+                (0, 1, 0, 256, 256, 256),
+                (0, 2, 0, 512, 256, 88),
+                (1, 0, 256, 0, 244, 256),
+                (1, 1, 256, 256, 244, 256),
+                (1, 2, 256, 512, 244, 88),
+            ]
+        );
+
+        let empty = reader.read_tile_2d("temp_2m", 0, 0).unwrap();
+        assert!(matches!(empty.data(), TileData2D::Empty));
+        assert!(empty.get(0, 0).unwrap().is_nan());
+        assert!(empty.get(TILE_Y, 0).is_none());
+
+        let constant = reader.read_tile_2d("temp_2m", 0, 1).unwrap();
+        match constant.data() {
+            TileData2D::Constant(value) => assert_eq!(value.to_bits(), 42.0f32.to_bits()),
+            other => panic!("expected constant tile, got {other:?}"),
+        }
+
+        let edge = reader.read_tile_2d("temp_2m", 1, 2).unwrap();
+        assert_eq!(
+            (
+                edge.geometry().x0(),
+                edge.geometry().y0(),
+                edge.geometry().nx(),
+                edge.geometry().ny(),
+            ),
+            (512, 256, 88, 244)
+        );
+        match edge.data() {
+            TileData2D::Dense(values) => assert_eq!(values.len(), edge.cell_count()),
+            other => panic!("expected dense edge tile, got {other:?}"),
+        }
+
+        let full = reader.read_full_2d("temp_2m").unwrap();
+        let mut assembled = vec![0.0; NX * NY];
+        reader
+            .visit_tiles_2d("temp_2m", |tile| {
+                let geometry = tile.geometry();
+                for row in 0..geometry.ny() {
+                    for column in 0..geometry.nx() {
+                        assembled[(geometry.y0() + row) * NX + geometry.x0() + column] =
+                            tile.get(row, column).unwrap();
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_bits_eq(&assembled, &full, "tile visitor versus full read");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tile_visitor_streams_within_the_configured_cache_bound() {
+        let dir = test_dir("tile-api-streaming");
+        let path = dir.join("hour.rws");
+        write_sample(&path);
+        let tile_bytes = TILE_X * TILE_Y * size_of::<f32>();
+        let reader = HourReader::open_with_tile_cache_bytes(&path, tile_bytes).unwrap();
+
+        let mut visited_tiles = 0usize;
+        let mut visited_cells = 0usize;
+        let mut max_current_cells = 0usize;
+        let mut checksum = 0u64;
+        reader
+            .visit_tiles_2d("dewpoint_2m", |tile| {
+                visited_tiles += 1;
+                visited_cells += tile.cell_count();
+                max_current_cells = max_current_cells.max(tile.cell_count());
+                match tile.data() {
+                    TileData2D::Dense(values) => {
+                        assert_eq!(values.len(), tile.cell_count());
+                        for value in values.iter() {
+                            checksum = checksum.wrapping_add(u64::from(value.to_bits()));
+                        }
+                    }
+                    other => panic!("expected dense tile, got {other:?}"),
+                }
+                let cache = reader.tile_cache_stats();
+                assert!(cache.bytes <= cache.capacity_bytes, "cache: {cache:?}");
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(visited_tiles, 6);
+        assert_eq!(visited_cells, NX * NY);
+        assert_eq!(max_current_cells, TILE_X * TILE_Y);
+        assert_ne!(checksum, 0);
+        let cache = reader.tile_cache_stats();
+        assert_eq!((cache.misses, cache.insertions), (6, 6));
+        assert!(cache.bytes <= tile_bytes, "cache: {cache:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tile_api_rejects_bad_indices_and_kinds_and_stops_on_visitor_error() {
+        let dir = test_dir("tile-api-errors");
+        let path = dir.join("hour.rws");
+        write_sample(&path);
+        let reader = HourReader::open(&path).unwrap();
+
+        for (tile_y, tile_x) in [(2, 0), (0, 3), (usize::MAX, usize::MAX)] {
+            let err = reader.read_tile_2d("temp_2m", tile_y, tile_x).unwrap_err();
+            match err {
+                RwStoreError::Format(message) => assert!(
+                    message.contains("outside tile grid"),
+                    "unexpected message: {message}"
+                ),
+                other => panic!("expected Format error, got {other:?}"),
+            }
+        }
+
+        let unknown = reader.tiles_2d("not_present").unwrap_err();
+        assert!(
+            matches!(&unknown, RwStoreError::UnknownVariable(name) if name == "not_present"),
+            "expected UnknownVariable, got {unknown:?}"
+        );
+
+        let mut visits = 0usize;
+        let stopped = reader
+            .visit_tiles_2d("temp_2m", |_| {
+                visits += 1;
+                Err(RwStoreError::Chunk("visitor stop".to_string()))
+            })
+            .unwrap_err();
+        assert_eq!(visits, 1);
+        assert!(
+            matches!(&stopped, RwStoreError::Chunk(message) if message == "visitor stop"),
+            "unexpected visitor error: {stopped:?}"
+        );
+
+        let pressure_path = dir.join("pressure.rws");
+        let pressure_plane = vec![280.0; 4];
+        let pressure_planes: [&[f32]; 1] = [&pressure_plane];
+        let mut writer = HourWriter::new("hrrr", "run", 0, 2, 2, "grid", "build");
+        writer
+            .add_pressure3d(
+                "temperature",
+                "K",
+                serde_json::Value::Null,
+                &[1000],
+                &pressure_planes,
+            )
+            .unwrap();
+        writer.finish(&pressure_path).unwrap();
+        let pressure_reader = HourReader::open(&pressure_path).unwrap();
+
+        let enumerate_error = pressure_reader.tiles_2d("temperature").unwrap_err();
+        let read_error = pressure_reader
+            .read_tile_2d("temperature", 0, 0)
+            .unwrap_err();
+        let visit_error = pressure_reader
+            .visit_tiles_2d("temperature", |_| Ok(()))
+            .unwrap_err();
+        for err in [enumerate_error, read_error, visit_error] {
+            match err {
+                RwStoreError::Format(message) => assert!(
+                    message.contains("pressure3d") && message.contains("surface2d"),
+                    "unexpected message: {message}"
+                ),
+                other => panic!("expected Format error, got {other:?}"),
+            }
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

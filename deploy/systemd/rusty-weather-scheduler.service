@@ -1,0 +1,50 @@
+[Unit]
+Description=Rusty Weather model ingest scheduler
+Documentation=https://github.com/FahrenheitResearch/rusty-weather
+Wants=network-online.target
+After=network-online.target local-fs.target
+
+[Service]
+Type=simple
+User=rusty-weather
+Group=rusty-weather
+EnvironmentFile=-/etc/default/rusty-weather-scheduler
+ExecStartPre=/usr/local/bin/rw-scheduler --config /etc/rusty-weather/rusty-weather-scheduler.toml plan
+ExecStart=/usr/local/bin/rw-scheduler --config /etc/rusty-weather/rusty-weather-scheduler.toml daemon
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=30s
+TimeoutStopSec=120s
+KillSignal=SIGINT
+UMask=0027
+LimitNOFILE=65536
+
+StateDirectory=rusty-weather/scheduler
+StateDirectoryMode=0750
+CacheDirectory=rusty-weather/ingest
+CacheDirectoryMode=0750
+LogsDirectory=rusty-weather
+LogsDirectoryMode=0750
+ReadWritePaths=/var/lib/rusty-weather/store /var/lib/rusty-weather/scheduler /var/cache/rusty-weather/ingest
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

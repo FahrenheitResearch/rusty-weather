@@ -154,12 +154,23 @@ fn prepared_projected_maps_use_composite_components_as_projection_sample() {
 }
 
 fn sample_direct_request(model: ModelId) -> DirectBatchRequest {
+    let source = rustwx_models::model_summary(model)
+        .sources
+        .first()
+        .map(|descriptor| descriptor.id)
+        .unwrap_or_else(|| match model {
+            // WRF/GDEX is intentionally local-import-only now, but this unit
+            // fixture still needs the historical source token to exercise
+            // title formatting without pretending remote acquisition exists.
+            ModelId::WrfGdex => rustwx_core::SourceId::Gdex,
+            _ => panic!("test fixture requires a catalogued source for {model:?}"),
+        });
     DirectBatchRequest {
         model,
         date_yyyymmdd: "20260414".to_string(),
         cycle_override_utc: Some(23),
         forecast_hour: 6,
-        source: rustwx_models::model_summary(model).sources[0].id,
+        source,
         domain: DomainSpec::new("midwest", (-105.0, -80.0, 30.0, 50.0)),
         out_dir: PathBuf::from("C:\\temp\\rustwx-tests"),
         cache_root: PathBuf::from("C:\\temp\\rustwx-tests-cache"),

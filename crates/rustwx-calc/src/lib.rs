@@ -2,6 +2,9 @@ mod derived;
 mod ecape;
 mod error;
 mod mesoanalysis;
+// Keep the independently reviewed precipitation-type implementation byte-stable
+// during unrelated workspace-wide formatting passes.
+#[rustfmt::skip]
 mod ptype;
 mod severe;
 mod windowed;

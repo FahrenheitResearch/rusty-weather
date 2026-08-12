@@ -136,7 +136,7 @@ struct PersistedPaths {
 /// Serialize [`PersistedPaths`] to a JSON string via serde_json.
 ///
 /// serde_json correctly JSON-escapes backslashes and other special characters,
-/// so Windows paths (e.g. `C:\Users\drew\store`) survive the round-trip.
+/// so Windows paths (e.g. `C:\Users\alice\store`) survive the round-trip.
 ///
 /// # Persistence feature note
 ///
@@ -943,6 +943,7 @@ fn cadence_hint(model: rustwx_core::ModelId, _cycle: u8) -> &'static str {
         }
         ModelId::Rap => "f000-f021 most cycles, f000-f051 at 03/09/15/21z",
         ModelId::Nam => "hourly <=36, 3-hourly 39-84",
+        ModelId::Rtma | ModelId::Urma => "hourly cycles, analysis only (f000)",
         _ => "",
     }
 }
@@ -951,6 +952,15 @@ fn normalize_download_spec(mut spec: DownloadSpec) -> DownloadSpec {
     let Ok(model) = spec.model.parse::<rustwx_core::ModelId>() else {
         return spec;
     };
+    let capability = rw_ingest::model_ingest_capability(model);
+    if capability
+        .limitations
+        .contains(&rw_ingest::IngestCapabilityLimitation::SurfaceOnly)
+    {
+        spec.profile = "analysis".to_string();
+        spec.derived = false;
+        spec.heavy = false;
+    }
     if let Some(hours) = normalize_hour_spec_for_model(model, spec.cycle, &spec.hours) {
         spec.hours = hours;
     }
@@ -1606,6 +1616,10 @@ impl App {
             }
             "view" => {
                 spec.derived = true;
+                spec.heavy = false;
+            }
+            "analysis" => {
+                spec.derived = false;
                 spec.heavy = false;
             }
             _ => {}
@@ -3625,7 +3639,7 @@ mod tests {
     #[test]
     fn persist_roundtrip_both_fields() {
         let original = PersistedPaths {
-            store_root: Some("C:\\Users\\drew\\store".to_string()),
+            store_root: Some("C:\\Users\\alice\\store".to_string()),
             cache_dir: Some("out/cache".to_string()),
         };
         let json = serialize_persisted(&original);
@@ -3658,7 +3672,7 @@ mod tests {
     #[test]
     fn persist_roundtrip_windows_backslash_path() {
         let original = PersistedPaths {
-            store_root: Some("C:\\Users\\drew\\rw\\store".to_string()),
+            store_root: Some("C:\\Users\\alice\\rw\\store".to_string()),
             cache_dir: Some("C:\\Temp\\cache".to_string()),
         };
         let json = serialize_persisted(&original);
@@ -3843,6 +3857,12 @@ mod tests {
             nam.contains("36") && nam.contains("39-84"),
             "NAM cadence note must mention the hourly/3-hourly split, got: {nam}"
         );
+
+        let rtma = cadence_hint(rustwx_core::ModelId::Rtma, 17);
+        assert!(
+            rtma.contains("analysis") && rtma.contains("f000"),
+            "RTMA cadence note must identify the analysis-only lead, got: {rtma}"
+        );
     }
 
     #[test]
@@ -3865,6 +3885,21 @@ mod tests {
             None,
             "a direct invalid hour should stay invalid and surface validation"
         );
+    }
+
+    #[test]
+    fn surface_only_model_normalization_selects_analysis_profile_and_f000() {
+        let normalized = normalize_download_spec(DownloadSpec {
+            model: "rtma".to_string(),
+            hours: "0-6".to_string(),
+            profile: "sounding".to_string(),
+            derived: true,
+            heavy: true,
+            ..DownloadSpec::default()
+        });
+        assert_eq!(normalized.profile, "analysis");
+        assert_eq!(normalized.hours, "0");
+        assert!(!normalized.derived && !normalized.heavy);
     }
 
     #[test]

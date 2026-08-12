@@ -6,7 +6,7 @@
 //! A profile is the customization surface for model-data packs: volumes
 //! (the 3D isobaric variables), the isobaric level step (25 or 50 hPa),
 //! the 2D surface field set (everything, or a named subset), and the two
-//! compute stages (derived, heavy). Three named presets exist:
+//! compute stages (derived, heavy). Five named presets exist:
 //!
 //! * `full` — today's default ingest, unchanged: all 5 volumes at 25 hPa
 //!   steps, every 2D field (surface set + trailing 1 h windows + vorticity
@@ -16,6 +16,12 @@
 //!   the render-grade 2D planes.
 //! * `view` — the 2D map pack: every 2D field including the derived grids,
 //!   NO volumes, no heavy.
+//! * `surface` - every directly published 2D field, with no pressure-volume
+//!   or derived/heavy dependency. This is the complete native pack for a
+//!   surface-only forecast product.
+//! * `analysis` - the narrow surface-analysis pack: only fields published by
+//!   the RTMA/URMA `2dvaranl_ndfd` product, with no pressure volumes or
+//!   derived/heavy stages.
 //!
 //! Validation happens HERE, not mid-ingest: the derived/heavy stages decode
 //! their thermo inputs from the full surface + pressure files, so a profile
@@ -110,6 +116,22 @@ pub const SOUNDING_SURFACE_FIELDS: [&str; 7] = [
     "orography",
 ];
 
+/// Surface fields published by the CONUS RTMA/URMA `2dvaranl_ndfd`
+/// analysis. This deliberately excludes fields absent from the product
+/// (MSLP, precipitation, reflectivity, pressure-level data) so selecting the
+/// preset can never manufacture or imply unsupported data.
+pub const ANALYSIS_SURFACE_FIELDS: [&str; 9] = [
+    "temperature_2m",
+    "dewpoint_2m",
+    "u_10m",
+    "v_10m",
+    "wind_gust_10m",
+    "surface_pressure",
+    "orography",
+    "cloud_cover_total",
+    "visibility",
+];
+
 impl IngestProfile {
     /// Today's default ingest, unchanged: everything, both compute stages.
     pub fn full() -> Self {
@@ -151,14 +173,53 @@ impl IngestProfile {
         }
     }
 
+    /// Complete direct-field pack for surface-only forecast products. A named
+    /// set deliberately avoids the pressure-sourced planes attached to
+    /// `FieldSet::All`, while retaining every surface selector the product can
+    /// actually realize (partial extraction skips absent selectors honestly).
+    pub fn surface() -> Self {
+        Self {
+            volumes: Vec::new(),
+            level_step_hpa: 25,
+            surface_fields: FieldSet::Named(
+                surface_plan()
+                    .into_iter()
+                    .map(|(name, _)| name.to_string())
+                    .collect(),
+            ),
+            derived: false,
+            heavy: false,
+        }
+    }
+
+    /// Surface-only analysis pack for products such as RTMA/URMA
+    /// `2dvaranl_ndfd`: no pressure volumes and no compute stages whose
+    /// inputs require a pressure product.
+    pub fn analysis() -> Self {
+        Self {
+            volumes: Vec::new(),
+            level_step_hpa: 25,
+            surface_fields: FieldSet::Named(
+                ANALYSIS_SURFACE_FIELDS
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+            ),
+            derived: false,
+            heavy: false,
+        }
+    }
+
     /// Preset lookup by CLI name.
     pub fn preset(name: &str) -> Result<Self, String> {
         match name {
             "full" => Ok(Self::full()),
             "sounding" => Ok(Self::sounding()),
             "view" => Ok(Self::view()),
+            "surface" => Ok(Self::surface()),
+            "analysis" => Ok(Self::analysis()),
             other => Err(format!(
-                "--profile: unknown preset '{other}' (expected full, sounding, or view)"
+                "--profile: unknown preset '{other}' (expected full, sounding, view, surface, or analysis)"
             )),
         }
     }
@@ -500,6 +561,43 @@ mod tests {
     }
 
     #[test]
+    fn analysis_preset_is_surface_only_and_needs_no_pressure_product() {
+        let analysis = IngestProfile::analysis();
+        assert!(analysis.volumes.is_empty());
+        assert!(!analysis.includes_full_2d());
+        assert!(!analysis.derived && !analysis.heavy);
+        assert!(!analysis.needs_prs());
+        for name in ANALYSIS_SURFACE_FIELDS {
+            assert!(
+                analysis.includes_surface_field(name),
+                "analysis must include '{name}'"
+            );
+        }
+        assert!(!analysis.includes_surface_field("mslp"));
+        assert!(!analysis.includes_surface_field("apcp_run_total"));
+        analysis.validate().expect("analysis preset validates");
+    }
+
+    #[test]
+    fn surface_preset_keeps_every_direct_surface_selector_without_pressure() {
+        let surface = IngestProfile::surface();
+        assert!(surface.volumes.is_empty());
+        assert!(!surface.includes_full_2d());
+        assert!(!surface.derived && !surface.heavy);
+        assert!(!surface.needs_prs());
+        assert_eq!(
+            surface.surface_fields,
+            FieldSet::Named(
+                surface_plan()
+                    .into_iter()
+                    .map(|(name, _)| name.to_string())
+                    .collect()
+            )
+        );
+        surface.validate().expect("surface preset validates");
+    }
+
+    #[test]
     fn every_sounding_surface_field_is_a_known_plan_name() {
         let plan = surface_plan();
         for name in SOUNDING_SURFACE_FIELDS {
@@ -668,6 +766,10 @@ mod tests {
         assert_eq!(
             IngestProfile::view().describe(),
             "no volumes, all 2D fields, derived on, heavy off"
+        );
+        assert_eq!(
+            IngestProfile::analysis().describe(),
+            "no volumes, 9 named surface field(s), derived off, heavy off"
         );
         let mut sounding = IngestProfile::sounding();
         sounding.level_step_hpa = 50;

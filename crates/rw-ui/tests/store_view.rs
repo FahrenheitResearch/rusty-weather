@@ -578,9 +578,9 @@ fn reader_pool_can_be_disabled_and_one_shot_opens_bypass_it() {
 /// flip it. Run with:
 /// `cargo test -p rw-ui real_hrrr -- --ignored --nocapture`
 #[test]
-#[ignore = "requires the real store at C:/Users/drew/rusty-weather/store"]
+#[ignore = "requires a real store at C:/weather-data/rusty-weather/store"]
 fn real_hrrr_store_field_is_north_to_south() {
-    let view = StoreView::new("C:/Users/drew/rusty-weather/store");
+    let view = StoreView::new("C:/weather-data/rusty-weather/store");
     let worker = StoreWorker::spawn(view, || {});
     let field_key = FieldKey {
         hour: HourKey {

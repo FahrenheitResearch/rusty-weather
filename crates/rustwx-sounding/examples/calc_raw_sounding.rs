@@ -9,13 +9,13 @@ const KTS_TO_MS: f64 = 0.514_444_444_444_444_5;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let input = env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(r"C:\Users\drew\Downloads\sounding_20110427-200600_lat32.98_lon-88.59.txt")
+        PathBuf::from(r"C:\weather-data\sounding_20110427-200600_lat32.98_lon-88.59.txt")
     });
     let text = fs::read_to_string(&input)?;
     let column = parse_sounding(&text)?;
     let sounding = NativeSounding::from_column(&column)?;
 
-    let out_dir = PathBuf::from(r"C:\Users\drew\Downloads");
+    let out_dir = PathBuf::from(r"C:\weather-data");
     fs::create_dir_all(&out_dir)?;
     let png_path = out_dir.join("sounding_20110427_200600_lat32.98_lon-88.59_rustwx.png");
     sounding.write_full_png(&png_path)?;

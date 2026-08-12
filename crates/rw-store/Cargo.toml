@@ -18,3 +18,9 @@ sha2 = "0.10"
 thiserror.workspace = true
 zstd = "0.13"
 rustwx-core = { path = "../rustwx-core" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_WindowsProgramming",
+] }

@@ -1,0 +1,35 @@
+<service>
+  <id>rusty-weather</id>
+  <name>Rusty Weather</name>
+  <description>Self-hosted weather data and analytics service.</description>
+
+  <executable>%BASE%\rw-server.exe</executable>
+  <arguments>--config &quot;%BASE%\rusty-weather.toml&quot; serve</arguments>
+  <workingdirectory>%BASE%</workingdirectory>
+
+  <env name="RW_LISTEN" value="127.0.0.1:8788" />
+  <env name="RW_STORE_ROOT" value="%BASE%\data\store" />
+  <env name="RW_ARTIFACT_ROOT" value="%BASE%\data\artifacts" />
+  <env name="RW_API_TOKEN_FILE" value="%BASE%\secrets\api-tokens.txt" />
+  <env name="RW_LOG" value="rw_server=info,tower_http=info" />
+
+  <serviceaccount>
+    <username>NT AUTHORITY\NetworkService</username>
+  </serviceaccount>
+
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+  <stoptimeout>30sec</stoptimeout>
+  <onfailure action="restart" delay="10 sec" />
+  <onfailure action="restart" delay="30 sec" />
+  <resetfailure>1 hour</resetfailure>
+  <hidewindow>true</hidewindow>
+  <logpath>%BASE%\logs</logpath>
+  <log mode="roll-by-size-time">
+    <sizeThreshold>10485760</sizeThreshold>
+    <pattern>yyyyMMdd</pattern>
+    <autoRollAtTime>00:00:00</autoRollAtTime>
+    <zipOlderThanNumDays>7</zipOlderThanNumDays>
+    <zipDateFormat>yyyyMM</zipDateFormat>
+  </log>
+</service>

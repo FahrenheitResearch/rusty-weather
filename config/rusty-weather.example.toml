@@ -1,0 +1,44 @@
+# RW_* environment variables override this file. --config or RW_CONFIG selects it.
+
+[server]
+listen = "127.0.0.1:8788"
+store_root = "./store"
+artifact_root = "./artifacts"
+allow_unauthenticated_public_bind = false
+cors_origins = []
+
+[auth]
+# Prefer RW_API_TOKEN_FILE in production. The file contains one token per line
+# and must be readable only by the service account.
+# token_file = "/etc/rusty-weather/api-tokens.txt"
+protect_metrics = true
+
+[limits]
+request_body_bytes = 2097152
+variables_per_query = 32
+points_per_query = 100
+sync_result_values = 2000000
+json_grid_values = 250000
+# Async temporal jobs use independent budgets. These defaults cover HRRR's
+# 1799x1059 native domain, including the 13-value vector-summary result.
+temporal_reduction_cells = 4000000
+temporal_output_values = 32000000
+catalog_time_points = 10000
+temporal_frames = 120
+light_concurrency = 32
+heavy_concurrency = 2
+queued_jobs = 64
+job_history_records = 10000
+sync_timeout_seconds = 10
+job_timeout_seconds = 300
+job_retention_seconds = 604800
+job_result_bytes = 536870912
+reader_cache_bytes = 268435456
+response_cache_bytes = 134217728
+
+[catalog]
+response_cache_seconds = 300
+
+[logging]
+filter = "rw_server=info,tower_http=info"
+format = "json"

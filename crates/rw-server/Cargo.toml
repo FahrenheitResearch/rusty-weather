@@ -1,0 +1,42 @@
+[package]
+name = "rw-server"
+version = "0.5.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Hardened self-hosted HTTP service for Rusty Weather stores and analytics"
+
+[dependencies]
+axum = { version = "0.8.9", features = ["json", "macros", "query", "tokio"] }
+blake3 = "1.8.6"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+chrono-tz = { version = "0.10.4", features = ["serde"] }
+clap = { workspace = true, features = ["env"] }
+http = "1.5.0"
+moka = { version = "0.12.16", features = ["sync"] }
+prometheus-client = "0.25.0"
+rw-ingest = { path = "../rw-ingest" }
+rw-query = { path = "../rw-query" }
+rw-store = { path = "../rw-store" }
+rustwx-core = { path = "../rustwx-core" }
+rustwx-models = { path = "../rustwx-models" }
+schemars = "1.2.2"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+subtle = "2.6.1"
+thiserror.workspace = true
+tokio = { version = "1.53.1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8.23"
+tower = { version = "0.5.3", features = ["limit", "load-shed", "timeout", "util"] }
+tower-http = { version = "0.7.0", features = ["catch-panic", "compression-gzip", "cors", "fs", "limit", "request-id", "sensitive-headers", "set-header", "timeout", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+utoipa = { version = "5.5.0", features = ["axum_extras", "chrono", "uuid"] }
+uuid = { version = "1.20.0", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5.3", features = ["util"] }

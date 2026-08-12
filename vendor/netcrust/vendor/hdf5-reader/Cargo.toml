@@ -67,7 +67,7 @@ features = ["rust_backend"]
 default-features = false
 
 [dependencies.lru]
-version = "0.16.3"
+version = "0.18.2"
 
 [dependencies.lz4_flex]
 version = "0.11"

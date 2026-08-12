@@ -1,0 +1,31 @@
+<service>
+  <id>rusty-weather-scheduler</id>
+  <name>Rusty Weather Scheduler</name>
+  <description>Durable weather-model ingest scheduler.</description>
+
+  <executable>%BASE%\rw-scheduler.exe</executable>
+  <arguments>--config &quot;%BASE%\rusty-weather-scheduler.toml&quot; daemon</arguments>
+  <workingdirectory>%BASE%</workingdirectory>
+
+  <env name="RW_LOG" value="rw_scheduler=info,rw_ingest=info" />
+
+  <serviceaccount>
+    <username>NT AUTHORITY\LocalService</username>
+  </serviceaccount>
+
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+  <stoptimeout>120sec</stoptimeout>
+  <onfailure action="restart" delay="15 sec" />
+  <onfailure action="restart" delay="60 sec" />
+  <resetfailure>1 hour</resetfailure>
+  <hidewindow>true</hidewindow>
+  <logpath>%BASE%\logs\scheduler</logpath>
+  <log mode="roll-by-size-time">
+    <sizeThreshold>10485760</sizeThreshold>
+    <pattern>yyyyMMdd</pattern>
+    <autoRollAtTime>00:00:00</autoRollAtTime>
+    <zipOlderThanNumDays>7</zipOlderThanNumDays>
+    <zipDateFormat>yyyyMM</zipDateFormat>
+  </log>
+</service>

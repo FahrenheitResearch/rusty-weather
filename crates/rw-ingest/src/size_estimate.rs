@@ -817,10 +817,15 @@ pub fn estimate(
     // historical rule).  Unknown/unsupported models fall back to the HRRR
     // rule so callers can still get a rough estimate.
     let per_hour_download_bytes = match fetch_plan(model).ok().as_deref() {
-        Some([_single]) => {
-            // One physical file covers both roles. The calibration's
-            // prs_file_bytes slot carries that single-product download size.
-            calibration.prs_file_bytes
+        Some([single]) => {
+            // One physical file: dual-role forecast products are calibrated
+            // in the prs slot; explicitly surface-only analyses use the sfc
+            // slot and must not be priced as a pressure download.
+            if single.pressure_source {
+                calibration.prs_file_bytes
+            } else {
+                calibration.sfc_file_bytes
+            }
         }
         _ => {
             // Two-entry (prs + sfc) or unknown plan: legacy HRRR logic.
@@ -1221,6 +1226,16 @@ mod tests {
         let unknown = calibration.lookup_2d("some_future_variable");
         let builtin_mean = mean(BUILTIN_BYTES_2D.iter().map(|(_, b)| *b)).unwrap();
         assert_eq!(unknown, builtin_mean);
+    }
+
+    #[test]
+    fn surface_only_analysis_prices_the_surface_file_slot() {
+        let mut calibration = Calibration::builtin_default();
+        calibration.prs_file_bytes = 400_000;
+        calibration.sfc_file_bytes = 150_000;
+        let estimate = estimate(&IngestProfile::analysis(), ModelId::Rtma, 2, &calibration);
+        assert_eq!(estimate.per_hour_download_bytes, 150_000);
+        assert_eq!(estimate.download_bytes, 300_000);
     }
 
     // ─── GFS calibration tests ──────────────────────────────────────────────

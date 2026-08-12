@@ -27,7 +27,7 @@ pub struct DownloadSpec {
     pub cycle: u8,
     /// Forecast hours in the `parse_hours` grammar: "7", "0-6", "0,3,6".
     pub hours: String,
-    /// Profile preset name: full | sounding | view.
+    /// Profile preset name: full | sounding | view | analysis.
     pub profile: String,
     /// Isobaric level step (25 or 50 hPa).
     pub level_step_hpa: u16,
@@ -567,7 +567,7 @@ impl DownloadPanel {
                 .selected_text(&self.spec.profile)
                 .width(100.0)
                 .show_ui(ui, |ui| {
-                    for preset in ["full", "sounding", "view"] {
+                    for preset in ["full", "sounding", "view", "analysis"] {
                         ui.selectable_value(&mut self.spec.profile, preset.to_string(), preset);
                     }
                 });
@@ -576,8 +576,8 @@ impl DownloadPanel {
                 // lands on a valid combination.  `heavy` is ONLY turned OFF
                 // automatically (safe direction); it is NEVER turned ON
                 // automatically — the user must opt in via the checkbox.
-                self.spec.derived = self.spec.profile != "sounding";
-                if self.spec.profile == "sounding" || self.spec.profile == "view" {
+                self.spec.derived = !matches!(self.spec.profile.as_str(), "sounding" | "analysis");
+                if matches!(self.spec.profile.as_str(), "sounding" | "view" | "analysis") {
                     self.spec.heavy = false;
                 }
             }
@@ -593,8 +593,15 @@ impl DownloadPanel {
                         );
                     }
                 });
-            ui.checkbox(&mut self.spec.derived, "derived");
-            ui.checkbox(&mut self.spec.heavy, "heavy");
+            let compute_enabled = self.spec.profile != "analysis";
+            ui.add_enabled(
+                compute_enabled,
+                egui::Checkbox::new(&mut self.spec.derived, "derived"),
+            );
+            ui.add_enabled(
+                compute_enabled,
+                egui::Checkbox::new(&mut self.spec.heavy, "heavy"),
+            );
             if self.spec.heavy {
                 ui.label(
                     RichText::new("ECAPE: saturates all cores for ≈1-1.5 min per hour")

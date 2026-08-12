@@ -1,8 +1,13 @@
 # rusty-weather — design
 
 **Date:** 2026-06-09
-**Status:** approved direction, pre-implementation
-**Source repo:** rustwx, branch `review/grib-wxa-fast-plots-20260605` (worktree at `C:\Users\drew\rustwx-fastplots-wt`)
+**Status:** historical pre-implementation design; superseded by
+[`../../SERVICE_V1.md`](../../SERVICE_V1.md),
+[`../../MODEL_SUPPORT.md`](../../MODEL_SUPPORT.md), and
+[`../../REDUCTIONS.md`](../../REDUCTIONS.md)
+**Source lineage:** extracted from the historical rustwx fast-plots work; see
+the repository history and vendored-component provenance records for immutable
+source identities.
 
 ## Why this exists
 

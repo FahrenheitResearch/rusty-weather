@@ -5,6 +5,7 @@
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=RW_BUILD_SHA");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     // HEAD alone goes stale: same-branch commits rewrite the ref file (not
     // HEAD), so also watch the ref HEAD points at, plus the index so
@@ -20,6 +21,9 @@ fn main() {
 }
 
 fn build_sha() -> Option<String> {
+    if let Some(explicit) = explicit_build_sha() {
+        return Some(explicit);
+    }
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
     let rev = Command::new("git")
         .args(["rev-parse", "--short=12", "HEAD"])
@@ -45,4 +49,10 @@ fn build_sha() -> Option<String> {
         sha.push_str("-dirty");
     }
     Some(sha)
+}
+
+fn explicit_build_sha() -> Option<String> {
+    let value = std::env::var("RW_BUILD_SHA").ok()?;
+    let value = value.trim();
+    (!value.is_empty() && value != "unknown").then(|| value.to_string())
 }

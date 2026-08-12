@@ -1333,6 +1333,7 @@ mod tests {
                             written_unix: 0,
                             encode_ms: 0,
                             variables: Vec::new(),
+                            source_provenance: Vec::new(),
                         },
                     )
                 })

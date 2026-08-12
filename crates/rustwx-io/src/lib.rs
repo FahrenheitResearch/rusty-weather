@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use wx_core::download::client::MAX_BODY_SIZE;
 use wx_core::download::{DownloadClient, byte_ranges, find_entries, parse_idx};
 
 const FETCH_CACHE_LOCK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
@@ -1278,6 +1279,15 @@ impl ParsedModelGrib {
                 }
             }
         }
+        if self.model == ModelId::Aifs {
+            synthesize_aifs_dewpoint_values(
+                &self.grib,
+                &mut extracted,
+                &mut missing,
+                &mut grid_memo,
+                forecast_hour,
+            )?;
+        }
         if self.model == ModelId::Nbm {
             synthesize_nbm_10m_wind_component_values_from_speed_direction(
                 &self.grib,
@@ -1326,6 +1336,9 @@ pub fn extract_fields_partial_from_model_bytes_at_forecast_hour(
             } else {
                 extract_fields_from_grib2_partial(&grib, selectors)?
             };
+            if model == ModelId::Aifs {
+                synthesize_aifs_dewpoint_fields(&grib, &mut partial, forecast_hour)?;
+            }
             if model == ModelId::Nbm {
                 synthesize_nbm_10m_wind_components_from_speed_direction(&grib, &mut partial)?;
             }
@@ -1526,6 +1539,109 @@ fn synthesize_nbm_10m_wind_components_from_speed_direction(
     Ok(())
 }
 
+fn synthesize_aifs_dewpoint_values(
+    grib: &Grib2File,
+    extracted: &mut Vec<ExtractedFieldValues>,
+    missing: &mut Vec<FieldSelector>,
+    grid_memo: &mut GridMemo,
+    forecast_hour: Option<u16>,
+) -> Result<(), IoError> {
+    let candidates = missing.clone();
+    let mut synthesized = Vec::new();
+    for selector in candidates {
+        let VerticalSelector::IsobaricHpa(level_hpa) = selector.vertical else {
+            continue;
+        };
+        if selector.field != CanonicalField::Dewpoint {
+            continue;
+        }
+        let Some(message) = aifs_specific_humidity_message(grib, selector, forecast_hour) else {
+            continue;
+        };
+        let mut field = build_field_values(message, selector, "K", grid_memo)?;
+        for value in &mut field.values {
+            *value = dewpoint_k_from_specific_humidity(*value, level_hpa);
+        }
+        extracted.push(field);
+        synthesized.push(selector);
+    }
+    missing.retain(|selector| !synthesized.contains(selector));
+    Ok(())
+}
+
+fn synthesize_aifs_dewpoint_fields(
+    grib: &Grib2File,
+    partial: &mut PartialExtraction,
+    forecast_hour: Option<u16>,
+) -> Result<(), IoError> {
+    let candidates = partial.missing.clone();
+    let mut synthesized = Vec::new();
+    let mut grid_memo = GridMemo::new();
+    for selector in candidates {
+        let VerticalSelector::IsobaricHpa(level_hpa) = selector.vertical else {
+            continue;
+        };
+        if selector.field != CanonicalField::Dewpoint {
+            continue;
+        }
+        let Some(message) = aifs_specific_humidity_message(grib, selector, forecast_hour) else {
+            continue;
+        };
+        let mut field = build_selected_field(message, selector, "K", &mut grid_memo)?;
+        for value in &mut field.values {
+            *value = dewpoint_k_from_specific_humidity(*value, level_hpa);
+        }
+        partial.extracted.push(field);
+        synthesized.push(selector);
+    }
+    partial
+        .missing
+        .retain(|selector| !synthesized.contains(selector));
+    Ok(())
+}
+
+fn aifs_specific_humidity_message<'a>(
+    grib: &'a Grib2File,
+    dewpoint_selector: FieldSelector,
+    forecast_hour: Option<u16>,
+) -> Option<&'a Grib2Message> {
+    let VerticalSelector::IsobaricHpa(level_hpa) = dewpoint_selector.vertical else {
+        return None;
+    };
+    let prepared = [PreparedSelector {
+        selector: dewpoint_selector,
+        message: StructuredMessageSelector {
+            parameters: PARAMETER_SPECIFIC_HUMIDITY,
+            level: LevelMatch::IsobaricHpa(level_hpa),
+            units: "kg/kg",
+        },
+    }];
+    match_prepared_selectors(grib, &prepared, forecast_hour)
+        .into_iter()
+        .next()
+        .flatten()
+        .map(|(message, _)| message)
+}
+
+/// Convert pressure-level specific humidity to dewpoint using the standard
+/// mixing-ratio/vapor-pressure relation and Bolton saturation-vapor-pressure
+/// inversion. AIFS publishes `q`, not a direct pressure-level dewpoint field.
+fn dewpoint_k_from_specific_humidity(q_kgkg: f32, pressure_hpa: u16) -> f32 {
+    let q = f64::from(q_kgkg);
+    let pressure = f64::from(pressure_hpa);
+    if !q.is_finite() || !(0.0..1.0).contains(&q) || pressure <= 0.0 {
+        return f32::NAN;
+    }
+    let mixing_ratio = q / (1.0 - q);
+    let vapor_pressure_hpa = (mixing_ratio * pressure / (0.622 + mixing_ratio)).max(1.0e-10);
+    let log_ratio = (vapor_pressure_hpa / 6.112).ln();
+    let denominator = 17.67 - log_ratio;
+    if !denominator.is_finite() || denominator.abs() < f64::EPSILON {
+        return f32::NAN;
+    }
+    (243.5 * log_ratio / denominator + 273.15) as f32
+}
+
 /// `ModelId::WrfGdex` is still a registered model (URL builders and recipes
 /// reference it), so the extraction dispatch needs this arm even though
 /// rusty-weather ships without the NetCDF/WRF decode path.
@@ -1680,13 +1796,27 @@ fn build_hybrid_level_volume(
 
 fn filtered_urls(fetch: &FetchRequest) -> Result<Vec<ResolvedUrl>, IoError> {
     let urls = resolve_urls(&fetch.request)?;
-    Ok(match fetch.source_override {
+    let urls = match fetch.source_override {
         Some(source) => urls
             .into_iter()
             .filter(|url| url.source == source)
             .collect(),
         None => urls,
-    })
+    };
+    Ok(prefer_subset_capable_sources(fetch, urls))
+}
+
+/// Prefer sources that can honor a message-subset request while preserving
+/// every registered source as a fallback. An explicit source override has
+/// already reduced `urls` to one entry and therefore remains untouched.
+fn prefer_subset_capable_sources(fetch: &FetchRequest, urls: Vec<ResolvedUrl>) -> Vec<ResolvedUrl> {
+    if fetch.variable_patterns.is_empty() || urls.len() < 2 {
+        return urls;
+    }
+    let (subset_capable, rest): (Vec<_>, Vec<_>) = urls
+        .into_iter()
+        .partition(|url| should_use_idx_subset_fetch(url.source));
+    subset_capable.into_iter().chain(rest).collect()
 }
 
 fn fetch_request_is_available(
@@ -1769,11 +1899,30 @@ fn maybe_decompress_grib_payload(url: &str, bytes: Vec<u8>) -> Result<Vec<u8>, S
         return Ok(bytes);
     }
 
-    let mut decoder = flate2::read::GzDecoder::new(bytes.as_slice());
+    decompress_gzip_payload_with_limit(url, &bytes, MAX_BODY_SIZE)
+}
+
+fn decompress_gzip_payload_with_limit(
+    url: &str,
+    bytes: &[u8],
+    max_output_size: u64,
+) -> Result<Vec<u8>, String> {
+    let read_limit = max_output_size
+        .checked_add(1)
+        .ok_or_else(|| format!("gzip decompress {url}: output limit overflow"))?;
+    let decoder = flate2::read::GzDecoder::new(bytes);
+    let mut bounded = decoder.take(read_limit);
     let mut decompressed = Vec::new();
-    decoder
+    bounded
         .read_to_end(&mut decompressed)
         .map_err(|err| format!("gzip decompress {url}: {err}"))?;
+    let decompressed_len = u64::try_from(decompressed.len())
+        .map_err(|_| format!("gzip decompress {url}: output length cannot be represented"))?;
+    if decompressed_len > max_output_size {
+        return Err(format!(
+            "gzip decompress {url}: expanded payload exceeds the {max_output_size} byte limit"
+        ));
+    }
     Ok(decompressed)
 }
 
@@ -1784,19 +1933,73 @@ fn should_use_parallel_whole_file_fetch(source: SourceId) -> bool {
 fn should_use_idx_subset_fetch(source: SourceId) -> bool {
     // NOMADS production fetches full GRIB files. The .idx sidecar is allowed
     // for availability probes only, not product subsetting.
-    matches!(source, SourceId::Aws | SourceId::Google)
+    matches!(source, SourceId::Aws | SourceId::Google | SourceId::Ecmwf)
+}
+
+/// Pattern-list directive that excludes probabilistic companions sharing a
+/// deterministic field's variable and level. Keeping the directive in the
+/// pattern list also makes it part of the existing fetch-cache key.
+pub const IDX_DETERMINISTIC_ONLY: &str = "!deterministic";
+
+fn probabilistic_idx_offsets(idx_text: &str) -> HashSet<u64> {
+    let mut offsets = HashSet::new();
+    for line in idx_text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(8, ':').collect();
+        if parts.len() < 7 {
+            continue;
+        }
+        let Ok(offset) = parts[1].parse::<u64>() else {
+            continue;
+        };
+        let tail = parts[6..].join(":").to_ascii_lowercase();
+        let probabilistic = tail.contains("% level")
+            || tail.contains("prob ")
+            || tail.contains("ens std dev")
+            || tail.contains("ens spread");
+        if probabilistic {
+            offsets.insert(offset);
+        }
+    }
+    offsets
 }
 
 fn idx_subset_ranges(idx_text: &str, patterns: &[&str]) -> Result<Option<Vec<(u64, u64)>>, String> {
+    // ECMWF Open Data uses newline-delimited JSON `.index` companions with
+    // explicit `_offset`/`_length` values. Keep its exact-match query
+    // grammar separate from NOAA's colon-delimited substring index so a NOAA
+    // pattern can never accidentally select an unrelated ECMWF parameter.
+    if idx_text.trim_start().starts_with('{') {
+        return ecmwf_index_subset_ranges(idx_text, patterns);
+    }
+
     let entries = parse_idx(idx_text);
     if entries.is_empty() {
         return Ok(None);
     }
 
+    let deterministic_only = patterns
+        .iter()
+        .any(|pattern| pattern.trim() == IDX_DETERMINISTIC_ONLY);
+    let skip = if deterministic_only {
+        probabilistic_idx_offsets(idx_text)
+    } else {
+        HashSet::new()
+    };
+
     let mut selected = Vec::new();
     let mut seen_offsets = HashSet::new();
     for pattern in patterns {
+        if pattern.trim() == IDX_DETERMINISTIC_ONLY {
+            continue;
+        }
         for entry in find_entries(&entries, pattern) {
+            if skip.contains(&entry.byte_offset) {
+                continue;
+            }
             if seen_offsets.insert(entry.byte_offset) {
                 selected.push(entry);
             }
@@ -1809,6 +2012,77 @@ fn idx_subset_ranges(idx_text: &str, patterns: &[&str]) -> Result<Option<Vec<(u6
     Ok(Some(coalesce_contiguous_ranges(byte_ranges(
         &entries, &selected,
     ))))
+}
+
+#[derive(serde::Deserialize)]
+struct EcmwfIndexEntry {
+    param: String,
+    levtype: String,
+    #[serde(default)]
+    levelist: Option<String>,
+    #[serde(rename = "_offset")]
+    offset: u64,
+    #[serde(rename = "_length")]
+    length: u64,
+}
+
+/// Select ranges from ECMWF's line-delimited JSON index.
+///
+/// Patterns are exact `key=value` predicates for `param`, `levtype`, or
+/// `levelist`. The AIFS ingest plan uses exact `param=...` predicates.
+/// Returning `None` for another grammar deliberately falls back to a whole
+/// file fetch instead of guessing from provider metadata.
+fn ecmwf_index_subset_ranges(
+    idx_text: &str,
+    patterns: &[&str],
+) -> Result<Option<Vec<(u64, u64)>>, String> {
+    let predicates = patterns
+        .iter()
+        .map(|pattern| pattern.trim().split_once('='))
+        .collect::<Option<Vec<_>>>();
+    let Some(predicates) = predicates else {
+        return Ok(None);
+    };
+    if predicates
+        .iter()
+        .any(|(key, _)| !matches!(*key, "param" | "levtype" | "levelist"))
+    {
+        return Ok(None);
+    }
+
+    let mut ranges = Vec::new();
+    for (line_number, line) in idx_text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: EcmwfIndexEntry = serde_json::from_str(line).map_err(|err| {
+            format!(
+                "ECMWF JSON index line {} is invalid: {err}",
+                line_number + 1
+            )
+        })?;
+        let selected = predicates.iter().any(|(key, expected)| match *key {
+            "param" => entry.param == *expected,
+            "levtype" => entry.levtype == *expected,
+            "levelist" => entry.levelist.as_deref() == Some(*expected),
+            _ => false,
+        });
+        if !selected || entry.length == 0 {
+            continue;
+        }
+        let end = entry.offset.checked_add(entry.length - 1).ok_or_else(|| {
+            format!(
+                "ECMWF JSON index range overflow at offset {} length {}",
+                entry.offset, entry.length
+            )
+        })?;
+        ranges.push((entry.offset, end));
+    }
+    if ranges.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(coalesce_contiguous_ranges(ranges)))
 }
 
 fn coalesce_contiguous_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
@@ -1893,6 +2167,11 @@ const PARAMETER_DPT: &[ParameterCode] = &[ParameterCode {
     category: 0,
     number: 6,
 }];
+const PARAMETER_SPECIFIC_HUMIDITY: &[ParameterCode] = &[ParameterCode {
+    discipline: 0,
+    category: 1,
+    number: 0,
+}];
 const PARAMETER_RH: &[ParameterCode] = &[ParameterCode {
     discipline: 0,
     category: 1,
@@ -1903,11 +2182,20 @@ const PARAMETER_PWAT: &[ParameterCode] = &[ParameterCode {
     category: 1,
     number: 3,
 }];
-const PARAMETER_TOTAL_PRECIPITATION: &[ParameterCode] = &[ParameterCode {
-    discipline: 0,
-    category: 1,
-    number: 8,
-}];
+const PARAMETER_TOTAL_PRECIPITATION: &[ParameterCode] = &[
+    ParameterCode {
+        discipline: 0,
+        category: 1,
+        number: 8,
+    },
+    // ECMWF AIFS Single v2 open data uses the WMO total-precipitation code
+    // 0/1/52 (units kg m^-2).
+    ParameterCode {
+        discipline: 0,
+        category: 1,
+        number: 52,
+    },
+];
 const PARAMETER_PROBABILITY_OF_PRECIPITATION: &[ParameterCode] = PARAMETER_TOTAL_PRECIPITATION;
 const PARAMETER_CATEGORICAL_RAIN: &[ParameterCode] = &[
     ParameterCode {

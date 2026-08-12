@@ -337,6 +337,7 @@ pub fn write_band_frame(
             variables: vec![variable.clone()],
             lead_seconds: None,
             valid_unix: None,
+            source_provenance: Vec::new(),
         },
     );
     manifest.save(&manifest_path)?;
@@ -434,6 +435,7 @@ pub fn write_satellite_grid_frame(
             variables: vec![variable.clone()],
             lead_seconds: None,
             valid_unix: None,
+            source_provenance: Vec::new(),
         },
     );
     manifest.save(&manifest_path)?;

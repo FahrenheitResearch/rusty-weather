@@ -5,7 +5,7 @@ use rustwx_core::{
     ResolvedUrl, RustwxError, SourceId, StatisticalProcess, VerticalSelector,
 };
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, time::Duration};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProductFamily {
@@ -406,7 +406,10 @@ const GEFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const AI_MODEL_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const ECMWF_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const AIFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
-const AIFS_LOCAL_MAX_FORECAST_HOUR: u16 = 43_848;
+/// Public ECMWF AIFS Single v2 horizon. Local inference archives may carry
+/// longer experiment leads, but those are not part of the public model
+/// schedule returned by `supported_forecast_hours`.
+const AIFS_OPEN_DATA_MAX_FORECAST_HOUR: u16 = 360;
 const RAP_CYCLE_HOURS: &[u8] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
 ];
@@ -551,7 +554,10 @@ const ECMWF_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
 const AIFS_SOURCES: &[SourceDescriptor] = &[
     SourceDescriptor {
         id: SourceId::Ecmwf,
-        idx_available: false,
+        // ECMWF publishes a line-delimited JSON companion index by replacing
+        // `.grib2` with `.index`. `resolve_urls` handles that provider-specific
+        // suffix and rustwx-io uses the explicit offsets for range subsetting.
+        idx_available: true,
         priority: 1,
         max_age_hours: None,
         notes: "ECMWF AIFS Single v2 open-data GRIB2 feed",
@@ -596,21 +602,11 @@ const REFS_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
     notes: "NOAA REFS ensemble post-processing AWS bucket",
 }];
 
-const RRFS_FIREWX_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
-    id: SourceId::Aws,
-    idx_available: true,
-    priority: 1,
-    max_age_hours: None,
-    notes: "NOAA RRFS public fire-weather nest AWS bucket",
-}];
-
-const WRF_GDEX_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
-    id: SourceId::Gdex,
-    idx_available: false,
-    priority: 1,
-    max_age_hours: None,
-    notes: "UCAR GDEX THREDDS fileServer",
-}];
+// These identifiers remain readable for existing configs/stores, but neither
+// is a public remote acquisition lane. WRF is imported from user-provided
+// wrfout/NetCDF data. The old RRFS nested product is retained as a legacy
+// catalog identifier only.
+const NO_REMOTE_SOURCES: &[SourceDescriptor] = &[];
 
 const MODELS: &[ModelSummary] = &[
     ModelSummary {
@@ -705,10 +701,10 @@ const MODELS: &[ModelSummary] = &[
     },
     ModelSummary {
         id: ModelId::Aifs,
-        description: "ECMWF AIFS Single v2 open-data and Earth2Archive forecast",
+        description: "ECMWF AIFS Single v2 open-data 0.25 degree forecast",
         default_product: "oper",
         cycle_hours_utc: AIFS_CYCLE_HOURS,
-        max_forecast_hour: AIFS_LOCAL_MAX_FORECAST_HOUR,
+        max_forecast_hour: AIFS_OPEN_DATA_MAX_FORECAST_HOUR,
         sources: AIFS_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::Deterministic,
@@ -769,7 +765,7 @@ const MODELS: &[ModelSummary] = &[
         default_product: "2dvaranl_ndfd",
         cycle_hours_utc: HOURLY_ANALYSIS_CYCLE_HOURS,
         max_forecast_hour: 0,
-        sources: NOMADS_ONLY_SOURCES,
+        sources: NOMADS_AWS_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::Deterministic,
     },
@@ -779,7 +775,7 @@ const MODELS: &[ModelSummary] = &[
         default_product: "2dvaranl_ndfd",
         cycle_hours_utc: HOURLY_ANALYSIS_CYCLE_HOURS,
         max_forecast_hour: 0,
-        sources: NOMADS_ONLY_SOURCES,
+        sources: NOMADS_AWS_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::Deterministic,
     },
@@ -808,7 +804,7 @@ const MODELS: &[ModelSummary] = &[
         description: "RRFS public prototype 3 km CONUS deterministic forecast",
         default_product: "prs-conus",
         cycle_hours_utc: RRFS_PUBLIC_CYCLE_HOURS,
-        max_forecast_hour: 60,
+        max_forecast_hour: 84,
         sources: RRFS_PUBLIC_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::Deterministic,
@@ -825,21 +821,21 @@ const MODELS: &[ModelSummary] = &[
     },
     ModelSummary {
         id: ModelId::RrfsFireWx,
-        description: "RRFS public 1.5 km fire-weather nest deterministic forecast",
+        description: "Legacy RRFS nested-product identifier (no public acquisition lane)",
         default_product: "2dfld-firewx",
         cycle_hours_utc: RRFS_FIREWX_CYCLE_HOURS,
         max_forecast_hour: 36,
-        sources: RRFS_FIREWX_SOURCES,
+        sources: NO_REMOTE_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::Deterministic,
     },
     ModelSummary {
         id: ModelId::WrfGdex,
-        description: "WRF NetCDF/wrfout datasets; UCAR GDEX is one supported source",
+        description: "User-provided WRF NetCDF/wrfout local import",
         default_product: WRF_GDEX_DEFAULT_SURFACE_PRODUCT,
         cycle_hours_utc: WRF_GDEX_CYCLE_HOURS,
         max_forecast_hour: 0,
-        sources: WRF_GDEX_SOURCES,
+        sources: NO_REMOTE_SOURCES,
         runtime_family: ModelRuntimeFamily::WrfNetcdfArchive,
         ensemble_mode: EnsembleMode::Deterministic,
     },
@@ -5987,8 +5983,11 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
             6 | 18 => (0..=144).step_by(3).collect(),
             _ => Vec::new(),
         },
+        // ECMWF AIFS Single v2 runs four times daily, every six hours to
+        // 15 days. Do not expose experimental local-archive horizons as the
+        // public acquisition schedule.
         ModelId::Aifs => match cycle_hour_utc {
-            0 | 6 | 12 | 18 => (0..=AIFS_LOCAL_MAX_FORECAST_HOUR).step_by(6).collect(),
+            0 | 6 | 12 | 18 => (0..=AIFS_OPEN_DATA_MAX_FORECAST_HOUR).step_by(6).collect(),
             _ => Vec::new(),
         },
         ModelId::Rap => {
@@ -6003,16 +6002,51 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
             hours.extend((39..=84).step_by(3));
             hours
         }
-        ModelId::Hiresw => (0..=48).collect(),
-        ModelId::Href => (1..=48).collect(),
-        ModelId::Sref => (0..=87).step_by(3).collect(),
+        ModelId::Hiresw => {
+            if HIRESW_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=48).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ModelId::Href => {
+            if HREF_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (1..=48).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ModelId::Sref => {
+            if SREF_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=87).step_by(3).collect()
+            } else {
+                Vec::new()
+            }
+        }
         ModelId::Rtma | ModelId::Urma => vec![0],
-        ModelId::Nbm => (1..=264).collect(),
+        ModelId::Nbm => {
+            let mut hours = (1..=36).collect::<Vec<u16>>();
+            hours.extend((39..=192).step_by(3));
+            hours.extend((198..=264).step_by(6));
+            hours
+        }
         ModelId::RrfsA => (0..=60).collect(),
-        ModelId::RrfsPublic => (0..=60).collect(),
-        ModelId::Refs => (1..=60).collect(),
-        ModelId::RrfsFireWx => (0..=36).collect(),
-        ModelId::WrfGdex => (0..=23).collect(),
+        ModelId::RrfsPublic => {
+            if RRFS_PUBLIC_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                let max_hour = if cycle_hour_utc % 6 == 0 { 84 } else { 18 };
+                (0..=max_hour).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ModelId::Refs => {
+            if REFS_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (1..=60).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ModelId::RrfsFireWx | ModelId::WrfGdex => Vec::new(),
     }
 }
 
@@ -6140,7 +6174,7 @@ pub fn resolve_urls(request: &ModelRunRequest) -> Result<Vec<ResolvedUrl>, Model
                     continue;
                 }
                 let idx_url = if source.idx_available {
-                    Some(format!("{grib_url}.idx"))
+                    Some(companion_index_url(source.id, &grib_url))
                 } else {
                     None
                 };
@@ -6171,6 +6205,16 @@ pub fn resolve_urls(request: &ModelRunRequest) -> Result<Vec<ResolvedUrl>, Model
             .unwrap_or(u8::MAX)
     });
     Ok(urls)
+}
+
+fn companion_index_url(source: SourceId, grib_url: &str) -> String {
+    if source == SourceId::Ecmwf {
+        return grib_url
+            .strip_suffix(".grib2")
+            .map(|base| format!("{base}.index"))
+            .unwrap_or_else(|| format!("{grib_url}.index"));
+    }
+    format!("{grib_url}.idx")
 }
 
 pub fn latest_available_run(
@@ -6426,10 +6470,45 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderHttpTimeouts {
+    global: Duration,
+    per_call: Duration,
+    resolve: Duration,
+    connect: Duration,
+    send_request: Duration,
+    send_body: Duration,
+    recv_response: Duration,
+    recv_body: Duration,
+}
+
+const PROVIDER_HTTP_TIMEOUTS: ProviderHttpTimeouts = ProviderHttpTimeouts {
+    global: Duration::from_secs(8),
+    per_call: Duration::from_secs(6),
+    resolve: Duration::from_secs(2),
+    connect: Duration::from_secs(3),
+    send_request: Duration::from_secs(2),
+    send_body: Duration::from_secs(2),
+    recv_response: Duration::from_secs(4),
+    recv_body: Duration::from_secs(3),
+};
+
 fn build_agent() -> ureq::Agent {
-    rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider()).ok();
-    let crypto = std::sync::Arc::new(rustls_rustcrypto::provider());
+    build_agent_with_timeouts(PROVIDER_HTTP_TIMEOUTS)
+}
+
+fn build_agent_with_timeouts(timeouts: ProviderHttpTimeouts) -> ureq::Agent {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+    let crypto = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     ureq::Agent::config_builder()
+        .timeout_global(Some(timeouts.global))
+        .timeout_per_call(Some(timeouts.per_call))
+        .timeout_resolve(Some(timeouts.resolve))
+        .timeout_connect(Some(timeouts.connect))
+        .timeout_send_request(Some(timeouts.send_request))
+        .timeout_send_body(Some(timeouts.send_body))
+        .timeout_recv_response(Some(timeouts.recv_response))
+        .timeout_recv_body(Some(timeouts.recv_body))
         .tls_config(
             ureq::tls::TlsConfig::builder()
                 .provider(ureq::tls::TlsProvider::Rustls)
@@ -6941,17 +7020,6 @@ fn build_ecmwf_url(source: SourceId, request: &ModelRunRequest) -> Result<String
     ))
 }
 
-fn ecmwf_open_data_forecast_hour_supported(cycle_hour_utc: u8, forecast_hour: u16) -> bool {
-    match cycle_hour_utc {
-        0 | 12 => {
-            (forecast_hour <= 144 && forecast_hour % 3 == 0)
-                || (forecast_hour > 144 && forecast_hour <= 360 && forecast_hour % 6 == 0)
-        }
-        6 | 18 => forecast_hour <= 144 && forecast_hour % 3 == 0,
-        _ => false,
-    }
-}
-
 fn build_aifs_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
     match source {
         SourceId::AifsInference => Ok(format!(
@@ -6963,7 +7031,7 @@ fn build_aifs_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
             request.cycle.date_yyyymmdd, request.cycle.hour_utc, request.forecast_hour
         )),
         SourceId::Ecmwf => {
-            if !ecmwf_open_data_forecast_hour_supported(
+            if !aifs_open_data_forecast_hour_supported(
                 request.cycle.hour_utc,
                 request.forecast_hour,
             ) {
@@ -6971,7 +7039,7 @@ fn build_aifs_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
                     model: request.model,
                     cycle_hour: request.cycle.hour_utc,
                     forecast_hour: request.forecast_hour,
-                    reason: "AIFS-Single open data follows the ECMWF open-data step cadence; use aifs-inference for experimental multi-year AIFS NetCDF runs".to_string(),
+                    reason: "ECMWF AIFS Single v2 publishes 6-hourly steps from f000 through f360 on 00/06/12/18z cycles; local experiment archives are not part of this public acquisition lane".to_string(),
                 });
             }
             let stream = match normalize_token(&request.product).as_str() {
@@ -6998,6 +7066,12 @@ fn build_aifs_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         }
         other => Ok(unsupported_source(other, request.model)),
     }
+}
+
+fn aifs_open_data_forecast_hour_supported(cycle_hour_utc: u8, forecast_hour: u16) -> bool {
+    AIFS_CYCLE_HOURS.contains(&cycle_hour_utc)
+        && forecast_hour <= AIFS_OPEN_DATA_MAX_FORECAST_HOUR
+        && forecast_hour % 6 == 0
 }
 
 fn build_aigfs_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
@@ -7165,6 +7239,15 @@ fn build_hiresw_url(source: SourceId, request: &ModelRunRequest) -> Result<Strin
     if source != SourceId::Nomads {
         return Ok(unsupported_source(source, request.model));
     }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "HIRESW CONUS ARW runs at 00/12z with hourly output from f00 through f48"
+                .to_string(),
+        });
+    }
     let token = normalize_token(&request.product);
     let raw_core = token
         .split('/')
@@ -7251,6 +7334,15 @@ fn build_sref_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
     if source != SourceId::Nomads {
         return Ok(unsupported_source(source, request.model));
     }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "SREF runs at 03/09/15/21z with 3-hourly output from f00 through f87"
+                .to_string(),
+        });
+    }
     let token = normalize_token(&request.product);
     if token.starts_with("ensprod") || token.contains("mean") || token.contains("spread") {
         let grid = token
@@ -7315,8 +7407,13 @@ fn build_sref_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
 }
 
 fn build_rtma_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
-    if source != SourceId::Nomads {
-        return Ok(unsupported_source(source, request.model));
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "RTMA is an hourly analysis; only f000 is published".to_string(),
+        });
     }
     let product = match normalize_token(&request.product).as_str() {
         "2dvaranl_ndfd" | "anl" | "analysis" => "2dvaranl_ndfd",
@@ -7329,15 +7426,27 @@ fn build_rtma_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
             });
         }
     };
-    Ok(format!(
-        "https://nomads.ncep.noaa.gov/pub/data/nccf/com/rtma/prod/rtma2p5.{}/rtma2p5.t{:02}z.{}.grb2_wexp",
-        request.cycle.date_yyyymmdd, request.cycle.hour_utc, product
-    ))
+    Ok(match source {
+        SourceId::Nomads => format!(
+            "https://nomads.ncep.noaa.gov/pub/data/nccf/com/rtma/prod/rtma2p5.{}/rtma2p5.t{:02}z.{}.grb2_wexp",
+            request.cycle.date_yyyymmdd, request.cycle.hour_utc, product
+        ),
+        SourceId::Aws => format!(
+            "https://noaa-rtma-pds.s3.amazonaws.com/rtma2p5.{}/rtma2p5.t{:02}z.{}.grb2_wexp",
+            request.cycle.date_yyyymmdd, request.cycle.hour_utc, product
+        ),
+        other => unsupported_source(other, request.model),
+    })
 }
 
 fn build_urma_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
-    if source != SourceId::Nomads {
-        return Ok(unsupported_source(source, request.model));
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "URMA is an hourly analysis; only f000 is published".to_string(),
+        });
     }
     let product = match normalize_token(&request.product).as_str() {
         "2dvaranl_ndfd" | "anl" | "analysis" => "2dvaranl_ndfd",
@@ -7350,13 +7459,29 @@ fn build_urma_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
             });
         }
     };
-    Ok(format!(
-        "https://nomads.ncep.noaa.gov/pub/data/nccf/com/urma/prod/urma2p5.{}/urma2p5.t{:02}z.{}.grb2_wexp",
-        request.cycle.date_yyyymmdd, request.cycle.hour_utc, product
-    ))
+    Ok(match source {
+        SourceId::Nomads => format!(
+            "https://nomads.ncep.noaa.gov/pub/data/nccf/com/urma/prod/urma2p5.{}/urma2p5.t{:02}z.{}.grb2_wexp",
+            request.cycle.date_yyyymmdd, request.cycle.hour_utc, product
+        ),
+        SourceId::Aws => format!(
+            "https://noaa-urma-pds.s3.amazonaws.com/urma2p5.{}/urma2p5.t{:02}z.{}.grb2_wexp",
+            request.cycle.date_yyyymmdd, request.cycle.hour_utc, product
+        ),
+        other => unsupported_source(other, request.model),
+    })
 }
 
 fn build_nbm_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "NBM core guidance is hourly through f036, 3-hourly through f192, then 6-hourly through f264"
+                .to_string(),
+        });
+    }
     let token = normalize_token(&request.product);
     let stream = token
         .split(['_', '/'])
@@ -7448,6 +7573,15 @@ fn build_rrfs_public_url(
     if source != SourceId::Aws {
         return Ok(unsupported_source(source, request.model));
     }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "RRFS Public CONUS runs at 00/03/06/09/12/15/18/21z; 00/06/12/18z are hourly through f084 and 03/09/15/21z are hourly through f018"
+                .to_string(),
+        });
+    }
 
     let suffix = match normalize_token(&request.product).as_str() {
         "prs_conus" | "prslev_conus" | "conus" => {
@@ -7473,6 +7607,15 @@ fn build_rrfs_public_url(
 fn build_refs_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
     if source != SourceId::Aws {
         return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "REFS post-processed products run at 00/06/12/18z with hourly output from f01 through f60"
+                .to_string(),
+        });
     }
 
     let token = normalize_token(&request.product);
@@ -8081,7 +8224,7 @@ fn model_specific_pressure_field_gap(field: &GribFieldSpec, model: ModelId) -> O
             | "absolute_vorticity_700mb"
             | "absolute_vorticity_850mb",
         ) => Some(format!(
-            "{} is not present in the Earth2Archive AIFS NetCDF schema currently wired by rustwx-models",
+            "{} is not present in the ECMWF AIFS Single v2 public 'oper' product currently wired by rustwx-models",
             field.label
         )),
         (
@@ -8192,14 +8335,7 @@ fn model_specific_surface_field_gap(field: &GribFieldSpec, model: ModelId) -> Op
             "Visibility is not part of the current WRF/GDEX one-off path; no verified wrfout visibility field is wired yet".to_string(),
         ),
         (ModelId::Aifs, "wind_gust_10m_agl" | "visibility_surface") => Some(format!(
-            "{} is not present in the current Earth2Archive AIFS NetCDF schema",
-            field.label
-        )),
-        (
-            ModelId::Aifs,
-            "low_cloud_cover" | "middle_cloud_cover" | "high_cloud_cover",
-        ) => Some(format!(
-            "{} is not present in the current Earth2Archive AIFS NetCDF schema; total cloud cover is available as tcc",
+            "{} is not present in the ECMWF AIFS Single v2 public 'oper' product",
             field.label
         )),
         (_, "cloud_cover_levels") => None,

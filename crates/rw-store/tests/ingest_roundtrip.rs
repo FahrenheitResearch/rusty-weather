@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use rustwx_core::{
     CanonicalField, FieldSelector, GridProjection, GridShape, LatLonGrid, SelectedField2D,
 };
-use rw_store::RwsExactTime;
 use rw_store::error::RwStoreError;
 use rw_store::grid::GridFile;
 use rw_store::ingest::{
@@ -24,6 +23,7 @@ use rw_store::ingest::{
 use rw_store::lock::RunLock;
 use rw_store::reader::HourReader;
 use rw_store::run::RwsRunManifest;
+use rw_store::{RwsExactTime, RwsSourceProvenance};
 
 const NX: usize = 80;
 const NY: usize = 60;
@@ -959,6 +959,65 @@ fn read_field_2d_rejects_mismatched_grid_file() {
         matches!(err, RwStoreError::Grid(_)),
         "expected Grid error for grid-hash mismatch, got {err:?}"
     );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Safe provider records survive the real atomic manifest publication path.
+#[test]
+fn ingest_writer_persists_normalized_source_provenance() {
+    let dir = test_dir("source-provenance");
+    let store_root = dir.join("store");
+    let temp = temp_field();
+    let mut writer = HourIngestWriter::begin(
+        &store_root,
+        MODEL,
+        RUN,
+        6,
+        &temp.grid,
+        temp.projection.as_ref(),
+        BUILD,
+    )
+    .unwrap();
+    writer
+        .set_source_provenance(vec![
+            RwsSourceProvenance::new(
+                "ECMWF-OPEN-DATA",
+                vec!["surface".into()],
+                vec!["oper".into()],
+            )
+            .unwrap(),
+            RwsSourceProvenance::new(
+                "ecmwf-open-data",
+                vec!["pressure".into()],
+                vec!["oper".into()],
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+    writer
+        .add_field_2d(
+            "temp_2m",
+            "K",
+            serde_json::json!({"v": "TMP"}),
+            &temp.values,
+        )
+        .unwrap();
+    writer.finish(WRITTEN_UNIX).unwrap();
+
+    let manifest = load_manifest(&store_root);
+    assert_eq!(
+        manifest.hours[&6].source_provenance,
+        vec![RwsSourceProvenance {
+            provider: "ecmwf-open-data".into(),
+            roles: vec!["pressure".into(), "surface".into()],
+            products: vec!["oper".into()],
+        }]
+    );
+    let persisted = fs::read_to_string(run_dir(&store_root).join("run.json")).unwrap();
+    assert!(persisted.contains("ecmwf-open-data"));
+    assert!(!persisted.contains("https://"));
+    assert!(!persisted.contains("authorization"));
 
     let _ = fs::remove_dir_all(&dir);
 }

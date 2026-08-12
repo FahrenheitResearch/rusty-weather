@@ -1,0 +1,4726 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Rusty Weather API",
+    "description": "Self-hosted model catalog, point/profile queries, and exact-time temporal analytics.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/metrics": {
+      "get": {
+        "tags": [
+          "operations"
+        ],
+        "description": "OpenMetrics endpoint. It is protected by bearer authentication by default (auth.protect_metrics = true); operators may explicitly opt out with auth.protect_metrics = false. When no tokens are configured, authentication middleware permits local requests.",
+        "operationId": "metrics_doc",
+        "responses": {
+          "200": {
+            "description": "OpenMetrics text exposition",
+            "content": {
+              "application/openmetrics-text": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when metrics protection and tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Metrics encoding failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/analytics/spatial-series": {
+      "post": {
+        "tags": [
+          "analytics"
+        ],
+        "operationId": "spatial_series_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpatialSeriesApiRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Per-valid-time full-grid minimum, maximum, and coverage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpatialSeriesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request body, variable, or time range is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Requested variable is absent",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Run changed while the query was executing",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the configured byte limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request is not application/json",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Query limit or strict missing-data requirement was not satisfied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store, metadata, allocation, or serialization failure",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is busy or shutting down",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Query exceeded its execution deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/analytics/temporal-grid": {
+      "post": {
+        "tags": [
+          "analytics"
+        ],
+        "operationId": "temporal_grid_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TemporalGridApiRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Semantics-aware full-grid temporal reduction",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemporalGridResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request body, temporal window, semantics, or variables are invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A requested variable or storage slot is absent",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Run changed while the query was executing",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the configured byte limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request is not application/json",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Reducer, query limit, or strict missing-data requirement was not satisfied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store, metadata, allocation, or serialization failure",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is busy or shutting down",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Query exceeded its execution deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/artifacts/{hash}/{file}": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "artifact_doc",
+        "parameters": [
+          {
+            "name": "hash",
+            "in": "path",
+            "description": "Artifact SHA-256",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "file",
+            "in": "path",
+            "description": "Artifact filename from JobView",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Immutable temporal-grid JSON artifact",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TemporalGridResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Artifact hash or filename is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Artifact was not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Artifact could not be streamed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/health/live": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "operationId": "live_doc",
+        "responses": {
+          "200": {
+            "description": "Process is live",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server failure",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/health/ready": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "operationId": "ready_doc",
+        "responses": {
+          "200": {
+            "description": "Store and query executor are ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected readiness failure",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Store is unreadable, service is busy, or shutdown is in progress",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Readiness check exceeded its execution deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/temporal-grid": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "submit_temporal_grid_job_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TemporalGridApiRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Durable asynchronous job accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request body or job request is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The requested model or run does not exist",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Run changed while the job was being admitted",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the configured byte limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request is not application/json",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request body could not be decoded",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Asynchronous job capacity is full",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Job metadata or durable publication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is busy or shutting down",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Snapshot admission exceeded its execution deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/jobs/{id}": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "job_doc",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Canonical job UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current durable job state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Job id is not a canonical UUID",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Job was not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Job metadata could not be read",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "cancel_job_doc",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Canonical job UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Terminal job returned without a new cancellation transition",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobView"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Cancellation accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Job id is not a canonical UUID",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Job was not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Job cannot make the requested state transition",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Job metadata could not be updated",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "models_doc",
+        "responses": {
+          "200": {
+            "description": "Known ingest capabilities merged with stored run counts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ModelCapabilityResponse"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Stored catalog contains an invalid entry",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Configured catalog limit was exceeded",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Catalog I/O or metadata failure",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is busy or shutting down",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Catalog work exceeded its execution deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/models/{model}/runs": {
+      "get": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "runs_doc",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "description": "Canonical stored model id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Immutable run snapshots available for the model",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RunCatalogEntryResponse"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Model id or stored catalog entry is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A run changed while its snapshot was resolved",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Configured catalog limit was exceeded",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Model directory, run metadata, or store I/O failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is busy or shutting down",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Catalog work exceeded its execution deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/models/{model}/runs/{run}": {
+      "get": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "run_doc",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "description": "Canonical stored model id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "run",
+            "in": "path",
+            "description": "Explicit immutable run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Resolved immutable run descriptor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDescriptorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Model id, run id, or run metadata is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Run changed while its snapshot was resolved",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Configured snapshot limit was exceeded",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Run metadata or store I/O failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is busy or shutting down",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Snapshot resolution exceeded its execution deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/models/{model}/runs/{run}/variables": {
+      "get": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "variables_doc",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "description": "Canonical stored model id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "run",
+            "in": "path",
+            "description": "Explicit immutable run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stored variable coverage and temporal capabilities",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/VariableCapabilityResponse"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Model id, run id, or variable metadata is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Run changed while variable capabilities were inventoried",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Configured snapshot or catalog limit was exceeded",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Run metadata or store I/O failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is busy or shutting down",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Capability inventory exceeded its execution deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/openapi.json": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "operationId": "openapi_doc",
+        "responses": {
+          "200": {
+            "description": "This OpenAPI 3 document",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "500": {
+            "description": "Document serialization failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/point": {
+      "get": {
+        "tags": [
+          "query"
+        ],
+        "operationId": "point_doc",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "run",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "latitude",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          {
+            "name": "longitude",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          {
+            "name": "variables",
+            "in": "query",
+            "description": "Comma-separated variable names.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "start_unix",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "end_unix",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "missing_policy",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ApiMissingPolicy"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact-time series at the nearest stored grid point",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PointSeriesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Coordinates, variables, or time range are invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A requested variable or storage slot is absent",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Run changed while the query was executing",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Query limit or strict missing-data requirement was not satisfied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store, metadata, allocation, or serialization failure",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is busy or shutting down",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Query exceeded its execution deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/points": {
+      "post": {
+        "tags": [
+          "query"
+        ],
+        "operationId": "points_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PointsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "One exact-time series result per requested point",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PointSeriesResponse"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request body, coordinates, variables, or time range are invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A requested variable or storage slot is absent",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Run changed while the query was executing",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the configured byte limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request is not application/json",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Point/value limit or strict missing-data requirement was not satisfied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store, metadata, allocation, or serialization failure",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is busy or shutting down",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Query exceeded its execution deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/profile": {
+      "post": {
+        "tags": [
+          "query"
+        ],
+        "operationId": "profile_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileApiRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Pressure-level profiles at one stored time and nearest grid point",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request body, coordinates, or variables are invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A requested variable or storage slot is absent",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Run changed while the query was executing",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the configured byte limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request is not application/json",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Query limit, variable kind, or strict missing-data requirement was not satisfied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store, metadata, allocation, or serialization failure",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is busy or shutting down",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Query exceeded its execution deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/version": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "operationId": "version_doc",
+        "responses": {
+          "200": {
+            "description": "Service build identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected server failure",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/window": {
+      "post": {
+        "tags": [
+          "query"
+        ],
+        "operationId": "window_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WindowApiRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stored two-dimensional index window",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IndexWindowResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request body or window bounds are invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Requested variable or storage slot is absent",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Run changed while the query was executing",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the configured byte limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request is not application/json",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "JSON grid-value or query limit was exceeded",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store, metadata, allocation, or serialization failure",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is busy or shutting down",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Query exceeded its execution deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiIngestCapabilityLimitation": {
+        "type": "string",
+        "enum": [
+          "analysis_only",
+          "surface_only",
+          "ensemble_mean_only",
+          "sparse_pressure_levels",
+          "derived_products_disabled",
+          "conus_only",
+          "pre_operational_feed"
+        ]
+      },
+      "ApiIntervalSupport": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "seconds",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "starts_at_valid_time"
+                ]
+              },
+              "seconds": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "seconds",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "ends_at_valid_time"
+                ]
+              },
+              "seconds": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "until_next_expected_time"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "since_previous_expected_time"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ApiMissingPolicy": {
+        "type": "string",
+        "enum": [
+          "strict",
+          "partial"
+        ]
+      },
+      "ApiTemporalCapabilityBasis": {
+        "type": "string",
+        "enum": [
+          "canonical_selector",
+          "canonical_selector_and_name",
+          "built_in_derived_variable",
+          "name_and_units",
+          "unsupported_variable_kind",
+          "manual_required"
+        ]
+      },
+      "ApiTemporalOperation": {
+        "type": "string",
+        "enum": [
+          "scalar_minimum",
+          "scalar_maximum",
+          "scalar_range",
+          "time_weighted_mean",
+          "arg_minimum_time",
+          "arg_maximum_time",
+          "interval_total",
+          "minimum_interval_amount",
+          "maximum_interval_amount",
+          "range_interval_amount",
+          "minimum_of_interval_maxima",
+          "maximum_of_interval_maxima",
+          "range_of_interval_maxima",
+          "arg_minimum_interval_maximum_time",
+          "arg_maximum_interval_maximum_time",
+          "total_increment",
+          "minimum_increment",
+          "maximum_increment",
+          "range_increment",
+          "minimum_rate",
+          "maximum_rate",
+          "range_rate",
+          "duration_weighted_mean",
+          "integral",
+          "minimum_vector_speed",
+          "maximum_vector_speed",
+          "range_vector_speed",
+          "time_weighted_mean_speed",
+          "vector_mean",
+          "circular_mean",
+          "category_mode",
+          "category_duration",
+          "category_transitions"
+        ]
+      },
+      "ApiTemporalReducer": {
+        "type": "string",
+        "enum": [
+          "scalar_summary",
+          "interval_summary",
+          "interval_maximum_summary",
+          "cumulative_summary",
+          "rate_summary",
+          "vector_summary",
+          "circular_mean",
+          "categorical_summary"
+        ]
+      },
+      "ApiTemporalSemantics": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "instantaneous_scalar"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "support",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "interval_accumulation"
+                ]
+              },
+              "support": {
+                "$ref": "#/components/schemas/ApiIntervalSupport"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "support",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "interval_maximum"
+                ]
+              },
+              "support": {
+                "$ref": "#/components/schemas/ApiIntervalSupport"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "include_first_value": {
+                "type": "boolean"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "cumulative_from_origin"
+                ]
+              },
+              "reset_tolerance": {
+                "type": "number",
+                "format": "double"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "support",
+              "seconds_per_rate_unit",
+              "integral_units",
+              "kind"
+            ],
+            "properties": {
+              "integral_units": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "interval_rate"
+                ]
+              },
+              "seconds_per_rate_unit": {
+                "type": "number",
+                "format": "double"
+              },
+              "support": {
+                "$ref": "#/components/schemas/ApiIntervalSupport"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "vector_components"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "circular_degrees"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "categorical"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "unknown"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ApiTemporalValueClass": {
+        "type": "string",
+        "enum": [
+          "instantaneous_scalar",
+          "interval_accumulation",
+          "cumulative_accumulation",
+          "rate",
+          "vector_component",
+          "circular_direction",
+          "categorical",
+          "interval_extremum",
+          "unknown"
+        ]
+      },
+      "ApiTemporalVerticalSelection": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "levels_hpa",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "pressure_levels"
+                ]
+              },
+              "levels_hpa": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        ]
+      },
+      "ApiTemporalWindow": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "start_unix",
+              "end_unix",
+              "kind"
+            ],
+            "properties": {
+              "end_unix": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "utc"
+                ]
+              },
+              "start_unix": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "date",
+              "timezone",
+              "kind"
+            ],
+            "properties": {
+              "date": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "local_day"
+                ]
+              },
+              "timezone": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "ApiTimeExpectation": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "basis"
+            ],
+            "properties": {
+              "basis": {
+                "type": "string",
+                "enum": [
+                  "manifest_axis"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "step_seconds",
+              "basis"
+            ],
+            "properties": {
+              "anchor_unix": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64"
+              },
+              "basis": {
+                "type": "string",
+                "enum": [
+                  "fixed_cadence"
+                ]
+              },
+              "step_seconds": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          }
+        ]
+      },
+      "ArtifactRef": {
+        "type": "object",
+        "required": [
+          "sha256",
+          "file",
+          "content_type",
+          "bytes",
+          "download_path"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "content_type": {
+            "type": "string"
+          },
+          "download_path": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          }
+        }
+      },
+      "CategoricalSummaryGridResponse": {
+        "type": "object",
+        "required": [
+          "metadata",
+          "mode",
+          "mode_duration_seconds",
+          "category_durations",
+          "transitions",
+          "finite_count",
+          "covered_duration_seconds",
+          "duration_coverage"
+        ],
+        "properties": {
+          "category_durations": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/CategoryDurationResponse"
+              }
+            }
+          },
+          "covered_duration_seconds": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          "duration_coverage": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "finite_count": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/TemporalGridMetadataResponse"
+          },
+          "mode": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32"
+            }
+          },
+          "mode_duration_seconds": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          "transitions": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        }
+      },
+      "CategoryDurationResponse": {
+        "type": "object",
+        "required": [
+          "category",
+          "duration_seconds"
+        ],
+        "properties": {
+          "category": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "duration_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "CircularMeanGridResponse": {
+        "type": "object",
+        "required": [
+          "metadata",
+          "mean_degrees",
+          "resultant_length",
+          "finite_count",
+          "covered_duration_seconds",
+          "duration_coverage"
+        ],
+        "properties": {
+          "covered_duration_seconds": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          "duration_coverage": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "finite_count": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "mean_degrees": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/TemporalGridMetadataResponse"
+          },
+          "resultant_length": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          }
+        }
+      },
+      "CoordinateRequest": {
+        "type": "object",
+        "required": [
+          "latitude",
+          "longitude"
+        ],
+        "properties": {
+          "latitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "longitude": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "CumulativeSummaryGridResponse": {
+        "type": "object",
+        "required": [
+          "metadata",
+          "total_increment",
+          "minimum_increment",
+          "maximum_increment",
+          "range_increment",
+          "argmin_time_index",
+          "argmax_time_index",
+          "finite_increment_count",
+          "reset_count",
+          "covered_duration_seconds",
+          "duration_coverage"
+        ],
+        "properties": {
+          "argmax_time_index": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "argmin_time_index": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "covered_duration_seconds": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          "duration_coverage": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "finite_increment_count": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "maximum_increment": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/TemporalGridMetadataResponse"
+          },
+          "minimum_increment": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "range_increment": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "reset_count": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "total_increment": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          }
+        }
+      },
+      "GridPointResponse": {
+        "type": "object",
+        "required": [
+          "requested_latitude",
+          "requested_longitude",
+          "x",
+          "y",
+          "grid_latitude",
+          "grid_longitude"
+        ],
+        "properties": {
+          "grid_latitude": {
+            "type": "number",
+            "format": "float"
+          },
+          "grid_longitude": {
+            "type": "number",
+            "format": "float"
+          },
+          "requested_latitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "requested_longitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "x": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "y": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "uptime_seconds"
+        ],
+        "properties": {
+          "status": {
+            "type": "string"
+          },
+          "uptime_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "IndexWindowResponse": {
+        "type": "object",
+        "required": [
+          "run",
+          "time",
+          "variable",
+          "units",
+          "x0",
+          "y0",
+          "nx",
+          "ny",
+          "values"
+        ],
+        "properties": {
+          "nx": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ny": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "run": {
+            "$ref": "#/components/schemas/RunDescriptorResponse"
+          },
+          "time": {
+            "$ref": "#/components/schemas/TimePointResponse"
+          },
+          "units": {
+            "type": "string"
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "float"
+            }
+          },
+          "variable": {
+            "type": "string"
+          },
+          "x0": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "y0": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "IntervalMaximumSummaryGridResponse": {
+        "type": "object",
+        "required": [
+          "metadata",
+          "minimum_of_interval_maxima",
+          "maximum_of_interval_maxima",
+          "range_of_interval_maxima",
+          "argmin_interval_maximum_time_index",
+          "argmax_interval_maximum_time_index",
+          "finite_interval_maximum_count",
+          "covered_duration_seconds",
+          "duration_coverage"
+        ],
+        "properties": {
+          "argmax_interval_maximum_time_index": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "argmin_interval_maximum_time_index": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "covered_duration_seconds": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          "duration_coverage": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "finite_interval_maximum_count": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "maximum_of_interval_maxima": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/TemporalGridMetadataResponse"
+          },
+          "minimum_of_interval_maxima": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "range_of_interval_maxima": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          }
+        }
+      },
+      "IntervalSummaryGridResponse": {
+        "type": "object",
+        "required": [
+          "metadata",
+          "total",
+          "minimum_interval",
+          "maximum_interval",
+          "range_interval",
+          "argmin_time_index",
+          "argmax_time_index",
+          "finite_count",
+          "covered_duration_seconds",
+          "duration_coverage"
+        ],
+        "properties": {
+          "argmax_time_index": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "argmin_time_index": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "covered_duration_seconds": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          "duration_coverage": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "finite_count": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "maximum_interval": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/TemporalGridMetadataResponse"
+          },
+          "minimum_interval": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "range_interval": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "total": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          }
+        }
+      },
+      "JobStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "succeeded",
+          "failed",
+          "cancelled"
+        ]
+      },
+      "JobView": {
+        "type": "object",
+        "required": [
+          "schema",
+          "id",
+          "kind",
+          "request_fingerprint",
+          "status",
+          "created_unix",
+          "updated_unix"
+        ],
+        "properties": {
+          "artifact": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ArtifactRef"
+              }
+            ]
+          },
+          "created_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "error_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "request_fingerprint": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          },
+          "updated_unix": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "ModelCapabilityResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "description",
+          "cycle_hours_utc",
+          "max_forecast_hour",
+          "registry_source_count",
+          "ingest_status",
+          "verification",
+          "limitations",
+          "products",
+          "provider_attributions",
+          "stored_run_count"
+        ],
+        "properties": {
+          "cycle_hours_utc": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "ingest_status": {
+            "type": "string"
+          },
+          "limitations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApiIngestCapabilityLimitation"
+            }
+          },
+          "max_forecast_hour": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "products": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProductCapabilityResponse"
+            }
+          },
+          "provider_attributions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProviderAttributionResponse"
+            }
+          },
+          "registry_source_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "stored_run_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "verification": {
+            "type": "string"
+          }
+        }
+      },
+      "PointQueryRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "run",
+          "latitude",
+          "longitude",
+          "variables"
+        ],
+        "properties": {
+          "end_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "latitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "longitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "missing_policy": {
+            "$ref": "#/components/schemas/ApiMissingPolicy"
+          },
+          "model": {
+            "type": "string"
+          },
+          "run": {
+            "type": "string"
+          },
+          "start_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "variables": {
+            "type": "string",
+            "description": "Comma-separated variable names."
+          }
+        }
+      },
+      "PointSeriesResponse": {
+        "type": "object",
+        "required": [
+          "run",
+          "point",
+          "axis",
+          "variables"
+        ],
+        "properties": {
+          "axis": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TimePointResponse"
+            }
+          },
+          "point": {
+            "$ref": "#/components/schemas/GridPointResponse"
+          },
+          "run": {
+            "$ref": "#/components/schemas/RunDescriptorResponse"
+          },
+          "variables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PointVariableSeriesResponse"
+            }
+          }
+        }
+      },
+      "PointVariableSeriesResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "units",
+          "values",
+          "available_samples",
+          "expected_samples",
+          "coverage"
+        ],
+        "properties": {
+          "available_samples": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "coverage": {
+            "type": "number",
+            "format": "double"
+          },
+          "expected_samples": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "units": {
+            "type": "string"
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "float"
+            }
+          }
+        }
+      },
+      "PointsRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "run",
+          "points",
+          "variables"
+        ],
+        "properties": {
+          "end_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "missing_policy": {
+            "$ref": "#/components/schemas/ApiMissingPolicy"
+          },
+          "model": {
+            "type": "string"
+          },
+          "points": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CoordinateRequest"
+            }
+          },
+          "run": {
+            "type": "string"
+          },
+          "start_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "variables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "PressureProfileResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "units",
+          "levels_hpa",
+          "values",
+          "available_levels",
+          "expected_levels",
+          "coverage"
+        ],
+        "properties": {
+          "available_levels": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "coverage": {
+            "type": "number",
+            "format": "double"
+          },
+          "expected_levels": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "levels_hpa": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "units": {
+            "type": "string"
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "float"
+            }
+          }
+        }
+      },
+      "ProblemDetails": {
+        "type": "object",
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "code",
+          "request_id"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "instance": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
+      "ProductCapabilityResponse": {
+        "type": "object",
+        "required": [
+          "product",
+          "surface_source",
+          "pressure_source",
+          "indexed_subset"
+        ],
+        "properties": {
+          "indexed_subset": {
+            "type": "boolean"
+          },
+          "pressure_source": {
+            "type": "boolean"
+          },
+          "product": {
+            "type": "string"
+          },
+          "surface_source": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ProfileApiRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "run",
+          "latitude",
+          "longitude",
+          "storage_slot",
+          "variables"
+        ],
+        "properties": {
+          "latitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "longitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "model": {
+            "type": "string"
+          },
+          "run": {
+            "type": "string"
+          },
+          "storage_slot": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "variables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ProfileResponse": {
+        "type": "object",
+        "required": [
+          "run",
+          "point",
+          "time",
+          "variables"
+        ],
+        "properties": {
+          "point": {
+            "$ref": "#/components/schemas/GridPointResponse"
+          },
+          "run": {
+            "$ref": "#/components/schemas/RunDescriptorResponse"
+          },
+          "time": {
+            "$ref": "#/components/schemas/TimePointResponse"
+          },
+          "variables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PressureProfileResponse"
+            }
+          }
+        }
+      },
+      "ProviderAttributionResponse": {
+        "type": "object",
+        "required": [
+          "provider",
+          "copyright_statement",
+          "notice",
+          "source_url",
+          "license",
+          "license_url",
+          "terms_url",
+          "modification_notice",
+          "disclaimer"
+        ],
+        "properties": {
+          "copyright_statement": {
+            "type": "string"
+          },
+          "disclaimer": {
+            "type": "string"
+          },
+          "license": {
+            "type": "string"
+          },
+          "license_url": {
+            "type": "string"
+          },
+          "modification_notice": {
+            "type": "string"
+          },
+          "notice": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "source_url": {
+            "type": "string"
+          },
+          "terms_url": {
+            "type": "string"
+          }
+        }
+      },
+      "RateSummaryGridResponse": {
+        "type": "object",
+        "required": [
+          "metadata",
+          "integral_units",
+          "minimum_rate",
+          "maximum_rate",
+          "range_rate",
+          "duration_weighted_mean",
+          "integral",
+          "argmin_time_index",
+          "argmax_time_index",
+          "finite_count",
+          "covered_duration_seconds",
+          "duration_coverage"
+        ],
+        "properties": {
+          "argmax_time_index": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "argmin_time_index": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "covered_duration_seconds": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          "duration_coverage": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "duration_weighted_mean": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "finite_count": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "integral": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "integral_units": {
+            "type": "string"
+          },
+          "maximum_rate": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/TemporalGridMetadataResponse"
+          },
+          "minimum_rate": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "range_rate": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          }
+        }
+      },
+      "ResolvedTemporalWindowResponse": {
+        "type": "object",
+        "required": [
+          "start_unix",
+          "end_unix",
+          "duration_seconds"
+        ],
+        "properties": {
+          "duration_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "end_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "requested_local_date": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "start_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "timezone": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "RunCatalogEntryResponse": {
+        "type": "object",
+        "required": [
+          "run",
+          "variable_count"
+        ],
+        "properties": {
+          "run": {
+            "$ref": "#/components/schemas/RunDescriptorResponse"
+          },
+          "variable_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "RunDescriptorResponse": {
+        "type": "object",
+        "description": "Public run identity and exact stored time-axis summary.",
+        "required": [
+          "model",
+          "run",
+          "schema",
+          "snapshot_id",
+          "grid_hash",
+          "nx",
+          "ny",
+          "exact_time_axis",
+          "sample_count",
+          "source_provenance",
+          "provider_attributions"
+        ],
+        "properties": {
+          "exact_time_axis": {
+            "type": "boolean"
+          },
+          "first_valid_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "grid_hash": {
+            "type": "string"
+          },
+          "last_valid_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "model": {
+            "type": "string"
+          },
+          "nx": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ny": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "origin_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "provider_attributions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProviderAttributionResponse"
+            }
+          },
+          "run": {
+            "type": "string"
+          },
+          "sample_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "schema": {
+            "type": "string"
+          },
+          "snapshot_id": {
+            "type": "string"
+          },
+          "source_provenance": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceProvenanceResponse"
+            }
+          }
+        }
+      },
+      "ScalarSummaryGridResponse": {
+        "type": "object",
+        "required": [
+          "metadata",
+          "minimum",
+          "maximum",
+          "range",
+          "time_weighted_mean",
+          "argmin_time_index",
+          "argmax_time_index",
+          "finite_count",
+          "covered_duration_seconds",
+          "duration_coverage"
+        ],
+        "properties": {
+          "argmax_time_index": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "argmin_time_index": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "covered_duration_seconds": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          "duration_coverage": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "finite_count": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "maximum": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/TemporalGridMetadataResponse"
+          },
+          "minimum": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "range": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "time_weighted_mean": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          }
+        }
+      },
+      "SourceProvenanceResponse": {
+        "type": "object",
+        "description": "Sanitized union of resolved providers represented in a run.",
+        "required": [
+          "provider",
+          "roles",
+          "products"
+        ],
+        "properties": {
+          "products": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "provider": {
+            "type": "string"
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "SpatialSeriesApiRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "run",
+          "variable"
+        ],
+        "properties": {
+          "end_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "missing_policy": {
+            "$ref": "#/components/schemas/ApiMissingPolicy"
+          },
+          "model": {
+            "type": "string"
+          },
+          "run": {
+            "type": "string"
+          },
+          "start_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "variable": {
+            "type": "string"
+          }
+        }
+      },
+      "SpatialSeriesResponse": {
+        "type": "object",
+        "required": [
+          "run",
+          "variable",
+          "units",
+          "samples",
+          "expected_samples",
+          "available_samples",
+          "coverage"
+        ],
+        "properties": {
+          "available_samples": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "coverage": {
+            "type": "number",
+            "format": "double"
+          },
+          "expected_samples": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "run": {
+            "$ref": "#/components/schemas/RunDescriptorResponse"
+          },
+          "samples": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SpatialStatsSampleResponse"
+            }
+          },
+          "units": {
+            "type": "string"
+          },
+          "variable": {
+            "type": "string"
+          }
+        }
+      },
+      "SpatialStatsSampleResponse": {
+        "type": "object",
+        "required": [
+          "time",
+          "variable_available",
+          "finite_count",
+          "missing_count"
+        ],
+        "properties": {
+          "finite_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maximum": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "minimum": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "missing_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "time": {
+            "$ref": "#/components/schemas/TimePointResponse"
+          },
+          "variable_available": {
+            "type": "boolean"
+          }
+        }
+      },
+      "TemporalCompletenessResponse": {
+        "type": "object",
+        "required": [
+          "expectation",
+          "expected_samples",
+          "available_samples",
+          "missing_samples",
+          "missing_valid_unix",
+          "expected_duration_seconds",
+          "covered_duration_seconds",
+          "duration_coverage",
+          "largest_gap_seconds"
+        ],
+        "properties": {
+          "available_samples": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "covered_duration_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "duration_coverage": {
+            "type": "number",
+            "format": "double"
+          },
+          "expectation": {
+            "$ref": "#/components/schemas/ApiTimeExpectation"
+          },
+          "expected_duration_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "expected_samples": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "largest_gap_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "missing_samples": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "missing_valid_unix": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        }
+      },
+      "TemporalGridApiRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "run",
+          "variables",
+          "semantics",
+          "reducer",
+          "window"
+        ],
+        "properties": {
+          "expectation": {
+            "$ref": "#/components/schemas/ApiTimeExpectation"
+          },
+          "missing_policy": {
+            "$ref": "#/components/schemas/ApiMissingPolicy"
+          },
+          "model": {
+            "type": "string"
+          },
+          "reducer": {
+            "$ref": "#/components/schemas/ApiTemporalReducer"
+          },
+          "run": {
+            "type": "string"
+          },
+          "semantics": {
+            "$ref": "#/components/schemas/ApiTemporalSemantics"
+          },
+          "variables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "vertical": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApiTemporalVerticalSelection"
+              }
+            ]
+          },
+          "window": {
+            "$ref": "#/components/schemas/ApiTemporalWindow"
+          }
+        }
+      },
+      "TemporalGridLayoutResponse": {
+        "type": "string",
+        "enum": [
+          "level_y_x"
+        ]
+      },
+      "TemporalGridMetadataResponse": {
+        "type": "object",
+        "required": [
+          "run",
+          "variables",
+          "units",
+          "semantics",
+          "reducer",
+          "nx",
+          "ny",
+          "axis",
+          "window",
+          "completeness"
+        ],
+        "properties": {
+          "axis": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TimePointResponse"
+            }
+          },
+          "completeness": {
+            "$ref": "#/components/schemas/TemporalCompletenessResponse"
+          },
+          "layout": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TemporalGridLayoutResponse"
+              }
+            ]
+          },
+          "levels_hpa": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "nx": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ny": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reducer": {
+            "$ref": "#/components/schemas/ApiTemporalReducer"
+          },
+          "run": {
+            "$ref": "#/components/schemas/RunDescriptorResponse"
+          },
+          "semantics": {
+            "$ref": "#/components/schemas/ApiTemporalSemantics"
+          },
+          "shape": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "units": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "variables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "window": {
+            "$ref": "#/components/schemas/ResolvedTemporalWindowResponse"
+          }
+        }
+      },
+      "TemporalGridResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "data",
+              "result"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/ScalarSummaryGridResponse"
+              },
+              "result": {
+                "type": "string",
+                "enum": [
+                  "scalar"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "data",
+              "result"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/IntervalSummaryGridResponse"
+              },
+              "result": {
+                "type": "string",
+                "enum": [
+                  "interval"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "data",
+              "result"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/IntervalMaximumSummaryGridResponse"
+              },
+              "result": {
+                "type": "string",
+                "enum": [
+                  "interval_maximum"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "data",
+              "result"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/CumulativeSummaryGridResponse"
+              },
+              "result": {
+                "type": "string",
+                "enum": [
+                  "cumulative"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "data",
+              "result"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/RateSummaryGridResponse"
+              },
+              "result": {
+                "type": "string",
+                "enum": [
+                  "rate"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "data",
+              "result"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/VectorSummaryGridResponse"
+              },
+              "result": {
+                "type": "string",
+                "enum": [
+                  "vector"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "data",
+              "result"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/CircularMeanGridResponse"
+              },
+              "result": {
+                "type": "string",
+                "enum": [
+                  "circular"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "data",
+              "result"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/CategoricalSummaryGridResponse"
+              },
+              "result": {
+                "type": "string",
+                "enum": [
+                  "categorical"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Exact tagged union emitted by the temporal-grid reducer and job artifacts."
+      },
+      "TimePointResponse": {
+        "type": "object",
+        "description": "One exact stored valid time. Internal store filenames are intentionally not exposed.",
+        "required": [
+          "storage_slot",
+          "lead_seconds",
+          "valid_unix"
+        ],
+        "properties": {
+          "lead_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "storage_slot": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "valid_unix": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "VariableCapabilityResponse": {
+        "type": "object",
+        "required": [
+          "name",
+          "units",
+          "kind",
+          "codec",
+          "levels_hpa",
+          "selector",
+          "available_slots",
+          "available_samples",
+          "expected_samples",
+          "coverage",
+          "point_series",
+          "pressure_profile",
+          "scalar_temporal_reduction",
+          "temporal"
+        ],
+        "properties": {
+          "available_samples": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "available_slots": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "codec": {
+            "type": "string"
+          },
+          "coverage": {
+            "type": "number",
+            "format": "double"
+          },
+          "expected_samples": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "kind": {
+            "type": "string"
+          },
+          "levels_hpa": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "point_series": {
+            "type": "boolean"
+          },
+          "pressure_profile": {
+            "type": "boolean"
+          },
+          "scalar_temporal_reduction": {
+            "type": "boolean"
+          },
+          "selector": {},
+          "temporal": {
+            "$ref": "#/components/schemas/VariableTemporalCapabilityResponse"
+          },
+          "units": {
+            "type": "string"
+          }
+        }
+      },
+      "VariableTemporalCapabilityResponse": {
+        "type": "object",
+        "required": [
+          "value_class",
+          "basis",
+          "supported_reducers",
+          "operations",
+          "required_variables",
+          "requires_manual_semantics",
+          "note"
+        ],
+        "properties": {
+          "basis": {
+            "$ref": "#/components/schemas/ApiTemporalCapabilityBasis"
+          },
+          "note": {
+            "type": "string"
+          },
+          "operations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApiTemporalOperation"
+            }
+          },
+          "recommended_semantics": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApiTemporalSemantics"
+              }
+            ]
+          },
+          "required_variables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "requires_manual_semantics": {
+            "type": "boolean"
+          },
+          "supported_reducers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApiTemporalReducer"
+            }
+          },
+          "value_class": {
+            "$ref": "#/components/schemas/ApiTemporalValueClass"
+          }
+        }
+      },
+      "VectorSummaryGridResponse": {
+        "type": "object",
+        "required": [
+          "metadata",
+          "minimum_speed",
+          "maximum_speed",
+          "range_speed",
+          "time_weighted_mean_speed",
+          "vector_mean_u",
+          "vector_mean_v",
+          "vector_mean_speed",
+          "vector_mean_direction_toward_degrees",
+          "argmin_time_index",
+          "argmax_time_index",
+          "finite_count",
+          "covered_duration_seconds",
+          "duration_coverage"
+        ],
+        "properties": {
+          "argmax_time_index": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "argmin_time_index": {
+            "type": "array",
+            "items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "covered_duration_seconds": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          "duration_coverage": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "finite_count": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "maximum_speed": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/TemporalGridMetadataResponse"
+          },
+          "minimum_speed": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "range_speed": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "time_weighted_mean_speed": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "vector_mean_direction_toward_degrees": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "vector_mean_speed": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "vector_mean_u": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "vector_mean_v": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          }
+        }
+      },
+      "VersionResponse": {
+        "type": "object",
+        "required": [
+          "service",
+          "version",
+          "git",
+          "api"
+        ],
+        "properties": {
+          "api": {
+            "type": "string"
+          },
+          "git": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "WindowApiRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "run",
+          "storage_slot",
+          "variable",
+          "x0",
+          "y0",
+          "x1",
+          "y1"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "run": {
+            "type": "string"
+          },
+          "storage_slot": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "variable": {
+            "type": "string"
+          },
+          "x0": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x1": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "y0": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "y1": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer_auth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque",
+        "description": "Token supplied by RW_API_TOKENS or RW_API_TOKEN_FILE"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "health",
+      "description": "Process and store readiness"
+    },
+    {
+      "name": "catalog",
+      "description": "Models, runs, and variables"
+    },
+    {
+      "name": "query",
+      "description": "Bounded synchronous queries"
+    },
+    {
+      "name": "analytics",
+      "description": "Exact-time and diurnal analytics"
+    },
+    {
+      "name": "jobs",
+      "description": "Bounded asynchronous work and immutable artifacts"
+    },
+    {
+      "name": "operations",
+      "description": "Operator metrics"
+    }
+  ]
+}

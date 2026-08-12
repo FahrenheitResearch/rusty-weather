@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
         with:
           persist-credentials: false
 
@@ -57,3 +57,34 @@ jobs:
       - name: Run workspace library and integration tests
         if: runner.os == 'Linux'
         run: cargo +1.92.0 test --locked --workspace --lib --tests
+
+  dependency-policy:
+    name: Dependency policy - ${{ matrix.package.name }} - ${{ matrix.checks }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - name: desktop
+            manifest: crates/rusty-weather-ui/Cargo.toml
+          - name: packaged-tools
+            manifest: crates/rusty-weather/Cargo.toml
+          - name: server
+            manifest: crates/rw-server/Cargo.toml
+          - name: scheduler
+            manifest: crates/rw-scheduler/Cargo.toml
+        checks:
+          - advisories
+          - bans licenses sources
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Check Cargo dependency policy
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          rust-version: "1.92.0"
+          command: check ${{ matrix.checks }}
+          arguments: --manifest-path ${{ matrix.package.manifest }} --all-features --locked

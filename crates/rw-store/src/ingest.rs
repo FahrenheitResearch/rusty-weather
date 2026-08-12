@@ -21,7 +21,10 @@ use crate::format::{RwsExactTime, RwsWriterInfo};
 use crate::grid::{GridFile, encode_grid_bytes};
 use crate::lock::RunLock;
 use crate::reader::HourReader;
-use crate::run::{RwsHourEntry, RwsRunManifest};
+use crate::run::{
+    MAX_SOURCE_PROVENANCE_PER_HOUR, RwsHourEntry, RwsRunManifest, RwsSourceProvenance,
+    normalize_source_provenance,
+};
 use crate::writer::HourWriter;
 
 /// How long [`HourIngestWriter::begin`] waits for the run-dir advisory lock
@@ -466,6 +469,7 @@ pub struct HourIngestWriter {
     writer: HourWriter,
     vars_normal: Vec<String>,
     vars_deferred: Vec<String>,
+    source_provenance: Vec<RwsSourceProvenance>,
     encode_elapsed: Duration,
     /// Exclusive advisory lock on this run dir, held for the whole
     /// begin→finish critical section (grid validation + hour write +
@@ -626,9 +630,26 @@ impl HourIngestWriter {
             writer,
             vars_normal: Vec::new(),
             vars_deferred: Vec::new(),
+            source_provenance: Vec::new(),
             encode_elapsed: Duration::ZERO,
             _lock: lock,
         })
+    }
+
+    /// Attach sanitized resolved-source identities to this stored hour.
+    ///
+    /// Entries are normalized, sorted, and merged by provider. Full URLs,
+    /// credentials, and free-form text are rejected by the manifest token
+    /// validator.
+    pub fn set_source_provenance(&mut self, provenance: Vec<RwsSourceProvenance>) -> RwResult<()> {
+        if provenance.len() > MAX_SOURCE_PROVENANCE_PER_HOUR {
+            return Err(RwStoreError::Meta(format!(
+                "hour source provenance contains {} entries; limit is {MAX_SOURCE_PROVENANCE_PER_HOUR}",
+                provenance.len(),
+            )));
+        }
+        self.source_provenance = normalize_source_provenance(provenance)?;
+        Ok(())
     }
 
     /// Add one extracted 2D field (raw selector JSON), id in add order.
@@ -779,6 +800,7 @@ impl HourIngestWriter {
                 written_unix,
                 encode_ms: 0,
                 variables: vars.clone(),
+                source_provenance: self.source_provenance.clone(),
             },
         );
         manifest.validate_contents()?;
@@ -801,6 +823,7 @@ impl HourIngestWriter {
                 written_unix,
                 encode_ms,
                 variables: vars.clone(),
+                source_provenance: self.source_provenance.clone(),
             },
         );
         manifest.validate_hour_meta(self.forecast_hour, &hour_meta)?;

@@ -1,0 +1,345 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingPolicy {
+    Strict,
+    Partial,
+}
+
+impl Default for MissingPolicy {
+    fn default() -> Self {
+        Self::Strict
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TimeRange {
+    /// Inclusive UTC Unix timestamp.
+    pub start_unix: Option<i64>,
+    /// Exclusive UTC Unix timestamp.
+    pub end_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryLimits {
+    pub max_catalog_entries: usize,
+    /// Maximum physical samples retained in one run snapshot.
+    pub max_time_points: usize,
+    /// Maximum samples selected by one point or temporal request.
+    pub max_selected_time_points: usize,
+    pub max_variables: usize,
+    /// Maximum cells decoded by non-temporal grid reductions and windows.
+    pub max_reduction_cells: usize,
+    /// Maximum native-grid cells reduced by one temporal-grid request.
+    pub max_temporal_reduction_cells: usize,
+    /// Maximum fixed and dynamic values allocated by one temporal result.
+    pub max_temporal_output_values: usize,
+    pub max_point_values: usize,
+}
+
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self {
+            max_catalog_entries: 10_000,
+            max_time_points: 4_096,
+            max_selected_time_points: 4_096,
+            max_variables: 64,
+            max_reduction_cells: 4_000_000,
+            max_temporal_reduction_cells: 4_000_000,
+            max_temporal_output_values: 32_000_000,
+            max_point_values: 1_000_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimePoint {
+    pub storage_slot: u16,
+    pub lead_seconds: u64,
+    pub valid_unix: i64,
+    /// Store filenames never cross the public DTO boundary.
+    #[serde(skip)]
+    pub(crate) file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceProvenance {
+    pub provider: String,
+    pub roles: Vec<String>,
+    pub products: Vec<String>,
+}
+
+impl From<rw_store::RwsSourceProvenance> for SourceProvenance {
+    fn from(value: rw_store::RwsSourceProvenance) -> Self {
+        Self {
+            provider: value.provider,
+            roles: value.roles,
+            products: value.products,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAttribution {
+    pub provider: String,
+    pub copyright_statement: String,
+    pub notice: String,
+    pub source_url: String,
+    pub license: String,
+    pub license_url: String,
+    pub terms_url: String,
+    pub modification_notice: String,
+    pub disclaimer: String,
+}
+
+pub fn ecmwf_provider_attribution() -> ProviderAttribution {
+    let notice = "This service is based on data and products of the European Centre for Medium-Range Weather Forecasts (ECMWF).";
+    ProviderAttribution {
+        provider: "European Centre for Medium-Range Weather Forecasts (ECMWF)".into(),
+        copyright_statement: notice.into(),
+        notice: notice.into(),
+        source_url: "https://www.ecmwf.int/".into(),
+        license: "This ECMWF data is published under a Creative Commons Attribution 4.0 International (CC BY 4.0).".into(),
+        license_url: "https://creativecommons.org/licenses/by/4.0/".into(),
+        terms_url: "https://apps.ecmwf.int/datasets/licences/general/".into(),
+        modification_notice: "The ECMWF source data has been subset, normalized, and re-encoded by this service.".into(),
+        disclaimer: "ECMWF does not accept any liability whatsoever for any error or omission in the data, their availability, or for any loss or damage arising from their use.".into(),
+    }
+}
+
+pub fn noaa_provider_attribution() -> ProviderAttribution {
+    ProviderAttribution {
+        provider: "National Oceanic and Atmospheric Administration (NOAA) / National Weather Service (NWS)".into(),
+        copyright_statement: "NOAA/NWS data and products are U.S. Government works in the public domain unless specifically noted otherwise.".into(),
+        notice: "This service uses NOAA/NWS data and products. Credit NOAA/NWS as the source, do not imply NOAA/NWS endorsement, and do not present modified output as an official government product.".into(),
+        source_url: "https://www.noaa.gov/information-technology/open-data-dissemination".into(),
+        license: "Public domain in the United States unless specifically noted; contributed or third-party archive holdings may carry separate terms.".into(),
+        license_url: "https://www.weather.gov/disclaimer/".into(),
+        terms_url: "https://www.weather.gov/disclaimer/".into(),
+        modification_notice: "The NOAA source data has been subset, normalized, derived, and re-encoded by this service; this output is not an official NOAA/NWS product.".into(),
+        disclaimer: "NOAA/NWS data is furnished as-is without warranties of accuracy, timeliness, completeness, merchantability, or fitness for a particular purpose; delivery is not guaranteed.".into(),
+    }
+}
+
+pub fn provider_attributions_for_provenance(
+    sources: &[SourceProvenance],
+) -> Vec<ProviderAttribution> {
+    let mut attributions = Vec::with_capacity(2);
+    if sources
+        .iter()
+        .any(|source| source.provider == "ecmwf-open-data")
+    {
+        attributions.push(ecmwf_provider_attribution());
+    }
+    if sources.iter().any(|source| {
+        matches!(
+            source.provider.as_str(),
+            "noaa-nomads"
+                | "noaa-ncei"
+                | "noaa-aws-public-data"
+                | "noaa-google-public-data"
+                | "noaa-microsoft-azure-public-data"
+                // Backward-compatible identities written by the first
+                // provenance-capable development snapshots.
+                | "aws-public-data"
+                | "google-public-data"
+                | "microsoft-azure-public-data"
+        )
+    }) {
+        attributions.push(noaa_provider_attribution());
+    }
+    attributions
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunDescriptor {
+    pub model: String,
+    pub run: String,
+    pub schema: String,
+    pub snapshot_id: String,
+    pub grid_hash: String,
+    pub nx: usize,
+    pub ny: usize,
+    pub exact_time_axis: bool,
+    pub origin_unix: Option<i64>,
+    pub sample_count: usize,
+    pub first_valid_unix: Option<i64>,
+    pub last_valid_unix: Option<i64>,
+    #[serde(default)]
+    pub source_provenance: Vec<SourceProvenance>,
+    #[serde(default)]
+    pub provider_attributions: Vec<ProviderAttribution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GridPoint {
+    pub requested_latitude: f64,
+    pub requested_longitude: f64,
+    pub x: usize,
+    pub y: usize,
+    pub grid_latitude: f32,
+    pub grid_longitude: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariableCapability {
+    pub name: String,
+    pub units: String,
+    pub kind: String,
+    pub codec: String,
+    pub levels_hpa: Vec<u16>,
+    pub selector: serde_json::Value,
+    pub available_slots: Vec<u16>,
+    pub available_samples: usize,
+    pub expected_samples: usize,
+    pub coverage: f64,
+    pub point_series: bool,
+    pub pressure_profile: bool,
+    pub scalar_temporal_reduction: bool,
+    pub temporal: crate::VariableTemporalCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCatalogEntry {
+    pub model: String,
+    pub run_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunCatalogEntry {
+    pub run: RunDescriptor,
+    pub variable_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PointSeriesRequest {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub variables: Vec<String>,
+    #[serde(default)]
+    pub time: TimeRange,
+    #[serde(default)]
+    pub missing_policy: MissingPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PointVariableSeries {
+    pub name: String,
+    pub units: String,
+    pub values: Vec<Option<f32>>,
+    pub available_samples: usize,
+    pub expected_samples: usize,
+    pub coverage: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PointSeriesResult {
+    pub run: RunDescriptor,
+    pub point: GridPoint,
+    pub axis: Vec<TimePoint>,
+    pub variables: Vec<PointVariableSeries>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileRequest {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub storage_slot: u16,
+    pub variables: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PressureProfile {
+    pub name: String,
+    pub units: String,
+    pub levels_hpa: Vec<u16>,
+    pub values: Vec<Option<f32>>,
+    pub available_levels: usize,
+    pub expected_levels: usize,
+    pub coverage: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileResult {
+    pub run: RunDescriptor,
+    pub point: GridPoint,
+    pub time: TimePoint,
+    pub variables: Vec<PressureProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScalarTemporalRequest {
+    pub variable: String,
+    #[serde(default)]
+    pub time: TimeRange,
+    #[serde(default)]
+    pub missing_policy: MissingPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScalarTemporalResult {
+    pub run: RunDescriptor,
+    pub variable: String,
+    pub units: String,
+    pub nx: usize,
+    pub ny: usize,
+    pub axis: Vec<TimePoint>,
+    pub expected_samples: usize,
+    pub missing_variable_slots: Vec<u16>,
+    pub minimum: Vec<Option<f32>>,
+    pub maximum: Vec<Option<f32>>,
+    pub range: Vec<Option<f32>>,
+    /// Arithmetic mean of finite stored samples; it is not time-weighted.
+    pub sample_mean: Vec<Option<f64>>,
+    /// Index into `axis`; ties retain the earliest index.
+    pub argmin_time_index: Vec<Option<u32>>,
+    /// Index into `axis`; ties retain the earliest index.
+    pub argmax_time_index: Vec<Option<u32>>,
+    pub finite_count: Vec<u32>,
+    pub coverage: Vec<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provenance(provider: &str) -> SourceProvenance {
+        SourceProvenance {
+            provider: provider.into(),
+            roles: vec!["surface".into()],
+            products: vec!["product".into()],
+        }
+    }
+
+    #[test]
+    fn provider_attributions_cover_noaa_mirrors_and_ecmwf_without_duplicates() {
+        let sources = vec![
+            provenance("noaa-nomads"),
+            provenance("noaa-aws-public-data"),
+            provenance("ecmwf-open-data"),
+        ];
+        let attributions = provider_attributions_for_provenance(&sources);
+        assert_eq!(attributions.len(), 2);
+        assert!(
+            attributions
+                .iter()
+                .any(|item| item.provider.contains("ECMWF"))
+        );
+        let noaa = attributions
+            .iter()
+            .find(|item| item.provider.contains("NOAA"))
+            .expect("NOAA attribution");
+        assert!(noaa.notice.contains("do not imply NOAA/NWS endorsement"));
+        assert!(
+            noaa.modification_notice
+                .contains("not an official NOAA/NWS product")
+        );
+    }
+
+    #[test]
+    fn legacy_noaa_mirror_identity_keeps_attribution() {
+        let attributions = provider_attributions_for_provenance(&[provenance("aws-public-data")]);
+        assert_eq!(attributions, vec![noaa_provider_attribution()]);
+    }
+}
