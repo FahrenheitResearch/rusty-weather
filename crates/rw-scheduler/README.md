@@ -90,16 +90,16 @@ non-queryable ownership shell marked `.rw-scheduler-purged.json`. Applied
 retention also removes the matching terminal scheduler-state record, so bounded
 run retention does not leave state files accumulating indefinitely.
 
-## Public-origin catalog planning
+## Public-origin catalog execution
 
-`origin_catalog_plan` is an optional, declarative policy seam for a bounded
-public origin. In this architecture, the origin host is a trusted conventional
-HTTPS fallback and canonical-manifest signer. It is not a relay and this module
-contains no peer or relay transport. The plan does not activate downloads,
-aliases, signing, publication, or deletion. The current executor discovers only
-one cycle per model, so it cannot honestly maintain the independent
-newest-HRRR and complete-extended-HRRR lanes; multi-cycle execution must be
-added separately.
+`origin_catalog_plan` is an optional production policy for a bounded public
+origin. In this architecture, the origin host is a trusted conventional HTTPS
+fallback and canonical-manifest signer. It is not a relay and this module
+contains no peer or relay transport. Once the capacity audit is complete, the
+executor discovers and ingests the four lanes independently, deeply validates
+their rw-store data, atomically publishes the alias inventory, and feeds its
+protected generations into scheduler-owned retention. Signing and R2 object
+promotion remain separate origin-service responsibilities.
 
 The initial preset is intentionally exact and capability-driven:
 
@@ -110,11 +110,13 @@ The initial preset is intentionally exact and capability-driven:
 - newest available NBM cycle using the complete `surface` ingest profile.
 
 The two HRRR entries are intentionally distinct aliases: `hrrr-hourly` follows
-the newest queryable hourly generation, while `hrrr-extended` advances only to
-the newest fully complete cycle in the capability registry's longest-horizon
-family. GFS and NBM each expose their newest queryable generation. Candidate
-storage must have passed the normal store/query validation before it is handed
-to this publication planner.
+the newest queryable cycle, while `hrrr-extended` advances only to the newest
+fully complete cycle in the capability registry's longest-horizon family. The
+production provider discovery probes an early forecast hour for queryable lanes
+and the declared terminal forecast hour for the complete extended lane. GFS and
+NBM each expose their newest queryable generation. Every published candidate is
+reopened through the exact run manifest, grid, and referenced-hour validation;
+the extended selector additionally requires complete temporal inventory.
 
 R2 is the separate hot-object tier for origin-signed canonical manifests,
 common immutable objects, promoted popular results, and explicitly published
@@ -123,9 +125,14 @@ does not upload to R2. A cache miss ultimately falls back over normal HTTPS to
 the origin.
 
 Each lane protects its active generation and exactly one previous generation.
-Overlapping lane generations are deduplicated. Callers may pass the plan's
-`protected` set to the existing retention planner as its alias/protection set;
-the origin planner never mutates storage itself.
+Overlapping HRRR lane generations are deduplicated. The executor writes the
+bounded `rw-scheduler.origin-catalog.v1` document to
+`<store_root>/.rw-origin-catalog.json` with durable same-directory atomic
+replacement. It revalidates every previously published generation after a
+restart, requeues a recoverable invalid generation from durable job state, and
+refuses alias or retention mutation if a published generation cannot be
+recovered. The same catalog supplies the alias/protection set to retention and
+is included in the scheduler's JSON `status` report.
 
 ```toml
 models = ["hrrr", "gfs", "nbm"]
@@ -142,20 +149,46 @@ previous_generations = 1
 # max_concurrent_jobs = <audited value>
 ```
 
-Pending audit configuration rejects either capacity value if supplied. Once
-the audit is explicitly marked `complete`, both values become required and
-must be nonzero. The scheduler's general example concurrency and free-space
-reserve are not approved public-origin capacity values.
+Pending audit configuration rejects either capacity value if supplied. It is a
+valid offline-planning/staging configuration, but `discover`, `run-once`, and
+`daemon` fail before creating roots or contacting a provider. Once the audit is
+explicitly marked `complete`, both values become required and nonzero. Runtime
+job concurrency is capped by the smaller of the general scheduler setting and
+the audited origin setting. Store usage is bounded against the audited disk
+budget before work, before each ingest hour, and before job completion. The
+general queued-plus-running capacity must provide eight durable state slots (an
+active and rollback generation for each of four lanes). The scheduler's general
+example concurrency and free-space reserve are not approved public-origin
+capacity values.
+
+## Direct host capacity evidence
+
+Before changing `origin_catalog_plan.capacity_audit` to `complete`, run:
+
+```text
+rw-scheduler --config /etc/rusty-weather-scheduler.toml capacity-audit
+```
+
+This command is read-only: it does not create scheduler roots, probe providers,
+or download data. Its JSON reports filesystem total/available bytes, observed
+store/cache usage, logical parallelism, largest `.rws` hour, largest observed
+run, and the exact `largest_hour * max_concurrent_hours` in-flight headroom
+formula. It intentionally does not invent production disk or concurrency
+values. Record and review the output on the actual origin host, then set the two
+audited capacity values explicitly.
 
 ## Intentional v1 boundaries
 
 - An in-flight provider availability HTTP probe is not cancelled immediately;
   it returns at the configured per-probe timeout (six seconds by default),
   after which shutdown is observed before another probe starts.
-- The executable has no service-alias state source. The retention library can
-  protect caller-supplied aliases, while the executable protects active jobs
-  and the configured newest-run count.
-- `origin_catalog_plan` is validated and exposed by the library but is not
-  consumed by the one-cycle-per-model executor yet.
+- The scheduler publishes an atomic alias inventory but does not sign canonical
+  query-object manifests, upload hot objects to R2, or configure the HTTPS
+  server; those remain origin-service responsibilities.
+- Disk accounting is exact before each admission boundary, but an ingest hour
+  is the smallest write unit. Up to `max_concurrent_hours` in-flight hour writes
+  can cross the audited budget before their following checks fail closed, so
+  operators must retain headroom for that many largest configured hours.
 - Provider integration tests are deliberately absent. Scheduler tests use an
-  injected local discovery implementation and never contact the network.
+  injected discovery, execution, and exact-validation implementation and never
+  download payloads or contact the network.

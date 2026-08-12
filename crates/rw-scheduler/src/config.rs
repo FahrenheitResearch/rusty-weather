@@ -45,8 +45,9 @@ pub struct SchedulerConfig {
     pub free_space_reserve_bytes: u64,
     pub retry: RetryConfig,
     pub retention: RetentionConfig,
-    /// Declarative public-origin lane policy. The current executor validates
-    /// and exposes this plan but intentionally does not execute multiple lanes.
+    /// Capability-driven public-origin lane policy. Once its capacity audit is
+    /// complete, the executor discovers, ingests, validates, aliases, and
+    /// retention-protects the independent lane generations.
     pub origin_catalog_plan: Option<OriginCatalogPlanConfig>,
 }
 
@@ -248,6 +249,20 @@ impl SchedulerConfig {
         let allowed = expanded.iter().copied().collect::<BTreeSet<_>>();
         if let Some(origin) = &self.origin_catalog_plan {
             origin.validate_for_models(&allowed)?;
+            let required_state_slots = origin
+                .lanes()
+                .len()
+                .checked_mul(usize::from(origin.previous_generations) + 1)
+                .ok_or_else(|| {
+                    SchedulerError::InvalidConfig(
+                        "origin catalog durable-state capacity overflows usize".to_string(),
+                    )
+                })?;
+            if capacity < required_state_slots {
+                return Err(SchedulerError::InvalidConfig(format!(
+                    "origin catalog requires max_concurrent_jobs + max_queued_jobs >= {required_state_slots} for active and rollback generations"
+                )));
+            }
             for lane in origin.lanes() {
                 lane.validate_profile(&self.profile_for(lane.model)?)?;
             }

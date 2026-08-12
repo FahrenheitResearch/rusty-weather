@@ -51,11 +51,14 @@ enabled = false
 dry_run = true
 keep_latest_per_model = 3
 
-# Optional planning-only policy for a bounded, trusted conventional HTTPS
-# origin/signer. This is never a relay. The current scheduler executor does not
-# execute these independent lanes or promote objects to R2. Uncomment only with
+# Optional production policy for a bounded, trusted conventional HTTPS
+# origin/signer. This is never a relay and does not promote objects to R2.
+# Enabling it changes discovery to four independent lanes, atomically publishes
+# `.rw-origin-catalog.json` after exact storage validation, and protects active
+# plus one previous generation from retention. Use only with
 # models = ["hrrr", "gfs", "nbm"] and an exact NBM `surface` profile.
-# Capacity remains deliberately unset until the target host is audited.
+# A pending audit is a fail-closed staging state: discover/run-once/daemon do no
+# work until it is changed to complete and both audited values are supplied.
 # [origin_catalog_plan]
 # preset = "initial_public_subset"
 # capacity_audit = "pending"

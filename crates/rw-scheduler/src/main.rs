@@ -5,7 +5,9 @@ use std::time::Duration;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use rw_scheduler::config::SchedulerConfig;
-use rw_scheduler::{ExecutionReport, SchedulerError, SchedulerHost, SchedulerResult};
+use rw_scheduler::{
+    ExecutionReport, SchedulerError, SchedulerHost, SchedulerResult, audit_host_capacity,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -41,12 +43,24 @@ enum Command {
     Daemon,
     /// Print durable job state without network access.
     Status,
+    /// Measure host/filesystem facts without creating roots or contacting providers.
+    CapacityAudit {
+        /// Override the clock for reproducible operations/tests.
+        #[arg(long, hide = true)]
+        now_unix: Option<i64>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let config = SchedulerConfig::load(&cli.config)?;
+    if let Command::CapacityAudit { now_unix } = &cli.command {
+        let report =
+            audit_host_capacity(&config, now_unix.unwrap_or_else(|| Utc::now().timestamp()))?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     let host = Arc::new(SchedulerHost::new(config)?);
     match cli.command {
         Command::Plan { now_unix } => {
@@ -64,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Status => {
             println!("{}", serde_json::to_string_pretty(&host.status()?)?);
         }
+        Command::CapacityAudit { .. } => unreachable!("handled before scheduler initialization"),
         Command::Daemon => daemon(host).await?,
     }
     Ok(())

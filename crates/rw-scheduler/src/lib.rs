@@ -9,6 +9,7 @@
 mod durable;
 
 pub mod alias;
+pub mod capacity;
 pub mod config;
 pub mod coverage;
 pub mod error;
@@ -20,16 +21,23 @@ pub mod retention;
 pub mod state;
 
 pub use alias::{RunCandidate, select_latest, select_latest_available, select_latest_covering};
+pub use capacity::{
+    CapacityPathEvidence, ConfiguredOriginCapacity, HOST_CAPACITY_AUDIT_SCHEMA,
+    HostCapacityAuditReport, StorePayloadEvidence, audit_host_capacity,
+};
 pub use coverage::{RunCoverage, SlotMismatch, ValidTime, verify_manifest, verify_run_json};
 pub use error::{SchedulerError, SchedulerResult};
 pub use executor::{
     CycleDiscovery, DiscoveredCycle, DiscoveredModelCycle, DiscoveryReport, ExecutionReport,
-    ProviderCycleDiscovery, SchedulerHost, StatusReport, deterministic_jittered_delay,
+    JobExecution, ProviderCycleDiscovery, RunValidation, SchedulerHost, StatusReport,
+    deterministic_jittered_delay,
 };
 pub use limits::{AdmissionDecision, SchedulerLimits};
 pub use origin::{
-    CapacityAuditStatus, OriginCatalogPlanConfig, OriginCatalogPreset, OriginLane, OriginLanePlan,
-    OriginLaneSelector, OriginProfileRequirement, OriginPublicationPlan,
+    CapacityAuditStatus, ORIGIN_CATALOG_FILE, ORIGIN_CATALOG_STATE_SCHEMA, OriginCatalogPlanConfig,
+    OriginCatalogPreset, OriginCatalogState, OriginCatalogStateStore, OriginLane, OriginLanePlan,
+    OriginLaneSelector, OriginProfileRequirement, OriginPublicationPlan, OriginPublishedGeneration,
+    OriginPublishedLane,
 };
 pub use plan::{
     ExpectedValidTime, IngestProductPlan, JOB_PLAN_SCHEMA, JobPlan, PersistedIngestProfile,

@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
@@ -403,6 +403,21 @@ fn scheduler_config(label: &str, models: &[&str]) -> config::SchedulerConfig {
     }
 }
 
+fn completed_origin_config(label: &str) -> config::SchedulerConfig {
+    let mut config = scheduler_config(label, &["hrrr", "gfs", "nbm"]);
+    config.max_concurrent_jobs = 4;
+    config.retention.enabled = true;
+    config.retention.dry_run = true;
+    config.retention.keep_latest_per_model = 1;
+    config.origin_catalog_plan = Some(origin::OriginCatalogPlanConfig {
+        capacity_audit: origin::CapacityAuditStatus::Complete,
+        disk_budget_bytes: Some(u64::MAX),
+        max_concurrent_jobs: Some(2),
+        ..origin::OriginCatalogPlanConfig::default()
+    });
+    config
+}
+
 #[test]
 fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
     let empty = scheduler_config("empty-config", &[]);
@@ -461,7 +476,7 @@ fn config_bounds_provider_discovery_timeouts() {
 }
 
 #[test]
-fn scheduler_config_validates_the_planning_only_origin_subset() {
+fn scheduler_config_validates_the_origin_subset() {
     let mut config = scheduler_config("origin-plan", &["hrrr", "gfs", "nbm"]);
     config.origin_catalog_plan = Some(crate::origin::OriginCatalogPlanConfig::default());
     assert!(config.validate().is_ok());
@@ -475,6 +490,357 @@ fn scheduler_config_validates_the_planning_only_origin_subset() {
         .model_profiles
         .insert("nbm".to_string(), "analysis".to_string());
     assert!(config.validate().is_err());
+
+    let mut undersized = scheduler_config("origin-plan-state-capacity", &["hrrr", "gfs", "nbm"]);
+    undersized.max_concurrent_jobs = 2;
+    undersized.max_queued_jobs = 5;
+    undersized.origin_catalog_plan = Some(crate::origin::OriginCatalogPlanConfig::default());
+    assert!(undersized.validate().is_err());
+    undersized.max_queued_jobs = 6;
+    assert!(undersized.validate().is_ok());
+}
+
+#[derive(Default)]
+struct MemoryRuns {
+    coverage: Mutex<BTreeMap<String, RunCoverage>>,
+    rejected: Mutex<BTreeSet<String>>,
+    repairable: Mutex<BTreeSet<String>>,
+    active: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl MemoryRuns {
+    fn reject(&self, job_id: &str) {
+        self.rejected.lock().unwrap().insert(job_id.to_string());
+    }
+
+    fn corrupt_until_executed(&self, job_id: &str) {
+        self.reject(job_id);
+        self.repairable.lock().unwrap().insert(job_id.to_string());
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::Acquire)
+    }
+}
+
+impl JobExecution for MemoryRuns {
+    fn execute(&self, plan: &JobPlan) -> SchedulerResult<RunCoverage> {
+        let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+        self.peak.fetch_max(active, Ordering::AcqRel);
+        std::thread::sleep(Duration::from_millis(10));
+        let expected = plan
+            .expected_valid_times
+            .iter()
+            .copied()
+            .map(ValidTime::from)
+            .collect::<BTreeSet<_>>();
+        let coverage = RunCoverage {
+            expected: expected.clone(),
+            available: expected.clone(),
+            present: expected.clone(),
+            missing: BTreeSet::new(),
+            unexpected: BTreeSet::new(),
+            slot_mismatches: Vec::new(),
+            missing_slots: BTreeSet::new(),
+            storage_validated: true,
+            validated_slots: plan
+                .expected_valid_times
+                .iter()
+                .map(|expected| expected.storage_slot)
+                .collect(),
+            variable_slots: BTreeMap::new(),
+        };
+        self.coverage
+            .lock()
+            .unwrap()
+            .insert(plan.job_id.clone(), coverage.clone());
+        if self.repairable.lock().unwrap().remove(&plan.job_id) {
+            self.rejected.lock().unwrap().remove(&plan.job_id);
+        }
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        Ok(coverage)
+    }
+}
+
+impl RunValidation for MemoryRuns {
+    fn verify(&self, plan: &JobPlan) -> SchedulerResult<RunCoverage> {
+        if self.rejected.lock().unwrap().contains(&plan.job_id) {
+            return Err(SchedulerError::InvalidCoverage(format!(
+                "test rejection for '{}'",
+                plan.job_id
+            )));
+        }
+        self.coverage
+            .lock()
+            .unwrap()
+            .get(&plan.job_id)
+            .cloned()
+            .ok_or_else(|| {
+                SchedulerError::InvalidCoverage(format!(
+                    "test has no validated coverage for '{}'",
+                    plan.job_id
+                ))
+            })
+    }
+}
+
+struct LaneDiscovery {
+    generation: AtomicUsize,
+}
+
+impl LaneDiscovery {
+    fn set_generation(&self, generation: usize) {
+        self.generation.store(generation, Ordering::Release);
+    }
+
+    fn cycle_for(&self, lane: OriginLane) -> CycleSpec {
+        match (self.generation.load(Ordering::Acquire), lane.id) {
+            (0, "hrrr-hourly") => cycle("20260812", 13),
+            (0, "hrrr-extended") => cycle("20260812", 12),
+            (0, "gfs" | "nbm-surface") => cycle("20260812", 12),
+            (1, "hrrr-hourly") => cycle("20260813", 1),
+            (1, "hrrr-extended" | "gfs" | "nbm-surface") => cycle("20260813", 0),
+            (3, "hrrr-hourly" | "hrrr-extended") => cycle("20260812", 12),
+            (3, "gfs" | "nbm-surface") => cycle("20260812", 12),
+            (_, "hrrr-hourly") => cycle("20260814", 1),
+            (_, "hrrr-extended" | "gfs" | "nbm-surface") => cycle("20260814", 0),
+            (_, other) => panic!("unexpected origin lane '{other}'"),
+        }
+    }
+}
+
+impl CycleDiscovery for LaneDiscovery {
+    fn discover(
+        &self,
+        _model: ModelId,
+        _source: Option<SourceId>,
+        _now_unix: i64,
+        _rollback_days: u16,
+    ) -> SchedulerResult<DiscoveredCycle> {
+        Err(SchedulerError::InvalidState(
+            "origin test requires lane discovery".to_string(),
+        ))
+    }
+
+    fn discover_origin_lane(
+        &self,
+        lane: OriginLane,
+        _source: Option<SourceId>,
+        _now_unix: i64,
+        _rollback_days: u16,
+    ) -> SchedulerResult<DiscoveredCycle> {
+        Ok(DiscoveredCycle {
+            cycle: self.cycle_for(lane),
+            source: SourceId::Nomads,
+        })
+    }
+}
+
+fn injected_origin_host(
+    config: config::SchedulerConfig,
+    discovery: Arc<LaneDiscovery>,
+    runs: Arc<MemoryRuns>,
+) -> SchedulerHost {
+    let execution: Arc<dyn JobExecution> = runs.clone();
+    let validation: Arc<dyn RunValidation> = runs;
+    SchedulerHost::with_components(config, discovery, execution, validation).unwrap()
+}
+
+#[test]
+fn origin_execution_fails_closed_before_mutation_while_audit_is_pending() {
+    let mut config = scheduler_config("origin-pending-runtime", &["hrrr", "gfs", "nbm"]);
+    config.origin_catalog_plan = Some(origin::OriginCatalogPlanConfig::default());
+    let store_root = config.store_root.clone();
+    let discovery = Arc::new(LaneDiscovery {
+        generation: AtomicUsize::new(0),
+    });
+    let host = injected_origin_host(config, discovery, Arc::new(MemoryRuns::default()));
+    assert!(matches!(
+        host.discover_at(1_786_579_200),
+        Err(SchedulerError::Capacity(_))
+    ));
+    assert!(matches!(
+        host.run_once_at(1_786_579_200),
+        Err(SchedulerError::Capacity(_))
+    ));
+    assert!(!store_root.exists());
+}
+
+#[test]
+fn production_origin_discovery_shape_separates_queryable_and_extended_hrrr() {
+    let (first, hourly_cycles) =
+        executor::discovery_shape_for_selector(ModelId::Hrrr, OriginLaneSelector::NewestAvailable)
+            .unwrap();
+    let (terminal, extended_cycles) = executor::discovery_shape_for_selector(
+        ModelId::Hrrr,
+        OriginLaneSelector::NewestCompleteLongestHorizon,
+    )
+    .unwrap();
+    assert_eq!(first, 0);
+    assert_eq!(terminal, 48);
+    assert!(hourly_cycles.len() > extended_cycles.len());
+    assert!(!extended_cycles.is_empty());
+    assert!(extended_cycles.iter().all(|hour| {
+        rustwx_models::supported_forecast_hours(ModelId::Hrrr, *hour)
+            .into_iter()
+            .max()
+            == Some(terminal)
+    }));
+}
+
+#[test]
+fn origin_execution_obeys_the_audited_store_budget() {
+    let mut config = completed_origin_config("origin-disk-budget");
+    config
+        .origin_catalog_plan
+        .as_mut()
+        .unwrap()
+        .disk_budget_bytes = Some(1);
+    fs::create_dir_all(&config.store_root).unwrap();
+    fs::write(config.store_root.join("accounted.bin"), [0_u8, 1]).unwrap();
+    let discovery = Arc::new(LaneDiscovery {
+        generation: AtomicUsize::new(0),
+    });
+    let runs = Arc::new(MemoryRuns::default());
+    let host = injected_origin_host(config, discovery, runs.clone());
+    let error = host.run_once_at(1_786_579_200).unwrap_err();
+    assert!(matches!(error, SchedulerError::Capacity(_)));
+    assert_eq!(runs.peak(), 0, "no job started above the audited budget");
+}
+
+#[test]
+fn overlapping_origin_lanes_admit_a_shared_run_only_once() {
+    let config = completed_origin_config("origin-overlap");
+    let discovery = Arc::new(LaneDiscovery {
+        generation: AtomicUsize::new(3),
+    });
+    let runs = Arc::new(MemoryRuns::default());
+    let host = injected_origin_host(config, discovery, runs);
+    let report = host.run_once_at(1_786_579_200).unwrap();
+    assert_eq!(report.admitted.len(), 3);
+    assert_eq!(
+        report.admitted.iter().collect::<BTreeSet<_>>().len(),
+        report.admitted.len()
+    );
+}
+
+#[test]
+fn origin_lanes_publish_validated_active_and_one_previous_across_restart() {
+    let config = completed_origin_config("origin-runtime");
+    let store_root = config.store_root.clone();
+    let discovery = Arc::new(LaneDiscovery {
+        generation: AtomicUsize::new(0),
+    });
+    let runs = Arc::new(MemoryRuns::default());
+    let host = injected_origin_host(config.clone(), discovery.clone(), runs.clone());
+
+    let first = host.run_once_at(1_786_579_200).unwrap();
+    assert_eq!(runs.peak(), 2, "the audited two-job ceiling is enforced");
+    let first_catalog = first.origin_catalog.unwrap();
+    assert_eq!(first_catalog.lanes.len(), 4);
+    assert!(first_catalog.lanes.iter().all(|lane| lane.active.is_some()));
+    assert!(
+        first_catalog
+            .lanes
+            .iter()
+            .find(|lane| lane.id == "hrrr-hourly")
+            .unwrap()
+            .previous
+            .is_some(),
+        "the preceding queryable HRRR cycle is the complete-cycle generation"
+    );
+    assert!(
+        first_catalog
+            .lanes
+            .iter()
+            .filter(|lane| lane.id != "hrrr-hourly")
+            .all(|lane| lane.previous.is_none())
+    );
+
+    discovery.set_generation(1);
+    let second = host.run_once_at(1_786_665_600).unwrap();
+    let second_catalog = second.origin_catalog.unwrap();
+    assert!(
+        second_catalog
+            .lanes
+            .iter()
+            .all(|lane| lane.active.is_some() && lane.previous.is_some())
+    );
+    assert_eq!(
+        second_catalog.protected().unwrap().len(),
+        7,
+        "the hourly rollback generation overlaps the active extended run"
+    );
+
+    let restarted = injected_origin_host(config.clone(), discovery.clone(), runs.clone());
+    let after_restart = restarted.run_once_at(1_786_665_601).unwrap();
+    assert_eq!(after_restart.origin_catalog.unwrap(), second_catalog);
+    let persisted = OriginCatalogStateStore::new(&store_root)
+        .load_or_empty(config.origin_catalog_plan.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(persisted, second_catalog);
+    assert_eq!(
+        restarted.status().unwrap().origin_catalog.unwrap(),
+        second_catalog
+    );
+
+    runs.corrupt_until_executed("hrrr-20260812-12z");
+    let repaired = restarted.run_once_at(1_786_665_602).unwrap();
+    assert!(
+        repaired
+            .succeeded
+            .contains(&"hrrr-20260812-12z".to_string()),
+        "restart inventory keeps a published rollback generation repairable"
+    );
+    assert_eq!(repaired.origin_catalog.unwrap(), second_catalog);
+
+    runs.reject("gfs-20260814-00z");
+    discovery.set_generation(2);
+    let third = restarted.run_once_at(1_786_752_000).unwrap();
+    let third_catalog = third.origin_catalog.unwrap();
+    let gfs = third_catalog
+        .lanes
+        .iter()
+        .find(|lane| lane.id == "gfs")
+        .unwrap();
+    assert_eq!(gfs.active.as_ref().unwrap().run_id, "20260813_00z");
+    assert_eq!(gfs.previous.as_ref().unwrap().run_id, "20260812_12z");
+    let lane = |id: &str| {
+        third_catalog
+            .lanes
+            .iter()
+            .find(|lane| lane.id == id)
+            .unwrap()
+    };
+    assert_eq!(
+        lane("hrrr-hourly").active.as_ref().unwrap().run_id,
+        "20260814_01z"
+    );
+    assert_eq!(
+        lane("hrrr-hourly").previous.as_ref().unwrap().run_id,
+        "20260814_00z"
+    );
+    for id in ["hrrr-extended", "nbm-surface"] {
+        assert_eq!(lane(id).active.as_ref().unwrap().run_id, "20260814_00z");
+        assert_eq!(lane(id).previous.as_ref().unwrap().run_id, "20260813_00z");
+    }
+    let retention = third.retention.unwrap();
+    assert!(
+        retention
+            .candidates
+            .contains(&"hrrr:20260812_12z".to_string())
+    );
+    assert!(
+        retention
+            .candidates
+            .contains(&"hrrr:20260812_13z".to_string())
+    );
+    assert!(
+        !retention
+            .candidates
+            .contains(&"gfs:20260812_12z".to_string())
+    );
 }
 
 #[test]
