@@ -99,6 +99,10 @@ impl AppConfig {
         if let Some(value) = env_nonempty("RW_FEDERATION_ENABLED") {
             self.federation.enabled = parse_env("RW_FEDERATION_ENABLED", &value)?;
         }
+        if let Some(value) = env_nonempty("RW_FEDERATION_HEALTH_MONITOR_ENABLED") {
+            self.federation.health_monitor_enabled =
+                parse_env("RW_FEDERATION_HEALTH_MONITOR_ENABLED", &value)?;
+        }
         if let Some(value) = env_nonempty("RW_FEDERATION_SIGNING_KEY_FILE") {
             self.federation.catalog_signing_key_file = Some(PathBuf::from(value));
         }
@@ -427,6 +431,9 @@ impl CaseRoomConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct FederationConfig {
     pub enabled: bool,
+    /// Actively probe the signed, deliberately public origin health endpoints.
+    /// This remains separately disabled even when catalog federation is on.
+    pub health_monitor_enabled: bool,
     pub catalog_id: String,
     pub catalog_signing_key_id: String,
     /// Private Ed25519 catalog key. It is loaded from a permission-restricted
@@ -442,6 +449,16 @@ pub struct FederationConfig {
     pub catalog_ttl_seconds: u64,
     pub health_failure_threshold: u32,
     pub health_quarantine_seconds: u64,
+    /// Durable, address-free monitor state. Required when active monitoring is
+    /// enabled so quarantine survives process restarts.
+    pub health_state_file: Option<PathBuf>,
+    pub health_probe_interval_seconds: u64,
+    pub health_probe_concurrency: usize,
+    pub health_resolve_timeout_seconds: u64,
+    pub health_connect_timeout_seconds: u64,
+    pub health_send_timeout_seconds: u64,
+    pub health_receive_timeout_seconds: u64,
+    pub health_global_timeout_seconds: u64,
     pub maximum_selection_results: usize,
 }
 
@@ -449,6 +466,7 @@ impl Default for FederationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            health_monitor_enabled: false,
             catalog_id: "fahrenheit-public-origins".into(),
             catalog_signing_key_id: "federation-catalog-v1".into(),
             catalog_signing_key_file: None,
@@ -459,6 +477,14 @@ impl Default for FederationConfig {
             catalog_ttl_seconds: 300,
             health_failure_threshold: 3,
             health_quarantine_seconds: 60,
+            health_state_file: None,
+            health_probe_interval_seconds: 30,
+            health_probe_concurrency: 4,
+            health_resolve_timeout_seconds: 2,
+            health_connect_timeout_seconds: 3,
+            health_send_timeout_seconds: 2,
+            health_receive_timeout_seconds: 4,
+            health_global_timeout_seconds: 8,
             maximum_selection_results: 8,
         }
     }
@@ -478,6 +504,24 @@ impl FederationConfig {
             || self.health_failure_threshold > 100
             || self.health_quarantine_seconds == 0
             || self.health_quarantine_seconds > 24 * 60 * 60
+            || self.health_probe_interval_seconds == 0
+            || self.health_probe_interval_seconds > 60 * 60
+            || self.health_probe_concurrency == 0
+            || self.health_probe_concurrency > 32
+            || self.health_resolve_timeout_seconds == 0
+            || self.health_resolve_timeout_seconds > 60
+            || self.health_connect_timeout_seconds == 0
+            || self.health_connect_timeout_seconds > 60
+            || self.health_send_timeout_seconds == 0
+            || self.health_send_timeout_seconds > 60
+            || self.health_receive_timeout_seconds == 0
+            || self.health_receive_timeout_seconds > 60
+            || self.health_global_timeout_seconds == 0
+            || self.health_global_timeout_seconds > 120
+            || self.health_global_timeout_seconds < self.health_resolve_timeout_seconds
+            || self.health_global_timeout_seconds < self.health_connect_timeout_seconds
+            || self.health_global_timeout_seconds < self.health_send_timeout_seconds
+            || self.health_global_timeout_seconds < self.health_receive_timeout_seconds
             || self.maximum_selection_results == 0
             || self.maximum_selection_results > 128
         {
@@ -513,6 +557,15 @@ impl FederationConfig {
                         .into(),
                 ));
             }
+            if origin
+                .health_bearer_token_file
+                .as_ref()
+                .is_some_and(|path| path.as_os_str().is_empty())
+            {
+                return Err(ConfigError::Invalid(
+                    "federation health bearer-token paths must not be empty".into(),
+                ));
+            }
             let mut key_ids = std::collections::BTreeSet::new();
             for key in &origin.descriptor_signing_keys {
                 validate_config_id("federation key_id", &key.key_id, 128)?;
@@ -541,6 +594,26 @@ impl FederationConfig {
                 "federation descriptor paths must not be empty".into(),
             ));
         }
+        if self
+            .health_state_file
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "federation.health_state_file must not be empty".into(),
+            ));
+        }
+        if self.health_monitor_enabled && !self.enabled {
+            return Err(ConfigError::Invalid(
+                "federation health monitoring requires federation.enabled = true".into(),
+            ));
+        }
+        if self.health_monitor_enabled && self.health_state_file.is_none() {
+            return Err(ConfigError::Invalid(
+                "federation.health_state_file is required when active health monitoring is enabled"
+                    .into(),
+            ));
+        }
         if self.enabled {
             if self.catalog_signing_key_file.is_none() {
                 return Err(ConfigError::Invalid(
@@ -564,6 +637,9 @@ impl FederationConfig {
 pub struct ApprovedFederationOriginConfig {
     pub origin_id: String,
     pub descriptor_signing_keys: Vec<FederationTrustedKeyConfig>,
+    /// Optional permission-restricted bearer token file for this public
+    /// origin's same-origin health endpoint. Tokens are never accepted inline.
+    pub health_bearer_token_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -812,6 +888,7 @@ fn is_public_bind(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     #[test]
     fn loopback_default_is_safe_without_tokens() {
@@ -862,6 +939,37 @@ mod tests {
             config.validate(true),
             Err(ConfigError::Invalid(detail)) if detail.contains("operator-provisioned")
         ));
+    }
+
+    #[test]
+    fn federation_health_monitor_is_separately_gated_and_requires_durable_state() {
+        let mut config = AppConfig::default();
+        config.federation.health_monitor_enabled = true;
+        assert!(matches!(
+            config.validate(true),
+            Err(ConfigError::Invalid(detail)) if detail.contains("requires federation.enabled")
+        ));
+        config.federation.enabled = true;
+        config.federation.catalog_signing_key_file = Some(PathBuf::from("catalog.key"));
+        config.federation.descriptor_files = vec![PathBuf::from("lab.json")];
+        config.federation.approved_origins = vec![ApprovedFederationOriginConfig {
+            origin_id: "lab".into(),
+            descriptor_signing_keys: vec![FederationTrustedKeyConfig {
+                key_id: "lab-key".into(),
+                public_key_base64: base64::engine::general_purpose::STANDARD.encode(
+                    ed25519_dalek::SigningKey::from_bytes(&[4; 32])
+                        .verifying_key()
+                        .to_bytes(),
+                ),
+            }],
+            health_bearer_token_file: None,
+        }];
+        assert!(matches!(
+            config.validate(true),
+            Err(ConfigError::Invalid(detail)) if detail.contains("health_state_file")
+        ));
+        config.federation.health_state_file = Some(PathBuf::from("health.json"));
+        config.validate(true).unwrap();
     }
 
     #[test]

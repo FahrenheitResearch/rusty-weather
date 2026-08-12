@@ -106,6 +106,11 @@ default_retention_seconds = 2592000
 # is no self-registration endpoint and no ordinary-client address discovery.
 [federation]
 enabled = false
+# Active probes are separately gated and remain off by default. When enabled,
+# every probe freshly resolves the signed hostname, rejects the complete DNS
+# answer set if any address is non-global, pins one address for that connection,
+# preserves the hostname for TLS validation, and never follows redirects.
+health_monitor_enabled = false
 catalog_id = "fahrenheit-public-origins"
 catalog_signing_key_id = "federation-catalog-v1"
 # catalog_signing_key_file = "/etc/rusty-weather/federation-catalog.key"
@@ -116,6 +121,16 @@ revoked_key_ids = []
 catalog_ttl_seconds = 300
 health_failure_threshold = 3
 health_quarantine_seconds = 60
+# Required when health_monitor_enabled = true. This file contains only origin
+# ids and coarse health/quarantine timestamps; never IPs, URLs, or credentials.
+# health_state_file = "/var/lib/rusty-weather/federation-health.json"
+health_probe_interval_seconds = 30
+health_probe_concurrency = 4
+health_resolve_timeout_seconds = 2
+health_connect_timeout_seconds = 3
+health_send_timeout_seconds = 2
+health_receive_timeout_seconds = 4
+health_global_timeout_seconds = 8
 maximum_selection_results = 8
 
 # Operator-approved origin example (uncomment only with a real signed
@@ -125,6 +140,9 @@ maximum_selection_results = 8
 # descriptor_signing_keys = [
 #   { key_id = "lab-2026-a", public_key_base64 = "<base64-ed25519-public-key>" },
 # ]
+# Optional; omit for a public health endpoint. The bearer token is read from a
+# permission-restricted file and sent only to the signed same-origin path.
+# health_bearer_token_file = "/etc/rusty-weather/example-lab-health.token"
 
 [logging]
 filter = "rw_server=info,tower_http=info"

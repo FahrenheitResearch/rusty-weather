@@ -72,8 +72,17 @@
         "catalog_ttl_seconds": 300,
         "descriptor_files": [],
         "enabled": false,
+        "health_connect_timeout_seconds": 3,
         "health_failure_threshold": 3,
+        "health_global_timeout_seconds": 8,
+        "health_monitor_enabled": false,
+        "health_probe_concurrency": 4,
+        "health_probe_interval_seconds": 30,
         "health_quarantine_seconds": 60,
+        "health_receive_timeout_seconds": 4,
+        "health_resolve_timeout_seconds": 2,
+        "health_send_timeout_seconds": 2,
+        "health_state_file": null,
         "maximum_selection_results": 8,
         "revoked_key_ids": [],
         "revoked_origin_ids": []
@@ -134,6 +143,14 @@
           "items": {
             "$ref": "#/$defs/FederationTrustedKeyConfig"
           }
+        },
+        "health_bearer_token_file": {
+          "description": "Optional permission-restricted bearer token file for this public\norigin's same-origin health endpoint. Tokens are never accepted inline.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "origin_id": {
           "type": "string",
@@ -436,10 +453,39 @@
           "type": "boolean",
           "default": false
         },
+        "health_connect_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 3,
+          "minimum": 0
+        },
         "health_failure_threshold": {
           "type": "integer",
           "format": "uint32",
           "default": 3,
+          "minimum": 0
+        },
+        "health_global_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 8,
+          "minimum": 0
+        },
+        "health_monitor_enabled": {
+          "description": "Actively probe the signed, deliberately public origin health endpoints.\nThis remains separately disabled even when catalog federation is on.",
+          "type": "boolean",
+          "default": false
+        },
+        "health_probe_concurrency": {
+          "type": "integer",
+          "format": "uint",
+          "default": 4,
+          "minimum": 0
+        },
+        "health_probe_interval_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 30,
           "minimum": 0
         },
         "health_quarantine_seconds": {
@@ -447,6 +493,32 @@
           "format": "uint64",
           "default": 60,
           "minimum": 0
+        },
+        "health_receive_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 4,
+          "minimum": 0
+        },
+        "health_resolve_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 2,
+          "minimum": 0
+        },
+        "health_send_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 2,
+          "minimum": 0
+        },
+        "health_state_file": {
+          "description": "Durable, address-free monitor state. Required when active monitoring is\nenabled so quarantine survives process restarts.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "maximum_selection_results": {
           "type": "integer",

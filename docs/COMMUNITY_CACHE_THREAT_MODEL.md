@@ -99,12 +99,26 @@ Decoded application schemas are validated before cache publication or render.
 ### Network-address disclosure
 
 Address disclosure can arise through signaling candidates, URLs, logs, UI,
-errors, telemetry, peer identifiers, or direct socket observations. The wire
-contract exposes only opaque relay/session/ticket identifiers. Relay IDs reject
-address-shaped text; DTOs have no address/host/port fields and reject unknown
-fields. Candidate kinds other than `relay` cannot deserialize. Public errors
-and logs must use request IDs and coarse failure codes, never remote candidates
-or another user's connection metadata.
+errors, telemetry, peer identifiers, or direct socket observations. The public
+candidate/discovery contract exposes only opaque relay/session/ticket
+identifiers. Relay IDs reject address-shaped text; public DTOs have no
+address/host/port fields and reject unknown fields. Candidate kinds other than
+`relay` cannot deserialize. Public errors and logs must use request IDs and
+coarse failure codes, never remote candidates or another user's connection
+metadata.
+
+The one closed transport-private exception is a TURN provider allocation route:
+TURN cannot connect two allocations without each participant learning the
+other provider-owned relay IP/port. This is not either participant's network
+address. The backend accepts a route only from the authenticated owner of the
+matching active role credential, bound to the exact session/object and
+ephemeral key offer, and only when the route is globally routable inside an
+operator-audited provider CIDR allowlist that is empty by default. No provider
+ranges are compiled as trust. The route type has redacted debug output and no
+general serialization; only the participant-authenticated transport response
+can encode the counterpart allocation. A malicious client can at worst select
+another address within the audited relay-provider range and make its encrypted
+session fail—it cannot inject an ordinary user's direct address.
 
 There is no address-bearing discovery, direct candidate gathering, direct ICE,
 STUN, direct QUIC/TCP/UDP, LAN discovery, or fallback. Any future dependency

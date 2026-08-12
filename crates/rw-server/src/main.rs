@@ -127,12 +127,18 @@ async fn serve(config_path: Option<&Path>) -> Result<(), AnyError> {
     }
     let listen = config.server.listen;
     let state = AppState::new(config, tokens)?;
+    let federation_health_monitor = state.federation.start_health_monitor(state.metrics.clone());
     let router = build_router(state)?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     info!(address = %listener.local_addr()?, "Rusty Weather service listening");
-    axum::serve(listener, router)
+    let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
+    if let Some(task) = federation_health_monitor {
+        task.abort();
+        let _ = task.await;
+    }
+    serve_result?;
     info!("Rusty Weather service stopped");
     Ok(())
 }
@@ -205,6 +211,26 @@ fn doctor(config_path: Option<&Path>) -> Result<(), AnyError> {
                 "signing key, providers, quotas, and cache root validated",
             )),
             Err(error) => checks.push(fail("community_security", error.to_string())),
+        }
+    }
+    if config.federation.enabled {
+        match rw_server::federation::FederationService::open(&config.federation) {
+            Ok(service) => match service.health_status() {
+                Ok(status) => checks.push(ok(
+                    "federation_security",
+                    format!(
+                        "{} signed public origin(s) validated; active health monitor {}",
+                        status.total_origins,
+                        if status.monitor_enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    ),
+                )),
+                Err(error) => checks.push(fail("federation_security", error.to_string())),
+            },
+            Err(error) => checks.push(fail("federation_security", error.to_string())),
         }
     }
 

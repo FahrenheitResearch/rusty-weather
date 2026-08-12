@@ -518,6 +518,29 @@ struct SignedFederationCatalogDoc {
     signature: serde_json::Value,
 }
 
+#[derive(utoipa::ToSchema)]
+struct FederationOriginHealthStatusDoc {
+    origin_id: String,
+    state: String,
+    consecutive_failures: u32,
+    quarantine_until_unix: Option<i64>,
+    last_probe_unix: Option<i64>,
+    last_success_unix: Option<i64>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct FederationHealthStatusDoc {
+    schema: String,
+    monitor_enabled: bool,
+    total_origins: usize,
+    healthy_origins: usize,
+    degraded_origins: usize,
+    quarantined_origins: usize,
+    unknown_origins: usize,
+    last_round_unix: Option<i64>,
+    origins: Vec<FederationOriginHealthStatusDoc>,
+}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -554,6 +577,7 @@ struct SignedFederationCatalogDoc {
         community_revoke_case_doc,
         federation_catalog_doc,
         federation_origin_doc,
+        federation_health_doc,
         metrics_doc,
     ),
     components(schemas(
@@ -633,6 +657,8 @@ struct SignedFederationCatalogDoc {
         SignedFederationOriginDescriptorDoc,
         FederationCatalogDoc,
         SignedFederationCatalogDoc,
+        FederationOriginHealthStatusDoc,
+        FederationHealthStatusDoc,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -1208,6 +1234,21 @@ fn federation_origin_doc() {}
 
 #[utoipa::path(
     get,
+    path = "/v1/federation/health",
+    tag = "federation",
+    description = "Return coarse operator health and quarantine state for deliberately public origins. The response never contains resolved addresses, endpoint URLs, bearer credentials, or transport errors.",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Address-free public-origin health summary", body = FederationHealthStatusDoc),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Public-origin federation is disabled or the service is busy", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Health status retrieval exceeded its deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn federation_health_doc() {}
+
+#[utoipa::path(
+    get,
     path = "/metrics",
     tag = "operations",
     description = "OpenMetrics endpoint. It is protected by bearer authentication by default (auth.protect_metrics = true); operators may explicitly opt out with auth.protect_metrics = false. When no tokens are configured, authentication middleware permits local requests.",
@@ -1359,6 +1400,10 @@ mod tests {
             assert!(operation["responses"]["422"].is_object());
             assert!(value["paths"][path]["post"].is_null());
         }
+        let health = operation(&value, "/v1/federation/health", "get");
+        assert_eq!(health["security"][0]["bearer_auth"], serde_json::json!([]));
+        assert!(health["responses"]["401"].is_object());
+        assert!(value["paths"]["/v1/federation/health"]["post"].is_null());
         assert_response_ref(
             &value,
             "/v1/federation/origins",
@@ -1371,6 +1416,13 @@ mod tests {
             "/v1/federation/origins/{origin_id}",
             "get",
             "#/components/schemas/SignedFederationOriginDescriptorDoc",
+            false,
+        );
+        assert_response_ref(
+            &value,
+            "/v1/federation/health",
+            "get",
+            "#/components/schemas/FederationHealthStatusDoc",
             false,
         );
     }

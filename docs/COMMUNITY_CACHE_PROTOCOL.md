@@ -343,6 +343,21 @@ candidates. A provider that cannot guarantee relay-only operation is not a
 valid provider. There is no silent or user-selectable direct fallback now or in
 a future mode.
 
+TURN participants necessarily exchange the relay provider's allocated route so
+the provider can create a permission/channel between its own allocations. This
+is not a host, server-reflexive, peer-reflexive, or direct candidate. It is
+carried only by a closed participant-authenticated transport response, never by
+`RelayCandidate`, discovery, UI state, errors, telemetry, or ordinary logs. A
+client may register only the address returned by its own TURN allocation. The
+backend accepts it only when it is globally routable and inside an exact,
+operator-audited relay-provider CIDR allowlist; that allowlist is empty by
+default and no provider ranges are compiled as trust. Registration binds the
+route to the active signed role credential, authenticated principal, object,
+session, and ephemeral key offer. Each participant receives only the other
+provider allocation and signed E2E transcript. A host/srflx/direct address is
+therefore outside the representable public candidate contract and outside the
+admitted transport-route policy.
+
 The relay operator necessarily observes connection metadata such as the
 connecting user's IP, time, transfer size, relay/session identifiers, and abuse
 signals. Other BowEcho users never receive those addresses. Relays cannot read

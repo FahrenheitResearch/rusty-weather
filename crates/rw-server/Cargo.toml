@@ -25,6 +25,7 @@ rw-query = { path = "../rw-query" }
 rw-store = { path = "../rw-store" }
 rustwx-core = { path = "../rustwx-core" }
 rustwx-models = { path = "../rustwx-models" }
+rustls.workspace = true
 schemars = "1.2.2"
 serde.workspace = true
 serde_json.workspace = true

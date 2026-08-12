@@ -1,7 +1,7 @@
 # Rusty Weather public-origin federation v1
 
-Status: implemented discovery and selection foundation. Network replication is
-not enabled by this contract.
+Status: implemented discovery, bounded active health monitoring, and failover
+selection. Network replication is not enabled by this contract.
 
 Public-origin federation is conventional HTTPS discovery for institutions and
 operators who deliberately publish a Rusty Weather service address. It is not
@@ -58,12 +58,22 @@ hosts. Health is a bounded relative `/v1/...` path, so a descriptor cannot
 redirect a health probe to another host. Policy links use the same public-host
 rules and bounded paths.
 
-Static syntax checks cannot defeat DNS rebinding by themselves. Any component
-that later opens a connection MUST resolve the hostname immediately before the
-request, reject every non-global answer, pin the selected address for that TLS
-connection, retain the signed hostname for certificate/SNI validation, disable
-redirects, and repeat the check for every new connection. The current server
-selection seam performs no descriptor-directed network request.
+Static syntax checks cannot defeat DNS rebinding by themselves. The separately
+feature-gated server health monitor therefore creates a fresh client for every
+probe, resolves the signed hostname immediately before connecting, rejects the
+entire answer set if it is empty, oversized, or contains any non-global address,
+and gives the connector exactly one pinned socket address. The original signed
+hostname remains in the HTTPS URI for TLS SNI and certificate validation.
+Redirects are disabled, response bodies are bounded, and resolve, connect,
+request-send, response-receive, and whole-call deadlines are independently
+bounded. A new resolution and policy check occurs for every new probe; pooled
+connections cannot bypass it.
+
+Active monitoring is off by default even when catalog federation is enabled.
+Enabling it requires a durable health-state path. Each approved origin may
+optionally name a permission-restricted bearer-token file for its same-origin
+health path; otherwise the monitor performs a public HTTPS GET. Tokens are
+never accepted inline, exposed by an API, or placed in logs.
 
 ## Delivery and failover roles
 
@@ -94,3 +104,18 @@ another user never sees a participant address. Publishing a WRF-compatible run
 does not automatically create a public federated origin or grant replication:
 both require explicit rights confirmation and the separate operator approval
 flow.
+
+## Health, quarantine, and operator visibility
+
+Probe success clears a prior failure and quarantine immediately. Consecutive
+failures reach an operator-configured threshold and quarantine the origin for a
+bounded interval; the monitor continues probing quarantined origins so recovery
+does not wait for the interval to expire. Health state is atomically persisted
+without IP addresses, endpoint URLs, credentials, or raw transport errors, so
+restart cannot silently erase quarantine.
+
+Authenticated `GET /v1/federation/health` returns only origin ids, coarse
+healthy/degraded/quarantined/unknown states, counters, and timestamps. OpenMetrics
+exports only aggregate unlabeled federation counts and probe totals. Application
+logs contain the public origin id and coarse outcomes, never a resolved address,
+health URL, token, or low-level error containing one.

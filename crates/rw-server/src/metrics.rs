@@ -16,6 +16,14 @@ pub struct Metrics {
     cache_hits: Counter<u64, AtomicU64>,
     cache_misses: Counter<u64, AtomicU64>,
     inflight: Gauge<i64, AtomicI64>,
+    federation_probe_successes: Counter<u64, AtomicU64>,
+    federation_probe_failures: Counter<u64, AtomicU64>,
+    federation_monitor_enabled: Gauge<i64, AtomicI64>,
+    federation_origins: Gauge<i64, AtomicI64>,
+    federation_origins_healthy: Gauge<i64, AtomicI64>,
+    federation_origins_degraded: Gauge<i64, AtomicI64>,
+    federation_origins_quarantined: Gauge<i64, AtomicI64>,
+    federation_origins_unknown: Gauge<i64, AtomicI64>,
     duration_seconds: Histogram,
 }
 
@@ -39,6 +47,14 @@ impl Metrics {
         let cache_hits = Counter::default();
         let cache_misses = Counter::default();
         let inflight = Gauge::default();
+        let federation_probe_successes = Counter::default();
+        let federation_probe_failures = Counter::default();
+        let federation_monitor_enabled = Gauge::default();
+        let federation_origins = Gauge::default();
+        let federation_origins_healthy = Gauge::default();
+        let federation_origins_degraded = Gauge::default();
+        let federation_origins_quarantined = Gauge::default();
+        let federation_origins_unknown = Gauge::default();
         let duration_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 18));
 
         let mut registry = Registry::default();
@@ -73,6 +89,46 @@ impl Metrics {
             inflight.clone(),
         );
         registry.register(
+            "rw_federation_health_probe_successes",
+            "Successful checks of operator-approved public HTTPS origins.",
+            federation_probe_successes.clone(),
+        );
+        registry.register(
+            "rw_federation_health_probe_failures",
+            "Failed checks of operator-approved public HTTPS origins.",
+            federation_probe_failures.clone(),
+        );
+        registry.register(
+            "rw_federation_health_monitor_enabled",
+            "Whether active public-origin health monitoring is enabled.",
+            federation_monitor_enabled.clone(),
+        );
+        registry.register(
+            "rw_federation_origins",
+            "Total operator-approved public origins in the active catalog.",
+            federation_origins.clone(),
+        );
+        registry.register(
+            "rw_federation_origins_healthy",
+            "Public origins whose most recent health check succeeded.",
+            federation_origins_healthy.clone(),
+        );
+        registry.register(
+            "rw_federation_origins_degraded",
+            "Public origins with failures below the quarantine threshold.",
+            federation_origins_degraded.clone(),
+        );
+        registry.register(
+            "rw_federation_origins_quarantined",
+            "Public origins temporarily excluded from failover selection.",
+            federation_origins_quarantined.clone(),
+        );
+        registry.register(
+            "rw_federation_origins_unknown",
+            "Public origins not yet checked by the active monitor.",
+            federation_origins_unknown.clone(),
+        );
+        registry.register(
             "rw_http_duration_seconds",
             "End-to-end HTTP request duration in seconds.",
             duration_seconds.clone(),
@@ -86,6 +142,14 @@ impl Metrics {
             cache_hits,
             cache_misses,
             inflight,
+            federation_probe_successes,
+            federation_probe_failures,
+            federation_monitor_enabled,
+            federation_origins,
+            federation_origins_healthy,
+            federation_origins_degraded,
+            federation_origins_quarantined,
+            federation_origins_unknown,
             duration_seconds,
         }
     }
@@ -109,6 +173,29 @@ impl Metrics {
 
     pub fn cache_miss(&self) {
         self.cache_misses.inc();
+    }
+
+    pub fn record_federation_probe(&self, healthy: bool) {
+        if healthy {
+            self.federation_probe_successes.inc();
+        } else {
+            self.federation_probe_failures.inc();
+        }
+    }
+
+    pub fn set_federation_health(&self, status: &crate::federation::FederationHealthStatus) {
+        self.federation_monitor_enabled
+            .set(i64::from(status.monitor_enabled));
+        self.federation_origins
+            .set(i64::try_from(status.total_origins).unwrap_or(i64::MAX));
+        self.federation_origins_healthy
+            .set(i64::try_from(status.healthy_origins).unwrap_or(i64::MAX));
+        self.federation_origins_degraded
+            .set(i64::try_from(status.degraded_origins).unwrap_or(i64::MAX));
+        self.federation_origins_quarantined
+            .set(i64::try_from(status.quarantined_origins).unwrap_or(i64::MAX));
+        self.federation_origins_unknown
+            .set(i64::try_from(status.unknown_origins).unwrap_or(i64::MAX));
     }
 
     pub fn encode(&self) -> Result<String, fmt::Error> {
@@ -157,11 +244,29 @@ mod tests {
             .begin_request()
             .finish(Duration::from_millis(5), false);
         metrics.reject();
+        metrics.record_federation_probe(true);
+        metrics.set_federation_health(&crate::federation::FederationHealthStatus {
+            schema: "rw.federation.health-status.v1".into(),
+            monitor_enabled: true,
+            total_origins: 2,
+            healthy_origins: 1,
+            degraded_origins: 0,
+            quarantined_origins: 1,
+            unknown_origins: 0,
+            last_round_unix: Some(1_786_500_000),
+            origins: Vec::new(),
+        });
         let encoded = metrics.encode().unwrap();
         assert!(encoded.contains("rw_http_requests_total 1"));
         assert!(encoded.contains("rw_query_rejections_total 1"));
         assert!(encoded.contains("rw_response_cache_hits_total 0"));
+        assert!(encoded.contains("rw_federation_health_probe_successes_total 1"));
+        assert!(encoded.contains("rw_federation_origins_healthy 1"));
+        assert!(encoded.contains("rw_federation_origins_quarantined 1"));
         assert!(!encoded.contains("model="));
         assert!(!encoded.contains("run="));
+        assert!(!encoded.contains("origin_id="));
+        assert!(!encoded.contains("https://"));
+        assert!(!encoded.contains("127.0.0.1"));
     }
 }

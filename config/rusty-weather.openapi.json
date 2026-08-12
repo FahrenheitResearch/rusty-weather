@@ -1223,6 +1223,62 @@
         ]
       }
     },
+    "/v1/federation/health": {
+      "get": {
+        "tags": [
+          "federation"
+        ],
+        "description": "Return coarse operator health and quarantine state for deliberately public origins. The response never contains resolved addresses, endpoint URLs, bearer credentials, or transport errors.",
+        "operationId": "federation_health_doc",
+        "responses": {
+          "200": {
+            "description": "Address-free public-origin health summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FederationHealthStatusDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Public-origin federation is disabled or the service is busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Health status retrieval exceeded its deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/v1/federation/origins": {
       "get": {
         "tags": [
@@ -3955,6 +4011,60 @@
           }
         }
       },
+      "FederationHealthStatusDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "monitor_enabled",
+          "total_origins",
+          "healthy_origins",
+          "degraded_origins",
+          "quarantined_origins",
+          "unknown_origins",
+          "origins"
+        ],
+        "properties": {
+          "degraded_origins": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "healthy_origins": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "last_round_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "monitor_enabled": {
+            "type": "boolean"
+          },
+          "origins": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FederationOriginHealthStatusDoc"
+            }
+          },
+          "quarantined_origins": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "schema": {
+            "type": "string"
+          },
+          "total_origins": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "unknown_origins": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
       "FederationOriginDescriptorDoc": {
         "type": "object",
         "description": "Runtime parsing uses the exact closed DTOs in `rw-community-protocol`.\nThese document wrappers keep the HTTP surface legible without maintaining\na second canonical-signing implementation in the server crate.",
@@ -4025,6 +4135,48 @@
           "replication": {},
           "retention": {},
           "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "FederationOriginHealthStatusDoc": {
+        "type": "object",
+        "required": [
+          "origin_id",
+          "state",
+          "consecutive_failures"
+        ],
+        "properties": {
+          "consecutive_failures": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "last_probe_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "last_success_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "origin_id": {
+            "type": "string"
+          },
+          "quarantine_until_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "state": {
             "type": "string"
           }
         }

@@ -907,6 +907,7 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
             rw_community_protocol::FEDERATION_ORIGIN_PATH_TEMPLATE,
             get(federation_origin),
         )
+        .route("/v1/federation/health", get(federation_health))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_authentication,
@@ -2101,6 +2102,19 @@ async fn federation_origin(
     }
 }
 
+async fn federation_health(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(_principal): Extension<AuthPrincipal>,
+) -> Response {
+    let federation = state.federation.clone();
+    match state.run_light(move || federation.health_status()).await {
+        Ok(Ok(status)) => json_with_etag(StatusCode::OK, &status, request_id.0),
+        Ok(Err(error)) => federation_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
 async fn artifact(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
@@ -2450,6 +2464,10 @@ fn federation_problem(error: FederationError, request_id: Uuid) -> ProblemDetail
             "Refresh the signed federation catalog before selecting an archival origin.",
             request_id,
         ),
+        FederationError::Persistence => {
+            error!(%request_id, "federation health persistence failed");
+            ProblemDetails::internal(request_id)
+        }
         FederationError::Invalid(detail) => {
             error!(%request_id, %detail, "federation request is invalid");
             ProblemDetails::new(
@@ -2875,22 +2893,22 @@ mod tests {
     #[tokio::test]
     async fn federation_catalog_is_authenticated_and_feature_gated() {
         let (_directory, app) = test_app();
-        let denied = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(rw_community_protocol::FEDERATION_CATALOG_PATH)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        for path in [
+            rw_community_protocol::FEDERATION_CATALOG_PATH,
+            "/v1/federation/health",
+        ] {
+            let denied = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
 
-        let disabled = get_with_token(app, rw_community_protocol::FEDERATION_CATALOG_PATH).await;
-        assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = response_json(disabled).await;
-        assert_eq!(body["code"], "FEDERATION_DISABLED");
+            let disabled = get_with_token(app.clone(), path).await;
+            assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = response_json(disabled).await;
+            assert_eq!(body["code"], "FEDERATION_DISABLED");
+        }
     }
 
     #[tokio::test]

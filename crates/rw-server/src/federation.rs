@@ -4,9 +4,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
@@ -17,11 +20,22 @@ use rw_community_protocol::{
     parse_verifying_key_base64, sign_federation_catalog, verify_signed_federation_catalog,
     verify_signed_public_origin_descriptor,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
+use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{Connector as _, RustlsConnector, TcpConnector};
 
-use crate::config::FederationConfig;
+use crate::Metrics;
+use crate::config::{ApprovedFederationOriginConfig, FederationConfig};
 
 const MAX_SECRET_BYTES: u64 = 64 * 1024;
+const MAX_HEALTH_STATE_BYTES: u64 = 256 * 1024;
+const MAX_HEALTH_BODY_BYTES: u64 = 4 * 1024;
+const MAX_DNS_ANSWERS: usize = 16;
+const HEALTH_STATE_SCHEMA: &str = "rw.federation.health-state.v1";
+const HEALTH_STATUS_SCHEMA: &str = "rw.federation.health-status.v1";
 
 #[derive(Debug, Error)]
 pub enum FederationError {
@@ -29,6 +43,8 @@ pub enum FederationError {
     Disabled,
     #[error("federated origin was not found")]
     NotFound,
+    #[error("federation health state could not be persisted")]
+    Persistence,
     #[error("invalid federation configuration or state: {0}")]
     Invalid(String),
     #[error(transparent)]
@@ -43,6 +59,54 @@ pub enum FederationError {
 pub enum FederationHealthObservation {
     Healthy,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProbeFailureKind {
+    DnsRejected,
+    Timeout,
+    TlsOrNetwork,
+    HttpStatus,
+    WorkerFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeOutcome {
+    Healthy,
+    Failed(ProbeFailureKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FederationOriginHealthState {
+    Unknown,
+    Healthy,
+    Degraded,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FederationOriginHealthStatus {
+    pub origin_id: String,
+    pub state: FederationOriginHealthState,
+    pub consecutive_failures: u32,
+    pub quarantine_until_unix: Option<i64>,
+    pub last_probe_unix: Option<i64>,
+    pub last_success_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FederationHealthStatus {
+    pub schema: String,
+    pub monitor_enabled: bool,
+    pub total_origins: usize,
+    pub healthy_origins: usize,
+    pub degraded_origins: usize,
+    pub quarantined_origins: usize,
+    pub unknown_origins: usize,
+    pub last_round_unix: Option<i64>,
+    pub origins: Vec<FederationOriginHealthStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,10 +135,64 @@ pub struct SelectedFederatedOrigin {
     pub consecutive_failures: u32,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct HealthRecord {
     consecutive_failures: u32,
     quarantine_until_unix: i64,
+    last_probe_unix: Option<i64>,
+    last_success_unix: Option<i64>,
+    last_failure: Option<ProbeFailureKind>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableHealthState {
+    schema: String,
+    last_round_unix: Option<i64>,
+    records: BTreeMap<String, HealthRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct HealthProbeTarget {
+    origin_id: String,
+    health_url: String,
+    bearer_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HealthProbeTimeouts {
+    resolve: Duration,
+    connect: Duration,
+    send: Duration,
+    receive: Duration,
+    global: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct HealthMonitorSettings {
+    enabled: bool,
+    interval: Duration,
+    concurrency: usize,
+    state_file: Option<PathBuf>,
+    timeouts: HealthProbeTimeouts,
+}
+
+trait HealthProbe: std::fmt::Debug + Send + Sync + 'static {
+    fn probe(&self, target: &HealthProbeTarget, timeouts: HealthProbeTimeouts) -> ProbeOutcome;
+}
+
+#[derive(Debug)]
+struct SystemHealthProbe {
+    dns: BoundedDnsPool,
+}
+
+impl SystemHealthProbe {
+    fn new(workers: usize) -> Self {
+        Self {
+            dns: BoundedDnsPool::new(workers),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -93,7 +211,9 @@ struct FederationInner {
     health_failure_threshold: u32,
     health_quarantine_seconds: i64,
     maximum_selection_results: usize,
-    health: Mutex<BTreeMap<String, HealthRecord>>,
+    monitor: HealthMonitorSettings,
+    probe_targets: BTreeMap<String, HealthProbeTarget>,
+    health: Mutex<DurableHealthState>,
 }
 
 impl std::fmt::Debug for FederationService {
@@ -199,6 +319,47 @@ impl FederationService {
             ));
         }
 
+        let monitor = HealthMonitorSettings {
+            enabled: config.health_monitor_enabled,
+            interval: Duration::from_secs(config.health_probe_interval_seconds),
+            concurrency: config.health_probe_concurrency,
+            state_file: config.health_state_file.clone(),
+            timeouts: HealthProbeTimeouts {
+                resolve: Duration::from_secs(config.health_resolve_timeout_seconds),
+                connect: Duration::from_secs(config.health_connect_timeout_seconds),
+                send: Duration::from_secs(config.health_send_timeout_seconds),
+                receive: Duration::from_secs(config.health_receive_timeout_seconds),
+                global: Duration::from_secs(config.health_global_timeout_seconds),
+            },
+        };
+        let mut probe_targets = BTreeMap::new();
+        for (origin_id, signed) in &descriptors {
+            let approved = config
+                .approved_origins
+                .iter()
+                .find(|approved| approved.origin_id == *origin_id)
+                .ok_or_else(|| {
+                    FederationError::Invalid("approved origin mapping disappeared".into())
+                })?;
+            let bearer_token = if monitor.enabled {
+                load_health_token(approved)?
+            } else {
+                None
+            };
+            probe_targets.insert(
+                origin_id.clone(),
+                HealthProbeTarget {
+                    origin_id: origin_id.clone(),
+                    health_url: format!(
+                        "{}{}",
+                        signed.descriptor.https_base_url, signed.descriptor.health_path
+                    ),
+                    bearer_token,
+                },
+            );
+        }
+        let health = load_health_state(monitor.state_file.as_deref(), &descriptor_ids)?;
+
         let inner = FederationInner {
             catalog_id: config.catalog_id.clone(),
             catalog_signing_key_id: config.catalog_signing_key_id.clone(),
@@ -212,7 +373,9 @@ impl FederationService {
             health_quarantine_seconds: i64::try_from(config.health_quarantine_seconds)
                 .map_err(|_| FederationError::Invalid("health quarantine is too large".into()))?,
             maximum_selection_results: config.maximum_selection_results,
-            health: Mutex::new(BTreeMap::new()),
+            monitor,
+            probe_targets,
+            health: Mutex::new(health),
         };
         let service = Self {
             inner: Some(Arc::new(inner)),
@@ -246,6 +409,119 @@ impl FederationService {
         observation: FederationHealthObservation,
     ) -> Result<(), FederationError> {
         self.record_health_at(origin_id, observation, now_unix())
+    }
+
+    pub fn health_status(&self) -> Result<FederationHealthStatus, FederationError> {
+        self.health_status_at(now_unix())
+    }
+
+    /// Start the active public-origin monitor. Catalog federation and passive
+    /// failover selection remain usable when this separately gated task is off.
+    pub fn start_health_monitor(&self, metrics: Arc<Metrics>) -> Option<JoinHandle<()>> {
+        let inner = self.inner.as_ref()?;
+        let initial = self.health_status().ok()?;
+        metrics.set_federation_health(&initial);
+        if !inner.monitor.enabled {
+            return None;
+        }
+        let service = self.clone();
+        Some(tokio::spawn(async move {
+            let workers = service
+                .inner
+                .as_ref()
+                .map(|inner| inner.monitor.concurrency)
+                .unwrap_or(1);
+            let probe: Arc<dyn HealthProbe> = Arc::new(SystemHealthProbe::new(workers));
+            let mut interval = tokio::time::interval(service.monitor_interval());
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                service
+                    .run_health_round(probe.clone(), metrics.clone())
+                    .await;
+            }
+        }))
+    }
+
+    fn monitor_interval(&self) -> Duration {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.monitor.interval)
+            .unwrap_or(Duration::from_secs(60))
+    }
+
+    async fn run_health_round(&self, probe: Arc<dyn HealthProbe>, metrics: Arc<Metrics>) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        if !inner.monitor.enabled {
+            return;
+        }
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(inner.monitor.concurrency));
+        let timeouts = inner.monitor.timeouts;
+        let round_started = now_unix();
+        let targets = inner
+            .probe_targets
+            .iter()
+            .filter_map(|(origin_id, target)| {
+                let descriptor = inner.descriptors.get(origin_id)?;
+                verify_signed_public_origin_descriptor(
+                    descriptor,
+                    round_started,
+                    &inner.trust,
+                    &inner.limits,
+                )
+                .ok()
+                .map(|()| target.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut tasks = tokio::task::JoinSet::new();
+        for target in targets {
+            let Ok(permit) = semaphore.clone().acquire_owned().await else {
+                break;
+            };
+            let probe = probe.clone();
+            tasks.spawn(async move {
+                let origin_id = target.origin_id.clone();
+                let outcome = match tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    probe.probe(&target, timeouts)
+                })
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_) => ProbeOutcome::Failed(ProbeFailureKind::WorkerFailure),
+                };
+                (origin_id, outcome)
+            });
+        }
+        let observed_at = now_unix();
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok((origin_id, outcome)) => {
+                    metrics.record_federation_probe(matches!(outcome, ProbeOutcome::Healthy));
+                    if let Err(error) =
+                        self.record_probe_outcome_at(&origin_id, outcome, observed_at)
+                    {
+                        warn!(origin_id, %error, "public-origin health observation was not retained");
+                    }
+                }
+                Err(error) => warn!(%error, "public-origin health worker did not complete"),
+            }
+        }
+        if let Err(error) = self.record_round_completed_at(observed_at) {
+            warn!(%error, "public-origin health round could not be persisted");
+        }
+        if let Ok(status) = self.health_status_at(observed_at) {
+            metrics.set_federation_health(&status);
+            info!(
+                healthy = status.healthy_origins,
+                degraded = status.degraded_origins,
+                quarantined = status.quarantined_origins,
+                unknown = status.unknown_origins,
+                "public-origin health round completed"
+            );
+        }
     }
 
     fn catalog_at(&self, now: i64) -> Result<SignedFederationCatalog, FederationError> {
@@ -331,6 +607,7 @@ impl FederationService {
             }
             let descriptor = &signed.descriptor;
             let record = health
+                .records
                 .get(&descriptor.origin_id)
                 .cloned()
                 .unwrap_or_default();
@@ -362,12 +639,7 @@ impl FederationService {
                 consecutive_failures: record.consecutive_failures,
             });
         }
-        selected.sort_by(|a, b| {
-            a.consecutive_failures
-                .cmp(&b.consecutive_failures)
-                .then_with(|| a.origin_id.cmp(&b.origin_id))
-        });
-        selected.truncate(inner.maximum_selection_results);
+        order_and_bound_selected(&mut selected, inner.maximum_selection_results);
         Ok(selected)
     }
 
@@ -375,6 +647,21 @@ impl FederationService {
         &self,
         origin_id: &str,
         observation: FederationHealthObservation,
+        now: i64,
+    ) -> Result<(), FederationError> {
+        let outcome = match observation {
+            FederationHealthObservation::Healthy => ProbeOutcome::Healthy,
+            FederationHealthObservation::Failed => {
+                ProbeOutcome::Failed(ProbeFailureKind::TlsOrNetwork)
+            }
+        };
+        self.record_probe_outcome_at(origin_id, outcome, now)
+    }
+
+    fn record_probe_outcome_at(
+        &self,
+        origin_id: &str,
+        outcome: ProbeOutcome,
         now: i64,
     ) -> Result<(), FederationError> {
         validate_selection_id(origin_id)?;
@@ -386,19 +673,478 @@ impl FederationService {
             .health
             .lock()
             .map_err(|_| FederationError::Invalid("health lock is poisoned".into()))?;
-        let record = health.entry(origin_id.into()).or_default();
-        match observation {
-            FederationHealthObservation::Healthy => *record = HealthRecord::default(),
-            FederationHealthObservation::Failed => {
+        let mut next = health.clone();
+        let record = next.records.entry(origin_id.into()).or_default();
+        record.last_probe_unix = Some(now);
+        match outcome {
+            ProbeOutcome::Healthy => {
+                record.consecutive_failures = 0;
+                record.quarantine_until_unix = 0;
+                record.last_success_unix = Some(now);
+                record.last_failure = None;
+            }
+            ProbeOutcome::Failed(kind) => {
                 record.consecutive_failures = record.consecutive_failures.saturating_add(1);
+                record.last_failure = Some(kind);
                 if record.consecutive_failures >= inner.health_failure_threshold {
                     record.quarantine_until_unix =
                         now.saturating_add(inner.health_quarantine_seconds);
                 }
             }
         }
+        persist_health_state(inner.monitor.state_file.as_deref(), &next)?;
+        *health = next;
         Ok(())
     }
+
+    fn record_round_completed_at(&self, now: i64) -> Result<(), FederationError> {
+        let inner = self.inner.as_ref().ok_or(FederationError::Disabled)?;
+        let mut health = inner
+            .health
+            .lock()
+            .map_err(|_| FederationError::Invalid("health lock is poisoned".into()))?;
+        let mut next = health.clone();
+        next.last_round_unix = Some(now);
+        persist_health_state(inner.monitor.state_file.as_deref(), &next)?;
+        *health = next;
+        Ok(())
+    }
+
+    fn health_status_at(&self, now: i64) -> Result<FederationHealthStatus, FederationError> {
+        let inner = self.inner.as_ref().ok_or(FederationError::Disabled)?;
+        let health = inner
+            .health
+            .lock()
+            .map_err(|_| FederationError::Invalid("health lock is poisoned".into()))?;
+        let mut origins = Vec::with_capacity(inner.descriptors.len());
+        let mut healthy_origins = 0usize;
+        let mut degraded_origins = 0usize;
+        let mut quarantined_origins = 0usize;
+        let mut unknown_origins = 0usize;
+        for origin_id in inner.descriptors.keys() {
+            let record = health.records.get(origin_id).cloned().unwrap_or_default();
+            let state = if now < record.quarantine_until_unix {
+                quarantined_origins += 1;
+                FederationOriginHealthState::Quarantined
+            } else if record.last_probe_unix.is_none() {
+                unknown_origins += 1;
+                FederationOriginHealthState::Unknown
+            } else if record.consecutive_failures == 0 {
+                healthy_origins += 1;
+                FederationOriginHealthState::Healthy
+            } else {
+                degraded_origins += 1;
+                FederationOriginHealthState::Degraded
+            };
+            origins.push(FederationOriginHealthStatus {
+                origin_id: origin_id.clone(),
+                state,
+                consecutive_failures: record.consecutive_failures,
+                quarantine_until_unix: (record.quarantine_until_unix > now)
+                    .then_some(record.quarantine_until_unix),
+                last_probe_unix: record.last_probe_unix,
+                last_success_unix: record.last_success_unix,
+            });
+        }
+        Ok(FederationHealthStatus {
+            schema: HEALTH_STATUS_SCHEMA.into(),
+            monitor_enabled: inner.monitor.enabled,
+            total_origins: origins.len(),
+            healthy_origins,
+            degraded_origins,
+            quarantined_origins,
+            unknown_origins,
+            last_round_unix: health.last_round_unix,
+            origins,
+        })
+    }
+}
+
+fn order_and_bound_selected(selected: &mut Vec<SelectedFederatedOrigin>, maximum: usize) {
+    selected.sort_by(|a, b| {
+        a.consecutive_failures
+            .cmp(&b.consecutive_failures)
+            .then_with(|| a.origin_id.cmp(&b.origin_id))
+    });
+    selected.truncate(maximum);
+}
+
+#[derive(Clone)]
+struct BoundedDnsPool {
+    senders: Arc<Vec<mpsc::SyncSender<DnsJob>>>,
+    cursor: Arc<AtomicUsize>,
+}
+
+struct DnsJob {
+    lookup: String,
+    response: mpsc::SyncSender<std::io::Result<Vec<SocketAddr>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DnsPoolError {
+    Busy,
+    Timeout,
+    Disconnected,
+    Io,
+}
+
+impl std::fmt::Debug for BoundedDnsPool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BoundedDnsPool")
+            .field("workers", &self.senders.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl BoundedDnsPool {
+    fn new(maximum_workers: usize) -> Self {
+        let mut senders = Vec::with_capacity(maximum_workers);
+        for worker in 0..maximum_workers {
+            // One queued lookup per fixed worker avoids startup races while
+            // preserving a strict pool-wide upper bound of 2 * workers.
+            let (sender, receiver) = mpsc::sync_channel::<DnsJob>(1);
+            let spawned = thread::Builder::new()
+                .name(format!("rw-federation-dns-{worker}"))
+                .spawn(move || {
+                    while let Ok(job) = receiver.recv() {
+                        let result = job.lookup.to_socket_addrs().map(|addresses| {
+                            addresses
+                                .take(MAX_DNS_ANSWERS.saturating_add(1))
+                                .collect::<Vec<_>>()
+                        });
+                        let _ = job.response.send(result);
+                    }
+                });
+            if spawned.is_ok() {
+                senders.push(sender);
+            }
+        }
+        Self {
+            senders: Arc::new(senders),
+            cursor: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn resolve(&self, lookup: String, timeout: Duration) -> Result<Vec<SocketAddr>, DnsPoolError> {
+        if self.senders.is_empty() {
+            return Err(DnsPoolError::Disconnected);
+        }
+        let (response, receiver) = mpsc::sync_channel(1);
+        let mut job = Some(DnsJob { lookup, response });
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % self.senders.len();
+        let mut submitted = false;
+        for offset in 0..self.senders.len() {
+            let index = (start + offset) % self.senders.len();
+            match self.senders[index].try_send(job.take().expect("DNS job retained")) {
+                Ok(()) => {
+                    submitted = true;
+                    break;
+                }
+                Err(mpsc::TrySendError::Full(returned))
+                | Err(mpsc::TrySendError::Disconnected(returned)) => job = Some(returned),
+            }
+        }
+        if !submitted {
+            return Err(DnsPoolError::Busy);
+        }
+        match receiver.recv_timeout(timeout) {
+            Ok(Ok(addresses)) => Ok(addresses),
+            Ok(Err(_)) => Err(DnsPoolError::Io),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(DnsPoolError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(DnsPoolError::Disconnected),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SafePinnedResolver {
+    rejected_answer: Arc<Mutex<bool>>,
+    dns: BoundedDnsPool,
+}
+
+impl SafePinnedResolver {
+    fn rejected_answer(&self) -> bool {
+        self.rejected_answer
+            .lock()
+            .map(|value| *value)
+            .unwrap_or(true)
+    }
+
+    fn reject(&self) -> ureq::Error {
+        if let Ok(mut rejected) = self.rejected_answer.lock() {
+            *rejected = true;
+        }
+        ureq::Error::HostNotFound
+    }
+}
+
+impl Resolver for SafePinnedResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        if let Ok(mut rejected) = self.rejected_answer.lock() {
+            *rejected = false;
+        }
+        if uri.scheme_str() != Some("https") {
+            return Err(self.reject());
+        }
+        let host = uri.host().ok_or_else(|| self.reject())?.to_string();
+        let port = uri.port_u16().unwrap_or(443);
+        let lookup = format!("{host}:{port}");
+        let addresses = self
+            .dns
+            .resolve(lookup, *timeout.after)
+            .map_err(|error| match error {
+                DnsPoolError::Timeout => ureq::Error::Timeout(timeout.reason),
+                DnsPoolError::Busy | DnsPoolError::Disconnected | DnsPoolError::Io => {
+                    ureq::Error::HostNotFound
+                }
+            })?;
+        let selected = validate_and_pin_dns_answers(addresses).map_err(|()| self.reject())?;
+        let mut result = self.empty();
+        result.push(selected);
+        Ok(result)
+    }
+}
+
+impl HealthProbe for SystemHealthProbe {
+    fn probe(&self, target: &HealthProbeTarget, timeouts: HealthProbeTimeouts) -> ProbeOutcome {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
+        let resolver = SafePinnedResolver {
+            rejected_answer: Arc::new(Mutex::new(false)),
+            dns: self.dns.clone(),
+        };
+        let resolver_status = resolver.clone();
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .https_only(true)
+            .proxy(None)
+            .max_redirects(0)
+            .max_idle_connections(0)
+            .timeout_global(Some(timeouts.global))
+            .timeout_per_call(Some(timeouts.global))
+            .timeout_resolve(Some(timeouts.resolve))
+            .timeout_connect(Some(timeouts.connect))
+            .timeout_send_request(Some(timeouts.send))
+            .timeout_send_body(Some(timeouts.send))
+            .timeout_recv_response(Some(timeouts.receive))
+            .timeout_recv_body(Some(timeouts.receive))
+            .tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .provider(ureq::tls::TlsProvider::Rustls)
+                    .root_certs(ureq::tls::RootCerts::WebPki)
+                    .unversioned_rustls_crypto_provider(Arc::new(
+                        rustls::crypto::ring::default_provider(),
+                    ))
+                    .build(),
+            )
+            .build();
+        let connector = ().chain(TcpConnector::default()).chain(RustlsConnector::default());
+        // A fresh agent is intentional: no pooled connection may bypass the
+        // immediately preceding DNS policy check or its single pinned socket.
+        let agent = ureq::Agent::with_parts(config, connector, resolver);
+        let mut request = agent
+            .get(&target.health_url)
+            .header("accept", "application/json")
+            .header("user-agent", "rusty-weather-federation-health/1");
+        if let Some(token) = &target.bearer_token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let result = request.call().and_then(|mut response| {
+            if !response.status().is_success() {
+                return Err(ureq::Error::StatusCode(response.status().as_u16()));
+            }
+            response
+                .body_mut()
+                .with_config()
+                .limit(MAX_HEALTH_BODY_BYTES)
+                .read_to_vec()?;
+            Ok(())
+        });
+        match result {
+            Ok(()) => ProbeOutcome::Healthy,
+            Err(_) if resolver_status.rejected_answer() => {
+                ProbeOutcome::Failed(ProbeFailureKind::DnsRejected)
+            }
+            Err(ureq::Error::Timeout(_)) => ProbeOutcome::Failed(ProbeFailureKind::Timeout),
+            Err(ureq::Error::StatusCode(_)) | Err(ureq::Error::TooManyRedirects) => {
+                ProbeOutcome::Failed(ProbeFailureKind::HttpStatus)
+            }
+            Err(_) => ProbeOutcome::Failed(ProbeFailureKind::TlsOrNetwork),
+        }
+    }
+}
+
+fn validate_and_pin_dns_answers(mut addresses: Vec<SocketAddr>) -> Result<SocketAddr, ()> {
+    if addresses.is_empty()
+        || addresses.len() > MAX_DNS_ANSWERS
+        || addresses.iter().any(|address| !is_global_ip(address.ip()))
+    {
+        return Err(());
+    }
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses.into_iter().next().ok_or(())
+}
+
+fn is_global_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_global_ipv4(address),
+        IpAddr::V6(address) => is_global_ipv6(address),
+    }
+}
+
+fn is_global_ipv4(address: Ipv4Addr) -> bool {
+    let value = u32::from(address);
+    ![
+        (u32::from(Ipv4Addr::new(0, 0, 0, 0)), 8),
+        (u32::from(Ipv4Addr::new(10, 0, 0, 0)), 8),
+        (u32::from(Ipv4Addr::new(100, 64, 0, 0)), 10),
+        (u32::from(Ipv4Addr::new(127, 0, 0, 0)), 8),
+        (u32::from(Ipv4Addr::new(169, 254, 0, 0)), 16),
+        (u32::from(Ipv4Addr::new(172, 16, 0, 0)), 12),
+        (u32::from(Ipv4Addr::new(192, 0, 0, 0)), 24),
+        (u32::from(Ipv4Addr::new(192, 0, 2, 0)), 24),
+        (u32::from(Ipv4Addr::new(192, 88, 99, 0)), 24),
+        (u32::from(Ipv4Addr::new(192, 168, 0, 0)), 16),
+        (u32::from(Ipv4Addr::new(198, 18, 0, 0)), 15),
+        (u32::from(Ipv4Addr::new(198, 51, 100, 0)), 24),
+        (u32::from(Ipv4Addr::new(203, 0, 113, 0)), 24),
+        (u32::from(Ipv4Addr::new(224, 0, 0, 0)), 3),
+    ]
+    .iter()
+    .any(|(network, prefix)| in_ipv4_prefix(value, *network, *prefix))
+}
+
+fn in_ipv4_prefix(value: u32, network: u32, prefix: u32) -> bool {
+    let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+    value & mask == network & mask
+}
+
+fn is_global_ipv6(address: Ipv6Addr) -> bool {
+    let value = u128::from(address);
+    let globally_routed = in_ipv6_prefix(
+        value,
+        u128::from(Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0)),
+        3,
+    );
+    globally_routed
+        && ![
+            (u128::from(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0)), 23),
+            (u128::from(Ipv6Addr::new(0x2001, 2, 0, 0, 0, 0, 0, 0)), 48),
+            (
+                u128::from(Ipv6Addr::new(0x2001, 0x10, 0, 0, 0, 0, 0, 0)),
+                28,
+            ),
+            (
+                u128::from(Ipv6Addr::new(0x2001, 0x20, 0, 0, 0, 0, 0, 0)),
+                28,
+            ),
+            (
+                u128::from(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0)),
+                32,
+            ),
+            (u128::from(Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0)), 16),
+            (u128::from(Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0)), 20),
+        ]
+        .iter()
+        .any(|(network, prefix)| in_ipv6_prefix(value, *network, *prefix))
+}
+
+fn in_ipv6_prefix(value: u128, network: u128, prefix: u32) -> bool {
+    let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
+    value & mask == network & mask
+}
+
+fn load_health_token(
+    approved: &ApprovedFederationOriginConfig,
+) -> Result<Option<String>, FederationError> {
+    let Some(path) = approved.health_bearer_token_file.as_deref() else {
+        return Ok(None);
+    };
+    let token = read_secret(path)?;
+    if token.len() > 8 * 1024
+        || !token.is_ascii()
+        || token
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(FederationError::Invalid(
+            "federation health bearer token is malformed".into(),
+        ));
+    }
+    Ok(Some(token))
+}
+
+fn load_health_state(
+    path: Option<&Path>,
+    expected_origins: &BTreeSet<String>,
+) -> Result<DurableHealthState, FederationError> {
+    let Some(path) = path else {
+        return Ok(DurableHealthState {
+            schema: HEALTH_STATE_SCHEMA.into(),
+            last_round_unix: None,
+            records: BTreeMap::new(),
+        });
+    };
+    let bytes = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || !metadata.file_type().is_file()
+                || metadata.len() == 0
+                || metadata.len() > MAX_HEALTH_STATE_BYTES
+            {
+                return Err(FederationError::Invalid(
+                    "federation health state must be a bounded regular file".into(),
+                ));
+            }
+            fs::read(path)?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DurableHealthState {
+                schema: HEALTH_STATE_SCHEMA.into(),
+                last_round_unix: None,
+                records: BTreeMap::new(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let state: DurableHealthState = serde_json::from_slice(&bytes)?;
+    if state.schema != HEALTH_STATE_SCHEMA
+        || state.records.len() > expected_origins.len()
+        || state.records.iter().any(|(origin_id, record)| {
+            !expected_origins.contains(origin_id)
+                || record.consecutive_failures > 1_000_000
+                || record.quarantine_until_unix < 0
+                || record.last_probe_unix.is_some_and(|time| time < 0)
+                || record.last_success_unix.is_some_and(|time| time < 0)
+        })
+    {
+        return Err(FederationError::Invalid(
+            "federation health state is incompatible or malformed".into(),
+        ));
+    }
+    Ok(state)
+}
+
+fn persist_health_state(
+    path: Option<&Path>,
+    state: &DurableHealthState,
+) -> Result<(), FederationError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let bytes = serde_json::to_vec(state)?;
+    if bytes.len() as u64 > MAX_HEALTH_STATE_BYTES {
+        return Err(FederationError::Persistence);
+    }
+    rw_store::atomic::atomic_write_bytes(path, &bytes).map_err(|_| FederationError::Persistence)
 }
 
 fn coverage_contains(area: &FederationCoverageArea, requested: &FederationSelectionBounds) -> bool {
@@ -522,6 +1268,13 @@ mod tests {
     };
 
     fn write_service(now: i64) -> (tempfile::TempDir, FederationService) {
+        write_service_with(now, |_directory, _config| {})
+    }
+
+    fn write_service_with(
+        now: i64,
+        mutate: impl FnOnce(&tempfile::TempDir, &mut FederationConfig),
+    ) -> (tempfile::TempDir, FederationService) {
         let directory = tempfile::tempdir().unwrap();
         let origin_key = SigningKey::from_bytes(&[7; 32]);
         let catalog_key = SigningKey::from_bytes(&[9; 32]);
@@ -600,7 +1353,12 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(catalog_key.to_bytes()),
         )
         .unwrap();
-        let config = FederationConfig {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut config = FederationConfig {
             enabled: true,
             catalog_signing_key_file: Some(key_path),
             descriptor_files: vec![descriptor_path],
@@ -610,9 +1368,11 @@ mod tests {
                     key_id: "lab-2026-a".into(),
                     public_key_base64: encoded_origin_key,
                 }],
+                health_bearer_token_file: None,
             }],
             ..FederationConfig::default()
         };
+        mutate(&directory, &mut config);
         (directory, FederationService::open(&config).unwrap())
     }
 
@@ -675,6 +1435,7 @@ mod tests {
                     public_key_base64: base64::engine::general_purpose::STANDARD
                         .encode(SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes()),
                 }],
+                health_bearer_token_file: None,
             }],
             ..FederationConfig::default()
         };
@@ -701,6 +1462,7 @@ mod tests {
                     public_key_base64: base64::engine::general_purpose::STANDARD
                         .encode(SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes()),
                 }],
+                health_bearer_token_file: None,
             }],
             revoked_origin_ids: vec!["university-weather-lab".into()],
             ..FederationConfig::default()
@@ -711,5 +1473,265 @@ mod tests {
             service.descriptor_at("university-weather-lab", now),
             Err(FederationError::NotFound)
         ));
+    }
+
+    #[test]
+    fn dns_policy_rejects_rebinding_mixed_private_and_non_global_answers() {
+        for answers in [
+            vec![],
+            vec![
+                "8.8.8.8:443".parse().unwrap(),
+                "127.0.0.1:443".parse().unwrap(),
+            ],
+            vec![
+                "1.1.1.1:443".parse().unwrap(),
+                "10.0.0.7:443".parse().unwrap(),
+            ],
+            vec!["192.0.2.1:443".parse().unwrap()],
+            vec!["[2001:db8::1]:443".parse().unwrap()],
+            vec!["[fc00::1]:443".parse().unwrap()],
+            vec!["[fe80::1]:443".parse().unwrap()],
+        ] {
+            assert!(validate_and_pin_dns_answers(answers).is_err());
+        }
+        let pinned = validate_and_pin_dns_answers(vec![
+            "[2606:4700:4700::1111]:443".parse().unwrap(),
+            "1.1.1.1:443".parse().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(pinned, "1.1.1.1:443".parse().unwrap());
+    }
+
+    #[test]
+    fn all_special_use_address_classes_fail_closed() {
+        for address in [
+            "0.0.0.0",
+            "10.2.3.4",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.31.255.255",
+            "192.0.0.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "64:ff9b::1",
+            "2001:db8::1",
+            "2001:20::1",
+            "2002::1",
+            "3fff::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            assert!(!is_global_ip(address.parse().unwrap()), "{address}");
+        }
+        for address in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111"] {
+            assert!(is_global_ip(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[test]
+    fn timeout_failure_quarantines_and_a_success_recovers_immediately() {
+        let now = now_unix();
+        let (_directory, service) = write_service(now);
+        for _ in 0..3 {
+            service
+                .record_probe_outcome_at(
+                    "university-weather-lab",
+                    ProbeOutcome::Failed(ProbeFailureKind::Timeout),
+                    now,
+                )
+                .unwrap();
+        }
+        let status = service.health_status_at(now).unwrap();
+        assert_eq!(status.quarantined_origins, 1);
+        assert_eq!(
+            status.origins[0].state,
+            FederationOriginHealthState::Quarantined
+        );
+        service
+            .record_probe_outcome_at("university-weather-lab", ProbeOutcome::Healthy, now + 1)
+            .unwrap();
+        let recovered = service.health_status_at(now + 1).unwrap();
+        assert_eq!(recovered.healthy_origins, 1);
+        assert_eq!(recovered.origins[0].consecutive_failures, 0);
+        assert_eq!(recovered.origins[0].quarantine_until_unix, None);
+    }
+
+    #[test]
+    fn durable_quarantine_survives_restart_without_endpoint_or_address_leakage() {
+        let now = now_unix();
+        let (directory, service) = write_service_with(now, |directory, config| {
+            config.health_state_file = Some(directory.path().join("health.json"));
+        });
+        for _ in 0..3 {
+            service
+                .record_probe_outcome_at(
+                    "university-weather-lab",
+                    ProbeOutcome::Failed(ProbeFailureKind::DnsRejected),
+                    now,
+                )
+                .unwrap();
+        }
+        let bytes = fs::read(directory.path().join("health.json")).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("weather.example.edu"));
+        assert!(!text.contains("https://"));
+        assert!(!text.contains("127.0.0.1"));
+
+        let config = FederationConfig {
+            enabled: true,
+            catalog_signing_key_file: Some(directory.path().join("catalog.key")),
+            descriptor_files: vec![directory.path().join("lab.json")],
+            approved_origins: vec![crate::config::ApprovedFederationOriginConfig {
+                origin_id: "university-weather-lab".into(),
+                descriptor_signing_keys: vec![crate::config::FederationTrustedKeyConfig {
+                    key_id: "lab-2026-a".into(),
+                    public_key_base64: base64::engine::general_purpose::STANDARD
+                        .encode(SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes()),
+                }],
+                health_bearer_token_file: None,
+            }],
+            health_state_file: Some(directory.path().join("health.json")),
+            ..FederationConfig::default()
+        };
+        let restarted = FederationService::open(&config).unwrap();
+        assert_eq!(
+            restarted.health_status_at(now).unwrap().quarantined_origins,
+            1
+        );
+    }
+
+    #[test]
+    fn failover_order_is_exact_and_quarantine_advances_to_next_origin() {
+        let now = now_unix();
+        let (_directory, service) = write_service_with(now, |directory, config| {
+            let bytes = fs::read(directory.path().join("lab.json")).unwrap();
+            let signed =
+                parse_signed_public_origin_descriptor_bounded(&bytes, &FederationLimits::default())
+                    .unwrap();
+            let mut descriptor = signed.descriptor;
+            descriptor.origin_id = "alpha-lab".into();
+            descriptor.display_name = "Alpha Lab".into();
+            descriptor.https_base_url = "https://alpha.example.edu".into();
+            descriptor.policy_links.attribution_url =
+                "https://alpha.example.edu/attribution".into();
+            descriptor.policy_links.acceptable_use_url = "https://alpha.example.edu/policy".into();
+            descriptor.policy_links.privacy_url = "https://alpha.example.edu/privacy".into();
+            let key = SigningKey::from_bytes(&[7; 32]);
+            let alpha = sign_public_origin_descriptor(
+                descriptor,
+                "lab-2026-a",
+                &key,
+                &FederationLimits::default(),
+            )
+            .unwrap();
+            let alpha_path = directory.path().join("alpha.json");
+            fs::write(&alpha_path, serde_json::to_vec(&alpha).unwrap()).unwrap();
+            config.descriptor_files.push(alpha_path);
+            config
+                .approved_origins
+                .push(crate::config::ApprovedFederationOriginConfig {
+                    origin_id: "alpha-lab".into(),
+                    descriptor_signing_keys: vec![crate::config::FederationTrustedKeyConfig {
+                        key_id: "lab-2026-a".into(),
+                        public_key_base64: base64::engine::general_purpose::STANDARD
+                            .encode(key.verifying_key().to_bytes()),
+                    }],
+                    health_bearer_token_file: None,
+                });
+        });
+        let request = FederationSelectionRequest {
+            model: "hrrr".into(),
+            product: "native".into(),
+            query: FederationQueryCapability::ArbitraryDomainMap,
+            bounds: None,
+            minimum_response_bytes: 1024,
+            require_replication: false,
+        };
+        let ordered = service.select_at(&request, now).unwrap();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|item| item.origin_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha-lab", "university-weather-lab"]
+        );
+        service
+            .record_probe_outcome_at(
+                "alpha-lab",
+                ProbeOutcome::Failed(ProbeFailureKind::Timeout),
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            service.select_at(&request, now).unwrap()[0].origin_id,
+            "university-weather-lab"
+        );
+        for _ in 1..3 {
+            service
+                .record_probe_outcome_at(
+                    "alpha-lab",
+                    ProbeOutcome::Failed(ProbeFailureKind::Timeout),
+                    now,
+                )
+                .unwrap();
+        }
+        let failover = service.select_at(&request, now).unwrap();
+        assert_eq!(failover.len(), 1);
+        assert_eq!(failover[0].origin_id, "university-weather-lab");
+        service
+            .record_probe_outcome_at("alpha-lab", ProbeOutcome::Healthy, now + 1)
+            .unwrap();
+        assert_eq!(
+            service.select_at(&request, now + 1).unwrap()[0].origin_id,
+            "alpha-lab"
+        );
+    }
+
+    #[test]
+    fn timed_out_dns_worker_pool_has_fixed_capacity_and_never_queues_more_work() {
+        let (sender, receiver) = mpsc::sync_channel::<DnsJob>(1);
+        let (ready, ready_receiver) = mpsc::sync_channel(1);
+        let (started, started_receiver) = mpsc::sync_channel(1);
+        let (release, release_receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            ready.send(()).unwrap();
+            let job = receiver.recv().unwrap();
+            started.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            let _ = job.response.send(Ok(vec!["8.8.8.8:443".parse().unwrap()]));
+        });
+        let pool = BoundedDnsPool {
+            senders: Arc::new(vec![sender]),
+            cursor: Arc::new(AtomicUsize::new(0)),
+        };
+        ready_receiver.recv().unwrap();
+        let first_pool = pool.clone();
+        let first = thread::spawn(move || {
+            first_pool.resolve("blocked.example:443".into(), Duration::from_millis(10))
+        });
+        started_receiver.recv().unwrap();
+        assert_eq!(first.join().unwrap(), Err(DnsPoolError::Timeout));
+        // The one bounded queue slot can accept one more lookup while the
+        // fixed worker is stuck. A third cannot enqueue or spawn a replacement.
+        let second_pool = pool.clone();
+        let second = thread::spawn(move || {
+            second_pool.resolve("second.example:443".into(), Duration::from_millis(20))
+        });
+        thread::sleep(Duration::from_millis(2));
+        assert_eq!(
+            pool.resolve("third.example:443".into(), Duration::from_millis(10)),
+            Err(DnsPoolError::Busy)
+        );
+        assert_eq!(second.join().unwrap(), Err(DnsPoolError::Timeout));
+        release.send(()).unwrap();
+        worker.join().unwrap();
     }
 }
