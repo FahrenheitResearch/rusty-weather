@@ -18,6 +18,7 @@ rustwx-core = { path = "../rustwx-core" }
 rustwx-products = { path = "../rustwx-products" }
 rustwx-render = { path = "../rustwx-render" }
 rustwx-sounding = { path = "../rustwx-sounding" }
+sharppyrs = { path = "../../vendor/sharppyrs" }
 serde.workspace = true
 serde_json.workspace = true
 # Deep profiling scopes (default off; bowecho compiles without them). The

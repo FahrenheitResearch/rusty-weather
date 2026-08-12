@@ -96,6 +96,11 @@ local research files:
   horizontal/vertical/temporal calculus. The rw-store lane deliberately
   rejects operations whose exact geometry or valid-time metadata is absent
   instead of guessing.
+- The **Soundings** workspace uses the corrected native `sharppyrs` renderer
+  for model, observation-adjusted, RAOB, and imported-file profiles. Panels can
+  be moved and resized, the three diagnostic boards can be edited cell by cell
+  (including the current Formula Lab result), typography and text scale are
+  independent, and Stretch/Fit plus dock/float state persist across launches.
 - **Batch render** runs Rusty Weather's production renderer off the UI thread
   for a bounded product/hour selection, with progress, cancellation, native
   or explicit domains, and per-item failure reporting.

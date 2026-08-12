@@ -36,6 +36,7 @@ exclude = [
     "vendor/metrust",
     "vendor/netcrust/vendor/hdf5-reader",
     "vendor/sharprs",
+    "vendor/sharppyrs",
     "vendor/wx-core",
     "vendor/wx-field",
     "vendor/wx-radar",

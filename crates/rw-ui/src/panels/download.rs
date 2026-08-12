@@ -786,10 +786,7 @@ impl DownloadPanel {
 }
 
 fn apply_profile_preset_defaults(spec: &mut DownloadSpec) {
-    spec.derived = !matches!(
-        spec.profile.as_str(),
-        "sounding" | "surface" | "analysis"
-    );
+    spec.derived = !matches!(spec.profile.as_str(), "sounding" | "surface" | "analysis");
     if matches!(
         spec.profile.as_str(),
         "sounding" | "view" | "surface" | "analysis"

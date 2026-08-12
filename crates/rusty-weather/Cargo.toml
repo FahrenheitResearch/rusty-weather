@@ -32,6 +32,7 @@ rustwx-products = { path = "../rustwx-products" }
 rustwx-render = { path = "../rustwx-render" }
 rw-ingest = { path = "../rw-ingest" }
 rw-store = { path = "../rw-store" }
+ecape-rs = { path = "../../vendor/ecape-rs" }
 
 # Polite-mode priority drop (src/throttle.rs): windows-sys is already in
 # the tree transitively (clap's anstyle stack pulls 0.61), so this adds one

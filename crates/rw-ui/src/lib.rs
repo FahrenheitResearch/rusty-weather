@@ -45,9 +45,16 @@ pub use panels::{
     NativePlotSampling, NativePlotSettings, NativePlotStyle, PlotViewerPanel, RunBrowserPanel,
     SatDiskUsage, SatFollowSpec, SatFollowState, SatFrameImage, SatLayerOption, SatPlayerEvent,
     SatPlayerPanel, SatRunKey, SatRunListing, SatSatelliteOption, SatSectorOption, SatelliteEvent,
-    SatellitePanel, SoundingPanel, SoundingViewState, StageState, format_bytes,
-    shift_date_yyyymmdd, today_yyyymmdd_utc,
+    SatellitePanel, SoundingFormulaDiagnostic, SoundingPanel, SoundingViewState, StageState,
+    format_bytes, shift_date_yyyymmdd, today_yyyymmdd_utc,
 };
+
+/// Install the font families used by the native SHARPpy sounding widget.
+/// Hosts should call this once while configuring their egui context.
+pub fn install_sounding_fonts(ctx: &egui::Context) {
+    sharppyrs::install_fonts(ctx);
+}
+
 pub use store_view::{
     DEFAULT_POOLED_READER_TILE_CACHE_BYTES, HourEntry, MAX_READER_POOL_READERS,
     MAX_READER_POOL_TILE_CACHE_BYTES, ModelEntry, ReaderPoolLimits, ReaderPoolStats, RunEntry,
