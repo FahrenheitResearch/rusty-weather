@@ -49,3 +49,8 @@ This table will be advanced when a newer minor series is released.
 Release candidates must pass dependency advisory and license checks, include a
 CycloneDX SBOM and third-party notices, and publish SHA-256 checksums. Vendored
 code and static assets retain their own license and attribution files.
+Distributed releases must additionally satisfy the multi-node privacy,
+signature, quota, recovery, deployment, and packaged-workflow evidence in
+[`docs/DISTRIBUTED_RELEASE_GATES.md`](docs/DISTRIBUTED_RELEASE_GATES.md). A
+disabled feature, mock transport, or unit-test-only path is not production
+evidence.

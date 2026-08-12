@@ -1,6 +1,8 @@
 # BowEcho Community Cache protocol v1
 
-Status: Phase 1 contract. Network relay transport is not implemented here.
+Status: Phase 1 operational delivery plus a separately feature-gated Phase 2
+relay control plane. The concrete client TURN transport remains gated until
+packet-level relay-only and fallback tests pass.
 
 This document is normative for BowEcho Community Cache and Private Community
 Sharing. The words MUST, MUST NOT, SHOULD, and MAY have their RFC 2119 meanings.
@@ -39,7 +41,7 @@ reached through TURN or any peer transport. Every failure or absence at one
 tier MUST continue immediately to the next tier, and an R2 miss or outage MUST
 NOT make an otherwise valid origin query fail.
 
-A future historical-object path, if Phase 2 is separately enabled and passes
+A historical-object path, when Phase 2 is separately enabled and passes
 its security gates, is local cache, R2, a relay-only community seed, an
 archival HTTPS origin, then unavailable. No peer being online is a cache miss,
 never an application error. Frequently relayed objects SHOULD be promoted to
@@ -217,12 +219,17 @@ surface are bounded before acceptance.
 The canonical `case_artifact` request binds case/artifact/type, model, immutable
 run, source snapshot, grid, variables, recipe, provenance, publication policy,
 and `publication_owner_principal_sha256`. The latter MUST exactly match the
-SHA-256 principal derived from the authenticated bearer token. The origin
-serializes the typed wrapper, hashes the exact bytes, signs the complete object
-manifest, atomically stores bytes and manifest, and writes a durable audit
-record. Private WRF, ArWen, and user-provided publication additionally requires
-explicit owner action, confirmed redistribution rights, non-empty attribution
-and license fields, bounded retention, and
+SHA-256 principal derived from the authenticated bearer token. Every body sent
+to this client-authored endpoint MUST use `PrivateWrf`, `PrivateArwen`, or
+`UserProvided`, set explicit owner publication, confirm redistribution rights,
+and include non-empty attribution/license fields. `PublicProvider` is rejected
+even when the client supplies a plausible public model or provider name: the
+origin signature attests immutable owner-bound bytes and claims, not an
+unverified upstream identity. Underlying NOAA/ECMWF lineage remains bound in
+source provenance and attribution. The origin serializes the typed wrapper,
+hashes the exact bytes, signs the complete object manifest, atomically stores
+bytes and manifest, and writes a durable audit record. Publication also requires
+bounded retention and
 `community.cases.artifact_publication_enabled = true`.
 
 ### `POST /v1/community/artifacts/{sha256}/revoke`
@@ -253,24 +260,53 @@ Returns a bounded `SignedCaseRoomManifest`. `case_id` is an opaque safe token,
 never a path, address, username, or hostname. The client verifies the origin
 signature and all referenced object manifests before use.
 
+### `GET /v1/community/cases?after=&limit=`
+
+Returns `rw.community.case-directory.v1`, a private/no-store page of at most
+100 complete `SignedCaseRoomManifest` values in strictly increasing opaque
+`case_id` order. `after` is the final opaque ID from the preceding page and
+`next_after` is present only when more cases remain. The service verifies each
+case signature and every live referenced artifact before discovery. Passive
+searches, viewers, presence, peer state, and unpublished cases never enter the
+directory.
+
 ### `POST /v1/community/cases/{case_id}/revoke`
 
 Withdraws a case only when the authenticated principal owns every referenced
 artifact. A durable case tombstone is written before the live case manifest is
 removed, and the opaque case ID cannot be reused.
 
-## R2 immutable layout
+## R2 renewable signed-manifest layout
 
 R2 is an optional hot-object tier with deterministic keys:
 
-- `v1/manifests/{request_sha256}.json`
 - `v1/objects/{object_sha256}`
+- `v2/manifests/{manifest_sha256}.json`
+- `v2/requests/{request_sha256}.json`
 
-The manifest object is the bounded serialized `SignedObjectManifest`; the data
-object is the exact encoded body. Neither key contains model names, run names,
-queries, user IDs, filenames, or paths. Upload uses create-if-absent/conditional
-semantics. Existing bytes at a key MUST be compared by hash and MUST never be
-overwritten with different content. Promotion does not change signatures.
+The manifest blob is the bounded serialized `SignedObjectManifest`; its key is
+the SHA-256 of those exact bytes. The data object is the exact encoded body. A
+strict `rw.community.hot-manifest-pointer.v1` record binds one request hash to
+one manifest hash and is the only replaceable R2 key. Readers hash the fetched
+manifest bytes, then verify the origin signature, full request, object, and
+expiry; the pointer is discovery, never a trust root. The origin writes object,
+manifest blob, then pointer in that order. This permits signature/key renewal
+after expiry without overwriting immutable content or permanently stranding a
+request. Legacy `v1/manifests/{request_sha256}.json` is read-only migration
+fallback and receives no new writes.
+
+No key contains model names, run names, queries, user IDs, filenames, or paths.
+Immutable uploads use create-if-absent/conditional semantics and byte-compare
+conflicts. Pointer updates require authenticated strict-schema replacement.
+Promotion does not change canonical request or object identity.
+
+Revocable `case_artifact` objects are not promoted to the public hot tier in
+this version. They remain behind the authoritative origin's live tombstone
+check, so owner rights withdrawal takes effect for every conforming fetch.
+R2 case-artifact promotion must remain disabled until a mandatory fresh signed
+revocation-status contract is implemented by the origin, gateway, and BowEcho.
+Bytes already delivered before withdrawal cannot be clawed back; the UI states
+that unavoidable publication limitation before Publish.
 
 ## Source and publication policy
 
@@ -292,6 +328,13 @@ cache entry does not grant publication. No private directory or raw `wrfout`
 path crosses this contract. ArWen MAY publish a processed object immediately
 after its atomic `.rws` commit only following the owner's explicit publication
 action and rights confirmation.
+
+All client-authored case artifacts use that same explicit-owner boundary,
+including annotations, plots, or tables derived from public model data. They
+MUST NOT claim `PublicProvider`; only objects materialized from an
+origin-validated immutable run may carry that identity. A future source-handle
+contract may add stronger upstream attestation, but free-form client provenance
+is never upgraded into it.
 
 Raw `wrfout`, arbitrary files, and complete-run replication have no upload
 route. `rw.community.run-generation-publication.v1` is a disabled-by-default
@@ -330,13 +373,51 @@ They do not contain another user's identity or address.
 
 Payload chunks use `EncryptedRelayEnvelope`: opaque session ID, exact object
 hash, chunk index/count, plaintext byte count, a unique 24-byte nonce, and
-XChaCha20-Poly1305 ciphertext. A future key-agreement extension MUST exchange
-only ephemeral public keys through the authenticated backend, bind them to the
-credential/session transcript, and derive a per-object key end to end. The
-relay MUST never receive the content key. Envelope headers are authenticated
-additional data. Nonces MUST never repeat for a session key. The receiving
-client still applies the signed manifest, ciphertext authentication, hash,
-size, decompression, schema, and source-policy checks before publication.
+XChaCha20-Poly1305 ciphertext. V1 fixes plaintext chunks at 512 bytes (except
+the final chunk) and caps the complete compact JSON/base64 datagram at 1,200
+bytes. The worst-case 128-character session/u32-index envelope is tested at
+1,150 bytes, so the protocol does not depend on IPv4 or IPv6 fragmentation.
+Ephemeral X25519 public keys travel only through the authenticated backend and
+are bound, with both signed role credentials, into a signed session transcript.
+The relay never receives the derived per-object content key. Envelope headers
+are authenticated additional data. Nonces never repeat for a session key.
+
+TURN/UDP reliability is a bounded stop-and-wait protocol. The downloader sends
+one `receiver_ready` control datagram through its bound allocation before
+waiting for data. It is authenticated with the ACK key using the
+downloader-only kind and is bound to the opaque session, exact object, ACK
+kind, and index zero. This
+send causes the pinned TURN client to create the downloader's lazy receive
+permission. It has no receipt requirement: it may be discarded while the
+uploader's reverse permission does not yet exist. The uploader's first bounded
+data attempt creates that reverse permission. A valid late or duplicate
+`receiver_ready` is authenticated, bounded, and ignored while an ACK or final
+receipt is awaited; an unsigned, cross-session, cross-object, wrong-kind, or
+excessive marker fails closed.
+
+For each encrypted chunk, the downloader sends an end-to-end authenticated ACK
+bound to session, object, ACK kind, and exact chunk index. The uploader
+encrypts each chunk once and retransmits identical ciphertext only up to the
+configured attempt ceiling. A downloader may accept only the immediately
+preceding byte-identical duplicate; it authenticates the ciphertext again,
+re-ACKs it, and never appends it twice. Future or older chunks fail closed.
+After every chunk ACK, the uploader sends a separate
+authenticated transfer-complete confirmation. The downloader accepts that
+confirmation only after exact byte count and final SHA-256 match, then still
+applies the origin-signed manifest, decompression, schema, and source-policy
+checks and posts its authenticated broker completion before returning an
+authenticated transfer receipt. The uploader succeeds only after that receipt,
+then posts its own signed-role completion; it reports success only when the
+broker confirms matching exact-byte completion from both roles. A lost final
+receipt or missing counterpart completion fails/falls back rather than counting
+as a successful recovery.
+
+The initial stop-and-wait implementation admits only profile and point-series
+objects up to 64 KiB. At 512 bytes per RTT it is intentionally not presented as
+a practical large-object transport. Native/geographic windows, temporal grids,
+and case artifacts continue directly to archival HTTPS/unavailable after R2
+miss until a bounded authenticated sliding-window/selective-ACK transport and
+its loss/duplication/reordering tests pass.
 
 No implementation may add address-bearing signaling or gather direct
 candidates. A provider that cannot guarantee relay-only operation is not a
@@ -365,6 +446,41 @@ end-to-end encrypted payloads. The UI MUST disclose this distinction without
 claiming anonymity from the relay operator.
 
 ## Quotas, kill switch, and failure behavior
+
+The Phase 2 broker is an independently off-by-default server feature. It
+accepts only authenticated exact-hash cold historical operations:
+
+- `POST /v1/community/relay/advertisements` admits an origin-signed immutable
+  identity under local opt-in/category/storage/upload/metered policy;
+- `POST /v1/community/relay/historical/lookups` requires `historical = true`
+  and either durably reserves one caller-specific session or immediately
+  returns archival HTTPS/unavailable fallback;
+- caller-specific grant polling and exact role/session retrieval never expose
+  a seed/session directory or the other participant's grant;
+- `/routes` and `/transport` are the sole transport-private provider-allocation
+  exchange, authenticated and `Cache-Control: no-store`;
+- `/sessions/complete`, `/fail`, and `/revoke` durably commit the terminal
+  transition before reporting success; and
+- operator status/kill endpoints expose only coarse counters/gates and require
+  configured bearer-derived principal digests.
+
+Every mutating admission/reservation/terminal transition atomically replaces
+the bounded coordinator snapshot before returning success. TURN username,
+password, API token, allocation address, and provider credential are never
+persisted. After restart every pre-crash session is failed/revoked, its full
+reservation is conservatively charged, and short-lived TURN credentials are
+allowed to expire. A corrupt, incompatible, oversized, or configuration-mixed
+snapshot fails closed.
+
+The initial provider adapter calls Cloudflare's documented
+`/credentials/generate` endpoint with the exact configured TTL and opaque
+`customIdentifier`, uses `/credentials/{username}/revoke`, accepts only the
+documented 201/204 statuses, strips all STUN URLs, and admits only TURN/TURNS
+URLs on the operator host allowlist. Provider API HTTPS preserves
+`rtc.live.cloudflare.com` for TLS verification while pinning one freshly
+resolved address only after the complete DNS answer set is globally routable.
+Redirects and proxy discovery are disabled, all phases have bounded timeouts,
+and provider errors are deliberately coarse.
 
 Server policy enforces per-user upload, download, storage, concurrency, and
 monthly limits; local policy enforces disk allowance and cache eviction. Seed

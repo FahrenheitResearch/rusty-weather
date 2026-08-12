@@ -1,6 +1,6 @@
 # BowEcho Community Cache threat model
 
-Status: required security baseline before any relay transport implementation.
+Status: required security baseline and release gate for relay transport.
 
 ## Security properties
 
@@ -15,8 +15,8 @@ object store, the network, and submitted object bytes are hostile:
 5. Compressed/malformed content cannot cause unbounded allocation or decode.
 6. Private WRF, ArWen, and user-provided data cannot be published implicitly.
 7. Required provider attribution and modification notices survive every hop.
-8. Phase 1 R2 failure degrades to the authoritative Hetzner HTTPS origin;
-   future historical relay failure degrades to its archival HTTPS origin.
+8. Operational R2 failure degrades to the authoritative Hetzner HTTPS origin;
+   historical relay failure degrades to its archival HTTPS origin.
 9. Quotas, metered-network pause, eviction, and the global kill switch bound
    user and operator cost.
 10. Passive searches and presence are private; case rooms are deliberate
@@ -67,7 +67,18 @@ session, and immediately falls back. A seed cannot mint a trusted manifest.
 R2 may return stale, missing, swapped, or altered manifests/objects. Both are
 untrusted until origin-signature, request identity, hash, size, expiration,
 schema, and source-policy checks pass. Deterministic keys are not authorization.
-An existing immutable key is never overwritten with different content.
+An existing immutable object or manifest-blob key is never overwritten with
+different content. The sole replaceable request pointer is strict and bounded;
+it names a content-addressed manifest but cannot make an invalid, expired, or
+wrong-request signature trusted. Malformed/stale pointers fall through to the
+HTTPS origin, which can publish a fresh signed manifest and atomically renew the
+pointer.
+
+Revocable owner-published case artifacts are excluded from R2 promotion while
+the hot tier lacks a mandatory fresh revocation-status lookup. They are served
+through the authority, which checks durable tombstones. This prevents an
+unexpired cached signature from bypassing withdrawal; it cannot erase bytes a
+recipient legitimately downloaded before the owner revoked publication.
 
 ### Cache-key confusion
 
@@ -137,7 +148,7 @@ authenticated. Replay/nonces are tracked per session. Missing/corrupt chunks
 abort and fall back. The relay never receives an end-to-end content key.
 
 The control backend may relay ephemeral public keys but cannot derive an
-X25519 shared secret. A later Phase 2 transcript must bind both ephemeral keys,
+X25519 shared secret. The Phase 2 transcript binds both ephemeral keys,
 session ID, object hash, credential identities, cipher suite, and protocol
 version before deriving a per-object key. Long-term identity keys must not be
 used directly as payload-encryption keys.
@@ -159,11 +170,17 @@ force. Community limits constrain manifest/body/decode size and concurrency.
 Local caches have bounded atomic eviction. Server quotas, monthly/cost
 thresholds, a global kill switch, and metered-network defaults bound traffic.
 Popularity promotion moves recurring objects to R2. No peer availability is
-required. In the future historical path, relay failure proceeds immediately to
+required. In the separately gated historical path, relay failure proceeds immediately to
 the archival HTTPS origin rather than retrying or attempting direct transport.
 
-Provider pricing is deliberately not a protocol constant. Operators update
-thresholds after capacity and provider audits.
+Provider pricing is deliberately not a protocol constant. Cloudflare's
+published Realtime terms as of July 2026 describe a shared 1,000 GB/month
+SFU+TURN allowance, then US$0.05/GB edge-to-client egress including TURN
+overhead. Because terms and account treatment can change, the default-false
+`provider_pricing_verified` gate requires an operator to
+check the actual account plan and derive current byte/cost stops before each
+deployment can enable relay. Configuration examples are parsing-only, not an
+approved budget.
 
 ### Private-run exfiltration
 
@@ -215,7 +232,8 @@ Phase 1 must remain feature-gated until automated tests prove:
 - private WRF and ArWen requests fail without explicit publication and rights;
 - typed artifact publication rejects owner impersonation, paths, URLs,
   HTML/script, malformed image signatures, excessive pixels/cells/coordinates,
-  expired retention, and absent private-source license metadata;
+  expired retention, absent owner/license metadata, and every client attempt to
+  claim `PublicProvider` identity (including a relabeled private run);
 - revoked/expired artifacts and cases are unavailable and tombstoned identities
   cannot be republished;
 - ECMWF notices are mandatory on objects and case manifests;
@@ -234,7 +252,7 @@ Before Phase 2 can be enabled, tests must additionally prove:
   rejected after revocation;
 - encrypted envelopes reject nonce reuse, replay, reordering, tampering,
   wrong-session data, and oversized chunks;
-- relay outage in the future historical path immediately proceeds to the
+- relay outage in the historical path immediately proceeds to the
   archival HTTPS origin;
 - upload/download/storage/concurrency/monthly quotas, metered-network pause,
   global kill switch, cost thresholds, and hot-object promotion work;

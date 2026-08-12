@@ -25,6 +25,12 @@ LogsDirectory=rusty-weather
 LogsDirectoryMode=0750
 ReadOnlyPaths=/var/lib/rusty-weather/store
 ReadWritePaths=/var/lib/rusty-weather/artifacts
+# Optional distributed features remain disabled by default. When explicitly
+# enabled, keep their control/cache state beneath these service-owned paths;
+# the leading '-' lets the base service start before an operator creates them.
+ReadWritePaths=-/var/lib/rusty-weather/community-cache
+ReadWritePaths=-/var/lib/rusty-weather/federation
+ReadWritePaths=-/var/lib/rusty-weather/generation-replication
 
 NoNewPrivileges=true
 PrivateDevices=true

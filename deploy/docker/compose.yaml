@@ -31,7 +31,12 @@ services:
     volumes:
       - ./data/store:/var/lib/rusty-weather/store:ro
       - ./data/artifacts:/var/lib/rusty-weather/artifacts:rw
-      - ../../config/rusty-weather.example.toml:/etc/rusty-weather/rusty-weather.toml:ro
+      # Disabled features do not write these mounts. They exist so an audited
+      # Community Cache/federation configuration can persist state while the
+      # container root filesystem remains read-only.
+      - ./data/community-cache:/var/lib/rusty-weather/community-cache:rw
+      - ./data/federation:/var/lib/rusty-weather/federation:rw
+      - ${RW_SERVER_CONFIG_PATH:-../../config/rusty-weather.example.toml}:/etc/rusty-weather/rusty-weather.toml:ro
     secrets:
       - rw_api_tokens
     healthcheck:

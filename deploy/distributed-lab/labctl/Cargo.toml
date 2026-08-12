@@ -1,0 +1,26 @@
+[package]
+name = "rw-distributed-labctl"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace]
+
+[dependencies]
+async-trait = "0.1.89"
+base64 = "0.22.1"
+ed25519-dalek = "2.2.0"
+rcgen = "0.14.5"
+rw-community-protocol = { path = "../../../crates/rw-community-protocol" }
+rw-community-relay = { path = "../../../crates/rw-community-relay" }
+rw-federation-proxy = { path = "../../../crates/rw-federation-proxy" }
+rw-query = { path = "../../../crates/rw-query" }
+rw-store = { path = "../../../crates/rw-store" }
+rustwx-core = { path = "../../../crates/rustwx-core" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+ureq = { version = "3.2.0", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
+rustls = { version = "0.23.37", default-features = false, features = ["ring", "std"] }

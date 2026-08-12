@@ -31,6 +31,7 @@ RUN apt-get update \
         --shell /usr/sbin/nologin rusty-weather \
     && install -d -o "${RW_UID}" -g "${RW_GID}" -m 0750 \
         /var/lib/rusty-weather/store /var/lib/rusty-weather/artifacts \
+        /var/lib/rusty-weather/community-cache /var/lib/rusty-weather/federation \
         /var/lib/rusty-weather/scheduler /var/cache/rusty-weather/ingest \
     && install -d -o root -g "${RW_GID}" -m 0750 /etc/rusty-weather
 
@@ -50,6 +51,9 @@ COPY --chmod=0444 README.md SECURITY.md LICENSE THIRD_PARTY_NOTICES.md \
     /usr/share/doc/rusty-weather/
 COPY --chmod=0444 docs/DEPLOYMENT.md docs/OPERATIONS.md docs/SERVICE_V1.md \
     docs/DATA_SOURCES.md docs/MODEL_SUPPORT.md docs/REDUCTIONS.md \
+    docs/COMMUNITY_CACHE_PROTOCOL.md docs/COMMUNITY_CACHE_THREAT_MODEL.md \
+    docs/FEDERATION.md docs/FEDERATION_PROXY.md docs/ORIGIN_CATALOG.md docs/GENERATION_REPLICATION.md \
+    docs/DISTRIBUTED_RELEASE_GATES.md \
     /usr/share/doc/rusty-weather/
 COPY --from=builder --chmod=0444 /tmp/THIRD_PARTY_LICENSES.html \
     /usr/share/doc/rusty-weather/THIRD_PARTY_LICENSES.html

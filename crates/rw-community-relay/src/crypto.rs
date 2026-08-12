@@ -26,6 +26,21 @@ pub const SESSION_BINDING_SCHEMA: &str = "rw.community.relay-session-binding.v1"
 const SESSION_BINDING_DOMAIN: &[u8] = b"rw-community-relay-session-binding-v1\0";
 const SESSION_KEY_INFO: &[u8] = b"rw-community-relay-x25519-xchacha20poly1305-v1";
 const ENVELOPE_AAD_DOMAIN: &[u8] = b"rw-community-relay-envelope-aad-v1\0";
+const ACK_KEY_INFO: &[u8] = b"rw-community-relay-ack-xchacha20poly1305-v1";
+const ACK_AAD_DOMAIN: &[u8] = b"rw-community-relay-ack-aad-v1\0";
+pub const RELAY_ACK_SCHEMA: &str = "rw.community.relay-ack.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayAckKind {
+    Chunk,
+    TransferComplete,
+    TransferReceipt,
+    /// Downloader-authored, session/object-bound readiness marker. Sending it
+    /// through the bound TURN allocation establishes the downloader's lazy
+    /// receive permission before the uploader's first encrypted chunk.
+    ReceiverReady,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -197,6 +212,105 @@ pub struct SessionKey(Zeroizing<[u8; 32]>);
 impl fmt::Debug for SessionKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SessionKey([redacted])")
+    }
+}
+
+/// End-to-end authenticated relay control datagram. It contains only opaque
+/// session/object identities and is never accepted as authorization by itself.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatedRelayAck {
+    pub schema: String,
+    pub session_id: String,
+    pub object_sha256: String,
+    pub kind: RelayAckKind,
+    pub chunk_index: u32,
+    pub authenticator_base64: String,
+}
+
+impl fmt::Debug for AuthenticatedRelayAck {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthenticatedRelayAck([opaque session])")
+    }
+}
+
+struct AckAuthenticator {
+    cipher: XChaCha20Poly1305,
+}
+
+impl AckAuthenticator {
+    fn from_session_key(key: &SessionKey) -> Result<Self, RelayError> {
+        let hkdf = Hkdf::<Sha256>::new(None, key.0.as_slice());
+        let mut ack_key = Zeroizing::new([0_u8; 32]);
+        hkdf.expand(ACK_KEY_INFO, ack_key.as_mut())
+            .map_err(|_| RelayError::KeyAgreementRejected)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(ack_key.as_slice())
+            .map_err(|_| RelayError::KeyAgreementRejected)?;
+        Ok(Self { cipher })
+    }
+
+    fn authenticate(
+        &self,
+        session_id: &str,
+        object_sha256: &str,
+        kind: RelayAckKind,
+        chunk_index: u32,
+    ) -> Result<AuthenticatedRelayAck, RelayError> {
+        let (nonce, aad) = ack_material(session_id, object_sha256, kind, chunk_index)?;
+        let authenticator = self
+            .cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &[],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| RelayError::AuthenticationFailed)?;
+        Ok(AuthenticatedRelayAck {
+            schema: RELAY_ACK_SCHEMA.into(),
+            session_id: session_id.into(),
+            object_sha256: object_sha256.into(),
+            kind,
+            chunk_index,
+            authenticator_base64: base64::engine::general_purpose::STANDARD.encode(authenticator),
+        })
+    }
+
+    fn verify(
+        &self,
+        ack: &AuthenticatedRelayAck,
+        session_id: &str,
+        object_sha256: &str,
+        kind: RelayAckKind,
+        chunk_index: u32,
+    ) -> Result<(), RelayError> {
+        if ack.schema != RELAY_ACK_SCHEMA
+            || ack.session_id != session_id
+            || ack.object_sha256 != object_sha256
+            || ack.kind != kind
+            || ack.chunk_index != chunk_index
+            || ack.authenticator_base64.len() != 24
+        {
+            return Err(RelayError::AuthenticationFailed);
+        }
+        let authenticator = base64::engine::general_purpose::STANDARD
+            .decode(&ack.authenticator_base64)
+            .map_err(|_| RelayError::AuthenticationFailed)?;
+        if authenticator.len() != 16 {
+            return Err(RelayError::AuthenticationFailed);
+        }
+        let (nonce, aad) = ack_material(session_id, object_sha256, kind, chunk_index)?;
+        self.cipher
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &authenticator,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| RelayError::AuthenticationFailed)?;
+        Ok(())
     }
 }
 
@@ -380,13 +494,14 @@ pub struct RelayChunkPolicy {
 impl Default for RelayChunkPolicy {
     fn default() -> Self {
         Self {
-            max_plaintext_per_chunk: 1024 * 1024,
+            max_plaintext_per_chunk: crate::RELAY_PLAINTEXT_CHUNK_BYTES,
         }
     }
 }
 
 pub struct RelaySender {
     cipher: XChaCha20Poly1305,
+    ack_authenticator: AckAuthenticator,
     credential: RelayCredentialClaims,
     limits: ProtocolLimits,
     chunk_size: u32,
@@ -425,6 +540,7 @@ impl RelaySender {
         Ok(Self {
             cipher: XChaCha20Poly1305::new_from_slice(key.0.as_slice())
                 .map_err(|_| RelayError::KeyAgreementRejected)?,
+            ack_authenticator: AckAuthenticator::from_session_key(&key)?,
             credential: credential.clone(),
             limits,
             chunk_size: policy.max_plaintext_per_chunk,
@@ -494,6 +610,76 @@ impl RelaySender {
         Ok(envelope)
     }
 
+    pub fn verify_ack(
+        &self,
+        ack: &AuthenticatedRelayAck,
+        chunk_index: u32,
+    ) -> Result<(), RelayError> {
+        if chunk_index >= self.next_index {
+            return Err(RelayError::OutOfOrder);
+        }
+        self.ack_authenticator.verify(
+            ack,
+            &self.credential.session_id,
+            &self.credential.object_sha256,
+            RelayAckKind::Chunk,
+            chunk_index,
+        )
+    }
+
+    /// Verify a downloader-authored readiness marker. The marker is
+    /// idempotent and remains valid if network scheduling delivers a duplicate
+    /// while a chunk ACK or final receipt is awaited.
+    pub fn verify_receiver_ready(&self, ready: &AuthenticatedRelayAck) -> Result<(), RelayError> {
+        self.ack_authenticator.verify(
+            ready,
+            &self.credential.session_id,
+            &self.credential.object_sha256,
+            RelayAckKind::ReceiverReady,
+            0,
+        )
+    }
+
+    pub fn completion_confirmation(&self) -> Result<AuthenticatedRelayAck, RelayError> {
+        if self.next_index != self.chunk_count || self.observed_bytes != self.expected_bytes {
+            return Err(RelayError::ObjectMismatch);
+        }
+        self.ack_authenticator.authenticate(
+            &self.credential.session_id,
+            &self.credential.object_sha256,
+            RelayAckKind::TransferComplete,
+            self.chunk_count - 1,
+        )
+    }
+
+    pub fn verify_transfer_receipt(
+        &self,
+        receipt: &AuthenticatedRelayAck,
+    ) -> Result<(), RelayError> {
+        if self.next_index != self.chunk_count || self.observed_bytes != self.expected_bytes {
+            return Err(RelayError::ObjectMismatch);
+        }
+        self.ack_authenticator.verify(
+            receipt,
+            &self.credential.session_id,
+            &self.credential.object_sha256,
+            RelayAckKind::TransferReceipt,
+            self.chunk_count - 1,
+        )
+    }
+
+    pub fn next_plaintext_size(&self) -> Result<u32, RelayError> {
+        self.expected_next_size()
+    }
+
+    pub(crate) fn object_sha256(&self) -> &str {
+        &self.credential.object_sha256
+    }
+
+    pub(crate) const fn expected_chunk_count(&self) -> u32 {
+        self.chunk_count
+    }
+
     fn expected_next_size(&self) -> Result<u32, RelayError> {
         if self.next_index >= self.chunk_count || self.observed_bytes >= self.expected_bytes {
             return Err(RelayError::OutOfOrder);
@@ -512,6 +698,7 @@ impl RelaySender {
 
 pub struct RelayReceiver {
     cipher: XChaCha20Poly1305,
+    ack_authenticator: AckAuthenticator,
     credential: RelayCredentialClaims,
     limits: ProtocolLimits,
     chunk_size: u32,
@@ -521,6 +708,7 @@ pub struct RelayReceiver {
     observed_bytes: u64,
     used_nonces: BTreeSet<[u8; 24]>,
     assembled: Vec<u8>,
+    last_accepted: Option<EncryptedRelayEnvelope>,
 }
 
 impl fmt::Debug for RelayReceiver {
@@ -552,6 +740,7 @@ impl RelayReceiver {
         Ok(Self {
             cipher: XChaCha20Poly1305::new_from_slice(key.0.as_slice())
                 .map_err(|_| RelayError::KeyAgreementRejected)?,
+            ack_authenticator: AckAuthenticator::from_session_key(&key)?,
             credential: credential.clone(),
             limits,
             chunk_size: policy.max_plaintext_per_chunk,
@@ -561,10 +750,43 @@ impl RelayReceiver {
             observed_bytes: 0,
             used_nonces: BTreeSet::new(),
             assembled: Vec::with_capacity(capacity),
+            last_accepted: None,
         })
     }
 
     pub fn accept(&mut self, envelope: &EncryptedRelayEnvelope) -> Result<(), RelayError> {
+        self.accept_inner(envelope, false).map(|_| ())
+    }
+
+    /// Accept the next chunk, or authenticate the immediately preceding exact
+    /// ciphertext again so a lost ACK can be retransmitted without appending
+    /// bytes twice. Older, altered, or future chunks still fail closed.
+    pub fn accept_reliable(
+        &mut self,
+        envelope: &EncryptedRelayEnvelope,
+    ) -> Result<RelayReceiveDisposition, RelayError> {
+        self.accept_inner(envelope, true)
+    }
+
+    fn accept_inner(
+        &mut self,
+        envelope: &EncryptedRelayEnvelope,
+        permit_last_duplicate: bool,
+    ) -> Result<RelayReceiveDisposition, RelayError> {
+        if permit_last_duplicate
+            && self.next_index > 0
+            && envelope.chunk_index == self.next_index - 1
+        {
+            if self.last_accepted.as_ref() != Some(envelope) {
+                return Err(RelayError::Replay);
+            }
+            // Re-run AEAD authentication before authorizing a repeated ACK.
+            let plaintext = self.decrypt_checked(envelope, envelope.plaintext_size)?;
+            if plaintext.len() != envelope.plaintext_size as usize {
+                return Err(RelayError::EnvelopeRejected);
+            }
+            return Ok(RelayReceiveDisposition::DuplicateAuthenticated);
+        }
         let max_ciphertext_bytes = u64::from(self.chunk_size).saturating_add(16);
         let max_ciphertext_base64 = max_ciphertext_bytes.div_ceil(3).saturating_mul(4);
         if envelope.nonce_base64.len() != 32
@@ -590,6 +812,36 @@ impl RelayReceiver {
         if envelope.plaintext_size != expected_size {
             return Err(RelayError::EnvelopeRejected);
         }
+        let plaintext = self.decrypt_checked(envelope, expected_size)?;
+        if plaintext.len() != expected_size as usize {
+            return Err(RelayError::EnvelopeRejected);
+        }
+        self.used_nonces.insert(nonce);
+        self.observed_bytes = self
+            .observed_bytes
+            .checked_add(plaintext.len() as u64)
+            .ok_or(RelayError::EnvelopeRejected)?;
+        if self.observed_bytes > self.expected_bytes
+            || self.observed_bytes > self.credential.max_bytes
+            || self.observed_bytes > self.limits.max_encoded_bytes
+        {
+            return Err(RelayError::EnvelopeRejected);
+        }
+        self.assembled.extend_from_slice(&plaintext);
+        self.next_index += 1;
+        self.last_accepted = Some(envelope.clone());
+        Ok(RelayReceiveDisposition::Accepted)
+    }
+
+    fn decrypt_checked(
+        &self,
+        envelope: &EncryptedRelayEnvelope,
+        expected_size: u32,
+    ) -> Result<Vec<u8>, RelayError> {
+        envelope
+            .validate(&self.credential, &self.limits)
+            .map_err(|_| RelayError::EnvelopeRejected)?;
+        let nonce = decode_24(&envelope.nonce_base64)?;
         let ciphertext = base64::engine::general_purpose::STANDARD
             .decode(&envelope.ciphertext_base64)
             .map_err(|_| RelayError::EnvelopeRejected)?;
@@ -614,20 +866,75 @@ impl RelayReceiver {
         if plaintext.len() != expected_size as usize {
             return Err(RelayError::EnvelopeRejected);
         }
-        self.used_nonces.insert(nonce);
-        self.observed_bytes = self
-            .observed_bytes
-            .checked_add(plaintext.len() as u64)
-            .ok_or(RelayError::EnvelopeRejected)?;
-        if self.observed_bytes > self.expected_bytes
-            || self.observed_bytes > self.credential.max_bytes
-            || self.observed_bytes > self.limits.max_encoded_bytes
-        {
-            return Err(RelayError::EnvelopeRejected);
+        Ok(plaintext)
+    }
+
+    pub fn acknowledgement(&self, chunk_index: u32) -> Result<AuthenticatedRelayAck, RelayError> {
+        if chunk_index >= self.next_index {
+            return Err(RelayError::OutOfOrder);
         }
-        self.assembled.extend_from_slice(&plaintext);
-        self.next_index += 1;
-        Ok(())
+        self.ack_authenticator.authenticate(
+            &self.credential.session_id,
+            &self.credential.object_sha256,
+            RelayAckKind::Chunk,
+            chunk_index,
+        )
+    }
+
+    /// Build the downloader-only readiness marker used to establish the TURN
+    /// allocation's receive permission. It must be emitted before any data is
+    /// accepted; retransmitting the returned immutable marker is harmless.
+    pub fn receiver_ready(&self) -> Result<AuthenticatedRelayAck, RelayError> {
+        if self.next_index != 0 || self.observed_bytes != 0 {
+            return Err(RelayError::OutOfOrder);
+        }
+        self.ack_authenticator.authenticate(
+            &self.credential.session_id,
+            &self.credential.object_sha256,
+            RelayAckKind::ReceiverReady,
+            0,
+        )
+    }
+
+    pub fn verify_completion(&self, completion: &AuthenticatedRelayAck) -> Result<(), RelayError> {
+        if !self.is_complete_and_hash_valid() {
+            return Err(RelayError::ObjectMismatch);
+        }
+        self.ack_authenticator.verify(
+            completion,
+            &self.credential.session_id,
+            &self.credential.object_sha256,
+            RelayAckKind::TransferComplete,
+            self.chunk_count - 1,
+        )
+    }
+
+    pub fn transfer_receipt(&self) -> Result<AuthenticatedRelayAck, RelayError> {
+        if !self.is_complete_and_hash_valid() {
+            return Err(RelayError::ObjectMismatch);
+        }
+        self.ack_authenticator.authenticate(
+            &self.credential.session_id,
+            &self.credential.object_sha256,
+            RelayAckKind::TransferReceipt,
+            self.chunk_count - 1,
+        )
+    }
+
+    pub fn is_complete_and_hash_valid(&self) -> bool {
+        self.next_index == self.chunk_count
+            && self.observed_bytes == self.expected_bytes
+            && object_sha256(&self.assembled) == self.credential.object_sha256
+    }
+
+    pub(crate) fn verified_bytes(&self) -> Result<&[u8], RelayError> {
+        self.is_complete_and_hash_valid()
+            .then_some(self.assembled.as_slice())
+            .ok_or(RelayError::ObjectMismatch)
+    }
+
+    pub(crate) const fn expected_chunk_count(&self) -> u32 {
+        self.chunk_count
     }
 
     pub fn finish(self) -> Result<Vec<u8>, RelayError> {
@@ -639,6 +946,12 @@ impl RelayReceiver {
         }
         Ok(self.assembled)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayReceiveDisposition {
+    Accepted,
+    DuplicateAuthenticated,
 }
 
 fn validate_cipher_construction(
@@ -657,6 +970,7 @@ fn validate_cipher_construction(
         || expected_bytes > credential.max_bytes
         || expected_bytes > limits.max_encoded_bytes
         || policy.max_plaintext_per_chunk == 0
+        || policy.max_plaintext_per_chunk > crate::RELAY_PLAINTEXT_CHUNK_BYTES
         || u64::from(policy.max_plaintext_per_chunk) > limits.max_encoded_bytes
         || chunks == 0
         || chunks > u64::from(credential.max_chunks)
@@ -665,6 +979,24 @@ fn validate_cipher_construction(
         return Err(RelayError::EnvelopeRejected);
     }
     Ok(())
+}
+
+/// Exact allocation-free chunk arithmetic shared by credential issuance and
+/// clients. V1 preserves the full 64 MiB encoded-object protocol ceiling at
+/// 512 bytes per datagram while rejecting any byte or chunk overrun.
+pub fn bounded_relay_chunk_count(
+    expected_bytes: u64,
+    limits: &ProtocolLimits,
+) -> Result<u32, RelayError> {
+    if expected_bytes == 0 || expected_bytes > limits.max_encoded_bytes {
+        return Err(RelayError::EnvelopeRejected);
+    }
+    let chunks = expected_bytes.div_ceil(u64::from(crate::RELAY_PLAINTEXT_CHUNK_BYTES));
+    let chunks = u32::try_from(chunks).map_err(|_| RelayError::EnvelopeRejected)?;
+    if chunks == 0 || chunks > limits.max_relay_chunks {
+        return Err(RelayError::EnvelopeRejected);
+    }
+    Ok(chunks)
 }
 
 fn envelope_aad(
@@ -686,6 +1018,35 @@ fn envelope_aad(
     bytes.extend_from_slice(&plaintext_size.to_be_bytes());
     put_bytes(&mut bytes, nonce);
     bytes
+}
+
+fn ack_material(
+    session_id: &str,
+    object_sha256: &str,
+    kind: RelayAckKind,
+    chunk_index: u32,
+) -> Result<([u8; 24], Vec<u8>), RelayError> {
+    if !valid_opaque_id(session_id) || !valid_sha256(object_sha256) {
+        return Err(RelayError::AuthenticationFailed);
+    }
+    let mut aad = Vec::with_capacity(256);
+    aad.extend_from_slice(ACK_AAD_DOMAIN);
+    put_str(&mut aad, RELAY_ACK_SCHEMA);
+    put_str(&mut aad, session_id);
+    put_str(&mut aad, object_sha256);
+    aad.push(match kind {
+        RelayAckKind::Chunk => 1,
+        RelayAckKind::TransferComplete => 2,
+        RelayAckKind::TransferReceipt => 3,
+        // Appended instead of renumbering the existing v1 authenticated
+        // transcript values.
+        RelayAckKind::ReceiverReady => 4,
+    });
+    aad.extend_from_slice(&chunk_index.to_be_bytes());
+    let digest = Sha256::digest(&aad);
+    let mut nonce = [0_u8; 24];
+    nonce.copy_from_slice(&digest[..24]);
+    Ok((nonce, aad))
 }
 
 fn decode_32(encoded: &str) -> Result<[u8; 32], RelayError> {
@@ -1039,5 +1400,200 @@ mod tests {
         sender.finish().unwrap();
         receiver.accept(&envelope).unwrap();
         assert_eq!(receiver.finish(), Err(RelayError::ObjectMismatch));
+    }
+
+    #[test]
+    fn datagram_and_full_encoded_ceiling_are_exact_without_large_allocation() {
+        let limits = ProtocolLimits::default();
+        assert_eq!(
+            bounded_relay_chunk_count(64 * 1024 * 1024, &limits).unwrap(),
+            131_072
+        );
+        assert_eq!(
+            bounded_relay_chunk_count(64 * 1024 * 1024 + 1, &limits),
+            Err(RelayError::EnvelopeRejected)
+        );
+
+        let object = vec![0x5a; crate::RELAY_PLAINTEXT_CHUNK_BYTES as usize];
+        let hash = object_sha256(&object);
+        let (signing_key, keys, mut upload, mut download) = credentials(&hash, object.len() as u64);
+        upload.claims.session_id = "s".repeat(128);
+        download.claims.session_id = upload.claims.session_id.clone();
+        upload.claims.max_chunks = limits.max_relay_chunks;
+        download.claims.max_chunks = upload.claims.max_chunks;
+        upload = sign_relay_credential(upload.claims, "relay-signing", &signing_key, 100, &limits)
+            .unwrap();
+        download =
+            sign_relay_credential(download.claims, "relay-signing", &signing_key, 100, &limits)
+                .unwrap();
+        let uploader = EphemeralKeyPair::from_seed([7; 32]);
+        let downloader = EphemeralKeyPair::from_seed([8; 32]);
+        let up_offer = uploader
+            .offer(&upload, RelayRole::Uploader, 100, &limits)
+            .unwrap();
+        let down_offer = downloader
+            .offer(&download, RelayRole::Downloader, 100, &limits)
+            .unwrap();
+        let signed = sign_session_binding(
+            build_session_binding(&up_offer, &down_offer, 700).unwrap(),
+            "relay-signing",
+            &signing_key,
+        )
+        .unwrap();
+        let verified =
+            verify_signed_session_binding(&signed, &upload, &download, 100, &keys, &limits)
+                .unwrap();
+        let mut sender = RelaySender::new(
+            uploader
+                .derive_session_key(&verified, RelayRole::Uploader)
+                .unwrap(),
+            &verified,
+            &upload.claims,
+            object.len() as u64,
+            RelayChunkPolicy::default(),
+            limits,
+        )
+        .unwrap();
+        let mut envelope = sender
+            .encrypt_next(&object, &mut ChaCha20Rng::from_seed([15; 32]))
+            .unwrap();
+        envelope.chunk_index = u32::MAX - 1;
+        envelope.chunk_count = u32::MAX;
+        let encoded = serde_json::to_vec(&envelope).unwrap();
+        assert!(encoded.len() <= crate::MAX_RELAY_WIRE_DATAGRAM_BYTES);
+        assert_eq!(encoded.len(), 1_150);
+    }
+
+    #[test]
+    fn reliable_duplicate_reacks_only_exact_authenticated_last_chunk() {
+        let object = b"0123456789abcdef";
+        let policy = RelayChunkPolicy {
+            max_plaintext_per_chunk: 8,
+        };
+        let (binding, upload_key, download_key, upload, download) = bound_session(object);
+        let mut sender = RelaySender::new(
+            upload_key,
+            &binding,
+            &upload.claims,
+            object.len() as u64,
+            policy,
+            ProtocolLimits::default(),
+        )
+        .unwrap();
+        let mut receiver = RelayReceiver::new(
+            download_key,
+            &binding,
+            &download.claims,
+            object.len() as u64,
+            policy,
+            ProtocolLimits::default(),
+        )
+        .unwrap();
+        let mut rng = ChaCha20Rng::from_seed([21; 32]);
+        let first = sender.encrypt_next(&object[..8], &mut rng).unwrap();
+        let second = sender.encrypt_next(&object[8..], &mut rng).unwrap();
+        assert_eq!(
+            receiver.accept_reliable(&second),
+            Err(RelayError::OutOfOrder)
+        );
+        assert_eq!(
+            receiver.accept_reliable(&first).unwrap(),
+            RelayReceiveDisposition::Accepted
+        );
+        let ack = receiver.acknowledgement(0).unwrap();
+        sender.verify_ack(&ack, 0).unwrap();
+        assert_eq!(
+            receiver.accept_reliable(&first).unwrap(),
+            RelayReceiveDisposition::DuplicateAuthenticated
+        );
+        let mut altered = first.clone();
+        altered.ciphertext_base64.replace_range(0..1, "A");
+        assert_eq!(receiver.accept_reliable(&altered), Err(RelayError::Replay));
+        assert_eq!(
+            receiver.accept_reliable(&second).unwrap(),
+            RelayReceiveDisposition::Accepted
+        );
+        let completion = sender.completion_confirmation().unwrap();
+        receiver.verify_completion(&completion).unwrap();
+        assert_eq!(receiver.finish().unwrap(), object);
+    }
+
+    #[test]
+    fn receiver_ready_is_authenticated_idempotent_and_strictly_bound() {
+        let object = b"receiver permission readiness";
+        let policy = RelayChunkPolicy {
+            max_plaintext_per_chunk: 8,
+        };
+        let (binding, upload_key, download_key, upload, download) = bound_session(object);
+        let mut sender = RelaySender::new(
+            upload_key,
+            &binding,
+            &upload.claims,
+            object.len() as u64,
+            policy,
+            ProtocolLimits::default(),
+        )
+        .unwrap();
+        let mut receiver = RelayReceiver::new(
+            download_key,
+            &binding,
+            &download.claims,
+            object.len() as u64,
+            policy,
+            ProtocolLimits::default(),
+        )
+        .unwrap();
+
+        let ready = receiver.receiver_ready().unwrap();
+        assert_eq!(ready.kind, RelayAckKind::ReceiverReady);
+        assert_eq!(ready.chunk_index, 0);
+        sender.verify_receiver_ready(&ready).unwrap();
+        sender.verify_receiver_ready(&ready).unwrap();
+
+        let mut tampered = ready.clone();
+        let mut authenticator = base64::engine::general_purpose::STANDARD
+            .decode(&tampered.authenticator_base64)
+            .unwrap();
+        authenticator[0] ^= 0x80;
+        tampered.authenticator_base64 =
+            base64::engine::general_purpose::STANDARD.encode(authenticator);
+        assert_eq!(
+            sender.verify_receiver_ready(&tampered),
+            Err(RelayError::AuthenticationFailed)
+        );
+
+        let mut wrong_session = ready.clone();
+        wrong_session.session_id = "another-session".into();
+        assert_eq!(
+            sender.verify_receiver_ready(&wrong_session),
+            Err(RelayError::AuthenticationFailed)
+        );
+
+        let mut wrong_object = ready.clone();
+        wrong_object.object_sha256 = "a".repeat(64);
+        assert_eq!(
+            sender.verify_receiver_ready(&wrong_object),
+            Err(RelayError::AuthenticationFailed)
+        );
+
+        let mut wrong_role_kind = ready.clone();
+        wrong_role_kind.kind = RelayAckKind::Chunk;
+        assert_eq!(
+            sender.verify_receiver_ready(&wrong_role_kind),
+            Err(RelayError::AuthenticationFailed)
+        );
+
+        let mut out_of_order = ready;
+        out_of_order.chunk_index = 1;
+        assert_eq!(
+            sender.verify_receiver_ready(&out_of_order),
+            Err(RelayError::AuthenticationFailed)
+        );
+
+        let first = sender
+            .encrypt_next(&object[..8], &mut ChaCha20Rng::from_seed([33; 32]))
+            .unwrap();
+        receiver.accept(&first).unwrap();
+        assert_eq!(receiver.receiver_ready(), Err(RelayError::OutOfOrder));
     }
 }

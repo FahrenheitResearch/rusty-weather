@@ -353,7 +353,17 @@ fn remove_tree_no_symlinks(path: &Path) -> SchedulerResult<()> {
 }
 
 pub(crate) fn ensure_owner_marker(run_dir: &Path, record: &JobRecord) -> SchedulerResult<()> {
-    fs::create_dir_all(run_dir)?;
+    if !run_dir.exists() {
+        let parent = run_dir.parent().ok_or_else(|| {
+            SchedulerError::InvalidState("scheduler run has no model directory".to_string())
+        })?;
+        fs::create_dir_all(parent)?;
+        match fs::create_dir(run_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     let metadata = fs::symlink_metadata(run_dir)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(SchedulerError::InvalidState(format!(
@@ -377,6 +387,16 @@ pub(crate) fn ensure_owner_marker(run_dir: &Path, record: &JobRecord) -> Schedul
             )));
         }
         return Ok(());
+    }
+    // Never claim a pre-existing run directory. This is the cross-process
+    // ownership boundary for separately published replicated generations:
+    // a concurrent replication rename wins the namespace race, while the
+    // scheduler may only create and mark a directory it created itself.
+    if fs::read_dir(run_dir)?.next().is_some() {
+        return Err(SchedulerError::InvalidState(format!(
+            "run '{}' exists without scheduler ownership",
+            run_dir.display()
+        )));
     }
     durable_atomic_write(&path, &serde_json::to_vec_pretty(&expected)?)
 }

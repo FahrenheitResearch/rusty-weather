@@ -1,5 +1,7 @@
 /target
 **/target/
+**/node_modules/
+**/.wrangler/
 /out
 /store
 /live-store

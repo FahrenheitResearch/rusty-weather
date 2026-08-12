@@ -296,6 +296,14 @@ impl PublishCaseArtifactRequest {
         }
         validate_sha256_local("owner_principal_sha256", &self.owner_principal_sha256)?;
         self.request.validate(limits)?;
+        if self.request.publication.data_origin == DataOrigin::PublicProvider
+            || !self.request.publication.explicit_owner_publication
+        {
+            return invalid(
+                "request.publication",
+                "client-authored case artifacts must be explicit owner publications, not public-provider objects",
+            );
+        }
         let ShareQuery::CaseArtifact { artifact_type, .. } = self.request.query else {
             return invalid(
                 "request.query",
@@ -323,9 +331,7 @@ impl PublishCaseArtifactRequest {
         }
         self.payload.validate(limits)?;
         validate_notices_local(&self.attributions, &self.modification_notices, limits)?;
-        if self.request.publication.data_origin != DataOrigin::PublicProvider
-            && self.attributions.is_empty()
-        {
+        if self.attributions.is_empty() {
             return invalid(
                 "attributions",
                 "owner-published data requires attribution and license fields",
@@ -838,6 +844,7 @@ mod tests {
         let limits = ProtocolLimits::default();
         let mut value = request(DataOrigin::PrivateWrf);
         assert!(value.validate(&limits).is_ok());
+        assert!(request(DataOrigin::UserProvided).validate(&limits).is_ok());
         value.request.publication.explicit_owner_publication = false;
         assert_eq!(
             value.validate(&limits),
@@ -852,6 +859,25 @@ mod tests {
         value.request.publication.redistribution_rights_confirmed = true;
         value.owner_principal_sha256 = hash('d');
         assert!(value.validate(&limits).is_err());
+    }
+
+    #[test]
+    fn client_authored_artifact_cannot_claim_public_provider_identity() {
+        let limits = ProtocolLimits::default();
+        let mut value = request(DataOrigin::PublicProvider);
+        value.request.model = "hrrr".into();
+        value.request.source_provenance = vec![SourceProvenance {
+            provider: "noaa-aws-public-data".into(),
+            roles: vec!["surface".into()],
+            products: vec!["wrfsfcf".into()],
+        }];
+        assert!(matches!(
+            value.validate(&limits),
+            Err(ProtocolError::InvalidField {
+                field: "request.publication",
+                ..
+            })
+        ));
     }
 
     #[test]

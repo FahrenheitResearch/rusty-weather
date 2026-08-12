@@ -58,6 +58,13 @@ Hetzner and R2 never pass through this crate or a TURN allocation.
   destinations fail before network I/O. DNS, client startup, allocation, and
   shutdown are explicitly time-bounded so transport stalls immediately enter
   the normal archival-HTTPS-or-unavailable fallback path.
+- After route binding and E2E key derivation, the downloader sends one
+  authenticated `receiver_ready` marker through its bound allocation before
+  receiving. This creates `turn`'s lazy downloader permission even when the
+  reverse allocation discards the marker. The uploader's first bounded data
+  attempt creates its reverse permission; a valid late/duplicate readiness
+  marker is bounded and ignored, while tampered, wrong-session, wrong-object,
+  wrong-kind, or out-of-order markers fail closed.
 - The dependency's raw allocated `Conn` is crate-private. Product/application
   code cannot call `send_to` with an arbitrary address and create permissions
   or channel binds. `RelayRouteRegistry` now admits a participant's own TURN
@@ -75,6 +82,15 @@ Hetzner and R2 never pass through this crate or a TURN allocation.
   usernames/passwords, signing secrets, hosts, and addresses are structurally
   absent. Pre-crash sessions are never resumed: restore charges the full
   reservation and locally revokes both credential fingerprints.
+- `HistoricalRelayClient` is the closed participant orchestrator. It can only
+  advertise a previously verified, unexpired signed object or request the
+  exact signed hash of a cold historical object. It performs participant-only
+  broker polling, TURN allocation registration, signed peer-route binding,
+  bounded authenticated retransmission, receiver-side hash confirmation, and
+  both-role completion accounting. Initial product use is deliberately capped
+  to signed profile and point-series objects no larger than 64 KiB; larger
+  objects fall through to archival HTTPS or honest unavailability until a
+  separately tested throughput policy exists.
 
 ## Transport support boundary
 
@@ -95,39 +111,37 @@ verification, WebPKI trust roots, and the same destination/source pinning. That
 support must remain disabled until the implementation and packet test exist;
 the current crate never pretends UDP is TLS.
 
-## Required server integration (not yet wired)
+## Server integration status
 
-The active `rw-server` routes/configuration are being changed by other work, so
-this crate deliberately stops at a clean injected boundary. Integration must:
+`rw-server` now owns the default-off authenticated broker integration. It has
+three independent enable/security-test/capacity-audit gates, a separate kill
+switch, durable candidate-first coordinator snapshots, per-principal and
+global quota/cost ceilings, popularity signals, an operator principal
+allowlist, a relay signing-key reference, and a server-only Cloudflare API
+token reference. No provider price is compiled into the protocol.
 
-1. Add an off-by-default relay configuration containing the three independent
-   enable/security-test/capacity-audit gates, quota values, cost threshold,
-   promotion threshold, relay signing key reference, and Cloudflare secret
-   reference. No provider price is compiled into the protocol.
-2. Implement `RelayProvider` in the backend. Keep the Cloudflare long-lived key
-   server-side, request credentials with a TTL no greater than fifteen minutes,
-   pass the response through `CloudflareTurnAdapter`, use only an opaque
-   per-session alias as `customIdentifier`, and revoke both generated usernames
-   when a session closes.
-3. Atomically persist the coordinator snapshot after every mutation. A newly
-   issued session snapshot MUST reach durable storage before either participant
-   receives a grant; terminal/revocation state MUST persist before success is
-   reported. If persistence fails, return the normal archival fallback and do
-   not deliver the grant.
-4. Authenticate every control request. Availability accepts an exact signed
-   manifest; lookup accepts only its 64-character lowercase object hash. Do not
-   expose a seed list, passive query telemetry, account identity, socket,
-   provider response, or the combined two-participant grant.
-5. Exchange only ephemeral public keys and the signed session binding. Deliver
-   each participant its own candidate, credential, and TURN access secret. A
-   transport route allowlist must contain current, independently audited relay
-   allocation CIDRs; no provider ranges are trusted by default or compiled in.
-6. On the BowEcho side, invoke this path only after a historical local/R2 miss.
-   Any miss or failure immediately continues to archival HTTPS. Current data
-   remains local/R2/Hetzner and never invokes the coordinator.
-7. After decryption, run the existing complete `verify_signed_object`, bounded
-   decompression, typed schema, and attribution verification before committing
-   bytes to the local cache or rendering them.
+The backend requests credentials with a TTL no greater than fifteen minutes,
+uses only an opaque session alias as Cloudflare's `customIdentifier`, and
+revokes generated usernames at terminal state. Every control request is
+authenticated. A seed advertises one exact signed manifest; a cold requester
+supplies only its exact lowercase SHA-256. The broker exposes neither a seed
+list nor passive query telemetry, account identity, raw provider response, or
+a combined two-participant grant.
+
+Coordinator state is atomically persisted before a grant becomes observable,
+and terminal/revocation state is persisted before success is reported. A
+durability failure activates the safe relay kill path and returns the normal
+archival fallback. Each participant receives only its own credential and TURN
+secret, then the opposite provider allocation and signed E2E transcript after
+both independently register inside the operator-audited provider CIDR
+allowlist. No provider range is trusted by default or compiled in.
+
+The remaining release-gated seam is BowEcho integration: it must invoke
+`HistoricalRelayClient` only after a historical local/R2 miss, continue
+immediately to archival HTTPS on any failure, and run the full signature,
+hash, decompression, typed-schema, expiry, and attribution checks before
+caching or rendering. Operational requests remain local/R2/Hetzner (with
+approved server-side federation) and cannot enter the relay broker.
 
 ## Mandatory transport gate
 

@@ -15,25 +15,27 @@ use bytes::Bytes;
 use chrono::{Datelike, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rw_community_protocol::{
-    AttributionNotice, CASE_ARTIFACT_REVOCATION_SCHEMA, CASE_REVOCATION_SCHEMA, CASE_SCHEMA,
-    CaseRoomManifest, Compression, DataOrigin, DeliverySource, GEOGRAPHIC_WINDOW_PAYLOAD_SCHEMA,
-    NATIVE_WINDOW_PAYLOAD_SCHEMA, OBJECT_SCHEMA, ObjectManifest, POINT_SERIES_PAYLOAD_SCHEMA,
-    PROFILE_PAYLOAD_SCHEMA, PUBLICATION_AUDIT_SCHEMA, PUBLICATION_TOMBSTONE_SCHEMA,
-    ProfileObjectPayload, ProtocolError, ProtocolLimits, PublicationAuditRecord,
-    PublicationTombstone, PublishCaseArtifactRequest, RESOLVE_SCHEMA, ResolveObjectRequest,
-    ResolveObjectResponse, RevokePublicationRequest, ShareQuery, SignedCaseRoomManifest,
-    SignedObjectManifest, SurfaceSample, TEMPORAL_GRID_PAYLOAD_SCHEMA, TrustedSigningKeys,
-    TypedObjectPayload, case_artifact_payload_bytes, enforce_request_attributions, object_sha256,
-    request_sha256, sign_case_manifest, sign_object_manifest, validate_case_artifact_payload_bytes,
-    validate_profile_payload_identity, verify_signed_case, verify_signed_object,
+    AttributionNotice, CASE_ARTIFACT_REVOCATION_SCHEMA, CASE_DIRECTORY_SCHEMA,
+    CASE_REVOCATION_SCHEMA, CASE_SCHEMA, CaseRoomDirectoryPage, CaseRoomManifest, Compression,
+    DataOrigin, DeliverySource, GEOGRAPHIC_WINDOW_PAYLOAD_SCHEMA, HOT_MANIFEST_POINTER_SCHEMA,
+    HotManifestPointer, NATIVE_WINDOW_PAYLOAD_SCHEMA, OBJECT_SCHEMA, ObjectManifest,
+    POINT_SERIES_PAYLOAD_SCHEMA, PROFILE_PAYLOAD_SCHEMA, PUBLICATION_AUDIT_SCHEMA,
+    PUBLICATION_TOMBSTONE_SCHEMA, ProfileObjectPayload, ProtocolError, ProtocolLimits,
+    PublicationAuditRecord, PublicationTombstone, PublishCaseArtifactRequest, RESOLVE_SCHEMA,
+    ResolveObjectRequest, ResolveObjectResponse, RevokePublicationRequest, ShareQuery,
+    SignedCaseRoomManifest, SignedObjectManifest, SurfaceSample, TEMPORAL_GRID_PAYLOAD_SCHEMA,
+    TrustedSigningKeys, TypedObjectPayload, case_artifact_payload_bytes,
+    enforce_request_attributions, object_sha256, request_sha256, sign_case_manifest,
+    sign_object_manifest, validate_case_artifact_payload_bytes, validate_profile_payload_identity,
+    verify_signed_case, verify_signed_object,
 };
 use rw_query::{
     GeographicBoundingBox, GeographicVerticalSelection, GeographicWindowLimits,
     GeographicWindowRequest, IndexWindow2DRequest, IndexWindow3DRequest, IntervalSupport,
-    MissingPolicy, PointSeriesRequest, ProfileRequest, QueryError, StoreCatalog,
-    TemporalGridRequest, TemporalReducer, TemporalSemantics, TemporalVerticalSelection,
-    TemporalWindow, TimeExpectation, TimeRange, query_geographic_window_with_cancel,
-    query_point_series, query_profile, query_window_2d, query_window_3d, reduce_temporal_grid,
+    MissingPolicy, PointSeriesRequest, ProfileRequest, QueryError, TemporalGridRequest,
+    TemporalReducer, TemporalSemantics, TemporalVerticalSelection, TemporalWindow, TimeExpectation,
+    TimeRange, query_geographic_window_with_cancel, query_point_series, query_profile,
+    query_window_2d, query_window_3d, reduce_temporal_grid,
 };
 use thiserror::Error;
 
@@ -41,9 +43,15 @@ use crate::community_store::{
     AccountingLimits, CasLimits, CaseLimits, CommunityCas, CommunityStoreError, QuotaLedger,
 };
 use crate::config::{CommunityConfig, HotStoreConfig};
+use crate::origin_catalog::PublishedStoreCatalog;
 
-const ORIGIN_SIGNING_KEY_ID: &str = "rw-origin-v1";
+pub(crate) mod network;
+use network::{RemoteNetworkPolicy, StrictHttpsBaseUrl, hardened_https_agent};
+
 const MAX_SECRET_BYTES: u64 = 64 * 1024;
+const MAX_HOT_MANIFEST_POINTER_BYTES: u64 = 1024;
+#[cfg(test)]
+const ORIGIN_SIGNING_KEY_ID: &str = "rw-origin-v1";
 
 #[derive(Debug, Error)]
 pub enum CommunityError {
@@ -55,6 +63,8 @@ pub enum CommunityError {
     NotFound,
     #[error("community object type is not implemented in phase one")]
     Unsupported,
+    #[error("the authoritative origin publication catalog is unavailable")]
+    OriginCatalogUnavailable,
     #[error("community upstream failed: {0}")]
     Upstream(String),
     #[error("invalid Community Cache configuration or state: {0}")]
@@ -76,6 +86,9 @@ pub enum CommunityError {
 pub trait ImmutableObjectProvider: Send + Sync {
     fn get(&self, key: &str, maximum_bytes: u64) -> Result<Option<Vec<u8>>, CommunityError>;
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), CommunityError>;
+    /// Atomically replace the small request-to-manifest pointer. Implementors
+    /// must not use this for object or signed-manifest blob keys.
+    fn put_replaceable(&self, key: &str, bytes: &[u8]) -> Result<(), CommunityError>;
 }
 
 pub trait OriginResolver: Send + Sync {
@@ -166,11 +179,34 @@ impl ImmutableObjectProvider for FilesystemObjectProvider {
         }
         Ok(())
     }
+
+    fn put_replaceable(&self, key: &str, bytes: &[u8]) -> Result<(), CommunityError> {
+        let path = self.path(key)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| CommunityError::Invalid("replaceable key has no parent".into()))?;
+        fs::create_dir_all(parent)?;
+        let metadata = fs::symlink_metadata(parent)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(CommunityError::Invalid(
+                "hot-object key parent must be a real directory".into(),
+            ));
+        }
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && (metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            return Err(CommunityError::Invalid(
+                "replaceable hot-object key must be a regular file".into(),
+            ));
+        }
+        rw_store::atomic::atomic_write_bytes(&path, bytes)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct R2GatewayProvider {
-    base_url: String,
+    base_url: StrictHttpsBaseUrl,
     bucket: String,
     bearer_token: Arc<String>,
     agent: ureq::Agent,
@@ -183,66 +219,140 @@ impl R2GatewayProvider {
         token_file: &Path,
     ) -> Result<Self, CommunityError> {
         let bearer_token = read_secret(token_file)?;
-        let config = ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(5)))
-            .timeout_per_call(Some(Duration::from_secs(20)))
-            .tls_config(
-                ureq::tls::TlsConfig::builder()
-                    .provider(ureq::tls::TlsProvider::Rustls)
-                    .root_certs(ureq::tls::RootCerts::WebPki)
-                    .build(),
-            )
-            .build();
         Ok(Self {
-            base_url: base_url.trim_end_matches('/').into(),
+            base_url: StrictHttpsBaseUrl::parse(
+                &base_url,
+                true,
+                RemoteNetworkPolicy::PublicInternetOnly,
+            )?,
             bucket,
             bearer_token: Arc::new(bearer_token),
-            agent: config.into(),
+            agent: hardened_https_agent(
+                RemoteNetworkPolicy::PublicInternetOnly,
+                Duration::from_secs(5),
+                Duration::from_secs(20),
+            )?,
         })
     }
 
     fn url(&self, key: &str) -> Result<String, CommunityError> {
         validate_remote_key(key)?;
-        Ok(format!("{}/{}/{}", self.base_url, self.bucket, key))
+        Ok(format!(
+            "{}/{}/{}",
+            self.base_url.as_str(),
+            self.bucket,
+            key
+        ))
     }
 }
 
 impl ImmutableObjectProvider for R2GatewayProvider {
     fn get(&self, key: &str, maximum_bytes: u64) -> Result<Option<Vec<u8>>, CommunityError> {
-        let response = match self
+        let mut response = match self
             .agent
             .get(&self.url(key)?)
             .header("Authorization", &format!("Bearer {}", self.bearer_token))
+            .header("Accept", "application/octet-stream")
             .call()
         {
-            Ok(response) => response,
-            Err(ureq::Error::StatusCode(404)) => return Ok(None),
-            Err(error) => return Err(CommunityError::Upstream(error.to_string())),
+            Ok(response) if response.status().as_u16() == 404 => return Ok(None),
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) if response.status().is_redirection() => {
+                return Err(CommunityError::Upstream(
+                    "hot-object gateway redirect was rejected".into(),
+                ));
+            }
+            Ok(_) => return Err(CommunityError::Upstream("hot-object gateway failed".into())),
+            Err(ureq::Error::TooManyRedirects) => {
+                return Err(CommunityError::Upstream(
+                    "hot-object gateway redirect was rejected".into(),
+                ));
+            }
+            Err(_) => return Err(CommunityError::Upstream("hot-object gateway failed".into())),
         };
-        let mut body = response.into_body().into_reader();
-        let mut limited = (&mut body).take(maximum_bytes.saturating_add(1));
-        let mut bytes = Vec::new();
-        limited.read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > maximum_bytes {
-            return Err(CommunityError::Invalid(
-                "hot object exceeds size limit".into(),
-            ));
-        }
-        Ok(Some(bytes))
+        reject_redirect_headers(&response, "hot-object gateway")?;
+        require_remote_content_type(&response, "application/octet-stream", "hot-object gateway")?;
+        Ok(Some(read_remote_body_bounded(
+            &mut response,
+            maximum_bytes,
+            "hot object",
+        )?))
     }
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), CommunityError> {
-        match self
+        let response = self
             .agent
             .put(&self.url(key)?)
             .header("Authorization", &format!("Bearer {}", self.bearer_token))
             .header("Content-Type", "application/octet-stream")
             .header("If-None-Match", "*")
-            .send(bytes)
-        {
-            Ok(_) | Err(ureq::Error::StatusCode(412)) => Ok(()),
-            Err(error) => Err(CommunityError::Upstream(error.to_string())),
+            .send(bytes);
+        match response {
+            Ok(response) if response.status().is_success() => {
+                reject_redirect_headers(&response, "hot-object gateway")
+            }
+            Ok(response) if response.status().as_u16() == 412 => {
+                self.verify_existing_immutable_bytes(key, bytes)
+            }
+            Ok(response) if response.status().is_redirection() => Err(CommunityError::Upstream(
+                "hot-object gateway redirect was rejected".into(),
+            )),
+            Ok(_) => Err(CommunityError::Upstream("hot-object gateway failed".into())),
+            Err(ureq::Error::TooManyRedirects) => Err(CommunityError::Upstream(
+                "hot-object gateway redirect was rejected".into(),
+            )),
+            Err(_) => Err(CommunityError::Upstream("hot-object gateway failed".into())),
         }
+    }
+
+    fn put_replaceable(&self, key: &str, bytes: &[u8]) -> Result<(), CommunityError> {
+        let response = self
+            .agent
+            .put(&self.url(key)?)
+            .header("Authorization", &format!("Bearer {}", self.bearer_token))
+            .header("Content-Type", "application/octet-stream")
+            .send(bytes);
+        match response {
+            Ok(response) if response.status().is_success() => {
+                reject_redirect_headers(&response, "hot-object gateway")
+            }
+            Ok(response) if response.status().is_redirection() => Err(CommunityError::Upstream(
+                "hot-object gateway redirect was rejected".into(),
+            )),
+            Ok(_) => Err(CommunityError::Upstream("hot-object gateway failed".into())),
+            Err(ureq::Error::TooManyRedirects) => Err(CommunityError::Upstream(
+                "hot-object gateway redirect was rejected".into(),
+            )),
+            Err(_) => Err(CommunityError::Upstream("hot-object gateway failed".into())),
+        }
+    }
+}
+
+impl R2GatewayProvider {
+    /// Conditional-create conflict is success only when the immutable body
+    /// already stored under the exact key is byte-for-byte identical. This is
+    /// required for both content-addressed objects and request-hash manifests;
+    /// a stale or malicious first writer cannot permanently masquerade as the
+    /// value we attempted to publish.
+    fn verify_existing_immutable_bytes(
+        &self,
+        key: &str,
+        expected: &[u8],
+    ) -> Result<(), CommunityError> {
+        let actual = self.get(key, expected.len() as u64)?;
+        verify_exact_immutable_bytes(actual.as_deref(), expected)
+    }
+}
+
+fn verify_exact_immutable_bytes(
+    actual: Option<&[u8]>,
+    expected: &[u8],
+) -> Result<(), CommunityError> {
+    match actual {
+        Some(actual) if actual == expected => Ok(()),
+        Some(_) | None => Err(CommunityError::Invalid(
+            "immutable hot-object key collision".into(),
+        )),
     }
 }
 
@@ -252,6 +362,8 @@ pub struct CommunityService {
     killed: Arc<AtomicBool>,
     cas: Option<CommunityCas>,
     signing_key: Option<Arc<SigningKey>>,
+    signing_key_id: Arc<String>,
+    object_manifest_retention_seconds: i64,
     trusted_keys: Arc<TrustedSigningKeys>,
     limits: ProtocolLimits,
     hot: Option<Arc<dyn ImmutableObjectProvider>>,
@@ -265,6 +377,32 @@ pub struct CommunityService {
     artifact_publication_enabled: bool,
     maximum_case_retention_seconds: u64,
     quota: QuotaLedger,
+}
+
+/// Internal authority material shared with the federation proxy. It is taken
+/// from the already-open Community service so proxy objects cannot drift to a
+/// second signer, key id, retention policy, or protocol bound.
+#[derive(Clone)]
+pub(crate) struct CommunityAuthoritySigningMaterial {
+    pub(crate) signing_key_id: String,
+    pub(crate) signing_key: SigningKey,
+    pub(crate) object_manifest_retention_seconds: u64,
+    pub(crate) limits: ProtocolLimits,
+}
+
+impl std::fmt::Debug for CommunityAuthoritySigningMaterial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommunityAuthoritySigningMaterial")
+            .field("signing_key_id", &self.signing_key_id)
+            .field("signing_key", &"[REDACTED]")
+            .field(
+                "object_manifest_retention_seconds",
+                &self.object_manifest_retention_seconds,
+            )
+            .field("limits", &self.limits)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for CommunityService {
@@ -313,7 +451,23 @@ impl CommunityService {
         };
         let mut trusted_keys = parse_trusted_keys(&config.trusted_public_keys)?;
         if let Some(key) = &signing_key {
-            trusted_keys.insert(ORIGIN_SIGNING_KEY_ID.into(), key.verifying_key());
+            if trusted_keys
+                .values()
+                .any(|trusted| trusted == &key.verifying_key())
+            {
+                return Err(CommunityError::Invalid(
+                    "current signing key duplicates a trusted historical key under another id"
+                        .into(),
+                ));
+            }
+            if trusted_keys
+                .insert(config.signing_key_id.clone(), key.verifying_key())
+                .is_some()
+            {
+                return Err(CommunityError::Invalid(
+                    "current signing key id duplicates a trusted historical key id".into(),
+                ));
+            }
         }
         let hot: Option<Arc<dyn ImmutableObjectProvider>> = if !config.enabled {
             None
@@ -375,6 +529,11 @@ impl CommunityService {
             killed: Arc::new(AtomicBool::new(config.kill_switch)),
             cas,
             signing_key,
+            signing_key_id: Arc::new(config.signing_key_id.clone()),
+            object_manifest_retention_seconds: i64::try_from(
+                config.object_manifest_retention_seconds,
+            )
+            .map_err(|_| CommunityError::Invalid("object manifest retention is invalid".into()))?,
             trusted_keys: Arc::new(trusted_keys),
             limits: ProtocolLimits {
                 max_manifest_bytes: quotas.maximum_manifest_bytes,
@@ -413,6 +572,67 @@ impl CommunityService {
         self.killed.store(killed, Ordering::Release);
     }
 
+    pub(crate) fn federation_authority_signing_material(
+        &self,
+    ) -> Result<CommunityAuthoritySigningMaterial, CommunityError> {
+        self.ensure_available()?;
+        let signing_key = self
+            .signing_key
+            .as_ref()
+            .ok_or_else(|| CommunityError::Invalid("origin signing key is unavailable".into()))?;
+        Ok(CommunityAuthoritySigningMaterial {
+            signing_key_id: self.signing_key_id.as_str().to_owned(),
+            signing_key: signing_key.as_ref().clone(),
+            object_manifest_retention_seconds: u64::try_from(
+                self.object_manifest_retention_seconds,
+            )
+            .map_err(|_| CommunityError::Invalid("object manifest retention is invalid".into()))?,
+            limits: self.limits,
+        })
+    }
+
+    /// Final defense-in-depth boundary for a public-origin proxy result. The
+    /// proxy core has already verified the upstream descriptor/key, exact
+    /// payload schema, decompression, attribution, and authority re-signing;
+    /// this method rechecks the authority signature/hash/identity before the
+    /// object becomes reachable through the normal immutable object route.
+    pub(crate) fn stage_verified_federated_object(
+        &self,
+        identity: &str,
+        signed: &SignedObjectManifest,
+        encoded_object: &[u8],
+    ) -> Result<(), CommunityError> {
+        self.ensure_available()?;
+        if signed.signature.signing_key_id != self.signing_key_id.as_str()
+            || signed.manifest.request_sha256 != identity
+            || request_sha256(&signed.manifest.request)? != identity
+        {
+            return Err(CommunityError::Invalid(
+                "federated object is not signed by the current authority identity".into(),
+            ));
+        }
+        verify_signed_object(
+            signed,
+            &signed.manifest.request,
+            encoded_object,
+            now_unix(),
+            &self.trusted_keys,
+            &self.limits,
+        )?;
+        enforce_request_attributions(&signed.manifest.request, &signed.manifest)?;
+        let manifest_bytes = serde_json::to_vec(signed)?;
+        self.cas()?.put(
+            identity,
+            &signed.manifest.object_sha256,
+            encoded_object,
+            &manifest_bytes,
+        )?;
+        // Promotion remains best effort and obeys the existing popularity,
+        // object-size, monthly, and kill-switch policy.
+        let _ = self.note_popularity_and_promote(identity, signed, encoded_object);
+        Ok(())
+    }
+
     fn ensure_available(&self) -> Result<(), CommunityError> {
         if !self.enabled {
             return Err(CommunityError::Disabled);
@@ -436,7 +656,7 @@ impl CommunityService {
         &self,
         principal: &str,
         request: &ResolveObjectRequest,
-        catalog: &StoreCatalog,
+        catalog: &PublishedStoreCatalog,
     ) -> Result<(ResolveObjectResponse, Option<Bytes>), CommunityError> {
         self.ensure_available()?;
         let _permit = self.quota.begin(principal, current_month())?;
@@ -517,6 +737,10 @@ impl CommunityService {
                     });
                 match verified {
                     Ok(signed) => {
+                        // Popularity counts verified local reuse, not only the
+                        // first origin miss. Otherwise a threshold above one is
+                        // unreachable after the first response enters CAS.
+                        let _ = self.note_popularity_and_promote(&identity, &signed, &object);
                         return Ok((
                             resolved_response(identity, signed),
                             Some(Bytes::from(object)),
@@ -610,8 +834,121 @@ impl CommunityService {
         ))
     }
 
+    /// Resolve exactly one federation hop from this node's own holdings. This
+    /// path deliberately excludes `self.origin`, FederationProxy, and the
+    /// Community relay so cyclic A-to-B/B-to-A configurations terminate.
+    pub(crate) fn resolve_local_only(
+        &self,
+        principal: &str,
+        request: &ResolveObjectRequest,
+        catalog: &PublishedStoreCatalog,
+    ) -> Result<(ResolveObjectResponse, Option<Bytes>), CommunityError> {
+        self.ensure_available()?;
+        let _permit = self.quota.begin(principal, current_month())?;
+        if request.schema != RESOLVE_SCHEMA {
+            return Err(ProtocolError::UnsupportedSchema(request.schema.clone()).into());
+        }
+        request.request.validate(&self.limits)?;
+        let identity = request_sha256(&request.request)?;
+        if matches!(request.request.query, ShareQuery::CaseArtifact { .. })
+            && self.cas()?.publication_request_tombstoned(&identity)?
+        {
+            return Err(CommunityError::NotFound);
+        }
+
+        match self.cas()?.get(&identity) {
+            Ok(Some((manifest_bytes, object))) => {
+                let verified = serde_json::from_slice::<SignedObjectManifest>(&manifest_bytes)
+                    .map_err(CommunityError::from)
+                    .and_then(|signed| {
+                        verify_signed_object(
+                            &signed,
+                            &request.request,
+                            &object,
+                            now_unix(),
+                            &self.trusted_keys,
+                            &self.limits,
+                        )?;
+                        enforce_request_attributions(&request.request, &signed.manifest)?;
+                        Ok(signed)
+                    });
+                match verified {
+                    Ok(signed) => {
+                        return Ok((
+                            resolved_response(identity, signed),
+                            Some(Bytes::from(object)),
+                        ));
+                    }
+                    Err(_) => self.cas()?.invalidate_request(&identity)?,
+                }
+            }
+            Ok(None) => {}
+            Err(CommunityStoreError::HashMismatch)
+            | Err(CommunityStoreError::Invalid(_))
+            | Err(CommunityStoreError::Json(_)) => {
+                self.cas()?.invalidate_request(&identity)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        if let Some(provider) = &self.hot {
+            match self.fetch_provider(provider.as_ref(), &request.request, &identity) {
+                Ok(Some((signed, object))) => {
+                    let signed_bytes = serde_json::to_vec(&signed)?;
+                    self.cas()?.put(
+                        &identity,
+                        &signed.manifest.object_sha256,
+                        &object,
+                        &signed_bytes,
+                    )?;
+                    return Ok((
+                        resolved_response(identity, signed),
+                        Some(Bytes::from(object)),
+                    ));
+                }
+                Ok(None)
+                | Err(CommunityError::Upstream(_))
+                | Err(CommunityError::Protocol(_))
+                | Err(CommunityError::Json(_))
+                | Err(CommunityError::Invalid(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let (signed, object) = self.compute_origin_object(&request.request, catalog)?;
+        let signed_bytes = serde_json::to_vec(&signed)?;
+        self.cas()?.put(
+            &identity,
+            &signed.manifest.object_sha256,
+            &object,
+            &signed_bytes,
+        )?;
+        let _ = self.note_popularity_and_promote(&identity, &signed, &object);
+        Ok((
+            origin_only_response(identity, signed),
+            Some(Bytes::from(object)),
+        ))
+    }
+
     pub fn object(&self, principal: &str, sha256: &str) -> Result<Bytes, CommunityError> {
         self.ensure_assist_available()?;
+        self.object_verified(principal, sha256)
+    }
+
+    /// Token-isolated object read for the one-hop public-origin federation
+    /// route. It obeys quotas and signature checks but is independent of the
+    /// relay/Community-assist kill switch; the federation proxy has its own
+    /// separately fail-closed kill switch.
+    pub(crate) fn federation_object_local_only(
+        &self,
+        principal: &str,
+        sha256: &str,
+    ) -> Result<Bytes, CommunityError> {
+        self.ensure_available()?;
+        self.object_verified(principal, sha256)
+    }
+
+    fn object_verified(&self, principal: &str, sha256: &str) -> Result<Bytes, CommunityError> {
         let _permit = self.quota.begin(principal, current_month())?;
         if self.cas()?.publication_tombstone(sha256)?.is_some() {
             return Err(CommunityError::NotFound);
@@ -740,7 +1077,7 @@ impl CommunityService {
             expires_unix: publication.retain_until_unix,
         };
         enforce_request_attributions(&publication.request, &manifest)?;
-        let signed = sign_object_manifest(manifest, ORIGIN_SIGNING_KEY_ID, key)?;
+        let signed = sign_object_manifest(manifest, self.signing_key_id.as_str(), key)?;
         verify_signed_object(
             &signed,
             &publication.request,
@@ -986,7 +1323,7 @@ impl CommunityService {
             .signing_key
             .as_ref()
             .ok_or_else(|| CommunityError::Invalid("origin signing key is unavailable".into()))?;
-        let signed = sign_case_manifest(manifest, ORIGIN_SIGNING_KEY_ID, key)?;
+        let signed = sign_case_manifest(manifest, self.signing_key_id.as_str(), key)?;
         verify_signed_case(&signed, now_unix(), &self.trusted_keys, &self.limits)?;
         let bytes = serde_json::to_vec(&signed)?;
         self.quota.charge_upload(principal, bytes.len() as u64)?;
@@ -1010,6 +1347,49 @@ impl CommunityService {
         self.validate_live_case_artifacts(&signed)?;
         self.quota.charge_download(principal, bytes.len() as u64)?;
         Ok(signed)
+    }
+
+    pub fn list_cases(
+        &self,
+        principal: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<CaseRoomDirectoryPage, CommunityError> {
+        self.ensure_assist_available()?;
+        let _permit = self.quota.begin(principal, current_month())?;
+        if !self.cases_enabled {
+            return Err(CommunityError::Disabled);
+        }
+        let stored = self.cas()?.list_cases(after, limit)?;
+        let mut cases = Vec::with_capacity(stored.cases.len());
+        let mut transferred = 0_u64;
+        for (_case_id, bytes) in stored.cases {
+            let signed: SignedCaseRoomManifest = serde_json::from_slice(&bytes)?;
+            verify_signed_case(&signed, now_unix(), &self.trusted_keys, &self.limits)?;
+            // A revoked/expired referenced artifact makes this publication no
+            // longer discoverable. The cursor still advances past it, so an
+            // invalid old entry cannot pin directory traversal forever.
+            match self.validate_live_case_artifacts(&signed) {
+                Ok(()) => {}
+                Err(CommunityError::NotFound) => continue,
+                Err(error) => return Err(error),
+            }
+            transferred =
+                transferred
+                    .checked_add(bytes.len() as u64)
+                    .ok_or(CommunityError::Invalid(
+                        "case directory response size overflowed".into(),
+                    ))?;
+            cases.push(signed);
+        }
+        self.quota.charge_download(principal, transferred)?;
+        let page = CaseRoomDirectoryPage {
+            schema: CASE_DIRECTORY_SCHEMA.into(),
+            cases,
+            next_after: stored.next_after,
+        };
+        page.verify(now_unix(), &self.trusted_keys, &self.limits)?;
+        Ok(page)
     }
 
     fn validate_live_case_artifacts(
@@ -1067,10 +1447,34 @@ impl CommunityService {
         request: &rw_community_protocol::ShareRequest,
         request_hash: &str,
     ) -> Result<Option<(SignedObjectManifest, Vec<u8>)>, CommunityError> {
-        let manifest_key = format!("v1/manifests/{request_hash}.json");
-        let Some(manifest_bytes) = provider.get(&manifest_key, self.limits.max_manifest_bytes)?
-        else {
-            return Ok(None);
+        let pointer_key = format!("v2/requests/{request_hash}.json");
+        let manifest_bytes = if let Some(pointer_bytes) =
+            provider.get(&pointer_key, MAX_HOT_MANIFEST_POINTER_BYTES)?
+        {
+            let pointer: HotManifestPointer = serde_json::from_slice(&pointer_bytes)?;
+            pointer.validate_for_request(request_hash)?;
+            let manifest_key = format!("v2/manifests/{}.json", pointer.manifest_sha256);
+            let Some(manifest_bytes) =
+                provider.get(&manifest_key, self.limits.max_manifest_bytes)?
+            else {
+                return Ok(None);
+            };
+            if object_sha256(&manifest_bytes) != pointer.manifest_sha256 {
+                return Err(CommunityError::Invalid(
+                    "hot signed-manifest blob does not match its content-addressed key".into(),
+                ));
+            }
+            manifest_bytes
+        } else {
+            // Migration-only fallback for objects promoted before the v2
+            // renewable pointer contract. New writes never use this key.
+            let manifest_key = format!("v1/manifests/{request_hash}.json");
+            let Some(manifest_bytes) =
+                provider.get(&manifest_key, self.limits.max_manifest_bytes)?
+            else {
+                return Ok(None);
+            };
+            manifest_bytes
         };
         let signed: SignedObjectManifest = serde_json::from_slice(&manifest_bytes)?;
         let object_key = format!("v1/objects/{}", signed.manifest.object_sha256);
@@ -1092,13 +1496,22 @@ impl CommunityService {
     fn compute_origin_object(
         &self,
         request: &rw_community_protocol::ShareRequest,
-        catalog: &StoreCatalog,
+        catalog: &PublishedStoreCatalog,
     ) -> Result<(SignedObjectManifest, Vec<u8>), CommunityError> {
         let key = self
             .signing_key
             .as_ref()
             .ok_or_else(|| CommunityError::Invalid("origin signing key is unavailable".into()))?;
-        let snapshot = catalog.snapshot(&request.model, &request.run)?;
+        if catalog.unavailable() {
+            return Err(CommunityError::OriginCatalogUnavailable);
+        }
+        let snapshot = match catalog.snapshot(&request.model, &request.run) {
+            Ok(snapshot) => snapshot,
+            Err(_) if catalog.unavailable() => {
+                return Err(CommunityError::OriginCatalogUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
         let descriptor = snapshot.descriptor();
         if descriptor.snapshot_id != request.snapshot_id
             || descriptor.grid_hash != request.grid_hash
@@ -1406,10 +1819,10 @@ impl CommunityService {
             attributions,
             modification_notices,
             created_unix: now,
-            expires_unix: now.saturating_add(7 * 24 * 60 * 60),
+            expires_unix: immutable_manifest_expiry(now, self.object_manifest_retention_seconds),
         };
         enforce_request_attributions(request, &manifest)?;
-        let signed = sign_object_manifest(manifest, ORIGIN_SIGNING_KEY_ID, key)?;
+        let signed = sign_object_manifest(manifest, self.signing_key_id.as_str(), key)?;
         verify_signed_object(
             &signed,
             request,
@@ -1427,6 +1840,19 @@ impl CommunityService {
         signed: &SignedObjectManifest,
         object: &[u8],
     ) -> Result<(), CommunityError> {
+        // Owner rights withdrawal is enforced by the authoritative CAS
+        // tombstone. The public hot tier currently has no mandatory fresh
+        // revocation check, so publishing a long-lived CaseArtifact there
+        // would let a holder reuse its still-unexpired signature after the
+        // owner revokes it. Keep revocable artifacts origin-only until that
+        // end-to-end revocation status contract is implemented in server,
+        // gateway, and BowEcho.
+        if matches!(
+            signed.manifest.request.query,
+            ShareQuery::CaseArtifact { .. }
+        ) {
+            return Ok(());
+        }
         if !self.promotion_enabled
             || object.len() as u64 > self.promotion_maximum_bytes
             || self.hot.is_none()
@@ -1454,8 +1880,25 @@ impl CommunityService {
         }
         let hot = self.hot.as_ref().expect("checked above");
         let manifest_bytes = serde_json::to_vec(signed)?;
+        let manifest_hash = object_sha256(&manifest_bytes);
+        let pointer = HotManifestPointer {
+            schema: HOT_MANIFEST_POINTER_SCHEMA.into(),
+            request_sha256: request_hash.into(),
+            manifest_sha256: manifest_hash.clone(),
+        };
+        pointer.validate_for_request(request_hash)?;
+        let pointer_bytes = serde_json::to_vec(&pointer)?;
+        if let Some(existing) = hot.get(
+            &format!("v2/requests/{request_hash}.json"),
+            MAX_HOT_MANIFEST_POINTER_BYTES,
+        )? && serde_json::from_slice::<HotManifestPointer>(&existing)
+            .is_ok_and(|existing| existing == pointer)
+        {
+            return Ok(());
+        }
         let promotion_bytes = (object.len() as u64)
             .checked_add(manifest_bytes.len() as u64)
+            .and_then(|value| value.checked_add(pointer_bytes.len() as u64))
             .ok_or_else(|| CommunityError::Invalid("promotion byte count overflowed".into()))?;
         match self
             .quota
@@ -1474,9 +1917,10 @@ impl CommunityService {
             object,
         )?;
         hot.put(
-            &format!("v1/manifests/{request_hash}.json"),
+            &format!("v2/manifests/{manifest_hash}.json"),
             &manifest_bytes,
         )?;
+        hot.put_replaceable(&format!("v2/requests/{request_hash}.json"), &pointer_bytes)?;
         Ok(())
     }
 }
@@ -1507,7 +1951,7 @@ fn origin_only_response(
 
 #[derive(Debug, Clone)]
 struct HttpsOriginClient {
-    base_url: String,
+    base_url: StrictHttpsBaseUrl,
     bearer_token: Option<Arc<String>>,
     agent: ureq::Agent,
 }
@@ -1515,20 +1959,18 @@ struct HttpsOriginClient {
 impl HttpsOriginClient {
     fn new(base_url: String, token_file: Option<&Path>) -> Result<Self, CommunityError> {
         let token = token_file.map(read_secret).transpose()?.map(Arc::new);
-        let config = ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(5)))
-            .timeout_per_call(Some(Duration::from_secs(30)))
-            .tls_config(
-                ureq::tls::TlsConfig::builder()
-                    .provider(ureq::tls::TlsProvider::Rustls)
-                    .root_certs(ureq::tls::RootCerts::WebPki)
-                    .build(),
-            )
-            .build();
         Ok(Self {
-            base_url: base_url.trim_end_matches('/').into(),
+            base_url: StrictHttpsBaseUrl::parse(
+                &base_url,
+                true,
+                RemoteNetworkPolicy::PublicInternetOnly,
+            )?,
             bearer_token: token,
-            agent: config.into(),
+            agent: hardened_https_agent(
+                RemoteNetworkPolicy::PublicInternetOnly,
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            )?,
         })
     }
 }
@@ -1547,30 +1989,36 @@ impl OriginResolver for HttpsOriginClient {
         }
         let mut request = self
             .agent
-            .post(&format!(
-                "{}{}",
-                self.base_url,
-                rw_community_protocol::RESOLVE_OBJECT_PATH
-            ))
+            .post(
+                &self
+                    .base_url
+                    .endpoint(rw_community_protocol::RESOLVE_OBJECT_PATH)?,
+            )
+            .header("Accept", "application/json")
             .header("Content-Type", "application/json");
         if let Some(token) = &self.bearer_token {
             request = request.header("Authorization", &format!("Bearer {token}"));
         }
-        let response = match request.send(&body) {
-            Ok(response) => response,
-            Err(ureq::Error::StatusCode(404)) => return Ok(None),
-            Err(error) => return Err(CommunityError::Upstream(error.to_string())),
+        let mut response = match request.send(&body) {
+            Ok(response) if response.status().as_u16() == 404 => return Ok(None),
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) if response.status().is_redirection() => {
+                return Err(CommunityError::Upstream(
+                    "origin redirect was rejected".into(),
+                ));
+            }
+            Ok(_) => return Err(CommunityError::Upstream("origin request failed".into())),
+            Err(ureq::Error::TooManyRedirects) => {
+                return Err(CommunityError::Upstream(
+                    "origin redirect was rejected".into(),
+                ));
+            }
+            Err(_) => return Err(CommunityError::Upstream("origin request failed".into())),
         };
-        let mut reader = response.into_body().into_reader();
-        let mut response_bytes = Vec::new();
-        (&mut reader)
-            .take(limits.max_manifest_bytes.saturating_add(1))
-            .read_to_end(&mut response_bytes)?;
-        if response_bytes.len() as u64 > limits.max_manifest_bytes {
-            return Err(CommunityError::Invalid(
-                "origin resolve response exceeds limit".into(),
-            ));
-        }
+        reject_redirect_headers(&response, "origin")?;
+        require_remote_content_type(&response, "application/json", "origin")?;
+        let response_bytes =
+            read_remote_body_bounded(&mut response, limits.max_manifest_bytes, "origin resolve")?;
         let resolved: ResolveObjectResponse = serde_json::from_slice(&response_bytes)?;
         if resolved.schema != RESOLVE_SCHEMA
             || resolved.request_sha256 != request_sha256(&resolve_request.request)?
@@ -1582,28 +2030,34 @@ impl OriginResolver for HttpsOriginClient {
         let Some(signed) = resolved.signed_manifest else {
             return Ok(None);
         };
-        let mut object_request = self.agent.get(&format!(
-            "{}/v1/community/objects/{}",
-            self.base_url, signed.manifest.object_sha256
-        ));
+        let object_path = format!("/v1/community/objects/{}", signed.manifest.object_sha256);
+        let mut object_request = self
+            .agent
+            .get(&self.base_url.endpoint(&object_path)?)
+            .header("Accept", "application/octet-stream");
         if let Some(token) = &self.bearer_token {
             object_request = object_request.header("Authorization", &format!("Bearer {token}"));
         }
-        let response = match object_request.call() {
-            Ok(response) => response,
-            Err(ureq::Error::StatusCode(404)) => return Ok(None),
-            Err(error) => return Err(CommunityError::Upstream(error.to_string())),
+        let mut response = match object_request.call() {
+            Ok(response) if response.status().as_u16() == 404 => return Ok(None),
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) if response.status().is_redirection() => {
+                return Err(CommunityError::Upstream(
+                    "origin redirect was rejected".into(),
+                ));
+            }
+            Ok(_) => return Err(CommunityError::Upstream("origin request failed".into())),
+            Err(ureq::Error::TooManyRedirects) => {
+                return Err(CommunityError::Upstream(
+                    "origin redirect was rejected".into(),
+                ));
+            }
+            Err(_) => return Err(CommunityError::Upstream("origin request failed".into())),
         };
-        let mut reader = response.into_body().into_reader();
-        let mut object = Vec::new();
-        (&mut reader)
-            .take(limits.max_encoded_bytes.saturating_add(1))
-            .read_to_end(&mut object)?;
-        if object.len() as u64 > limits.max_encoded_bytes {
-            return Err(CommunityError::Invalid(
-                "origin object exceeds size limit".into(),
-            ));
-        }
+        reject_redirect_headers(&response, "origin")?;
+        require_remote_content_type(&response, "application/octet-stream", "origin")?;
+        let object =
+            read_remote_body_bounded(&mut response, limits.max_encoded_bytes, "origin object")?;
         Ok(Some((signed, object)))
     }
 }
@@ -1905,6 +2359,11 @@ fn parse_trusted_keys(values: &[String]) -> Result<TrustedSigningKeys, Community
             .map_err(|_| CommunityError::Invalid("trusted public key is not 32 bytes".into()))?;
         let key = VerifyingKey::from_bytes(&bytes)
             .map_err(|_| CommunityError::Invalid("trusted public key is invalid".into()))?;
+        if keys.values().any(|existing| existing == &key) {
+            return Err(CommunityError::Invalid(
+                "trusted public key is duplicated under another id".into(),
+            ));
+        }
         keys.insert(id.into(), key);
     }
     Ok(keys)
@@ -1973,11 +2432,107 @@ fn validate_remote_key(key: &str) -> Result<(), CommunityError> {
     Ok(())
 }
 
+fn reject_redirect_headers(
+    response: &ureq::http::Response<ureq::Body>,
+    service: &str,
+) -> Result<(), CommunityError> {
+    if response.status().is_redirection() || response.headers().contains_key("location") {
+        Err(CommunityError::Upstream(format!(
+            "{service} redirect was rejected"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_remote_content_type(
+    response: &ureq::http::Response<ureq::Body>,
+    expected: &str,
+    service: &str,
+) -> Result<(), CommunityError> {
+    if response.headers().contains_key("content-encoding") {
+        return Err(CommunityError::Invalid(format!(
+            "{service} must not apply HTTP content encoding"
+        )));
+    }
+    let actual = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(CommunityError::Invalid(format!(
+            "{service} returned an unexpected content type"
+        )))
+    }
+}
+
+fn read_remote_body_bounded(
+    response: &mut ureq::http::Response<ureq::Body>,
+    maximum_bytes: u64,
+    description: &str,
+) -> Result<Vec<u8>, CommunityError> {
+    if maximum_bytes == 0 {
+        return Err(CommunityError::Invalid(format!(
+            "{description} size limit is zero"
+        )));
+    }
+    if let Some(value) = response.headers().get("content-length") {
+        let length = value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                CommunityError::Invalid(format!("{description} has an invalid content length"))
+            })?;
+        if length == 0 || length > maximum_bytes {
+            return Err(CommunityError::Invalid(format!(
+                "{description} exceeds size limit"
+            )));
+        }
+    }
+    let mut reader = response.body_mut().as_reader();
+    let mut bytes = Vec::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes
+            .try_reserve(read)
+            .map_err(|_| CommunityError::Invalid(format!("{description} exceeds size limit")))?;
+        bytes.extend_from_slice(&buffer[..read]);
+        if bytes.len() as u64 > maximum_bytes {
+            return Err(CommunityError::Invalid(format!(
+                "{description} exceeds size limit"
+            )));
+        }
+    }
+    if bytes.is_empty() {
+        Err(CommunityError::Invalid(format!(
+            "{description} response is empty"
+        )))
+    } else {
+        Ok(bytes)
+    }
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+fn immutable_manifest_expiry(created_unix: i64, retention_seconds: i64) -> i64 {
+    created_unix.saturating_add(retention_seconds)
 }
 
 fn current_month() -> u32 {
@@ -1989,6 +2544,8 @@ fn current_month() -> u32 {
 mod tests {
     use super::*;
     use crate::config::{CaseRoomConfig, CommunityQuotasConfig, PromotionConfig};
+    use crate::origin_catalog::OriginCatalogConfig;
+    use rw_query::StoreCatalog;
 
     #[derive(Debug, Default)]
     struct MemoryProvider(Mutex<BTreeMap<String, Vec<u8>>>);
@@ -2008,6 +2565,11 @@ mod tests {
             self.0.lock().unwrap().insert(key.into(), bytes.into());
             Ok(())
         }
+
+        fn put_replaceable(&self, key: &str, bytes: &[u8]) -> Result<(), CommunityError> {
+            self.0.lock().unwrap().insert(key.into(), bytes.into());
+            Ok(())
+        }
     }
 
     #[derive(Debug)]
@@ -2019,6 +2581,10 @@ mod tests {
         }
 
         fn put(&self, _key: &str, _bytes: &[u8]) -> Result<(), CommunityError> {
+            Err(CommunityError::Upstream("simulated R2 outage".into()))
+        }
+
+        fn put_replaceable(&self, _key: &str, _bytes: &[u8]) -> Result<(), CommunityError> {
             Err(CommunityError::Upstream("simulated R2 outage".into()))
         }
     }
@@ -2054,6 +2620,22 @@ mod tests {
                 sign_object_manifest(manifest, ORIGIN_SIGNING_KEY_ID, &self.signing_key)?,
                 object,
             )))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ForbiddenOrigin(AtomicBool);
+
+    impl OriginResolver for ForbiddenOrigin {
+        fn resolve(
+            &self,
+            _request: &ResolveObjectRequest,
+            _limits: &ProtocolLimits,
+        ) -> Result<Option<(SignedObjectManifest, Vec<u8>)>, CommunityError> {
+            self.0.store(true, Ordering::Release);
+            Err(CommunityError::Upstream(
+                "local-only resolver crossed the remote-origin boundary".into(),
+            ))
         }
     }
 
@@ -2099,9 +2681,127 @@ mod tests {
             maximum_cases: 16,
             storage_bytes: 1024 * 1024,
             default_retention_seconds: 7 * 24 * 60 * 60,
-            ..CaseRoomConfig::default()
         };
         value
+    }
+
+    #[test]
+    fn signing_key_rotation_retains_distinct_old_keys_and_rejects_collisions() {
+        use base64::Engine as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut rotated = config(&directory);
+        rotated.signing_key_id = "rw-origin-v2".into();
+        let old = SigningKey::from_bytes(&[8; 32]).verifying_key();
+        rotated.trusted_public_keys = vec![format!(
+            "rw-origin-v1:{}",
+            base64::engine::general_purpose::STANDARD.encode(old.to_bytes())
+        )];
+        let service = CommunityService::open(&rotated).unwrap();
+        assert!(service.trusted_keys.contains_key("rw-origin-v1"));
+        assert!(service.trusted_keys.contains_key("rw-origin-v2"));
+
+        let current = SigningKey::from_bytes(&[7; 32]).verifying_key();
+        rotated.trusted_public_keys = vec![format!(
+            "rw-origin-v2:{}",
+            base64::engine::general_purpose::STANDARD.encode(old.to_bytes())
+        )];
+        assert!(matches!(
+            CommunityService::open(&rotated),
+            Err(CommunityError::Invalid(detail)) if detail.contains("duplicates")
+        ));
+
+        rotated.trusted_public_keys = vec![format!(
+            "historical-alias:{}",
+            base64::engine::general_purpose::STANDARD.encode(current.to_bytes())
+        )];
+        assert!(matches!(
+            CommunityService::open(&rotated),
+            Err(CommunityError::Invalid(detail)) if detail.contains("duplicates")
+        ));
+
+        rotated.trusted_public_keys = vec![
+            format!(
+                "old-a:{}",
+                base64::engine::general_purpose::STANDARD.encode(old.to_bytes())
+            ),
+            format!(
+                "old-b:{}",
+                base64::engine::general_purpose::STANDARD.encode(old.to_bytes())
+            ),
+        ];
+        assert!(matches!(
+            CommunityService::open(&rotated),
+            Err(CommunityError::Invalid(detail)) if detail.contains("duplicated")
+        ));
+    }
+
+    #[test]
+    fn immutable_manifest_retention_has_an_exact_expiry_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut configured = config(&directory);
+        configured.object_manifest_retention_seconds = 10;
+        let service = CommunityService::open(&configured).unwrap();
+        let request = test_share_request();
+        let object = b"bounded immutable object";
+        let created_unix = 1_800_000_000;
+        let expires_unix =
+            immutable_manifest_expiry(created_unix, service.object_manifest_retention_seconds);
+        assert_eq!(expires_unix, created_unix + 10);
+        let signed = sign_object_manifest(
+            ObjectManifest {
+                schema: rw_community_protocol::OBJECT_SCHEMA.into(),
+                request_sha256: request_sha256(&request).unwrap(),
+                request: request.clone(),
+                object_sha256: object_sha256(object),
+                content_type: "application/json".into(),
+                compression: Compression::None,
+                encoded_size: object.len() as u64,
+                decoded_size: object.len() as u64,
+                attributions: Vec::new(),
+                modification_notices: vec!["Rusty Weather re-encoded the object.".into()],
+                created_unix,
+                expires_unix,
+            },
+            service.signing_key_id.as_str(),
+            service.signing_key.as_ref().unwrap(),
+        )
+        .unwrap();
+        verify_signed_object(
+            &signed,
+            &request,
+            object,
+            expires_unix - 1,
+            &service.trusted_keys,
+            &service.limits,
+        )
+        .unwrap();
+        assert!(
+            verify_signed_object(
+                &signed,
+                &request,
+                object,
+                expires_unix,
+                &service.trusted_keys,
+                &service.limits,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn case_artifact_expiry_uses_explicit_publication_retention() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut configured = publication_config(&directory);
+        configured.object_manifest_retention_seconds = 1;
+        let service = CommunityService::open(&configured).unwrap();
+        let principal = "f".repeat(64);
+        let publication = artifact_publication(&principal, DataOrigin::PrivateWrf);
+        let signed = service
+            .publish_case_artifact(&principal, publication.clone())
+            .unwrap();
+        assert_eq!(signed.manifest.expires_unix, publication.retain_until_unix);
+        assert!(signed.manifest.expires_unix > publication.published_unix + 1);
     }
 
     fn artifact_publication(principal: &str, origin: DataOrigin) -> PublishCaseArtifactRequest {
@@ -2212,6 +2912,70 @@ mod tests {
     }
 
     #[test]
+    fn remote_base_urls_reject_userinfo_queries_fragments_and_ambiguous_paths() {
+        for invalid in [
+            "http://weather.example.com",
+            "https://token@weather.example.com",
+            "https://weather.example.com?next=https://evil.example",
+            "https://weather.example.com/#fragment",
+            "https://weather.example.com//api",
+            "https://weather.example.com/%2e%2e/secret",
+            "https://weather.example.com/api/",
+        ] {
+            assert!(
+                StrictHttpsBaseUrl::parse(invalid, true, RemoteNetworkPolicy::PublicInternetOnly)
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+        let base = StrictHttpsBaseUrl::parse(
+            "https://weather.example.org/api",
+            true,
+            RemoteNetworkPolicy::PublicInternetOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            base.endpoint("/v1/community/objects/resolve").unwrap(),
+            "https://weather.example.org/api/v1/community/objects/resolve"
+        );
+        assert!(base.endpoint("//evil.example/v1").is_err());
+        assert!(base.endpoint("/v1/%2e%2e/secret").is_err());
+    }
+
+    #[test]
+    fn r2_conditional_conflict_requires_exact_existing_bytes() {
+        assert!(verify_exact_immutable_bytes(Some(b"signed-manifest"), b"signed-manifest").is_ok());
+        assert!(
+            verify_exact_immutable_bytes(Some(b"signed-manifest"), b"refreshed-manifest").is_err()
+        );
+        assert!(verify_exact_immutable_bytes(None, b"object").is_err());
+    }
+
+    #[test]
+    fn redirect_headers_and_unbounded_bodies_fail_closed() {
+        let redirected = ureq::http::Response::builder()
+            .status(302)
+            .header("location", "https://attacker.invalid/steal")
+            .body(ureq::Body::builder().data(Vec::new()))
+            .unwrap();
+        assert!(reject_redirect_headers(&redirected, "origin").is_err());
+
+        let deceptive_success = ureq::http::Response::builder()
+            .status(200)
+            .header("location", "https://attacker.invalid/steal")
+            .body(ureq::Body::builder().data(b"ignored".to_vec()))
+            .unwrap();
+        assert!(reject_redirect_headers(&deceptive_success, "origin").is_err());
+
+        let mut oversized = ureq::http::Response::builder()
+            .status(200)
+            .header("content-length", "1024")
+            .body(ureq::Body::builder().data(b"small".to_vec()))
+            .unwrap();
+        assert!(read_remote_body_bounded(&mut oversized, 16, "origin").is_err());
+    }
+
+    #[test]
     fn typed_private_artifact_is_owner_bound_signed_and_exactly_retrievable() {
         let directory = tempfile::tempdir().unwrap();
         let service = CommunityService::open(&publication_config(&directory)).unwrap();
@@ -2246,6 +3010,10 @@ mod tests {
             service.case(&principal, "case-published").unwrap(),
             signed_case
         );
+        let directory = service.list_cases(&principal, None, 10).unwrap();
+        assert_eq!(directory.schema, CASE_DIRECTORY_SCHEMA);
+        assert_eq!(directory.cases, vec![signed_case]);
+        assert!(directory.next_after.is_none());
     }
 
     #[test]
@@ -2270,10 +3038,20 @@ mod tests {
             ))
         ));
         let mut relabeled = artifact_publication(&principal, DataOrigin::PublicProvider);
-        relabeled.request.model = "wrf".into();
+        // Even a plausible public model/source claim cannot turn client-authored
+        // bytes into an origin-attested public-provider object.
+        relabeled.request.model = "hrrr".into();
+        relabeled.request.source_provenance = vec![rw_community_protocol::SourceProvenance {
+            provider: "noaa-aws-public-data".into(),
+            roles: vec!["surface".into()],
+            products: vec!["wrfsfcf".into()],
+        }];
         assert!(matches!(
             service.publish_case_artifact(&principal, relabeled),
-            Err(CommunityError::Invalid(_))
+            Err(CommunityError::Protocol(ProtocolError::InvalidField {
+                field: "request.publication",
+                ..
+            }))
         ));
         service.set_kill_switch(true);
         assert!(matches!(
@@ -2339,14 +3117,22 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let service = CommunityService::open(&publication_config(&directory)).unwrap();
         let principal = "f".repeat(64);
-        let mut publication = artifact_publication(&principal, DataOrigin::PublicProvider);
+        let mut publication = artifact_publication(&principal, DataOrigin::UserProvided);
         publication.request.model = "ifs".into();
         publication.request.source_provenance = vec![rw_community_protocol::SourceProvenance {
             provider: "ecmwf-open-data".into(),
             roles: vec!["pressure".into()],
             products: vec!["ifs".into()],
         }];
-        publication.attributions.clear();
+        publication.attributions = vec![AttributionNotice {
+            provider: "not-ecmwf".into(),
+            notice: "Owner publication attribution remains present.".into(),
+            source_url: "https://example.invalid/source".into(),
+            license: "Owner-authorized redistribution".into(),
+            license_url: "https://example.invalid/license".into(),
+            terms_url: "https://example.invalid/terms".into(),
+            disclaimer: "Experimental publication.".into(),
+        }];
         assert!(matches!(
             service.publish_case_artifact(&principal, publication.clone()),
             Err(CommunityError::Protocol(ProtocolError::MissingEcmwfNotice))
@@ -2455,7 +3241,13 @@ mod tests {
         let service =
             CommunityService::with_providers(&config(&directory), None, Some(origin)).unwrap();
         service.set_kill_switch(true);
-        let catalog = StoreCatalog::new(directory.path().join("empty-store"));
+        let catalog = PublishedStoreCatalog::new(
+            StoreCatalog::new(directory.path().join("empty-store")),
+            OriginCatalogConfig {
+                enabled: true,
+                ..OriginCatalogConfig::default()
+            },
+        );
 
         let (response, object) = service
             .resolve(
@@ -2473,6 +3265,127 @@ mod tests {
     }
 
     #[test]
+    fn local_origin_compute_cannot_bypass_the_publication_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = CommunityService::with_providers(&config(&directory), None, None).unwrap();
+        let store_root = directory.path().join("store");
+        fs::create_dir_all(&store_root).unwrap();
+        let catalog = PublishedStoreCatalog::new(
+            StoreCatalog::new(store_root),
+            OriginCatalogConfig {
+                enabled: true,
+                ..OriginCatalogConfig::default()
+            },
+        );
+
+        let result = service.resolve(
+            "test",
+            &ResolveObjectRequest {
+                schema: RESOLVE_SCHEMA.into(),
+                request: test_share_request(),
+            },
+            &catalog,
+        );
+        assert!(matches!(
+            result,
+            Err(CommunityError::OriginCatalogUnavailable)
+        ));
+    }
+
+    #[test]
+    fn federation_local_only_resolve_never_calls_the_configured_remote_origin() {
+        let directory = tempfile::tempdir().unwrap();
+        let forbidden = Arc::new(ForbiddenOrigin::default());
+        let service =
+            CommunityService::with_providers(&config(&directory), None, Some(forbidden.clone()))
+                .unwrap();
+        let catalog = PublishedStoreCatalog::new(
+            StoreCatalog::new(directory.path().join("empty-store")),
+            OriginCatalogConfig {
+                enabled: true,
+                ..OriginCatalogConfig::default()
+            },
+        );
+        let result = service.resolve_local_only(
+            "test",
+            &ResolveObjectRequest {
+                schema: RESOLVE_SCHEMA.into(),
+                request: test_share_request(),
+            },
+            &catalog,
+        );
+        assert!(matches!(
+            result,
+            Err(CommunityError::OriginCatalogUnavailable)
+        ));
+        assert!(!forbidden.0.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn federated_stage_uses_the_current_community_authority_and_normal_object_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut configured = config(&directory);
+        configured.signing_key_id = "rw-origin-current".into();
+        configured.object_manifest_retention_seconds = 600;
+        let service = CommunityService::open(&configured).unwrap();
+        let authority = service.federation_authority_signing_material().unwrap();
+        assert_eq!(authority.signing_key_id, "rw-origin-current");
+        assert_eq!(authority.object_manifest_retention_seconds, 600);
+
+        let request = test_share_request();
+        let identity = request_sha256(&request).unwrap();
+        let object = serde_json::to_vec(&ProfileObjectPayload {
+            schema: PROFILE_PAYLOAD_SCHEMA.into(),
+            request_sha256: identity.clone(),
+            profile: serde_json::json!({"schema": "test-profile"}),
+            surface_samples: vec![SurfaceSample {
+                variable: "temperature_2m".into(),
+                units: "K".into(),
+                value: Some(273.15),
+            }],
+        })
+        .unwrap();
+        let now = now_unix();
+        let signed = sign_object_manifest(
+            ObjectManifest {
+                schema: rw_community_protocol::OBJECT_SCHEMA.into(),
+                request: request.clone(),
+                request_sha256: identity.clone(),
+                object_sha256: object_sha256(&object),
+                content_type: "application/json".into(),
+                compression: Compression::None,
+                encoded_size: object.len() as u64,
+                decoded_size: object.len() as u64,
+                attributions: vec![],
+                modification_notices: vec!["Verified public-origin object.".into()],
+                created_unix: now,
+                expires_unix: now + 600,
+            },
+            authority.signing_key_id,
+            &authority.signing_key,
+        )
+        .unwrap();
+        service
+            .stage_verified_federated_object(&identity, &signed, &object)
+            .unwrap();
+        assert_eq!(
+            service
+                .object("test", &signed.manifest.object_sha256)
+                .unwrap(),
+            Bytes::from(object)
+        );
+
+        let wrong_key = SigningKey::from_bytes(&[99; 32]);
+        let wrong =
+            sign_object_manifest(signed.manifest, "upstream-origin-object", &wrong_key).unwrap();
+        assert!(
+            service
+                .stage_verified_federated_object(&identity, &wrong, b"different")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn malformed_hot_manifest_falls_through_to_https_origin() {
         let directory = tempfile::tempdir().unwrap();
         let hot = Arc::new(MemoryProvider::default());
@@ -2485,7 +3398,10 @@ mod tests {
         });
         let service =
             CommunityService::with_providers(&config(&directory), Some(hot), Some(origin)).unwrap();
-        let catalog = StoreCatalog::new(directory.path().join("empty-store"));
+        let catalog = PublishedStoreCatalog::new(
+            StoreCatalog::new(directory.path().join("empty-store")),
+            OriginCatalogConfig::default(),
+        );
         let (response, object) = service
             .resolve(
                 "test",
@@ -2512,6 +3428,168 @@ mod tests {
     }
 
     #[test]
+    fn verified_cas_reuse_reaches_promotion_threshold_and_writes_v2_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let hot = Arc::new(MemoryProvider::default());
+        let origin = Arc::new(StaticOrigin {
+            signing_key: SigningKey::from_bytes(&[7u8; 32]),
+        });
+        let mut configured = config(&directory);
+        configured.promotion.minimum_hits = 3;
+        let service =
+            CommunityService::with_providers(&configured, Some(hot.clone()), Some(origin)).unwrap();
+        let request = test_share_request();
+        let identity = request_sha256(&request).unwrap();
+        let catalog = PublishedStoreCatalog::new(
+            StoreCatalog::new(directory.path().join("empty-store")),
+            OriginCatalogConfig::default(),
+        );
+
+        for _ in 0..3 {
+            service
+                .resolve(
+                    "test",
+                    &ResolveObjectRequest {
+                        schema: RESOLVE_SCHEMA.into(),
+                        request: request.clone(),
+                    },
+                    &catalog,
+                )
+                .unwrap();
+        }
+
+        let pointer_bytes = hot
+            .get(
+                &format!("v2/requests/{identity}.json"),
+                MAX_HOT_MANIFEST_POINTER_BYTES,
+            )
+            .unwrap()
+            .expect("third verified use must promote");
+        let pointer: HotManifestPointer = serde_json::from_slice(&pointer_bytes).unwrap();
+        pointer.validate_for_request(&identity).unwrap();
+        assert!(
+            hot.get(
+                &format!("v2/manifests/{}.json", pointer.manifest_sha256),
+                configured.quotas.maximum_manifest_bytes,
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            service
+                .fetch_provider(hot.as_ref(), &request, &identity)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn renewed_signature_replaces_only_pointer_and_preserves_manifest_blobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let hot = Arc::new(MemoryProvider::default());
+        let service =
+            CommunityService::with_providers(&config(&directory), Some(hot.clone()), None).unwrap();
+        let request = test_share_request();
+        let identity = request_sha256(&request).unwrap();
+        let object = br#"{"source":"renewal-test"}"#.to_vec();
+        let now = now_unix();
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let manifest = ObjectManifest {
+            schema: OBJECT_SCHEMA.into(),
+            request: request.clone(),
+            request_sha256: identity.clone(),
+            object_sha256: object_sha256(&object),
+            content_type: "application/json".into(),
+            compression: Compression::None,
+            encoded_size: object.len() as u64,
+            decoded_size: object.len() as u64,
+            attributions: vec![],
+            modification_notices: vec![],
+            created_unix: now,
+            expires_unix: now + 600,
+        };
+        let first = sign_object_manifest(manifest.clone(), ORIGIN_SIGNING_KEY_ID, &key).unwrap();
+        let mut renewed_manifest = manifest;
+        renewed_manifest.expires_unix += 600;
+        let renewed = sign_object_manifest(renewed_manifest, ORIGIN_SIGNING_KEY_ID, &key).unwrap();
+        let first_hash = object_sha256(&serde_json::to_vec(&first).unwrap());
+        let renewed_hash = object_sha256(&serde_json::to_vec(&renewed).unwrap());
+        assert_ne!(first_hash, renewed_hash);
+
+        service
+            .note_popularity_and_promote(&identity, &first, &object)
+            .unwrap();
+        service
+            .note_popularity_and_promote(&identity, &renewed, &object)
+            .unwrap();
+
+        let pointer: HotManifestPointer = serde_json::from_slice(
+            &hot.get(
+                &format!("v2/requests/{identity}.json"),
+                MAX_HOT_MANIFEST_POINTER_BYTES,
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pointer.manifest_sha256, renewed_hash);
+        for hash in [first_hash, renewed_hash] {
+            assert!(
+                hot.get(
+                    &format!("v2/manifests/{hash}.json"),
+                    ProtocolLimits::default().max_manifest_bytes,
+                )
+                .unwrap()
+                .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn revocable_case_artifacts_are_never_promoted_to_public_hot_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let hot = Arc::new(MemoryProvider::default());
+        let service = CommunityService::with_providers(
+            &publication_config(&directory),
+            Some(hot.clone()),
+            None,
+        )
+        .unwrap();
+        let principal = "f".repeat(64);
+        let publication = artifact_publication(&principal, DataOrigin::UserProvided);
+        let bytes = case_artifact_payload_bytes(&publication).unwrap();
+        let request_hash = request_sha256(&publication.request).unwrap();
+        let now = now_unix();
+        let manifest = ObjectManifest {
+            schema: OBJECT_SCHEMA.into(),
+            request: publication.request,
+            request_sha256: request_hash.clone(),
+            object_sha256: object_sha256(&bytes),
+            content_type: "application/json".into(),
+            compression: Compression::None,
+            encoded_size: bytes.len() as u64,
+            decoded_size: bytes.len() as u64,
+            attributions: publication.attributions,
+            modification_notices: publication.modification_notices,
+            created_unix: now,
+            expires_unix: now + 3600,
+        };
+        let signed = sign_object_manifest(
+            manifest,
+            ORIGIN_SIGNING_KEY_ID,
+            &SigningKey::from_bytes(&[7u8; 32]),
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            service
+                .note_popularity_and_promote(&request_hash, &signed, &bytes)
+                .unwrap();
+        }
+        assert!(hot.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn r2_outage_and_failed_promotion_do_not_break_https_origin() {
         let directory = tempfile::tempdir().unwrap();
         let request = test_share_request();
@@ -2524,7 +3602,10 @@ mod tests {
             Some(origin),
         )
         .unwrap();
-        let catalog = StoreCatalog::new(directory.path().join("empty-store"));
+        let catalog = PublishedStoreCatalog::new(
+            StoreCatalog::new(directory.path().join("empty-store")),
+            OriginCatalogConfig::default(),
+        );
 
         let (response, object) = service
             .resolve(

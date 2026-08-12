@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 
 use rw_community_protocol::SignedRelayCredential;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::control::{AuthenticatedSubject, OpaqueIdSource, RelayCoordinator};
 use crate::data_plane::is_global_relay_address;
@@ -109,12 +109,12 @@ impl RelayAllocationRoute {
 
     /// Deliberate data-plane access. This is the TURN provider's allocation,
     /// not the participant's host/server-reflexive address.
-    pub const fn socket_addr_for_relay_transport(self) -> SocketAddr {
+    pub(crate) const fn socket_addr_for_relay_transport(self) -> SocketAddr {
         self.0
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayRouteRegistrationReceipt {
     pub schema: String,
@@ -126,6 +126,7 @@ pub struct RelayRouteRegistrationReceipt {
 struct RegisteredParticipantRoute {
     route: RelayAllocationRoute,
     offer: EphemeralPublicOffer,
+    credential: SignedRelayCredential,
 }
 
 impl fmt::Debug for RegisteredParticipantRoute {
@@ -230,7 +231,11 @@ impl RelayRouteRegistry {
         } else {
             None
         };
-        *slot = Some(RegisteredParticipantRoute { route, offer });
+        *slot = Some(RegisteredParticipantRoute {
+            route,
+            offer,
+            credential: credential.clone(),
+        });
         session.binding = binding;
         Ok(RelayRouteRegistrationReceipt {
             schema: TRANSPORT_ROUTE_GRANT_SCHEMA.into(),
@@ -255,16 +260,16 @@ impl RelayRouteRegistry {
             .get(&authorized.session_id)
             .ok_or(RelayError::NotAvailable)?;
         let binding = session.binding.clone().ok_or(RelayError::NotAvailable)?;
-        let peer_route = match role {
+        let peer = match role {
             RelayRole::Uploader => session.downloader.as_ref(),
             RelayRole::Downloader => session.uploader.as_ref(),
         }
-        .ok_or(RelayError::NotAvailable)?
-        .route;
+        .ok_or(RelayError::NotAvailable)?;
         Ok(ParticipantTransportRouteGrant {
             session_id: authorized.session_id,
             role,
-            peer_relay_route: peer_route,
+            peer_relay_route: peer.route,
+            peer_credential: peer.credential.clone(),
             binding,
         })
     }
@@ -288,6 +293,7 @@ pub struct ParticipantTransportRouteGrant {
     session_id: String,
     role: RelayRole,
     peer_relay_route: RelayAllocationRoute,
+    peer_credential: SignedRelayCredential,
     binding: SignedSessionBinding,
 }
 
@@ -306,6 +312,10 @@ impl ParticipantTransportRouteGrant {
         &self.binding
     }
 
+    pub fn peer_credential(&self) -> &SignedRelayCredential {
+        &self.peer_credential
+    }
+
     /// The sole address-bearing wire seam. A server returns these bounded JSON
     /// bytes only from a participant-authenticated transport endpoint and must
     /// mark the response non-cacheable and exclude its body from logs/traces.
@@ -317,6 +327,7 @@ impl ParticipantTransportRouteGrant {
             session_id: &'a str,
             role: RelayRole,
             peer_relay_allocation: String,
+            peer_credential: &'a SignedRelayCredential,
             signed_binding: &'a SignedSessionBinding,
         }
         let bytes = serde_json::to_vec(&Wire {
@@ -324,6 +335,7 @@ impl ParticipantTransportRouteGrant {
             session_id: &self.session_id,
             role: self.role,
             peer_relay_allocation: self.peer_relay_route.0.to_string(),
+            peer_credential: &self.peer_credential,
             signed_binding: &self.binding,
         })
         .map_err(|_| RelayError::KeyAgreementRejected)?;

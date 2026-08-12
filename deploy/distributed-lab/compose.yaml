@@ -1,0 +1,463 @@
+name: rusty-weather-distributed-lab
+
+x-rw-server: &rw-server
+  image: rusty-weather-distributed-lab-server:local
+  build:
+    context: ../..
+    dockerfile: deploy/distributed-lab/Dockerfile.rw-lab
+    args:
+      RW_BUILD_SHA: distributed-lab-not-for-production
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 256
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=0700,uid=65532,gid=65532
+  restart: "no"
+  networks: [rw_lab]
+
+x-labctl: &labctl
+  image: rusty-weather-distributed-labctl:local
+  build:
+    context: ../..
+    dockerfile: deploy/distributed-lab/Dockerfile.labctl
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 128
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=65532,gid=65532
+  volumes:
+    - ./runtime:/lab
+  restart: "no"
+  networks: [rw_lab]
+
+services:
+  authority:
+    <<: *rw-server
+    environment:
+      RUST_MIN_STACK: "33554432"
+      RW_DOCKER_TOKEN_SOURCE: /run/secrets/api_tokens
+      RW_DOCKER_COMMUNITY_SIGNING_KEY_SOURCE: /run/secrets/community_signing_key
+      RW_DOCKER_COMMUNITY_RELAY_SIGNING_KEY_SOURCE: /run/secrets/relay_signing_key
+      RW_DOCKER_CLOUDFLARE_TURN_API_TOKEN_SOURCE: /run/secrets/cloudflare_api_token
+      RW_DOCKER_R2_GATEWAY_TOKEN_SOURCE: /run/secrets/r2_write_token
+      RW_DOCKER_SECRET_DIRECTORY_SOURCE: /run/scoped-federation-secrets
+      RW_DOCKER_FEDERATION_SIGNING_KEY_SOURCE: /run/secrets/federation_signing_key
+    secrets:
+      - api_tokens
+      - community_signing_key
+      - relay_signing_key
+      - cloudflare_api_token
+      - r2_write_token
+      - federation_signing_key
+    volumes:
+      - ./runtime/configs/authority.toml:/etc/rusty-weather/rusty-weather.toml:ro
+      - ./runtime/configs/alpha-descriptor.json:/etc/rusty-weather/alpha-descriptor.json:ro
+      - ./runtime/configs/beta-descriptor.json:/etc/rusty-weather/beta-descriptor.json:ro
+      - ./runtime/secrets/authority-scoped:/run/scoped-federation-secrets:ro
+      - ./runtime/data/authority/store:/var/lib/rusty-weather/store
+      - ./runtime/data/authority/artifacts:/var/lib/rusty-weather/artifacts
+      - ./runtime/data/authority/community:/var/lib/rusty-weather/community-cache
+      - ./runtime/data/authority/federation:/var/lib/rusty-weather/federation
+    networks:
+      rw_lab:
+        ipv4_address: 11.231.0.2
+
+  alpha-origin:
+    <<: *rw-server
+    environment:
+      RUST_MIN_STACK: "33554432"
+      RW_DOCKER_TOKEN_SOURCE: /run/secrets/alpha_api_tokens
+      RW_DOCKER_COMMUNITY_SIGNING_KEY_SOURCE: /run/secrets/alpha_community_signing_key
+      RW_DOCKER_GENERATION_REPLICATION_SIGNING_KEY_SOURCE: /run/secrets/alpha_replication_signing_key
+      RW_DOCKER_COMMUNITY_ORIGIN_TOKEN_SOURCE: /run/secrets/alpha_origin_token
+    secrets:
+      - alpha_api_tokens
+      - alpha_community_signing_key
+      - alpha_replication_signing_key
+      - alpha_origin_token
+    volumes:
+      - ./runtime/configs/alpha.toml:/etc/rusty-weather/rusty-weather.toml:ro
+      - ./runtime/data/alpha/store:/var/lib/rusty-weather/store
+      - ./runtime/data/alpha/artifacts:/var/lib/rusty-weather/artifacts
+      - ./runtime/data/alpha/community:/var/lib/rusty-weather/community-cache
+      - ./runtime/data/alpha/replication:/var/lib/rusty-weather/generation-replication
+    networks:
+      rw_lab:
+        ipv4_address: 11.231.0.3
+
+  beta-origin:
+    <<: *rw-server
+    environment:
+      RUST_MIN_STACK: "33554432"
+      RW_DOCKER_TOKEN_SOURCE: /run/secrets/beta_api_tokens
+      RW_DOCKER_COMMUNITY_SIGNING_KEY_SOURCE: /run/secrets/beta_community_signing_key
+      RW_DOCKER_GENERATION_REPLICATION_SIGNING_KEY_SOURCE: /run/secrets/beta_replication_signing_key
+      RW_DOCKER_COMMUNITY_ORIGIN_TOKEN_SOURCE: /run/secrets/beta_origin_token
+    secrets:
+      - beta_api_tokens
+      - beta_community_signing_key
+      - beta_replication_signing_key
+      - beta_origin_token
+    volumes:
+      - ./runtime/configs/beta.toml:/etc/rusty-weather/rusty-weather.toml:ro
+      - ./runtime/data/beta/store:/var/lib/rusty-weather/store
+      - ./runtime/data/beta/artifacts:/var/lib/rusty-weather/artifacts
+      - ./runtime/data/beta/community:/var/lib/rusty-weather/community-cache
+      - ./runtime/data/beta/replication:/var/lib/rusty-weather/generation-replication
+    networks:
+      rw_lab:
+        ipv4_address: 11.231.0.4
+
+  authority-edge:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    user: "65532:65532"
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    environment:
+      LAB_UPSTREAM: authority:8788
+    depends_on:
+      - authority
+    secrets:
+      - lab_tls_certificate
+      - lab_tls_private_key
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    networks:
+      rw_lab:
+        ipv4_address: 11.231.0.10
+        aliases:
+          - authority.rw-lab.example.edu
+
+  alpha-edge:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    user: "65532:65532"
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    environment:
+      LAB_UPSTREAM: alpha-origin:8788
+    depends_on:
+      - alpha-origin
+    secrets:
+      - lab_tls_certificate
+      - lab_tls_private_key
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    networks:
+      rw_lab:
+        ipv4_address: 11.231.0.11
+        aliases:
+          - alpha.rw-lab.example.edu
+
+  beta-edge:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    user: "65532:65532"
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    environment:
+      LAB_UPSTREAM: beta-origin:8788
+    depends_on:
+      - beta-origin
+    secrets:
+      - lab_tls_certificate
+      - lab_tls_private_key
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    networks:
+      rw_lab:
+        ipv4_address: 11.231.0.12
+        aliases:
+          - beta.rw-lab.example.edu
+
+  r2-hot:
+    image: rusty-weather-distributed-r2:local
+    build:
+      context: ../..
+      dockerfile: deploy/distributed-lab/Dockerfile.r2-lab
+    environment:
+      HOME: /tmp/home
+      XDG_CONFIG_HOME: /tmp/config
+      WRANGLER_SEND_METRICS: "false"
+    secrets:
+      - lab_tls_certificate
+      - lab_tls_private_key
+    volumes:
+      - ./runtime/data/r2:/data
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=0700,uid=65532,gid=65532
+      - /app/.wrangler:rw,noexec,nosuid,nodev,size=32m,mode=0700,uid=65532,gid=65532
+    networks:
+      rw_lab:
+        ipv4_address: 11.231.0.13
+        aliases:
+          - r2-hot.rw-lab.example.edu
+
+  cloudflare-turn-api:
+    image: node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
+    user: "65532:65532"
+    command: ["node", "/app/fake-cloudflare-turn-api.mjs"]
+    volumes:
+      - ./fake-cloudflare-turn-api.mjs:/app/fake-cloudflare-turn-api.mjs:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=8m,mode=0700,uid=65532,gid=65532
+    networks:
+      rw_lab:
+        ipv4_address: 11.231.0.6
+
+  cloudflare-turn-api-edge:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    user: "65532:65532"
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    environment:
+      LAB_UPSTREAM: cloudflare-turn-api:8080
+    depends_on:
+      - cloudflare-turn-api
+    secrets:
+      - lab_tls_certificate
+      - lab_tls_private_key
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    networks:
+      rw_lab:
+        ipv4_address: 11.231.0.14
+        aliases:
+          - rtc.live.cloudflare.com
+
+  turn:
+    image: coturn/coturn:4.8.0-debian@sha256:71c3c990283385567f11794ee692e3a47b66fd9b0bb39e42afbe776e331dd888
+    user: "65532:65532"
+    command:
+      - -n
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --fingerprint
+      - --verbose
+      - --lt-cred-mech
+      - --realm=rw-distributed-lab
+      - --user=distributed-lab-turn-user:distributed-lab-turn-password-0001
+      - --listening-ip=11.231.0.15
+      - --relay-ip=11.231.0.15
+      - --external-ip=11.231.0.15
+      - --min-port=49160
+      - --max-port=49179
+      - --no-multicast-peers
+      - --pidfile=/tmp/turnserver.pid
+      - --log-file=stdout
+      - --simple-log
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=8m,mode=0700,uid=65532,gid=65532
+    networks:
+      rw_lab:
+        ipv4_address: 11.231.0.15
+        aliases:
+          - turn.cloudflare.com
+
+  controller:
+    <<: *labctl
+    command: ["exercise", "/lab"]
+    depends_on:
+      - authority-edge
+      - alpha-edge
+      - beta-edge
+      - r2-hot
+      - cloudflare-turn-api-edge
+      - turn
+
+  uploader:
+    <<: *labctl
+    profiles: [exercise]
+    command: ["uploader", "/lab"]
+    networks:
+      rw_lab:
+        ipv4_address: 11.231.0.21
+
+  downloader:
+    <<: *labctl
+    profiles: [exercise]
+    command: ["downloader", "/lab"]
+    networks:
+      rw_lab:
+        ipv4_address: 11.231.0.22
+
+  observe-uploader:
+    image: nicolaka/netshoot:v0.15@sha256:47b907d662d139d1e2f22bfe14f4efca1e3f1feed283572f47c970c780c03b61
+    profiles: [exercise]
+    user: "0:0"
+    command: ["sh", "/opt/lab/observe.sh", "uploader", "4242"]
+    environment:
+      LAB_ENABLE_NETEM: ${LAB_ENABLE_NETEM:-0}
+    depends_on:
+      uploader:
+        condition: service_started
+    network_mode: service:uploader
+    volumes:
+      - ./runtime:/lab
+      - ./observe.sh:/opt/lab/observe.sh:ro
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE, NET_ADMIN, NET_RAW]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=8m
+    healthcheck:
+      test: ["CMD", "test", "-f", "/lab/control/observer-uploader.ready"]
+      interval: 250ms
+      timeout: 1s
+      retries: 40
+      start_period: 1s
+
+  observe-downloader:
+    image: nicolaka/netshoot:v0.15@sha256:47b907d662d139d1e2f22bfe14f4efca1e3f1feed283572f47c970c780c03b61
+    profiles: [exercise]
+    user: "0:0"
+    command: ["sh", "/opt/lab/observe.sh", "downloader", "8181"]
+    environment:
+      LAB_ENABLE_NETEM: ${LAB_ENABLE_NETEM:-0}
+    depends_on:
+      downloader:
+        condition: service_started
+    network_mode: service:downloader
+    volumes:
+      - ./runtime:/lab
+      - ./observe.sh:/opt/lab/observe.sh:ro
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE, NET_ADMIN, NET_RAW]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=8m
+    healthcheck:
+      test: ["CMD", "test", "-f", "/lab/control/observer-downloader.ready"]
+      interval: 250ms
+      timeout: 1s
+      retries: 40
+      start_period: 1s
+
+  traffic-gate:
+    image: alpine:3.22.2@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659
+    profiles: [exercise]
+    user: "65532:65532"
+    command: ["sh", "-eu", "-c", "printf 'ready\\n' > /lab/control/traffic-start"]
+    depends_on:
+      observe-uploader:
+        condition: service_healthy
+      observe-downloader:
+        condition: service_healthy
+    volumes:
+      - ./runtime:/lab
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      rw_lab:
+        ipv4_address: 11.231.0.23
+
+  packet-verifier:
+    image: nicolaka/netshoot:v0.15@sha256:47b907d662d139d1e2f22bfe14f4efca1e3f1feed283572f47c970c780c03b61
+    profiles: [verify]
+    user: "65532:65532"
+    command: ["sh", "/opt/lab/verify-packets.sh"]
+    network_mode: none
+    volumes:
+      - ./runtime:/lab
+      - ./verify-packets.sh:/opt/lab/verify-packets.sh:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+  result-verifier:
+    <<: *labctl
+    profiles: [verify]
+    command: ["verify", "/lab"]
+
+networks:
+  rw_lab:
+    internal: true
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 11.231.0.0/24
+          gateway: 11.231.0.1
+
+secrets:
+  api_tokens:
+    file: ./runtime/secrets/authority-api-tokens.txt
+  community_signing_key:
+    file: ./runtime/secrets/authority-community.key
+  relay_signing_key:
+    file: ./runtime/secrets/authority-relay.key
+  cloudflare_api_token:
+    file: ./runtime/secrets/cloudflare-api.token
+  r2_write_token:
+    file: ./runtime/secrets/r2-write.token
+  federation_signing_key:
+    file: ./runtime/secrets/federation-catalog.key
+  alpha_api_tokens:
+    file: ./runtime/secrets/alpha-api-tokens.txt
+  alpha_community_signing_key:
+    file: ./runtime/secrets/alpha-community.key
+  alpha_replication_signing_key:
+    file: ./runtime/secrets/alpha-replication.key
+  alpha_origin_token:
+    file: ./runtime/secrets/alpha-data.token
+  beta_api_tokens:
+    file: ./runtime/secrets/beta-api-tokens.txt
+  beta_community_signing_key:
+    file: ./runtime/secrets/beta-community.key
+  beta_replication_signing_key:
+    file: ./runtime/secrets/beta-replication.key
+  beta_origin_token:
+    file: ./runtime/secrets/beta-data.token
+  lab_tls_certificate:
+    file: ./runtime/tls/lab.crt
+  lab_tls_private_key:
+    file: ./runtime/tls/lab.key

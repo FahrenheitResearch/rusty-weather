@@ -6,12 +6,17 @@
 
 pub mod auth;
 pub mod community;
+pub mod community_relay;
+pub mod community_relay_provider;
 pub mod community_store;
 pub mod config;
 pub mod federation;
+pub mod federation_proxy;
+pub mod generation_replication;
 pub mod jobs;
 pub mod metrics;
 pub mod openapi;
+pub mod origin_catalog;
 pub mod problem;
 pub mod routes;
 pub mod state;
@@ -21,6 +26,10 @@ pub use config::{AppConfig, ConfigError};
 pub use federation::{
     FederationError, FederationHealthStatus, FederationOriginHealthState,
     FederationOriginHealthStatus, FederationService,
+};
+pub use generation_replication::{
+    GenerationReplicationError, ReplicationGarbageCollectionResponse, ReplicationKillSwitchRequest,
+    ReplicationStatusResponse, ServerGenerationReplication,
 };
 pub use jobs::{ArtifactRef, CancellationToken, JobError, JobManager, JobStatus, JobView};
 pub use metrics::Metrics;

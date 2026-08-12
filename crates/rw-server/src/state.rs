@@ -9,18 +9,29 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinError;
 
 use crate::community::CommunityService;
+use crate::community_relay::CommunityRelayService;
 use crate::federation::FederationService;
+use crate::federation_proxy::{
+    ServerFederationProxy, load_federation_origin_tokens, open_server_federation_proxy,
+    validate_credential_isolation,
+};
+use crate::generation_replication::ServerGenerationReplication;
+use crate::origin_catalog::PublishedStoreCatalog;
 use crate::{AppConfig, JobError, JobManager, Metrics, TokenSet};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
     pub tokens: Arc<TokenSet>,
-    pub catalog: Arc<StoreCatalog>,
+    pub federation_origin_tokens: Arc<TokenSet>,
+    pub catalog: Arc<PublishedStoreCatalog>,
     pub metrics: Arc<Metrics>,
     pub jobs: JobManager,
     pub community: CommunityService,
+    pub community_relay: CommunityRelayService,
     pub federation: FederationService,
+    pub(crate) federation_proxy: Option<Arc<ServerFederationProxy>>,
+    pub generation_replication: ServerGenerationReplication,
     pub response_cache: Cache<String, Bytes>,
     pub started_at: Instant,
     light: Arc<Semaphore>,
@@ -40,6 +51,9 @@ impl std::fmt::Debug for AppState {
 
 impl AppState {
     pub fn new(config: AppConfig, tokens: TokenSet) -> Result<Self, JobError> {
+        validate_credential_isolation(&config, &tokens).map_err(|detail| {
+            JobError::Invalid(format!("federation credential isolation: {detail}"))
+        })?;
         let limits = QueryLimits {
             max_catalog_entries: 10_000,
             max_time_points: config.limits.catalog_time_points,
@@ -55,6 +69,17 @@ impl AppState {
             limits,
             config.limits.reader_cache_bytes,
         );
+        let generation_replication = ServerGenerationReplication::open(
+            &config.generation_replication,
+            &config.server.store_root,
+        )
+        .map_err(|error| {
+            JobError::Invalid(format!(
+                "failed to initialize generation replication: {error}"
+            ))
+        })?;
+        let catalog = PublishedStoreCatalog::new(catalog, config.origin_catalog.clone())
+            .with_generation_replication(generation_replication.clone());
         let light = Arc::new(Semaphore::new(config.limits.light_concurrency));
         let heavy = Arc::new(Semaphore::new(config.limits.heavy_concurrency));
         let jobs = JobManager::open(
@@ -72,19 +97,58 @@ impl AppState {
         let community = CommunityService::open(&config.community).map_err(|error| {
             JobError::Invalid(format!("failed to initialize Community Cache: {error}"))
         })?;
+        let community_relay = CommunityRelayService::open(
+            &config.community,
+            rw_community_protocol::ProtocolLimits {
+                max_manifest_bytes: config.community.quotas.maximum_manifest_bytes,
+                max_encoded_bytes: config.community.quotas.maximum_object_bytes,
+                max_decoded_bytes: config.community.quotas.maximum_decompressed_bytes,
+                max_case_artifacts: config.community.cases.maximum_objects_per_case,
+                ..rw_community_protocol::ProtocolLimits::default()
+            },
+        )
+        .map_err(|error| {
+            JobError::Invalid(format!(
+                "failed to initialize Community Cache relay broker: {error}"
+            ))
+        })?;
+        let metrics = Arc::new(Metrics::new());
+        metrics.set_relay_kill_switch(
+            config.community.relay.enabled && config.community.relay.kill_switch,
+        );
+        if let Ok(status) = generation_replication.startup_status() {
+            metrics.set_replication_kill_switch(status.kill_switch);
+        }
         let federation = FederationService::open(&config.federation).map_err(|error| {
             JobError::Invalid(format!(
                 "failed to initialize public-origin federation: {error}"
             ))
         })?;
+        let federation_origin_tokens =
+            load_federation_origin_tokens(&config, &tokens).map_err(|detail| {
+                JobError::Invalid(format!("federation origin authentication: {detail}"))
+            })?;
+        let federation_proxy =
+            open_server_federation_proxy(&config, community.clone(), federation.clone()).map_err(
+                |detail| {
+                    JobError::Invalid(format!("failed to initialize federation proxy: {detail}"))
+                },
+            )?;
+        if let Some(proxy) = &federation_proxy {
+            metrics.set_federation_proxy_kill_switch(proxy.startup_status().kill_switch);
+        }
         Ok(Self {
             config: Arc::new(config),
             tokens: Arc::new(tokens),
+            federation_origin_tokens: Arc::new(federation_origin_tokens),
             catalog: Arc::new(catalog),
-            metrics: Arc::new(Metrics::new()),
+            metrics,
             jobs,
             community,
+            community_relay,
             federation,
+            federation_proxy,
+            generation_replication,
             response_cache,
             started_at: Instant::now(),
             light,

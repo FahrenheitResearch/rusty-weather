@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -13,7 +13,13 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use rustwx_core::{ModelId, SourceId};
 use rw_community_protocol::{
-    CaseRoomManifest, PublishCaseArtifactRequest, ResolveObjectRequest, RevokePublicationRequest,
+    BeginRunGenerationRequest, CaseRoomManifest, FinalizeRunGenerationRequest,
+    PublishCaseArtifactRequest, ResolveObjectRequest, RevokePublicationRequest,
+    RevokeRunGenerationRequest,
+};
+use rw_federation_proxy::{
+    FEDERATION_HOP_HEADER, FEDERATION_LOCAL_OBJECT_PATH_PREFIX, FEDERATION_LOCAL_RESOLVE_PATH,
+    FEDERATION_PROXY_PATH, FederationProxyError, FederationProxyRequest,
 };
 use rw_ingest::{IngestCapabilityLimitation, IngestSupportStatus, model_ingest_capability};
 use rw_query::{
@@ -41,8 +47,15 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::community::CommunityError;
+use crate::community_relay::{
+    CommunityRelayError, HistoricalRelayLookupRequest, RelayAdvertiseRequest,
+    RelayGrantPollRequest, RelayKillSwitchRequest, RelayRouteRegistrationRequest,
+    RelaySessionCompletionRequest, RelaySessionFailureRequest, RelayTransportGrantRequest,
+};
 use crate::config::ConfigError;
 use crate::federation::FederationError;
+use crate::federation_proxy::{FederationProxyControlError, FederationProxyKillSwitchRequest};
+use crate::generation_replication::{GenerationReplicationError, ReplicationKillSwitchRequest};
 use crate::problem::ProblemDetails;
 use crate::{AppState, CancellationToken, ExecutionError, JobError, JobStatus};
 
@@ -823,8 +836,62 @@ struct CommunityCasePath {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommunityCaseDirectoryQuery {
+    after: Option<String>,
+    #[serde(default = "default_case_directory_limit")]
+    limit: usize,
+}
+
+const fn default_case_directory_limit() -> usize {
+    50
+}
+
+impl CommunityCaseDirectoryQuery {
+    fn validate(&self) -> bool {
+        (1..=rw_community_protocol::MAX_CASE_DIRECTORY_PAGE).contains(&self.limit)
+            && self.after.as_ref().is_none_or(|cursor| {
+                !cursor.is_empty()
+                    && cursor.len() <= 128
+                    && cursor
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RelaySessionGrantPath {
+    session_id: String,
+    role: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct FederationOriginPath {
     origin_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplicationGenerationPath {
+    generation_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplicationChunkPath {
+    generation_id: String,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplicationMissingQuery {
+    after: Option<String>,
+    #[serde(default = "default_replication_missing_limit")]
+    limit: usize,
+}
+
+const fn default_replication_missing_limit() -> usize {
+    256
 }
 
 #[derive(Debug)]
@@ -859,7 +926,10 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
         .route("/v1/version", get(version))
         .route("/v1/openapi.json", get(openapi));
 
-    let protected = Router::new()
+    // Only conventional operational reads are publication-gated. Job result,
+    // case-room, federation, and relay control routes remain independently
+    // available and never gain a StoreCatalog bypass through this router.
+    let operational = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/models/{model}/runs", get(list_runs))
         .route("/v1/models/{model}/runs/{run}", get(run_detail))
@@ -875,6 +945,13 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
         .route("/v1/window", post(window))
         .route("/v1/geographic-window", post(geographic_window))
         .route("/v1/analytics/spatial-series", post(spatial_series))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_origin_catalog_ready,
+        ));
+
+    let protected = Router::new()
+        .merge(operational)
         .route("/v1/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/v1/artifacts/{hash}/{file}", get(artifact))
         .route(
@@ -892,12 +969,56 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
         )
         .route(
             rw_community_protocol::CREATE_CASE_PATH,
-            post(publish_community_case),
+            get(list_community_cases).post(publish_community_case),
         )
         .route("/v1/community/cases/{case_id}", get(community_case))
         .route(
             rw_community_protocol::REVOKE_CASE_PATH_TEMPLATE,
             post(revoke_community_case),
+        )
+        .route(
+            "/v1/community/relay/advertisements",
+            post(advertise_community_relay_object),
+        )
+        .route(
+            "/v1/community/relay/historical/lookups",
+            post(lookup_community_relay_historical),
+        )
+        .route(
+            "/v1/community/relay/grants/next",
+            post(next_community_relay_grant),
+        )
+        .route(
+            "/v1/community/relay/sessions/{session_id}/grants/{role}",
+            post(community_relay_session_grant),
+        )
+        .route(
+            "/v1/community/relay/routes",
+            post(register_community_relay_route),
+        )
+        .route(
+            "/v1/community/relay/transport",
+            post(community_relay_transport_grant),
+        )
+        .route(
+            "/v1/community/relay/sessions/complete",
+            post(complete_community_relay_session),
+        )
+        .route(
+            "/v1/community/relay/sessions/fail",
+            post(fail_community_relay_session),
+        )
+        .route(
+            "/v1/community/relay/sessions/revoke",
+            post(revoke_community_relay_session),
+        )
+        .route(
+            "/v1/community/relay/operator/kill-switch",
+            post(set_community_relay_kill_switch),
+        )
+        .route(
+            "/v1/community/relay/operator/status",
+            get(community_relay_status),
         )
         .route(
             rw_community_protocol::FEDERATION_CATALOG_PATH,
@@ -908,9 +1029,85 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
             get(federation_origin),
         )
         .route("/v1/federation/health", get(federation_health))
+        .route(FEDERATION_PROXY_PATH, post(resolve_federation_proxy))
+        .route(
+            "/v1/federation/proxy/operator/status",
+            get(federation_proxy_operator_status),
+        )
+        .route(
+            "/v1/federation/proxy/operator/kill-switch",
+            post(set_federation_proxy_kill_switch),
+        )
+        .route("/v1/origin-catalog/status", get(origin_catalog_status))
+        .route(
+            "/v1/community/generation-replication/owner",
+            get(generation_replication_owner),
+        )
+        .route(
+            rw_community_protocol::BEGIN_RUN_GENERATION_PATH,
+            post(begin_generation_replication),
+        )
+        .route(
+            "/v1/community/generations/{generation_id}",
+            get(generation_replication_status),
+        )
+        .route(
+            "/v1/community/generations/{generation_id}/missing",
+            get(generation_replication_missing),
+        )
+        .route(
+            "/v1/community/generations/{generation_id}/chunks/{sha256}",
+            post(upload_generation_replication_chunk).layer(DefaultBodyLimit::max(
+                usize::try_from(
+                    state
+                        .config
+                        .generation_replication
+                        .limits
+                        .maximum_chunk_bytes,
+                )
+                .unwrap_or(usize::MAX),
+            )),
+        )
+        .route(
+            "/v1/community/generations/{generation_id}/finalize",
+            post(finalize_generation_replication),
+        )
+        .route(
+            "/v1/community/generations/{generation_id}/revoke",
+            post(revoke_generation_replication),
+        )
+        .route(
+            "/v1/community/generation-replication/operator/status",
+            get(generation_replication_operator_status),
+        )
+        .route(
+            "/v1/community/generation-replication/operator/kill-switch",
+            post(set_generation_replication_kill_switch),
+        )
+        .route(
+            "/v1/community/generation-replication/operator/gc",
+            post(run_generation_replication_gc),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_authentication,
+        ));
+
+    // Dedicated public-origin service-to-service routes. Ordinary BowEcho API
+    // tokens cannot authenticate here, and the one-hop header is consumed by
+    // the handler rather than forwarded to another origin.
+    let federation_origin = Router::new()
+        .route(
+            FEDERATION_LOCAL_RESOLVE_PATH,
+            post(resolve_federation_local_only),
+        )
+        .route(
+            &format!("{FEDERATION_LOCAL_OBJECT_PATH_PREFIX}/{{sha256}}"),
+            get(federation_local_object),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_federation_origin_authentication,
         ));
 
     let metrics = Router::new().route("/metrics", get(metrics));
@@ -925,6 +1122,7 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
 
     let mut router = public
         .merge(protected)
+        .merge(federation_origin)
         .merge(metrics)
         .fallback(fallback)
         .with_state(state.clone())
@@ -1071,6 +1269,63 @@ async fn require_authentication(
     response
 }
 
+async fn require_federation_origin_authentication(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let enabled = state.config.federation.proxy.accept_local_resolve;
+    let principal = enabled.then(|| {
+        state
+            .federation_origin_tokens
+            .authorization_principal(request.headers().get(header::AUTHORIZATION))
+    });
+    if let Some(Some(principal)) = principal {
+        request.extensions_mut().insert(AuthPrincipal(principal));
+        return next.run(request).await;
+    }
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .copied()
+        .unwrap_or(RequestId(Uuid::nil()));
+    state.metrics.reject();
+    let mut response = ProblemDetails::unauthorized(request_id.0).into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer realm=\"rusty-weather-federation-origin\""),
+    );
+    response
+}
+
+async fn require_origin_catalog_ready(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !state.catalog.publication_gate_enabled() {
+        return next.run(request).await;
+    }
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .copied()
+        .unwrap_or(RequestId(Uuid::nil()));
+    let catalog = state.catalog.clone();
+    match state.run_light(move || catalog.publication_ready()).await {
+        Ok(true) => next.run(request).await,
+        Ok(false) => ProblemDetails::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ORIGIN_CATALOG_UNAVAILABLE",
+            "Origin publication catalog is unavailable",
+            "Retry against a healthy authoritative origin.",
+            request_id.0,
+        )
+        .into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
 async fn health_live(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "live",
@@ -1093,10 +1348,21 @@ async fn health_ready(
             StatusCode::SERVICE_UNAVAILABLE,
             "NOT_READY",
             "Service is not ready",
-            "The configured store is not currently readable.",
+            "The configured store or origin publication catalog is not currently ready.",
             request_id.0,
         )
         .into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn origin_catalog_status(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    let catalog = state.catalog.clone();
+    match state.run_light(move || catalog.health_status()).await {
+        Ok(status) => json_no_store(StatusCode::OK, &status, request_id.0),
         Err(error) => execution_problem(error, request_id.0).into_response(),
     }
 }
@@ -1119,6 +1385,7 @@ async fn list_models(
     Extension(request_id): Extension<RequestId>,
 ) -> Response {
     let catalog = state.catalog.clone();
+    let restrict_to_published = catalog.publication_gate_enabled();
     match state.run_light(move || catalog.list_models()).await {
         Ok(Ok(stored)) => {
             let stored: BTreeMap<_, _> = stored
@@ -1130,6 +1397,9 @@ async fn list_models(
             for summary in rustwx_models::built_in_models()
                 .iter()
                 .filter(|summary| summary.id != ModelId::RrfsFireWx)
+                .filter(|summary| {
+                    !restrict_to_published || stored.contains_key(&summary.id.to_string())
+                })
             {
                 let capability = model_ingest_capability(summary.id);
                 let verification = if summary.id == ModelId::WrfGdex {
@@ -1965,21 +2235,7 @@ async fn community_object(
         .run_light(move || community.object(&principal.0, &hash))
         .await
     {
-        Ok(Ok(bytes)) => {
-            let mut response = Response::new(Body::from(bytes));
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/octet-stream"),
-            );
-            response.headers_mut().insert(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("private, max-age=31536000, immutable"),
-            );
-            if let Ok(value) = HeaderValue::from_str(&format!("\"{}\"", path.sha256)) {
-                response.headers_mut().insert(header::ETAG, value);
-            }
-            response
-        }
+        Ok(Ok(bytes)) => immutable_object_response(bytes, &path.sha256),
         Ok(Err(error)) => community_problem(error, request_id.0).into_response(),
         Err(error) => execution_problem(error, request_id.0).into_response(),
     }
@@ -2072,6 +2328,507 @@ async fn community_case(
     }
 }
 
+async fn list_community_cases(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Query(query): Query<CommunityCaseDirectoryQuery>,
+) -> Response {
+    if !query.validate() {
+        return ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_CASE_CURSOR",
+            "Case directory cursor or limit is invalid",
+            "Use an opaque case id cursor and a limit from 1 through 100.",
+            request_id.0,
+        )
+        .into_response();
+    }
+    let community = state.community.clone();
+    match state
+        .run_light(move || community.list_cases(&principal.0, query.after.as_deref(), query.limit))
+        .await
+    {
+        Ok(Ok(page)) => json_no_store(StatusCode::OK, &page, request_id.0),
+        Ok(Err(error)) => community_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn advertise_community_relay_object(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(request): Json<RelayAdvertiseRequest>,
+) -> Response {
+    let relay = state.community_relay.clone();
+    match state
+        .run_light(move || relay.advertise(&principal.0, request))
+        .await
+    {
+        Ok(Ok(receipt)) => json_no_store(StatusCode::CREATED, &receipt, request_id.0),
+        Ok(Err(error)) => community_relay_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn lookup_community_relay_historical(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(request): Json<HistoricalRelayLookupRequest>,
+) -> Response {
+    let relay = state.community_relay.clone();
+    match state
+        .run_light(move || relay.historical_lookup_json(&principal.0, request))
+        .await
+    {
+        Ok(Ok((bytes, issued))) => {
+            state.metrics.record_relay_lookup(issued);
+            secret_json_response(StatusCode::OK, bytes)
+        }
+        Ok(Err(error)) => community_relay_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn next_community_relay_grant(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(request): Json<RelayGrantPollRequest>,
+) -> Response {
+    let relay = state.community_relay.clone();
+    match state
+        .run_light(move || relay.next_grant_json(&principal.0, request))
+        .await
+    {
+        Ok(Ok(bytes)) => secret_json_response(StatusCode::OK, bytes),
+        Ok(Err(error)) => community_relay_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn community_relay_session_grant(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(path): Path<RelaySessionGrantPath>,
+) -> Response {
+    let role = match path.role.as_str() {
+        "uploader" => rw_community_relay::RelayRole::Uploader,
+        "downloader" => rw_community_relay::RelayRole::Downloader,
+        _ => return ProblemDetails::not_found(request_id.0).into_response(),
+    };
+    let relay = state.community_relay.clone();
+    match state
+        .run_light(move || relay.grant_for_session_json(&principal.0, &path.session_id, role))
+        .await
+    {
+        Ok(Ok(bytes)) => secret_json_response(StatusCode::OK, bytes),
+        Ok(Err(error)) => community_relay_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn register_community_relay_route(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(request): Json<RelayRouteRegistrationRequest>,
+) -> Response {
+    let relay = state.community_relay.clone();
+    match state
+        .run_light(move || relay.register_route(&principal.0, request))
+        .await
+    {
+        Ok(Ok(receipt)) => json_no_store(StatusCode::OK, &receipt, request_id.0),
+        Ok(Err(error)) => community_relay_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn community_relay_transport_grant(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(request): Json<RelayTransportGrantRequest>,
+) -> Response {
+    let relay = state.community_relay.clone();
+    match state
+        .run_light(move || relay.transport_grant_json(&principal.0, request))
+        .await
+    {
+        Ok(Ok(bytes)) => secret_json_response(StatusCode::OK, bytes),
+        Ok(Err(error)) => community_relay_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn complete_community_relay_session(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(request): Json<RelaySessionCompletionRequest>,
+) -> Response {
+    let relay = state.community_relay.clone();
+    match state
+        .run_light(move || relay.complete(&principal.0, request))
+        .await
+    {
+        Ok(Ok((terminal, promotion))) => {
+            state.metrics.record_relay_completion(promotion.is_some());
+            json_no_store(StatusCode::OK, &terminal, request_id.0)
+        }
+        Ok(Err(error)) => community_relay_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn fail_community_relay_session(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(request): Json<RelaySessionFailureRequest>,
+) -> Response {
+    terminal_community_relay_session(state, request_id, principal, request, false).await
+}
+
+async fn revoke_community_relay_session(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(request): Json<RelaySessionFailureRequest>,
+) -> Response {
+    terminal_community_relay_session(state, request_id, principal, request, true).await
+}
+
+async fn terminal_community_relay_session(
+    state: AppState,
+    request_id: RequestId,
+    principal: AuthPrincipal,
+    request: RelaySessionFailureRequest,
+    revoke: bool,
+) -> Response {
+    let relay = state.community_relay.clone();
+    match state
+        .run_light(move || relay.fail_or_revoke(&principal.0, request, revoke))
+        .await
+    {
+        Ok(Ok(terminal)) => {
+            state.metrics.record_relay_failure();
+            json_no_store(StatusCode::OK, &terminal, request_id.0)
+        }
+        Ok(Err(error)) => community_relay_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn set_community_relay_kill_switch(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(request): Json<RelayKillSwitchRequest>,
+) -> Response {
+    let relay = state.community_relay.clone();
+    match state
+        .run_light(move || relay.set_kill_switch(&principal.0, request))
+        .await
+    {
+        Ok(Ok(status)) => {
+            state.metrics.set_relay_kill_switch(status.kill_switch);
+            json_no_store(StatusCode::OK, &status, request_id.0)
+        }
+        Ok(Err(error)) => community_relay_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn community_relay_status(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> Response {
+    let relay = state.community_relay.clone();
+    match state.run_light(move || relay.status(&principal.0)).await {
+        Ok(Ok(status)) => json_no_store(StatusCode::OK, &status, request_id.0),
+        Ok(Err(error)) => community_relay_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn begin_generation_replication(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(request): Json<BeginRunGenerationRequest>,
+) -> Response {
+    let replication = state.generation_replication.clone();
+    match state
+        .run_light(move || replication.begin(&principal.0, request))
+        .await
+    {
+        Ok(Ok(status)) => {
+            state.metrics.record_replication_begin();
+            json_no_store(StatusCode::CREATED, &status, request_id.0)
+        }
+        Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn generation_replication_owner(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> Response {
+    let replication = state.generation_replication.clone();
+    match state
+        .run_light(move || replication.owner_identity(&principal.0))
+        .await
+    {
+        Ok(Ok(owner)) => json_no_store(StatusCode::OK, &owner, request_id.0),
+        Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn generation_replication_status(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(path): Path<ReplicationGenerationPath>,
+) -> Response {
+    let replication = state.generation_replication.clone();
+    match state
+        .run_light(move || replication.upload_status(&principal.0, &path.generation_id))
+        .await
+    {
+        Ok(Ok(status)) => json_no_store(StatusCode::OK, &status, request_id.0),
+        Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn generation_replication_missing(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(path): Path<ReplicationGenerationPath>,
+    Query(query): Query<ReplicationMissingQuery>,
+) -> Response {
+    let replication = state.generation_replication.clone();
+    match state
+        .run_light(move || {
+            replication.missing_chunks(
+                &principal.0,
+                &path.generation_id,
+                query.after.as_deref(),
+                query.limit,
+            )
+        })
+        .await
+    {
+        Ok(Ok(page)) => json_no_store(StatusCode::OK, &page, request_id.0),
+        Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn upload_generation_replication_chunk(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(path): Path<ReplicationChunkPath>,
+    request: Request,
+) -> Response {
+    let content_type_ok = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("application/octet-stream"));
+    if !content_type_ok {
+        return ProblemDetails::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "GENERATION_CHUNK_MEDIA_TYPE",
+            "Generation chunk media type is unsupported",
+            "Send the exact declared chunk as application/octet-stream.",
+            request_id.0,
+        )
+        .into_response();
+    }
+    let body = match axum::body::to_bytes(
+        request.into_body(),
+        usize::try_from(
+            state
+                .config
+                .generation_replication
+                .limits
+                .maximum_chunk_bytes,
+        )
+        .unwrap_or(usize::MAX),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(_) => {
+            return ProblemDetails::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "REPLICATION_CHUNK_TOO_LARGE",
+                "Generation chunk is too large",
+                "Upload exactly the bounded content-addressed chunk declared by the generation manifest.",
+                request_id.0,
+            )
+            .into_response();
+        }
+    };
+    if body.is_empty() {
+        return ProblemDetails::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "GENERATION_CHUNK_EMPTY",
+            "Generation chunk is empty",
+            "Upload the non-empty content-addressed chunk declared by the generation manifest.",
+            request_id.0,
+        )
+        .into_response();
+    }
+    if body.len() as u64
+        > state
+            .config
+            .generation_replication
+            .limits
+            .maximum_chunk_bytes
+    {
+        return ProblemDetails::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "REPLICATION_CHUNK_TOO_LARGE",
+            "Generation chunk is too large",
+            "Upload exactly the bounded content-addressed chunk declared by the generation manifest.",
+            request_id.0,
+        )
+        .into_response();
+    }
+    let byte_count = body.len() as u64;
+    let replication = state.generation_replication.clone();
+    match state
+        .run_heavy_sync(move || {
+            replication.upload_chunk(&principal.0, &path.generation_id, &path.sha256, &body)
+        })
+        .await
+    {
+        Ok(Ok(())) => {
+            state.metrics.record_replication_upload(byte_count);
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store, private"),
+            );
+            response
+                .headers_mut()
+                .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+            response
+        }
+        Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn finalize_generation_replication(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(path): Path<ReplicationGenerationPath>,
+    Json(request): Json<FinalizeRunGenerationRequest>,
+) -> Response {
+    let replication = state.generation_replication.clone();
+    match state
+        .run_heavy_job(move || replication.finalize(&principal.0, &path.generation_id, request))
+        .await
+    {
+        Ok(Ok(outcome)) => {
+            state.metrics.record_replication_finalize();
+            json_no_store(StatusCode::CREATED, &outcome.published, request_id.0)
+        }
+        Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn revoke_generation_replication(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(path): Path<ReplicationGenerationPath>,
+    Json(request): Json<RevokeRunGenerationRequest>,
+) -> Response {
+    let replication = state.generation_replication.clone();
+    match state
+        .run_light(move || replication.revoke(&principal.0, &path.generation_id, request))
+        .await
+    {
+        Ok(Ok(tombstone)) => {
+            state.metrics.record_replication_revoke();
+            json_no_store(StatusCode::OK, &tombstone, request_id.0)
+        }
+        Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn generation_replication_operator_status(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> Response {
+    let replication = state.generation_replication.clone();
+    match state
+        .run_light(move || replication.operator_status(&principal.0))
+        .await
+    {
+        Ok(Ok(status)) => json_no_store(StatusCode::OK, &status, request_id.0),
+        Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn set_generation_replication_kill_switch(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(request): Json<ReplicationKillSwitchRequest>,
+) -> Response {
+    let replication = state.generation_replication.clone();
+    match state
+        .run_light(move || replication.set_kill_switch(&principal.0, request))
+        .await
+    {
+        Ok(Ok(status)) => {
+            state
+                .metrics
+                .set_replication_kill_switch(status.kill_switch);
+            json_no_store(StatusCode::OK, &status, request_id.0)
+        }
+        Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn run_generation_replication_gc(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> Response {
+    let replication = state.generation_replication.clone();
+    match state
+        .run_heavy_sync(move || replication.garbage_collect(&principal.0))
+        .await
+    {
+        Ok(Ok(report)) => json_no_store(StatusCode::OK, &report, request_id.0),
+        Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
 async fn federation_catalog(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
@@ -2113,6 +2870,133 @@ async fn federation_health(
         Ok(Err(error)) => federation_problem(error, request_id.0).into_response(),
         Err(error) => execution_problem(error, request_id.0).into_response(),
     }
+}
+
+async fn resolve_federation_proxy(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    headers: HeaderMap,
+    Json(request): Json<FederationProxyRequest>,
+) -> Response {
+    // A one-hop request may never re-enter the authority proxy.
+    if headers.contains_key(FEDERATION_HOP_HEADER) {
+        return federation_proxy_problem(FederationProxyError::InvalidRequest, request_id.0)
+            .into_response();
+    }
+    let Some(proxy) = state.federation_proxy.clone() else {
+        return federation_proxy_problem(FederationProxyError::Disabled, request_id.0)
+            .into_response();
+    };
+    match state
+        .run_light(move || proxy.resolve(&principal.0, &request))
+        .await
+    {
+        Ok(Ok(result)) => json_no_store(StatusCode::OK, &result.response, request_id.0),
+        Ok(Err(error)) => federation_proxy_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn federation_proxy_operator_status(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> Response {
+    let Some(proxy) = state.federation_proxy.clone() else {
+        return federation_proxy_control_problem(
+            FederationProxyControlError::Disabled,
+            request_id.0,
+        )
+        .into_response();
+    };
+    match state
+        .run_light(move || proxy.operator_status(&principal.0))
+        .await
+    {
+        Ok(Ok(status)) => json_no_store(StatusCode::OK, &status, request_id.0),
+        Ok(Err(error)) => federation_proxy_control_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn set_federation_proxy_kill_switch(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(request): Json<FederationProxyKillSwitchRequest>,
+) -> Response {
+    let Some(proxy) = state.federation_proxy.clone() else {
+        return federation_proxy_control_problem(
+            FederationProxyControlError::Disabled,
+            request_id.0,
+        )
+        .into_response();
+    };
+    match state
+        .run_light(move || proxy.set_kill_switch(&principal.0, request))
+        .await
+    {
+        Ok(Ok(status)) => {
+            state
+                .metrics
+                .set_federation_proxy_kill_switch(status.kill_switch);
+            json_no_store(StatusCode::OK, &status, request_id.0)
+        }
+        Ok(Err(error)) => {
+            if matches!(error, FederationProxyControlError::Persistence) {
+                state.metrics.set_federation_proxy_kill_switch(true);
+            }
+            federation_proxy_control_problem(error, request_id.0).into_response()
+        }
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn resolve_federation_local_only(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    headers: HeaderMap,
+    Json(request): Json<ResolveObjectRequest>,
+) -> Response {
+    if !has_exact_federation_hop(&headers) {
+        return federation_proxy_problem(FederationProxyError::InvalidRequest, request_id.0)
+            .into_response();
+    }
+    let community = state.community.clone();
+    let catalog = state.catalog.clone();
+    match state
+        .run_light(move || community.resolve_local_only(&principal.0, &request, &catalog))
+        .await
+    {
+        Ok(Ok((resolved, _object))) => json_no_store(StatusCode::OK, &resolved, request_id.0),
+        Ok(Err(error)) => community_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn federation_local_object(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(path): Path<CommunityObjectPath>,
+) -> Response {
+    let community = state.community.clone();
+    let sha256 = path.sha256.clone();
+    match state
+        .run_light(move || community.federation_object_local_only(&principal.0, &sha256))
+        .await
+    {
+        Ok(Ok(bytes)) => immutable_object_response(bytes, &path.sha256),
+        Ok(Err(error)) => community_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+fn has_exact_federation_hop(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(FEDERATION_HOP_HEADER).iter();
+    values.next().is_some_and(|value| value.as_bytes() == b"1") && values.next().is_none()
 }
 
 async fn artifact(
@@ -2191,6 +3075,52 @@ where
     if let Ok(value) = HeaderValue::from_str(&etag) {
         response.headers_mut().insert(header::ETAG, value);
     }
+    response
+}
+
+fn immutable_object_response(bytes: Bytes, sha256: &str) -> Response {
+    let mut response = Response::new(Body::from(bytes));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&format!("\"{sha256}\"")) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response
+}
+
+fn json_no_store<T>(status: StatusCode, value: &T, request_id: Uuid) -> Response
+where
+    T: Serialize + ?Sized,
+{
+    match serde_json::to_vec(value) {
+        Ok(body) => secret_json_response(status, body),
+        Err(error) => {
+            error!(%request_id, %error, "private response serialization failed");
+            ProblemDetails::internal(request_id).into_response()
+        }
+    }
+}
+
+fn secret_json_response(status: StatusCode, body: Vec<u8>) -> Response {
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
     response
 }
 
@@ -2375,6 +3305,13 @@ fn community_problem(error: CommunityError, request_id: Uuid) -> ProblemDetails 
             "Use the normal Rusty Weather query endpoint for this object type.",
             request_id,
         ),
+        CommunityError::OriginCatalogUnavailable => ProblemDetails::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ORIGIN_CATALOG_UNAVAILABLE",
+            "Origin publication catalog is unavailable",
+            "Retry against a healthy authoritative origin.",
+            request_id,
+        ),
         CommunityError::Cas(crate::community_store::CommunityStoreError::Quota) => {
             ProblemDetails::new(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -2448,6 +3385,90 @@ fn community_problem(error: CommunityError, request_id: Uuid) -> ProblemDetails 
     }
 }
 
+fn community_relay_problem(error: CommunityRelayError, request_id: Uuid) -> ProblemDetails {
+    match error {
+        CommunityRelayError::Disabled
+        | CommunityRelayError::Relay(
+            rw_community_relay::RelayError::Disabled | rw_community_relay::RelayError::SecurityGate,
+        ) => ProblemDetails::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "COMMUNITY_RELAY_DISABLED",
+            "Private Community Sharing is unavailable",
+            "Continue with the archival HTTPS origin or treat the historical object as unavailable.",
+            request_id,
+        ),
+        CommunityRelayError::NotFound
+        | CommunityRelayError::Relay(rw_community_relay::RelayError::NotAvailable) => {
+            ProblemDetails::new(
+                StatusCode::NOT_FOUND,
+                "COMMUNITY_RELAY_NOT_FOUND",
+                "No private community copy is available",
+                "Continue immediately to the archival HTTPS origin or report the object unavailable.",
+                request_id,
+            )
+        }
+        CommunityRelayError::Forbidden
+        | CommunityRelayError::Relay(
+            rw_community_relay::RelayError::CredentialInvalid
+            | rw_community_relay::RelayError::CredentialExpired
+            | rw_community_relay::RelayError::CredentialRevoked,
+        ) => ProblemDetails::new(
+            StatusCode::FORBIDDEN,
+            "COMMUNITY_RELAY_FORBIDDEN",
+            "Community relay authorization was rejected",
+            "Use only the participant grant issued to this authenticated account.",
+            request_id,
+        ),
+        CommunityRelayError::Relay(
+            rw_community_relay::RelayError::QuotaReached
+            | rw_community_relay::RelayError::CostThresholdReached
+            | rw_community_relay::RelayError::MeteredNetworkPaused
+            | rw_community_relay::RelayError::PolicyDenied,
+        ) => ProblemDetails::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "COMMUNITY_RELAY_POLICY",
+            "Community relay policy denied this transfer",
+            "Continue immediately to the archival HTTPS origin or unavailable result.",
+            request_id,
+        ),
+        CommunityRelayError::Invalid
+        | CommunityRelayError::Relay(
+            rw_community_relay::RelayError::UntrustedObject
+            | rw_community_relay::RelayError::UnsafeIdentifier
+            | rw_community_relay::RelayError::ProviderRejected
+            | rw_community_relay::RelayError::EnvelopeRejected
+            | rw_community_relay::RelayError::AuthenticationFailed
+            | rw_community_relay::RelayError::Replay
+            | rw_community_relay::RelayError::OutOfOrder
+            | rw_community_relay::RelayError::ObjectMismatch
+            | rw_community_relay::RelayError::KeyAgreementRejected
+            | rw_community_relay::RelayError::DnsRejected,
+        ) => ProblemDetails::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "COMMUNITY_RELAY_REJECTED",
+            "Community relay request failed validation",
+            "Discard this relay attempt and continue to the archival HTTPS origin.",
+            request_id,
+        ),
+        CommunityRelayError::Persistence
+        | CommunityRelayError::Io(_)
+        | CommunityRelayError::Relay(
+            rw_community_relay::RelayError::PersistenceRejected
+            | rw_community_relay::RelayError::ProviderUnavailable
+            | rw_community_relay::RelayError::TransportUnavailable,
+        ) => {
+            error!(%request_id, "Community relay control plane unavailable");
+            ProblemDetails::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "COMMUNITY_RELAY_UNAVAILABLE",
+                "Private Community Sharing is unavailable",
+                "Continue immediately to the archival HTTPS origin or unavailable result.",
+                request_id,
+            )
+        }
+    }
+}
+
 fn federation_problem(error: FederationError, request_id: Uuid) -> ProblemDetails {
     match error {
         FederationError::Disabled => ProblemDetails::new(
@@ -2494,6 +3515,180 @@ fn federation_problem(error: FederationError, request_id: Uuid) -> ProblemDetail
         }
         FederationError::Json(error) => {
             error!(%request_id, %error, "federation descriptor JSON failed");
+            ProblemDetails::internal(request_id)
+        }
+    }
+}
+
+fn federation_proxy_problem(error: FederationProxyError, request_id: Uuid) -> ProblemDetails {
+    match error {
+        FederationProxyError::Disabled => ProblemDetails::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "FEDERATION_PROXY_DISABLED",
+            "Federated data failover is unavailable",
+            "Continue with the authoritative local/R2/origin request path.",
+            request_id,
+        ),
+        FederationProxyError::InvalidRequest
+        | FederationProxyError::UnapprovedOriginHint
+        | FederationProxyError::Protocol(_) => ProblemDetails::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "FEDERATION_PROXY_REQUEST_REJECTED",
+            "Federated data request failed validation",
+            "Use an exact canonical request and an origin from the current signed catalog.",
+            request_id,
+        ),
+        FederationProxyError::NoCandidate => ProblemDetails::new(
+            StatusCode::NOT_FOUND,
+            "FEDERATION_PROXY_OBJECT_NOT_FOUND",
+            "No approved origin has the exact object",
+            "Continue with the authoritative local compute path or report the object unavailable.",
+            request_id,
+        ),
+        FederationProxyError::Quota => ProblemDetails::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "FEDERATION_PROXY_QUOTA_EXHAUSTED",
+            "Federated data quota is exhausted",
+            "Continue with the authoritative local/R2/origin request path.",
+            request_id,
+        ),
+        FederationProxyError::Unavailable { .. } | FederationProxyError::Stage => {
+            ProblemDetails::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "FEDERATION_PROXY_UNAVAILABLE",
+                "Federated data failover is unavailable",
+                "Continue immediately with the authoritative local/R2/origin request path.",
+                request_id,
+            )
+        }
+        FederationProxyError::InvalidConfiguration => {
+            error!(%request_id, "federation proxy configuration invariant failed");
+            ProblemDetails::internal(request_id)
+        }
+    }
+}
+
+fn federation_proxy_control_problem(
+    error: FederationProxyControlError,
+    request_id: Uuid,
+) -> ProblemDetails {
+    match error {
+        FederationProxyControlError::Disabled => ProblemDetails::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "FEDERATION_PROXY_CONTROL_DISABLED",
+            "Federation proxy control is unavailable",
+            "Enable the federation proxy before using its runtime operator controls.",
+            request_id,
+        ),
+        FederationProxyControlError::Forbidden => ProblemDetails::new(
+            StatusCode::FORBIDDEN,
+            "FEDERATION_PROXY_CONTROL_FORBIDDEN",
+            "Federation proxy operator authorization was rejected",
+            "Use a configured federation proxy operator account.",
+            request_id,
+        ),
+        FederationProxyControlError::Invalid => ProblemDetails::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "FEDERATION_PROXY_CONTROL_REJECTED",
+            "Federation proxy control request failed validation",
+            "Use the current closed kill-switch schema.",
+            request_id,
+        ),
+        FederationProxyControlError::Persistence => {
+            error!(%request_id, "federation proxy control persistence failed closed");
+            ProblemDetails::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "FEDERATION_PROXY_CONTROL_UNAVAILABLE",
+                "Federation proxy control state is unavailable",
+                "The proxy remains stopped; repair durable control storage before retrying.",
+                request_id,
+            )
+        }
+    }
+}
+
+fn generation_replication_problem(
+    error: GenerationReplicationError,
+    request_id: Uuid,
+) -> ProblemDetails {
+    use rw_generation_replication::ReplicationError;
+
+    match error {
+        GenerationReplicationError::Disabled
+        | GenerationReplicationError::Engine(
+            ReplicationError::Disabled | ReplicationError::KillSwitch,
+        ) => ProblemDetails::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "GENERATION_REPLICATION_DISABLED",
+            "Generation replication is unavailable",
+            "Use the normal HTTPS query API or retry after the advanced feature is enabled.",
+            request_id,
+        ),
+        GenerationReplicationError::Forbidden
+        | GenerationReplicationError::Engine(ReplicationError::WrongOwner) => ProblemDetails::new(
+            StatusCode::FORBIDDEN,
+            "GENERATION_REPLICATION_FORBIDDEN",
+            "Generation replication authorization was rejected",
+            "Use only a generation owned by this authenticated account.",
+            request_id,
+        ),
+        GenerationReplicationError::Engine(ReplicationError::NotFound) => ProblemDetails::new(
+            StatusCode::NOT_FOUND,
+            "GENERATION_REPLICATION_NOT_FOUND",
+            "Generation upload was not found",
+            "Begin the exact generation upload or refresh its status.",
+            request_id,
+        ),
+        GenerationReplicationError::Engine(ReplicationError::Conflict) => ProblemDetails::new(
+            StatusCode::CONFLICT,
+            "GENERATION_REPLICATION_CONFLICT",
+            "Generation publication conflicts with existing state",
+            "Do not replace an existing different generation; use the exact signed identity.",
+            request_id,
+        ),
+        GenerationReplicationError::Engine(ReplicationError::Expired) => ProblemDetails::new(
+            StatusCode::GONE,
+            "GENERATION_REPLICATION_EXPIRED",
+            "Generation upload expired",
+            "Create a fresh signed publication manifest within the configured retention window.",
+            request_id,
+        ),
+        GenerationReplicationError::Engine(ReplicationError::Quota(_)) => ProblemDetails::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "GENERATION_REPLICATION_QUOTA",
+            "Generation replication quota reached",
+            "Wait for upload expiry or retention cleanup, or ask the operator to review audited capacity.",
+            request_id,
+        ),
+        GenerationReplicationError::Engine(ReplicationError::Busy) => ProblemDetails::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "GENERATION_REPLICATION_BUSY",
+            "Generation replication is busy",
+            "Retry after the active generation operation completes.",
+            request_id,
+        ),
+        GenerationReplicationError::Invalid
+        | GenerationReplicationError::UnsafeSecret
+        | GenerationReplicationError::Engine(
+            ReplicationError::InvalidOwner
+            | ReplicationError::MissingChunk
+            | ReplicationError::UnknownChunk
+            | ReplicationError::InvalidGeneration(_)
+            | ReplicationError::Protocol(_),
+        ) => ProblemDetails::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "GENERATION_REPLICATION_REJECTED",
+            "Generation replication request failed validation",
+            "Correct the closed manifest, rights, provenance, attribution, identity, hash, or chunk contract.",
+            request_id,
+        ),
+        GenerationReplicationError::Io(error)
+        | GenerationReplicationError::Engine(ReplicationError::Io(error)) => {
+            error!(%request_id, %error, "generation replication I/O failed");
+            ProblemDetails::internal(request_id)
+        }
+        GenerationReplicationError::Engine(error) => {
+            error!(%request_id, %error, "generation replication state failed closed");
             ProblemDetails::internal(request_id)
         }
     }
@@ -2558,14 +3753,43 @@ fn job_problem(error: JobError, request_id: Uuid) -> ProblemDetails {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
-    use rustwx_core::{GridShape, LatLonGrid};
-    use rw_store::ingest::{DerivedFieldInput, write_hour_from_grid_with_derived_exact};
+    use base64::Engine as _;
+    use rustwx_core::{CycleSpec, GridShape, LatLonGrid};
+    use rw_community_protocol::{
+        AttributionNotice, BEGIN_RUN_GENERATION_SCHEMA, Compression, DataOrigin,
+        FINALIZE_RUN_GENERATION_SCHEMA, MissingPolicy, OBJECT_SCHEMA, ObjectManifest,
+        PROFILE_PAYLOAD_SCHEMA, ProfileObjectPayload, PublicationGrant, REQUEST_SCHEMA,
+        REVOKE_RUN_GENERATION_SCHEMA, RUN_GENERATION_CHUNK_SCHEMA_V1, RUN_GENERATION_FILE_SCHEMA,
+        RUN_GENERATION_REPLICATION_SCHEMA, RecipeIdentity, RunGenerationFile,
+        RunGenerationFileChunk, RunGenerationFileKind, RunGenerationReplicationManifest,
+        ShareQuery, ShareRequest, SourceProvenance, SurfaceSample, TimeWindow,
+        generation_content_sha256, object_sha256, request_sha256, sign_object_manifest,
+    };
+    use rw_community_relay::{
+        CloudflareTurnAdapter, ProviderCredentialLease, ProviderCredentialRequest, RelayError,
+        RelayProvider, RelayRole, SecretText, parse_historical_lookup_response_bounded,
+        parse_participant_grant_bounded,
+    };
+    use rw_query::RunSnapshot;
+    use rw_scheduler::{
+        OriginCatalogPlanConfig, OriginCatalogState, OriginCatalogStateStore,
+        OriginPublishedGeneration, OriginPublishedLane, cycle_origin_unix,
+    };
+    use rw_store::ingest::{
+        DerivedFieldInput, HourIngestWriter, write_hour_from_grid_with_derived_exact,
+    };
     use rw_store::run::RwsRunManifest;
     use rw_store::{PressureVolumeInput, RwsExactTime, RwsSourceProvenance};
+    use sha2::{Digest as _, Sha256};
+    use std::collections::BTreeMap;
     use std::fs;
     use tower::ServiceExt;
 
     const TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RELAY_REQUESTER_TOKEN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const RELAY_OUTSIDER_TOKEN: &str = "cccccccccccccccccccccccccccccccc";
+    const FEDERATION_ORIGIN_TOKEN: &str = "dddddddddddddddddddddddddddddddd";
+    const TEST_RELAY_ORIGIN_KEY_ID: &str = "test-origin";
     const FIXTURE_MODEL: &str = "fixture-model";
     const LEGACY_RETIRED_MODEL: &str = "rrfs-firewx";
     const FIXTURE_RUN: &str = "fixture-run";
@@ -2582,6 +3806,287 @@ mod tests {
         config.validate(!tokens.is_empty()).unwrap();
         let router = build_router(AppState::new(config, tokens).unwrap()).unwrap();
         (directory, router)
+    }
+
+    fn federation_local_http_test_app() -> (
+        tempfile::TempDir,
+        Router,
+        ResolveObjectRequest,
+        Vec<u8>,
+        String,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let key_path = directory.path().join("community-signing.key");
+        let origin_token_path = directory.path().join("federation-origin.token");
+        fs::write(
+            &key_path,
+            base64::engine::general_purpose::STANDARD.encode([31_u8; 32]),
+        )
+        .unwrap();
+        fs::write(&origin_token_path, FEDERATION_ORIGIN_TOKEN).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(&origin_token_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let mut config = crate::AppConfig::default();
+        config.server.store_root = directory.path().join("store");
+        config.server.artifact_root = directory.path().join("artifacts");
+        fs::create_dir_all(&config.server.store_root).unwrap();
+        fs::create_dir_all(&config.server.artifact_root).unwrap();
+        config.community.enabled = true;
+        config.community.capacity_audit_completed = true;
+        config.community.root = directory.path().join("community");
+        config.community.signing_key_file = Some(key_path);
+        config.federation.proxy.security_tests_passed = true;
+        config.federation.proxy.accept_local_resolve = true;
+        config.federation.proxy.local_resolve_token_file = Some(origin_token_path);
+        let tokens = crate::TokenSet::from_tokens([TOKEN]).unwrap();
+        config.validate(!tokens.is_empty()).unwrap();
+        let state = AppState::new(config, tokens).unwrap();
+
+        let share = ShareRequest {
+            schema: REQUEST_SCHEMA.into(),
+            model: "hrrr".into(),
+            run: "20260812T00Z".into(),
+            snapshot_id: "a".repeat(64),
+            grid_hash: "b".repeat(64),
+            variables: vec!["temperature".into(), "temperature_2m".into()],
+            query: ShareQuery::Profile {
+                latitude_e7: 350_000_000,
+                longitude_e7: -970_000_000,
+                storage_slot: 1,
+                valid_unix: 1_786_512_000,
+                pressure_variables: vec!["temperature".into()],
+                surface_variables: vec!["temperature_2m".into()],
+                pressure_levels_hpa: vec![],
+            },
+            recipe: RecipeIdentity {
+                recipe_id: "native-profile".into(),
+                recipe_version: "1".into(),
+                parameters: BTreeMap::new(),
+            },
+            source_provenance: vec![SourceProvenance {
+                provider: "noaa-aws-public-data".into(),
+                roles: vec!["pressure".into(), "surface".into()],
+                products: vec!["wrfprs".into(), "wrfsfc".into()],
+            }],
+            publication: PublicationGrant {
+                data_origin: DataOrigin::PublicProvider,
+                explicit_owner_publication: false,
+                redistribution_rights_confirmed: true,
+            },
+        };
+        let identity = request_sha256(&share).unwrap();
+        let object = serde_json::to_vec(&ProfileObjectPayload {
+            schema: PROFILE_PAYLOAD_SCHEMA.into(),
+            request_sha256: identity.clone(),
+            profile: serde_json::json!({"schema": "rw.profile.test.v1", "levels": []}),
+            surface_samples: vec![SurfaceSample {
+                variable: "temperature_2m".into(),
+                units: "K".into(),
+                value: Some(299.0),
+            }],
+        })
+        .unwrap();
+        let authority = state
+            .community
+            .federation_authority_signing_material()
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let signed = sign_object_manifest(
+            ObjectManifest {
+                schema: OBJECT_SCHEMA.into(),
+                request: share.clone(),
+                request_sha256: identity,
+                object_sha256: object_sha256(&object),
+                content_type: "application/json".into(),
+                compression: Compression::None,
+                encoded_size: object.len() as u64,
+                decoded_size: object.len() as u64,
+                attributions: vec![],
+                modification_notices: vec!["Verified public-origin object.".into()],
+                created_unix: now,
+                expires_unix: now + 600,
+            },
+            authority.signing_key_id,
+            &authority.signing_key,
+        )
+        .unwrap();
+        state
+            .community
+            .stage_verified_federated_object(&signed.manifest.request_sha256, &signed, &object)
+            .unwrap();
+        let sha256 = signed.manifest.object_sha256;
+        let router = build_router(state).unwrap();
+        (
+            directory,
+            router,
+            ResolveObjectRequest {
+                schema: rw_community_protocol::RESOLVE_SCHEMA.into(),
+                request: share,
+            },
+            object,
+            sha256,
+        )
+    }
+
+    fn federation_proxy_control_http_test_app() -> (tempfile::TempDir, Router) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::AppConfig::default();
+        config.server.store_root = directory.path().join("store");
+        config.server.artifact_root = directory.path().join("artifacts");
+        fs::create_dir_all(&config.server.store_root).unwrap();
+        fs::create_dir_all(&config.server.artifact_root).unwrap();
+        let tokens = crate::TokenSet::from_tokens([TOKEN, RELAY_REQUESTER_TOKEN]).unwrap();
+        let operator_header = HeaderValue::from_str(&format!("Bearer {TOKEN}")).unwrap();
+        let operator_principal = tokens
+            .authorization_principal(Some(&operator_header))
+            .unwrap();
+        config.validate(!tokens.is_empty()).unwrap();
+        let mut state = AppState::new(config, tokens).unwrap();
+        state.federation_proxy = Some(Arc::new(
+            crate::federation_proxy::test_server_federation_proxy(
+                &directory.path().join("federation-control.json"),
+                true,
+                operator_principal,
+            ),
+        ));
+        state.metrics.set_federation_proxy_kill_switch(true);
+        (directory, build_router(state).unwrap())
+    }
+
+    #[derive(Debug, Default)]
+    struct TestRelayProvider {
+        issued: u64,
+    }
+
+    impl RelayProvider for TestRelayProvider {
+        fn issue(
+            &mut self,
+            request: &ProviderCredentialRequest,
+            now_unix: i64,
+        ) -> Result<ProviderCredentialLease, RelayError> {
+            self.issued = self.issued.saturating_add(1);
+            let response = serde_json::json!({
+                "iceServers": [{
+                    "urls": ["turn:turn.cloudflare.com:3478?transport=udp"],
+                    "username": format!("test-turn-user-{}", self.issued),
+                    "credential": format!("test-turn-secret-{}", self.issued),
+                }]
+            });
+            CloudflareTurnAdapter::default().parse_and_sanitize(
+                &serde_json::to_vec(&response).unwrap(),
+                now_unix,
+                request.expires_unix,
+            )
+        }
+
+        fn revoke(&mut self, _revocation_id: &SecretText) -> Result<(), RelayError> {
+            Ok(())
+        }
+    }
+
+    fn relay_http_test_app() -> (
+        tempfile::TempDir,
+        Router,
+        ed25519_dalek::SigningKey,
+        ed25519_dalek::VerifyingKey,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::AppConfig::default();
+        config.server.store_root = directory.path().join("store");
+        config.server.artifact_root = directory.path().join("artifacts");
+        fs::create_dir_all(&config.server.store_root).unwrap();
+        fs::create_dir_all(&config.server.artifact_root).unwrap();
+        let tokens =
+            crate::TokenSet::from_tokens([TOKEN, RELAY_REQUESTER_TOKEN, RELAY_OUTSIDER_TOKEN])
+                .unwrap();
+        config.validate(!tokens.is_empty()).unwrap();
+        let mut state = AppState::new(config, tokens).unwrap();
+        let origin_key = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+        let relay_key = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let relay_verifying_key = relay_key.verifying_key();
+        let relay_config = crate::config::CommunityRelayConfig {
+            enabled: true,
+            security_tests_passed: true,
+            capacity_audit_completed: true,
+            provider_pricing_verified: true,
+            kill_switch: false,
+            state_file: directory.path().join("relay-state.json"),
+            cloudflare: crate::config::CloudflareRelayConfig {
+                audited_relay_cidrs: vec!["104.16.0.0/24".into()],
+                ..crate::config::CloudflareRelayConfig::default()
+            },
+            ..crate::config::CommunityRelayConfig::default()
+        };
+        state.community_relay = crate::community_relay::CommunityRelayService::with_test_provider(
+            &relay_config,
+            rw_community_protocol::ProtocolLimits::default(),
+            TEST_RELAY_ORIGIN_KEY_ID,
+            origin_key.verifying_key(),
+            relay_key,
+            Box::new(TestRelayProvider::default()),
+        )
+        .unwrap();
+        let router = build_router(state).unwrap();
+        (directory, router, origin_key, relay_verifying_key)
+    }
+
+    fn signed_relay_test_manifest(
+        origin_key: &ed25519_dalek::SigningKey,
+    ) -> rw_community_protocol::SignedObjectManifest {
+        let now = chrono::Utc::now().timestamp();
+        let request = ShareRequest {
+            schema: REQUEST_SCHEMA.into(),
+            model: "hrrr".into(),
+            run: "20260812T00Z".into(),
+            snapshot_id: "a".repeat(64),
+            grid_hash: "b".repeat(64),
+            variables: vec!["temperature_2m".into()],
+            query: ShareQuery::PointSeries {
+                latitude_e7: 350_000_000,
+                longitude_e7: -970_000_000,
+                window: TimeWindow::Utc {
+                    start_unix: now.saturating_sub(3_600),
+                    end_unix: now,
+                },
+                missing_policy: MissingPolicy::Strict,
+            },
+            recipe: RecipeIdentity {
+                recipe_id: "native-window".into(),
+                recipe_version: "1".into(),
+                parameters: BTreeMap::new(),
+            },
+            source_provenance: vec![SourceProvenance {
+                provider: "noaa-aws-public-data".into(),
+                roles: vec!["surface".into()],
+                products: vec!["wrfsfc".into()],
+            }],
+            publication: PublicationGrant {
+                data_origin: DataOrigin::PublicProvider,
+                explicit_owner_publication: false,
+                redistribution_rights_confirmed: true,
+            },
+        };
+        let body = vec![7_u8; 4096];
+        let manifest = ObjectManifest {
+            schema: OBJECT_SCHEMA.into(),
+            request_sha256: request_sha256(&request).unwrap(),
+            object_sha256: object_sha256(&body),
+            request,
+            content_type: "application/vnd.rusty-weather.window+zstd".into(),
+            compression: Compression::None,
+            encoded_size: body.len() as u64,
+            decoded_size: body.len() as u64,
+            attributions: Vec::new(),
+            modification_notices: vec!["Derived by Rusty Weather.".into()],
+            created_unix: now.saturating_sub(1),
+            expires_unix: now.saturating_add(3600),
+        };
+        sign_object_manifest(manifest, TEST_RELAY_ORIGIN_KEY_ID, origin_key).unwrap()
     }
 
     fn test_app_with_store() -> (tempfile::TempDir, Router) {
@@ -2703,11 +4208,20 @@ mod tests {
     }
 
     async fn post_json(app: Router, path: &str, value: serde_json::Value) -> Response {
+        post_json_with_token(app, path, value, TOKEN).await
+    }
+
+    async fn post_json_with_token(
+        app: Router,
+        path: &str,
+        value: serde_json::Value,
+        token: &str,
+    ) -> Response {
         app.oneshot(
             Request::builder()
                 .method(Method::POST)
                 .uri(path)
-                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(serde_json::to_vec(&value).unwrap()))
                 .unwrap(),
@@ -2750,6 +4264,126 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    fn replication_file(
+        kind: RunGenerationFileKind,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> RunGenerationFile {
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        RunGenerationFile {
+            schema: RUN_GENERATION_FILE_SCHEMA.into(),
+            kind,
+            file_name: file_name.into(),
+            byte_size: bytes.len() as u64,
+            file_sha256: sha256.clone(),
+            chunks: vec![RunGenerationFileChunk {
+                schema: RUN_GENERATION_CHUNK_SCHEMA_V1.into(),
+                ordinal: 0,
+                file_offset: 0,
+                object_sha256: sha256,
+                byte_size: bytes.len() as u64,
+            }],
+        }
+    }
+
+    fn replication_http_fixture(
+        source_store: &std::path::Path,
+        owner_principal_sha256: String,
+        now_unix: i64,
+    ) -> (RunGenerationReplicationManifest, BTreeMap<String, Vec<u8>>) {
+        const MODEL: &str = "wrf";
+        const RUN: &str = "20260812_00z";
+        const VALID: i64 = 1_786_512_000;
+        let grid = LatLonGrid::new(
+            GridShape::new(2, 2).unwrap(),
+            vec![40.0, 40.0, 41.0, 41.0],
+            vec![-100.0, -99.0, -100.0, -99.0],
+        )
+        .unwrap();
+        let mut writer = HourIngestWriter::begin_exact(
+            source_store,
+            MODEL,
+            RUN,
+            0,
+            RwsExactTime::new(0, VALID),
+            &grid,
+            None,
+            "replication-http-test",
+        )
+        .unwrap();
+        writer
+            .set_source_provenance(vec![
+                RwsSourceProvenance::new(
+                    "simulation-owner",
+                    vec!["generation".into()],
+                    vec!["rws".into()],
+                )
+                .unwrap(),
+            ])
+            .unwrap();
+        writer
+            .add_derived_2d("temperature", "K", &[280.0, 281.0, 282.0, 283.0])
+            .unwrap();
+        writer.finish(now_unix as u64).unwrap();
+
+        let run_dir = source_store.join(MODEL).join(RUN);
+        let snapshot = RunSnapshot::open(source_store, MODEL, RUN).unwrap();
+        let mut objects = BTreeMap::new();
+        let mut file = |kind, name: &str| {
+            let bytes = fs::read(run_dir.join(name)).unwrap();
+            let descriptor = replication_file(kind, name, &bytes);
+            objects.insert(descriptor.chunks[0].object_sha256.clone(), bytes);
+            descriptor
+        };
+        let files = vec![
+            file(RunGenerationFileKind::RunManifest, "run.json"),
+            file(RunGenerationFileKind::Grid, "grid.rwg"),
+            file(
+                RunGenerationFileKind::Hour {
+                    storage_slot: 0,
+                    valid_unix: VALID,
+                },
+                "f000.rws",
+            ),
+        ];
+        let mut manifest = RunGenerationReplicationManifest {
+            schema: RUN_GENERATION_REPLICATION_SCHEMA.into(),
+            generation_id: "wrf-http-lifecycle".into(),
+            model: MODEL.into(),
+            run: RUN.into(),
+            source_snapshot_id: snapshot.descriptor().snapshot_id.clone(),
+            grid_hash: snapshot.descriptor().grid_hash.clone(),
+            owner_principal_sha256,
+            publication: PublicationGrant {
+                data_origin: DataOrigin::PrivateWrf,
+                explicit_owner_publication: true,
+                redistribution_rights_confirmed: true,
+            },
+            source_provenance: vec![SourceProvenance {
+                provider: "simulation-owner".into(),
+                roles: vec!["generation".into()],
+                products: vec!["rws".into()],
+            }],
+            total_bytes: files.iter().map(|file| file.byte_size).sum(),
+            files,
+            generation_sha256: "00".repeat(32),
+            published_unix: now_unix,
+            retain_until_unix: now_unix + 3_600,
+            attributions: vec![AttributionNotice {
+                provider: "simulation-owner".into(),
+                notice: "Published by the simulation owner.".into(),
+                source_url: "https://example.invalid/source".into(),
+                license: "Owner-authorized redistribution".into(),
+                license_url: "https://example.invalid/license".into(),
+                terms_url: "https://example.invalid/terms".into(),
+                disclaimer: "Experimental simulation.".into(),
+            }],
+            modification_notices: vec!["Inventoried as immutable rws chunks.".into()],
+        };
+        manifest.generation_sha256 = generation_content_sha256(&manifest).unwrap();
+        (manifest, objects)
     }
 
     async fn assert_private_resource_is_not_found(response: Response) {
@@ -2909,6 +4543,826 @@ mod tests {
             let body = response_json(disabled).await;
             assert_eq!(body["code"], "FEDERATION_DISABLED");
         }
+    }
+
+    #[tokio::test]
+    async fn federation_one_hop_routes_use_a_separate_token_and_serve_verified_bytes() {
+        let (_directory, app, resolve, expected_object, object_sha256) =
+            federation_local_http_test_app();
+        let resolve_body = serde_json::to_vec(&resolve).unwrap();
+        let request = |token: &'static str, hop: Option<&'static str>| {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri(FEDERATION_LOCAL_RESOLVE_PATH)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(hop) = hop {
+                builder = builder.header(FEDERATION_HOP_HEADER, hop);
+            }
+            builder.body(Body::from(resolve_body.clone())).unwrap()
+        };
+
+        let ordinary_token_denied = app
+            .clone()
+            .oneshot(request(TOKEN, Some("1")))
+            .await
+            .unwrap();
+        assert_eq!(ordinary_token_denied.status(), StatusCode::UNAUTHORIZED);
+
+        let missing_hop = app
+            .clone()
+            .oneshot(request(FEDERATION_ORIGIN_TOKEN, None))
+            .await
+            .unwrap();
+        assert_eq!(missing_hop.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let resolved = app
+            .clone()
+            .oneshot(request(FEDERATION_ORIGIN_TOKEN, Some("1")))
+            .await
+            .unwrap();
+        assert_eq!(resolved.status(), StatusCode::OK);
+        let resolved_json = response_json(resolved).await;
+        assert_eq!(
+            resolved_json["signed_manifest"]["manifest"]["object_sha256"],
+            object_sha256
+        );
+        let serialized = serde_json::to_string(&resolved_json).unwrap();
+        assert!(!serialized.contains(FEDERATION_ORIGIN_TOKEN));
+        assert!(!serialized.contains("https://"));
+
+        let object = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "{FEDERATION_LOCAL_OBJECT_PATH_PREFIX}/{object_sha256}"
+                    ))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {FEDERATION_ORIGIN_TOKEN}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(object.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(object.into_body(), 1024 * 1024).await.unwrap(),
+            expected_object
+        );
+
+        let recursive = FederationProxyRequest {
+            schema: rw_federation_proxy::FEDERATION_PROXY_SCHEMA.into(),
+            request: resolve.request,
+            preferred_origin_id: None,
+        };
+        let rejected_reentry = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(FEDERATION_PROXY_PATH)
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(FEDERATION_HOP_HEADER, "1")
+                    .body(Body::from(serde_json::to_vec(&recursive).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected_reentry.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let problem = response_json(rejected_reentry).await;
+        let text = serde_json::to_string(&problem).unwrap();
+        assert!(!text.contains(FEDERATION_ORIGIN_TOKEN));
+        assert!(!text.contains("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn federation_proxy_operator_control_is_authenticated_coarse_durable_and_no_store() {
+        let (_directory, app) = federation_proxy_control_http_test_app();
+        let status_path = "/v1/federation/proxy/operator/status";
+        let kill_path = "/v1/federation/proxy/operator/kill-switch";
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(status_path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let forbidden = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(status_path)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {RELAY_REQUESTER_TOKEN}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let status = get_with_token(app.clone(), status_path).await;
+        assert_eq!(status.status(), StatusCode::OK);
+        assert_eq!(status.headers()[header::CACHE_CONTROL], "no-store, private");
+        let status = response_json(status).await;
+        assert_eq!(status["kill_switch"], true);
+        assert_eq!(status["persistence_healthy"], true);
+        let serialized = serde_json::to_string(&status).unwrap();
+        for forbidden in ["principal", "origin", "url", "address", "credential"] {
+            assert!(!serialized.contains(forbidden));
+        }
+
+        let set = |schema: &'static str, engaged: bool| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(kill_path)
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(
+                        &crate::federation_proxy::FederationProxyKillSwitchRequest {
+                            schema: schema.into(),
+                            engaged,
+                        },
+                    )
+                    .unwrap(),
+                ))
+                .unwrap()
+        };
+        let invalid = app.clone().oneshot(set("wrong", false)).await.unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let disengaged = app
+            .clone()
+            .oneshot(set(
+                crate::federation_proxy::FEDERATION_PROXY_KILL_SWITCH_SCHEMA,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(disengaged.status(), StatusCode::OK);
+        assert_eq!(
+            disengaged.headers()[header::CACHE_CONTROL],
+            "no-store, private"
+        );
+        assert_eq!(response_json(disengaged).await["kill_switch"], false);
+
+        let metrics = get_with_token(app.clone(), "/metrics").await;
+        let metrics = String::from_utf8(
+            to_bytes(metrics.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(metrics.contains("rw_federation_proxy_kill_switch 0"));
+
+        let engaged = app
+            .oneshot(set(
+                crate::federation_proxy::FEDERATION_PROXY_KILL_SWITCH_SCHEMA,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(engaged.status(), StatusCode::OK);
+        assert_eq!(response_json(engaged).await["kill_switch"], true);
+    }
+
+    #[tokio::test]
+    async fn generation_chunk_route_enforces_media_type_empty_size_and_hash_gates() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::AppConfig::default();
+        config.server.store_root = directory.path().join("store");
+        config.server.artifact_root = directory.path().join("artifacts");
+        config.generation_replication.limits.maximum_chunk_bytes = 4;
+        fs::create_dir_all(&config.server.store_root).unwrap();
+        fs::create_dir_all(&config.server.artifact_root).unwrap();
+        let tokens = crate::TokenSet::from_tokens([TOKEN]).unwrap();
+        config.validate(!tokens.is_empty()).unwrap();
+        let app = build_router(AppState::new(config, tokens).unwrap()).unwrap();
+        let path = format!(
+            "/v1/community/generations/generation-a/chunks/{}",
+            "a".repeat(64)
+        );
+        let request = |content_type: &'static str, body: Vec<u8>, path: &str| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let parameterized = app
+            .clone()
+            .oneshot(request(
+                "application/octet-stream; charset=binary",
+                vec![1],
+                &path,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(parameterized.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let empty = app
+            .clone()
+            .oneshot(request("application/octet-stream", Vec::new(), &path))
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let oversized = app
+            .clone()
+            .oneshot(request("application/octet-stream", vec![1; 5], &path))
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let malformed_hash_path = "/v1/community/generations/generation-a/chunks/not-a-sha256";
+        let malformed_hash = app
+            .clone()
+            .oneshot(request(
+                "application/octet-stream",
+                vec![1],
+                malformed_hash_path,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(malformed_hash.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let disabled = app
+            .oneshot(request("application/octet-stream", vec![1], &path))
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn replication_owner_identity_is_caller_isolated_and_operator_status_is_coarse() {
+        use base64::Engine as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::AppConfig::default();
+        config.server.store_root = directory.path().join("store");
+        config.server.artifact_root = directory.path().join("artifacts");
+        config.origin_catalog.enabled = true;
+        config.origin_catalog.publication_sources =
+            crate::origin_catalog::PublicationSourceMode::Replication;
+        config.generation_replication.enabled = true;
+        config.generation_replication.security_tests_passed = true;
+        config.generation_replication.capacity_audit_completed = true;
+        config.generation_replication.control_root = directory.path().join("replication");
+        let key_path = directory.path().join("replication.key");
+        fs::write(
+            &key_path,
+            base64::engine::general_purpose::STANDARD.encode([91; 32]),
+        )
+        .unwrap();
+        config.generation_replication.signing_key_file = Some(key_path);
+        fs::create_dir_all(&config.server.store_root).unwrap();
+        fs::create_dir_all(&config.server.artifact_root).unwrap();
+        let tokens = crate::TokenSet::from_tokens([TOKEN, RELAY_REQUESTER_TOKEN]).unwrap();
+        let operator_header = HeaderValue::from_str(&format!("Bearer {TOKEN}")).unwrap();
+        let operator_principal = tokens
+            .authorization_principal(Some(&operator_header))
+            .unwrap();
+        config.generation_replication.operator_principals = vec![operator_principal];
+        config.validate(!tokens.is_empty()).unwrap();
+        let app = build_router(AppState::new(config, tokens).unwrap()).unwrap();
+
+        let owner = |token: &'static str| {
+            Request::builder()
+                .uri("/v1/community/generation-replication/owner")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let first = app.clone().oneshot(owner(TOKEN)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(first.headers()[header::CACHE_CONTROL], "no-store, private");
+        let first = response_json(first).await;
+        let second = app
+            .clone()
+            .oneshot(owner(RELAY_REQUESTER_TOKEN))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second = response_json(second).await;
+        assert_ne!(
+            first["owner_principal_sha256"],
+            second["owner_principal_sha256"]
+        );
+        assert_eq!(first["owner_principal_sha256"].as_str().unwrap().len(), 64);
+
+        let operator = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/community/generation-replication/operator/status")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(operator.status(), StatusCode::OK);
+        let serialized = serde_json::to_string(&response_json(operator).await).unwrap();
+        for forbidden in [
+            "owner_principal",
+            "generation_id",
+            "store_root",
+            "source_url",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+
+        let outsider = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/community/generation-replication/operator/status")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {RELAY_REQUESTER_TOKEN}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outsider.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn replication_http_lifecycle_publishes_queries_and_revokes_exact_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_store = directory.path().join("source");
+        let mut config = crate::AppConfig::default();
+        config.server.store_root = directory.path().join("store");
+        config.server.artifact_root = directory.path().join("artifacts");
+        config.origin_catalog.enabled = true;
+        config.origin_catalog.publication_sources =
+            crate::origin_catalog::PublicationSourceMode::Replication;
+        config.generation_replication.enabled = true;
+        config.generation_replication.security_tests_passed = true;
+        config.generation_replication.capacity_audit_completed = true;
+        config.generation_replication.kill_switch = false;
+        config.generation_replication.control_root = directory.path().join("replication");
+        let key_path = directory.path().join("replication.key");
+        fs::write(
+            &key_path,
+            base64::engine::general_purpose::STANDARD.encode([92; 32]),
+        )
+        .unwrap();
+        config.generation_replication.signing_key_file = Some(key_path);
+        fs::create_dir_all(&source_store).unwrap();
+        fs::create_dir_all(&config.server.store_root).unwrap();
+        fs::create_dir_all(&config.server.artifact_root).unwrap();
+        let tokens = crate::TokenSet::from_tokens([TOKEN]).unwrap();
+        let operator_header = HeaderValue::from_str(&format!("Bearer {TOKEN}")).unwrap();
+        let operator_principal = tokens
+            .authorization_principal(Some(&operator_header))
+            .unwrap();
+        config.generation_replication.operator_principals = vec![operator_principal];
+        config.validate(!tokens.is_empty()).unwrap();
+        let app = build_router(AppState::new(config, tokens).unwrap()).unwrap();
+
+        let owner_response =
+            get_with_token(app.clone(), "/v1/community/generation-replication/owner").await;
+        assert_eq!(owner_response.status(), StatusCode::OK);
+        let owner = response_json(owner_response).await["owner_principal_sha256"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let now = chrono::Utc::now().timestamp();
+        let (manifest, objects) = replication_http_fixture(&source_store, owner, now);
+        let generation_id = manifest.generation_id.clone();
+        let generation_sha256 = manifest.generation_sha256.clone();
+
+        let begin = post_json(
+            app.clone(),
+            "/v1/community/generations",
+            serde_json::json!({
+                "schema": BEGIN_RUN_GENERATION_SCHEMA,
+                "manifest": manifest,
+            }),
+        )
+        .await;
+        assert_eq!(begin.status(), StatusCode::CREATED);
+        assert_eq!(begin.headers()[header::CACHE_CONTROL], "no-store, private");
+        let begin = response_json(begin).await;
+        assert_eq!(begin["missing_chunks"], objects.len());
+
+        let missing_path = format!("/v1/community/generations/{generation_id}/missing?limit=32");
+        let missing = get_with_token(app.clone(), &missing_path).await;
+        assert_eq!(missing.status(), StatusCode::OK);
+        let missing = response_json(missing).await;
+        assert_eq!(missing["chunks"].as_array().unwrap().len(), objects.len());
+
+        for (sha256, bytes) in &objects {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!(
+                            "/v1/community/generations/{generation_id}/chunks/{sha256}"
+                        ))
+                        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .body(Body::from(bytes.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "no-store, private"
+            );
+        }
+        let missing = get_with_token(app.clone(), &missing_path).await;
+        assert_eq!(missing.status(), StatusCode::OK);
+        assert!(
+            response_json(missing).await["chunks"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let finalize = post_json(
+            app.clone(),
+            &format!("/v1/community/generations/{generation_id}/finalize"),
+            serde_json::json!({
+                "schema": FINALIZE_RUN_GENERATION_SCHEMA,
+                "generation_sha256": generation_sha256,
+            }),
+        )
+        .await;
+        assert_eq!(finalize.status(), StatusCode::CREATED);
+        let finalized = response_json(finalize).await;
+        assert_eq!(finalized["generation_id"], generation_id);
+        assert_eq!(finalized["model"], "wrf");
+        assert_eq!(finalized["run"], "20260812_00z");
+
+        let query_path = "/v1/models/wrf/runs/20260812_00z";
+        let query = get_with_token(app.clone(), query_path).await;
+        assert_eq!(query.status(), StatusCode::OK);
+        let query = response_json(query).await;
+        assert_eq!(query["model"], "wrf");
+        assert_eq!(query["run"], "20260812_00z");
+
+        let revoke = post_json(
+            app.clone(),
+            &format!("/v1/community/generations/{generation_id}/revoke"),
+            serde_json::json!({
+                "schema": REVOKE_RUN_GENERATION_SCHEMA,
+                "generation_sha256": generation_sha256,
+                "rights_withdrawn": true,
+                "reason": "Owner withdrew this HTTP test publication.",
+            }),
+        )
+        .await;
+        assert_eq!(revoke.status(), StatusCode::OK);
+        let revoke = response_json(revoke).await;
+        assert_eq!(revoke["generation_id"], generation_id);
+        assert_eq!(revoke["rights_withdrawn"], true);
+
+        assert_eq!(
+            get_with_token(app.clone(), query_path).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        let status = get_with_token(
+            app.clone(),
+            "/v1/community/generation-replication/operator/status",
+        )
+        .await;
+        assert_eq!(status.status(), StatusCode::OK);
+        let status = response_json(status).await;
+        assert_eq!(status["published_generations"], 0);
+        assert_eq!(status["tombstones"], 1);
+        assert_eq!(status["pending_retirements"], 0);
+        assert_eq!(status["pending_retirement_bytes"], 0);
+
+        let replay = post_json(
+            app.clone(),
+            "/v1/community/generations",
+            serde_json::json!({
+                "schema": BEGIN_RUN_GENERATION_SCHEMA,
+                "manifest": manifest,
+            }),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+
+        let gc = post_json(
+            app,
+            "/v1/community/generation-replication/operator/gc",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(gc.status(), StatusCode::OK);
+        let gc = response_json(gc).await;
+        for field in [
+            "expired_uploads",
+            "expired_publications",
+            "retired_generations",
+            "pending_retirements",
+            "orphan_chunks",
+            "orphan_manifests",
+            "stale_candidates",
+        ] {
+            assert!(gc[field].is_number(), "missing coarse GC field {field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn community_relay_http_flow_is_cold_only_no_store_and_principal_isolated() {
+        let (_directory, app, origin_key, relay_verifying_key) = relay_http_test_app();
+        let signed_manifest = signed_relay_test_manifest(&origin_key);
+        let object_sha256 = signed_manifest.manifest.object_sha256.clone();
+
+        // A current/operational request cannot accidentally enter the cold
+        // relay path, even when an exact hash is supplied.
+        let operational = post_json_with_token(
+            app.clone(),
+            "/v1/community/relay/historical/lookups",
+            serde_json::json!({
+                "schema": "rw.community.relay-historical-lookup.v1",
+                "historical": false,
+                "object_sha256": object_sha256,
+                "opted_in": true,
+                "download_allowance_bytes": 1_000_000,
+            }),
+            RELAY_REQUESTER_TOKEN,
+        )
+        .await;
+        assert_eq!(operational.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let advertisement = post_json_with_token(
+            app.clone(),
+            "/v1/community/relay/advertisements",
+            serde_json::json!({
+                "schema": "rw.community.relay-advertise-request.v1",
+                "signed_manifest": signed_manifest,
+                "opted_in": true,
+                "categories": ["point_series"],
+                "disk_allowance_bytes": 1_000_000,
+                "upload_allowance_bytes": 1_000_000,
+                "metered_network": false,
+                "allow_metered_seeding": false,
+            }),
+            TOKEN,
+        )
+        .await;
+        assert_eq!(advertisement.status(), StatusCode::CREATED);
+        assert!(
+            advertisement.headers()[header::CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .contains("no-store")
+        );
+
+        let lookup = post_json_with_token(
+            app.clone(),
+            "/v1/community/relay/historical/lookups",
+            serde_json::json!({
+                "schema": "rw.community.relay-historical-lookup.v1",
+                "historical": true,
+                "object_sha256": object_sha256,
+                "opted_in": true,
+                "download_allowance_bytes": 1_000_000,
+            }),
+            RELAY_REQUESTER_TOKEN,
+        )
+        .await;
+        assert_eq!(lookup.status(), StatusCode::OK);
+        assert_eq!(lookup.headers()[header::CACHE_CONTROL], "no-store, private");
+        assert!(lookup.headers().get(header::ETAG).is_none());
+        let lookup_body = to_bytes(lookup.into_body(), 256 * 1024).await.unwrap();
+        let lookup_wire = parse_historical_lookup_response_bounded(&lookup_body).unwrap();
+        let downloader = lookup_wire.participant_grant.unwrap();
+        let relay_keys = rw_community_protocol::TrustedSigningKeys::from([(
+            "rw-relay-v1".to_string(),
+            relay_verifying_key,
+        )]);
+        downloader
+            .validate(
+                &object_sha256,
+                RelayRole::Downloader,
+                chrono::Utc::now().timestamp(),
+                &relay_keys,
+                &rw_community_protocol::ProtocolLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(downloader.role, RelayRole::Downloader);
+        assert_eq!(downloader.object_sha256, object_sha256);
+        let session_id = downloader.session_id.clone();
+        let downloader_serialized = serde_json::to_string(&downloader).unwrap();
+        for forbidden in [
+            TOKEN,
+            RELAY_REQUESTER_TOKEN,
+            RELAY_OUTSIDER_TOKEN,
+            "peer_ip",
+            "host_candidate",
+            "server_reflexive",
+        ] {
+            assert!(
+                !downloader_serialized.contains(forbidden),
+                "participant response leaked forbidden marker {forbidden}"
+            );
+        }
+
+        let uploader = post_json_with_token(
+            app.clone(),
+            "/v1/community/relay/grants/next",
+            serde_json::json!({"schema": "rw.community.relay-grant-poll.v1"}),
+            TOKEN,
+        )
+        .await;
+        assert_eq!(uploader.status(), StatusCode::OK);
+        assert_eq!(
+            uploader.headers()[header::CACHE_CONTROL],
+            "no-store, private"
+        );
+        let uploader_body = to_bytes(uploader.into_body(), 256 * 1024).await.unwrap();
+        let uploader = parse_participant_grant_bounded(
+            &uploader_body,
+            &object_sha256,
+            RelayRole::Uploader,
+            chrono::Utc::now().timestamp(),
+            &relay_keys,
+            &rw_community_protocol::ProtocolLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(uploader.role, RelayRole::Uploader);
+        assert_eq!(uploader.session_id, session_id);
+
+        // Neither an unrelated authenticated account nor the counterpart can
+        // enumerate or retrieve another participant's grant.
+        let outsider_poll = post_json_with_token(
+            app.clone(),
+            "/v1/community/relay/grants/next",
+            serde_json::json!({"schema": "rw.community.relay-grant-poll.v1"}),
+            RELAY_OUTSIDER_TOKEN,
+        )
+        .await;
+        assert_eq!(outsider_poll.status(), StatusCode::NOT_FOUND);
+
+        for (token, role) in [
+            (TOKEN, "downloader"),
+            (RELAY_REQUESTER_TOKEN, "uploader"),
+            (RELAY_OUTSIDER_TOKEN, "uploader"),
+        ] {
+            let response = post_json_with_token(
+                app.clone(),
+                &format!("/v1/community/relay/sessions/{session_id}/grants/{role}"),
+                serde_json::json!({}),
+                token,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        // Shared client/server wire types round-trip through the authenticated
+        // route endpoint, including the opposite signed role credential. No
+        // host/srflx/direct candidate is representable in this exchange.
+        let now = chrono::Utc::now().timestamp();
+        let uploader_keys = rw_community_relay::EphemeralKeyPair::generate();
+        let downloader_keys = rw_community_relay::EphemeralKeyPair::generate();
+        let uploader_offer = uploader_keys
+            .offer(
+                &uploader.credential,
+                RelayRole::Uploader,
+                now,
+                &rw_community_protocol::ProtocolLimits::default(),
+            )
+            .unwrap();
+        let downloader_offer = downloader_keys
+            .offer(
+                &downloader.credential,
+                RelayRole::Downloader,
+                now,
+                &rw_community_protocol::ProtocolLimits::default(),
+            )
+            .unwrap();
+        for (token, credential, offer, allocation) in [
+            (
+                TOKEN,
+                uploader.credential.clone(),
+                uploader_offer,
+                "104.16.0.7:49152",
+            ),
+            (
+                RELAY_REQUESTER_TOKEN,
+                downloader.credential.clone(),
+                downloader_offer,
+                "104.16.0.8:49153",
+            ),
+        ] {
+            let registration = rw_community_relay::RelayRouteRegistrationRequest {
+                schema: rw_community_relay::RELAY_ROUTE_REGISTRATION_SCHEMA.into(),
+                credential,
+                offer,
+                turn_local_addr: allocation.into(),
+            };
+            let response = post_json_with_token(
+                app.clone(),
+                rw_community_relay::RELAY_ROUTE_REGISTRATION_PATH,
+                serde_json::to_value(registration).unwrap(),
+                token,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let transport = post_json_with_token(
+            app.clone(),
+            rw_community_relay::RELAY_TRANSPORT_GRANT_PATH,
+            serde_json::to_value(rw_community_relay::RelayTransportGrantRequest {
+                schema: rw_community_relay::RELAY_TRANSPORT_GRANT_REQUEST_SCHEMA.into(),
+                role: RelayRole::Downloader,
+                credential: downloader.credential.clone(),
+            })
+            .unwrap(),
+            RELAY_REQUESTER_TOKEN,
+        )
+        .await;
+        assert_eq!(transport.status(), StatusCode::OK);
+        assert_eq!(
+            transport.headers()[header::CACHE_CONTROL],
+            "no-store, private"
+        );
+        let transport_body = to_bytes(transport.into_body(), 256 * 1024).await.unwrap();
+        let route_policy =
+            rw_community_relay::RelayRoutePolicy::from_audited_cidrs(["104.16.0.0/24"]).unwrap();
+        let (transport_wire, _route, _binding) = rw_community_relay::parse_transport_route_bounded(
+            &transport_body,
+            rw_community_relay::TransportRouteExpectation {
+                session_id: &session_id,
+                role: RelayRole::Downloader,
+                own_credential: &downloader.credential,
+                object_sha256: &object_sha256,
+                encoded_size: downloader.encoded_size,
+                now_unix: now,
+                trusted_relay_keys: &relay_keys,
+                limits: &rw_community_protocol::ProtocolLimits::default(),
+                policy: &route_policy,
+            },
+        )
+        .unwrap();
+        assert_eq!(transport_wire.peer_credential, uploader.credential);
+        let transport_text = String::from_utf8(transport_body.to_vec()).unwrap();
+        for forbidden in ["peer_ip", "host_candidate", "server_reflexive", TOKEN] {
+            assert!(!transport_text.contains(forbidden));
+        }
+
+        // One role can never claim success. Only matching exact-byte reports
+        // from both authenticated signed roles complete the broker session.
+        let downloader_complete = post_json_with_token(
+            app.clone(),
+            rw_community_relay::RELAY_SESSION_COMPLETE_PATH,
+            serde_json::to_value(rw_community_relay::RelaySessionCompletionRequest {
+                schema: rw_community_relay::RELAY_SESSION_COMPLETION_SCHEMA.into(),
+                role: RelayRole::Downloader,
+                credential: downloader.credential,
+                transferred_bytes: downloader.encoded_size,
+            })
+            .unwrap(),
+            RELAY_REQUESTER_TOKEN,
+        )
+        .await;
+        assert_eq!(downloader_complete.status(), StatusCode::OK);
+        let downloader_terminal: rw_community_relay::RelayTerminalResponse =
+            serde_json::from_value(response_json(downloader_complete).await).unwrap();
+        assert!(!downloader_terminal.session_complete);
+        let uploader_complete = post_json_with_token(
+            app,
+            rw_community_relay::RELAY_SESSION_COMPLETE_PATH,
+            serde_json::to_value(rw_community_relay::RelaySessionCompletionRequest {
+                schema: rw_community_relay::RELAY_SESSION_COMPLETION_SCHEMA.into(),
+                role: RelayRole::Uploader,
+                credential: uploader.credential,
+                transferred_bytes: uploader.encoded_size,
+            })
+            .unwrap(),
+            TOKEN,
+        )
+        .await;
+        assert_eq!(uploader_complete.status(), StatusCode::OK);
+        let uploader_terminal: rw_community_relay::RelayTerminalResponse =
+            serde_json::from_value(response_json(uploader_complete).await).unwrap();
+        assert!(uploader_terminal.session_complete);
     }
 
     #[tokio::test]
@@ -3102,6 +5556,119 @@ mod tests {
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(problem["code"], "NOT_READY");
+    }
+
+    #[tokio::test]
+    async fn enabled_missing_origin_catalog_fails_operational_routes_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::AppConfig::default();
+        config.server.store_root = directory.path().join("store");
+        config.server.artifact_root = directory.path().join("artifacts");
+        config.origin_catalog.enabled = true;
+        fs::create_dir_all(&config.server.store_root).unwrap();
+        fs::create_dir_all(&config.server.artifact_root).unwrap();
+        // No .rw-origin-catalog.json exists: startup is intentionally pending
+        // and must never fall back to a broad store scan.
+        fs::create_dir_all(
+            config
+                .server
+                .store_root
+                .join("hidden-model")
+                .join("hidden-run"),
+        )
+        .unwrap();
+        let tokens = crate::TokenSet::from_tokens([TOKEN]).unwrap();
+        config.validate(!tokens.is_empty()).unwrap();
+        let app = build_router(AppState::new(config, tokens).unwrap()).unwrap();
+
+        let ready = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response_json(ready).await["code"], "NOT_READY");
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let models = get_with_token(app.clone(), "/v1/models").await;
+        assert_eq!(models.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let problem = response_json(models).await;
+        assert_eq!(problem["code"], "ORIGIN_CATALOG_UNAVAILABLE");
+        let serialized = serde_json::to_string(&problem).unwrap();
+        assert!(!serialized.contains("hidden-model"));
+        assert!(!serialized.contains("hidden-run"));
+
+        let status = get_with_token(app, "/v1/origin-catalog/status").await;
+        assert_eq!(status.status(), StatusCode::OK);
+        assert_eq!(status.headers()[header::CACHE_CONTROL], "no-store, private");
+        let status = response_json(status).await;
+        assert_eq!(status["state"], "pending");
+        assert_eq!(status["ready"], false);
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert!(!serialized.contains("hidden-model"));
+        assert!(!serialized.contains("hidden-run"));
+    }
+
+    #[tokio::test]
+    async fn stale_origin_catalog_returns_503_instead_of_an_empty_model_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::AppConfig::default();
+        config.server.store_root = directory.path().join("store");
+        config.server.artifact_root = directory.path().join("artifacts");
+        config.origin_catalog.enabled = true;
+        fs::create_dir_all(&config.server.store_root).unwrap();
+        fs::create_dir_all(&config.server.artifact_root).unwrap();
+
+        let cycle = CycleSpec::new("20260812", 0).unwrap();
+        let mut catalog = OriginCatalogState::empty(&OriginCatalogPlanConfig::default());
+        catalog.updated_unix = chrono::Utc::now().timestamp().saturating_sub(7_201);
+        catalog.lanes[0] = OriginPublishedLane {
+            id: "hrrr-hourly".into(),
+            active: Some(OriginPublishedGeneration {
+                model: ModelId::Hrrr,
+                cycle: cycle.clone(),
+                run_id: "20260812_00z".into(),
+                coverage_complete: false,
+                available_valid_unix: [cycle_origin_unix(&cycle).unwrap()].into(),
+            }),
+            previous: None,
+        };
+        OriginCatalogStateStore::new(&config.server.store_root)
+            .save(&OriginCatalogPlanConfig::default(), &catalog)
+            .unwrap();
+        let tokens = crate::TokenSet::from_tokens([TOKEN]).unwrap();
+        config.validate(!tokens.is_empty()).unwrap();
+        let app = build_router(AppState::new(config, tokens).unwrap()).unwrap();
+
+        let response = get_with_token(app.clone(), "/v1/models").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let problem = response_json(response).await;
+        assert_eq!(problem["code"], "ORIGIN_CATALOG_UNAVAILABLE");
+        assert!(
+            !serde_json::to_string(&problem)
+                .unwrap()
+                .contains("20260812")
+        );
+
+        let status = response_json(get_with_token(app, "/v1/origin-catalog/status").await).await;
+        assert_eq!(status["state"], "unavailable");
+        assert_eq!(status["published_runs"], 0);
     }
 
     #[tokio::test]

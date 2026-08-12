@@ -17,14 +17,17 @@ use thiserror::Error;
 
 mod federation;
 mod publication;
+mod replication;
 
 pub use federation::*;
 pub use publication::*;
+pub use replication::*;
 
 pub const REQUEST_SCHEMA: &str = "rw.community.request.v1";
 pub const OBJECT_SCHEMA: &str = "rw.community.object.v1";
 pub const RESOLVE_SCHEMA: &str = "rw.community.resolve.v1";
 pub const CASE_SCHEMA: &str = "rw.community.case.v1";
+pub const CASE_DIRECTORY_SCHEMA: &str = "rw.community.case-directory.v1";
 pub const RELAY_CREDENTIAL_SCHEMA: &str = "rw.community.relay-credential.v1";
 pub const RELAY_ENVELOPE_SCHEMA: &str = "rw.community.relay-envelope.v1";
 pub const PROFILE_PAYLOAD_SCHEMA: &str = "rw.community.profile-payload.v1";
@@ -37,9 +40,17 @@ pub const CASE_ARTIFACT_PAYLOAD_SCHEMA: &str = "rw.community.case-artifact-paylo
 pub const RESOLVE_OBJECT_PATH: &str = "/v1/community/objects/resolve";
 pub const OBJECT_PATH_TEMPLATE: &str = "/v1/community/objects/{sha256}";
 pub const CREATE_CASE_PATH: &str = "/v1/community/cases";
+pub const LIST_CASES_PATH: &str = CREATE_CASE_PATH;
 pub const CASE_PATH_TEMPLATE: &str = "/v1/community/cases/{case_id}";
+pub const MAX_CASE_DIRECTORY_PAGE: usize = 100;
+/// Legacy immutable request-keyed manifest location. Readers MAY use it as a
+/// migration fallback, but new promotion writes use the v2 pointer contract so
+/// a fresh signed manifest can replace an expired one.
 pub const R2_MANIFEST_KEY_TEMPLATE: &str = "v1/manifests/{request_sha256}.json";
 pub const R2_OBJECT_KEY_TEMPLATE: &str = "v1/objects/{object_sha256}";
+pub const HOT_MANIFEST_POINTER_SCHEMA: &str = "rw.community.hot-manifest-pointer.v1";
+pub const R2_REQUEST_POINTER_KEY_TEMPLATE: &str = "v2/requests/{request_sha256}.json";
+pub const R2_MANIFEST_BLOB_KEY_TEMPLATE: &str = "v2/manifests/{manifest_sha256}.json";
 
 const OBJECT_SIGNATURE_DOMAIN: &[u8] = b"rw-community-object-signature-v1\0";
 const CASE_SIGNATURE_DOMAIN: &[u8] = b"rw-community-case-signature-v1\0";
@@ -128,7 +139,9 @@ impl Default for ProtocolLimits {
             max_provenance_entries: 16,
             max_attributions: 16,
             max_case_artifacts: 256,
-            max_relay_chunks: 65_536,
+            // 64 MiB at the relay's fixed 512-byte datagram-safe plaintext
+            // chunk size. This is still an absolute bounded protocol ceiling.
+            max_relay_chunks: 131_072,
         }
     }
 }
@@ -435,6 +448,34 @@ pub struct SignedObjectManifest {
     pub signature: SignatureBlock,
 }
 
+/// Small refreshable lookup record for the immutable hot tier. The pointer is
+/// not a trust root: clients hash the referenced manifest bytes, then verify
+/// the origin signature and full canonical request before accepting an object.
+/// This indirection lets an origin renew an expired signature without changing
+/// either the canonical request identity or immutable object bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HotManifestPointer {
+    pub schema: String,
+    pub request_sha256: String,
+    pub manifest_sha256: String,
+}
+
+impl HotManifestPointer {
+    pub fn validate_for_request(&self, expected_request_sha256: &str) -> Result<(), ProtocolError> {
+        if self.schema != HOT_MANIFEST_POINTER_SCHEMA {
+            return Err(ProtocolError::UnsupportedSchema(self.schema.clone()));
+        }
+        validate_sha256("request_sha256", &self.request_sha256)?;
+        validate_sha256("manifest_sha256", &self.manifest_sha256)?;
+        validate_sha256("expected_request_sha256", expected_request_sha256)?;
+        if self.request_sha256 != expected_request_sha256 {
+            return Err(ProtocolError::RequestHashMismatch);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveObjectRequest {
@@ -618,6 +659,46 @@ pub struct CaseRoomManifest {
 pub struct SignedCaseRoomManifest {
     pub manifest: CaseRoomManifest,
     pub signature: SignatureBlock,
+}
+
+/// Cursor-bounded directory of deliberate publications. Each entry remains
+/// the complete origin-signed case manifest, so clients never trust an
+/// unsigned search summary and passive model searches cannot appear here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaseRoomDirectoryPage {
+    pub schema: String,
+    pub cases: Vec<SignedCaseRoomManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<String>,
+}
+
+impl CaseRoomDirectoryPage {
+    pub fn verify(
+        &self,
+        now_unix: i64,
+        trusted_keys: &TrustedSigningKeys,
+        limits: &ProtocolLimits,
+    ) -> Result<(), ProtocolError> {
+        if self.schema != CASE_DIRECTORY_SCHEMA {
+            return Err(ProtocolError::UnsupportedSchema(self.schema.clone()));
+        }
+        if self.cases.len() > MAX_CASE_DIRECTORY_PAGE {
+            return invalid("cases", "case directory page exceeds its fixed bound");
+        }
+        if let Some(cursor) = &self.next_after {
+            validate_opaque_id("next_after", cursor)?;
+        }
+        let mut previous = None;
+        for signed in &self.cases {
+            verify_signed_case(signed, now_unix, trusted_keys, limits)?;
+            if previous.is_some_and(|value: &str| value >= signed.manifest.case_id.as_str()) {
+                return invalid("cases", "case directory entries are not strictly ordered");
+            }
+            previous = Some(signed.manifest.case_id.as_str());
+        }
+        Ok(())
+    }
 }
 
 /// The enum intentionally has one representable value. Serde therefore fails
@@ -2352,6 +2433,63 @@ mod tests {
             ),
             Err(ProtocolError::InvalidSignature)
         );
+    }
+
+    #[test]
+    fn case_directory_is_bounded_ordered_and_contains_only_signed_manifests() {
+        let request = sample_request();
+        let key = SigningKey::from_bytes(&[11; 32]);
+        let keys = BTreeMap::from([("origin-case-a".into(), key.verifying_key())]);
+        let mut first = sample_case(&request);
+        first.case_id = "case-a".into();
+        let mut second = sample_case(&request);
+        second.case_id = "case-b".into();
+        let page = CaseRoomDirectoryPage {
+            schema: CASE_DIRECTORY_SCHEMA.into(),
+            cases: vec![
+                sign_case_manifest(first, "origin-case-a", &key).unwrap(),
+                sign_case_manifest(second, "origin-case-a", &key).unwrap(),
+            ],
+            next_after: Some("case-b".into()),
+        };
+        page.verify(1_786_500_001, &keys, &ProtocolLimits::default())
+            .unwrap();
+
+        let mut reversed = page.clone();
+        reversed.cases.reverse();
+        assert!(
+            reversed
+                .verify(1_786_500_001, &keys, &ProtocolLimits::default())
+                .is_err()
+        );
+        let mut unsigned_tamper = page;
+        unsigned_tamper.cases[0].manifest.title = "tampered".into();
+        assert!(
+            unsigned_tamper
+                .verify(1_786_500_001, &keys, &ProtocolLimits::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn hot_manifest_pointer_is_strict_and_request_bound() {
+        let expected = hash('a');
+        let pointer = HotManifestPointer {
+            schema: HOT_MANIFEST_POINTER_SCHEMA.into(),
+            request_sha256: expected.clone(),
+            manifest_sha256: hash('b'),
+        };
+        pointer.validate_for_request(&expected).unwrap();
+        assert_eq!(
+            pointer.validate_for_request(&hash('c')),
+            Err(ProtocolError::RequestHashMismatch)
+        );
+        let mut wrong_schema = pointer;
+        wrong_schema.schema = "rw.community.hot-manifest-pointer.v2".into();
+        assert!(matches!(
+            wrong_schema.validate_for_request(&expected),
+            Err(ProtocolError::UnsupportedSchema(_))
+        ));
     }
 
     #[test]

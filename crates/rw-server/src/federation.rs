@@ -1369,6 +1369,7 @@ mod tests {
                     public_key_base64: encoded_origin_key,
                 }],
                 health_bearer_token_file: None,
+                data_bearer_token_file: None,
             }],
             ..FederationConfig::default()
         };
@@ -1436,6 +1437,7 @@ mod tests {
                         .encode(SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes()),
                 }],
                 health_bearer_token_file: None,
+                data_bearer_token_file: None,
             }],
             ..FederationConfig::default()
         };
@@ -1463,6 +1465,7 @@ mod tests {
                         .encode(SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes()),
                 }],
                 health_bearer_token_file: None,
+                data_bearer_token_file: None,
             }],
             revoked_origin_ids: vec!["university-weather-lab".into()],
             ..FederationConfig::default()
@@ -1597,6 +1600,7 @@ mod tests {
                         .encode(SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes()),
                 }],
                 health_bearer_token_file: None,
+                data_bearer_token_file: None,
             }],
             health_state_file: Some(directory.path().join("health.json")),
             ..FederationConfig::default()
@@ -1645,6 +1649,7 @@ mod tests {
                             .encode(key.verifying_key().to_bytes()),
                     }],
                     health_bearer_token_file: None,
+                    data_bearer_token_file: None,
                 });
         });
         let request = FederationSelectionRequest {
@@ -1721,16 +1726,20 @@ mod tests {
         assert_eq!(first.join().unwrap(), Err(DnsPoolError::Timeout));
         // The one bounded queue slot can accept one more lookup while the
         // fixed worker is stuck. A third cannot enqueue or spawn a replacement.
-        let second_pool = pool.clone();
-        let second = thread::spawn(move || {
-            second_pool.resolve("second.example:443".into(), Duration::from_millis(20))
-        });
-        thread::sleep(Duration::from_millis(2));
+        let (queued_response, _queued_receiver) = mpsc::sync_channel(1);
+        assert!(
+            pool.senders[0]
+                .try_send(DnsJob {
+                    lookup: "127.0.0.1:443".into(),
+                    response: queued_response,
+                })
+                .is_ok(),
+            "the fixed worker's single bounded queue slot must accept exactly one waiting job"
+        );
         assert_eq!(
             pool.resolve("third.example:443".into(), Duration::from_millis(10)),
             Err(DnsPoolError::Busy)
         );
-        assert_eq!(second.join().unwrap(), Err(DnsPoolError::Timeout));
         release.send(()).unwrap();
         worker.join().unwrap();
     }

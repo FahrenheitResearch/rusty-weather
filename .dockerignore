@@ -3,6 +3,8 @@
 .cargo
 target
 **/target
+**/node_modules
+*.cdx.json
 out
 work
 store

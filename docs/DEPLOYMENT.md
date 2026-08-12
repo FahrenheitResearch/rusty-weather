@@ -9,12 +9,15 @@ and does not enable cross-origin access unless exact origins are configured.
 Release service archives contain `rw-server`, `rw-scheduler`, both example
 configurations, the server JSON Schema, the generated OpenAPI document,
 scheduler README, systemd and Windows deployment templates, license notices,
-security policy, operations guide, and a `SHA256SUMS.txt` manifest covering
-every file inside the extracted top-level `rusty-weather-server` directory.
-Docker files are source-checkout-only and are
-intentionally absent because a binary archive is not a Docker build context.
-Verify the archive's `.sha256` file and review the matching `rw-server` and
-`rw-scheduler` CycloneDX SBOMs before installing it.
+security policy, operations guide, R2 gateway source plus its Node license/SBOM
+inventory, and a `SHA256SUMS.txt` manifest covering every file inside the
+extracted top-level `rusty-weather-server` directory. Docker files remain
+absent because a binary archive is not a Docker build context; use the matching
+attested `rusty-weather-source.tar.gz` when an exact source build is required.
+Verify the archive's `.sha256` file and review the matching `rw-server`,
+`rw-scheduler`, and R2 Worker CycloneDX SBOMs before installing it. The separate
+`rusty-weather-r2-gateway.tar.gz` is the already-bundled deployable Worker, not
+a replacement for the conventional Rusty Weather HTTPS service.
 
 Verify the downloaded archive before extraction. The release sidecar uses the
 standard SHA-256 checksum-file format:
@@ -138,13 +141,24 @@ model store or backups. Capacity values in the example are non-production
 parsing examples, not recommendations; replace them with audited values.
 
 `community.hot_store` supports a filesystem test/local provider or an
-R2-compatible authenticated HTTPS gateway with immutable keys. The gateway
-must expose exact GET/PUT semantics at `<base_url>/<bucket>/v1/...`, enforce
-TLS, keep its bearer token in `token_file`, and reject replacement of existing
-keys with different bytes. Deterministic keys are:
+R2-compatible authenticated HTTPS gateway with content-addressed objects and
+signed-manifest blobs plus one strictly bounded renewable request pointer. The
+gateway must expose exact GET/PUT semantics at `<base_url>/<bucket>/v1/...` and
+`.../v2/...`, enforce TLS, keep its bearer token in `token_file`, and reject
+replacement of immutable keys with different bytes. Deterministic keys are:
 
-- `v1/manifests/{request_sha256}.json`
 - `v1/objects/{object_sha256}`
+- `v2/manifests/{manifest_sha256}.json`
+- `v2/requests/{request_sha256}.json`
+
+The source distribution includes a concrete Cloudflare Worker/R2 binding at
+`deploy/cloudflare-r2-gateway`. It implements this exact closed key grammar,
+public cacheable GETs for BowEcho, authenticated create-only immutable PUTs,
+strict atomic pointer replacement, fixed byte ceilings, and no list/delete
+surface. Run its tests and
+Wrangler dry-run, install its bearer token as a private file, and use a TLS
+custom domain before enabling promotion. BowEcho receives only the public base
+URL; it never receives the gateway write token.
 
 Configure `community.origin_base_url` only as an absolute HTTPS URL. It is the
 authoritative Hetzner Rusty Weather dynamic resolve/object API and manifest
@@ -161,10 +175,14 @@ promotion and case publication while retaining signed normal-origin fallback.
 Case publication has its own `[community.cases].enabled` gate. Typed artifact
 uploads additionally require
 `community.cases.artifact_publication_enabled = true`; keep it false until
-rights/attribution workflows and publication quotas are verified. The reserved
-`community.cases.full_run_replication_enabled` setting must remain false: the
-current service deliberately exposes no arbitrary file, raw wrfout, or
-complete-run upload route.
+rights/attribution workflows and publication quotas are verified. Complete
+immutable `.rws` generation transfer is owned by the separate, default-off
+`[generation_replication]` service and its advanced deployment overlay.
+Enabling typed case artifacts does not enable generation replication, and
+neither feature exposes an arbitrary-file, private-directory, or raw `wrfout`
+upload route. Replication additionally requires its explicit security and
+capacity gates, owner principals, signing key, writable same-filesystem
+staging/store topology, and `origin_catalog.publication_sources` policy.
 Set `community.quotas.maximum_principals` to bound the durable monthly
 accounting file. Bound case retention independently with
 `community.cases.maximum_cases`, `community.cases.storage_bytes`, and
@@ -205,6 +223,12 @@ The hardened unit assumes these paths:
 - token file: `/etc/rusty-weather/api-tokens.txt`
 - store: `/var/lib/rusty-weather/store`
 - artifacts: `/var/lib/rusty-weather/artifacts`
+- optional Community cache/control state:
+  `/var/lib/rusty-weather/community-cache`
+- optional federation health/accounting state:
+  `/var/lib/rusty-weather/federation`
+- optional generation-replication control state:
+  `/var/lib/rusty-weather/generation-replication`
 
 Example installation as root:
 
@@ -219,7 +243,33 @@ Example installation as root:
 
 Create `/etc/rusty-weather/api-tokens.txt` separately, owned by
 `rusty-weather:rusty-weather` with mode `0600`. The server intentionally
-rejects any Unix token file with group or other permission bits. Then:
+rejects any Unix token file with group or other permission bits.
+
+Create an optional state directory only when its feature is deliberately
+enabled, and keep every signing key/provider token as a distinct `0600`
+regular file under `/etc/rusty-weather`. The systemd unit grants those bounded
+state locations write access while its more-specific `ReadOnlyPaths` rule keeps
+the operational model store read-only. Advanced generation replication is the
+only mode that also needs a separately reviewed writable-store policy. The
+packaged `rusty-weather-generation-replication.conf` is that narrowly scoped
+systemd drop-in: it resets the base store's read-only path rule and grants write
+access only to the model store and the replication control root. Install it
+only after the security/capacity gates and configuration in
+[`GENERATION_REPLICATION.md`](GENERATION_REPLICATION.md) have been reviewed:
+
+    install -d -o rusty-weather -g rusty-weather -m 0750 \
+      /var/lib/rusty-weather/generation-replication
+    install -d -o root -g root -m 0755 \
+      /etc/systemd/system/rusty-weather.service.d
+    install -o root -g root -m 0644 \
+      deploy/systemd/rusty-weather-generation-replication.conf \
+      /etc/systemd/system/rusty-weather.service.d/50-generation-replication.conf
+
+Do not install the drop-in on an ordinary operational API node. Its filesystem
+permission alone does not enable replication: the feature remains default-off,
+requires its distinct signing key and operator gates, and starts kill-switched.
+
+Then validate and start:
 
     sudo -u rusty-weather /usr/local/bin/rw-server --config /etc/rusty-weather/rusty-weather.toml doctor
     systemctl daemon-reload

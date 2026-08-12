@@ -120,6 +120,13 @@ and concurrency values came from the completed capacity audit.
 The Phase 1 origin is the authoritative Hetzner Rusty Weather HTTPS service and
 manifest signer; it is never a TURN destination. Operational lookup order is
 local CAS, R2, then Hetzner dynamic origin, followed by optional R2 promotion.
+`community.object_manifest_retention_seconds` controls exact immutable query
+manifest lifetime and is hard-bounded to five years; the shipped parsing
+example is one year. Case artifacts retain their explicit, separately bounded
+case lifetime. Rotate the object signer by changing
+`community.signing_key_id` with the private key and retaining each old public
+key in `trusted_public_keys`. Duplicate key IDs, or identical key bytes under
+multiple IDs, fail startup closed.
 
 During a cost, abuse, privacy, or hot-provider incident set
 `RW_COMMUNITY_KILL_SWITCH=true` and restart the service. This stops case
@@ -145,12 +152,13 @@ Keep `community.cases.artifact_publication_enabled = false` until the typed
 publication security tests and owner-facing rights confirmation UI pass. When
 enabled, the only accepted bodies are closed annotation/table/overlay/image
 DTOs; never proxy a filesystem path, URL, raw wrfout, archive, or arbitrary
-multipart body into this endpoint. Audit records live under
+multipart body into this endpoint. Every artifact must be an explicit
+rights-confirmed owner publication; reject `PublicProvider` even for artifacts
+derived from public data because client-supplied provenance is not an
+origin-validated source handle. Audit records live under
 `community.root/publication-audit`; rights withdrawal creates durable object
 and case tombstones before live mappings are removed. Preserve tombstones for
 the life of the deployment so withdrawn hashes and case IDs cannot be reused.
-`community.cases.full_run_replication_enabled` is reserved and configuration
-validation rejects enabling it because no reviewed replication service exists.
 
 Treat any signature, embedded-request hash, object hash, decoded-size,
 decompression-ratio, schema, expiry, or ECMWF-notice failure as untrusted
@@ -163,7 +171,79 @@ Private WRF and ArWen content is non-shareable by default. A case/object may be
 published only after the owner deliberately supplies both explicit-publication
 and redistribution-rights confirmations. Passive searches, local cache fills,
 and opening a run are never publication events. Relay-mediated peer-assisted
-transfers are a later phase; direct-IP sharing is not a recovery mode.
+transfers use only the separately gated cold broker; direct-IP sharing is not a
+recovery mode.
+
+### Advanced full-generation replication
+
+`generation_replication` is a distinct default-off service for deliberate
+publication of a complete immutable `.rws` run. It never participates in the
+normal operational object path or in TURN. Before enablement, set
+`origin_catalog.publication_sources` to `replication` (university/lab archive)
+or `union` (scheduler plus replication), provision the isolated control root
+and separate signing key, configure operator principal digests, complete the
+security suite and direct capacity audit, and keep the kill switch engaged
+until recovery evidence is recorded.
+
+The owner first reads its replication-domain hash from
+`GET /v1/community/generation-replication/owner`, then begins a closed manifest,
+pages missing SHA-256 chunks, uploads exact non-empty octet-stream chunks, and
+finalizes only after deep store validation. Private WRF/ArWen requires a
+deliberate publication grant, confirmed redistribution rights, provenance,
+attribution, and modification notices. No raw path, URL, directory, archive,
+or `wrfout` upload is representable.
+
+Monitor `rw_generation_replication_begins`,
+`rw_generation_replication_upload_bytes`,
+`rw_generation_replication_finalizations`,
+`rw_generation_replication_revocations`, and
+`rw_generation_replication_kill_switch`. Operator status and GC are
+authenticated and expose coarse counts only. `rw-server doctor` authenticates
+the durable state, validates key custody/root isolation, reports coarse counts,
+and exercises the same publication view used by queries. Scheduler retention
+removes only scheduler-owned marked directories; replication publications stay
+outside active/previous lane pruning.
+
+### Phase 2 relay broker operations
+
+`community.relay` is a separate default-off gate for rare cold historical
+objects. It is never part of current operational local → R2 → Hetzner HTTPS
+delivery. Enablement requires Phase 1, API tokens, both explicit security and
+capacity approvals, a separate Ed25519 relay key file, a private Cloudflare API
+token file, operator principal digests, and a non-empty current audit of TURN
+provider allocation CIDRs. An empty CIDR policy intentionally disables the
+transport-private route exchange; no Cloudflare address range is compiled as
+trust.
+
+Generate each operator principal with lowercase SHA-256 over the exact byte
+sequence `rw-authenticated-principal-v1\0` followed by that operator's bearer
+token. Store only the digest in `operator_principals`; never place the bearer
+token itself in TOML, logs, or status output. The provider
+`customIdentifier` is a separate opaque session alias and contains no account
+name, address, email, or token fingerprint.
+
+Before enablement, run `rw-server doctor` and verify the relay security check,
+then exercise provider credential generation/revocation, exact-hash cold
+fallback, restart recovery, kill switch, metered-network pause, per-user and
+global quotas, cost threshold, and two-client role isolation. Provider DNS is
+freshly resolved and pinned per request while preserving the TLS hostname;
+redirects and proxy discovery are disabled. Never loosen this to accept a raw
+URL or provider error body.
+
+The durable relay state contains advertisements, accounting, full reserved
+usage, terminal/revocation fingerprints, and popularity only. It contains no
+TURN username/password, API token, provider allocation, peer address, payload,
+or signing key. Back it up like accounting state, but do not attempt to resume
+pre-crash sessions: restart must fail/revoke them and conservatively charge the
+full reservation.
+
+Monitor `rw_community_relay_sessions_issued`,
+`rw_community_relay_lookup_fallbacks`, `rw_community_relay_completions`,
+`rw_community_relay_failures`, `rw_community_relay_promotion_signals`, and
+`rw_community_relay_kill_switch`. Operator status is authenticated, no-store,
+and deliberately exposes only coarse counters. In a privacy, abuse, provider,
+or cost incident set `RW_COMMUNITY_RELAY_KILL_SWITCH=true` and restart, or use
+the operator kill endpoint. Normal R2/Hetzner HTTPS access remains available.
 
 ## Scheduler operations
 
@@ -185,6 +265,19 @@ allow its cooperative shutdown timeout to expire before forcing termination.
 Interrupted running jobs are recovered from durable state on restart. The API
 may continue serving already published immutable runs while the scheduler is
 stopped.
+
+For a bounded public Hetzner origin, enable `[origin_catalog]` only after the
+scheduler and server share the same audited `store_root`. The scheduler writes
+`.rw-origin-catalog.json`; the server validates that closed document and every
+referenced snapshot before publishing active plus one previous generation. A
+missing, stale, malformed, or inconsistent catalog makes readiness and all
+operational catalog/query endpoints return 503 without scanning other runs.
+Inspect the authenticated, no-store `GET /v1/origin-catalog/status` response for
+coarse state and counts. It deliberately omits paths, model/run identities, and
+validation errors. `RW_ORIGIN_CATALOG_ENABLED`,
+`RW_ORIGIN_CATALOG_REFRESH_SECONDS`, and
+`RW_ORIGIN_CATALOG_MAX_AGE_SECONDS` override the corresponding file settings.
+See `docs/ORIGIN_CATALOG.md` for startup, replacement, and recovery behavior.
 
 Scheduler retention considers only scheduler-owned run IDs and revalidates the
 root, ownership marker, path, and writer lock immediately before mutation. It

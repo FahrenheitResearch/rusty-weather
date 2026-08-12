@@ -1,7 +1,8 @@
 # Rusty Weather public-origin federation v1
 
-Status: implemented discovery, bounded active health monitoring, and failover
-selection. Network replication is not enabled by this contract.
+Status: implemented signed discovery, bounded active health monitoring,
+deterministic selection, and default-off authoritative data failover. Full-run
+replication remains a separate advanced contract.
 
 Public-origin federation is conventional HTTPS discovery for institutions and
 operators who deliberately publish a Rusty Weather service address. It is not
@@ -83,20 +84,22 @@ Current operational BowEcho data remains:
 2. R2/CDN immutable hot object when materialized;
 3. the authoritative Rusty Weather HTTPS origin for a dynamic miss.
 
-Federated public origins are a later archival/failover option, not a peer tier
-inserted into current operational access. A client verifies the catalog and
-descriptor chains, matches exact model/product/query/geographic capability and
-quota, then uses conventional HTTPS. Hosted R2 and the current authoritative
-origin retain priority unless the product policy explicitly selects archival
-federation.
+Federated public origins are an explicit authority-mediated failover option,
+not a peer tier inserted into current operational access. BowEcho may inspect
+the signed public catalog, but sends an exact request only to the authoritative
+`POST /v1/federation/objects/resolve` endpoint. The authority selects an
+approved origin and uses its own origin-scoped credential over conventional
+HTTPS; BowEcho never receives that credential or connects directly.
 
-The server exposes a bounded selection seam used by future clients/operators.
-It filters exact capability, requested bounds, response-size quota, and (when
-required) replication opt-in. Repeated health failures temporarily quarantine
-an origin; healthy observations reset it; ordering is deterministic and output
-count is capped. A failed public origin advances to the next selected origin or
-an honest unavailable result. It never falls through to an ordinary user's
-address.
+The server filters exact capability, requested bounds, response-size quota,
+and (when required) replication opt-in. Repeated health failures temporarily
+quarantine an origin; healthy observations reset it; ordering and failover are
+deterministic and bounded. The dedicated upstream `resolve-local` route can
+consult only that origin's CAS, R2, and published store, so cyclic federation
+cannot recurse. A failed public origin advances to the next candidate or an
+honest unavailable result. It never falls through to an ordinary user's
+address. The exact proxy, verification, credential, and deployment contract is
+documented in `FEDERATION_PROXY.md`.
 
 Community Cache remains a separate cold immutable-object mechanism for
 ordinary opted-in users. Those transfers are encrypted and relay-mediated, and

@@ -13,17 +13,29 @@
 
 #![forbid(unsafe_code)]
 
+mod broker;
+mod client;
 mod control;
 mod crypto;
 mod data_plane;
 mod provider;
 mod route;
 
+pub use broker::*;
+pub use client::*;
 pub use control::*;
 pub use crypto::*;
 pub use data_plane::*;
 pub use provider::*;
 pub use route::*;
+
+/// Conservative plaintext carried by one encrypted TURN/UDP datagram. The
+/// exact worst-case compact JSON envelope remains below 1,200 bytes, avoiding
+/// dependence on IPv4/IPv6 fragmentation on ordinary Internet paths.
+pub const RELAY_PLAINTEXT_CHUNK_BYTES: u32 = 512;
+/// Absolute serialized application-datagram ceiling, including the JSON and
+/// base64 expansion around ciphertext. No transport path may exceed it.
+pub const MAX_RELAY_WIRE_DATAGRAM_BYTES: usize = 1_200;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

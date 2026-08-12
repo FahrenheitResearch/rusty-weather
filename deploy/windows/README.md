@@ -9,7 +9,12 @@ repository, verify its published checksum, rename it to
 - `rusty-weather.toml`
 
 Create `data\store`, `data\artifacts`, `logs`, and `secrets`. Put one random
-API token of at least 32 bytes per line in `secrets\api-tokens.txt`.
+API token of at least 32 bytes per line in `secrets\api-tokens.txt`. If a
+distributed feature is explicitly enabled, also create only the corresponding
+`data\community-cache`, `data\federation`, or
+`data\generation-replication` control directory. These are service state, not
+arbitrary upload directories, and `data\store` remains read-only to the API in
+normal scheduler-origin mode.
 
 The template runs as the built-in NetworkService identity. From an elevated
 PowerShell prompt in the install directory, grant that identity read/execute
@@ -25,8 +30,25 @@ logs. Then replace the token DACL with entries for NetworkService and SYSTEM:
     icacls .\secrets\api-tokens.txt /grant:r "${serviceSid}:(R)" "${systemSid}:(F)"
     icacls .\secrets\api-tokens.txt
 
-The last command must not show access for Users, Authenticated Users, or
-Everyone. Adapt the service SID if the XML is changed to a dedicated account.
+For each enabled distributed feature, grant `NetworkService` modify access to
+that feature's control directory only. Replication is the one advanced mode
+that also requires write access to `data\store`; grant it only after the
+capacity/security gates and publication-source policy have been reviewed:
+
+    icacls .\data\community-cache /grant:r "${serviceSid}:(OI)(CI)(M)"
+    icacls .\data\federation /grant:r "${serviceSid}:(OI)(CI)(M)"
+    icacls .\data\generation-replication /grant:r "${serviceSid}:(OI)(CI)(M)"
+    # Advanced replication-only/union origin:
+    # icacls .\data\store /grant:r "${serviceSid}:(OI)(CI)(M)"
+
+Keep Community, relay, federation, and generation signing keys plus provider
+tokens as separate regular files under `secrets`. Remove inherited ACLs and
+grant read only to `NetworkService` and full control to `SYSTEM`, using the
+same pattern as `api-tokens.txt`; never put secret text in the XML or TOML.
+
+The token ACL inspection command must not show access for Users, Authenticated
+Users, or Everyone. Adapt the service SID if the XML is changed to a dedicated
+account.
 Rust's portable file APIs cannot evaluate Windows DACLs, so rw-server doctor
 checks token structure and readability but does **not** enforce this Windows ACL
 policy. The installer/operator must review it with icacls or Get-Acl.

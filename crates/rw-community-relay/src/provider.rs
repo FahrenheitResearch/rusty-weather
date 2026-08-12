@@ -159,6 +159,40 @@ impl fmt::Debug for ProviderRelayAccess {
 }
 
 impl ProviderRelayAccess {
+    /// Consume the already bounded broker wire value into the transport-only
+    /// credential type. The initial deployment deliberately accepts only the
+    /// audited Cloudflare TURN host/port matrix; STUN, literal-IP, unknown
+    /// hosts, arbitrary ports and unsupported schemes fail closed.
+    pub fn from_broker_wire(
+        mut wire: crate::RelayTurnAccessWire,
+        now_unix: i64,
+        credential_expires_unix: i64,
+    ) -> Result<Self, RelayError> {
+        wire.validate(now_unix, credential_expires_unix)?;
+        let adapter = CloudflareTurnAdapter::default();
+        let mut endpoints = wire
+            .urls
+            .iter()
+            .map(|url| parse_turn_url(url, &adapter.allowed_hosts))
+            .collect::<Result<Vec<_>, _>>()?;
+        endpoints.sort_by(|left, right| left.canonical.cmp(&right.canonical));
+        endpoints.dedup_by(|left, right| left.canonical == right.canonical);
+        if endpoints.is_empty()
+            || !endpoints.iter().any(|endpoint| {
+                endpoint.scheme == TurnScheme::Turn
+                    && endpoint.transport == Some(TurnTransport::Udp)
+            })
+        {
+            return Err(RelayError::TransportUnavailable);
+        }
+        Ok(Self {
+            endpoints,
+            username: SecretText::new(std::mem::take(&mut wire.username))?,
+            credential: SecretText::new(std::mem::take(&mut wire.credential))?,
+            expires_unix: wire.expires_unix,
+        })
+    }
+
     pub fn endpoints(&self) -> &[TurnEndpoint] {
         &self.endpoints
     }
@@ -501,6 +535,35 @@ mod tests {
                 Err(RelayError::ProviderRejected)
             ));
         }
+    }
+
+    #[test]
+    fn broker_wire_becomes_only_redacted_sanitized_turn_access() {
+        let wire = crate::RelayTurnAccessWire {
+            urls: vec![
+                "turn:turn.cloudflare.com:3478?transport=udp".into(),
+                "turns:turn.cloudflare.com:5349?transport=tcp".into(),
+            ],
+            username: "short-lived-user".into(),
+            credential: "short-lived-secret".into(),
+            expires_unix: 700,
+        };
+        let access = ProviderRelayAccess::from_broker_wire(wire, 100, 700).unwrap();
+        assert_eq!(access.endpoints().len(), 2);
+        assert_eq!(access.username().expose(), "short-lived-user");
+        let rendered = format!("{access:?}");
+        assert!(!rendered.contains("short-lived"));
+        assert!(!rendered.contains("turn.cloudflare.com"));
+
+        let unsafe_wire = crate::RelayTurnAccessWire {
+            urls: vec!["turn:peer.example:3478?transport=udp".into()],
+            username: "secret-user".into(),
+            credential: "secret-password".into(),
+            expires_unix: 700,
+        };
+        let error = ProviderRelayAccess::from_broker_wire(unsafe_wire, 100, 700).unwrap_err();
+        assert_eq!(error, RelayError::ProviderRejected);
+        assert!(!error.to_string().contains("peer.example"));
     }
 
     #[test]

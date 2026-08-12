@@ -1179,6 +1179,33 @@ fn retention_executes_only_marked_scheduler_owned_runs() {
 }
 
 #[test]
+fn scheduler_never_claims_or_retains_an_unowned_generation_directory() {
+    let dir = test_dir("retention-unowned-generation");
+    let store_root = dir.join("store");
+    let plan = JobPlan::build(ModelId::Rtma, cycle("20260730", 18)).unwrap();
+    let mut record = JobRecord::new(plan, 1).unwrap();
+    record.state = JobState::Failed { finished_unix: 2 };
+    record.attempts = 1;
+    record.last_error = Some("terminal".to_string());
+    let run_dir = store_root
+        .join(record.plan.model.as_str())
+        .join(&record.plan.run_id);
+    fs::create_dir_all(&run_dir).unwrap();
+    fs::write(run_dir.join("run.json"), b"replication-owned-placeholder").unwrap();
+
+    assert!(matches!(
+        crate::retention::ensure_owner_marker(&run_dir, &record),
+        Err(SchedulerError::InvalidState(detail)) if detail.contains("without scheduler ownership")
+    ));
+    assert!(!run_dir.join(crate::retention::OWNER_FILE).exists());
+
+    let retention = plan_owned_retention(&[record.clone()], &BTreeSet::new(), 0).unwrap();
+    assert!(execute_retention(&store_root, &[record], &retention, false).is_err());
+    assert!(run_dir.join("run.json").is_file());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn applied_retention_can_prune_state_for_an_already_absent_run() {
     let dir = test_dir("retention-absent-state");
     let store_root = dir.join("store");

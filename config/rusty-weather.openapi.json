@@ -615,6 +615,101 @@
       }
     },
     "/v1/community/cases": {
+      "get": {
+        "tags": [
+          "community"
+        ],
+        "description": "Return a cursor-bounded directory containing only deliberate, complete origin-signed case-room publications. Passive searches never appear. Responses are private and no-store.",
+        "operationId": "community_list_cases_doc",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Opaque last case id from the previous page",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size from 1 through 100; default 50",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Strictly ordered signed case-room page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommunityCaseDirectoryPageDoc"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Cursor or limit is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A stored case or referenced artifact failed verification",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Community download quota reached",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Case rooms are disabled, killed, or service is busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
       "post": {
         "tags": [
           "community"
@@ -966,6 +1061,832 @@
         ]
       }
     },
+    "/v1/community/generation-replication/operator/gc": {
+      "post": {
+        "tags": [
+          "operations"
+        ],
+        "description": "Run one bounded collection pass that terminally expires due publications before retiring their local generations, then removes expired uploads, unreferenced chunks, stale candidates, and orphan signed manifests.",
+        "operationId": "generation_replication_gc_doc",
+        "responses": {
+          "200": {
+            "description": "Coarse bounded collection counts; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationGarbageCollectionResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller is not a configured replication operator",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Collection is unavailable or busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/generation-replication/operator/kill-switch": {
+      "post": {
+        "tags": [
+          "operations"
+        ],
+        "operationId": "generation_replication_kill_switch_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplicationKillSwitchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Durably updated coarse status; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller is not a configured replication operator",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Kill-switch schema rejected",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Kill state could not be committed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/generation-replication/operator/status": {
+      "get": {
+        "tags": [
+          "operations"
+        ],
+        "description": "Return authorized and pending-retirement counts, byte totals, health, and kill state only; never owner IDs, generations, paths, URLs, models, or runs.",
+        "operationId": "generation_replication_operator_status_doc",
+        "responses": {
+          "200": {
+            "description": "Coarse replication status; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller is not a configured replication operator",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Replication is unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/generation-replication/owner": {
+      "get": {
+        "tags": [
+          "generation-replication"
+        ],
+        "description": "Return only this authenticated caller's replication-domain owner hash for constructing an owner-bound manifest. No bearer token or other owner is exposed.",
+        "operationId": "generation_replication_owner_doc",
+        "responses": {
+          "200": {
+            "description": "Caller-specific owner identity; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicationOwnerResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Advanced replication is disabled",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/generations": {
+      "post": {
+        "tags": [
+          "generation-replication"
+        ],
+        "description": "Begin or idempotently resume one exact closed run-generation upload. Private WRF/ArWen requires explicit owner publication, confirmed redistribution rights, attribution, and modification notices.",
+        "operationId": "generation_replication_begin_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BeginRunGenerationRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Bounded resumable upload admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunGenerationUploadStatusDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Generation identity conflicts with durable state",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Manifest body exceeds the configured JSON limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Manifest, owner, rights, provenance, attribution, schema, or limits failed closed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Owner or global quota reached",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Feature disabled, killed, busy, or unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/generations/{generation_id}": {
+      "get": {
+        "tags": [
+          "generation-replication"
+        ],
+        "operationId": "generation_replication_status_doc",
+        "parameters": [
+          {
+            "name": "generation_id",
+            "in": "path",
+            "description": "Owner-bound canonical generation id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Owned upload status; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunGenerationUploadStatusDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller does not own this generation",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Upload not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Feature disabled, killed, busy, or unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/generations/{generation_id}/chunks/{sha256}": {
+      "post": {
+        "tags": [
+          "generation-replication"
+        ],
+        "description": "Upload one exact non-empty manifest-declared SHA-256 chunk. Content-Type must be exactly application/octet-stream.",
+        "operationId": "generation_replication_upload_doc",
+        "parameters": [
+          {
+            "name": "generation_id",
+            "in": "path",
+            "description": "Owner-bound canonical generation id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sha256",
+            "in": "path",
+            "description": "Lowercase exact chunk SHA-256",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Exact chunk admitted; private no-store"
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller does not own this generation",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Chunk exceeds its route-specific configured maximum",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Content-Type is absent or not exactly application/octet-stream",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Empty, malformed, undeclared, wrong-size, or wrong-hash chunk rejected",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Monthly upload quota reached",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Feature disabled, killed, busy, or unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/generations/{generation_id}/finalize": {
+      "post": {
+        "tags": [
+          "generation-replication"
+        ],
+        "operationId": "generation_replication_finalize_doc",
+        "parameters": [
+          {
+            "name": "generation_id",
+            "in": "path",
+            "description": "Owner-bound canonical generation id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FinalizeRunGenerationRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Deep-validated generation atomically published",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublishedRunGenerationDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller does not own this generation",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A scheduler-owned or different generation occupies the namespace",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Missing/tampered chunks or deep rw-store validation failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Feature disabled, killed, busy, or unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/generations/{generation_id}/missing": {
+      "get": {
+        "tags": [
+          "generation-replication"
+        ],
+        "operationId": "generation_replication_missing_doc",
+        "parameters": [
+          {
+            "name": "generation_id",
+            "in": "path",
+            "description": "Owner-bound canonical generation id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Exact previous chunk SHA-256 cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Bounded page size, maximum 1024",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact missing content-addressed chunks; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunGenerationMissingPageDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller does not own this generation",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Upload not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Cursor or page limit rejected",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Feature disabled, killed, busy, or unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/generations/{generation_id}/revoke": {
+      "post": {
+        "tags": [
+          "generation-replication"
+        ],
+        "operationId": "generation_replication_revoke_doc",
+        "parameters": [
+          {
+            "name": "generation_id",
+            "in": "path",
+            "description": "Owner-bound canonical generation id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevokeRunGenerationRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Durable owner-bound rights-withdrawal tombstone",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunGenerationTombstoneDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller does not own this generation",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Owned publication not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Revocation identity or confirmation rejected",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Feature disabled, killed, busy, or unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/v1/community/objects/resolve": {
       "post": {
         "tags": [
@@ -1223,6 +2144,782 @@
         ]
       }
     },
+    "/v1/community/relay/advertisements": {
+      "post": {
+        "tags": [
+          "community"
+        ],
+        "description": "Advertise one exact cold immutable object from an origin-signed manifest. This opt-in endpoint accepts no arbitrary file, raw directory, private unpublished run, seed listing, address, or direct candidate.",
+        "operationId": "relay_advertise_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelayAdvertisementRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Durably accepted advertisement",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelayAdvertisementReceiptDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Manifest, rights, category, signature, or schema rejected",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Storage, upload, metered-network, concurrency, or cost policy denied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Relay disabled, killed, or durable state unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/relay/grants/next": {
+      "post": {
+        "tags": [
+          "community"
+        ],
+        "description": "Poll only the authenticated caller's oldest uploader grant. There is no session, seed, peer, account, or address directory.",
+        "operationId": "relay_next_grant_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelayGrantPollRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Caller-specific participant grant; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ParticipantRelayGrantDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No grant exists for this authenticated principal",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Relay unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/relay/historical/lookups": {
+      "post": {
+        "tags": [
+          "community"
+        ],
+        "description": "Resolve only an exact cold historical origin-signed hash. `historical` must be true; current operational local → R2 → Hetzner traffic never invokes this endpoint. A miss immediately selects archival HTTPS or honest unavailable fallback.",
+        "operationId": "relay_historical_lookup_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HistoricalRelayLookupRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Caller-specific downloader grant or immediate fallback; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HistoricalRelayLookupResponseDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Not an exact cold historical request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Download, concurrency, metered-network, or cost policy denied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Relay/provider unavailable; continue immediately to archival HTTPS/unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/relay/operator/kill-switch": {
+      "post": {
+        "tags": [
+          "operations"
+        ],
+        "description": "Immediately stop admissions, clear ephemeral dispatch/routes, revoke active sessions, and durably record the relay kill switch. Access is restricted to configured authenticated-principal digests.",
+        "operationId": "relay_kill_switch_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelayKillSwitchRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Redacted relay status; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelayStatusResponseDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller is not a configured relay operator",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Kill state could not be durably committed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/relay/operator/status": {
+      "get": {
+        "tags": [
+          "operations"
+        ],
+        "description": "Return coarse counters and gates only. No session, seed, participant, credential, route, address, or user identity is exposed.",
+        "operationId": "relay_status_doc",
+        "responses": {
+          "200": {
+            "description": "Redacted relay status; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelayStatusResponseDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller is not a configured relay operator",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Relay unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/relay/routes": {
+      "post": {
+        "tags": [
+          "community"
+        ],
+        "description": "Register only this participant's own TURN `local_addr()` after subject/role/credential/key binding and an operator-audited provider-allocation CIDR check. Host, server-reflexive, private, STUN, ICE, and direct candidates are forbidden. The address is transport-private and the response is no-store.",
+        "operationId": "relay_register_route_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelayRouteRegistrationRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Route registration receipt without any address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelayRouteRegistrationReceiptDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Participant credential does not belong to caller",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Route, role, offer, binding, or replay rejected",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Relay or audited route gate unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/relay/sessions/complete": {
+      "post": {
+        "tags": [
+          "community"
+        ],
+        "description": "Durably record successful receipt. Only the authenticated downloader credential may complete a session; full conservative reservation accounting is retained.",
+        "operationId": "relay_complete_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelaySessionCompletionRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Durable terminal result and optional R2 promotion signal",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelayTerminalResponseDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Credential does not belong to caller/downloader",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Completion size, state, or credential rejected",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Terminal state could not be durably committed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/relay/sessions/fail": {
+      "post": {
+        "tags": [
+          "community"
+        ],
+        "description": "Durably fail and revoke a caller-owned participant session, then return immediate archival HTTPS/unavailable fallback.",
+        "operationId": "relay_fail_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelaySessionFailureRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Durable terminal fallback",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelayTerminalResponseDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Credential does not belong to caller",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Terminal state could not be durably committed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/relay/sessions/revoke": {
+      "post": {
+        "tags": [
+          "community"
+        ],
+        "description": "Explicitly revoke a caller-owned participant session and return immediate archival HTTPS/unavailable fallback.",
+        "operationId": "relay_revoke_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelaySessionFailureRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Durable terminal fallback",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelayTerminalResponseDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Credential does not belong to caller",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Terminal state could not be durably committed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/relay/sessions/{session_id}/grants/{role}": {
+      "post": {
+        "tags": [
+          "community"
+        ],
+        "description": "Retrieve one exact participant grant only when the authenticated caller owns that session role.",
+        "operationId": "relay_session_grant_doc",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "description": "Opaque relay session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role",
+            "in": "path",
+            "description": "uploader or downloader",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Caller-specific participant grant; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ParticipantRelayGrantDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No matching caller-owned grant",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Relay unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/relay/transport": {
+      "post": {
+        "tags": [
+          "community"
+        ],
+        "description": "Return only the authenticated participant's counterpart TURN-provider allocation and signed end-to-end key transcript. It never returns a peer host/server-reflexive/direct address, combined grants, or account identity; response bodies are private no-store and excluded from logs.",
+        "operationId": "relay_transport_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelayTransportGrantRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Participant-specific transport-private relay route",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RelayTransportGrantDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Participant credential does not belong to caller",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Counterpart TURN allocation is not ready",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Relay unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/v1/federation/health": {
       "get": {
         "tags": [
@@ -1275,6 +2972,260 @@
         "security": [
           {
             "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/federation/objects/resolve": {
+      "post": {
+        "tags": [
+          "federation"
+        ],
+        "description": "Ask the authoritative Rusty Weather server to try bounded deterministic failover across operator-approved public origins. The authority alone holds origin-scoped credentials, verifies exact request identity, descriptor object keys, expiry, hash, size, schema, provenance, and attribution, then re-signs and stages the object under its normal immutable contract. A one-hop header is rejected here to prevent recursion.",
+        "operationId": "federation_proxy_resolve_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FederationProxyRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Authority-signed immutable object manifest; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommunityResolveResponseDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "BowEcho bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No approved healthy origin has the exact object",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request, hint, signature, object identity, provenance, schema, or one-hop boundary rejected",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-principal federation quota exhausted",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Proxy disabled, killed, unavailable, or staging failed; caller must continue normal authority fallback",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Bounded authority work exceeded its deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/federation/objects/resolve-local": {
+      "post": {
+        "tags": [
+          "federation"
+        ],
+        "description": "Origin-to-authority one-hop resolver. Requires the dedicated origin token and exactly `X-Rusty-Federation-Hop: 1`; consults only this node's CAS, R2, and local published store and never invokes federation or Community relay.",
+        "operationId": "federation_local_resolve_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommunityResolveRequestDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Origin-signed exact immutable object manifest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommunityResolveResponseDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Dedicated federation-origin bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Exact object is not retained or locally computable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Canonical request or one-hop boundary rejected",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Local-only resolver unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "federation_origin_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/federation/objects/{sha256}": {
+      "get": {
+        "tags": [
+          "federation"
+        ],
+        "description": "Fetch bytes referenced by the immediately preceding one-hop signed manifest. Requires the dedicated origin token; ordinary BowEcho tokens are rejected.",
+        "operationId": "federation_local_object_doc",
+        "parameters": [
+          {
+            "name": "sha256",
+            "in": "path",
+            "description": "Lowercase SHA-256 from the signed object manifest",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Verified immutable encoded object",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Dedicated federation-origin bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Object is absent, expired, revoked, or invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Origin data quota exhausted",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Local immutable store unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "federation_origin_auth": []
           }
         ]
       }
@@ -1426,6 +3377,158 @@
           },
           "504": {
             "description": "Descriptor verification exceeded its deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/federation/proxy/operator/kill-switch": {
+      "post": {
+        "tags": [
+          "operations"
+        ],
+        "description": "Durably engage or disengage public-origin proxy transfers. Engaging stops transport before persistence; disengaging never reopens transport until the atomic control state is durable.",
+        "operationId": "federation_proxy_kill_switch_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FederationProxyKillSwitchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Durably updated coarse status; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FederationProxyStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller is not a configured federation proxy operator",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Kill-switch schema rejected",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Kill state could not be durably committed and proxy remains stopped",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Control update exceeded its deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/federation/proxy/operator/status": {
+      "get": {
+        "tags": [
+          "operations"
+        ],
+        "description": "Return only enabled, durable-persistence health, and runtime kill state. No principal, origin, URL, address, credential, request, or quota identity is exposed.",
+        "operationId": "federation_proxy_operator_status_doc",
+        "responses": {
+          "200": {
+            "description": "Coarse federation proxy status; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FederationProxyStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller is not a configured federation proxy operator",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Federation proxy control is unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Status retrieval exceeded its deadline",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2429,6 +4532,62 @@
             }
           }
         }
+      }
+    },
+    "/v1/origin-catalog/status": {
+      "get": {
+        "tags": [
+          "operations"
+        ],
+        "description": "Return a coarse publication-gate state without paths, model names, run IDs, aliases, or validation errors.",
+        "operationId": "origin_catalog_status_doc",
+        "responses": {
+          "200": {
+            "description": "Address- and identity-free origin publication status; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OriginCatalogHealthStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Status worker is unavailable or shutdown is in progress",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Status retrieval exceeded its deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
       }
     },
     "/v1/point": {
@@ -3524,6 +5683,21 @@
           }
         }
       },
+      "BeginRunGenerationRequestDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "manifest"
+        ],
+        "properties": {
+          "manifest": {
+            "$ref": "#/components/schemas/RunGenerationManifestDoc"
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
       "CategoricalSummaryGridResponse": {
         "type": "object",
         "required": [
@@ -3712,6 +5886,30 @@
           "retain_until_unix": {
             "type": "integer",
             "format": "int64"
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "CommunityCaseDirectoryPageDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "cases"
+        ],
+        "properties": {
+          "cases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SignedCommunityCaseManifestDoc"
+            }
+          },
+          "next_after": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "schema": {
             "type": "string"
@@ -4177,6 +6375,82 @@
             "format": "int64"
           },
           "state": {
+            "type": "string"
+          }
+        }
+      },
+      "FederationProxyKillSwitchRequest": {
+        "type": "object",
+        "required": [
+          "schema",
+          "engaged"
+        ],
+        "properties": {
+          "engaged": {
+            "type": "boolean"
+          },
+          "schema": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "FederationProxyRequestDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "request"
+        ],
+        "properties": {
+          "preferred_origin_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional preference among origins already admitted by signed policy."
+          },
+          "request": {
+            "description": "Exact canonical ShareRequest; mutable aliases are forbidden."
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "FederationProxyStatusResponse": {
+        "type": "object",
+        "required": [
+          "schema",
+          "enabled",
+          "kill_switch",
+          "persistence_healthy"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "kill_switch": {
+            "type": "boolean"
+          },
+          "persistence_healthy": {
+            "type": "boolean"
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "FinalizeRunGenerationRequestDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "generation_sha256"
+        ],
+        "properties": {
+          "generation_sha256": {
+            "type": "string"
+          },
+          "schema": {
             "type": "string"
           }
         }
@@ -4653,6 +6927,57 @@
           }
         }
       },
+      "HistoricalRelayLookupRequestDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "historical",
+          "object_sha256",
+          "opted_in",
+          "download_allowance_bytes"
+        ],
+        "properties": {
+          "download_allowance_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "historical": {
+            "type": "boolean"
+          },
+          "object_sha256": {
+            "type": "string"
+          },
+          "opted_in": {
+            "type": "boolean"
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "HistoricalRelayLookupResponseDoc": {
+        "type": "object",
+        "required": [
+          "schema"
+        ],
+        "properties": {
+          "fallback": {},
+          "participant_grant": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ParticipantRelayGrantDoc"
+              }
+            ]
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
       "IndexWindowResponse": {
         "type": "object",
         "required": [
@@ -5074,6 +7399,103 @@
           }
         }
       },
+      "OriginCatalogHealthStatus": {
+        "type": "object",
+        "description": "Coarse, address- and identity-free state suitable for readiness/operator\nstatus. It intentionally omits paths, model names, run IDs, and errors.",
+        "required": [
+          "schema",
+          "enabled",
+          "ready",
+          "state",
+          "publication_sources",
+          "scheduler_ready",
+          "replication_ready",
+          "published_models",
+          "published_runs"
+        ],
+        "properties": {
+          "catalog_updated_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "last_reload_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "publication_sources": {
+            "$ref": "#/components/schemas/PublicationSourceMode"
+          },
+          "published_models": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "published_runs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "replication_ready": {
+            "type": "boolean"
+          },
+          "scheduler_ready": {
+            "type": "boolean"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          }
+        }
+      },
+      "ParticipantRelayGrantDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "session_id",
+          "object_sha256",
+          "encoded_size",
+          "role",
+          "candidate",
+          "credential",
+          "turn"
+        ],
+        "properties": {
+          "candidate": {},
+          "credential": {},
+          "encoded_size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "object_sha256": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "turn": {
+            "$ref": "#/components/schemas/RelayTurnAccessDoc"
+          }
+        }
+      },
       "PointQueryRequest": {
         "type": "object",
         "required": [
@@ -5457,6 +7879,58 @@
           }
         }
       },
+      "PublicationSourceMode": {
+        "type": "string",
+        "enum": [
+          "scheduler",
+          "replication",
+          "union"
+        ]
+      },
+      "PublishedRunGenerationDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "generation_id",
+          "generation_sha256",
+          "source_snapshot_id",
+          "local_snapshot_id",
+          "grid_hash",
+          "model",
+          "run",
+          "published_unix"
+        ],
+        "properties": {
+          "generation_id": {
+            "type": "string"
+          },
+          "generation_sha256": {
+            "type": "string"
+          },
+          "grid_hash": {
+            "type": "string"
+          },
+          "local_snapshot_id": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "published_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "run": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "source_snapshot_id": {
+            "type": "string"
+          }
+        }
+      },
       "RateSummaryGridResponse": {
         "type": "object",
         "required": [
@@ -5577,6 +8051,459 @@
           }
         }
       },
+      "RelayAdvertisementReceiptDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "advertisement_id",
+          "object_sha256",
+          "expires_unix"
+        ],
+        "properties": {
+          "advertisement_id": {
+            "type": "string"
+          },
+          "expires_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "object_sha256": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "RelayAdvertisementRequestDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "signed_manifest",
+          "opted_in",
+          "categories",
+          "disk_allowance_bytes",
+          "upload_allowance_bytes",
+          "metered_network",
+          "allow_metered_seeding"
+        ],
+        "properties": {
+          "allow_metered_seeding": {
+            "type": "boolean"
+          },
+          "categories": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "disk_allowance_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "metered_network": {
+            "type": "boolean"
+          },
+          "opted_in": {
+            "type": "boolean"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "signed_manifest": {
+            "$ref": "#/components/schemas/SignedCommunityObjectManifestDoc"
+          },
+          "upload_allowance_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "RelayGrantPollRequestDoc": {
+        "type": "object",
+        "required": [
+          "schema"
+        ],
+        "properties": {
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "RelayKillSwitchRequestDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "RelayRouteRegistrationReceiptDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "session_id",
+          "role",
+          "binding_ready"
+        ],
+        "properties": {
+          "binding_ready": {
+            "type": "boolean"
+          },
+          "role": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        }
+      },
+      "RelayRouteRegistrationRequestDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "credential",
+          "offer",
+          "turn_local_addr"
+        ],
+        "properties": {
+          "credential": {},
+          "offer": {},
+          "schema": {
+            "type": "string"
+          },
+          "turn_local_addr": {
+            "type": "string",
+            "description": "This participant's own provider allocation returned by TURN. It is\ntransport-private, never a host/server-reflexive/direct candidate."
+          }
+        }
+      },
+      "RelaySessionCompletionRequestDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "credential",
+          "transferred_bytes"
+        ],
+        "properties": {
+          "credential": {},
+          "schema": {
+            "type": "string"
+          },
+          "transferred_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "RelaySessionFailureRequestDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "role",
+          "credential"
+        ],
+        "properties": {
+          "credential": {},
+          "role": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "RelayStatusResponseDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "enabled",
+          "kill_switch",
+          "persistence_healthy",
+          "transport_route_gate_configured",
+          "sessions_issued",
+          "sessions_completed",
+          "sessions_failed",
+          "promotion_signals"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "kill_switch": {
+            "type": "boolean"
+          },
+          "persistence_healthy": {
+            "type": "boolean"
+          },
+          "promotion_signals": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "schema": {
+            "type": "string"
+          },
+          "sessions_completed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "sessions_failed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "sessions_issued": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "transport_route_gate_configured": {
+            "type": "boolean"
+          }
+        }
+      },
+      "RelayTerminalResponseDoc": {
+        "type": "object",
+        "required": [
+          "promotion_requested"
+        ],
+        "properties": {
+          "fallback": {},
+          "promotion_requested": {
+            "type": "boolean"
+          }
+        }
+      },
+      "RelayTransportGrantDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "session_id",
+          "role",
+          "peer_relay_allocation",
+          "signed_binding"
+        ],
+        "properties": {
+          "peer_relay_allocation": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "signed_binding": {}
+        }
+      },
+      "RelayTransportGrantRequestDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "role",
+          "credential"
+        ],
+        "properties": {
+          "credential": {},
+          "role": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "RelayTurnAccessDoc": {
+        "type": "object",
+        "required": [
+          "urls",
+          "username",
+          "credential",
+          "expires_unix"
+        ],
+        "properties": {
+          "credential": {
+            "type": "string"
+          },
+          "expires_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "urls": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "username": {
+            "type": "string"
+          }
+        }
+      },
+      "ReplicationGarbageCollectionResponse": {
+        "type": "object",
+        "required": [
+          "schema",
+          "expired_uploads",
+          "expired_publications",
+          "retired_generations",
+          "pending_retirements",
+          "orphan_chunks",
+          "orphan_manifests",
+          "stale_candidates"
+        ],
+        "properties": {
+          "expired_publications": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "expired_uploads": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "orphan_chunks": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "orphan_manifests": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pending_retirements": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "retired_generations": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "schema": {
+            "type": "string"
+          },
+          "stale_candidates": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ReplicationKillSwitchRequest": {
+        "type": "object",
+        "required": [
+          "schema",
+          "engaged"
+        ],
+        "properties": {
+          "engaged": {
+            "type": "boolean"
+          },
+          "schema": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ReplicationOwnerResponse": {
+        "type": "object",
+        "description": "The caller's replication-domain owner identifier. It is derived from the\nalready authenticated principal and reveals neither the bearer token nor\nany other owner's identity.",
+        "required": [
+          "schema",
+          "owner_principal_sha256"
+        ],
+        "properties": {
+          "owner_principal_sha256": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "ReplicationStatusResponse": {
+        "type": "object",
+        "required": [
+          "schema",
+          "enabled",
+          "kill_switch",
+          "healthy",
+          "active_uploads",
+          "published_generations",
+          "tombstones",
+          "pending_retirements",
+          "reserved_bytes",
+          "published_bytes",
+          "pending_retirement_bytes",
+          "monthly_accepted_upload_bytes"
+        ],
+        "properties": {
+          "active_uploads": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "healthy": {
+            "type": "boolean"
+          },
+          "kill_switch": {
+            "type": "boolean"
+          },
+          "monthly_accepted_upload_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "pending_retirement_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "pending_retirements": {
+            "type": "integer",
+            "description": "Terminal, non-public generations awaiting bounded physical cleanup.",
+            "minimum": 0
+          },
+          "published_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "published_generations": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reserved_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "schema": {
+            "type": "string"
+          },
+          "tombstones": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
       "ResolvedTemporalWindowResponse": {
         "type": "object",
         "required": [
@@ -5609,6 +8536,29 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "RevokeRunGenerationRequestDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "generation_sha256",
+          "rights_withdrawn",
+          "reason"
+        ],
+        "properties": {
+          "generation_sha256": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "rights_withdrawn": {
+            "type": "boolean"
+          },
+          "schema": {
+            "type": "string"
           }
         }
       },
@@ -5707,6 +8657,202 @@
             "items": {
               "$ref": "#/components/schemas/SourceProvenanceResponse"
             }
+          }
+        }
+      },
+      "RunGenerationManifestDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "generation_id",
+          "model",
+          "run",
+          "source_snapshot_id",
+          "grid_hash",
+          "owner_principal_sha256",
+          "publication",
+          "source_provenance",
+          "files",
+          "total_bytes",
+          "generation_sha256",
+          "published_unix",
+          "retain_until_unix",
+          "attributions",
+          "modification_notices"
+        ],
+        "properties": {
+          "attributions": {
+            "type": "array",
+            "items": {}
+          },
+          "files": {
+            "type": "array",
+            "items": {}
+          },
+          "generation_id": {
+            "type": "string"
+          },
+          "generation_sha256": {
+            "type": "string"
+          },
+          "grid_hash": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "modification_notices": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "owner_principal_sha256": {
+            "type": "string"
+          },
+          "publication": {},
+          "published_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "retain_until_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "run": {
+            "type": "string"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "source_provenance": {
+            "type": "array",
+            "items": {}
+          },
+          "source_snapshot_id": {
+            "type": "string"
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "RunGenerationMissingChunkDoc": {
+        "type": "object",
+        "required": [
+          "object_sha256",
+          "byte_size"
+        ],
+        "properties": {
+          "byte_size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "object_sha256": {
+            "type": "string"
+          }
+        }
+      },
+      "RunGenerationMissingPageDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "generation_id",
+          "chunks"
+        ],
+        "properties": {
+          "chunks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RunGenerationMissingChunkDoc"
+            }
+          },
+          "generation_id": {
+            "type": "string"
+          },
+          "next_after": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "RunGenerationTombstoneDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "generation_id",
+          "generation_sha256",
+          "owner_principal_sha256",
+          "revoked_unix",
+          "rights_withdrawn",
+          "reason"
+        ],
+        "properties": {
+          "generation_id": {
+            "type": "string"
+          },
+          "generation_sha256": {
+            "type": "string"
+          },
+          "owner_principal_sha256": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "revoked_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "rights_withdrawn": {
+            "type": "boolean"
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "RunGenerationUploadStatusDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "generation_id",
+          "generation_sha256",
+          "total_chunks",
+          "missing_chunks",
+          "upload_expires_unix"
+        ],
+        "properties": {
+          "generation_id": {
+            "type": "string"
+          },
+          "generation_sha256": {
+            "type": "string"
+          },
+          "missing_chunks": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "schema": {
+            "type": "string"
+          },
+          "total_chunks": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "upload_expires_unix": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -6741,6 +9887,12 @@
         "scheme": "bearer",
         "bearerFormat": "opaque",
         "description": "Token supplied by RW_API_TOKENS or RW_API_TOKEN_FILE"
+      },
+      "federation_origin_auth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque",
+        "description": "Dedicated per-origin token; ordinary BowEcho API tokens are rejected"
       }
     }
   },
@@ -6772,6 +9924,10 @@
     {
       "name": "federation",
       "description": "Operator-approved signed discovery for deliberately public institutional HTTPS origins"
+    },
+    {
+      "name": "generation-replication",
+      "description": "Advanced default-off owner publication of complete immutable rw-store generations"
     },
     {
       "name": "operations",

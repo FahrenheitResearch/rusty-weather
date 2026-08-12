@@ -107,10 +107,12 @@ There is no arbitrary-file, directory, raw-WRF, or full-run endpoint.
 Case artifacts are created only through a second off-by-default gate and a
 closed typed payload union: annotation, scalar table, fixed-coordinate overlay,
 or bounded PNG/WebP image. The authenticated principal must match the owner
-hash embedded in canonical request identity. Private WRF, ArWen, and
-user-provided artifacts require explicit owner publication, confirmed rights,
-attribution/license fields, source snapshot/grid identity, and bounded
-retention. Durable audit records and rights-withdrawal tombstones prevent
+hash embedded in canonical request identity. Every client-authored artifact is
+an explicit `PrivateWrf`, `PrivateArwen`, or `UserProvided` owner publication;
+the endpoint rejects `PublicProvider` claims rather than origin-signing
+client-asserted upstream identity. Confirmed rights, attribution/license fields,
+source snapshot/grid identity, and bounded retention are mandatory. Durable
+audit records and rights-withdrawal tombstones prevent
 another principal from publishing/revoking on the owner's behalf or reviving a
 withdrawn identity. Complete `.rws` generation inventory exists only as a
 disabled protocol contract; no raw file/wrfout/full-run HTTP upload exists.

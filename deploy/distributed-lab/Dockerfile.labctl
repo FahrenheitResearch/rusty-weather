@@ -1,0 +1,13 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+FROM rust:1.92-bookworm@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2 AS builder
+WORKDIR /src
+COPY . .
+RUN cargo build --locked --release \
+    --manifest-path deploy/distributed-lab/labctl/Cargo.toml
+
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+COPY --from=builder /src/deploy/distributed-lab/labctl/target/release/rw-distributed-labctl \
+    /usr/local/bin/rw-distributed-labctl
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/rw-distributed-labctl"]

@@ -5,6 +5,8 @@ members = [
     "crates/rw-glm",
     "crates/rw-gdex",
     "crates/rw-formula",
+    "crates/rw-federation-proxy",
+    "crates/rw-generation-replication",
     "crates/rw-ingest",
     "crates/rw-query",
     "crates/rw-server",

@@ -11,6 +11,8 @@ use crate::config::AuthConfig;
 
 const MAX_TOKEN_FILE_BYTES: u64 = 1024 * 1024;
 const MIN_TOKEN_BYTES: usize = 32;
+const TOKEN_DIGEST_DOMAIN: &[u8] = b"rw-bearer-token-digest-v1\0";
+const PRINCIPAL_HASH_DOMAIN: &[u8] = b"rw-authenticated-principal-v1\0";
 
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -62,6 +64,12 @@ impl TokenSet {
         Self::from_tokens(tokens)
     }
 
+    /// Load a dedicated, permission-restricted token file without consulting
+    /// the ordinary BowEcho API-token environment variable.
+    pub fn load_file(path: &Path) -> Result<Self, AuthError> {
+        Self::from_tokens(read_token_file(path)?)
+    }
+
     pub fn from_tokens<I, S>(tokens: I) -> Result<Self, AuthError>
     where
         I: IntoIterator<Item = S>,
@@ -98,6 +106,19 @@ impl TokenSet {
         bool::from(accepted)
     }
 
+    /// Compare two credential domains without retaining or exposing bearer
+    /// values. Digests are domain-separated from raw SHA-256 and quota
+    /// principal identities, and every pair is compared in constant time.
+    pub(crate) fn overlaps(&self, other: &Self) -> bool {
+        let mut overlap = Choice::from(0);
+        for left in &self.digests {
+            for right in &other.digests {
+                overlap |= left.ct_eq(right);
+            }
+        }
+        bool::from(overlap)
+    }
+
     pub fn verify_authorization_header(&self, value: Option<&HeaderValue>) -> bool {
         self.authorization_principal(value).is_some()
     }
@@ -110,7 +131,10 @@ impl TokenSet {
         if token.is_empty() || token.trim() != token || !self.verify(token) {
             return None;
         }
-        Some(format!("{:x}", Sha256::digest(token.as_bytes())))
+        let mut digest = Sha256::new();
+        digest.update(PRINCIPAL_HASH_DOMAIN);
+        digest.update(token.as_bytes());
+        Some(format!("{:x}", digest.finalize()))
     }
 }
 
@@ -145,8 +169,8 @@ fn validate_private_permissions(metadata: &fs::Metadata) -> Result<(), AuthError
 #[cfg(not(unix))]
 fn validate_private_permissions(_metadata: &fs::Metadata) -> Result<(), AuthError> {
     // Windows deployments should grant the service identity and SYSTEM only.
-    // A portable std API cannot evaluate an ACL; the installer/doctor command
-    // performs the platform-specific check before public-bind service startup.
+    // A portable std API cannot evaluate a DACL, so operators must verify it
+    // with `icacls`/`Get-Acl` as part of the documented deployment gate.
     Ok(())
 }
 
@@ -161,7 +185,10 @@ fn validate_token(token: &str) -> Result<(), AuthError> {
 }
 
 fn hash_token(token: &[u8]) -> [u8; 32] {
-    Sha256::digest(token).into()
+    let mut digest = Sha256::new();
+    digest.update(TOKEN_DIGEST_DOMAIN);
+    digest.update(token);
+    digest.finalize().into()
 }
 
 #[cfg(test)]
@@ -180,6 +207,13 @@ mod tests {
         let header = HeaderValue::from_str(&format!("Bearer {TOKEN_B}")).unwrap();
         assert!(tokens.verify_authorization_header(Some(&header)));
         assert!(!format!("{tokens:?}").contains(TOKEN_A));
+        let header = HeaderValue::from_str(&format!("Bearer {TOKEN_A}")).unwrap();
+        let principal = tokens.authorization_principal(Some(&header)).unwrap();
+        assert_eq!(principal.len(), 64);
+        assert_ne!(
+            principal,
+            format!("{:x}", Sha256::digest(TOKEN_A.as_bytes()))
+        );
     }
 
     #[test]
@@ -198,5 +232,15 @@ mod tests {
                 "bearer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             )))
         );
+    }
+
+    #[test]
+    fn detects_token_set_overlap_using_only_domain_separated_digests() {
+        let normal = TokenSet::from_tokens([TOKEN_A]).unwrap();
+        let disjoint = TokenSet::from_tokens([TOKEN_B]).unwrap();
+        let overlapping = TokenSet::from_tokens([TOKEN_B, TOKEN_A]).unwrap();
+        assert!(!normal.overlaps(&disjoint));
+        assert!(normal.overlaps(&overlapping));
+        assert!(!format!("{normal:?}{overlapping:?}").contains(TOKEN_A));
     }
 }

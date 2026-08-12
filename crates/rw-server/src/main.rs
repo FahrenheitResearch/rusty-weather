@@ -11,6 +11,8 @@ use rustwx_core::ModelId;
 use rw_ingest::{IngestSupportStatus, model_ingest_capability};
 use rw_query::{QueryLimits, StoreCatalog};
 use rw_server::config::LogFormat;
+use rw_server::generation_replication::ServerGenerationReplication;
+use rw_server::origin_catalog::PublishedStoreCatalog;
 use rw_server::{AppConfig, AppState, TokenSet, build_router};
 use serde::Serialize;
 use tracing::{info, warn};
@@ -118,6 +120,22 @@ async fn serve(config_path: Option<&Path>) -> Result<(), AnyError> {
         ensure_distinct_roots(&config.server.store_root, &config.community.root)?;
         ensure_distinct_roots(&config.server.artifact_root, &config.community.root)?;
     }
+    if config.generation_replication.enabled {
+        fs::create_dir_all(&config.generation_replication.control_root)?;
+        ensure_real_directory(
+            &config.generation_replication.control_root,
+            "generation_replication.control_root",
+        )?;
+        for root in [&config.server.store_root, &config.server.artifact_root] {
+            ensure_distinct_roots(root, &config.generation_replication.control_root)?;
+        }
+        if config.community.enabled {
+            ensure_distinct_roots(
+                &config.community.root,
+                &config.generation_replication.control_root,
+            )?;
+        }
+    }
 
     if tokens.is_empty() {
         warn!(
@@ -174,6 +192,18 @@ fn doctor(config_path: Option<&Path>) -> Result<(), AnyError> {
         Ok(()) => checks.push(ok("safety_policy", "bind and resource limits are valid")),
         Err(error) => checks.push(fail("safety_policy", error.to_string())),
     }
+    if config.federation.proxy.enabled
+        || config.federation.proxy.accept_local_resolve
+        || config.federation.health_monitor_enabled
+    {
+        match rw_server::federation_proxy::validate_credential_isolation(&config, &tokens) {
+            Ok(()) => checks.push(ok(
+                "federation_credential_isolation",
+                "active API, local-resolve, origin data, and health credential domains are value-disjoint",
+            )),
+            Err(error) => checks.push(fail("federation_credential_isolation", error)),
+        }
+    }
     checks.push(check_directory("store_root", &config.server.store_root));
     checks.push(check_directory(
         "artifact_root",
@@ -212,6 +242,79 @@ fn doctor(config_path: Option<&Path>) -> Result<(), AnyError> {
             )),
             Err(error) => checks.push(fail("community_security", error.to_string())),
         }
+        if config.community.relay.enabled {
+            let limits = rw_community_protocol::ProtocolLimits {
+                max_manifest_bytes: config.community.quotas.maximum_manifest_bytes,
+                max_encoded_bytes: config.community.quotas.maximum_object_bytes,
+                max_decoded_bytes: config.community.quotas.maximum_decompressed_bytes,
+                max_case_artifacts: config.community.cases.maximum_objects_per_case,
+                ..rw_community_protocol::ProtocolLimits::default()
+            };
+            match rw_server::community_relay::CommunityRelayService::open(
+                &config.community,
+                limits,
+            ) {
+                Ok(_) => checks.push(ok(
+                    "community_relay_security",
+                    "separate Phase 2 gates, durable state, signing key, provider secret, and audited relay-allocation ranges validated",
+                )),
+                Err(error) => checks.push(fail("community_relay_security", error.to_string())),
+            }
+        }
+    }
+    let mut generation_replication = ServerGenerationReplication::default();
+    if config.generation_replication.enabled {
+        checks.push(check_directory(
+            "generation_replication.control_root",
+            &config.generation_replication.control_root,
+        ));
+        for (name, root) in [
+            ("replication_store_isolation", &config.server.store_root),
+            (
+                "replication_artifact_isolation",
+                &config.server.artifact_root,
+            ),
+        ] {
+            match ensure_distinct_roots(root, &config.generation_replication.control_root) {
+                Ok(()) => checks.push(ok(name, "replication control root is isolated")),
+                Err(error) => checks.push(fail(name, error.to_string())),
+            }
+        }
+        if config.community.enabled {
+            match ensure_distinct_roots(
+                &config.community.root,
+                &config.generation_replication.control_root,
+            ) {
+                Ok(()) => checks.push(ok(
+                    "replication_community_isolation",
+                    "replication control root is isolated",
+                )),
+                Err(error) => {
+                    checks.push(fail("replication_community_isolation", error.to_string()))
+                }
+            }
+        }
+        match ServerGenerationReplication::open(
+            &config.generation_replication,
+            &config.server.store_root,
+        ) {
+            Ok(service) => match service.startup_status() {
+                Ok(status) => {
+                    checks.push(ok(
+                        "generation_replication",
+                        format!(
+                            "durable state authenticated; {} active upload(s), {} published generation(s), kill switch {}",
+                            status.active_uploads,
+                            status.published_generations,
+                            if status.kill_switch { "engaged" } else { "disengaged" }
+                        ),
+                    ));
+                    generation_replication = service;
+                }
+                Err(error) => checks.push(fail("generation_replication", error.to_string())),
+            },
+            Err(error) => checks.push(fail("generation_replication", error.to_string())),
+        }
     }
     if config.federation.enabled {
         match rw_server::federation::FederationService::open(&config.federation) {
@@ -233,6 +336,23 @@ fn doctor(config_path: Option<&Path>) -> Result<(), AnyError> {
             Err(error) => checks.push(fail("federation_security", error.to_string())),
         }
     }
+    if config.federation.proxy.enabled || config.federation.proxy.accept_local_resolve {
+        match rw_server::federation_proxy::doctor_status(&config, &tokens) {
+            Ok(status) => checks.push(ok(
+                "federation_proxy_security",
+                format!(
+                    "{} approved origin(s); authority key id {}; durable accounting {}; kill switch {}; local-only resolver {}; dedicated origin credential {}",
+                    status.approved_origins,
+                    status.authority_signing_key_id,
+                    if status.durable_accounting_opened { "opened" } else { "closed" },
+                    if status.kill_switch { "engaged" } else { "disengaged" },
+                    if status.local_resolve_enabled { "enabled" } else { "disabled" },
+                    if status.local_resolve_credential_loaded { "loaded" } else { "not required" },
+                ),
+            )),
+            Err(error) => checks.push(fail("federation_proxy_security", error)),
+        }
+    }
 
     if config.server.store_root.is_dir() {
         let catalog = StoreCatalog::with_limits(
@@ -248,6 +368,25 @@ fn doctor(config_path: Option<&Path>) -> Result<(), AnyError> {
                 max_point_values: config.limits.sync_result_values,
             },
         );
+        let catalog = PublishedStoreCatalog::new(catalog, config.origin_catalog.clone())
+            .with_generation_replication(generation_replication);
+        if config.origin_catalog.enabled {
+            let status = catalog.health_status();
+            if status.ready {
+                checks.push(ok(
+                    "origin_catalog",
+                    format!(
+                        "{} published model namespace(s) and {} generation(s) validated",
+                        status.published_models, status.published_runs
+                    ),
+                ));
+            } else {
+                checks.push(fail(
+                    "origin_catalog",
+                    "enabled scheduler publication catalog is not ready",
+                ));
+            }
+        }
         match catalog.list_models() {
             Ok(models) => checks.push(ok(
                 "catalog",
@@ -285,15 +424,30 @@ fn print_config(config_path: Option<&Path>) -> Result<(), AnyError> {
 
 fn print_models(config_path: Option<&Path>) -> Result<(), AnyError> {
     let config = AppConfig::load(config_path)?;
+    let tokens = TokenSet::load(&config.auth)?;
+    config.validate(!tokens.is_empty())?;
     let mut stored = BTreeMap::new();
-    if config.server.store_root.is_dir() {
-        for entry in StoreCatalog::new(&config.server.store_root).list_models()? {
+    let restrict_to_published = config.origin_catalog.enabled;
+    if config.server.store_root.is_dir() || restrict_to_published {
+        let replication = ServerGenerationReplication::open(
+            &config.generation_replication,
+            &config.server.store_root,
+        )?;
+        let catalog = PublishedStoreCatalog::new(
+            StoreCatalog::new(&config.server.store_root),
+            config.origin_catalog.clone(),
+        )
+        .with_generation_replication(replication);
+        for entry in catalog.list_models()? {
             stored.insert(entry.model, entry.run_count);
         }
     }
     let models: Vec<_> = rustwx_models::built_in_models()
         .iter()
         .filter(|summary| summary.id != ModelId::RrfsFireWx)
+        .filter(|summary| {
+            !restrict_to_published || stored.contains_key(&summary.id.to_string())
+        })
         .map(|summary| {
             let capability = model_ingest_capability(summary.id);
             let status = match (summary.id, capability.status) {

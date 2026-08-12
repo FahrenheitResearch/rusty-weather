@@ -1,0 +1,23 @@
+[package]
+name = "rw-federation-proxy"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+rust-version = "1.92"
+description = "Hardened authoritative proxy for approved Rusty Weather public origins"
+
+[dependencies]
+ed25519-dalek = "2.2"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+rw-community-protocol = { path = "../rw-community-protocol" }
+rw-query = { path = "../rw-query" }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ureq.workspace = true
+zstd = "0.13"
+
+[dev-dependencies]
+base64 = "0.22"

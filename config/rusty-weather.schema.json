@@ -25,7 +25,6 @@
           "artifact_publication_enabled": false,
           "default_retention_seconds": 2592000,
           "enabled": false,
-          "full_run_replication_enabled": false,
           "maximum_cases": 1000,
           "maximum_manifest_bytes": 262144,
           "maximum_objects_per_case": 512,
@@ -36,6 +35,7 @@
           "provider": "disabled"
         },
         "kill_switch": false,
+        "object_manifest_retention_seconds": 31536000,
         "origin_base_url": null,
         "origin_token_file": null,
         "promotion": {
@@ -56,8 +56,50 @@
           "storage_bytes": 10737418240,
           "upload_bytes_per_month": 107374182400
         },
+        "relay": {
+          "archival_origin_available": false,
+          "capacity_audit_completed": false,
+          "cloudflare": {
+            "allowed_turn_hosts": [
+              "turn.cloudflare.com"
+            ],
+            "api_token_file": null,
+            "audited_relay_cidrs": [],
+            "connect_timeout_seconds": 5,
+            "global_timeout_seconds": 15,
+            "receive_timeout_seconds": 10,
+            "resolve_timeout_seconds": 3,
+            "send_timeout_seconds": 5,
+            "turn_key_id": ""
+          },
+          "credential_lifetime_seconds": 600,
+          "enabled": false,
+          "kill_switch": true,
+          "max_chunk_plaintext_bytes": 512,
+          "operator_principals": [],
+          "promotion": {
+            "relayed_bytes": 268435456,
+            "successful_recoveries": 3
+          },
+          "provider_pricing_verified": false,
+          "quotas": {
+            "cost_stop_after_bytes_per_month": 966367641600,
+            "global_concurrency": 32,
+            "global_relay_bytes_per_month": 1099511627776,
+            "per_user_advertised_storage_bytes": 26843545600,
+            "per_user_concurrency": 2,
+            "per_user_download_bytes_per_month": 10737418240,
+            "per_user_upload_bytes_per_month": 10737418240
+          },
+          "relay_id": "cloudflare-turn",
+          "security_tests_passed": false,
+          "signing_key_file": null,
+          "signing_key_id": "rw-relay-v1",
+          "state_file": "./community-cache/relay-state.json"
+        },
         "root": "./community-cache",
         "signing_key_file": null,
+        "signing_key_id": "rw-origin-v1",
         "trusted_public_keys": []
       }
     },
@@ -84,8 +126,67 @@
         "health_send_timeout_seconds": 2,
         "health_state_file": null,
         "maximum_selection_results": 8,
+        "proxy": {
+          "accept_local_resolve": false,
+          "accounting_state_file": "./community/federation-accounting.json",
+          "authority_https_root": "https://weather.fahrenheitresearch.com",
+          "authority_origin_id": "hetzner-authority",
+          "concurrent_requests_per_principal": 2,
+          "connect_timeout_seconds": 4,
+          "control_state_file": "./community/federation-control.json",
+          "enabled": false,
+          "global_timeout_seconds": 30,
+          "kill_switch": true,
+          "local_resolve_token_file": null,
+          "maximum_attempts": 2,
+          "maximum_principals": 100000,
+          "monthly_download_bytes_per_principal": 107374182400,
+          "operator_principals": [],
+          "receive_timeout_seconds": 20,
+          "resolve_timeout_seconds": 2,
+          "security_tests_passed": false,
+          "send_timeout_seconds": 5
+        },
         "revoked_key_ids": [],
         "revoked_origin_ids": []
+      }
+    },
+    "generation_replication": {
+      "description": "Advanced, owner-published replication of complete immutable rw-store\ngenerations. This is separate from operational HTTPS delivery and from\nrelay-mediated Community Cache objects.",
+      "$ref": "#/$defs/GenerationReplicationConfig",
+      "default": {
+        "capacity_audit_completed": false,
+        "control_root": "./generation-replication",
+        "enabled": false,
+        "kill_switch": true,
+        "limits": {
+          "maximum_attributions": 32,
+          "maximum_chunk_bytes": 8388608,
+          "maximum_chunks": 262144,
+          "maximum_files": 65538,
+          "maximum_generation_bytes": 274877906944,
+          "maximum_manifest_bytes": 8388608,
+          "maximum_provenance_entries": 32,
+          "maximum_retention_seconds": 7776000
+        },
+        "operator_principals": [],
+        "quotas": {
+          "maximum_gc_deletions": 25000,
+          "maximum_gc_entries": 250000,
+          "maximum_state_bytes": 67108864,
+          "per_owner_concurrent_uploads": 2,
+          "per_owner_generations": 8,
+          "per_owner_storage_bytes": 549755813888,
+          "per_owner_upload_bytes_per_month": 1099511627776,
+          "total_concurrent_uploads": 8,
+          "total_generations": 64,
+          "total_storage_bytes": 2199023255552,
+          "total_upload_bytes_per_month": 4398046511104,
+          "upload_ttl_seconds": 86400
+        },
+        "security_tests_passed": false,
+        "signing_key_file": null,
+        "signing_key_id": "rw-generation-replication-v1"
       }
     },
     "limits": {
@@ -121,6 +222,16 @@
         "format": "json"
       }
     },
+    "origin_catalog": {
+      "description": "Optional scheduler-controlled publication boundary for the conventional\nHTTPS origin. When enabled, only active and previous generations from\nthe validated origin catalog are visible.",
+      "$ref": "#/$defs/OriginCatalogConfig",
+      "default": {
+        "enabled": false,
+        "max_age_seconds": 7200,
+        "publication_sources": "scheduler",
+        "refresh_seconds": 5
+      }
+    },
     "server": {
       "$ref": "#/$defs/ServerConfig",
       "default": {
@@ -137,6 +248,14 @@
     "ApprovedFederationOriginConfig": {
       "type": "object",
       "properties": {
+        "data_bearer_token_file": {
+          "description": "Dedicated server-side credential for this origin's one-hop local-only\nresolver. It is never returned by catalog, status, UI, logs, or errors.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "descriptor_signing_keys": {
           "type": "array",
           "default": [],
@@ -195,11 +314,6 @@
           "type": "boolean",
           "default": false
         },
-        "full_run_replication_enabled": {
-          "description": "Reserved contract gate for a later typed `.rws` generation replication\nservice. No current HTTP route consumes it and it must remain false.",
-          "type": "boolean",
-          "default": false
-        },
         "maximum_cases": {
           "description": "Total number of unexpired case manifests retained locally.",
           "type": "integer",
@@ -241,6 +355,71 @@
       },
       "additionalProperties": false
     },
+    "CloudflareRelayConfig": {
+      "type": "object",
+      "properties": {
+        "allowed_turn_hosts": {
+          "type": "array",
+          "default": [
+            "turn.cloudflare.com"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "api_token_file": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "audited_relay_cidrs": {
+          "description": "Exact provider allocation ranges audited by the operator. Empty is the\nsafe default; no Cloudflare address range is compiled as trust.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "connect_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 5,
+          "minimum": 0
+        },
+        "global_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 15,
+          "minimum": 0
+        },
+        "receive_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 10,
+          "minimum": 0
+        },
+        "resolve_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 3,
+          "minimum": 0
+        },
+        "send_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 5,
+          "minimum": 0
+        },
+        "turn_key_id": {
+          "description": "Cloudflare-generated 32-character TURN key ID; it is an identifier, not\nthe long-lived API token.",
+          "type": "string",
+          "default": ""
+        }
+      },
+      "additionalProperties": false
+    },
     "CommunityConfig": {
       "description": "Phase-one Community Cache configuration. Capacity values intentionally\nremain conservative and operator-configurable until the deployment host is\naudited. Enabling this does not enable any peer transport.",
       "type": "object",
@@ -256,7 +435,6 @@
             "artifact_publication_enabled": false,
             "default_retention_seconds": 2592000,
             "enabled": false,
-            "full_run_replication_enabled": false,
             "maximum_cases": 1000,
             "maximum_manifest_bytes": 262144,
             "maximum_objects_per_case": 512,
@@ -277,6 +455,13 @@
           "description": "Immediate server-side stop for assisted cache reads, publication, and\npromotion. Signed conventional HTTPS-origin resolution remains live.",
           "type": "boolean",
           "default": false
+        },
+        "object_manifest_retention_seconds": {
+          "description": "Lifetime of exact immutable query-object manifests. Long retention is\nsafe because identities bind concrete run/snapshot/grid/recipe values.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 31536000,
+          "minimum": 0
         },
         "origin_base_url": {
           "description": "Normal HTTPS Hetzner/origin fallback. Mutable aliases are not allowed.",
@@ -317,6 +502,51 @@
             "upload_bytes_per_month": 107374182400
           }
         },
+        "relay": {
+          "description": "Separately gated Phase 2 control plane for cold historical objects.\nOperational local/R2/Hetzner delivery never consults this service.",
+          "$ref": "#/$defs/CommunityRelayConfig",
+          "default": {
+            "archival_origin_available": false,
+            "capacity_audit_completed": false,
+            "cloudflare": {
+              "allowed_turn_hosts": [
+                "turn.cloudflare.com"
+              ],
+              "api_token_file": null,
+              "audited_relay_cidrs": [],
+              "connect_timeout_seconds": 5,
+              "global_timeout_seconds": 15,
+              "receive_timeout_seconds": 10,
+              "resolve_timeout_seconds": 3,
+              "send_timeout_seconds": 5,
+              "turn_key_id": ""
+            },
+            "credential_lifetime_seconds": 600,
+            "enabled": false,
+            "kill_switch": true,
+            "max_chunk_plaintext_bytes": 512,
+            "operator_principals": [],
+            "promotion": {
+              "relayed_bytes": 268435456,
+              "successful_recoveries": 3
+            },
+            "provider_pricing_verified": false,
+            "quotas": {
+              "cost_stop_after_bytes_per_month": 966367641600,
+              "global_concurrency": 32,
+              "global_relay_bytes_per_month": 1099511627776,
+              "per_user_advertised_storage_bytes": 26843545600,
+              "per_user_concurrency": 2,
+              "per_user_download_bytes_per_month": 10737418240,
+              "per_user_upload_bytes_per_month": 10737418240
+            },
+            "relay_id": "cloudflare-turn",
+            "security_tests_passed": false,
+            "signing_key_file": null,
+            "signing_key_id": "rw-relay-v1",
+            "state_file": "./community-cache/relay-state.json"
+          }
+        },
         "root": {
           "type": "string",
           "default": "./community-cache"
@@ -328,6 +558,11 @@
             "null"
           ],
           "default": null
+        },
+        "signing_key_id": {
+          "description": "Canonical identifier for the current object/case signing key. Rotate by\nchanging this id/key and retaining old public keys below.",
+          "type": "string",
+          "default": "rw-origin-v1"
         },
         "trusted_public_keys": {
           "description": "Public verification keys accepted for origin and hot-store manifests.",
@@ -403,6 +638,179 @@
           "type": "integer",
           "format": "uint64",
           "default": 107374182400,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "CommunityRelayConfig": {
+      "type": "object",
+      "properties": {
+        "archival_origin_available": {
+          "description": "Honest post-relay fallback advertised by this deployment. False means\nan unavailable result when hosted historical retention has expired.",
+          "type": "boolean",
+          "default": false
+        },
+        "capacity_audit_completed": {
+          "type": "boolean",
+          "default": false
+        },
+        "cloudflare": {
+          "$ref": "#/$defs/CloudflareRelayConfig",
+          "default": {
+            "allowed_turn_hosts": [
+              "turn.cloudflare.com"
+            ],
+            "api_token_file": null,
+            "audited_relay_cidrs": [],
+            "connect_timeout_seconds": 5,
+            "global_timeout_seconds": 15,
+            "receive_timeout_seconds": 10,
+            "resolve_timeout_seconds": 3,
+            "send_timeout_seconds": 5,
+            "turn_key_id": ""
+          }
+        },
+        "credential_lifetime_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 600,
+          "minimum": 0
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "kill_switch": {
+          "type": "boolean",
+          "default": true
+        },
+        "max_chunk_plaintext_bytes": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 512,
+          "minimum": 0
+        },
+        "operator_principals": {
+          "description": "Domain-separated authenticated principal digests allowed to change the\nruntime relay kill switch. These are identifiers, never bearer tokens.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "promotion": {
+          "$ref": "#/$defs/CommunityRelayPromotionConfig",
+          "default": {
+            "relayed_bytes": 268435456,
+            "successful_recoveries": 3
+          }
+        },
+        "provider_pricing_verified": {
+          "description": "Operator confirmed the current provider plan and derived byte/cost\nstops from its actual billed terms. This is intentionally false after\nevery fresh install or config regeneration.",
+          "type": "boolean",
+          "default": false
+        },
+        "quotas": {
+          "$ref": "#/$defs/CommunityRelayQuotasConfig",
+          "default": {
+            "cost_stop_after_bytes_per_month": 966367641600,
+            "global_concurrency": 32,
+            "global_relay_bytes_per_month": 1099511627776,
+            "per_user_advertised_storage_bytes": 26843545600,
+            "per_user_concurrency": 2,
+            "per_user_download_bytes_per_month": 10737418240,
+            "per_user_upload_bytes_per_month": 10737418240
+          }
+        },
+        "relay_id": {
+          "type": "string",
+          "default": "cloudflare-turn"
+        },
+        "security_tests_passed": {
+          "type": "boolean",
+          "default": false
+        },
+        "signing_key_file": {
+          "description": "Separate Ed25519 key used only for short-lived relay credentials and\nsession transcripts. Secret material is loaded from this file.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "signing_key_id": {
+          "type": "string",
+          "default": "rw-relay-v1"
+        },
+        "state_file": {
+          "type": "string",
+          "default": "./community-cache/relay-state.json"
+        }
+      },
+      "additionalProperties": false
+    },
+    "CommunityRelayPromotionConfig": {
+      "type": "object",
+      "properties": {
+        "relayed_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 268435456,
+          "minimum": 0
+        },
+        "successful_recoveries": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 3,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "CommunityRelayQuotasConfig": {
+      "type": "object",
+      "properties": {
+        "cost_stop_after_bytes_per_month": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 966367641600,
+          "minimum": 0
+        },
+        "global_concurrency": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 32,
+          "minimum": 0
+        },
+        "global_relay_bytes_per_month": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 1099511627776,
+          "minimum": 0
+        },
+        "per_user_advertised_storage_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 26843545600,
+          "minimum": 0
+        },
+        "per_user_concurrency": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 2,
+          "minimum": 0
+        },
+        "per_user_download_bytes_per_month": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 10737418240,
+          "minimum": 0
+        },
+        "per_user_upload_bytes_per_month": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 10737418240,
           "minimum": 0
         }
       },
@@ -526,6 +934,31 @@
           "default": 8,
           "minimum": 0
         },
+        "proxy": {
+          "description": "Server-mediated data failover. Public descriptor URLs remain visible,\nbut only the authority holds origin-scoped data credentials.",
+          "$ref": "#/$defs/FederationProxyServerConfig",
+          "default": {
+            "accept_local_resolve": false,
+            "accounting_state_file": "./community/federation-accounting.json",
+            "authority_https_root": "https://weather.fahrenheitresearch.com",
+            "authority_origin_id": "hetzner-authority",
+            "concurrent_requests_per_principal": 2,
+            "connect_timeout_seconds": 4,
+            "control_state_file": "./community/federation-control.json",
+            "enabled": false,
+            "global_timeout_seconds": 30,
+            "kill_switch": true,
+            "local_resolve_token_file": null,
+            "maximum_attempts": 2,
+            "maximum_principals": 100000,
+            "monthly_download_bytes_per_principal": 107374182400,
+            "operator_principals": [],
+            "receive_timeout_seconds": 20,
+            "resolve_timeout_seconds": 2,
+            "security_tests_passed": false,
+            "send_timeout_seconds": 5
+          }
+        },
         "revoked_key_ids": {
           "type": "array",
           "default": [],
@@ -543,6 +976,116 @@
       },
       "additionalProperties": false
     },
+    "FederationProxyServerConfig": {
+      "type": "object",
+      "properties": {
+        "accept_local_resolve": {
+          "description": "Enable the token-isolated, one-hop local resolver on a public origin.",
+          "type": "boolean",
+          "default": false
+        },
+        "accounting_state_file": {
+          "type": "string",
+          "default": "./community/federation-accounting.json"
+        },
+        "authority_https_root": {
+          "type": "string",
+          "default": "https://weather.fahrenheitresearch.com"
+        },
+        "authority_origin_id": {
+          "type": "string",
+          "default": "hetzner-authority"
+        },
+        "concurrent_requests_per_principal": {
+          "type": "integer",
+          "format": "uint",
+          "default": 2,
+          "minimum": 0
+        },
+        "connect_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 4,
+          "minimum": 0
+        },
+        "control_state_file": {
+          "description": "Atomic durable runtime kill-switch state. A persisted engaged switch\nsurvives restart; `kill_switch = true` always overrides it safely.",
+          "type": "string",
+          "default": "./community/federation-control.json"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "global_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 30,
+          "minimum": 0
+        },
+        "kill_switch": {
+          "type": "boolean",
+          "default": true
+        },
+        "local_resolve_token_file": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "maximum_attempts": {
+          "type": "integer",
+          "format": "uint",
+          "default": 2,
+          "minimum": 0
+        },
+        "maximum_principals": {
+          "type": "integer",
+          "format": "uint",
+          "default": 100000,
+          "minimum": 0
+        },
+        "monthly_download_bytes_per_principal": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 107374182400,
+          "minimum": 0
+        },
+        "operator_principals": {
+          "description": "Auth-domain principal digests authorized for the runtime status and\nkill-switch endpoints. These are identifiers, never bearer tokens.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "receive_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 20,
+          "minimum": 0
+        },
+        "resolve_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 2,
+          "minimum": 0
+        },
+        "security_tests_passed": {
+          "description": "Operator attestation that the release-gate suite was run for this build.",
+          "type": "boolean",
+          "default": false
+        },
+        "send_timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 5,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
     "FederationTrustedKeyConfig": {
       "type": "object",
       "properties": {
@@ -553,6 +1096,215 @@
         "public_key_base64": {
           "type": "string",
           "default": ""
+        }
+      },
+      "additionalProperties": false
+    },
+    "GenerationReplicationConfig": {
+      "type": "object",
+      "properties": {
+        "capacity_audit_completed": {
+          "description": "Disk, inode, concurrency, bandwidth, retention, and recovery capacity\nvalues below were selected from a deployment-specific audit.",
+          "type": "boolean",
+          "default": false
+        },
+        "control_root": {
+          "description": "Durable authenticated control state, immutable chunks, and signed\nmanifests. It must be a separate persistent root, never `store_root`.",
+          "type": "string",
+          "default": "./generation-replication"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "kill_switch": {
+          "type": "boolean",
+          "default": true
+        },
+        "limits": {
+          "$ref": "#/$defs/GenerationReplicationLimitsConfig",
+          "default": {
+            "maximum_attributions": 32,
+            "maximum_chunk_bytes": 8388608,
+            "maximum_chunks": 262144,
+            "maximum_files": 65538,
+            "maximum_generation_bytes": 274877906944,
+            "maximum_manifest_bytes": 8388608,
+            "maximum_provenance_entries": 32,
+            "maximum_retention_seconds": 7776000
+          }
+        },
+        "operator_principals": {
+          "description": "Auth-domain principal digests allowed to use coarse operator routes.\nOwner manifests use a further replication-domain-derived identity.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "quotas": {
+          "$ref": "#/$defs/GenerationReplicationQuotasConfig",
+          "default": {
+            "maximum_gc_deletions": 25000,
+            "maximum_gc_entries": 250000,
+            "maximum_state_bytes": 67108864,
+            "per_owner_concurrent_uploads": 2,
+            "per_owner_generations": 8,
+            "per_owner_storage_bytes": 549755813888,
+            "per_owner_upload_bytes_per_month": 1099511627776,
+            "total_concurrent_uploads": 8,
+            "total_generations": 64,
+            "total_storage_bytes": 2199023255552,
+            "total_upload_bytes_per_month": 4398046511104,
+            "upload_ttl_seconds": 86400
+          }
+        },
+        "security_tests_passed": {
+          "description": "Deployment has passed the replication security and recovery suite for\nthis exact build and filesystem topology.",
+          "type": "boolean",
+          "default": false
+        },
+        "signing_key_file": {
+          "description": "Separate Ed25519 key used for replicated-generation manifests/state.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "signing_key_id": {
+          "type": "string",
+          "default": "rw-generation-replication-v1"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GenerationReplicationLimitsConfig": {
+      "type": "object",
+      "properties": {
+        "maximum_attributions": {
+          "type": "integer",
+          "format": "uint",
+          "default": 32,
+          "minimum": 0
+        },
+        "maximum_chunk_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 8388608,
+          "minimum": 0
+        },
+        "maximum_chunks": {
+          "type": "integer",
+          "format": "uint",
+          "default": 262144,
+          "minimum": 0
+        },
+        "maximum_files": {
+          "type": "integer",
+          "format": "uint",
+          "default": 65538,
+          "minimum": 0
+        },
+        "maximum_generation_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 274877906944,
+          "minimum": 0
+        },
+        "maximum_manifest_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "default": 8388608,
+          "minimum": 0
+        },
+        "maximum_provenance_entries": {
+          "type": "integer",
+          "format": "uint",
+          "default": 32,
+          "minimum": 0
+        },
+        "maximum_retention_seconds": {
+          "type": "integer",
+          "format": "int64",
+          "default": 7776000
+        }
+      },
+      "additionalProperties": false
+    },
+    "GenerationReplicationQuotasConfig": {
+      "type": "object",
+      "properties": {
+        "maximum_gc_deletions": {
+          "type": "integer",
+          "format": "uint",
+          "default": 25000,
+          "minimum": 0
+        },
+        "maximum_gc_entries": {
+          "type": "integer",
+          "format": "uint",
+          "default": 250000,
+          "minimum": 0
+        },
+        "maximum_state_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 67108864,
+          "minimum": 0
+        },
+        "per_owner_concurrent_uploads": {
+          "type": "integer",
+          "format": "uint",
+          "default": 2,
+          "minimum": 0
+        },
+        "per_owner_generations": {
+          "type": "integer",
+          "format": "uint",
+          "default": 8,
+          "minimum": 0
+        },
+        "per_owner_storage_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 549755813888,
+          "minimum": 0
+        },
+        "per_owner_upload_bytes_per_month": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 1099511627776,
+          "minimum": 0
+        },
+        "total_concurrent_uploads": {
+          "type": "integer",
+          "format": "uint",
+          "default": 8,
+          "minimum": 0
+        },
+        "total_generations": {
+          "type": "integer",
+          "format": "uint",
+          "default": 64,
+          "minimum": 0
+        },
+        "total_storage_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 2199023255552,
+          "minimum": 0
+        },
+        "total_upload_bytes_per_month": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 4398046511104,
+          "minimum": 0
+        },
+        "upload_ttl_seconds": {
+          "type": "integer",
+          "format": "int64",
+          "default": 86400
         }
       },
       "additionalProperties": false
@@ -772,6 +1524,33 @@
       },
       "additionalProperties": false
     },
+    "OriginCatalogConfig": {
+      "description": "Conventional HTTPS-origin publication gate. It is deliberately disabled\nby default. An enabled gate always enforces bounded freshness.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "max_age_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 7200,
+          "minimum": 0
+        },
+        "publication_sources": {
+          "$ref": "#/$defs/PublicationSourceMode",
+          "default": "scheduler"
+        },
+        "refresh_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 5,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
     "PromotionConfig": {
       "type": "object",
       "properties": {
@@ -799,6 +1578,25 @@
         }
       },
       "additionalProperties": false
+    },
+    "PublicationSourceMode": {
+      "oneOf": [
+        {
+          "description": "Hetzner-style operational origin: a fresh scheduler active/previous\ncatalog is mandatory and replication publications are not exposed.",
+          "type": "string",
+          "const": "scheduler"
+        },
+        {
+          "description": "Institutional archive: only durable engine-authorized replications are\nvisible; every unrelated raw rw-store directory remains hidden.",
+          "type": "string",
+          "const": "replication"
+        },
+        {
+          "description": "Both authorities are mandatory. Their exact model/run namespaces must\nbe disjoint or the complete publication view fails closed.",
+          "type": "string",
+          "const": "union"
+        }
+      ]
     },
     "ServerConfig": {
       "type": "object",

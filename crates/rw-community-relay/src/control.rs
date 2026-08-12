@@ -25,13 +25,18 @@ use crate::{
 pub const ADVERTISEMENT_SCHEMA: &str = "rw.community.relay-advertisement.v1";
 pub const AUDIT_EVENT_SCHEMA: &str = "rw.community.relay-audit.v1";
 pub const PROMOTION_SCHEMA: &str = "rw.community.relay-promotion.v1";
-const PERSISTENCE_SCHEMA: &str = "rw.community.relay-state.v1";
+const PERSISTENCE_SCHEMA: &str = "rw.community.relay-state.v2";
 const MAX_PERSISTENCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PERSISTED_SUBJECTS: usize = 100_000;
 const MAX_PERSISTED_ADVERTISEMENTS: usize = 250_000;
 const MAX_PERSISTED_SESSIONS: usize = 100_000;
 const MAX_PERSISTED_REVOCATIONS: usize = 250_000;
 const MAX_PERSISTED_POPULARITY: usize = 250_000;
+/// Stop-and-wait v1 is deliberately limited to small profile/point products.
+/// Native windows, temporal grids, and case artifacts fall through to
+/// archival HTTPS until a bounded authenticated sliding-window transport is
+/// implemented and release-tested.
+pub const INITIAL_RELAY_OBJECT_BYTES: u64 = 64 * 1024;
 
 /// Closed v1 categories. There is intentionally no blob, filename, directory,
 /// raw WRF output, or full-run category.
@@ -228,6 +233,11 @@ impl ClientSeedingPolicy {
     fn permits(&self, object: &VerifiedRelayObject) -> Result<(), RelayError> {
         if !self.opted_in
             || !self.categories.contains(&object.category)
+            || !matches!(
+                object.category,
+                RelayObjectCategory::Profile | RelayObjectCategory::PointSeries
+            )
+            || object.encoded_size > INITIAL_RELAY_OBJECT_BYTES
             || object.encoded_size > self.disk_allowance_bytes
             || object.encoded_size > self.upload_allowance_bytes
         {
@@ -310,6 +320,7 @@ pub struct RelayControlConfig {
     pub phase2_enabled: bool,
     pub security_tests_passed: bool,
     pub capacity_audit_complete: bool,
+    pub provider_pricing_verified: bool,
     pub relay_id: String,
     pub signing_key_id: String,
     pub credential_lifetime_seconds: i64,
@@ -323,7 +334,7 @@ impl RelayControlConfig {
         if !valid_opaque_id(&self.relay_id)
             || !valid_opaque_id(&self.signing_key_id)
             || !(1..=15 * 60).contains(&self.credential_lifetime_seconds)
-            || self.max_chunk_plaintext_bytes == 0
+            || self.max_chunk_plaintext_bytes != crate::RELAY_PLAINTEXT_CHUNK_BYTES
             || u64::from(self.max_chunk_plaintext_bytes) > limits.max_encoded_bytes
         {
             return Err(RelayError::PolicyDenied);
@@ -336,7 +347,10 @@ impl RelayControlConfig {
         if !self.phase2_enabled {
             return Err(RelayError::Disabled);
         }
-        if !self.security_tests_passed || !self.capacity_audit_complete {
+        if !self.security_tests_passed
+            || !self.capacity_audit_complete
+            || !self.provider_pricing_verified
+        {
             return Err(RelayError::SecurityGate);
         }
         Ok(())
@@ -478,6 +492,12 @@ pub struct CompletionResult {
     pub promotion: Option<PromotionSignal>,
 }
 
+#[derive(Debug)]
+pub enum ParticipantCompletionResult {
+    AwaitingCounterpart,
+    Complete(CompletionResult),
+}
+
 pub enum ColdLookupOutcome {
     Relay(Box<RelaySessionGrant>),
     Fallback(PublicRelayFailure),
@@ -527,6 +547,8 @@ struct PendingSession {
     observed_download_bytes: u64,
     observed_upload_chunks: u32,
     observed_download_chunks: u32,
+    upload_completion_bytes: Option<u64>,
+    download_completion_bytes: Option<u64>,
 }
 
 impl fmt::Debug for PendingSession {
@@ -592,6 +614,8 @@ struct PersistedPendingSession {
     observed_download_bytes: u64,
     observed_upload_chunks: u32,
     observed_download_chunks: u32,
+    upload_completion_bytes: Option<u64>,
+    download_completion_bytes: Option<u64>,
 }
 
 /// In-memory deterministic core. A server integration should place it behind a
@@ -614,6 +638,7 @@ pub struct RelayCoordinator<P, I> {
     pending: BTreeMap<String, PendingSession>,
     revoked_credentials: BTreeMap<String, i64>,
     popularity: BTreeMap<String, ObjectPopularity>,
+    persistence_maximum_bytes: usize,
 }
 
 impl<P: RelayProvider, I: OpaqueIdSource> RelayCoordinator<P, I> {
@@ -652,6 +677,7 @@ impl<P: RelayProvider, I: OpaqueIdSource> RelayCoordinator<P, I> {
             pending: BTreeMap::new(),
             revoked_credentials: BTreeMap::new(),
             popularity: BTreeMap::new(),
+            persistence_maximum_bytes: MAX_PERSISTENCE_BYTES,
         })
     }
 
@@ -699,6 +725,8 @@ impl<P: RelayProvider, I: OpaqueIdSource> RelayCoordinator<P, I> {
                 observed_download_bytes: session.observed_download_bytes,
                 observed_upload_chunks: session.observed_upload_chunks,
                 observed_download_chunks: session.observed_download_chunks,
+                upload_completion_bytes: session.upload_completion_bytes,
+                download_completion_bytes: session.download_completion_bytes,
             })
             .collect();
         let usage = self
@@ -728,10 +756,15 @@ impl<P: RelayProvider, I: OpaqueIdSource> RelayCoordinator<P, I> {
             return Err(RelayError::PersistenceRejected);
         }
         let bytes = serde_json::to_vec(&snapshot).map_err(|_| RelayError::PersistenceRejected)?;
-        if bytes.is_empty() || bytes.len() > MAX_PERSISTENCE_BYTES {
+        if bytes.is_empty() || bytes.len() > self.persistence_maximum_bytes {
             return Err(RelayError::PersistenceRejected);
         }
         Ok(bytes)
+    }
+
+    #[cfg(test)]
+    fn set_persistence_maximum_bytes_for_test(&mut self, value: usize) {
+        self.persistence_maximum_bytes = value;
     }
 
     /// Restore a bounded snapshot before accepting traffic. Sessions that were
@@ -846,6 +879,12 @@ impl<P: RelayProvider, I: OpaqueIdSource> RelayCoordinator<P, I> {
                 || pending.observed_download_bytes > pending.expected_bytes
                 || pending.observed_upload_chunks > self.limits.max_relay_chunks
                 || pending.observed_download_chunks > self.limits.max_relay_chunks
+                || pending
+                    .upload_completion_bytes
+                    .is_some_and(|bytes| bytes != pending.expected_bytes)
+                || pending
+                    .download_completion_bytes
+                    .is_some_and(|bytes| bytes != pending.expected_bytes)
             {
                 return Err(RelayError::PersistenceRejected);
             }
@@ -1013,6 +1052,7 @@ impl<P: RelayProvider, I: OpaqueIdSource> RelayCoordinator<P, I> {
         digest.update(self.config.signing_key_id.as_bytes());
         for value in [
             self.config.credential_lifetime_seconds as u64,
+            self.config.provider_pricing_verified as u64,
             u64::from(self.config.max_chunk_plaintext_bytes),
             self.config.quotas.per_user_upload_bytes_per_month,
             self.config.quotas.per_user_download_bytes_per_month,
@@ -1065,6 +1105,21 @@ impl<P: RelayProvider, I: OpaqueIdSource> RelayCoordinator<P, I> {
             .seeds
             .get(object.object_sha256())
             .is_some_and(|entries| entries.iter().any(|entry| entry.subject == subject));
+        let advertisement_count = self.seeds.values().map(Vec::len).sum::<usize>();
+        if !already_advertised && advertisement_count >= MAX_PERSISTED_ADVERTISEMENTS {
+            return Err(RelayError::PersistenceRejected);
+        }
+        if !self.usage.contains_key(&subject) && self.usage.len() >= MAX_PERSISTED_SUBJECTS {
+            return Err(RelayError::PersistenceRejected);
+        }
+        // Advertisement admission is transactional with respect to the exact
+        // durable snapshot. This prevents one otherwise-valid advertisement
+        // from pushing state beyond its JSON/count bound and causing the
+        // server's subsequent persist-or-kill path to fail on an unpersistable
+        // in-memory state.
+        let previous_usage = self.usage.get(&subject).copied();
+        let object_key = object.object_sha256.clone();
+        let previous_entries = self.seeds.get(&object_key).cloned();
         let usage = self.usage.entry(subject.clone()).or_default();
         if !already_advertised
             && usage.advertised_storage.saturating_add(object.encoded_size)
@@ -1097,6 +1152,25 @@ impl<P: RelayProvider, I: OpaqueIdSource> RelayCoordinator<P, I> {
         entries.retain(|existing| existing.subject != subject);
         entries.push(entry);
         entries.sort_by(|left, right| left.advertisement_id.cmp(&right.advertisement_id));
+        if let Err(error) = self.export_persistence_json() {
+            match previous_usage {
+                Some(usage) => {
+                    self.usage.insert(subject.clone(), usage);
+                }
+                None => {
+                    self.usage.remove(&subject);
+                }
+            }
+            match previous_entries {
+                Some(entries) => {
+                    self.seeds.insert(object_key, entries);
+                }
+                None => {
+                    self.seeds.remove(&object_key);
+                }
+            }
+            return Err(error);
+        }
         let receipt = AdvertisementReceipt {
             schema: ADVERTISEMENT_SCHEMA.into(),
             advertisement_id,
@@ -1310,6 +1384,50 @@ impl<P: RelayProvider, I: OpaqueIdSource> RelayCoordinator<P, I> {
         Ok(())
     }
 
+    /// Record one authenticated participant's exact-byte completion. Success
+    /// and popularity are committed only after both opposite signed roles
+    /// report the full identical object size. A lost final data-plane message
+    /// therefore leaves the session pending until expiry/failure and cannot be
+    /// counted as a successful recovery.
+    pub fn report_participant_completion(
+        &mut self,
+        session_id: &str,
+        role: RelayRole,
+        transferred_bytes: u64,
+        period: BillingPeriod,
+    ) -> Result<ParticipantCompletionResult, RelayError> {
+        self.roll_period(period);
+        let ready = {
+            let pending = self
+                .pending
+                .get_mut(session_id)
+                .ok_or(RelayError::CredentialRevoked)?;
+            if transferred_bytes != pending.expected_bytes {
+                return Err(RelayError::ObjectMismatch);
+            }
+            let report = match role {
+                RelayRole::Uploader => &mut pending.upload_completion_bytes,
+                RelayRole::Downloader => &mut pending.download_completion_bytes,
+            };
+            if report.is_some_and(|bytes| bytes != transferred_bytes) {
+                return Err(RelayError::Replay);
+            }
+            *report = Some(transferred_bytes);
+            pending.upload_completion_bytes == Some(pending.expected_bytes)
+                && pending.download_completion_bytes == Some(pending.expected_bytes)
+        };
+        if !ready {
+            return Ok(ParticipantCompletionResult::AwaitingCounterpart);
+        }
+        let pending = self
+            .pending
+            .remove(session_id)
+            .ok_or(RelayError::CredentialRevoked)?;
+        self.finish_removed_session(session_id, pending, transferred_bytes, true)
+            .map(ParticipantCompletionResult::Complete)
+    }
+
+    #[cfg(test)]
     pub fn complete_session(
         &mut self,
         session_id: &str,
@@ -1322,6 +1440,16 @@ impl<P: RelayProvider, I: OpaqueIdSource> RelayCoordinator<P, I> {
             .pending
             .remove(session_id)
             .ok_or(RelayError::CredentialRevoked)?;
+        self.finish_removed_session(session_id, pending, transferred_bytes, successful)
+    }
+
+    fn finish_removed_session(
+        &mut self,
+        session_id: &str,
+        pending: PendingSession,
+        transferred_bytes: u64,
+        successful: bool,
+    ) -> Result<CompletionResult, RelayError> {
         if transferred_bytes > pending.expected_bytes {
             // The signed credential and provider lease cap the transfer at the
             // expected object size. If an integration reports more, account
@@ -1470,6 +1598,8 @@ impl<P: RelayProvider, I: OpaqueIdSource> RelayCoordinator<P, I> {
                 observed_download_bytes: 0,
                 observed_upload_chunks: 0,
                 observed_download_chunks: 0,
+                upload_completion_bytes: None,
+                download_completion_bytes: None,
             },
         );
         Ok(grant)
@@ -1522,14 +1652,8 @@ impl<P: RelayProvider, I: OpaqueIdSource> RelayCoordinator<P, I> {
             return Err(RelayError::UnsafeIdentifier);
         }
         let expires_unix = now_unix.saturating_add(self.config.credential_lifetime_seconds);
-        let chunks = seed
-            .object
-            .encoded_size
-            .div_ceil(u64::from(self.config.max_chunk_plaintext_bytes));
-        let max_chunks = u32::try_from(chunks).map_err(|_| RelayError::QuotaReached)?;
-        if max_chunks == 0 || max_chunks > self.limits.max_relay_chunks {
-            return Err(RelayError::QuotaReached);
-        }
+        let max_chunks = crate::bounded_relay_chunk_count(seed.object.encoded_size, &self.limits)
+            .map_err(|_| RelayError::QuotaReached)?;
         let upload_credential = self.sign_credential(
             &session_id,
             &upload_alias,
@@ -2029,10 +2153,11 @@ mod tests {
             phase2_enabled: true,
             security_tests_passed: true,
             capacity_audit_complete: true,
+            provider_pricing_verified: true,
             relay_id: "cloudflare-turn".into(),
             signing_key_id: "relay-signing".into(),
             credential_lifetime_seconds: 600,
-            max_chunk_plaintext_bytes: 4,
+            max_chunk_plaintext_bytes: crate::RELAY_PLAINTEXT_CHUNK_BYTES,
             quotas: RelayQuotaPolicy {
                 per_user_upload_bytes_per_month: limit,
                 per_user_download_bytes_per_month: limit,
@@ -2159,6 +2284,41 @@ mod tests {
     }
 
     #[test]
+    fn advertisement_over_persistence_budget_is_rejected_without_mutation() {
+        let bytes = b"point-series";
+        let (mut coordinator, origin_key) = coordinator(1024, false);
+        let signed = signed_object(&origin_key, DataOrigin::PublicProvider, false, true, bytes);
+        let empty_bytes = coordinator.export_persistence_json().unwrap();
+        coordinator.set_persistence_maximum_bytes_for_test(empty_bytes.len());
+
+        assert_eq!(
+            coordinator.advertise(
+                AuthenticatedSubject::new("bounded-seed").unwrap(),
+                &signed,
+                policy(1024),
+                200,
+                BillingPeriod::new(2026, 8).unwrap(),
+            ),
+            Err(RelayError::PersistenceRejected)
+        );
+        assert!(coordinator.seeds.is_empty());
+        assert!(coordinator.usage.is_empty());
+        assert!(!coordinator.kill_switch());
+        assert_eq!(coordinator.export_persistence_json().unwrap(), empty_bytes);
+
+        coordinator.set_persistence_maximum_bytes_for_test(MAX_PERSISTENCE_BYTES);
+        coordinator
+            .advertise(
+                AuthenticatedSubject::new("bounded-seed").unwrap(),
+                &signed,
+                policy(1024),
+                200,
+                BillingPeriod::new(2026, 8).unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn relay_grants_expose_only_opaque_candidates_and_scoped_credentials() {
         let bytes = b"point-series";
         let (mut coordinator, origin_key) = coordinator(1024, false);
@@ -2226,16 +2386,19 @@ mod tests {
             object_sha256: object_sha256(bytes),
             cipher: EndToEndCipher::XChaCha20Poly1305,
             chunk_index: 0,
-            chunk_count: 3,
-            plaintext_size: 4,
+            chunk_count: 1,
+            plaintext_size: bytes.len() as u32,
             nonce_base64: base64::engine::general_purpose::STANDARD.encode([1_u8; 24]),
-            ciphertext_base64: base64::engine::general_purpose::STANDARD.encode([2_u8; 20]),
+            ciphertext_base64: base64::engine::general_purpose::STANDARD.encode(vec![
+                2_u8;
+                bytes.len()
+                    + 16
+            ]),
         };
         coordinator
             .admit_envelope(&grant.download.credential, &envelope, 200)
             .unwrap();
         let mut overflow = envelope.clone();
-        overflow.chunk_index = 1;
         overflow.plaintext_size = bytes.len() as u32;
         assert_eq!(
             coordinator.admit_envelope(&grant.download.credential, &overflow, 200),
@@ -2367,6 +2530,110 @@ mod tests {
             }
             _ => panic!("kill switch must force HTTPS fallback"),
         }
+    }
+
+    #[test]
+    fn success_requires_matching_completion_from_both_signed_roles() {
+        let bytes = b"two-role-completion";
+        let (mut coordinator, origin_key) = coordinator(4096, false);
+        let signed = signed_object(&origin_key, DataOrigin::PublicProvider, false, true, bytes);
+        coordinator
+            .advertise(
+                AuthenticatedSubject::new("seed").unwrap(),
+                &signed,
+                policy(4096),
+                200,
+                BillingPeriod::new(2026, 8).unwrap(),
+            )
+            .unwrap();
+        let session = match coordinator.begin_cold_lookup(
+            AuthenticatedSubject::new("requester").unwrap(),
+            retrieval(4096),
+            &object_sha256(bytes),
+            true,
+            200,
+            BillingPeriod::new(2026, 8).unwrap(),
+        ) {
+            ColdLookupOutcome::Relay(grant) => grant,
+            _ => panic!("expected relay"),
+        };
+        assert!(matches!(
+            coordinator
+                .report_participant_completion(
+                    &session.session_id,
+                    RelayRole::Downloader,
+                    bytes.len() as u64,
+                    BillingPeriod::new(2026, 8).unwrap(),
+                )
+                .unwrap(),
+            ParticipantCompletionResult::AwaitingCounterpart
+        ));
+        assert!(coordinator.pending.contains_key(&session.session_id));
+        assert!(coordinator.popularity.is_empty());
+        assert!(matches!(
+            coordinator.report_participant_completion(
+                &session.session_id,
+                RelayRole::Uploader,
+                bytes.len() as u64 - 1,
+                BillingPeriod::new(2026, 8).unwrap(),
+            ),
+            Err(RelayError::ObjectMismatch)
+        ));
+        let result = coordinator
+            .report_participant_completion(
+                &session.session_id,
+                RelayRole::Uploader,
+                bytes.len() as u64,
+                BillingPeriod::new(2026, 8).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(result, ParticipantCompletionResult::Complete(_)));
+        assert!(!coordinator.pending.contains_key(&session.session_id));
+        assert_eq!(
+            coordinator
+                .popularity
+                .get(&object_sha256(bytes))
+                .unwrap()
+                .successful_recoveries,
+            1
+        );
+
+        let lost_counterpart = match coordinator.begin_cold_lookup(
+            AuthenticatedSubject::new("requester-two").unwrap(),
+            retrieval(4096),
+            &object_sha256(bytes),
+            true,
+            300,
+            BillingPeriod::new(2026, 8).unwrap(),
+        ) {
+            ColdLookupOutcome::Relay(grant) => grant,
+            _ => panic!("expected second relay"),
+        };
+        assert!(matches!(
+            coordinator
+                .report_participant_completion(
+                    &lost_counterpart.session_id,
+                    RelayRole::Uploader,
+                    bytes.len() as u64,
+                    BillingPeriod::new(2026, 8).unwrap(),
+                )
+                .unwrap(),
+            ParticipantCompletionResult::AwaitingCounterpart
+        ));
+        coordinator.fail_and_fallback(
+            &lost_counterpart.session_id,
+            0,
+            BillingPeriod::new(2026, 8).unwrap(),
+        );
+        assert_eq!(
+            coordinator
+                .popularity
+                .get(&object_sha256(bytes))
+                .unwrap()
+                .successful_recoveries,
+            1,
+            "a lost counterpart completion must never count success"
+        );
     }
 
     #[test]
@@ -2736,7 +3003,8 @@ mod tests {
                 200,
             )
             .unwrap();
-        let upload_json = String::from_utf8(upload_transport.transport_json().unwrap()).unwrap();
+        let upload_bytes = upload_transport.transport_json().unwrap();
+        let upload_json = String::from_utf8(upload_bytes.clone()).unwrap();
         assert!(upload_json.contains("104.16.0.8:49152"));
         assert!(!upload_json.contains("104.16.0.7:49152"));
         assert!(!upload_json.contains("seed-principal-hash"));
@@ -2754,6 +3022,44 @@ mod tests {
             &ProtocolLimits::default(),
         )
         .unwrap();
+        let (wire, peer_route, _verified) = crate::parse_transport_route_bounded(
+            &upload_bytes,
+            crate::TransportRouteExpectation {
+                session_id: &grant.session_id,
+                role: RelayRole::Uploader,
+                own_credential: &grant.upload.credential,
+                object_sha256: &object_sha256(bytes),
+                encoded_size: bytes.len() as u64,
+                now_unix: 200,
+                trusted_relay_keys: &relay_keys,
+                limits: &ProtocolLimits::default(),
+                policy: &route_policy,
+            },
+        )
+        .unwrap();
+        assert_eq!(wire.peer_credential, grant.download.credential);
+        assert!(!format!("{peer_route:?} {wire:?}").contains("104.16"));
+
+        let mut cross_session: serde_json::Value = serde_json::from_slice(&upload_bytes).unwrap();
+        cross_session["peer_credential"]["claims"]["session_id"] =
+            serde_json::json!("substituted-session");
+        assert!(
+            crate::parse_transport_route_bounded(
+                &serde_json::to_vec(&cross_session).unwrap(),
+                crate::TransportRouteExpectation {
+                    session_id: &grant.session_id,
+                    role: RelayRole::Uploader,
+                    own_credential: &grant.upload.credential,
+                    object_sha256: &object_sha256(bytes),
+                    encoded_size: bytes.len() as u64,
+                    now_unix: 200,
+                    trusted_relay_keys: &relay_keys,
+                    limits: &ProtocolLimits::default(),
+                    policy: &route_policy,
+                },
+            )
+            .is_err()
+        );
         assert!(matches!(
             routes.participant_grant(
                 &coordinator,

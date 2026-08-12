@@ -1,0 +1,24 @@
+[package]
+name = "rw-generation-replication"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Fail-closed full rw-store generation replication engine"
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ed25519-dalek = "2.2"
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
+rw-community-protocol = { path = "../rw-community-protocol" }
+rw-query = { path = "../rw-query" }
+rw-store = { path = "../rw-store" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+
+[dev-dependencies]
+rustwx-core = { path = "../rustwx-core" }

@@ -24,11 +24,22 @@ mandatory pre-transport
 [`docs/COMMUNITY_CACHE_THREAT_MODEL.md`](docs/COMMUNITY_CACHE_THREAT_MODEL.md).
 The design permits only relay-mediated peer assistance; direct user-to-user
 connectivity is permanently out of scope.
+The deployable immutable R2/CDN tier lives in
+[`deploy/cloudflare-r2-gateway`](deploy/cloudflare-r2-gateway); it exposes
+public signed-object reads and authenticated create-only writes, never a
+mutable bucket browser.
 
 Operator-approved university, lab, and public-service origins use the separate
 signed conventional-HTTPS federation contract in
 [`docs/FEDERATION.md`](docs/FEDERATION.md). Public origins are intentionally
 addressable; ordinary Community Cache clients are never listed there.
+Scheduler-to-origin publication is described in
+[`docs/ORIGIN_CATALOG.md`](docs/ORIGIN_CATALOG.md), while advanced signed
+complete-generation transfer is a separate opt-in contract in
+[`docs/GENERATION_REPLICATION.md`](docs/GENERATION_REPLICATION.md). The exact
+system, deployment, privacy, package, and usability proof required before the
+distributed product is called complete is recorded in
+[`docs/DISTRIBUTED_RELEASE_GATES.md`](docs/DISTRIBUTED_RELEASE_GATES.md).
 
 ## Self-hosted data service
 
@@ -46,6 +57,7 @@ Compose may create root-owned directories that the service cannot write:
 
     sudo install -d -o 65532 -g 65532 -m 0750 \
       deploy/docker/data/store deploy/docker/data/artifacts \
+      deploy/docker/data/community-cache deploy/docker/data/federation \
       deploy/docker/data/scheduler-cache deploy/docker/data/scheduler-state
 
 See [`deploy/docker/README.md`](deploy/docker/README.md) for token handling and

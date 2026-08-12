@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+FROM rust:1.92-bookworm@sha256:e90e846de4124376164ddfbaab4b0774c7bdeef5e738866295e5a90a34a307a2 AS builder
+
+ARG RW_BUILD_SHA
+RUN test -n "${RW_BUILD_SHA}" && test "${RW_BUILD_SHA}" != unknown
+ENV RW_BUILD_SHA=${RW_BUILD_SHA}
+WORKDIR /src
+COPY . .
+COPY deploy/distributed-lab/runtime/tls/ca.crt /lab/ca.crt
+RUN sh deploy/distributed-lab/apply-lab-ca.sh \
+    && cargo build --locked --release -p rw-server --bin rw-server
+
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime
+
+ARG RW_BUILD_SHA
+ARG RW_UID=65532
+ARG RW_GID=65532
+
+RUN groupadd --gid "${RW_GID}" rusty-weather \
+    && useradd --uid "${RW_UID}" --gid "${RW_GID}" \
+        --home-dir /var/lib/rusty-weather --no-create-home \
+        --shell /usr/sbin/nologin rusty-weather \
+    && install -d -o "${RW_UID}" -g "${RW_GID}" -m 0750 \
+        /var/lib/rusty-weather/store /var/lib/rusty-weather/artifacts \
+        /var/lib/rusty-weather/community-cache /var/lib/rusty-weather/federation \
+        /var/lib/rusty-weather/generation-replication \
+    && install -d -o root -g "${RW_GID}" -m 0750 /etc/rusty-weather
+
+COPY --from=builder /src/target/release/rw-server /usr/local/bin/rw-server
+COPY --chmod=0555 deploy/docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY --from=builder --chmod=0444 /lab/ca.crt /usr/share/doc/rusty-weather/distributed-lab-ca.crt
+
+WORKDIR /var/lib/rusty-weather
+USER ${RW_UID}:${RW_GID}
+LABEL org.opencontainers.image.revision="${RW_BUILD_SHA}" \
+      org.opencontainers.image.title="Rusty Weather isolated distributed lab" \
+      org.opencontainers.image.licenses="MIT AND BSD-3-Clause" \
+      com.fahrenheitresearch.rusty-weather.distributed-lab-only="true" \
+      com.fahrenheitresearch.rusty-weather.production-image="false"
+EXPOSE 8788
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["--config", "/etc/rusty-weather/rusty-weather.toml", "serve"]

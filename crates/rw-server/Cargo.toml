@@ -20,8 +20,12 @@ ed25519-dalek = "2.2"
 moka = { version = "0.12.16", features = ["sync"] }
 prometheus-client = "0.25.0"
 rw-community-protocol = { path = "../rw-community-protocol" }
+rw-community-relay = { path = "../rw-community-relay" }
+rw-federation-proxy = { path = "../rw-federation-proxy" }
+rw-generation-replication = { path = "../rw-generation-replication" }
 rw-ingest = { path = "../rw-ingest" }
 rw-query = { path = "../rw-query" }
+rw-scheduler = { path = "../rw-scheduler" }
 rw-store = { path = "../rw-store" }
 rustwx-core = { path = "../rustwx-core" }
 rustwx-models = { path = "../rustwx-models" }

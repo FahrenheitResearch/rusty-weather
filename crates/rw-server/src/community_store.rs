@@ -24,6 +24,12 @@ const ACCOUNTING_SCHEMA: &str = "rw.community.accounting.v1";
 const MAX_ACCOUNTING_STATE_BYTES: u64 = 8 * 1024 * 1024;
 type ManifestAndObject = (Vec<u8>, Vec<u8>);
 
+#[derive(Debug)]
+pub struct StoredCasePage {
+    pub cases: Vec<(String, Vec<u8>)>,
+    pub next_after: Option<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum CommunityStoreError {
     #[error("Community Cache is disabled by the server kill switch")]
@@ -355,6 +361,54 @@ impl CommunityCas {
             return Ok(None);
         }
         Ok(Some(bytes))
+    }
+
+    /// Return a bounded lexicographic page of deliberate case publications.
+    /// This does not expose passive searches or filesystem paths. Callers must
+    /// still verify every signature and referenced artifact before returning
+    /// the page to a client.
+    pub fn list_cases(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<StoredCasePage, CommunityStoreError> {
+        if !(1..=rw_community_protocol::MAX_CASE_DIRECTORY_PAGE).contains(&limit) {
+            return Err(CommunityStoreError::Invalid(
+                "case directory limit is outside its fixed bound".into(),
+            ));
+        }
+        if let Some(cursor) = after {
+            validate_case_id(cursor)?;
+        }
+        let now = now_unix();
+        let cases = self.inspect_cases(now, true)?;
+        let selected = cases
+            .keys()
+            .filter(|case_id| after.is_none_or(|cursor| case_id.as_str() > cursor))
+            .take(limit.saturating_add(1))
+            .cloned()
+            .collect::<Vec<_>>();
+        let has_more = selected.len() > limit;
+        let selected = selected.into_iter().take(limit).collect::<Vec<_>>();
+        let next_after = has_more.then(|| selected.last().cloned()).flatten();
+        let mut entries = Vec::with_capacity(selected.len());
+        for case_id in selected {
+            let bytes = read_bounded(
+                &self.case_path(&case_id),
+                self.case_limits.maximum_manifest_bytes,
+            )?;
+            let signed: SignedCaseRoomManifest = serde_json::from_slice(&bytes)?;
+            if signed.manifest.case_id != case_id || signed.manifest.retain_until_unix <= now {
+                return Err(CommunityStoreError::Invalid(
+                    "case changed while its directory page was being read".into(),
+                ));
+            }
+            entries.push((case_id, bytes));
+        }
+        Ok(StoredCasePage {
+            cases: entries,
+            next_after,
+        })
     }
 
     /// Persist the authenticated owner binding and rights decision associated
@@ -942,10 +996,13 @@ impl QuotaLedger {
             let bytes = read_bounded(&path, MAX_ACCOUNTING_STATE_BYTES)?;
             let state: DurableAccountingState = serde_json::from_slice(&bytes)?;
             validate_accounting_state(&state, limits)?;
-            if state.month == month {
-                state
-            } else {
+            if state.month < month {
                 DurableAccountingState::empty(month)
+            } else {
+                // Preserve a future-dated state and fail requests closed until
+                // the clock catches up. Resetting it here would let a clock
+                // rollback plus restart erase durable monthly consumption.
+                state
             }
         } else {
             DurableAccountingState::empty(month)
@@ -980,22 +1037,41 @@ impl QuotaLedger {
         principal: &str,
         month: u32,
     ) -> Result<TransferPermit, CommunityStoreError> {
+        self.begin_with_reserved_download(principal, month, 0)
+    }
+
+    /// Atomically acquire a concurrency permit and durably consume a bounded
+    /// download reservation. Persistence happens before the permit is
+    /// returned, so a process failure cannot turn completed upstream egress
+    /// into unaccounted bytes.
+    pub fn begin_reserved_download(
+        &self,
+        principal: &str,
+        month: u32,
+        bytes: u64,
+    ) -> Result<TransferPermit, CommunityStoreError> {
+        if bytes == 0 {
+            return Err(CommunityStoreError::Invalid(
+                "download reservation must be greater than zero".into(),
+            ));
+        }
+        self.begin_with_reserved_download(principal, month, bytes)
+    }
+
+    fn begin_with_reserved_download(
+        &self,
+        principal: &str,
+        month: u32,
+        reserved_download_bytes: u64,
+    ) -> Result<TransferPermit, CommunityStoreError> {
         validate_quota_principal(principal)?;
         validate_month(month)?;
         let mut inner = self.inner.lock().expect("community quota mutex poisoned");
-        if inner.durable.month != month {
-            let candidate = DurableAccountingState::empty(month);
-            self.persist(&candidate)?;
-            inner.durable = candidate;
+        if inner.durable.month > month {
+            return Err(CommunityStoreError::Quota);
         }
-        if !inner.durable.principals.contains_key(principal) {
-            if inner.durable.principals.len() >= self.limits.maximum_principals {
-                return Err(CommunityStoreError::Quota);
-            }
-            let mut candidate = inner.durable.clone();
-            candidate
-                .principals
-                .insert(principal.into(), PrincipalUsage::default());
+        if inner.durable.month < month {
+            let candidate = DurableAccountingState::empty(month);
             self.persist(&candidate)?;
             inner.durable = candidate;
         }
@@ -1003,6 +1079,29 @@ impl QuotaLedger {
         if active >= self.limits.concurrent_transfers {
             return Err(CommunityStoreError::Quota);
         }
+        let mut candidate = inner.durable.clone();
+        if !candidate.principals.contains_key(principal) {
+            if candidate.principals.len() >= self.limits.maximum_principals {
+                return Err(CommunityStoreError::Quota);
+            }
+            candidate
+                .principals
+                .insert(principal.into(), PrincipalUsage::default());
+        }
+        let usage = candidate
+            .principals
+            .get_mut(principal)
+            .ok_or(CommunityStoreError::Quota)?;
+        let next = usage
+            .downloaded
+            .checked_add(reserved_download_bytes)
+            .ok_or(CommunityStoreError::Quota)?;
+        if next > self.limits.download_bytes_per_month {
+            return Err(CommunityStoreError::Quota);
+        }
+        usage.downloaded = next;
+        self.persist(&candidate)?;
+        inner.durable = candidate;
         inner.active.insert(principal.into(), active + 1);
         Ok(TransferPermit {
             principal: principal.into(),
@@ -1044,7 +1143,10 @@ impl QuotaLedger {
     pub fn reserve_promotion(&self, month: u32, bytes: u64) -> Result<(), CommunityStoreError> {
         validate_month(month)?;
         let mut inner = self.inner.lock().expect("community quota mutex poisoned");
-        if inner.durable.month != month {
+        if inner.durable.month > month {
+            return Err(CommunityStoreError::Quota);
+        }
+        if inner.durable.month < month {
             let candidate = DurableAccountingState::empty(month);
             self.persist(&candidate)?;
             inner.durable = candidate;
@@ -1305,6 +1407,69 @@ mod tests {
     }
 
     #[test]
+    fn reserved_download_is_atomic_durable_and_monotonic_across_months() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reserved-accounting.json");
+        let limits = accounting_limits(10, 20, 30);
+        {
+            let ledger = QuotaLedger::open(&path, limits, 202608).unwrap();
+            let permit = ledger
+                .begin_reserved_download("user-a", 202608, 20)
+                .unwrap();
+            assert!(matches!(
+                ledger.begin_reserved_download("user-a", 202608, 1),
+                Err(CommunityStoreError::Quota)
+            ));
+            drop(permit);
+        }
+
+        let restarted = QuotaLedger::open(&path, limits, 202608).unwrap();
+        assert!(matches!(
+            restarted.begin_reserved_download("user-a", 202608, 1),
+            Err(CommunityStoreError::Quota)
+        ));
+
+        let rolled_back = QuotaLedger::open(&path, limits, 202607).unwrap();
+        assert!(matches!(
+            rolled_back.begin_reserved_download("user-a", 202607, 1),
+            Err(CommunityStoreError::Quota)
+        ));
+
+        {
+            let next_month = QuotaLedger::open(&path, limits, 202609).unwrap();
+            let _permit = next_month
+                .begin_reserved_download("user-a", 202609, 20)
+                .unwrap();
+        }
+        let next_month_restart = QuotaLedger::open(&path, limits, 202609).unwrap();
+        assert!(matches!(
+            next_month_restart.begin_reserved_download("user-a", 202609, 1),
+            Err(CommunityStoreError::Quota)
+        ));
+        assert!(matches!(
+            next_month_restart.begin_reserved_download("user-a", 202609, 0),
+            Err(CommunityStoreError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn reserved_download_concurrency_rejection_is_preflight_and_not_charged() {
+        let ledger = QuotaLedger::memory(accounting_limits(10, 40, 30), 202608).unwrap();
+        let permit = ledger
+            .begin_reserved_download("user-a", 202608, 10)
+            .unwrap();
+        assert!(matches!(
+            ledger.begin_reserved_download("user-a", 202608, 10),
+            Err(CommunityStoreError::Quota)
+        ));
+        drop(permit);
+        let _permit = ledger
+            .begin_reserved_download("user-a", 202608, 30)
+            .unwrap();
+        assert!(ledger.begin_reserved_download("user-b", 202608, 1).is_ok());
+    }
+
+    #[test]
     fn case_storage_is_bounded_and_expired_cases_are_cleaned_on_restart() {
         let directory = tempfile::tempdir().unwrap();
         let first = signed_case("case-a", now_unix() + 3600);
@@ -1335,5 +1500,39 @@ mod tests {
         assert!(restarted.get_case("case-a").unwrap().is_none());
         restarted.put_case("case-b", &second).unwrap();
         assert_eq!(restarted.case_storage_bytes().unwrap(), second.len() as u64);
+    }
+
+    #[test]
+    fn case_directory_pages_are_stable_bounded_and_cursor_ordered() {
+        let directory = tempfile::tempdir().unwrap();
+        let cases = CaseLimits {
+            maximum_manifest_bytes: 4096,
+            storage_bytes: 16 * 1024,
+            maximum_cases: 4,
+        };
+        let cas = CommunityCas::open(directory.path(), limits(8, 1), cases).unwrap();
+        for case_id in ["case-c", "case-a", "case-b"] {
+            cas.put_case(case_id, &signed_case(case_id, now_unix() + 3600))
+                .unwrap();
+        }
+        let first = cas.list_cases(None, 2).unwrap();
+        assert_eq!(
+            first
+                .cases
+                .iter()
+                .map(|(case_id, _)| case_id.as_str())
+                .collect::<Vec<_>>(),
+            ["case-a", "case-b"]
+        );
+        assert_eq!(first.next_after.as_deref(), Some("case-b"));
+        let second = cas.list_cases(first.next_after.as_deref(), 2).unwrap();
+        assert_eq!(second.cases.len(), 1);
+        assert_eq!(second.cases[0].0, "case-c");
+        assert!(second.next_after.is_none());
+        assert!(cas.list_cases(None, 0).is_err());
+        assert!(
+            cas.list_cases(None, rw_community_protocol::MAX_CASE_DIRECTORY_PAGE + 1)
+                .is_err()
+        );
     }
 }

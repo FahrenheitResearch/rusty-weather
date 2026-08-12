@@ -1,0 +1,9 @@
+{
+	admin off
+	auto_https off
+}
+
+:443 {
+	tls /run/secrets/lab_tls_certificate /run/secrets/lab_tls_private_key
+	reverse_proxy {$LAB_UPSTREAM}
+}
