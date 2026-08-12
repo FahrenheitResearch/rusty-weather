@@ -62,12 +62,14 @@ jobs:
           bash -n deploy/docker/docker-entrypoint.sh
           bash -n deploy/docker/smoke-production-candidate.sh
           bash -n deploy/distributed-lab/run.sh
-          mkdir -p "$RUNNER_TEMP/systemd/rusty-weather.service.d"
-          cp deploy/systemd/rusty-weather.service \
-            "$RUNNER_TEMP/systemd/rusty-weather.service"
-          cp deploy/systemd/rusty-weather-generation-replication.conf \
-            "$RUNNER_TEMP/systemd/rusty-weather.service.d/50-generation-replication.conf"
-          systemd-analyze verify "$RUNNER_TEMP/systemd/rusty-weather.service"
+          systemd_root="$RUNNER_TEMP/systemd-root"
+          install -Dm0644 deploy/systemd/rusty-weather.service \
+            "$systemd_root/etc/systemd/system/rusty-weather.service"
+          install -Dm0644 deploy/systemd/rusty-weather-generation-replication.conf \
+            "$systemd_root/etc/systemd/system/rusty-weather.service.d/50-generation-replication.conf"
+          install -Dm0755 /bin/true "$systemd_root/usr/local/bin/rw-server"
+          systemd-analyze --root="$systemd_root" --recursive-errors=no \
+            verify rusty-weather.service
           docker compose -f deploy/docker/compose.yaml config --quiet
           docker compose -f deploy/docker/compose.yaml \
             -f deploy/docker/compose.replication.yaml config --quiet
