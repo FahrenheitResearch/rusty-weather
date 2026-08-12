@@ -80,8 +80,7 @@ jobs:
 
       - name: Check the isolated distributed lab controller
         if: runner.os == 'Linux'
-        run: cargo +1.92.0 check --locked \
-          --manifest-path deploy/distributed-lab/labctl/Cargo.toml --all-targets
+        run: cargo +1.92.0 check --locked --manifest-path deploy/distributed-lab/labctl/Cargo.toml --all-targets
 
       - name: Deny warnings in distributed service code
         if: runner.os == 'Linux'
@@ -101,8 +100,7 @@ jobs:
 
       - name: Test the isolated distributed lab controller
         if: runner.os == 'Linux'
-        run: cargo +1.92.0 test --locked \
-          --manifest-path deploy/distributed-lab/labctl/Cargo.toml --all-targets
+        run: cargo +1.92.0 test --locked --manifest-path deploy/distributed-lab/labctl/Cargo.toml --all-targets
 
   dependency-policy:
     name: Dependency policy - ${{ matrix.package.name }} - ${{ matrix.checks }}
