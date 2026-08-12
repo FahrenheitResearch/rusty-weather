@@ -75,6 +75,13 @@ that the two values are equal.
    terminal expiry tombstone plus authenticated retirement work before it can
    return bytes or catalog visibility.
 
+Finalization is also the lost-response reconciliation boundary. Once an exact
+owner/generation-id/generation-hash publication is durable, repeating finalize
+returns the original `PublishedRunGeneration` unchanged, including after
+restart and while the kill switch is engaged. A different owner is rejected,
+a different hash conflicts, and a tombstone remains terminal. The first HTTP
+success is `201 Created`; an exact durable replay is `200 OK`.
+
 ## Visibility and replacement atomicity
 
 The engine never overwrites or temporarily removes an existing different run.
@@ -157,14 +164,34 @@ The protected API provides:
 
 - `GET /v1/community/generation-replication/owner` for this caller's
   replication-domain-separated owner hash;
+- `GET /v1/community/generation-replication/capabilities` for the serving
+  origin's actual protocol/chunk/retention/upload-lifetime limits, per-owner
+  quota ceilings, and only this caller's durable usage;
+- `GET /v1/community/generations` for deterministic generation-id pagination
+  over only this owner's live publications and tombstones;
 - `POST /v1/community/generations` for begin/idempotent resume;
 - owner-bound status and cursor-bounded missing-chunk reads;
+- `GET /v1/community/generations/{generation_id}/publication` for exact
+  owner-only reconciliation. Missing and another owner's identity both return
+  not-found so the route cannot enumerate other accounts;
+- `DELETE /v1/community/generations/{generation_id}` for durable cancellation
+  of one active owned upload and immediate release of its storage/count/
+  concurrency reservation;
 - exact `application/octet-stream` chunk upload with a route-specific body
   limit, empty-body rejection, and hash/size/inventory validation;
 - finalize and durable owner revocation; and
 - operator-only coarse status, kill-switch, and bounded GC routes.
 
-Every response is private/no-store. Operator status contains aggregate health,
+Every response is private/no-store. Capabilities, owner publication/tombstone
+lookup and pagination, exact finalize reconciliation, and upload cancellation
+remain readable or usable while killed. The kill switch still blocks begin,
+status/missing, chunk admission, and new finalize work. `accepting_uploads` is
+false when killed or when any per-owner count/storage/concurrency/monthly byte
+ceiling is exhausted. Usage remains truthful if an operator lowers a quota
+below already durable consumption, allowing the owner to reconcile or cancel
+instead of turning the planning endpoint into an error.
+
+Operator status contains aggregate health,
 authorized publication counts/bytes, pending-retirement counts/bytes, and
 tombstone totals only—never owner IDs, model/run IDs, paths, source URLs, or
 credentials. The GC response separately reports expired publications, completed

@@ -812,12 +812,7 @@ mod tests {
     const ORIGIN_TOKEN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn write_private_token(path: &std::path::Path, token: &str) {
-        std::fs::write(path, format!("{token}\n")).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        crate::test_support::write_private_file(path, format!("{token}\n"));
     }
 
     fn hash(character: char) -> String {
@@ -1065,16 +1060,10 @@ mod tests {
         let token_path = directory.path().join("local-resolve.token");
         write_private_token(&token_path, ORIGIN_TOKEN);
         let key_path = directory.path().join("community.key");
-        std::fs::write(
+        crate::test_support::write_private_file(
             &key_path,
             base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        );
         let mut config = AppConfig::default();
         config.community.enabled = true;
         config.community.root = directory.path().join("community");

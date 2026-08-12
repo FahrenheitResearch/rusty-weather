@@ -2642,11 +2642,10 @@ mod tests {
     fn config(directory: &tempfile::TempDir) -> CommunityConfig {
         use base64::Engine as _;
         let key_path = directory.path().join("signing.key");
-        fs::write(
+        crate::test_support::write_private_file(
             &key_path,
             base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
-        )
-        .unwrap();
+        );
         CommunityConfig {
             enabled: true,
             root: directory.path().join("cas"),

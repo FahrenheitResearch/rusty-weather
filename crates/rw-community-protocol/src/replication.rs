@@ -29,8 +29,17 @@ pub const FINALIZE_RUN_GENERATION_SCHEMA: &str = "rw.community.run-generation-fi
 pub const PUBLISHED_RUN_GENERATION_SCHEMA: &str = "rw.community.run-generation-published.v1";
 pub const REVOKE_RUN_GENERATION_SCHEMA: &str = "rw.community.run-generation-revoke.v1";
 pub const RUN_GENERATION_TOMBSTONE_SCHEMA: &str = "rw.community.run-generation-tombstone.v1";
+pub const RUN_GENERATION_OWNER_CAPABILITIES_SCHEMA: &str =
+    "rw.community.run-generation-owner-capabilities.v1";
+pub const RUN_GENERATION_OWNER_RECORD_SCHEMA: &str = "rw.community.run-generation-owner-record.v1";
+pub const RUN_GENERATION_OWNER_LIST_SCHEMA: &str = "rw.community.run-generation-owner-list.v1";
+pub const CANCELLED_RUN_GENERATION_SCHEMA: &str = "rw.community.run-generation-cancelled.v1";
 pub const BEGIN_RUN_GENERATION_PATH: &str = "/v1/community/generations";
 pub const RUN_GENERATION_PATH_TEMPLATE: &str = "/v1/community/generations/{generation_id}";
+pub const RUN_GENERATION_CAPABILITIES_PATH: &str =
+    "/v1/community/generation-replication/capabilities";
+pub const RUN_GENERATION_PUBLICATION_PATH_TEMPLATE: &str =
+    "/v1/community/generations/{generation_id}/publication";
 pub const RUN_GENERATION_MISSING_PATH_TEMPLATE: &str =
     "/v1/community/generations/{generation_id}/missing";
 pub const FINALIZE_RUN_GENERATION_PATH_TEMPLATE: &str =
@@ -42,6 +51,7 @@ pub const RUN_GENERATION_CHUNK_PATH_TEMPLATE: &str =
 pub const GET_RUN_GENERATION_OBJECT_PATH_TEMPLATE: &str =
     "/v1/community/generation-objects/{sha256}";
 pub const MAX_RUN_GENERATION_MISSING_PAGE: usize = 1024;
+pub const MAX_RUN_GENERATION_OWNER_PAGE: usize = 100;
 
 const SIGNATURE_DOMAIN: &[u8] = b"rw-community-run-generation-signature-v1\0";
 const CONTENT_ID_DOMAIN: &[u8] = b"rw-community-run-generation-content-v1\0";
@@ -239,6 +249,104 @@ pub struct RunGenerationTombstone {
     pub revoked_unix: i64,
     pub rights_withdrawn: bool,
     pub reason: String,
+}
+
+/// Exact protocol ceilings advertised to an authenticated generation owner.
+/// These are runtime values from the serving origin, not client defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunGenerationAdvertisedLimits {
+    pub maximum_generation_bytes: u64,
+    pub maximum_files: u64,
+    pub maximum_chunks: u64,
+    pub maximum_chunk_bytes: u64,
+    pub maximum_manifest_bytes: u64,
+    pub minimum_retention_seconds: i64,
+    pub maximum_retention_seconds: i64,
+    pub maximum_provenance_entries: u64,
+    pub maximum_attributions: u64,
+    pub upload_ttl_seconds: i64,
+}
+
+/// Per-owner durable quota ceilings. Global operator capacity is deliberately
+/// omitted so one owner cannot infer other owners' activity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunGenerationOwnerQuota {
+    pub maximum_storage_bytes: u64,
+    pub maximum_generations: u64,
+    pub maximum_concurrent_uploads: u64,
+    pub maximum_monthly_upload_bytes: u64,
+}
+
+/// This owner's current durable usage at one atomic service snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunGenerationOwnerUsage {
+    pub active_uploads: u64,
+    pub live_publications: u64,
+    pub pending_retirements: u64,
+    pub tombstones: u64,
+    pub reserved_bytes: u64,
+    pub published_bytes: u64,
+    pub pending_retirement_bytes: u64,
+    pub billing_utc_month: String,
+    pub monthly_accepted_upload_bytes: u64,
+}
+
+/// Owner-scoped planning contract for a safe manifest, chunk plan, retention
+/// request, and resumable upload. `accepting_uploads` reflects the durable kill
+/// switch without exposing global usage or another owner's identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunGenerationOwnerCapabilities {
+    pub schema: String,
+    pub owner_principal_sha256: String,
+    pub accepting_uploads: bool,
+    pub limits: RunGenerationAdvertisedLimits,
+    pub quota: RunGenerationOwnerQuota,
+    pub usage: RunGenerationOwnerUsage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunGenerationOwnerRecordState {
+    Published,
+    Tombstone,
+}
+
+/// Compact reconciliation record. Exactly one of `publication` or
+/// `tombstone` is present, as selected by `state`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunGenerationOwnerRecord {
+    pub schema: String,
+    pub state: RunGenerationOwnerRecordState,
+    pub generation_id: String,
+    pub generation_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<PublishedRunGeneration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstone: Option<RunGenerationTombstone>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunGenerationOwnerListPage {
+    pub schema: String,
+    pub records: Vec<RunGenerationOwnerRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelledRunGeneration {
+    pub schema: String,
+    pub generation_id: String,
+    pub generation_sha256: String,
+    pub cancelled_unix: i64,
+    pub released_reserved_bytes: u64,
 }
 
 impl RunGenerationReplicationManifest {
@@ -483,6 +591,207 @@ impl RunGenerationTombstone {
             return invalid("tombstone", "invalid revocation time or confirmation");
         }
         validate_plain_text("reason", &self.reason, 1024)
+    }
+}
+
+impl RunGenerationAdvertisedLimits {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        let limits = RunGenerationLimits {
+            max_generation_bytes: self.maximum_generation_bytes,
+            max_files: usize::try_from(self.maximum_files)
+                .map_err(|_| ProtocolError::EncodedSizeLimit)?,
+            max_chunks: usize::try_from(self.maximum_chunks)
+                .map_err(|_| ProtocolError::EncodedSizeLimit)?,
+            max_chunk_bytes: self.maximum_chunk_bytes,
+            max_manifest_bytes: usize::try_from(self.maximum_manifest_bytes)
+                .map_err(|_| ProtocolError::ManifestSizeLimit)?,
+            max_retention_seconds: self.maximum_retention_seconds,
+            max_provenance_entries: usize::try_from(self.maximum_provenance_entries)
+                .map_err(|_| ProtocolError::EncodedSizeLimit)?,
+            max_attributions: usize::try_from(self.maximum_attributions)
+                .map_err(|_| ProtocolError::EncodedSizeLimit)?,
+        };
+        limits.validate()?;
+        if self.minimum_retention_seconds <= 0
+            || self.minimum_retention_seconds > self.maximum_retention_seconds
+            || self.upload_ttl_seconds <= 0
+            || self.upload_ttl_seconds > ABSOLUTE_MAX_RETENTION_SECONDS
+        {
+            return invalid(
+                "advertised limits",
+                "retention or upload lifetime is invalid",
+            );
+        }
+        Ok(())
+    }
+}
+
+impl RunGenerationOwnerQuota {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.maximum_storage_bytes == 0
+            || self.maximum_generations == 0
+            || self.maximum_concurrent_uploads == 0
+            || self.maximum_monthly_upload_bytes == 0
+        {
+            return invalid("owner quota", "owner quota ceilings must be non-zero");
+        }
+        Ok(())
+    }
+}
+
+impl RunGenerationOwnerCapabilities {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema != RUN_GENERATION_OWNER_CAPABILITIES_SCHEMA {
+            return Err(ProtocolError::UnsupportedSchema(self.schema.clone()));
+        }
+        validate_sha256("owner_principal_sha256", &self.owner_principal_sha256)?;
+        self.limits.validate()?;
+        self.quota.validate()?;
+        validate_utc_month("billing_utc_month", &self.usage.billing_utc_month)?;
+        let generations = self
+            .usage
+            .active_uploads
+            .checked_add(self.usage.live_publications)
+            .and_then(|value| value.checked_add(self.usage.pending_retirements))
+            .ok_or(ProtocolError::EncodedSizeLimit)?;
+        let storage = self
+            .usage
+            .reserved_bytes
+            .checked_add(self.usage.published_bytes)
+            .and_then(|value| value.checked_add(self.usage.pending_retirement_bytes))
+            .ok_or(ProtocolError::EncodedSizeLimit)?;
+        // Usage is an observation, not an admission request. It may truthfully
+        // exceed a newly lowered operator ceiling; callers must still receive
+        // that state so they can reconcile/cancel. `accepting_uploads` carries
+        // the current admission answer and must not claim availability once a
+        // per-owner ceiling is exhausted.
+        let quota_exhausted = self.usage.active_uploads >= self.quota.maximum_concurrent_uploads
+            || generations >= self.quota.maximum_generations
+            || storage >= self.quota.maximum_storage_bytes
+            || self.usage.monthly_accepted_upload_bytes >= self.quota.maximum_monthly_upload_bytes;
+        if self.accepting_uploads && quota_exhausted {
+            return invalid(
+                "accepting_uploads",
+                "owner quota is exhausted but upload admission is advertised",
+            );
+        }
+        Ok(())
+    }
+}
+
+impl RunGenerationOwnerRecord {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema != RUN_GENERATION_OWNER_RECORD_SCHEMA {
+            return Err(ProtocolError::UnsupportedSchema(self.schema.clone()));
+        }
+        validate_token("generation_id", &self.generation_id, 128, false)?;
+        validate_sha256("generation_sha256", &self.generation_sha256)?;
+        match self.state {
+            RunGenerationOwnerRecordState::Published => {
+                let publication =
+                    self.publication
+                        .as_ref()
+                        .ok_or_else(|| ProtocolError::InvalidField {
+                            field: "publication",
+                            reason: "published record is missing its publication".into(),
+                        })?;
+                if self.tombstone.is_some() {
+                    return invalid("tombstone", "published record contains a tombstone");
+                }
+                publication.validate()?;
+                if publication.generation_id != self.generation_id
+                    || publication.generation_sha256 != self.generation_sha256
+                {
+                    return invalid("publication", "publication identity does not match record");
+                }
+            }
+            RunGenerationOwnerRecordState::Tombstone => {
+                let tombstone =
+                    self.tombstone
+                        .as_ref()
+                        .ok_or_else(|| ProtocolError::InvalidField {
+                            field: "tombstone",
+                            reason: "tombstone record is missing its tombstone".into(),
+                        })?;
+                if self.publication.is_some() {
+                    return invalid("publication", "tombstone record contains a publication");
+                }
+                tombstone.validate()?;
+                if tombstone.generation_id != self.generation_id
+                    || tombstone.generation_sha256 != self.generation_sha256
+                {
+                    return invalid("tombstone", "tombstone identity does not match record");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RunGenerationOwnerListPage {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema != RUN_GENERATION_OWNER_LIST_SCHEMA {
+            return Err(ProtocolError::UnsupportedSchema(self.schema.clone()));
+        }
+        if self.records.len() > MAX_RUN_GENERATION_OWNER_PAGE {
+            return invalid("records", "owner generation page exceeds protocol bound");
+        }
+        if self
+            .records
+            .windows(2)
+            .any(|pair| pair[0].generation_id >= pair[1].generation_id)
+        {
+            return Err(ProtocolError::NonCanonical("owner generation records"));
+        }
+        for record in &self.records {
+            record.validate()?;
+        }
+        if let Some(cursor) = &self.next_after {
+            validate_token("next_after", cursor, 128, false)?;
+            if self
+                .records
+                .last()
+                .is_none_or(|record| record.generation_id != *cursor)
+            {
+                return invalid(
+                    "next_after",
+                    "cursor must equal the last returned generation id",
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CancelledRunGeneration {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.schema != CANCELLED_RUN_GENERATION_SCHEMA {
+            return Err(ProtocolError::UnsupportedSchema(self.schema.clone()));
+        }
+        validate_token("generation_id", &self.generation_id, 128, false)?;
+        validate_sha256("generation_sha256", &self.generation_sha256)?;
+        if self.cancelled_unix < 0 || self.released_reserved_bytes == 0 {
+            return invalid(
+                "cancellation",
+                "cancellation time or released bytes is invalid",
+            );
+        }
+        Ok(())
+    }
+}
+
+fn validate_utc_month(field: &'static str, value: &str) -> Result<(), ProtocolError> {
+    if value.len() == 7
+        && value.as_bytes()[4] == b'-'
+        && value[..4].bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(
+            &value[5..],
+            "01" | "02" | "03" | "04" | "05" | "06" | "07" | "08" | "09" | "10" | "11" | "12"
+        )
+    {
+        Ok(())
+    } else {
+        invalid(field, "month must be canonical YYYY-MM")
     }
 }
 
@@ -1149,5 +1458,89 @@ mod tests {
         revoke.validate().unwrap();
         revoke.rights_withdrawn = false;
         assert!(revoke.validate().is_err());
+    }
+
+    #[test]
+    fn owner_capability_reconciliation_and_cancellation_contracts_are_strict() {
+        let manifest = manifest(DataOrigin::PrivateWrf);
+        let publication = PublishedRunGeneration {
+            schema: PUBLISHED_RUN_GENERATION_SCHEMA.into(),
+            generation_id: manifest.generation_id.clone(),
+            generation_sha256: manifest.generation_sha256.clone(),
+            source_snapshot_id: manifest.source_snapshot_id.clone(),
+            local_snapshot_id: hash(0xee),
+            grid_hash: manifest.grid_hash.clone(),
+            model: manifest.model.clone(),
+            run: manifest.run.clone(),
+            published_unix: 1_800_000_100,
+        };
+        let record = RunGenerationOwnerRecord {
+            schema: RUN_GENERATION_OWNER_RECORD_SCHEMA.into(),
+            state: RunGenerationOwnerRecordState::Published,
+            generation_id: manifest.generation_id.clone(),
+            generation_sha256: manifest.generation_sha256.clone(),
+            publication: Some(publication),
+            tombstone: None,
+        };
+        record.validate().unwrap();
+        RunGenerationOwnerListPage {
+            schema: RUN_GENERATION_OWNER_LIST_SCHEMA.into(),
+            records: vec![record],
+            next_after: None,
+        }
+        .validate()
+        .unwrap();
+
+        let capabilities = RunGenerationOwnerCapabilities {
+            schema: RUN_GENERATION_OWNER_CAPABILITIES_SCHEMA.into(),
+            owner_principal_sha256: manifest.owner_principal_sha256,
+            accepting_uploads: true,
+            limits: RunGenerationAdvertisedLimits {
+                maximum_generation_bytes: 1024 * 1024,
+                maximum_files: 32,
+                maximum_chunks: 128,
+                maximum_chunk_bytes: 1024,
+                maximum_manifest_bytes: 1024 * 1024,
+                minimum_retention_seconds: 1,
+                maximum_retention_seconds: 86_400,
+                maximum_provenance_entries: 8,
+                maximum_attributions: 8,
+                upload_ttl_seconds: 3_600,
+            },
+            quota: RunGenerationOwnerQuota {
+                maximum_storage_bytes: 8 * 1024 * 1024,
+                maximum_generations: 4,
+                maximum_concurrent_uploads: 2,
+                maximum_monthly_upload_bytes: 16 * 1024 * 1024,
+            },
+            usage: RunGenerationOwnerUsage {
+                active_uploads: 1,
+                live_publications: 1,
+                pending_retirements: 0,
+                tombstones: 1,
+                reserved_bytes: 1024,
+                published_bytes: 2048,
+                pending_retirement_bytes: 0,
+                billing_utc_month: "2027-01".into(),
+                monthly_accepted_upload_bytes: 4096,
+            },
+        };
+        capabilities.validate().unwrap();
+        let mut invalid = capabilities;
+        invalid.usage.active_uploads = 3;
+        invalid.accepting_uploads = false;
+        // A deployment may lower a quota below already durable usage. The
+        // owner must still be able to parse truthful reconciliation state.
+        invalid.validate().unwrap();
+
+        CancelledRunGeneration {
+            schema: CANCELLED_RUN_GENERATION_SCHEMA.into(),
+            generation_id: "cancel-me".into(),
+            generation_sha256: hash(0xab),
+            cancelled_unix: 1_800_000_200,
+            released_reserved_bytes: 1024,
+        }
+        .validate()
+        .unwrap();
     }
 }

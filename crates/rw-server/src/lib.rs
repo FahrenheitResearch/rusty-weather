@@ -42,3 +42,21 @@ pub use state::{AppState, ExecutionError};
 pub fn config_schema_document() -> schemars::Schema {
     schemars::schema_for!(AppConfig)
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    /// Write a test credential with the same private-file invariant enforced
+    /// by production loaders. Linux CI otherwise creates fixtures as 0644,
+    /// which correctly fails the production 0600 gate.
+    pub(crate) fn write_private_file(path: &Path, bytes: impl AsRef<[u8]>) {
+        std::fs::write(path, bytes).expect("write private test credential");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("set private test credential permissions");
+        }
+    }
+}

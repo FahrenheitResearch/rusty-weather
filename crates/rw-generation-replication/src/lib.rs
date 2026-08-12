@@ -20,11 +20,16 @@ use chrono::{DateTime, Datelike, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use fs4::{FileExt, TryLockError};
 use rw_community_protocol::{
-    BeginRunGenerationRequest, FinalizeRunGenerationRequest, PUBLISHED_RUN_GENERATION_SCHEMA,
-    PublishedRunGeneration, RUN_GENERATION_MISSING_PAGE_SCHEMA, RUN_GENERATION_TOMBSTONE_SCHEMA,
-    RUN_GENERATION_UPLOAD_STATUS_SCHEMA, RevokeRunGenerationRequest, RunGenerationFile,
+    BeginRunGenerationRequest, CANCELLED_RUN_GENERATION_SCHEMA, CancelledRunGeneration,
+    FinalizeRunGenerationRequest, PUBLISHED_RUN_GENERATION_SCHEMA, PublishedRunGeneration,
+    RUN_GENERATION_MISSING_PAGE_SCHEMA, RUN_GENERATION_OWNER_CAPABILITIES_SCHEMA,
+    RUN_GENERATION_OWNER_LIST_SCHEMA, RUN_GENERATION_OWNER_RECORD_SCHEMA,
+    RUN_GENERATION_TOMBSTONE_SCHEMA, RUN_GENERATION_UPLOAD_STATUS_SCHEMA,
+    RevokeRunGenerationRequest, RunGenerationAdvertisedLimits, RunGenerationFile,
     RunGenerationFileKind, RunGenerationLimits, RunGenerationMissingChunk,
-    RunGenerationMissingPage, RunGenerationReplicationManifest, RunGenerationTombstone,
+    RunGenerationMissingPage, RunGenerationOwnerCapabilities, RunGenerationOwnerListPage,
+    RunGenerationOwnerQuota, RunGenerationOwnerRecord, RunGenerationOwnerRecordState,
+    RunGenerationOwnerUsage, RunGenerationReplicationManifest, RunGenerationTombstone,
     RunGenerationUploadStatus, SignatureAlgorithm, SignedRunGenerationManifest,
     canonical_run_generation_bytes, sign_run_generation, verify_run_generation_chunk,
 };
@@ -177,6 +182,9 @@ pub struct ReplicationConfig {
 pub struct FinalizeOutcome {
     pub published: PublishedRunGeneration,
     pub signed_manifest: SignedRunGenerationManifest,
+    /// True when this call reconciled an already durable exact publication
+    /// (for example after a restart or a lost successful HTTP response).
+    pub was_already_published: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -388,6 +396,142 @@ impl GenerationReplicationService {
         Ok(service)
     }
 
+    /// Return the exact runtime protocol limits, upload lifetime, per-owner
+    /// ceilings, and this owner's durable usage without exposing any global or
+    /// other-owner capacity information. This remains available while the kill
+    /// switch is engaged so clients can pause safely and reconcile local work.
+    pub fn owner_capabilities(
+        &self,
+        owner: &AuthenticatedOwner,
+        now_unix: i64,
+    ) -> Result<RunGenerationOwnerCapabilities> {
+        self.require_enabled()?;
+        self.expire_due_publications(now_unix)?;
+        let _ = self.drain_retirements(1);
+        let month = utc_month(now_unix)?;
+        let state = self.lock_state()?;
+        let uploads: Vec<_> = state
+            .uploads
+            .values()
+            .filter(|record| record.manifest.owner_principal_sha256 == owner.sha256())
+            .collect();
+        let publications: Vec<_> = state
+            .published
+            .values()
+            .filter(|record| {
+                record.signed_manifest.manifest.owner_principal_sha256 == owner.sha256()
+            })
+            .collect();
+        let retirements: Vec<_> = state
+            .retirements
+            .values()
+            .filter(|record| {
+                record.signed_manifest.manifest.owner_principal_sha256 == owner.sha256()
+            })
+            .collect();
+        let tombstones = state
+            .tombstones
+            .values()
+            .filter(|record| record.owner_principal_sha256 == owner.sha256())
+            .count();
+        let active_uploads = usize_as_u64(uploads.len())?;
+        let live_publications = usize_as_u64(publications.len())?;
+        let pending_retirements = usize_as_u64(retirements.len())?;
+        let reserved_bytes = sum_upload_bytes(uploads.iter().copied())?;
+        let published_bytes = sum_published_bytes(publications.iter().copied())?;
+        let pending_retirement_bytes = sum_published_bytes(retirements.iter().copied())?;
+        let monthly_accepted_upload_bytes = if state.billing.utc_month == month {
+            state
+                .billing
+                .owner_upload_bytes
+                .get(owner.sha256())
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let owner_generations = active_uploads
+            .checked_add(live_publications)
+            .and_then(|value| value.checked_add(pending_retirements))
+            .ok_or(ReplicationError::CorruptState)?;
+        let owner_storage = reserved_bytes
+            .checked_add(published_bytes)
+            .and_then(|value| value.checked_add(pending_retirement_bytes))
+            .ok_or(ReplicationError::CorruptState)?;
+        let total_generations = state
+            .uploads
+            .len()
+            .saturating_add(state.published.len())
+            .saturating_add(state.retirements.len());
+        let total_storage = state
+            .uploads
+            .values()
+            .map(|record| record.manifest.total_bytes)
+            .chain(
+                state
+                    .published
+                    .values()
+                    .map(|record| record.signed_manifest.manifest.total_bytes),
+            )
+            .chain(
+                state
+                    .retirements
+                    .values()
+                    .map(|record| record.signed_manifest.manifest.total_bytes),
+            )
+            .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
+            .ok_or(ReplicationError::CorruptState)?;
+        let total_monthly_upload_bytes = if state.billing.utc_month == month {
+            state.billing.total_upload_bytes
+        } else {
+            0
+        };
+        let capabilities = RunGenerationOwnerCapabilities {
+            schema: RUN_GENERATION_OWNER_CAPABILITIES_SCHEMA.into(),
+            owner_principal_sha256: owner.sha256().into(),
+            accepting_uploads: !state.kill_switch
+                && active_uploads < usize_as_u64(self.policy.max_owner_concurrent_uploads)?
+                && owner_generations < usize_as_u64(self.policy.max_owner_generations)?
+                && owner_storage < self.policy.max_owner_storage_bytes
+                && monthly_accepted_upload_bytes < self.policy.max_owner_monthly_upload_bytes
+                && state.uploads.len() < self.policy.max_total_concurrent_uploads
+                && total_generations < self.policy.max_total_generations
+                && total_storage < self.policy.max_total_storage_bytes
+                && total_monthly_upload_bytes < self.policy.max_total_monthly_upload_bytes,
+            limits: RunGenerationAdvertisedLimits {
+                maximum_generation_bytes: self.limits.max_generation_bytes,
+                maximum_files: usize_as_u64(self.limits.max_files)?,
+                maximum_chunks: usize_as_u64(self.limits.max_chunks)?,
+                maximum_chunk_bytes: self.limits.max_chunk_bytes,
+                maximum_manifest_bytes: usize_as_u64(self.limits.max_manifest_bytes)?,
+                minimum_retention_seconds: 1,
+                maximum_retention_seconds: self.limits.max_retention_seconds,
+                maximum_provenance_entries: usize_as_u64(self.limits.max_provenance_entries)?,
+                maximum_attributions: usize_as_u64(self.limits.max_attributions)?,
+                upload_ttl_seconds: self.policy.upload_ttl_seconds,
+            },
+            quota: RunGenerationOwnerQuota {
+                maximum_storage_bytes: self.policy.max_owner_storage_bytes,
+                maximum_generations: usize_as_u64(self.policy.max_owner_generations)?,
+                maximum_concurrent_uploads: usize_as_u64(self.policy.max_owner_concurrent_uploads)?,
+                maximum_monthly_upload_bytes: self.policy.max_owner_monthly_upload_bytes,
+            },
+            usage: RunGenerationOwnerUsage {
+                active_uploads,
+                live_publications,
+                pending_retirements,
+                tombstones: usize_as_u64(tombstones)?,
+                reserved_bytes,
+                published_bytes,
+                pending_retirement_bytes,
+                billing_utc_month: month,
+                monthly_accepted_upload_bytes,
+            },
+        };
+        capabilities.validate()?;
+        Ok(capabilities)
+    }
+
     pub fn begin(
         &self,
         owner: &AuthenticatedOwner,
@@ -468,6 +612,138 @@ impl GenerationReplicationService {
         require_owner(owner, &upload.manifest)?;
         require_active(upload, now_unix)?;
         self.status_for(upload)
+    }
+
+    /// Cancel one active owner upload and durably release its storage/count/
+    /// concurrency reservation. Cancellation is intentionally allowed while
+    /// the kill switch is engaged; it cannot publish bytes or authorize data.
+    pub fn cancel_upload(
+        &self,
+        owner: &AuthenticatedOwner,
+        generation_id: &str,
+        now_unix: i64,
+    ) -> Result<CancelledRunGeneration> {
+        self.require_enabled()?;
+        require_generation_id(generation_id)?;
+        if now_unix < 0 {
+            return Err(ReplicationError::Expired);
+        }
+        let mut state = self.lock_state()?;
+        let upload = state
+            .uploads
+            .get(generation_id)
+            .ok_or(ReplicationError::NotFound)?;
+        require_owner(owner, &upload.manifest)?;
+        let response = CancelledRunGeneration {
+            schema: CANCELLED_RUN_GENERATION_SCHEMA.into(),
+            generation_id: generation_id.into(),
+            generation_sha256: upload.manifest.generation_sha256.clone(),
+            cancelled_unix: now_unix,
+            released_reserved_bytes: upload.manifest.total_bytes,
+        };
+        response.validate()?;
+        let previous = state
+            .uploads
+            .remove(generation_id)
+            .expect("owned upload checked above");
+        if let Err(error) = self.persist(&state) {
+            state.uploads.insert(generation_id.into(), previous);
+            return Err(error);
+        }
+        Ok(response)
+    }
+
+    /// Exact owner-only publication/tombstone lookup. An absent generation and
+    /// another owner's generation are intentionally indistinguishable.
+    pub fn owner_record(
+        &self,
+        owner: &AuthenticatedOwner,
+        generation_id: &str,
+        now_unix: i64,
+    ) -> Result<RunGenerationOwnerRecord> {
+        self.require_enabled()?;
+        require_generation_id(generation_id)?;
+        self.expire_due_publications(now_unix)?;
+        let _ = self.drain_retirements(1);
+        let state = self.lock_state()?;
+        let record = if let Some(record) = state.published.get(generation_id) {
+            if record.signed_manifest.manifest.owner_principal_sha256 != owner.sha256() {
+                return Err(ReplicationError::NotFound);
+            }
+            owner_publication_record(record)?
+        } else if let Some(tombstone) = state.tombstones.get(generation_id) {
+            if tombstone.owner_principal_sha256 != owner.sha256() {
+                return Err(ReplicationError::NotFound);
+            }
+            owner_tombstone_record(tombstone)?
+        } else {
+            return Err(ReplicationError::NotFound);
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Deterministic generation-id ordered page containing only this owner's
+    /// live publications and terminal tombstones. Active uploads are queried
+    /// through their existing exact status route and are not mixed here.
+    pub fn owner_records(
+        &self,
+        owner: &AuthenticatedOwner,
+        after: Option<&str>,
+        limit: usize,
+        now_unix: i64,
+    ) -> Result<RunGenerationOwnerListPage> {
+        self.require_enabled()?;
+        if limit == 0 || limit > rw_community_protocol::MAX_RUN_GENERATION_OWNER_PAGE {
+            return Err(ReplicationError::InvalidGeneration(
+                "owner generation page limit is invalid".into(),
+            ));
+        }
+        if let Some(cursor) = after {
+            require_generation_id(cursor)?;
+        }
+        self.expire_due_publications(now_unix)?;
+        let _ = self.drain_retirements(1);
+        let state = self.lock_state()?;
+        let mut owned = BTreeMap::new();
+        for (generation_id, record) in state
+            .published
+            .iter()
+            .filter(|(generation_id, record)| {
+                after.is_none_or(|cursor| generation_id.as_str() > cursor)
+                    && record.signed_manifest.manifest.owner_principal_sha256 == owner.sha256()
+            })
+            .take(limit.saturating_add(1))
+        {
+            owned.insert(generation_id.clone(), owner_publication_record(record)?);
+        }
+        for (generation_id, tombstone) in state
+            .tombstones
+            .iter()
+            .filter(|(generation_id, tombstone)| {
+                after.is_none_or(|cursor| generation_id.as_str() > cursor)
+                    && tombstone.owner_principal_sha256 == owner.sha256()
+            })
+            .take(limit.saturating_add(1))
+        {
+            owned.insert(generation_id.clone(), owner_tombstone_record(tombstone)?);
+        }
+        let mut records: Vec<_> = owned.into_values().take(limit.saturating_add(1)).collect();
+        let has_more = records.len() > limit;
+        records.truncate(limit);
+        let page = RunGenerationOwnerListPage {
+            schema: RUN_GENERATION_OWNER_LIST_SCHEMA.into(),
+            next_after: has_more.then(|| {
+                records
+                    .last()
+                    .expect("non-empty bounded owner page")
+                    .generation_id
+                    .clone()
+            }),
+            records,
+        };
+        page.validate()?;
+        Ok(page)
     }
 
     pub fn missing_chunks(
@@ -582,7 +858,25 @@ impl GenerationReplicationService {
     ) -> Result<FinalizeOutcome> {
         self.require_enabled()?;
         request.validate()?;
+        require_generation_id(generation_id)?;
+        self.expire_due_publications(now_unix)?;
         let mut state = self.lock_state()?;
+        if let Some(record) = state.published.get(generation_id) {
+            require_owner(owner, &record.signed_manifest.manifest)?;
+            require_publication_time(record, now_unix)?;
+            if request.generation_sha256 != record.signed_manifest.manifest.generation_sha256 {
+                return Err(ReplicationError::Conflict);
+            }
+            let mut outcome = finalize_outcome(record)?;
+            outcome.was_already_published = true;
+            return Ok(outcome);
+        }
+        if let Some(tombstone) = state.tombstones.get(generation_id) {
+            if tombstone.owner_principal_sha256 != owner.sha256() {
+                return Err(ReplicationError::WrongOwner);
+            }
+            return Err(ReplicationError::Conflict);
+        }
         self.require_running(&state)?;
         let upload = state
             .uploads
@@ -650,6 +944,7 @@ impl GenerationReplicationService {
         Ok(FinalizeOutcome {
             published,
             signed_manifest,
+            was_already_published: false,
         })
     }
 
@@ -772,6 +1067,7 @@ impl GenerationReplicationService {
                     published_unix: record.published_unix,
                 },
                 signed_manifest: record.signed_manifest.clone(),
+                was_already_published: true,
             }
         }))
     }
@@ -1738,6 +2034,91 @@ fn validate_reconstructed(
         ));
     }
     Ok(snapshot)
+}
+
+fn publication_for(record: &PublishedRecord) -> Result<PublishedRunGeneration> {
+    let manifest = &record.signed_manifest.manifest;
+    let publication = PublishedRunGeneration {
+        schema: PUBLISHED_RUN_GENERATION_SCHEMA.into(),
+        generation_id: manifest.generation_id.clone(),
+        generation_sha256: manifest.generation_sha256.clone(),
+        source_snapshot_id: manifest.source_snapshot_id.clone(),
+        local_snapshot_id: record.local_snapshot_id.clone(),
+        grid_hash: manifest.grid_hash.clone(),
+        model: manifest.model.clone(),
+        run: manifest.run.clone(),
+        published_unix: record.published_unix,
+    };
+    publication.validate()?;
+    Ok(publication)
+}
+
+fn finalize_outcome(record: &PublishedRecord) -> Result<FinalizeOutcome> {
+    Ok(FinalizeOutcome {
+        published: publication_for(record)?,
+        signed_manifest: record.signed_manifest.clone(),
+        was_already_published: true,
+    })
+}
+
+fn owner_publication_record(record: &PublishedRecord) -> Result<RunGenerationOwnerRecord> {
+    let publication = publication_for(record)?;
+    let owner_record = RunGenerationOwnerRecord {
+        schema: RUN_GENERATION_OWNER_RECORD_SCHEMA.into(),
+        state: RunGenerationOwnerRecordState::Published,
+        generation_id: publication.generation_id.clone(),
+        generation_sha256: publication.generation_sha256.clone(),
+        publication: Some(publication),
+        tombstone: None,
+    };
+    owner_record.validate()?;
+    Ok(owner_record)
+}
+
+fn owner_tombstone_record(tombstone: &RunGenerationTombstone) -> Result<RunGenerationOwnerRecord> {
+    let owner_record = RunGenerationOwnerRecord {
+        schema: RUN_GENERATION_OWNER_RECORD_SCHEMA.into(),
+        state: RunGenerationOwnerRecordState::Tombstone,
+        generation_id: tombstone.generation_id.clone(),
+        generation_sha256: tombstone.generation_sha256.clone(),
+        publication: None,
+        tombstone: Some(tombstone.clone()),
+    };
+    owner_record.validate()?;
+    Ok(owner_record)
+}
+
+fn sum_upload_bytes<'a>(records: impl Iterator<Item = &'a UploadRecord>) -> Result<u64> {
+    records
+        .map(|record| record.manifest.total_bytes)
+        .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
+        .ok_or(ReplicationError::CorruptState)
+}
+
+fn sum_published_bytes<'a>(records: impl Iterator<Item = &'a PublishedRecord>) -> Result<u64> {
+    records
+        .map(|record| record.signed_manifest.manifest.total_bytes)
+        .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
+        .ok_or(ReplicationError::CorruptState)
+}
+
+fn usize_as_u64(value: usize) -> Result<u64> {
+    u64::try_from(value).map_err(|_| ReplicationError::CorruptState)
+}
+
+fn require_generation_id(value: &str) -> Result<()> {
+    if !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        Ok(())
+    } else {
+        Err(ReplicationError::InvalidGeneration(
+            "generation id is invalid".into(),
+        ))
+    }
 }
 
 fn require_owner(
@@ -3107,5 +3488,291 @@ mod tests {
         let state = service.lock_state().unwrap();
         assert_eq!(state.billing.utc_month, utc_month(next_month).unwrap());
         assert_eq!(state.billing.total_upload_bytes, run_bytes.len() as u64);
+    }
+
+    #[test]
+    fn successful_finalize_reconciles_exactly_after_restart_and_lost_response() {
+        let dir = TestDir::new("finalize-reconcile");
+        let source_store = dir.0.join("source");
+        let target_store = dir.0.join("target");
+        let source_run = build_source(&source_store, 289.0);
+        let authenticated_owner = owner(0x91);
+        let other = owner(0x92);
+        let manifest = source_manifest(
+            &source_store,
+            "wrf-case-finalize-reconcile",
+            &authenticated_owner,
+        );
+        let service =
+            GenerationReplicationService::open(config(&dir.0, &target_store, policy())).unwrap();
+        service
+            .begin(&authenticated_owner, begin_request(manifest.clone()), NOW)
+            .unwrap();
+        upload_all(&service, &authenticated_owner, &manifest, &source_run);
+        let first = service
+            .finalize(
+                &authenticated_owner,
+                &manifest.generation_id,
+                finalize_request(&manifest),
+                NOW,
+            )
+            .unwrap();
+        assert!(!first.was_already_published);
+        service.set_kill_switch(true).unwrap();
+        drop(service);
+
+        let reopened =
+            GenerationReplicationService::open(config(&dir.0, &target_store, policy())).unwrap();
+        let replay = reopened
+            .finalize(
+                &authenticated_owner,
+                &manifest.generation_id,
+                finalize_request(&manifest),
+                NOW + 1,
+            )
+            .unwrap();
+        assert!(replay.was_already_published);
+        assert_eq!(replay.published, first.published);
+        assert_eq!(replay.signed_manifest, first.signed_manifest);
+        assert!(matches!(
+            reopened.finalize(
+                &other,
+                &manifest.generation_id,
+                finalize_request(&manifest),
+                NOW + 1
+            ),
+            Err(ReplicationError::WrongOwner)
+        ));
+        let mut wrong_hash = finalize_request(&manifest);
+        wrong_hash.generation_sha256 = "ab".repeat(32);
+        assert!(matches!(
+            reopened.finalize(
+                &authenticated_owner,
+                &manifest.generation_id,
+                wrong_hash,
+                NOW + 1
+            ),
+            Err(ReplicationError::Conflict)
+        ));
+        assert!(
+            !reopened
+                .owner_capabilities(&authenticated_owner, NOW + 1)
+                .unwrap()
+                .accepting_uploads
+        );
+    }
+
+    #[test]
+    fn owner_records_are_isolated_paginated_and_cancel_releases_while_killed() {
+        let dir = TestDir::new("owner-records-cancel");
+        let source_store = dir.0.join("source");
+        let target_store = dir.0.join("target");
+        let source_run = build_source(&source_store, 291.0);
+        let authenticated_owner = owner(0xa1);
+        let other = owner(0xa2);
+        let first_manifest = source_manifest(
+            &source_store,
+            "alpha-owner-generation",
+            &authenticated_owner,
+        );
+        let service =
+            GenerationReplicationService::open(config(&dir.0, &target_store, policy())).unwrap();
+        service
+            .begin(
+                &authenticated_owner,
+                begin_request(first_manifest.clone()),
+                NOW,
+            )
+            .unwrap();
+        upload_all(&service, &authenticated_owner, &first_manifest, &source_run);
+        service
+            .finalize(
+                &authenticated_owner,
+                &first_manifest.generation_id,
+                finalize_request(&first_manifest),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(
+            service
+                .owner_record(&authenticated_owner, &first_manifest.generation_id, NOW)
+                .unwrap()
+                .state,
+            RunGenerationOwnerRecordState::Published
+        );
+        service
+            .revoke(
+                &authenticated_owner,
+                &first_manifest.generation_id,
+                RevokeRunGenerationRequest {
+                    schema: REVOKE_RUN_GENERATION_SCHEMA.into(),
+                    generation_sha256: first_manifest.generation_sha256.clone(),
+                    rights_withdrawn: true,
+                    reason: "Owner replaced the test publication.".into(),
+                },
+                NOW + 1,
+            )
+            .unwrap();
+        assert!(!target_store.join(MODEL).join(RUN).join("run.json").exists());
+
+        let second_generation_id = "bravo-owner-generation";
+        {
+            let mut state = service.lock_state().unwrap();
+            state.tombstones.insert(
+                second_generation_id.into(),
+                RunGenerationTombstone {
+                    schema: RUN_GENERATION_TOMBSTONE_SCHEMA.into(),
+                    generation_id: second_generation_id.into(),
+                    generation_sha256: "ba".repeat(32),
+                    owner_principal_sha256: authenticated_owner.sha256().into(),
+                    revoked_unix: NOW + 2,
+                    rights_withdrawn: true,
+                    reason: "Synthetic prior owner publication for paging.".into(),
+                },
+            );
+            service.persist(&state).unwrap();
+        }
+
+        let first_page = service
+            .owner_records(&authenticated_owner, None, 1, NOW + 3)
+            .unwrap();
+        assert_eq!(first_page.records.len(), 1);
+        assert_eq!(
+            first_page.records[0].state,
+            RunGenerationOwnerRecordState::Tombstone
+        );
+        assert_eq!(
+            first_page.next_after.as_deref(),
+            Some("alpha-owner-generation")
+        );
+        let second_page = service
+            .owner_records(
+                &authenticated_owner,
+                first_page.next_after.as_deref(),
+                1,
+                NOW + 3,
+            )
+            .unwrap();
+        assert_eq!(second_page.records.len(), 1);
+        assert_eq!(
+            second_page.records[0].state,
+            RunGenerationOwnerRecordState::Tombstone
+        );
+        assert!(second_page.next_after.is_none());
+        assert!(matches!(
+            service.owner_record(&other, second_generation_id, NOW + 3),
+            Err(ReplicationError::NotFound)
+        ));
+        assert!(
+            service
+                .owner_records(&other, None, 10, NOW + 3)
+                .unwrap()
+                .records
+                .is_empty()
+        );
+
+        let mut third_manifest = source_manifest(
+            &source_store,
+            "charlie-active-generation",
+            &authenticated_owner,
+        );
+        third_manifest.model = "wrf-test-pending".into();
+        third_manifest.generation_sha256 = generation_content_sha256(&third_manifest).unwrap();
+        third_manifest.validate(&limits()).unwrap();
+        service
+            .begin(
+                &authenticated_owner,
+                begin_request(third_manifest.clone()),
+                NOW + 3,
+            )
+            .unwrap();
+        let before = service
+            .owner_capabilities(&authenticated_owner, NOW + 3)
+            .unwrap();
+        assert_eq!(before.usage.active_uploads, 1);
+        assert_eq!(before.usage.reserved_bytes, third_manifest.total_bytes);
+        assert_eq!(before.usage.live_publications, 0);
+        assert_eq!(before.usage.tombstones, 2);
+        service.set_kill_switch(true).unwrap();
+        assert!(matches!(
+            service.status(&authenticated_owner, &third_manifest.generation_id, NOW + 3),
+            Err(ReplicationError::KillSwitch)
+        ));
+        assert!(matches!(
+            service.cancel_upload(&other, &third_manifest.generation_id, NOW + 3),
+            Err(ReplicationError::WrongOwner)
+        ));
+        let cancelled = service
+            .cancel_upload(&authenticated_owner, &third_manifest.generation_id, NOW + 3)
+            .unwrap();
+        assert_eq!(
+            cancelled.released_reserved_bytes,
+            third_manifest.total_bytes
+        );
+        let after = service
+            .owner_capabilities(&authenticated_owner, NOW + 3)
+            .unwrap();
+        assert!(!after.accepting_uploads);
+        assert_eq!(after.usage.active_uploads, 0);
+        assert_eq!(after.usage.reserved_bytes, 0);
+        drop(service);
+
+        let reopened =
+            GenerationReplicationService::open(config(&dir.0, &target_store, policy())).unwrap();
+        assert_eq!(
+            reopened
+                .owner_capabilities(&authenticated_owner, NOW + 4)
+                .unwrap()
+                .usage
+                .active_uploads,
+            0
+        );
+        assert!(matches!(
+            reopened.cancel_upload(&authenticated_owner, &third_manifest.generation_id, NOW + 4),
+            Err(ReplicationError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn lowered_owner_quota_reports_truthful_overage_and_keeps_cancel_available() {
+        let dir = TestDir::new("lowered-owner-quota");
+        let source_store = dir.0.join("source");
+        let target_store = dir.0.join("target");
+        build_source(&source_store, 293.0);
+        let authenticated_owner = owner(0xb1);
+        let manifest = source_manifest(
+            &source_store,
+            "wrf-case-lowered-owner-quota",
+            &authenticated_owner,
+        );
+        let service =
+            GenerationReplicationService::open(config(&dir.0, &target_store, policy())).unwrap();
+        service
+            .begin(&authenticated_owner, begin_request(manifest.clone()), NOW)
+            .unwrap();
+        drop(service);
+
+        let mut lowered = policy();
+        lowered.max_owner_storage_bytes = 1;
+        let reopened =
+            GenerationReplicationService::open(config(&dir.0, &target_store, lowered)).unwrap();
+        let capabilities = reopened
+            .owner_capabilities(&authenticated_owner, NOW + 1)
+            .unwrap();
+        assert_eq!(capabilities.quota.maximum_storage_bytes, 1);
+        assert_eq!(capabilities.usage.reserved_bytes, manifest.total_bytes);
+        assert!(capabilities.usage.reserved_bytes > capabilities.quota.maximum_storage_bytes);
+        assert!(!capabilities.accepting_uploads);
+        reopened
+            .cancel_upload(&authenticated_owner, &manifest.generation_id, NOW + 1)
+            .unwrap();
+        assert_eq!(
+            reopened
+                .owner_capabilities(&authenticated_owner, NOW + 1)
+                .unwrap()
+                .usage
+                .reserved_bytes,
+            0
+        );
     }
 }

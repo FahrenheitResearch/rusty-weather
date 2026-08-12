@@ -785,6 +785,84 @@ struct RunGenerationTombstoneDoc {
     reason: String,
 }
 
+#[derive(utoipa::ToSchema)]
+struct RunGenerationAdvertisedLimitsDoc {
+    maximum_generation_bytes: u64,
+    maximum_files: u64,
+    maximum_chunks: u64,
+    maximum_chunk_bytes: u64,
+    maximum_manifest_bytes: u64,
+    minimum_retention_seconds: i64,
+    maximum_retention_seconds: i64,
+    maximum_provenance_entries: u64,
+    maximum_attributions: u64,
+    upload_ttl_seconds: i64,
+}
+
+#[derive(utoipa::ToSchema)]
+struct RunGenerationOwnerQuotaDoc {
+    maximum_storage_bytes: u64,
+    maximum_generations: u64,
+    maximum_concurrent_uploads: u64,
+    maximum_monthly_upload_bytes: u64,
+}
+
+#[derive(utoipa::ToSchema)]
+struct RunGenerationOwnerUsageDoc {
+    active_uploads: u64,
+    live_publications: u64,
+    pending_retirements: u64,
+    tombstones: u64,
+    reserved_bytes: u64,
+    published_bytes: u64,
+    pending_retirement_bytes: u64,
+    billing_utc_month: String,
+    monthly_accepted_upload_bytes: u64,
+}
+
+#[derive(utoipa::ToSchema)]
+struct RunGenerationOwnerCapabilitiesDoc {
+    schema: String,
+    owner_principal_sha256: String,
+    accepting_uploads: bool,
+    limits: RunGenerationAdvertisedLimitsDoc,
+    quota: RunGenerationOwnerQuotaDoc,
+    usage: RunGenerationOwnerUsageDoc,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum RunGenerationOwnerRecordStateDoc {
+    Published,
+    Tombstone,
+}
+
+#[derive(utoipa::ToSchema)]
+struct RunGenerationOwnerRecordDoc {
+    schema: String,
+    state: RunGenerationOwnerRecordStateDoc,
+    generation_id: String,
+    generation_sha256: String,
+    publication: Option<PublishedRunGenerationDoc>,
+    tombstone: Option<RunGenerationTombstoneDoc>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct RunGenerationOwnerListPageDoc {
+    schema: String,
+    records: Vec<RunGenerationOwnerRecordDoc>,
+    next_after: Option<String>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct CancelledRunGenerationDoc {
+    schema: String,
+    generation_id: String,
+    generation_sha256: String,
+    cancelled_unix: i64,
+    released_reserved_bytes: u64,
+}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -841,8 +919,12 @@ struct RunGenerationTombstoneDoc {
         federation_local_object_doc,
         origin_catalog_status_doc,
         generation_replication_owner_doc,
+        generation_replication_capabilities_doc,
+        generation_replication_list_doc,
         generation_replication_begin_doc,
         generation_replication_status_doc,
+        generation_replication_cancel_doc,
+        generation_replication_publication_doc,
         generation_replication_missing_doc,
         generation_replication_upload_doc,
         generation_replication_finalize_doc,
@@ -965,6 +1047,14 @@ struct RunGenerationTombstoneDoc {
         PublishedRunGenerationDoc,
         RevokeRunGenerationRequestDoc,
         RunGenerationTombstoneDoc,
+        RunGenerationAdvertisedLimitsDoc,
+        RunGenerationOwnerQuotaDoc,
+        RunGenerationOwnerUsageDoc,
+        RunGenerationOwnerCapabilitiesDoc,
+        RunGenerationOwnerRecordStateDoc,
+        RunGenerationOwnerRecordDoc,
+        RunGenerationOwnerListPageDoc,
+        CancelledRunGenerationDoc,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -1887,6 +1977,39 @@ fn origin_catalog_status_doc() {}
 fn generation_replication_owner_doc() {}
 
 #[utoipa::path(
+    get,
+    path = "/v1/community/generation-replication/capabilities",
+    tag = "generation-replication",
+    description = "Return actual runtime protocol ceilings, retention/upload lifetime, per-owner quota ceilings, and only this caller's usage. Global and other-owner utilization is omitted. Private no-store and available while the kill switch is engaged for safe planning/reconciliation.",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Caller-specific replication planning contract; private no-store", body = RunGenerationOwnerCapabilitiesDoc),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Advanced replication is disabled or unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn generation_replication_capabilities_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/community/generations",
+    tag = "generation-replication",
+    description = "List a deterministic bounded generation-id ordered page containing only this caller's live publications and tombstones. Active uploads use the exact upload-status route. Private no-store; another owner's identities never appear.",
+    security(("bearer_auth" = [])),
+    params(
+        ("after" = Option<String>, Query, description = "Exact previous generation-id cursor"),
+        ("limit" = Option<usize>, Query, description = "Bounded page size, maximum 100")
+    ),
+    responses(
+        (status = 200, description = "Owner-isolated publication/tombstone page; private no-store", body = RunGenerationOwnerListPageDoc),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Cursor or page limit rejected", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Advanced replication is disabled or unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn generation_replication_list_doc() {}
+
+#[utoipa::path(
     post,
     path = "/v1/community/generations",
     tag = "generation-replication",
@@ -1920,6 +2043,41 @@ fn generation_replication_begin_doc() {}
     )
 )]
 fn generation_replication_status_doc() {}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/community/generations/{generation_id}",
+    tag = "generation-replication",
+    description = "Cancel one active owned upload and durably release its storage/count/concurrency reservation. Cancellation remains available while the kill switch is engaged and never publishes or authorizes data.",
+    security(("bearer_auth" = [])),
+    params(("generation_id" = String, Path, description = "Owner-bound canonical generation id")),
+    responses(
+        (status = 200, description = "Upload cancelled and reservation released; private no-store", body = CancelledRunGenerationDoc),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 403, description = "Caller does not own this active upload", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Active upload not found", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Generation id rejected", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Feature disabled or durable cancellation unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn generation_replication_cancel_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/community/generations/{generation_id}/publication",
+    tag = "generation-replication",
+    description = "Reconcile one exact caller-owned live publication or tombstone. Absent and other-owner identities are deliberately indistinguishable. Private no-store and available while killed.",
+    security(("bearer_auth" = [])),
+    params(("generation_id" = String, Path, description = "Owner-bound canonical generation id")),
+    responses(
+        (status = 200, description = "Exact owned publication or tombstone; private no-store", body = RunGenerationOwnerRecordDoc),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "No caller-owned publication or tombstone exists", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Generation id rejected", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Feature disabled or durable state unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn generation_replication_publication_doc() {}
 
 #[utoipa::path(
     get,
@@ -1974,6 +2132,7 @@ fn generation_replication_upload_doc() {}
     params(("generation_id" = String, Path, description = "Owner-bound canonical generation id")),
     request_body = FinalizeRunGenerationRequestDoc,
     responses(
+        (status = 200, description = "Exact durable publication reconciled after a prior successful finalize or lost response", body = PublishedRunGenerationDoc),
         (status = 201, description = "Deep-validated generation atomically published", body = PublishedRunGenerationDoc),
         (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
         (status = 403, description = "Caller does not own this generation", content_type = "application/problem+json", body = ProblemDetails),
@@ -2203,8 +2362,15 @@ mod tests {
         let value = serde_json::to_value(document()).unwrap();
         for (path, method) in [
             ("/v1/community/generation-replication/owner", "get"),
+            ("/v1/community/generation-replication/capabilities", "get"),
+            ("/v1/community/generations", "get"),
             ("/v1/community/generations", "post"),
             ("/v1/community/generations/{generation_id}", "get"),
+            ("/v1/community/generations/{generation_id}", "delete"),
+            (
+                "/v1/community/generations/{generation_id}/publication",
+                "get",
+            ),
             ("/v1/community/generations/{generation_id}/missing", "get"),
             (
                 "/v1/community/generations/{generation_id}/chunks/{sha256}",
@@ -2247,6 +2413,41 @@ mod tests {
         for forbidden in ["owner_principal", "generation_id", "path", "source_url"] {
             assert!(!serialized.contains(forbidden));
         }
+        let finalize = operation(
+            &value,
+            "/v1/community/generations/{generation_id}/finalize",
+            "post",
+        );
+        assert!(finalize["responses"]["200"].is_object());
+        assert!(finalize["responses"]["201"].is_object());
+        let exact = operation(
+            &value,
+            "/v1/community/generations/{generation_id}/publication",
+            "get",
+        );
+        assert!(exact["responses"]["404"].is_object());
+        assert!(exact["responses"].get("403").is_none());
+        let capabilities = operation(
+            &value,
+            "/v1/community/generation-replication/capabilities",
+            "get",
+        );
+        assert!(capabilities["responses"]["200"].is_object());
+        let advertised_limits =
+            &value["components"]["schemas"]["RunGenerationAdvertisedLimitsDoc"]["properties"];
+        for required in [
+            "maximum_chunk_bytes",
+            "maximum_retention_seconds",
+            "upload_ttl_seconds",
+        ] {
+            assert!(advertised_limits[required].is_object());
+        }
+        assert!(value["components"]["schemas"]["RunGenerationOwnerQuotaDoc"]["properties"]
+            ["maximum_storage_bytes"]
+            .is_object());
+        assert!(value["components"]["schemas"]["RunGenerationOwnerUsageDoc"]["properties"]
+            ["monthly_accepted_upload_bytes"]
+            .is_object());
     }
 
     #[test]

@@ -937,11 +937,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let current_key = SigningKey::from_bytes(&[71; 32]);
         let key_path = directory.path().join("origin.key");
-        fs::write(
+        crate::test_support::write_private_file(
             &key_path,
             base64::engine::general_purpose::STANDARD.encode(current_key.to_bytes()),
-        )
-        .unwrap();
+        );
         let historical_key = SigningKey::from_bytes(&[72; 32]).verifying_key();
         let encoded_historical =
             base64::engine::general_purpose::STANDARD.encode(historical_key.to_bytes());

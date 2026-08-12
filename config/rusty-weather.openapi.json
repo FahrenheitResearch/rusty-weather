@@ -1061,6 +1061,52 @@
         ]
       }
     },
+    "/v1/community/generation-replication/capabilities": {
+      "get": {
+        "tags": [
+          "generation-replication"
+        ],
+        "description": "Return actual runtime protocol ceilings, retention/upload lifetime, per-owner quota ceilings, and only this caller's usage. Global and other-owner utilization is omitted. Private no-store and available while the kill switch is engaged for safe planning/reconciliation.",
+        "operationId": "generation_replication_capabilities_doc",
+        "responses": {
+          "200": {
+            "description": "Caller-specific replication planning contract; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunGenerationOwnerCapabilitiesDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Advanced replication is disabled or unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/v1/community/generation-replication/operator/gc": {
       "post": {
         "tags": [
@@ -1295,6 +1341,81 @@
       }
     },
     "/v1/community/generations": {
+      "get": {
+        "tags": [
+          "generation-replication"
+        ],
+        "description": "List a deterministic bounded generation-id ordered page containing only this caller's live publications and tombstones. Active uploads use the exact upload-status route. Private no-store; another owner's identities never appear.",
+        "operationId": "generation_replication_list_doc",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Exact previous generation-id cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Bounded page size, maximum 100",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Owner-isolated publication/tombstone page; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunGenerationOwnerListPageDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Cursor or page limit rejected",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Advanced replication is disabled or unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
       "post": {
         "tags": [
           "generation-replication"
@@ -1464,6 +1585,91 @@
             "bearer_auth": []
           }
         ]
+      },
+      "delete": {
+        "tags": [
+          "generation-replication"
+        ],
+        "description": "Cancel one active owned upload and durably release its storage/count/concurrency reservation. Cancellation remains available while the kill switch is engaged and never publishes or authorizes data.",
+        "operationId": "generation_replication_cancel_doc",
+        "parameters": [
+          {
+            "name": "generation_id",
+            "in": "path",
+            "description": "Owner-bound canonical generation id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Upload cancelled and reservation released; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CancelledRunGenerationDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller does not own this active upload",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Active upload not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Generation id rejected",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Feature disabled or durable cancellation unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
       }
     },
     "/v1/community/generations/{generation_id}/chunks/{sha256}": {
@@ -1618,6 +1824,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "description": "Exact durable publication reconciled after a prior successful finalize or lost response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublishedRunGenerationDoc"
+                }
+              }
+            }
+          },
           "201": {
             "description": "Deep-validated generation atomically published",
             "content": {
@@ -1775,6 +1991,83 @@
           },
           "503": {
             "description": "Feature disabled, killed, busy, or unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/generations/{generation_id}/publication": {
+      "get": {
+        "tags": [
+          "generation-replication"
+        ],
+        "description": "Reconcile one exact caller-owned live publication or tombstone. Absent and other-owner identities are deliberately indistinguishable. Private no-store and available while killed.",
+        "operationId": "generation_replication_publication_doc",
+        "parameters": [
+          {
+            "name": "generation_id",
+            "in": "path",
+            "description": "Owner-bound canonical generation id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact owned publication or tombstone; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunGenerationOwnerRecordDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No caller-owned publication or tombstone exists",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Generation id rejected",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Feature disabled or durable state unavailable",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -5698,6 +5991,36 @@
           }
         }
       },
+      "CancelledRunGenerationDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "generation_id",
+          "generation_sha256",
+          "cancelled_unix",
+          "released_reserved_bytes"
+        ],
+        "properties": {
+          "cancelled_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "generation_id": {
+            "type": "string"
+          },
+          "generation_sha256": {
+            "type": "string"
+          },
+          "released_reserved_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
       "CategoricalSummaryGridResponse": {
         "type": "object",
         "required": [
@@ -8660,6 +8983,70 @@
           }
         }
       },
+      "RunGenerationAdvertisedLimitsDoc": {
+        "type": "object",
+        "required": [
+          "maximum_generation_bytes",
+          "maximum_files",
+          "maximum_chunks",
+          "maximum_chunk_bytes",
+          "maximum_manifest_bytes",
+          "minimum_retention_seconds",
+          "maximum_retention_seconds",
+          "maximum_provenance_entries",
+          "maximum_attributions",
+          "upload_ttl_seconds"
+        ],
+        "properties": {
+          "maximum_attributions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maximum_chunk_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maximum_chunks": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maximum_files": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maximum_generation_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maximum_manifest_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maximum_provenance_entries": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maximum_retention_seconds": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "minimum_retention_seconds": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "upload_ttl_seconds": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "RunGenerationManifestDoc": {
         "type": "object",
         "required": [
@@ -8781,6 +9168,201 @@
           },
           "schema": {
             "type": "string"
+          }
+        }
+      },
+      "RunGenerationOwnerCapabilitiesDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "owner_principal_sha256",
+          "accepting_uploads",
+          "limits",
+          "quota",
+          "usage"
+        ],
+        "properties": {
+          "accepting_uploads": {
+            "type": "boolean"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/RunGenerationAdvertisedLimitsDoc"
+          },
+          "owner_principal_sha256": {
+            "type": "string"
+          },
+          "quota": {
+            "$ref": "#/components/schemas/RunGenerationOwnerQuotaDoc"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/RunGenerationOwnerUsageDoc"
+          }
+        }
+      },
+      "RunGenerationOwnerListPageDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "records"
+        ],
+        "properties": {
+          "next_after": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "records": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RunGenerationOwnerRecordDoc"
+            }
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "RunGenerationOwnerQuotaDoc": {
+        "type": "object",
+        "required": [
+          "maximum_storage_bytes",
+          "maximum_generations",
+          "maximum_concurrent_uploads",
+          "maximum_monthly_upload_bytes"
+        ],
+        "properties": {
+          "maximum_concurrent_uploads": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maximum_generations": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maximum_monthly_upload_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "maximum_storage_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "RunGenerationOwnerRecordDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "state",
+          "generation_id",
+          "generation_sha256"
+        ],
+        "properties": {
+          "generation_id": {
+            "type": "string"
+          },
+          "generation_sha256": {
+            "type": "string"
+          },
+          "publication": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedRunGenerationDoc"
+              }
+            ]
+          },
+          "schema": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunGenerationOwnerRecordStateDoc"
+          },
+          "tombstone": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunGenerationTombstoneDoc"
+              }
+            ]
+          }
+        }
+      },
+      "RunGenerationOwnerRecordStateDoc": {
+        "type": "string",
+        "enum": [
+          "published",
+          "tombstone"
+        ]
+      },
+      "RunGenerationOwnerUsageDoc": {
+        "type": "object",
+        "required": [
+          "active_uploads",
+          "live_publications",
+          "pending_retirements",
+          "tombstones",
+          "reserved_bytes",
+          "published_bytes",
+          "pending_retirement_bytes",
+          "billing_utc_month",
+          "monthly_accepted_upload_bytes"
+        ],
+        "properties": {
+          "active_uploads": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "billing_utc_month": {
+            "type": "string"
+          },
+          "live_publications": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "monthly_accepted_upload_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "pending_retirement_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "pending_retirements": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "published_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reserved_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tombstones": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },

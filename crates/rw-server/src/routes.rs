@@ -890,6 +890,18 @@ struct ReplicationMissingQuery {
     limit: usize,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplicationOwnerListQuery {
+    after: Option<String>,
+    #[serde(default = "default_replication_owner_list_limit")]
+    limit: usize,
+}
+
+const fn default_replication_owner_list_limit() -> usize {
+    50
+}
+
 const fn default_replication_missing_limit() -> usize {
     256
 }
@@ -1044,12 +1056,20 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
             get(generation_replication_owner),
         )
         .route(
+            rw_community_protocol::RUN_GENERATION_CAPABILITIES_PATH,
+            get(generation_replication_capabilities),
+        )
+        .route(
             rw_community_protocol::BEGIN_RUN_GENERATION_PATH,
-            post(begin_generation_replication),
+            get(list_generation_replication_records).post(begin_generation_replication),
         )
         .route(
             "/v1/community/generations/{generation_id}",
-            get(generation_replication_status),
+            get(generation_replication_status).delete(cancel_generation_replication),
+        )
+        .route(
+            rw_community_protocol::RUN_GENERATION_PUBLICATION_PATH_TEMPLATE,
+            get(generation_replication_publication),
         )
         .route(
             "/v1/community/generations/{generation_id}/missing",
@@ -2593,6 +2613,41 @@ async fn generation_replication_owner(
     }
 }
 
+async fn generation_replication_capabilities(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+) -> Response {
+    let replication = state.generation_replication.clone();
+    match state
+        .run_light(move || replication.owner_capabilities(&principal.0))
+        .await
+    {
+        Ok(Ok(capabilities)) => json_no_store(StatusCode::OK, &capabilities, request_id.0),
+        Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn list_generation_replication_records(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Query(query): Query<ReplicationOwnerListQuery>,
+) -> Response {
+    let replication = state.generation_replication.clone();
+    match state
+        .run_light(move || {
+            replication.owner_records(&principal.0, query.after.as_deref(), query.limit)
+        })
+        .await
+    {
+        Ok(Ok(page)) => json_no_store(StatusCode::OK, &page, request_id.0),
+        Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
 async fn generation_replication_status(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
@@ -2605,6 +2660,40 @@ async fn generation_replication_status(
         .await
     {
         Ok(Ok(status)) => json_no_store(StatusCode::OK, &status, request_id.0),
+        Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn cancel_generation_replication(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(path): Path<ReplicationGenerationPath>,
+) -> Response {
+    let replication = state.generation_replication.clone();
+    match state
+        .run_light(move || replication.cancel_upload(&principal.0, &path.generation_id))
+        .await
+    {
+        Ok(Ok(cancelled)) => json_no_store(StatusCode::OK, &cancelled, request_id.0),
+        Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn generation_replication_publication(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(path): Path<ReplicationGenerationPath>,
+) -> Response {
+    let replication = state.generation_replication.clone();
+    match state
+        .run_light(move || replication.owner_record(&principal.0, &path.generation_id))
+        .await
+    {
+        Ok(Ok(record)) => json_no_store(StatusCode::OK, &record, request_id.0),
         Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
         Err(error) => execution_problem(error, request_id.0).into_response(),
     }
@@ -2747,7 +2836,12 @@ async fn finalize_generation_replication(
     {
         Ok(Ok(outcome)) => {
             state.metrics.record_replication_finalize();
-            json_no_store(StatusCode::CREATED, &outcome.published, request_id.0)
+            let status = if outcome.was_already_published {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            json_no_store(status, &outcome.published, request_id.0)
         }
         Ok(Err(error)) => generation_replication_problem(error, request_id.0).into_response(),
         Err(error) => execution_problem(error, request_id.0).into_response(),
@@ -3818,18 +3912,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let key_path = directory.path().join("community-signing.key");
         let origin_token_path = directory.path().join("federation-origin.token");
-        fs::write(
+        crate::test_support::write_private_file(
             &key_path,
             base64::engine::general_purpose::STANDARD.encode([31_u8; 32]),
-        )
-        .unwrap();
-        fs::write(&origin_token_path, FEDERATION_ORIGIN_TOKEN).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
-            fs::set_permissions(&origin_token_path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        );
+        crate::test_support::write_private_file(&origin_token_path, FEDERATION_ORIGIN_TOKEN);
 
         let mut config = crate::AppConfig::default();
         config.server.store_root = directory.path().join("store");
@@ -4825,11 +4912,10 @@ mod tests {
         config.generation_replication.capacity_audit_completed = true;
         config.generation_replication.control_root = directory.path().join("replication");
         let key_path = directory.path().join("replication.key");
-        fs::write(
+        crate::test_support::write_private_file(
             &key_path,
             base64::engine::general_purpose::STANDARD.encode([91; 32]),
-        )
-        .unwrap();
+        );
         config.generation_replication.signing_key_file = Some(key_path);
         fs::create_dir_all(&config.server.store_root).unwrap();
         fs::create_dir_all(&config.server.artifact_root).unwrap();
@@ -4920,22 +5006,22 @@ mod tests {
         config.generation_replication.kill_switch = false;
         config.generation_replication.control_root = directory.path().join("replication");
         let key_path = directory.path().join("replication.key");
-        fs::write(
+        crate::test_support::write_private_file(
             &key_path,
             base64::engine::general_purpose::STANDARD.encode([92; 32]),
-        )
-        .unwrap();
+        );
         config.generation_replication.signing_key_file = Some(key_path);
         fs::create_dir_all(&source_store).unwrap();
         fs::create_dir_all(&config.server.store_root).unwrap();
         fs::create_dir_all(&config.server.artifact_root).unwrap();
-        let tokens = crate::TokenSet::from_tokens([TOKEN]).unwrap();
+        let tokens = crate::TokenSet::from_tokens([TOKEN, RELAY_REQUESTER_TOKEN]).unwrap();
         let operator_header = HeaderValue::from_str(&format!("Bearer {TOKEN}")).unwrap();
         let operator_principal = tokens
             .authorization_principal(Some(&operator_header))
             .unwrap();
         config.generation_replication.operator_principals = vec![operator_principal];
         config.validate(!tokens.is_empty()).unwrap();
+        let expected_replication = config.generation_replication.clone();
         let app = build_router(AppState::new(config, tokens).unwrap()).unwrap();
 
         let owner_response =
@@ -4945,6 +5031,57 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
+        let capabilities = get_with_token(
+            app.clone(),
+            rw_community_protocol::RUN_GENERATION_CAPABILITIES_PATH,
+        )
+        .await;
+        assert_eq!(capabilities.status(), StatusCode::OK);
+        assert_eq!(
+            capabilities.headers()[header::CACHE_CONTROL],
+            "no-store, private"
+        );
+        let capabilities = response_json(capabilities).await;
+        assert_eq!(capabilities["owner_principal_sha256"], owner);
+        assert_eq!(capabilities["accepting_uploads"], true);
+        assert_eq!(
+            capabilities["limits"]["maximum_chunk_bytes"],
+            expected_replication.limits.maximum_chunk_bytes
+        );
+        assert_eq!(
+            capabilities["limits"]["maximum_retention_seconds"],
+            expected_replication.limits.maximum_retention_seconds
+        );
+        assert_eq!(
+            capabilities["limits"]["upload_ttl_seconds"],
+            expected_replication.quotas.upload_ttl_seconds
+        );
+        assert_eq!(
+            capabilities["quota"]["maximum_storage_bytes"],
+            expected_replication.quotas.per_owner_storage_bytes
+        );
+        assert_eq!(capabilities["usage"]["active_uploads"], 0);
+        let outsider_list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/community/generations?limit=10")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {RELAY_REQUESTER_TOKEN}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outsider_list.status(), StatusCode::OK);
+        assert!(
+            response_json(outsider_list).await["records"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         let now = chrono::Utc::now().timestamp();
         let (manifest, objects) = replication_http_fixture(&source_store, owner, now);
         let generation_id = manifest.generation_id.clone();
@@ -5016,6 +5153,51 @@ mod tests {
         assert_eq!(finalized["model"], "wrf");
         assert_eq!(finalized["run"], "20260812_00z");
 
+        let replay_finalize = post_json(
+            app.clone(),
+            &format!("/v1/community/generations/{generation_id}/finalize"),
+            serde_json::json!({
+                "schema": FINALIZE_RUN_GENERATION_SCHEMA,
+                "generation_sha256": generation_sha256,
+            }),
+        )
+        .await;
+        assert_eq!(replay_finalize.status(), StatusCode::OK);
+        assert_eq!(response_json(replay_finalize).await, finalized);
+
+        let exact_path = format!("/v1/community/generations/{generation_id}/publication");
+        let exact = get_with_token(app.clone(), &exact_path).await;
+        assert_eq!(exact.status(), StatusCode::OK);
+        assert_eq!(exact.headers()[header::CACHE_CONTROL], "no-store, private");
+        assert_eq!(response_json(exact).await["state"], "published");
+        let outsider_exact = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&exact_path)
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {RELAY_REQUESTER_TOKEN}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outsider_exact.status(), StatusCode::NOT_FOUND);
+        let list = get_with_token(app.clone(), "/v1/community/generations?limit=1").await;
+        assert_eq!(list.status(), StatusCode::OK);
+        let list = response_json(list).await;
+        assert_eq!(list["records"][0]["state"], "published");
+        assert_eq!(list["records"][0]["generation_id"], generation_id);
+        assert!(list.get("next_after").is_none());
+        assert_eq!(
+            get_with_token(app.clone(), "/v1/community/generations?limit=101")
+                .await
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
         let query_path = "/v1/models/wrf/runs/20260812_00z";
         let query = get_with_token(app.clone(), query_path).await;
         assert_eq!(query.status(), StatusCode::OK);
@@ -5038,6 +5220,9 @@ mod tests {
         let revoke = response_json(revoke).await;
         assert_eq!(revoke["generation_id"], generation_id);
         assert_eq!(revoke["rights_withdrawn"], true);
+        let tombstone = get_with_token(app.clone(), &exact_path).await;
+        assert_eq!(tombstone.status(), StatusCode::OK);
+        assert_eq!(response_json(tombstone).await["state"], "tombstone");
 
         assert_eq!(
             get_with_token(app.clone(), query_path).await.status(),
@@ -5065,6 +5250,73 @@ mod tests {
         )
         .await;
         assert_eq!(replay.status(), StatusCode::CONFLICT);
+
+        let mut cancellable_manifest = manifest.clone();
+        cancellable_manifest.generation_id = "wrf-http-cancellable".into();
+        let cancellable = post_json(
+            app.clone(),
+            "/v1/community/generations",
+            serde_json::json!({
+                "schema": BEGIN_RUN_GENERATION_SCHEMA,
+                "manifest": cancellable_manifest,
+            }),
+        )
+        .await;
+        assert_eq!(cancellable.status(), StatusCode::CREATED);
+        let outsider_cancel = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/v1/community/generations/wrf-http-cancellable")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {RELAY_REQUESTER_TOKEN}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outsider_cancel.status(), StatusCode::FORBIDDEN);
+        let killed = post_json(
+            app.clone(),
+            "/v1/community/generation-replication/operator/kill-switch",
+            serde_json::json!({
+                "schema": crate::generation_replication::REPLICATION_KILL_SWITCH_SCHEMA,
+                "engaged": true,
+            }),
+        )
+        .await;
+        assert_eq!(killed.status(), StatusCode::OK);
+        assert_eq!(response_json(killed).await["kill_switch"], true);
+        let cancel = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/v1/community/generations/wrf-http-cancellable")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancel.status(), StatusCode::OK);
+        assert_eq!(cancel.headers()[header::CACHE_CONTROL], "no-store, private");
+        let cancel = response_json(cancel).await;
+        assert_eq!(cancel["generation_id"], "wrf-http-cancellable");
+        assert_eq!(cancel["released_reserved_bytes"], manifest.total_bytes);
+        let killed_capabilities = get_with_token(
+            app.clone(),
+            rw_community_protocol::RUN_GENERATION_CAPABILITIES_PATH,
+        )
+        .await;
+        assert_eq!(killed_capabilities.status(), StatusCode::OK);
+        let killed_capabilities = response_json(killed_capabilities).await;
+        assert_eq!(killed_capabilities["accepting_uploads"], false);
+        assert_eq!(killed_capabilities["usage"]["active_uploads"], 0);
+        assert_eq!(killed_capabilities["usage"]["reserved_bytes"], 0);
 
         let gc = post_json(
             app,

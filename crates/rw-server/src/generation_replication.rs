@@ -14,9 +14,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use ed25519_dalek::SigningKey;
 use rw_community_protocol::{
-    BeginRunGenerationRequest, FinalizeRunGenerationRequest, PublishedRunGeneration,
-    RevokeRunGenerationRequest, RunGenerationMissingPage, RunGenerationTombstone,
-    RunGenerationUploadStatus, SignedRunGenerationManifest,
+    BeginRunGenerationRequest, CancelledRunGeneration, FinalizeRunGenerationRequest,
+    PublishedRunGeneration, RevokeRunGenerationRequest, RunGenerationMissingPage,
+    RunGenerationOwnerCapabilities, RunGenerationOwnerListPage, RunGenerationOwnerRecord,
+    RunGenerationTombstone, RunGenerationUploadStatus, SignedRunGenerationManifest,
 };
 use rw_generation_replication::{
     AuthenticatedOwner, FinalizeOutcome, GarbageCollectionReport, GenerationReplicationService,
@@ -171,6 +172,15 @@ impl ServerGenerationReplication {
         })
     }
 
+    pub fn owner_capabilities(
+        &self,
+        principal: &str,
+    ) -> Result<RunGenerationOwnerCapabilities, GenerationReplicationError> {
+        self.engine()?
+            .owner_capabilities(&owner(principal)?, now_unix())
+            .map_err(Into::into)
+    }
+
     /// Internal coarse state for startup diagnostics and metrics. HTTP callers
     /// must use `operator_status`, which checks the configured operator set.
     pub fn startup_status(&self) -> Result<ReplicationStatusResponse, GenerationReplicationError> {
@@ -186,6 +196,42 @@ impl ServerGenerationReplication {
         require_generation_id(generation_id)?;
         self.engine()?
             .status(&owner(principal)?, generation_id, now_unix())
+            .map_err(Into::into)
+    }
+
+    pub fn cancel_upload(
+        &self,
+        principal: &str,
+        generation_id: &str,
+    ) -> Result<CancelledRunGeneration, GenerationReplicationError> {
+        require_generation_id(generation_id)?;
+        self.engine()?
+            .cancel_upload(&owner(principal)?, generation_id, now_unix())
+            .map_err(Into::into)
+    }
+
+    pub fn owner_record(
+        &self,
+        principal: &str,
+        generation_id: &str,
+    ) -> Result<RunGenerationOwnerRecord, GenerationReplicationError> {
+        require_generation_id(generation_id)?;
+        self.engine()?
+            .owner_record(&owner(principal)?, generation_id, now_unix())
+            .map_err(Into::into)
+    }
+
+    pub fn owner_records(
+        &self,
+        principal: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<RunGenerationOwnerListPage, GenerationReplicationError> {
+        if let Some(cursor) = after {
+            require_generation_id(cursor)?;
+        }
+        self.engine()?
+            .owner_records(&owner(principal)?, after, limit, now_unix())
             .map_err(Into::into)
     }
 

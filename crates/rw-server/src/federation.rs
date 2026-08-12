@@ -1348,16 +1348,10 @@ mod tests {
         let descriptor_path = directory.path().join("lab.json");
         fs::write(&descriptor_path, serde_json::to_vec(&signed).unwrap()).unwrap();
         let key_path = directory.path().join("catalog.key");
-        fs::write(
+        crate::test_support::write_private_file(
             &key_path,
             base64::engine::general_purpose::STANDARD.encode(catalog_key.to_bytes()),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        );
         let mut config = FederationConfig {
             enabled: true,
             catalog_signing_key_file: Some(key_path),
