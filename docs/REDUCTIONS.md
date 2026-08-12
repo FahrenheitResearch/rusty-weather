@@ -91,8 +91,15 @@ returns precomputed full-domain finite minimum, maximum, and counts at each
 valid time without decoding field payloads.
 
 POST /v1/window reads one bounded, half-open native index rectangle from one
-storage slot. Geographic bounding-box masking, reprojection, polygon
-aggregation, and antimeridian-aware subsets are not part of the v1 contract.
+storage slot. POST /v1/geographic-window instead resolves a finite geographic
+bbox against an exact `snapshot_id` and `grid_hash`. Longitude is the eastward
+arc from west to east, so west > east crosses the antimeridian and -180..180
+selects the full globe. The response is the minimal native rectangular
+envelope containing selected grid-point centres, with only that envelope's
+lat/lon arrays, exact projection metadata, and an explicit per-cell mask.
+Surface fields and explicit pressure levels use window/chunk reads; pressure
+levels remain separate and are never vertically reduced. Polygon aggregation
+and reprojection remain outside this contract.
 
 ## Determinism and memory
 
@@ -102,7 +109,9 @@ domain_cells * timesteps * variables input value at once. Result memory still
 scales with domain cells and the reducer's output fields; the query limits
 reject the reducer-specific output cardinality before allocation.
 Synchronous JSON is separately capped by `json_grid_values` and
-`sync_result_values`. Asynchronous temporal jobs use
+`sync_result_values`. Geographic windows have independent
+`geographic_window_cells` and `geographic_window_output_values` caps.
+Asynchronous temporal jobs use
 `temporal_reduction_cells` and `temporal_output_values`; the production
 defaults admit full-domain HRRR scalar and 13-array vector summaries while retaining
 the independent serialized `job_result_bytes` cap.

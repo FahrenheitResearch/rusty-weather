@@ -9,6 +9,7 @@
 mod capability;
 mod catalog;
 mod error;
+mod geographic;
 mod point;
 mod profile;
 mod reduce;
@@ -20,6 +21,7 @@ mod types;
 pub use capability::*;
 pub use catalog::StoreCatalog;
 pub use error::{QueryError, QueryResult};
+pub use geographic::*;
 pub use point::query_point_series;
 pub use profile::query_profile;
 pub use reduce::reduce_scalar_temporal;

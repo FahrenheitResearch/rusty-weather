@@ -14,7 +14,8 @@ versioned API.
 - `rw-ingest`: provider acquisition, extraction, derivation, and publication.
 - `rw-scheduler`: optional durable cycle discovery, bounded ingest execution,
   restart recovery, and scheduler-owned retention.
-- `rw-query`: transport-independent catalog, point/profile/window, and
+- `rw-query`: transport-independent catalog, point/profile/native and
+  geographic window, and
   temporal/spatial analytics.
 - `rw-server`: bounded HTTP host, authentication, observability, jobs, and
   immutable artifacts.
@@ -32,6 +33,7 @@ versioned API.
 - `POST /v1/points`
 - `POST /v1/profile`
 - `POST /v1/window`
+- `POST /v1/geographic-window`
 - `POST /v1/analytics/spatial-series`
 - `POST /v1/analytics/temporal-grid`
 - `POST /v1/jobs/temporal-grid`
@@ -81,6 +83,14 @@ query support, rendering, temporal semantics, and verification level are
 reported independently. A catalog entry is not advertised as operationally
 verified merely because a URL template exists.
 
+Stored `surface2d` and `pressure3d` capabilities advertise
+`geographic_window=true`. A geographic request must bind the exact catalogued
+snapshot and grid hashes. Its versioned response contains a minimal native
+rectangular envelope, cropped lat/lon arrays, exact projection metadata, and a
+mask that prevents curvilinear envelope cells outside the requested bbox from
+being plotted as selected data. Antimeridian-crossing eastward arcs and
+explicit, unreduced pressure levels are first-class.
+
 Local valid stores are queryable even when their model identifier is not built
 into the registry. This keeps private WRF, ArWen, and other compatible output
 first-class.
@@ -90,9 +100,9 @@ first-class.
 Community Cache is disabled by default and adds no peer transport. It admits
 only the closed query-object categories in `rw-community-protocol`: sounding
 profiles with exact-time surface anchors, point series, native surface or
-selected-pressure windows, temporal/diurnal grids, and deliberately published
-case artifacts. There is no arbitrary-file, directory, raw-WRF, or full-run
-endpoint.
+selected-pressure windows, geographically selected surface or pressure
+windows, temporal/diurnal grids, and deliberately published case artifacts.
+There is no arbitrary-file, directory, raw-WRF, or full-run endpoint.
 
 Case artifacts are created only through a second off-by-default gate and a
 closed typed payload union: annotation, scalar table, fixed-coordinate overlay,

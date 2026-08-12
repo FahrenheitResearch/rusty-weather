@@ -17,11 +17,13 @@ use rw_community_protocol::{
 };
 use rw_ingest::{IngestCapabilityLimitation, IngestSupportStatus, model_ingest_capability};
 use rw_query::{
-    IndexWindow2DRequest, IntervalSupport, MissingPolicy, PointSeriesRequest, PointSeriesResult,
-    ProfileRequest, QueryError, SpatialStatsSeriesRequest, TemporalCapabilityBasis,
-    TemporalGridRequest, TemporalOperation, TemporalReducer, TemporalReductionLimits,
-    TemporalSemantics, TemporalValueClass, TemporalVerticalSelection, TemporalWindow,
-    TimeExpectation, TimeRange, VariableCapability, query_point_series, query_profile,
+    GeographicBoundingBox, GeographicVerticalSelection, GeographicWindowLimits,
+    GeographicWindowRequest, IndexWindow2DRequest, IntervalSupport, MissingPolicy,
+    PointSeriesRequest, PointSeriesResult, ProfileRequest, QueryError, SpatialStatsSeriesRequest,
+    TemporalCapabilityBasis, TemporalGridRequest, TemporalOperation, TemporalReducer,
+    TemporalReductionLimits, TemporalSemantics, TemporalValueClass, TemporalVerticalSelection,
+    TemporalWindow, TimeExpectation, TimeRange, VariableCapability,
+    query_geographic_window_with_cancel, query_point_series, query_profile,
     query_spatial_stats_series, query_window_2d, reduce_temporal_grid_with_cancel,
     reduce_temporal_grid_with_cancel_and_limits,
 };
@@ -690,6 +692,7 @@ pub struct VariableCapabilityResponse {
     coverage: f64,
     point_series: bool,
     pressure_profile: bool,
+    geographic_window: bool,
     scalar_temporal_reduction: bool,
     temporal: VariableTemporalCapabilityResponse,
 }
@@ -710,6 +713,7 @@ impl From<VariableCapability> for VariableCapabilityResponse {
             coverage: value.coverage,
             point_series: value.point_series,
             pressure_profile: value.pressure_profile,
+            geographic_window: value.geographic_window,
             scalar_temporal_reduction: value.scalar_temporal_reduction,
             temporal: VariableTemporalCapabilityResponse {
                 value_class: temporal.value_class.into(),
@@ -739,6 +743,40 @@ pub struct WindowApiRequest {
     y0: usize,
     x1: usize,
     y1: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GeographicVerticalApiSelection {
+    Surface2d,
+    PressureLevels { levels_hpa: Vec<u16> },
+}
+
+impl From<&GeographicVerticalApiSelection> for GeographicVerticalSelection {
+    fn from(value: &GeographicVerticalApiSelection) -> Self {
+        match value {
+            GeographicVerticalApiSelection::Surface2d => Self::Surface2d,
+            GeographicVerticalApiSelection::PressureLevels { levels_hpa } => Self::PressureLevels {
+                levels_hpa: levels_hpa.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GeographicWindowApiRequest {
+    model: String,
+    run: String,
+    expected_snapshot_id: String,
+    expected_grid_hash: String,
+    storage_slot: u16,
+    variables: Vec<String>,
+    west_longitude: f64,
+    south_latitude: f64,
+    east_longitude: f64,
+    north_latitude: f64,
+    vertical: GeographicVerticalApiSelection,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -835,6 +873,7 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
         .route("/v1/analytics/temporal-grid", post(temporal_grid))
         .route("/v1/jobs/temporal-grid", post(submit_temporal_grid_job))
         .route("/v1/window", post(window))
+        .route("/v1/geographic-window", post(geographic_window))
         .route("/v1/analytics/spatial-series", post(spatial_series))
         .route("/v1/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/v1/artifacts/{hash}/{file}", get(artifact))
@@ -1493,6 +1532,68 @@ async fn window(
         })
         .await
     {
+        Ok(Ok(bytes)) => json_bytes_with_etag(StatusCode::OK, bytes),
+        Ok(Err(error)) => response_work_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn geographic_window(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(request): Json<GeographicWindowApiRequest>,
+) -> Response {
+    if let Some(response) = reject_retired_selection(
+        &state,
+        request_id.0,
+        &request.model,
+        request.variables.iter().map(String::as_str),
+    ) {
+        return response;
+    }
+    let catalog = state.catalog.clone();
+    let cache = state.response_cache.clone();
+    let metrics = state.metrics.clone();
+    let limits = GeographicWindowLimits {
+        max_native_cells: state.config.limits.geographic_window_cells,
+        max_output_values: state.config.limits.geographic_window_output_values,
+    };
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = cancellation.clone();
+    let result = state
+        .run_heavy_sync(move || {
+            let snapshot = catalog.snapshot(&request.model, &request.run)?;
+            let query = GeographicWindowRequest {
+                expected_snapshot_id: request.expected_snapshot_id.clone(),
+                expected_grid_hash: request.expected_grid_hash.clone(),
+                storage_slot: request.storage_slot,
+                variables: request.variables.clone(),
+                bbox: GeographicBoundingBox {
+                    west_longitude: request.west_longitude,
+                    south_latitude: request.south_latitude,
+                    east_longitude: request.east_longitude,
+                    north_latitude: request.north_latitude,
+                },
+                vertical: (&request.vertical).into(),
+            };
+            cache_or_compute(
+                &cache,
+                &metrics,
+                "geographic_window_v1",
+                &snapshot.descriptor().snapshot_id,
+                &request,
+                || {
+                    query_geographic_window_with_cancel(&snapshot, &query, limits, || {
+                        worker_cancellation.load(Ordering::Acquire)
+                    })
+                },
+            )
+        })
+        .await;
+    if matches!(result, Err(ExecutionError::ExecutionTimeout)) {
+        cancellation.store(true, Ordering::Release);
+    }
+    match result {
         Ok(Ok(bytes)) => json_bytes_with_etag(StatusCode::OK, bytes),
         Ok(Err(error)) => response_work_problem(error, request_id.0).into_response(),
         Err(error) => execution_problem(error, request_id.0).into_response(),
@@ -3316,6 +3417,79 @@ mod tests {
             value["data"]["metadata"]["semantics"]["kind"],
             "instantaneous_scalar"
         );
+    }
+
+    #[tokio::test]
+    async fn geographic_window_is_authenticated_snapshot_bound_and_self_describing() {
+        let (_directory, state) = test_state_with_store_limit(2_000_000);
+        let descriptor = state
+            .catalog
+            .snapshot(FIXTURE_MODEL, FIXTURE_RUN)
+            .unwrap()
+            .descriptor()
+            .clone();
+        let app = build_router(state).unwrap();
+        let request = serde_json::json!({
+            "model": FIXTURE_MODEL,
+            "run": FIXTURE_RUN,
+            "expected_snapshot_id": descriptor.snapshot_id,
+            "expected_grid_hash": descriptor.grid_hash,
+            "storage_slot": 0,
+            "variables": ["temperature_iso"],
+            "west_longitude": -100.1,
+            "south_latitude": 39.9,
+            "east_longitude": -98.9,
+            "north_latitude": 41.1,
+            "vertical": {"kind": "pressure_levels", "levels_hpa": [500, 850]}
+        });
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/geographic-window")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let response = post_json(app.clone(), "/v1/geographic-window", request.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key(header::ETAG));
+        let body = response_json(response).await;
+        assert_eq!(body["schema"], "rw.query.geographic-window.v1");
+        assert_eq!(body["run"]["snapshot_id"], descriptor.snapshot_id);
+        assert_eq!(body["run"]["grid_hash"], descriptor.grid_hash);
+        assert_eq!(
+            body["envelope"],
+            serde_json::json!({"x0": 0, "y0": 0, "nx": 2, "ny": 2})
+        );
+        assert_eq!(body["latitudes"].as_array().unwrap().len(), 4);
+        assert_eq!(body["longitudes"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            body["cell_mask"],
+            serde_json::json!([true, true, true, true])
+        );
+        assert_eq!(body["fields"][0]["data"]["kind"], "pressure_levels");
+        assert_eq!(
+            body["fields"][0]["data"]["levels_hpa"],
+            serde_json::json!([500, 850])
+        );
+        assert_eq!(
+            body["fields"][0]["data"]["values"]
+                .as_array()
+                .unwrap()
+                .len(),
+            8
+        );
+
+        let mut stale = request;
+        stale["expected_snapshot_id"] = serde_json::Value::String("0".repeat(64));
+        let rejected = post_json(app, "/v1/geographic-window", stale).await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -16,21 +16,23 @@ use chrono::{Datelike, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rw_community_protocol::{
     AttributionNotice, CASE_ARTIFACT_REVOCATION_SCHEMA, CASE_REVOCATION_SCHEMA, CASE_SCHEMA,
-    CaseRoomManifest, Compression, DataOrigin, DeliverySource, NATIVE_WINDOW_PAYLOAD_SCHEMA,
-    OBJECT_SCHEMA, ObjectManifest, POINT_SERIES_PAYLOAD_SCHEMA, PROFILE_PAYLOAD_SCHEMA,
-    PUBLICATION_AUDIT_SCHEMA, PUBLICATION_TOMBSTONE_SCHEMA, ProfileObjectPayload, ProtocolError,
-    ProtocolLimits, PublicationAuditRecord, PublicationTombstone, PublishCaseArtifactRequest,
-    RESOLVE_SCHEMA, ResolveObjectRequest, ResolveObjectResponse, RevokePublicationRequest,
-    ShareQuery, SignedCaseRoomManifest, SignedObjectManifest, SurfaceSample,
-    TEMPORAL_GRID_PAYLOAD_SCHEMA, TrustedSigningKeys, TypedObjectPayload,
-    case_artifact_payload_bytes, enforce_request_attributions, object_sha256, request_sha256,
-    sign_case_manifest, sign_object_manifest, validate_case_artifact_payload_bytes,
+    CaseRoomManifest, Compression, DataOrigin, DeliverySource, GEOGRAPHIC_WINDOW_PAYLOAD_SCHEMA,
+    NATIVE_WINDOW_PAYLOAD_SCHEMA, OBJECT_SCHEMA, ObjectManifest, POINT_SERIES_PAYLOAD_SCHEMA,
+    PROFILE_PAYLOAD_SCHEMA, PUBLICATION_AUDIT_SCHEMA, PUBLICATION_TOMBSTONE_SCHEMA,
+    ProfileObjectPayload, ProtocolError, ProtocolLimits, PublicationAuditRecord,
+    PublicationTombstone, PublishCaseArtifactRequest, RESOLVE_SCHEMA, ResolveObjectRequest,
+    ResolveObjectResponse, RevokePublicationRequest, ShareQuery, SignedCaseRoomManifest,
+    SignedObjectManifest, SurfaceSample, TEMPORAL_GRID_PAYLOAD_SCHEMA, TrustedSigningKeys,
+    TypedObjectPayload, case_artifact_payload_bytes, enforce_request_attributions, object_sha256,
+    request_sha256, sign_case_manifest, sign_object_manifest, validate_case_artifact_payload_bytes,
     validate_profile_payload_identity, verify_signed_case, verify_signed_object,
 };
 use rw_query::{
-    IndexWindow2DRequest, IndexWindow3DRequest, IntervalSupport, MissingPolicy, PointSeriesRequest,
-    ProfileRequest, QueryError, StoreCatalog, TemporalGridRequest, TemporalReducer,
-    TemporalSemantics, TemporalVerticalSelection, TemporalWindow, TimeExpectation, TimeRange,
+    GeographicBoundingBox, GeographicVerticalSelection, GeographicWindowLimits,
+    GeographicWindowRequest, IndexWindow2DRequest, IndexWindow3DRequest, IntervalSupport,
+    MissingPolicy, PointSeriesRequest, ProfileRequest, QueryError, StoreCatalog,
+    TemporalGridRequest, TemporalReducer, TemporalSemantics, TemporalVerticalSelection,
+    TemporalWindow, TimeExpectation, TimeRange, query_geographic_window_with_cancel,
     query_point_series, query_profile, query_window_2d, query_window_3d, reduce_temporal_grid,
 };
 use thiserror::Error;
@@ -1284,6 +1286,55 @@ impl CommunityService {
                     schema: NATIVE_WINDOW_PAYLOAD_SCHEMA.into(),
                     request_sha256: request_sha256(request)?,
                     data: windows,
+                })?
+            }
+            ShareQuery::GeographicWindow {
+                storage_slot,
+                valid_unix,
+                west_longitude_e7,
+                south_latitude_e7,
+                east_longitude_e7,
+                north_latitude_e7,
+                pressure_levels_hpa,
+            } => {
+                let time = snapshot.timepoint(*storage_slot)?;
+                if time.valid_unix != *valid_unix {
+                    return Err(CommunityError::Invalid(
+                        "geographic-window storage slot does not match request valid time".into(),
+                    ));
+                }
+                let vertical = if pressure_levels_hpa.is_empty() {
+                    GeographicVerticalSelection::Surface2d
+                } else {
+                    GeographicVerticalSelection::PressureLevels {
+                        levels_hpa: pressure_levels_hpa.clone(),
+                    }
+                };
+                let result = query_geographic_window_with_cancel(
+                    &snapshot,
+                    &GeographicWindowRequest {
+                        expected_snapshot_id: request.snapshot_id.clone(),
+                        expected_grid_hash: request.grid_hash.clone(),
+                        storage_slot: *storage_slot,
+                        variables: request.variables.clone(),
+                        bbox: GeographicBoundingBox {
+                            west_longitude: f64::from(*west_longitude_e7) / 10_000_000.0,
+                            south_latitude: f64::from(*south_latitude_e7) / 10_000_000.0,
+                            east_longitude: f64::from(*east_longitude_e7) / 10_000_000.0,
+                            north_latitude: f64::from(*north_latitude_e7) / 10_000_000.0,
+                        },
+                        vertical,
+                    },
+                    GeographicWindowLimits {
+                        max_native_cells: snapshot.limits().max_reduction_cells,
+                        max_output_values: snapshot.limits().max_point_values,
+                    },
+                    || false,
+                )?;
+                serde_json::to_vec(&TypedObjectPayload {
+                    schema: GEOGRAPHIC_WINDOW_PAYLOAD_SCHEMA.into(),
+                    request_sha256: request_sha256(request)?,
+                    data: result,
                 })?
             }
             ShareQuery::TemporalGrid {

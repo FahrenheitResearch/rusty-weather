@@ -83,6 +83,8 @@
       "$ref": "#/$defs/LimitsConfig",
       "default": {
         "catalog_time_points": 10000,
+        "geographic_window_cells": 250000,
+        "geographic_window_output_values": 2000000,
         "heavy_concurrency": 2,
         "job_history_records": 10000,
         "job_result_bytes": 536870912,
@@ -548,6 +550,20 @@
           "type": "integer",
           "format": "uint",
           "default": 10000,
+          "minimum": 0
+        },
+        "geographic_window_cells": {
+          "description": "Native cells in one synchronous arbitrary geographic-domain envelope.",
+          "type": "integer",
+          "format": "uint",
+          "default": 250000,
+          "minimum": 0
+        },
+        "geographic_window_output_values": {
+          "description": "Coordinates, mask entries, and field/level values serialized by one\nsynchronous arbitrary geographic-domain response.",
+          "type": "integer",
+          "format": "uint",
+          "default": 2000000,
           "minimum": 0
         },
         "heavy_concurrency": {

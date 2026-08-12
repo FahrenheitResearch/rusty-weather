@@ -196,6 +196,9 @@ pub struct VariableCapability {
     pub coverage: f64,
     pub point_series: bool,
     pub pressure_profile: bool,
+    /// This stored variable can be returned in a bounded geographic-domain
+    /// window with cropped coordinates and exact projection metadata.
+    pub geographic_window: bool,
     pub scalar_temporal_reduction: bool,
     pub temporal: crate::VariableTemporalCapability,
 }

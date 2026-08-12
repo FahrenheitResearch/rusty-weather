@@ -649,6 +649,11 @@ pub struct LimitsConfig {
     pub points_per_query: usize,
     pub sync_result_values: usize,
     pub json_grid_values: usize,
+    /// Native cells in one synchronous arbitrary geographic-domain envelope.
+    pub geographic_window_cells: usize,
+    /// Coordinates, mask entries, and field/level values serialized by one
+    /// synchronous arbitrary geographic-domain response.
+    pub geographic_window_output_values: usize,
     /// Native-domain cells allowed for an asynchronous temporal reduction.
     pub temporal_reduction_cells: usize,
     /// Fixed and dynamic values allowed in an asynchronous temporal result.
@@ -675,6 +680,8 @@ impl Default for LimitsConfig {
             points_per_query: 100,
             sync_result_values: 2_000_000,
             json_grid_values: 250_000,
+            geographic_window_cells: 250_000,
+            geographic_window_output_values: 2_000_000,
             temporal_reduction_cells: 4_000_000,
             temporal_output_values: 32_000_000,
             catalog_time_points: 10_000,
@@ -701,6 +708,11 @@ impl LimitsConfig {
             ("points_per_query", self.points_per_query),
             ("sync_result_values", self.sync_result_values),
             ("json_grid_values", self.json_grid_values),
+            ("geographic_window_cells", self.geographic_window_cells),
+            (
+                "geographic_window_output_values",
+                self.geographic_window_output_values,
+            ),
             ("temporal_reduction_cells", self.temporal_reduction_cells),
             ("temporal_output_values", self.temporal_output_values),
             ("catalog_time_points", self.catalog_time_points),

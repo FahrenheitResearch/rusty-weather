@@ -9,10 +9,11 @@ use crate::routes::{
     ApiIngestCapabilityLimitation, ApiIntervalSupport, ApiMissingPolicy,
     ApiTemporalCapabilityBasis, ApiTemporalOperation, ApiTemporalReducer, ApiTemporalSemantics,
     ApiTemporalValueClass, ApiTemporalVerticalSelection, ApiTemporalWindow, ApiTimeExpectation,
-    CoordinateRequest, HealthResponse, ModelCapabilityResponse, PointQueryRequest, PointsRequest,
-    ProductCapabilityResponse, ProfileApiRequest, ProviderAttributionResponse,
-    SpatialSeriesApiRequest, TemporalGridApiRequest, VariableCapabilityResponse,
-    VariableTemporalCapabilityResponse, VersionResponse, WindowApiRequest,
+    CoordinateRequest, GeographicVerticalApiSelection, GeographicWindowApiRequest, HealthResponse,
+    ModelCapabilityResponse, PointQueryRequest, PointsRequest, ProductCapabilityResponse,
+    ProfileApiRequest, ProviderAttributionResponse, SpatialSeriesApiRequest,
+    TemporalGridApiRequest, VariableCapabilityResponse, VariableTemporalCapabilityResponse,
+    VersionResponse, WindowApiRequest,
 };
 use crate::{ArtifactRef, JobStatus, JobView};
 
@@ -115,6 +116,93 @@ struct IndexWindowResponse {
     nx: usize,
     ny: usize,
     values: Vec<Option<f32>>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct NativeGridEnvelopeResponse {
+    x0: usize,
+    y0: usize,
+    nx: usize,
+    ny: usize,
+}
+
+#[derive(utoipa::ToSchema)]
+struct GeographicBoundingBoxResponse {
+    west_longitude: f64,
+    south_latitude: f64,
+    east_longitude: f64,
+    north_latitude: f64,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum LongitudeArcResponse {
+    Ordinary,
+    CrossesAntimeridian,
+    FullGlobe,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum GridProjectionResponse {
+    Geographic,
+    LambertConformal {
+        standard_parallel_1_deg: f64,
+        standard_parallel_2_deg: f64,
+        central_meridian_deg: f64,
+    },
+    PolarStereographic {
+        true_latitude_deg: f64,
+        central_meridian_deg: f64,
+        south_pole_on_projection_plane: bool,
+    },
+    Mercator {
+        latitude_of_true_scale_deg: f64,
+        central_meridian_deg: f64,
+    },
+    Other {
+        template: u16,
+    },
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum GeographicFieldValuesResponse {
+    Surface2d {
+        values: Vec<Option<f32>>,
+    },
+    PressureLevels {
+        levels_hpa: Vec<u16>,
+        values: Vec<Option<f32>>,
+    },
+}
+
+#[derive(utoipa::ToSchema)]
+struct GeographicFieldResponse {
+    variable: String,
+    units: String,
+    selector: serde_json::Value,
+    data: GeographicFieldValuesResponse,
+}
+
+/// Schema `rw.query.geographic-window.v1`. Projection carries the exact
+/// serialized rustwx-core GridProjection tagged union or null.
+#[derive(utoipa::ToSchema)]
+struct GeographicWindowResponse {
+    schema: String,
+    run: RunDescriptorResponse,
+    time: TimePointResponse,
+    requested_bbox: GeographicBoundingBoxResponse,
+    longitude_arc: LongitudeArcResponse,
+    envelope_semantics: String,
+    cell_inclusion_semantics: String,
+    envelope: NativeGridEnvelopeResponse,
+    latitudes: Vec<Option<f32>>,
+    longitudes: Vec<Option<f32>>,
+    cell_mask: Vec<bool>,
+    mask_required: bool,
+    projection: Option<GridProjectionResponse>,
+    fields: Vec<GeographicFieldResponse>,
 }
 
 #[derive(utoipa::ToSchema)]
@@ -450,6 +538,7 @@ struct SignedFederationCatalogDoc {
         points_doc,
         profile_doc,
         window_doc,
+        geographic_window_doc,
         spatial_series_doc,
         temporal_grid_doc,
         submit_temporal_grid_job_doc,
@@ -480,6 +569,8 @@ struct SignedFederationCatalogDoc {
         PointsRequest,
         ProfileApiRequest,
         WindowApiRequest,
+        GeographicVerticalApiSelection,
+        GeographicWindowApiRequest,
         SpatialSeriesApiRequest,
         TemporalGridApiRequest,
         ApiTemporalWindow,
@@ -507,6 +598,13 @@ struct SignedFederationCatalogDoc {
         PressureProfileResponse,
         ProfileResponse,
         IndexWindowResponse,
+        NativeGridEnvelopeResponse,
+        GeographicBoundingBoxResponse,
+        LongitudeArcResponse,
+        GridProjectionResponse,
+        GeographicFieldValuesResponse,
+        GeographicFieldResponse,
+        GeographicWindowResponse,
         SpatialStatsSampleResponse,
         SpatialSeriesResponse,
         ResolvedTemporalWindowResponse,
@@ -784,6 +882,29 @@ fn profile_doc() {}
     )
 )]
 fn window_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/geographic-window",
+    tag = "query",
+    description = "Resolve a finite geographic bbox against one exact snapshot/grid, then return its minimal native rectangular envelope with cropped lat/lon arrays, exact projection metadata, and a cell mask. Longitude is an eastward arc; west > east crosses the antimeridian and -180..180 selects the globe. Surface fields and explicit pressure levels are read from intersecting native chunks only; no full-grid coordinate payload or vertical reduction is emitted.",
+    security(("bearer_auth" = [])),
+    request_body = GeographicWindowApiRequest,
+    responses(
+        (status = 200, description = "Versioned self-describing geographic-domain field window", body = GeographicWindowResponse),
+        (status = 400, description = "Bounds, identity, variables, levels, or request shape are invalid or have no overlap", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Requested variable, storage slot, model, or run is absent", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 409, description = "Run changed while the geographic window was executing", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 413, description = "Request body exceeds the configured byte limit", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 415, description = "Request is not application/json", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Geographic cell/output cap or variable-kind constraint was exceeded", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Store, allocation, or serialization failure", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Service is busy or shutting down", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Geographic extraction exceeded its deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn geographic_window_doc() {}
 
 #[utoipa::path(
     post,

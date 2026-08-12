@@ -32,7 +32,8 @@ addressable; ordinary Community Cache clients are never listed there.
 
 ## Self-hosted data service
 
-`rw-server` exposes bounded catalog, point, profile, and temporal analytics over
+`rw-server` exposes bounded catalog, point, profile, arbitrary geographic-domain
+plots (including explicit pressure levels), and temporal analytics over
 validated stores without requiring the desktop application. Start with
 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), then use
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for health checks, backup, upgrades,

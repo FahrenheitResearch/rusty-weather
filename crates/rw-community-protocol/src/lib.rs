@@ -30,6 +30,7 @@ pub const RELAY_ENVELOPE_SCHEMA: &str = "rw.community.relay-envelope.v1";
 pub const PROFILE_PAYLOAD_SCHEMA: &str = "rw.community.profile-payload.v1";
 pub const POINT_SERIES_PAYLOAD_SCHEMA: &str = "rw.community.point-series-payload.v1";
 pub const NATIVE_WINDOW_PAYLOAD_SCHEMA: &str = "rw.community.native-window-payload.v1";
+pub const GEOGRAPHIC_WINDOW_PAYLOAD_SCHEMA: &str = "rw.community.geographic-window-payload.v1";
 pub const TEMPORAL_GRID_PAYLOAD_SCHEMA: &str = "rw.community.temporal-grid-payload.v1";
 pub const CASE_ARTIFACT_PAYLOAD_SCHEMA: &str = "rw.community.case-artifact-payload.v1";
 
@@ -247,6 +248,19 @@ pub enum ShareQuery {
         #[serde(default)]
         pressure_levels_hpa: Vec<u16>,
     },
+    /// One geographically selected, self-describing native-grid envelope.
+    /// The eastward longitude arc crosses the antimeridian when west > east;
+    /// -180..180 denotes the full globe. Bounds use exact 1e-7 degree units.
+    GeographicWindow {
+        storage_slot: u16,
+        valid_unix: i64,
+        west_longitude_e7: i32,
+        south_latitude_e7: i32,
+        east_longitude_e7: i32,
+        north_latitude_e7: i32,
+        #[serde(default)]
+        pressure_levels_hpa: Vec<u16>,
+    },
     TemporalGrid {
         window: TimeWindow,
         reducer: String,
@@ -461,6 +475,7 @@ pub struct TypedObjectPayload<T> {
 
 pub type PointSeriesObjectPayload<T> = TypedObjectPayload<T>;
 pub type NativeWindowObjectPayload<T> = TypedObjectPayload<T>;
+pub type GeographicWindowObjectPayload<T> = TypedObjectPayload<T>;
 pub type TemporalGridObjectPayload<T> = TypedObjectPayload<T>;
 pub type CaseArtifactObjectPayload<T> = TypedObjectPayload<T>;
 
@@ -481,6 +496,10 @@ pub fn validate_typed_payload_identity<T>(
             | (
                 ShareQuery::NativeWindow { .. },
                 NATIVE_WINDOW_PAYLOAD_SCHEMA
+            )
+            | (
+                ShareQuery::GeographicWindow { .. },
+                GEOGRAPHIC_WINDOW_PAYLOAD_SCHEMA
             )
             | (
                 ShareQuery::TemporalGrid { .. },
@@ -1284,6 +1303,26 @@ fn validate_query(query: &ShareQuery, limits: &ProtocolLimits) -> Result<(), Pro
             }
             validate_levels(pressure_levels_hpa)?;
         }
+        ShareQuery::GeographicWindow {
+            valid_unix,
+            west_longitude_e7,
+            south_latitude_e7,
+            east_longitude_e7,
+            north_latitude_e7,
+            pressure_levels_hpa,
+            ..
+        } => {
+            if *valid_unix < 0 {
+                return invalid("valid_unix", "must be a non-negative UTC Unix timestamp");
+            }
+            validate_geographic_bbox(
+                *west_longitude_e7,
+                *south_latitude_e7,
+                *east_longitude_e7,
+                *north_latitude_e7,
+            )?;
+            validate_levels(pressure_levels_hpa)?;
+        }
         ShareQuery::PointSeries {
             latitude_e7,
             longitude_e7,
@@ -1322,6 +1361,29 @@ fn validate_query(query: &ShareQuery, limits: &ProtocolLimits) -> Result<(), Pro
             );
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn validate_geographic_bbox(
+    west_longitude_e7: i32,
+    south_latitude_e7: i32,
+    east_longitude_e7: i32,
+    north_latitude_e7: i32,
+) -> Result<(), ProtocolError> {
+    validate_coordinates(south_latitude_e7, west_longitude_e7)?;
+    validate_coordinates(north_latitude_e7, east_longitude_e7)?;
+    if south_latitude_e7 >= north_latitude_e7 {
+        return invalid(
+            "geographic_bbox",
+            "south latitude must be strictly less than north latitude",
+        );
+    }
+    if west_longitude_e7 == east_longitude_e7 {
+        return invalid(
+            "geographic_bbox",
+            "longitude bounds must select a non-empty eastward arc",
+        );
     }
     Ok(())
 }
@@ -1538,6 +1600,10 @@ fn normalize_query(query: &mut ShareQuery) {
             pressure_levels_hpa,
             ..
         }
+        | ShareQuery::GeographicWindow {
+            pressure_levels_hpa,
+            ..
+        }
         | ShareQuery::TemporalGrid {
             pressure_levels_hpa,
             ..
@@ -1672,6 +1738,25 @@ fn encode_query(out: &mut Vec<u8>, value: &ShareQuery) {
             put_u32(out, *y0);
             put_u32(out, *x1);
             put_u32(out, *y1);
+            put_u16s(out, pressure_levels_hpa);
+        }
+        ShareQuery::GeographicWindow {
+            storage_slot,
+            valid_unix,
+            west_longitude_e7,
+            south_latitude_e7,
+            east_longitude_e7,
+            north_latitude_e7,
+            pressure_levels_hpa,
+        } => {
+            // Appended tag: existing v1 query identities remain byte-stable.
+            put_u8(out, 5);
+            put_u16(out, *storage_slot);
+            put_i64(out, *valid_unix);
+            put_i32(out, *west_longitude_e7);
+            put_i32(out, *south_latitude_e7);
+            put_i32(out, *east_longitude_e7);
+            put_i32(out, *north_latitude_e7);
             put_u16s(out, pressure_levels_hpa);
         }
         ShareQuery::TemporalGrid {
@@ -2011,6 +2096,51 @@ mod tests {
             request_sha256(&first).unwrap(),
             request_sha256(&different_variables).unwrap()
         );
+    }
+
+    #[test]
+    fn geographic_window_identity_binds_bbox_slot_grid_variables_and_levels() {
+        let mut request = sample_request();
+        request.variables = vec!["temperature".into()];
+        request.query = ShareQuery::GeographicWindow {
+            storage_slot: 2,
+            valid_unix: 1_786_500_000,
+            west_longitude_e7: 1_700_000_000,
+            south_latitude_e7: -200_000_000,
+            east_longitude_e7: -1_700_000_000,
+            north_latitude_e7: 200_000_000,
+            pressure_levels_hpa: vec![850, 500],
+        };
+        request.normalize();
+        request.validate(&ProtocolLimits::default()).unwrap();
+        let identity = request_sha256(&request).unwrap();
+        let mut changed = request.clone();
+        if let ShareQuery::GeographicWindow {
+            west_longitude_e7, ..
+        } = &mut changed.query
+        {
+            *west_longitude_e7 += 1;
+        }
+        assert_ne!(identity, request_sha256(&changed).unwrap());
+        let mut changed = request.clone();
+        changed.grid_hash = hash('f');
+        assert_ne!(identity, request_sha256(&changed).unwrap());
+        let mut changed = request.clone();
+        if let ShareQuery::GeographicWindow {
+            pressure_levels_hpa,
+            ..
+        } = &mut changed.query
+        {
+            pressure_levels_hpa.pop();
+        }
+        assert_ne!(identity, request_sha256(&changed).unwrap());
+        let payload = TypedObjectPayload {
+            schema: GEOGRAPHIC_WINDOW_PAYLOAD_SCHEMA.into(),
+            request_sha256: identity,
+            data: serde_json::json!({"schema": "rw.query.geographic-window.v1"}),
+        };
+        validate_typed_payload_identity(&payload, GEOGRAPHIC_WINDOW_PAYLOAD_SCHEMA, &request)
+            .unwrap();
     }
 
     #[test]

@@ -59,6 +59,10 @@ operator inputs and MUST NOT be compiled into this protocol.
 - `point_series`: an exact point time series;
 - `native_window`: a native-grid window or tile at an exact storage slot and
   valid time;
+- `geographic_window`: a finite fixed-point geographic bbox resolved against
+  the exact signed snapshot/grid, returning a versioned minimal native
+  envelope with cropped coordinates, projection metadata, cell mask, and
+  either surface fields or explicit pressure levels;
 - `temporal_grid`: a temporal/diurnal reduction with explicit window,
   semantics, reducer, vertical selection, and missing-data policy;
 - `case_artifact`: an artifact deliberately attached to a published case room.
@@ -77,6 +81,14 @@ Normal surface candidates include `temperature_2m`, `dewpoint_2m`, `u_10m`,
 `v_10m`, a model's canonical surface-pressure field or documented
 approximation, `orography`, and `mslp`; a missing field is represented as a
 typed null sample, not silently substituted under the same identity.
+
+`geographic_window` uses the distinct typed payload schema
+`rw.community.geographic-window-payload.v1`; it is never decoded as the older
+native-index window payload. The signed bbox uses eastward-arc longitude
+semantics (west > east crosses the antimeridian), and the object data uses
+`rw.query.geographic-window.v1` with a minimal native envelope, exact cropped
+coordinates/projection, a cell mask, and unreduced `[level][y][x]` pressure
+layout when levels were requested.
 
 ## Canonical request identity
 

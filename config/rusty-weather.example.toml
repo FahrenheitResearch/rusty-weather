@@ -19,6 +19,10 @@ variables_per_query = 32
 points_per_query = 100
 sync_result_values = 2000000
 json_grid_values = 250000
+# Arbitrary geographic plots return a minimal native rectangular envelope,
+# cropped coordinates, a cell mask, and selected field/pressure-level values.
+geographic_window_cells = 250000
+geographic_window_output_values = 2000000
 # Async temporal jobs use independent budgets. These defaults cover HRRR's
 # 1799x1059 native domain, including the 13-value vector-summary result.
 temporal_reduction_cells = 4000000

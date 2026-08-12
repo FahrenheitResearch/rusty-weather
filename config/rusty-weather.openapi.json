@@ -1386,6 +1386,142 @@
         ]
       }
     },
+    "/v1/geographic-window": {
+      "post": {
+        "tags": [
+          "query"
+        ],
+        "description": "Resolve a finite geographic bbox against one exact snapshot/grid, then return its minimal native rectangular envelope with cropped lat/lon arrays, exact projection metadata, and a cell mask. Longitude is an eastward arc; west > east crosses the antimeridian and -180..180 selects the globe. Surface fields and explicit pressure levels are read from intersecting native chunks only; no full-grid coordinate payload or vertical reduction is emitted.",
+        "operationId": "geographic_window_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GeographicWindowApiRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Versioned self-describing geographic-domain field window",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GeographicWindowResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bounds, identity, variables, levels, or request shape are invalid or have no overlap",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Requested variable, storage slot, model, or run is absent",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Run changed while the geographic window was executing",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the configured byte limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request is not application/json",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Geographic cell/output cap or variable-kind constraint was exceeded",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store, allocation, or serialization failure",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is busy or shutting down",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Geographic extraction exceeded its deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/v1/health/live": {
       "get": {
         "tags": [
@@ -3893,6 +4029,309 @@
           }
         }
       },
+      "GeographicBoundingBoxResponse": {
+        "type": "object",
+        "required": [
+          "west_longitude",
+          "south_latitude",
+          "east_longitude",
+          "north_latitude"
+        ],
+        "properties": {
+          "east_longitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "north_latitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "south_latitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "west_longitude": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "GeographicFieldResponse": {
+        "type": "object",
+        "required": [
+          "variable",
+          "units",
+          "selector",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/GeographicFieldValuesResponse"
+          },
+          "selector": {},
+          "units": {
+            "type": "string"
+          },
+          "variable": {
+            "type": "string"
+          }
+        }
+      },
+      "GeographicFieldValuesResponse": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "values",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "surface2d"
+                ]
+              },
+              "values": {
+                "type": "array",
+                "items": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "format": "float"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "levels_hpa",
+              "values",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "pressure_levels"
+                ]
+              },
+              "levels_hpa": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              },
+              "values": {
+                "type": "array",
+                "items": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "format": "float"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "GeographicVerticalApiSelection": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "surface2d"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "levels_hpa",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "pressure_levels"
+                ]
+              },
+              "levels_hpa": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        ]
+      },
+      "GeographicWindowApiRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "run",
+          "expected_snapshot_id",
+          "expected_grid_hash",
+          "storage_slot",
+          "variables",
+          "west_longitude",
+          "south_latitude",
+          "east_longitude",
+          "north_latitude",
+          "vertical"
+        ],
+        "properties": {
+          "east_longitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "expected_grid_hash": {
+            "type": "string"
+          },
+          "expected_snapshot_id": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "north_latitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "run": {
+            "type": "string"
+          },
+          "south_latitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "storage_slot": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "variables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "vertical": {
+            "$ref": "#/components/schemas/GeographicVerticalApiSelection"
+          },
+          "west_longitude": {
+            "type": "number",
+            "format": "double"
+          }
+        },
+        "additionalProperties": false
+      },
+      "GeographicWindowResponse": {
+        "type": "object",
+        "description": "Schema `rw.query.geographic-window.v1`. Projection carries the exact\nserialized rustwx-core GridProjection tagged union or null.",
+        "required": [
+          "schema",
+          "run",
+          "time",
+          "requested_bbox",
+          "longitude_arc",
+          "envelope_semantics",
+          "cell_inclusion_semantics",
+          "envelope",
+          "latitudes",
+          "longitudes",
+          "cell_mask",
+          "mask_required",
+          "fields"
+        ],
+        "properties": {
+          "cell_inclusion_semantics": {
+            "type": "string"
+          },
+          "cell_mask": {
+            "type": "array",
+            "items": {
+              "type": "boolean"
+            }
+          },
+          "envelope": {
+            "$ref": "#/components/schemas/NativeGridEnvelopeResponse"
+          },
+          "envelope_semantics": {
+            "type": "string"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GeographicFieldResponse"
+            }
+          },
+          "latitudes": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "float"
+            }
+          },
+          "longitude_arc": {
+            "$ref": "#/components/schemas/LongitudeArcResponse"
+          },
+          "longitudes": {
+            "type": "array",
+            "items": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "float"
+            }
+          },
+          "mask_required": {
+            "type": "boolean"
+          },
+          "projection": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GridProjectionResponse"
+              }
+            ]
+          },
+          "requested_bbox": {
+            "$ref": "#/components/schemas/GeographicBoundingBoxResponse"
+          },
+          "run": {
+            "$ref": "#/components/schemas/RunDescriptorResponse"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "time": {
+            "$ref": "#/components/schemas/TimePointResponse"
+          }
+        }
+      },
       "GridPointResponse": {
         "type": "object",
         "required": [
@@ -3929,6 +4368,121 @@
             "minimum": 0
           }
         }
+      },
+      "GridProjectionResponse": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "geographic"
+            ]
+          },
+          {
+            "type": "object",
+            "required": [
+              "lambert_conformal"
+            ],
+            "properties": {
+              "lambert_conformal": {
+                "type": "object",
+                "required": [
+                  "standard_parallel_1_deg",
+                  "standard_parallel_2_deg",
+                  "central_meridian_deg"
+                ],
+                "properties": {
+                  "central_meridian_deg": {
+                    "type": "number",
+                    "format": "double"
+                  },
+                  "standard_parallel_1_deg": {
+                    "type": "number",
+                    "format": "double"
+                  },
+                  "standard_parallel_2_deg": {
+                    "type": "number",
+                    "format": "double"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "polar_stereographic"
+            ],
+            "properties": {
+              "polar_stereographic": {
+                "type": "object",
+                "required": [
+                  "true_latitude_deg",
+                  "central_meridian_deg",
+                  "south_pole_on_projection_plane"
+                ],
+                "properties": {
+                  "central_meridian_deg": {
+                    "type": "number",
+                    "format": "double"
+                  },
+                  "south_pole_on_projection_plane": {
+                    "type": "boolean"
+                  },
+                  "true_latitude_deg": {
+                    "type": "number",
+                    "format": "double"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "mercator"
+            ],
+            "properties": {
+              "mercator": {
+                "type": "object",
+                "required": [
+                  "latitude_of_true_scale_deg",
+                  "central_meridian_deg"
+                ],
+                "properties": {
+                  "central_meridian_deg": {
+                    "type": "number",
+                    "format": "double"
+                  },
+                  "latitude_of_true_scale_deg": {
+                    "type": "number",
+                    "format": "double"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "other"
+            ],
+            "properties": {
+              "other": {
+                "type": "object",
+                "required": [
+                  "template"
+                ],
+                "properties": {
+                  "template": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          }
+        ]
       },
       "HealthResponse": {
         "type": "object",
@@ -4264,6 +4818,14 @@
           }
         }
       },
+      "LongitudeArcResponse": {
+        "type": "string",
+        "enum": [
+          "ordinary",
+          "crosses_antimeridian",
+          "full_globe"
+        ]
+      },
       "ModelCapabilityResponse": {
         "type": "object",
         "required": [
@@ -4330,6 +4892,33 @@
           },
           "verification": {
             "type": "string"
+          }
+        }
+      },
+      "NativeGridEnvelopeResponse": {
+        "type": "object",
+        "required": [
+          "x0",
+          "y0",
+          "nx",
+          "ny"
+        ],
+        "properties": {
+          "nx": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ny": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "x0": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "y0": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },
@@ -5659,6 +6248,7 @@
           "coverage",
           "point_series",
           "pressure_profile",
+          "geographic_window",
           "scalar_temporal_reduction",
           "temporal"
         ],
@@ -5685,6 +6275,9 @@
           "expected_samples": {
             "type": "integer",
             "minimum": 0
+          },
+          "geographic_window": {
+            "type": "boolean"
           },
           "kind": {
             "type": "string"
