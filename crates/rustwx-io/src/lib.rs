@@ -349,7 +349,79 @@ pub fn fetch_eumetnet_opera_odim_h5(url: &str) -> Result<Vec<u8>, IoError> {
         .map_err(|err| IoError::Download(err.to_string()))
 }
 
+/// What a no-echo (`undetect`) cell is worth, in dBZ.
+///
+/// ODIM declares two sentinels and they mean opposite things. `nodata` is *no
+/// radar coverage* — genuinely unobserved. `undetect` is *no echo* — the
+/// network looked and found nothing, which is an observation, and on a live
+/// composite it is the single most common true one. On a measured frame
+/// (`OPERA@20260812T1930@0@DBZH.h5`, 3800x4400, 16 720 000 cells) `nodata`
+/// covered 49.7 % of cells and `undetect` 46.2 %, with 4.1 % carrying a
+/// measurement: collapsing the two discards nearly half the frame, and what
+/// it discards is every correct negative a skill score is built on.
+///
+/// The value sits below the -32.0 dBZ floor real data was measured at on that
+/// frame, so a clear-air cell scores as clear air rather than as weak echo.
+pub const OPERA_NO_ECHO_DBZ: f32 = -35.0;
+
+/// Which of the three states ODIM defines a decoded composite cell is in.
+///
+/// Carried beside the values rather than encoded into them. A caller that has
+/// to tell a clear-air negative from an unobserved cell should not have to
+/// compare a float against a magic number, and [`OPERA_NO_ECHO_DBZ`] is a
+/// legal reflectivity that a calibrated measurement could in principle also
+/// land on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperaCellClass {
+    /// `nodata`, or a non-finite stored value: no radar covered this cell.
+    /// Its value is NaN, and NaN now means only this.
+    NoCoverage,
+    /// `undetect`: covered, and nothing was detected. This is an observation,
+    /// and its value is the frame's no-echo reflectivity.
+    NoEcho,
+    /// A calibrated reflectivity measurement.
+    Echo,
+}
+
+/// A decoded OPERA composite together with the sentinel distinction the
+/// archive draws and the counts that prove it was drawn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperaDbzhField {
+    pub field: SelectedField2D,
+    /// One entry per cell, in the same row-major order as `field.values`.
+    pub classes: Vec<OperaCellClass>,
+    pub no_echo_dbz: f32,
+    /// The sentinels the frame itself declared, recorded so a reader can see
+    /// which distinction was available rather than assuming one.
+    pub nodata_raw: Option<f64>,
+    pub undetect_raw: Option<f64>,
+    pub no_coverage_cells: usize,
+    pub no_echo_cells: usize,
+    pub echo_cells: usize,
+}
+
+impl OperaDbzhField {
+    /// Fraction of cells the network actually observed: echo plus no-echo.
+    pub fn observed_fraction(&self) -> f64 {
+        let cells = self.classes.len();
+        if cells == 0 {
+            return 0.0;
+        }
+        (self.no_echo_cells + self.echo_cells) as f64 / cells as f64
+    }
+}
+
+/// Decode an OPERA composite, keeping the two ODIM sentinels apart.
+///
+/// [`extract_eumetnet_opera_dbzh_from_odim_h5`] is this function's field
+/// alone, for callers that only want the grid and the numbers.
 pub fn extract_eumetnet_opera_dbzh_from_odim_h5(bytes: &[u8]) -> Result<SelectedField2D, IoError> {
+    Ok(extract_eumetnet_opera_dbzh_classified_from_odim_h5(bytes)?.field)
+}
+
+pub fn extract_eumetnet_opera_dbzh_classified_from_odim_h5(
+    bytes: &[u8],
+) -> Result<OperaDbzhField, IoError> {
     let file = Hdf5File::from_bytes(bytes).map_err(|err| IoError::Odim(err.to_string()))?;
     let dataset = file
         .dataset("/dataset1/data1/data")
@@ -380,19 +452,8 @@ pub fn extract_eumetnet_opera_dbzh_from_odim_h5(bytes: &[u8]) -> Result<Selected
     let undetect = hdf5_group_attr_f64_optional(&data_what, "undetect")?;
 
     let raw = hdf5_dataset_values_f64(&dataset)?;
-    let values = raw
-        .into_iter()
-        .map(|value| {
-            let missing = !value.is_finite()
-                || nodata.is_some_and(|sentinel| (value - sentinel).abs() < 0.5)
-                || undetect.is_some_and(|sentinel| (value - sentinel).abs() < 0.5);
-            if missing {
-                f32::NAN
-            } else {
-                (value * gain + offset) as f32
-            }
-        })
-        .collect::<Vec<_>>();
+    let (values, classes, counts) =
+        classify_opera_dbzh_slab(&raw, gain, offset, nodata, undetect, OPERA_NO_ECHO_DBZ);
 
     let meta = opera_radar_meta_from_hdf5(&file)?;
     if meta.xsize != nx || meta.ysize != ny {
@@ -402,13 +463,73 @@ pub fn extract_eumetnet_opera_dbzh_from_odim_h5(bytes: &[u8]) -> Result<Selected
         )));
     }
     let grid = opera_laea_latlon_grid(&meta)?;
-    SelectedField2D::new(
+    let field = SelectedField2D::new(
         FieldSelector::entire_atmosphere(CanonicalField::CompositeReflectivity),
         "dBZ",
         grid,
         values,
-    )
-    .map_err(Into::into)
+    )?;
+    Ok(OperaDbzhField {
+        field,
+        classes,
+        no_echo_dbz: OPERA_NO_ECHO_DBZ,
+        nodata_raw: nodata,
+        undetect_raw: undetect,
+        no_coverage_cells: counts[0],
+        no_echo_cells: counts[1],
+        echo_cells: counts[2],
+    })
+}
+
+/// Sort one ODIM slab's stored values into the three states ODIM defines,
+/// calibrating the measurements only.
+///
+/// Returns the values, the per-cell classes and the
+/// `[no_coverage, no_echo, echo]` counts. Split out of the HDF5 reader so the
+/// distinction can be proved against a synthetic slab without a file or a
+/// network.
+///
+/// `nodata` is tested first: were a frame ever to declare both sentinels at
+/// the same value, the cell reads as unobserved rather than as a fabricated
+/// observation. A frame that declares no `undetect` at all simply has no
+/// no-echo cells — nothing is being collapsed in that case, so nothing is
+/// refused.
+fn classify_opera_dbzh_slab(
+    raw: &[f64],
+    gain: f64,
+    offset: f64,
+    nodata: Option<f64>,
+    undetect: Option<f64>,
+    no_echo_dbz: f32,
+) -> (Vec<f32>, Vec<OperaCellClass>, [usize; 3]) {
+    let mut values = Vec::with_capacity(raw.len());
+    let mut classes = Vec::with_capacity(raw.len());
+    let mut counts = [0usize; 3];
+    for &stored in raw {
+        if !stored.is_finite() || is_opera_sentinel(stored, nodata) {
+            values.push(f32::NAN);
+            classes.push(OperaCellClass::NoCoverage);
+            counts[0] += 1;
+        } else if is_opera_sentinel(stored, undetect) {
+            values.push(no_echo_dbz);
+            classes.push(OperaCellClass::NoEcho);
+            counts[1] += 1;
+        } else {
+            values.push((stored * gain + offset) as f32);
+            classes.push(OperaCellClass::Echo);
+            counts[2] += 1;
+        }
+    }
+    (values, classes, counts)
+}
+
+/// ODIM states its sentinels as raw storage values, so the comparison is
+/// against the stored value and not the calibrated one. The half-unit window
+/// is what an integer-stored frame needs and what a float-stored one
+/// tolerates; the measured frame declared -9999000 and -8888000, which are
+/// nine million apart and in no danger from it.
+fn is_opera_sentinel(stored: f64, sentinel: Option<f64>) -> bool {
+    sentinel.is_some_and(|value| (stored - value).abs() < 0.5)
 }
 
 fn parse_eumetnet_opera_dbzh_coverage_json(bytes: &[u8]) -> Result<OperaDbzhCoverage, IoError> {
@@ -488,7 +609,114 @@ fn opera_radar_meta_from_hdf5(file: &Hdf5File) -> Result<OperaRadarMeta, IoError
     })
 }
 
-fn opera_laea_latlon_grid(meta: &OperaRadarMeta) -> Result<LatLonGrid, IoError> {
+/// How far a corner derived here may sit from the corner the frame declares,
+/// in degrees, before the frame is refused.
+///
+/// The frame states its own four corner coordinates, so the geometry has an
+/// oracle inside it. Measured agreement with the ellipsoidal inversion below
+/// is ~6e-14 deg at all four corners of a live frame; the spherical inversion
+/// this screen exists to catch misses by 2.2e-1 deg. A 1e-4 deg ceiling —
+/// about 11 m — is nine orders clear of the noise and three orders inside the
+/// error, so it is a real screen rather than a formality.
+pub const OPERA_CORNER_TOLERANCE_DEG: f64 = 1.0e-4;
+
+/// Inverse Lambert azimuthal equal-area on an ellipsoid (Snyder, *Map
+/// Projections — A Working Manual*, eqs. 24-30 .. 24-33 with the authalic
+/// latitude series 3-18).
+///
+/// OPERA's `projdef` declares `+ellps=WGS84`, so this is the inversion the
+/// declaration asks for. Inverting it on a sphere instead — an authalic
+/// radius in place of the ellipsoid — displaces the northern corners of the
+/// published 3800x4400 composite by ~0.216 deg of longitude, about 9.4 km at
+/// 67 N, nine cells on a 1 km grid, with every cell in between displaced by
+/// some part of that. [`OPERA_CORNER_TOLERANCE_DEG`] keeps the distinction
+/// proved on each frame rather than merely asserted here.
+struct OperaLaea {
+    lat0: f64,
+    lon0: f64,
+    false_easting: f64,
+    false_northing: f64,
+    /// First eccentricity squared: the only ellipsoid constant the inverse
+    /// still needs once `rq`, `beta0` and `d` are precomputed.
+    e2: f64,
+    rq: f64,
+    beta0: f64,
+    d: f64,
+}
+
+/// WGS84, the ellipsoid OPERA's `projdef` names.
+const OPERA_WGS84_A: f64 = 6_378_137.0;
+const OPERA_WGS84_F: f64 = 1.0 / 298.257_223_563;
+
+impl OperaLaea {
+    fn new(lat0: f64, lon0: f64, false_easting: f64, false_northing: f64) -> Self {
+        let e2 = OPERA_WGS84_F * (2.0 - OPERA_WGS84_F);
+        let e = e2.sqrt();
+        let q = |phi: f64| -> f64 {
+            let s = phi.sin();
+            (1.0 - e2)
+                * (s / (1.0 - e2 * s * s)
+                    - (1.0 / (2.0 * e)) * ((1.0 - e * s) / (1.0 + e * s)).ln())
+        };
+        let qp = q(std::f64::consts::FRAC_PI_2);
+        let rq = OPERA_WGS84_A * (qp / 2.0).sqrt();
+        let beta0 = (q(lat0) / qp).asin();
+        let d = OPERA_WGS84_A * lat0.cos()
+            / (1.0 - e2 * lat0.sin().powi(2)).sqrt()
+            / (rq * beta0.cos());
+        Self {
+            lat0,
+            lon0,
+            false_easting,
+            false_northing,
+            e2,
+            rq,
+            beta0,
+            d,
+        }
+    }
+
+    /// Authalic latitude to geodetic latitude, Snyder 3-18.
+    fn geodetic_from_authalic(&self, beta: f64) -> f64 {
+        let e2 = self.e2;
+        let e4 = e2 * e2;
+        let e6 = e4 * e2;
+        beta + (e2 / 3.0 + 31.0 * e4 / 180.0 + 517.0 * e6 / 5040.0) * (2.0 * beta).sin()
+            + (23.0 * e4 / 360.0 + 251.0 * e6 / 3780.0) * (4.0 * beta).sin()
+            + (761.0 * e6 / 45360.0) * (6.0 * beta).sin()
+    }
+
+    /// Projected metres to `(lat_deg, lon_deg)`.
+    fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
+        let dx = x - self.false_easting;
+        let dy = y - self.false_northing;
+        let rho = ((dx / self.d).powi(2) + (self.d * dy).powi(2)).sqrt();
+        if rho <= f64::EPSILON {
+            return (
+                self.lat0.to_degrees(),
+                normalize_longitude(self.lon0.to_degrees()),
+            );
+        }
+        let ce = 2.0 * (rho / (2.0 * self.rq)).clamp(-1.0, 1.0).asin();
+        let sin_ce = ce.sin();
+        let cos_ce = ce.cos();
+        let beta = (cos_ce * self.beta0.sin() + self.d * dy * sin_ce * self.beta0.cos() / rho)
+            .clamp(-1.0, 1.0)
+            .asin();
+        let lambda = self.lon0
+            + (dx * sin_ce).atan2(
+                self.d * rho * self.beta0.cos() * cos_ce
+                    - self.d * self.d * dy * self.beta0.sin() * sin_ce,
+            );
+        (
+            self.geodetic_from_authalic(beta).to_degrees(),
+            normalize_longitude(lambda.to_degrees()),
+        )
+    }
+}
+
+/// Build the projection the frame declares.
+fn opera_laea_projection(meta: &OperaRadarMeta) -> Result<OperaLaea, IoError> {
     if !meta
         .projdef
         .split_whitespace()
@@ -499,16 +727,85 @@ fn opera_laea_latlon_grid(meta: &OperaRadarMeta) -> Result<LatLonGrid, IoError> 
             meta.projdef
         )));
     }
-    let lat0 = projdef_value(&meta.projdef, "+lat_0=")
-        .ok_or_else(|| IoError::Odim(format!("missing +lat_0 in {}", meta.projdef)))?
-        .to_radians();
-    let lon0 = projdef_value(&meta.projdef, "+lon_0=")
-        .ok_or_else(|| IoError::Odim(format!("missing +lon_0 in {}", meta.projdef)))?
-        .to_radians();
-    let false_easting = projdef_value(&meta.projdef, "+x_0=")
-        .ok_or_else(|| IoError::Odim(format!("missing +x_0 in {}", meta.projdef)))?;
-    let false_northing = projdef_value(&meta.projdef, "+y_0=")
-        .ok_or_else(|| IoError::Odim(format!("missing +y_0 in {}", meta.projdef)))?;
+    let need = |key: &str| -> Result<f64, IoError> {
+        projdef_value(&meta.projdef, key)
+            .ok_or_else(|| IoError::Odim(format!("missing {key} in {}", meta.projdef)))
+    };
+    Ok(OperaLaea::new(
+        need("+lat_0=")?.to_radians(),
+        need("+lon_0=")?.to_radians(),
+        need("+x_0=")?,
+        need("+y_0=")?,
+    ))
+}
+
+/// The four grid-edge corners this module derives, as LL, UL, UR, LR pairs of
+/// `(lat_deg, lon_deg)`, beside the ones the frame declares.
+///
+/// The `/where` corners are the grid's outer edges — projected `(0,0)`,
+/// `(0,ny)`, `(nx,ny)`, `(nx,0)` — not cell centres, and this is written
+/// against the edges for that reason.
+fn opera_laea_corners(
+    meta: &OperaRadarMeta,
+    projection: &OperaLaea,
+) -> ([(f64, f64); 4], [(f64, f64); 4]) {
+    let nx = meta.xsize as f64;
+    let ny = meta.ysize as f64;
+    let edges = [
+        (0.0, -ny * meta.yscale_m),
+        (0.0, 0.0),
+        (nx * meta.xscale_m, 0.0),
+        (nx * meta.xscale_m, -ny * meta.yscale_m),
+    ];
+    let derived = edges.map(|(x, y)| projection.inverse(x, y));
+    let declared = [
+        (meta.ll_lat_deg, meta.ll_lon_deg),
+        (meta.ul_lat_deg, meta.ul_lon_deg),
+        (meta.ur_lat_deg, meta.ur_lon_deg),
+        (meta.lr_lat_deg, meta.lr_lon_deg),
+    ];
+    (derived, declared)
+}
+
+const OPERA_CORNER_NAMES: [&str; 4] = ["LL", "UL", "UR", "LR"];
+
+/// How far the derived corners sit from the declared ones, worst case, in
+/// degrees.
+fn opera_corner_offset_deg(meta: &OperaRadarMeta, projection: &OperaLaea) -> f64 {
+    let (derived, declared) = opera_laea_corners(meta, projection);
+    derived
+        .iter()
+        .zip(declared.iter())
+        .map(|((lat, lon), (want_lat, want_lon))| {
+            (lat - want_lat).abs().max((lon - want_lon).abs())
+        })
+        .fold(0.0f64, f64::max)
+}
+
+fn opera_laea_latlon_grid(meta: &OperaRadarMeta) -> Result<LatLonGrid, IoError> {
+    let projection = opera_laea_projection(meta)?;
+
+    // Prove the georeference against the frame's own statement of it before
+    // any cell is placed with it. A georeference nobody checked is the kind of
+    // wrong number that looks like a right one for a whole campaign, and every
+    // observation in the file would be assimilated at the wrong place.
+    let worst = opera_corner_offset_deg(meta, &projection);
+    if !worst.is_finite() || worst > OPERA_CORNER_TOLERANCE_DEG {
+        let (derived, declared) = opera_laea_corners(meta, &projection);
+        let detail = OPERA_CORNER_NAMES
+            .iter()
+            .zip(derived.iter().zip(declared.iter()))
+            .map(|(name, ((lat, lon), (want_lat, want_lon)))| {
+                format!("{name} derived {lat:.6},{lon:.6} declared {want_lat:.6},{want_lon:.6}")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(IoError::Odim(format!(
+            "OPERA grid misses the corners the frame declares by up to {worst:.6} deg, past the \
+             {OPERA_CORNER_TOLERANCE_DEG} deg ceiling: {detail}"
+        )));
+    }
+
     let shape = GridShape::new(meta.xsize, meta.ysize)?;
     let mut lat_deg = Vec::with_capacity(shape.len());
     let mut lon_deg = Vec::with_capacity(shape.len());
@@ -516,44 +813,12 @@ fn opera_laea_latlon_grid(meta: &OperaRadarMeta) -> Result<LatLonGrid, IoError> 
         let projected_y = -((y as f64) + 0.5) * meta.yscale_m;
         for x in 0..meta.xsize {
             let projected_x = ((x as f64) + 0.5) * meta.xscale_m;
-            let (lat, lon) = inverse_spherical_laea(
-                projected_x,
-                projected_y,
-                lat0,
-                lon0,
-                false_easting,
-                false_northing,
-            );
+            let (lat, lon) = projection.inverse(projected_x, projected_y);
             lat_deg.push(lat as f32);
             lon_deg.push(lon as f32);
         }
     }
     LatLonGrid::new(shape, lat_deg, lon_deg).map_err(Into::into)
-}
-
-fn inverse_spherical_laea(
-    x: f64,
-    y: f64,
-    lat0: f64,
-    lon0: f64,
-    false_easting: f64,
-    false_northing: f64,
-) -> (f64, f64) {
-    const AUTHALIC_RADIUS_M: f64 = 6_371_007.181;
-    let dx = x - false_easting;
-    let dy = y - false_northing;
-    let rho = dx.hypot(dy);
-    if rho <= f64::EPSILON {
-        return (lat0.to_degrees(), normalize_longitude(lon0.to_degrees()));
-    }
-    let c = 2.0 * (rho / (2.0 * AUTHALIC_RADIUS_M)).clamp(-1.0, 1.0).asin();
-    let sin_c = c.sin();
-    let cos_c = c.cos();
-    let sin_lat0 = lat0.sin();
-    let cos_lat0 = lat0.cos();
-    let lat = (cos_c * sin_lat0 + dy * sin_c * cos_lat0 / rho).asin();
-    let lon = lon0 + (dx * sin_c).atan2(rho * cos_lat0 * cos_c - dy * sin_lat0 * sin_c);
-    (lat.to_degrees(), normalize_longitude(lon.to_degrees()))
 }
 
 fn projdef_value(projdef: &str, key: &str) -> Option<f64> {

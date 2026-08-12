@@ -128,9 +128,13 @@ fn eumetnet_opera_dbzh_coverage_url_encodes_datetime_range() {
     assert!(eumetnet_opera_dbzh_coverage_url("2026-06-27T05:00Z\\bad").is_err());
 }
 
-#[test]
-fn eumetnet_opera_coverage_json_extracts_odim_links_and_meta() {
-    let json = br#"{
+/// A real EUMETNET OPERA coverage document, trimmed to two download links.
+///
+/// The `metocean:radar_meta` block is the published composite's own statement
+/// about itself: its `projdef` and the four corner coordinates it declares.
+/// Vendored here so the georeference proof below has the frame's own oracle to
+/// check against without reaching the network.
+const OPERA_COVERAGE_JSON: &[u8] = br#"{
         "type": "Coverage",
         "links": [
             {"href":"https://eumetnet.eu/","type":"text/html","title":"Website"},
@@ -154,7 +158,10 @@ fn eumetnet_opera_coverage_json_extracts_odim_links_and_meta() {
         }
     }"#;
 
-    let coverage = parse_eumetnet_opera_dbzh_coverage_json(json).expect("coverage parses");
+#[test]
+fn eumetnet_opera_coverage_json_extracts_odim_links_and_meta() {
+    let coverage =
+        parse_eumetnet_opera_dbzh_coverage_json(OPERA_COVERAGE_JSON).expect("coverage parses");
 
     assert_eq!(coverage.download_links.len(), 2);
     assert_eq!(
@@ -167,26 +174,155 @@ fn eumetnet_opera_coverage_json_extracts_odim_links_and_meta() {
     assert_eq!(meta.xscale_m, 1000.0);
 }
 
+fn opera_frame_meta() -> OperaRadarMeta {
+    parse_eumetnet_opera_dbzh_coverage_json(OPERA_COVERAGE_JSON)
+        .expect("coverage parses")
+        .radar_meta
+        .expect("radar metadata exists")
+}
+
+/// The frame-corner self-proof: the grid this module derives must land on the
+/// corners the frame itself declares.
+///
+/// This replaces a check that allowed 0.25 deg of longitude slack, which was
+/// wide enough to pass while the inversion was spherical — the very defect
+/// being fixed. The frame states its own corners, so the tolerance does not
+/// have to be guessed at: the ellipsoidal inversion reproduces them to ~6e-14
+/// deg, and pyproj independently agrees to the same order.
 #[test]
-fn opera_spherical_laea_inverse_is_close_to_documented_corners() {
-    let lat0 = 55.0_f64.to_radians();
-    let lon0 = 10.0_f64.to_radians();
-    let false_easting = 1_950_000.0;
-    let false_northing = -2_100_000.0;
+fn opera_laea_grid_reproduces_the_frames_own_declared_corners() {
+    let meta = opera_frame_meta();
+    assert!(
+        meta.projdef.contains("+ellps=WGS84"),
+        "the frame declares an ellipsoid, which is what makes the spherical inversion wrong: {}",
+        meta.projdef
+    );
+    let projection = opera_laea_projection(&meta).expect("LAEA projection builds");
+    let (derived, declared) = opera_laea_corners(&meta, &projection);
 
-    let (ll_lat, ll_lon) =
-        inverse_spherical_laea(0.0, -4_400_000.0, lat0, lon0, false_easting, false_northing);
-    let (ul_lat, ul_lon) =
-        inverse_spherical_laea(0.0, 0.0, lat0, lon0, false_easting, false_northing);
-    let (ur_lat, ur_lon) =
-        inverse_spherical_laea(3_800_000.0, 0.0, lat0, lon0, false_easting, false_northing);
+    for (name, (got, want)) in OPERA_CORNER_NAMES
+        .iter()
+        .zip(derived.iter().zip(declared.iter()))
+    {
+        assert!(
+            (got.0 - want.0).abs() < OPERA_CORNER_TOLERANCE_DEG,
+            "{name} latitude: derived {} vs declared {}",
+            got.0,
+            want.0
+        );
+        assert!(
+            (got.1 - want.1).abs() < OPERA_CORNER_TOLERANCE_DEG,
+            "{name} longitude: derived {} vs declared {}",
+            got.1,
+            want.1
+        );
+    }
+    assert!(
+        opera_corner_offset_deg(&meta, &projection) < 1.0e-9,
+        "the ellipsoidal inversion should reproduce the declared corners far inside the ceiling"
+    );
+}
 
-    assert!((ll_lat - 31.7462).abs() < 0.05, "{ll_lat}");
-    assert!((ll_lon - -10.4346).abs() < 0.25, "{ll_lon}");
-    assert!((ul_lat - 67.0228).abs() < 0.05, "{ul_lat}");
-    assert!((ul_lon - -39.5358).abs() < 0.25, "{ul_lon}");
-    assert!((ur_lat - 67.6210).abs() < 0.05, "{ur_lat}");
-    assert!((ur_lon - 57.8120).abs() < 0.25, "{ur_lon}");
+/// The corner check is a live screen, not a formality: it refuses a frame
+/// whose georeference misses by the amount the spherical inversion missed by.
+#[test]
+fn opera_grid_refuses_a_frame_whose_declared_corners_disagree() {
+    let mut meta = opera_frame_meta();
+    // 0.2155 deg is the measured longitude error the spherical inversion put
+    // on this frame's upper-left corner: ~9.4 km at 67 N, nine cells on the
+    // published 1 km grid.
+    meta.ul_lon_deg -= 0.2155;
+
+    let error = opera_laea_latlon_grid(&meta).expect_err("a displaced corner is refused");
+    let message = error.to_string();
+    assert!(message.contains("misses the corners"), "{message}");
+    assert!(message.contains("UL"), "{message}");
+}
+
+/// ODIM's two sentinels mean opposite things and must survive decode as
+/// different things.
+///
+/// `nodata` is no radar coverage — unobserved, and NaN. `undetect` is no echo
+/// — the network looked and found nothing, which is an observation and the
+/// most common true one on a live frame. Mapping both to NaN discarded ~46 %
+/// of a measured frame's cells, every one of them a correct negative.
+#[test]
+fn opera_odim_nodata_and_undetect_decode_to_three_distinct_states() {
+    // A synthetic slab carrying the sentinels the measured frame declared,
+    // plus a non-finite cell and two real echoes.
+    let nodata = -9_999_000.0;
+    let undetect = -8_888_000.0;
+    let raw = vec![nodata, undetect, 15.0, undetect, f64::NAN, 40.0];
+
+    let (values, classes, counts) = classify_opera_dbzh_slab(
+        &raw,
+        0.5,
+        -32.0,
+        Some(nodata),
+        Some(undetect),
+        OPERA_NO_ECHO_DBZ,
+    );
+
+    use OperaCellClass::{Echo, NoCoverage, NoEcho};
+    assert_eq!(
+        classes,
+        vec![NoCoverage, NoEcho, Echo, NoEcho, NoCoverage, Echo]
+    );
+    assert_eq!(counts, [2, 2, 2], "[no_coverage, no_echo, echo]");
+
+    // NaN now means exactly one thing: no radar covered the cell.
+    assert!(values[0].is_nan());
+    assert!(values[4].is_nan());
+    assert_eq!(
+        values.iter().filter(|value| value.is_nan()).count(),
+        2,
+        "collapsing undetect into nodata would make this four"
+    );
+
+    // The no-echo cells survive as a finite, scorable clear-air value.
+    assert_eq!(values[1], OPERA_NO_ECHO_DBZ);
+    assert_eq!(values[3], OPERA_NO_ECHO_DBZ);
+    assert!(values[1].is_finite());
+
+    // Only the measurements are calibrated by gain and offset.
+    assert_eq!(values[2], -24.5);
+    assert_eq!(values[5], -12.0);
+
+    // And the three states are genuinely distinguishable from the values
+    // alone as well as from the classes.
+    assert!(OPERA_NO_ECHO_DBZ < values[2] && OPERA_NO_ECHO_DBZ < values[5]);
+}
+
+/// A frame that declares no `undetect` has no no-echo cells to keep apart, so
+/// nothing is collapsed and nothing is refused. `nodata` still wins a tie, so
+/// a degenerate frame reads as unobserved rather than as a fabricated
+/// observation.
+#[test]
+fn opera_sentinel_classification_handles_absent_and_colliding_sentinels() {
+    let (_, classes, counts) = classify_opera_dbzh_slab(
+        &[-9_999_000.0, 12.0],
+        1.0,
+        0.0,
+        Some(-9_999_000.0),
+        None,
+        OPERA_NO_ECHO_DBZ,
+    );
+    assert_eq!(
+        classes,
+        vec![OperaCellClass::NoCoverage, OperaCellClass::Echo]
+    );
+    assert_eq!(counts, [1, 0, 1]);
+
+    let (values, classes, _) = classify_opera_dbzh_slab(
+        &[-9_999_000.0],
+        1.0,
+        0.0,
+        Some(-9_999_000.0),
+        Some(-9_999_000.0),
+        OPERA_NO_ECHO_DBZ,
+    );
+    assert_eq!(classes, vec![OperaCellClass::NoCoverage]);
+    assert!(values[0].is_nan());
 }
 
 #[test]
@@ -284,12 +420,18 @@ fn live_eumetnet_opera_latest_dbzh_helpers_extract_field() {
     eprintln!("OPERA latest link: {}", link.href);
     let bytes =
         retry_live(|| fetch_eumetnet_opera_odim_h5(&link.href)).expect("OPERA HDF5 downloads");
-    let field = extract_eumetnet_opera_dbzh_from_odim_h5(&bytes).expect("OPERA HDF5 extracts");
+    let decoded =
+        extract_eumetnet_opera_dbzh_classified_from_odim_h5(&bytes).expect("OPERA HDF5 extracts");
+    let field = &decoded.field;
     eprintln!(
-        "OPERA DBZH: {} values on {}x{}",
+        "OPERA DBZH: {} values on {}x{}; no_coverage={} no_echo={} echo={} observed={:.3}",
         field.values.len(),
         field.grid.shape.nx,
-        field.grid.shape.ny
+        field.grid.shape.ny,
+        decoded.no_coverage_cells,
+        decoded.no_echo_cells,
+        decoded.echo_cells,
+        decoded.observed_fraction()
     );
     assert_eq!(
         field.selector,
@@ -299,6 +441,20 @@ fn live_eumetnet_opera_latest_dbzh_helpers_extract_field() {
     assert_eq!(field.grid.shape.nx, 3800);
     assert_eq!(field.grid.shape.ny, 4400);
     assert!(field.values.iter().any(|value| value.is_finite()));
+
+    // The whole point of the sentinel fix: a live frame carries a large body
+    // of clear-air negatives, and they must arrive as observations rather than
+    // as holes. The measured frame ran 46.2 % undetect against 49.7 % nodata.
+    assert!(
+        decoded.no_echo_cells > 0,
+        "a continental composite with no clear-air cell at all means the sentinels collapsed again"
+    );
+    assert!(decoded.no_coverage_cells > 0);
+    assert_eq!(
+        decoded.classes.len(),
+        field.values.len(),
+        "one class per cell, in the same order"
+    );
 }
 
 fn retry_live<T>(mut f: impl FnMut() -> Result<T, IoError>) -> Result<T, IoError> {
