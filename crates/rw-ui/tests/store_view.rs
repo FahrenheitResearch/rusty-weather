@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use rustwx_core::{CanonicalField, FieldSelector, GridShape, LatLonGrid, SelectedField2D};
@@ -11,8 +12,8 @@ use rw_ui::synthetic::{
     write_synthetic_store,
 };
 use rw_ui::{
-    FieldKey, HourKey, StoreRequest, StoreResponse, StoreView, StoreWorker, VarKind,
-    format_lead_seconds, format_valid_unix,
+    DEFAULT_POOLED_READER_TILE_CACHE_BYTES, FieldKey, HourKey, ReaderPoolLimits, StoreRequest,
+    StoreResponse, StoreView, StoreWorker, VarKind, format_lead_seconds, format_valid_unix,
 };
 
 fn test_dir(name: &str) -> PathBuf {
@@ -360,15 +361,226 @@ fn worker_round_trip_on_synthetic_store() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn reader_pool_is_shared_by_store_view_clones() {
+    let dir = test_dir("reader-pool-clones");
+    let root = dir.join("store");
+    write_synthetic_store(&root).unwrap();
+
+    let view = StoreView::new(&root);
+    let clone = view.clone();
+    let first = view
+        .open_hour_shared(SYNTHETIC_MODEL, SYNTHETIC_RUN, SYNTHETIC_HOURS[0])
+        .unwrap();
+    let second = clone
+        .open_hour_shared(SYNTHETIC_MODEL, SYNTHETIC_RUN, SYNTHETIC_HOURS[0])
+        .unwrap();
+
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(
+        first.tile_cache_stats().capacity_bytes,
+        DEFAULT_POOLED_READER_TILE_CACHE_BYTES
+    );
+    let stats = view.reader_pool_stats();
+    assert_eq!(stats.hits, 1);
+    assert_eq!(stats.misses, 1);
+    assert_eq!(stats.insertions, 1);
+    assert_eq!(stats.entries, 1);
+    assert_eq!(
+        stats.retained_tile_cache_budget_bytes,
+        DEFAULT_POOLED_READER_TILE_CACHE_BYTES
+    );
+
+    drop((first, second, view, clone));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reader_pool_concurrent_first_open_inserts_once() {
+    const THREADS: usize = 16;
+
+    let dir = test_dir("reader-pool-concurrent-first-open");
+    let root = dir.join("store");
+    write_synthetic_store(&root).unwrap();
+
+    let view = StoreView::new(&root);
+    let barrier = Arc::new(Barrier::new(THREADS + 1));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let view = view.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let reader = view
+                    .open_hour_shared(SYNTHETIC_MODEL, SYNTHETIC_RUN, SYNTHETIC_HOURS[0])
+                    .unwrap();
+                assert_eq!(reader.read_point_2d("temperature_2m", 0, 0).unwrap(), 288.0);
+                reader
+            })
+        })
+        .collect();
+    barrier.wait();
+    let readers: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect();
+
+    assert!(
+        readers
+            .iter()
+            .skip(1)
+            .all(|reader| Arc::ptr_eq(&readers[0], reader))
+    );
+    let stats = view.reader_pool_stats();
+    assert_eq!(stats.entries, 1);
+    assert_eq!(stats.insertions, 1);
+    assert_eq!(
+        stats.retained_tile_cache_budget_bytes,
+        DEFAULT_POOLED_READER_TILE_CACHE_BYTES
+    );
+
+    drop((readers, view));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reader_pool_enforces_capacity_and_evicts_lru() {
+    let dir = test_dir("reader-pool-capacity");
+    let root = dir.join("store");
+    write_synthetic_store(&root).unwrap();
+    let view = StoreView::with_reader_pool_limits(
+        &root,
+        ReaderPoolLimits {
+            max_readers: 1,
+            per_reader_tile_cache_bytes: 1024 * 1024,
+            total_tile_cache_bytes: 1024 * 1024,
+        },
+    );
+
+    let first = view
+        .open_hour_shared(SYNTHETIC_MODEL, SYNTHETIC_RUN, SYNTHETIC_HOURS[0])
+        .unwrap();
+    let weak_first = Arc::downgrade(&first);
+    drop(first);
+    let second = view
+        .open_hour_shared(SYNTHETIC_MODEL, SYNTHETIC_RUN, SYNTHETIC_HOURS[1])
+        .unwrap();
+    assert!(
+        weak_first.upgrade().is_none(),
+        "first LRU reader was evicted"
+    );
+
+    let stats = view.reader_pool_stats();
+    assert_eq!(stats.entries, 1);
+    assert_eq!(stats.evictions, 1);
+    assert_eq!(stats.retained_tile_cache_budget_bytes, 1024 * 1024);
+    drop(second);
+    let _first_again = view
+        .open_hour_shared(SYNTHETIC_MODEL, SYNTHETIC_RUN, SYNTHETIC_HOURS[0])
+        .unwrap();
+    assert_eq!(view.reader_pool_stats().evictions, 2);
+
+    drop((_first_again, view));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reader_pool_invalidates_same_path_after_atomic_replacement() {
+    let dir = test_dir("reader-pool-replacement");
+    let root = dir.join("store");
+    let model = "wrf";
+    let run = "replacement";
+    let exact_time = RwsExactTime {
+        lead_seconds: 300,
+        valid_unix: 1_780_000_300,
+    };
+    let original = exact_test_field(280.0);
+    write_hour_from_fields_exact(
+        &root,
+        model,
+        run,
+        0,
+        exact_time,
+        &[("temperature_2m", &original)],
+        &[],
+        "reader-pool-test",
+        1_780_000_000,
+    )
+    .unwrap();
+
+    let view = StoreView::new(&root);
+    let hour_path = root.join(model).join(run).join("f000.rws");
+    let first = view.open_hour_shared(model, run, 0).unwrap();
+    assert_eq!(first.read_point_2d("temperature_2m", 0, 0).unwrap(), 280.0);
+    assert!(first.source_matches_path(&hour_path).unwrap());
+
+    let replacement = exact_test_field(300.0);
+    write_hour_from_fields_exact(
+        &root,
+        model,
+        run,
+        0,
+        exact_time,
+        &[("temperature_2m", &replacement)],
+        &[],
+        "reader-pool-test",
+        1_780_000_001,
+    )
+    .unwrap();
+    assert!(!first.source_matches_path(&hour_path).unwrap());
+    let second = view.open_hour_shared(model, run, 0).unwrap();
+
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(second.read_point_2d("temperature_2m", 0, 0).unwrap(), 300.0);
+    assert!(second.source_matches_path(&hour_path).unwrap());
+    assert_eq!(view.reader_pool_stats().entries, 1);
+    assert_eq!(view.reader_pool_stats().invalidations, 1);
+
+    drop((first, second, view));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reader_pool_can_be_disabled_and_one_shot_opens_bypass_it() {
+    let dir = test_dir("reader-pool-disabled");
+    let root = dir.join("store");
+    write_synthetic_store(&root).unwrap();
+
+    let disabled = StoreView::with_reader_pool_limits(&root, ReaderPoolLimits::disabled());
+    let first = disabled
+        .open_hour_shared(SYNTHETIC_MODEL, SYNTHETIC_RUN, SYNTHETIC_HOURS[0])
+        .unwrap();
+    let second = disabled
+        .open_hour_shared(SYNTHETIC_MODEL, SYNTHETIC_RUN, SYNTHETIC_HOURS[0])
+        .unwrap();
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(first.tile_cache_stats().capacity_bytes, 0);
+    assert_eq!(disabled.reader_pool_stats().entries, 0);
+
+    let pooled = StoreView::new(&root);
+    let one_shot = pooled
+        .open_hour(SYNTHETIC_MODEL, SYNTHETIC_RUN, SYNTHETIC_HOURS[0])
+        .unwrap();
+    assert_eq!(one_shot.tile_cache_stats().capacity_bytes, 0);
+    let explicit = pooled
+        .open_hour_with_tile_cache_bytes(SYNTHETIC_MODEL, SYNTHETIC_RUN, SYNTHETIC_HOURS[0], 4096)
+        .unwrap();
+    assert_eq!(explicit.tile_cache_stats().capacity_bytes, 4096);
+    assert_eq!(pooled.reader_pool_stats().entries, 0);
+
+    drop((first, second, disabled, one_shot, explicit, pooled));
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Worker against the REAL ingested HRRR store: that data is stored
 /// north-to-south (row 0 = ~47.8N, last row = ~21.1N — verified 2026-06-09),
 /// so the field must arrive flagged `lat_descending` and the viewer must NOT
 /// flip it. Run with:
 /// `cargo test -p rw-ui real_hrrr -- --ignored --nocapture`
 #[test]
-#[ignore = "requires the real store at C:/Users/drew/rusty-weather/store"]
+#[ignore = "requires a real store at C:/weather-data/rusty-weather/store"]
 fn real_hrrr_store_field_is_north_to_south() {
-    let view = StoreView::new("C:/Users/drew/rusty-weather/store");
+    let view = StoreView::new("C:/weather-data/rusty-weather/store");
     let worker = StoreWorker::spawn(view, || {});
     let field_key = FieldKey {
         hour: HourKey {

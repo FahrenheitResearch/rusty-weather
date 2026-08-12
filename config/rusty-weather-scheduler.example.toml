@@ -1,0 +1,76 @@
+# Production-oriented example for the `rw-scheduler` binary.
+# All roots must be absolute, distinct, and non-nested. For Windows services,
+# use escaped absolute paths such as `D:\\rusty-weather\\store`.
+store_root = "/var/lib/rusty-weather/store"
+cache_root = "/var/cache/rusty-weather/ingest"
+state_root = "/var/lib/rusty-weather/scheduler"
+
+# Explicit allowlist. To opt into every adapter whose current typed capability
+# is Ready, replace this with exactly: models = ["all_ready"]
+models = ["hrrr", "gfs", "rtma"]
+
+# `auto` selects a limitation-safe profile per model: analysis feeds use the
+# narrow `analysis` pack, surface-only forecasts retain every direct field via
+# `surface`, derived-disabled products disable those stages, and ordinary
+# forecast models use `view`.
+profile = "auto"
+# Disabled by default because the download cache is not yet self-pruning.
+# Enabling it improves retry/resume bandwidth, but requires an external
+# size/age retention policy for cache_root.
+use_cache = false
+verify = true
+
+# Availability discovery checks the current UTC date and bounded rollback.
+rollback_days = 2
+poll_seconds = 300
+
+# Provider discovery is metadata-only and bounded per model. Individual
+# HEAD/one-byte range probes use the smaller per-probe budget.
+discovery_timeout_seconds = 30
+discovery_probe_timeout_seconds = 6
+
+# Job concurrency and the process-global ingest-hour ceiling.
+max_concurrent_jobs = 2
+max_concurrent_hours = 2
+max_queued_jobs = 128
+
+# Admission stops before each hour when the store filesystem (and cache
+# filesystem when use_cache=true) has less than this many available bytes.
+free_space_reserve_bytes = 10737418240
+
+[retry]
+max_attempts = 5
+initial_backoff_seconds = 60
+max_backoff_seconds = 3600
+jitter_percent = 20
+
+# Retention requires scheduler state + a matching ownership marker + the run
+# writer lock. It is intentionally disabled and dry-run by default.
+[retention]
+enabled = false
+dry_run = true
+keep_latest_per_model = 3
+
+# Optional production policy for a bounded, trusted conventional HTTPS
+# origin/signer. This is never a relay and does not promote objects to R2.
+# Enabling it changes discovery to four independent lanes, atomically publishes
+# `.rw-origin-catalog.json` after exact storage validation, and protects active
+# plus one previous generation from retention. Use only with
+# models = ["hrrr", "gfs", "nbm"] and an exact NBM `surface` profile.
+# A pending audit is a fail-closed staging state: discover/run-once/daemon do no
+# work until it is changed to complete and both audited values are supplied.
+# [origin_catalog_plan]
+# preset = "initial_public_subset"
+# capacity_audit = "pending"
+# previous_generations = 1
+# disk_budget_bytes = <set only from the completed capacity audit>
+# max_concurrent_jobs = <set only from the completed capacity audit>
+
+# Optional canonical per-model overrides:
+# [model_profiles]
+# hrrr = "view"
+# rtma = "analysis"
+# nbm = "surface"
+#
+# [model_sources]
+# hrrr = "aws"

@@ -44,6 +44,30 @@ pub struct StoreProductGrid {
     pub values: Vec<f64>,
 }
 
+/// Optional presentation identity for derived products rendered from stored
+/// grids.
+///
+/// The values affect only the artifact filename suffix and the two subtitle
+/// fields. They do not change the recipe, data, scale, map, or rendering
+/// controls. The output suffix is sanitized by the same path used by the
+/// other derived render lanes before it reaches a filename.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoreDerivedPresentationOverrides {
+    pub output_suffix: Option<String>,
+    pub subtitle_left_override: Option<String>,
+    pub subtitle_right_override: Option<String>,
+}
+
+impl StoreDerivedPresentationOverrides {
+    fn as_render_overrides(&self) -> DerivedRenderOverrides<'_> {
+        DerivedRenderOverrides {
+            output_suffix: self.output_suffix.as_deref(),
+            subtitle_left: self.subtitle_left_override.as_deref(),
+            subtitle_right: self.subtitle_right_override.as_deref(),
+        }
+    }
+}
+
 /// Render every recipe in `request.recipe_slugs` from store-read grids.
 ///
 /// `full_grid`/`projection` describe the full hour grid the values sit on;
@@ -62,6 +86,36 @@ pub fn render_derived_recipes_from_store_grids(
     grids: &[StoreProductGrid],
     surface_winds_10m_ms: Option<(&[f64], &[f64])>,
     input_fetch_keys: Vec<String>,
+) -> Result<Vec<DerivedRenderedRecipe>, Box<dyn std::error::Error>> {
+    render_derived_recipes_from_store_grids_with_presentation(
+        request,
+        cycle_utc,
+        full_grid,
+        projection,
+        grids,
+        surface_winds_10m_ms,
+        input_fetch_keys,
+        StoreDerivedPresentationOverrides::default(),
+    )
+}
+
+/// Render stored derived grids through the production derived/heavy lanes,
+/// with optional caller-supplied artifact and subtitle identity.
+///
+/// This is the presentation-aware counterpart to
+/// [`render_derived_recipes_from_store_grids`]. Passing
+/// A default [`StoreDerivedPresentationOverrides`] is exactly equivalent to
+/// calling that legacy entry point.
+#[allow(clippy::too_many_arguments)]
+pub fn render_derived_recipes_from_store_grids_with_presentation(
+    request: &DerivedBatchRequest,
+    cycle_utc: u8,
+    full_grid: &rustwx_core::LatLonGrid,
+    projection: Option<&rustwx_core::GridProjection>,
+    grids: &[StoreProductGrid],
+    surface_winds_10m_ms: Option<(&[f64], &[f64])>,
+    input_fetch_keys: Vec<String>,
+    presentation: StoreDerivedPresentationOverrides,
 ) -> Result<Vec<DerivedRenderedRecipe>, Box<dyn std::error::Error>> {
     let recipes = request
         .recipe_slugs
@@ -160,6 +214,7 @@ pub fn render_derived_recipes_from_store_grids(
     }
 
     let render_one = |recipe: &DerivedRecipe| -> Result<DerivedRenderedRecipe, String> {
+        let render_overrides = presentation.as_render_overrides();
         if recipe.is_heavy() {
             let store_grid = by_slug[recipe.slug()];
             let field = WeatherPanelField::new(
@@ -180,7 +235,7 @@ pub fn render_derived_recipes_from_store_grids(
                 request.source,
                 request.model,
                 input_fetch_keys.clone(),
-                DerivedRenderOverrides::default(),
+                render_overrides,
             )
             .map_err(|err| err.to_string())
         } else {
@@ -197,7 +252,7 @@ pub fn render_derived_recipes_from_store_grids(
                 request.model,
                 &computed,
                 input_fetch_keys.clone(),
-                DerivedRenderOverrides::default(),
+                render_overrides,
             )
             .map_err(|err| err.to_string())
         }
@@ -403,6 +458,30 @@ pub(super) fn weather_product_for_heavy_recipe(
 mod tests {
     use super::super::store::{store_derived_recipe_slugs, store_heavy_recipe_slugs};
     use super::*;
+
+    #[test]
+    fn owned_store_presentation_maps_to_internal_render_overrides() {
+        let presentation = StoreDerivedPresentationOverrides {
+            output_suffix: Some("valid 20260722T010203Z".to_string()),
+            subtitle_left_override: Some("exact valid time".to_string()),
+            subtitle_right_override: Some("rw-store variable metadata".to_string()),
+        };
+        let mapped = presentation.as_render_overrides();
+        assert_eq!(mapped.output_suffix, Some("valid 20260722T010203Z"));
+        assert_eq!(mapped.subtitle_left, Some("exact valid time"));
+        assert_eq!(mapped.subtitle_right, Some("rw-store variable metadata"));
+        assert_eq!(
+            super::super::presentation::derived_output_suffix(mapped.output_suffix),
+            "_valid_20260722t010203z",
+            "the public store override must retain the existing filename sanitizer"
+        );
+
+        let default = StoreDerivedPresentationOverrides::default();
+        let mapped = default.as_render_overrides();
+        assert_eq!(mapped.output_suffix, None);
+        assert_eq!(mapped.subtitle_left, None);
+        assert_eq!(mapped.subtitle_right, None);
+    }
 
     /// Every non-heavy store slug has a computed-fields slot, and assigning
     /// it round-trips through the same field the render builder reads

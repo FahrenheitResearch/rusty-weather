@@ -6,7 +6,7 @@
 
 **Architecture:** One self-contained hour file (`f###.rws`: header → JSON meta → binary chunk index → zstd payload) per (model, run, forecast hour), plus per-run `grid.rwg` (lat/lon arrays + projection, stored once) and `run.json` manifest. 2D fields = 256×256 f32 tiles, zstd-1, decoded per-window. 3D pressure fields = 16×16-column chunks × all levels, affine-i16 quantized (ported verbatim from the old volume store) then zstd-1, laid out column-contiguous so a sounding decodes 1–4 small chunks via mmap. Writes are rayon-parallel across chunks and atomic (temp+fsync+rename). **Speed is the prime directive** — every task with a perf surface states a target and measures it.
 
-**Tech Stack:** Rust; new deps for rw-store only: `zstd = "0.13"`, `memmap2 = "0.9"` (same versions the old repo used). Port sources live in the READ-ONLY worktree `C:\Users\drew\rustwx-fastplots-wt` (cited as `WT:` below).
+**Tech Stack:** Rust; new deps for rw-store only: `zstd = "0.13"`, `memmap2 = "0.9"` (same versions the old repo used). Port sources live in the READ-ONLY worktree `C:\work\rustwx-fastplots-wt` (cited as `WT:` below).
 
 **Spec:** `docs/superpowers/specs/2026-06-09-rusty-weather-design.md` (section "Store v2"). Branch: `plan-2-rw-store`.
 

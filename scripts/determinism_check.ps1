@@ -16,7 +16,7 @@
 #
 # Usage (from the repo root, Windows PowerShell 5.1):
 #   powershell -File scripts\determinism_check.ps1 `
-#     -BaselineWorktree C:\Users\drew\rw-main-review -Runs 3
+#     -BaselineWorktree C:\work\rw-main-review -Runs 3
 #
 # Exit code 0 = gate passed; 1 = gate failed; 2 = setup/assertion error.
 

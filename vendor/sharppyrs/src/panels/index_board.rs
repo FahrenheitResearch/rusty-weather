@@ -1,7 +1,7 @@
 //! SHARPpy-Reimagined bottom index board — port of
 //! `sharpmod/viz/index_board.py` laid out across THREE columns:
 //!
-//! 1. **Convective** — parcel table (PCL/CAPE/CINH/LCL/LI/LFC/EL for
+//! 1. **Convective** — parcel table (PCL/CAPE/CINH/LCL/LI/LFC/EL/MPL for
 //!    SFC/ML/FCST/MU), the thermo stats block (3 sub-columns), and the
 //!    lapse-rate box paired with the colored Severe Weather Composite box
 //!    (Supercell Comp / STP(cin) / STP(fix) / SHIP / Derecho Comp).
@@ -17,17 +17,22 @@
 //! recomputed: parcels come from [`Profile`], every scalar from
 //! [`DerivedParams`] (NaN renders as `--`).
 
-use egui::{Align2, Color32, FontId, Painter, Rect, Stroke, Vec2, pos2, vec2};
+use egui::{Align2, Color32, FontId, Painter, Rect, Stroke, StrokeKind, Vec2, pos2, vec2};
 
 use sharprs::params::cape::ParcelResult;
 
 use crate::Profile;
 use crate::derived::{Comp, DerivedParams, Vect};
+use crate::diagnostic_table::{
+    DiagnosticTablePanelKind, DiagnosticTableRow, NativeDiagnosticPatchBoard,
+    NativeDiagnosticSlotPatch,
+};
 use crate::skewt::SkewTStyle;
 use crate::utils::{float2str, int2str, qc};
 
 /// The string drawn in place of an unavailable value.
 const MISS: &str = "--";
+const PARCEL_MATRIX_HEADERS: [&str; 8] = ["PCL", "CAPE", "CINH", "LCL", "LI", "LFC", "EL", "MPL"];
 
 // Board palette (fixed hues from index_board.py / colors.py).
 const RULE: Color32 = Color32::from_rgb(0x8A, 0x8A, 0x8A);
@@ -48,7 +53,13 @@ const SWEAT_BLUE: Color32 = Color32::from_rgb(0x33, 0x99, 0xFF);
 const BARB_BLUE: Color32 = Color32::from_rgb(0x0A, 0x74, 0xC6);
 const BARB_RED: Color32 = Color32::from_rgb(0xAA, 0x00, 0x00);
 
-/// Draw the three-column index board into `rect`.
+/// Draw the legacy three-column index board into `rect`.
+///
+/// New layouts normally place the logical sections through
+/// [`draw_convective`], [`draw_kinematics`], and [`draw_indices`] so each is a
+/// first-class movable panel. This combined renderer remains available for
+/// restored layouts which explicitly selected the historical `Index board`
+/// panel.
 pub fn draw(painter: &Painter, rect: Rect, prof: &Profile, dv: &DerivedParams, style: &SkewTStyle) {
     let (w, h) = (rect.width(), rect.height());
     if w <= 6.0 || h <= 6.0 {
@@ -61,14 +72,16 @@ pub fn draw(painter: &Painter, rect: Rect, prof: &Profile, dv: &DerivedParams, s
     // 13-px regular+bold and 10-px small-bold Helvetica over a ~2-row-slack
     // layout; scale those proportions to the given rect).
     let rh = (h / 18.0).clamp(10.0, 64.0);
+    let (rf, hf, hfs) = board_fonts(rh, style);
     let b = Board {
         prof,
         dv,
         st: style,
         rh,
-        rf: FontId::new(rh * 0.78, style.font_regular.clone()),
-        hf: FontId::new(rh * 0.78, style.font_bold.clone()),
-        hfs: FontId::new((rh * 0.60).max(8.0), style.font_bold.clone()),
+        rf,
+        hf,
+        hfs,
+        patches: None,
     };
 
     // Column dividers: convective ends at 38% of the width, kinematics at
@@ -97,7 +110,156 @@ pub fn draw(painter: &Painter, rect: Rect, prof: &Profile, dv: &DerivedParams, s
     b.col_comp(
         &p,
         Rect::from_min_max(pos2(x2 + 6.0, top), pos2(rect.right() - 1.0, bot)),
+        true,
     );
+}
+
+/// Draw the combined legacy board while applying sparse native-cell patches.
+pub(crate) fn draw_patched(
+    painter: &Painter,
+    rect: Rect,
+    prof: &Profile,
+    dv: &DerivedParams,
+    style: &SkewTStyle,
+    patches: &NativeDiagnosticPatchBoard,
+) {
+    let (w, h) = (rect.width(), rect.height());
+    if w <= 6.0 || h <= 6.0 {
+        return;
+    }
+    let p = painter.with_clip_rect(rect);
+    p.rect_filled(rect, 0.0, style.bg_color);
+    let rh = (h / 18.0).clamp(10.0, 64.0);
+    let (rf, hf, hfs) = board_fonts(rh, style);
+    let b = Board {
+        prof,
+        dv,
+        st: style,
+        rh,
+        rf,
+        hf,
+        hfs,
+        patches: Some(patches),
+    };
+    let x1 = rect.left() + w * 0.38;
+    let x2 = rect.left() + w * 0.718;
+    let rule = Stroke::new(1.0, RULE);
+    p.line_segment(
+        [pos2(x1, rect.top() + 2.0), pos2(x1, rect.bottom() - 2.0)],
+        rule,
+    );
+    p.line_segment(
+        [pos2(x2, rect.top() + 2.0), pos2(x2, rect.bottom() - 2.0)],
+        rule,
+    );
+    let (top, bot) = (rect.top() + 2.0, rect.bottom() - 2.0);
+    b.col_conv(
+        &p,
+        Rect::from_min_max(pos2(rect.left() + 4.0, top), pos2(x1 - 4.0, bot)),
+    );
+    b.col_kin(
+        &p,
+        Rect::from_min_max(pos2(x1 + 6.0, top), pos2(x2 - 4.0, bot)),
+    );
+    b.col_comp(
+        &p,
+        Rect::from_min_max(pos2(x2 + 6.0, top), pos2(rect.right() - 1.0, bot)),
+        true,
+    );
+}
+
+/// Draw the parcel, thermodynamic, lapse-rate, and severe-composite section
+/// as a standalone panel.
+pub fn draw_convective(
+    painter: &Painter,
+    rect: Rect,
+    prof: &Profile,
+    dv: &DerivedParams,
+    style: &SkewTStyle,
+) {
+    let Some((p, b, content)) = standalone_board(painter, rect, prof, dv, style, 18.0) else {
+        return;
+    };
+    b.col_conv(&p, content);
+}
+
+pub(crate) fn draw_convective_patched(
+    painter: &Painter,
+    rect: Rect,
+    prof: &Profile,
+    dv: &DerivedParams,
+    style: &SkewTStyle,
+    patches: &NativeDiagnosticPatchBoard,
+) {
+    let Some((p, b, content)) =
+        standalone_board_patched(painter, rect, prof, dv, style, 18.0, Some(patches))
+    else {
+        return;
+    };
+    b.col_conv(&p, content);
+}
+
+/// Draw the layer kinematics, storm-motion, and AGL-wind section as a
+/// standalone panel.
+pub fn draw_kinematics(
+    painter: &Painter,
+    rect: Rect,
+    prof: &Profile,
+    dv: &DerivedParams,
+    style: &SkewTStyle,
+) {
+    let Some((p, b, content)) = standalone_board(painter, rect, prof, dv, style, 18.0) else {
+        return;
+    };
+    b.col_kin(&p, content);
+}
+
+pub(crate) fn draw_kinematics_patched(
+    painter: &Painter,
+    rect: Rect,
+    prof: &Profile,
+    dv: &DerivedParams,
+    style: &SkewTStyle,
+    patches: &NativeDiagnosticPatchBoard,
+) {
+    let Some((p, b, content)) =
+        standalone_board_patched(painter, rect, prof, dv, style, 18.0, Some(patches))
+    else {
+        return;
+    };
+    b.col_kin(&p, content);
+}
+
+/// Draw the environmental and severe-weather index readouts without the SHIP
+/// distribution chart. SHIP is a separate first-class panel in the split
+/// layout.
+pub fn draw_indices(
+    painter: &Painter,
+    rect: Rect,
+    prof: &Profile,
+    dv: &DerivedParams,
+    style: &SkewTStyle,
+) {
+    let Some((p, b, content)) = standalone_board(painter, rect, prof, dv, style, 9.0) else {
+        return;
+    };
+    b.col_comp(&p, content, false);
+}
+
+pub(crate) fn draw_indices_patched(
+    painter: &Painter,
+    rect: Rect,
+    prof: &Profile,
+    dv: &DerivedParams,
+    style: &SkewTStyle,
+    patches: &NativeDiagnosticPatchBoard,
+) {
+    let Some((p, b, content)) =
+        standalone_board_patched(painter, rect, prof, dv, style, 9.0, Some(patches))
+    else {
+        return;
+    };
+    b.col_comp(&p, content, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +556,12 @@ enum HA {
     Center,
 }
 
+struct NativeRowDisplay {
+    label: String,
+    value: String,
+    color: Color32,
+}
+
 // ---------------------------------------------------------------------------
 // The board
 // ---------------------------------------------------------------------------
@@ -409,6 +577,58 @@ struct Board<'a> {
     hf: FontId,
     /// Smaller bold font for tight column headers / the barb label.
     hfs: FontId,
+    /// Sparse edits to native cells. `None` is the exact legacy renderer.
+    patches: Option<&'a NativeDiagnosticPatchBoard>,
+}
+
+fn board_fonts(rh: f32, style: &SkewTStyle) -> (FontId, FontId, FontId) {
+    (
+        style.regular_font(rh * 0.78),
+        style.bold_font(rh * 0.78),
+        style.bold_font((rh * 0.60).max(8.0)),
+    )
+}
+
+fn standalone_board<'a>(
+    painter: &Painter,
+    rect: Rect,
+    prof: &'a Profile,
+    dv: &'a DerivedParams,
+    style: &'a SkewTStyle,
+    nominal_rows: f32,
+) -> Option<(Painter, Board<'a>, Rect)> {
+    standalone_board_patched(painter, rect, prof, dv, style, nominal_rows, None)
+}
+
+fn standalone_board_patched<'a>(
+    painter: &Painter,
+    rect: Rect,
+    prof: &'a Profile,
+    dv: &'a DerivedParams,
+    style: &'a SkewTStyle,
+    nominal_rows: f32,
+    patches: Option<&'a NativeDiagnosticPatchBoard>,
+) -> Option<(Painter, Board<'a>, Rect)> {
+    if rect.width() <= 6.0 || rect.height() <= 6.0 {
+        return None;
+    }
+    let p = painter.with_clip_rect(rect);
+    p.rect_filled(rect, 0.0, style.bg_color);
+    p.rect_stroke(rect, 0.0, Stroke::new(1.0, RULE), StrokeKind::Inside);
+    let content = rect.shrink2(vec2(4.0, 2.0));
+    let rh = (content.height() / nominal_rows).clamp(10.0, 64.0);
+    let (rf, hf, hfs) = board_fonts(rh, style);
+    let board = Board {
+        prof,
+        dv,
+        st: style,
+        rh,
+        rf,
+        hf,
+        hfs,
+        patches,
+    };
+    Some((p, board, content))
 }
 
 impl Board<'_> {
@@ -479,17 +699,159 @@ impl Board<'_> {
         );
     }
 
+    fn patch(
+        &self,
+        panel: DiagnosticTablePanelKind,
+        slot_id: &str,
+    ) -> Option<&NativeDiagnosticSlotPatch> {
+        self.patches
+            .and_then(|patches| patches.patch(panel, slot_id))
+    }
+
+    fn inline_display(
+        &self,
+        panel: DiagnosticTablePanelKind,
+        slot_id: &str,
+        canonical_label: &str,
+        canonical_value: &str,
+        canonical_color: Color32,
+    ) -> Option<NativeRowDisplay> {
+        match self.patch(panel, slot_id) {
+            None => Some(NativeRowDisplay {
+                label: canonical_label.to_owned(),
+                value: canonical_value.to_owned(),
+                color: canonical_color,
+            }),
+            Some(NativeDiagnosticSlotPatch::Blank) => None,
+            Some(NativeDiagnosticSlotPatch::Replace(row)) => Some(NativeRowDisplay {
+                label: if row.label.trim().is_empty() {
+                    canonical_label.to_owned()
+                } else {
+                    row.label.trim().to_owned()
+                },
+                value: Self::replacement_value(row),
+                color: row.color.unwrap_or(canonical_color),
+            }),
+        }
+    }
+
+    fn replacement_value(row: &DiagnosticTableRow) -> String {
+        if row.value == MISS || row.value.is_empty() || row.unit.trim().is_empty() {
+            row.value.clone()
+        } else {
+            format!("{} {}", row.value, row.unit.trim())
+        }
+    }
+
+    /// Draw a native inline `label = value` slot, changing only its contents.
+    #[allow(clippy::too_many_arguments)]
+    fn inline_slot(
+        &self,
+        p: &Painter,
+        panel: DiagnosticTablePanelKind,
+        slot_id: &str,
+        cx: f32,
+        cw: f32,
+        cy: f32,
+        canonical_label: &str,
+        canonical_value: &str,
+        canonical_color: Color32,
+    ) {
+        match self.patch(panel, slot_id) {
+            None => self.row_at(
+                p,
+                cx,
+                cw,
+                cy,
+                canonical_label,
+                canonical_value,
+                canonical_color,
+            ),
+            Some(NativeDiagnosticSlotPatch::Blank) => {}
+            Some(NativeDiagnosticSlotPatch::Replace(row)) => {
+                let label = if row.label.trim().is_empty() {
+                    canonical_label
+                } else {
+                    row.label.trim()
+                };
+                let value = Self::replacement_value(row);
+                self.row_at(
+                    p,
+                    cx,
+                    cw,
+                    cy,
+                    label,
+                    &value,
+                    row.color.unwrap_or(canonical_color),
+                );
+            }
+        }
+    }
+
+    fn fitted_cell_font(&self, p: &Painter, text: &str, width: f32) -> FontId {
+        let mut font = self.rf.clone();
+        let min_size = (self.rf.size * 0.54).max(6.0);
+        while font.size > min_size && self.vuw(p, &font, text) > width {
+            font.size = (font.size - 0.5).max(min_size);
+        }
+        font
+    }
+
+    /// Draw a value in one native matrix cell. A replacement that changes
+    /// the cell's meaning includes its explicit label, fitted inside the same
+    /// geometry; a same-semantic replacement remains value-only.
+    #[allow(clippy::too_many_arguments)]
+    fn matrix_slot(
+        &self,
+        p: &Painter,
+        panel: DiagnosticTablePanelKind,
+        slot_id: &str,
+        rect: Rect,
+        canonical_label: &str,
+        canonical_value: &str,
+        canonical_color: Color32,
+    ) {
+        match self.patch(panel, slot_id) {
+            None => self.text(
+                p,
+                rect,
+                canonical_value,
+                &self.rf,
+                canonical_color,
+                HA::Center,
+            ),
+            Some(NativeDiagnosticSlotPatch::Blank) => {}
+            Some(NativeDiagnosticSlotPatch::Replace(row)) => {
+                let value = Self::replacement_value(row);
+                let label = row.label.trim();
+                let text = if label.is_empty() || label.eq_ignore_ascii_case(canonical_label) {
+                    value
+                } else if value.is_empty() {
+                    label.to_owned()
+                } else {
+                    format!("{label} {value}")
+                };
+                let font = self.fitted_cell_font(p, &text, rect.width());
+                self.text(
+                    p,
+                    rect,
+                    &text,
+                    &font,
+                    row.color.unwrap_or(canonical_color),
+                    HA::Center,
+                );
+            }
+        }
+    }
+
     // ---- column 1: convective -----------------------------------------
     fn col_conv(&self, p: &Painter, r: Rect) {
         let fg = self.st.fg_color;
         let rh = self.rh;
         let (x, w) = (r.left(), r.width());
         let mut y = r.top();
-        let cw = w / 7.0;
-        for (i, c) in ["PCL", "CAPE", "CINH", "LCL", "LI", "LFC", "EL"]
-            .iter()
-            .enumerate()
-        {
+        let cw = w / 8.0;
+        for (i, c) in PARCEL_MATRIX_HEADERS.iter().enumerate() {
             self.text(
                 p,
                 self.cell(x + i as f32 * cw, y, cw),
@@ -504,17 +866,17 @@ impl Board<'_> {
         // Content below the header = 4 parcel + 6 stats + 5 lapse = 15 rows.
         let per_div = ((r.height() - 16.0 * rh - 1.0) / 2.0).max(6.0);
 
-        let parcels: [(&str, &ParcelResult); 4] = [
-            ("SFC", &self.prof.sfcpcl),
-            ("ML", &self.prof.mlpcl),
-            ("FCST", &self.prof.fcstpcl),
-            ("MU", &self.prof.mupcl),
+        let parcels: [(&str, &str, &ParcelResult); 4] = [
+            ("SFC", "sfc", &self.prof.sfcpcl),
+            ("ML", "ml", &self.prof.mlpcl),
+            ("FCST", "fcst", &self.prof.fcstpcl),
+            ("MU", "mu", &self.prof.mupcl),
         ];
-        for (name, pcl) in parcels {
+        for (name, parcel_id, pcl) in parcels {
             let cape = fin(pcl.bplus);
             let has_cape = cape.is_some_and(|c| c > 0.0);
             // CAPE/CINH/LI escalate only when the parcel has positive CAPE;
-            // LCL, LFC, EL and the parcel name stay neutral.
+            // LCL, LFC, EL, MPL and the parcel name stay neutral.
             let (cape_c, cinh_c, li_c) = if has_cape {
                 (
                     gradient(cape, 1000.0, 2500.0, 4000.0, true, fg),
@@ -524,23 +886,27 @@ impl Board<'_> {
             } else {
                 (fg, fg, fg)
             };
-            let cells: [(String, Color32); 7] = [
-                (name.to_string(), fg),
-                (int2str(pcl.bplus), cape_c),
-                (int2str(pcl.bminus), cinh_c),
-                (int2str(pcl.lclhght), fg),
-                (int2str(pcl.li5), li_c),
-                (int2str(pcl.lfchght), fg),
-                (int2str(pcl.elhght), fg),
+            self.text(p, self.cell(x, y, cw), name, &self.rf, fg, HA::Center);
+            let cells: [(&str, &str, String, Color32); 7] = [
+                ("cape", "CAPE", int2str(pcl.bplus), cape_c),
+                ("cinh", "CINH", int2str(pcl.bminus), cinh_c),
+                ("lcl", "LCL", int2str(pcl.lclhght), fg),
+                ("li", "LI", int2str(pcl.li5), li_c),
+                ("lfc", "LFC", int2str(pcl.lfchght), fg),
+                ("el", "EL", int2str(pcl.elhght), fg),
+                ("mpl", "MPL", int2str(pcl.mplhght), fg),
             ];
-            for (i, (v, c)) in cells.iter().enumerate() {
-                self.text(
+            for (i, (field, heading, value, color)) in cells.iter().enumerate() {
+                let slot_id = format!("parcel.{parcel_id}.{field}");
+                let canonical_label = format!("{name} {heading}");
+                self.matrix_slot(
                     p,
-                    self.cell(x + i as f32 * cw, y, cw),
-                    v,
-                    &self.rf,
-                    *c,
-                    HA::Center,
+                    DiagnosticTablePanelKind::Convective,
+                    &slot_id,
+                    self.cell(x + (i + 1) as f32 * cw, y, cw),
+                    &canonical_label,
+                    value,
+                    *color,
                 );
             }
             y += rh;
@@ -551,49 +917,73 @@ impl Board<'_> {
 
         // Thermo stats block, three sub-columns of six rows.
         let dv = self.dv;
-        let col1: [(&str, String, Color32); 6] = [
-            ("PWAT", pwat_in(dv.pwat), fg),
-            ("MeanW", suf(float2str(dv.mean_mixr, 2), " g/kg"), fg),
-            ("LowRH", suf(int2str(dv.low_rh), "%"), fg),
-            ("MidRH", suf(int2str(dv.mid_rh), "%"), fg),
-            ("DCAPE", int2str(dv.dcape), fg),
-            ("DownT", temp_f(dv.drush_f), fg),
-        ];
-        let col2: [(&str, String, Color32); 6] = [
-            ("K", int2str(dv.k_idx), fg),
-            ("TT", int2str(dv.totals_totals), fg),
-            ("ConvT", temp_f(dv.conv_t_f), fg),
-            ("MaxT", temp_f(dv.max_t_f), fg),
-            ("ESP", float2str(dv.esp, 1), fg),
-            ("MMP", float2str(dv.mmp, 2), fg),
-        ];
-        let col3: [(&str, String, Color32); 6] = [
-            ("WNDG", float2str(dv.wndg, 1), fg),
-            ("TEI", int2str(dv.tei), fg),
+        let col1: [(&str, &str, String, Color32); 6] = [
+            ("thermo.pwat", "PWAT", pwat_in(dv.pwat), fg),
             (
+                "thermo.mean_mixr",
+                "MeanW",
+                suf(float2str(dv.mean_mixr, 2), " g/kg"),
+                fg,
+            ),
+            ("thermo.low_rh", "LowRH", suf(int2str(dv.low_rh), "%"), fg),
+            ("thermo.mid_rh", "MidRH", suf(int2str(dv.mid_rh), "%"), fg),
+            ("thermo.dcape", "DCAPE", int2str(dv.dcape), fg),
+            ("thermo.downrush_temp", "DownT", temp_f(dv.drush_f), fg),
+        ];
+        let col2: [(&str, &str, String, Color32); 6] = [
+            ("thermo.k_index", "K", int2str(dv.k_idx), fg),
+            ("thermo.total_totals", "TT", int2str(dv.totals_totals), fg),
+            ("thermo.convective_temp", "ConvT", temp_f(dv.conv_t_f), fg),
+            ("thermo.max_temp", "MaxT", temp_f(dv.max_t_f), fg),
+            ("thermo.esp", "ESP", float2str(dv.esp, 1), fg),
+            ("thermo.mmp", "MMP", float2str(dv.mmp, 2), fg),
+        ];
+        let col3: [(&str, &str, String, Color32); 6] = [
+            ("thermo.wndg", "WNDG", float2str(dv.wndg, 1), fg),
+            ("thermo.tei", "TEI", int2str(dv.tei), fg),
+            (
+                "thermo.cape_0_3km",
                 "3CAPE",
                 int2str(dv.cape_0_3km),
                 cape3_color(fin(dv.cape_0_3km), fg),
             ),
             (
+                "thermo.cape_0_6km",
                 "6CAPE",
                 int2str(dv.cape_0_6km),
                 cape3_color(fin(dv.cape_0_6km), fg),
             ),
-            ("MBURST", int2str(dv.mburst), fg),
+            ("thermo.mburst", "MBURST", int2str(dv.mburst), fg),
             (
+                "thermo.sig_severe",
                 "SigSvr",
                 suf(int2str(dv.sig_severe), " m\u{b3}/s\u{b3}"),
                 fg,
             ),
         ];
         let stat_cols = [&col1, &col2, &col3];
+        let displayed_cols = stat_cols
+            .iter()
+            .map(|col| {
+                col.iter()
+                    .map(|(id, label, value, color)| {
+                        self.inline_display(
+                            DiagnosticTablePanelKind::Convective,
+                            id,
+                            label,
+                            value,
+                            *color,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         let mut gutter = 4.0f32;
         let mut min_widths = [0.0f32; 3];
-        for (ci, col) in stat_cols.iter().enumerate() {
-            for (lbl, val, _) in col.iter() {
-                let mw = self.width(p, &self.rf, &format!("{lbl} = "))
-                    + self.vuw(p, &self.rf, val)
+        for (ci, col) in displayed_cols.iter().enumerate() {
+            for display in col.iter().flatten() {
+                let mw = self.width(p, &self.rf, &format!("{} = ", display.label))
+                    + self.vuw(p, &self.rf, &display.value)
                     + 2.0;
                 min_widths[ci] = min_widths[ci].max(mw);
             }
@@ -616,21 +1006,22 @@ impl Board<'_> {
             stat_xs[i] = cursor_x;
             cursor_x += stat_widths[i] + gutter;
         }
-        for (ci, col) in stat_cols.iter().enumerate() {
+        for (ci, col) in displayed_cols.iter().enumerate() {
             let cx = stat_xs[ci];
             let col_width = stat_widths[ci];
             let val_right = cx + col_width;
-            for (ri, (lbl, val, cc)) in col.iter().enumerate() {
+            for (ri, display) in col.iter().enumerate() {
+                let Some(display) = display else { continue };
                 let ry = y + ri as f32 * rh;
                 // "label = " left-aligned, then the value right after it so
                 // long labels are never clipped on the left.
-                let ltext = format!("{lbl} = ");
+                let ltext = format!("{} = ", display.label);
                 self.text(
                     p,
                     self.cell(cx, ry, col_width),
                     &ltext,
                     &self.rf,
-                    *cc,
+                    display.color,
                     HA::Left,
                 );
                 let lw = self.width(p, &self.rf, &ltext);
@@ -638,18 +1029,25 @@ impl Board<'_> {
                 // Shrink the value font just enough to fit its slot so unit
                 // suffixes are never clipped in the narrow sub-columns.
                 let mut vfont = self.rf.clone();
-                if vw > 0.0 && self.vuw(p, &vfont, val) > vw {
+                if vw > 0.0 && self.vuw(p, &vfont, &display.value) > vw {
                     let min_px = (self.rf.size * (9.0 / 13.0)).max(8.0);
                     let mut px = self.rf.size;
                     while px > min_px {
                         px -= 1.0;
                         vfont = FontId::new(px, self.rf.family.clone());
-                        if self.vuw(p, &vfont, val) <= vw {
+                        if self.vuw(p, &vfont, &display.value) <= vw {
                             break;
                         }
                     }
                 }
-                self.text(p, self.cell(cx + lw, ry, vw), val, &vfont, *cc, HA::Left);
+                self.text(
+                    p,
+                    self.cell(cx + lw, ry, vw),
+                    &display.value,
+                    &vfont,
+                    display.color,
+                    HA::Left,
+                );
             }
         }
         y += 6.0 * rh;
@@ -659,31 +1057,40 @@ impl Board<'_> {
 
         // Lapse-rate box (left) beside the Severe Weather Composite (right),
         // each value colored by its own threshold tier.
-        let lapse: [(&str, f64); 5] = [
-            ("SFC-500m LR", dv.lapserate_sfc_500m),
-            ("SFC-1km LR", dv.lapserate_sfc_1km),
-            ("SFC-3km LR", dv.lapserate_3km),
-            ("850-500 LR", dv.lapserate_850_500),
-            ("700-500 LR", dv.lapserate_700_500),
+        let lapse: [(&str, &str, f64); 5] = [
+            ("lapse.sfc_500m", "SFC-500m LR", dv.lapserate_sfc_500m),
+            ("lapse.sfc_1km", "SFC-1km LR", dv.lapserate_sfc_1km),
+            ("lapse.sfc_3km", "SFC-3km LR", dv.lapserate_3km),
+            ("lapse.850_500", "850-500 LR", dv.lapserate_850_500),
+            ("lapse.700_500", "700-500 LR", dv.lapserate_700_500),
         ];
-        let severe: [(&str, String, Color32); 5] = [
+        let severe: [(&str, &str, String, Color32); 5] = [
             (
+                "composite.scp_right",
                 "Supercell Comp",
                 float2str(dv.right_scp, 1),
                 scp_color(fin(dv.right_scp), fg),
             ),
             (
+                "composite.stp_effective",
                 "STP(cin)",
                 float2str(dv.stp_cin, 1),
                 stp_effective_color(fin(dv.stp_cin), fg),
             ),
             (
+                "composite.stp_fixed",
                 "STP(fix)",
                 float2str(dv.stp_fixed, 1),
                 stp_fixed_color(fin(dv.stp_fixed), fg),
             ),
-            ("SHIP", float2str(dv.ship, 1), ship_color(fin(dv.ship), fg)),
             (
+                "composite.ship",
+                "SHIP",
+                float2str(dv.ship, 1),
+                ship_color(fin(dv.ship), fg),
+            ),
+            (
+                "composite.dcp",
                 "Derecho Comp",
                 float2str(dv.dcp, 1),
                 dcp_color(fin(dv.dcp), fg),
@@ -709,38 +1116,38 @@ impl Board<'_> {
             start = start.min(max_start);
         }
 
-        for (i, (llbl, lval)) in lapse.iter().enumerate() {
+        for (i, (slot_id, llbl, lval)) in lapse.iter().enumerate() {
             let row_y = start + i as f32 * row_step;
             let c = lapse_rate_color(fin(*lval), fg);
-            let lt = format!("{llbl} = ");
-            self.text(p, self.cell(x, row_y, lwid), &lt, &self.rf, c, HA::Left);
-            let lw2 = self.width(p, &self.rf, &lt);
             let lvt = if fin(*lval).is_some() {
                 format!("{} C/km", float2str(*lval, 1))
             } else {
                 MISS.to_string()
             };
-            self.text(
+            self.inline_slot(
                 p,
-                self.cell(x + lw2, row_y, lwid - lw2),
+                DiagnosticTablePanelKind::Convective,
+                slot_id,
+                x,
+                lwid,
+                row_y,
+                llbl,
                 &lvt,
-                &self.rf,
                 c,
-                HA::Left,
             );
         }
-        for (i, (slbl, sval, sc)) in severe.iter().enumerate() {
+        for (i, (slot_id, slbl, sval, sc)) in severe.iter().enumerate() {
             let row_y = start + i as f32 * row_step;
-            let stx = format!("{slbl} = ");
-            self.text(p, self.cell(sx, row_y, swid), &stx, &self.rf, *sc, HA::Left);
-            let sw2 = self.width(p, &self.rf, &stx);
-            self.text(
+            self.inline_slot(
                 p,
-                self.cell(sx + sw2, row_y, swid - sw2 - 2.0),
+                DiagnosticTablePanelKind::Convective,
+                slot_id,
+                sx,
+                swid,
+                row_y,
+                slbl,
                 sval,
-                &self.rf,
                 *sc,
-                HA::Left,
             );
         }
         // Separator between the lapse rates and the severe composite.
@@ -857,19 +1264,128 @@ impl Board<'_> {
                 uv_dirspd(dv.srw_ebw),
             ),
         ];
-        for (lbl, srh, shr, mnw, srw) in rows {
+        let slot_ids: [[Option<&str>; 4]; 8] = [
+            [
+                Some("kin.sfc_500m.srh"),
+                Some("kin.sfc_500m.shear"),
+                Some("kin.sfc_500m.mean_wind"),
+                Some("kin.sfc_500m.srw"),
+            ],
+            [
+                Some("kin.sfc_1km.srh"),
+                Some("kin.sfc_1km.shear"),
+                Some("kin.sfc_1km.mean_wind"),
+                Some("kin.sfc_1km.srw"),
+            ],
+            [
+                Some("kin.sfc_3km.srh"),
+                Some("kin.sfc_3km.shear"),
+                Some("kin.sfc_3km.mean_wind"),
+                Some("kin.sfc_3km.srw"),
+            ],
+            [
+                Some("kin.effective.srh"),
+                Some("kin.effective.shear"),
+                Some("kin.effective.mean_wind"),
+                Some("kin.effective.srw"),
+            ],
+            [
+                None,
+                Some("kin.sfc_6km.shear"),
+                Some("kin.sfc_6km.mean_wind"),
+                Some("kin.sfc_6km.srw"),
+            ],
+            [
+                None,
+                Some("kin.sfc_8km.shear"),
+                Some("kin.sfc_8km.mean_wind"),
+                Some("kin.sfc_8km.srw"),
+            ],
+            [
+                None,
+                Some("kin.lcl_el.shear"),
+                Some("kin.lcl_el.mean_wind"),
+                Some("kin.lcl_el.srw"),
+            ],
+            [
+                None,
+                Some("kin.ebwd.shear"),
+                Some("kin.ebwd.mean_wind"),
+                Some("kin.ebwd.srw"),
+            ],
+        ];
+        let canonical_labels: [[Option<&str>; 4]; 8] = [
+            [
+                Some("SFC-500m SRH"),
+                Some("SFC-500m Shear"),
+                Some("SFC-500m Mean Wind"),
+                Some("SFC-500m SR Wind"),
+            ],
+            [
+                Some("SFC-1km SRH"),
+                Some("SFC-1km Shear"),
+                Some("SFC-1km Mean Wind"),
+                Some("SFC-1km SR Wind"),
+            ],
+            [
+                Some("SFC-3km SRH"),
+                Some("SFC-3km Shear"),
+                Some("SFC-3km Mean Wind"),
+                Some("SFC-3km SR Wind"),
+            ],
+            [
+                Some("Effective SRH"),
+                Some("Effective Inflow Shear"),
+                Some("Effective Mean Wind"),
+                Some("Effective SR Wind"),
+            ],
+            [
+                None,
+                Some("SFC-6km Shear"),
+                Some("SFC-6km Mean Wind"),
+                Some("SFC-6km SR Wind"),
+            ],
+            [
+                None,
+                Some("SFC-8km Shear"),
+                Some("SFC-8km Mean Wind"),
+                Some("SFC-8km SR Wind"),
+            ],
+            [
+                None,
+                Some("LCL-EL Shear"),
+                Some("LCL-EL Mean Wind"),
+                Some("LCL-EL SR Wind"),
+            ],
+            [
+                None,
+                Some("Effective Bulk Shear"),
+                Some("Effective Bulk Mean Wind"),
+                Some("Effective Bulk SR Wind"),
+            ],
+        ];
+        for (row_index, (lbl, srh, shr, mnw, srw)) in rows.into_iter().enumerate() {
             self.text(p, self.cell(x, y, lw), lbl, &self.rf, fg, HA::Left);
             for (i, v) in [&srh, &shr, &mnw, &srw].into_iter().enumerate() {
-                if v == MISS {
-                    continue; // leave unavailable cells blank (no "--")
+                let Some(slot_id) = slot_ids[row_index][i] else {
+                    continue;
+                };
+                let canonical_label = canonical_labels[row_index][i].expect("native slot label");
+                if v == MISS
+                    && self
+                        .patch(DiagnosticTablePanelKind::Kinematics, slot_id)
+                        .is_none()
+                {
+                    continue; // preserve native empty unavailable cells
                 }
-                self.text(
+                self.matrix_slot(
                     p,
+                    DiagnosticTablePanelKind::Kinematics,
+                    slot_id,
                     self.cell(value_xs[i], y, value_ws[i]),
+                    canonical_label,
                     v,
-                    &self.rf,
                     fg,
-                    HA::Center,
                 );
             }
             y += rh;
@@ -884,25 +1400,30 @@ impl Board<'_> {
         // The AGL wind barbs anchor at the top of the right-hand whitespace
         // beside the BRN/SR-wind + storm-motion rows.
         let barb_top = y;
-        for (lbl, val, unit) in [
-            ("BRN Shear", int2str(dv.brnshear), " m2/s2"),
-            ("4-6km SR Wind", dirspd(dv.srw_4_5km), " kt"),
+        for (slot_id, lbl, val, unit) in [
+            ("kin.brn_shear", "BRN Shear", int2str(dv.brnshear), " m2/s2"),
+            (
+                "kin.srw_4_6km",
+                "4-6km SR Wind",
+                dirspd(dv.srw_4_5km),
+                " kt",
+            ),
         ] {
-            let lt = format!("{lbl} = ");
-            self.text(p, self.cell(x, y, w), &lt, &self.rf, fg, HA::Left);
-            let lw3 = self.width(p, &self.rf, &lt);
             let vt = if val != MISS {
                 format!("{val}{unit}")
             } else {
                 MISS.to_string()
             };
-            self.text(
+            self.inline_slot(
                 p,
-                self.cell(x + lw3, y, w - lw3 - 2.0),
+                DiagnosticTablePanelKind::Kinematics,
+                slot_id,
+                x,
+                w,
+                y,
+                lbl,
                 &vt,
-                &self.rf,
                 fg,
-                HA::Left,
             );
             y += rh;
         }
@@ -928,28 +1449,42 @@ impl Board<'_> {
         y += rh;
         // Bunkers Right (cyan) / Left (red) follow legacy SHARPpy; Corfidi
         // vectors stay neutral. Labels stay white; only the value is colored.
-        for (lbl, val, vcol) in [
-            ("Bunkers Right", br, CYAN_TXT),
-            ("Bunkers Left", bl, RED_TXT),
-            ("Corfidi Dshr", cor_dn, fg),
-            ("Corfidi Ushr", cor_up, fg),
+        for (slot_id, lbl, val, vcol) in [
+            ("kin.bunkers_right", "Bunkers Right", br, CYAN_TXT),
+            ("kin.bunkers_left", "Bunkers Left", bl, RED_TXT),
+            ("kin.corfidi_down", "Corfidi Dshr", cor_dn, fg),
+            ("kin.corfidi_up", "Corfidi Ushr", cor_up, fg),
         ] {
-            let lt = format!("{lbl} = ");
-            self.text(p, self.cell(x, y, text_w), &lt, &self.rf, fg, HA::Left);
-            let lw3 = self.width(p, &self.rf, &lt);
             let vt = if val != MISS {
                 format!("{val} kt")
             } else {
                 MISS.to_string()
             };
-            self.text(
-                p,
-                self.cell(x + lw3, y, text_w - lw3 - 2.0),
-                &vt,
-                &self.rf,
-                vcol,
-                HA::Left,
-            );
+            match self.patch(DiagnosticTablePanelKind::Kinematics, slot_id) {
+                None => {
+                    let lt = format!("{lbl} = ");
+                    self.text(p, self.cell(x, y, text_w), &lt, &self.rf, fg, HA::Left);
+                    let lw3 = self.width(p, &self.rf, &lt);
+                    self.text(
+                        p,
+                        self.cell(x + lw3, y, text_w - lw3 - 2.0),
+                        &vt,
+                        &self.rf,
+                        vcol,
+                        HA::Left,
+                    );
+                }
+                Some(NativeDiagnosticSlotPatch::Blank) => {}
+                Some(NativeDiagnosticSlotPatch::Replace(row)) => {
+                    let label = if row.label.trim().is_empty() {
+                        lbl
+                    } else {
+                        row.label.trim()
+                    };
+                    let value = Self::replacement_value(row);
+                    self.row_at(p, x, text_w, y, label, &value, row.color.unwrap_or(vcol));
+                }
+            }
             y += rh;
         }
         let agl_h = (rh * 5.0).max(r.bottom() - barb_top);
@@ -962,9 +1497,14 @@ impl Board<'_> {
     fn draw_agl_barbs(&self, p: &Painter, rx: f32, top: f32, rw: f32, h: f32) {
         let (d1, s1) = self.dv.wind1km;
         let (d6, s6) = self.dv.wind6km;
-        let have1 = qc(d1) && qc(s1);
-        let have6 = qc(d6) && qc(s6);
-        if !have1 && !have6 {
+        let patch1 = self.patch(DiagnosticTablePanelKind::Kinematics, "kin.wind_1km");
+        let patch6 = self.patch(DiagnosticTablePanelKind::Kinematics, "kin.wind_6km");
+        let patched = patch1.is_some() || patch6.is_some();
+        let have1 = qc(d1) && qc(s1) && patch1.is_none();
+        let have6 = qc(d6) && qc(s6) && patch6.is_none();
+        let replacement_visible = matches!(patch1, Some(NativeDiagnosticSlotPatch::Replace(_)))
+            || matches!(patch6, Some(NativeDiagnosticSlotPatch::Replace(_)));
+        if !have1 && !have6 && !replacement_visible {
             return;
         }
         let shemis = self.prof.latitude() < 0.0;
@@ -980,7 +1520,7 @@ impl Board<'_> {
         let base = self.hfs.size;
         let lbl_font = FontId::new(
             (base + 1.0).max((base * rel).round()),
-            self.st.font_bold.clone(),
+            self.hfs.family.clone(),
         );
         let line_h = p
             .layout_no_wrap("1km & 6km AGL".to_owned(), lbl_font.clone(), BARB_BLUE)
@@ -1026,24 +1566,64 @@ impl Board<'_> {
             }
         }
 
-        p.text(
-            pos2(center_x, label_top),
-            Align2::CENTER_TOP,
-            "1km & 6km AGL",
-            lbl_font.clone(),
-            BARB_BLUE,
-        );
-        p.text(
-            pos2(center_x, label_top + line_h),
-            Align2::CENTER_TOP,
-            "Wind Barbs",
-            lbl_font,
-            BARB_BLUE,
-        );
+        if !patched {
+            p.text(
+                pos2(center_x, label_top),
+                Align2::CENTER_TOP,
+                "1km & 6km AGL",
+                lbl_font.clone(),
+                BARB_BLUE,
+            );
+            p.text(
+                pos2(center_x, label_top + line_h),
+                Align2::CENTER_TOP,
+                "Wind Barbs",
+                lbl_font,
+                BARB_BLUE,
+            );
+        } else {
+            for (index, (slot_id, canonical_label, color)) in [
+                ("kin.wind_1km", "1km Wind", BARB_RED),
+                ("kin.wind_6km", "6km Wind", BARB_BLUE),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let y = label_top + index as f32 * line_h;
+                match self.patch(DiagnosticTablePanelKind::Kinematics, slot_id) {
+                    Some(NativeDiagnosticSlotPatch::Blank) => {}
+                    Some(NativeDiagnosticSlotPatch::Replace(row)) => {
+                        let label = if row.label.trim().is_empty() {
+                            canonical_label
+                        } else {
+                            row.label.trim()
+                        };
+                        let text = format!("{label} = {}", Self::replacement_value(row));
+                        let font = self.fitted_cell_font(p, &text, rw - 2.0);
+                        p.text(
+                            pos2(center_x, y),
+                            Align2::CENTER_TOP,
+                            text,
+                            font,
+                            row.color.unwrap_or(color),
+                        );
+                    }
+                    None => {
+                        p.text(
+                            pos2(center_x, y),
+                            Align2::CENTER_TOP,
+                            canonical_label,
+                            lbl_font.clone(),
+                            color,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // ---- column 3: composite indices ----------------------------------
-    fn col_comp(&self, p: &Painter, r: Rect) {
+    fn col_comp(&self, p: &Painter, r: Rect, include_ship_chart: bool) {
         let dv = self.dv;
         let fg = self.st.fg_color;
         let rh = self.rh;
@@ -1059,31 +1639,58 @@ impl Board<'_> {
         let mshe = fin(dv.modified_sherbe);
         let lrgh = fin(dv.lrghail);
         let swt = fin(dv.sweat);
-        let top_list: [(&str, String, Color32); 8] = [
-            ("EHI 0-1km", f1o(ehi1), ehi_color(ehi1, fg)),
-            ("EHI 0-3km", f1o(ehi3), ehi_color(ehi3, fg)),
-            ("VGP", float2str(dv.vgp, 2), fg),
-            ("Peskov Index", f1o(pesk), peskov_color(pesk, fg)),
-            ("MCS Index", f1o(mcs), mcs_color(mcs, fg)),
-            ("SWEAT", i0o(swt), sweat_color(swt, fg)),
-            ("MOSHE", f1o(mshe), gradient(mshe, 1.0, 2.0, 3.0, true, fg)),
-            ("LRGHAIL", f1o(lrgh), lrghail_color(lrgh, fg)),
+        let top_list: [(&str, &str, String, Color32); 8] = [
+            (
+                "severe.ehi_0_1km",
+                "EHI 0-1km",
+                f1o(ehi1),
+                ehi_color(ehi1, fg),
+            ),
+            (
+                "severe.ehi_0_3km",
+                "EHI 0-3km",
+                f1o(ehi3),
+                ehi_color(ehi3, fg),
+            ),
+            ("severe.vgp", "VGP", float2str(dv.vgp, 2), fg),
+            (
+                "severe.peskov",
+                "Peskov Index",
+                f1o(pesk),
+                peskov_color(pesk, fg),
+            ),
+            ("severe.mcs", "MCS Index", f1o(mcs), mcs_color(mcs, fg)),
+            ("severe.sweat", "SWEAT", i0o(swt), sweat_color(swt, fg)),
+            (
+                "severe.moshe",
+                "MOSHE",
+                f1o(mshe),
+                gradient(mshe, 1.0, 2.0, 3.0, true, fg),
+            ),
+            (
+                "severe.lrghail",
+                "LRGHAIL",
+                f1o(lrgh),
+                lrghail_color(lrgh, fg),
+            ),
         ];
         let hgz = fin(dv.hgz_cape);
         let ncape = fin(dv.ncape);
         let wbz = fin(dv.wbz_height);
         let ecape = fin(dv.ecape);
         // (label, value, unit suffix, color); the right entry is optional.
-        type BotEntry = (&'static str, String, &'static str, Color32);
+        type BotEntry = (&'static str, &'static str, String, &'static str, Color32);
         let bot: [(BotEntry, Option<BotEntry>); 4] = [
             (
                 (
+                    "severe.hgz_cape",
                     "HGZ CAPE",
                     i0o(hgz),
                     " J/kg",
                     gradient(hgz, 1000.0, 2500.0, 4000.0, true, fg),
                 ),
                 Some((
+                    "severe.nstp",
                     "NSTP",
                     f1o(nstp),
                     "",
@@ -1092,12 +1699,14 @@ impl Board<'_> {
             ),
             (
                 (
+                    "severe.ncape",
                     "NCAPE",
                     f2o(ncape),
                     " J/kg/m",
                     gradient(ncape, 0.1, 0.2, 0.3, true, fg),
                 ),
                 Some((
+                    "severe.ecape",
                     "ECAPE",
                     i0o(ecape),
                     " J/kg",
@@ -1106,6 +1715,7 @@ impl Board<'_> {
             ),
             (
                 (
+                    "severe.lscp",
                     "LSCP",
                     f1o(lscp),
                     "",
@@ -1113,7 +1723,10 @@ impl Board<'_> {
                 ),
                 None,
             ),
-            (("WBZ Height", i0o(wbz), " m AGL", fg), None),
+            (
+                ("severe.wbz_height", "WBZ Height", i0o(wbz), " m AGL", fg),
+                None,
+            ),
         ];
 
         // SHIP box-and-whisker chart at the TOP: the two-column indices only
@@ -1123,7 +1736,7 @@ impl Board<'_> {
         let slack = (r.height() - n_rows * rh).max(0.0);
         const MID_GAP: f32 = 12.0; // gap around the indices -> CAPE divider
         const CHART_DIV: f32 = 8.0; // gap the SHIP chart's divider consumes
-        let (chart_h, mid_gap) = if slack > 70.0 {
+        let (chart_h, mid_gap) = if include_ship_chart && slack > 70.0 {
             (slack - MID_GAP - CHART_DIV, MID_GAP)
         } else {
             (0.0, slack.max(6.0))
@@ -1147,35 +1760,75 @@ impl Board<'_> {
         let right_x = (x + w * 0.54).min(x + w - min_right_w);
         let left_w = (right_x - x - col_gutter).max(1.0);
         let right_w = (x + w - right_x - 2.0).max(1.0);
-        for (idx, (lbl, val, c)) in top_list.iter().enumerate() {
+        for (idx, (slot_id, lbl, val, c)) in top_list.iter().enumerate() {
             let (cx, cw, ri) = if idx < 4 {
                 (x, left_w, idx)
             } else {
                 (right_x, right_w, idx - 4)
             };
-            self.row_at(p, cx, cw, y + ri as f32 * rh, lbl, val, *c);
+            self.inline_slot(
+                p,
+                DiagnosticTablePanelKind::Severe,
+                slot_id,
+                cx,
+                cw,
+                y + ri as f32 * rh,
+                lbl,
+                val,
+                *c,
+            );
         }
         y += top_rows * rh;
         y += mid_gap / 2.0;
         p.line_segment([pos2(x, y), pos2(x + w, y)], Stroke::new(1.0, RULE));
         y += mid_gap / 2.0;
         for (left, right) in bot {
-            let (lbl, val, sfx, c) = left;
+            let (slot_id, lbl, val, sfx, c) = left;
             let text = if val != MISS {
                 format!("{val}{sfx}")
             } else {
                 MISS.to_string()
             };
-            if let Some((rl, rv, rs, rc)) = right {
-                self.row_at(p, x, left_w, y, lbl, &text, c);
+            if let Some((right_id, rl, rv, rs, rc)) = right {
+                self.inline_slot(
+                    p,
+                    DiagnosticTablePanelKind::Severe,
+                    slot_id,
+                    x,
+                    left_w,
+                    y,
+                    lbl,
+                    &text,
+                    c,
+                );
                 let rtext = if rv != MISS {
                     format!("{rv}{rs}")
                 } else {
                     MISS.to_string()
                 };
-                self.row_at(p, right_x, right_w, y, rl, &rtext, rc);
+                self.inline_slot(
+                    p,
+                    DiagnosticTablePanelKind::Severe,
+                    right_id,
+                    right_x,
+                    right_w,
+                    y,
+                    rl,
+                    &rtext,
+                    rc,
+                );
             } else {
-                self.row_at(p, x, w, y, lbl, &text, c);
+                self.inline_slot(
+                    p,
+                    DiagnosticTablePanelKind::Severe,
+                    slot_id,
+                    x,
+                    w,
+                    y,
+                    lbl,
+                    &text,
+                    c,
+                );
             }
             y += rh;
         }
@@ -1258,5 +1911,31 @@ fn build_barb(wdir: f64, wspd: f64, shemis: bool, scale: f32) -> BarbPath {
         circle: None,
         min,
         max,
+    }
+}
+
+#[cfg(test)]
+mod typography_tests {
+    use super::*;
+    use crate::skewt::SoundingFontPreset;
+
+    #[test]
+    fn parcel_matrix_places_maximum_parcel_level_after_equilibrium_level() {
+        assert_eq!(PARCEL_MATRIX_HEADERS.len(), 8);
+        assert_eq!(&PARCEL_MATRIX_HEADERS[6..], &["EL", "MPL"]);
+    }
+
+    #[test]
+    fn shared_typography_reaches_index_board_regular_and_bold_cells() {
+        let (base_regular, _, _) = board_fonts(20.0, &SkewTStyle::default());
+        let style = SkewTStyle::default()
+            .with_font_preset(SoundingFontPreset::TechnicalMonospace)
+            .with_text_scale(1.3);
+        let (regular, bold, small_bold) = board_fonts(20.0, &style);
+
+        assert!((regular.size - base_regular.size * 1.3).abs() < 0.001);
+        assert_eq!(regular.family, egui::FontFamily::Monospace);
+        assert_eq!(bold.family, egui::FontFamily::Monospace);
+        assert_eq!(small_bold.family, egui::FontFamily::Monospace);
     }
 }

@@ -1,15 +1,67 @@
 # rusty-weather
 
-A self-contained weather model viewer: fetch HRRR (more models coming),
-store hours in a fast-access format, and view map plots, instant soundings,
-and live GOES satellite loops in a native egui app. Full Rust, MIT licensed.
-Extracted and rebuilt from the rustwx fast path.
+A self-contained weather data engine and native model viewer: acquire a broad
+catalog of public deterministic, ensemble, AI, and analysis feeds; normalize
+public or private WRF-compatible runs into a validated fast-access store; serve
+point, profile, window, and native diurnal analytics; and view maps, soundings,
+and live satellite loops in the desktop app. The Rusty Weather code is MIT;
+bundled components retain their compatible permissive licenses, documented in
+`THIRD_PARTY_NOTICES.md` and the generated license bundle.
 
 Storage paths (`--store-root`, `--cache-dir`) are configurable in-app via
 the collapsible "Storage" section in the left panel and are persisted across
 launches (precedence: CLI arg > persisted setting > built-in default).
 
-Design: docs/superpowers/specs/2026-06-09-rusty-weather-design.md
+The June 2026 design record is retained for history, but it predates the
+implemented service. The current contracts are
+[`docs/SERVICE_V1.md`](docs/SERVICE_V1.md),
+[`docs/MODEL_SUPPORT.md`](docs/MODEL_SUPPORT.md), and
+[`docs/REDUCTIONS.md`](docs/REDUCTIONS.md).
+
+BowEcho's opt-in Community Cache is specified separately in
+[`docs/COMMUNITY_CACHE_PROTOCOL.md`](docs/COMMUNITY_CACHE_PROTOCOL.md) and its
+mandatory pre-transport
+[`docs/COMMUNITY_CACHE_THREAT_MODEL.md`](docs/COMMUNITY_CACHE_THREAT_MODEL.md).
+The design permits only relay-mediated peer assistance; direct user-to-user
+connectivity is permanently out of scope.
+The deployable immutable R2/CDN tier lives in
+[`deploy/cloudflare-r2-gateway`](deploy/cloudflare-r2-gateway); it exposes
+public signed-object reads and authenticated create-only writes, never a
+mutable bucket browser.
+
+Operator-approved university, lab, and public-service origins use the separate
+signed conventional-HTTPS federation contract in
+[`docs/FEDERATION.md`](docs/FEDERATION.md). Public origins are intentionally
+addressable; ordinary Community Cache clients are never listed there.
+Scheduler-to-origin publication is described in
+[`docs/ORIGIN_CATALOG.md`](docs/ORIGIN_CATALOG.md), while advanced signed
+complete-generation transfer is a separate opt-in contract in
+[`docs/GENERATION_REPLICATION.md`](docs/GENERATION_REPLICATION.md). The exact
+system, deployment, privacy, package, and usability proof required before the
+distributed product is called complete is recorded in
+[`docs/DISTRIBUTED_RELEASE_GATES.md`](docs/DISTRIBUTED_RELEASE_GATES.md).
+
+## Self-hosted data service
+
+`rw-server` exposes bounded catalog, point, profile, arbitrary geographic-domain
+plots (including explicit pressure levels), and temporal analytics over
+validated stores without requiring the desktop application. Start with
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), then use
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) for health checks, backup, upgrades,
+and rollback. The versioned HTTP contract is documented in
+[`docs/SERVICE_V1.md`](docs/SERVICE_V1.md).
+
+The Compose deployment is source-checkout-only. Before starting it on Linux,
+create the bind mounts for its non-root UID/GID `65532:65532`; otherwise
+Compose may create root-owned directories that the service cannot write:
+
+    sudo install -d -o 65532 -g 65532 -m 0750 \
+      deploy/docker/data/store deploy/docker/data/artifacts \
+      deploy/docker/data/community-cache deploy/docker/data/federation \
+      deploy/docker/data/scheduler-cache deploy/docker/data/scheduler-state
+
+See [`deploy/docker/README.md`](deploy/docker/README.md) for token handling and
+the explicit scheduler profile.
 
 ## Desktop model workflows
 
@@ -278,14 +330,18 @@ count matched the sum of bucket records.
 
 ## Model support
 
-| Model | Ingest | Store | Render | Soundings | Download UI | Notes |
-|-------|--------|-------|--------|-----------|-------------|-------|
-| HRRR  | full   | full  | full   | full      | enabled     | 1799×1059 CONUS, hourly f000-f048 |
-| GFS   | full   | full  | full   | full      | enabled     | 1440×721 global 0.25°, synoptic cycles, hourly f000-f120 then 3-hourly f123-f384 |
-| RRFS-A | full  | full  | full   | full      | enabled     | 2938×1739 CONUS **cropped at ingest** from the 4881×2961 rotated-pole NA grid, hourly cycles 00-23z, f000-f060 |
-| REFS / NBM / RAP | — | — | — | — | coming soon | each needs a fetch-plan entry + validation pass |
+The remote acquisition and ingest catalog currently covers HRRR/HRRR Alaska,
+RAP, GFS, GDAS, GEFS, NOAA AI-GFS/AI-GEFS/HGEFS, ECMWF IFS Open Data,
+ECMWF AIFS Single v2, NAM, RRFS-A, the public RRFS prototype, NBM, HIRESW,
+HREF, SREF, REFS, RTMA, and URMA. Local WRF/wrfout runs use the same store
+and exact-time query engine. Model-specific products, cadence, pressure
+levels, and verification maturity are intentionally reported independently;
+the service never substitutes a similarly named field or ensemble statistic.
 
-**GFS product exclusions (not available in pgrb2.0p25):** composite\_reflectivity, UH/rotation tracks, smoke columns, simulated IR, 1-hour APCP (GFS uses bucketed 0-6h accumulations; windowed QPF requires bucket-difference logic, deferred to v2). All other HRRR products are supported for GFS.
+See [the model capability matrix](docs/MODEL_SUPPORT.md) for the human-readable
+scope and use `GET /v1/models` plus each run's `/variables` resource as the
+machine-readable authority. Source-specific missing products are omitted
+rather than fabricated.
 
 **GFS ingest examples:**
 
@@ -374,7 +430,12 @@ plan for ≥48 GB RAM for full-profile RRFS-A ingests (HRRR peaks ~5 GB by compa
 
 ## Status
 
-HRRR, GFS, and RRFS-A are fully supported end-to-end. The workspace builds and renders live plots for all three models. GFS is exposed in the download picker alongside HRRR (hours field shows the cadence hint: "hourly ≤120, 3-hourly 123-384"); RRFS-A auto-enables in the picker via `ingest_supported`.
+HRRR, GFS, and RRFS-A have full live end-to-end validation. Eighteen additional
+remote model/analysis families have typed fetch plans and focused inventory,
+cadence, extraction, and query contracts at the verification levels reported by
+`/v1/models`; they are not mislabeled as live-verified. Local WRF is reported as
+`local_import`, not as a remote acquisition source. See
+[`docs/MODEL_SUPPORT.md`](docs/MODEL_SUPPORT.md) for the exact current matrix.
 
     # HRRR quick smoke test
     cargo run --release -p rusty-weather --bin smoke_direct -- --model hrrr --date YYYYMMDD --cycle 0 --forecast-hour 6 --region midwest --all-supported --out-dir out
@@ -495,7 +556,9 @@ work; the cost is the vendored `ecape-rs` physics kernel.
 **TOTAL WALL: 59.1 s | process CPU 657.7 s | 290 products rendered (47 skipped/blocked)**  
 GFS vs HRRR baseline (59.8 s / 248 products): GFS is slightly faster (smaller cells: 1.04 M vs 1.9 M CONUS grid points) and renders more products (full global field set vs midwest-region subset).
 
-**Next:** REFS / NBM / RAP support — each follows the GFS pattern (fetch-plan entry + validation pass; RRFS-A added the crop-at-ingest + `.idx`-subset machinery any oversized-domain model can now reuse) — see docs/superpowers/specs/2026-06-09-rusty-weather-design.md.
+Further model breadth is gated by a real public source, an explicit data-policy
+entry, and a fixture or live inventory; the registry does not advertise a model
+merely because a URL pattern can be guessed.
 
 ## Layout
 

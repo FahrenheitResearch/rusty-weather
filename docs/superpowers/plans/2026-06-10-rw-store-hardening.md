@@ -6,7 +6,7 @@
 
 **Architecture:** Five additive capabilities layered onto the existing `rw-store` crate: a validation library, committed golden fixtures that pin v1 bytes forever, a written FORMAT.md spec, a dependency-free NetCDF3/CDF-2 exporter (kills the interop objection), writer-side advisory locks (fixes the real bowecho collision), and an `rws` CLI that fronts all of it. No existing public API signature changes — additive only. The two diffs to existing behavior: `HourIngestWriter::begin` acquires a run-dir lock, and `RwStoreError` gains variants (breaking only for exhaustive matchers — flag to bowecho).
 
-**Tech Stack:** Rust workspace at `C:\Users\drew\rusty-weather`. New dep: `fs4` (advisory file locks, Windows+Unix). NetCDF3 writer is from scratch (pure byte emission, zero deps) — netcrust is read-only and reads NetCDF4/HDF5, not classic. CLI uses workspace `clap` 4.5 derive like `rw_ingest`.
+**Tech Stack:** Rust workspace at `C:\work\rusty-weather`. New dep: `fs4` (advisory file locks, Windows+Unix). NetCDF3 writer is from scratch (pure byte emission, zero deps) — netcrust is read-only and reads NetCDF4/HDF5, not classic. CLI uses workspace `clap` 4.5 derive like `rw_ingest`.
 
 **Context for implementers (verified against source 2026-06-10):**
 
@@ -24,7 +24,7 @@
 - Bin arg-parse pattern: clap derive, all `#[arg(long)]`, see `rw_ingest.rs`.
 - **Reviewer hygiene (standing policy):** discard any workspace-wide rustfmt churn (`git checkout -- .` on untouched files) and `.verify*/` scratch dirs before commit/merge.
 
-**Working directory for ALL commands: `C:\Users\drew\rusty-weather` (NOT rustwx). Branch: `rw-store-hardening` off `main`.**
+**Working directory for ALL commands: `C:\work\rusty-weather` (NOT rustwx). Branch: `rw-store-hardening` off `main`.**
 
 ---
 

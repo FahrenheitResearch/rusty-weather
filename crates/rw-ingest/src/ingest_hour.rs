@@ -60,12 +60,12 @@ use rustwx_core::{
     CanonicalField, CycleSpec, FieldSelector, ModelId, ModelRunRequest, SourceId, VerticalSelector,
 };
 use rustwx_io::{
-    CachedFetchResult, FetchRequest, SharedExtractionGrid,
-    extract_field_values_partial_from_model_bytes_at_forecast_hour, fetch_bytes_with_cache,
+    CachedFetchResult, FetchRequest, ParsedModelGrib, SharedExtractionGrid, fetch_bytes_with_cache,
 };
 use rustwx_models::plot_recipe_fetch_plan;
 use rustwx_products::derived::{store_derived_recipe_slugs, store_heavy_recipe_slugs};
 use rustwx_products::direct::supported_direct_recipe_slugs;
+use rw_store::RwsSourceProvenance;
 use rw_store::grid::GridFile;
 use rw_store::ingest::{HourIngestWriter, derived_selector, read_field_2d, read_grid_2d};
 use rw_store::reader::HourReader;
@@ -77,7 +77,7 @@ pub mod ingest_profile;
 #[path = "size_estimate.rs"]
 pub mod size_estimate;
 use crate::events::{IngestError, IngestEvent, IngestStage, other};
-use crate::{fetch_plan, profile_scope};
+use crate::{fetch_plan, profile_scope, validate_ingest_profile_for_model};
 use ingest_compute::DerivedGrid2D;
 use ingest_profile::{IngestProfile, VolumeChoice, surface_plan};
 
@@ -113,8 +113,9 @@ const TRAILING_2D_NAMES: [&str; 3] = ["apcp_1h", "uh_2to5km_max_1h", "wind_speed
 /// `pgrb2` APCP is a BUCKETED accumulation that resets every 6 h (0-6, 6-12,
 /// ...), so the trailing-window re-select at `hour - 1` would NOT yield an
 /// honest 1 h precip increment — and GFS carries no native sub-hourly UH/
-/// wind-max messages at all. So GFS (and any future non-HRRR model) excludes
-/// the trailing set rather than claim a 1 h field it can't produce. Honest
+/// wind-max messages at all. So GFS (and any model without these native
+/// windows) excludes the trailing set rather than claim a 1 h field it can't
+/// produce. Honest
 /// GFS windowed QPF (bucket-difference logic) is a separate, deferred feature.
 ///
 /// RRFS-A's `natlev.na` is genuinely HRRR-grade here — recon-verified messages
@@ -125,9 +126,34 @@ const TRAILING_2D_NAMES: [&str; 3] = ["apcp_1h", "uh_2to5km_max_1h", "wind_speed
 /// WIND:10 m above ground:0-1 hour max fcst
 /// ```
 /// so `apcp_1h`/`uh_2to5km_max_1h`/`wind_speed_10m_max_1h` are honest for
-/// RRFS-A. The RRFS fetch plan subsets exactly these messages from `nat-na`.
+/// RRFS-A. RRFS Public's `2dfld.conus` index publishes the same three native
+/// trailing windows; both RRFS fetch plans subset those exact messages.
 fn model_has_trailing_1h_window(model: ModelId) -> bool {
-    matches!(model, ModelId::Hrrr | ModelId::HrrrAk | ModelId::RrfsA)
+    matches!(
+        model,
+        ModelId::Hrrr | ModelId::HrrrAk | ModelId::RrfsA | ModelId::RrfsPublic
+    )
+}
+
+/// Give directly selected surface statistics an honest temporal identity.
+/// The generic surface selector does not retain a GRIB interval in store
+/// metadata, so the stable variable name must distinguish interval amounts
+/// and maxima from cumulative or instantaneous fields.
+fn stored_surface_field_name(model: ModelId, name: &'static str) -> &'static str {
+    match (model, name) {
+        // The deterministic NBM core inventory places its native 1-hour APCP
+        // before longer aggregation companions at every forecast file.
+        (ModelId::Nbm | ModelId::Href, "apcp_run_total") => "apcp_1h",
+        // SREF's mean_3hrly file publishes one 3-hour APCP amount per step.
+        (ModelId::Sref, "apcp_run_total") => "apcp_3h",
+        // REFS changes the first APCP aggregation at 6-hour boundaries. Keep
+        // the raw field available without falsely advertising it as a run
+        // total or one fixed interval until explicit 1-hour selection lands.
+        (ModelId::Refs, "apcp_run_total") => "apcp_native_interval",
+        // HIRESW's only 2-5 km UH message is a trailing one-hour maximum.
+        (ModelId::Hiresw, "uh_2to5km") => "uh_2to5km_max_1h",
+        _ => name,
+    }
 }
 
 /// Compute the crop-at-ingest spec for this hour, or `None` for models with no
@@ -308,7 +334,8 @@ impl IngestConfig<'_> {
 #[derive(Debug)]
 pub struct FetchedHour {
     pub hour: u16,
-    pub prs: CachedFetchResult,
+    /// Absent for an explicitly surface-only fetch plan (RTMA/URMA).
+    pub prs: Option<CachedFetchResult>,
     pub sfc: CachedFetchResult,
     pub prs_fetch_ms: u128,
     pub sfc_fetch_ms: u128,
@@ -342,7 +369,7 @@ struct SpilledFetch {
 #[derive(Debug)]
 pub struct SpilledFetchedHour {
     pub hour: u16,
-    prs: SpilledFetch,
+    prs: Option<SpilledFetch>,
     sfc: SpilledFetch,
     prs_fetch_ms: u128,
     sfc_fetch_ms: u128,
@@ -423,7 +450,10 @@ impl FetchedHour {
         let hour = self.hour;
         Ok(SpilledFetchedHour {
             hour,
-            prs: spill_fetch(self.prs, spill_dir, &format!("f{hour:03}_prs"))?,
+            prs: self
+                .prs
+                .map(|prs| spill_fetch(prs, spill_dir, &format!("f{hour:03}_prs")))
+                .transpose()?,
             sfc: spill_fetch(self.sfc, spill_dir, &format!("f{hour:03}_sfc"))?,
             prs_fetch_ms: self.prs_fetch_ms,
             sfc_fetch_ms: self.sfc_fetch_ms,
@@ -438,7 +468,7 @@ impl SpilledFetchedHour {
     pub fn rehydrate(self) -> std::io::Result<FetchedHour> {
         Ok(FetchedHour {
             hour: self.hour,
-            prs: rehydrate_fetch(self.prs)?,
+            prs: self.prs.map(rehydrate_fetch).transpose()?,
             sfc: rehydrate_fetch(self.sfc)?,
             prs_fetch_ms: self.prs_fetch_ms,
             sfc_fetch_ms: self.sfc_fetch_ms,
@@ -460,6 +490,8 @@ pub struct IngestedHour {
     pub hour: u16,
     pub prs_fetch_ms: u128,
     pub sfc_fetch_ms: u128,
+    /// False for an explicitly surface-only analysis product.
+    pub has_pressure_source: bool,
     pub prs_cache_hit: bool,
     pub sfc_cache_hit: bool,
     /// True when the model's fetch plan has exactly one file serving both the
@@ -469,7 +501,8 @@ pub struct IngestedHour {
     /// `prs_mb + sfc_mb` to avoid double-counting.
     pub single_file_model: bool,
     pub prs_mb: f64,
-    /// Zero for single-file models (`single_file_model == true`).
+    /// Zero for single-file dual-role models (`single_file_model == true`);
+    /// the real analysis-file size for surface-only models.
     pub sfc_mb: f64,
     pub prs_extract_ms: u128,
     pub sfc_extract_ms: u128,
@@ -550,17 +583,19 @@ fn fetch_product(
 /// GFS's single `pgrb2.0p25` file is fetched once under the `FetchPrs`
 /// stage and bound to BOTH slots (the surface slot clones it; only one
 /// HTTP fetch happens), so `process_fetched_hour` reads the same bytes for
-/// the surface and pressure passes.
+/// the surface and pressure passes. RTMA/URMA emit only `FetchSfc` and leave
+/// the optional pressure slot empty.
 pub fn fetch_hour(config: &IngestConfig<'_>, hour: u16) -> Result<FetchedHour, IngestError> {
+    validate_ingest_profile_for_model(config.model, config.profile)?;
     let plan = fetch_plan(config.model)?;
     let mut pressure: Option<(CachedFetchResult, u128)> = None;
     let mut surface: Option<(CachedFetchResult, u128)> = None;
-    // First entry downloads under the FetchPrs stage, the second (HRRR's
-    // sfc) under FetchSfc — preserving the historical two-stage sequence;
-    // GFS has a single entry and only emits FetchPrs.
-    for (index, product) in plan.iter().enumerate() {
+    // Choose the event from the product's real role. Plan order still keeps
+    // historical pressure-then-surface models unchanged; a surface-only
+    // analysis emits no FetchPrs event.
+    for product in &plan {
         config.check_cancel()?;
-        let stage = if index == 0 {
+        let stage = if product.pressure_source {
             IngestStage::FetchPrs
         } else {
             IngestStage::FetchSfc
@@ -578,12 +613,10 @@ pub fn fetch_hour(config: &IngestConfig<'_>, hour: u16) -> Result<FetchedHour, I
             surface = Some((fetched, fetch_ms));
         }
     }
-    let (prs, prs_fetch_ms) = pressure.ok_or_else(|| {
-        other(format!(
-            "fetch plan for {} has no pressure-source product",
-            config.model
-        ))
-    })?;
+    let (prs, prs_fetch_ms) = match pressure {
+        Some((prs, ms)) => (Some(prs), ms),
+        None => (None, 0),
+    };
     let (sfc, sfc_fetch_ms) = surface.ok_or_else(|| {
         other(format!(
             "fetch plan for {} has no surface-source product",
@@ -628,6 +661,74 @@ const PASS_PRS: usize = 0;
 const PASS_SFC: usize = 1;
 const PASS_TRAILING: usize = 2;
 
+fn safe_provider_identity(source: SourceId) -> &'static str {
+    match source {
+        SourceId::Aws => "noaa-aws-public-data",
+        SourceId::Nomads => "noaa-nomads",
+        SourceId::Google => "noaa-google-public-data",
+        SourceId::Azure => "noaa-microsoft-azure-public-data",
+        SourceId::Ecmwf => "ecmwf-open-data",
+        SourceId::Ncei => "noaa-ncei",
+        SourceId::Gdex => "ucar-gdex",
+        SourceId::AifsInference => "local-aifs-inference",
+        SourceId::Earth2Archive => "local-earth2-archive",
+    }
+}
+
+fn safe_product_identity(product: &str) -> String {
+    let mut safe = String::with_capacity(product.len());
+    for byte in product.bytes() {
+        let byte = byte.to_ascii_lowercase();
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            safe.push(char::from(byte));
+        } else if !safe.ends_with('-') {
+            safe.push('-');
+        }
+    }
+    safe.trim_matches('-').to_string()
+}
+
+fn resolved_source_provenance(
+    model: ModelId,
+    prs: Option<&CachedFetchResult>,
+    sfc: &CachedFetchResult,
+) -> Result<Vec<RwsSourceProvenance>, IngestError> {
+    fetch_plan(model)?
+        .into_iter()
+        .map(|product| {
+            let fetched = match (product.pressure_source, product.surface_source) {
+                (true, true) => prs.unwrap_or(sfc),
+                (true, false) => prs.ok_or_else(|| {
+                    other(format!(
+                        "fetch plan product '{}' has a pressure role but no resolved pressure source",
+                        product.product
+                    ))
+                })?,
+                (false, true) => sfc,
+                (false, false) => {
+                    return Err(other(format!(
+                        "fetch plan product '{}' has no extraction role",
+                        product.product
+                    )));
+                }
+            };
+            let mut roles = Vec::with_capacity(2);
+            if product.pressure_source {
+                roles.push("pressure".to_string());
+            }
+            if product.surface_source {
+                roles.push("surface".to_string());
+            }
+            RwsSourceProvenance::new(
+                safe_provider_identity(fetched.result.source),
+                roles,
+                vec![safe_product_identity(product.product)],
+            )
+            .map_err(other)
+        })
+        .collect()
+}
+
 /// The CPU half of one hour: extract both files, compute derived/heavy
 /// grids, write the store hour, and (optionally) verify the round-trip.
 /// All parallelism rides the rayon pool of the CALLING thread — the global
@@ -644,6 +745,7 @@ pub fn process_fetched_hour(
         "process_fetched_hour called with an unvalidated profile: {:?}",
         config.profile.validate()
     );
+    validate_ingest_profile_for_model(config.model, config.profile)?;
     config.check_cancel()?;
     let process_started = Instant::now();
     let FetchedHour {
@@ -653,20 +755,25 @@ pub fn process_fetched_hour(
         prs_fetch_ms,
         sfc_fetch_ms,
     } = fetched;
-    let prs_cache_hit = prs.cache_hit;
-    let prs_mb = prs.result.bytes.len() as f64 / (1024.0 * 1024.0);
+    let has_pressure_source = prs.is_some();
+    let prs_cache_hit = prs.as_ref().is_some_and(|prs| prs.cache_hit);
+    let prs_mb = prs
+        .as_ref()
+        .map(|prs| prs.result.bytes.len() as f64 / (1024.0 * 1024.0))
+        .unwrap_or(0.0);
     let sfc_cache_hit = sfc.cache_hit;
     // Single-file models (GFS): the sfc slot is a clone of the prs file; the
     // download was one fetch, not two. Price the download once by zeroing sfc_mb
     // so callers that sum prs_mb + sfc_mb get the honest single-file total.
     let single_file_model = fetch_plan(config.model)
-        .map(|plan| plan.len() == 1)
+        .map(|plan| plan.len() == 1 && plan[0].pressure_source && plan[0].surface_source)
         .unwrap_or(false);
     let sfc_mb = if single_file_model {
         0.0
     } else {
         sfc.result.bytes.len() as f64 / (1024.0 * 1024.0)
     };
+    let source_provenance = resolved_source_provenance(config.model, prs.as_ref(), &sfc)?;
 
     // --- prs product file: 3D isobaric superset, one decode pass ---
     // The profile picks the volumes and level step; the render-grade 2D
@@ -720,16 +827,24 @@ pub fn process_fetched_hour(
         .collect();
     let mut prs_fields_2d: Vec<(String, FieldPlane2D)> = Vec::new();
     let mut prs_grids: Vec<SharedExtractionGrid> = Vec::new();
+    let prs_grib = if prs_selectors.is_empty() {
+        None
+    } else {
+        let prs = prs.as_ref().ok_or_else(|| {
+            other(format!(
+                "model '{}' profile requires pressure fields, but the fetched hour has no pressure source",
+                config.model
+            ))
+        })?;
+        Some(ParsedModelGrib::from_model_bytes(config.model, &prs.result.bytes).map_err(other)?)
+    };
     if !prs_selectors.is_empty() {
         profile_scope!("ingest_extract_prs");
-        let prs_extraction = extract_field_values_partial_from_model_bytes_at_forecast_hour(
-            config.model,
-            &prs.result.bytes,
-            Some(&prs.bytes_path),
-            &prs_selectors,
-            Some(hour),
-        )
-        .map_err(other)?;
+        let prs_extraction = prs_grib
+            .as_ref()
+            .expect("non-empty prs selector pass has a parsed GRIB")
+            .extract_field_values_partial_at_forecast_hour(&prs_selectors, Some(hour))
+            .map_err(other)?;
         prs_extract_ms = extract_started.elapsed().as_millis();
         prs_grids = prs_extraction.grids;
         for extracted in prs_extraction.extracted {
@@ -800,8 +915,7 @@ pub fn process_fetched_hour(
 
     // Dewpoint fallback: when the profile stores a dewpoint volume but the
     // prs file realizes < 2 dewpoint levels, re-select RelativeHumidity
-    // from the already-fetched bytes (the GRIB index re-parses, but only
-    // the RH messages decode).
+    // from the same per-file parsed GRIB (only the RH messages decode).
     let dewpoint_planned = volumes_data
         .iter()
         .any(|volume| volume.field == CanonicalField::Dewpoint);
@@ -823,14 +937,11 @@ pub fn process_fetched_hour(
             .map(|&level| FieldSelector::isobaric(CanonicalField::RelativeHumidity, level))
             .collect();
         let rh_started = Instant::now();
-        let rh_extraction = extract_field_values_partial_from_model_bytes_at_forecast_hour(
-            config.model,
-            &prs.result.bytes,
-            Some(&prs.bytes_path),
-            &rh_selectors,
-            Some(hour),
-        )
-        .map_err(other)?;
+        let rh_extraction = prs_grib
+            .as_ref()
+            .expect("dewpoint fallback follows a non-empty prs selector pass")
+            .extract_field_values_partial_at_forecast_hour(&rh_selectors, Some(hour))
+            .map_err(other)?;
         prs_extract_ms += rh_started.elapsed().as_millis();
         let dewpoint = volumes_data
             .iter_mut()
@@ -847,6 +958,9 @@ pub fn process_fetched_hour(
             }
         }
     }
+    // The parsed owner is strictly per-file/per-hour. Release its packed
+    // message copies before the surface phase and the products f64 decoder.
+    drop(prs_grib);
     // `prs` stays alive: the derived/heavy compute stage decodes the
     // thermo pair from the raw prs + sfc bytes below.
     config.emit(IngestEvent::StageDone {
@@ -870,16 +984,13 @@ pub fn process_fetched_hour(
     let sfc_selectors: Vec<FieldSelector> =
         surface_plan.iter().map(|(_, selector)| *selector).collect();
     let extract_started = Instant::now();
+    let sfc_grib =
+        ParsedModelGrib::from_model_bytes(config.model, &sfc.result.bytes).map_err(other)?;
     let mut sfc_extraction = {
         profile_scope!("ingest_extract_sfc");
-        extract_field_values_partial_from_model_bytes_at_forecast_hour(
-            config.model,
-            &sfc.result.bytes,
-            Some(&sfc.bytes_path),
-            &sfc_selectors,
-            Some(hour),
-        )
-        .map_err(other)?
+        sfc_grib
+            .extract_field_values_partial_at_forecast_hour(&sfc_selectors, Some(hour))
+            .map_err(other)?
     };
     let mut sfc_extract_ms = extract_started.elapsed().as_millis();
     let sfc_grids = std::mem::take(&mut sfc_extraction.grids);
@@ -894,7 +1005,7 @@ pub fn process_fetched_hour(
             Some(index) => {
                 let extracted = sfc_extraction.extracted.swap_remove(index);
                 fields_2d_owned.push((
-                    name.to_string(),
+                    stored_surface_field_name(config.model, name).to_string(),
                     FieldPlane2D {
                         selector: extracted.selector,
                         units: extracted.units,
@@ -914,8 +1025,8 @@ pub fn process_fetched_hour(
     }
 
     // Trailing (h-1)->h window fields, all selected at `hour - 1` in ONE
-    // re-select pass (the GRIB index re-parses, but only these three
-    // messages decode):
+    // re-select pass against the same per-file parsed GRIB (only these
+    // three messages decode):
     //
     // * apcp_1h — both sfc APCP accumulations end at hour h and tie on
     //   match score at hour h, where the run total wins as first in file
@@ -940,9 +1051,9 @@ pub fn process_fetched_hour(
     // sfc file. If a future HRRR build reorders them, run_total silently
     // becomes the 1 h window. A windowed-product sanity check (run_total >=
     // 1h sum for h > 1) is the cheap detector if this ever bites.
-    // GFS (and any non-HRRR model) excludes the trailing 1 h window set: its
-    // bucketed APCP can't honestly produce a 1 h increment and it has no
-    // native sub-hourly UH/wind-max messages (see
+    // GFS (and any model without native windows) excludes the trailing 1 h
+    // set: its bucketed APCP can't honestly produce a 1 h increment and it
+    // has no native sub-hourly UH/wind-max messages (see
     // `model_has_trailing_1h_window`).
     let include_trailing = include_full_2d && model_has_trailing_1h_window(config.model);
     let mut trailing_grids: Vec<SharedExtractionGrid> = Vec::new();
@@ -966,14 +1077,8 @@ pub fn process_fetched_hour(
             .map(|(_, selector)| *selector)
             .collect();
         let trailing_started = Instant::now();
-        let mut trailing_extraction =
-            extract_field_values_partial_from_model_bytes_at_forecast_hour(
-                config.model,
-                &sfc.result.bytes,
-                Some(&sfc.bytes_path),
-                &trailing_selectors,
-                Some(hour - 1),
-            )
+        let mut trailing_extraction = sfc_grib
+            .extract_field_values_partial_at_forecast_hour(&trailing_selectors, Some(hour - 1))
             .map_err(other)?;
         sfc_extract_ms += trailing_started.elapsed().as_millis();
         trailing_grids = std::mem::take(&mut trailing_extraction.grids);
@@ -1014,6 +1119,8 @@ pub fn process_fetched_hour(
             ),
         });
     }
+    // Never retain parsed inventories across products or forecast hours.
+    drop(sfc_grib);
 
     config.emit(IngestEvent::StageDone {
         hour,
@@ -1027,7 +1134,7 @@ pub fn process_fetched_hour(
     // the store write bit-verifies that). The vorticity + direct-recipe
     // planes ride with any full-2D profile; the trailing 1 h window set
     // (apcp_1h, uh_2to5km_max_1h, wind_speed_10m_max_1h) rides only for
-    // models that carry it (HRRR-class) — GFS omits it (bucketed APCP).
+    // models that carry it (HRRR/RRFS-class) — GFS omits it (bucketed APCP).
     let planned_2d = surface_plan.len()
         + if include_full_2d {
             VORTICITY_PLAN.len() + direct_planes.len()
@@ -1136,6 +1243,9 @@ pub fn process_fetched_hour(
         )
         .map_err(other)?
     };
+    hour_writer
+        .set_source_provenance(source_provenance)
+        .map_err(other)?;
     let keep_planes = config.verify;
     {
         profile_scope!("ingest_encode_extracted");
@@ -1211,7 +1321,7 @@ pub fn process_fetched_hour(
     let stages = compute_product_grids(
         config,
         sfc.result.bytes,
-        prs.result.bytes,
+        prs.map(|prs| prs.result.bytes),
         hour,
         profile.derived,
         profile.heavy,
@@ -1293,6 +1403,7 @@ pub fn process_fetched_hour(
         hour,
         prs_fetch_ms,
         sfc_fetch_ms,
+        has_pressure_source,
         prs_cache_hit,
         sfc_cache_hit,
         single_file_model,
@@ -1348,7 +1459,7 @@ struct ComputedProductGrids {
 fn compute_product_grids(
     config: &IngestConfig<'_>,
     surface_bytes: Vec<u8>,
-    pressure_bytes: Vec<u8>,
+    pressure_bytes: Option<Vec<u8>>,
     hour: u16,
     derived_enabled: bool,
     heavy_enabled: bool,
@@ -1361,6 +1472,11 @@ fn compute_product_grids(
         });
         return Ok(ComputedProductGrids::default());
     }
+    let pressure_bytes = pressure_bytes.ok_or_else(|| {
+        other(format!(
+            "f{hour:03}: derived/heavy compute requires a pressure-source product"
+        ))
+    })?;
     config.check_cancel()?;
     config.emit(IngestEvent::StageStarted {
         hour,
@@ -1703,11 +1819,11 @@ pub fn planned_store_variables(profile: &IngestProfile, model: ModelId) -> Plann
     let mut fields_2d: Vec<String> = surface_plan()
         .iter()
         .filter(|(name, _)| profile.includes_surface_field(name))
-        .map(|(name, _)| (*name).to_string())
+        .map(|(name, _)| stored_surface_field_name(model, name).to_string())
         .collect();
     if profile.includes_full_2d() {
         // Trailing 1 h window fields ride only for models that carry them
-        // (HRRR-class); GFS omits them (bucketed APCP — see
+        // (HRRR/RRFS-class); GFS omits them (bucketed APCP — see
         // `model_has_trailing_1h_window`).
         if model_has_trailing_1h_window(model) {
             fields_2d.extend(TRAILING_2D_NAMES.iter().map(|name| (*name).to_string()));
@@ -1809,11 +1925,12 @@ pub fn validate_forecast_hours(
     }
     let supported = rustwx_models::supported_forecast_hours(model, cycle_hour_utc);
     if let Some(&bad) = hours.iter().find(|hour| !supported.contains(hour)) {
+        let min = supported.first().copied().unwrap_or(0);
         let max = supported.last().copied().unwrap_or(0);
         let cadence = forecast_hour_cadence_note(model, cycle_hour_utc, max);
         return Err(format!(
             "--hours: f{bad:03} is not a valid {model} forecast hour for the {cycle_hour_utc:02}z \
-             cycle (valid hours run 0..={max}; {cadence})"
+             cycle (valid hours run f{min:03}..=f{max:03}; {cadence})"
         )
         .into());
     }
@@ -1837,9 +1954,27 @@ fn forecast_hour_cadence_note(model: ModelId, cycle_hour_utc: u8, max: u16) -> S
         ModelId::EcmwfOpenData => {
             "ECMWF Open Data is 3-hourly to f144, then 6-hourly on 00/12z cycles".to_string()
         }
+        ModelId::Aifs => "AIFS Single v2 is 6-hourly from f000 through f360".to_string(),
         ModelId::Rap => "RAP is hourly; 03/09/15/21z cycles extend to f051".to_string(),
         ModelId::Nam => "NAM is hourly to f036, then 3-hourly to f084".to_string(),
+        ModelId::Hiresw => "HIRESW CONUS ARW is hourly from f000 through f048".to_string(),
+        ModelId::Href => "HREF CONUS ensemble means are hourly from f001 through f048".to_string(),
+        ModelId::Sref => "SREF ensemble means are 3-hourly from f000 through f087".to_string(),
+        ModelId::Rtma => "RTMA is an hourly analysis; only f000 is valid".to_string(),
+        ModelId::Urma => "URMA is an hourly analysis; only f000 is valid".to_string(),
+        ModelId::Nbm => {
+            "NBM is hourly through f036, 3-hourly through f192, then 6-hourly through f264"
+                .to_string()
+        }
         ModelId::RrfsA => "RRFS-A is hourly to f060".to_string(),
+        ModelId::RrfsPublic => {
+            if cycle_hour_utc % 6 == 0 {
+                "RRFS Public CONUS is hourly to f084 on 00/06/12/18z cycles".to_string()
+            } else {
+                "RRFS Public CONUS is hourly to f018 on 03/09/15/21z cycles".to_string()
+            }
+        }
+        ModelId::Refs => "REFS CONUS ensemble means are hourly from f001 through f060".to_string(),
         _ => format!("see the model cadence table for supported hours through f{max:03}"),
     }
 }
@@ -1872,7 +2007,7 @@ mod tests {
         };
         let fetched = FetchedHour {
             hour: 4,
-            prs: make("prs", &prs_bytes),
+            prs: Some(make("prs", &prs_bytes)),
             sfc: make("sfc", &sfc_bytes),
             prs_fetch_ms: 123,
             sfc_fetch_ms: 456,
@@ -1884,10 +2019,32 @@ mod tests {
         assert_eq!(rehydrated.hour, 4);
         assert_eq!(rehydrated.prs_fetch_ms, 123);
         assert_eq!(rehydrated.sfc_fetch_ms, 456);
-        assert_eq!(rehydrated.prs.result.bytes, prs_bytes);
+        let prs = rehydrated.prs.as_ref().expect("pressure payload");
+        assert_eq!(prs.result.bytes, prs_bytes);
         assert_eq!(rehydrated.sfc.result.bytes, sfc_bytes);
-        assert_eq!(rehydrated.prs.result.url, "https://example.invalid/prs");
+        assert_eq!(prs.result.url, "https://example.invalid/prs");
         assert_eq!(rehydrated.sfc.result.url, "https://example.invalid/sfc");
+    }
+
+    #[test]
+    fn resolved_source_provenance_keeps_identity_but_not_fetch_urls() {
+        let dir = std::env::temp_dir().join("rw_ingest_source_provenance");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (fetched, _, _) = fetched_hour_fixture(&dir, false);
+        let provenance =
+            resolved_source_provenance(ModelId::Hrrr, fetched.prs.as_ref(), &fetched.sfc).unwrap();
+        assert_eq!(provenance.len(), 2);
+        assert_eq!(provenance[0].provider, "noaa-aws-public-data");
+        assert_eq!(provenance[0].roles, vec!["pressure"]);
+        assert_eq!(provenance[0].products, vec!["prs"]);
+        assert_eq!(provenance[1].provider, "noaa-aws-public-data");
+        assert_eq!(provenance[1].roles, vec!["surface"]);
+        assert_eq!(provenance[1].products, vec!["sfc"]);
+        let serialized = serde_json::to_string(&provenance).unwrap();
+        assert!(!serialized.contains("example.invalid"));
+        assert!(!serialized.contains("https://"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Cache-hit shape: the fetch cache file holds the exact bytes, so the
@@ -1902,7 +2059,11 @@ mod tests {
         let (fetched, prs_bytes, sfc_bytes) = fetched_hour_fixture(&dir, true);
         let spilled = fetched.spill(&spill_dir).unwrap();
         assert!(
-            spilled.prs.temp_spill.is_none() && spilled.sfc.temp_spill.is_none(),
+            spilled
+                .prs
+                .as_ref()
+                .is_some_and(|prs| prs.temp_spill.is_none())
+                && spilled.sfc.temp_spill.is_none(),
             "a usable cache copy must spill without writing"
         );
         assert!(
@@ -1911,7 +2072,28 @@ mod tests {
         );
         let rehydrated = spilled.rehydrate().unwrap();
         assert_round_trip(&rehydrated, &prs_bytes, &sfc_bytes);
-        assert!(rehydrated.prs.cache_hit && rehydrated.sfc.cache_hit);
+        assert!(
+            rehydrated.prs.as_ref().is_some_and(|prs| prs.cache_hit) && rehydrated.sfc.cache_hit
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_round_trips_a_surface_only_hour_without_pressure_bytes() {
+        let dir = std::env::temp_dir().join("rw_ingest_spill_test_surface_only");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spill_dir = dir.join("spill");
+
+        let (mut fetched, _, sfc_bytes) = fetched_hour_fixture(&dir, true);
+        fetched.prs = None;
+        fetched.prs_fetch_ms = 0;
+        let spilled = fetched.spill(&spill_dir).unwrap();
+        assert!(spilled.prs.is_none(), "must not synthesize a prs spill");
+        let rehydrated = spilled.rehydrate().unwrap();
+        assert!(rehydrated.prs.is_none(), "must not synthesize prs bytes");
+        assert_eq!(rehydrated.prs_fetch_ms, 0);
+        assert_eq!(rehydrated.sfc.result.bytes, sfc_bytes);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1926,13 +2108,19 @@ mod tests {
 
         let (fetched, prs_bytes, sfc_bytes) = fetched_hour_fixture(&dir, false);
         let spilled = fetched.spill(&spill_dir).unwrap();
-        let prs_temp = spilled.prs.temp_spill.clone().expect("prs spill file");
+        let prs_temp = spilled
+            .prs
+            .as_ref()
+            .and_then(|prs| prs.temp_spill.clone())
+            .expect("prs spill file");
         let sfc_temp = spilled.sfc.temp_spill.clone().expect("sfc spill file");
         assert_eq!(std::fs::read(&prs_temp).unwrap(), prs_bytes);
         assert_eq!(std::fs::read(&sfc_temp).unwrap(), sfc_bytes);
         let rehydrated = spilled.rehydrate().unwrap();
         assert_round_trip(&rehydrated, &prs_bytes, &sfc_bytes);
-        assert!(!rehydrated.prs.cache_hit && !rehydrated.sfc.cache_hit);
+        assert!(
+            rehydrated.prs.as_ref().is_some_and(|prs| !prs.cache_hit) && !rehydrated.sfc.cache_hit
+        );
         assert!(
             !prs_temp.exists() && !sfc_temp.exists(),
             "spill files must be deleted after rehydration"
@@ -1951,10 +2139,17 @@ mod tests {
 
         let (fetched, prs_bytes, sfc_bytes) = fetched_hour_fixture(&dir, true);
         // Truncate the prs cache copy: its length no longer matches.
-        std::fs::write(&fetched.prs.bytes_path, &prs_bytes[..100]).unwrap();
+        std::fs::write(
+            &fetched.prs.as_ref().expect("pressure payload").bytes_path,
+            &prs_bytes[..100],
+        )
+        .unwrap();
         let spilled = fetched.spill(&spill_dir).unwrap();
         assert!(
-            spilled.prs.temp_spill.is_some(),
+            spilled
+                .prs
+                .as_ref()
+                .is_some_and(|prs| prs.temp_spill.is_some()),
             "mismatched cache copy must force a spill file"
         );
         assert!(
@@ -2115,7 +2310,8 @@ mod tests {
     /// APCP honesty: the GFS full 2D plan must NOT claim `apcp_1h` (nor the
     /// other HRRR-trick trailing fields), because GFS `pgrb2` APCP is a
     /// bucketed accumulation (0-6h resets) the re-select can't honestly turn
-    /// into a 1 h increment. HRRR's plan keeps the trailing set unchanged.
+    /// into a 1 h increment. HRRR and RRFS Public keep their natively
+    /// published trailing sets.
     #[test]
     fn gfs_full_plan_excludes_apcp_1h_but_hrrr_keeps_it() {
         let hrrr = planned_store_variables(&IngestProfile::full(), ModelId::Hrrr);
@@ -2129,6 +2325,14 @@ mod tests {
                 .contains(&"wind_speed_10m_max_1h".to_string())
         );
 
+        let rrfs_public = planned_store_variables(&IngestProfile::full(), ModelId::RrfsPublic);
+        for trailing in TRAILING_2D_NAMES {
+            assert!(
+                rrfs_public.fields_2d.contains(&trailing.to_string()),
+                "RRFS Public publishes the trailing 1 h field '{trailing}' natively"
+            );
+        }
+
         let gfs = planned_store_variables(&IngestProfile::full(), ModelId::Gfs);
         for trailing in TRAILING_2D_NAMES {
             assert!(
@@ -2141,6 +2345,28 @@ mod tests {
             gfs.fields_2d.contains(&"apcp_run_total".to_string()),
             "GFS still stores the plain run-total accumulation"
         );
+    }
+
+    #[test]
+    fn model_native_intervals_are_not_mislabeled_as_cumulative_or_instantaneous() {
+        let surface = IngestProfile::surface();
+        for model in [ModelId::Nbm, ModelId::Href] {
+            let plan = planned_store_variables(&surface, model);
+            assert!(plan.fields_2d.contains(&"apcp_1h".to_string()));
+            assert!(!plan.fields_2d.contains(&"apcp_run_total".to_string()));
+        }
+
+        let sref = planned_store_variables(&surface, ModelId::Sref);
+        assert!(sref.fields_2d.contains(&"apcp_3h".to_string()));
+        assert!(!sref.fields_2d.contains(&"apcp_run_total".to_string()));
+
+        let refs = planned_store_variables(&surface, ModelId::Refs);
+        assert!(refs.fields_2d.contains(&"apcp_native_interval".to_string()));
+        assert!(!refs.fields_2d.contains(&"apcp_run_total".to_string()));
+
+        let hiresw = planned_store_variables(&surface, ModelId::Hiresw);
+        assert!(hiresw.fields_2d.contains(&"uh_2to5km_max_1h".to_string()));
+        assert!(!hiresw.fields_2d.contains(&"uh_2to5km".to_string()));
     }
 
     #[test]
@@ -2220,7 +2446,7 @@ mod tests {
 
         let fetched = FetchedHour {
             hour: 6,
-            prs: rustwx_io::CachedFetchResult {
+            prs: Some(rustwx_io::CachedFetchResult {
                 result: rustwx_io::FetchResult {
                     source: SourceId::Aws,
                     url: String::new(),
@@ -2229,7 +2455,7 @@ mod tests {
                 cache_hit: true,
                 bytes_path: PathBuf::new(),
                 metadata_path: PathBuf::new(),
-            },
+            }),
             sfc: rustwx_io::CachedFetchResult {
                 result: rustwx_io::FetchResult {
                     source: SourceId::Aws,
@@ -2273,6 +2499,79 @@ mod tests {
             validate_forecast_hours(ModelId::Gfs, cycle, &[385]).is_err(),
             "f385 is past the GFS horizon"
         );
+    }
+
+    #[test]
+    fn validate_forecast_hours_enforces_nbm_native_cadence() {
+        validate_forecast_hours(ModelId::Nbm, 12, &[1, 36, 39, 192, 198, 264])
+            .expect("native NBM forecast hours pass");
+
+        for invalid in [0, 37, 193, 195, 265] {
+            let err = validate_forecast_hours(ModelId::Nbm, 12, &[invalid])
+                .expect_err("off-cadence NBM hour must fail");
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("f{invalid:03}")),
+                "got: {message}"
+            );
+            assert!(message.contains("f001..=f264"), "got: {message}");
+            assert!(message.contains("3-hourly through f192"), "got: {message}");
+            assert!(message.contains("6-hourly through f264"), "got: {message}");
+        }
+    }
+
+    #[test]
+    fn validate_forecast_hours_enforces_aifs_open_data_cadence() {
+        validate_forecast_hours(ModelId::Aifs, 18, &[0, 6, 24, 360])
+            .expect("official AIFS Open Data hours pass");
+
+        for invalid in [3, 359, 366] {
+            let message = validate_forecast_hours(ModelId::Aifs, 18, &[invalid])
+                .expect_err("off-cadence or out-of-range AIFS hour must fail")
+                .to_string();
+            assert!(
+                message.contains(&format!("f{invalid:03}")),
+                "got: {message}"
+            );
+            assert!(message.contains("6-hourly"), "got: {message}");
+            assert!(message.contains("f360"), "got: {message}");
+        }
+        assert!(validate_forecast_hours(ModelId::Aifs, 3, &[0]).is_err());
+    }
+
+    #[test]
+    fn validate_forecast_hours_enforces_regional_ensemble_cadences() {
+        let cases: &[(ModelId, u8, &[u16], u16, &str)] = &[
+            (ModelId::Hiresw, 0, &[0, 24, 48], 49, "hourly from f000"),
+            (ModelId::Href, 6, &[1, 24, 48], 0, "hourly from f001"),
+            (ModelId::Sref, 3, &[0, 3, 87], 1, "3-hourly from f000"),
+            (ModelId::Refs, 12, &[1, 24, 60], 0, "hourly from f001"),
+        ];
+        for (model, cycle, valid, invalid, cadence) in cases {
+            validate_forecast_hours(*model, *cycle, valid)
+                .unwrap_or_else(|err| panic!("{model} native hours rejected: {err}"));
+            let message = validate_forecast_hours(*model, *cycle, &[*invalid])
+                .expect_err("off-cadence lead must fail")
+                .to_string();
+            assert!(
+                message.contains(&format!("f{invalid:03}")),
+                "got: {message}"
+            );
+            assert!(message.contains(cadence), "got: {message}");
+        }
+    }
+
+    #[test]
+    fn validate_forecast_hours_enforces_hourly_analysis_as_f000_only() {
+        for model in [ModelId::Rtma, ModelId::Urma] {
+            validate_forecast_hours(model, 17, &[0])
+                .expect("every UTC hour publishes one f000 analysis");
+            let message = validate_forecast_hours(model, 17, &[1])
+                .expect_err("an analysis has no positive forecast lead")
+                .to_string();
+            assert!(message.contains("f001"), "got: {message}");
+            assert!(message.contains("only f000 is valid"), "got: {message}");
+        }
     }
 
     #[test]
@@ -2332,6 +2631,26 @@ mod tests {
         assert!(message.contains("f061"), "must name the hour: {message}");
     }
 
+    #[test]
+    fn validate_forecast_hours_enforces_rrfs_public_cycle_horizons() {
+        validate_forecast_hours(ModelId::RrfsPublic, 0, &[0, 18, 84])
+            .expect("00z RRFS Public reaches f084");
+        assert!(validate_forecast_hours(ModelId::RrfsPublic, 0, &[85]).is_err());
+
+        validate_forecast_hours(ModelId::RrfsPublic, 3, &[0, 18])
+            .expect("03z RRFS Public reaches f018");
+        let err = validate_forecast_hours(ModelId::RrfsPublic, 3, &[19])
+            .expect_err("03z RRFS Public stops at f018");
+        let message = err.to_string();
+        assert!(message.contains("f019"), "got: {message}");
+        assert!(message.contains("f018"), "got: {message}");
+
+        assert!(
+            validate_forecast_hours(ModelId::RrfsPublic, 1, &[0]).is_err(),
+            "01z has no main CONUS pressure/2-D RRFS Public cycle"
+        );
+    }
+
     /// HRRR cadence is unchanged: f018 is valid on every cycle, the 6-hourly
     /// cycles reach f048, and f019 is rejected on an off-synoptic cycle.
     #[test]
@@ -2350,7 +2669,7 @@ mod tests {
     #[test]
     fn single_file_flag_matches_fetch_plan_entry_count() {
         let gfs_is_single = fetch_plan(ModelId::Gfs)
-            .map(|plan| plan.len() == 1)
+            .map(|plan| plan.len() == 1 && plan[0].pressure_source && plan[0].surface_source)
             .unwrap_or(false);
         assert!(
             gfs_is_single,
@@ -2358,11 +2677,18 @@ mod tests {
         );
 
         let hrrr_is_single = fetch_plan(ModelId::Hrrr)
-            .map(|plan| plan.len() == 1)
+            .map(|plan| plan.len() == 1 && plan[0].pressure_source && plan[0].surface_source)
             .unwrap_or(false);
         assert!(
             !hrrr_is_single,
             "HRRR fetch plan has two entries → not single_file"
+        );
+        let rtma_is_single = fetch_plan(ModelId::Rtma)
+            .map(|plan| plan.len() == 1 && plan[0].pressure_source && plan[0].surface_source)
+            .unwrap_or(false);
+        assert!(
+            !rtma_is_single,
+            "RTMA has one physical file but it serves only the surface role"
         );
     }
 

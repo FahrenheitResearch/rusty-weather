@@ -94,15 +94,33 @@ impl Fonts {
     fn new(hgt: f64, style: &SkewTStyle) -> Fonts {
         const PT: f64 = 4.0 / 3.0;
         let fsize = 7.0;
-        let bold = style.font_bold.clone();
         let label_pt = fsize + hgt * 0.0045;
         let critical_pt = fsize + 2.0 + hgt * 0.0045;
         Fonts {
-            label: FontId::new((label_pt * PT) as f32, bold.clone()),
-            critical: FontId::new((critical_pt * PT) as f32, bold),
+            label: style.bold_font((label_pt * PT) as f32),
+            critical: style.bold_font((critical_pt * PT) as f32),
             // xHeight() + 5 + hgt*0.0045, approximated like skewt::Fonts.
             critical_height: critical_pt * PT * 0.5 + 5.0 + hgt * 0.0045,
         }
+    }
+}
+
+#[cfg(test)]
+mod typography_tests {
+    use super::*;
+    use crate::skewt::SoundingFontPreset;
+
+    #[test]
+    fn shared_typography_reaches_hodograph_labels_without_geometry_scaling() {
+        let base = Fonts::new(440.0, &SkewTStyle::default());
+        let style = SkewTStyle::default()
+            .with_font_preset(SoundingFontPreset::TechnicalMonospace)
+            .with_text_scale(1.4);
+        let scaled = Fonts::new(440.0, &style);
+
+        assert!((scaled.label.size - base.label.size * 1.4).abs() < 0.001);
+        assert_eq!(scaled.label.family, egui::FontFamily::Monospace);
+        assert_eq!(scaled.critical_height, base.critical_height);
     }
 }
 
@@ -585,7 +603,7 @@ pub(crate) fn cursor_marker(
         crate::utils::int2str(wdir),
         crate::utils::int2str(wspd)
     );
-    let font = FontId::new(11.0, style.font_regular.clone());
+    let font = style.regular_font(11.0);
     let galley = p.layout_no_wrap(text, font, style.fg_color);
     let mut anchor = c + Vec2::new(8.0, -8.0 - galley.size().y);
     if anchor.x + galley.size().x > rect.max.x - 2.0 {

@@ -1,0 +1,50 @@
+# Deterministic, fail-closed license policy for cargo-about 0.8.4.
+#
+# Keep dependency classes and supported targets explicit so that a notice
+# generated on one CI host covers the same graph as a notice generated on
+# another. A dependency with an unsatisfied or unknown license must fail
+# generation; this file intentionally contains no blanket clarification or
+# NOASSERTION/missing-license filter.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "0BSD",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT-0",
+    "NCSA",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+ignore-build-dependencies = false
+ignore-dev-dependencies = false
+ignore-transitive-dependencies = false
+filter-noassertion = false
+private = { ignore = false }
+
+# These additional permissive terms apply only to the named legacy packages;
+# they are not accepted globally for future dependencies.
+[ring]
+accepted = ["OpenSSL"]
+
+[unicode-ident]
+accepted = ["Unicode-DFS-2016"]

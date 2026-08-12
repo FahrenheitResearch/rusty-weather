@@ -275,7 +275,8 @@ struct Args {
         long,
         default_value = "full",
         help = "Ingest profile: full (everything, today's default), sounding (5 volumes + 7 \
-                surface fields, no compute stages), view (all 2D incl. derived, no volumes). \
+                surface fields, no compute stages), view (all 2D incl. derived, no volumes), \
+                analysis (RTMA/URMA surface fields only). \
                 Products whose store variables a profile excludes skip at render"
     )]
     profile: String,
@@ -566,6 +567,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         model: args.model,
         date_yyyymmdd: args.date.clone(),
         cycle_utc: args.cycle,
+        exact_time: None,
         source: provenance_source,
         domain: domain.clone(),
         out_dir: args.out_dir.clone(),
@@ -683,6 +685,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                         cache_state(ingested.prs_cache_hit),
                         ingested.prs_mb,
                     )
+                } else if !ingested.has_pressure_source {
+                    format!(
+                        "sfc fetch {} ms ({}, {:.1} MB, surface-only)",
+                        ingested.sfc_fetch_ms,
+                        cache_state(ingested.sfc_cache_hit),
+                        ingested.sfc_mb,
+                    )
                 } else {
                     format!(
                         "prs fetch {} ms ({}, {:.1} MB) | sfc fetch {} ms ({}, {:.1} MB)",
@@ -725,6 +734,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     hour,
                     &request.direct,
                     &request.derived,
+                    &request.generic,
                     Some(&chunk_gate),
                 )
                 .map_err(|err| format!("f{hour:03}: render: {err}"))?;
@@ -931,6 +941,15 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                         "file_ms": ingested.prs_fetch_ms,
                         "file_cache_hit": ingested.prs_cache_hit,
                         "file_mb": ingested.prs_mb,
+                    })
+                } else if !ingested.has_pressure_source {
+                    serde_json::json!({
+                        "wall_ms": ingested.sfc_fetch_ms,
+                        "cpu_ms": report.fetch_cpu_ms,
+                        "surface_only": true,
+                        "sfc_ms": ingested.sfc_fetch_ms,
+                        "sfc_cache_hit": ingested.sfc_cache_hit,
+                        "sfc_mb": ingested.sfc_mb,
                     })
                 } else {
                     serde_json::json!({

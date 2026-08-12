@@ -34,6 +34,13 @@ pub use ingest::{
     write_hour_from_grid_with_derived_exact,
 };
 pub use lock::{LOCK_FILE_NAME, RunLock};
+pub use reader::{
+    FieldStats2D, PressureLevelChunk3D, PressureLevelChunkData3D, PressureLevelChunkGeometry3D,
+    PressureLevelChunks3D, SelectedPressureLevelChunk3D, SelectedPressureLevelChunkData3D,
+    SelectedPressureLevelChunkGeometry3D, SelectedPressureLevelChunks3D,
+    SelectedPressureLevelPlane3D, Tile2D, TileData2D, TileGeometry2D, Tiles2D,
+};
+pub use run::RwsSourceProvenance;
 pub use validate::{
     ValidateDepth, ValidationReport, ValidationStats, validate_hour_file, validate_run_dir,
 };

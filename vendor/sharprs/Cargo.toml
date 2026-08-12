@@ -3,8 +3,8 @@ name = "sharprs"
 version = "0.1.0"
 edition = "2021"
 description = "Sounding/Hodograph Analysis and Research Program — Rust port of SHARPpy's sharptab"
-license = "BSD-3-Clause"
-repository = "https://github.com/yourusername/sharprs"
+license = "MIT AND BSD-3-Clause"
+repository = "https://github.com/FahrenheitResearch/rusty-weather"
 
 [lib]
 name = "sharprs"
@@ -22,7 +22,7 @@ wasm = ["wasm-bindgen"]
 
 [dependencies]
 thiserror = "2"
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["png"] }
 rusttype = "0.9"
 
 # Optional: Python bindings via PyO3

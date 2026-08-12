@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use ecape_rs::{CapeType, ParcelOptions, StormMotionType, calc_ecape_parcel};
+use ecape_rs::{CapeType, ParcelOptions, StormMotionType, calc_ecape_ncape, calc_ecape_parcel};
 use image::ImageFormat;
 use serde::{Deserialize, Serialize};
 use sharprs::Profile as SharprsProfile;
@@ -257,8 +257,11 @@ impl NativeSounding {
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VerifiedEcapeParcelParams {
+    /// Peters-style analytic ECAPE from `calc_ecape_ncape`.
     pub ecape: f64,
+    /// NCAPE paired with the analytic ECAPE calculation.
     pub ncape: f64,
+    /// Non-entraining parcel CAPE fallback for the native SHARPpy table.
     pub cape: f64,
     pub cinh: f64,
     pub cape_3km: f64,
@@ -320,6 +323,7 @@ struct EcapeProfileInputs {
     height_m: Vec<f64>,
     temperature_k: Vec<f64>,
     dewpoint_k: Vec<f64>,
+    qv_kgkg: Vec<f64>,
     u_ms: Vec<f64>,
     v_ms: Vec<f64>,
     surface_height_m: f64,
@@ -343,6 +347,7 @@ impl EcapeProfileInputs {
         let mut height_m = Vec::with_capacity(profile.num_levels());
         let mut temperature_k = Vec::with_capacity(profile.num_levels());
         let mut dewpoint_k = Vec::with_capacity(profile.num_levels());
+        let mut qv_kgkg = Vec::with_capacity(profile.num_levels());
         let mut u_ms = Vec::with_capacity(profile.num_levels());
         let mut v_ms = Vec::with_capacity(profile.num_levels());
 
@@ -367,6 +372,10 @@ impl EcapeProfileInputs {
                 height_m.push(h_m);
                 temperature_k.push(t_k);
                 dewpoint_k.push(td_k);
+                qv_kgkg.push(wx_math::thermo::specific_humidity_from_dewpoint(
+                    p_pa / 100.0,
+                    td_k - 273.15,
+                ));
                 u_ms.push(u);
                 v_ms.push(v);
             }
@@ -382,6 +391,7 @@ impl EcapeProfileInputs {
             height_m,
             temperature_k,
             dewpoint_k,
+            qv_kgkg,
             u_ms,
             v_ms,
         })
@@ -398,11 +408,14 @@ fn verified_ecape_parcel(
         pseudoadiabatic: Some(true),
         ..ParcelOptions::default()
     };
-    let entraining = calc_ecape_parcel(
+    // The ECAPE column is the standard analytic quantity. Do not select
+    // calc_ecape_parcel().ecape_jkg here: that field applies the analytic
+    // entrainment equation again after following an already-entraining path.
+    let analytic = calc_ecape_ncape(
         &inputs.height_m,
         &inputs.pressure_pa,
         &inputs.temperature_k,
-        &inputs.dewpoint_k,
+        &inputs.qv_kgkg,
         &inputs.u_ms,
         &inputs.v_ms,
         &base_options,
@@ -422,7 +435,7 @@ fn verified_ecape_parcel(
         &undiluted_options,
     );
 
-    let Ok(entraining) = entraining else {
+    let Ok(analytic) = analytic else {
         return VerifiedEcapeParcelParams::missing();
     };
     let Ok(undiluted) = undiluted else {
@@ -430,8 +443,8 @@ fn verified_ecape_parcel(
     };
 
     VerifiedEcapeParcelParams {
-        ecape: entraining.ecape_jkg,
-        ncape: entraining.ncape_jkg,
+        ecape: analytic.ecape_jkg,
+        ncape: analytic.ncape_jkg,
         cape: undiluted.cape_jkg,
         cinh: undiluted.cin_jkg,
         cape_3km: positive_buoyancy_to_depth(&undiluted, 3000.0),

@@ -94,9 +94,10 @@ fn worker_main(requests: Receiver<ObsRequest>, responses: Sender<ObsResponse>, n
 fn build_agent() -> ureq::Agent {
     static PROVIDER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     PROVIDER.get_or_init(|| {
-        rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider()).ok();
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+            .ok();
     });
-    let crypto = std::sync::Arc::new(rustls_rustcrypto::provider());
+    let crypto = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(45)))
         .tls_config(

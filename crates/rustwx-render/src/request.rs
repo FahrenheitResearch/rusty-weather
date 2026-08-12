@@ -1303,7 +1303,7 @@ mod tests {
             request.scale,
             ColorScale::Weather(crate::weather::WeatherPreset::Ecape)
         ));
-        assert_eq!(request.title.as_deref(), Some("MLECAPE"));
+        assert_eq!(request.title.as_deref(), Some("ML ANALYTIC ECAPE"));
         assert_eq!(request.cbar_tick_step, Some(500.0));
         assert_eq!(
             request

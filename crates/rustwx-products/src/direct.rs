@@ -74,9 +74,12 @@ use projection::{
 };
 pub use projection::{
     build_natural_projected_map_with_projection,
-    build_natural_projected_map_with_projection_and_basemap_padding, build_projected_map,
-    build_projected_map_with_projection, build_requested_projected_map_with_projection,
-    model_data_domain_frame_for_projection,
+    build_natural_projected_map_with_projection_and_basemap_detail,
+    build_natural_projected_map_with_projection_and_basemap_padding,
+    build_natural_projected_map_with_projection_and_basemap_padding_and_detail,
+    build_projected_map, build_projected_map_with_projection,
+    build_projected_map_with_projection_and_basemap_detail,
+    build_requested_projected_map_with_projection, model_data_domain_frame_for_projection,
 };
 pub(crate) use query::{load_direct_sampled_fields_from_latest, required_direct_fetch_products};
 #[cfg(test)]

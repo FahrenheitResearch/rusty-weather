@@ -7,12 +7,20 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytemuck = "1"
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 memmap2 = "0.9"
 rayon.workspace = true
+same-file = "1"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 thiserror.workspace = true
 zstd = "0.13"
 rustwx-core = { path = "../rustwx-core" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_WindowsProgramming",
+] }

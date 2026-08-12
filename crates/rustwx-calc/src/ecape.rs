@@ -149,9 +149,16 @@ impl<'a> EcapeTripletOptions<'a> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EcapeFields {
+    /// Analytic ECAPE for `compute_analytic_*` entry points. Explicit
+    /// parcel-path entry points retain ecape-rs' post-path analytic field;
+    /// do not present that variant as standard ECAPE.
     pub ecape_jkg: Vec<f64>,
+    /// NCAPE paired with the selected solver path.
     pub ncape_jkg: Vec<f64>,
+    /// Reference CAPE for analytic entry points; integrated entraining
+    /// parcel-path CAPE for explicit parcel-path entry points.
     pub cape_jkg: Vec<f64>,
+    /// Integrated entraining parcel-path CIN (zero in analytic-only results).
     pub cin_jkg: Vec<f64>,
     pub lfc_m: Vec<f64>,
     pub el_m: Vec<f64>,
@@ -189,6 +196,10 @@ pub struct EcapeTripletFields {
     pub mu: EcapeFields,
 }
 
+/// Follow an explicit entraining parcel path.
+///
+/// `cape_jkg` is the integrated entraining parcel CAPE. `ecape_jkg` is the
+/// legacy post-path analytic field and is not the standard analytic ECAPE.
 pub fn compute_ecape(
     inputs: EcapeGridInputs<'_>,
     options: &EcapeOptions<'_>,
@@ -205,6 +216,11 @@ pub fn compute_ecape_with_failure_mask(
     compute_ecape_with_failure_mask_from_parts(inputs.shape.grid, volume, surface, *options)
 }
 
+/// Follow explicit SB/ML/MU entraining parcel paths.
+///
+/// Use `cape_jkg` for entraining parcel-path CAPE. Use
+/// [`compute_analytic_ecape_triplet_with_failure_mask_from_parts`] when the
+/// product is labeled ECAPE.
 pub fn compute_ecape_triplet_with_failure_mask(
     inputs: EcapeGridInputs<'_>,
     options: &EcapeTripletOptions<'_>,
@@ -404,6 +420,8 @@ pub fn compute_ecape_triplet_with_failure_mask_from_parts(
     })
 }
 
+/// Compute standard Peters-style analytic SB/ML/MU ECAPE and NCAPE without
+/// applying a second analytic step to an already-entraining parcel path.
 pub fn compute_analytic_ecape_triplet_with_failure_mask_from_parts(
     grid: GridShape,
     volume: EcapeVolumeInputs<'_>,

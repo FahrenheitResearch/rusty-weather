@@ -14,7 +14,7 @@ Requirements:
   - sharprs built as a cdylib or callable binary (future)
 
 Usage:
-  cd /tmp/SHARPpy && PYTHONPATH=/tmp/SHARPpy python C:/Users/drew/sharprs/tests/compare_sharppy.py
+  cd /tmp/SHARPpy && PYTHONPATH=/tmp/SHARPpy python C:/work/sharprs/tests/compare_sharppy.py
 """
 
 from __future__ import annotations

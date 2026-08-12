@@ -1,6 +1,6 @@
 [package]
 name = "rusty-weather-ui"
-version = "0.1.0"
+version = "0.5.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
@@ -16,14 +16,13 @@ netcrust = { path = "../../vendor/netcrust" }
 rayon.workspace = true
 rfd = "0.15"
 rustls.workspace = true
-rustls-rustcrypto.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 sharprs = { path = "../../vendor/sharprs" }
 thiserror = { workspace = true }
+wrf-core = { path = "../../vendor/wrf-rust/crates/wrf-core", default-features = false, features = ["pure-rust-reader"] }
 ureq.workspace = true
-wrf-core = { git = "https://github.com/FahrenheitResearch/wrf-rust.git", rev = "2550d4e2f85c61a190cf639d59e713f553facd07", package = "wrf-core", default-features = false, features = ["pure-rust-reader"] }
 rustwx-core = { path = "../rustwx-core" }
 rustwx-io = { path = "../rustwx-io" }
 rustwx-models = { path = "../rustwx-models" }

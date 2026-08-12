@@ -10,6 +10,11 @@ const SAMPLE_IDX: &str = "\
 5:200000:d=2026041420:VGRD:10 m above ground:anl:
 ";
 
+const AIFS_INDEX_SAMPLE: &str = r#"{"domain": "g", "date": "20260810", "time": "0000", "expver": "0001", "class": "ai", "type": "fc", "stream": "oper", "step": "24", "levelist": "925", "levtype": "pl", "param": "q", "model": "aifs-single", "_offset": 2465216, "_length": 647313}
+{"domain": "g", "date": "20260810", "time": "0000", "expver": "0001", "class": "ai", "type": "fc", "stream": "oper", "step": "24", "levelist": "250", "levtype": "pl", "param": "t", "model": "aifs-single", "_offset": 3112529, "_length": 488724}
+{"domain": "g", "date": "20260810", "time": "0000", "expver": "0001", "class": "ai", "type": "fc", "stream": "oper", "step": "24", "levtype": "sfc", "param": "2t", "model": "aifs-single", "_offset": 82676279, "_length": 551319}
+"#;
+
 #[test]
 fn gzip_grib_payloads_are_decompressed_before_decode() {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -23,6 +28,21 @@ fn gzip_grib_payloads_are_decompressed_before_decode() {
     .expect("gzip payload decodes");
 
     assert_eq!(decoded, b"GRIBtest");
+}
+
+#[test]
+fn download_oom_guard_rejects_gzip_output_past_limit() {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&[0_u8; 256]).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let error = decompress_gzip_payload_with_limit(
+        "https://example.invalid/decompression-bomb.grib2.gz",
+        &compressed,
+        64,
+    )
+    .expect_err("expanded payload must be bounded");
+    assert!(error.contains("exceeds the 64 byte limit"));
 }
 
 #[test]
@@ -377,6 +397,175 @@ fn ieee_f32_message(
 }
 
 #[test]
+fn parsed_model_grib_repeated_passes_match_fresh_parse_results() {
+    use wx_core::grib2::{
+        Grib2Writer, GridDefinition as WxGridDefinition, MessageBuilder, PackingMethod,
+        ProductDefinition as WxProductDefinition,
+    };
+
+    let grid = WxGridDefinition {
+        template: 0,
+        nx: 2,
+        ny: 2,
+        lat1: 40.0,
+        lon1: -105.0,
+        lat2: 39.0,
+        lon2: -104.0,
+        dx: 1.0,
+        dy: 1.0,
+        scan_mode: 0,
+        ..WxGridDefinition::default()
+    };
+    let message = |category, number, values| {
+        MessageBuilder::new(0, values)
+            .grid(grid.clone())
+            .product(WxProductDefinition {
+                template: 0,
+                parameter_category: category,
+                parameter_number: number,
+                generating_process: 2,
+                forecast_time: 6,
+                time_range_unit: 1,
+                level_type: 100,
+                level_value: 50_000.0,
+            })
+            .packing(PackingMethod::Simple { bits_per_value: 16 })
+    };
+    let bytes = Grib2Writer::new()
+        .add_message(message(0, 0, vec![250.0, 251.0, 252.0, 253.0]))
+        .add_message(message(1, 1, vec![40.0, 50.0, 60.0, 70.0]))
+        .to_bytes()
+        .unwrap();
+    let primary = [
+        FieldSelector::isobaric(CanonicalField::Temperature, 500),
+        FieldSelector::isobaric(CanonicalField::Temperature, 700),
+    ];
+    let alternate = [FieldSelector::isobaric(
+        CanonicalField::RelativeHumidity,
+        500,
+    )];
+
+    let fresh_primary = extract_field_values_partial_from_model_bytes_at_forecast_hour(
+        ModelId::Hrrr,
+        &bytes,
+        None,
+        &primary,
+        Some(6),
+    )
+    .unwrap();
+    let fresh_alternate = extract_field_values_partial_from_model_bytes_at_forecast_hour(
+        ModelId::Hrrr,
+        &bytes,
+        None,
+        &alternate,
+        Some(6),
+    )
+    .unwrap();
+    let parsed = ParsedModelGrib::from_model_bytes(ModelId::Hrrr, &bytes).unwrap();
+    let reused_primary = parsed
+        .extract_field_values_partial_at_forecast_hour(&primary, Some(6))
+        .unwrap();
+    let reused_alternate = parsed
+        .extract_field_values_partial_at_forecast_hour(&alternate, Some(6))
+        .unwrap();
+
+    let assert_same = |actual: &PartialValuesExtraction, expected: &PartialValuesExtraction| {
+        assert_eq!(actual.missing, expected.missing);
+        assert_eq!(actual.grids.len(), expected.grids.len());
+        for (actual, expected) in actual.grids.iter().zip(&expected.grids) {
+            assert_eq!(actual.grid, expected.grid);
+            assert_eq!(actual.projection, expected.projection);
+        }
+        assert_eq!(actual.extracted.len(), expected.extracted.len());
+        for (actual, expected) in actual.extracted.iter().zip(&expected.extracted) {
+            assert_eq!(actual.selector, expected.selector);
+            assert_eq!(actual.units, expected.units);
+            assert_eq!(actual.grid_index, expected.grid_index);
+            assert_eq!(
+                actual
+                    .values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+    };
+    assert_same(&reused_primary, &fresh_primary);
+    assert_same(&reused_alternate, &fresh_alternate);
+}
+
+#[test]
+fn aifs_specific_humidity_synthesizes_pressure_level_dewpoint() {
+    use wx_core::grib2::{
+        Grib2Writer, GridDefinition as WxGridDefinition, MessageBuilder, PackingMethod,
+        ProductDefinition as WxProductDefinition,
+    };
+
+    let grid = WxGridDefinition {
+        template: 0,
+        nx: 2,
+        ny: 2,
+        lat1: 40.0,
+        lon1: -105.0,
+        lat2: 39.0,
+        lon2: -104.0,
+        dx: 1.0,
+        dy: 1.0,
+        scan_mode: 0,
+        ..WxGridDefinition::default()
+    };
+    let q = MessageBuilder::new(0, vec![0.008, 0.009, 0.010, 0.011])
+        .grid(grid)
+        .product(WxProductDefinition {
+            template: 0,
+            parameter_category: 1,
+            parameter_number: 0,
+            generating_process: 2,
+            forecast_time: 6,
+            time_range_unit: 1,
+            level_type: 100,
+            level_value: 85_000.0,
+        })
+        .packing(PackingMethod::Simple { bits_per_value: 24 });
+    let bytes = Grib2Writer::new().add_message(q).to_bytes().unwrap();
+    let selector = FieldSelector::isobaric(CanonicalField::Dewpoint, 850);
+
+    let parsed = ParsedModelGrib::from_model_bytes(ModelId::Aifs, &bytes).unwrap();
+    let values = parsed
+        .extract_field_values_partial_at_forecast_hour(&[selector], Some(6))
+        .unwrap();
+    assert!(values.missing.is_empty());
+    assert_eq!(values.extracted.len(), 1);
+    assert_eq!(values.extracted[0].selector, selector);
+    assert_eq!(values.extracted[0].units, "K");
+    assert!(
+        values.extracted[0]
+            .values
+            .iter()
+            .all(|value| value.is_finite() && (275.0..295.0).contains(value))
+    );
+
+    let fields = extract_fields_partial_from_model_bytes_at_forecast_hour(
+        ModelId::Aifs,
+        &bytes,
+        None,
+        &[selector],
+        Some(6),
+    )
+    .unwrap();
+    assert!(fields.missing.is_empty());
+    assert_eq!(fields.extracted.len(), 1);
+    assert_eq!(fields.extracted[0].selector, selector);
+    assert_eq!(fields.extracted[0].units, "K");
+    assert_eq!(fields.extracted[0].values, values.extracted[0].values);
+}
+
+#[test]
 fn projection_metadata_is_inferred_from_grib_grid_templates() {
     let lambert = GridDefinition {
         template: 30,
@@ -444,6 +633,14 @@ fn candidate_hours_match_model_rules() {
         candidate_hours(ModelId::EcmwfOpenData, 18).last().copied(),
         Some(144)
     );
+    let nbm = candidate_hours(ModelId::Nbm, 12);
+    assert!(nbm.contains(&36));
+    assert!(nbm.contains(&39));
+    assert!(nbm.contains(&192));
+    assert!(nbm.contains(&198));
+    assert_eq!(nbm.last().copied(), Some(264));
+    assert!(!nbm.contains(&37));
+    assert!(!nbm.contains(&195));
 }
 
 #[test]
@@ -570,6 +767,185 @@ fn idx_subset_ranges_falls_back_when_idx_is_unparseable() {
         idx_subset_ranges("not an idx", &["TMP:2 m above ground"]).unwrap(),
         None
     );
+}
+
+#[test]
+fn aifs_json_index_uses_explicit_offsets_and_lengths() {
+    let ranges = idx_subset_ranges(AIFS_INDEX_SAMPLE, &["param=q", "param=2t"])
+        .unwrap()
+        .expect("AIFS JSON index ranges should exist");
+    assert_eq!(
+        ranges,
+        vec![(2_465_216, 3_112_528), (82_676_279, 83_227_597)]
+    );
+}
+
+#[test]
+fn aifs_json_index_requires_its_exact_key_value_grammar() {
+    assert_eq!(
+        idx_subset_ranges(AIFS_INDEX_SAMPLE, &["TMP:2 m above ground"]).unwrap(),
+        None
+    );
+    assert_eq!(
+        idx_subset_ranges(AIFS_INDEX_SAMPLE, &["unknown=value"]).unwrap(),
+        None
+    );
+}
+
+const NBM_IDX_SAMPLE: &str = "\
+1:1000:d=2026072512:TMP:2 m above ground:9 hour fcst:
+2:2000:d=2026072512:TMP:2 m above ground:9 hour fcst:ens std dev
+3:3000:d=2026072512:DPT:2 m above ground:9 hour fcst:
+4:4000:d=2026072512:DPT:2 m above ground:9 hour fcst:ens std dev
+5:5000:d=2026072512:PWAT:entire atmosphere (considered as a single layer):9 hour fcst:
+6:6000:d=2026072512:PWAT:entire atmosphere (considered as a single layer):9 hour fcst:10% level
+7:7000:d=2026072512:PWAT:entire atmosphere (considered as a single layer):9 hour fcst:90% level
+8:8000:d=2026072512:APCP:surface:8-9 hour acc fcst:
+9:9000:d=2026072512:APCP:surface:8-9 hour acc fcst:prob >0.254:prob fcst 255/255
+10:10000:d=2026072512:VIS:surface:9 hour fcst:
+";
+
+#[test]
+fn idx_subset_without_directive_pulls_probabilistic_companions() {
+    let patterns = [
+        "TMP:2 m above ground",
+        "DPT:2 m above ground",
+        "PWAT:entire atmosphere",
+        "APCP:surface",
+        "VIS:surface",
+    ];
+    let ranges = idx_subset_ranges(NBM_IDX_SAMPLE, &patterns)
+        .expect("subset ok")
+        .expect("some ranges");
+    assert_eq!(ranges, vec![(1000, u64::MAX)]);
+}
+
+#[test]
+fn idx_subset_deterministic_only_drops_probabilistic_companions() {
+    let patterns = [
+        IDX_DETERMINISTIC_ONLY,
+        "TMP:2 m above ground",
+        "DPT:2 m above ground",
+        "PWAT:entire atmosphere",
+        "APCP:surface",
+        "VIS:surface",
+    ];
+    let ranges = idx_subset_ranges(NBM_IDX_SAMPLE, &patterns)
+        .expect("subset ok")
+        .expect("some ranges");
+    assert_eq!(
+        ranges,
+        vec![
+            (1000, 1999),
+            (3000, 3999),
+            (5000, 5999),
+            (8000, 8999),
+            (10000, u64::MAX),
+        ]
+    );
+}
+
+#[test]
+fn idx_deterministic_only_keeps_ensemble_mean() {
+    let idx = "\
+1:1000:d=2026072512:TMP:2 m above ground:9 hour fcst:ens mean
+2:2000:d=2026072512:TMP:2 m above ground:9 hour fcst:ens std dev
+";
+    let ranges = idx_subset_ranges(idx, &[IDX_DETERMINISTIC_ONLY, "TMP:2 m above ground"])
+        .expect("subset ok")
+        .expect("some ranges");
+    assert_eq!(ranges, vec![(1000, 1999)]);
+}
+
+#[test]
+fn subset_requests_prefer_subset_capable_sources() {
+    let fetch = FetchRequest {
+        request: ModelRunRequest::new(
+            ModelId::Nbm,
+            rustwx_core::CycleSpec::new("20260725", 12).unwrap(),
+            12,
+            "core/co",
+        )
+        .unwrap(),
+        source_override: None,
+        variable_patterns: vec!["TMP:2 m above ground".to_string()],
+    };
+    let urls = filtered_urls(&fetch).expect("resolve");
+    assert!(
+        urls.len() >= 2,
+        "NBM should resolve AWS and NOMADS: {urls:?}"
+    );
+    assert!(
+        should_use_idx_subset_fetch(urls[0].source),
+        "first source must support indexed subsets: {urls:?}"
+    );
+    assert!(
+        urls.iter().any(|url| url.source == SourceId::Nomads),
+        "NOMADS must remain a whole-file fallback: {urls:?}"
+    );
+}
+
+#[test]
+fn rtma_urma_subset_requests_prefer_the_indexed_aws_archives() {
+    for model in [ModelId::Rtma, ModelId::Urma] {
+        let fetch = FetchRequest {
+            request: ModelRunRequest::new(
+                model,
+                rustwx_core::CycleSpec::new("20260810", 17).unwrap(),
+                0,
+                "2dvaranl_ndfd",
+            )
+            .unwrap(),
+            source_override: None,
+            variable_patterns: vec!["TMP:2 m above ground".to_string()],
+        };
+        let urls = filtered_urls(&fetch).expect("resolve analysis sources");
+        assert_eq!(urls[0].source, SourceId::Aws, "{model}: {urls:?}");
+        assert!(urls[0].idx_url.is_some(), "{model}: {urls:?}");
+        assert!(
+            urls.iter().any(|url| url.source == SourceId::Nomads),
+            "NOMADS must remain a whole-file fallback for {model}: {urls:?}"
+        );
+    }
+}
+
+#[test]
+fn whole_file_requests_keep_registry_source_order() {
+    let fetch = FetchRequest {
+        request: ModelRunRequest::new(
+            ModelId::Nbm,
+            rustwx_core::CycleSpec::new("20260725", 12).unwrap(),
+            12,
+            "core/co",
+        )
+        .unwrap(),
+        source_override: None,
+        variable_patterns: Vec::new(),
+    };
+    let ordered = filtered_urls(&fetch).expect("resolve");
+    let baseline = resolve_urls(&fetch.request).expect("baseline");
+    assert_eq!(
+        ordered.iter().map(|url| url.source).collect::<Vec<_>>(),
+        baseline.iter().map(|url| url.source).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn subset_request_honors_explicit_source_override() {
+    let fetch = FetchRequest {
+        request: ModelRunRequest::new(
+            ModelId::Nbm,
+            rustwx_core::CycleSpec::new("20260725", 12).unwrap(),
+            12,
+            "core/co",
+        )
+        .unwrap(),
+        source_override: Some(SourceId::Nomads),
+        variable_patterns: vec!["TMP:2 m above ground".to_string()],
+    };
+    let urls = filtered_urls(&fetch).expect("resolve");
+    assert_eq!(urls.len(), 1);
+    assert_eq!(urls[0].source, SourceId::Nomads);
 }
 
 #[test]
@@ -700,6 +1076,24 @@ fn structured_selector_matches_supported_upper_air_subset() {
     let dewpoint_700_message =
         ieee_f32_message(PARAMETER_DPT[0], 100, 70_000.0, &[270.0], -99.0, -99.0);
     assert!(dewpoint_700.matches(&dewpoint_700_message));
+
+    let total_precipitation = StructuredMessageSelector::try_from(FieldSelector::surface(
+        CanonicalField::TotalPrecipitation,
+    ))
+    .unwrap();
+    let aifs_total_precipitation = ieee_f32_message(
+        ParameterCode {
+            discipline: 0,
+            category: 1,
+            number: 52,
+        },
+        1,
+        0.0,
+        &[12.5],
+        -99.0,
+        -99.0,
+    );
+    assert!(total_precipitation.matches(&aifs_total_precipitation));
 
     let vorticity_500 = StructuredMessageSelector::try_from(FieldSelector::isobaric(
         CanonicalField::AbsoluteVorticity,

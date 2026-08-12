@@ -5,7 +5,7 @@
 //! the profile colored magenta like the hodograph split
 //! (`_install_speed_0500`, `HODO_0_500_COLOR`).
 
-use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke};
+use egui::{Align2, Color32, Painter, Pos2, Rect, Shape, Stroke};
 
 use crate::Profile;
 use crate::derived::DerivedParams;
@@ -40,8 +40,8 @@ pub fn draw(painter: &Painter, rect: Rect, prof: &Profile, dv: &DerivedParams, s
     // the SHARPpy-Reimagined render overrides.
     let title_pt = (w * 0.12).round().min(9.0) + 1.0;
     let label_pt = ((w * 0.12).round() + 2.0).min(9.0);
-    let title_font = FontId::new((title_pt * PT) as f32, style.font_regular.clone());
-    let label_font = FontId::new((label_pt * PT) as f32, style.font_regular.clone());
+    let title_font = style.regular_font((title_pt * PT) as f32);
+    let label_font = style.regular_font((label_pt * PT) as f32);
 
     // Frame border.
     let border = Stroke::new(2.0, style.fg_color);

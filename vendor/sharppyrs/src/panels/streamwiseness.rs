@@ -35,10 +35,14 @@ struct StreamwisenessData {
 /// Port of `streamwiseness_profile` (right mover, 0-6 km AGL, 100 m grid).
 ///
 /// Horizontal vorticity is the horizontal part of `curl(V)` for a wind that
-/// varies with height: `(-dv/dz, du/dz)`. Streamwiseness is the magnitude of
-/// its projection onto the storm-relative wind unit vector divided by the
-/// total horizontal-vorticity magnitude; the sign is kept separately for the
-/// cyclonic/anticyclonic shading.
+/// varies with height: `(-dv/dz, du/dz)`. Streamwiseness is the square of its
+/// projection onto the storm-relative wind unit vector divided by the total
+/// horizontal-vorticity magnitude. The sign of the projection is kept
+/// separately for the cyclonic/anticyclonic shading.
+///
+/// In symbols, `percent = (omega_streamwise / |omega_h|)^2 * 100`. Squaring is
+/// applied to the dimensionless ratio, not to a value that has already been
+/// converted to percent.
 fn streamwiseness_profile(prof: &Profile) -> Option<StreamwisenessData> {
     const MAX_HEIGHT_M: f64 = 6000.0;
     const STEP_M: f64 = 100.0;
@@ -161,9 +165,9 @@ fn streamwiseness_profile(prof: &Profile) -> Option<StreamwisenessData> {
         if omega_mag > 1.0e-6 && sr_speed > 0.1 {
             any_usable = true;
             let omega_streamwise = omega_u * (u_sr[i] / sr_speed) + omega_v * (v_sr[i] / sr_speed);
-            let p = (omega_streamwise.abs() / omega_mag * 100.0).clamp(0.0, 100.0);
+            let (p, signed_p) = streamwiseness_percent(omega_streamwise, omega_mag);
             percent[i] = p;
-            signed[i] = omega_streamwise.signum() * p;
+            signed[i] = signed_p;
         }
     }
     if !any_usable {
@@ -175,6 +179,13 @@ fn streamwiseness_profile(prof: &Profile) -> Option<StreamwisenessData> {
         percent,
         signed_percent: signed,
     })
+}
+
+/// Return `(magnitude_percent, signed_percent)` for one usable sample.
+fn streamwiseness_percent(omega_streamwise: f64, omega_mag: f64) -> (f64, f64) {
+    let ratio = omega_streamwise / omega_mag;
+    let percent = (ratio * ratio * 100.0).clamp(0.0, 100.0);
+    (percent, omega_streamwise.signum() * percent)
 }
 
 /// Plot geometry (port of `plotStreamwiseness._geometry`), in rect-local px.
@@ -249,11 +260,11 @@ pub fn draw(painter: &Painter, rect: Rect, prof: &Profile, dv: &DerivedParams, s
     let title_size = (h * 0.027).round().clamp(8.0, 11.0);
     let axis_size = (h * 0.022).round().clamp(7.0, 9.0);
     let tiny_size = (h * 0.019).round().clamp(6.0, 8.0);
-    let title_font = FontId::new(title_size, style.font_bold.clone());
-    let axis_font = FontId::new(axis_size, style.font_regular.clone());
-    let axis_font_bold = FontId::new(axis_size, style.font_bold.clone());
-    let tiny_font = FontId::new(tiny_size, style.font_regular.clone());
-    let tiny_font_bold = FontId::new(tiny_size, style.font_bold.clone());
+    let title_font = style.bold_font(title_size);
+    let axis_font = style.regular_font(axis_size);
+    let axis_font_bold = style.bold_font(axis_size);
+    let tiny_font = style.regular_font(tiny_size);
+    let tiny_font_bold = style.bold_font(tiny_size);
 
     // Title, centered in the band above the plot.
     painter.text(
@@ -273,7 +284,7 @@ pub fn draw(painter: &Painter, rect: Rect, prof: &Profile, dv: &DerivedParams, s
                 g.pt(g.left + g.width() / 2.0, g.top + g.height() / 2.0),
                 Align2::CENTER_CENTER,
                 "--",
-                FontId::new(12.0f32.max(title_size + 2.0), style.font_bold.clone()),
+                style.bold_font(12.0f32.max(title_size + 2.0)),
                 TEXT_COLOR,
             );
         }
@@ -513,5 +524,26 @@ fn draw_legend(painter: &Painter, g: &Geom, style: &SkewTStyle, font: &FontId) {
             font.clone(),
             TEXT_COLOR,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::streamwiseness_percent;
+
+    #[test]
+    fn half_streamwise_vorticity_is_twenty_five_percent() {
+        let (percent, signed) = streamwiseness_percent(1.0, 2.0);
+
+        assert_eq!(percent, 25.0);
+        assert_eq!(signed, 25.0);
+    }
+
+    #[test]
+    fn negative_half_streamwise_vorticity_keeps_negative_shading() {
+        let (percent, signed) = streamwiseness_percent(-1.0, 2.0);
+
+        assert_eq!(percent, 25.0);
+        assert_eq!(signed, -25.0);
     }
 }

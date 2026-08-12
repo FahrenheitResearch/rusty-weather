@@ -10,7 +10,7 @@
 //! 9-11 km mean-SR-wind bars use `sharprs::winds::sr_wind` over the same
 //! layers as SHARPpy's convective profile.
 
-use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke};
+use egui::{Align2, Color32, Painter, Pos2, Rect, Shape, Stroke};
 
 use crate::Profile;
 use crate::derived::DerivedParams;
@@ -66,7 +66,7 @@ pub fn draw(painter: &Painter, rect: Rect, prof: &Profile, dv: &DerivedParams, s
     let speed_to_pix = |s: f64| bry - ((smax - s) / smax) * brx;
 
     let label_pt = (h * 0.0512).round();
-    let label_font = FontId::new((label_pt * PT) as f32, style.font_regular.clone());
+    let label_font = style.regular_font((label_pt * PT) as f32);
     let fg = style.fg_color;
     let clsc = Color32::from_rgb(0xB1, 0x01, 0x9A);
 

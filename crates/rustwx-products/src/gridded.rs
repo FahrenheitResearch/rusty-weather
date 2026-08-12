@@ -948,6 +948,10 @@ pub(crate) fn load_or_decode_pressure_cropped_with_shape(
 
 fn decode_surface(bytes: &[u8]) -> Result<SurfaceFields, Box<dyn std::error::Error>> {
     let file = Grib2File::from_bytes(bytes)?;
+    decode_surface_file(file)
+}
+
+fn decode_surface_file(file: Grib2File) -> Result<SurfaceFields, Box<dyn std::error::Error>> {
     let sample = file
         .messages
         .first()
@@ -1008,6 +1012,22 @@ fn decode_surface_cropped(
     crop: GridCrop,
 ) -> Result<SurfaceFields, Box<dyn std::error::Error>> {
     let file = Grib2File::from_bytes(bytes)?;
+    decode_surface_file_cropped(file, crop)
+}
+
+fn decode_surface_cropped_owned(
+    bytes: Vec<u8>,
+    crop: GridCrop,
+) -> Result<SurfaceFields, Box<dyn std::error::Error>> {
+    let file = Grib2File::from_bytes(&bytes)?;
+    drop(bytes);
+    decode_surface_file_cropped(file, crop)
+}
+
+fn decode_surface_file_cropped(
+    file: Grib2File,
+    crop: GridCrop,
+) -> Result<SurfaceFields, Box<dyn std::error::Error>> {
     let sample = file
         .messages
         .first()
@@ -1240,6 +1260,24 @@ fn decode_pressure_cropped_with_shape(
     crop: GridCrop,
 ) -> Result<(PressureFields, usize, usize), Box<dyn std::error::Error>> {
     let file = Grib2File::from_bytes(bytes)?;
+    decode_pressure_file_cropped_with_shape_opts(file, crop, pressure_optional_decode_enabled())
+}
+
+fn decode_pressure_cropped_with_shape_opts_owned(
+    bytes: Vec<u8>,
+    crop: GridCrop,
+    include_optional: bool,
+) -> Result<(PressureFields, usize, usize), Box<dyn std::error::Error>> {
+    let file = Grib2File::from_bytes(&bytes)?;
+    drop(bytes);
+    decode_pressure_file_cropped_with_shape_opts(file, crop, include_optional)
+}
+
+fn decode_pressure_file_cropped_with_shape_opts(
+    file: Grib2File,
+    crop: GridCrop,
+    include_optional: bool,
+) -> Result<(PressureFields, usize, usize), Box<dyn std::error::Error>> {
     let (nx, _ny) = pressure_grid_shape_from_messages(&file.messages)?;
     let longitude_row_wraps = normalized_longitude_row_wraps_from_messages(&file.messages)?;
     let temperature =
@@ -1256,7 +1294,6 @@ fn decode_pressure_cropped_with_shape(
         crop,
         &longitude_row_wraps,
     )?;
-    let include_optional = pressure_optional_decode_enabled();
     let omega = if include_optional {
         collect_optional_levels_cropped(
             &file.messages,
@@ -2618,6 +2655,23 @@ pub fn decode_store_thermo_pair_owned(
     let surface = decode_surface(&surface_bytes)?;
     drop(surface_bytes);
     let (pressure, nx, ny) = decode_pressure_with_shape_opts_owned(pressure_bytes, false)?;
+    validate_store_thermo_pair(&surface, &pressure, nx, ny)?;
+    Ok((surface, pressure))
+}
+
+/// [`decode_store_thermo_pair_owned`] for an explicit source-grid crop. GRIB
+/// values are scan-normalized exactly as in the full decoder, but only the
+/// crop's y row window is unpacked when the packing template supports it; the
+/// x range is sliced before any thermo volume is assembled. The store lane's
+/// optional-pressure policy remains unchanged (`false`).
+pub fn decode_store_thermo_pair_cropped_owned(
+    surface_bytes: Vec<u8>,
+    pressure_bytes: Vec<u8>,
+    crop: GridCrop,
+) -> Result<(SurfaceFields, PressureFields), Box<dyn std::error::Error>> {
+    let surface = decode_surface_cropped_owned(surface_bytes, crop)?;
+    let (pressure, nx, ny) =
+        decode_pressure_cropped_with_shape_opts_owned(pressure_bytes, crop, false)?;
     validate_store_thermo_pair(&surface, &pressure, nx, ny)?;
     Ok((surface, pressure))
 }

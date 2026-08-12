@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rusty Weather third-party license notices</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }
+    body {
+      margin: 0;
+      background: Canvas;
+      color: CanvasText;
+    }
+    main {
+      box-sizing: border-box;
+      max-width: 72rem;
+      margin: 0 auto;
+      padding: 2rem;
+    }
+    section {
+      margin-block: 2rem;
+    }
+    .license {
+      border-top: 1px solid GrayText;
+      padding-top: 1.25rem;
+    }
+    .source {
+      overflow-wrap: anywhere;
+    }
+    pre {
+      overflow-x: auto;
+      padding: 1rem;
+      border: 1px solid GrayText;
+      border-radius: 0.25rem;
+      background: color-mix(in srgb, Canvas 94%, CanvasText 6%);
+      color: CanvasText;
+      white-space: pre-wrap;
+      word-break: normal;
+    }
+    code, pre {
+      font-family: ui-monospace, "Cascadia Mono", "Segoe UI Mono", monospace;
+    }
+    @media print {
+      main {
+        max-width: none;
+        padding: 0;
+      }
+      pre {
+        overflow: visible;
+        break-inside: auto;
+      }
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Rusty Weather third-party license notices</h1>
+  <p>
+    This self-contained notice identifies third-party Rust packages and the
+    license text selected to satisfy each package's declared license expression.
+  </p>
+
+  <section aria-labelledby="license-overview">
+    <h2 id="license-overview">License overview</h2>
+    <ul>
+      {{#each overview}}
+      <li>{{name}} ({{count}} package license assignments)</li>
+      {{/each}}
+    </ul>
+  </section>
+
+  <section aria-labelledby="license-texts">
+    <h2 id="license-texts">Package sources and license texts</h2>
+    {{#each licenses}}
+    <article class="license" id="license-{{id}}-{{@index}}">
+      <h3>{{name}}</h3>
+      <h4>Packages</h4>
+      <ul>
+        {{#each used_by}}
+        <li>
+          <code>{{crate.name}}</code> {{crate.version}}
+          <span class="source">
+            — source:
+            {{#if crate.repository}}
+              <a href="{{crate.repository}}">{{crate.repository}}</a>
+            {{else}}
+              {{#if crate.source}}
+                <code>{{crate.source}}</code>
+              {{else}}
+                {{#if crate.homepage}}
+                  <a href="{{crate.homepage}}">{{crate.homepage}}</a>
+                {{else}}
+                  {{#if path}}
+                    <code>{{path}}</code>
+                  {{else}}
+                    workspace or local path dependency
+                  {{/if}}
+                {{/if}}
+              {{/if}}
+            {{/if}}
+          </span>
+        </li>
+        {{/each}}
+      </ul>
+      <h4>License text</h4>
+      <pre>{{text}}</pre>
+    </article>
+    {{/each}}
+  </section>
+</main>
+</body>
+</html>

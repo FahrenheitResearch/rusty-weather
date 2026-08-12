@@ -1,10 +1,11 @@
 //! Ingest-time derived + heavy precompute: decode the surface + pressure
 //! thermodynamic pair from the already-fetched family GRIB bytes through
 //! the SAME products decode lane the derived/heavy render paths use
-//! (`rustwx_products::gridded::decode_store_thermo_pair_owned` — same
-//! message matching, same moisture preference with specific humidity
-//! first, same f64 precision), then run all 29 non-heavy derived recipes
-//! and all 16 heavy ECAPE-class recipes through the products store lanes
+//! (`rustwx_products::gridded::decode_store_thermo_pair_owned`, or its
+//! crop-during-unpack twin — same message matching, same moisture preference
+//! with specific humidity first, same f64 precision), then run all 29
+//! non-heavy derived recipes and all 16 heavy ECAPE-class recipes through
+//! the products store lanes
 //! (`compute_store_derived_grids_f32` / `compute_store_heavy_grids_f32` —
 //! the exact prep + kernel dispatch the render lanes run, emitting the
 //! same `as f32` cast grid per recipe), handing back f32 grids ready to
@@ -33,7 +34,9 @@ use rustwx_products::derived::{
     StoreComputeInputs, StoreHeavyTiming, compute_store_derived_grids_f32,
     compute_store_heavy_grids_f32, prepare_store_compute_inputs,
 };
-use rustwx_products::gridded::decode_store_thermo_pair_owned;
+use rustwx_products::gridded::{
+    decode_store_thermo_pair_cropped_owned, decode_store_thermo_pair_owned,
+};
 
 /// One derived grid ready to store: variable name (the recipe slug), display
 /// units, and full-grid row-major values.
@@ -97,25 +100,20 @@ pub fn decode_products_inputs(
 }
 
 /// [`decode_products_inputs`] with an optional crop: when `crop` is set, the
-/// decoded surface+pressure pair is sliced to that index block via the
-/// products lane's own `crop_heavy_domain_with` (the same crop the extracted
-/// field planes used), so the derived/heavy grids land on the identical cropped
-/// grid as the stored 2D fields — provably in lock-step. The crop's
-/// `(x_end, y_end)` must lie within the decoded surface shape (it does: it was
-/// computed from the same GRIB grid).
+/// products lane unpacks only that row window and slices its x range before
+/// assembling the surface+pressure pair. This is the same crop the extracted
+/// field planes used, so the derived/heavy grids land on the identical cropped
+/// grid as the stored 2D fields — provably in lock-step without first allocating
+/// the full native-domain thermo volumes. The crop's `(x_end, y_end)` must lie
+/// within the source grid (it does: it was computed from that same GRIB grid).
 pub fn decode_products_inputs_cropped(
     surface_bytes: Vec<u8>,
     pressure_bytes: Vec<u8>,
     crop: Option<rustwx_products::gridded::GridCrop>,
 ) -> Result<ProductsComputeInputs, Box<dyn std::error::Error>> {
-    let (surface, pressure) = decode_store_thermo_pair_owned(surface_bytes, pressure_bytes)?;
     let (surface, pressure) = match crop {
-        Some(crop) => {
-            let cropped =
-                rustwx_products::gridded::crop_heavy_domain_with(&surface, &pressure, crop)?;
-            (cropped.surface, cropped.pressure)
-        }
-        None => (surface, pressure),
+        Some(crop) => decode_store_thermo_pair_cropped_owned(surface_bytes, pressure_bytes, crop)?,
+        None => decode_store_thermo_pair_owned(surface_bytes, pressure_bytes)?,
     };
     Ok(ProductsComputeInputs::new(surface, pressure))
 }

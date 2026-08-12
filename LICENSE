@@ -23,6 +23,9 @@ SOFTWARE.
 ---
 
 Vendored components under vendor/ retain their original licenses:
-sharprs (BSD-3-Clause), metrust/wx-core/wx-math/wx-field/wx-radar/ecape-rs/
-netcrust (MIT or MIT/Apache-2.0), hdf5-reader (per its bundled license).
-See each crate's LICENSE file.
+sharprs (MIT AND BSD-3-Clause), metrust/wx-core/wx-math/wx-field/wx-radar/ecape-rs/
+netcrust (MIT or MIT/Apache-2.0), hdf5-reader (per its bundled license),
+and wrf-rust/wrf-core/wrf-formula (MIT).
+See THIRD_PARTY_NOTICES.md and THIRD_PARTY_LICENSES.html for exact notices and
+the locations of bundled license texts; not every internal vendored crate has a
+standalone LICENSE file.

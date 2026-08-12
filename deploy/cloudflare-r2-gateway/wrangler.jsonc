@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rusty-weather-r2-gateway",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-01",
+  "workers_dev": false,
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.01
+  },
+  "vars": {
+    "BUCKET_PATH": "rusty-weather-hot",
+    "MAX_MANIFEST_BYTES": "262144",
+    "MAX_OBJECT_BYTES": "67108864"
+  },
+  "r2_buckets": [
+    {
+      "binding": "HOT_OBJECTS",
+      "bucket_name": "replace-with-production-bucket"
+    }
+  ]
+}

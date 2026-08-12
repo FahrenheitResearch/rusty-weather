@@ -5511,7 +5511,7 @@ mod tests {
             assert!(
                 publisher
                     .transaction_root
-                    .starts_with(root.join(STAGING_DIR_NAME)),
+                    .starts_with(&publisher.staging_root),
                 "staging must stay under the hidden non-model subtree"
             );
             assert!(

@@ -11,7 +11,7 @@
 //! constant time step (25 s), initial 5 m/s nudge, and a constant mean
 //! buoyancy acceleration — a close approximation of the original z sequence.
 
-use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke};
+use egui::{Align2, Color32, Painter, Pos2, Rect, Stroke};
 
 use crate::Profile;
 use crate::derived::DerivedParams;
@@ -41,7 +41,7 @@ pub fn draw(painter: &Painter, rect: Rect, prof: &Profile, dv: &DerivedParams, s
     let xy_to_pix = |x: f64, y: f64| pt(centerx + x * scale, centery - y * scale);
 
     let title_pt = (h * 0.0512).round() + 2.0;
-    let title_font = FontId::new((title_pt * PT) as f32, style.font_regular.clone());
+    let title_font = style.regular_font((title_pt * PT) as f32);
 
     // X/Y axes.
     let axes = Stroke::new(2.0, Color32::from_rgb(0x00, 0x33, 0x66));

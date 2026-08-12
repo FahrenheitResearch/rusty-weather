@@ -1,0 +1,96 @@
+name: rusty-weather
+
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        RW_BUILD_SHA: ${RW_BUILD_SHA:?set RW_BUILD_SHA to the exact source commit}
+    image: rusty-weather:local
+    init: true
+    restart: unless-stopped
+    read_only: true
+    user: "65532:65532"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    environment:
+      RW_LISTEN: 0.0.0.0:8788
+      RW_STORE_ROOT: /var/lib/rusty-weather/store
+      RW_ARTIFACT_ROOT: /var/lib/rusty-weather/artifacts
+      RW_DOCKER_TOKEN_SOURCE: /run/secrets/rw_api_tokens
+      RW_API_TOKEN_FILE: /tmp/rusty-weather-api-tokens
+      RW_LOG: rw_server=info,tower_http=info
+    ports:
+      - "127.0.0.1:8788:8788"
+    volumes:
+      - ./data/store:/var/lib/rusty-weather/store:ro
+      - ./data/artifacts:/var/lib/rusty-weather/artifacts:rw
+      # Disabled features do not write these mounts. They exist so an audited
+      # Community Cache/federation configuration can persist state while the
+      # container root filesystem remains read-only.
+      - ./data/community-cache:/var/lib/rusty-weather/community-cache:rw
+      - ./data/federation:/var/lib/rusty-weather/federation:rw
+      - ${RW_SERVER_CONFIG_PATH:-../../config/rusty-weather.example.toml}:/etc/rusty-weather/rusty-weather.toml:ro
+    secrets:
+      - rw_api_tokens
+    healthcheck:
+      test:
+        - CMD
+        - /usr/local/bin/rw-server
+        - --config
+        - /etc/rusty-weather/rusty-weather.toml
+        - healthcheck
+        - --timeout-seconds
+        - "4"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  scheduler:
+    profiles:
+      - scheduler
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        RW_BUILD_SHA: ${RW_BUILD_SHA:?set RW_BUILD_SHA to the exact source commit}
+    image: rusty-weather:local
+    init: true
+    restart: unless-stopped
+    read_only: true
+    user: "65532:65532"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    entrypoint:
+      - /usr/local/bin/rw-scheduler
+    command:
+      - --config
+      - /etc/rusty-weather/rusty-weather-scheduler.toml
+      - daemon
+    environment:
+      RW_LOG: rw_scheduler=info,rw_ingest=info
+    volumes:
+      - ./data/store:/var/lib/rusty-weather/store:rw
+      - ./data/scheduler-cache:/var/cache/rusty-weather/ingest:rw
+      - ./data/scheduler-state:/var/lib/rusty-weather/scheduler:rw
+      - ${RW_SCHEDULER_CONFIG_PATH:-../../config/rusty-weather-scheduler.example.toml}:/etc/rusty-weather/rusty-weather-scheduler.toml:ro
+    stop_signal: SIGINT
+    stop_grace_period: 2m
+    healthcheck:
+      disable: true
+
+secrets:
+  rw_api_tokens:
+    file: ./secrets/api-tokens.txt

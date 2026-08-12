@@ -192,22 +192,28 @@ impl DerivedRecipe {
             Self::Mucape => "MUCAPE",
             Self::Mucin => "MUCIN",
             Self::Dcape => "DCAPE",
-            Self::Sbecape => "SBECAPE",
-            Self::Mlecape => "MLECAPE",
-            Self::Muecape => "MUECAPE",
-            Self::SbEcapeDerivedCapeRatio => "SB ECAPE / Derived CAPE Ratio (EXP)",
-            Self::MlEcapeDerivedCapeRatio => "ML ECAPE / Derived CAPE Ratio (EXP)",
-            Self::MuEcapeDerivedCapeRatio => "MU ECAPE / Derived CAPE Ratio (EXP)",
-            Self::SbEcapeNativeCapeRatio => "SB ECAPE / Native CAPE Ratio (EXP)",
-            Self::MlEcapeNativeCapeRatio => "ML ECAPE / Native CAPE Ratio (EXP)",
-            Self::MuEcapeNativeCapeRatio => "MU ECAPE / Native CAPE Ratio (EXP)",
-            Self::Sbncape => "SBNCAPE",
-            Self::Sbecin => "SBECIN",
-            Self::Mlecin => "MLECIN",
-            Self::EcapeScp => "ECAPE SCP (EXP)",
-            Self::EcapeEhi01km => "ECAPE EHI 0-1 km (EXP)",
-            Self::EcapeEhi03km => "ECAPE EHI 0-3 km (EXP)",
-            Self::EcapeStp => "ECAPE STP (EXP)",
+            Self::Sbecape => "SB Analytic ECAPE",
+            Self::Mlecape => "ML Analytic ECAPE",
+            Self::Muecape => "MU Analytic ECAPE",
+            Self::SbEcapeDerivedCapeRatio => {
+                "SB Analytic ECAPE / Entraining Parcel CAPE Ratio (EXP)"
+            }
+            Self::MlEcapeDerivedCapeRatio => {
+                "ML Analytic ECAPE / Entraining Parcel CAPE Ratio (EXP)"
+            }
+            Self::MuEcapeDerivedCapeRatio => {
+                "MU Analytic ECAPE / Entraining Parcel CAPE Ratio (EXP)"
+            }
+            Self::SbEcapeNativeCapeRatio => "SB Analytic ECAPE / Native CAPE Ratio (EXP)",
+            Self::MlEcapeNativeCapeRatio => "ML Analytic ECAPE / Native CAPE Ratio (EXP)",
+            Self::MuEcapeNativeCapeRatio => "MU Analytic ECAPE / Native CAPE Ratio (EXP)",
+            Self::Sbncape => "SBNCAPE (Analytic)",
+            Self::Sbecin => "SB Entraining Parcel CIN",
+            Self::Mlecin => "ML Entraining Parcel CIN",
+            Self::EcapeScp => "Analytic ECAPE SCP (EXP)",
+            Self::EcapeEhi01km => "Analytic ECAPE EHI 0-1 km (EXP)",
+            Self::EcapeEhi03km => "Analytic ECAPE EHI 0-3 km (EXP)",
+            Self::EcapeStp => "Analytic ECAPE STP (EXP)",
             Self::ThetaE2m10mWinds => "2 m Theta-e, 10 m Wind",
             Self::Vpd2m => "2 m Vapor Pressure Deficit",
             Self::DewpointDepression2m => "2 m Dewpoint Depression",

@@ -1,0 +1,19 @@
+{
+  "name": "rusty-weather-r2-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "check": "node --check src/index.js && node --test test/index.test.mjs",
+    "audit": "npm audit --audit-level=high",
+    "sbom": "cyclonedx-npm --gather-license-texts --output-reproducible --spec-version 1.5 --output-format JSON --output-file rusty-weather-r2-gateway.cdx.json --validate package.json",
+    "licenses": "node scripts/generate-license-bundle.mjs THIRD_PARTY_LICENSES-node.md",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cyclonedx/cyclonedx-npm": "6.0.1",
+    "spdx-license-list": "6.12.0",
+    "wrangler": "4.121.0"
+  }
+}

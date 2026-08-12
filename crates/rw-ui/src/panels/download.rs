@@ -27,7 +27,7 @@ pub struct DownloadSpec {
     pub cycle: u8,
     /// Forecast hours in the `parse_hours` grammar: "7", "0-6", "0,3,6".
     pub hours: String,
-    /// Profile preset name: full | sounding | view.
+    /// Profile preset name: full | sounding | view | surface | analysis.
     pub profile: String,
     /// Isobaric level step (25 or 50 hPa).
     pub level_step_hpa: u16,
@@ -567,7 +567,7 @@ impl DownloadPanel {
                 .selected_text(&self.spec.profile)
                 .width(100.0)
                 .show_ui(ui, |ui| {
-                    for preset in ["full", "sounding", "view"] {
+                    for preset in ["full", "sounding", "view", "surface", "analysis"] {
                         ui.selectable_value(&mut self.spec.profile, preset.to_string(), preset);
                     }
                 });
@@ -576,10 +576,7 @@ impl DownloadPanel {
                 // lands on a valid combination.  `heavy` is ONLY turned OFF
                 // automatically (safe direction); it is NEVER turned ON
                 // automatically — the user must opt in via the checkbox.
-                self.spec.derived = self.spec.profile != "sounding";
-                if self.spec.profile == "sounding" || self.spec.profile == "view" {
-                    self.spec.heavy = false;
-                }
+                apply_profile_preset_defaults(&mut self.spec);
             }
             ComboBox::from_id_salt("rw-ui-download-levelstep")
                 .selected_text(format!("{} hPa", self.spec.level_step_hpa))
@@ -593,8 +590,15 @@ impl DownloadPanel {
                         );
                     }
                 });
-            ui.checkbox(&mut self.spec.derived, "derived");
-            ui.checkbox(&mut self.spec.heavy, "heavy");
+            let compute_enabled = !matches!(self.spec.profile.as_str(), "surface" | "analysis");
+            ui.add_enabled(
+                compute_enabled,
+                egui::Checkbox::new(&mut self.spec.derived, "derived"),
+            );
+            ui.add_enabled(
+                compute_enabled,
+                egui::Checkbox::new(&mut self.spec.heavy, "heavy"),
+            );
             if self.spec.heavy {
                 ui.label(
                     RichText::new("ECAPE: saturates all cores for ≈1-1.5 min per hour")
@@ -778,6 +782,16 @@ impl DownloadPanel {
                 "availability/latest probe timed out; Download is still available if the run settings are valid".to_owned(),
             );
         }
+    }
+}
+
+fn apply_profile_preset_defaults(spec: &mut DownloadSpec) {
+    spec.derived = !matches!(spec.profile.as_str(), "sounding" | "surface" | "analysis");
+    if matches!(
+        spec.profile.as_str(),
+        "sounding" | "view" | "surface" | "analysis"
+    ) {
+        spec.heavy = false;
     }
 }
 
@@ -1090,6 +1104,19 @@ mod tests {
             !spec.derived,
             "derived must be false by default for sounding"
         );
+    }
+
+    #[test]
+    fn surface_profile_disables_incompatible_compute_stages() {
+        let mut spec = DownloadSpec {
+            profile: "surface".to_owned(),
+            derived: true,
+            heavy: true,
+            ..DownloadSpec::default()
+        };
+        apply_profile_preset_defaults(&mut spec);
+        assert!(!spec.derived);
+        assert!(!spec.heavy);
     }
 
     #[test]

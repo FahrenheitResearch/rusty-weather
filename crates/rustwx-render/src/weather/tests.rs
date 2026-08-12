@@ -3,8 +3,11 @@ use crate::request::{ProductMaturity, ProductSemanticFlag};
 
 #[test]
 fn explicit_ecape_panel_products_have_expected_titles_and_experimental_flags() {
-    assert_eq!(WeatherProduct::Sbecape.display_title(), "SBECAPE");
-    assert_eq!(WeatherProduct::Mlecin.display_title(), "MLECIN");
+    assert_eq!(WeatherProduct::Sbecape.display_title(), "SB ANALYTIC ECAPE");
+    assert_eq!(
+        WeatherProduct::Mlecin.display_title(),
+        "ML ENTRAINING PARCEL CIN"
+    );
     assert!(WeatherProduct::EcapeScpExperimental.is_experimental());
     assert!(WeatherProduct::EcapeEhi01kmExperimental.is_experimental());
     assert!(WeatherProduct::EcapeEhi03kmExperimental.is_experimental());

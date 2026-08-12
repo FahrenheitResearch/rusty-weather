@@ -4,7 +4,7 @@
 //! values come straight from [`DerivedParams::temp_adv`] /
 //! [`DerivedParams::temp_adv_bounds`]; nothing is recomputed here.
 
-use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke};
+use egui::{Align2, Color32, Painter, Pos2, Rect, Shape, Stroke};
 
 use crate::Profile;
 use crate::derived::DerivedParams;
@@ -44,7 +44,7 @@ pub fn draw(painter: &Painter, rect: Rect, prof: &Profile, dv: &DerivedParams, s
 
     // Label/title font: width * 0.12 + 3 pt, capped at 9 pt (Reimagined).
     let label_pt = ((w * 0.12).round() + 3.0).min(9.0);
-    let label_font = FontId::new((label_pt * PT) as f32, style.font_regular.clone());
+    let label_font = style.regular_font((label_pt * PT) as f32);
 
     // Frame border.
     let border = Stroke::new(2.0, style.fg_color);

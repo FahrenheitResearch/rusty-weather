@@ -2109,6 +2109,7 @@ mod tests {
                 written_unix: 0,
                 encode_ms: 0,
                 variables: vec!["temp_2m".to_string()],
+                source_provenance: Vec::new(),
             },
         );
         manifest.hours.insert(
@@ -2120,6 +2121,7 @@ mod tests {
                 written_unix: 0,
                 encode_ms: 0,
                 variables: vec!["temp_2m".to_string()],
+                source_provenance: Vec::new(),
             },
         );
 

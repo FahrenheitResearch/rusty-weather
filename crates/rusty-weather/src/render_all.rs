@@ -12,11 +12,12 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use rustwx_core::{CycleSpec, ModelId, SourceId};
 use rustwx_models::{LatestRun, plot_recipe};
 use rustwx_products::derived::{
-    DerivedBatchRequest, NativeContourRenderMode, is_heavy_derived_recipe_slug,
-    store_derived_recipe_slugs, store_heavy_recipe_slugs,
+    DerivedBatchRequest, NativeContourRenderMode, StoreDerivedPresentationOverrides,
+    is_heavy_derived_recipe_slug, store_derived_recipe_slugs, store_heavy_recipe_slugs,
 };
 use rustwx_products::direct::{DirectBatchRequest, supported_direct_recipe_slugs};
 use rustwx_products::places::PlaceLabelOverlay;
@@ -27,6 +28,7 @@ use rustwx_products::windowed::{
     render_windowed_products_from_store_grids,
 };
 use rustwx_render::PngCompressionMode;
+use rw_store::RwsExactTime;
 
 #[path = "store_render.rs"]
 pub mod store_render;
@@ -41,6 +43,9 @@ pub use store_render::{StoreFieldSource, StoreRenderSkip};
 pub struct ProductRequest {
     pub direct: Vec<String>,
     pub derived: Vec<String>,
+    /// Explicit arbitrary 2-D store variable names (`var:<name>`). Generic
+    /// variables are never implicitly included by catalog keywords.
+    pub generic: Vec<String>,
     pub windowed: Vec<String>,
     /// The windowed list came from the "all" keyword: render it only when
     /// the run has more than one stored hour (a single hour realizes only
@@ -95,6 +100,7 @@ pub fn partition_products(
                 .into_iter()
                 .chain(heavy_catalog())
                 .collect(),
+            generic: Vec::new(),
             windowed: windowed_catalog(),
             windowed_auto: true,
             strict: false,
@@ -102,6 +108,7 @@ pub fn partition_products(
         "direct" => Ok(ProductRequest {
             direct: supported_direct_recipe_slugs(model),
             derived: Vec::new(),
+            generic: Vec::new(),
             windowed: Vec::new(),
             windowed_auto: false,
             strict: false,
@@ -109,6 +116,7 @@ pub fn partition_products(
         "derived" => Ok(ProductRequest {
             direct: Vec::new(),
             derived: derived_catalog(),
+            generic: Vec::new(),
             windowed: Vec::new(),
             windowed_auto: false,
             strict: false,
@@ -116,6 +124,7 @@ pub fn partition_products(
         "heavy" => Ok(ProductRequest {
             direct: Vec::new(),
             derived: heavy_catalog(),
+            generic: Vec::new(),
             windowed: Vec::new(),
             windowed_auto: false,
             strict: false,
@@ -123,6 +132,7 @@ pub fn partition_products(
         "windowed" => Ok(ProductRequest {
             direct: Vec::new(),
             derived: Vec::new(),
+            generic: Vec::new(),
             windowed: windowed_catalog(),
             windowed_auto: false,
             strict: false,
@@ -130,8 +140,14 @@ pub fn partition_products(
         list => {
             let mut direct = Vec::new();
             let mut derived = Vec::new();
+            let mut generic = Vec::new();
             let mut windowed = Vec::new();
             for slug in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(name) = slug.strip_prefix("var:") {
+                    validate_generic_variable_name(name)?;
+                    generic.push(name.to_string());
+                    continue;
+                }
                 let is_derived = store_derived_recipe_slugs().contains(&slug)
                     || store_heavy_recipe_slugs().contains(&slug)
                     || is_heavy_derived_recipe_slug(slug);
@@ -149,12 +165,14 @@ pub fn partition_products(
                     .into());
                 }
             }
-            if direct.is_empty() && derived.is_empty() && windowed.is_empty() {
+            if direct.is_empty() && derived.is_empty() && generic.is_empty() && windowed.is_empty()
+            {
                 return Err("pass at least one product slug via --products".into());
             }
             Ok(ProductRequest {
                 direct,
                 derived,
+                generic,
                 windowed,
                 windowed_auto: false,
                 strict: true,
@@ -163,12 +181,28 @@ pub fn partition_products(
     }
 }
 
+pub(crate) fn validate_generic_variable_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if name.is_empty() {
+        return Err("generic store product must name a variable after 'var:'".into());
+    }
+    if name.len() > 512 {
+        return Err("generic store variable name exceeds 512 bytes".into());
+    }
+    if name.trim() != name || name.contains(',') || name.chars().any(char::is_control) {
+        return Err(format!("generic store variable name is not request-safe: {name:?}").into());
+    }
+    Ok(())
+}
+
 /// Everything the render passes need to know, independent of any bin's CLI.
 #[derive(Clone)]
 pub struct StoreRenderConfig {
     pub model: ModelId,
     pub date_yyyymmdd: String,
     pub cycle_utc: u8,
+    /// Authoritative physical time when the selected store key is an
+    /// exact-time v2 ordinal slot. Legacy whole-hour entries leave this None.
+    pub exact_time: Option<RwsExactTime>,
     /// Source stamped into provenance subtitles (the store does not record
     /// the fetch source).
     pub source: SourceId,
@@ -215,6 +249,7 @@ pub fn render_hour_products(
     hour: u16,
     direct_slugs: &[String],
     derived_slugs: &[String],
+    generic_variables: &[String],
     // Optional pacing hook for the direct lane's chunked render: called
     // before each chunk loads its fields. `rw_batch` passes its memory
     // gate (defer chunks inside high-memory ingest windows); `rw_render`
@@ -223,6 +258,7 @@ pub fn render_hour_products(
 ) -> Result<HourRenderOutcome, Box<dyn std::error::Error>> {
     let mut rendered = Vec::new();
     let mut skipped = Vec::new();
+    let presentation = exact_time_presentation(config.exact_time);
 
     if !direct_slugs.is_empty() {
         let direct_request = DirectBatchRequest {
@@ -243,9 +279,15 @@ pub fn render_hour_products(
             output_height: config.output_height,
             png_compression: config.png_compression,
             place_label_overlay: config.place_label_overlay.clone(),
-            output_suffix: None,
-            subtitle_left_override: None,
-            subtitle_right_override: None,
+            output_suffix: presentation
+                .as_ref()
+                .map(|value| value.output_suffix.clone()),
+            subtitle_left_override: presentation
+                .as_ref()
+                .map(|value| value.subtitle_left.clone()),
+            subtitle_right_override: presentation
+                .as_ref()
+                .map(|value| format!("{} | source {}", value.subtitle_right, config.source)),
         };
         let outcome = store_render::render_direct_recipes_from_store(
             store,
@@ -296,6 +338,17 @@ pub fn render_hour_products(
             &derived_request,
             config.cycle_utc,
             derived_slugs,
+            presentation
+                .as_ref()
+                .map(|value| StoreDerivedPresentationOverrides {
+                    output_suffix: Some(value.output_suffix.clone()),
+                    subtitle_left_override: Some(value.subtitle_left.clone()),
+                    subtitle_right_override: Some(format!(
+                        "{} | source {}",
+                        value.subtitle_right, config.source
+                    )),
+                })
+                .unwrap_or_default(),
         )?;
         rendered.extend(outcome.rendered.into_iter().map(|recipe| RenderedProduct {
             slug: recipe.recipe_slug,
@@ -305,7 +358,65 @@ pub fn render_hour_products(
         skipped.extend(outcome.skipped);
     }
 
+    for variable in generic_variables {
+        if let Some(gate) = direct_chunk_gate {
+            gate();
+        }
+        match store_render::render_generic_store_variable(store, config, hour, variable) {
+            Ok(product) => rendered.push(RenderedProduct {
+                slug: format!("var:{}", product.variable),
+                total_ms: product.total_ms,
+                output_path: product.output_path,
+            }),
+            Err(error) => skipped.push(StoreRenderSkip {
+                slug: format!("var:{variable}"),
+                reason: error.to_string(),
+            }),
+        }
+    }
+
     Ok(HourRenderOutcome { rendered, skipped })
+}
+
+pub(super) struct ExactTimePresentation {
+    pub(super) output_suffix: String,
+    pub(super) subtitle_left: String,
+    pub(super) subtitle_right: String,
+}
+
+pub(super) fn exact_time_presentation(
+    exact: Option<RwsExactTime>,
+) -> Option<ExactTimePresentation> {
+    let exact = exact?;
+    let valid = DateTime::<Utc>::from_timestamp(exact.valid_unix, 0);
+    let origin = exact
+        .origin_unix()
+        .and_then(|unix| DateTime::<Utc>::from_timestamp(unix, 0));
+    let valid_label = valid
+        .map(|time| time.format("%Y-%m-%d %H:%M:%SZ").to_string())
+        .unwrap_or_else(|| format!("Unix {}", exact.valid_unix));
+    let origin_label = origin
+        .map(|time| time.format("%Y-%m-%d %H:%M:%SZ").to_string())
+        .unwrap_or_else(|| "unrepresentable origin".to_string());
+    let lead_hours = exact.lead_seconds / 3_600;
+    let lead_minutes = exact.lead_seconds % 3_600 / 60;
+    let lead_seconds = exact.lead_seconds % 60;
+    let output_valid = valid
+        .map(|time| time.format("%Y%m%dT%H%M%SZ").to_string())
+        .unwrap_or_else(|| {
+            if exact.valid_unix < 0 {
+                format!("unix_neg{}", exact.valid_unix.unsigned_abs())
+            } else {
+                format!("unix_{}", exact.valid_unix)
+            }
+        });
+    Some(ExactTimePresentation {
+        output_suffix: format!("valid_{output_valid}_lead_{}s", exact.lead_seconds),
+        subtitle_left: format!(
+            "Init {origin_label} | Lead +{lead_hours:02}:{lead_minutes:02}:{lead_seconds:02} | Valid {valid_label}"
+        ),
+        subtitle_right: "rw-store exact-time v2".to_string(),
+    })
 }
 
 /// Outcome of the windowed compute + render pass over the run's stored
@@ -408,6 +519,7 @@ mod tests {
         let all = partition_products("all", ModelId::Hrrr).unwrap();
         assert!(!all.strict);
         assert_eq!(all.direct, supported_direct_recipe_slugs(ModelId::Hrrr));
+        assert!(all.generic.is_empty());
         assert_eq!(
             all.derived.len(),
             store_derived_recipe_slugs().len() + store_heavy_recipe_slugs().len()
@@ -442,7 +554,7 @@ mod tests {
     #[test]
     fn product_lists_classify_into_lanes_and_are_strict() {
         let picked = partition_products(
-            "2m_temperature,sbcape,ecape_stp,qpf_6h,uh_2to5km_run_max",
+            "2m_temperature,sbcape,ecape_stp,var:custom_plane,qpf_6h,uh_2to5km_run_max",
             ModelId::Hrrr,
         )
         .unwrap();
@@ -452,12 +564,15 @@ mod tests {
             picked.derived,
             vec!["sbcape".to_string(), "ecape_stp".to_string()]
         );
+        assert_eq!(picked.generic, vec!["custom_plane".to_string()]);
         assert_eq!(
             picked.windowed,
             vec!["qpf_6h".to_string(), "uh_2to5km_run_max".to_string()]
         );
         assert!(!picked.windowed_auto);
         assert!(partition_products("definitely_not_a_product", ModelId::Hrrr).is_err());
+        assert!(partition_products("var:", ModelId::Hrrr).is_err());
+        assert!(partition_products("var:unsafe\nname", ModelId::Hrrr).is_err());
     }
 
     #[test]

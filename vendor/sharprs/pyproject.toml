@@ -6,11 +6,12 @@ build-backend = "maturin"
 name = "sharprs"
 version = "0.1.0"
 description = "Sounding/Hodograph Analysis and Research Program — Rust-accelerated Python bindings"
-license = { text = "BSD-3-Clause" }
+license = { text = "MIT AND BSD-3-Clause" }
 requires-python = ">=3.9"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: Implementation :: CPython",

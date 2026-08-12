@@ -12,17 +12,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::thread::JoinHandle;
 
+use chrono::{DateTime, Timelike, Utc};
 use eframe::egui;
 use rustwx_core::CycleSpec;
 use rusty_weather::batch_render::{
     BatchHourScope, BatchProductKind, BatchRenderCatalog, BatchRenderDomain, BatchRenderEvent,
-    BatchRenderLimits, BatchRenderRequest, BatchRenderSummary, infer_run_cycle,
+    BatchRenderLimits, BatchRenderRequest, BatchRenderSummary, BatchRenderTime, infer_run_cycle,
     inspect_renderable_products, run_batch_render,
 };
 use rw_ui::{HourKey, StoreView};
 
 const MAX_LOG_ROWS: usize = 120;
-const EXACT_TIME_BATCH_UNSUPPORTED: &str = "Production batch rendering is not yet available for exact-time ordinal runs. The direct viewer, Native Plot, soundings, and Formula Lab remain available; batch rendering is disabled rather than treating storage slots as forecast hours.";
 
 /// Plain-data messages emitted by [`BatchRenderTask`].
 #[derive(Debug, Clone)]
@@ -235,12 +235,7 @@ impl BatchRenderPanel {
         start_blocked: Option<&str>,
     ) {
         let current_hour = current_hour.cloned();
-        if current_hour
-            .as_ref()
-            .is_none_or(|hour| !hour.has_exact_time())
-        {
-            self.ensure_catalog(ui.ctx(), store_root, current_hour.as_ref());
-        }
+        self.ensure_catalog(ui.ctx(), store_root, current_hour.as_ref());
         self.poll_catalog(current_var);
         self.poll_render_task();
 
@@ -283,16 +278,6 @@ impl BatchRenderPanel {
         });
 
         let running = self.is_running();
-        if hour.has_exact_time() {
-            ui.label(
-                egui::RichText::new(EXACT_TIME_BATCH_UNSUPPORTED).color(egui::Color32::YELLOW),
-            );
-            if !running {
-                self.render_status(ui);
-                return;
-            }
-        }
-
         ui.add_enabled_ui(!running, |ui| {
             self.render_product_picker(ui, current_var);
             ui.separator();
@@ -623,7 +608,7 @@ impl BatchRenderPanel {
                     );
                 });
                 if let Some(key) = &self.catalog_key {
-                    if let Some((date, cycle)) = infer_run_cycle(&key.hour.run) {
+                    if let Some((date, cycle)) = inferred_cycle(&key.hour) {
                         ui.label(
                             egui::RichText::new(format!("Inferred: {date} {cycle:02}Z"))
                                 .small()
@@ -635,9 +620,6 @@ impl BatchRenderPanel {
     }
 
     fn validate_start(&self, hour: &HourKey) -> Result<usize, String> {
-        if hour.has_exact_time() {
-            return Err(EXACT_TIME_BATCH_UNSUPPORTED.to_string());
-        }
         let catalog = self
             .catalog
             .as_ref()
@@ -648,7 +630,7 @@ impl BatchRenderPanel {
         if self.output_dir.trim().is_empty() {
             return Err("Choose an output directory.".to_string());
         }
-        let inferred = infer_run_cycle(&hour.run);
+        let inferred = inferred_cycle(hour);
         let date = if self.date_override.trim().is_empty() {
             inferred
                 .as_ref()
@@ -762,6 +744,7 @@ impl BatchRenderPanel {
             } else {
                 BatchHourScope::Current(hour.hour)
             },
+            expected_exact_time: (!self.all_hours).then_some(hour.exact_time).flatten(),
             product_spec: self
                 .selected_products
                 .iter()
@@ -833,7 +816,7 @@ impl BatchRenderPanel {
             BatchRenderTaskMessage::Event(event) => match event {
                 BatchRenderEvent::Started {
                     planned_items,
-                    hours,
+                    times,
                     products,
                     output_dir,
                 } => {
@@ -845,17 +828,17 @@ impl BatchRenderPanel {
                     self.push_log(format!(
                         "Started: {} product(s), {} hour(s) -> {}",
                         products.len(),
-                        hours.len(),
+                        times.len(),
                         output_dir.display()
                     ));
                     false
                 }
-                BatchRenderEvent::HourStarted { hour, index, total } => {
-                    self.push_log(format!("Hour {index}/{total}: F{hour:03}"));
+                BatchRenderEvent::HourStarted { time, index, total } => {
+                    self.push_log(format!("Time {index}/{total}: {}", format_time(time)));
                     false
                 }
                 BatchRenderEvent::ItemStarted {
-                    hour,
+                    time,
                     slug,
                     kind,
                     completed,
@@ -864,29 +847,31 @@ impl BatchRenderPanel {
                     self.progress = Some(ProgressState {
                         completed,
                         total,
-                        current: Some(format_item(hour, &slug, kind.label())),
+                        current: Some(format_item(time, &slug, kind.label())),
                     });
                     false
                 }
                 BatchRenderEvent::ItemRendered {
-                    hour,
+                    time,
                     slug,
                     output_path,
                     render_ms,
+                    source_fields: _,
+                    units: _,
                     completed,
                     total,
                 } => {
                     self.update_progress(completed, total, None);
                     self.push_log(format!(
                         "OK {} ({} ms) -> {}",
-                        format_item(hour, &slug, "render"),
+                        format_item(time, &slug, "render"),
                         render_ms,
                         output_path.display()
                     ));
                     false
                 }
                 BatchRenderEvent::ItemSkipped {
-                    hour,
+                    time,
                     slug,
                     reason,
                     completed,
@@ -895,12 +880,12 @@ impl BatchRenderPanel {
                     self.update_progress(completed, total, None);
                     self.push_log(format!(
                         "SKIP {}: {reason}",
-                        format_item(hour, &slug, "render")
+                        format_item(time, &slug, "render")
                     ));
                     false
                 }
                 BatchRenderEvent::ItemFailed {
-                    hour,
+                    time,
                     slug,
                     error,
                     completed,
@@ -909,7 +894,7 @@ impl BatchRenderPanel {
                     self.update_progress(completed, total, None);
                     self.push_log(format!(
                         "ERROR {}: {error}",
-                        format_item(hour, &slug, "render")
+                        format_item(time, &slug, "render")
                     ));
                     false
                 }
@@ -1079,11 +1064,36 @@ fn sanitize_component(value: &str) -> String {
     }
 }
 
-fn format_item(hour: Option<u16>, slug: &str, kind: &str) -> String {
-    match hour {
-        Some(hour) => format!("F{hour:03} {slug} [{kind}]"),
+fn format_item(time: Option<BatchRenderTime>, slug: &str, kind: &str) -> String {
+    match time {
+        Some(time) => format!("{} {slug} [{kind}]", format_time(time)),
         None => format!("window {slug} [{kind}]"),
     }
+}
+
+fn format_time(time: BatchRenderTime) -> String {
+    match time.exact_time {
+        None => format!("F{:03}", time.storage_slot),
+        Some(exact) => {
+            let valid = DateTime::<Utc>::from_timestamp(exact.valid_unix, 0)
+                .map(|time| time.format("%Y-%m-%d %H:%M:%SZ").to_string())
+                .unwrap_or_else(|| format!("Unix {}", exact.valid_unix));
+            format!(
+                "slot {} lead +{}s valid {valid}",
+                time.storage_slot, exact.lead_seconds
+            )
+        }
+    }
+}
+
+fn exact_time_cycle(hour: &HourKey) -> Option<(String, u8)> {
+    let origin = hour.exact_time?.origin_unix()?;
+    let origin = DateTime::<Utc>::from_timestamp(origin, 0)?;
+    Some((origin.format("%Y%m%d").to_string(), origin.hour() as u8))
+}
+
+fn inferred_cycle(hour: &HourKey) -> Option<(String, u8)> {
+    exact_time_cycle(hour).or_else(|| infer_run_cycle(&hour.run))
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -1098,17 +1108,17 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 /// Final on-click trust check. The browser key can become stale between a
 /// tree refresh and a click; reopening through StoreView validates both the
-/// manifest and hour metadata before an ordinal can reach the hour-based
-/// production engine.
+/// manifest and hour metadata before a selected slot can reach the renderer.
 fn validate_persisted_batch_hour(store_root: &Path, hour: &HourKey) -> Result<(), String> {
-    if hour.has_exact_time() {
-        return Err(EXACT_TIME_BATCH_UNSUPPORTED.to_string());
-    }
     let reader = StoreView::new(store_root)
         .open_hour(&hour.model, &hour.run, hour.hour)
         .map_err(|error| format!("Cannot verify selected batch-render timestep: {error}"))?;
-    if reader.meta().exact_time().is_some() {
-        return Err(EXACT_TIME_BATCH_UNSUPPORTED.to_string());
+    if reader.meta().exact_time() != hour.exact_time {
+        return Err(format!(
+            "Selected timestep timing changed: browser has {:?}, persisted slot has {:?}",
+            hour.exact_time,
+            reader.meta().exact_time()
+        ));
     }
     Ok(())
 }
@@ -1120,7 +1130,7 @@ mod tests {
     fn exact_hour() -> HourKey {
         HourKey {
             model: "wrf".to_string(),
-            run: "exact-run".to_string(),
+            run: "20260608_00z".to_string(),
             hour: 7,
             exact_time: Some(rw_store::RwsExactTime {
                 lead_seconds: 31_680,
@@ -1130,21 +1140,16 @@ mod tests {
     }
 
     #[test]
-    fn exact_time_batch_render_fails_before_slots_reach_hour_based_engine() {
-        let mut panel = BatchRenderPanel::new();
+    fn exact_time_labels_and_cycle_use_physical_time_not_slot() {
         let hour = exact_hour();
-        let error = panel
-            .validate_start(&hour)
-            .expect_err("exact run must fail closed before catalog validation");
-        assert!(error.contains("storage slots as forecast hours"));
-
-        panel.start(hour, PathBuf::from("store"), egui::Context::default());
-        assert!(panel.task.is_none());
+        assert_eq!(exact_time_cycle(&hour), Some(("19740403".to_string(), 9)));
+        assert_eq!(inferred_cycle(&hour), Some(("19740403".to_string(), 9)));
         assert!(
-            panel
-                .error
-                .as_deref()
-                .is_some_and(|message| message.contains("not yet available"))
+            format_time(BatchRenderTime {
+                storage_slot: hour.hour,
+                exact_time: hour.exact_time,
+            })
+            .contains("slot 7 lead +31680s")
         );
     }
 

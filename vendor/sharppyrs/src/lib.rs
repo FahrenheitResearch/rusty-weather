@@ -21,6 +21,7 @@
 
 pub mod barbs;
 pub mod derived;
+pub mod diagnostic_table;
 pub mod extras;
 pub mod panels;
 pub mod profile;
@@ -29,10 +30,15 @@ pub mod utils;
 pub mod window;
 
 pub use derived::DerivedParams;
-pub use profile::{ParcelType, Profile, SoundingData};
+pub use diagnostic_table::{
+    DiagnosticTableBoard, DiagnosticTablePanel, DiagnosticTablePanelKind, DiagnosticTableRow,
+    DiagnosticTableSection, NativeDiagnosticPatch, NativeDiagnosticPatchBoard,
+    NativeDiagnosticSlotPatch, native_diagnostic_slot_ids,
+};
+pub use profile::{LocationFootprint, ParcelType, Profile, SoundingData};
 pub use sharprs;
 pub use sharprs::params::cape::ParcelResult as Parcel;
-pub use skewt::{SkewT, SkewTStyle};
+pub use skewt::{SkewT, SkewTStyle, SoundingFontPreset};
 pub use window::{
     CornerPanel, PanelKind, SoundingLayout, SoundingView, store_layout, stored_layout,
 };

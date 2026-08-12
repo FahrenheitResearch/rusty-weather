@@ -22,6 +22,7 @@ mod region;
 mod render_all;
 use rw_ingest::throttle;
 
+use chrono::{DateTime, Timelike, Utc};
 use clap::{Parser, ValueEnum};
 use contour_mode::ContourModeArg;
 use rayon::prelude::*;
@@ -31,6 +32,7 @@ use rustwx_core::{ModelId, SourceId};
 use rustwx_models::model_summary;
 use rustwx_products::places::{PlaceLabelDensityTier, default_place_label_overlay_for_domain};
 use rustwx_products::shared_context::DomainSpec;
+use rw_store::RwsExactTime;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -162,6 +164,25 @@ fn parse_run_slug(run: &str) -> Result<(String, u8), Box<dyn std::error::Error>>
         .filter(|value| *value < 24)
         .ok_or_else(|| format!("--run '{run}': '{cycle}' is not a cycle of the form CCz"))?;
     Ok((date.to_string(), cycle))
+}
+
+fn resolve_run_cycle(
+    run: &str,
+    exact_time: Option<RwsExactTime>,
+) -> Result<(String, u8), Box<dyn std::error::Error>> {
+    if let Some(exact_time) = exact_time {
+        let origin = exact_time
+            .origin_unix()
+            .and_then(|unix| DateTime::<Utc>::from_timestamp(unix, 0))
+            .ok_or_else(|| {
+                format!(
+                    "exact-time metadata for --run '{run}' has an invalid origin (valid {}, lead {}s)",
+                    exact_time.valid_unix, exact_time.lead_seconds
+                )
+            })?;
+        return Ok((origin.format("%Y%m%d").to_string(), origin.hour() as u8));
+    }
+    parse_run_slug(run)
 }
 
 fn static_output_dimension(name: &str, fallback: u32) -> u32 {
@@ -411,7 +432,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let total_started = Instant::now();
-    let (date, cycle) = parse_run_slug(&args.run)?;
     let request = render_all::partition_products(&args.products, args.model)?;
     let regions = selected_regions(args)?;
     let multi_domain = regions.len() > 1;
@@ -424,14 +444,19 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let open_started = Instant::now();
     let store = StoreFieldSource::open(&args.store_root, &model_slug, &args.run, args.hour)?;
+    let (date, cycle) = resolve_run_cycle(&args.run, store.exact_time())?;
     let open_ms = open_started.elapsed().as_millis();
     println!(
-        "rw_render build {} | store {} | {} products requested ({} direct, {} derived/heavy, {} windowed) | {} domain(s) | output {:?} | open {} ms",
+        "rw_render build {} | store {} | {} products requested ({} direct, {} derived/heavy, {} generic, {} windowed) | {} domain(s) | output {:?} | open {} ms",
         env!("RW_BUILD_SHA"),
         store.hour_path().display(),
-        request.direct.len() + request.derived.len() + request.windowed.len(),
+        request.direct.len()
+            + request.derived.len()
+            + request.generic.len()
+            + request.windowed.len(),
         request.direct.len(),
         request.derived.len(),
+        request.generic.len(),
         request.windowed.len(),
         regions.len(),
         args.output_format,
@@ -456,6 +481,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             model: args.model,
             date_yyyymmdd: date.clone(),
             cycle_utc: cycle,
+            exact_time: store.exact_time(),
             source,
             domain: domain.clone(),
             out_dir,
@@ -486,6 +512,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             args.hour,
             &request.direct,
             &request.derived,
+            &request.generic,
             // Solo render: nothing else competes for memory, no chunk gate.
             None,
         )?;
@@ -507,7 +534,10 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 .map(|skip| (domain_slug.to_string(), skip)),
         );
 
-        if !request.windowed.is_empty() {
+        if !request.windowed.is_empty() && store.exact_time().is_some() {
+            let reason = "windowed products require a legacy contiguous whole-hour forecast axis; this run uses exact-time ordinal slots";
+            println!("windowed {domain_slug:<15} skipped ({reason})");
+        } else if !request.windowed.is_empty() {
             match render_all::render_windowed_products(
                 &config,
                 &store,
@@ -642,6 +672,18 @@ mod tests {
                 "error for '{bad}' must name --run: {err}"
             );
         }
+    }
+
+    #[test]
+    fn exact_time_origin_overrides_a_conflicting_parseable_run_slug() {
+        let exact = RwsExactTime {
+            lead_seconds: 31_680,
+            valid_unix: 134_243_280,
+        };
+        assert_eq!(
+            resolve_run_cycle("20260608_00z", Some(exact)).unwrap(),
+            ("19740403".to_string(), 9)
+        );
     }
 
     #[test]

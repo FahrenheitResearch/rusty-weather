@@ -4,8 +4,9 @@
 //! once per frame and calls the `notify` hook (typically
 //! `egui::Context::request_repaint`) to wake the UI when a response lands.
 //!
-//! The worker keeps a one-entry cache of the open [`HourReader`] and the
-//! run's [`GridFile`], so hour scrubbing inside one run only decodes chunks.
+//! The worker keeps a one-entry reference into [`StoreView`]'s bounded,
+//! clone-shared reader pool plus the current run's [`GridFile`], so hour
+//! scrubbing and repeated soundings can reuse decoded tiles safely.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -343,7 +344,7 @@ impl StoreWorker {
 /// grid file.
 struct WorkerState {
     view: StoreView,
-    hour: Option<(HourKey, HourReader)>,
+    hour: Option<(HourKey, Arc<HourReader>)>,
     grid: Option<((String, String), Arc<GridFile>)>,
     style_overrides: StyleOverrideSettings,
 }
@@ -456,21 +457,29 @@ fn handle(state: &mut WorkerState, request: StoreRequest) -> StoreResponse {
     }
 }
 
-/// Open (or reuse) the hour reader for `key`.
+/// Open (or reuse) the generation-current hour reader for `key`.
 fn reader_for<'s>(state: &'s mut WorkerState, key: &HourKey) -> rw_store::RwResult<&'s HourReader> {
-    let cached = matches!(&state.hour, Some((have, _)) if have == key);
-    if !cached {
-        profile_scope!("store_open_hour");
-        let reader = state.view.open_hour(&key.model, &key.run, key.hour)?;
-        if reader.meta().exact_time() != key.exact_time {
-            return Err(RwStoreError::Meta(format!(
-                "requested timestep {} does not match the exact-time metadata stored in its manifest",
-                key.time_label()
-            )));
-        }
+    // Always resolve through StoreView. A same-key hour can be atomically
+    // replaced between requests; the shared pool makes unchanged hits cheap
+    // and its generation key prevents this local Arc from hiding a replacement.
+    profile_scope!("store_open_hour");
+    let reader = state
+        .view
+        .open_hour_shared(&key.model, &key.run, key.hour)?;
+    if reader.meta().exact_time() != key.exact_time {
+        return Err(RwStoreError::Meta(format!(
+            "requested timestep {} does not match the exact-time metadata stored in its manifest",
+            key.time_label()
+        )));
+    }
+    let still_current = matches!(
+        &state.hour,
+        Some((have, cached)) if have == key && Arc::ptr_eq(cached, &reader)
+    );
+    if !still_current {
         state.hour = Some((key.clone(), reader));
     }
-    Ok(&state.hour.as_ref().expect("just cached").1)
+    Ok(state.hour.as_ref().expect("just cached").1.as_ref())
 }
 
 fn hour_vars(state: &mut WorkerState, key: &HourKey) -> rw_store::RwResult<Vec<VarInfo>> {
@@ -727,8 +736,8 @@ fn load_sounding(
         vars.push(ProfileVar {
             name,
             units,
-            levels_hpa,
             values,
+            levels_hpa,
         });
     }
 
@@ -740,19 +749,18 @@ fn load_sounding(
     for &name in SURFACE_SAMPLE_VARS {
         let Some(units) = reader
             .variable(name)
-            .filter(|var| var.kind == "surface2d")
-            .map(|var| var.units.clone())
+            .and_then(|var| (var.kind == "surface2d").then(|| var.units.clone()))
         else {
             continue;
         };
-        let window = {
-            profile_scope!("store_read_window_2d");
-            reader.read_window_2d(name, ix, iy, ix + 1, iy + 1)?
+        let value = {
+            profile_scope!("store_read_point_2d");
+            reader.read_point_2d(name, ix, iy)?
         };
         surface.push(SurfaceSample {
             name: name.to_string(),
             units,
-            value: window.values[0],
+            value,
         });
     }
 

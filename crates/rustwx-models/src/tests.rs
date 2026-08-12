@@ -1,6 +1,94 @@
 use super::*;
 
 #[test]
+fn provider_probe_agent_bounds_every_network_phase() {
+    let agent = build_agent();
+    let timeouts = agent.config().timeouts();
+
+    assert_eq!(timeouts.global, Some(PROVIDER_HTTP_TIMEOUTS.global));
+    assert_eq!(timeouts.per_call, Some(PROVIDER_HTTP_TIMEOUTS.per_call));
+    assert_eq!(timeouts.resolve, Some(PROVIDER_HTTP_TIMEOUTS.resolve));
+    assert_eq!(timeouts.connect, Some(PROVIDER_HTTP_TIMEOUTS.connect));
+    assert_eq!(
+        timeouts.send_request,
+        Some(PROVIDER_HTTP_TIMEOUTS.send_request)
+    );
+    assert_eq!(timeouts.send_body, Some(PROVIDER_HTTP_TIMEOUTS.send_body));
+    assert_eq!(
+        timeouts.recv_response,
+        Some(PROVIDER_HTTP_TIMEOUTS.recv_response)
+    );
+    assert_eq!(timeouts.recv_body, Some(PROVIDER_HTTP_TIMEOUTS.recv_body));
+
+    for phase in [
+        timeouts.per_call,
+        timeouts.resolve,
+        timeouts.connect,
+        timeouts.send_request,
+        timeouts.send_body,
+        timeouts.recv_response,
+        timeouts.recv_body,
+    ] {
+        let phase = phase.expect("provider network phase must be bounded");
+        assert!(phase > Duration::ZERO);
+        assert!(phase <= PROVIDER_HTTP_TIMEOUTS.global);
+    }
+}
+
+#[test]
+fn provider_probe_agent_times_out_a_stalled_response_offline() {
+    use std::io::Read;
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind loopback listener");
+    let address = listener.local_addr().expect("read loopback address");
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept probe request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("bound loopback request read");
+        let mut request = [0_u8; 512];
+        let _ = stream.read(&mut request);
+        let _ = release_rx.recv_timeout(Duration::from_secs(2));
+    });
+
+    let short_timeouts = ProviderHttpTimeouts {
+        global: Duration::from_millis(250),
+        per_call: Duration::from_millis(200),
+        resolve: Duration::from_millis(100),
+        connect: Duration::from_millis(100),
+        send_request: Duration::from_millis(100),
+        send_body: Duration::from_millis(100),
+        recv_response: Duration::from_millis(75),
+        recv_body: Duration::from_millis(100),
+    };
+    let agent = build_agent_with_timeouts(short_timeouts);
+    let url = format!("http://{address}/availability");
+    let started = Instant::now();
+    let error = match agent.head(&url).call() {
+        Ok(_) => panic!("stalled provider unexpectedly returned a response"),
+        Err(error) => error,
+    };
+    let elapsed = started.elapsed();
+
+    let _ = release_tx.send(());
+    server.join().expect("join loopback provider");
+
+    assert_eq!(
+        error.to_string(),
+        ureq::Error::Timeout(ureq::Timeout::RecvResponse).to_string()
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "stalled response escaped configured bounds: {elapsed:?}"
+    );
+}
+
+#[test]
 fn built_in_models_are_real() {
     assert_eq!(built_in_models().len(), 23);
     assert_eq!(model_summary(ModelId::HrrrAk).default_product, "sfc");
@@ -13,7 +101,7 @@ fn built_in_models_are_real() {
     assert_eq!(model_summary(ModelId::Aigefs).default_product, "sfc/avg");
     assert_eq!(model_summary(ModelId::Hgefs).default_product, "sfc/avg");
     assert_eq!(model_summary(ModelId::Hgefs).max_forecast_hour, 240);
-    assert_eq!(model_summary(ModelId::Aifs).max_forecast_hour, 43_848);
+    assert_eq!(model_summary(ModelId::Aifs).max_forecast_hour, 360);
     assert_eq!(
         model_summary(ModelId::Href).default_product,
         "ensprod/conus/sprd"
@@ -29,6 +117,7 @@ fn built_in_models_are_real() {
         model_summary(ModelId::RrfsPublic).cycle_hours_utc,
         RRFS_PUBLIC_CYCLE_HOURS
     );
+    assert_eq!(model_summary(ModelId::RrfsPublic).max_forecast_hour, 84);
     assert_eq!(model_summary(ModelId::Refs).default_product, "mean-conus");
     assert_eq!(
         model_summary(ModelId::Refs).cycle_hours_utc,
@@ -728,11 +817,63 @@ fn ecmwf_summary_matches_current_open_data_cycles_and_horizon() {
 fn aifs_summary_defaults_to_operational_v2_open_data() {
     let summary = model_summary(ModelId::Aifs);
     assert!(summary.description.contains("v2"));
+    assert_eq!(summary.cycle_hours_utc, &[0, 6, 12, 18]);
+    assert_eq!(summary.max_forecast_hour, 360);
     assert_eq!(summary.sources[0].id, SourceId::Ecmwf);
+    assert!(summary.sources[0].idx_available);
     assert_eq!(summary.sources[1].id, SourceId::AifsInference);
     assert_eq!(summary.sources[2].id, SourceId::Earth2Archive);
     assert_eq!(summary.runtime_family, ModelRuntimeFamily::Grib2Forecast);
     assert_eq!(summary.ensemble_mode, EnsembleMode::Deterministic);
+}
+
+#[test]
+fn aifs_public_schedule_is_six_hourly_through_f360() {
+    for cycle in [0, 6, 12, 18] {
+        let hours = supported_forecast_hours(ModelId::Aifs, cycle);
+        assert_eq!(hours.len(), 61);
+        assert_eq!(hours.first(), Some(&0));
+        assert_eq!(hours.last(), Some(&360));
+        assert!(hours.iter().all(|hour| hour % 6 == 0));
+    }
+    assert!(supported_forecast_hours(ModelId::Aifs, 3).is_empty());
+    assert!(!forecast_hour_supported(ModelId::Aifs, 0, 3));
+    assert!(!forecast_hour_supported(ModelId::Aifs, 0, 366));
+}
+
+#[test]
+fn aifs_recipe_gaps_match_the_public_oper_inventory() {
+    for slug in ["low_cloud_cover", "middle_cloud_cover", "high_cloud_cover"] {
+        assert!(
+            plot_recipe_fetch_blockers(slug, ModelId::Aifs)
+                .expect("known cloud recipe")
+                .is_empty(),
+            "{slug} is present in the verified AIFS oper inventory"
+        );
+    }
+    for slug in ["10m_wind_gusts", "visibility"] {
+        let blockers = plot_recipe_fetch_blockers(slug, ModelId::Aifs).expect("known recipe");
+        assert_eq!(blockers.len(), 1);
+        assert!(blockers[0].reason.contains("public 'oper' product"));
+    }
+}
+
+#[test]
+fn local_only_model_identifiers_do_not_advertise_remote_sources() {
+    for model in [ModelId::RrfsFireWx, ModelId::WrfGdex] {
+        assert!(model_summary(model).sources.is_empty());
+        assert!(supported_forecast_hours(model, 0).is_empty());
+    }
+    assert!(
+        model_summary(ModelId::WrfGdex)
+            .description
+            .contains("local import")
+    );
+    assert!(
+        model_summary(ModelId::RrfsFireWx)
+            .description
+            .contains("no public acquisition lane")
+    );
 }
 
 #[test]
@@ -784,6 +925,197 @@ fn gefs_supported_forecast_hours_follow_operational_high_hour_cadence() {
     assert!(hours.contains(&246));
     assert!(!hours.contains(&249));
     assert!(hours.contains(&384));
+}
+
+#[test]
+fn nbm_supported_forecast_hours_follow_native_cadence() {
+    let hours = supported_forecast_hours(ModelId::Nbm, 12);
+    for valid in [1, 2, 36, 39, 192, 198, 264] {
+        assert!(hours.contains(&valid), "f{valid:03} should be published");
+    }
+    for invalid in [0, 37, 38, 193, 195, 265] {
+        assert!(
+            !hours.contains(&invalid),
+            "f{invalid:03} is off the native NBM cadence"
+        );
+    }
+}
+
+#[test]
+fn rtma_urma_summaries_are_hourly_f000_analyses_with_aws_archives() {
+    for model in [ModelId::Rtma, ModelId::Urma] {
+        let summary = model_summary(model);
+        assert_eq!(summary.cycle_hours_utc, HOURLY_ANALYSIS_CYCLE_HOURS);
+        assert_eq!(summary.max_forecast_hour, 0);
+        assert_eq!(supported_forecast_hours(model, 17), vec![0]);
+        assert!(
+            summary
+                .sources
+                .iter()
+                .any(|source| source.id == SourceId::Aws && source.idx_available),
+            "{model} should advertise its indexed NOAA S3 archive"
+        );
+    }
+}
+
+#[test]
+fn rtma_urma_url_builders_reject_positive_forecast_leads() {
+    let cycle = rustwx_core::CycleSpec::new("20260810", 17).unwrap();
+    for model in [ModelId::Rtma, ModelId::Urma] {
+        let request = ModelRunRequest::new(model, cycle.clone(), 1, "2dvaranl_ndfd").unwrap();
+        let err = build_grib_url(SourceId::Aws, &request)
+            .expect_err("surface analyses publish only f000");
+        assert!(matches!(
+            err,
+            ModelError::UnsupportedForecastHour {
+                forecast_hour: 1,
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn nbm_url_builder_rejects_off_cadence_hours() {
+    let cycle = rustwx_core::CycleSpec::new("20260725", 12).unwrap();
+    for valid in [1, 36, 39, 192, 198, 264] {
+        let request = ModelRunRequest::new(ModelId::Nbm, cycle.clone(), valid, "core/co").unwrap();
+        let url = build_grib_url(SourceId::Aws, &request).expect("valid NBM URL");
+        assert!(url.contains(&format!("f{valid:03}")), "got: {url}");
+    }
+    for invalid in [0, 37, 193, 195, 265] {
+        let request =
+            ModelRunRequest::new(ModelId::Nbm, cycle.clone(), invalid, "core/co").unwrap();
+        assert!(matches!(
+            build_grib_url(SourceId::Aws, &request),
+            Err(ModelError::UnsupportedForecastHour { .. })
+        ));
+    }
+}
+
+#[test]
+fn regional_and_ensemble_ingest_products_follow_native_cadence() {
+    let hiresw = supported_forecast_hours(ModelId::Hiresw, 0);
+    assert_eq!(hiresw.first(), Some(&0));
+    assert_eq!(hiresw.last(), Some(&48));
+    assert_eq!(hiresw.len(), 49);
+    assert!(supported_forecast_hours(ModelId::Hiresw, 6).is_empty());
+
+    let href = supported_forecast_hours(ModelId::Href, 6);
+    assert_eq!(href.first(), Some(&1));
+    assert_eq!(href.last(), Some(&48));
+    assert_eq!(href.len(), 48);
+    assert!(supported_forecast_hours(ModelId::Href, 3).is_empty());
+
+    let sref = supported_forecast_hours(ModelId::Sref, 3);
+    assert_eq!(sref.first(), Some(&0));
+    assert_eq!(sref.last(), Some(&87));
+    assert!(sref.contains(&3));
+    assert!(!sref.contains(&1));
+    assert!(supported_forecast_hours(ModelId::Sref, 0).is_empty());
+
+    let refs = supported_forecast_hours(ModelId::Refs, 12);
+    assert_eq!(refs.first(), Some(&1));
+    assert_eq!(refs.last(), Some(&60));
+    assert_eq!(refs.len(), 60);
+    assert!(supported_forecast_hours(ModelId::Refs, 3).is_empty());
+}
+
+#[test]
+fn rrfs_public_supported_forecast_hours_are_cycle_aware() {
+    let synoptic = supported_forecast_hours(ModelId::RrfsPublic, 0);
+    assert_eq!(synoptic.first(), Some(&0));
+    assert_eq!(synoptic.last(), Some(&84));
+    assert_eq!(synoptic.len(), 85);
+
+    let short = supported_forecast_hours(ModelId::RrfsPublic, 3);
+    assert_eq!(short.first(), Some(&0));
+    assert_eq!(short.last(), Some(&18));
+    assert_eq!(short.len(), 19);
+
+    assert!(supported_forecast_hours(ModelId::RrfsPublic, 1).is_empty());
+}
+
+#[test]
+fn rrfs_public_url_builder_rejects_off_cadence_leads() {
+    let synoptic = CycleSpec::new("20260810", 0).unwrap();
+    for valid in [0, 1, 84] {
+        let request =
+            ModelRunRequest::new(ModelId::RrfsPublic, synoptic.clone(), valid, "prs-conus")
+                .unwrap();
+        let url = build_grib_url(SourceId::Aws, &request).expect("valid synoptic RRFS lead");
+        assert!(url.contains(&format!("f{valid:03}")), "got: {url}");
+    }
+    let request = ModelRunRequest::new(ModelId::RrfsPublic, synoptic, 85, "prs-conus").unwrap();
+    assert!(matches!(
+        build_grib_url(SourceId::Aws, &request),
+        Err(ModelError::UnsupportedForecastHour { .. })
+    ));
+
+    let short = CycleSpec::new("20260810", 3).unwrap();
+    let request =
+        ModelRunRequest::new(ModelId::RrfsPublic, short.clone(), 18, "2dfld-conus").unwrap();
+    build_grib_url(SourceId::Aws, &request).expect("valid short-cycle RRFS lead");
+    let request = ModelRunRequest::new(ModelId::RrfsPublic, short, 19, "2dfld-conus").unwrap();
+    assert!(matches!(
+        build_grib_url(SourceId::Aws, &request),
+        Err(ModelError::UnsupportedForecastHour { .. })
+    ));
+}
+
+#[test]
+fn regional_and_ensemble_url_builders_reject_off_cadence_leads() {
+    let cases = [
+        (
+            ModelId::Hiresw,
+            0,
+            48,
+            49,
+            "arw_2p5km/conus",
+            SourceId::Nomads,
+            "f48.conus.grib2",
+        ),
+        (
+            ModelId::Href,
+            6,
+            48,
+            0,
+            "ensprod/conus/mean",
+            SourceId::Nomads,
+            "conus.mean.f48.grib2",
+        ),
+        (
+            ModelId::Sref,
+            3,
+            87,
+            1,
+            "ensprod/pgrb212/mean_3hrly",
+            SourceId::Nomads,
+            "pgrb212.mean_3hrly.grib2",
+        ),
+        (
+            ModelId::Refs,
+            12,
+            60,
+            0,
+            "mean-conus",
+            SourceId::Aws,
+            "mean.f60.conus.grib2",
+        ),
+    ];
+
+    for (model, cycle_hour, valid, invalid, product, source, suffix) in cases {
+        let cycle = rustwx_core::CycleSpec::new("20260810", cycle_hour).unwrap();
+        let request = ModelRunRequest::new(model, cycle.clone(), valid, product).unwrap();
+        let url = build_grib_url(source, &request).expect("native lead resolves");
+        assert!(url.ends_with(suffix), "got: {url}");
+
+        let request = ModelRunRequest::new(model, cycle, invalid, product).unwrap();
+        assert!(matches!(
+            build_grib_url(source, &request),
+            Err(ModelError::UnsupportedForecastHour { .. })
+        ));
+    }
 }
 
 #[test]
@@ -971,6 +1303,20 @@ fn easy_ncep_model_urls_use_current_operational_layouts() {
         build_grib_url(SourceId::Nomads, &rtma).unwrap(),
         "https://nomads.ncep.noaa.gov/pub/data/nccf/com/rtma/prod/rtma2p5.20260502/rtma2p5.t00z.2dvaranl_ndfd.grb2_wexp"
     );
+    assert_eq!(
+        build_grib_url(SourceId::Aws, &rtma).unwrap(),
+        "https://noaa-rtma-pds.s3.amazonaws.com/rtma2p5.20260502/rtma2p5.t00z.2dvaranl_ndfd.grb2_wexp"
+    );
+
+    let urma = ModelRunRequest::new(ModelId::Urma, cycle.clone(), 0, "2dvaranl_ndfd").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::Nomads, &urma).unwrap(),
+        "https://nomads.ncep.noaa.gov/pub/data/nccf/com/urma/prod/urma2p5.20260502/urma2p5.t00z.2dvaranl_ndfd.grb2_wexp"
+    );
+    assert_eq!(
+        build_grib_url(SourceId::Aws, &urma).unwrap(),
+        "https://noaa-urma-pds.s3.amazonaws.com/urma2p5.20260502/urma2p5.t00z.2dvaranl_ndfd.grb2_wexp"
+    );
 
     let sref_cycle = rustwx_core::CycleSpec::new("20260502", 3).unwrap();
     let sref = ModelRunRequest::new(ModelId::Sref, sref_cycle, 24, "arw/ctl/pgrb132").unwrap();
@@ -1009,6 +1355,17 @@ fn aifs_supports_local_long_runs_and_ecmwf_open_data_urls() {
         build_grib_url(SourceId::Ecmwf, &open_data).unwrap(),
         "https://data.ecmwf.int/forecasts/20260502/00z/aifs-single/0p25/oper/20260502000000-24h-oper-fc.grib2"
     );
+    let resolved = resolve_urls(&open_data).expect("AIFS Open Data URL resolves");
+    let ecmwf = resolved
+        .iter()
+        .find(|url| url.source == SourceId::Ecmwf)
+        .expect("ECMWF is the public AIFS source");
+    assert_eq!(
+        ecmwf.idx_url.as_deref(),
+        Some(
+            "https://data.ecmwf.int/forecasts/20260502/00z/aifs-single/0p25/oper/20260502000000-24h-oper-fc.index"
+        )
+    );
 
     let wave = ModelRunRequest::new(
         ModelId::Aifs,
@@ -1030,6 +1387,24 @@ fn aifs_supports_local_long_runs_and_ecmwf_open_data_urls() {
             ..
         })
     ));
+
+    for invalid in [3, 366] {
+        let request = ModelRunRequest::new(
+            ModelId::Aifs,
+            rustwx_core::CycleSpec::new("20260502", 0).unwrap(),
+            invalid,
+            "oper",
+        )
+        .unwrap();
+        assert!(matches!(
+            build_grib_url(SourceId::Ecmwf, &request),
+            Err(ModelError::UnsupportedForecastHour {
+                model: ModelId::Aifs,
+                forecast_hour,
+                ..
+            }) if forecast_hour == invalid
+        ));
+    }
 }
 
 #[test]
@@ -3060,7 +3435,7 @@ fn rrfs_public_urls_match_public_bucket_pattern() {
 }
 
 #[test]
-fn rrfs_firewx_urls_match_public_firewx_bucket_pattern() {
+fn legacy_rrfs_nested_identifier_has_no_public_acquisition_lane() {
     let request = ModelRunRequest::new(
         ModelId::RrfsFireWx,
         CycleSpec::new("20260507", 6).unwrap(),
@@ -3068,17 +3443,13 @@ fn rrfs_firewx_urls_match_public_firewx_bucket_pattern() {
         "prs-firewx",
     )
     .unwrap();
-    let urls = resolve_urls(&request).unwrap();
-    assert_eq!(
-        urls[0].grib_url,
-        "https://noaa-rrfs-pds.s3.amazonaws.com/rrfs_public/firewx.20260507/06/rrfs.t06z.prslev.1p5km.f024.firewx_lcc.grib2"
-    );
-    assert_eq!(
-        urls[0].idx_url.as_deref(),
-        Some(
-            "https://noaa-rrfs-pds.s3.amazonaws.com/rrfs_public/firewx.20260507/06/rrfs.t06z.prslev.1p5km.f024.firewx_lcc.grib2.idx"
-        )
-    );
+    assert!(matches!(
+        resolve_urls(&request),
+        Err(ModelError::UnsupportedProduct {
+            model: ModelId::RrfsFireWx,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -3098,114 +3469,27 @@ fn rrfs_a_subhourly_hi_urls_match_live_bucket_pattern() {
 }
 
 #[test]
-fn wrf_gdex_urls_match_gdex_wrfout_pattern() {
-    let request = ModelRunRequest::new(
-        ModelId::WrfGdex,
-        CycleSpec::new("20150101", 0).unwrap(),
-        0,
-        "d010047-d01",
-    )
-    .unwrap();
-    let urls = resolve_urls(&request).unwrap();
-    assert_eq!(
-        urls[0].grib_url,
-        "https://tds.gdex.ucar.edu/thredds/fileServer/files/d010047/201501/wrfout_d01_2015-01-01_00:00:00.nc"
-    );
-    assert!(urls[0].idx_url.is_none());
-}
-
-#[test]
-fn wrf_gdex_urls_roll_forward_by_forecast_hour() {
-    let request = ModelRunRequest::new(
-        ModelId::WrfGdex,
-        CycleSpec::new("20150101", 0).unwrap(),
-        15,
-        "d010047-d01",
-    )
-    .unwrap();
-    let urls = resolve_urls(&request).unwrap();
-    assert_eq!(
-        urls[0].grib_url,
-        "https://tds.gdex.ucar.edu/thredds/fileServer/files/d010047/201501/wrfout_d01_2015-01-01_15:00:00.nc"
-    );
-}
-
-#[test]
-fn wrf_gdex_hist2d_urls_match_osdf_pattern() {
-    let request = ModelRunRequest::new(
-        ModelId::WrfGdex,
-        CycleSpec::new("19950101", 0).unwrap(),
-        12,
-        "d612005-hist2d",
-    )
-    .unwrap();
-    let urls = resolve_urls(&request).unwrap();
-    assert_eq!(
-        urls[0].grib_url,
-        "https://tds.gdex.ucar.edu/thredds/fileServer/files/g/d612005/hist2D/199501/wrf2d_d01_1995-01-01_12:00:00.nc"
-    );
-}
-
-#[test]
-fn wrf_gdex_hist3d_urls_match_osdf_pattern() {
-    let request = ModelRunRequest::new(
-        ModelId::WrfGdex,
-        CycleSpec::new("19950101", 0).unwrap(),
-        12,
-        "d612005-hist3d",
-    )
-    .unwrap();
-    let urls = resolve_urls(&request).unwrap();
-    assert_eq!(
-        urls[0].grib_url,
-        "https://tds.gdex.ucar.edu/thredds/fileServer/files/g/d612005/hist3D/199501/wrf3d_d01_1995-01-01_12:00:00.nc"
-    );
-}
-
-#[test]
-fn wrf_gdex_future2d_urls_match_osdf_pattern() {
-    let request = ModelRunRequest::new(
-        ModelId::WrfGdex,
-        CycleSpec::new("20800101", 0).unwrap(),
-        0,
-        "d612005-future2d",
-    )
-    .unwrap();
-    let urls = resolve_urls(&request).unwrap();
-    assert_eq!(
-        urls[0].grib_url,
-        "https://tds.gdex.ucar.edu/thredds/fileServer/files/g/d612005/future2D/208001/wrf2d_d01_2080-01-01_00:00:00.nc"
-    );
-}
-
-#[test]
-fn wrf_gdex_future3d_urls_match_osdf_pattern() {
-    let request = ModelRunRequest::new(
-        ModelId::WrfGdex,
-        CycleSpec::new("20800101", 0).unwrap(),
-        0,
-        "d612005-future3d",
-    )
-    .unwrap();
-    let urls = resolve_urls(&request).unwrap();
-    assert_eq!(
-        urls[0].grib_url,
-        "https://tds.gdex.ucar.edu/thredds/fileServer/files/g/d612005/future3D/208001/wrf3d_d01_2080-01-01_00:00:00.nc"
-    );
-}
-
-#[test]
-fn wrf_gdex_hist3d_rejects_off_cadence_valid_times() {
-    let request = ModelRunRequest::new(
-        ModelId::WrfGdex,
-        CycleSpec::new("19950101", 0).unwrap(),
-        1,
-        "d612005-hist3d",
-    )
-    .unwrap();
-    let err = resolve_urls(&request).unwrap_err();
-    assert!(
-        err.to_string().contains("every 3 hours"),
-        "unexpected error: {err}"
-    );
+fn wrf_gdex_is_local_import_only_without_remote_resolved_urls() {
+    for (date, hour, product) in [
+        ("20150101", 0, "d010047-d01"),
+        ("19950101", 12, "d612005-hist2d"),
+        ("19950101", 12, "d612005-hist3d"),
+        ("20800101", 0, "d612005-future2d"),
+        ("20800101", 0, "d612005-future3d"),
+    ] {
+        let request = ModelRunRequest::new(
+            ModelId::WrfGdex,
+            CycleSpec::new(date, 0).unwrap(),
+            hour,
+            product,
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_urls(&request),
+            Err(ModelError::UnsupportedProduct {
+                model: ModelId::WrfGdex,
+                ..
+            })
+        ));
+    }
 }

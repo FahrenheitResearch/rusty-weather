@@ -1,0 +1,24 @@
+services:
+  api:
+    environment:
+      RW_ORIGIN_CATALOG_ENABLED: ${RW_ORIGIN_CATALOG_ENABLED:-false}
+      RW_ORIGIN_CATALOG_PUBLICATION_SOURCES: ${RW_ORIGIN_CATALOG_PUBLICATION_SOURCES:-replication}
+      RW_GENERATION_REPLICATION_ENABLED: ${RW_GENERATION_REPLICATION_ENABLED:-false}
+      RW_GENERATION_REPLICATION_SECURITY_TESTS_PASSED: ${RW_GENERATION_REPLICATION_SECURITY_TESTS_PASSED:-false}
+      RW_GENERATION_REPLICATION_CAPACITY_AUDIT_COMPLETED: ${RW_GENERATION_REPLICATION_CAPACITY_AUDIT_COMPLETED:-false}
+      RW_GENERATION_REPLICATION_KILL_SWITCH: ${RW_GENERATION_REPLICATION_KILL_SWITCH:-true}
+      RW_GENERATION_REPLICATION_ROOT: /var/lib/rusty-weather/generation-replication
+      RW_GENERATION_REPLICATION_SIGNING_KEY_ID: ${RW_GENERATION_REPLICATION_SIGNING_KEY_ID:-rw-generation-replication-v1}
+      RW_GENERATION_REPLICATION_OPERATOR_PRINCIPALS: ${RW_GENERATION_REPLICATION_OPERATOR_PRINCIPALS:-}
+      RW_DOCKER_GENERATION_REPLICATION_SIGNING_KEY_SOURCE: /run/secrets/rw_generation_replication_signing_key
+    volumes:
+      # This target deliberately replaces the base Compose read-only store
+      # mount only in the advanced replication topology.
+      - ./data/store:/var/lib/rusty-weather/store:rw
+      - ./data/generation-replication:/var/lib/rusty-weather/generation-replication:rw
+    secrets:
+      - rw_generation_replication_signing_key
+
+secrets:
+  rw_generation_replication_signing_key:
+    file: ./secrets/generation-replication-ed25519.key

@@ -20,6 +20,6 @@ name = "run_case_raw"
 path = "src/bin/run_case_raw.rs"
 
 [dependencies]
-wx-math = { path = "../wx-math" }
+wx-math = { version = "0.3.6", path = "../wx-math" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

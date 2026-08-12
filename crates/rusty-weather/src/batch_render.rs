@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use chrono::{DateTime, Timelike, Utc};
 use rustwx_core::{CycleSpec, ModelId, SourceId};
 use rustwx_models::{model_summary, plot_recipe_fetch_plan};
 use rustwx_products::derived::{
@@ -20,6 +21,7 @@ use rustwx_products::direct::supported_direct_recipe_slugs;
 use rustwx_products::shared_context::DomainSpec;
 use rustwx_products::windowed::HrrrWindowedProduct;
 use rustwx_render::PngCompressionMode;
+use rw_store::RwsExactTime;
 
 use crate::render_all::{
     StoreFieldSource, StoreRenderConfig, partition_products, render_hour_products,
@@ -59,6 +61,23 @@ pub enum BatchHourScope {
     AllStored,
 }
 
+/// One stored time identity. `storage_slot` is the on-disk key; `exact_time`
+/// is authoritative for v2 runs and absent for legacy whole-hour v1 runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchRenderTime {
+    pub storage_slot: u16,
+    pub exact_time: Option<RwsExactTime>,
+}
+
+impl BatchRenderTime {
+    pub const fn legacy_hour(hour: u16) -> Self {
+        Self {
+            storage_slot: hour,
+            exact_time: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum BatchRenderDomain {
     /// Tight finite lat/lon extent of the run's `grid.rwg`.
@@ -79,6 +98,9 @@ pub struct BatchRenderRequest {
     pub model_slug: String,
     pub run_slug: String,
     pub hours: BatchHourScope,
+    /// Optional caller-side guard for a selected exact-time slot. If set, the
+    /// manifest pair must match exactly; it is invalid with `AllStored`.
+    pub expected_exact_time: Option<RwsExactTime>,
     /// Comma-separated production slugs, or a `render_all` catalog keyword.
     pub product_spec: String,
     pub out_dir: PathBuf,
@@ -108,6 +130,7 @@ impl BatchRenderRequest {
             model_slug: model_slug.into(),
             run_slug: run_slug.into(),
             hours: BatchHourScope::Current(hour),
+            expected_exact_time: None,
             product_spec: product_slug.into(),
             out_dir: out_dir.into(),
             domain: BatchRenderDomain::NativeGrid,
@@ -126,6 +149,7 @@ pub enum BatchProductKind {
     Direct,
     Derived,
     Heavy,
+    Generic,
     Windowed,
 }
 
@@ -135,6 +159,7 @@ impl BatchProductKind {
             Self::Direct => "direct",
             Self::Derived => "derived",
             Self::Heavy => "heavy",
+            Self::Generic => "generic",
             Self::Windowed => "windowed",
         }
     }
@@ -150,12 +175,14 @@ pub struct BatchProductOption {
     pub slug: String,
     pub kind: BatchProductKind,
     pub source_fields: Vec<String>,
+    pub units: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchRenderCatalog {
     pub products: Vec<BatchProductOption>,
     pub stored_hours: Vec<u16>,
+    pub stored_times: Vec<BatchRenderTime>,
 }
 
 /// Inspect one hour without decoding any field payloads.  Selector metadata is
@@ -193,6 +220,7 @@ pub fn inspect_renderable_products(
                 slug,
                 kind: BatchProductKind::Direct,
                 source_fields,
+                units: None,
             });
         }
     }
@@ -213,13 +241,37 @@ pub fn inspect_renderable_products(
                 BatchProductKind::Derived
             },
             source_fields: vec![slug.clone()],
+            units: store.surface_variable(slug).map(|var| var.units.clone()),
         });
     }
 
-    let stored_hours =
-        crate::render_all::windowed_store::stored_run_hours(store_root, model_slug, run_slug)
-            .map_err(|err| err.to_string())?;
-    if model == ModelId::Hrrr && stored_hours.len() > 1 {
+    for variable in store.surface_variables() {
+        if crate::render_all::validate_generic_variable_name(&variable.name).is_err() {
+            continue;
+        }
+        products.push(BatchProductOption {
+            slug: format!("var:{}", variable.name),
+            kind: BatchProductKind::Generic,
+            source_fields: vec![variable.name.clone()],
+            units: Some(variable.units.clone()),
+        });
+    }
+
+    let stored_times =
+        crate::render_all::windowed_store::stored_run_times(store_root, model_slug, run_slug)
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .map(|(storage_slot, exact_time)| BatchRenderTime {
+                storage_slot,
+                exact_time,
+            })
+            .collect::<Vec<_>>();
+    let stored_hours = stored_times
+        .iter()
+        .map(|time| time.storage_slot)
+        .collect::<Vec<_>>();
+    let legacy_axis = stored_times.iter().all(|time| time.exact_time.is_none());
+    if model == ModelId::Hrrr && legacy_axis && stored_hours.len() > 1 {
         products.extend(
             HrrrWindowedProduct::supported_products()
                 .iter()
@@ -227,6 +279,7 @@ pub fn inspect_renderable_products(
                     slug: product.slug().to_string(),
                     kind: BatchProductKind::Windowed,
                     source_fields: Vec::new(),
+                    units: None,
                 }),
         );
     }
@@ -241,6 +294,7 @@ pub fn inspect_renderable_products(
     Ok(BatchRenderCatalog {
         products,
         stored_hours,
+        stored_times,
     })
 }
 
@@ -248,39 +302,41 @@ pub fn inspect_renderable_products(
 pub enum BatchRenderEvent {
     Started {
         planned_items: usize,
-        hours: Vec<u16>,
+        times: Vec<BatchRenderTime>,
         products: Vec<String>,
         output_dir: PathBuf,
     },
     HourStarted {
-        hour: u16,
+        time: BatchRenderTime,
         index: usize,
         total: usize,
     },
     ItemStarted {
-        hour: Option<u16>,
+        time: Option<BatchRenderTime>,
         slug: String,
         kind: BatchProductKind,
         completed: usize,
         total: usize,
     },
     ItemRendered {
-        hour: Option<u16>,
+        time: Option<BatchRenderTime>,
         slug: String,
         output_path: PathBuf,
         render_ms: u128,
+        source_fields: Vec<String>,
+        units: Option<String>,
         completed: usize,
         total: usize,
     },
     ItemSkipped {
-        hour: Option<u16>,
+        time: Option<BatchRenderTime>,
         slug: String,
         reason: String,
         completed: usize,
         total: usize,
     },
     ItemFailed {
-        hour: Option<u16>,
+        time: Option<BatchRenderTime>,
         slug: String,
         error: String,
         completed: usize,
@@ -304,6 +360,8 @@ enum ProductOutcome {
     Rendered {
         output_path: PathBuf,
         render_ms: u128,
+        source_fields: Vec<String>,
+        units: Option<String>,
     },
     Skipped(String),
 }
@@ -325,7 +383,27 @@ pub fn run_batch_render(
     }
     let model = parse_model(&request.model_slug)?;
     validate_dimensions(&request)?;
-    let cycle = resolve_cycle(&request)?;
+    let stored_times = crate::render_all::windowed_store::stored_run_times(
+        &request.store_root,
+        &request.model_slug,
+        &request.run_slug,
+    )
+    .map_err(|err| err.to_string())?
+    .into_iter()
+    .map(|(storage_slot, exact_time)| BatchRenderTime {
+        storage_slot,
+        exact_time,
+    })
+    .collect::<Vec<_>>();
+    let times = select_times(&request, &stored_times)?;
+    if times.is_empty() {
+        return Err(format!(
+            "run {}/{} has no stored times",
+            request.model_slug, request.run_slug
+        ));
+    }
+    let exact_axis = stored_times.iter().all(|time| time.exact_time.is_some());
+    let cycle = resolve_cycle(&request, times.first().and_then(|time| time.exact_time))?;
     let source = match request.source {
         Some(source) => source,
         None => model_summary(model)
@@ -339,26 +417,11 @@ pub fn run_batch_render(
         partition_products(&request.product_spec, model).map_err(|err| err.to_string())?;
     dedup(&mut product_request.direct);
     dedup(&mut product_request.derived);
+    dedup(&mut product_request.generic);
     dedup(&mut product_request.windowed);
 
-    let stored_hours = crate::render_all::windowed_store::stored_run_hours(
-        &request.store_root,
-        &request.model_slug,
-        &request.run_slug,
-    )
-    .map_err(|err| err.to_string())?;
-    if product_request.windowed_auto && stored_hours.len() <= 1 {
+    if product_request.windowed_auto && (stored_times.len() <= 1 || exact_axis) {
         product_request.windowed.clear();
-    }
-    let hours = match request.hours {
-        BatchHourScope::Current(hour) => vec![hour],
-        BatchHourScope::AllStored => stored_hours.clone(),
-    };
-    if hours.is_empty() {
-        return Err(format!(
-            "run {}/{} has no stored hours",
-            request.model_slug, request.run_slug
-        ));
     }
 
     let mut per_hour = Vec::new();
@@ -377,9 +440,15 @@ pub fn run_batch_render(
         };
         (kind, slug)
     }));
+    per_hour.extend(
+        product_request
+            .generic
+            .iter()
+            .map(|name| (BatchProductKind::Generic, format!("var:{name}"))),
+    );
     validate_work(
         &request,
-        &hours,
+        &times,
         per_hour.len(),
         product_request.windowed.len(),
     )?;
@@ -390,7 +459,7 @@ pub fn run_batch_render(
         )
     })?;
 
-    let planned = hours
+    let planned = times
         .len()
         .checked_mul(per_hour.len())
         .and_then(|count| count.checked_add(product_request.windowed.len()))
@@ -402,7 +471,7 @@ pub fn run_batch_render(
         .collect::<Vec<_>>();
     emit(BatchRenderEvent::Started {
         planned_items: planned,
-        hours: hours.clone(),
+        times: times.clone(),
         products: all_products,
         output_dir: request.out_dir.clone(),
     });
@@ -414,21 +483,21 @@ pub fn run_batch_render(
     let mut completed = 0usize;
     let mut native_domain = None;
 
-    'hours: for (hour_index, &hour) in hours.iter().enumerate() {
+    'times: for (time_index, &time) in times.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         emit(BatchRenderEvent::HourStarted {
-            hour,
-            index: hour_index + 1,
-            total: hours.len(),
+            time,
+            index: time_index + 1,
+            total: times.len(),
         });
         let store = match protected(|| {
             StoreFieldSource::open(
                 &request.store_root,
                 &request.model_slug,
                 &request.run_slug,
-                hour,
+                time.storage_slot,
             )
             .map_err(|err| err.to_string())
         }) {
@@ -436,10 +505,10 @@ pub fn run_batch_render(
             Err(error) => {
                 for (kind, slug) in &per_hour {
                     if cancel.load(Ordering::Relaxed) {
-                        break 'hours;
+                        break 'times;
                     }
                     emit(BatchRenderEvent::ItemStarted {
-                        hour: Some(hour),
+                        time: Some(time),
                         slug: slug.clone(),
                         kind: *kind,
                         completed,
@@ -448,7 +517,7 @@ pub fn run_batch_render(
                     completed += 1;
                     summary.failed += 1;
                     emit(BatchRenderEvent::ItemFailed {
-                        hour: Some(hour),
+                        time: Some(time),
                         slug: slug.clone(),
                         error: format!("open stored hour: {error}"),
                         completed,
@@ -459,34 +528,48 @@ pub fn run_batch_render(
             }
         };
 
+        if store.exact_time() != time.exact_time {
+            return Err(format!(
+                "store slot {} timing changed after manifest selection: expected {:?}, opened {:?}",
+                time.storage_slot,
+                time.exact_time,
+                store.exact_time()
+            ));
+        }
+
         let domain = resolve_render_domain(&request.domain, &store, &mut native_domain)?;
-        let config = render_config(&request, model, &cycle, source, domain);
+        let config = render_config(&request, model, &cycle, source, domain, time.exact_time);
 
         for (kind, slug) in &per_hour {
             if cancel.load(Ordering::Relaxed) {
-                break 'hours;
+                break 'times;
             }
             emit(BatchRenderEvent::ItemStarted {
-                hour: Some(hour),
+                time: Some(time),
                 slug: slug.clone(),
                 kind: *kind,
                 completed,
                 total: planned,
             });
-            let outcome = protected(|| render_hour_item(&config, &store, hour, *kind, slug));
+            let outcome =
+                protected(|| render_hour_item(&config, &store, time.storage_slot, *kind, slug));
             completed += 1;
             match outcome {
                 Ok(ProductOutcome::Rendered {
                     output_path,
                     render_ms,
+                    source_fields,
+                    units,
                 }) => {
                     summary.rendered += 1;
                     summary.outputs.push(output_path.clone());
                     emit(BatchRenderEvent::ItemRendered {
-                        hour: Some(hour),
+                        time: Some(time),
                         slug: slug.clone(),
                         output_path,
                         render_ms,
+                        source_fields,
+                        units,
                         completed,
                         total: planned,
                     });
@@ -494,7 +577,7 @@ pub fn run_batch_render(
                 Ok(ProductOutcome::Skipped(reason)) => {
                     summary.skipped += 1;
                     emit(BatchRenderEvent::ItemSkipped {
-                        hour: Some(hour),
+                        time: Some(time),
                         slug: slug.clone(),
                         reason,
                         completed,
@@ -504,7 +587,7 @@ pub fn run_batch_render(
                 Err(error) => {
                     summary.failed += 1;
                     emit(BatchRenderEvent::ItemFailed {
-                        hour: Some(hour),
+                        time: Some(time),
                         slug: slug.clone(),
                         error,
                         completed,
@@ -515,10 +598,29 @@ pub fn run_batch_render(
         }
     }
 
-    if !cancel.load(Ordering::Relaxed) && !product_request.windowed.is_empty() {
-        let anchor_hour = stored_hours
+    if !cancel.load(Ordering::Relaxed) && !product_request.windowed.is_empty() && exact_axis {
+        for slug in &product_request.windowed {
+            emit(BatchRenderEvent::ItemStarted {
+                time: None,
+                slug: slug.clone(),
+                kind: BatchProductKind::Windowed,
+                completed,
+                total: planned,
+            });
+            completed += 1;
+            summary.skipped += 1;
+            emit(BatchRenderEvent::ItemSkipped {
+                time: None,
+                slug: slug.clone(),
+                reason: "windowed products require a legacy contiguous whole-hour forecast axis; this run uses exact-time ordinal slots".to_string(),
+                completed,
+                total: planned,
+            });
+        }
+    } else if !cancel.load(Ordering::Relaxed) && !product_request.windowed.is_empty() {
+        let anchor_hour = stored_times
             .last()
-            .copied()
+            .map(|time| time.storage_slot)
             .ok_or_else(|| "windowed render needs at least one stored hour".to_string())?;
         let store = protected(|| {
             StoreFieldSource::open(
@@ -532,10 +634,10 @@ pub fn run_batch_render(
         match store {
             Ok(store) => {
                 let domain = resolve_render_domain(&request.domain, &store, &mut native_domain)?;
-                let config = render_config(&request, model, &cycle, source, domain);
+                let config = render_config(&request, model, &cycle, source, domain, None);
                 for slug in &product_request.windowed {
                     emit(BatchRenderEvent::ItemStarted {
-                        hour: None,
+                        time: None,
                         slug: slug.clone(),
                         kind: BatchProductKind::Windowed,
                         completed,
@@ -564,14 +666,18 @@ pub fn run_batch_render(
                                 ProductOutcome::Rendered {
                                     output_path,
                                     render_ms,
+                                    source_fields,
+                                    units,
                                 } => {
                                     summary.rendered += 1;
                                     summary.outputs.push(output_path.clone());
                                     emit(BatchRenderEvent::ItemRendered {
-                                        hour: None,
+                                        time: None,
                                         slug,
                                         output_path,
                                         render_ms,
+                                        source_fields,
+                                        units,
                                         completed,
                                         total: planned,
                                     });
@@ -579,7 +685,7 @@ pub fn run_batch_render(
                                 ProductOutcome::Skipped(reason) => {
                                     summary.skipped += 1;
                                     emit(BatchRenderEvent::ItemSkipped {
-                                        hour: None,
+                                        time: None,
                                         slug,
                                         reason,
                                         completed,
@@ -594,7 +700,7 @@ pub fn run_batch_render(
                             completed += 1;
                             summary.failed += 1;
                             emit(BatchRenderEvent::ItemFailed {
-                                hour: None,
+                                time: None,
                                 slug: slug.clone(),
                                 error: error.clone(),
                                 completed,
@@ -610,7 +716,7 @@ pub fn run_batch_render(
                         break;
                     }
                     emit(BatchRenderEvent::ItemStarted {
-                        hour: None,
+                        time: None,
                         slug: slug.clone(),
                         kind: BatchProductKind::Windowed,
                         completed,
@@ -619,7 +725,7 @@ pub fn run_batch_render(
                     completed += 1;
                     summary.failed += 1;
                     emit(BatchRenderEvent::ItemFailed {
-                        hour: None,
+                        time: None,
                         slug: slug.clone(),
                         error: format!("open window anchor hour: {error}"),
                         completed,
@@ -643,6 +749,21 @@ fn render_hour_item(
     kind: BatchProductKind,
     slug: &str,
 ) -> Result<ProductOutcome, String> {
+    if kind == BatchProductKind::Generic {
+        let variable = slug.strip_prefix("var:").ok_or_else(|| {
+            format!("internal generic product identity {slug:?} is missing the 'var:' prefix")
+        })?;
+        let rendered = crate::render_all::store_render::render_generic_store_variable(
+            store, config, hour, variable,
+        )
+        .map_err(|err| err.to_string())?;
+        return Ok(ProductOutcome::Rendered {
+            output_path: rendered.output_path,
+            render_ms: rendered.total_ms,
+            source_fields: vec![rendered.variable],
+            units: Some(rendered.input_units),
+        });
+    }
     let single = vec![slug.to_string()];
     let empty: &[String] = &[];
     let (direct, derived) = if kind == BatchProductKind::Direct {
@@ -650,12 +771,26 @@ fn render_hour_item(
     } else {
         (empty, single.as_slice())
     };
-    let mut outcome = render_hour_products(config, store, hour, direct, derived, None)
+    let mut outcome = render_hour_products(config, store, hour, direct, derived, empty, None)
         .map_err(|err| err.to_string())?;
     if let Some(rendered) = outcome.rendered.pop() {
         return Ok(ProductOutcome::Rendered {
             output_path: rendered.output_path,
             render_ms: rendered.total_ms,
+            source_fields: if kind == BatchProductKind::Direct {
+                plot_recipe_fetch_plan(slug, config.model)
+                    .ok()
+                    .map(|plan| {
+                        plan.selectors()
+                            .iter()
+                            .filter_map(|selector| store.resolve(selector).map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                vec![slug.to_string()]
+            },
+            units: store.surface_variable(slug).map(|var| var.units.clone()),
         });
     }
     if let Some(skipped) = outcome.skipped.pop() {
@@ -699,6 +834,8 @@ fn render_windowed_items(
             ProductOutcome::Rendered {
                 output_path: rendered.output_path,
                 render_ms: rendered.total_ms,
+                source_fields: Vec::new(),
+                units: None,
             },
         );
     }
@@ -725,11 +862,13 @@ fn render_config(
     cycle: &CycleSpec,
     source: SourceId,
     domain: DomainSpec,
+    exact_time: Option<RwsExactTime>,
 ) -> StoreRenderConfig {
     StoreRenderConfig {
         model,
         date_yyyymmdd: cycle.date_yyyymmdd.clone(),
         cycle_utc: cycle.hour_utc,
+        exact_time,
         source,
         domain,
         out_dir: request.out_dir.clone(),
@@ -788,14 +927,14 @@ fn validate_dimensions(request: &BatchRenderRequest) -> Result<(), String> {
 
 fn validate_work(
     request: &BatchRenderRequest,
-    hours: &[u16],
+    times: &[BatchRenderTime],
     per_hour_products: usize,
     windowed_products: usize,
 ) -> Result<(), String> {
-    if hours.len() > request.limits.max_hours {
+    if times.len() > request.limits.max_hours {
         return Err(format!(
             "{} hours selected; GUI ceiling is {} (split the run into smaller jobs)",
-            hours.len(),
+            times.len(),
             request.limits.max_hours
         ));
     }
@@ -805,7 +944,7 @@ fn validate_work(
             request.limits.max_products_per_hour
         ));
     }
-    let work = hours
+    let work = times
         .len()
         .checked_mul(per_hour_products)
         .and_then(|count| count.checked_add(windowed_products))
@@ -822,14 +961,51 @@ fn validate_work(
     Ok(())
 }
 
-fn resolve_cycle(request: &BatchRenderRequest) -> Result<CycleSpec, String> {
+fn select_times(
+    request: &BatchRenderRequest,
+    stored_times: &[BatchRenderTime],
+) -> Result<Vec<BatchRenderTime>, String> {
+    match request.hours {
+        BatchHourScope::AllStored => {
+            if request.expected_exact_time.is_some() {
+                return Err("expected_exact_time is only valid with Current(slot)".to_string());
+            }
+            Ok(stored_times.to_vec())
+        }
+        BatchHourScope::Current(slot) => {
+            let time = stored_times
+                .iter()
+                .copied()
+                .find(|time| time.storage_slot == slot)
+                .ok_or_else(|| format!("storage slot {slot} is absent from the run manifest"))?;
+            if let Some(expected) = request.expected_exact_time
+                && time.exact_time != Some(expected)
+            {
+                return Err(format!(
+                    "storage slot {slot} exact time does not match caller expectation: expected {:?}, manifest has {:?}",
+                    expected, time.exact_time
+                ));
+            }
+            Ok(vec![time])
+        }
+    }
+}
+
+fn resolve_cycle(
+    request: &BatchRenderRequest,
+    exact_time: Option<RwsExactTime>,
+) -> Result<CycleSpec, String> {
     let inferred = infer_run_cycle(&request.run_slug);
+    let exact_origin = exact_time
+        .and_then(RwsExactTime::origin_unix)
+        .and_then(|unix| DateTime::<Utc>::from_timestamp(unix, 0));
     let date = request
         .date_yyyymmdd
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+        .or_else(|| exact_origin.map(|time| time.format("%Y%m%d").to_string()))
         .or_else(|| inferred.as_ref().map(|(date, _)| date.clone()))
         .ok_or_else(|| {
             format!(
@@ -839,6 +1015,7 @@ fn resolve_cycle(request: &BatchRenderRequest) -> Result<CycleSpec, String> {
         })?;
     let hour = request
         .cycle_utc
+        .or_else(|| exact_origin.map(|time| time.hour() as u8))
         .or_else(|| inferred.map(|(_, hour)| hour))
         .ok_or_else(|| {
             format!(
@@ -1034,7 +1211,12 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::infer_run_cycle;
+    use std::sync::atomic::AtomicBool;
+
+    use rustwx_core::{CanonicalField, FieldSelector, GridShape, LatLonGrid, SelectedField2D};
+    use rw_store::{DerivedFieldInput, RwsExactTime, write_hour_from_fields_with_derived_exact};
+
+    use super::*;
 
     #[test]
     fn infers_operational_and_local_wrf_run_names() {
@@ -1047,5 +1229,163 @@ mod tests {
             Some(("20110524".to_string(), 18))
         );
         assert_eq!(infer_run_cycle("local_wrf_no_time"), None);
+    }
+
+    #[test]
+    fn exact_origin_overrides_a_conflicting_parseable_run_slug() {
+        let request = BatchRenderRequest::conservative(
+            "store",
+            "wrf",
+            "20260608_00z",
+            0,
+            "2m_temperature",
+            "out",
+        );
+        let exact = RwsExactTime {
+            lead_seconds: 31_680,
+            valid_unix: 134_243_280,
+        };
+        let cycle = resolve_cycle(&request, Some(exact)).unwrap();
+        assert_eq!(cycle.date_yyyymmdd, "19740403");
+        assert_eq!(cycle.hour_utc, 9);
+    }
+
+    #[test]
+    fn exact_time_direct_generic_and_windowed_contract_is_honest() {
+        let root = test_dir("exact-generic");
+        let out = root.join("out");
+        let run = "minute_loop";
+        let exact = RwsExactTime::new(1_800, 1_700_001_800);
+        let shape = GridShape::new(4, 3).unwrap();
+        let lat = vec![
+            35.0, 35.0, 35.0, 35.0, 36.0, 36.0, 36.0, 36.0, 37.0, 37.0, 37.0, 37.0,
+        ];
+        let lon = vec![
+            -100.0, -99.0, -98.0, -97.0, -100.0, -99.0, -98.0, -97.0, -100.0, -99.0, -98.0, -97.0,
+        ];
+        let grid = LatLonGrid::new(shape, lat, lon).unwrap();
+        let temperature = SelectedField2D::new(
+            FieldSelector::height_agl(CanonicalField::Temperature, 2),
+            "K",
+            grid,
+            (0..12).map(|value| 270.0 + value as f32).collect(),
+        )
+        .unwrap();
+        let generic_values = (0..12).map(|value| value as f32).collect::<Vec<_>>();
+        let sbcape_values = (0..12)
+            .map(|value| 500.0 + value as f32 * 100.0)
+            .collect::<Vec<_>>();
+        let generic_name = "weird/../value";
+        write_hour_from_fields_with_derived_exact(
+            &root,
+            "hrrr",
+            run,
+            7,
+            exact,
+            &[("temperature_2m", &temperature)],
+            &[
+                DerivedFieldInput {
+                    name: "sbcape",
+                    units: "J/kg",
+                    values: &sbcape_values,
+                },
+                DerivedFieldInput {
+                    name: generic_name,
+                    units: "widgets",
+                    values: &generic_values,
+                },
+            ],
+            &[],
+            "batch-render-test",
+            1_800_000_000,
+        )
+        .unwrap();
+
+        let catalog = inspect_renderable_products(&root, "hrrr", run, 7).unwrap();
+        assert_eq!(
+            catalog.stored_times,
+            vec![BatchRenderTime {
+                storage_slot: 7,
+                exact_time: Some(exact),
+            }]
+        );
+        assert!(catalog.products.iter().any(|product| {
+            product.slug == format!("var:{generic_name}")
+                && product.kind == BatchProductKind::Generic
+                && product.units.as_deref() == Some("widgets")
+        }));
+        assert!(
+            catalog
+                .products
+                .iter()
+                .all(|product| product.kind != BatchProductKind::Windowed)
+        );
+
+        let store = StoreFieldSource::open(&root, "hrrr", run, 7).unwrap();
+        assert_eq!(store.exact_time(), Some(exact));
+        assert!(
+            store
+                .fetch_key()
+                .contains("slot7:lead1800s:valid1700001800")
+        );
+
+        let mut request = BatchRenderRequest::conservative(
+            &root,
+            "hrrr",
+            run,
+            7,
+            format!("2m_temperature,sbcape,var:{generic_name},qpf_1h"),
+            &out,
+        );
+        request.expected_exact_time = Some(exact);
+        request.output_width = 320;
+        request.output_height = 240;
+        let mut events = Vec::new();
+        let summary =
+            run_batch_render(request, &AtomicBool::new(false), |event| events.push(event)).unwrap();
+        assert_eq!(summary.rendered, 3);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.outputs.len(), 3);
+        for output in &summary.outputs {
+            assert!(output.starts_with(&out));
+            assert!(output.exists(), "{}", output.display());
+            let name = output.file_name().unwrap().to_string_lossy();
+            assert!(name.contains("valid_"), "{name}");
+            assert!(name.contains("lead_1800s"), "{name}");
+            assert!(!name.contains(".."), "{name}");
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            BatchRenderEvent::ItemRendered {
+                time: Some(BatchRenderTime { exact_time: Some(time), .. }),
+                slug,
+                source_fields,
+                units: Some(units),
+                ..
+            } if *time == exact
+                && slug == &format!("var:{generic_name}")
+                && source_fields == &[generic_name.to_string()]
+                && units == "widgets"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            BatchRenderEvent::ItemSkipped { slug, reason, .. }
+                if slug == "qpf_1h" && reason.contains("legacy contiguous whole-hour")
+        )));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn test_dir(label: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rusty-weather-batch-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

@@ -2,10 +2,11 @@
 name = "sharppyrs"
 version = "0.1.0"
 edition = "2024"
+license = "BSD-3-Clause"
 
 [dependencies]
 egui = "0.34.3"
-sharprs = { git = "https://github.com/FahrenheitResearch/sharprs", version = "0.1.0" }
+sharprs = { path = "../sharprs", version = "0.1.0" }
 
 [dev-dependencies]
 eframe = "0.34.3"

@@ -209,9 +209,10 @@ const RECV_BODY_TIMEOUT: Duration = Duration::from_secs(120);
 pub fn build_agent() -> ureq::Agent {
     static CRYPTO_PROVIDER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     CRYPTO_PROVIDER.get_or_init(|| {
-        rustls::crypto::CryptoProvider::install_default(rustls_rustcrypto::provider()).ok();
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+            .ok();
     });
-    let crypto = std::sync::Arc::new(rustls_rustcrypto::provider());
+    let crypto = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     ureq::Agent::config_builder()
         .timeout_resolve(Some(CONNECT_TIMEOUT))
         .timeout_connect(Some(CONNECT_TIMEOUT))

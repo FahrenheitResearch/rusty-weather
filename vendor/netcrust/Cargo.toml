@@ -10,7 +10,7 @@ keywords = ["netcdf", "hdf5", "wrf", "weather", "meteorology"]
 categories = ["science", "parser-implementations"]
 
 [dependencies]
-hdf5-reader = { path = "vendor/hdf5-reader" }
+hdf5-reader = { version = "0.3.0", path = "vendor/hdf5-reader" }
 ndarray = "0.17"
 netcdf-reader = "0.3"
 thiserror = "2"

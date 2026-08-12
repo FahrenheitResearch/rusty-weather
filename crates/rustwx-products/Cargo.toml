@@ -21,5 +21,7 @@ rustwx-calc = { path = "../rustwx-calc" }
 rustwx-core = { path = "../rustwx-core" }
 rustwx-io = { path = "../rustwx-io" }
 rustwx-models = { path = "../rustwx-models" }
+rustwx-regrid = { path = "../rustwx-regrid" }
 rustwx-render = { path = "../rustwx-render" }
 grib-core = { path = "../../vendor/grib-core" }
+thiserror.workspace = true

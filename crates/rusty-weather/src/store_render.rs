@@ -20,18 +20,28 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use rustwx_core::{FieldSelector, SelectedField2D};
+use rustwx_core::{Field2D, FieldSelector, ProductKey, SelectedField2D};
 use rustwx_models::{LatestRun, plot_recipe_fetch_plan};
 use rustwx_products::derived::{
-    DerivedBatchRequest, DerivedRenderedRecipe, StoreProductGrid,
-    render_derived_recipes_from_store_grids,
+    DerivedBatchRequest, DerivedRenderedRecipe, StoreDerivedPresentationOverrides,
+    StoreProductGrid, render_derived_recipes_from_store_grids_with_presentation,
 };
 use rustwx_products::direct::{
-    DirectBatchRequest, DirectRenderedRecipe, direct_render_chunk_size,
-    render_direct_recipes_chunked_from_loader,
+    DirectBatchRequest, DirectRenderedRecipe, build_projected_map_with_projection,
+    direct_render_chunk_size, render_direct_recipes_chunked_from_loader,
+};
+use rustwx_products::plot_design::StaticPlotDesign;
+use rustwx_products::viewer::{
+    generic_style_for_store_variable, operational_style_for_store_variable,
+};
+use rustwx_render::{
+    MapRenderRequest, PngWriteOptions, ProductVisualMode, ProjectedDomain, map_frame_aspect_ratio,
+    save_png_profile_with_options,
 };
 use rw_store::error::RwStoreError;
+use rw_store::format::{RwsExactTime, RwsVariableMeta};
 use rw_store::grid::GridFile;
 use rw_store::ingest::{StoredField2D, derived_selector_slug, read_field_2d, read_grid_2d};
 use rw_store::reader::HourReader;
@@ -61,6 +71,8 @@ pub struct StoreFieldSource {
     hour_path: PathBuf,
     reader: HourReader,
     grid: GridFile,
+    exact_time: Option<RwsExactTime>,
+    surface_variables: Vec<RwsVariableMeta>,
     /// `FieldSelector` -> stored 2D variable name. First write wins on
     /// selector collisions, mirroring GRIB file-order semantics: the sfc
     /// file's two APCP accumulations share the plain TotalPrecipitation
@@ -73,9 +85,10 @@ pub struct StoreFieldSource {
 }
 
 impl StoreFieldSource {
-    /// Open one legacy whole-hour manifest entry plus the run's `grid.rwg` and
-    /// build the selector/derived resolution maps. Exact-time v2 runs are
-    /// rejected until production render requests carry physical timestamps.
+    /// Open one registered storage slot plus the run's `grid.rwg` and build
+    /// the selector/derived resolution maps. For exact-time v2 runs, `hour`
+    /// is an ordinal storage slot and [`Self::exact_time`] is the authoritative
+    /// physical lead/valid identity.
     pub fn open(
         store_root: &Path,
         model_slug: &str,
@@ -108,17 +121,12 @@ impl StoreFieldSource {
         let manifest_path =
             canonical_contained_path(&run_dir, &run_dir.join("run.json"), "run manifest")?;
         let manifest = RwsRunManifest::load_for_run(&manifest_path, model_slug, run_slug)?;
-        if manifest.is_exact_time_axis() {
-            return Err(RwStoreError::Meta(format!(
-                "run {model_slug}/{run_slug} uses an exact-time ordinal axis; production rendering is disabled until render requests carry exact lead and valid times"
-            ))
-            .into());
-        }
         let entry = manifest.hours.get(&hour).ok_or_else(|| {
             RwStoreError::Meta(format!(
-                "forecast hour f{hour:03} is absent from {model_slug}/{run_slug}/run.json"
+                "storage slot {hour} is absent from {model_slug}/{run_slug}/run.json"
             ))
         })?;
+        let exact_time = entry.exact_time();
         let hour_path = canonical_contained_path(
             &run_dir,
             &run_dir.join(&entry.file),
@@ -134,28 +142,20 @@ impl StoreFieldSource {
 
         let mut selector_vars = HashMap::new();
         let mut derived_slugs = Vec::new();
+        let mut surface_variables = Vec::new();
         for var in &reader.meta().variables {
             if var.kind != "surface2d" {
                 continue;
             }
+            surface_variables.push(var.clone());
             if let Some(slug) = derived_selector_slug(&var.selector) {
                 derived_slugs.push(slug.to_string());
                 continue;
             }
-            match serde_json::from_value::<FieldSelector>(var.selector.clone()) {
-                Ok(selector) => {
-                    selector_vars
-                        .entry(selector)
-                        .or_insert_with(|| var.name.clone());
-                }
-                Err(err) => {
-                    return Err(format!(
-                        "stored variable '{}' has a selector that is neither a FieldSelector \
-                         nor a derived marker: {err}",
-                        var.name
-                    )
-                    .into());
-                }
+            if let Ok(selector) = serde_json::from_value::<FieldSelector>(var.selector.clone()) {
+                selector_vars
+                    .entry(selector)
+                    .or_insert_with(|| var.name.clone());
             }
         }
 
@@ -163,6 +163,8 @@ impl StoreFieldSource {
             hour_path,
             reader,
             grid,
+            exact_time,
+            surface_variables,
             selector_vars,
             derived_slugs,
         })
@@ -170,6 +172,33 @@ impl StoreFieldSource {
 
     pub fn hour_path(&self) -> &Path {
         &self.hour_path
+    }
+
+    /// Exact physical time for a v2 ordinal slot; `None` for a legacy v1
+    /// whole-forecast-hour entry.
+    pub fn exact_time(&self) -> Option<RwsExactTime> {
+        self.exact_time
+    }
+
+    /// All stored 2-D variables in stable file order, including variables
+    /// whose selector is intentionally opaque to production recipes.
+    pub fn surface_variables(&self) -> &[RwsVariableMeta] {
+        &self.surface_variables
+    }
+
+    pub fn surface_variable(&self, name: &str) -> Option<&RwsVariableMeta> {
+        self.surface_variables.iter().find(|var| var.name == name)
+    }
+
+    /// Read an arbitrary stored 2-D plane without pretending it is a known
+    /// operational recipe.
+    pub fn generic_grid(&self, name: &str) -> Result<StoredField2D, RwStoreError> {
+        read_grid_2d(&self.reader, &self.grid, name)
+    }
+
+    /// Bounded min/max/count metadata without decompressing field payloads.
+    pub fn stats_2d(&self, name: &str) -> Result<rw_store::FieldStats2D, RwStoreError> {
+        self.reader.stats_2d(name)
     }
 
     /// The stored 2D variable carrying this selector, if any.
@@ -225,10 +254,16 @@ impl StoreFieldSource {
     /// Provenance strings for the rendered-recipe reports (never pixels).
     pub fn fetch_key(&self) -> String {
         let meta = self.reader.meta();
-        format!(
-            "rw-store:{}:{}:f{:03}",
-            meta.model, meta.run, meta.forecast_hour
-        )
+        match self.exact_time {
+            Some(exact) => format!(
+                "rw-store:{}:{}:slot{}:lead{}s:valid{}",
+                meta.model, meta.run, meta.forecast_hour, exact.lead_seconds, exact.valid_unix
+            ),
+            None => format!(
+                "rw-store:{}:{}:f{:03}",
+                meta.model, meta.run, meta.forecast_hour
+            ),
+        }
     }
 }
 
@@ -317,6 +352,157 @@ pub struct DerivedStoreOutcome {
     pub skipped: Vec<StoreRenderSkip>,
 }
 
+/// Render metadata for an arbitrary stored 2-D variable.
+pub struct GenericRenderedVariable {
+    pub variable: String,
+    pub input_units: String,
+    pub display_units: String,
+    pub output_path: PathBuf,
+    pub total_ms: u128,
+}
+
+/// Render an arbitrary `surface2d` variable through the same native map,
+/// basemap, static design, and PNG writer used by production recipes.
+/// Operationally recognized selector metadata retains its production style;
+/// otherwise a deterministic full-finite-range generic style is used.
+pub fn render_generic_store_variable(
+    source: &StoreFieldSource,
+    config: &super::StoreRenderConfig,
+    storage_slot: u16,
+    variable: &str,
+) -> Result<GenericRenderedVariable, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let meta = source
+        .surface_variable(variable)
+        .ok_or_else(|| format!("stored 2-D variable {variable:?} does not exist"))?;
+    let stats = source.stats_2d(variable)?;
+    let finite_range = stats.finite_min.zip(stats.finite_max);
+    let style =
+        operational_style_for_store_variable(variable, &meta.selector, &meta.units, config.model)
+            .unwrap_or_else(|| {
+                generic_style_for_store_variable(variable, &meta.units, finite_range)
+            });
+    let mut stored = source.generic_grid(variable)?;
+    for value in &mut stored.values {
+        if value.is_finite() {
+            *value = style.convert.apply(*value);
+        }
+    }
+
+    let projected = build_projected_map_with_projection(
+        &stored.grid.lat_deg,
+        &stored.grid.lon_deg,
+        source.projection(),
+        config.domain.bounds,
+        map_frame_aspect_ratio(config.output_width, config.output_height, true, true),
+    )?;
+    let field = Field2D::new(
+        ProductKey::named(generic_variable_output_slug(variable)),
+        style.display_units.clone(),
+        stored.grid,
+        stored.values,
+    )?;
+    let mut request = MapRenderRequest::from_core_field(field, style.scale);
+    StaticPlotDesign::new(config.domain.bounds, ProductVisualMode::FilledMeteorology)
+        .apply_to_request(&mut request);
+    request.width = config.output_width;
+    request.height = config.output_height;
+    request.title = Some(style.title);
+    request.cbar_tick_step = style.cbar_tick_step;
+    request.render_density = style.colormap_options.render_density;
+    request.legend = style.colormap_options.legend;
+    let presentation = super::exact_time_presentation(config.exact_time);
+    request.subtitle_left = Some(
+        presentation
+            .as_ref()
+            .map(|value| value.subtitle_left.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "Init {} {:02}Z | F{storage_slot:03}",
+                    config.date_yyyymmdd, config.cycle_utc
+                )
+            }),
+    );
+    request.subtitle_right = Some(format!(
+        "rw-store variable {variable} [{}] | source {}",
+        meta.units, config.source
+    ));
+    request.projected_domain = Some(ProjectedDomain {
+        x: projected.projected_x,
+        y: projected.projected_y,
+        extent: projected.extent,
+    });
+    request.projected_lines = projected.lines;
+    request.projected_polygons = projected.polygons;
+    request.inverse_raster_projection = projected.inverse_raster_projection;
+
+    std::fs::create_dir_all(&config.out_dir)?;
+    let time_token = presentation
+        .as_ref()
+        .map(|value| format!("slot{storage_slot:04}_{}", value.output_suffix))
+        .unwrap_or_else(|| format!("f{storage_slot:03}"));
+    let output_path = config.out_dir.join(format!(
+        "{}_{}_{:02}z_{}_{}_{}.png",
+        config.model,
+        config.date_yyyymmdd,
+        config.cycle_utc,
+        time_token,
+        generic_variable_output_slug(variable),
+        safe_artifact_component(&config.domain.slug),
+    ));
+    save_png_profile_with_options(
+        &request,
+        &output_path,
+        &PngWriteOptions {
+            compression: config.png_compression,
+        },
+    )?;
+    Ok(GenericRenderedVariable {
+        variable: variable.to_string(),
+        input_units: meta.units.clone(),
+        display_units: style.display_units,
+        output_path,
+        total_ms: started.elapsed().as_millis(),
+    })
+}
+
+fn generic_variable_output_slug(variable: &str) -> String {
+    let mut safe = safe_artifact_component(variable);
+    safe.truncate(56);
+    let hash = variable
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    format!("var_{safe}_{hash:016x}")
+}
+
+fn safe_artifact_component(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len().min(64));
+    let mut underscore = false;
+    for byte in value.bytes() {
+        let next = if byte.is_ascii_alphanumeric() {
+            underscore = false;
+            Some((byte as char).to_ascii_lowercase())
+        } else if !underscore {
+            underscore = true;
+            Some('_')
+        } else {
+            None
+        };
+        if let Some(next) = next {
+            safe.push(next);
+        }
+    }
+    let safe = safe.trim_matches('_');
+    if safe.is_empty() {
+        "unnamed".to_string()
+    } else {
+        safe.to_string()
+    }
+}
+
 /// Render the requested derived/heavy recipes from their precomputed store
 /// grids through the derived lane's store-render seam (the same projected
 /// crop, styles, scales, and save path the GRIB lane runs). A recipe is
@@ -327,6 +513,7 @@ pub fn render_derived_recipes_from_store(
     request: &DerivedBatchRequest,
     cycle_utc: u8,
     recipe_slugs: &[String],
+    presentation: StoreDerivedPresentationOverrides,
 ) -> Result<DerivedStoreOutcome, Box<dyn std::error::Error>> {
     use rustwx_core::CanonicalField;
 
@@ -379,7 +566,7 @@ pub fn render_derived_recipes_from_store(
     let mut sub_request = request.clone();
     sub_request.recipe_slugs = renderable;
     let full_grid = source.full_grid();
-    let rendered = render_derived_recipes_from_store_grids(
+    let rendered = render_derived_recipes_from_store_grids_with_presentation(
         &sub_request,
         cycle_utc,
         &full_grid,
@@ -389,6 +576,7 @@ pub fn render_derived_recipes_from_store(
             .as_ref()
             .map(|(u10, v10)| (u10.as_slice(), v10.as_slice())),
         vec![source.fetch_key()],
+        presentation,
     )?;
     Ok(DerivedStoreOutcome { rendered, skipped })
 }

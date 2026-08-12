@@ -41,11 +41,12 @@ mod worker;
 pub use panels::{
     AvailabilityView, ColorTableEditorPanel, CustomDomain, DownloadEvent, DownloadPanel,
     DownloadRunState, DownloadSpec, DownloadStage, EstimateView, FieldViewerEvent,
-    FieldViewerPanel, HourDoneView, ModelOption, PlotViewerPanel, RunBrowserPanel, SatDiskUsage,
-    SatFollowSpec, SatFollowState, SatFrameImage, SatLayerOption, SatPlayerEvent, SatPlayerPanel,
-    SatRunKey, SatRunListing, SatSatelliteOption, SatSectorOption, SatelliteEvent, SatellitePanel,
-    SoundingFormulaDiagnostic, SoundingPanel, SoundingViewState, StageState, format_bytes,
-    shift_date_yyyymmdd, today_yyyymmdd_utc,
+    FieldViewerPanel, HourDoneView, ModelOption, NativePlotMapDetail, NativePlotRenderScale,
+    NativePlotSampling, NativePlotSettings, NativePlotStyle, PlotViewerPanel, RunBrowserPanel,
+    SatDiskUsage, SatFollowSpec, SatFollowState, SatFrameImage, SatLayerOption, SatPlayerEvent,
+    SatPlayerPanel, SatRunKey, SatRunListing, SatSatelliteOption, SatSectorOption, SatelliteEvent,
+    SatellitePanel, SoundingFormulaDiagnostic, SoundingPanel, SoundingViewState, StageState,
+    format_bytes, shift_date_yyyymmdd, today_yyyymmdd_utc,
 };
 
 /// Install the font families used by the native SHARPpy sounding widget.
@@ -53,7 +54,12 @@ pub use panels::{
 pub fn install_sounding_fonts(ctx: &egui::Context) {
     sharppyrs::install_fonts(ctx);
 }
-pub use store_view::{HourEntry, ModelEntry, RunEntry, StoreTree, StoreView};
+
+pub use store_view::{
+    DEFAULT_POOLED_READER_TILE_CACHE_BYTES, HourEntry, MAX_READER_POOL_READERS,
+    MAX_READER_POOL_TILE_CACHE_BYTES, ModelEntry, ReaderPoolLimits, ReaderPoolStats, RunEntry,
+    StoreTree, StoreView,
+};
 pub use style_overrides::{
     ProductStyleBinding, StyleOverrideSettings, UserColorTable, UserExtendMode, UserLegendMode,
     UserUnitConvert, normalize_product_key,

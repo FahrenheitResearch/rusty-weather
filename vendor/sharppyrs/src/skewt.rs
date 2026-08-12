@@ -47,6 +47,19 @@ pub struct SkewTStyle {
     /// [`SkewTStyle::space_grotesk`] selects it.
     pub font_regular: FontFamily,
     pub font_bold: FontFamily,
+    /// Independent multiplier for every sounding `FontId`. Panel and line
+    /// geometry remain in their original coordinate system.
+    pub text_scale: f32,
+}
+
+/// Cross-platform font pairs that never depend on operating-system fonts.
+/// Space Grotesk is bundled by this crate; the other choices use egui's
+/// bundled fallback faces.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SoundingFontPreset {
+    SpaceGrotesk,
+    CleanProportional,
+    TechnicalMonospace,
 }
 
 impl Default for SkewTStyle {
@@ -84,6 +97,7 @@ impl Default for SkewTStyle {
             ],
             font_regular: FontFamily::Proportional,
             font_bold: FontFamily::Proportional,
+            text_scale: 1.0,
         }
     }
 }
@@ -97,6 +111,55 @@ impl SkewTStyle {
             font_bold: FontFamily::Name(crate::FONT_FAMILY_BOLD.into()),
             ..Default::default()
         }
+    }
+
+    /// Select one of the fully bundled/cross-platform sounding font pairs.
+    pub fn with_font_preset(mut self, preset: SoundingFontPreset) -> Self {
+        (self.font_regular, self.font_bold) = match preset {
+            SoundingFontPreset::SpaceGrotesk => (
+                FontFamily::Name(crate::FONT_FAMILY.into()),
+                FontFamily::Name(crate::FONT_FAMILY_BOLD.into()),
+            ),
+            SoundingFontPreset::CleanProportional => {
+                (FontFamily::Proportional, FontFamily::Proportional)
+            }
+            SoundingFontPreset::TechnicalMonospace => {
+                (FontFamily::Monospace, FontFamily::Monospace)
+            }
+        };
+        self
+    }
+
+    /// Set the independent sounding text scale. Invalid/extreme input is
+    /// normalized so persisted settings cannot hide text or request
+    /// pathological glyph sizes.
+    pub fn with_text_scale(mut self, scale: f32) -> Self {
+        self.text_scale = normalized_text_scale(scale);
+        self
+    }
+
+    /// Construct a regular font using this style's family and text scale.
+    pub fn regular_font(&self, base_size: f32) -> FontId {
+        FontId::new(
+            base_size * normalized_text_scale(self.text_scale),
+            self.font_regular.clone(),
+        )
+    }
+
+    /// Construct a bold font using this style's family and text scale.
+    pub fn bold_font(&self, base_size: f32) -> FontId {
+        FontId::new(
+            base_size * normalized_text_scale(self.text_scale),
+            self.font_bold.clone(),
+        )
+    }
+}
+
+fn normalized_text_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(0.5, 2.0)
+    } else {
+        1.0
     }
 }
 
@@ -287,21 +350,19 @@ impl Fonts {
         const PT: f64 = 4.0 / 3.0;
         let fsize = 6.0;
         let fsizet = 10.0;
-        let reg = style.font_regular.clone();
-        let bold = style.font_bold.clone();
         // TITLE_FONT_SCALE = 0.90 from the SHARPpy-Reimagined renderer.
         let title_pt = (fsizet + hgt * 0.006) * 0.90;
         let label_pt = fsize + 2.0 + hgt * 0.0045;
         let esrh_pt = fsize + 2.0 + hgt * 0.0045;
         Fonts {
-            title: FontId::new((title_pt * PT) as f32, reg.clone()),
-            label: FontId::new((label_pt * PT) as f32, reg.clone()),
-            label_bold: FontId::new((label_pt * PT) as f32, bold.clone()),
-            env_trace: FontId::new(((11.0 + hgt * 0.0045) * PT) as f32, reg.clone()),
-            in_plot: FontId::new(((fsize + hgt * 0.0045) * PT) as f32, reg.clone()),
-            esrh: FontId::new((esrh_pt * PT) as f32, reg.clone()),
-            hght: FontId::new(((9.0 + hgt * 0.0045) * PT) as f32, reg),
-            hgz: FontId::new((9.0 * PT) as f32, bold),
+            title: style.regular_font((title_pt * PT) as f32),
+            label: style.regular_font((label_pt * PT) as f32),
+            label_bold: style.bold_font((label_pt * PT) as f32),
+            env_trace: style.regular_font(((11.0 + hgt * 0.0045) * PT) as f32),
+            in_plot: style.regular_font(((fsize + hgt * 0.0045) * PT) as f32),
+            esrh: style.regular_font((esrh_pt * PT) as f32),
+            hght: style.regular_font(((9.0 + hgt * 0.0045) * PT) as f32),
+            hgz: style.bold_font((9.0 * PT) as f32),
             esrh_height: esrh_pt * PT * 0.5 + 9.0 + hgt * 0.0045,
             title_height: title_pt * PT * 0.5 + 5.0 + hgt * 0.003,
         }
@@ -1197,7 +1258,7 @@ impl SkewT<'_> {
         let hgt_agl = inner.to_agl(inner.interp_hght(pres));
         let t = inner.interp_tmpc(pres);
         let td = inner.interp_dwpc(pres);
-        let font = FontId::new(11.0, st.font_regular.clone());
+        let font = st.regular_font(11.0);
 
         let boxed = |pos: Pos2, anchor: Align2, text: String, color: Color32| {
             let galley = painter.layout_no_wrap(text.clone(), font.clone(), color);
@@ -1231,5 +1292,43 @@ impl SkewT<'_> {
             format!("Td={} C", crate::utils::float2str(td, 1)),
             st.dewp_color,
         );
+    }
+}
+
+#[cfg(test)]
+mod typography_tests {
+    use super::*;
+
+    #[test]
+    fn text_scale_and_family_reach_the_skewt_font_bundle() {
+        let base = Fonts::new(900.0, &SkewTStyle::default());
+        let style = SkewTStyle::default()
+            .with_font_preset(SoundingFontPreset::TechnicalMonospace)
+            .with_text_scale(1.25);
+        let scaled = Fonts::new(900.0, &style);
+
+        assert!((scaled.title.size - base.title.size * 1.25).abs() < 0.001);
+        assert!((scaled.in_plot.size - base.in_plot.size * 1.25).abs() < 0.001);
+        assert_eq!(scaled.title.family, FontFamily::Monospace);
+        assert_eq!(scaled.label_bold.family, FontFamily::Monospace);
+        assert_eq!(scaled.title_height, base.title_height);
+    }
+
+    #[test]
+    fn font_presets_are_cross_platform_egui_or_bundled_families() {
+        let space = SkewTStyle::default().with_font_preset(SoundingFontPreset::SpaceGrotesk);
+        assert_eq!(
+            space.regular_font(10.0).family,
+            FontFamily::Name(crate::FONT_FAMILY.into())
+        );
+        assert_eq!(
+            space.bold_font(10.0).family,
+            FontFamily::Name(crate::FONT_FAMILY_BOLD.into())
+        );
+
+        let clean = SkewTStyle::default()
+            .with_font_preset(SoundingFontPreset::CleanProportional)
+            .regular_font(10.0);
+        assert_eq!(clean.family, FontFamily::Proportional);
     }
 }

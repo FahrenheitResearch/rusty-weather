@@ -7,11 +7,11 @@ license = "MIT"
 
 [dependencies]
 # Core dependencies
-wx-core = { path = "../wx-core" }
-wx-math = { path = "../wx-math" }
-wx-field = { path = "../wx-field" }
-wx-radar = { path = "../wx-radar" }
-ecape-rs = { path = "../ecape-rs" }
+wx-core = { version = "0.3.9", path = "../wx-core" }
+wx-math = { version = "0.3.6", path = "../wx-math" }
+wx-field = { version = "0.3.6", path = "../wx-field" }
+wx-radar = { version = "0.3.6", path = "../wx-radar" }
+ecape-rs = { version = "0.1.4", path = "../ecape-rs" }
 
 # Minimal external deps
 chrono = "0.4"

@@ -9,7 +9,6 @@ rust-version.workspace = true
 [dependencies]
 rayon.workspace = true
 rustls.workspace = true
-rustls-rustcrypto.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 ureq.workspace = true

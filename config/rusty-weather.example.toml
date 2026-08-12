@@ -1,0 +1,293 @@
+# RW_* environment variables override this file. --config or RW_CONFIG selects it.
+
+[server]
+listen = "127.0.0.1:8788"
+store_root = "./store"
+artifact_root = "./artifacts"
+allow_unauthenticated_public_bind = false
+cors_origins = []
+
+[auth]
+# Prefer RW_API_TOKEN_FILE in production. The file contains one token per line
+# and must be readable only by the service account.
+# token_file = "/etc/rusty-weather/api-tokens.txt"
+protect_metrics = true
+
+[limits]
+request_body_bytes = 2097152
+variables_per_query = 32
+points_per_query = 100
+sync_result_values = 2000000
+json_grid_values = 250000
+# Arbitrary geographic plots return a minimal native rectangular envelope,
+# cropped coordinates, a cell mask, and selected field/pressure-level values.
+geographic_window_cells = 250000
+geographic_window_output_values = 2000000
+# Async temporal jobs use independent budgets. These defaults cover HRRR's
+# 1799x1059 native domain, including the 13-value vector-summary result.
+temporal_reduction_cells = 4000000
+temporal_output_values = 32000000
+catalog_time_points = 10000
+temporal_frames = 120
+light_concurrency = 32
+heavy_concurrency = 2
+queued_jobs = 64
+job_history_records = 10000
+sync_timeout_seconds = 10
+job_timeout_seconds = 300
+job_retention_seconds = 604800
+job_result_bytes = 536870912
+reader_cache_bytes = 268435456
+response_cache_bytes = 134217728
+
+[catalog]
+response_cache_seconds = 300
+
+# Conventional HTTPS-origin publication boundary. The scheduler atomically
+# writes <store_root>/.rw-origin-catalog.json. When enabled, model/run listings
+# and direct queries expose only each configured lane's active and previous
+# generation; missing, stale, or corrupt state fails closed.
+[origin_catalog]
+enabled = false
+# "scheduler" (Hetzner), "replication" (replication-only university/lab), or
+# "union" (both mandatory and collision checked). No mode broad-scans raw runs.
+publication_sources = "scheduler"
+refresh_seconds = 5
+max_age_seconds = 7200
+
+# Advanced full `.rws` generation publication is separate from operational
+# local -> R2 -> HTTPS delivery and from cold Community Cache relay transfers.
+# It is default-off and cannot enable until security and host-capacity gates pass.
+[generation_replication]
+enabled = false
+security_tests_passed = false
+capacity_audit_completed = false
+kill_switch = true
+control_root = "./generation-replication"
+# signing_key_file = "/etc/rusty-weather/generation-replication-ed25519.key"
+signing_key_id = "rw-generation-replication-v1"
+# Auth-domain principal SHA-256 values; owners receive a further
+# replication-domain-separated identity from the authenticated owner route.
+operator_principals = []
+
+# Parsing-only safety ceilings, not audited deployment capacity choices.
+[generation_replication.limits]
+maximum_generation_bytes = 274877906944
+maximum_files = 65538
+maximum_chunks = 262144
+maximum_chunk_bytes = 8388608
+maximum_manifest_bytes = 8388608
+maximum_retention_seconds = 7776000
+maximum_provenance_entries = 32
+maximum_attributions = 32
+
+# Replace every value from a direct disk/inode/concurrency/bandwidth audit
+# before setting capacity_audit_completed = true.
+[generation_replication.quotas]
+per_owner_storage_bytes = 549755813888
+total_storage_bytes = 2199023255552
+per_owner_generations = 8
+total_generations = 64
+per_owner_concurrent_uploads = 2
+total_concurrent_uploads = 8
+per_owner_upload_bytes_per_month = 1099511627776
+total_upload_bytes_per_month = 4398046511104
+upload_ttl_seconds = 86400
+maximum_state_bytes = 67108864
+maximum_gc_entries = 250000
+maximum_gc_deletions = 25000
+
+# Community Cache is a phase-one, server-mediated immutable-object cache. It
+# is fully disabled by default and contains no direct peer-connectivity code.
+[community]
+enabled = false
+# This example is intentionally not production-approved. Set true only after
+# the target origin host's disk/concurrency audit supplies every quota below.
+capacity_audit_completed = false
+kill_switch = false
+root = "./community-cache"
+# signing_key_file = "/etc/rusty-weather/community-ed25519.key"
+# Change the id when rotating the current key and retain old verification keys.
+signing_key_id = "rw-origin-v1"
+# Exact immutable run/snapshot/grid/query manifests remain useful for cold
+# historical lookup; case artifacts keep their explicit case retention.
+object_manifest_retention_seconds = 31536000
+trusted_public_keys = []
+# origin_base_url = "https://weather.example.com"
+# origin_token_file = "/etc/rusty-weather/community-origin-token"
+
+[community.hot_store]
+provider = "disabled"
+# R2-compatible gateway example (credentials are read from token_file):
+# provider = "r2"
+# base_url = "https://objects.example.com"
+# bucket = "rusty-weather-hot"
+# token_file = "/etc/rusty-weather/r2-gateway-token"
+
+[community.promotion]
+enabled = false
+minimum_hits = 3
+window_seconds = 300
+maximum_object_bytes = 67108864
+
+# Non-production parsing examples only; they are not chosen capacity values.
+# Enabling Community Cache requires replacing them with audited values and
+# setting capacity_audit_completed = true.
+[community.quotas]
+maximum_object_bytes = 67108864
+maximum_decompressed_bytes = 268435456
+maximum_manifest_bytes = 262144
+storage_bytes = 10737418240
+upload_bytes_per_month = 107374182400
+download_bytes_per_month = 107374182400
+# Global hot-provider promotion cost ceiling. Crossing it pauses promotion;
+# normal local-cache and HTTPS-origin fallback remain available.
+promoted_bytes_per_month = 107374182400
+concurrent_transfers = 4
+maximum_principals = 10000
+maximum_objects = 100000
+
+[community.cases]
+enabled = false
+artifact_publication_enabled = false
+maximum_manifest_bytes = 262144
+maximum_objects_per_case = 512
+maximum_cases = 1000
+storage_bytes = 268435456
+default_retention_seconds = 2592000
+
+# Phase 2 Private Community Sharing is independently gated and off. It serves
+# only exact cold historical hashes after hosted retention expires. Current
+# operational local -> R2 -> Hetzner requests never enter this broker.
+[community.relay]
+enabled = false
+security_tests_passed = false
+capacity_audit_completed = false
+# Must be deliberately set only after checking the current account's provider
+# pricing and deriving the byte/cost stops below from those actual terms.
+provider_pricing_verified = false
+kill_switch = true
+state_file = "./community-cache/relay-state.json"
+# Separate Ed25519 key; never reuse the object-origin signing key.
+# signing_key_file = "/etc/rusty-weather/community-relay-ed25519.key"
+signing_key_id = "rw-relay-v1"
+relay_id = "cloudflare-turn"
+credential_lifetime_seconds = 600
+# Fixed by the v1 datagram contract: worst-case encrypted JSON stays <=1200 B.
+max_chunk_plaintext_bytes = 512
+archival_origin_available = false
+# SHA-256("rw-authenticated-principal-v1\0" || bearer-token), never raw tokens.
+operator_principals = []
+
+[community.relay.cloudflare]
+# Cloudflare TURN identifiers and secrets are deliberately blank in this
+# parsing example. The long-lived API token is read only from a private file.
+turn_key_id = ""
+# api_token_file = "/etc/rusty-weather/cloudflare-turn-api.token"
+allowed_turn_hosts = ["turn.cloudflare.com"]
+# No ranges are trusted by default. Populate only from a current operator
+# audit of provider TURN allocation ranges; example IPs must not grant trust.
+audited_relay_cidrs = []
+resolve_timeout_seconds = 3
+connect_timeout_seconds = 5
+send_timeout_seconds = 5
+receive_timeout_seconds = 10
+global_timeout_seconds = 15
+
+# Parsing-only, non-production values; they are not approved capacity or cost
+# settings. Cloudflare's published Realtime terms as of July 2026 describe a
+# shared 1,000 GB/month SFU+TURN allowance, then $0.05/GB edge-to-client
+# egress including TURN overhead. Provider terms can change; verify the actual
+# account plan first. TURN traffic is opaque, so a reservation is charged in
+# full.
+[community.relay.quotas]
+per_user_upload_bytes_per_month = 10737418240
+per_user_download_bytes_per_month = 10737418240
+per_user_advertised_storage_bytes = 26843545600
+per_user_concurrency = 2
+global_concurrency = 32
+global_relay_bytes_per_month = 1099511627776
+cost_stop_after_bytes_per_month = 966367641600
+
+[community.relay.promotion]
+successful_recoveries = 3
+relayed_bytes = 268435456
+
+# Public-origin federation is separate from Community Cache. Entries are
+# deliberately public university/lab/service HTTPS origins whose descriptors
+# were signed by the origin and approved out of band by this operator. There
+# is no self-registration endpoint and no ordinary-client address discovery.
+[federation]
+enabled = false
+# Active probes are separately gated and remain off by default. When enabled,
+# every probe freshly resolves the signed hostname, rejects the complete DNS
+# answer set if any address is non-global, pins one address for that connection,
+# preserves the hostname for TLS validation, and never follows redirects.
+health_monitor_enabled = false
+catalog_id = "fahrenheit-public-origins"
+catalog_signing_key_id = "federation-catalog-v1"
+# catalog_signing_key_file = "/etc/rusty-weather/federation-catalog.key"
+descriptor_files = []
+approved_origins = []
+revoked_origin_ids = []
+revoked_key_ids = []
+catalog_ttl_seconds = 300
+health_failure_threshold = 3
+health_quarantine_seconds = 60
+# Required when health_monitor_enabled = true. This file contains only origin
+# ids and coarse health/quarantine timestamps; never IPs, URLs, or credentials.
+# health_state_file = "/var/lib/rusty-weather/federation-health.json"
+health_probe_interval_seconds = 30
+health_probe_concurrency = 4
+health_resolve_timeout_seconds = 2
+health_connect_timeout_seconds = 3
+health_send_timeout_seconds = 2
+health_receive_timeout_seconds = 4
+health_global_timeout_seconds = 8
+maximum_selection_results = 8
+
+# Operator-approved origin example (uncomment only with a real signed
+# descriptor and the descriptor key verified out of band):
+# [[federation.approved_origins]]
+# origin_id = "example-university-weather-lab"
+# descriptor_signing_keys = [
+#   { key_id = "lab-2026-a", public_key_base64 = "<base64-ed25519-public-key>" },
+# ]
+# Optional; omit for a public health endpoint. The bearer token is read from a
+# permission-restricted file and sent only to the signed same-origin path.
+# Its value must be unique across all API, local-resolve, origin data, and
+# origin health credential domains, even when separate files are used.
+# health_bearer_token_file = "/etc/rusty-weather/example-lab-health.token"
+# Required on the authority when [federation.proxy].enabled = true. This must
+# be a distinct origin-scoped token and is accepted only by resolve-local.
+# Its value must not be reused by any other credential domain.
+# data_bearer_token_file = "/etc/rusty-weather/example-lab-data.token"
+
+[federation.proxy]
+enabled = false
+security_tests_passed = false
+kill_switch = true
+# Atomic runtime state survives restart. Keep this separate from accounting.
+control_state_file = "/var/lib/rusty-weather/federation-control.json"
+# Auth-domain SHA-256 principals allowed to read status or change the switch.
+# Derive each as documented in OPERATIONS.md; never place bearer values here.
+operator_principals = []
+# Public origin nodes enable this without enabling outbound proxy selection.
+accept_local_resolve = false
+# local_resolve_token_file = "/etc/rusty-weather/federation-origin.token"
+authority_origin_id = "hetzner-authority"
+authority_https_root = "https://weather.fahrenheitresearch.com"
+maximum_attempts = 2
+accounting_state_file = "/var/lib/rusty-weather/federation-accounting.json"
+monthly_download_bytes_per_principal = 107374182400
+concurrent_requests_per_principal = 2
+maximum_principals = 100000
+resolve_timeout_seconds = 2
+connect_timeout_seconds = 4
+send_timeout_seconds = 5
+receive_timeout_seconds = 20
+global_timeout_seconds = 30
+
+[logging]
+filter = "rw_server=info,tower_http=info"
+format = "json"

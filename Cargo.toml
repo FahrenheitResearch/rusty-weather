@@ -1,9 +1,16 @@
 [workspace]
 members = [
+    "crates/rw-community-relay",
+    "crates/rw-community-protocol",
     "crates/rw-glm",
     "crates/rw-gdex",
     "crates/rw-formula",
+    "crates/rw-federation-proxy",
+    "crates/rw-generation-replication",
     "crates/rw-ingest",
+    "crates/rw-query",
+    "crates/rw-server",
+    "crates/rw-scheduler",
     "crates/rw-sat",
     "crates/rw-sat-check",
     "crates/rw-store",
@@ -20,6 +27,8 @@ members = [
     "crates/rusty-weather",
     "crates/rusty-weather-ui",
     "vendor/netcrust",
+    "vendor/wrf-rust/crates/wrf-core",
+    "vendor/wrf-rust/crates/wrf-formula",
 ]
 exclude = [
     "vendor/ecape-rs",
@@ -44,8 +53,7 @@ rust-version = "1.92"
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
 rayon = "1"
-rustls = { version = "0.23", default-features = false, features = ["std"] }
-rustls-rustcrypto = "0.0.2-alpha"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -56,6 +64,14 @@ ureq = { version = "3", default-features = false, features = ["rustls-no-provide
 # package. Patches only apply from the workspace root, so the pin lives here.
 [patch.crates-io]
 hdf5-reader = { path = "vendor/netcrust/vendor/hdf5-reader" }
+
+# The WRF ECAPE golden corpus is pinned to ecape-rs 8292253. Keep that
+# algorithm revision while resolving its meteorology support crates to this
+# audited workspace tree, avoiding the pinned repository's unused default
+# network/TLS feature graph.
+[patch."https://github.com/FahrenheitResearch/metrust-py.git"]
+metrust = { path = "vendor/metrust" }
+wx-math = { path = "vendor/wx-math" }
 
 [profile.release]
 lto = "thin"

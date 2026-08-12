@@ -200,7 +200,7 @@ fn for_weather_product_sets_expected_titles_for_experimental_fields() {
         WeatherProduct::EcapeScpExperimental,
     );
 
-    assert_eq!(request.title.as_deref(), Some("ECAPE SCP (EXP)"));
+    assert_eq!(request.title.as_deref(), Some("ANALYTIC ECAPE SCP (EXP)"));
     assert_eq!(request.cbar_tick_step, Some(5.0));
     assert!(matches!(
         request.scale,

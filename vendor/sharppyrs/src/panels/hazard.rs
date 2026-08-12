@@ -7,7 +7,7 @@
 //! The FLASH FLOOD / BLIZZARD / heat categories need climatology or precip
 //! type inputs outside this crate's scope and are omitted.
 
-use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Stroke};
+use egui::{Align2, Color32, Painter, Pos2, Rect, Stroke};
 
 use crate::Profile;
 use crate::derived::DerivedParams;
@@ -142,8 +142,8 @@ pub fn draw(painter: &Painter, rect: Rect, prof: &Profile, dv: &DerivedParams, s
     // Fonts (font_ratio = 0.0512, like the vendored watch box).
     let title_pt = (h * 0.0512).round() + 5.0;
     let plot_pt = (h * 0.0512).round() + 4.0;
-    let title_font = FontId::new((title_pt * PT) as f32, style.font_regular.clone());
-    let plot_font = FontId::new((plot_pt * PT) as f32, style.font_regular.clone());
+    let title_font = style.regular_font((title_pt * PT) as f32);
+    let plot_font = style.regular_font((plot_pt * PT) as f32);
     let fg = style.fg_color;
 
     // Frame border.

@@ -7,5 +7,5 @@ license = "MIT"
 authors = ["Fahrenheit Research"]
 
 [dependencies]
-wx-field = { path = "../wx-field" }
+wx-field = { version = "0.3.6", path = "../wx-field" }
 rayon = "1"

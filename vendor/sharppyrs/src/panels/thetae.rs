@@ -7,7 +7,7 @@
 //! Theta-e (Kelvin) comes from `prof.inner.thetae`; the theta axis range is
 //! data-driven (min/max over p > 400 mb, padded by 10 K) like the original.
 
-use egui::{Align2, FontId, Painter, Pos2, Rect, Stroke};
+use egui::{Align2, Painter, Pos2, Rect, Stroke};
 
 use crate::Profile;
 use crate::derived::DerivedParams;
@@ -65,7 +65,7 @@ pub fn draw(painter: &Painter, rect: Rect, prof: &Profile, dv: &DerivedParams, s
     let theta_to_pix = |t: f64| bry - ((tmax - t) / (tmax - tmin)) * bry;
 
     let label_pt = (h * 0.0512).round();
-    let label_font = FontId::new((label_pt * PT) as f32, style.font_regular.clone());
+    let label_font = style.regular_font((label_pt * PT) as f32);
     let fg = style.fg_color;
 
     // Frame border.

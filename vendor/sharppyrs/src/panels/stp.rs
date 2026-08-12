@@ -289,7 +289,7 @@ pub fn draw(painter: &Painter, rect: Rect, prof: &Profile, dv: &DerivedParams, s
     // fsize1/fsize2 from initUI (point sizes; Windows trims the descent off).
     let fsize1 = windows_descent_trim((h * FONT_RATIO).round() + 2.0);
     let fsize2 = windows_descent_trim((h * FONT_RATIO).round());
-    let plot_font = FontId::new(fsize1 * PT, style.font_regular.clone());
+    let plot_font = style.regular_font(fsize1 * PT);
     // plot_height = plot_metrics.xHeight() (~0.52 em of the pixel size).
     let plot_height = fsize1 * PT * 0.52;
     let g = Geom::new(rect, plot_height);
@@ -360,7 +360,7 @@ fn draw_frame(
     // Y gridlines (dashed, line_color) + white tick labels 11..0. The label
     // scale patch shrinks font_ratio for these draw-time fonts.
     let ytick_size = ((STP_LABEL_SCALE * FONT_RATIO * g.hgt).round() + 1.0) * PT;
-    let ytick_font = FontId::new(ytick_size, style.font_regular.clone());
+    let ytick_font = style.regular_font(ytick_size);
     for yt in (0..=11).rev() {
         let tick_pxl = g.stp_to_pix(yt as f64);
         painter.extend(Shape::dashed_line(
@@ -383,7 +383,7 @@ fn draw_frame(
     let width = g.brx / 14.0;
     let spacing = g.brx / 7.0;
     let ef_size = (STP_LABEL_SCALE * FONT_RATIO * g.hgt).round() * PT;
-    let ef_font = FontId::new(ef_size, style.font_regular.clone());
+    let ef_font = style.regular_font(ef_size);
     for (i, (row, (text, ef_color))) in EF_CLIMO.iter().zip(EF_LABELS).enumerate() {
         let cx = spacing * (i as f32 + 1.0);
         if cx >= g.brx {
@@ -465,7 +465,7 @@ fn draw_prob_box(
             .x
     };
     let mut box_pt = fsize2;
-    let mut box_font = FontId::new(box_pt * PT, style.font_regular.clone());
+    let mut box_font = style.regular_font(box_pt * PT);
     let content_width = |font: &FontId| -> (f32, f32, f32) {
         let label_w = PROB_LABELS
             .iter()
@@ -484,7 +484,7 @@ fn draw_prob_box(
     if content_w + 8.0 > available_w {
         let scale = available_w / (content_w + 8.0);
         box_pt = (box_pt * scale * 0.96).max(5.0);
-        box_font = FontId::new(box_pt * PT, style.font_regular.clone());
+        box_font = style.regular_font(box_pt * PT);
         (content_w, label_w, col_gap) = content_width(&box_font);
     }
 

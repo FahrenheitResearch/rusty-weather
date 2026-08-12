@@ -7,7 +7,7 @@
 //! colored by the hail-size class it falls in (red once SHIP >= 1, yellow
 //! below — the same yellow/red scheme as the categories).
 
-use egui::{Align2, Color32, FontId, Painter, Rect, Shape, Stroke, StrokeKind, pos2};
+use egui::{Align2, Color32, Painter, Rect, Shape, Stroke, StrokeKind, pos2};
 
 use crate::Profile;
 use crate::derived::DerivedParams;
@@ -43,8 +43,8 @@ pub fn draw(painter: &Painter, rect: Rect, prof: &Profile, dv: &DerivedParams, s
     // Small bold header font, sized from the inset height (the Qt original
     // used the board's 10-px bold header font over a ~150-px-tall chart).
     let fs = (h * 0.062).clamp(8.0, 40.0);
-    let font = FontId::new(fs, style.font_bold.clone());
-    let unit_font = FontId::new((fs * 0.78).round().max(8.0), style.font_bold.clone());
+    let font = style.bold_font(fs);
+    let unit_font = style.bold_font((fs * 0.78).round().max(8.0));
 
     p.text(
         pos2(x + w / 2.0, y + 1.0),

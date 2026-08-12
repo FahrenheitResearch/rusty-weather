@@ -233,6 +233,7 @@ fn resolve_spec(
     profile.derived = spec.derived;
     profile.heavy = spec.heavy;
     profile.validate()?;
+    rw_ingest::validate_ingest_profile_for_model(model, &profile).map_err(|err| err.to_string())?;
     let hours = parse_hours(&spec.hours).map_err(|err| err.to_string())?;
     let cycle = CycleSpec::new(spec.date.clone(), spec.cycle).map_err(|err| err.to_string())?;
     // Defense-in-depth seam: validate cycle against the model's published cycle
@@ -703,6 +704,30 @@ mod tests {
     }
 
     #[test]
+    fn resolve_spec_accepts_only_the_surface_analysis_profile_for_rtma_urma() {
+        for (slug, expected) in [("rtma", ModelId::Rtma), ("urma", ModelId::Urma)] {
+            let mut analysis = spec();
+            analysis.model = slug.to_string();
+            analysis.cycle = 17;
+            analysis.hours = "0".to_string();
+            analysis.profile = "analysis".to_string();
+            let (model, profile, hours, _) =
+                resolve_spec(&analysis).expect("surface analysis spec resolves");
+            assert_eq!(model, expected);
+            assert!(!profile.needs_prs());
+            assert_eq!(hours, vec![0]);
+
+            analysis.profile = "full".to_string();
+            analysis.derived = true;
+            analysis.heavy = true;
+            let message = resolve_spec(&analysis)
+                .expect_err("full profile must not reach a surface-only fetch")
+                .to_string();
+            assert!(message.contains("surface-only"), "got: {message}");
+        }
+    }
+
+    #[test]
     fn resolve_spec_surfaces_validation_errors_instead_of_panicking() {
         // Heavy on a sounding profile: the exact combination that would
         // trip process_fetched_hour's debug_assert if it got through.
@@ -721,7 +746,7 @@ mod tests {
         );
 
         let mut bad = spec();
-        bad.model = "nbm".to_string();
+        bad.model = "wrf-gdex".to_string();
         let message = resolve_spec(&bad).expect_err("unsupported model");
         assert!(message.contains("not ingest-supported"), "got: {message}");
         // The supported list is derived, so it names the models that DO have

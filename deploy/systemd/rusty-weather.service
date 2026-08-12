@@ -1,0 +1,55 @@
+[Unit]
+Description=Rusty Weather self-hosted data service
+Documentation=https://github.com/FahrenheitResearch/rusty-weather
+Wants=network-online.target
+After=network-online.target local-fs.target
+
+[Service]
+Type=simple
+User=rusty-weather
+Group=rusty-weather
+EnvironmentFile=-/etc/default/rusty-weather
+ExecStartPre=/usr/local/bin/rw-server --config /etc/rusty-weather/rusty-weather.toml doctor
+ExecStart=/usr/local/bin/rw-server --config /etc/rusty-weather/rusty-weather.toml serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0027
+LimitNOFILE=65536
+
+StateDirectory=rusty-weather
+StateDirectoryMode=0750
+LogsDirectory=rusty-weather
+LogsDirectoryMode=0750
+ReadOnlyPaths=/var/lib/rusty-weather/store
+ReadWritePaths=/var/lib/rusty-weather/artifacts
+# Optional distributed features remain disabled by default. When explicitly
+# enabled, keep their control/cache state beneath these service-owned paths;
+# the leading '-' lets the base service start before an operator creates them.
+ReadWritePaths=-/var/lib/rusty-weather/community-cache
+ReadWritePaths=-/var/lib/rusty-weather/federation
+ReadWritePaths=-/var/lib/rusty-weather/generation-replication
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

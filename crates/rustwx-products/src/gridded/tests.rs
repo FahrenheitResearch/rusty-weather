@@ -190,6 +190,187 @@ fn cropped_row_window_rotation_matches_full_rotate_then_crop() {
     assert_eq!(actual, expected);
 }
 
+fn synthetic_store_thermo_files(scan_mode: u8) -> (Grib2File, Grib2File) {
+    use grib_core::grib2::{DataRepresentation, ProductDefinition};
+
+    let grid = GridDefinition {
+        nx: 5,
+        ny: 4,
+        lat1: 42.0,
+        lon1: 170.0,
+        lat2: 30.0,
+        lon2: -150.0,
+        scan_mode,
+        num_data_points: 20,
+        ..GridDefinition::default()
+    };
+    let make = |category: u8,
+                number: u8,
+                level_type: u8,
+                level_value: f64,
+                reference_value: f32,
+                decimal_scale: i16,
+                seed: u8| {
+        let bitmap: Vec<bool> = (0..grid.num_data_points)
+            // Source x=3/4 rotate into the cropped x=1/2 columns on this
+            // date-line-crossing grid; both source rows stay inside the crop
+            // under either north/south scan direction.
+            .map(|index| index != 8 && index != 14)
+            .collect();
+        let raw_data = (0..grid.num_data_points)
+            .filter(|&index| bitmap[index as usize])
+            .map(|offset| seed + offset as u8)
+            .collect();
+        Grib2Message {
+            discipline: 0,
+            reference_time: chrono::NaiveDate::from_ymd_opt(2026, 6, 11)
+                .unwrap()
+                .and_hms_opt(16, 0, 0)
+                .unwrap(),
+            grid: grid.clone(),
+            product: ProductDefinition {
+                parameter_category: category,
+                parameter_number: number,
+                level_type,
+                level_value,
+                ..ProductDefinition::default()
+            },
+            data_rep: DataRepresentation {
+                reference_value,
+                decimal_scale,
+                bits_per_value: 8,
+                section5_num_data_points: grid.num_data_points,
+                ..DataRepresentation::default()
+            },
+            bitmap: Some(bitmap),
+            raw_data,
+        }
+    };
+    let surface = Grib2File {
+        messages: vec![
+            make(3, 0, 1, 0.0, 90_000.0, 0, 1),
+            make(3, 5, 1, 0.0, 100.0, 0, 2),
+            make(0, 0, 103, 2.0, 270.0, 0, 3),
+            make(1, 0, 103, 2.0, 0.0, 4, 4),
+            make(2, 2, 103, 10.0, -20.0, 0, 5),
+            make(2, 3, 103, 10.0, -10.0, 0, 6),
+            make(7, 6, 1, 0.0, 1_000.0, 0, 7),
+            make(3, 18, 1, 0.0, 500.0, 0, 8),
+        ],
+    };
+    let mut pressure = Vec::new();
+    for (index, level) in [100_000.0, 90_000.0].into_iter().enumerate() {
+        let seed = 20 + index as u8 * 20;
+        pressure.extend([
+            make(0, 0, 100, level, 250.0, 0, seed),
+            make(1, 0, 100, level, 0.0, 4, seed + 1),
+            make(2, 2, 100, level, -40.0, 0, seed + 2),
+            make(2, 3, 100, level, -30.0, 0, seed + 3),
+            make(3, 5, 100, level, 0.0, 0, seed + 4),
+        ]);
+    }
+    (surface, Grib2File { messages: pressure })
+}
+
+fn assert_f64_bits_eq(actual: &[f64], expected: &[f64], context: &str) {
+    assert_eq!(actual.len(), expected.len(), "{context}: length");
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "{context}: value {index}"
+        );
+    }
+}
+
+#[test]
+fn cropped_store_thermo_decode_matches_full_decode_then_crop_across_scan_modes() {
+    let crop = GridCrop {
+        x_start: 1,
+        x_end: 4,
+        y_start: 1,
+        y_end: 3,
+    };
+    for scan_mode in [0x00, 0x40] {
+        let context = format!("scan mode 0x{scan_mode:02x}");
+        let (surface_file, pressure_file) = synthetic_store_thermo_files(scan_mode);
+        let full_surface = decode_surface_file(surface_file.clone()).unwrap();
+        let (full_pressure, _, _) =
+            decode_pressure_file_with_shape_opts(pressure_file.clone(), false).unwrap();
+        let expected = crop_heavy_domain_with(&full_surface, &full_pressure, crop).unwrap();
+        let actual_surface = decode_surface_file_cropped(surface_file, crop).unwrap();
+        let (actual_pressure, nx, ny) =
+            decode_pressure_file_cropped_with_shape_opts(pressure_file, crop, false).unwrap();
+
+        assert_eq!((nx, ny), (crop.width(), crop.height()), "{context}");
+        assert_eq!(
+            actual_surface.projection, expected.surface.projection,
+            "{context}"
+        );
+        assert!(
+            actual_surface.psfc_pa.iter().any(|value| value.is_nan()),
+            "{context}"
+        );
+        assert!(
+            actual_pressure
+                .temperature_c_3d
+                .iter()
+                .any(|value| value.is_nan()),
+            "{context}"
+        );
+        for (name, actual, expected) in [
+            ("lat", &actual_surface.lat, &expected.surface.lat),
+            ("lon", &actual_surface.lon, &expected.surface.lon),
+            ("psfc", &actual_surface.psfc_pa, &expected.surface.psfc_pa),
+            ("orog", &actual_surface.orog_m, &expected.surface.orog_m),
+            ("t2", &actual_surface.t2_k, &expected.surface.t2_k),
+            ("q2", &actual_surface.q2_kgkg, &expected.surface.q2_kgkg),
+            ("u10", &actual_surface.u10_ms, &expected.surface.u10_ms),
+            ("v10", &actual_surface.v10_ms, &expected.surface.v10_ms),
+            (
+                "sbcape",
+                actual_surface.native_sbcape_jkg.as_ref().unwrap(),
+                expected.surface.native_sbcape_jkg.as_ref().unwrap(),
+            ),
+            (
+                "pblh",
+                actual_surface.native_pblh_m.as_ref().unwrap(),
+                expected.surface.native_pblh_m.as_ref().unwrap(),
+            ),
+        ] {
+            assert_f64_bits_eq(actual, expected, &format!("{context}: {name}"));
+        }
+        assert_f64_bits_eq(
+            &actual_pressure.pressure_levels_hpa,
+            &expected.pressure.pressure_levels_hpa,
+            &format!("{context}: levels"),
+        );
+        for (name, actual, expected) in [
+            (
+                "temperature",
+                &actual_pressure.temperature_c_3d,
+                &expected.pressure.temperature_c_3d,
+            ),
+            (
+                "moisture",
+                &actual_pressure.qvapor_kgkg_3d,
+                &expected.pressure.qvapor_kgkg_3d,
+            ),
+            ("u", &actual_pressure.u_ms_3d, &expected.pressure.u_ms_3d),
+            ("v", &actual_pressure.v_ms_3d, &expected.pressure.v_ms_3d),
+            (
+                "height",
+                &actual_pressure.gh_m_3d,
+                &expected.pressure.gh_m_3d,
+            ),
+        ] {
+            assert_f64_bits_eq(actual, expected, &format!("{context}: {name}"));
+        }
+        assert!(actual_pressure.omega_pa_s_3d.is_none(), "{context}");
+        assert!(actual_pressure.cloud_liquid_kgkg_3d.is_none(), "{context}");
+    }
+}
+
 #[test]
 fn projected_crop_uses_projected_extent_with_padding() {
     let nx = 4usize;

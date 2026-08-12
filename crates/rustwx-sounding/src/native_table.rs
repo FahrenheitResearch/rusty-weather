@@ -262,7 +262,7 @@ fn draw_locator_summary(image: &mut RgbaImage, data: &TableData, metadata: &Soun
                 cape_color(sb_cape),
             ),
             (
-                "SB ECAPE".to_string(),
+                "SB A-ECAPE".to_string(),
                 fmt_unit(sb_ecape, "J/kg", 0),
                 cape_color(sb_ecape),
             ),
@@ -815,7 +815,7 @@ fn draw_parcels(image: &mut RgbaImage, x: i32, y: i32, data: &TableData) {
 
     draw_text_line(image, "PCL", x, header_y, LABEL, LABEL_SCALE);
     for (label, col) in [
-        ("ECAPE", cols[1]),
+        ("A-ECAPE", cols[1]),
         ("NCAPE", cols[2]),
         ("CAPE", cols[3]),
         ("3CAPE", cols[4]),

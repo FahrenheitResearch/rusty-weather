@@ -1,7 +1,8 @@
 //! Atomic file writes ported from rustwx-products/src/publication.rs
 //! (`atomic_write_bytes` / `temp_path_for`, rustwx-fastplots-wt): write to a
-//! hidden temp file in the same directory, fsync, then rename into place;
-//! the temp file is removed on any failure.
+//! hidden temp file in the same directory, fsync, atomically replace the
+//! destination, and make the directory entry durable. The temp file is
+//! removed on any failure without deleting the previous destination first.
 
 use std::fs;
 use std::io::{self, Write};
@@ -51,12 +52,19 @@ where
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp_path = temp_path_for(path);
-    let write_result = (|| -> RwResult<()> {
-        let file = fs::OpenOptions::new()
+    let (tmp_path, file) = loop {
+        let candidate = temp_path_for(path);
+        match fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(&tmp_path)?;
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let write_result = (|| -> RwResult<()> {
         let mut writer = io::BufWriter::with_capacity(1 << 20, file);
         write(&mut writer)?;
         writer.flush()?;
@@ -71,16 +79,117 @@ where
         return Err(err);
     }
     let finalize_result = (|| -> RwResult<()> {
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        fs::rename(&tmp_path, path)?;
+        replace_file(&tmp_path, path)?;
+        sync_parent(path)?;
         Ok(())
     })();
     if let Err(err) = finalize_result {
         let _ = fs::remove_file(&tmp_path);
         return Err(err);
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_WRITE_THROUGH, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FileRenameInfoEx,
+        SetFileInformationByHandle,
+    };
+    use windows_sys::Win32::System::WindowsProgramming::{
+        FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+    };
+
+    // The ordinary rename is the correct path for first publication. It also
+    // closes the race where another writer creates the destination between an
+    // existence check and this operation: that case simply falls through to
+    // the replacement path below.
+    match fs::rename(source, destination) {
+        Ok(()) => return Ok(()),
+        Err(error) if !source.exists() => return Err(error),
+        Err(_) => {}
+    }
+
+    // MoveFileExW(REPLACE_EXISTING) cannot replace an actively memory-mapped
+    // destination on Windows. FILE_RENAME_INFO_EX with POSIX semantics is the
+    // supported atomic namespace swap: existing readers keep their old file
+    // object while new opens resolve to the replacement. Rust File handles
+    // opt into FILE_SHARE_DELETE, which is required by this operation.
+    let destination = std::path::absolute(destination)?;
+    let destination_wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let name_bytes = destination_wide
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| io::Error::other("destination path is too long"))?;
+    // FileNameLength excludes the terminator, but keeping a trailing UTF-16
+    // NUL avoids filesystem/driver implementations reading uninitialized
+    // padding beyond the variable-length name.
+    let buffer_bytes = offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(name_bytes)
+        .and_then(|bytes| bytes.checked_add(size_of::<u16>()))
+        .ok_or_else(|| io::Error::other("rename buffer length overflow"))?;
+    let words = buffer_bytes.div_ceil(size_of::<usize>());
+    let mut buffer = vec![0usize; words];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // Open the already-fsynced temp with DELETE access so Windows permits a
+    // handle-based rename. access_mode overrides the read/write builder bits.
+    let source_file = fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .custom_flags(FILE_FLAG_WRITE_THROUGH)
+        .open(source)?;
+    // SAFETY: the buffer is usize-aligned and large enough for the fixed
+    // header plus the exact UTF-16 name payload. The source handle and buffer
+    // remain live for the entire call.
+    let replaced = unsafe {
+        (*info).Anonymous = FILE_RENAME_INFO_0 {
+            Flags: FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS,
+        };
+        (*info).RootDirectory = ptr::null_mut();
+        (*info).FileNameLength = u32::try_from(name_bytes)
+            .map_err(|_| io::Error::other("destination path is too long"))?;
+        ptr::copy_nonoverlapping(
+            destination_wide.as_ptr(),
+            (*info).FileName.as_mut_ptr(),
+            destination_wide.len(),
+        );
+        SetFileInformationByHandle(
+            source_file.as_raw_handle() as _,
+            FileRenameInfoEx,
+            info.cast::<c_void>(),
+            u32::try_from(buffer_bytes)
+                .map_err(|_| io::Error::other("rename buffer is too large"))?,
+        )
+    };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(not(windows))]
+fn sync_parent(path: &Path) -> io::Result<()> {
+    match path.parent() {
+        Some(parent) => fs::File::open(parent)?.sync_all(),
+        None => Ok(()),
+    }
+}
+
+#[cfg(windows)]
+fn sync_parent(_path: &Path) -> io::Result<()> {
+    // The handle used by replace_file is opened with FILE_FLAG_WRITE_THROUGH.
+    // Windows applies that policy to metadata updates caused by the rename.
     Ok(())
 }
 
@@ -154,6 +263,30 @@ mod tests {
             Vec::<String>::new(),
             "temp file must be cleaned up after failure"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_replacements_publish_one_complete_value() {
+        let dir = test_dir("concurrent-replace");
+        let path = dir.join("state.json");
+        atomic_write_bytes(&path, b"initial").unwrap();
+        let writers = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let payload = format!("writer-{index}-{}", "x".repeat(32 * 1024));
+                    atomic_write_bytes(&path, payload.as_bytes()).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let value = fs::read_to_string(&path).unwrap();
+        assert!(value.starts_with("writer-"));
+        assert_eq!(value.len(), "writer-0-".len() + 32 * 1024);
+        assert_eq!(tmp_entries(&dir), Vec::<String>::new());
         let _ = fs::remove_dir_all(&dir);
     }
 }

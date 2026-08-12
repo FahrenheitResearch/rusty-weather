@@ -1,3 +1,4 @@
+mod bundled_basemap;
 mod color;
 mod colorbar;
 mod colormap;
@@ -17,6 +18,9 @@ mod request;
 mod text;
 pub mod weather;
 
+pub use bundled_basemap::{
+    BundledShapefile, bundled_natural_earth_admin1_10m, bundled_natural_earth_lakes_10m,
+};
 pub use contour_fill::{
     ProjectedContourGeometry, ProjectedContourGeometryTiming, ProjectedContourLineStyle,
     build_projected_contour_geometry, build_projected_contour_geometry_profile,
