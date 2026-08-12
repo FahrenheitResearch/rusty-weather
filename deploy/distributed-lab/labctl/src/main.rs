@@ -51,6 +51,15 @@ const ALPHA_URL: &str = "https://alpha.rw-lab.example.edu";
 const BETA_URL: &str = "https://beta.rw-lab.example.edu";
 const R2_URL: &str = "https://r2-hot.rw-lab.example.edu";
 const R2_BUCKET: &str = "rusty-weather-hot";
+const CLOUDFLARE_TURN_API_URL: &str = "https://rtc.live.cloudflare.com";
+const R2_READINESS_REQUEST_SHA256: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+const CLOUDFLARE_READINESS_KEY_ID: &str = "ffffffffffffffffffffffffffffffff";
+// 24 probes at a two-second per-request bound plus the intervals below keep
+// each readiness gate below one minute even when every request times out.
+const READINESS_ATTEMPTS: usize = 24;
+const READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const READINESS_INTERVAL: Duration = Duration::from_millis(500);
 const MODEL: &str = "golden";
 const RUN: &str = "distributed_lab";
 const PRODUCT: &str = "analysis";
@@ -103,6 +112,15 @@ struct HttpReply {
 
 impl LabHttp {
     fn new(base: &str, token: &str, ca_path: &Path) -> LabResult<Self> {
+        Self::new_with_timeout(base, token, ca_path, Duration::from_secs(90))
+    }
+
+    fn new_with_timeout(
+        base: &str,
+        token: &str,
+        ca_path: &Path,
+        timeout: Duration,
+    ) -> LabResult<Self> {
         let ca = fs::read(ca_path)?;
         let certificate = ureq::tls::Certificate::from_pem(&ca)?;
         rustls::crypto::ring::default_provider()
@@ -114,7 +132,7 @@ impl LabHttp {
             .proxy(None)
             .max_redirects(0)
             .max_idle_connections(0)
-            .timeout_global(Some(Duration::from_secs(90)))
+            .timeout_global(Some(timeout))
             .tls_config(
                 ureq::tls::TlsConfig::builder()
                     .provider(ureq::tls::TlsProvider::Rustls)
@@ -308,11 +326,24 @@ fn prepare_container_ownership(root: &Path) -> LabResult<()> {
     if !common.success() {
         return Err("failed to assign isolated lab runtime ownership".into());
     }
+    make_evidence_directory_host_writable(&root.join("results"))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn prepare_container_ownership(_root: &Path) -> LabResult<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_evidence_directory_host_writable(results: &Path) -> LabResult<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // This isolated directory contains only non-secret release evidence and
+    // compose logs. The host runner must be able to append failure evidence
+    // after provisioning assigns the rest of /lab to the unprivileged
+    // container uid. Do not broaden this mode to /lab, configs, or secrets.
+    fs::set_permissions(results, fs::Permissions::from_mode(0o777))?;
     Ok(())
 }
 
@@ -1004,6 +1035,55 @@ fn wait_ready(http: &LabHttp, name: &str) -> LabResult<()> {
     Err(format!("{name} did not become ready").into())
 }
 
+fn wait_for_exact_not_found<F>(name: &str, mut probe: F) -> LabResult<()>
+where
+    F: FnMut() -> LabResult<HttpReply>,
+{
+    wait_for_exact_not_found_with_policy(name, READINESS_ATTEMPTS, READINESS_INTERVAL, &mut probe)
+}
+
+fn wait_for_exact_not_found_with_policy<F>(
+    name: &str,
+    attempts: usize,
+    interval: Duration,
+    mut probe: F,
+) -> LabResult<()>
+where
+    F: FnMut() -> LabResult<HttpReply>,
+{
+    let mut last_observation = "no response".to_string();
+    for attempt in 0..attempts {
+        match probe() {
+            Ok(reply) if reply.status == 404 => return Ok(()),
+            Ok(reply) => last_observation = format!("HTTP {}", reply.status),
+            Err(_) => last_observation = "transport error".into(),
+        }
+        if attempt + 1 < attempts {
+            thread::sleep(interval);
+        }
+    }
+    Err(format!(
+        "{name} did not return the required exact HTTP 404 readiness response ({last_observation})"
+    )
+    .into())
+}
+
+fn wait_r2_ready(http: &LabHttp) -> LabResult<()> {
+    let absent_pointer = format!("/{R2_BUCKET}/v2/requests/{R2_READINESS_REQUEST_SHA256}.json");
+    wait_for_exact_not_found("R2 hot store", || http.public_get(&absent_pointer))
+}
+
+fn wait_cloudflare_turn_api_ready(http: &LabHttp) -> LabResult<()> {
+    let absent_key = format!("/v1/turn/keys/{CLOUDFLARE_READINESS_KEY_ID}/credentials/generate");
+    let probe = serde_json::json!({
+        "ttl": 1,
+        "customIdentifier": "distributed-lab-readiness"
+    });
+    wait_for_exact_not_found("Cloudflare TURN credential API", || {
+        http.post_json(&absent_key, &probe)
+    })
+}
+
 fn request_for(descriptor: &RunDescriptor, public: &LabPublicState, recipe: &str) -> ShareRequest {
     ShareRequest {
         schema: REQUEST_SCHEMA.into(),
@@ -1047,6 +1127,25 @@ fn exercise(root: &Path) -> LabResult<()> {
     wait_ready(&authority, "authority")?;
     wait_ready(&alpha, "alpha")?;
     wait_ready(&beta, "beta")?;
+    // Compose's dependency ordering starts containers but does not make
+    // Wrangler/R2 or the credential edge request-ready. Probe valid, absent
+    // identities over the same pinned HTTPS/DNS path before either service
+    // can participate in the exercise; only an exact 404 proves readiness.
+    let r2_readiness = LabHttp::new_with_timeout(
+        R2_URL,
+        "unused-public-get-token-000000000000",
+        &ca,
+        READINESS_PROBE_TIMEOUT,
+    )?;
+    wait_r2_ready(&r2_readiness)?;
+    let cloudflare_turn_api = LabHttp::new_with_timeout(
+        CLOUDFLARE_TURN_API_URL,
+        CLOUDFLARE_API_TOKEN,
+        &ca,
+        READINESS_PROBE_TIMEOUT,
+    )?;
+    wait_cloudflare_turn_api_ready(&cloudflare_turn_api)?;
+    let r2 = LabHttp::new(R2_URL, "unused-public-get-token-000000000000", &ca)?;
 
     let begin: BeginRunGenerationRequest = decode_json(
         &fs::read(root.join("replication/begin.json"))?,
@@ -1177,7 +1276,6 @@ fn exercise(root: &Path) -> LabResult<()> {
         serde_json::to_vec_pretty(&resolved)?,
     )?;
 
-    let r2 = LabHttp::new(R2_URL, "unused-public-get-token-000000000000", &ca)?;
     let hot_pointer_bytes = require_status(
         r2.public_get(&format!(
             "/{R2_BUCKET}/v2/requests/{}.json",
@@ -1738,5 +1836,97 @@ async fn main() -> LabResult<()> {
         "downloader" => downloader(&root).await,
         "verify" => verify_results(&root),
         _ => Err(format!("unknown labctl command: {command}").into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_identities_are_valid_and_distinct_from_real_fixtures() {
+        assert_eq!(R2_READINESS_REQUEST_SHA256.len(), 64);
+        assert!(
+            R2_READINESS_REQUEST_SHA256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        assert_eq!(CLOUDFLARE_READINESS_KEY_ID.len(), 32);
+        assert!(
+            CLOUDFLARE_READINESS_KEY_ID
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        assert_ne!(CLOUDFLARE_READINESS_KEY_ID, TURN_KEY_ID);
+    }
+
+    #[test]
+    fn readiness_retries_transport_and_non_404_until_exact_not_found() {
+        let mut calls = 0;
+        wait_for_exact_not_found_with_policy("scripted endpoint", 3, Duration::ZERO, || {
+            calls += 1;
+            match calls {
+                1 => Err("not listening yet".into()),
+                2 => Ok(HttpReply {
+                    status: 200,
+                    bytes: Vec::new(),
+                }),
+                _ => Ok(HttpReply {
+                    status: 404,
+                    bytes: Vec::new(),
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn readiness_is_bounded_and_rejects_every_non_404_status() {
+        let mut calls = 0;
+        let error =
+            wait_for_exact_not_found_with_policy("scripted endpoint", 2, Duration::ZERO, || {
+                calls += 1;
+                Ok(HttpReply {
+                    status: 503,
+                    bytes: Vec::new(),
+                })
+            })
+            .unwrap_err();
+        assert_eq!(calls, 2);
+        assert!(error.to_string().contains("exact HTTP 404"));
+        assert!(error.to_string().contains("HTTP 503"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_non_secret_evidence_directory_becomes_host_writable() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rw-distributed-lab-permissions-{}-{nonce}",
+            std::process::id()
+        ));
+        let results = root.join("results");
+        let secret = root.join("secrets/credential");
+        fs::create_dir_all(&results).unwrap();
+        write(&secret, b"not-a-real-secret").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+
+        make_evidence_directory_host_writable(&results).unwrap();
+
+        assert_eq!(
+            fs::metadata(&results).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert_eq!(
+            fs::metadata(&secret).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -578,6 +578,14 @@ impl GenerationReplicationService {
         {
             return Err(ReplicationError::Conflict);
         }
+        // The concrete rw-store namespace is `(model, run)`, not the opaque
+        // upload id. Two generation ids must never reserve or authorize the
+        // same directory: retiring either one could otherwise remove bytes
+        // still referenced by the other. Perform this admission check before
+        // quota accounting or accepting any chunks.
+        if namespace_is_occupied_by_other_generation(&state, &request.manifest) {
+            return Err(ReplicationError::Conflict);
+        }
         self.check_quotas(&state, owner, request.manifest.total_bytes)?;
         let expires_unix = now_unix
             .saturating_add(self.policy.upload_ttl_seconds)
@@ -1342,14 +1350,22 @@ impl GenerationReplicationService {
         let mut retired = 0;
         for (generation_id, record) in work {
             let manifest = &record.signed_manifest.manifest;
+            let mut state = self.lock_state()?;
+            if state.retirements.get(&generation_id) != Some(&record) {
+                continue;
+            }
+            // State validation and begin admission make this impossible for
+            // newly written state. Keep the state lock across the filesystem
+            // retirement as defense in depth for a legacy/corrupt in-memory
+            // duplicate: never delete a namespace another upload/publication/
+            // retirement still references.
+            if namespace_is_occupied_by_other_generation(&state, manifest) {
+                return Err(ReplicationError::CorruptState);
+            }
             if self
                 .retire_if_current(manifest, &record.local_snapshot_id)
                 .is_err()
             {
-                continue;
-            }
-            let mut state = self.lock_state()?;
-            if state.retirements.get(&generation_id) != Some(&record) {
                 continue;
             }
             state.retirements.remove(&generation_id);
@@ -2320,6 +2336,58 @@ fn validate_state(
             return Err(ReplicationError::CorruptState);
         }
     }
+    validate_unique_live_namespaces(state)?;
+    Ok(())
+}
+
+fn same_run_namespace(
+    left: &RunGenerationReplicationManifest,
+    right: &RunGenerationReplicationManifest,
+) -> bool {
+    left.model == right.model && left.run == right.run
+}
+
+/// Whether a distinct generation id currently owns the candidate's concrete
+/// rw-store namespace. Retirements count as owners until their authenticated
+/// cleanup completes, preventing a replacement upload from racing deletion.
+fn namespace_is_occupied_by_other_generation(
+    state: &PersistentState,
+    candidate: &RunGenerationReplicationManifest,
+) -> bool {
+    state.uploads.iter().any(|(generation_id, record)| {
+        generation_id != &candidate.generation_id && same_run_namespace(&record.manifest, candidate)
+    }) || state.published.iter().any(|(generation_id, record)| {
+        generation_id != &candidate.generation_id
+            && same_run_namespace(&record.signed_manifest.manifest, candidate)
+    }) || state.retirements.iter().any(|(generation_id, record)| {
+        generation_id != &candidate.generation_id
+            && same_run_namespace(&record.signed_manifest.manifest, candidate)
+    })
+}
+
+fn validate_unique_live_namespaces(state: &PersistentState) -> Result<()> {
+    let mut namespaces = BTreeSet::<(&str, &str)>::new();
+    for manifest in state
+        .uploads
+        .values()
+        .map(|record| &record.manifest)
+        .chain(
+            state
+                .published
+                .values()
+                .map(|record| &record.signed_manifest.manifest),
+        )
+        .chain(
+            state
+                .retirements
+                .values()
+                .map(|record| &record.signed_manifest.manifest),
+        )
+    {
+        if !namespaces.insert((manifest.model.as_str(), manifest.run.as_str())) {
+            return Err(ReplicationError::CorruptState);
+        }
+    }
     Ok(())
 }
 
@@ -2777,6 +2845,16 @@ mod tests {
         manifest: &RunGenerationReplicationManifest,
         source_run: &Path,
     ) {
+        upload_all_at(service, owner, manifest, source_run, NOW);
+    }
+
+    fn upload_all_at(
+        service: &GenerationReplicationService,
+        owner: &AuthenticatedOwner,
+        manifest: &RunGenerationReplicationManifest,
+        source_run: &Path,
+        now_unix: i64,
+    ) {
         for file in &manifest.files {
             let bytes = fs::read(source_run.join(&file.file_name)).unwrap();
             service
@@ -2785,7 +2863,7 @@ mod tests {
                     &manifest.generation_id,
                     &file.chunks[0].object_sha256,
                     &bytes,
-                    NOW,
+                    now_unix,
                 )
                 .unwrap();
         }
@@ -2796,6 +2874,328 @@ mod tests {
         for name in ["run.json", "grid.rwg", "f000.rws"] {
             fs::copy(source_run.join(name), target_run.join(name)).unwrap();
         }
+    }
+
+    fn reidentify_manifest(
+        manifest: &RunGenerationReplicationManifest,
+        generation_id: &str,
+        authenticated_owner: &AuthenticatedOwner,
+    ) -> RunGenerationReplicationManifest {
+        let mut identified = manifest.clone();
+        identified.generation_id = generation_id.into();
+        identified.owner_principal_sha256 = authenticated_owner.sha256().into();
+        // Content identity deliberately excludes transport/owner identity.
+        assert_eq!(
+            identified.generation_sha256,
+            generation_content_sha256(&identified).unwrap()
+        );
+        identified.validate(&limits()).unwrap();
+        identified
+    }
+
+    fn write_authenticated_state_without_validation(
+        service: &GenerationReplicationService,
+        state: PersistentState,
+    ) {
+        let state_bytes = serde_json::to_vec(&state).unwrap();
+        let signature = service
+            .signing_key
+            .sign(&state_preimage(&service.signing_key_id, &state_bytes));
+        let envelope = StateEnvelope {
+            schema: STATE_ENVELOPE_SCHEMA.into(),
+            signing_key_id: service.signing_key_id.clone(),
+            state,
+            signature_base64: base64::engine::general_purpose::STANDARD
+                .encode(signature.to_bytes()),
+        };
+        atomic_write_bytes(&service.state_path, &serde_json::to_vec(&envelope).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn run_namespace_is_exclusive_before_quota_or_chunk_work_and_survives_restart() {
+        let dir = TestDir::new("namespace-admission");
+        let source_store = dir.0.join("source");
+        build_source(&source_store, 279.0);
+        let target_store = dir.0.join("target");
+        let first_owner = owner(0x0a);
+        let second_owner = owner(0x0b);
+        let first = source_manifest(&source_store, "namespace-first", &first_owner);
+        let same_owner_duplicate =
+            reidentify_manifest(&first, "namespace-same-owner-duplicate", &first_owner);
+        let other_owner_duplicate =
+            reidentify_manifest(&first, "namespace-other-owner-duplicate", &second_owner);
+
+        let service =
+            GenerationReplicationService::open(config(&dir.0, &target_store, policy())).unwrap();
+        let initial = service
+            .begin(&first_owner, begin_request(first.clone()), NOW)
+            .unwrap();
+        let replay = service
+            .begin(&first_owner, begin_request(first.clone()), NOW + 1)
+            .unwrap();
+        assert_eq!(replay.generation_id, initial.generation_id);
+        assert_eq!(replay.generation_sha256, initial.generation_sha256);
+        assert_eq!(replay.missing_chunks, initial.missing_chunks);
+
+        assert!(matches!(
+            service.begin(
+                &first_owner,
+                begin_request(same_owner_duplicate.clone()),
+                NOW + 1
+            ),
+            Err(ReplicationError::Conflict)
+        ));
+        assert!(matches!(
+            service.begin(
+                &second_owner,
+                begin_request(other_owner_duplicate.clone()),
+                NOW + 1
+            ),
+            Err(ReplicationError::Conflict)
+        ));
+        {
+            let state = service.lock_state().unwrap();
+            assert_eq!(state.uploads.len(), 1);
+            assert!(state.uploads.contains_key(&first.generation_id));
+            assert_eq!(state.billing.total_upload_bytes, 0);
+        }
+        assert_eq!(
+            fs::read_dir(dir.0.join("control/chunks")).unwrap().count(),
+            0,
+            "begin conflicts must not create or charge chunk storage"
+        );
+        drop(service);
+
+        let reopened =
+            GenerationReplicationService::open(config(&dir.0, &target_store, policy())).unwrap();
+        assert!(matches!(
+            reopened.begin(&first_owner, begin_request(same_owner_duplicate), NOW + 2),
+            Err(ReplicationError::Conflict)
+        ));
+        assert!(matches!(
+            reopened.begin(&second_owner, begin_request(other_owner_duplicate), NOW + 2),
+            Err(ReplicationError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn revoke_and_expiry_release_a_namespace_only_after_authenticated_retirement() {
+        let dir = TestDir::new("namespace-retirement");
+        let source_store = dir.0.join("source");
+        let source_run = build_source(&source_store, 281.0);
+        let target_store = dir.0.join("target");
+        let authenticated_owner = owner(0x0c);
+        let first = source_manifest(&source_store, "namespace-revoke", &authenticated_owner);
+        let replacement =
+            reidentify_manifest(&first, "namespace-after-revoke", &authenticated_owner);
+        let service =
+            GenerationReplicationService::open(config(&dir.0, &target_store, policy())).unwrap();
+        service
+            .begin(&authenticated_owner, begin_request(first.clone()), NOW)
+            .unwrap();
+        upload_all(&service, &authenticated_owner, &first, &source_run);
+        service
+            .finalize(
+                &authenticated_owner,
+                &first.generation_id,
+                finalize_request(&first),
+                NOW,
+            )
+            .unwrap();
+        assert!(matches!(
+            service.begin(
+                &authenticated_owner,
+                begin_request(replacement.clone()),
+                NOW + 1
+            ),
+            Err(ReplicationError::Conflict)
+        ));
+        service
+            .revoke(
+                &authenticated_owner,
+                &first.generation_id,
+                RevokeRunGenerationRequest {
+                    schema: REVOKE_RUN_GENERATION_SCHEMA.into(),
+                    generation_sha256: first.generation_sha256.clone(),
+                    rights_withdrawn: true,
+                    reason: "Owner is replacing this generation.".into(),
+                },
+                NOW + 2,
+            )
+            .unwrap();
+        assert!(!target_store.join(MODEL).join(RUN).join("run.json").exists());
+        service
+            .begin(
+                &authenticated_owner,
+                begin_request(replacement.clone()),
+                NOW + 3,
+            )
+            .unwrap();
+        service
+            .cancel_upload(&authenticated_owner, &replacement.generation_id, NOW + 3)
+            .unwrap();
+
+        let expiry_dir = TestDir::new("namespace-expiry");
+        let expiry_target = expiry_dir.0.join("target");
+        let expiry_service =
+            GenerationReplicationService::open(config(&expiry_dir.0, &expiry_target, policy()))
+                .unwrap();
+        let expiring = reidentify_manifest(&first, "namespace-expiring", &authenticated_owner);
+        expiry_service
+            .begin(
+                &authenticated_owner,
+                begin_request(expiring.clone()),
+                NOW + 4,
+            )
+            .unwrap();
+        upload_all_at(
+            &expiry_service,
+            &authenticated_owner,
+            &expiring,
+            &source_run,
+            NOW + 4,
+        );
+        expiry_service
+            .finalize(
+                &authenticated_owner,
+                &expiring.generation_id,
+                finalize_request(&expiring),
+                NOW + 4,
+            )
+            .unwrap();
+        let mut after_expiry =
+            reidentify_manifest(&first, "namespace-after-expiry", &authenticated_owner);
+        after_expiry.published_unix = expiring.retain_until_unix;
+        after_expiry.retain_until_unix = expiring.retain_until_unix + 3_600;
+        after_expiry.validate(&limits()).unwrap();
+        assert!(matches!(
+            expiry_service.begin(
+                &authenticated_owner,
+                begin_request(after_expiry.clone()),
+                expiring.retain_until_unix
+            ),
+            Err(ReplicationError::Conflict)
+        ));
+        let report = expiry_service
+            .garbage_collect(expiring.retain_until_unix)
+            .unwrap();
+        assert_eq!(report.retired_generations, 1);
+        assert!(
+            !expiry_target
+                .join(MODEL)
+                .join(RUN)
+                .join("run.json")
+                .exists()
+        );
+
+        expiry_service
+            .begin(
+                &authenticated_owner,
+                begin_request(after_expiry),
+                expiring.retain_until_unix,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn corrupt_duplicate_namespace_cannot_delete_live_bytes_or_survive_restart() {
+        let dir = TestDir::new("namespace-corrupt-runtime");
+        let source_store = dir.0.join("source");
+        let source_run = build_source(&source_store, 283.0);
+        let target_store = dir.0.join("target");
+        let first_owner = owner(0x0d);
+        let second_owner = owner(0x0e);
+        let first = source_manifest(&source_store, "namespace-retiring", &first_owner);
+        let second = reidentify_manifest(&first, "namespace-still-live", &second_owner);
+        let service =
+            GenerationReplicationService::open(config(&dir.0, &target_store, policy())).unwrap();
+        service
+            .begin(&first_owner, begin_request(first.clone()), NOW)
+            .unwrap();
+        upload_all(&service, &first_owner, &first, &source_run);
+        let published = service
+            .finalize(
+                &first_owner,
+                &first.generation_id,
+                finalize_request(&first),
+                NOW,
+            )
+            .unwrap();
+        {
+            let mut state = service.lock_state().unwrap();
+            let retiring = state.published.remove(&first.generation_id).unwrap();
+            state
+                .retirements
+                .insert(first.generation_id.clone(), retiring);
+            state.tombstones.insert(
+                first.generation_id.clone(),
+                RunGenerationTombstone {
+                    schema: RUN_GENERATION_TOMBSTONE_SCHEMA.into(),
+                    generation_id: first.generation_id.clone(),
+                    generation_sha256: first.generation_sha256.clone(),
+                    owner_principal_sha256: first_owner.sha256().into(),
+                    revoked_unix: NOW + 1,
+                    rights_withdrawn: true,
+                    reason: "Synthetic legacy retirement collision.".into(),
+                },
+            );
+            state.published.insert(
+                second.generation_id.clone(),
+                PublishedRecord {
+                    signed_manifest: sign_run_generation(
+                        second,
+                        service.signing_key_id.clone(),
+                        &service.signing_key,
+                        &service.limits,
+                    )
+                    .unwrap(),
+                    local_snapshot_id: published.published.local_snapshot_id.clone(),
+                    published_unix: NOW,
+                },
+            );
+        }
+        assert!(matches!(
+            service.drain_retirements(1),
+            Err(ReplicationError::CorruptState)
+        ));
+        assert!(
+            target_store
+                .join(MODEL)
+                .join(RUN)
+                .join("run.json")
+                .is_file()
+        );
+
+        let restart_dir = TestDir::new("namespace-corrupt-restart");
+        let restart_source = restart_dir.0.join("source");
+        build_source(&restart_source, 284.0);
+        let restart_target = restart_dir.0.join("target");
+        let restart_owner = owner(0x0f);
+        let restart_first = source_manifest(&restart_source, "restart-first", &restart_owner);
+        let restart_second =
+            reidentify_manifest(&restart_first, "restart-duplicate", &restart_owner);
+        let restart_service =
+            GenerationReplicationService::open(config(&restart_dir.0, &restart_target, policy()))
+                .unwrap();
+        restart_service
+            .begin(&restart_owner, begin_request(restart_first.clone()), NOW)
+            .unwrap();
+        let corrupt_state = {
+            let state = restart_service.lock_state().unwrap();
+            let mut corrupt = state.clone();
+            let mut duplicate = corrupt.uploads[&restart_first.generation_id].clone();
+            duplicate.manifest = restart_second;
+            corrupt
+                .uploads
+                .insert(duplicate.manifest.generation_id.clone(), duplicate);
+            corrupt
+        };
+        write_authenticated_state_without_validation(&restart_service, corrupt_state);
+        drop(restart_service);
+        assert!(matches!(
+            GenerationReplicationService::open(config(&restart_dir.0, &restart_target, policy())),
+            Err(ReplicationError::CorruptState)
+        ));
     }
 
     #[test]
