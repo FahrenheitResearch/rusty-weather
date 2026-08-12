@@ -158,7 +158,13 @@ alerts are verified. `community.quotas.promoted_bytes_per_month` is the global
 promotion cost ceiling; crossing it pauses promotion without disabling local
 cache or origin queries. `RW_COMMUNITY_KILL_SWITCH=true` likewise stops hot
 promotion and case publication while retaining signed normal-origin fallback.
-Case publication has its own `[community.cases].enabled` gate.
+Case publication has its own `[community.cases].enabled` gate. Typed artifact
+uploads additionally require
+`community.cases.artifact_publication_enabled = true`; keep it false until
+rights/attribution workflows and publication quotas are verified. The reserved
+`community.cases.full_run_replication_enabled` setting must remain false: the
+current service deliberately exposes no arbitrary file, raw wrfout, or
+complete-run upload route.
 Set `community.quotas.maximum_principals` to bound the durable monthly
 accounting file. Bound case retention independently with
 `community.cases.maximum_cases`, `community.cases.storage_bytes`, and

@@ -40,8 +40,13 @@ versioned API.
 - `GET /v1/artifacts/{hash}/{file}`
 - `POST /v1/community/objects/resolve` (feature-gated Phase 1)
 - `GET /v1/community/objects/{sha256}` (feature-gated Phase 1)
+- `POST /v1/community/artifacts` (typed, owner-bound explicit publication)
+- `POST /v1/community/artifacts/{sha256}/revoke`
 - `POST /v1/community/cases` (explicit publication; separately gated)
 - `GET /v1/community/cases/{case_id}`
+- `POST /v1/community/cases/{case_id}/revoke`
+- `GET /v1/federation/origins` (feature-gated signed public-origin catalog)
+- `GET /v1/federation/origins/{origin_id}` (feature-gated signed descriptor)
 - `GET /v1/openapi.json`
 - `GET /metrics`
 
@@ -89,6 +94,17 @@ selected-pressure windows, temporal/diurnal grids, and deliberately published
 case artifacts. There is no arbitrary-file, directory, raw-WRF, or full-run
 endpoint.
 
+Case artifacts are created only through a second off-by-default gate and a
+closed typed payload union: annotation, scalar table, fixed-coordinate overlay,
+or bounded PNG/WebP image. The authenticated principal must match the owner
+hash embedded in canonical request identity. Private WRF, ArWen, and
+user-provided artifacts require explicit owner publication, confirmed rights,
+attribution/license fields, source snapshot/grid identity, and bounded
+retention. Durable audit records and rights-withdrawal tombstones prevent
+another principal from publishing/revoking on the owner's behalf or reviving a
+withdrawn identity. Complete `.rws` generation inventory exists only as a
+disabled protocol contract; no raw file/wrfout/full-run HTTP upload exists.
+
 Every accepted object is SHA-256 content-addressed and described by an
 origin-signed, self-contained `rw.community.object.v1` manifest binding the
 model, immutable run and snapshot, grid, variables, exact valid time/window,
@@ -112,3 +128,22 @@ The wire contract and threat model are in `COMMUNITY_CACHE_PROTOCOL.md` and
 afterward; direct connectivity is permanently out of scope. Phase 1 contains
 no STUN, direct ICE, candidate gathering, peer-address exchange, or direct
 fallback code.
+
+## Public-origin federation
+
+Federation is a distinct conventional-HTTPS path for opt-in universities,
+labs, and public service nodes whose origin addresses are intentionally public.
+It never publishes an ordinary BowEcho or Community Cache client's address.
+The authenticated federation endpoints return an authority-signed catalog of
+origin-signed `rw.federation.origin.v1` descriptors. Each descriptor binds its
+HTTPS root, Ed25519 descriptor/object keys, exact model/product/query
+capabilities, geographic coverage, retention, build/schema versions, expiry,
+same-origin health path, policy links, replication consent, and quotas.
+
+Origins cannot self-register. The service reads bounded signed descriptor
+files provisioned by the operator and requires an exact out-of-band origin-ID
+and descriptor-key allowlist. Revoked origins and keys fail closed. The
+transport-neutral verifier rejects unknown schemas/fields, unsafe or local URL
+forms, untrusted keys, expired material, duplicate identities, and malicious
+capability counts. See `FEDERATION.md` for the complete trust and selection
+contract.

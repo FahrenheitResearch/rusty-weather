@@ -8,6 +8,7 @@ pub mod auth;
 pub mod community;
 pub mod community_store;
 pub mod config;
+pub mod federation;
 pub mod jobs;
 pub mod metrics;
 pub mod openapi;
@@ -17,6 +18,7 @@ pub mod state;
 
 pub use auth::{AuthError, TokenSet};
 pub use config::{AppConfig, ConfigError};
+pub use federation::{FederationError, FederationService};
 pub use jobs::{ArtifactRef, CancellationToken, JobError, JobManager, JobStatus, JobView};
 pub use metrics::Metrics;
 pub use problem::ProblemDetails;

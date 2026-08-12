@@ -12,7 +12,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use rustwx_core::{ModelId, SourceId};
-use rw_community_protocol::{CaseRoomManifest, ResolveObjectRequest};
+use rw_community_protocol::{
+    CaseRoomManifest, PublishCaseArtifactRequest, ResolveObjectRequest, RevokePublicationRequest,
+};
 use rw_ingest::{IngestCapabilityLimitation, IngestSupportStatus, model_ingest_capability};
 use rw_query::{
     IndexWindow2DRequest, IntervalSupport, MissingPolicy, PointSeriesRequest, PointSeriesResult,
@@ -38,6 +40,7 @@ use uuid::Uuid;
 
 use crate::community::CommunityError;
 use crate::config::ConfigError;
+use crate::federation::FederationError;
 use crate::problem::ProblemDetails;
 use crate::{AppState, CancellationToken, ExecutionError, JobError, JobStatus};
 
@@ -781,6 +784,11 @@ struct CommunityCasePath {
     case_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct FederationOriginPath {
+    origin_id: String,
+}
+
 #[derive(Debug)]
 enum JobWorkError {
     Query(QueryError),
@@ -836,10 +844,30 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
         )
         .route("/v1/community/objects/{sha256}", get(community_object))
         .route(
+            rw_community_protocol::PUBLISH_CASE_ARTIFACT_PATH,
+            post(publish_community_case_artifact),
+        )
+        .route(
+            rw_community_protocol::REVOKE_CASE_ARTIFACT_PATH_TEMPLATE,
+            post(revoke_community_case_artifact),
+        )
+        .route(
             rw_community_protocol::CREATE_CASE_PATH,
             post(publish_community_case),
         )
         .route("/v1/community/cases/{case_id}", get(community_case))
+        .route(
+            rw_community_protocol::REVOKE_CASE_PATH_TEMPLATE,
+            post(revoke_community_case),
+        )
+        .route(
+            rw_community_protocol::FEDERATION_CATALOG_PATH,
+            get(federation_catalog),
+        )
+        .route(
+            rw_community_protocol::FEDERATION_ORIGIN_PATH_TEMPLATE,
+            get(federation_origin),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_authentication,
@@ -1872,6 +1900,59 @@ async fn publish_community_case(
     }
 }
 
+async fn publish_community_case_artifact(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Json(publication): Json<PublishCaseArtifactRequest>,
+) -> Response {
+    let community = state.community.clone();
+    match state
+        .run_light(move || community.publish_case_artifact(&principal.0, publication))
+        .await
+    {
+        Ok(Ok(signed)) => json_with_etag(StatusCode::CREATED, &signed, request_id.0),
+        Ok(Err(error)) => community_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn revoke_community_case_artifact(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(path): Path<CommunityObjectPath>,
+    Json(request): Json<RevokePublicationRequest>,
+) -> Response {
+    let community = state.community.clone();
+    match state
+        .run_light(move || community.revoke_case_artifact(&principal.0, &path.sha256, request))
+        .await
+    {
+        Ok(Ok(tombstone)) => json_with_etag(StatusCode::OK, &tombstone, request_id.0),
+        Ok(Err(error)) => community_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn revoke_community_case(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(path): Path<CommunityCasePath>,
+    Json(request): Json<RevokePublicationRequest>,
+) -> Response {
+    let community = state.community.clone();
+    match state
+        .run_light(move || community.revoke_case(&principal.0, &path.case_id, request))
+        .await
+    {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(error)) => community_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
 async fn community_case(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
@@ -1885,6 +1966,36 @@ async fn community_case(
     {
         Ok(Ok(signed)) => json_with_etag(StatusCode::OK, &signed, request_id.0),
         Ok(Err(error)) => community_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn federation_catalog(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(_principal): Extension<AuthPrincipal>,
+) -> Response {
+    let federation = state.federation.clone();
+    match state.run_light(move || federation.catalog()).await {
+        Ok(Ok(catalog)) => json_with_etag(StatusCode::OK, &catalog, request_id.0),
+        Ok(Err(error)) => federation_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn federation_origin(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(_principal): Extension<AuthPrincipal>,
+    Path(path): Path<FederationOriginPath>,
+) -> Response {
+    let federation = state.federation.clone();
+    match state
+        .run_light(move || federation.descriptor(&path.origin_id))
+        .await
+    {
+        Ok(Ok(descriptor)) => json_with_etag(StatusCode::OK, &descriptor, request_id.0),
+        Ok(Err(error)) => federation_problem(error, request_id.0).into_response(),
         Err(error) => execution_problem(error, request_id.0).into_response(),
     }
 }
@@ -2217,6 +2328,53 @@ fn community_problem(error: CommunityError, request_id: Uuid) -> ProblemDetails 
         }
         CommunityError::Cas(crate::community_store::CommunityStoreError::Json(error)) => {
             error!(%request_id, %error, "Community CAS metadata failed");
+            ProblemDetails::internal(request_id)
+        }
+    }
+}
+
+fn federation_problem(error: FederationError, request_id: Uuid) -> ProblemDetails {
+    match error {
+        FederationError::Disabled => ProblemDetails::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "FEDERATION_DISABLED",
+            "Public-origin federation is unavailable",
+            "Use the authoritative Rusty Weather origin or retry after federation is enabled.",
+            request_id,
+        ),
+        FederationError::NotFound => ProblemDetails::new(
+            StatusCode::NOT_FOUND,
+            "FEDERATED_ORIGIN_NOT_FOUND",
+            "Federated origin was not found",
+            "Refresh the signed federation catalog before selecting an archival origin.",
+            request_id,
+        ),
+        FederationError::Invalid(detail) => {
+            error!(%request_id, %detail, "federation request is invalid");
+            ProblemDetails::new(
+                StatusCode::BAD_REQUEST,
+                "FEDERATION_REQUEST_INVALID",
+                "Federation request is invalid",
+                "Use a canonical origin identifier from the signed catalog.",
+                request_id,
+            )
+        }
+        FederationError::Protocol(error) => {
+            error!(%request_id, %error, "federation signature or policy rejected");
+            ProblemDetails::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "FEDERATION_DESCRIPTOR_REJECTED",
+                "Federation descriptor failed validation",
+                "Refresh the catalog; untrusted, revoked, expired, malformed, or unsafe origins fail closed.",
+                request_id,
+            )
+        }
+        FederationError::Io(error) => {
+            error!(%request_id, %error, "federation descriptor I/O failed");
+            ProblemDetails::internal(request_id)
+        }
+        FederationError::Json(error) => {
+            error!(%request_id, %error, "federation descriptor JSON failed");
             ProblemDetails::internal(request_id)
         }
     }
@@ -2611,6 +2769,27 @@ mod tests {
                 "pre_operational_feed"
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn federation_catalog_is_authenticated_and_feature_gated() {
+        let (_directory, app) = test_app();
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(rw_community_protocol::FEDERATION_CATALOG_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let disabled = get_with_token(app, rw_community_protocol::FEDERATION_CATALOG_PATH).await;
+        assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(disabled).await;
+        assert_eq!(body["code"], "FEDERATION_DISABLED");
     }
 
     #[tokio::test]

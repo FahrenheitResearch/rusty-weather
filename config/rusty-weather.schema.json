@@ -22,8 +22,10 @@
       "default": {
         "capacity_audit_completed": false,
         "cases": {
+          "artifact_publication_enabled": false,
           "default_retention_seconds": 2592000,
           "enabled": false,
+          "full_run_replication_enabled": false,
           "maximum_cases": 1000,
           "maximum_manifest_bytes": 262144,
           "maximum_objects_per_case": 512,
@@ -57,6 +59,24 @@
         "root": "./community-cache",
         "signing_key_file": null,
         "trusted_public_keys": []
+      }
+    },
+    "federation": {
+      "description": "Operator-approved public university/lab/service origins. This is a\nconventional HTTPS federation, not ordinary-client peer discovery.",
+      "$ref": "#/$defs/FederationConfig",
+      "default": {
+        "approved_origins": [],
+        "catalog_id": "fahrenheit-public-origins",
+        "catalog_signing_key_file": null,
+        "catalog_signing_key_id": "federation-catalog-v1",
+        "catalog_ttl_seconds": 300,
+        "descriptor_files": [],
+        "enabled": false,
+        "health_failure_threshold": 3,
+        "health_quarantine_seconds": 60,
+        "maximum_selection_results": 8,
+        "revoked_key_ids": [],
+        "revoked_origin_ids": []
       }
     },
     "limits": {
@@ -103,6 +123,23 @@
   },
   "additionalProperties": false,
   "$defs": {
+    "ApprovedFederationOriginConfig": {
+      "type": "object",
+      "properties": {
+        "descriptor_signing_keys": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FederationTrustedKeyConfig"
+          }
+        },
+        "origin_id": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "additionalProperties": false
+    },
     "AuthConfig": {
       "type": "object",
       "properties": {
@@ -123,6 +160,11 @@
     "CaseRoomConfig": {
       "type": "object",
       "properties": {
+        "artifact_publication_enabled": {
+          "description": "Separate opt-in gate for authenticated typed artifact publication.\nRaw files, directories, wrfout, and complete-run uploads remain outside\nthis endpoint regardless of this setting.",
+          "type": "boolean",
+          "default": false
+        },
         "default_retention_seconds": {
           "description": "Maximum requested retention interval for a published case.",
           "type": "integer",
@@ -131,6 +173,11 @@
           "minimum": 0
         },
         "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "full_run_replication_enabled": {
+          "description": "Reserved contract gate for a later typed `.rws` generation replication\nservice. No current HTTP route consumes it and it must remain false.",
           "type": "boolean",
           "default": false
         },
@@ -187,8 +234,10 @@
         "cases": {
           "$ref": "#/$defs/CaseRoomConfig",
           "default": {
+            "artifact_publication_enabled": false,
             "default_retention_seconds": 2592000,
             "enabled": false,
+            "full_run_replication_enabled": false,
             "maximum_cases": 1000,
             "maximum_manifest_bytes": 262144,
             "maximum_objects_per_case": 512,
@@ -336,6 +385,100 @@
           "format": "uint64",
           "default": 107374182400,
           "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "FederationConfig": {
+      "type": "object",
+      "properties": {
+        "approved_origins": {
+          "description": "Explicit identity/key allowlist established out of band.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ApprovedFederationOriginConfig"
+          }
+        },
+        "catalog_id": {
+          "type": "string",
+          "default": "fahrenheit-public-origins"
+        },
+        "catalog_signing_key_file": {
+          "description": "Private Ed25519 catalog key. It is loaded from a permission-restricted\nfile and is never accepted inline or emitted by configuration APIs.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "catalog_signing_key_id": {
+          "type": "string",
+          "default": "federation-catalog-v1"
+        },
+        "catalog_ttl_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 300,
+          "minimum": 0
+        },
+        "descriptor_files": {
+          "description": "Signed descriptors provisioned by an operator. There is deliberately\nno HTTP self-registration endpoint.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "health_failure_threshold": {
+          "type": "integer",
+          "format": "uint32",
+          "default": 3,
+          "minimum": 0
+        },
+        "health_quarantine_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "default": 60,
+          "minimum": 0
+        },
+        "maximum_selection_results": {
+          "type": "integer",
+          "format": "uint",
+          "default": 8,
+          "minimum": 0
+        },
+        "revoked_key_ids": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "revoked_origin_ids": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "FederationTrustedKeyConfig": {
+      "type": "object",
+      "properties": {
+        "key_id": {
+          "type": "string",
+          "default": ""
+        },
+        "public_key_base64": {
+          "type": "string",
+          "default": ""
         }
       },
       "additionalProperties": false

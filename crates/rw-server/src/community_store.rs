@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rw_community_protocol::SignedCaseRoomManifest;
+use rw_community_protocol::{
+    PublicationAuditRecord, PublicationTombstone, SignedCaseRoomManifest,
+    validate_publication_audit, validate_publication_tombstone,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -121,6 +124,10 @@ impl CommunityCas {
         create_real_directory(&root.join("manifests"))?;
         create_real_directory(&root.join("index"))?;
         create_real_directory(&root.join("cases"))?;
+        create_real_directory(&root.join("publication-audit"))?;
+        create_real_directory(&root.join("publication-tombstones"))?;
+        create_real_directory(&root.join("publication-request-tombstones"))?;
+        create_real_directory(&root.join("case-tombstones"))?;
         let index = load_index(&root, limits)?;
         let store = Self {
             root: Arc::new(root),
@@ -284,6 +291,11 @@ impl CommunityCas {
 
     pub fn put_case(&self, case_id: &str, bytes: &[u8]) -> Result<(), CommunityStoreError> {
         validate_case_id(case_id)?;
+        if self.case_tombstoned(case_id)? {
+            return Err(CommunityStoreError::Invalid(
+                "a tombstoned case id cannot be reused".into(),
+            ));
+        }
         if bytes.is_empty() || bytes.len() as u64 > self.case_limits.maximum_manifest_bytes {
             return Err(CommunityStoreError::TooLarge);
         }
@@ -300,6 +312,10 @@ impl CommunityCas {
             ));
         }
         let cases = self.inspect_cases(now, true)?;
+        let tombstone_count = bounded_directory_file_count(
+            &self.root.join("case-tombstones"),
+            MAX_CASE_DIRECTORY_ENTRIES,
+        )?;
         let existing_bytes = cases.get(case_id).copied().unwrap_or(0);
         let count_after = cases.len() + usize::from(existing_bytes == 0);
         let bytes_after = cases
@@ -309,7 +325,7 @@ impl CommunityCas {
             .saturating_sub(existing_bytes)
             .checked_add(bytes.len() as u64)
             .ok_or(CommunityStoreError::Quota)?;
-        if count_after > self.case_limits.maximum_cases
+        if count_after.saturating_add(tombstone_count) > self.case_limits.maximum_cases
             || bytes_after > self.case_limits.storage_bytes
         {
             return Err(CommunityStoreError::Quota);
@@ -320,6 +336,9 @@ impl CommunityCas {
 
     pub fn get_case(&self, case_id: &str) -> Result<Option<Vec<u8>>, CommunityStoreError> {
         validate_case_id(case_id)?;
+        if self.case_tombstoned(case_id)? {
+            return Ok(None);
+        }
         let path = self.case_path(case_id);
         if !path.exists() {
             return Ok(None);
@@ -336,6 +355,182 @@ impl CommunityCas {
             return Ok(None);
         }
         Ok(Some(bytes))
+    }
+
+    /// Persist the authenticated owner binding and rights decision associated
+    /// with an immutable artifact. This is operator audit state, not a source
+    /// of object identity; the signed object manifest remains authoritative.
+    pub fn put_publication_audit(
+        &self,
+        record: &PublicationAuditRecord,
+    ) -> Result<(), CommunityStoreError> {
+        validate_publication_audit(record)
+            .map_err(|error| CommunityStoreError::Invalid(error.to_string()))?;
+        let bytes = serde_json::to_vec(record)?;
+        if bytes.len() as u64 > self.case_limits.maximum_manifest_bytes {
+            return Err(CommunityStoreError::TooLarge);
+        }
+        let path = self.publication_audit_path(&record.object_sha256);
+        if path.exists() {
+            if read_bounded(&path, self.case_limits.maximum_manifest_bytes)? != bytes {
+                return Err(CommunityStoreError::Invalid(
+                    "immutable publication audit identity collision".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if bounded_directory_file_count(
+            &self.root.join("publication-audit"),
+            self.limits.maximum_objects,
+        )? >= self.limits.maximum_objects
+        {
+            return Err(CommunityStoreError::Quota);
+        }
+        rw_store::atomic::atomic_write_bytes(&path, &bytes)?;
+        Ok(())
+    }
+
+    pub fn publication_audit(
+        &self,
+        object_sha256: &str,
+    ) -> Result<Option<PublicationAuditRecord>, CommunityStoreError> {
+        validate_hash(object_sha256)?;
+        let path = self.publication_audit_path(object_sha256);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = read_bounded(&path, self.case_limits.maximum_manifest_bytes)?;
+        let record: PublicationAuditRecord = serde_json::from_slice(&bytes)?;
+        validate_publication_audit(&record)
+            .map_err(|error| CommunityStoreError::Invalid(error.to_string()))?;
+        if record.object_sha256 != object_sha256 {
+            return Err(CommunityStoreError::Invalid(
+                "publication audit filename does not match object identity".into(),
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    pub fn revoke_publication(
+        &self,
+        record: &PublicationAuditRecord,
+        tombstone: &PublicationTombstone,
+    ) -> Result<(), CommunityStoreError> {
+        validate_publication_audit(record)
+            .map_err(|error| CommunityStoreError::Invalid(error.to_string()))?;
+        validate_publication_tombstone(tombstone)
+            .map_err(|error| CommunityStoreError::Invalid(error.to_string()))?;
+        if record.object_sha256 != tombstone.object_sha256
+            || record.request_sha256 != tombstone.request_sha256
+            || record.owner_principal_sha256 != tombstone.owner_principal_sha256
+        {
+            return Err(CommunityStoreError::Invalid(
+                "publication tombstone does not match its owner and object".into(),
+            ));
+        }
+        let bytes = serde_json::to_vec(tombstone)?;
+        if bytes.len() as u64 > self.case_limits.maximum_manifest_bytes {
+            return Err(CommunityStoreError::TooLarge);
+        }
+        let path = self.publication_tombstone_path(&record.object_sha256);
+        if path.exists() {
+            let existing = read_bounded(&path, self.case_limits.maximum_manifest_bytes)?;
+            if existing != bytes {
+                return Err(CommunityStoreError::Invalid(
+                    "publication is already tombstoned".into(),
+                ));
+            }
+        } else {
+            rw_store::atomic::atomic_write_bytes(&path, &bytes)?;
+        }
+        let request_path = self.publication_request_tombstone_path(&record.request_sha256);
+        if request_path.exists() {
+            if read_bounded(&request_path, self.case_limits.maximum_manifest_bytes)? != bytes {
+                return Err(CommunityStoreError::Invalid(
+                    "publication request is already tombstoned".into(),
+                ));
+            }
+        } else {
+            rw_store::atomic::atomic_write_bytes(&request_path, &bytes)?;
+        }
+        // Write the durable tombstone before removing the live request map.
+        self.invalidate_request(&record.request_sha256)
+    }
+
+    pub fn publication_tombstone(
+        &self,
+        object_sha256: &str,
+    ) -> Result<Option<PublicationTombstone>, CommunityStoreError> {
+        validate_hash(object_sha256)?;
+        let path = self.publication_tombstone_path(object_sha256);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = read_bounded(&path, self.case_limits.maximum_manifest_bytes)?;
+        let tombstone: PublicationTombstone = serde_json::from_slice(&bytes)?;
+        validate_publication_tombstone(&tombstone)
+            .map_err(|error| CommunityStoreError::Invalid(error.to_string()))?;
+        if tombstone.object_sha256 != object_sha256 {
+            return Err(CommunityStoreError::Invalid(
+                "publication tombstone filename does not match object identity".into(),
+            ));
+        }
+        Ok(Some(tombstone))
+    }
+
+    pub fn publication_request_tombstoned(
+        &self,
+        request_sha256: &str,
+    ) -> Result<bool, CommunityStoreError> {
+        validate_hash(request_sha256)?;
+        let path = self.publication_request_tombstone_path(request_sha256);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let bytes = read_bounded(&path, self.case_limits.maximum_manifest_bytes)?;
+        let tombstone: PublicationTombstone = serde_json::from_slice(&bytes)?;
+        validate_publication_tombstone(&tombstone)
+            .map_err(|error| CommunityStoreError::Invalid(error.to_string()))?;
+        if tombstone.request_sha256 != request_sha256 {
+            return Err(CommunityStoreError::Invalid(
+                "request tombstone filename does not match request identity".into(),
+            ));
+        }
+        Ok(true)
+    }
+
+    pub fn revoke_case(&self, case_id: &str, tombstone: &[u8]) -> Result<(), CommunityStoreError> {
+        validate_case_id(case_id)?;
+        if tombstone.is_empty() || tombstone.len() as u64 > self.case_limits.maximum_manifest_bytes
+        {
+            return Err(CommunityStoreError::TooLarge);
+        }
+        let path = self.case_tombstone_path(case_id);
+        if path.exists() {
+            if read_bounded(&path, self.case_limits.maximum_manifest_bytes)? != tombstone {
+                return Err(CommunityStoreError::Invalid(
+                    "case is already tombstoned".into(),
+                ));
+            }
+        } else {
+            rw_store::atomic::atomic_write_bytes(&path, tombstone)?;
+        }
+        remove_file_if_present(&self.case_path(case_id))
+    }
+
+    pub fn case_tombstoned(&self, case_id: &str) -> Result<bool, CommunityStoreError> {
+        validate_case_id(case_id)?;
+        let path = self.case_tombstone_path(case_id);
+        if !path.exists() {
+            return Ok(false);
+        }
+        let bytes = read_bounded(&path, self.case_limits.maximum_manifest_bytes)?;
+        if bytes.is_empty() {
+            return Err(CommunityStoreError::Invalid(
+                "case tombstone is empty".into(),
+            ));
+        }
+        Ok(true)
     }
 
     pub fn case_count(&self) -> Result<usize, CommunityStoreError> {
@@ -382,6 +577,30 @@ impl CommunityCas {
 
     fn case_path(&self, case_id: &str) -> PathBuf {
         self.root.join("cases").join(format!("{case_id}.json"))
+    }
+
+    fn publication_audit_path(&self, object_sha256: &str) -> PathBuf {
+        self.root
+            .join("publication-audit")
+            .join(format!("{object_sha256}.json"))
+    }
+
+    fn publication_tombstone_path(&self, object_sha256: &str) -> PathBuf {
+        self.root
+            .join("publication-tombstones")
+            .join(format!("{object_sha256}.json"))
+    }
+
+    fn publication_request_tombstone_path(&self, request_sha256: &str) -> PathBuf {
+        self.root
+            .join("publication-request-tombstones")
+            .join(format!("{request_sha256}.json"))
+    }
+
+    fn case_tombstone_path(&self, case_id: &str) -> PathBuf {
+        self.root
+            .join("case-tombstones")
+            .join(format!("{case_id}.json"))
     }
 
     fn inspect_cases(
@@ -485,6 +704,26 @@ fn load_index(root: &Path, limits: CasLimits) -> Result<CasIndex, CommunityStore
         evict_for_admission(root, limits, &mut index, 0, "")?;
     }
     Ok(index)
+}
+
+fn bounded_directory_file_count(
+    directory: &Path,
+    maximum: usize,
+) -> Result<usize, CommunityStoreError> {
+    let mut count = 0usize;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            return Err(CommunityStoreError::Invalid(
+                "bounded publication directory contains a non-file entry".into(),
+            ));
+        }
+        count = count.saturating_add(1);
+        if count > maximum {
+            return Err(CommunityStoreError::Quota);
+        }
+    }
+    Ok(count)
 }
 
 fn evict_for_admission(

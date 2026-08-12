@@ -86,11 +86,41 @@ maximum_objects = 100000
 
 [community.cases]
 enabled = false
+artifact_publication_enabled = false
+# Reserved for a later typed .rws-generation replication service. There is no
+# raw file, directory, or wrfout upload endpoint.
+full_run_replication_enabled = false
 maximum_manifest_bytes = 262144
 maximum_objects_per_case = 512
 maximum_cases = 1000
 storage_bytes = 268435456
 default_retention_seconds = 2592000
+
+# Public-origin federation is separate from Community Cache. Entries are
+# deliberately public university/lab/service HTTPS origins whose descriptors
+# were signed by the origin and approved out of band by this operator. There
+# is no self-registration endpoint and no ordinary-client address discovery.
+[federation]
+enabled = false
+catalog_id = "fahrenheit-public-origins"
+catalog_signing_key_id = "federation-catalog-v1"
+# catalog_signing_key_file = "/etc/rusty-weather/federation-catalog.key"
+descriptor_files = []
+approved_origins = []
+revoked_origin_ids = []
+revoked_key_ids = []
+catalog_ttl_seconds = 300
+health_failure_threshold = 3
+health_quarantine_seconds = 60
+maximum_selection_results = 8
+
+# Operator-approved origin example (uncomment only with a real signed
+# descriptor and the descriptor key verified out of band):
+# [[federation.approved_origins]]
+# origin_id = "example-university-weather-lab"
+# descriptor_signing_keys = [
+#   { key_id = "lab-2026-a", public_key_base64 = "<base64-ed25519-public-key>" },
+# ]
 
 [logging]
 filter = "rw_server=info,tower_http=info"

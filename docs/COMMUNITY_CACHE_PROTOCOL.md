@@ -188,6 +188,37 @@ value. The handler accepts only 64 lowercase hexadecimal characters and serves
 only objects referenced by a valid signed manifest. It does not accept a
 filename or path component. The client verifies the expected manifest, size,
 hash, signature, attribution, and bounded decode independently of HTTPS.
+Revoked owner publications are tombstoned before their live request mapping is
+removed and return unavailable; an object hash cannot be republished through
+the artifact endpoint after rights withdrawal.
+
+### `POST /v1/community/artifacts`
+
+Publishes exactly one typed case artifact with schema
+`rw.community.case-artifact-publication.v1`. The closed payload union admits
+only a plain-text annotation, a bounded scalar table, a fixed-coordinate
+point/polyline/polygon overlay, or a bounded PNG/WebP rendered image. It has no
+path, filename, directory, URL, HTML, script, raw-file, or process-command
+field. Image signatures, encoded bytes, declared dimensions, and decoded pixel
+surface are bounded before acceptance.
+
+The canonical `case_artifact` request binds case/artifact/type, model, immutable
+run, source snapshot, grid, variables, recipe, provenance, publication policy,
+and `publication_owner_principal_sha256`. The latter MUST exactly match the
+SHA-256 principal derived from the authenticated bearer token. The origin
+serializes the typed wrapper, hashes the exact bytes, signs the complete object
+manifest, atomically stores bytes and manifest, and writes a durable audit
+record. Private WRF, ArWen, and user-provided publication additionally requires
+explicit owner action, confirmed redistribution rights, non-empty attribution
+and license fields, bounded retention, and
+`community.cases.artifact_publication_enabled = true`.
+
+### `POST /v1/community/artifacts/{sha256}/revoke`
+
+Only the recorded authenticated owner may confirm rights withdrawal. The
+server durably writes an owner/object/reason/time tombstone before removing the
+live request mapping. A tombstoned artifact is never served or silently
+recreated under that object identity.
 
 ### `POST /v1/community/cases`
 
@@ -195,8 +226,10 @@ Creates a deliberate publication from a validated `CaseRoomManifest` with
 schema `rw.community.case.v1`. It requires an authenticated explicit Publish
 action, redistribution-rights confirmation, event/time bounds, title,
 retention, model/run/snapshot/grid source attribution, and bounded references
-to already signed Community Cache objects. Passive searches never call this
-endpoint.
+to already signed, unexpired, non-revoked typed artifacts owned by the same
+authenticated principal. Every reference must exactly match the signed
+case/artifact/type/request/object identity and an exact source entry. Passive
+searches never call this endpoint.
 
 The origin assigns or validates the opaque `case_id`, signs the canonical case
 manifest with Ed25519, and returns `SignedCaseRoomManifest`. Case mutation is a
@@ -207,6 +240,12 @@ new signed generation; existing object bytes remain immutable.
 Returns a bounded `SignedCaseRoomManifest`. `case_id` is an opaque safe token,
 never a path, address, username, or hostname. The client verifies the origin
 signature and all referenced object manifests before use.
+
+### `POST /v1/community/cases/{case_id}/revoke`
+
+Withdraws a case only when the authenticated principal owns every referenced
+artifact. A durable case tombstone is written before the live case manifest is
+removed, and the opaque case ID cannot be reused.
 
 ## R2 immutable layout
 
@@ -241,6 +280,12 @@ cache entry does not grant publication. No private directory or raw `wrfout`
 path crosses this contract. ArWen MAY publish a processed object immediately
 after its atomic `.rws` commit only following the owner's explicit publication
 action and rights confirmation.
+
+Raw `wrfout`, arbitrary files, and complete-run replication have no upload
+route. `rw.community.run-generation-publication.v1` is a disabled-by-default
+inventory contract for a later, separately reviewed service. It can inventory
+only immutable `.rws` generation chunks by opaque ID, ordinal, byte count, and
+SHA-256; `publication_enabled = true` currently fails validation.
 
 ## Case rooms and privacy
 

@@ -15,6 +15,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod federation;
+mod publication;
+
+pub use federation::*;
+pub use publication::*;
+
 pub const REQUEST_SCHEMA: &str = "rw.community.request.v1";
 pub const OBJECT_SCHEMA: &str = "rw.community.object.v1";
 pub const RESOLVE_SCHEMA: &str = "rw.community.resolve.v1";
@@ -87,6 +93,14 @@ pub enum ProtocolError {
     ManifestExpired,
     #[error("relay envelope exceeds its credential or protocol limit")]
     RelayEnvelopeLimit,
+    #[error("federation descriptor or catalog is expired or outside its validity interval")]
+    FederationExpired,
+    #[error("federation origin '{0}' is not operator-approved")]
+    UntrustedFederationOrigin(String),
+    #[error("federation origin or signing key '{0}' is revoked")]
+    RevokedFederationIdentity(String),
+    #[error("federation URL is not a canonical public HTTPS endpoint")]
+    UnsafeFederationUrl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1300,13 +1314,14 @@ fn validate_query(query: &ShareQuery, limits: &ProtocolLimits) -> Result<(), Pro
             validate_opaque_id("artifact_id", artifact_id)?;
         }
     }
-    if let ShareQuery::NativeWindow { x0, y0, x1, y1, .. } = query
-        && (x0 >= x1 || y0 >= y1)
-    {
-        return invalid(
-            "native_window",
-            "window bounds must be non-empty and ordered",
-        );
+    match query {
+        ShareQuery::NativeWindow { x0, y0, x1, y1, .. } if x0 >= x1 || y0 >= y1 => {
+            return invalid(
+                "native_window",
+                "window bounds must be non-empty and ordered",
+            );
+        }
+        _ => {}
     }
     Ok(())
 }

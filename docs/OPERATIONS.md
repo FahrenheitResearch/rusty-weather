@@ -141,6 +141,17 @@ are separately bounded by `community.cases.maximum_cases` and
 on case access/publication. Requested retention cannot exceed
 `community.cases.default_retention_seconds`.
 
+Keep `community.cases.artifact_publication_enabled = false` until the typed
+publication security tests and owner-facing rights confirmation UI pass. When
+enabled, the only accepted bodies are closed annotation/table/overlay/image
+DTOs; never proxy a filesystem path, URL, raw wrfout, archive, or arbitrary
+multipart body into this endpoint. Audit records live under
+`community.root/publication-audit`; rights withdrawal creates durable object
+and case tombstones before live mappings are removed. Preserve tombstones for
+the life of the deployment so withdrawn hashes and case IDs cannot be reused.
+`community.cases.full_run_replication_enabled` is reserved and configuration
+validation rejects enabling it because no reviewed replication service exists.
+
 Treat any signature, embedded-request hash, object hash, decoded-size,
 decompression-ratio, schema, expiry, or ECMWF-notice failure as untrusted
 content. Preserve the bounded request ID and coarse failure code; do not log

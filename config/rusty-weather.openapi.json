@@ -411,6 +411,209 @@
         ]
       }
     },
+    "/v1/community/artifacts": {
+      "post": {
+        "tags": [
+          "community"
+        ],
+        "description": "Explicitly publish one closed, typed case artifact (annotation, derived table, overlay, or PNG/WebP rendered image). The canonical request is bound to the authenticated owner principal and exact source snapshot/grid. Private WRF, ArWen, and user-provided artifacts require confirmed redistribution rights, attribution/license fields, and a separate server gate. Paths, URLs, HTML/script, arbitrary files, raw wrfout, and complete runs are not accepted.",
+        "operationId": "community_publish_artifact_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommunityCaseArtifactPublicationDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Origin-signed content-addressed artifact manifest",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignedCommunityObjectManifestDoc"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Owner binding, identity, payload, or retention is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Typed artifact exceeds configured bounds",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Rights, attribution, schema, hash, signature, or typed payload validation failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Publication quota reached",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Artifact publication disabled, killed, or service busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/artifacts/{sha256}/revoke": {
+      "post": {
+        "tags": [
+          "community"
+        ],
+        "description": "Create a durable rights-withdrawal tombstone and stop serving an owner-published artifact. Only the authenticated publication owner may revoke it.",
+        "operationId": "community_revoke_artifact_doc",
+        "parameters": [
+          {
+            "name": "sha256",
+            "in": "path",
+            "description": "Exact published object SHA-256",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommunityRevocationDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Durable publication tombstone",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommunityPublicationTombstoneDoc"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Revocation or owner binding is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Owned publication was not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Revocation confirmation or tombstone schema failed validation",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Publication quota reached",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Publication disabled, killed, or service busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/v1/community/cases": {
       "post": {
         "tags": [
@@ -647,6 +850,106 @@
           },
           "504": {
             "description": "Case read exceeded its deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/community/cases/{case_id}/revoke": {
+      "post": {
+        "tags": [
+          "community"
+        ],
+        "description": "Withdraw a deliberately published case room and persist a tombstone. The authenticated principal must own every referenced typed artifact.",
+        "operationId": "community_revoke_case_doc",
+        "parameters": [
+          {
+            "name": "case_id",
+            "in": "path",
+            "description": "Opaque case-room id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommunityRevocationDoc"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Case publication revoked"
+          },
+          "400": {
+            "description": "Revocation or owner binding is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Owned case publication was not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Revocation confirmation or tombstone schema failed validation",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Publication quota reached",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Case publication disabled, killed, or service busy",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -904,6 +1207,169 @@
           },
           "504": {
             "description": "Object read exceeded its deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/federation/origins": {
+      "get": {
+        "tags": [
+          "federation"
+        ],
+        "description": "Return an authority-signed catalog containing origin-signed descriptors for operator-approved university, lab, and public Rusty Weather HTTPS origins. Ordinary Community Cache clients never appear in this catalog and there is no self-registration endpoint.",
+        "operationId": "federation_catalog_doc",
+        "responses": {
+          "200": {
+            "description": "Signed bounded public-origin catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignedFederationCatalogDoc"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A descriptor is expired, revoked, untrusted, malformed, or has an unsafe URL",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Public-origin federation is disabled or the service is busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Catalog signing exceeded its deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/federation/origins/{origin_id}": {
+      "get": {
+        "tags": [
+          "federation"
+        ],
+        "description": "Return one exact origin-signed descriptor already admitted by the operator allowlist and revocation policy.",
+        "operationId": "federation_origin_doc",
+        "parameters": [
+          {
+            "name": "origin_id",
+            "in": "path",
+            "description": "Canonical public origin id from the signed catalog",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Signed public-origin descriptor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignedFederationOriginDescriptorDoc"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Origin id is not canonical",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Origin is absent from the approved catalog",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Descriptor is expired, revoked, untrusted, malformed, or has an unsafe URL",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Public-origin federation is disabled or the service is busy",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Descriptor verification exceeded its deadline",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3019,6 +3485,47 @@
           }
         }
       },
+      "CommunityCaseArtifactPublicationDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "owner_principal_sha256",
+          "request",
+          "payload",
+          "published_unix",
+          "retain_until_unix",
+          "attributions",
+          "modification_notices"
+        ],
+        "properties": {
+          "attributions": {
+            "type": "array",
+            "items": {}
+          },
+          "modification_notices": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "owner_principal_sha256": {
+            "type": "string"
+          },
+          "payload": {},
+          "published_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "request": {},
+          "retain_until_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
       "CommunityCaseManifestDoc": {
         "type": "object",
         "required": [
@@ -3058,6 +3565,42 @@
           }
         }
       },
+      "CommunityPublicationTombstoneDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "owner_principal_sha256",
+          "request_sha256",
+          "object_sha256",
+          "revoked_unix",
+          "rights_withdrawn",
+          "reason"
+        ],
+        "properties": {
+          "object_sha256": {
+            "type": "string"
+          },
+          "owner_principal_sha256": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "request_sha256": {
+            "type": "string"
+          },
+          "revoked_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "rights_withdrawn": {
+            "type": "boolean"
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
       "CommunityResolveRequestDoc": {
         "type": "object",
         "required": [
@@ -3092,6 +3635,25 @@
             "type": "string"
           },
           "signed_manifest": {}
+        }
+      },
+      "CommunityRevocationDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "rights_withdrawn",
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string"
+          },
+          "rights_withdrawn": {
+            "type": "boolean"
+          },
+          "schema": {
+            "type": "string"
+          }
         }
       },
       "CoordinateRequest": {
@@ -3222,6 +3784,112 @@
               ],
               "format": "double"
             }
+          }
+        }
+      },
+      "FederationCatalogDoc": {
+        "type": "object",
+        "required": [
+          "schema",
+          "catalog_id",
+          "generated_unix",
+          "expires_unix",
+          "origins"
+        ],
+        "properties": {
+          "catalog_id": {
+            "type": "string"
+          },
+          "expires_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "generated_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "origins": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SignedFederationOriginDescriptorDoc"
+            }
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
+      "FederationOriginDescriptorDoc": {
+        "type": "object",
+        "description": "Runtime parsing uses the exact closed DTOs in `rw-community-protocol`.\nThese document wrappers keep the HTTP surface legible without maintaining\na second canonical-signing implementation in the server crate.",
+        "required": [
+          "schema",
+          "origin_id",
+          "display_name",
+          "https_base_url",
+          "health_path",
+          "descriptor_signing_keys",
+          "object_signing_keys",
+          "models",
+          "geographic_coverage",
+          "retention",
+          "api_schema_version",
+          "build_version",
+          "issued_unix",
+          "expires_unix",
+          "policy_links",
+          "replication",
+          "quotas"
+        ],
+        "properties": {
+          "api_schema_version": {
+            "type": "string"
+          },
+          "build_version": {
+            "type": "string"
+          },
+          "descriptor_signing_keys": {
+            "type": "array",
+            "items": {}
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "expires_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "geographic_coverage": {
+            "type": "array",
+            "items": {}
+          },
+          "health_path": {
+            "type": "string"
+          },
+          "https_base_url": {
+            "type": "string"
+          },
+          "issued_unix": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "models": {
+            "type": "array",
+            "items": {}
+          },
+          "object_signing_keys": {
+            "type": "array",
+            "items": {}
+          },
+          "origin_id": {
+            "type": "string"
+          },
+          "policy_links": {},
+          "quotas": {},
+          "replication": {},
+          "retention": {},
+          "schema": {
+            "type": "string"
           }
         }
       },
@@ -4419,6 +5087,43 @@
           "signature": {}
         }
       },
+      "SignedCommunityObjectManifestDoc": {
+        "type": "object",
+        "required": [
+          "manifest",
+          "signature"
+        ],
+        "properties": {
+          "manifest": {},
+          "signature": {}
+        }
+      },
+      "SignedFederationCatalogDoc": {
+        "type": "object",
+        "required": [
+          "catalog",
+          "signature"
+        ],
+        "properties": {
+          "catalog": {
+            "$ref": "#/components/schemas/FederationCatalogDoc"
+          },
+          "signature": {}
+        }
+      },
+      "SignedFederationOriginDescriptorDoc": {
+        "type": "object",
+        "required": [
+          "descriptor",
+          "signature"
+        ],
+        "properties": {
+          "descriptor": {
+            "$ref": "#/components/schemas/FederationOriginDescriptorDoc"
+          },
+          "signature": {}
+        }
+      },
       "SourceProvenanceResponse": {
         "type": "object",
         "description": "Sanitized union of resolved providers represented in a run.",
@@ -5318,6 +6023,10 @@
     {
       "name": "community",
       "description": "Opt-in signed Community Cache objects and deliberate case publication"
+    },
+    {
+      "name": "federation",
+      "description": "Operator-approved signed discovery for deliberately public institutional HTTPS origins"
     },
     {
       "name": "operations",

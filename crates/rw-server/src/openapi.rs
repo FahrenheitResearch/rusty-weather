@@ -333,6 +333,12 @@ struct CommunityResolveResponseDoc {
 }
 
 #[derive(utoipa::ToSchema)]
+struct SignedCommunityObjectManifestDoc {
+    manifest: serde_json::Value,
+    signature: serde_json::Value,
+}
+
+#[derive(utoipa::ToSchema)]
 struct CommunityCaseManifestDoc {
     schema: String,
     case_id: String,
@@ -346,6 +352,81 @@ struct CommunityCaseManifestDoc {
 #[derive(utoipa::ToSchema)]
 struct SignedCommunityCaseManifestDoc {
     manifest: CommunityCaseManifestDoc,
+    signature: serde_json::Value,
+}
+
+#[derive(utoipa::ToSchema)]
+struct CommunityCaseArtifactPublicationDoc {
+    schema: String,
+    owner_principal_sha256: String,
+    request: serde_json::Value,
+    payload: serde_json::Value,
+    published_unix: i64,
+    retain_until_unix: i64,
+    attributions: Vec<serde_json::Value>,
+    modification_notices: Vec<String>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct CommunityRevocationDoc {
+    schema: String,
+    rights_withdrawn: bool,
+    reason: String,
+}
+
+#[derive(utoipa::ToSchema)]
+struct CommunityPublicationTombstoneDoc {
+    schema: String,
+    owner_principal_sha256: String,
+    request_sha256: String,
+    object_sha256: String,
+    revoked_unix: i64,
+    rights_withdrawn: bool,
+    reason: String,
+}
+
+/// Runtime parsing uses the exact closed DTOs in `rw-community-protocol`.
+/// These document wrappers keep the HTTP surface legible without maintaining
+/// a second canonical-signing implementation in the server crate.
+#[derive(utoipa::ToSchema)]
+struct FederationOriginDescriptorDoc {
+    schema: String,
+    origin_id: String,
+    display_name: String,
+    https_base_url: String,
+    health_path: String,
+    descriptor_signing_keys: Vec<serde_json::Value>,
+    object_signing_keys: Vec<serde_json::Value>,
+    models: Vec<serde_json::Value>,
+    geographic_coverage: Vec<serde_json::Value>,
+    retention: serde_json::Value,
+    api_schema_version: String,
+    build_version: String,
+    issued_unix: i64,
+    expires_unix: i64,
+    policy_links: serde_json::Value,
+    replication: serde_json::Value,
+    quotas: serde_json::Value,
+}
+
+#[derive(utoipa::ToSchema)]
+struct SignedFederationOriginDescriptorDoc {
+    descriptor: FederationOriginDescriptorDoc,
+    signature: serde_json::Value,
+}
+
+#[derive(utoipa::ToSchema)]
+struct FederationCatalogDoc {
+    schema: String,
+    catalog_id: String,
+    generated_unix: i64,
+    expires_unix: i64,
+    origins: Vec<SignedFederationOriginDescriptorDoc>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct SignedFederationCatalogDoc {
+    catalog: FederationCatalogDoc,
     signature: serde_json::Value,
 }
 
@@ -377,8 +458,13 @@ struct SignedCommunityCaseManifestDoc {
         artifact_doc,
         community_resolve_doc,
         community_object_doc,
+        community_publish_artifact_doc,
+        community_revoke_artifact_doc,
         community_create_case_doc,
         community_case_doc,
+        community_revoke_case_doc,
+        federation_catalog_doc,
+        federation_origin_doc,
         metrics_doc,
     ),
     components(schemas(
@@ -439,8 +525,16 @@ struct SignedCommunityCaseManifestDoc {
         TemporalGridResponse,
         CommunityResolveRequestDoc,
         CommunityResolveResponseDoc,
+        SignedCommunityObjectManifestDoc,
         CommunityCaseManifestDoc,
         SignedCommunityCaseManifestDoc,
+        CommunityCaseArtifactPublicationDoc,
+        CommunityRevocationDoc,
+        CommunityPublicationTombstoneDoc,
+        FederationOriginDescriptorDoc,
+        SignedFederationOriginDescriptorDoc,
+        FederationCatalogDoc,
+        SignedFederationCatalogDoc,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -450,6 +544,7 @@ struct SignedCommunityCaseManifestDoc {
         (name = "analytics", description = "Exact-time and diurnal analytics"),
         (name = "jobs", description = "Bounded asynchronous work and immutable artifacts"),
         (name = "community", description = "Opt-in signed Community Cache objects and deliberate case publication"),
+        (name = "federation", description = "Operator-approved signed discovery for deliberately public institutional HTTPS origins"),
         (name = "operations", description = "Operator metrics")
     )
 )]
@@ -855,6 +950,45 @@ fn community_object_doc() {}
 
 #[utoipa::path(
     post,
+    path = "/v1/community/artifacts",
+    tag = "community",
+    description = "Explicitly publish one closed, typed case artifact (annotation, derived table, overlay, or PNG/WebP rendered image). The canonical request is bound to the authenticated owner principal and exact source snapshot/grid. Private WRF, ArWen, and user-provided artifacts require confirmed redistribution rights, attribution/license fields, and a separate server gate. Paths, URLs, HTML/script, arbitrary files, raw wrfout, and complete runs are not accepted.",
+    security(("bearer_auth" = [])),
+    request_body = CommunityCaseArtifactPublicationDoc,
+    responses(
+        (status = 201, description = "Origin-signed content-addressed artifact manifest", body = SignedCommunityObjectManifestDoc),
+        (status = 400, description = "Owner binding, identity, payload, or retention is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 413, description = "Typed artifact exceeds configured bounds", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Rights, attribution, schema, hash, signature, or typed payload validation failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 429, description = "Publication quota reached", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Artifact publication disabled, killed, or service busy", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn community_publish_artifact_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/community/artifacts/{sha256}/revoke",
+    tag = "community",
+    description = "Create a durable rights-withdrawal tombstone and stop serving an owner-published artifact. Only the authenticated publication owner may revoke it.",
+    security(("bearer_auth" = [])),
+    params(("sha256" = String, Path, description = "Exact published object SHA-256")),
+    request_body = CommunityRevocationDoc,
+    responses(
+        (status = 200, description = "Durable publication tombstone", body = CommunityPublicationTombstoneDoc),
+        (status = 400, description = "Revocation or owner binding is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Owned publication was not found", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Revocation confirmation or tombstone schema failed validation", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 429, description = "Publication quota reached", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Publication disabled, killed, or service busy", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn community_revoke_artifact_doc() {}
+
+#[utoipa::path(
+    post,
     path = "/v1/community/cases",
     tag = "community",
     description = "Deliberately publish one case room. Passive searches are never published. Private WRF/ArWen requires explicit owner publication and confirmed redistribution rights.",
@@ -895,6 +1029,61 @@ fn community_create_case_doc() {}
     )
 )]
 fn community_case_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/community/cases/{case_id}/revoke",
+    tag = "community",
+    description = "Withdraw a deliberately published case room and persist a tombstone. The authenticated principal must own every referenced typed artifact.",
+    security(("bearer_auth" = [])),
+    params(("case_id" = String, Path, description = "Opaque case-room id")),
+    request_body = CommunityRevocationDoc,
+    responses(
+        (status = 204, description = "Case publication revoked"),
+        (status = 400, description = "Revocation or owner binding is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Owned case publication was not found", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Revocation confirmation or tombstone schema failed validation", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 429, description = "Publication quota reached", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Case publication disabled, killed, or service busy", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn community_revoke_case_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/federation/origins",
+    tag = "federation",
+    description = "Return an authority-signed catalog containing origin-signed descriptors for operator-approved university, lab, and public Rusty Weather HTTPS origins. Ordinary Community Cache clients never appear in this catalog and there is no self-registration endpoint.",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Signed bounded public-origin catalog", body = SignedFederationCatalogDoc),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "A descriptor is expired, revoked, untrusted, malformed, or has an unsafe URL", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Public-origin federation is disabled or the service is busy", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Catalog signing exceeded its deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn federation_catalog_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/federation/origins/{origin_id}",
+    tag = "federation",
+    description = "Return one exact origin-signed descriptor already admitted by the operator allowlist and revocation policy.",
+    security(("bearer_auth" = [])),
+    params(("origin_id" = String, Path, description = "Canonical public origin id from the signed catalog")),
+    responses(
+        (status = 200, description = "Signed public-origin descriptor", body = SignedFederationOriginDescriptorDoc),
+        (status = 400, description = "Origin id is not canonical", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Origin is absent from the approved catalog", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Descriptor is expired, revoked, untrusted, malformed, or has an unsafe URL", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Public-origin federation is disabled or the service is busy", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Descriptor verification exceeded its deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn federation_origin_doc() {}
 
 #[utoipa::path(
     get,
@@ -1012,8 +1201,11 @@ mod tests {
         for (path, method) in [
             ("/v1/community/objects/resolve", "post"),
             ("/v1/community/objects/{sha256}", "get"),
+            ("/v1/community/artifacts", "post"),
+            ("/v1/community/artifacts/{sha256}/revoke", "post"),
             ("/v1/community/cases", "post"),
             ("/v1/community/cases/{case_id}", "get"),
+            ("/v1/community/cases/{case_id}/revoke", "post"),
         ] {
             let operation = operation(&value, path, method);
             assert_eq!(
@@ -1028,6 +1220,38 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(description.contains("no direct peer-connectivity"));
+    }
+
+    #[test]
+    fn federation_is_get_only_authenticated_and_concretely_documented() {
+        let value = serde_json::to_value(document()).unwrap();
+        for path in [
+            "/v1/federation/origins",
+            "/v1/federation/origins/{origin_id}",
+        ] {
+            let operation = operation(&value, path, "get");
+            assert_eq!(
+                operation["security"][0]["bearer_auth"],
+                serde_json::json!([])
+            );
+            assert!(operation["responses"]["401"].is_object());
+            assert!(operation["responses"]["422"].is_object());
+            assert!(value["paths"][path]["post"].is_null());
+        }
+        assert_response_ref(
+            &value,
+            "/v1/federation/origins",
+            "get",
+            "#/components/schemas/SignedFederationCatalogDoc",
+            false,
+        );
+        assert_response_ref(
+            &value,
+            "/v1/federation/origins/{origin_id}",
+            "get",
+            "#/components/schemas/SignedFederationOriginDescriptorDoc",
+            false,
+        );
     }
 
     #[test]

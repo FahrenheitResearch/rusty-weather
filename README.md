@@ -25,6 +25,11 @@ mandatory pre-transport
 The design permits only relay-mediated peer assistance; direct user-to-user
 connectivity is permanently out of scope.
 
+Operator-approved university, lab, and public-service origins use the separate
+signed conventional-HTTPS federation contract in
+[`docs/FEDERATION.md`](docs/FEDERATION.md). Public origins are intentionally
+addressable; ordinary Community Cache clients are never listed there.
+
 ## Self-hosted data service
 
 `rw-server` exposes bounded catalog, point, profile, and temporal analytics over

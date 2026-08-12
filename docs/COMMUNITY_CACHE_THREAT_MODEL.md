@@ -162,6 +162,15 @@ closed object union cannot carry raw files or private directories. Publication
 policy is included in signed identity, so a private result cannot be relabeled
 as public under the same request hash.
 
+The executable upload boundary is a closed typed union: plain-text annotation,
+bounded scalar table, fixed-coordinate overlay, or bounded PNG/WebP image.
+Paths, URLs, HTML/script, arbitrary JSON, raw files, directories, and complete
+runs are structurally absent or rejected. The server binds the bearer-derived
+principal into the signed request identity, records source snapshot/grid and
+rights metadata in a durable audit entry, and refuses impersonation. Rights
+withdrawal writes a tombstone before removing live mappings, so stale case
+references and retries fail closed.
+
 ### Licensing/attribution loss
 
 Software licensing does not relicense model data. Source provenance is part of
@@ -190,6 +199,11 @@ Phase 1 must remain feature-gated until automated tests prove:
   tampering fail closed;
 - bounded decode rejects a decompression bomb before unbounded retention;
 - private WRF and ArWen requests fail without explicit publication and rights;
+- typed artifact publication rejects owner impersonation, paths, URLs,
+  HTML/script, malformed image signatures, excessive pixels/cells/coordinates,
+  expired retention, and absent private-source license metadata;
+- revoked/expired artifacts and cases are unavailable and tombstoned identities
+  cannot be republished;
 - ECMWF notices are mandatory on objects and case manifests;
 - cache writes are atomic, immutable, bounded, and evict correctly;
 - R2 failure falls back to origin and no missing hot object is fatal;

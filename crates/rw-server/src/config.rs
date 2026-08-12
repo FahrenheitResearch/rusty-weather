@@ -34,6 +34,9 @@ pub struct AppConfig {
     /// Optional, privacy-preserving Community Cache. This is disabled unless
     /// an operator explicitly enables it and supplies signing material.
     pub community: CommunityConfig,
+    /// Operator-approved public university/lab/service origins. This is a
+    /// conventional HTTPS federation, not ordinary-client peer discovery.
+    pub federation: FederationConfig,
     pub logging: LoggingConfig,
 }
 
@@ -93,6 +96,12 @@ impl AppConfig {
         if let Some(value) = env_nonempty("RW_COMMUNITY_ORIGIN_BASE_URL") {
             self.community.origin_base_url = Some(value);
         }
+        if let Some(value) = env_nonempty("RW_FEDERATION_ENABLED") {
+            self.federation.enabled = parse_env("RW_FEDERATION_ENABLED", &value)?;
+        }
+        if let Some(value) = env_nonempty("RW_FEDERATION_SIGNING_KEY_FILE") {
+            self.federation.catalog_signing_key_file = Some(PathBuf::from(value));
+        }
         Ok(())
     }
 
@@ -121,6 +130,7 @@ impl AppConfig {
             ));
         }
         self.community.validate()?;
+        self.federation.validate()?;
         Ok(())
     }
 }
@@ -349,6 +359,13 @@ impl CommunityQuotasConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CaseRoomConfig {
     pub enabled: bool,
+    /// Separate opt-in gate for authenticated typed artifact publication.
+    /// Raw files, directories, wrfout, and complete-run uploads remain outside
+    /// this endpoint regardless of this setting.
+    pub artifact_publication_enabled: bool,
+    /// Reserved contract gate for a later typed `.rws` generation replication
+    /// service. No current HTTP route consumes it and it must remain false.
+    pub full_run_replication_enabled: bool,
     pub maximum_manifest_bytes: u64,
     pub maximum_objects_per_case: usize,
     /// Total number of unexpired case manifests retained locally.
@@ -363,6 +380,8 @@ impl Default for CaseRoomConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            artifact_publication_enabled: false,
+            full_run_replication_enabled: false,
             maximum_manifest_bytes: 256 * 1024,
             maximum_objects_per_case: 512,
             maximum_cases: 1_000,
@@ -374,6 +393,17 @@ impl Default for CaseRoomConfig {
 
 impl CaseRoomConfig {
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.full_run_replication_enabled {
+            return Err(ConfigError::Invalid(
+                "community.cases.full_run_replication_enabled cannot be enabled before the separate replication service is implemented"
+                    .into(),
+            ));
+        }
+        if self.artifact_publication_enabled && !self.enabled {
+            return Err(ConfigError::Invalid(
+                "community.cases.enabled is required for artifact publication".into(),
+            ));
+        }
         if self.maximum_manifest_bytes == 0
             || self.maximum_objects_per_case == 0
             || self.maximum_cases == 0
@@ -391,6 +421,174 @@ impl CaseRoomConfig {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct FederationConfig {
+    pub enabled: bool,
+    pub catalog_id: String,
+    pub catalog_signing_key_id: String,
+    /// Private Ed25519 catalog key. It is loaded from a permission-restricted
+    /// file and is never accepted inline or emitted by configuration APIs.
+    pub catalog_signing_key_file: Option<PathBuf>,
+    /// Signed descriptors provisioned by an operator. There is deliberately
+    /// no HTTP self-registration endpoint.
+    pub descriptor_files: Vec<PathBuf>,
+    /// Explicit identity/key allowlist established out of band.
+    pub approved_origins: Vec<ApprovedFederationOriginConfig>,
+    pub revoked_origin_ids: Vec<String>,
+    pub revoked_key_ids: Vec<String>,
+    pub catalog_ttl_seconds: u64,
+    pub health_failure_threshold: u32,
+    pub health_quarantine_seconds: u64,
+    pub maximum_selection_results: usize,
+}
+
+impl Default for FederationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            catalog_id: "fahrenheit-public-origins".into(),
+            catalog_signing_key_id: "federation-catalog-v1".into(),
+            catalog_signing_key_file: None,
+            descriptor_files: Vec::new(),
+            approved_origins: Vec::new(),
+            revoked_origin_ids: Vec::new(),
+            revoked_key_ids: Vec::new(),
+            catalog_ttl_seconds: 300,
+            health_failure_threshold: 3,
+            health_quarantine_seconds: 60,
+            maximum_selection_results: 8,
+        }
+    }
+}
+
+impl FederationConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        validate_config_id("federation.catalog_id", &self.catalog_id, 96)?;
+        validate_config_id(
+            "federation.catalog_signing_key_id",
+            &self.catalog_signing_key_id,
+            128,
+        )?;
+        if self.catalog_ttl_seconds == 0
+            || self.catalog_ttl_seconds > 60 * 60
+            || self.health_failure_threshold == 0
+            || self.health_failure_threshold > 100
+            || self.health_quarantine_seconds == 0
+            || self.health_quarantine_seconds > 24 * 60 * 60
+            || self.maximum_selection_results == 0
+            || self.maximum_selection_results > 128
+        {
+            return Err(ConfigError::Invalid(
+                "federation catalog, health, or selection limits are invalid".into(),
+            ));
+        }
+        if self.descriptor_files.len() > 128
+            || self.approved_origins.len() > 128
+            || self.revoked_origin_ids.len() > 128
+            || self.revoked_key_ids.len() > 1_024
+        {
+            return Err(ConfigError::Invalid(
+                "federation list exceeds its configured safety bound".into(),
+            ));
+        }
+        let mut origins = std::collections::BTreeSet::new();
+        for origin in &self.approved_origins {
+            validate_config_id(
+                "federation.approved_origins.origin_id",
+                &origin.origin_id,
+                96,
+            )?;
+            if !origins.insert(&origin.origin_id) {
+                return Err(ConfigError::Invalid(
+                    "federation approved origin ids must be unique".into(),
+                ));
+            }
+            if origin.descriptor_signing_keys.is_empty() || origin.descriptor_signing_keys.len() > 8
+            {
+                return Err(ConfigError::Invalid(
+                    "each federation origin requires between one and eight trusted descriptor keys"
+                        .into(),
+                ));
+            }
+            let mut key_ids = std::collections::BTreeSet::new();
+            for key in &origin.descriptor_signing_keys {
+                validate_config_id("federation key_id", &key.key_id, 128)?;
+                if !key_ids.insert(&key.key_id)
+                    || rw_community_protocol::parse_verifying_key_base64(&key.public_key_base64)
+                        .is_err()
+                {
+                    return Err(ConfigError::Invalid(
+                        "federation trusted descriptor keys are duplicate or malformed".into(),
+                    ));
+                }
+            }
+        }
+        for value in &self.revoked_origin_ids {
+            validate_config_id("federation.revoked_origin_ids", value, 96)?;
+        }
+        for value in &self.revoked_key_ids {
+            validate_config_id("federation.revoked_key_ids", value, 128)?;
+        }
+        if self
+            .descriptor_files
+            .iter()
+            .any(|path| path.as_os_str().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "federation descriptor paths must not be empty".into(),
+            ));
+        }
+        if self.enabled {
+            if self.catalog_signing_key_file.is_none() {
+                return Err(ConfigError::Invalid(
+                    "federation.catalog_signing_key_file is required when federation is enabled"
+                        .into(),
+                ));
+            }
+            if self.descriptor_files.is_empty() || self.approved_origins.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "federation requires operator-provisioned descriptors and an explicit origin allowlist"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApprovedFederationOriginConfig {
+    pub origin_id: String,
+    pub descriptor_signing_keys: Vec<FederationTrustedKeyConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct FederationTrustedKeyConfig {
+    pub key_id: String,
+    pub public_key_base64: String,
+}
+
+fn validate_config_id(name: &'static str, value: &str, maximum: usize) -> Result<(), ConfigError> {
+    if value.is_empty()
+        || value.len() > maximum
+        || value.bytes().any(|byte| {
+            !(byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'-' | b'_' | b'.'))
+        })
+        || value.starts_with(['-', '_', '.'])
+        || value.ends_with(['-', '_', '.'])
+    {
+        return Err(ConfigError::Invalid(format!(
+            "{name} must be a canonical lowercase identifier"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_https_url(name: &'static str, value: &str) -> Result<(), ConfigError> {
@@ -637,6 +835,21 @@ mod tests {
         ));
         config.community.capacity_audit_completed = true;
         config.validate(true).unwrap();
+    }
+
+    #[test]
+    fn federation_enablement_requires_operator_provisioning() {
+        let mut config = AppConfig::default();
+        config.federation.enabled = true;
+        assert!(matches!(
+            config.validate(true),
+            Err(ConfigError::Invalid(detail)) if detail.contains("catalog_signing_key_file")
+        ));
+        config.federation.catalog_signing_key_file = Some(PathBuf::from("catalog.key"));
+        assert!(matches!(
+            config.validate(true),
+            Err(ConfigError::Invalid(detail)) if detail.contains("operator-provisioned")
+        ));
     }
 
     #[test]

@@ -15,14 +15,17 @@ use bytes::Bytes;
 use chrono::{Datelike, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rw_community_protocol::{
-    AttributionNotice, CASE_SCHEMA, CaseRoomManifest, Compression, DataOrigin, DeliverySource,
-    NATIVE_WINDOW_PAYLOAD_SCHEMA, ObjectManifest, POINT_SERIES_PAYLOAD_SCHEMA,
-    PROFILE_PAYLOAD_SCHEMA, ProfileObjectPayload, ProtocolError, ProtocolLimits, RESOLVE_SCHEMA,
-    ResolveObjectRequest, ResolveObjectResponse, ShareQuery, SignedCaseRoomManifest,
-    SignedObjectManifest, SurfaceSample, TEMPORAL_GRID_PAYLOAD_SCHEMA, TrustedSigningKeys,
-    TypedObjectPayload, enforce_request_attributions, object_sha256, request_sha256,
-    sign_case_manifest, sign_object_manifest, validate_profile_payload_identity,
-    verify_signed_case, verify_signed_object,
+    AttributionNotice, CASE_ARTIFACT_REVOCATION_SCHEMA, CASE_REVOCATION_SCHEMA, CASE_SCHEMA,
+    CaseRoomManifest, Compression, DataOrigin, DeliverySource, NATIVE_WINDOW_PAYLOAD_SCHEMA,
+    OBJECT_SCHEMA, ObjectManifest, POINT_SERIES_PAYLOAD_SCHEMA, PROFILE_PAYLOAD_SCHEMA,
+    PUBLICATION_AUDIT_SCHEMA, PUBLICATION_TOMBSTONE_SCHEMA, ProfileObjectPayload, ProtocolError,
+    ProtocolLimits, PublicationAuditRecord, PublicationTombstone, PublishCaseArtifactRequest,
+    RESOLVE_SCHEMA, ResolveObjectRequest, ResolveObjectResponse, RevokePublicationRequest,
+    ShareQuery, SignedCaseRoomManifest, SignedObjectManifest, SurfaceSample,
+    TEMPORAL_GRID_PAYLOAD_SCHEMA, TrustedSigningKeys, TypedObjectPayload,
+    case_artifact_payload_bytes, enforce_request_attributions, object_sha256, request_sha256,
+    sign_case_manifest, sign_object_manifest, validate_case_artifact_payload_bytes,
+    validate_profile_payload_identity, verify_signed_case, verify_signed_object,
 };
 use rw_query::{
     IndexWindow2DRequest, IndexWindow3DRequest, IntervalSupport, MissingPolicy, PointSeriesRequest,
@@ -257,6 +260,7 @@ pub struct CommunityService {
     promotion_maximum_bytes: u64,
     hits: Arc<Mutex<BTreeMap<String, (i64, u64)>>>,
     cases_enabled: bool,
+    artifact_publication_enabled: bool,
     maximum_case_retention_seconds: u64,
     quota: QuotaLedger,
 }
@@ -385,6 +389,7 @@ impl CommunityService {
             promotion_maximum_bytes: config.promotion.maximum_object_bytes,
             hits: Arc::new(Mutex::new(BTreeMap::new())),
             cases_enabled: config.cases.enabled,
+            artifact_publication_enabled: config.cases.artifact_publication_enabled,
             maximum_case_retention_seconds: config.cases.default_retention_seconds,
             quota,
         })
@@ -438,6 +443,11 @@ impl CommunityService {
         }
         request.request.validate(&self.limits)?;
         let identity = request_sha256(&request.request)?;
+        if matches!(request.request.query, ShareQuery::CaseArtifact { .. })
+            && self.cas()?.publication_request_tombstoned(&identity)?
+        {
+            return Err(CommunityError::NotFound);
+        }
 
         // The kill switch disables community-assisted delivery and all hot
         // promotion, but never strands a normal signed HTTPS-origin request.
@@ -601,6 +611,17 @@ impl CommunityService {
     pub fn object(&self, principal: &str, sha256: &str) -> Result<Bytes, CommunityError> {
         self.ensure_assist_available()?;
         let _permit = self.quota.begin(principal, current_month())?;
+        if self.cas()?.publication_tombstone(sha256)?.is_some() {
+            return Err(CommunityError::NotFound);
+        }
+        let expired_audit = self
+            .cas()?
+            .publication_audit(sha256)?
+            .filter(|audit| audit.retain_until_unix <= now_unix());
+        if let Some(audit) = expired_audit {
+            self.cas()?.invalidate_request(&audit.request_sha256)?;
+            return Err(CommunityError::NotFound);
+        }
         let (manifest_bytes, object) = self
             .cas()?
             .get_object_reference(sha256)?
@@ -619,9 +640,220 @@ impl CommunityService {
                 "signed manifest references a different object".into(),
             ));
         }
+        if matches!(
+            signed.manifest.request.query,
+            ShareQuery::CaseArtifact { .. }
+        ) {
+            validate_case_artifact_payload_bytes(&object, &signed.manifest.request, &self.limits)?;
+        }
         let object = Bytes::from(object);
         self.quota.charge_download(principal, object.len() as u64)?;
         Ok(object)
+    }
+
+    /// Deliberately publish one strictly typed case artifact. The authenticated
+    /// bearer principal is embedded in the canonical request recipe and may
+    /// never be supplied on behalf of another owner.
+    pub fn publish_case_artifact(
+        &self,
+        principal: &str,
+        publication: PublishCaseArtifactRequest,
+    ) -> Result<SignedObjectManifest, CommunityError> {
+        self.ensure_assist_available()?;
+        let _permit = self.quota.begin(principal, current_month())?;
+        if !self.cases_enabled || !self.artifact_publication_enabled {
+            return Err(CommunityError::Disabled);
+        }
+        if publication.owner_principal_sha256 != principal {
+            return Err(CommunityError::Invalid(
+                "authenticated principal cannot publish for another owner".into(),
+            ));
+        }
+        publication.validate(&self.limits)?;
+        let private_origin_mismatch = private_origin_for_model(&publication.request.model)
+            .is_some_and(|required| publication.request.publication.data_origin != required);
+        if private_origin_mismatch {
+            return Err(CommunityError::Invalid(
+                "private WRF/ArWen artifact cannot be relabeled as public-provider data".into(),
+            ));
+        }
+        let retention_seconds = publication
+            .retain_until_unix
+            .checked_sub(publication.published_unix)
+            .ok_or_else(|| CommunityError::Invalid("artifact retention overflowed".into()))?;
+        if retention_seconds <= 0
+            || u64::try_from(retention_seconds).unwrap_or(u64::MAX)
+                > self.maximum_case_retention_seconds
+        {
+            return Err(CommunityError::Invalid(
+                "artifact retention exceeds the configured maximum".into(),
+            ));
+        }
+        let now = now_unix();
+        if publication.published_unix > now.saturating_add(300)
+            || publication.retain_until_unix <= now
+        {
+            return Err(CommunityError::Invalid(
+                "artifact publication is expired or too far in the future".into(),
+            ));
+        }
+        let bytes = case_artifact_payload_bytes(&publication)?;
+        if bytes.len() as u64 > self.limits.max_encoded_bytes {
+            return Err(ProtocolError::EncodedSizeLimit.into());
+        }
+        validate_case_artifact_payload_bytes(&bytes, &publication.request, &self.limits)?;
+        let ShareQuery::CaseArtifact {
+            case_id,
+            artifact_id,
+            artifact_type,
+        } = &publication.request.query
+        else {
+            return Err(CommunityError::Invalid(
+                "artifact endpoint requires a case_artifact request".into(),
+            ));
+        };
+        let key = self
+            .signing_key
+            .as_ref()
+            .ok_or_else(|| CommunityError::Invalid("origin signing key is unavailable".into()))?;
+        let request_hash = request_sha256(&publication.request)?;
+        let object_hash = object_sha256(&bytes);
+        if self.cas()?.publication_tombstone(&object_hash)?.is_some() {
+            return Err(CommunityError::Invalid(
+                "a revoked content identity cannot be republished".into(),
+            ));
+        }
+        let manifest = ObjectManifest {
+            schema: OBJECT_SCHEMA.into(),
+            request: publication.request.clone(),
+            request_sha256: request_hash.clone(),
+            object_sha256: object_hash.clone(),
+            content_type: "application/json".into(),
+            compression: Compression::None,
+            encoded_size: bytes.len() as u64,
+            decoded_size: bytes.len() as u64,
+            attributions: publication.attributions.clone(),
+            modification_notices: publication.modification_notices.clone(),
+            created_unix: publication.published_unix,
+            expires_unix: publication.retain_until_unix,
+        };
+        enforce_request_attributions(&publication.request, &manifest)?;
+        let signed = sign_object_manifest(manifest, ORIGIN_SIGNING_KEY_ID, key)?;
+        verify_signed_object(
+            &signed,
+            &publication.request,
+            &bytes,
+            now,
+            &self.trusted_keys,
+            &self.limits,
+        )?;
+        let signed_bytes = serde_json::to_vec(&signed)?;
+        let charged_bytes = (bytes.len() as u64).saturating_add(signed_bytes.len() as u64);
+        self.quota.charge_upload(principal, charged_bytes)?;
+        self.cas()?.put_publication_audit(&PublicationAuditRecord {
+            schema: PUBLICATION_AUDIT_SCHEMA.into(),
+            owner_principal_sha256: principal.into(),
+            request_sha256: request_hash.clone(),
+            object_sha256: object_hash.clone(),
+            case_id: case_id.clone(),
+            artifact_id: artifact_id.clone(),
+            artifact_type: *artifact_type,
+            data_origin: publication.request.publication.data_origin,
+            published_unix: publication.published_unix,
+            retain_until_unix: publication.retain_until_unix,
+            source_snapshot_id: publication.request.snapshot_id.clone(),
+            source_grid_hash: publication.request.grid_hash.clone(),
+        })?;
+        self.cas()?
+            .put(&request_hash, &object_hash, &bytes, &signed_bytes)?;
+        Ok(signed)
+    }
+
+    pub fn revoke_case_artifact(
+        &self,
+        principal: &str,
+        object_sha256: &str,
+        request: RevokePublicationRequest,
+    ) -> Result<PublicationTombstone, CommunityError> {
+        self.ensure_assist_available()?;
+        let _permit = self.quota.begin(principal, current_month())?;
+        if !self.cases_enabled || !self.artifact_publication_enabled {
+            return Err(CommunityError::Disabled);
+        }
+        request.validate(CASE_ARTIFACT_REVOCATION_SCHEMA)?;
+        let audit = self
+            .cas()?
+            .publication_audit(object_sha256)?
+            .ok_or(CommunityError::NotFound)?;
+        if audit.owner_principal_sha256 != principal {
+            return Err(CommunityError::Invalid(
+                "authenticated principal cannot revoke another owner's artifact".into(),
+            ));
+        }
+        let tombstone = PublicationTombstone {
+            schema: PUBLICATION_TOMBSTONE_SCHEMA.into(),
+            owner_principal_sha256: principal.into(),
+            request_sha256: audit.request_sha256.clone(),
+            object_sha256: object_sha256.into(),
+            revoked_unix: now_unix(),
+            rights_withdrawn: request.rights_withdrawn,
+            reason: request.reason,
+        };
+        let bytes = serde_json::to_vec(&tombstone)?;
+        self.quota.charge_upload(principal, bytes.len() as u64)?;
+        self.cas()?.revoke_publication(&audit, &tombstone)?;
+        Ok(tombstone)
+    }
+
+    pub fn revoke_case(
+        &self,
+        principal: &str,
+        case_id: &str,
+        request: RevokePublicationRequest,
+    ) -> Result<(), CommunityError> {
+        self.ensure_assist_available()?;
+        let _permit = self.quota.begin(principal, current_month())?;
+        if !self.cases_enabled {
+            return Err(CommunityError::Disabled);
+        }
+        request.validate(CASE_REVOCATION_SCHEMA)?;
+        let bytes = self
+            .cas()?
+            .get_case(case_id)?
+            .ok_or(CommunityError::NotFound)?;
+        let signed: SignedCaseRoomManifest = serde_json::from_slice(&bytes)?;
+        for artifact in &signed.manifest.artifacts {
+            let audit = self
+                .cas()?
+                .publication_audit(&artifact.object_sha256)?
+                .ok_or(CommunityError::NotFound)?;
+            if audit.owner_principal_sha256 != principal {
+                return Err(CommunityError::Invalid(
+                    "authenticated principal does not own every case artifact".into(),
+                ));
+            }
+        }
+        #[derive(serde::Serialize)]
+        struct CaseTombstone<'a> {
+            schema: &'static str,
+            case_id: &'a str,
+            owner_principal_sha256: &'a str,
+            revoked_unix: i64,
+            rights_withdrawn: bool,
+            reason: &'a str,
+        }
+        let tombstone = serde_json::to_vec(&CaseTombstone {
+            schema: "rw.community.case-tombstone.v1",
+            case_id,
+            owner_principal_sha256: principal,
+            revoked_unix: now_unix(),
+            rights_withdrawn: request.rights_withdrawn,
+            reason: &request.reason,
+        })?;
+        self.quota
+            .charge_upload(principal, tombstone.len() as u64)?;
+        self.cas()?.revoke_case(case_id, &tombstone)?;
+        Ok(())
     }
 
     pub fn publish_case(
@@ -650,6 +882,29 @@ impl CommunityService {
             ));
         }
         for artifact in &manifest.artifacts {
+            let audit = self
+                .cas()?
+                .publication_audit(&artifact.object_sha256)?
+                .ok_or(CommunityError::NotFound)?;
+            if audit.owner_principal_sha256 != principal
+                || audit.case_id != manifest.case_id
+                || audit.artifact_id != artifact.artifact_id
+                || audit.artifact_type != artifact.artifact_type
+                || audit.request_sha256 != artifact.request_sha256
+                || audit.retain_until_unix < manifest.retain_until_unix
+            {
+                return Err(CommunityError::Invalid(
+                    "case artifact is not an exact live publication owned by this principal".into(),
+                ));
+            }
+            if self
+                .cas()?
+                .publication_tombstone(&artifact.object_sha256)?
+                .is_some()
+                || audit.retain_until_unix <= now_unix()
+            {
+                return Err(CommunityError::NotFound);
+            }
             let (signed_bytes, object) = self
                 .cas()?
                 .get(&artifact.request_sha256)?
@@ -666,6 +921,62 @@ impl CommunityService {
             if signed.manifest.object_sha256 != artifact.object_sha256 {
                 return Err(CommunityError::Invalid(
                     "case artifact request and object identities do not match".into(),
+                ));
+            }
+            let ShareQuery::CaseArtifact {
+                case_id,
+                artifact_id,
+                artifact_type,
+            } = &signed.manifest.request.query
+            else {
+                return Err(CommunityError::Invalid(
+                    "case reference points to a non-case object".into(),
+                ));
+            };
+            if case_id != &manifest.case_id
+                || artifact_id != &artifact.artifact_id
+                || artifact_type != &artifact.artifact_type
+                || signed.manifest.request_sha256 != artifact.request_sha256
+            {
+                return Err(CommunityError::Invalid(
+                    "case reference does not match the signed artifact identity".into(),
+                ));
+            }
+            validate_case_artifact_payload_bytes(&object, &signed.manifest.request, &self.limits)?;
+            if signed.manifest.request.publication.data_origin != DataOrigin::PublicProvider
+                && manifest.publication.data_origin == DataOrigin::PublicProvider
+            {
+                return Err(CommunityError::Invalid(
+                    "a case containing owner-provided data cannot be labeled public-provider"
+                        .into(),
+                ));
+            }
+            if signed
+                .manifest
+                .attributions
+                .iter()
+                .any(|notice| !manifest.attributions.contains(notice))
+                || signed
+                    .manifest
+                    .modification_notices
+                    .iter()
+                    .any(|notice| !manifest.modification_notices.contains(notice))
+            {
+                return Err(CommunityError::Invalid(
+                    "case manifest did not propagate every artifact attribution and modification notice"
+                        .into(),
+                ));
+            }
+            let source_matches = manifest.sources.iter().any(|source| {
+                source.model == signed.manifest.request.model
+                    && source.run == signed.manifest.request.run
+                    && source.snapshot_id == signed.manifest.request.snapshot_id
+                    && source.grid_hash == signed.manifest.request.grid_hash
+                    && source.source_provenance == signed.manifest.request.source_provenance
+            });
+            if !source_matches {
+                return Err(CommunityError::Invalid(
+                    "case sources do not contain the exact signed artifact source".into(),
                 ));
             }
         }
@@ -694,8 +1005,58 @@ impl CommunityService {
             .ok_or(CommunityError::NotFound)?;
         let signed: SignedCaseRoomManifest = serde_json::from_slice(&bytes)?;
         verify_signed_case(&signed, now_unix(), &self.trusted_keys, &self.limits)?;
+        self.validate_live_case_artifacts(&signed)?;
         self.quota.charge_download(principal, bytes.len() as u64)?;
         Ok(signed)
+    }
+
+    fn validate_live_case_artifacts(
+        &self,
+        signed: &SignedCaseRoomManifest,
+    ) -> Result<(), CommunityError> {
+        for artifact in &signed.manifest.artifacts {
+            if self
+                .cas()?
+                .publication_tombstone(&artifact.object_sha256)?
+                .is_some()
+            {
+                return Err(CommunityError::NotFound);
+            }
+            let audit = self
+                .cas()?
+                .publication_audit(&artifact.object_sha256)?
+                .ok_or(CommunityError::NotFound)?;
+            if audit.request_sha256 != artifact.request_sha256
+                || audit.case_id != signed.manifest.case_id
+                || audit.artifact_id != artifact.artifact_id
+                || audit.artifact_type != artifact.artifact_type
+                || audit.retain_until_unix <= now_unix()
+            {
+                return Err(CommunityError::NotFound);
+            }
+            let (manifest_bytes, object) = self
+                .cas()?
+                .get(&artifact.request_sha256)?
+                .ok_or(CommunityError::NotFound)?;
+            let object_manifest: SignedObjectManifest = serde_json::from_slice(&manifest_bytes)?;
+            verify_signed_object(
+                &object_manifest,
+                &object_manifest.manifest.request,
+                &object,
+                now_unix(),
+                &self.trusted_keys,
+                &self.limits,
+            )?;
+            if object_manifest.manifest.object_sha256 != artifact.object_sha256 {
+                return Err(CommunityError::NotFound);
+            }
+            validate_case_artifact_payload_bytes(
+                &object,
+                &object_manifest.manifest.request,
+                &self.limits,
+            )?;
+        }
+        Ok(())
     }
 
     fn fetch_provider(
@@ -955,7 +1316,11 @@ impl CommunityService {
                 })?
             }
             ShareQuery::CaseArtifact { .. } => {
-                return Err(CommunityError::Unsupported);
+                // Case artifacts are never synthesized from an arbitrary
+                // query or private directory. They enter the CAS only through
+                // the authenticated, typed, rights-confirmed publication
+                // endpoint above.
+                return Err(CommunityError::NotFound);
             }
         };
         if bytes.is_empty() || bytes.len() as u64 > self.limits.max_encoded_bytes {
@@ -1221,9 +1586,9 @@ fn validate_request_source(
     request: &rw_community_protocol::ShareRequest,
     descriptor: &rw_query::RunDescriptor,
 ) -> Result<(), CommunityError> {
-    if let Some(required_origin) = private_origin_for_model(&descriptor.model)
-        && request.publication.data_origin != required_origin
-    {
+    let private_origin_mismatch = private_origin_for_model(&descriptor.model)
+        .is_some_and(|required| request.publication.data_origin != required);
+    if private_origin_mismatch {
         return Err(CommunityError::Invalid(
             "private WRF/ArWen runs cannot be relabeled as public-provider data".into(),
         ));
@@ -1670,6 +2035,121 @@ mod tests {
         }
     }
 
+    fn publication_config(directory: &tempfile::TempDir) -> CommunityConfig {
+        let mut value = config(directory);
+        value.quotas.maximum_object_bytes = 256 * 1024;
+        value.quotas.maximum_decompressed_bytes = 1024 * 1024;
+        value.quotas.storage_bytes = 4 * 1024 * 1024;
+        value.cases = CaseRoomConfig {
+            enabled: true,
+            artifact_publication_enabled: true,
+            maximum_manifest_bytes: 256 * 1024,
+            maximum_objects_per_case: 16,
+            maximum_cases: 16,
+            storage_bytes: 1024 * 1024,
+            default_retention_seconds: 7 * 24 * 60 * 60,
+            ..CaseRoomConfig::default()
+        };
+        value
+    }
+
+    fn artifact_publication(principal: &str, origin: DataOrigin) -> PublishCaseArtifactRequest {
+        let now = now_unix();
+        PublishCaseArtifactRequest {
+            schema: rw_community_protocol::CASE_ARTIFACT_PUBLICATION_SCHEMA.into(),
+            owner_principal_sha256: principal.into(),
+            request: rw_community_protocol::ShareRequest {
+                schema: rw_community_protocol::REQUEST_SCHEMA.into(),
+                model: "owner-wrf".into(),
+                run: "20260812T00Z".into(),
+                snapshot_id: "a".repeat(64),
+                grid_hash: "b".repeat(64),
+                variables: vec!["annotation".into()],
+                query: ShareQuery::CaseArtifact {
+                    case_id: "case-published".into(),
+                    artifact_id: "note-a".into(),
+                    artifact_type: rw_community_protocol::CaseArtifactType::Annotation,
+                },
+                recipe: rw_community_protocol::RecipeIdentity {
+                    recipe_id: "case-annotation".into(),
+                    recipe_version: "1".into(),
+                    parameters: BTreeMap::from([(
+                        rw_community_protocol::PUBLICATION_OWNER_PARAMETER.into(),
+                        principal.into(),
+                    )]),
+                },
+                source_provenance: vec![rw_community_protocol::SourceProvenance {
+                    provider: "simulation-owner".into(),
+                    roles: vec!["simulation".into()],
+                    products: vec!["wrf".into()],
+                }],
+                publication: rw_community_protocol::PublicationGrant {
+                    data_origin: origin,
+                    explicit_owner_publication: true,
+                    redistribution_rights_confirmed: true,
+                },
+            },
+            payload: rw_community_protocol::CaseArtifactPayload::Annotation(
+                rw_community_protocol::AnnotationArtifact {
+                    title: "Owner analysis".into(),
+                    text: "Simulated circulation reached peak intensity.".into(),
+                    event_unix: Some(now),
+                },
+            ),
+            published_unix: now,
+            retain_until_unix: now + 3600,
+            attributions: vec![AttributionNotice {
+                provider: "simulation-owner".into(),
+                notice: "Published by the simulation owner.".into(),
+                source_url: "https://example.invalid/source".into(),
+                license: "Owner-authorized redistribution".into(),
+                license_url: "https://example.invalid/license".into(),
+                terms_url: "https://example.invalid/terms".into(),
+                disclaimer: "Experimental simulation.".into(),
+            }],
+            modification_notices: vec!["Encoded as a typed annotation.".into()],
+        }
+    }
+
+    fn case_for_publication(
+        publication: &PublishCaseArtifactRequest,
+        signed: &SignedObjectManifest,
+    ) -> CaseRoomManifest {
+        let ShareQuery::CaseArtifact {
+            case_id,
+            artifact_id,
+            artifact_type,
+        } = &publication.request.query
+        else {
+            unreachable!()
+        };
+        CaseRoomManifest {
+            schema: CASE_SCHEMA.into(),
+            case_id: case_id.clone(),
+            title: "Rights-confirmed simulation case".into(),
+            event_start_unix: publication.published_unix - 3600,
+            event_end_unix: publication.published_unix,
+            published_unix: publication.published_unix,
+            retain_until_unix: publication.retain_until_unix,
+            publication: publication.request.publication.clone(),
+            sources: vec![rw_community_protocol::CaseModelSource {
+                model: publication.request.model.clone(),
+                run: publication.request.run.clone(),
+                snapshot_id: publication.request.snapshot_id.clone(),
+                grid_hash: publication.request.grid_hash.clone(),
+                source_provenance: publication.request.source_provenance.clone(),
+            }],
+            artifacts: vec![rw_community_protocol::CaseArtifactRef {
+                artifact_id: artifact_id.clone(),
+                artifact_type: *artifact_type,
+                request_sha256: signed.manifest.request_sha256.clone(),
+                object_sha256: signed.manifest.object_sha256.clone(),
+            }],
+            attributions: publication.attributions.clone(),
+            modification_notices: publication.modification_notices.clone(),
+        }
+    }
+
     #[test]
     fn filesystem_provider_is_immutable_and_path_safe() {
         let directory = tempfile::tempdir().unwrap();
@@ -1678,6 +2158,167 @@ mod tests {
         provider.put("v1/objects/abc", b"one").unwrap();
         assert!(provider.put("v1/objects/abc", b"two").is_err());
         assert!(provider.get("../secret", 100).is_err());
+    }
+
+    #[test]
+    fn typed_private_artifact_is_owner_bound_signed_and_exactly_retrievable() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = CommunityService::open(&publication_config(&directory)).unwrap();
+        let principal = "f".repeat(64);
+        let publication = artifact_publication(&principal, DataOrigin::PrivateWrf);
+        let signed = service
+            .publish_case_artifact(&principal, publication.clone())
+            .unwrap();
+        assert_eq!(
+            signed.manifest.request.publication.data_origin,
+            DataOrigin::PrivateWrf
+        );
+        assert_eq!(
+            signed
+                .manifest
+                .request
+                .recipe
+                .parameters
+                .get(rw_community_protocol::PUBLICATION_OWNER_PARAMETER),
+            Some(&principal)
+        );
+        let bytes = service
+            .object(&principal, &signed.manifest.object_sha256)
+            .unwrap();
+        assert_eq!(object_sha256(&bytes), signed.manifest.object_sha256);
+        validate_case_artifact_payload_bytes(&bytes, &publication.request, &service.limits)
+            .unwrap();
+
+        let case = case_for_publication(&publication, &signed);
+        let signed_case = service.publish_case(&principal, case).unwrap();
+        assert_eq!(
+            service.case(&principal, "case-published").unwrap(),
+            signed_case
+        );
+    }
+
+    #[test]
+    fn artifact_publication_rejects_impersonation_missing_rights_and_kill_switch() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = CommunityService::open(&publication_config(&directory)).unwrap();
+        let principal = "f".repeat(64);
+        let publication = artifact_publication(&principal, DataOrigin::PrivateArwen);
+        assert!(matches!(
+            service.publish_case_artifact(&"e".repeat(64), publication.clone()),
+            Err(CommunityError::Invalid(_))
+        ));
+        let mut no_rights = publication.clone();
+        no_rights
+            .request
+            .publication
+            .redistribution_rights_confirmed = false;
+        assert!(matches!(
+            service.publish_case_artifact(&principal, no_rights),
+            Err(CommunityError::Protocol(
+                ProtocolError::RedistributionRightsUnconfirmed
+            ))
+        ));
+        let mut relabeled = artifact_publication(&principal, DataOrigin::PublicProvider);
+        relabeled.request.model = "wrf".into();
+        assert!(matches!(
+            service.publish_case_artifact(&principal, relabeled),
+            Err(CommunityError::Invalid(_))
+        ));
+        service.set_kill_switch(true);
+        assert!(matches!(
+            service.publish_case_artifact(&principal, publication),
+            Err(CommunityError::Killed)
+        ));
+    }
+
+    #[test]
+    fn rights_withdrawal_tombstones_artifact_and_case() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = CommunityService::open(&publication_config(&directory)).unwrap();
+        let principal = "f".repeat(64);
+        let publication = artifact_publication(&principal, DataOrigin::PrivateWrf);
+        let signed = service
+            .publish_case_artifact(&principal, publication.clone())
+            .unwrap();
+        service
+            .publish_case(&principal, case_for_publication(&publication, &signed))
+            .unwrap();
+        service
+            .revoke_case(
+                &principal,
+                "case-published",
+                RevokePublicationRequest {
+                    schema: CASE_REVOCATION_SCHEMA.into(),
+                    rights_withdrawn: true,
+                    reason: "Owner withdrew case publication rights.".into(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            service.case(&principal, "case-published"),
+            Err(CommunityError::NotFound)
+        ));
+        service
+            .revoke_case_artifact(
+                &principal,
+                &signed.manifest.object_sha256,
+                RevokePublicationRequest {
+                    schema: CASE_ARTIFACT_REVOCATION_SCHEMA.into(),
+                    rights_withdrawn: true,
+                    reason: "Owner withdrew artifact redistribution rights.".into(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            service.object(&principal, &signed.manifest.object_sha256),
+            Err(CommunityError::NotFound)
+        ));
+        assert!(
+            service
+                .cas()
+                .unwrap()
+                .publication_tombstone(&signed.manifest.object_sha256)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn ecmwf_artifact_notices_must_propagate_into_case() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = CommunityService::open(&publication_config(&directory)).unwrap();
+        let principal = "f".repeat(64);
+        let mut publication = artifact_publication(&principal, DataOrigin::PublicProvider);
+        publication.request.model = "ifs".into();
+        publication.request.source_provenance = vec![rw_community_protocol::SourceProvenance {
+            provider: "ecmwf-open-data".into(),
+            roles: vec!["pressure".into()],
+            products: vec!["ifs".into()],
+        }];
+        publication.attributions.clear();
+        assert!(matches!(
+            service.publish_case_artifact(&principal, publication.clone()),
+            Err(CommunityError::Protocol(ProtocolError::MissingEcmwfNotice))
+        ));
+
+        publication.attributions = vec![AttributionNotice::ecmwf_open_data()];
+        publication.modification_notices =
+            vec!["Rusty Weather encoded a typed case annotation.".into()];
+        let signed = service
+            .publish_case_artifact(&principal, publication.clone())
+            .unwrap();
+        assert_eq!(signed.manifest.attributions, publication.attributions);
+
+        let mut case = case_for_publication(&publication, &signed);
+        case.attributions.clear();
+        assert!(matches!(
+            service.publish_case(&principal, case),
+            Err(CommunityError::Invalid(_))
+                | Err(CommunityError::Protocol(ProtocolError::MissingEcmwfNotice))
+        ));
+        service
+            .publish_case(&principal, case_for_publication(&publication, &signed))
+            .unwrap();
     }
 
     #[test]
@@ -1738,7 +2379,7 @@ mod tests {
                 &serde_json::to_vec(&signed_case).unwrap(),
             )
             .unwrap();
-        assert!(service.case("test", "case-a").is_ok());
+        assert!(service.cas().unwrap().get_case("case-a").unwrap().is_some());
         service.set_kill_switch(true);
         assert!(matches!(
             service.object("test", &signed.manifest.object_sha256),
