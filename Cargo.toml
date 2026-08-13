@@ -8,6 +8,7 @@ members = [
     "crates/rw-federation-proxy",
     "crates/rw-generation-replication",
     "crates/rw-ingest",
+    "crates/rw-odim",
     "crates/rw-query",
     "crates/rw-server",
     "crates/rw-scheduler",
