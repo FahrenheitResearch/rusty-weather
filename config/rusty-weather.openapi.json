@@ -4457,116 +4457,7 @@
         ]
       }
     },
-    "/v1/models/{model}/runs": {
-      "get": {
-        "tags": [
-          "catalog"
-        ],
-        "operationId": "runs_doc",
-        "parameters": [
-          {
-            "name": "model",
-            "in": "path",
-            "description": "Canonical stored model id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Immutable run snapshots available for the model",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/RunCatalogEntryResponse"
-                  }
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Model id or stored catalog entry is invalid",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Bearer authentication failed when tokens are configured",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "A run changed while its snapshot was resolved",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Configured catalog limit was exceeded",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Model directory, run metadata, or store I/O failed",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Service is busy or shutting down",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            }
-          },
-          "504": {
-            "description": "Catalog work exceeded its execution deadline",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ]
-      }
-    },
-    "/v1/models/{model}/runs/latest": {
+    "/v1/models/{model}/latest-run": {
       "get": {
         "tags": [
           "catalog"
@@ -4667,6 +4558,115 @@
           },
           "504": {
             "description": "Latest-run resolution exceeded its execution deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/v1/models/{model}/runs": {
+      "get": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "runs_doc",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "description": "Canonical stored model id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Immutable run snapshots available for the model",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RunCatalogEntryResponse"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Model id or stored catalog entry is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A run changed while its snapshot was resolved",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Configured catalog limit was exceeded",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Model directory, run metadata, or store I/O failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is busy or shutting down",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Catalog work exceeded its execution deadline",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -5467,7 +5467,7 @@
         },
         "responses": {
           "200": {
-            "description": "Deterministically ordered pressure profiles and explicit gaps for every selected stored time in one immutable run",
+            "description": "Deterministically ordered pressure profiles, colocated surface samples, and explicit gaps for every selected stored time in one immutable run",
             "content": {
               "application/json": {
                 "schema": {
@@ -8426,6 +8426,12 @@
             ],
             "format": "int64"
           },
+          "surface_variables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "variables": {
             "type": "array",
             "items": {
@@ -8440,6 +8446,7 @@
           "run",
           "point",
           "requested_variables",
+          "requested_surface_variables",
           "requested_time",
           "missing_policy",
           "samples"
@@ -8450,6 +8457,12 @@
           },
           "point": {
             "$ref": "#/components/schemas/GridPointResponse"
+          },
+          "requested_surface_variables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
           "requested_time": {
             "$ref": "#/components/schemas/TimeRangeResponse"
@@ -8478,9 +8491,17 @@
           "source_provenance",
           "status",
           "variables",
-          "missing_variables"
+          "missing_variables",
+          "surface_samples",
+          "missing_surface_variables"
         ],
         "properties": {
+          "missing_surface_variables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "missing_variables": {
             "type": "array",
             "items": {
@@ -8495,6 +8516,12 @@
           },
           "status": {
             "$ref": "#/components/schemas/ProfileCycleSampleStatusResponse"
+          },
+          "surface_samples": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProfileSurfaceSampleResponse"
+            }
           },
           "time": {
             "$ref": "#/components/schemas/TimePointResponse"
@@ -8538,6 +8565,28 @@
             "items": {
               "$ref": "#/components/schemas/PressureProfileResponse"
             }
+          }
+        }
+      },
+      "ProfileSurfaceSampleResponse": {
+        "type": "object",
+        "required": [
+          "variable",
+          "units"
+        ],
+        "properties": {
+          "units": {
+            "type": "string"
+          },
+          "value": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float"
+          },
+          "variable": {
+            "type": "string"
           }
         }
       },

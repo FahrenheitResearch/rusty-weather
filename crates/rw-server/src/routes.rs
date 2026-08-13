@@ -414,6 +414,8 @@ pub struct ProfileCycleApiRequest {
     latitude: f64,
     longitude: f64,
     variables: Vec<String>,
+    #[serde(default)]
+    surface_variables: Vec<String>,
     start_unix: Option<i64>,
     end_unix: Option<i64>,
     #[serde(default)]
@@ -959,7 +961,7 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
     let operational = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/models/{model}/runs", get(list_runs))
-        .route("/v1/models/{model}/runs/latest", get(latest_run))
+        .route("/v1/models/{model}/latest-run", get(latest_run))
         .route("/v1/models/{model}/runs/{run}", get(run_detail))
         .route(
             "/v1/models/{model}/runs/{run}/variables",
@@ -1816,7 +1818,11 @@ async fn profile_cycle(
         &state,
         request_id.0,
         &request.model,
-        request.variables.iter().map(String::as_str),
+        request
+            .variables
+            .iter()
+            .chain(request.surface_variables.iter())
+            .map(String::as_str),
     ) {
         return response;
     }
@@ -1832,6 +1838,7 @@ async fn profile_cycle(
                 latitude: request.latitude,
                 longitude: request.longitude,
                 variables: request.variables.clone(),
+                surface_variables: request.surface_variables.clone(),
                 time: TimeRange {
                     start_unix: request.start_unix,
                     end_unix: request.end_unix,
@@ -4749,7 +4756,7 @@ mod tests {
     #[tokio::test]
     async fn latest_run_pointer_is_authenticated_and_never_cached() {
         let (_directory, app) = test_app_with_store();
-        let path = format!("/v1/models/{FIXTURE_MODEL}/runs/latest");
+        let path = format!("/v1/models/{FIXTURE_MODEL}/latest-run");
 
         let denied = app
             .clone()
@@ -4768,7 +4775,16 @@ mod tests {
         assert_eq!(latest["run"], FIXTURE_RUN);
         assert_eq!(latest["origin_unix"], FIXTURE_ORIGIN);
 
-        let missing = get_with_token(app, "/v1/models/not-present/runs/latest").await;
+        // `latest` remains a legal run ID. The old colliding spelling now
+        // dispatches through the ordinary run-detail route, not the pointer.
+        let literal_run = get_with_token(
+            app.clone(),
+            &format!("/v1/models/{FIXTURE_MODEL}/runs/latest"),
+        )
+        .await;
+        assert_eq!(literal_run.status(), StatusCode::NOT_FOUND);
+
+        let missing = get_with_token(app, "/v1/models/not-present/latest-run").await;
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             missing.headers()[header::CACHE_CONTROL],
@@ -6684,6 +6700,7 @@ mod tests {
                 "latitude": 40.5,
                 "longitude": -99.5,
                 "variables": ["optional_pressure_iso"],
+                "surface_variables": ["scalar"],
                 "missing_policy": "partial"
             }),
         )
@@ -6701,10 +6718,14 @@ mod tests {
             profile_cycle["requested_variables"],
             serde_json::json!(["optional_pressure_iso"])
         );
+        assert_eq!(
+            profile_cycle["requested_surface_variables"],
+            serde_json::json!(["scalar"])
+        );
         assert_eq!(profile_cycle["missing_policy"], "partial");
         assert_eq!(profile_cycle["samples"].as_array().unwrap().len(), 2);
         assert_eq!(profile_cycle["samples"][0]["time"]["storage_slot"], 0);
-        assert_eq!(profile_cycle["samples"][0]["status"], "gap");
+        assert_eq!(profile_cycle["samples"][0]["status"], "partial");
         assert_eq!(
             profile_cycle["samples"][0]["missing_variables"],
             serde_json::json!(["optional_pressure_iso"])
@@ -6712,6 +6733,14 @@ mod tests {
         assert_eq!(
             profile_cycle["samples"][0]["source_provenance"][0]["provider"],
             "ecmwf-open-data"
+        );
+        assert_eq!(
+            profile_cycle["samples"][0]["surface_samples"][0],
+            serde_json::json!({"variable": "scalar", "units": "K", "value": 4.0})
+        );
+        assert_eq!(
+            profile_cycle["samples"][0]["missing_surface_variables"],
+            serde_json::json!([])
         );
         assert_eq!(profile_cycle["samples"][1]["time"]["storage_slot"], 1);
         assert_eq!(profile_cycle["samples"][1]["status"], "complete");

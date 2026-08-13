@@ -247,6 +247,7 @@ fn profile_cycle_binds_every_time_gap_level_point_snapshot_and_provenance() {
         latitude: 40.0,
         longitude: -100.0,
         variables: vec!["temperature".into(), "optional_pressure".into()],
+        surface_variables: vec!["scalar".into()],
         time: TimeRange::default(),
         missing_policy: MissingPolicy::Partial,
     };
@@ -257,6 +258,7 @@ fn profile_cycle_binds_every_time_gap_level_point_snapshot_and_provenance() {
     assert_eq!(cycle.point.requested_longitude, request.longitude);
     assert_eq!((cycle.point.x, cycle.point.y), (0, 0));
     assert_eq!(cycle.requested_variables, request.variables);
+    assert_eq!(cycle.requested_surface_variables, request.surface_variables);
     assert_eq!(cycle.requested_time, TimeRange::default());
     assert_eq!(cycle.missing_policy, MissingPolicy::Partial);
     assert_eq!(
@@ -283,6 +285,10 @@ fn profile_cycle_binds_every_time_gap_level_point_snapshot_and_provenance() {
     );
     assert_eq!(cycle.samples[0].variables[0].name, "temperature");
     assert_eq!(cycle.samples[0].variables[0].levels_hpa, vec![1000, 900]);
+    assert_eq!(cycle.samples[0].surface_samples[0].variable, "scalar");
+    assert_eq!(cycle.samples[0].surface_samples[0].units, "K");
+    assert_eq!(cycle.samples[0].surface_samples[0].value, Some(5.0));
+    assert!(cycle.samples[0].missing_surface_variables.is_empty());
     assert_eq!(cycle.samples[1].variables.len(), 2);
     assert_eq!(cycle.samples[1].missing_variables, Vec::<String>::new());
     assert_eq!(
@@ -315,6 +321,7 @@ fn profile_cycle_binds_every_time_gap_level_point_snapshot_and_provenance() {
         &snapshot,
         &ProfileCycleRequest {
             variables: vec!["optional_pressure".into()],
+            surface_variables: Vec::new(),
             ..request.clone()
         },
     )
@@ -356,12 +363,130 @@ fn profile_cycle_binds_every_time_gap_level_point_snapshot_and_provenance() {
 }
 
 #[test]
+fn profile_cycle_surface_bundle_preserves_order_missing_values_kinds_and_shared_caps() {
+    let (_dir, root) = exact_store();
+    let snapshot = RunSnapshot::open(&root, MODEL, RUN).unwrap();
+    let request = ProfileCycleRequest {
+        latitude: 40.0,
+        longitude: -100.0,
+        variables: vec!["temperature".into()],
+        surface_variables: vec!["scalar".into(), "optional".into()],
+        time: TimeRange::default(),
+        missing_policy: MissingPolicy::Partial,
+    };
+    let cycle = query_profile_cycle(&snapshot, &request).unwrap();
+
+    assert_eq!(cycle.requested_surface_variables, request.surface_variables);
+    assert_eq!(cycle.samples[0].status, ProfileCycleSampleStatus::Partial);
+    assert_eq!(cycle.samples[0].missing_surface_variables, vec!["optional"]);
+    assert_eq!(
+        cycle.samples[0]
+            .surface_samples
+            .iter()
+            .map(|sample| (
+                sample.variable.as_str(),
+                sample.units.as_str(),
+                sample.value
+            ))
+            .collect::<Vec<_>>(),
+        vec![("scalar", "K", Some(5.0)), ("optional", "1", None)]
+    );
+    assert_eq!(cycle.samples[1].status, ProfileCycleSampleStatus::Complete);
+    assert_eq!(cycle.samples[1].surface_samples[1].value, Some(9.0));
+    assert_eq!(cycle.samples[2].missing_surface_variables, vec!["optional"]);
+
+    let strict_error = query_profile_cycle(
+        &snapshot,
+        &ProfileCycleRequest {
+            missing_policy: MissingPolicy::Strict,
+            ..request.clone()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        strict_error,
+        QueryError::MissingVariable {
+            variable,
+            slot: 0
+        } if variable == "optional"
+    ));
+
+    let wrong_kind = query_profile_cycle(
+        &snapshot,
+        &ProfileCycleRequest {
+            surface_variables: vec!["optional_pressure".into()],
+            ..request.clone()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(wrong_kind, QueryError::WrongVariableKind { .. }));
+
+    let unknown = query_profile_cycle(
+        &snapshot,
+        &ProfileCycleRequest {
+            surface_variables: vec!["not_present".into()],
+            ..request.clone()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(unknown, QueryError::UnknownVariable(name) if name == "not_present"));
+
+    let value_limited = RunSnapshot::open_with_limits(
+        &root,
+        MODEL,
+        RUN,
+        QueryLimits {
+            max_point_values: 8,
+            ..QueryLimits::default()
+        },
+    )
+    .unwrap();
+    let cap_error = query_profile_cycle(
+        &value_limited,
+        &ProfileCycleRequest {
+            surface_variables: vec!["scalar".into()],
+            ..request.clone()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        cap_error,
+        QueryError::LimitExceeded {
+            what: "profile-cycle values",
+            requested: 9,
+            limit: 8
+        }
+    ));
+
+    let variable_limited = RunSnapshot::open_with_limits(
+        &root,
+        MODEL,
+        RUN,
+        QueryLimits {
+            max_variables: 2,
+            ..QueryLimits::default()
+        },
+    )
+    .unwrap();
+    let variable_error = query_profile_cycle(&variable_limited, &request).unwrap_err();
+    assert!(matches!(
+        variable_error,
+        QueryError::LimitExceeded {
+            what: "variables",
+            requested: 3,
+            limit: 2
+        }
+    ));
+}
+
+#[test]
 fn profile_cycle_enforces_missing_kind_count_time_and_cancellation_gates() {
     let (_dir, root) = exact_store();
     let request = |variables: Vec<String>, missing_policy| ProfileCycleRequest {
         latitude: 40.0,
         longitude: -100.0,
         variables,
+        surface_variables: Vec::new(),
         time: TimeRange::default(),
         missing_policy,
     };

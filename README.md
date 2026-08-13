@@ -48,8 +48,9 @@ profile, arbitrary geographic-domain plots (including explicit pressure
 levels), and temporal analytics over validated stores without requiring the
 desktop application. `POST /v1/profile-cycle` returns one deterministically
 ordered entry per selected stored time, including explicit pressure-field gaps
-and sanitized per-time source provenance, while retaining the immutable
-run/snapshot/grid and requested/native point identity. Start with
+plus a typed colocated surface bundle and sanitized per-time source provenance,
+while retaining the immutable run/snapshot/grid and requested/native point
+identity. Start with
 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), then use
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for health checks, backup, upgrades,
 and rollback. The versioned HTTP contract is documented in
@@ -344,7 +345,7 @@ the service never substitutes a similarly named field or ensemble statistic.
 
 See [the model capability matrix](docs/MODEL_SUPPORT.md) for the human-readable
 scope and use `GET /v1/models`, the authenticated no-store
-`GET /v1/models/{model}/runs/latest` pointer, and each selected run's
+`GET /v1/models/{model}/latest-run` pointer, and each selected run's
 `/variables` resource as the machine-readable authority. Source-specific
 missing products are omitted rather than fabricated.
 

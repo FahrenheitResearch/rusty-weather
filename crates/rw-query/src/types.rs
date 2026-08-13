@@ -278,7 +278,11 @@ pub struct ProfileResult {
 pub struct ProfileCycleRequest {
     pub latitude: f64,
     pub longitude: f64,
+    /// Pressure-level variables decoded as complete vertical profiles.
     pub variables: Vec<String>,
+    /// Surface variables sampled at the same nearest native-grid point.
+    #[serde(default)]
+    pub surface_variables: Vec<String>,
     #[serde(default)]
     pub time: TimeRange,
     #[serde(default)]
@@ -288,12 +292,23 @@ pub struct ProfileCycleRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileCycleSampleStatus {
-    /// Every requested pressure variable is present at this stored time.
+    /// Every requested pressure and surface variable is present at this stored time.
     Complete,
-    /// Some requested pressure variables are present and some are absent.
+    /// Some requested pressure or surface values are present and some are absent.
     Partial,
-    /// None of the requested pressure variables are present at this stored time.
+    /// None of the requested pressure or surface values are present at this stored time.
     Gap,
+}
+
+/// One surface value colocated with a cycle sounding.
+///
+/// This intentionally matches the typed `SurfaceSample` carried by the
+/// Community Cache profile payload while remaining HTTP- and protocol-neutral.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileSurfaceSample {
+    pub variable: String,
+    pub units: String,
+    pub value: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -306,6 +321,10 @@ pub struct ProfileCycleSample {
     pub variables: Vec<PressureProfile>,
     /// Absent requested pressure variables in request order.
     pub missing_variables: Vec<String>,
+    /// Surface values in requested order. Missing/non-finite values remain explicit `None`.
+    pub surface_samples: Vec<ProfileSurfaceSample>,
+    /// Requested surface variables absent or non-finite at this stored time.
+    pub missing_surface_variables: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -313,6 +332,7 @@ pub struct ProfileCycleResult {
     pub run: RunDescriptor,
     pub point: GridPoint,
     pub requested_variables: Vec<String>,
+    pub requested_surface_variables: Vec<String>,
     pub requested_time: TimeRange,
     pub missing_policy: MissingPolicy,
     /// One entry for every selected stored time, in deterministic physical-time order.

@@ -132,6 +132,15 @@ struct ProfileCycleSampleResponse {
     status: ProfileCycleSampleStatusResponse,
     variables: Vec<PressureProfileResponse>,
     missing_variables: Vec<String>,
+    surface_samples: Vec<ProfileSurfaceSampleResponse>,
+    missing_surface_variables: Vec<String>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct ProfileSurfaceSampleResponse {
+    variable: String,
+    units: String,
+    value: Option<f32>,
 }
 
 #[derive(utoipa::ToSchema)]
@@ -139,6 +148,7 @@ struct ProfileCycleResponse {
     run: RunDescriptorResponse,
     point: GridPointResponse,
     requested_variables: Vec<String>,
+    requested_surface_variables: Vec<String>,
     requested_time: TimeRangeResponse,
     missing_policy: ApiMissingPolicy,
     samples: Vec<ProfileCycleSampleResponse>,
@@ -1013,6 +1023,7 @@ struct CancelledRunGenerationDoc {
         ProfileResponse,
         TimeRangeResponse,
         ProfileCycleSampleStatusResponse,
+        ProfileSurfaceSampleResponse,
         ProfileCycleSampleResponse,
         ProfileCycleResponse,
         IndexWindowResponse,
@@ -1230,7 +1241,7 @@ fn runs_doc() {}
 
 #[utoipa::path(
     get,
-    path = "/v1/models/{model}/runs/latest",
+    path = "/v1/models/{model}/latest-run",
     tag = "catalog",
     security(("bearer_auth" = [])),
     params(("model" = String, Path, description = "Canonical stored model id")),
@@ -1364,7 +1375,7 @@ fn profile_doc() {}
     security(("bearer_auth" = [])),
     request_body = ProfileCycleApiRequest,
     responses(
-        (status = 200, description = "Deterministically ordered pressure profiles and explicit gaps for every selected stored time in one immutable run", body = ProfileCycleResponse),
+        (status = 200, description = "Deterministically ordered pressure profiles, colocated surface samples, and explicit gaps for every selected stored time in one immutable run", body = ProfileCycleResponse),
         (status = 400, description = "Request body, coordinates, variables, or half-open time range are invalid", content_type = "application/problem+json", body = ProblemDetails),
         (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
         (status = 404, description = "The run or a variable absent from the complete selection was not found", content_type = "application/problem+json", body = ProblemDetails),
@@ -2361,7 +2372,7 @@ mod tests {
             "/v1/health/live",
             "/v1/openapi.json",
             "/v1/models",
-            "/v1/models/{model}/runs/latest",
+            "/v1/models/{model}/latest-run",
             "/v1/point",
             "/v1/profile-cycle",
             "/v1/window",
@@ -2375,6 +2386,10 @@ mod tests {
         ] {
             assert!(paths.contains_key(path), "missing OpenAPI path {path}");
         }
+        assert!(
+            !paths.contains_key("/v1/models/{model}/runs/latest"),
+            "latest-run pointer must not reserve the legal run ID 'latest'"
+        );
         assert!(
             paths["/v1/window"]["post"]["responses"]
                 .get("501")
@@ -2406,7 +2421,7 @@ mod tests {
             "#/components/schemas/OriginCatalogHealthStatus",
             false,
         );
-        let latest = operation(&value, "/v1/models/{model}/runs/latest", "get");
+        let latest = operation(&value, "/v1/models/{model}/latest-run", "get");
         assert_eq!(latest["security"][0]["bearer_auth"], serde_json::json!([]));
         assert!(latest["responses"]["401"].is_object());
         assert!(
@@ -2656,7 +2671,7 @@ mod tests {
                 true,
             ),
             (
-                "/v1/models/{model}/runs/latest",
+                "/v1/models/{model}/latest-run",
                 "get",
                 "#/components/schemas/RunDescriptorResponse",
                 false,
@@ -2741,6 +2756,14 @@ mod tests {
         assert_eq!(
             schemas["ProfileCycleSampleResponse"]["properties"]["source_provenance"]["items"]["$ref"],
             "#/components/schemas/SourceProvenanceResponse"
+        );
+        assert_eq!(
+            schemas["ProfileCycleSampleResponse"]["properties"]["surface_samples"]["items"]["$ref"],
+            "#/components/schemas/ProfileSurfaceSampleResponse"
+        );
+        assert!(
+            schemas["ProfileCycleResponse"]["properties"]["requested_surface_variables"]
+                .is_object()
         );
         assert_eq!(
             schemas["ProfileCycleSampleStatusResponse"]["enum"],

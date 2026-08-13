@@ -27,7 +27,7 @@ versioned API.
 - `GET /v1/version`
 - `GET /v1/models`
 - `GET /v1/models/{model}/runs`
-- `GET /v1/models/{model}/runs/latest`
+- `GET /v1/models/{model}/latest-run`
 - `GET /v1/models/{model}/runs/{run}`
 - `GET /v1/models/{model}/runs/{run}/variables`
 - `GET /v1/point`
@@ -55,7 +55,7 @@ versioned API.
 - `GET /metrics`
 
 Every data request names an explicit run. The one explicit mutable pointer,
-`GET /v1/models/{model}/runs/latest`, selects only from the authenticated
+`GET /v1/models/{model}/latest-run`, selects only from the authenticated
 visible catalog by physical cycle origin, uses the canonical run ID only as a
 deterministic tie-break, and is returned with `Cache-Control: no-store,
 private`. Applications should resolve that pointer once, then bind subsequent
@@ -69,9 +69,15 @@ response binds the run, snapshot, grid, requested latitude/longitude, resolved
 native point, requested fields, and missing policy. It retains one entry per
 selected stored time in deterministic order. Each entry contains its exact
 time, sanitized hour-specific source provenance, available pressure profiles
-with their own level axes, an ordered missing-variable list, and a
-`complete`/`partial`/`gap` status. Strict mode rejects the first missing field;
-partial mode never hides a missing timestep.
+with their own level axes, and an ordered `surface_samples` bundle for the
+requested colocated native-grid fields. Surface entries use the same typed
+`variable`/`units`/nullable-`value` shape as published profile objects.
+Separate ordered pressure and surface missing-field lists plus a
+`complete`/`partial`/`gap` status make every incomplete sounding explicit.
+Strict mode rejects the first missing field or non-finite surface value;
+partial mode never hides a missing timestep. `variables` selects pressure
+profiles and `surface_variables` selects bounded surface fields such as 2 m
+temperature/dewpoint, 10 m wind components, and surface pressure.
 
 Like the other operational query routes, this endpoint is bearer-authenticated
 when tokens are configured and is protected by the authoritative publication
@@ -81,7 +87,7 @@ instead of exposing an otherwise readable unpublished store run.
 The endpoint uses the heavy synchronous worker pool and cooperative
 cancellation checkpoints. `limits.variables_per_query`,
 `limits.temporal_frames`, and `limits.sync_result_values` bound fields, selected
-times, and decoded profile values across the entire response;
+times, and decoded pressure plus surface values across the entire response;
 `limits.request_body_bytes` and `limits.sync_timeout_seconds` bound the HTTP
 body and shared admission/execution deadline. A request exceeding a count cap
 fails before allocating the value that would cross it.

@@ -26,7 +26,7 @@ When `origin_catalog.enabled = true`, the server:
   document passes validation; and
 - applies that allow-set to model/run listings and every direct query snapshot,
   so an unlisted run is indistinguishable from a nonexistent run; and
-- resolves `GET /v1/models/{model}/runs/latest` only within that same allow-set,
+- resolves `GET /v1/models/{model}/latest-run` only within that same allow-set,
   ordered by physical cycle origin with a deterministic run-ID tie-break and a
   private, no-store response.
 
