@@ -383,10 +383,11 @@ impl NcData<'_> {
     }
 }
 
-/// Round `n` up to the next multiple of 4.
+/// Round `n` up to the next multiple of 4, refusing an unrepresentable
+/// padded length instead of wrapping it back to zero.
 #[inline]
-fn pad4(n: u64) -> u64 {
-    (n + 3) & !3
+fn pad4(n: u64) -> Option<u64> {
+    n.checked_add(3).map(|padded| padded & !3)
 }
 
 /// Per-variable layout the writer resolves once at `create` time.
@@ -441,6 +442,7 @@ impl NcClassicWriter {
         num_records: u64,
     ) -> RwResult<Self> {
         let record_dimid = validate_defs(&dims, &gattrs, &vars, num_records)?;
+        validate_nonneg_widths(format, &dims, &gattrs, &vars, num_records)?;
 
         // Slab geometry, before offsets are known.
         let mut layouts: Vec<VarLayout> = Vec::with_capacity(vars.len());
@@ -465,13 +467,19 @@ impl NcClassicWriter {
                     var.name
                 ))
             })?;
+            let slab_stride = pad4(slab_bytes).ok_or_else(|| {
+                RwStoreError::Format(format!(
+                    "netcdf_classic: variable '{}' padded slab byte size overflows u64",
+                    var.name
+                ))
+            })?;
             layouts.push(VarLayout {
                 name: var.name.clone(),
                 ty: var.ty,
                 is_record,
                 slab_elems: elems,
                 slab_bytes,
-                slab_stride: pad4(slab_bytes),
+                slab_stride,
                 begin: 0,
             });
         }
@@ -479,26 +487,25 @@ impl NcClassicWriter {
         // The specification's single-record-variable exception: one record
         // variable of a sub-word type means its slabs are not padded.
         let record_var_count = layouts.iter().filter(|l| l.is_record).count();
-        if record_var_count == 1 {
-            if let Some(l) = layouts.iter_mut().find(|l| l.is_record) {
-                if l.ty.unpadded_when_sole_record_var() {
-                    l.slab_stride = l.slab_bytes;
-                }
-            }
+        if record_var_count == 1
+            && let Some(l) = layouts.iter_mut().find(|l| l.is_record)
+            && l.ty.unpadded_when_sole_record_var()
+        {
+            l.slab_stride = l.slab_bytes;
         }
 
         // CDF-1 and CDF-2 report vsize in a 32-bit field. A slab that does not
         // fit is a real limit of the chosen format, not a field to clamp:
         // refuse and name the format that would carry it.
-        if format.nonneg_width() == 4 {
-            if let Some(l) = layouts.iter().find(|l| l.slab_stride > u32::MAX as u64) {
-                return Err(RwStoreError::Format(format!(
-                    "netcdf_classic: variable '{}' needs {} bytes per slab, past what {}'s 32-bit vsize carries; write CDF-5 instead",
-                    l.name,
-                    l.slab_stride,
-                    format.label()
-                )));
-            }
+        if format.nonneg_width() == 4
+            && let Some(l) = layouts.iter().find(|l| l.slab_stride > u32::MAX as u64)
+        {
+            return Err(RwStoreError::Format(format!(
+                "netcdf_classic: variable '{}' needs {} bytes per slab, past what {}'s 32-bit vsize carries; write CDF-5 instead",
+                l.name,
+                l.slab_stride,
+                format.label()
+            )));
         }
 
         // Two-pass header serialization. Pass 1 measures with placeholder
@@ -520,15 +527,18 @@ impl NcClassicWriter {
         let mut record_stride: u64 = 0;
         for layout in layouts.iter_mut().filter(|l| l.is_record) {
             layout.begin = record_origin + record_stride;
-            record_stride = record_stride.checked_add(layout.slab_stride).ok_or_else(|| {
-                RwStoreError::Format("netcdf_classic: record size overflows u64".to_string())
-            })?;
+            record_stride = record_stride
+                .checked_add(layout.slab_stride)
+                .ok_or_else(|| {
+                    RwStoreError::Format("netcdf_classic: record size overflows u64".to_string())
+                })?;
         }
-        let file_len = record_origin
-            .checked_add(record_stride.saturating_mul(num_records))
-            .ok_or_else(|| {
-                RwStoreError::Format("netcdf_classic: file length overflows u64".to_string())
-            })?;
+        let record_bytes = record_stride.checked_mul(num_records).ok_or_else(|| {
+            RwStoreError::Format("netcdf_classic: record section size overflows u64".to_string())
+        })?;
+        let file_len = record_origin.checked_add(record_bytes).ok_or_else(|| {
+            RwStoreError::Format("netcdf_classic: file length overflows u64".to_string())
+        })?;
 
         // Every `begin` must be nameable in this format's offset field. The
         // last byte of the file is the binding constraint, so check that.
@@ -774,6 +784,81 @@ fn check_attrs(scope: &str, attrs: &[NcAttr]) -> RwResult<()> {
     Ok(())
 }
 
+/// CDF-1 and CDF-2 encode every `NON_NEG` field in four bytes. Keep every
+/// conversion to that wire type checked in one preflight so header
+/// serialization can never silently truncate a count or length.
+fn check_nonneg_width(format: NcFormat, field: &str, value: u64) -> RwResult<()> {
+    if format.nonneg_width() == 4 && value > u64::from(u32::MAX) {
+        return Err(RwStoreError::Format(format!(
+            "netcdf_classic: {field} is {value}, past what {}'s 32-bit NON_NEG field carries; write CDF-5 instead",
+            format.label()
+        )));
+    }
+    Ok(())
+}
+
+fn check_attr_widths(format: NcFormat, scope: &str, attrs: &[NcAttr]) -> RwResult<()> {
+    check_nonneg_width(
+        format,
+        &format!("{scope} attribute count"),
+        attrs.len() as u64,
+    )?;
+    for attr in attrs {
+        check_nonneg_width(
+            format,
+            &format!("attribute '{}' name length", attr.name),
+            attr.name.len() as u64,
+        )?;
+        check_nonneg_width(
+            format,
+            &format!("attribute '{}' value count", attr.name),
+            attr.value.nelems(),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_nonneg_widths(
+    format: NcFormat,
+    dims: &[NcDim],
+    gattrs: &[NcAttr],
+    vars: &[NcVarDef],
+    num_records: u64,
+) -> RwResult<()> {
+    check_nonneg_width(format, "record count", num_records)?;
+    check_nonneg_width(format, "dimension count", dims.len() as u64)?;
+    for dim in dims {
+        check_nonneg_width(
+            format,
+            &format!("dimension '{}' name length", dim.name),
+            dim.name.len() as u64,
+        )?;
+        if !dim.unlimited {
+            check_nonneg_width(
+                format,
+                &format!("dimension '{}' length", dim.name),
+                dim.len as u64,
+            )?;
+        }
+    }
+    check_attr_widths(format, "global", gattrs)?;
+    check_nonneg_width(format, "variable count", vars.len() as u64)?;
+    for var in vars {
+        check_nonneg_width(
+            format,
+            &format!("variable '{}' name length", var.name),
+            var.name.len() as u64,
+        )?;
+        check_nonneg_width(
+            format,
+            &format!("variable '{}' dimension count", var.name),
+            var.dimids.len() as u64,
+        )?;
+        check_attr_widths(format, &format!("variable '{}'", var.name), &var.attrs)?;
+    }
+    Ok(())
+}
+
 /// Returns the record dimension's dimid, when the schema declares one.
 fn validate_defs(
     dims: &[NcDim],
@@ -883,7 +968,7 @@ fn put_offset(buf: &mut Vec<u8>, format: NcFormat, v: u64) {
 }
 
 fn pad_to_4(buf: &mut Vec<u8>) {
-    while buf.len() % 4 != 0 {
+    while !buf.len().is_multiple_of(4) {
         buf.push(0);
     }
 }
@@ -1189,8 +1274,10 @@ mod tests {
         let mut w =
             NcClassicWriter::create(&p, NcFormat::Offset64, dims, Vec::new(), vars, 2).unwrap();
         let len = w.file_len();
-        w.put_record_text("Times", 0, "2026-08-10_13:00:00").unwrap();
-        w.put_record_text("Times", 1, "2026-08-10_14:00:00").unwrap();
+        w.put_record_text("Times", 0, "2026-08-10_13:00:00")
+            .unwrap();
+        w.put_record_text("Times", 1, "2026-08-10_14:00:00")
+            .unwrap();
         w.finish().unwrap();
         let bytes = std::fs::read(&p).unwrap();
         assert_eq!(bytes.len() as u64, len);
@@ -1339,6 +1426,54 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no dimension is unlimited"), "{err}");
+    }
+
+    #[test]
+    fn cdf2_refuses_a_record_count_its_header_would_truncate() {
+        let p = tmp_path("record-count-overflow.nc");
+        let dims = vec![NcDim::record("Time")];
+        let too_many = u64::from(u32::MAX) + 1;
+        let err = NcClassicWriter::create(
+            &p,
+            NcFormat::Offset64,
+            dims,
+            Vec::new(),
+            Vec::new(),
+            too_many,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("record count"), "{err}");
+        assert!(err.contains("write CDF-5 instead"), "{err}");
+        assert!(
+            !p.exists(),
+            "width refusal must happen before file creation"
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn cdf2_refuses_a_dimension_length_its_header_would_truncate() {
+        let p = tmp_path("dimension-length-overflow.nc");
+        let too_wide = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        let dims = vec![NcDim::fixed("n", too_wide)];
+        let err = NcClassicWriter::create(&p, NcFormat::Offset64, dims, Vec::new(), Vec::new(), 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dimension 'n' length"), "{err}");
+        assert!(err.contains("write CDF-5 instead"), "{err}");
+        assert!(
+            !p.exists(),
+            "width refusal must happen before file creation"
+        );
+    }
+
+    #[test]
+    fn four_byte_padding_refuses_u64_wraparound() {
+        assert_eq!(pad4(0), Some(0));
+        assert_eq!(pad4(u64::MAX - 3), Some(u64::MAX - 3));
+        assert_eq!(pad4(u64::MAX - 2), None);
+        assert_eq!(pad4(u64::MAX), None);
     }
 
     #[test]

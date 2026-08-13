@@ -745,10 +745,13 @@ fn opera_laea_projection(meta: &OperaRadarMeta) -> Result<OperaLaea, IoError> {
 /// The `/where` corners are the grid's outer edges — projected `(0,0)`,
 /// `(0,ny)`, `(nx,ny)`, `(nx,0)` — not cell centres, and this is written
 /// against the edges for that reason.
+type OperaCorner = (f64, f64);
+type OperaCorners = [OperaCorner; 4];
+
 fn opera_laea_corners(
     meta: &OperaRadarMeta,
     projection: &OperaLaea,
-) -> ([(f64, f64); 4], [(f64, f64); 4]) {
+) -> (OperaCorners, OperaCorners) {
     let nx = meta.xsize as f64;
     let ny = meta.ysize as f64;
     let edges = [

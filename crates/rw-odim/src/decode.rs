@@ -282,6 +282,7 @@ fn read_sweep(
             format!("the sweep declares {nrays} rays of {nbins} bins, which is not a sweep"),
         ));
     }
+    let gate_count = checked_gate_count(nrays, nbins, &where_path)?;
     let range_scale_m = where_attrs.f64("rscale")?;
     if !range_scale_m.is_finite() || range_scale_m <= 0.0 {
         return Err(OdimError::format(
@@ -371,6 +372,7 @@ fn read_sweep(
             &moment_what,
             nrays,
             nbins,
+            gate_count,
             options,
         )?);
     }
@@ -467,6 +469,17 @@ fn normalise_deg(degrees: f64) -> f64 {
     if folded >= 360.0 { 0.0 } else { folded }
 }
 
+fn checked_gate_count(nrays: usize, nbins: usize, context: &str) -> Result<usize> {
+    nrays.checked_mul(nbins).ok_or_else(|| {
+        OdimError::format(
+            format!("reading {context}"),
+            format!(
+                "the declared {nrays} rays times {nbins} bins overflows this platform's gate count"
+            ),
+        )
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn read_moment(
     file: &Hdf5File,
@@ -476,6 +489,7 @@ fn read_moment(
     what: &Attrs,
     nrays: usize,
     nbins: usize,
+    gate_count: usize,
     options: &DecodeOptions,
 ) -> Result<Moment> {
     let gain = what.f64_opt("gain")?.unwrap_or(1.0);
@@ -533,7 +547,19 @@ fn read_moment(
             ),
         ));
     }
-    if shape[0] as usize != nrays || shape[1] as usize != nbins {
+    let payload_nrays = usize::try_from(shape[0]).map_err(|_| {
+        OdimError::format(
+            format!("reading {data_path}"),
+            format!("payload ray count {} exceeds usize", shape[0]),
+        )
+    })?;
+    let payload_nbins = usize::try_from(shape[1]).map_err(|_| {
+        OdimError::format(
+            format!("reading {data_path}"),
+            format!("payload bin count {} exceeds usize", shape[1]),
+        )
+    })?;
+    if payload_nrays != nrays || payload_nbins != nbins {
         return Err(OdimError::format(
             format!("reading {data_path}"),
             format!(
@@ -562,13 +588,13 @@ fn read_moment(
     }
 
     let raw = read_raw_f64(&dataset, path, &data_path)?;
-    if raw.len() != nrays * nbins {
+    if raw.len() != gate_count {
         return Err(OdimError::format(
             format!("reading {data_path}"),
             format!(
                 "the payload decoded to {} values but the shape says {}",
                 raw.len(),
-                nrays * nbins
+                gate_count
             ),
         ));
     }
@@ -840,5 +866,18 @@ mod tests {
         assert_eq!(basename("/dataset1"), "dataset1");
         assert_eq!(basename("dataset1"), "dataset1");
         assert_eq!(basename("/dataset1/data2"), "data2");
+    }
+
+    #[test]
+    fn overflowing_gate_geometry_is_refused_before_payload_decode() {
+        let err = checked_gate_count(usize::MAX, 2, "/dataset1/where")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("overflows"), "{err}");
+        assert!(err.contains("/dataset1/where"), "{err}");
+        assert_eq!(
+            checked_gate_count(360, 720, "/dataset1/where").unwrap(),
+            259_200
+        );
     }
 }

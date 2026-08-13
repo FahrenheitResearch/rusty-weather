@@ -174,16 +174,7 @@ impl Attrs {
 
     /// A required count, refused if it is negative or not a whole number.
     pub fn usize(&self, name: &str) -> Result<usize> {
-        let value = self.f64(name)?;
-        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
-            return Err(OdimError::AttributeType {
-                group: self.path.clone(),
-                name: name.to_string(),
-                found: format!("{value}"),
-                expected: "a non-negative whole number".to_string(),
-            });
-        }
-        Ok(value as usize)
+        count_from_f64(&self.path, name, self.f64(name)?)
     }
 
     /// An optional count.
@@ -213,6 +204,22 @@ impl Attrs {
         })?;
         Ok(Some(raw.trim_end_matches(['\0', ' ']).to_string()))
     }
+}
+
+/// Convert an ODIM count without relying on Rust's saturating float-to-int
+/// cast. A corrupt `nrays` at or above 2^usize::BITS must be a refusal, not a
+/// plausible-looking `usize::MAX` geometry.
+fn count_from_f64(group: &str, name: &str, value: f64) -> Result<usize> {
+    let usize_upper_exclusive = 2.0_f64.powi(usize::BITS as i32);
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value >= usize_upper_exclusive {
+        return Err(OdimError::AttributeType {
+            group: group.to_string(),
+            name: name.to_string(),
+            found: format!("{value}"),
+            expected: "a non-negative whole number representable as usize".to_string(),
+        });
+    }
+    Ok(value as usize)
 }
 
 /// Fetch a child group, returning `None` when it is simply absent.
@@ -295,5 +302,18 @@ mod tests {
         // Optional lookups stay quiet, which is what makes `how` optional.
         assert_eq!(attrs.f64_opt("NI").unwrap(), None);
         assert_eq!(attrs.string_opt("task").unwrap(), None);
+    }
+
+    #[test]
+    fn counts_outside_usize_are_refused_instead_of_saturating() {
+        let upper = 2.0_f64.powi(usize::BITS as i32);
+        for value in [f64::NAN, f64::INFINITY, -1.0, 1.5, upper] {
+            let err = count_from_f64("/where", "nrays", value).unwrap_err();
+            assert!(
+                matches!(err, OdimError::AttributeType { .. }),
+                "{value} produced {err}"
+            );
+        }
+        assert_eq!(count_from_f64("/where", "nrays", 360.0).unwrap(), 360);
     }
 }
