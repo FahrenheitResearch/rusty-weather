@@ -944,6 +944,7 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
     let operational = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/models/{model}/runs", get(list_runs))
+        .route("/v1/models/{model}/runs/latest", get(latest_run))
         .route("/v1/models/{model}/runs/{run}", get(run_detail))
         .route(
             "/v1/models/{model}/runs/{run}/variables",
@@ -1524,6 +1525,31 @@ async fn list_runs(
         Ok(Err(error)) => query_problem(error, request_id.0).into_response(),
         Err(error) => execution_problem(error, request_id.0).into_response(),
     }
+}
+
+async fn latest_run(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(path): Path<ModelPath>,
+) -> Response {
+    if let Some(response) = reject_retired_selection(
+        &state,
+        request_id.0,
+        &path.model,
+        std::iter::empty::<&str>(),
+    ) {
+        return private_no_store(response);
+    }
+    let catalog = state.catalog.clone();
+    let response = match state
+        .run_light(move || catalog.latest_run(&path.model))
+        .await
+    {
+        Ok(Ok(snapshot)) => json_no_store(StatusCode::OK, snapshot.descriptor(), request_id.0),
+        Ok(Err(error)) => query_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    };
+    private_no_store(response)
 }
 
 async fn run_detail(
@@ -3218,6 +3244,18 @@ fn secret_json_response(status: StatusCode, body: Vec<u8>) -> Response {
     response
 }
 
+fn private_no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response.headers_mut().remove(header::ETAG);
+    response
+}
+
 fn json_bytes_with_etag(status: StatusCode, body: Bytes) -> Response {
     let digest = blake3::hash(&body).to_hex();
     let etag = format!("{digest:?}");
@@ -4609,6 +4647,38 @@ mod tests {
                 "pre_operational_feed"
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn latest_run_pointer_is_authenticated_and_never_cached() {
+        let (_directory, app) = test_app_with_store();
+        let path = format!("/v1/models/{FIXTURE_MODEL}/runs/latest");
+
+        let denied = app
+            .clone()
+            .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let latest = get_with_token(app.clone(), &path).await;
+        assert_eq!(latest.status(), StatusCode::OK);
+        assert_eq!(latest.headers()[header::CACHE_CONTROL], "no-store, private");
+        assert_eq!(latest.headers()[header::PRAGMA], "no-cache");
+        assert!(!latest.headers().contains_key(header::ETAG));
+        let latest = response_json(latest).await;
+        assert_eq!(latest["model"], FIXTURE_MODEL);
+        assert_eq!(latest["run"], FIXTURE_RUN);
+        assert_eq!(latest["origin_unix"], FIXTURE_ORIGIN);
+
+        let missing = get_with_token(app, "/v1/models/not-present/runs/latest").await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing.headers()[header::CACHE_CONTROL],
+            "no-store, private"
+        );
+        assert_eq!(missing.headers()[header::PRAGMA], "no-cache");
+        assert_eq!(response_json(missing).await["code"], "DATA_NOT_FOUND");
     }
 
     #[tokio::test]

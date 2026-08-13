@@ -25,7 +25,10 @@ When `origin_catalog.enabled = true`, the server:
 - atomically replaces its in-memory allow-set only after the complete new
   document passes validation; and
 - applies that allow-set to model/run listings and every direct query snapshot,
-  so an unlisted run is indistinguishable from a nonexistent run.
+  so an unlisted run is indistinguishable from a nonexistent run; and
+- resolves `GET /v1/models/{model}/runs/latest` only within that same allow-set,
+  ordered by physical cycle origin with a deterministic run-ID tie-break and a
+  private, no-store response.
 
 `origin_catalog.publication_sources` selects the authority:
 
@@ -57,6 +60,11 @@ a missing, stale, malformed, replaced-with-a-symlink, or storage-inconsistent
 catalog changes the state to `unavailable`, clears the complete published view,
 and fails readiness. Restoring a valid scheduler document recovers without a
 server restart.
+
+The latest-run pointer follows the same failure boundary: an empty, stale,
+unavailable, or internally inconsistent publication view cannot fall back to a
+raw store scan or reveal an unlisted run. Clients retain the returned run and
+snapshot identities for all subsequent immutable queries.
 
 The authenticated origin-catalog status response is deliberately coarse. It
 reports only enabled/ready state, timestamps, and aggregate model/run counts;

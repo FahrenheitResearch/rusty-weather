@@ -4566,6 +4566,123 @@
         ]
       }
     },
+    "/v1/models/{model}/runs/latest": {
+      "get": {
+        "tags": [
+          "catalog"
+        ],
+        "description": "Resolve the newest visible, authorized run by physical cycle origin. The mutable pointer is deterministic, private, and no-store; clients should bind subsequent queries to the returned immutable run and snapshot identities.",
+        "operationId": "latest_run_doc",
+        "parameters": [
+          {
+            "name": "model",
+            "in": "path",
+            "description": "Canonical stored model id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest visible immutable run descriptor; private no-store",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDescriptorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Model id or visible run ordering metadata is invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No visible run is available for the model",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The selected run changed while its snapshot was resolved",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Configured catalog or snapshot limit was exceeded",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Catalog, run metadata, or store I/O failed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Publication catalog is unavailable, service is busy, or shutdown is in progress",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Latest-run resolution exceeded its execution deadline",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/v1/models/{model}/runs/{run}": {
       "get": {
         "tags": [

@@ -877,6 +877,7 @@ struct CancelledRunGenerationDoc {
         openapi_doc,
         models_doc,
         runs_doc,
+        latest_run_doc,
         run_doc,
         variables_doc,
         point_doc,
@@ -1187,6 +1188,27 @@ fn models_doc() {}
     )
 )]
 fn runs_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/models/{model}/runs/latest",
+    tag = "catalog",
+    security(("bearer_auth" = [])),
+    params(("model" = String, Path, description = "Canonical stored model id")),
+    description = "Resolve the newest visible, authorized run by physical cycle origin. The mutable pointer is deterministic, private, and no-store; clients should bind subsequent queries to the returned immutable run and snapshot identities.",
+    responses(
+        (status = 200, description = "Newest visible immutable run descriptor; private no-store", body = RunDescriptorResponse),
+        (status = 400, description = "Model id or visible run ordering metadata is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "No visible run is available for the model", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 409, description = "The selected run changed while its snapshot was resolved", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Configured catalog or snapshot limit was exceeded", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Catalog, run metadata, or store I/O failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Publication catalog is unavailable, service is busy, or shutdown is in progress", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Latest-run resolution exceeded its execution deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn latest_run_doc() {}
 
 #[utoipa::path(
     get,
@@ -2278,6 +2300,7 @@ mod tests {
             "/v1/health/live",
             "/v1/openapi.json",
             "/v1/models",
+            "/v1/models/{model}/runs/latest",
             "/v1/point",
             "/v1/window",
             "/v1/analytics/spatial-series",
@@ -2320,6 +2343,14 @@ mod tests {
             "get",
             "#/components/schemas/OriginCatalogHealthStatus",
             false,
+        );
+        let latest = operation(&value, "/v1/models/{model}/runs/latest", "get");
+        assert_eq!(latest["security"][0]["bearer_auth"], serde_json::json!([]));
+        assert!(latest["responses"]["401"].is_object());
+        assert!(
+            latest["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("no-store"))
         );
         let submit_responses = &paths["/v1/jobs/temporal-grid"]["post"]["responses"];
         for status in ["404", "409", "503", "504"] {
@@ -2561,6 +2592,12 @@ mod tests {
                 "get",
                 "#/components/schemas/RunCatalogEntryResponse",
                 true,
+            ),
+            (
+                "/v1/models/{model}/runs/latest",
+                "get",
+                "#/components/schemas/RunDescriptorResponse",
+                false,
             ),
             (
                 "/v1/models/{model}/runs/{run}",

@@ -339,9 +339,10 @@ levels, and verification maturity are intentionally reported independently;
 the service never substitutes a similarly named field or ensemble statistic.
 
 See [the model capability matrix](docs/MODEL_SUPPORT.md) for the human-readable
-scope and use `GET /v1/models` plus each run's `/variables` resource as the
-machine-readable authority. Source-specific missing products are omitted
-rather than fabricated.
+scope and use `GET /v1/models`, the authenticated no-store
+`GET /v1/models/{model}/runs/latest` pointer, and each selected run's
+`/variables` resource as the machine-readable authority. Source-specific
+missing products are omitted rather than fabricated.
 
 **GFS ingest examples:**
 

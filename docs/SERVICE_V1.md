@@ -27,6 +27,7 @@ versioned API.
 - `GET /v1/version`
 - `GET /v1/models`
 - `GET /v1/models/{model}/runs`
+- `GET /v1/models/{model}/runs/latest`
 - `GET /v1/models/{model}/runs/{run}`
 - `GET /v1/models/{model}/runs/{run}/variables`
 - `GET /v1/point`
@@ -52,10 +53,13 @@ versioned API.
 - `GET /v1/openapi.json`
 - `GET /metrics`
 
-Every request names an explicit run. The durable scheduler exposes safe
-latest/latest-available/latest-covering selection primitives, but the v1 HTTP
-surface does not silently resolve mutable aliases. Applications should resolve
-a run from the catalog once, then use that immutable run ID for the query.
+Every data request names an explicit run. The one explicit mutable pointer,
+`GET /v1/models/{model}/runs/latest`, selects only from the authenticated
+visible catalog by physical cycle origin, uses the canonical run ID only as a
+deterministic tie-break, and is returned with `Cache-Control: no-store,
+private`. Applications should resolve that pointer once, then bind subsequent
+requests to the returned immutable run and snapshot identities. No data query
+silently resolves an alias.
 
 ## Safe defaults
 
