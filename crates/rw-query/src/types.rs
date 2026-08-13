@@ -196,6 +196,9 @@ pub struct VariableCapability {
     pub coverage: f64,
     pub point_series: bool,
     pub pressure_profile: bool,
+    /// This pressure-level variable can be returned for multiple exact stored
+    /// times by the bounded profile-cycle query.
+    pub profile_cycle: bool,
     /// This stored variable can be returned in a bounded geographic-domain
     /// window with cropped coordinates and exact projection metadata.
     pub geographic_window: bool,
@@ -269,6 +272,51 @@ pub struct ProfileResult {
     pub point: GridPoint,
     pub time: TimePoint,
     pub variables: Vec<PressureProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileCycleRequest {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub variables: Vec<String>,
+    #[serde(default)]
+    pub time: TimeRange,
+    #[serde(default)]
+    pub missing_policy: MissingPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileCycleSampleStatus {
+    /// Every requested pressure variable is present at this stored time.
+    Complete,
+    /// Some requested pressure variables are present and some are absent.
+    Partial,
+    /// None of the requested pressure variables are present at this stored time.
+    Gap,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileCycleSample {
+    pub time: TimePoint,
+    /// Sanitized acquisition provenance from this exact manifest hour entry.
+    pub source_provenance: Vec<SourceProvenance>,
+    pub status: ProfileCycleSampleStatus,
+    /// Available profiles in request order, with a level axis bound to this time.
+    pub variables: Vec<PressureProfile>,
+    /// Absent requested pressure variables in request order.
+    pub missing_variables: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileCycleResult {
+    pub run: RunDescriptor,
+    pub point: GridPoint,
+    pub requested_variables: Vec<String>,
+    pub requested_time: TimeRange,
+    pub missing_policy: MissingPolicy,
+    /// One entry for every selected stored time, in deterministic physical-time order.
+    pub samples: Vec<ProfileCycleSample>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

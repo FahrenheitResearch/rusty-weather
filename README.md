@@ -43,9 +43,13 @@ distributed product is called complete is recorded in
 
 ## Self-hosted data service
 
-`rw-server` exposes bounded catalog, point, profile, arbitrary geographic-domain
-plots (including explicit pressure levels), and temporal analytics over
-validated stores without requiring the desktop application. Start with
+`rw-server` exposes bounded catalog, point, single-time profile, whole-cycle
+profile, arbitrary geographic-domain plots (including explicit pressure
+levels), and temporal analytics over validated stores without requiring the
+desktop application. `POST /v1/profile-cycle` returns one deterministically
+ordered entry per selected stored time, including explicit pressure-field gaps
+and sanitized per-time source provenance, while retaining the immutable
+run/snapshot/grid and requested/native point identity. Start with
 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), then use
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for health checks, backup, upgrades,
 and rollback. The versioned HTTP contract is documented in

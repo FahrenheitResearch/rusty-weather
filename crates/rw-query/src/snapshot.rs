@@ -406,6 +406,7 @@ impl RunSnapshot {
                     coverage: ratio(available, expected),
                     point_series: kind == "surface2d",
                     pressure_profile: kind == "pressure3d",
+                    profile_cycle: kind == "pressure3d",
                     geographic_window: matches!(kind.as_str(), "surface2d" | "pressure3d"),
                     scalar_temporal_reduction: temporal
                         .supported_reducers

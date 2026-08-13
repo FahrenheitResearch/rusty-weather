@@ -25,13 +25,13 @@ use rw_ingest::{IngestCapabilityLimitation, IngestSupportStatus, model_ingest_ca
 use rw_query::{
     GeographicBoundingBox, GeographicVerticalSelection, GeographicWindowLimits,
     GeographicWindowRequest, IndexWindow2DRequest, IntervalSupport, MissingPolicy,
-    PointSeriesRequest, PointSeriesResult, ProfileRequest, QueryError, SpatialStatsSeriesRequest,
-    TemporalCapabilityBasis, TemporalGridRequest, TemporalOperation, TemporalReducer,
-    TemporalReductionLimits, TemporalSemantics, TemporalValueClass, TemporalVerticalSelection,
-    TemporalWindow, TimeExpectation, TimeRange, VariableCapability,
+    PointSeriesRequest, PointSeriesResult, ProfileCycleRequest, ProfileRequest, QueryError,
+    SpatialStatsSeriesRequest, TemporalCapabilityBasis, TemporalGridRequest, TemporalOperation,
+    TemporalReducer, TemporalReductionLimits, TemporalSemantics, TemporalValueClass,
+    TemporalVerticalSelection, TemporalWindow, TimeExpectation, TimeRange, VariableCapability,
     query_geographic_window_with_cancel, query_point_series, query_profile,
-    query_spatial_stats_series, query_window_2d, reduce_temporal_grid_with_cancel,
-    reduce_temporal_grid_with_cancel_and_limits,
+    query_profile_cycle_with_cancel, query_spatial_stats_series, query_window_2d,
+    reduce_temporal_grid_with_cancel, reduce_temporal_grid_with_cancel_and_limits,
 };
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
@@ -407,6 +407,19 @@ pub struct ProfileApiRequest {
     variables: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct ProfileCycleApiRequest {
+    model: String,
+    run: String,
+    latitude: f64,
+    longitude: f64,
+    variables: Vec<String>,
+    start_unix: Option<i64>,
+    end_unix: Option<i64>,
+    #[serde(default)]
+    missing_policy: ApiMissingPolicy,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ApiTemporalWindow {
@@ -705,6 +718,7 @@ pub struct VariableCapabilityResponse {
     coverage: f64,
     point_series: bool,
     pressure_profile: bool,
+    profile_cycle: bool,
     geographic_window: bool,
     scalar_temporal_reduction: bool,
     temporal: VariableTemporalCapabilityResponse,
@@ -726,6 +740,7 @@ impl From<VariableCapability> for VariableCapabilityResponse {
             coverage: value.coverage,
             point_series: value.point_series,
             pressure_profile: value.pressure_profile,
+            profile_cycle: value.profile_cycle,
             geographic_window: value.geographic_window,
             scalar_temporal_reduction: value.scalar_temporal_reduction,
             temporal: VariableTemporalCapabilityResponse {
@@ -953,6 +968,7 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
         .route("/v1/point", get(point))
         .route("/v1/points", post(points))
         .route("/v1/profile", post(profile))
+        .route("/v1/profile-cycle", post(profile_cycle))
         .route("/v1/analytics/temporal-grid", post(temporal_grid))
         .route("/v1/jobs/temporal-grid", post(submit_temporal_grid_job))
         .route("/v1/window", post(window))
@@ -1785,6 +1801,63 @@ async fn profile(
         })
         .await
     {
+        Ok(Ok(bytes)) => json_bytes_with_etag(StatusCode::OK, bytes),
+        Ok(Err(error)) => response_work_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn profile_cycle(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(request): Json<ProfileCycleApiRequest>,
+) -> Response {
+    if let Some(response) = reject_retired_selection(
+        &state,
+        request_id.0,
+        &request.model,
+        request.variables.iter().map(String::as_str),
+    ) {
+        return response;
+    }
+    let catalog = state.catalog.clone();
+    let cache = state.response_cache.clone();
+    let metrics = state.metrics.clone();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = cancellation.clone();
+    let result = state
+        .run_heavy_sync(move || {
+            let snapshot = catalog.snapshot(&request.model, &request.run)?;
+            let query = ProfileCycleRequest {
+                latitude: request.latitude,
+                longitude: request.longitude,
+                variables: request.variables.clone(),
+                time: TimeRange {
+                    start_unix: request.start_unix,
+                    end_unix: request.end_unix,
+                },
+                missing_policy: request.missing_policy.into(),
+            };
+            cache_or_compute(
+                &cache,
+                &metrics,
+                "profile_cycle_v1",
+                &snapshot.descriptor().snapshot_id,
+                &request,
+                || {
+                    query_profile_cycle_with_cancel(&snapshot, &query, || {
+                        worker_cancellation.load(Ordering::Acquire)
+                    })
+                },
+            )
+        })
+        .await;
+    if matches!(result, Err(ExecutionError::ExecutionTimeout)) {
+        // Dropping a spawn_blocking handle does not preempt it. Profile-cycle
+        // queries check this flag at every time/variable/decode boundary.
+        cancellation.store(true, Ordering::Release);
+    }
+    match result {
         Ok(Ok(bytes)) => json_bytes_with_etag(StatusCode::OK, bytes),
         Ok(Err(error)) => response_work_problem(error, request_id.0).into_response(),
         Err(error) => execution_problem(error, request_id.0).into_response(),
@@ -4256,12 +4329,22 @@ mod tests {
             ];
             let pressure_850 = [280.0 + slot as f32; 4];
             let pressure_500 = [250.0 + slot as f32; 4];
-            let volumes = [PressureVolumeInput {
+            let optional_850 = [270.0 + slot as f32; 4];
+            let optional_500 = [240.0 + slot as f32; 4];
+            let mut volumes = vec![PressureVolumeInput {
                 name: "temperature_iso",
                 units: "K",
                 selector_template: serde_json::json!({"fixture": "temperature_iso"}),
                 levels: vec![(850, &pressure_850), (500, &pressure_500)],
             }];
+            if slot == 1 {
+                volumes.push(PressureVolumeInput {
+                    name: "optional_pressure_iso",
+                    units: "K",
+                    selector_template: serde_json::json!({"fixture": "optional_pressure_iso"}),
+                    levels: vec![(850, &optional_850), (500, &optional_500)],
+                });
+            }
             write_hour_from_grid_with_derived_exact(
                 &config.server.store_root,
                 FIXTURE_MODEL,
@@ -4576,6 +4659,20 @@ mod tests {
             denied.headers().get(header::CONTENT_TYPE).unwrap(),
             crate::problem::PROBLEM_CONTENT_TYPE
         );
+
+        let denied_profile_cycle = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/profile-cycle")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied_profile_cycle.status(), StatusCode::UNAUTHORIZED);
 
         let allowed = app
             .oneshot(
@@ -5734,6 +5831,16 @@ mod tests {
                 }),
             ),
             (
+                "/v1/profile-cycle",
+                serde_json::json!({
+                    "model": LEGACY_RETIRED_MODEL,
+                    "run": FIXTURE_RUN,
+                    "latitude": 40.0,
+                    "longitude": -100.0,
+                    "variables": ["scalar"]
+                }),
+            ),
+            (
                 "/v1/window",
                 serde_json::json!({
                     "model": LEGACY_RETIRED_MODEL,
@@ -5778,7 +5885,7 @@ mod tests {
         assert_eq!(runs.status(), StatusCode::OK);
         let runs = response_json(runs).await;
         assert_eq!(
-            runs[0]["variable_count"], 2,
+            runs[0]["variable_count"], 3,
             "the public count excludes the retired compatibility variable"
         );
         let variables = get_with_token(
@@ -5817,6 +5924,16 @@ mod tests {
                     "latitude": 40.0,
                     "longitude": -100.0,
                     "storage_slot": 0,
+                    "variables": [RETIRED_VARIABLE_NAME]
+                }),
+            ),
+            (
+                "/v1/profile-cycle",
+                serde_json::json!({
+                    "model": FIXTURE_MODEL,
+                    "run": FIXTURE_RUN,
+                    "latitude": 40.0,
+                    "longitude": -100.0,
                     "variables": [RETIRED_VARIABLE_NAME]
                 }),
             ),
@@ -5936,6 +6053,24 @@ mod tests {
         assert!(!serialized.contains("hidden-model"));
         assert!(!serialized.contains("hidden-run"));
 
+        let profile_cycle = post_json(
+            app.clone(),
+            "/v1/profile-cycle",
+            serde_json::json!({
+                "model": "hidden-model",
+                "run": "hidden-run",
+                "latitude": 40.0,
+                "longitude": -100.0,
+                "variables": ["temperature"]
+            }),
+        )
+        .await;
+        assert_eq!(profile_cycle.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_json(profile_cycle).await["code"],
+            "ORIGIN_CATALOG_UNAVAILABLE"
+        );
+
         let status = get_with_token(app, "/v1/origin-catalog/status").await;
         assert_eq!(status.status(), StatusCode::OK);
         assert_eq!(status.headers()[header::CACHE_CONTROL], "no-store, private");
@@ -6042,7 +6177,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/v1/points")
+                    .uri("/v1/profile-cycle")
                     .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(vec![b'x'; 128]))
@@ -6221,6 +6356,27 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["code"], "QUERY_LIMIT");
+    }
+
+    #[tokio::test]
+    async fn profile_cycle_shares_one_decoded_level_value_budget_across_times() {
+        let (_directory, app) = test_app_with_store_limit(3);
+        let response = post_json(
+            app,
+            "/v1/profile-cycle",
+            serde_json::json!({
+                "model": FIXTURE_MODEL,
+                "run": FIXTURE_RUN,
+                "latitude": 40.0,
+                "longitude": -100.0,
+                "variables": ["temperature_iso"],
+                "missing_policy": "partial"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let problem = response_json(response).await;
         assert_eq!(problem["code"], "QUERY_LIMIT");
     }
 
@@ -6449,7 +6605,9 @@ mod tests {
                 .any(|variable| variable["name"] == "scalar" && variable["point_series"] == true)
         );
         assert!(variables.as_array().unwrap().iter().any(|variable| {
-            variable["name"] == "temperature_iso" && variable["pressure_profile"] == true
+            variable["name"] == "temperature_iso"
+                && variable["pressure_profile"] == true
+                && variable["profile_cycle"] == true
         }));
 
         let point_path = format!(
@@ -6515,6 +6673,55 @@ mod tests {
         assert_eq!(
             profile["variables"][0]["values"],
             serde_json::json!([280.0, 250.0])
+        );
+
+        let profile_cycle = post_json(
+            app.clone(),
+            "/v1/profile-cycle",
+            serde_json::json!({
+                "model": FIXTURE_MODEL,
+                "run": FIXTURE_RUN,
+                "latitude": 40.5,
+                "longitude": -99.5,
+                "variables": ["optional_pressure_iso"],
+                "missing_policy": "partial"
+            }),
+        )
+        .await;
+        assert_eq!(profile_cycle.status(), StatusCode::OK);
+        assert!(profile_cycle.headers().contains_key(header::ETAG));
+        let profile_cycle = response_json(profile_cycle).await;
+        assert_eq!(profile_cycle["run"]["run"], FIXTURE_RUN);
+        assert_eq!(profile_cycle["run"]["sample_count"], 2);
+        assert_eq!(
+            profile_cycle["point"]["requested_latitude"],
+            serde_json::json!(40.5)
+        );
+        assert_eq!(
+            profile_cycle["requested_variables"],
+            serde_json::json!(["optional_pressure_iso"])
+        );
+        assert_eq!(profile_cycle["missing_policy"], "partial");
+        assert_eq!(profile_cycle["samples"].as_array().unwrap().len(), 2);
+        assert_eq!(profile_cycle["samples"][0]["time"]["storage_slot"], 0);
+        assert_eq!(profile_cycle["samples"][0]["status"], "gap");
+        assert_eq!(
+            profile_cycle["samples"][0]["missing_variables"],
+            serde_json::json!(["optional_pressure_iso"])
+        );
+        assert_eq!(
+            profile_cycle["samples"][0]["source_provenance"][0]["provider"],
+            "ecmwf-open-data"
+        );
+        assert_eq!(profile_cycle["samples"][1]["time"]["storage_slot"], 1);
+        assert_eq!(profile_cycle["samples"][1]["status"], "complete");
+        assert_eq!(
+            profile_cycle["samples"][1]["variables"][0]["levels_hpa"],
+            serde_json::json!([850, 500])
+        );
+        assert_eq!(
+            profile_cycle["samples"][1]["variables"][0]["values"],
+            serde_json::json!([271.0, 241.0])
         );
 
         let job_response = post_json(
@@ -6586,7 +6793,7 @@ mod tests {
         let metrics = to_bytes(metrics.into_body(), 256 * 1024).await.unwrap();
         let metrics = String::from_utf8(metrics.to_vec()).unwrap();
         assert!(metrics.contains("rw_response_cache_hits_total 1"));
-        assert!(metrics.contains("rw_response_cache_misses_total 4"));
+        assert!(metrics.contains("rw_response_cache_misses_total 5"));
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ pub use catalog::StoreCatalog;
 pub use error::{QueryError, QueryResult};
 pub use geographic::*;
 pub use point::query_point_series;
-pub use profile::query_profile;
+pub use profile::{query_profile, query_profile_cycle, query_profile_cycle_with_cancel};
 pub use reduce::reduce_scalar_temporal;
 pub use snapshot::RunSnapshot;
 pub use temporal::*;

@@ -33,6 +33,7 @@ versioned API.
 - `GET /v1/point`
 - `POST /v1/points`
 - `POST /v1/profile`
+- `POST /v1/profile-cycle`
 - `POST /v1/window`
 - `POST /v1/geographic-window`
 - `POST /v1/analytics/spatial-series`
@@ -60,6 +61,30 @@ deterministic tie-break, and is returned with `Cache-Control: no-store,
 private`. Applications should resolve that pointer once, then bind subsequent
 requests to the returned immutable run and snapshot identities. No data query
 silently resolves an alias.
+
+`POST /v1/profile-cycle` is the bounded multi-time sounding primitive. With no
+time bounds it selects the complete immutable run; optional `start_unix`
+(inclusive) and `end_unix` (exclusive) narrow that physical-time axis. The
+response binds the run, snapshot, grid, requested latitude/longitude, resolved
+native point, requested fields, and missing policy. It retains one entry per
+selected stored time in deterministic order. Each entry contains its exact
+time, sanitized hour-specific source provenance, available pressure profiles
+with their own level axes, an ordered missing-variable list, and a
+`complete`/`partial`/`gap` status. Strict mode rejects the first missing field;
+partial mode never hides a missing timestep.
+
+Like the other operational query routes, this endpoint is bearer-authenticated
+when tokens are configured and is protected by the authoritative publication
+catalog gate. A missing, stale, or inconsistent published catalog fails closed
+instead of exposing an otherwise readable unpublished store run.
+
+The endpoint uses the heavy synchronous worker pool and cooperative
+cancellation checkpoints. `limits.variables_per_query`,
+`limits.temporal_frames`, and `limits.sync_result_values` bound fields, selected
+times, and decoded profile values across the entire response;
+`limits.request_body_bytes` and `limits.sync_timeout_seconds` bound the HTTP
+body and shared admission/execution deadline. A request exceeding a count cap
+fails before allocating the value that would cross it.
 
 ## Safe defaults
 
@@ -94,6 +119,11 @@ rectangular envelope, cropped lat/lon arrays, exact projection metadata, and a
 mask that prevents curvilinear envelope cells outside the requested bbox from
 being plotted as selected data. Antimeridian-crossing eastward arcs and
 explicit, unreduced pressure levels are first-class.
+
+Stored `pressure3d` variables independently advertise
+`pressure_profile=true` for a single stored time and `profile_cycle=true` for
+the bounded multi-time contract. Availability slots and coverage remain the
+authoritative guide to whether partial requests will contain explicit gaps.
 
 Local valid stores are queryable even when their model identifier is not built
 into the registry. This keeps private WRF, ArWen, and other compatible output

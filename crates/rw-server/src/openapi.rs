@@ -17,9 +17,9 @@ use crate::routes::{
     ApiTemporalValueClass, ApiTemporalVerticalSelection, ApiTemporalWindow, ApiTimeExpectation,
     CoordinateRequest, GeographicVerticalApiSelection, GeographicWindowApiRequest, HealthResponse,
     ModelCapabilityResponse, PointQueryRequest, PointsRequest, ProductCapabilityResponse,
-    ProfileApiRequest, ProviderAttributionResponse, SpatialSeriesApiRequest,
-    TemporalGridApiRequest, VariableCapabilityResponse, VariableTemporalCapabilityResponse,
-    VersionResponse, WindowApiRequest,
+    ProfileApiRequest, ProfileCycleApiRequest, ProviderAttributionResponse,
+    SpatialSeriesApiRequest, TemporalGridApiRequest, VariableCapabilityResponse,
+    VariableTemporalCapabilityResponse, VersionResponse, WindowApiRequest,
 };
 use crate::{ArtifactRef, JobStatus, JobView};
 
@@ -109,6 +109,39 @@ struct ProfileResponse {
     point: GridPointResponse,
     time: TimePointResponse,
     variables: Vec<PressureProfileResponse>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct TimeRangeResponse {
+    start_unix: Option<i64>,
+    end_unix: Option<i64>,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum ProfileCycleSampleStatusResponse {
+    Complete,
+    Partial,
+    Gap,
+}
+
+#[derive(utoipa::ToSchema)]
+struct ProfileCycleSampleResponse {
+    time: TimePointResponse,
+    source_provenance: Vec<SourceProvenanceResponse>,
+    status: ProfileCycleSampleStatusResponse,
+    variables: Vec<PressureProfileResponse>,
+    missing_variables: Vec<String>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct ProfileCycleResponse {
+    run: RunDescriptorResponse,
+    point: GridPointResponse,
+    requested_variables: Vec<String>,
+    requested_time: TimeRangeResponse,
+    missing_policy: ApiMissingPolicy,
+    samples: Vec<ProfileCycleSampleResponse>,
 }
 
 #[derive(utoipa::ToSchema)]
@@ -883,6 +916,7 @@ struct CancelledRunGenerationDoc {
         point_doc,
         points_doc,
         profile_doc,
+        profile_cycle_doc,
         window_doc,
         geographic_window_doc,
         spatial_series_doc,
@@ -947,6 +981,7 @@ struct CancelledRunGenerationDoc {
         PointQueryRequest,
         PointsRequest,
         ProfileApiRequest,
+        ProfileCycleApiRequest,
         WindowApiRequest,
         GeographicVerticalApiSelection,
         GeographicWindowApiRequest,
@@ -976,6 +1011,10 @@ struct CancelledRunGenerationDoc {
         PointSeriesResponse,
         PressureProfileResponse,
         ProfileResponse,
+        TimeRangeResponse,
+        ProfileCycleSampleStatusResponse,
+        ProfileCycleSampleResponse,
+        ProfileCycleResponse,
         IndexWindowResponse,
         NativeGridEnvelopeResponse,
         GeographicBoundingBoxResponse,
@@ -1317,6 +1356,28 @@ fn points_doc() {}
     )
 )]
 fn profile_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/profile-cycle",
+    tag = "query",
+    security(("bearer_auth" = [])),
+    request_body = ProfileCycleApiRequest,
+    responses(
+        (status = 200, description = "Deterministically ordered pressure profiles and explicit gaps for every selected stored time in one immutable run", body = ProfileCycleResponse),
+        (status = 400, description = "Request body, coordinates, variables, or half-open time range are invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "The run or a variable absent from the complete selection was not found", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 409, description = "Run changed while the query was executing", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 413, description = "Request body exceeds the configured byte limit", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 415, description = "Request is not application/json", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Variable, selected-time, decoded-value, or strict missing-data limit was not satisfied", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Store, metadata, allocation, or serialization failure", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Service is busy, shutting down, or the authoritative publication catalog is unavailable", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Query exceeded its execution deadline and cooperative cancellation was requested", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn profile_cycle_doc() {}
 
 #[utoipa::path(
     post,
@@ -2302,6 +2363,7 @@ mod tests {
             "/v1/models",
             "/v1/models/{model}/runs/latest",
             "/v1/point",
+            "/v1/profile-cycle",
             "/v1/window",
             "/v1/analytics/spatial-series",
             "/v1/analytics/temporal-grid",
@@ -2630,6 +2692,12 @@ mod tests {
                 false,
             ),
             (
+                "/v1/profile-cycle",
+                "post",
+                "#/components/schemas/ProfileCycleResponse",
+                false,
+            ),
+            (
                 "/v1/window",
                 "post",
                 "#/components/schemas/IndexWindowResponse",
@@ -2670,6 +2738,15 @@ mod tests {
             schemas["ModelCapabilityResponse"]["properties"]["provider_attributions"]["items"]["$ref"],
             "#/components/schemas/ProviderAttributionResponse"
         );
+        assert_eq!(
+            schemas["ProfileCycleSampleResponse"]["properties"]["source_provenance"]["items"]["$ref"],
+            "#/components/schemas/SourceProvenanceResponse"
+        );
+        assert_eq!(
+            schemas["ProfileCycleSampleStatusResponse"]["enum"],
+            serde_json::json!(["complete", "partial", "gap"])
+        );
+        assert!(schemas["VariableCapabilityResponse"]["properties"]["profile_cycle"].is_object());
     }
 
     #[test]

@@ -5449,6 +5449,141 @@
         ]
       }
     },
+    "/v1/profile-cycle": {
+      "post": {
+        "tags": [
+          "query"
+        ],
+        "operationId": "profile_cycle_doc",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileCycleApiRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Deterministically ordered pressure profiles and explicit gaps for every selected stored time in one immutable run",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileCycleResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request body, coordinates, variables, or half-open time range are invalid",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Bearer authentication failed when tokens are configured",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The run or a variable absent from the complete selection was not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Run changed while the query was executing",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the configured byte limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Request is not application/json",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Variable, selected-time, decoded-value, or strict missing-data limit was not satisfied",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store, metadata, allocation, or serialization failure",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service is busy, shutting down, or the authoritative publication catalog is unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Query exceeded its execution deadline and cooperative cancellation was requested",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/v1/version": {
       "get": {
         "tags": [
@@ -8250,6 +8385,136 @@
           }
         }
       },
+      "ProfileCycleApiRequest": {
+        "type": "object",
+        "required": [
+          "model",
+          "run",
+          "latitude",
+          "longitude",
+          "variables"
+        ],
+        "properties": {
+          "end_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "latitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "longitude": {
+            "type": "number",
+            "format": "double"
+          },
+          "missing_policy": {
+            "$ref": "#/components/schemas/ApiMissingPolicy"
+          },
+          "model": {
+            "type": "string"
+          },
+          "run": {
+            "type": "string"
+          },
+          "start_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "variables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ProfileCycleResponse": {
+        "type": "object",
+        "required": [
+          "run",
+          "point",
+          "requested_variables",
+          "requested_time",
+          "missing_policy",
+          "samples"
+        ],
+        "properties": {
+          "missing_policy": {
+            "$ref": "#/components/schemas/ApiMissingPolicy"
+          },
+          "point": {
+            "$ref": "#/components/schemas/GridPointResponse"
+          },
+          "requested_time": {
+            "$ref": "#/components/schemas/TimeRangeResponse"
+          },
+          "requested_variables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "run": {
+            "$ref": "#/components/schemas/RunDescriptorResponse"
+          },
+          "samples": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProfileCycleSampleResponse"
+            }
+          }
+        }
+      },
+      "ProfileCycleSampleResponse": {
+        "type": "object",
+        "required": [
+          "time",
+          "source_provenance",
+          "status",
+          "variables",
+          "missing_variables"
+        ],
+        "properties": {
+          "missing_variables": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "source_provenance": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceProvenanceResponse"
+            }
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProfileCycleSampleStatusResponse"
+          },
+          "time": {
+            "$ref": "#/components/schemas/TimePointResponse"
+          },
+          "variables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PressureProfileResponse"
+            }
+          }
+        }
+      },
+      "ProfileCycleSampleStatusResponse": {
+        "type": "string",
+        "enum": [
+          "complete",
+          "partial",
+          "gap"
+        ]
+      },
       "ProfileResponse": {
         "type": "object",
         "required": [
@@ -10230,6 +10495,25 @@
           }
         }
       },
+      "TimeRangeResponse": {
+        "type": "object",
+        "properties": {
+          "end_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "start_unix": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
       "VariableCapabilityResponse": {
         "type": "object",
         "required": [
@@ -10245,6 +10529,7 @@
           "coverage",
           "point_series",
           "pressure_profile",
+          "profile_cycle",
           "geographic_window",
           "scalar_temporal_reduction",
           "temporal"
@@ -10294,6 +10579,9 @@
             "type": "boolean"
           },
           "pressure_profile": {
+            "type": "boolean"
+          },
+          "profile_cycle": {
             "type": "boolean"
           },
           "scalar_temporal_reduction": {
