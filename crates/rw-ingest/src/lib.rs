@@ -778,17 +778,14 @@ pub fn validate_ingest_profile_for_model(
     profile: &ingest_profile::IngestProfile,
 ) -> Result<(), IngestError> {
     profile.validate().map_err(events::other)?;
-    if model == rustwx_core::ModelId::Geps && profile != &ingest_profile::IngestProfile::surface() {
-        return Err(events::other(
-            "model 'geps' stores provider-published pressure-level and surface statistics as a typed 2-D collection; use --profile surface exactly",
-        ));
-    }
-    if model == rustwx_core::ModelId::Reps
+    if model_ingest_capability(model)
+        .limitations
+        .contains(&IngestCapabilityLimitation::ProviderStatisticsOnly)
         && profile != &ingest_profile::IngestProfile::surface_for_model(model)
     {
-        return Err(events::other(
-            "model 'reps' exposes only its exact typed provider-statistics inventory; use --profile surface exactly",
-        ));
+        return Err(events::other(format!(
+            "model '{model}' exposes only its exact typed provider-statistics inventory; use --profile surface exactly"
+        )));
     }
     let plan = fetch_plan(model)?;
     if !plan.iter().any(|product| product.surface_source) {
@@ -1902,24 +1899,31 @@ mod tests {
     }
 
     #[test]
-    fn geps_requires_the_exact_typed_two_dimensional_statistics_profile() {
+    fn provider_statistics_models_require_their_exact_typed_surface_profile() {
         use rustwx_core::ModelId;
 
-        validate_ingest_profile_for_model(ModelId::Geps, &ingest_profile::IngestProfile::surface())
-            .expect("the complete surface preset selects the typed GEPS 2-D collection");
-        for profile in [
-            ingest_profile::IngestProfile::analysis(),
-            ingest_profile::IngestProfile::sounding(),
-            ingest_profile::IngestProfile::full(),
-        ] {
-            let message = validate_ingest_profile_for_model(ModelId::Geps, &profile)
-                .expect_err("no partial or pressure-volume profile may relabel GEPS statistics")
-                .to_string();
-            assert!(message.contains("provider-published"), "got: {message}");
-            assert!(
-                message.contains("--profile surface exactly"),
-                "got: {message}"
-            );
+        for model in [ModelId::CmaGeps, ModelId::Geps, ModelId::Reps] {
+            validate_ingest_profile_for_model(
+                model,
+                &ingest_profile::IngestProfile::surface_for_model(model),
+            )
+            .expect("the model-specific surface preset selects the exact typed statistics set");
+            for profile in [
+                ingest_profile::IngestProfile::analysis(),
+                ingest_profile::IngestProfile::sounding(),
+                ingest_profile::IngestProfile::full(),
+            ] {
+                let message = validate_ingest_profile_for_model(model, &profile)
+                    .expect_err(
+                        "no partial or pressure-volume profile may relabel provider statistics",
+                    )
+                    .to_string();
+                assert!(message.contains("provider-statistics"), "got: {message}");
+                assert!(
+                    message.contains("--profile surface exactly"),
+                    "got: {message}"
+                );
+            }
         }
     }
 
