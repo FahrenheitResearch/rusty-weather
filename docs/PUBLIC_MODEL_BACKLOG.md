@@ -5,7 +5,7 @@ document, not a claim that the feeds below are supported. Current support is
 reported only by [MODEL_SUPPORT.md](MODEL_SUPPORT.md) and the running service's
 `/v1/models` response.
 
-This inventory contains 61 deduplicated atmospheric model/domain lanes that
+This inventory contains 70 deduplicated atmospheric model/domain lanes that
 are not represented as working remote lanes in the current capability matrix.
 A lane is counted once even when it has both published statistics and raw
 members, or several delivery choices. Different resolutions of the same model
@@ -60,6 +60,18 @@ server-side filters, or one-field objects where available. The size figures
 below are observed or provider-documented budgeting examples, not contracts.
 Record measured object and selected-range sizes in the fixture manifest.
 
+### Preserve atmospheric-composition identity
+
+Air-quality fields are not interchangeable just because their display units
+can be converted. Persist chemical species or aerosol size class, concentration
+basis (mass, dry-air mole fraction, mixing ratio, optical depth, or column
+integral), humidity convention, vertical support, averaging interval, and raw,
+bias-corrected, analysis, or forecast status. A provider-local constituent code
+must resolve through a pinned official table or remain unsupported. Never map a
+column integral to a surface concentration, a provider median to a deterministic
+member, or a bias-corrected product over the raw field with the same canonical
+identity.
+
 ## Ranked implementation queue
 
 The order favors operational, anonymous, structured GRIB2 feeds that preserve
@@ -68,9 +80,9 @@ existing contract, `P2` needs a new bounded acquisition/format adapter, and
 `P3` is gated by a core storage or topology extension.
 
 Rank numbers are stable, append-only review identifiers so links and review
-notes do not churn. Rows 46-55 are the third discovery wave and rows 56-61 are
-the fourth; use `Class` and the shared implementation sequence below for
-current execution priority.
+notes do not churn. Rows 46-55 are the third discovery wave, rows 56-61 are the
+fourth, and rows 62-70 are the fifth; use `Class` and the shared implementation
+sequence below for current execution priority.
 
 | Rank | Lane | Class | Native schedule and domain | Public data and first implementation slice |
 | ---: | --- | --- | --- | --- |
@@ -135,27 +147,36 @@ current execution priority.
 | 59 | ARPAE-SIMC ICON-2I Emilia-Romagna crop | P2 | Emilia-Romagna, 153x81 regular lat/lon, 00/12Z; hourly f000-f072 | Anonymous single-cycle GRIB2, about 169 MB and 7,521 messages, with six pressure levels. No sidecar index is published: range-scan once, cache exact message offsets, and fail closed on provider-local unknown fields. |
 | 60 | RMI ALARO Belgium 4 km | P3 | Belgium and surroundings, 177x177 regular lat/lon near 4 km, 00/06/12/18Z; hourly f000-f060 | Anonymous per-variable GRIB1, about 362 MB for a current full run. Pressure fields carry 15 levels; provider local tables are mandatory for precipitation and other local concepts. |
 | 61 | UWC-West DINI-EPS Ireland | P3 | Ireland regional 2 km Lambert grids, hourly cycling; control to f060 and lagged 31-member ensemble to f054 | Met Eireann's near-real-time API delivers GRIB2 CCSDS. Five perturbed members arrive each hour and the full ensemble spans six reference times; preserve reference time, perturbation number, and accumulation resets, and never route duplicated filenames alone. |
+| 62 | ECCC REPS published statistics | P1/P3 | Canada and adjacent US, 908x960 rotated lat/lon at 0.09 degree, 00/06/12/18Z; 3-hourly f000-f072 | Anonymous per-field GRIB2. Ingest provider percentiles, mean, spread, minimum, and maximum first. The control plus 20 perturbed members remain P3 until member identity is durable. |
+| 63 | ECCC CAPS Arctic 3 km atmosphere | P1/P2 | Arctic basin, 2230x1830 rotated lat/lon at 0.03 degree, 00/12Z; hourly f000-f048 | Anonymous per-field GRIB2 from an experimental coupled atmosphere-ocean-ice system. Start a sparse atmospheric surface/pressure suite, preserve experimental status, and keep ocean/ice output outside this lane. |
+| 64 | ECCC RAQDPS air quality | P1/P2 | North America, 729x599 rotated lat/lon at 0.09 degree, 00/12Z; hourly f000-f072 | Anonymous per-field GRIB2 for surface pollutants and separate column products. Pin ECCC constituent mappings, including wildfire-smoke PM2.5; stock ecCodes currently reports some live messages as unknown. |
+| 65 | NOAA AQM/CMAQ CONUS grid 227 | P1/P2 | CONUS, 1473x1025 Lambert grid at about 5.1 km; current listing publishes 06/12Z, 72 one-hour forecast intervals | Anonymous per-variable aggregate GRIB2 without `.idx`. Start raw one-hour PM2.5 and ozone, build a bounded inventory once, and keep bias-corrected/max-window products distinct. |
+| 66 | NOAA AQM/CMAQ Alaska grid 198 | P1/P2 | Alaska, 825x553 polar stereographic grid at about 6 km; current listing publishes 06/12Z, 72 one-hour intervals | Same AQM contract on a materially different provider grid. A complete current PM2.5 aggregate is about 18.5 MB and contains 72 messages. |
+| 67 | NOAA AQM/CMAQ Hawaii grid 196 | P1/P2 | Hawaii, 321x225 Mercator grid at 2.5 km; current listing publishes 06/12Z, 72 one-hour intervals | Same AQM contract on the provider's Hawaii grid. A complete current PM2.5 aggregate is about 1.8 MB and is the smallest geometry/interval fixture. |
+| 68 | NASA GMAO GEOS-CF v2 | P2 | Global 0.25-degree 1440x721 grid, daily production with a five-day forecast; hourly surface and pressure-level composition collections | Anonymous NCCS OPeNDAP and public S3 Zarr. Treat it as a research composition forecast, preserve half-hour-centred average times and RH35 PM identity, and use only projected slices or bounded chunks. |
+| 69 | CAMS global atmospheric composition forecast | P2 | Global 0.4-degree regular grid, 00/12Z to five days; hourly single-level and provider-constrained multi-level output | Account/API-token ADS retrieval under CC BY 4.0. Use the anonymous STAC/form/cost endpoints to validate and budget a tightly targeted GRIB or zipped-NetCDF request before authenticated execution. |
+| 70 | CAMS European air-quality ensemble median | P2/P3 | Europe 25W-45E, 30N-72N at 0.1 degree, daily; hourly f000-f096 on surface through 5000 m | Ingest the provider-published 11-system ensemble median first. Individual system outputs and any locally derived spread need a durable model-member identity and remain P3. |
 
 ### Shared implementation sequence
 
-Do not create 61 unrelated downloaders. Land the reusable contracts in this
+Do not create 70 unrelated downloaders. Land the reusable contracts in this
 order, then add thin provider manifests and canonical maps:
 
 1. Separate producer, licensing publisher, direct transport, and mirror in
    provenance. Make licence/attribution visible at run and API level.
 2. Add a bounded remote GRIB inventory scanner that can use byte ranges when a
    provider lacks `.idx`, plus an explicit WMO bulletin-wrapper decoder. This
-   unlocks CMA, Roshydromet, CWA, CPTEC/INPE, ARPAE-SIMC, and later large
-   package feeds.
+   unlocks CMA, Roshydromet, CWA, CPTEC/INPE, ARPAE-SIMC, NOAA AQM, and later
+   large package feeds.
 3. Add one bounded CF-NetCDF/OPeNDAP acquisition contract with dimension,
-   chunk, response, and decompression ceilings. Use it for GEOS-FP, Met Office,
-   MET Norway, Argentina SMN, GeoSphere Austria, and MeteoGalicia rather than
-   provider-specific NetCDF parsers.
+   chunk, response, and decompression ceilings. Use it for GEOS-FP, GEOS-CF,
+   Met Office, MET Norway, Argentina SMN, GeoSphere Austria, and MeteoGalicia
+   rather than provider-specific NetCDF parsers.
 4. Add LAEA geometry before claiming UKV or MOGREPS-UK. Keep provider-native
    coordinates and grid mapping; any regrid is a derived product.
 5. Add ensemble member plus reference-time identity before raw GEPS, ECMWF,
-   MOGREPS, CFSv2, PEARP, SMHI MEPS, MeteoGalicia WRF, WeatherNext 2,
-   DINI-EPS, or ICON EPS members.
+   REPS, MOGREPS, CFSv2, PEARP, SMHI MEPS, MeteoGalicia WRF, WeatherNext 2,
+   CAMS individual systems, DINI-EPS, or ICON EPS members.
 6. Add triangular topology before native global ICON, DWD ICON EPS, or
    MeteoSwiss ICON-CH. Do not silently substitute a local rectangular regrid.
 7. Decide whether GRIB1 is decoded in process or normalized by a separately
@@ -164,6 +185,10 @@ order, then add thin provider manifests and canonical maps:
 8. Add a fail-closed availability/licence-window policy before WeatherNext 2:
    historical objects older than 48 hours may enter the public adapter, while
    current data remain undiscoverable and unqueryable without different rights.
+9. Add the composition identity contract before RAQDPS, NOAA AQM, GEOS-CF, or
+   CAMS. Require provider-table fixtures and distinct canonical roles for
+   surface concentration, mixing ratio, mole fraction, optical depth, column
+   integral, averaging window, humidity basis, and bias correction.
 
 ## Authoritative access contracts
 
@@ -184,14 +209,66 @@ alternate delivery host, not a different producer.
   and `https://dd.weather.gc.ca/today/model_hrdps/continental/2.5km/{HH}/{hhh}/`
 - GEPS: <https://eccc-msc.github.io/open-data/msc-data/nwp_geps/readme_geps-datamart_en/>
   and `https://dd.weather.gc.ca/today/ensemble/geps/grib2/{raw|products}/{HH}/{hhh}/`
+- REPS: <https://eccc-msc.github.io/open-data/msc-data/nwp_reps/readme_reps-datamart_en/>
+  and `https://dd.weather.gc.ca/today/ensemble/reps/10km/grib2/{HH}/{hhh}/`
+- CAPS: <https://eccc-msc.github.io/open-data/msc-data/nwp_caps/readme_caps-datamart_en/>
+  and `https://dd.weather.gc.ca/today/model_caps/3km/{HH}/{hhh}/`
+- RAQDPS: <https://eccc-msc.github.io/open-data/msc-data/nwp_raqdps/readme_raqdps-datamart_en/>
+  and `https://dd.weather.gc.ca/today/model_raqdps/10km/grib2/{HH}/{hhh}/`
 
 Authentication is not required. Dated DataMart roots retain roughly 30 days;
 `/today` is the current-day view. No companion record indexes are published,
-but files are already split by variable, level, and lead (GEPS groups all
-members or all products for that field). Whole-object GET is therefore the
-normal path. Enumerate a bounded directory, HEAD selected objects, and sum
-their lengths before acquisition. AMQP notification is the preferred follow
+but files are already split by variable, level, and lead (GEPS and REPS group
+members or products for one field). Whole-object GET is therefore the normal
+path. Enumerate a bounded directory, HEAD selected objects, and sum their
+lengths before acquisition. AMQP notification is the preferred follow
 mechanism after the initial HTTP adapter.
+
+REPS runs four times daily and publishes 3-hourly leads through f072 on a
+908x960 rotated grid. Its current naming table and live directories reach f072
+even though one introductory directory bullet still says f048; cadence tests
+must follow observed complete roles rather than that stale bullet. The bounded
+`20260814T00Z_MSC_REPS_TMP-Prob_AGL-2m_RLatLon0.09x0.09_PT024H.grib2`
+fixture is 4,602,451 bytes, ETag `"463a53-658f9779ad240"`, and SHA-256
+`1cb07165788e942d1c3a9b6680078f54b494f16243032157ae5f5c00b5952259`.
+Direct object:
+`https://dd.weather.gc.ca/today/ensemble/reps/10km/grib2/00/024/20260814T00Z_MSC_REPS_TMP-Prob_AGL-2m_RLatLon0.09x0.09_PT024H.grib2`.
+Its nine messages are provider statistics: percentiles 10/25/50/75/90 in
+product definition template 6, followed by spread, unweighted mean, minimum,
+and maximum in template 2, each describing 20 perturbed forecasts. The paired
+9,108,868-byte raw-member object has ETag `"8afd84-658f994cfa0c0"` and SHA-256
+`c70292b8829c83721395fa525853f0b94f10602467601974b68e2846bc938926`
+and contains the control plus perturbations 1-20. It is a member-contract
+fixture, not permission to expose raw members early.
+Its direct URL is
+`https://dd.weather.gc.ca/today/ensemble/reps/10km/grib2/00/024/20260814T00Z_MSC_REPS_TMP_AGL-2m_RLatLon0.09x0.09_PT024H.grib2`.
+
+CAPS runs at 00/12Z with hourly f000-f048 atmospheric objects on a 2230x1830
+rotated grid. It is explicitly experimental and coupled to ocean and ice; the
+first RWS lane is atmospheric GRIB2 only. The f000 2 m air-temperature object
+`20260814T00Z_MSC_CAPS_AirTemp_AGL-2m_RLatLon0.03_PT000H.grib2` is
+1,268,084 bytes, ETag `"135974-658fba778a080"`, and SHA-256
+`8e6a8a6eaea0ec75b56595f549566c545ad8397e2edef3ac55ef8a869fad54b9`.
+Direct object:
+`https://dd.weather.gc.ca/today/model_caps/3km/00/000/20260814T00Z_MSC_CAPS_AirTemp_AGL-2m_RLatLon0.03_PT000H.grib2`.
+Its GRIB production-status key is experimental. The geometry fixture must also
+prove rotated-grid coordinates and vector-wind rotation rather than trusting
+unrotated corner labels.
+
+RAQDPS publishes deterministic hourly f000-f072 surface concentrations and
+separate entire-atmosphere integrals. The f001 wildfire-smoke PM2.5 object
+`20260814T00Z_MSC_RAQDPS_PM2.5-WildfireSmokePlume_Sfc_RLatLon0.09_PT001H.grib2`
+is 98,069 bytes, ETag `"17f15-658f9c155f180"`, and SHA-256
+`74a0629afe020a887dbd1f76ba43b44e4cc89874c0516170fc22481bdfd8d496`.
+Direct object:
+`https://dd.weather.gc.ca/today/model_raqdps/10km/grib2/00/001/20260814T00Z_MSC_RAQDPS_PM2.5-WildfireSmokePlume_Sfc_RLatLon0.09_PT001H.grib2`.
+It is one message on a 729x599 rotated grid. Its provider-local
+`constituentType=62026` is unresolved by stock ecCodes even though the filename
+and ECCC inventory identify wildfire-smoke PM2.5; the adapter must pin ECCC's
+official mapping and fail closed on every unmapped code. The observed message
+also reports a 2 m height-above-ground fixed surface despite `Sfc` in the
+filename; fixture the decoded vertical support and never route by filename
+alone.
 
 ### Deutscher Wetterdienst (DWD)
 
@@ -279,6 +356,89 @@ surface fields and pressure levels 1000, 925, 850, 700, 600, 500, 400, 300,
 250, 200, 150, 100, 50, and 10 hPa. Capture exact type/number semantics for
 `cf`, `pf`, `em`, `es`, and `ep`; do not infer them from filename position.
 
+### Copernicus Atmosphere Monitoring Service (CAMS)
+
+The global forecast is produced by **CAMS/ECMWF**. The European forecast and
+its median are produced by the **CAMS regional production consortium** and
+published centrally by ECMWF. For both, the licensing publisher is the
+**European Union represented by ECMWF**. Direct transport is the Atmosphere
+Data Store (ADS); its backing ECMWF object-store host is only transport.
+
+- Global dataset:
+  <https://ads.atmosphere.copernicus.eu/datasets/cams-global-atmospheric-composition-forecasts>
+- Global STAC collection:
+  <https://ads.atmosphere.copernicus.eu/api/catalogue/v1/collections/cams-global-atmospheric-composition-forecasts>
+- Global technical documentation:
+  <https://confluence.ecmwf.int/pages/viewpage.action?pageId=347605172>
+- European dataset:
+  <https://ads.atmosphere.copernicus.eu/datasets/cams-europe-air-quality-forecasts>
+- European STAC collection:
+  <https://ads.atmosphere.copernicus.eu/api/catalogue/v1/collections/cams-europe-air-quality-forecasts>
+- Retrieve endpoint template:
+  `https://ads.atmosphere.copernicus.eu/api/retrieve/v1/processes/{dataset}`
+- Cost endpoint template:
+  `https://ads.atmosphere.copernicus.eu/api/retrieve/v1/processes/{dataset}/costing`
+
+Retrieval requires a free ADS account, accepted terms, and an API token. STAC,
+form, constraint, process-schema, and costing endpoints are anonymous, so an
+adapter can validate and budget a credential-stripped request before execution.
+Never persist the token or an expiring result URL. Both current STAC records
+declare CC BY 4.0. The Copernicus licence permits worldwide reproduction,
+distribution, and adaptation for any lawful purpose but requires the applicable
+`Generated using` or `Contains modified Copernicus Atmosphere Monitoring
+Service information [Year]` notice plus the liability disclaimer.
+
+The global forecast is provider-interpolated to a regular 0.4-degree grid,
+runs at 00/12Z, and reaches 120 hours. Surface fields are hourly; multi-level
+availability is constrained by variable, pressure/model level, and lead. It
+includes more than 50 chemical species, seven aerosol families, and selected
+meteorological fields. Persist surface concentration, dry-air mole fraction,
+mass mixing ratio, optical depth, and column products as different roles. The
+ADS catalogue spans 2015 to present; the current form warns that dates older
+than 30 days are slow, tape-backed retrievals.
+
+The global form is 93,863 bytes, SHA-256
+`97f7eee229c6535a5edcf71666f0596cbdbe4c04bd77e4cc6f61280683cc12e7`;
+its 886,338-byte constraint graph has SHA-256
+`d5823ffab0ba80a391dbf9fa1d457bce00d62538f6731f6747735976e9a196c4`.
+Exact form and constraint URLs are
+`https://object-store.os-api.cci2.ecmwf.int:443/cci2-prod-catalogue/resources/cams-global-atmospheric-composition-forecasts/form_97f7eee229c6535a5edcf71666f0596cbdbe4c04bd77e4cc6f61280683cc12e7.json`
+and
+`https://object-store.os-api.cci2.ecmwf.int:443/cci2-prod-catalogue/resources/cams-global-atmospheric-composition-forecasts/constraints_d5823ffab0ba80a391dbf9fa1d457bce00d62538f6731f6747735976e9a196c4.json`.
+An anonymous cost request for `particulate_matter_2.5um`, 2026-08-13 00Z,
+f000, forecast, GRIB, and area `[1,0,0,1]` returned the 40-byte response
+`{"id":"size","cost":1.0,"limit":10000.0}`, SHA-256
+`7ad15aee938bbf976aa2a315d50cc7022208db7a35c02f1e5b8ff14e4f9978e8`.
+Fixture the exact current process-schema keys, including `data_format`, rather
+than copying obsolete client examples that use `format`.
+
+The European product is a daily, hourly, 96-hour forecast on a 0.1-degree grid
+over 25W-45E and 30N-72N, with surface and 50/100/250/500/750/1000/2000/3000/
+5000 m levels. Eleven regional systems contribute to the provider-published
+median. Only NO, NO2, SO2, ozone, PM2.5, PM10, and dust are regularly validated;
+advertise other variables as experimental. The first adapter selects
+`model=ensemble` only. Individual systems are not exchangeable perturbations
+and require a durable model-member identity before support. The archive rolls
+over three years. The provider targets 06:45 UTC availability for f000-f048 and
+08:30 UTC for f049-f096; completeness must be role-based across that split.
+
+The European form is 11,969 bytes, SHA-256
+`96247c7d47e29c46b4063e465e7a2e5ccbd28b35749df5da41b1c9b2938ef40a`;
+its 75,565-byte constraint graph has SHA-256
+`61b62d0a522e5bdc30f4303465e9f5f2b51a84319366f371858433a0794f0f49`.
+Exact form and constraint URLs are
+`https://object-store.os-api.cci2.ecmwf.int:443/cci2-prod-catalogue/resources/cams-europe-air-quality-forecasts/form_96247c7d47e29c46b4063e465e7a2e5ccbd28b35749df5da41b1c9b2938ef40a.json`
+and
+`https://object-store.os-api.cci2.ecmwf.int:443/cci2-prod-catalogue/resources/cams-europe-air-quality-forecasts/constraints_61b62d0a522e5bdc30f4303465e9f5f2b51a84319366f371858433a0794f0f49.json`.
+An anonymous cost request for ensemble PM2.5 at level 0, 2026-08-13 00Z,
+f000, forecast, GRIB, and area `[31,-24,30,-23]` returned the 39-byte response
+`{"id":"size","cost":1.0,"limit":5000.0}`, SHA-256
+`2fb9a946e02e4b456d9c2624ab3d37cea9f91d02c874f493fed2d09318cb0229`.
+The costing result is a request-unit budget, not a byte estimate. Before
+downloading, require the authenticated job's returned asset `file:size` to fit
+the response/decompression budget; this survey deliberately used no account
+and therefore does not claim a payload byte count.
+
 ### Met Office
 
 Producer and licensing publisher: **UK Met Office**. The anonymous public
@@ -330,7 +490,7 @@ and [WIS2 Global Cache data sheet](https://www.metoffice.gov.uk/binaries/content
 
 Producer: **NASA Global Modeling and Assimilation Office**. Licensing
 publisher: **NASA**. Direct transports are the NCCS OPeNDAP and GMAO portal
-hosts; neither is a separate data owner.
+hosts; the public AWS S3 bucket is a mirror. None is a separate data owner.
 
 - GMAO product catalogue: <https://gmao.gsfc.nasa.gov/gmao-products/>
 - GEOS near-real-time products:
@@ -343,6 +503,12 @@ hosts; neither is a separate data owner.
 - Pressure-level latest endpoint:
   <https://opendap.nccs.nasa.gov/dods/GEOS-5/fp/0.25_deg/fcast/inst3_3d_asm_Cp.latest>
 - Dated portal root: <https://portal.nccs.nasa.gov/datashare/gmao/geos-fp/>
+- GEOS-CF overview: <https://gmao.gsfc.nasa.gov/gmao-products/geos-cf/>
+- GEOS-CF data access: <https://gmao.gsfc.nasa.gov/gmao-products/geos-cf/data-access_geos-cf/>
+- GEOS-CF v2 forecast OPeNDAP root:
+  <https://opendap.nccs.nasa.gov/dods/gmao/geos-cf/v2/fcst>
+- GEOS-CF latest public Zarr mirror:
+  `s3://smce-geos-cf-public/geos-cf-v2-fcst-latest.zarr/`
 
 Authentication is not required. The current production system uses a C720
 cubed-sphere solver near 12.5 km, but the published analysis/forecast files are
@@ -358,6 +524,30 @@ says NASA-led unrestricted data are available under CC0 by default, permit
 reproduction and distribution, require acknowledgement of NASA, and do not
 permit implied endorsement. GMAO explicitly calls GEOS-FP experimental and
 non-operational with no backup; expose that stability class in capabilities.
+
+GEOS-CF v2 is a separate research composition forecast, not another GEOS-FP
+grid alias. It publishes global 1440x721 regular 0.25-degree collections from a
+daily forecast extending five days. The surface air-quality collection has 120
+hourly averages; chemistry and meteorology are also published on 23 pressure
+levels, and other collections have model-level or 15-minute products. GMAO says
+v2 begins 2025-08-04. The public `aqc` forecast history is retained, while most
+other forecast collections retain only the latest 14 days.
+
+Use a dated dataset for numerical fixtures, never the mutable `.latest` alias.
+For `aqc_tavg_1hr_glo_L1440x721_slv.20260813_09z`, the 1,572-byte DDS has
+SHA-256
+`740124d098c80f92a98500952d84f68a0a7ea70b01ea22ba4651c291950d9b9f`
+and the 2,918-byte DAS has SHA-256
+`322d6e050503928771e53d554f6d36fbf33db5fc5eb1e1d00ac9c5d9ba9c64be`.
+The bounded OPeNDAP projection
+`?pm25_rh35[0:1:0][0:1:0][360:1:361][720:1:721]` is 164 bytes, SHA-256
+`8c38fe2e601d1c5c4ae04b374b38bc457ebc2206e6ae519fdc061aa1cb22f6b4`,
+and returns four values at latitudes 0/0.25 and longitudes 0/0.25. Its first
+time is 09:30Z, not the 09Z run label. The DAS defines `pm25_rh35` as PM2.5
+mass including water at 35 percent relative humidity in micrograms per cubic
+metre; preserve that humidity basis in the canonical identity.
+The exact projection URL is
+`https://opendap.nccs.nasa.gov/dods/gmao/geos-cf/v2/fcst/aqc_tavg_1hr_glo_L1440x721_slv/aqc_tavg_1hr_glo_L1440x721_slv.20260813_09z.ascii?pm25_rh35[0:1:0][0:1:0][360:1:361][720:1:721]`.
 
 ### Météo-France
 
@@ -687,7 +877,7 @@ age gate, fail closed around the boundary, and never advertise a current or
 `latest` run. Start with the official mean, then add raw members only after
 the ensemble-member contract and bounded Zarr/BigQuery acquisition are ready.
 
-### NOAA/NCEP CFSv2
+### NOAA/NCEP CFSv2 and Air Quality Model
 
 Producer/licensor: **NOAA National Centers for Environmental Prediction**.
 Real-time transport is NCEP NOMADS; long-term archive transport is NOAA NCEI.
@@ -699,6 +889,10 @@ Real-time transport is NCEP NOMADS; long-term archive transport is NOAA NCEI.
   `https://nomads.ncep.noaa.gov/pub/data/nccf/com/cfs/prod/cfs.{YYYYMMDD}/{HH}/6hrly_grib_{01|02|03|04}/`
 - NCEI archive:
   <https://www.ncei.noaa.gov/data/climate-forecast-system/access/operational-9-month-forecast/>
+- AQM/CMAQ product inventory:
+  <https://www.nco.ncep.noaa.gov/pmb/products/aqm/>
+- AQM current-cycle template:
+  `https://nomads.ncep.noaa.gov/pub/data/nccf/com/aqm/prod/aqm.{YYYYMMDD}/{HH}/`
 
 Authentication is not required. Each GRIB2 object has an `.idx` companion and
 supports range selection. Representative current object sizes are about 4.2
@@ -706,6 +900,46 @@ MB for one `flxf` valid time, 23.9 MB for `pgbf`, and 5.2 MB for `ipvf`, before
 multiplying by four members and the long 6-hourly horizon. The live NOMADS root
 holds roughly a week; NCEI provides the durable archive. Ocean output should be
 a later, separate canonical-domain effort.
+
+AQM is NOAA/NWS/NCEP's operational CMAQ-based deterministic composition
+forecast; NOMADS is transport, not owner. Its raw one-hour PM2.5 and ozone
+files are separate 72-message GRIB2 aggregates on provider grids 227 (CONUS
+Lambert), 198 (Alaska polar stereographic), and 196 (Hawaii Mercator). The
+current listing publishes 06/12Z cycles even though the generic inventory page
+shows four cycle placeholders; fixture observed cadence and do not advertise a
+cycle merely because a URL template permits it. The live directory has no
+`.idx`, but objects accept byte ranges. Inventory each selected aggregate once,
+cache exact message offsets, and distinguish raw fields from bias-corrected,
+8/24-hour, and maximum products. The observed NOMADS AQM root held only two
+dates; treat it as volatile current transport and retain immutable fixtures.
+
+Three 2026-08-13 12Z `ave_1hr_pm25` objects provide bounded domain fixtures:
+
+- Grid 196 is 1,837,008 bytes with 72 messages, SHA-256
+  `551e3df97df5618b6cceff4e4de0dc6c6201069f83af33ba9736db2e7b214e4f`.
+  Direct object:
+  `https://nomads.ncep.noaa.gov/pub/data/nccf/com/aqm/prod/aqm.20260813/12/aqm.t12z.ave_1hr_pm25.196.grib2`.
+  It is a 321x225 Mercator grid at 2,500 m. Byte range `0-23875` is the first
+  complete message, SHA-256
+  `4b569cad155b402c70b5281abc72e2ab30622f10272025a8527782d4cb8510ad`.
+- Grid 198 is 18,452,903 bytes with 72 messages, SHA-256
+  `ce3056d4cc9af7c77835a1ca07b9599931ff0f532b823ece138feb5742e05dd1`.
+  Direct object:
+  `https://nomads.ncep.noaa.gov/pub/data/nccf/com/aqm/prod/aqm.20260813/12/aqm.t12z.ave_1hr_pm25.198.grib2`.
+  It is an 825x553 polar stereographic grid at 5,953 m. Byte range `0-243774`
+  is the first message, SHA-256
+  `67f70cc75a72a432f44e242cfee5b01e430a891b2ebbd3a723de0fe13c897b9e`.
+- Grid 227 is 62,592,411 bytes with 72 messages, SHA-256
+  `149334195d267c7d0d0315de08db3699aba8a152d196f1915cbc0c6f2277f0ef`.
+  Direct object:
+  `https://nomads.ncep.noaa.gov/pub/data/nccf/com/aqm/prod/aqm.20260813/12/aqm.t12z.ave_1hr_pm25.227.grib2`.
+  It is a 1473x1025 Lambert grid at 5,079 m. Byte range `0-833245` is the first
+  message, SHA-256
+  `5de8cad0659ec29d92d39cf56b4b5d2c78c501c6abc200064f6a18be21d3233a`.
+
+Each fixture's 72 messages describe exact one-hour average intervals from 0-1
+through 71-72 hours. Preserve those bounds and the native PM mass-concentration
+units rather than treating the fields as instantaneous valid-time snapshots.
 
 ### MeteoSwiss
 
@@ -899,6 +1133,8 @@ are recorded.
 | `cma` | CMA-GEPS record declares WMO core: free and unrestricted, without charge or conditions on use | No WMO-core usage condition; retain CMA origin and WIS2 record as provenance | [CMA-GEPS discovery metadata](https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn%3Awmo%3Amd%3Acn-cma%3Adata.core.weather.prediction.forecast.medium-range.probabilistic.global?f=html) and [WMO policy](https://public.wmo.int/wmo-unified-data-policy-resolution-res1) |
 | `roshydromet` | ICON limited-area record declares WMO core: free and unrestricted, without charge or conditions on use | No WMO-core usage condition; retain Roshydromet/Hydrometcentre origin and WIS2 record as provenance | [Roshydromet discovery metadata](https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn%3Awmo%3Amd%3Aru-roshydromet%3Awipps-dc.forecast.short-range.deterministic.limited-area.icon?f=html) and [WMO policy](https://public.wmo.int/wmo-unified-data-policy-resolution-res1) |
 | `ecmwf` | Open subset may be redistributed and used commercially under CC BY 4.0 plus ECMWF terms | ECMWF attribution required by the terms; preserve licence and modification information | <https://www.ecmwf.int/en/forecasts/datasets/open-data> |
+| `cams-ecmwf-global` via `copernicus-eu` | CAMS STAC declares CC BY 4.0; the Copernicus licence permits worldwide reproduction, distribution, adaptation, and commercial use | Persist CAMS/ECMWF as producer, European Union represented by ECMWF as licensing publisher, the applicable `Generated using` or `Contains modified Copernicus Atmosphere Monitoring Service information [Year]` notice, and the required EC/ECMWF liability disclaimer | [global STAC](https://ads.atmosphere.copernicus.eu/api/catalogue/v1/collections/cams-global-atmospheric-composition-forecasts) and [Copernicus licence](https://ads.atmosphere.copernicus.eu/licences/licence-to-use-copernicus-products) |
+| `cams-regional-ensemble` via `copernicus-eu` | The European forecast STAC declares the same CC BY 4.0 terms | Persist the CAMS regional production consortium as producer, European Union represented by ECMWF as licensing publisher, the CAMS notice, year, modification status, and disclaimer | [European STAC](https://ads.atmosphere.copernicus.eu/api/catalogue/v1/collections/cams-europe-air-quality-forecasts) and [Copernicus licence](https://ads.atmosphere.copernicus.eu/licences/licence-to-use-copernicus-products) |
 | `met-office` | ASDI atmospheric model data are British Crown copyright under CC BY-SA | UK Met Office/Crown attribution, licence link, and share-alike obligations for adapted material | [Met Office global ASDI registry](https://registry.opendata.aws/met-office-global-deterministic/) |
 | `nasa-gmao` | NASA-led unrestricted Earth-science data default to CC0 and permit reproduction/distribution | Acknowledge NASA/GMAO; do not imply NASA endorsement | <https://www.earthdata.nasa.gov/engage/open-data-services-software/data-use-policy> |
 | `meteo-france` | Licence Ouverte / Open Licence 2.0 permits reuse, including commercial reuse | `Météo-France`, source link, and indication of modifications | <https://www.data.gouv.fr/datasets/paquets-arpege-resolution-0-25deg> |
@@ -967,7 +1203,12 @@ Provider-specific minimum fixtures:
 
 - ECCC: GDPS/RDPS/HRDPS directory listing plus surface, isobaric, wind, and
   precipitation objects; GEPS `products` file proving each statistic's GRIB
-  metadata, followed later by one `allmbrs` file.
+  metadata, followed later by one `allmbrs` file. For REPS, assert all nine
+  published-statistic messages and use the 21-message raw counterpart only as
+  a disabled member-contract fixture. CAPS must prove 2230x1830 rotated
+  geometry, wind rotation, and experimental status. RAQDPS must fixture an
+  official constituent-code table plus negative unknown-code and
+  surface-versus-column cases.
 - DWD: `.bz2` surface and pressure objects, decompression ceiling, grid-template
   assertion, and deterministic rejection of native-mesh files in structured
   lanes.
@@ -980,13 +1221,21 @@ Provider-specific minimum fixtures:
   and one pressure plus one accumulated surface message.
 - ECMWF: `.index` plus selected ranges for `em`, `es`, `ep`, `cf`, and one `pf`;
   assert ensemble number/control metadata rather than filename-only routing.
+- CAMS: retain anonymous STAC, form, constraint-graph, process-schema, and cost
+  responses, then one credential-stripped targeted-request manifest and tiny
+  authenticated GRIB or NetCDF result. Global fixtures must distinguish
+  concentration, mole fraction, mixing ratio, optical depth, and column roles.
+  Europe must prove `model=ensemble` is the provider median and reject all 11
+  individual system values until model-member identity exists.
 - Met Office: anonymous ASDI listing plus NetCDF header/chunk metadata. Prove
   global regular-grid geometry, UKV/MOGREPS-UK LAEA metadata, MOGREPS-G's 18
   realizations, and MOGREPS-UK's three realizations/reference time without
   downloading a complete field or cycle.
-- NASA GMAO: OPeNDAP DDS/DAS, one tiny projected surface response, one pressure
-  slice, live-vs-spec dimension assertion, and experimental-service stability
-  metadata.
+- NASA GMAO: for GEOS-FP, retain OPeNDAP DDS/DAS, one tiny projected surface
+  response, one pressure slice, live-vs-spec dimension assertion, and
+  experimental-service stability metadata. For GEOS-CF, use a dated v2 DDS/DAS
+  and tiny `pm25_rh35` projection; assert 1440x721 geometry, 120 half-hour-centred
+  average times, RH35/water identity, and the 14-day non-`aqc` retention class.
 - Météo-France: package/API discovery JSON, one small targeted GRIB2 response,
   representative package metadata without downloading a multi-GB object, and
   a precipitation-window fixture.
@@ -1025,6 +1274,10 @@ Provider-specific minimum fixtures:
   rejection of every current/`latest` discovery path before raw members.
 - CFSv2: `.idx` and selected message ranges from `flxf`, `pgbf`, and `ipvf`,
   with member and six-hour valid-time assertions.
+- NOAA AQM: one live directory listing and the pinned first-message ranges from
+  grids 196, 198, and 227. Assert all three projections/dimensions, 72 exact
+  one-hour intervals, raw-versus-bias-corrected identity, PM units, and absence
+  of `.idx`; never fetch all variables to discover one field.
 - MeteoSwiss: STAC collection and item, parameter CSV, static geometry asset,
   and one bounded signed-asset range with the signature removed from fixtures.
 - KNMI: API manifest, safe tar inventory, and the smallest legal GRIB1 sample;
@@ -1054,7 +1307,7 @@ Provider-specific minimum fixtures:
 
 ## Watchlist and access gates
 
-These feeds are not included in the 61-lane implementation count. Recheck them
+These feeds are not included in the 70-lane implementation count. Recheck them
 periodically, but do not build a production adapter until the named gate is
 closed with an official source and a live bounded fixture.
 
@@ -1066,6 +1319,8 @@ closed with an official source and a live bounded fixture.
 | Australia Bureau of Meteorology ACCESS | [ACCESS NWP products](https://www.bom.gov.au/nwp/doc/access/NWPData.shtml), [copyright notice](https://www.bom.gov.au/copyright), and [data licence agreement](https://www.bom.gov.au/sites/default/files/2026-07/bureau-of-meteorology-data-licence-agreement-june-2026.pdf) | Operational model files use a Registered User/subscriber channel. Default Bureau terms do not establish unrestricted third-party or commercial redistribution. | Obtain and record a licence that covers RWS redistribution and automated access. |
 | JMA GSM/MSM/LFM GPV | [official product catalogue](https://www.data.jma.go.jp/suishin/cgi-bin/catalogue/make_product_page.cgi?id=ZenModel), [JMBSC distribution](https://www.jmbsc.or.jp/en/index-e.html), and [official samples](https://www.data.jma.go.jp/developer/gpv_sample.html) | Operational GPV delivery is through the contracted/paid JMBSC service. Public sample files are suitable only as decoder fixtures and do not establish redistribution rights. | Establish an official operational access and redistribution contract; do not treat sample files as a live feed. |
 | CPTEC/INPE BAM | [official anonymous directory](https://ftp.cptec.inpe.br/modelos/tempo/BAM/) and [INPE 2025-2027 open-data plan](https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/repositorio-de-arquivos/pda_inpe_25_27_v3_defesoeleitoral2026.pdf) | The current anonymous `singleLevel` GRIB2 tree is only a limited subset. The plan marks the base open but schedules complete global raw BAM grid output for June 2027. | Confirm the complete raw grid, inventory, and bounded transport after the scheduled opening; the remaining gate is technical completeness, not general INPE reuse permission. |
+| CPTEC/INPE ETA South America 40 km and RJ/SP 1 km | [official ETA directory](https://ftp.cptec.inpe.br/modelos/tempo/Eta/) and [INPE 2025-2027 open-data plan](https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/repositorio-de-arquivos/pda_inpe_25_27_v3_defesoeleitoral2026.pdf) | Fresh anonymous GRIB1 is live at `ams_40km/brutos/` and `rjsp_01km/brutos/`; 2026-08-14 f000 objects were 10,462,260 and 59,857,266 bytes and accepted byte ranges. The same official plan schedules ETA's formal opening for July 2027, so discoverability is not yet a sufficient redistribution grant. The advertised 8 km archive path was also broken for current 2026 data. | Wait for the scheduled opening or obtain written terms tied to these exact forecast objects, then pin provider GRIB1 tables, grids, schedules, and a bounded range inventory. |
+| Singapore MSS/ASMC smoke-haze dispersion model | [official WIS2 product record](https://wis2.asmc.asean.org/smoke-haze-dispersion-model/) and [live product API](https://z9ppn1a4nj.execute-api.ap-southeast-1.amazonaws.com/v1/collections/asmc_smoke_haze_dispersion/items/ASMC_SMOKE_HAZE_DISPERSION) | The record describes 3-hourly surface PM10 estimates through 24 hours, but the API returns only a 474,117-byte `GIF89a` animation (SHA-256 `0bdf91428bd7a55c462cbcf8204d0dbd259aaae6218ded99c3589ed0db4aa3a3`), not a machine-readable concentration grid. | Locate an official structured PM10 field with explicit reuse terms, or scope the GIF separately as a derived visualization rather than canonical model data. |
 | AEMET HARMONIE-AROME packages | [official catalogue](https://datos.gob.es/en/catalogo/e05068001-datos-del-modelo-harmonie-arome) and [AEMET legal notice](https://www.aemet.es/es/nota_legal) | Public packages are selected derived GeoTIFF/GeoJSON surface products, not a canonical full NWP state. Reuse is allowed with attribution, but counting it as full model normalization would overstate semantics. | Add only as an explicitly derived-product lane, or locate an official full-field feed. |
 | ICPAC WRF East Africa rainfall products | [official dataset API](https://floodwatch.icpac.net/api/datasets), [WRF total-rainfall metadata](https://floodwatch.icpac.net/api/metadata/2769c1e8-97cb-4144-a460-cfca2f97ce3f), and [WRF extreme-rainfall metadata](https://floodwatch.icpac.net/api/metadata/a3a96f87-a5b5-4fb1-9bd0-603959ef6b25) | The live public products are derived daily total/extreme-rainfall COG/tile layers, not the full WRF state, and both official metadata records have a null licence field. | Obtain an ICPAC reuse/redistribution statement tied to the products and either locate the raw model grid or define an explicitly derived-rainfall canonical lane. |
 | Colombia IDEAM WRF | [official model portal](https://bart.ideam.gov.co/wrfideam/) and [live NetCDF directory](https://bart.ideam.gov.co/wrfideam/new_modelo/WRF00COLOMBIA/netcdf/) | Anonymous WRF NetCDF is live, but whole aggregates are tens of GB, the transport offers no observed server-side subset/index contract, and the portal's requested citation is not an explicit redistribution licence. | Tie an official commercial/redistribution licence to this exact dataset and prove a bounded variable/time acquisition path. |
@@ -1075,13 +1330,13 @@ closed with an official source and a live bounded fixture.
 
 ## Deliberately deferred adjacent feeds
 
-The same official catalogues expose ECCC CAPS/REPS/CanSIPS/NAEFS, ECCC analysis
-and air-quality systems, NASA GEOS-CF atmospheric chemistry, CMA-CW dust and
-chemistry products, and multiple ocean, ice, wave, surge, and climate-analysis
-products. They are valuable, but they should be researched as separate
-canonical-domain lanes rather than being counted as atmospheric weather-model
-support. This prevents a large catalogue number from hiding missing semantics
-in the store and API.
+The same official catalogues expose ECCC CanSIPS/NAEFS and analysis systems,
+CMA-CW dust and chemistry products, and multiple ocean, ice, wave, surge, and
+climate-analysis products. They are valuable, but they should be researched as
+separate canonical-domain lanes rather than being counted as atmospheric
+weather-model support. Rows 64-70 are explicitly composition-domain lanes;
+their presence does not imply a complete meteorological state. This prevents a
+large catalogue number from hiding missing semantics in the store and API.
 
 Open model weights or inference code are not themselves an operational public
 forecast feed. GraphCast/GenCast, FourCastNet, Pangu-Weather, Aurora, and
