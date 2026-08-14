@@ -2788,15 +2788,54 @@ fn try_fetch_one(
 }
 
 fn maybe_decompress_grib_payload(url: &str, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
-    let is_gzip = url.to_ascii_lowercase().ends_with(".gz")
-        || bytes
-            .get(0..2)
-            .is_some_and(|magic| magic == [0x1f_u8, 0x8b_u8]);
-    if !is_gzip {
-        return Ok(bytes);
+    let lowercase_url = url.to_ascii_lowercase();
+    let gzip_magic = bytes
+        .get(0..2)
+        .is_some_and(|magic| magic == [0x1f_u8, 0x8b_u8]);
+    let bzip2_magic = bytes.get(0..3).is_some_and(|magic| magic == b"BZh");
+
+    // Prefer an explicit wire-format signature to the URL suffix. This keeps
+    // redirected or extensionless provider objects decodable and makes a
+    // mislabeled response fail in the decoder for the bytes it actually
+    // carries rather than in the decoder implied by its name.
+    if gzip_magic {
+        return decompress_gzip_payload_with_limit(url, &bytes, MAX_BODY_SIZE);
+    }
+    if bzip2_magic {
+        return decompress_bzip2_payload_with_limit(url, &bytes, MAX_BODY_SIZE);
+    }
+    if lowercase_url.ends_with(".gz") {
+        return decompress_gzip_payload_with_limit(url, &bytes, MAX_BODY_SIZE);
+    }
+    if lowercase_url.ends_with(".bz2") {
+        return decompress_bzip2_payload_with_limit(url, &bytes, MAX_BODY_SIZE);
     }
 
-    decompress_gzip_payload_with_limit(url, &bytes, MAX_BODY_SIZE)
+    Ok(bytes)
+}
+
+fn read_decompressed_payload_with_limit(
+    format: &str,
+    url: &str,
+    decoder: impl Read,
+    max_output_size: u64,
+) -> Result<Vec<u8>, String> {
+    let read_limit = max_output_size
+        .checked_add(1)
+        .ok_or_else(|| format!("{format} decompress {url}: output limit overflow"))?;
+    let mut bounded = decoder.take(read_limit);
+    let mut decompressed = Vec::new();
+    bounded
+        .read_to_end(&mut decompressed)
+        .map_err(|err| format!("{format} decompress {url}: {err}"))?;
+    let decompressed_len = u64::try_from(decompressed.len())
+        .map_err(|_| format!("{format} decompress {url}: output length cannot be represented"))?;
+    if decompressed_len > max_output_size {
+        return Err(format!(
+            "{format} decompress {url}: expanded payload exceeds the {max_output_size} byte limit"
+        ));
+    }
+    Ok(decompressed)
 }
 
 fn decompress_gzip_payload_with_limit(
@@ -2804,23 +2843,17 @@ fn decompress_gzip_payload_with_limit(
     bytes: &[u8],
     max_output_size: u64,
 ) -> Result<Vec<u8>, String> {
-    let read_limit = max_output_size
-        .checked_add(1)
-        .ok_or_else(|| format!("gzip decompress {url}: output limit overflow"))?;
     let decoder = flate2::read::GzDecoder::new(bytes);
-    let mut bounded = decoder.take(read_limit);
-    let mut decompressed = Vec::new();
-    bounded
-        .read_to_end(&mut decompressed)
-        .map_err(|err| format!("gzip decompress {url}: {err}"))?;
-    let decompressed_len = u64::try_from(decompressed.len())
-        .map_err(|_| format!("gzip decompress {url}: output length cannot be represented"))?;
-    if decompressed_len > max_output_size {
-        return Err(format!(
-            "gzip decompress {url}: expanded payload exceeds the {max_output_size} byte limit"
-        ));
-    }
-    Ok(decompressed)
+    read_decompressed_payload_with_limit("gzip", url, decoder, max_output_size)
+}
+
+fn decompress_bzip2_payload_with_limit(
+    url: &str,
+    bytes: &[u8],
+    max_output_size: u64,
+) -> Result<Vec<u8>, String> {
+    let decoder = bzip2::read::MultiBzDecoder::new(bytes);
+    read_decompressed_payload_with_limit("bzip2", url, decoder, max_output_size)
 }
 
 fn should_use_parallel_whole_file_fetch(source: SourceId) -> bool {
@@ -3052,11 +3085,45 @@ struct PreparedSelector {
     message: StructuredMessageSelector,
 }
 
-const PARAMETER_HGT: &[ParameterCode] = &[ParameterCode {
-    discipline: 0,
-    category: 3,
-    number: 5,
-}];
+const PARAMETER_HGT: &[ParameterCode] = &[
+    // Geopotential height (gpm), used by NOAA products.
+    ParameterCode {
+        discipline: 0,
+        category: 3,
+        number: 5,
+    },
+    // Geopotential (m^2 s^-2), used by DWD ICON `FI` pressure objects.
+    // `build_field_values` converts this alternative to canonical gpm.
+    ParameterCode {
+        discipline: 0,
+        category: 3,
+        number: 4,
+    },
+];
+const PARAMETER_SURFACE_HEIGHT: &[ParameterCode] = &[
+    // Surface orography can be encoded as geopotential height, geopotential,
+    // or geometric height. Pressure-level selectors intentionally keep using
+    // `PARAMETER_HGT`; geometric height is only a valid canonical alternative
+    // for the surface-orography lane.
+    ParameterCode {
+        discipline: 0,
+        category: 3,
+        number: 5,
+    },
+    ParameterCode {
+        discipline: 0,
+        category: 3,
+        number: 4,
+    },
+    // DWD ICON `HSURF`: geometric height in metres. RWS surface-orography
+    // consumers already treat gpm and metres as height values; unlike WMO
+    // geopotential (0/3/4), this representation needs no gravity conversion.
+    ParameterCode {
+        discipline: 0,
+        category: 3,
+        number: 6,
+    },
+];
 const PARAMETER_PRESSURE: &[ParameterCode] = &[ParameterCode {
     discipline: 0,
     category: 3,
@@ -3581,7 +3648,7 @@ impl TryFrom<FieldSelector> for StructuredMessageSelector {
                 vertical: VerticalSelector::Surface,
                 ..
             } => Ok(Self {
-                parameters: PARAMETER_HGT,
+                parameters: PARAMETER_SURFACE_HEIGHT,
                 level: LevelMatch::Surface,
                 units: "gpm",
             }),
@@ -4174,6 +4241,7 @@ fn build_field_values(
         flip_rows(&mut values, nx, ny);
     }
     rotate_rows_left(&mut values, nx, &entry.row_wraps);
+    normalize_canonical_field_values(message, selector, &mut values);
 
     let values: Vec<f32> = values.into_iter().map(|value| value as f32).collect();
     if values.len() != entry.grid.shape.len() {
@@ -4190,6 +4258,27 @@ fn build_field_values(
         values,
         grid_index,
     })
+}
+
+/// Normalize provider alternatives that share a canonical selector but not
+/// its units. WMO parameter 0/3/4 is geopotential in m^2 s^-2; RWS exposes
+/// canonical geopotential height in geopotential metres, so divide by the
+/// conventional standard gravity. Parameter 0/3/5 already carries gpm and is
+/// intentionally left bit-for-bit unchanged.
+fn normalize_canonical_field_values(
+    message: &Grib2Message,
+    selector: FieldSelector,
+    values: &mut [f64],
+) {
+    const STANDARD_GRAVITY_M_S2: f64 = 9.806_65;
+    let is_geopotential = message.discipline == 0
+        && message.product.parameter_category == 3
+        && message.product.parameter_number == 4;
+    if selector.field == CanonicalField::GeopotentialHeight && is_geopotential {
+        for value in values.iter_mut().filter(|value| value.is_finite()) {
+            *value /= STANDARD_GRAVITY_M_S2;
+        }
+    }
 }
 
 /// Build one `SelectedField2D`: [`build_field_values`] plus a per-field

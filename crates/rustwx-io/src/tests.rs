@@ -17,6 +17,119 @@ const AIFS_INDEX_SAMPLE: &str = r#"{"domain": "g", "date": "20260810", "time": "
 {"domain": "g", "date": "20260810", "time": "0000", "expver": "0001", "class": "ai", "type": "fc", "stream": "oper", "step": "24", "levtype": "sfc", "param": "2t", "model": "aifs-single", "_offset": 82676279, "_length": 551319}
 "#;
 
+const DWD_ICON_REGULAR_LATLON_INVENTORY: &str =
+    include_str!("../tests/fixtures/dwd-icon-regular-latlon-20260814.inventory.txt");
+
+fn dwd_inventory_rows(kind: &str) -> Vec<Vec<&'static str>> {
+    DWD_ICON_REGULAR_LATLON_INVENTORY
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.split('|').collect::<Vec<_>>())
+        .filter(|row| row.first().copied() == Some(kind))
+        .collect()
+}
+
+#[test]
+fn dwd_regular_latlon_fixture_pins_schedule_and_canonical_object_inventory() {
+    let all_rows = DWD_ICON_REGULAR_LATLON_INVENTORY
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.split('|').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert!(all_rows.iter().all(|row| row.len() == 8));
+
+    let schedules = dwd_inventory_rows("SCHEDULE");
+    assert_eq!(schedules.len(), 3);
+    assert!(schedules.iter().any(|row| {
+        row[1] == "icon-eu"
+            && row[2] == "main-00-06-12-18"
+            && row[4] == "93"
+            && row[5] == "f000-f078 hourly; f081-f120 three-hourly"
+    }));
+    assert!(schedules.iter().any(|row| {
+        row[1] == "icon-eu"
+            && row[2] == "short-03-09-15-21"
+            && row[4] == "34"
+            && row[5] == "f000-f030 hourly; f036/f042/f048"
+    }));
+    assert!(
+        schedules
+            .iter()
+            .any(|row| { row[1] == "icon-d2" && row[4] == "49" && row[5] == "f000-f048 hourly" })
+    );
+
+    let surfaces = dwd_inventory_rows("SURFACE");
+    let expected_surface_keys = [
+        "t_2m",
+        "td_2m",
+        "relhum_2m",
+        "u_10m",
+        "v_10m",
+        "pmsl",
+        "ps",
+        "hsurf",
+        "tot_prec",
+    ];
+    for model in ["icon-eu", "icon-d2"] {
+        let model_rows = surfaces
+            .iter()
+            .filter(|row| row[1] == model)
+            .collect::<Vec<_>>();
+        assert_eq!(model_rows.len(), expected_surface_keys.len());
+        for key in expected_surface_keys {
+            let row = model_rows
+                .iter()
+                .find(|row| row[2] == key)
+                .unwrap_or_else(|| panic!("missing {model} surface object {key}"));
+            assert!(row[3].ends_with(".grib2.bz2"));
+        }
+    }
+
+    let pressure = dwd_inventory_rows("PRESSURE");
+    for model in ["icon-eu", "icon-d2"] {
+        let keys = pressure
+            .iter()
+            .filter(|row| row[1] == model)
+            .map(|row| row[2])
+            .collect::<Vec<_>>();
+        assert_eq!(keys, ["t", "relhum", "u", "v", "fi"]);
+    }
+    assert_eq!(
+        pressure
+            .iter()
+            .find(|row| row[1] == "icon-eu" && row[2] == "t")
+            .unwrap()[5],
+        "50,70,100,150,200,250,300,400,500,600,700,775,800,825,850,875,900,925,950,1000"
+    );
+    assert_eq!(
+        pressure
+            .iter()
+            .find(|row| row[1] == "icon-d2" && row[2] == "t")
+            .unwrap()[5],
+        "200,250,300,400,500,600,700,850,950,975,1000"
+    );
+}
+
+#[test]
+fn dwd_regular_latlon_fixture_pins_bounded_live_payload_evidence() {
+    let payloads = dwd_inventory_rows("PAYLOAD");
+    assert_eq!(payloads.len(), 30);
+    for row in payloads {
+        assert!(row[3].starts_with("https://opendata.dwd.de/weather/nwp/"));
+        assert!(row[3].ends_with(".grib2.bz2"));
+        assert!(row[4].parse::<usize>().is_ok_and(|bytes| bytes > 0));
+        assert_eq!(row[5].len(), 64);
+        assert!(row[5].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(row[6].contains("decoded="));
+        assert!(row[6].contains("packing="));
+    }
+    assert!(
+        DWD_ICON_REGULAR_LATLON_INVENTORY.contains(
+            "windows=0-60/75/90/105min|f001 selector should choose the first message only"
+        )
+    );
+}
+
 #[test]
 fn gzip_grib_payloads_are_decompressed_before_decode() {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -30,6 +143,36 @@ fn gzip_grib_payloads_are_decompressed_before_decode() {
     .expect("gzip payload decodes");
 
     assert_eq!(decoded, b"GRIBtest");
+}
+
+#[test]
+fn bzip2_grib_payloads_are_decompressed_before_decode() {
+    let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+    encoder.write_all(b"GRIBtest").unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let decoded = maybe_decompress_grib_payload(
+        "https://opendata.dwd.de/weather/nwp/icon-eu/grib/00/t_2m/icon-eu.grib2.bz2",
+        compressed,
+    )
+    .expect("bzip2 payload decodes");
+
+    assert_eq!(decoded, b"GRIBtest");
+}
+
+#[test]
+fn bzip2_magic_decodes_even_without_a_filename_suffix() {
+    let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+    encoder.write_all(b"GRIBmagic").unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let decoded = maybe_decompress_grib_payload(
+        "https://example.invalid/redirected-provider-object",
+        compressed,
+    )
+    .expect("bzip2 magic decodes");
+
+    assert_eq!(decoded, b"GRIBmagic");
 }
 
 #[test]
@@ -48,6 +191,21 @@ fn download_oom_guard_rejects_gzip_output_past_limit() {
 }
 
 #[test]
+fn download_oom_guard_rejects_bzip2_output_past_limit() {
+    let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+    encoder.write_all(&[0_u8; 256]).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let error = decompress_bzip2_payload_with_limit(
+        "https://example.invalid/decompression-bomb.grib2.bz2",
+        &compressed,
+        64,
+    )
+    .expect_err("expanded payload must be bounded");
+    assert!(error.contains("exceeds the 64 byte limit"));
+}
+
+#[test]
 fn plain_grib_payloads_are_left_unchanged() {
     let decoded = maybe_decompress_grib_payload(
         "https://example.invalid/hrrr.t00z.wrfsfcf006.grib2",
@@ -56,6 +214,59 @@ fn plain_grib_payloads_are_left_unchanged() {
     .expect("plain payload passes through");
 
     assert_eq!(decoded, b"GRIBtest");
+}
+
+#[test]
+fn wmo_geopotential_parameter_normalizes_to_canonical_height() {
+    let geopotential = ieee_f32_message(
+        ParameterCode {
+            discipline: 0,
+            category: 3,
+            number: 4,
+        },
+        100,
+        50_000.0,
+        &[9_806.65, 49_033.25],
+        -99.0,
+        -98.0,
+    );
+    let height = extract_field_from_grib2(
+        &Grib2File {
+            messages: vec![geopotential],
+        },
+        FieldSelector::isobaric(CanonicalField::GeopotentialHeight, 500),
+    )
+    .expect("WMO geopotential maps to canonical height");
+
+    assert_eq!(height.units, "gpm");
+    assert!((height.values[0] - 1_000.0).abs() < 1.0e-3);
+    assert!((height.values[1] - 5_000.0).abs() < 1.0e-3);
+}
+
+#[test]
+fn wmo_surface_geometric_height_maps_to_canonical_orography_without_conversion() {
+    let geometric_height = ieee_f32_message(
+        ParameterCode {
+            discipline: 0,
+            category: 3,
+            number: 6,
+        },
+        1,
+        0.0,
+        &[0.0, 326.5, 2_962.25],
+        -99.0,
+        -98.0,
+    );
+    let orography = extract_field_from_grib2(
+        &Grib2File {
+            messages: vec![geometric_height],
+        },
+        FieldSelector::surface(CanonicalField::GeopotentialHeight),
+    )
+    .expect("WMO geometric surface height maps to canonical orography");
+
+    assert_eq!(orography.units, "gpm");
+    assert_eq!(orography.values, vec![0.0, 326.5, 2_962.25]);
 }
 
 #[test]

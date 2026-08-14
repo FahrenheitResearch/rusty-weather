@@ -4471,6 +4471,7 @@ name = "rustwx-io"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "bzip2",
  "chrono",
  "flate2",
  "grib-core",
