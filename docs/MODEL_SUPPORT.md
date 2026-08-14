@@ -21,12 +21,12 @@ not automatically presented as live-verified.
 | Model family | Acquisition | Current status | Important scope |
 | --- | --- | --- | --- |
 | HRRR CONUS | Remote | Verified | Deterministic surface and pressure products |
-| HRRR Alaska | Remote | Ingest beta | Regional deterministic products |
+| HRRR Alaska | Remote | Ingest beta | Alaska `prs` + `sfc`; hourly f000-f018, with 00/06/12/18z extended through f048; official inventory fixture-verified |
 | GFS | Remote | Verified | Global deterministic products |
 | RRFS-A | Remote | Verified | Deterministic NA source cropped during ingest |
-| RAP | Remote | Ingest beta | North American deterministic products |
-| NAM | Remote | Ingest beta | Regional deterministic products |
-| GDAS | Remote | Ingest beta | Global analysis/short forecast |
+| RAP | Remote | Ingest beta | Grid-130 `awp130pgrb` (13 km); hourly f000-f021, with 03/09/15/21z extended through f051; live ingest/store verified |
+| NAM | Remote | Ingest beta | Ingest is pinned to grid-212 `awip3d` (40 km), not the registry's separate `awip12` plotting product; hourly f000-f036 then 3-hourly through f084; live ingest/store verified |
+| GDAS | Remote | Ingest beta | Global 0.25-degree `pgrb2.0p25`; f000-f009 each 00/06/12/18z cycle; official inventory fixture-verified |
 | GEFS | Remote | Ingest beta | Control/statistical product route; not full member ingestion |
 | NOAA AI-GFS | Remote | Ingest beta | Deterministic pressure and surface products |
 | NOAA AI-GEFS | Remote | Ingest beta | Average/statistical products only; not full member ingestion; nonlinear derived/heavy diagnostics disabled |
@@ -63,6 +63,10 @@ until an explicit fixed-window selector is implemented. This prevents a
 native interval from being advertised as a cumulative run total.
 
 The focused ingest fixtures pin inventories captured from the official
+[HRRR](https://www.nco.ncep.noaa.gov/pmb/products/hrrr/),
+[RAP](https://www.nco.ncep.noaa.gov/pmb/products/rap/),
+[NAM](https://www.nco.ncep.noaa.gov/pmb/products/nam/),
+[GFS/GDAS](https://www.nco.ncep.noaa.gov/pmb/products/gfs/),
 [HIRESW](https://www.nco.ncep.noaa.gov/pmb/products/hiresw/),
 [HREF](https://www.nco.ncep.noaa.gov/pmb/products/href/),
 [SREF](https://www.nco.ncep.noaa.gov/pmb/products/sref/),
@@ -70,6 +74,17 @@ The focused ingest fixtures pin inventories captured from the official
 [RRFS](https://www.nco.ncep.noaa.gov/pmb/products/rrfs/), and
 [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data) feeds.
 Fixture source URLs and SHA-256 values are recorded beside the fixtures.
+
+For the NOAA deterministic wave, normalization follows the fields actually
+published. HRRR Alaska carries native pressure-level temperature, dewpoint,
+RH, winds, and height every 25 hPa from 50-1000 hPa. RAP carries the same
+100-1000 hPa temperature/RH/wind/height grid but no native isobaric dewpoint,
+so the store retains `rh_iso` rather than inventing `dewpoint_iso`. NAM's
+`awip3d` carries temperature/RH/wind/height every 25 hPa from 50-1000 hPa,
+while dewpoint is native only at 300/400/500/700/850/1000 hPa and 2 m moisture
+is RH rather than dewpoint. GDAS likewise publishes pressure-level RH rather
+than pressure-level dewpoint. Manifests and query capability report realized
+variables and levels per run, so these distinctions remain visible.
 
 ## Product availability
 

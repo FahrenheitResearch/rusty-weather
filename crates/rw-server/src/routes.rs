@@ -4720,6 +4720,18 @@ mod tests {
         assert_eq!(nbm["products"][0]["surface_source"], true);
         assert_eq!(nbm["products"][0]["pressure_source"], false);
 
+        for id in ["rap", "nam"] {
+            assert_eq!(model(id)["verification"], "live_verified");
+        }
+        for id in ["hrrr-ak", "gdas"] {
+            assert_eq!(model(id)["verification"], "fixture_verified");
+        }
+        assert_eq!(model("hrrr-ak")["products"][0]["product"], "prs");
+        assert_eq!(model("hrrr-ak")["products"][1]["product"], "sfc");
+        assert_eq!(model("rap")["products"][0]["product"], "awp130pgrb");
+        assert_eq!(model("nam")["products"][0]["product"], "awip3d");
+        assert_eq!(model("gdas")["products"][0]["product"], "pgrb2.0p25");
+
         for id in ["aigefs", "hgefs"] {
             assert_eq!(
                 model(id)["limitations"],

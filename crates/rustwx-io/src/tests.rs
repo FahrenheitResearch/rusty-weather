@@ -626,6 +626,19 @@ fn parsed_model_grib_repeated_passes_match_fresh_parse_results() {
     let reused_alternate = parsed
         .extract_field_values_partial_at_forecast_hour(&alternate, Some(6))
         .unwrap();
+    assert_eq!(
+        parsed
+            .matching_native_field_selectors_at_forecast_hour(&primary, Some(6))
+            .unwrap(),
+        vec![primary[0]],
+        "inventory probing reports the native 500 hPa field without decoding it"
+    );
+    assert_eq!(
+        parsed
+            .matching_native_field_selectors_at_forecast_hour(&alternate, Some(6))
+            .unwrap(),
+        alternate
+    );
 
     let assert_same = |actual: &PartialValuesExtraction, expected: &PartialValuesExtraction| {
         assert_eq!(actual.missing, expected.missing);

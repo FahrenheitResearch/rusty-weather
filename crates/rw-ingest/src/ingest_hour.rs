@@ -84,7 +84,7 @@ use ingest_profile::{IngestProfile, VolumeChoice, surface_plan};
 
 /// The volume plan under one profile: `(field, store name)` pairs in the
 /// stable full-ingest order. Dewpoint falls back to RelativeHumidity
-/// ("rh_iso") when the file realizes fewer than two dewpoint levels.
+/// ("rh_iso") when RH provides a denser usable native pressure coordinate.
 ///
 /// Moisture note: the derived/CAPE compute path (`rustwx_calc::ecape::
 /// {SurfaceInputs, EcapeVolumeInputs}`) consumes mixing ratio, which
@@ -98,6 +98,13 @@ fn volume_plan(profile: &IngestProfile) -> Vec<(CanonicalField, &'static str)> {
         .filter(|choice| profile.volumes.contains(choice))
         .map(|choice| (choice.field(), choice.store_name()))
         .collect()
+}
+
+fn relative_humidity_is_better_covered(
+    dewpoint_realized: usize,
+    relative_humidity_available: usize,
+) -> bool {
+    relative_humidity_available >= 2 && relative_humidity_available > dewpoint_realized
 }
 
 /// The trailing (h-1)->h window field names (see the re-select pass in
@@ -995,9 +1002,11 @@ pub fn process_fetched_hour(
         }
     }
 
-    // Dewpoint fallback: when the profile stores a dewpoint volume but the
-    // prs file realizes < 2 dewpoint levels, re-select RelativeHumidity
-    // from the same per-file parsed GRIB (only the RH messages decode).
+    // Moisture coverage fallback: prefer native dewpoint when its coordinate
+    // is at least as complete, otherwise retain the denser native RH volume.
+    // The native-match probe reads metadata only, so HRRR's equal-coverage RH
+    // messages are not redundantly unpacked. NAM awip3d is the important
+    // asymmetric case: six DPT levels versus 37 RH levels.
     let dewpoint_planned = volumes_data
         .iter()
         .any(|volume| volume.field == CanonicalField::Dewpoint);
@@ -1006,18 +1015,34 @@ pub fn process_fetched_hour(
         .find(|volume| volume.field == CanonicalField::Dewpoint)
         .map(|volume| volume.levels.len())
         .unwrap_or(0);
-    if dewpoint_planned && dewpoint_realized < 2 {
+    let rh_selectors: Vec<FieldSelector> = if dewpoint_planned {
+        levels
+            .iter()
+            .map(|&level| FieldSelector::isobaric(CanonicalField::RelativeHumidity, level))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let relative_humidity_available = if dewpoint_planned {
+        prs_grib
+            .as_ref()
+            .expect("moisture fallback follows a non-empty prs selector pass")
+            .matching_native_field_selectors_at_forecast_hour(&rh_selectors, Some(hour))
+            .map_err(other)?
+            .len()
+    } else {
+        0
+    };
+    if dewpoint_planned
+        && relative_humidity_is_better_covered(dewpoint_realized, relative_humidity_available)
+    {
         config.emit(IngestEvent::Warning {
             hour,
             message: format!(
-                "f{hour:03}: dewpoint_iso realized only {dewpoint_realized} level(s); \
-                 falling back to relative humidity (rh_iso)"
+                "f{hour:03}: dewpoint_iso realized {dewpoint_realized} level(s), but relative \
+                 humidity realizes {relative_humidity_available}; storing denser rh_iso"
             ),
         });
-        let rh_selectors: Vec<FieldSelector> = levels
-            .iter()
-            .map(|&level| FieldSelector::isobaric(CanonicalField::RelativeHumidity, level))
-            .collect();
         let rh_started = Instant::now();
         let rh_extraction = prs_grib
             .as_ref()
@@ -1891,7 +1916,7 @@ pub struct PlannedStoreVariables {
 /// Resolve one profile into the variables it plans to store for `model`.
 /// Predictive by construction: candidate levels are assumed realized (true
 /// for HRRR's 25 hPa prs files) and the dewpoint volume keeps its planned
-/// `dewpoint_iso` name (the rh_iso fallback is a per-file degradation).
+/// `dewpoint_iso` name (the denser-rh choice is resolved per file).
 pub fn planned_store_variables(profile: &IngestProfile, model: ModelId) -> PlannedStoreVariables {
     let level_count = profile.candidate_levels().len();
     let volumes = volume_plan(profile)
@@ -2064,6 +2089,14 @@ fn forecast_hour_cadence_note(model: ModelId, cycle_hour_utc: u8, max: u16) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moisture_volume_prefers_the_denser_usable_native_coordinate() {
+        assert!(!relative_humidity_is_better_covered(37, 37));
+        assert!(relative_humidity_is_better_covered(6, 37));
+        assert!(relative_humidity_is_better_covered(0, 21));
+        assert!(!relative_humidity_is_better_covered(0, 1));
+    }
 
     fn fetched_hour_fixture(
         dir: &Path,

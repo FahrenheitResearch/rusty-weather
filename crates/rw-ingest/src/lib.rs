@@ -734,8 +734,12 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 rustwx_core::ModelId::Hrrr
                 | rustwx_core::ModelId::Gfs
                 | rustwx_core::ModelId::Gdps
+                | rustwx_core::ModelId::Rap
+                | rustwx_core::ModelId::Nam
                 | rustwx_core::ModelId::RrfsA => IngestVerificationLevel::LiveVerified,
-                rustwx_core::ModelId::Nbm
+                rustwx_core::ModelId::HrrrAk
+                | rustwx_core::ModelId::Gdas
+                | rustwx_core::ModelId::Nbm
                 | rustwx_core::ModelId::Rtma
                 | rustwx_core::ModelId::Urma
                 | rustwx_core::ModelId::Hiresw
@@ -961,6 +965,21 @@ mod tests {
                 IngestCapabilityLimitation::PreOperationalFeed,
             ]
         );
+
+        for model in [ModelId::Rap, ModelId::Nam] {
+            assert_eq!(
+                model_ingest_capability(model).verification,
+                IngestVerificationLevel::LiveVerified,
+                "{model} completed an official-payload ingest and deep store validation"
+            );
+        }
+        for model in [ModelId::HrrrAk, ModelId::Gdas] {
+            assert_eq!(
+                model_ingest_capability(model).verification,
+                IngestVerificationLevel::FixtureVerified,
+                "{model} has pinned official URL, cadence, and inventory evidence"
+            );
+        }
 
         let unsupported = model_ingest_capability(ModelId::WrfGdex);
         assert_eq!(unsupported.status, IngestSupportStatus::Unsupported);
@@ -1352,6 +1371,223 @@ mod tests {
             None => (pattern, None),
         };
         variable == var_pat && level_pat.is_none_or(|lp| level.contains(lp))
+    }
+
+    fn idx_has_row(idx: &str, variable: &str, level: &str) -> bool {
+        idx.lines().any(|line| {
+            let mut parts = line.split(':');
+            matches!(
+                (
+                    parts.nth(3),
+                    parts.next(),
+                ),
+                (Some(found_variable), Some(found_level))
+                    if found_variable == variable && found_level == level
+            )
+        })
+    }
+
+    fn pressure_levels(idx: &str, variable: &str, minimum_hpa: u16) -> Vec<u16> {
+        let mut levels = idx
+            .lines()
+            .filter_map(|line| {
+                let parts = line.split(':').collect::<Vec<_>>();
+                if parts.get(3).copied() != Some(variable) {
+                    return None;
+                }
+                parts
+                    .get(4)?
+                    .strip_suffix(" mb")?
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|level| *level >= minimum_hpa && *level <= 1_000)
+            })
+            .collect::<Vec<_>>();
+        levels.sort_unstable();
+        levels.dedup();
+        levels
+    }
+
+    fn assert_inventory_identity(idx: &str, lines: usize, date_stamp: &str) {
+        assert_eq!(idx.lines().count(), lines);
+        assert!(idx.lines().all(|line| {
+            line.split(':').nth(2) == Some(date_stamp)
+                && line
+                    .split(':')
+                    .nth(1)
+                    .is_some_and(|offset| offset.parse::<u64>().is_ok())
+        }));
+    }
+
+    #[test]
+    fn noaa_wave1_official_indexes_pin_urls_products_and_inventory() {
+        use rustwx_core::{CycleSpec, ModelId, ModelRunRequest, SourceId};
+
+        let hrrr_prs = include_str!("../tests/fixtures/hrrr-ak.t00z.wrfprsf01.grib2.idx");
+        let hrrr_sfc = include_str!("../tests/fixtures/hrrr-ak.t00z.wrfsfcf01.grib2.idx");
+        let rap = include_str!("../tests/fixtures/rap.t00z.awp130pgrbf01.grib2.idx");
+        let nam = include_str!("../tests/fixtures/nam.t00z.awip3d01.tm00.grib2.idx");
+        let gdas = include_str!("../tests/fixtures/gdas.t00z.pgrb2.0p25.f003.idx");
+
+        assert_inventory_identity(hrrr_prs, 702, "d=2026081200");
+        assert_inventory_identity(hrrr_sfc, 169, "d=2026081200");
+        assert_inventory_identity(rap, 355, "d=2026081200");
+        assert_inventory_identity(nam, 656, "d=2026081200");
+        assert_inventory_identity(gdas, 743, "d=2026081200");
+
+        let cycle = CycleSpec::new("20260812", 0).unwrap();
+        let cases = [
+            (
+                ModelId::HrrrAk,
+                1,
+                "prs",
+                "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.20260812/alaska/hrrr.t00z.wrfprsf01.ak.grib2.idx",
+            ),
+            (
+                ModelId::HrrrAk,
+                1,
+                "sfc",
+                "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.20260812/alaska/hrrr.t00z.wrfsfcf01.ak.grib2.idx",
+            ),
+            (
+                ModelId::Rap,
+                1,
+                "awp130pgrb",
+                "https://noaa-rap-pds.s3.amazonaws.com/rap.20260812/rap.t00z.awp130pgrbf01.grib2.idx",
+            ),
+            (
+                ModelId::Nam,
+                1,
+                "awip3d",
+                "https://noaa-nam-pds.s3.amazonaws.com/nam.20260812/nam.t00z.awip3d01.tm00.grib2.idx",
+            ),
+            (
+                ModelId::Gdas,
+                3,
+                "pgrb2.0p25",
+                "https://noaa-gfs-bdp-pds.s3.amazonaws.com/gdas.20260812/00/atmos/gdas.t00z.pgrb2.0p25.f003.idx",
+            ),
+        ];
+        for (model, hour, product, expected_idx_url) in cases {
+            let request = ModelRunRequest::new(model, cycle.clone(), hour, product).unwrap();
+            let urls = rustwx_models::resolve_urls(&request).unwrap();
+            let aws = urls
+                .iter()
+                .find(|candidate| candidate.source == SourceId::Aws)
+                .expect("official AWS route must resolve");
+            assert_eq!(format!("{}.idx", aws.grib_url), expected_idx_url);
+        }
+
+        for (idx, required_rows) in [
+            (
+                hrrr_sfc,
+                &[
+                    ("TMP", "2 m above ground"),
+                    ("DPT", "2 m above ground"),
+                    ("RH", "2 m above ground"),
+                    ("UGRD", "10 m above ground"),
+                    ("VGRD", "10 m above ground"),
+                    ("MSLMA", "mean sea level"),
+                    ("PRES", "surface"),
+                    ("HGT", "surface"),
+                ][..],
+            ),
+            (
+                rap,
+                &[
+                    ("TMP", "2 m above ground"),
+                    ("DPT", "2 m above ground"),
+                    ("RH", "2 m above ground"),
+                    ("UGRD", "10 m above ground"),
+                    ("VGRD", "10 m above ground"),
+                    ("MSLMA", "mean sea level"),
+                    ("PRES", "surface"),
+                    ("HGT", "surface"),
+                ][..],
+            ),
+            (
+                nam,
+                &[
+                    ("TMP", "2 m above ground"),
+                    ("RH", "2 m above ground"),
+                    ("UGRD", "10 m above ground"),
+                    ("VGRD", "10 m above ground"),
+                    ("PRMSL", "mean sea level"),
+                    ("PRES", "surface"),
+                    ("HGT", "surface"),
+                ][..],
+            ),
+            (
+                gdas,
+                &[
+                    ("TMP", "2 m above ground"),
+                    ("DPT", "2 m above ground"),
+                    ("RH", "2 m above ground"),
+                    ("UGRD", "10 m above ground"),
+                    ("VGRD", "10 m above ground"),
+                    ("PRMSL", "mean sea level"),
+                    ("PRES", "surface"),
+                    ("HGT", "surface"),
+                ][..],
+            ),
+        ] {
+            for (variable, level) in required_rows {
+                assert!(
+                    idx_has_row(idx, variable, level),
+                    "missing {variable}:{level}"
+                );
+            }
+        }
+        assert!(
+            !idx_has_row(nam, "DPT", "2 m above ground"),
+            "awip3d publishes 2 m RH, not a native 2 m dewpoint"
+        );
+    }
+
+    #[test]
+    fn noaa_wave1_inventory_pins_pressure_levels_and_accumulation_windows() {
+        let hrrr_prs = include_str!("../tests/fixtures/hrrr-ak.t00z.wrfprsf01.grib2.idx");
+        let hrrr_sfc = include_str!("../tests/fixtures/hrrr-ak.t00z.wrfsfcf01.grib2.idx");
+        let rap = include_str!("../tests/fixtures/rap.t00z.awp130pgrbf01.grib2.idx");
+        let nam = include_str!("../tests/fixtures/nam.t00z.awip3d01.tm00.grib2.idx");
+        let gdas = include_str!("../tests/fixtures/gdas.t00z.pgrb2.0p25.f003.idx");
+
+        let hrrr_levels = (50..=1_000).step_by(25).collect::<Vec<_>>();
+        let sounding_levels = (100..=1_000).step_by(25).collect::<Vec<_>>();
+        for variable in ["TMP", "DPT", "RH", "UGRD", "VGRD", "HGT"] {
+            assert_eq!(pressure_levels(hrrr_prs, variable, 50), hrrr_levels);
+        }
+        for variable in ["TMP", "RH", "UGRD", "VGRD", "HGT"] {
+            assert_eq!(pressure_levels(rap, variable, 100), sounding_levels);
+        }
+        assert!(pressure_levels(rap, "DPT", 100).is_empty());
+
+        for variable in ["TMP", "RH", "UGRD", "VGRD", "HGT"] {
+            assert_eq!(pressure_levels(nam, variable, 50), hrrr_levels);
+        }
+        assert_eq!(
+            pressure_levels(nam, "DPT", 50),
+            vec![300, 400, 500, 700, 850, 1_000]
+        );
+        assert_eq!(
+            pressure_levels(gdas, "TMP", 100),
+            vec![
+                100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850,
+                900, 925, 950, 975, 1_000,
+            ]
+        );
+        for variable in ["RH", "UGRD", "VGRD", "HGT"] {
+            assert_eq!(
+                pressure_levels(gdas, variable, 100),
+                pressure_levels(gdas, "TMP", 100)
+            );
+        }
+        assert!(pressure_levels(gdas, "DPT", 100).is_empty());
+
+        assert!(hrrr_sfc.contains(":APCP:surface:0-1 hour acc fcst:"));
+        assert!(rap.contains(":APCP:surface:0-1 hour acc fcst:"));
+        assert!(nam.contains(":APCP:surface:0-1 hour acc fcst:"));
+        assert!(gdas.contains(":APCP:surface:0-3 hour acc fcst:"));
     }
 
     /// REGRESSION (root cause of the first live ingest fetching whole 4.3+9.1 GB

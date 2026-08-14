@@ -108,6 +108,43 @@ fn nbm_plan_preserves_native_irregular_cadence_and_exact_times() {
 }
 
 #[test]
+fn noaa_wave1_plans_pin_ingest_products_and_native_cadence() {
+    let cases = [
+        (ModelId::HrrrAk, 0, 49, 48, vec!["prs", "sfc"]),
+        (ModelId::HrrrAk, 1, 19, 18, vec!["prs", "sfc"]),
+        (ModelId::Rap, 0, 22, 21, vec!["awp130pgrb"]),
+        (ModelId::Rap, 3, 52, 51, vec!["awp130pgrb"]),
+        (ModelId::Nam, 0, 53, 84, vec!["awip3d"]),
+        (ModelId::Gdas, 0, 10, 9, vec!["pgrb2.0p25"]),
+    ];
+    for (model, cycle_hour, expected_count, expected_last, products) in cases {
+        let plan = JobPlan::build(model, cycle("20260812", cycle_hour)).unwrap();
+        assert_eq!(plan.expected_valid_times.len(), expected_count, "{model}");
+        assert_eq!(
+            plan.expected_valid_times.last().unwrap().forecast_hour,
+            expected_last,
+            "{model} {cycle_hour:02}z horizon"
+        );
+        assert_eq!(
+            plan.ingest_products
+                .iter()
+                .map(|product| product.product.as_str())
+                .collect::<Vec<_>>(),
+            products,
+            "{model} scheduler product contract"
+        );
+        for (slot, expected) in plan.expected_valid_times.iter().enumerate() {
+            assert_eq!(usize::from(expected.storage_slot), slot);
+            assert_eq!(
+                expected.lead_seconds,
+                u64::from(expected.forecast_hour) * 3_600
+            );
+        }
+        plan.validate().unwrap();
+    }
+}
+
+#[test]
 fn plan_rejects_a_cycle_the_model_does_not_publish() {
     let error = JobPlan::build(ModelId::Gfs, cycle("20260731", 1)).unwrap_err();
     assert!(matches!(

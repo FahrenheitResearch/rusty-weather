@@ -1,11 +1,17 @@
 # Captured provider index fixtures
 
 These are immutable text inventories captured from official NOAA and ECMWF
-endpoints on 2026-08-11. They are test evidence, not runtime data and not a
-promise that an upstream experimental feed will remain available forever.
+endpoints on 2026-08-11 and 2026-08-12. They are test evidence, not runtime
+data and not a promise that an upstream experimental feed will remain
+available forever.
 
 | Fixture | Official source | Capture |
 | --- | --- | --- |
+| `hrrr-ak.t00z.wrfprsf01.grib2.idx` | `https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.20260812/alaska/hrrr.t00z.wrfprsf01.ak.grib2.idx` | full, 37,547 bytes, SHA-256 `829CAA4AE7A872A8A54B81F20F1617131618E92F2D3679DF8E927753D0A4944B` |
+| `hrrr-ak.t00z.wrfsfcf01.grib2.idx` | `https://noaa-hrrr-bdp-pds.s3.amazonaws.com/hrrr.20260812/alaska/hrrr.t00z.wrfsfcf01.ak.grib2.idx` | full, 9,993 bytes, SHA-256 `3467B5909FE3F66712DA942493DC7DB43403A84D886E7586941E6CBB888F35F1` |
+| `rap.t00z.awp130pgrbf01.grib2.idx` | `https://noaa-rap-pds.s3.amazonaws.com/rap.20260812/rap.t00z.awp130pgrbf01.grib2.idx` | full, 19,281 bytes, SHA-256 `8C2A989EB62E52603342B2C98B71D6F6DC2423C21055EFE7DD725AAC79E7697C` |
+| `nam.t00z.awip3d01.tm00.grib2.idx` | `https://noaa-nam-pds.s3.amazonaws.com/nam.20260812/nam.t00z.awip3d01.tm00.grib2.idx` | full, 35,031 bytes, SHA-256 `2D7C798F7B8BE4C4553EB8B8B8B8576DEAB34330912D85A4722B8D6E4EECD4B7` |
+| `gdas.t00z.pgrb2.0p25.f003.idx` | `https://noaa-gfs-bdp-pds.s3.amazonaws.com/gdas.20260812/00/atmos/gdas.t00z.pgrb2.0p25.f003.idx` | full, 40,449 bytes, SHA-256 `67897D16CC086BE9E11252A828F25147AC4F1561956439FAE2A9A3E9F40FDD66` |
 | `aifs-single.20260810T0000.f024.oper.index` | `https://data.ecmwf.int/forecasts/20260810/00z/aifs-single/0p25/oper/20260810000000-24h-oper-fc.index` | exact representative rows for every ingest-selected parameter plus every published `q` pressure level, excerpted from the 29,572-byte line-delimited JSON index; full-source SHA-256 `EDFED337AA2A077E510352FA6392BFC153E67A4D6B56A2EEF859082081AADFD3` |
 | `hiresw.t00z.arw_2p5km.f24.conus.grib2.idx` | `https://nomads.ncep.noaa.gov/pub/data/nccf/com/hiresw/prod/hiresw.20260810/hiresw.t00z.arw_2p5km.f24.conus.grib2.idx` | full, 5,121 bytes, SHA-256 `66C041E89BFCF489EC5A4708370C2A3215A53FDB57EABECA22C92D5A3EA895B9` |
 | `href.t00z.conus.mean.f24.grib2.idx` | `https://nomads.ncep.noaa.gov/pub/data/nccf/com/href/prod/href.20260810/ensprod/href.t00z.conus.mean.f24.grib2.idx` | full, 4,260 bytes, SHA-256 `BA04CCFF36A03DF40FB41D9D9B914F2E1FE62E0C07EB3CF4BD62D7DD0EAD0FD5` |
@@ -31,3 +37,15 @@ pressure levels on which specific humidity (`q`) is published. The software
 converts that `q` to canonical pressure-level dewpoint during extraction; the
 fixture is inventory evidence, not a substitute for a full-payload ingest
 round trip.
+
+The NOAA 2026-08-12 inventories are full provider sidecars. They pin each
+adapter's operational AWS URL and product name, message/submessage structure,
+surface fields, native pressure levels, and accumulation windows. RAP and NAM
+also completed live f001 `--profile sounding --verify` ingests from those
+exact products followed by deep run-directory validation. RAP read all
+18,329,646 source bytes and produced 7 direct 2-D fields plus five 37-level
+volumes. NAM read all 11,699,883 source bytes and produced 6 direct 2-D fields,
+plus 37-level temperature/RH/wind/height volumes. Its six native pressure
+dewpoint levels remain pinned by the inventory, but the normalized sounding
+keeps the denser `rh_iso` coordinate. Missing NAM 2 m dewpoint is reported
+rather than synthesized.

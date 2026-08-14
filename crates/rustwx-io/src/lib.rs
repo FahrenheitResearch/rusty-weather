@@ -1784,6 +1784,31 @@ impl ParsedModelGrib {
             grids: grid_memo.into_shared_grids(),
         })
     }
+
+    /// Return the selectors backed by native messages without unpacking their
+    /// grids. This is intentionally a native-inventory probe: synthesized
+    /// fields (for example AIFS `q` -> dewpoint) remain the responsibility of
+    /// the extraction method above.
+    pub fn matching_native_field_selectors_at_forecast_hour(
+        &self,
+        selectors: &[FieldSelector],
+        forecast_hour: Option<u16>,
+    ) -> Result<Vec<FieldSelector>, IoError> {
+        let prepared = selectors
+            .iter()
+            .copied()
+            .map(PreparedSelector::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(prepared
+            .iter()
+            .zip(match_prepared_selectors(
+                &self.grib,
+                &prepared,
+                forecast_hour,
+            ))
+            .filter_map(|(prepared, matched)| matched.is_some().then_some(prepared.selector))
+            .collect())
+    }
 }
 
 pub fn extract_fields_partial_from_model_bytes(
