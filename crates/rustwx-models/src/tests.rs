@@ -879,6 +879,22 @@ fn latest_available_run_prefers_source_priority_within_same_cycle() {
 }
 
 #[test]
+fn latest_available_run_probes_the_models_first_published_lead() {
+    let mut probed = Vec::new();
+    let latest = latest_available_run_with_probe(ModelId::Reps, None, "20260814", |resolved| {
+        let url = resolved.availability_probe_url().to_string();
+        probed.push(url.clone());
+        url.contains("20260814T18Z") && url.contains("PT003H")
+    })
+    .unwrap();
+
+    assert_eq!(latest.cycle.hour_utc, 18);
+    assert_eq!(latest.source, SourceId::Eccc);
+    assert!(!probed.is_empty());
+    assert!(probed.iter().all(|url| url.contains("PT003H")));
+}
+
+#[test]
 fn ecmwf_summary_matches_current_open_data_cycles_and_horizon() {
     let summary = model_summary(ModelId::EcmwfOpenData);
     assert!(summary.description.contains("50r1"));

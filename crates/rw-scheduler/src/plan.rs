@@ -355,6 +355,14 @@ impl JobPlan {
                 "persisted profile violates its derived-products limitation".to_string(),
             ));
         }
+        if limitations.contains("provider_statistics_only")
+            && profile != IngestProfile::surface_for_model(self.model)
+        {
+            return Err(SchedulerError::InvalidPlan(format!(
+                "persisted profile for model '{}' does not match its complete typed provider-statistics inventory",
+                self.model
+            )));
+        }
         let mut product_names = std::collections::BTreeSet::new();
         for product in &self.ingest_products {
             if product.product.trim().is_empty()
@@ -443,6 +451,13 @@ fn validate_profile_for_capability(
     {
         return Err(SchedulerError::InvalidPlan(format!(
             "model '{model}' requires the complete surface profile for its typed 2-D statistics collection"
+        )));
+    }
+    if limitations.contains(&IngestCapabilityLimitation::ProviderStatisticsOnly)
+        && profile != &IngestProfile::surface_for_model(model)
+    {
+        return Err(SchedulerError::InvalidPlan(format!(
+            "model '{model}' requires its complete typed provider-statistics profile"
         )));
     }
     if limitations.contains(&IngestCapabilityLimitation::DerivedProductsDisabled)

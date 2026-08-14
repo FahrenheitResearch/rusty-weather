@@ -702,6 +702,24 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
         .model_profiles
         .insert("geps".to_string(), "analysis".to_string());
     assert!(unsafe_geps.validate().is_err());
+
+    let reps = scheduler_config("reps-statistics-profile", &["reps"]);
+    let profile = reps.profile_for(ModelId::Reps).unwrap();
+    assert_eq!(
+        profile,
+        rw_ingest::ingest_profile::IngestProfile::surface_for_model(ModelId::Reps)
+    );
+    let mut unsafe_reps = reps;
+    unsafe_reps
+        .model_profiles
+        .insert("reps".to_string(), "analysis".to_string());
+    assert!(unsafe_reps.validate().is_err());
+
+    let mut unsafe_cma = scheduler_config("cma-statistics-profile", &["cma-geps"]);
+    unsafe_cma
+        .model_profiles
+        .insert("cma-geps".to_string(), "analysis".to_string());
+    assert!(unsafe_cma.validate().is_err());
 }
 
 #[test]
@@ -1312,6 +1330,21 @@ fn reps_plan_schedules_only_provider_statistics_from_f003_through_f072() {
     );
     assert!(!plan.ingest_profile.derived && !plan.ingest_profile.heavy);
     plan.validate().unwrap();
+
+    assert!(
+        JobPlan::build_with_profile(
+            ModelId::Reps,
+            cycle("20260814", 0),
+            &rw_ingest::ingest_profile::IngestProfile::analysis(),
+        )
+        .is_err()
+    );
+
+    let mut tampered = plan.clone();
+    tampered.ingest_profile =
+        PersistedIngestProfile::from_profile(&rw_ingest::ingest_profile::IngestProfile::analysis())
+            .unwrap();
+    assert!(tampered.validate().is_err());
 }
 
 #[test]

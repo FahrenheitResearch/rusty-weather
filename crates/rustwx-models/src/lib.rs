@@ -6680,12 +6680,13 @@ fn latest_available_run_with_probe<F>(
 where
     F: FnMut(&ResolvedUrl) -> bool,
 {
+    let forecast_hour = earliest_supported_forecast_hour(model)?;
     latest_available_run_for_products_with_probe_at_forecast_hour(
         model,
         source,
         date_yyyymmdd,
         &[model_summary(model).default_product],
-        0,
+        forecast_hour,
         probe_available,
     )
 }
@@ -6700,14 +6701,28 @@ fn latest_available_run_for_products_with_probe<F>(
 where
     F: FnMut(&ResolvedUrl) -> bool,
 {
+    let forecast_hour = earliest_supported_forecast_hour(model)?;
     latest_available_run_for_products_with_probe_at_forecast_hour(
         model,
         source,
         date_yyyymmdd,
         products,
-        0,
+        forecast_hour,
         probe_available,
     )
+}
+
+fn earliest_supported_forecast_hour(model: ModelId) -> Result<u16, ModelError> {
+    model_summary(model)
+        .cycle_hours_utc
+        .iter()
+        .filter_map(|cycle_hour| {
+            supported_forecast_hours(model, *cycle_hour)
+                .first()
+                .copied()
+        })
+        .min()
+        .ok_or(ModelError::NoAvailableRun { model })
 }
 
 fn latest_available_run_for_products_with_probe_at_forecast_hour<F>(

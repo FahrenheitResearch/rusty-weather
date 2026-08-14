@@ -438,6 +438,15 @@ impl SchedulerConfig {
         }
         if capability
             .limitations
+            .contains(&IngestCapabilityLimitation::ProviderStatisticsOnly)
+            && profile != IngestProfile::surface_for_model(model)
+        {
+            return Err(SchedulerError::InvalidConfig(format!(
+                "profile '{requested}' is incompatible with model '{model}', which requires its complete typed provider-statistics profile"
+            )));
+        }
+        if capability
+            .limitations
             .contains(&IngestCapabilityLimitation::DerivedProductsDisabled)
             && (profile.derived || profile.heavy)
         {
