@@ -23,6 +23,7 @@ not automatically presented as live-verified.
 | HRRR CONUS | Remote | Verified | Deterministic surface and pressure products |
 | HRRR Alaska | Remote | Ingest beta | Alaska `prs` + `sfc`; hourly f000-f018, with 00/06/12/18z extended through f048; official inventory fixture-verified |
 | GFS | Remote | Verified | Global deterministic products |
+| ECCC GDPS | Remote | Ingest beta | Global 0.15-degree deterministic 00/12z forecast; hourly f000-f084 then 3-hourly to f240; bounded per-field Datamart acquisition and a 19-level sounding profile are live ingest/store verified |
 | RRFS-A | Remote | Verified | Deterministic NA source cropped during ingest |
 | RAP | Remote | Ingest beta | Grid-130 `awp130pgrb` (13 km); hourly f000-f021, with 03/09/15/21z extended through f051; live ingest/store verified |
 | NAM | Remote | Ingest beta | Ingest is pinned to grid-212 `awip3d` (40 km), not the registry's separate `awip12` plotting product; hourly f000-f036 then 3-hourly through f084; live ingest/store verified |
@@ -74,6 +75,16 @@ The focused ingest fixtures pin inventories captured from the official
 [RRFS](https://www.nco.ncep.noaa.gov/pmb/products/rrfs/), and
 [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data) feeds.
 Fixture source URLs and SHA-256 values are recorded beside the fixtures.
+
+GDPS was additionally exercised against the official
+[ECCC MSC Datamart](https://eccc-msc.github.io/open-data/msc-data/nwp_gdps/readme_gdps-datamart_en/)
+on 2026-08-14. A bounded f000 sounding ingest assembled the selected
+per-field objects, realized seven surface variables plus temperature, relative
+humidity, u, v, and height at all 19 requested levels from 100-1000 hPa, passed
+the writer's exact verification, and passed deep validation at 12 variables,
+57,350 chunks, and 477,280,099 payload bytes. The required ECCC attribution is
+persisted and exposed by the server; direct legacy whole-file plotting remains
+disabled rather than silently using the one-field availability probe.
 
 For the NOAA deterministic wave, normalization follows the fields actually
 published. HRRR Alaska carries native pressure-level temperature, dewpoint,

@@ -1089,7 +1089,7 @@ fn every_ready_model_has_a_valid_cadence_profile_and_remote_source() {
         );
         plan.validate().unwrap();
     }
-    assert_eq!(ready, 21);
+    assert_eq!(ready, 22);
 }
 
 #[test]

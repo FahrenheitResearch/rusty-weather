@@ -203,7 +203,7 @@ impl From<IngestCapabilityLimitation> for ApiIngestCapabilityLimitation {
 fn provider_attributions(
     summary: &rustwx_models::ModelSummary,
 ) -> Vec<ProviderAttributionResponse> {
-    let mut attributions = Vec::with_capacity(2);
+    let mut attributions = Vec::with_capacity(3);
     if summary
         .sources
         .iter()
@@ -218,6 +218,13 @@ fn provider_attributions(
         )
     }) {
         attributions.push(rw_query::noaa_provider_attribution().into());
+    }
+    if summary
+        .sources
+        .iter()
+        .any(|source| source.id == SourceId::Eccc)
+    {
+        attributions.push(rw_query::eccc_provider_attribution().into());
     }
     attributions
 }
@@ -4726,6 +4733,18 @@ mod tests {
         assert_eq!(nbm["products"][0]["product"], "core/co");
         assert_eq!(nbm["products"][0]["surface_source"], true);
         assert_eq!(nbm["products"][0]["pressure_source"], false);
+
+        let gdps = model("gdps");
+        assert_eq!(gdps["ingest_status"], "ready");
+        assert_eq!(gdps["verification"], "live_verified");
+        assert_eq!(
+            gdps["limitations"],
+            serde_json::json!(["sparse_pressure_levels"])
+        );
+        assert_eq!(
+            gdps["provider_attributions"][0]["notice"],
+            "Data Source: Environment and Climate Change Canada"
+        );
 
         for id in ["rap", "nam"] {
             assert_eq!(model(id)["verification"], "live_verified");
