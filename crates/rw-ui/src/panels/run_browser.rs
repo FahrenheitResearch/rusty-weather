@@ -1,7 +1,7 @@
 //! Run browser: model -> run -> timesteps tree over a [`StoreTree`], with
 //! exact-time labels where available, variable counts, and the writer build.
 
-use egui::{CollapsingHeader, RichText, ScrollArea, Ui};
+use egui::{CollapsingHeader, RichText, ScrollArea, Ui, collapsing_header::CollapsingState};
 
 use crate::store_view::StoreTree;
 use crate::worker::HourKey;
@@ -12,6 +12,9 @@ use crate::worker::HourKey;
 #[derive(Debug, Default)]
 pub struct RunBrowserPanel {
     selected: Option<HourKey>,
+    /// Open the selected model/run once after a host-side selection so newly
+    /// downloaded hours cannot remain hidden under the previously viewed run.
+    reveal_selected: bool,
 }
 
 impl RunBrowserPanel {
@@ -27,6 +30,7 @@ impl RunBrowserPanel {
     /// auto-select of the first hour).
     pub fn select(&mut self, key: HourKey) {
         self.selected = Some(key);
+        self.reveal_selected = true;
     }
 
     /// Reconcile the current selection with a freshly enumerated store tree.
@@ -68,6 +72,7 @@ impl RunBrowserPanel {
             });
         let changed = self.selected != refreshed;
         self.selected = refreshed;
+        self.reveal_selected |= changed;
         changed
     }
 
@@ -75,6 +80,11 @@ impl RunBrowserPanel {
     /// a different hour.
     pub fn ui(&mut self, ui: &mut Ui, tree: &StoreTree) -> Option<HourKey> {
         let mut picked = None;
+        let reveal_selected = self.reveal_selected;
+        let selected_identity = self
+            .selected
+            .as_ref()
+            .map(|key| (key.model.clone(), key.run.clone()));
 
         if tree.models.is_empty() {
             ui.add_space(8.0);
@@ -82,11 +92,38 @@ impl RunBrowserPanel {
         }
 
         for model in &tree.models {
+            let model_salt = ("rw-run-model", &model.model);
+            if reveal_selected
+                && selected_identity
+                    .as_ref()
+                    .is_some_and(|(selected_model, _)| selected_model == &model.model)
+            {
+                let id = ui.make_persistent_id(model_salt);
+                let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, false);
+                state.set_open(true);
+                state.store(ui.ctx());
+            }
             CollapsingHeader::new(RichText::new(&model.model).strong())
+                .id_salt(model_salt)
                 .default_open(tree.models.len() == 1)
                 .show(ui, |ui| {
                     for run in &model.runs {
+                        let run_salt = ("rw-run", &model.model, &run.run);
+                        if reveal_selected
+                            && selected_identity.as_ref().is_some_and(
+                                |(selected_model, selected_run)| {
+                                    selected_model == &model.model && selected_run == &run.run
+                                },
+                            )
+                        {
+                            let id = ui.make_persistent_id(run_salt);
+                            let mut state =
+                                CollapsingState::load_with_default_open(ui.ctx(), id, false);
+                            state.set_open(true);
+                            state.store(ui.ctx());
+                        }
                         CollapsingHeader::new(&run.run)
+                            .id_salt(run_salt)
                             .default_open(model.runs.len() == 1)
                             .show(ui, |ui| {
                                 ui.label(
@@ -145,6 +182,8 @@ impl RunBrowserPanel {
                     }
                 });
         }
+
+        self.reveal_selected = false;
 
         if !tree.warnings.is_empty() {
             ui.add_space(8.0);
@@ -207,5 +246,66 @@ mod tests {
 
         assert!(panel.reconcile(&StoreTree::default()));
         assert!(panel.selected().is_none());
+    }
+
+    #[test]
+    fn host_selection_reveals_the_exact_model_and_run_once() {
+        let target = HourKey {
+            model: "hrrr".to_owned(),
+            run: "20260814_00z".to_owned(),
+            hour: 3,
+            exact_time: None,
+        };
+        let tree = StoreTree {
+            models: vec![ModelEntry {
+                model: "hrrr".to_owned(),
+                runs: vec![
+                    RunEntry {
+                        run: "20260814_19z".to_owned(),
+                        build: "test".to_owned(),
+                        writer_version: "test".to_owned(),
+                        nx: 2,
+                        ny: 2,
+                        exact_time_axis: false,
+                        hours: vec![HourEntry {
+                            hour: 0,
+                            file: "f000.rws".to_owned(),
+                            variable_count: 1,
+                            written_unix: 1,
+                            exact_time: None,
+                        }],
+                    },
+                    RunEntry {
+                        run: target.run.clone(),
+                        build: "test".to_owned(),
+                        writer_version: "test".to_owned(),
+                        nx: 2,
+                        ny: 2,
+                        exact_time_axis: false,
+                        hours: (0..=3)
+                            .map(|hour| HourEntry {
+                                hour,
+                                file: format!("f{hour:03}.rws"),
+                                variable_count: 1,
+                                written_unix: 1,
+                                exact_time: None,
+                            })
+                            .collect(),
+                    },
+                ],
+            }],
+            warnings: Vec::new(),
+        };
+        let mut panel = RunBrowserPanel::new();
+        panel.select(target.clone());
+        assert!(panel.reveal_selected);
+        assert!(!panel.reconcile(&tree));
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = panel.ui(ui, &tree);
+        });
+        assert_eq!(panel.selected(), Some(&target));
+        assert!(!panel.reveal_selected);
     }
 }

@@ -454,7 +454,10 @@ impl DownloadPanel {
         let running = self.is_running();
         let before = self.spec.clone();
 
-        ui.add_enabled_ui(!running, |ui| {
+        // A provider probe owns the exact visible spec until it resolves.
+        // Disabling the pickers prevents duplicate Latest/availability tasks
+        // and prevents a Download from racing a late lookup result.
+        ui.add_enabled_ui(!running && !self.probing, |ui| {
             self.pickers_ui(ui, &mut events);
         });
 
@@ -641,7 +644,7 @@ impl DownloadPanel {
     }
 
     fn push_latest_request_if_allowed(&mut self, clicked: bool, events: &mut Vec<DownloadEvent>) {
-        if !self.latest_action_visible || !clicked {
+        if !self.latest_action_visible || !clicked || self.probing {
             return;
         }
         self.set_probing();
@@ -723,7 +726,8 @@ impl DownloadPanel {
                     );
                 }
                 state => {
-                    let can_start = self.spec_error.is_none() && self.estimate.is_some();
+                    let can_start =
+                        !self.probing && self.spec_error.is_none() && self.estimate.is_some();
                     if ui
                         .add_enabled(can_start, egui::Button::new("⬇ Download"))
                         .clicked()
@@ -1166,6 +1170,8 @@ mod tests {
         default_panel.push_latest_request_if_allowed(true, &mut events);
         assert_eq!(events, vec![DownloadEvent::LatestRequested(expected)]);
         assert!(default_panel.probing);
+        default_panel.push_latest_request_if_allowed(true, &mut events);
+        assert_eq!(events.len(), 1, "a probe already in flight owns the spec");
 
         let mut explicit_run_panel = panel();
         explicit_run_panel.set_latest_action_visible(false);
