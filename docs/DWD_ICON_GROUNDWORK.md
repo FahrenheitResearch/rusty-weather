@@ -1,9 +1,8 @@
-# DWD ICON regular-grid groundwork
+# DWD ICON regular-grid integration
 
-This is an implementation audit, not a claim that either model is available
-through the RWS scheduler yet. It pins the public object layout observed on
-2026-08-14 and the decoder/acquisition work that is safe to reuse when the DWD
-model IDs and component-bundle adapter are added.
+This audit pins the public object layout observed on 2026-08-14 and the
+decoder, acquisition, normalization, scheduler, and query contracts now used
+by the live-verified ICON-EU and ICON-D2 regular-grid RWS lanes.
 
 ## Authoritative source and policy
 
@@ -27,10 +26,12 @@ transport operator.
 
 DWD publishes one externally bzip2-compressed GRIB2 object per
 field/level/named forecast time. There is no per-family byte-range index. The
-future acquisition adapter therefore needs the shared component-bundle lane;
-this branch deliberately does not duplicate it. The reusable transport layer
-now recognizes `.bz2` or `BZh`, bounds expansion, and gives the cache decoded
-GRIB bytes keyed by the original compressed URL.
+acquisition adapter uses the shared component-bundle lane. The reusable
+transport layer recognizes `.bz2` or `BZh`, bounds expansion, and gives the
+cache decoded GRIB bytes keyed by the original compressed URL. Logical
+`rws-pressure` and `rws-surface` products expand only to strict allowlisted
+field/level tokens, in deterministic order, before their GRIB messages are
+assembled for canonical extraction.
 
 ICON-EU exposes cycles at 00/03/06/09/12/15/18/21 UTC. On the captured server,
 00/06/12/18 UTC had 93 named times: hourly f000-f078, then every three hours
@@ -85,13 +86,29 @@ values. Geometric height is deliberately accepted only for surface orography;
 pressure-level canonical height still requires geopotential or geopotential
 height.
 
-One blocker remains deliberately unpromoted: DWD encodes forecast and
-statistical durations in WMO unit 0 (minutes). `tot_prec` f001/f002 decoded
-correctly and proved run-total windows of 0-60 and 0-120 minutes; ICON-D2 also
-carried 75/90/105 and 135/150/165-minute messages in those hourly objects. The
-current forecast selector only converts minute-valued instantaneous forecast
-times, while its statistical-window helper accepts hours only. That shared
-time-unit normalization must be fixed and regression-tested before DWD
-accumulations are advertised. No scheduler or server capability should be
-enabled before the DWD source/model IDs, component inventory, provenance, and
-this time-window blocker are integrated and live-validated together.
+## Time semantics and live RWS validation
+
+DWD encodes forecast and statistical durations in WMO unit 0 (minutes).
+`tot_prec` f001/f002 proved run-total windows of 0-60 and 0-120 minutes;
+ICON-D2 also carried 75/90/105 and 135/150/165-minute messages in those hourly
+objects. The shared selector now compares exact seconds and refuses to round
+or truncate a quarter-hour endpoint onto the integer-hour RWS axis. Regression
+coverage pins all four endpoints in each object and selects only 60 or 120
+minutes respectively. The field remains honestly named `apcp_run_total`.
+
+On 2026-08-14, bounded official 00z f000 sounding ingests for both models ran
+through DWD acquisition, bzip2 decode, canonical extraction, writer exact
+verification, and deep RWS validation:
+
+- ICON-EU realized seven surface variables and temperature, RH, U, V, and
+  height at all 18 schema-requested native levels from 100-1000 hPa. Deep
+  validation passed 12 variables, 18,396 chunks, and 161,516,424 payload bytes.
+- ICON-D2 realized the same seven surface variables and five pressure-volume
+  families at all 11 native levels from 200-1000 hPa. Deep validation passed
+  12 variables, 17,965 chunks, and 62,222,500 payload bytes.
+
+Both manifests persist `dwd-open-data` provenance. Server model and run
+responses expose DWD ownership, `Source: Deutscher Wetterdienst`, CC BY 4.0,
+and the RWS modification notice. Derived/heavy diagnostics remain disabled
+until their complete DWD input contract is separately live-validated; the
+native normalized surface and sounding lanes are scheduler-ready.

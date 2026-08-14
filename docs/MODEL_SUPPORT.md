@@ -27,6 +27,8 @@ not automatically presented as live-verified.
 | CMA GRAPES GEPS | Remote | Ingest beta | Global 0.25-degree provider-produced ensemble statistics; 00/12z, 3-hourly f000-f078 then 6-hourly to f360; mean/spread, percentile, and probability fields only—no raw member or deterministic sounding claim; live ingest/store verified |
 | ECCC RDPS | Remote | Ingest beta | North American 10 km rotated-grid deterministic forecast; 00/06/12/18z hourly f000-f084; bounded per-field acquisition and a 19-level sounding profile are live ingest/store verified; canonical U/V are paired and rotated to earth coordinates; derived/heavy disabled |
 | ECCC HRDPS continental | Remote | Ingest beta | Pan-Canadian 2.5 km rotated-grid deterministic forecast; 00/06/12/18z hourly f000-f048; bounded per-field acquisition and a 19-level sounding profile are live ingest/store verified; canonical U/V are paired and rotated to earth coordinates; derived/heavy disabled |
+| DWD ICON-EU regular | Remote | Ingest beta | European deterministic regular lat/lon feed; eight 3-hourly cycles, main-cycle f000-f120 and short-cycle f000-f048 native cadence; exact bzip2 component bundles and 18 schema-requested native pressure levels are live ingest/store verified; derived/heavy disabled |
+| DWD ICON-D2 regular | Remote | Ingest beta | Germany deterministic regular lat/lon feed; eight 3-hourly cycles and hourly f000-f048; exact bzip2 component bundles and all 11 native pressure levels are live ingest/store verified; quarter-hour messages retain exact time semantics; derived/heavy disabled |
 | RRFS-A | Remote | Verified | Deterministic NA source cropped during ingest |
 | RAP | Remote | Ingest beta | Grid-130 `awp130pgrb` (13 km); hourly f000-f021, with 03/09/15/21z extended through f051; live ingest/store verified |
 | NAM | Remote | Ingest beta | Ingest is pinned to grid-212 `awip3d` (40 km), not the registry's separate `awip12` plotting product; hourly f000-f036 then 3-hourly through f084; live ingest/store verified |
@@ -122,6 +124,14 @@ speed/direction objects covered 2,382,600 RDPS and 6,553,200 HRDPS components;
 RMS differences were 0.063552 and 0.006831 m/s respectively, within provider
 direction quantization. Derived/heavy diagnostics remain disabled until every
 diagnostic path is explicitly proven to consume the normalized vectors.
+ICON-EU and ICON-D2 regular-grid lanes were exercised against official
+[DWD Open Data](https://opendata.dwd.de/weather/nwp/) on 2026-08-14. Bounded
+00z f000 sounding ingests passed exact writer verification and deep store
+validation with seven 2-D variables plus temperature, RH, U, V, and height at
+18 ICON-EU and 11 ICON-D2 levels. DWD ownership, CC BY 4.0 attribution, and the
+normalization notice persist through manifests and server responses. Exact
+minute-unit regression coverage prevents ICON-D2's 75/90/105 and
+135/150/165-minute messages from being rounded onto hourly samples.
 
 For the NOAA deterministic wave, normalization follows the fields actually
 published. HRRR Alaska carries native pressure-level temperature, dewpoint,

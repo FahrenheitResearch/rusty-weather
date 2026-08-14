@@ -4780,7 +4780,7 @@ mod tests {
         for id in ["icon-eu", "icon-d2"] {
             let icon = model(id);
             assert_eq!(icon["ingest_status"], "ready");
-            assert_eq!(icon["verification"], "fixture_verified");
+            assert_eq!(icon["verification"], "live_verified");
             assert_eq!(
                 icon["limitations"],
                 serde_json::json!(["sparse_pressure_levels", "derived_products_disabled"])

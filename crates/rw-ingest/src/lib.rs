@@ -885,7 +885,9 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 | rustwx_core::ModelId::Aigfs
                 | rustwx_core::ModelId::Aigefs
                 | rustwx_core::ModelId::Hgefs
-                | rustwx_core::ModelId::EcmwfOpenData => IngestVerificationLevel::LiveVerified,
+                | rustwx_core::ModelId::EcmwfOpenData
+                | rustwx_core::ModelId::IconEu
+                | rustwx_core::ModelId::IconD2 => IngestVerificationLevel::LiveVerified,
                 rustwx_core::ModelId::HrrrAk
                 | rustwx_core::ModelId::Gdas
                 | rustwx_core::ModelId::Nbm
@@ -896,9 +898,7 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 | rustwx_core::ModelId::Sref
                 | rustwx_core::ModelId::Refs
                 | rustwx_core::ModelId::RrfsPublic
-                | rustwx_core::ModelId::Aifs
-                | rustwx_core::ModelId::IconEu
-                | rustwx_core::ModelId::IconD2 => IngestVerificationLevel::FixtureVerified,
+                | rustwx_core::ModelId::Aifs => IngestVerificationLevel::FixtureVerified,
                 _ => IngestVerificationLevel::ImplementedUnverified,
             };
             ModelIngestCapability {
@@ -2063,7 +2063,7 @@ mod tests {
             assert_eq!(capability.status, IngestSupportStatus::Ready);
             assert_eq!(
                 capability.verification,
-                IngestVerificationLevel::FixtureVerified
+                IngestVerificationLevel::LiveVerified
             );
             assert_eq!(
                 capability.limitations,
