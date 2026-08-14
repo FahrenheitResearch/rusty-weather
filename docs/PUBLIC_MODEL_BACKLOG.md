@@ -5,7 +5,7 @@ document, not a claim that the feeds below are supported. Current support is
 reported only by [MODEL_SUPPORT.md](MODEL_SUPPORT.md) and the running service's
 `/v1/models` response.
 
-This inventory contains 45 deduplicated atmospheric model/domain lanes that
+This inventory contains 55 deduplicated atmospheric model/domain lanes that
 are not represented as working remote lanes in the current capability matrix.
 A lane is counted once even when it has both published statistics and raw
 members, or several delivery choices. Different resolutions of the same model
@@ -67,6 +67,10 @@ their native semantics with existing RWS concepts. `P1` is adapter work on an
 existing contract, `P2` needs a new bounded acquisition/format adapter, and
 `P3` is gated by a core storage or topology extension.
 
+Rank numbers are stable, append-only review identifiers so links and review
+notes do not churn. Rows 46-55 are the third discovery wave; use `Class` and
+the shared implementation sequence below for current execution priority.
+
 | Rank | Lane | Class | Native schedule and domain | Public data and first implementation slice |
 | ---: | --- | --- | --- | --- |
 | 1 | ECCC GDPS 15 km | P1 | Global 0.15-degree regular lat/lon, 00/12Z; hourly f000-f084, then 3-hourly to f240 | Anonymous per-variable/level/lead GRIB2. Start surface plus the documented pressure-level sounding set. |
@@ -114,28 +118,43 @@ existing contract, `P2` needs a new bounded acquisition/format adapter, and
 | 43 | KNMI HARMONIE Netherlands | P3 | Netherlands, about 2 km regular lat/lon, hourly output to f060 | API-key access, tar-packaged GRIB1. Deterministic and rolling-ensemble products are separate datasets. Needs a GRIB1 gate or explicit external normalization. |
 | 44 | KNMI HARMONIE Europe | P3 | Europe 5.5 km rotated lat/lon, hourly output to f060 | GRIB1 tar packages. Rolling ensemble is 30 members delivered as six hourly batches of five; preserve each member's reference time and accumulation reset. |
 | 45 | KNMI HARMONIE Caribbean | P3 | Caribbean 0.05-degree regular grid, hourly output to f060 | GRIB1 tar packages and API-key access; implement after the GRIB1 decision. |
+| 46 | CPTEC/INPE WRF South America 7 km | P1 | South America, 1019x1081 regular lat/lon at 0.07 degree, daily 00Z; hourly f000-f180 | Anonymous GRIB2 with `.inv`, `.grib2.idx`, and GrADS control sidecars. Select indexed surface and pressure messages; a whole cycle is roughly 34 GiB. |
+| 47 | CPTEC/INPE BRAMS South America 8 km | P1 | South America, 978x1009 regular lat/lon, daily 00Z; hourly f000-f180 | Anonymous indexed GRIB2. Exclude the three pre-analysis files from the forecast run and preserve the grid's unequal longitude/latitude increments. |
+| 48 | GeoSphere Austria C-LAEF deterministic 2.5 km | P2 | AlpeAdria, provider-regridded regular WGS84 grid; every three hours, hourly to f060 | Anonymous targeted NetCDF or GeoJSON API. Persist native-model generation and GeoSphere's 1 km-to-2.5 km interpolation provenance. |
+| 49 | GeoSphere Austria C-LAEF percentiles 2.5 km | P2 | AlpeAdria, 00/12Z, hourly to f060; 17-run ensemble summarized as p10/p50/p90 | Ingest only the provider-published percentiles. Raw members are not exposed by this dataset; never reconstruct or imply member states. |
+| 50 | MeteoGalicia WRF Galicia 4 km | P2 | Galicia and nearby Atlantic, 117x126 Lambert grid, 00/12Z; hourly f001-f096 at 00Z and f001-f084 at 12Z | THREDDS/OPeNDAP CF-NetCDF. Start a tiny projected surface slice and retain the two-dimensional latitude/longitude coordinates. |
+| 51 | MeteoGalicia WRF Iberia 12 km | P2 | Iberia and Bay of Biscay, 171x138 Lambert grid, 00/12Z; hourly f001-f096 or f001-f084 | Same bounded THREDDS adapter as the 4 km grid, with a distinct geometry and model identity. |
+| 52 | MeteoGalicia WRF Atlantic/SW Europe 36 km | P2 | Atlantic and southwest Europe, 118x104 Lambert grid, 00/12Z; hourly f001-f096 or f001-f084 | Same bounded THREDDS adapter. Public fields are a surface/derived suite plus a small fixed upper-air subset, not a complete sounding profile. |
+| 53 | MeteoGalicia WRF ensemble Galicia 4 km | P3 | Galicia, daily 00Z, 21 raw members, hourly f001-f216 | OPeNDAP makes the multi-GB NetCDF files sliceable, but the dataset exposes no authoritative control/perturbed-member coordinate. Gate on an official member contract. |
+| 54 | MeteoGalicia WRF ensemble Iberia 12 km | P3 | Iberia and Bay of Biscay, daily 00Z, 21 raw members, hourly f001-f216 | Same member-identity gate as the 4 km ensemble; never guess that array index zero is the control. |
+| 55 | Google DeepMind WeatherNext 2 historical | P2/P3 | Global 0.25 degree, 00/06/12/18Z; 64 members and published mean, 6-hourly to 15 days | Scope the first adapter to data older than 48 hours and the published mean. Historical data are CC BY 4.0; current data have separate terms that prohibit an open RWS redistribution path. Raw members remain P3. |
 
 ### Shared implementation sequence
 
-Do not create 45 unrelated downloaders. Land the reusable contracts in this
+Do not create 55 unrelated downloaders. Land the reusable contracts in this
 order, then add thin provider manifests and canonical maps:
 
 1. Separate producer, licensing publisher, direct transport, and mirror in
    provenance. Make licence/attribution visible at run and API level.
 2. Add a bounded remote GRIB inventory scanner that can use byte ranges when a
    provider lacks `.idx`, plus an explicit WMO bulletin-wrapper decoder. This
-   unlocks CMA, Roshydromet, CWA, and later large package feeds.
+   unlocks CMA, Roshydromet, CWA, CPTEC/INPE, and later large package feeds.
 3. Add one bounded CF-NetCDF/OPeNDAP acquisition contract with dimension,
    chunk, response, and decompression ceilings. Use it for GEOS-FP, Met Office,
-   MET Norway, and Argentina SMN rather than provider-specific NetCDF parsers.
+   MET Norway, Argentina SMN, GeoSphere Austria, and MeteoGalicia rather than
+   provider-specific NetCDF parsers.
 4. Add LAEA geometry before claiming UKV or MOGREPS-UK. Keep provider-native
    coordinates and grid mapping; any regrid is a derived product.
 5. Add ensemble member plus reference-time identity before raw GEPS, ECMWF,
-   MOGREPS, CFSv2, PEARP, SMHI MEPS, or ICON EPS members.
+   MOGREPS, CFSv2, PEARP, SMHI MEPS, MeteoGalicia WRF, WeatherNext 2, or ICON
+   EPS members.
 6. Add triangular topology before native global ICON, DWD ICON EPS, or
    MeteoSwiss ICON-CH. Do not silently substitute a local rectangular regrid.
 7. Decide whether GRIB1 is decoded in process or normalized by a separately
    validated boundary tool before starting the three KNMI lanes.
+8. Add a fail-closed availability/licence-window policy before WeatherNext 2:
+   historical objects older than 48 hours may enter the public adapter, while
+   current data remain undiscoverable and unqueryable without different rights.
 
 ## Authoritative access contracts
 
@@ -512,6 +531,153 @@ was about 2.58 GiB per cycle. The public file inventory is mainly surface and
 derived fields; do not imply access to all 45 internal WRF model levels. Start
 with one hourly surface scalar, wind, and accumulated precipitation fixture.
 
+### Brazil CPTEC/INPE WRF and BRAMS
+
+Producer and licensing publisher: **Instituto Nacional de Pesquisas
+Espaciais (INPE), Centro de Previsão de Tempo e Estudos Climáticos (CPTEC)**.
+Transport is CPTEC's `dataserver.cptec.inpe.br`; this is not a third-party
+mirror.
+
+- INPE open-data page:
+  <https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/dados-abertos>
+- INPE 2025-2027 open-data plan:
+  <https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/repositorio-de-arquivos/pda_inpe_25_27_v3_defesoeleitoral2026.pdf>
+- Brazilian Open Data Policy, Decreto 8.777/2016:
+  <https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2016/decreto/d8777.htm>
+- WRF 7 km cycle template:
+  `https://dataserver.cptec.inpe.br/dataserver_modelos/wrf/ams_07km/brutos/{YYYY}/{MM}/{DD}/00/`
+- BRAMS 8 km cycle template:
+  `https://dataserver.cptec.inpe.br/dataserver_modelos/brams/ams_08km/brutos/{YYYY}/{MM}/{DD}/00/`
+
+Authentication is not required. The current INPE open-data plan identifies
+the WRF South America 7 km and BRAMS South America 8 km bases as open and
+daily. Under Decreto 8.777, an open federal dataset permits free use and reuse,
+subject to source credit. This dataset basis is distinct from the copyright
+notice on the surrounding `gov.br` page.
+
+Both directories retain dated cycles and publish one GRIB2 file per hourly
+lead with `.inv`, `.grib2.idx`, and `.ctl` sidecars. Byte ranges are supported.
+One observed WRF f000 object was 156,025,368 bytes; 181 leads make an
+unfiltered cycle roughly 34 GiB. Its control file declares a 1019x1081 regular
+0.07-degree grid and 25 pressure levels from 1000 to 50 hPa. One observed
+BRAMS f000 object was 144,055,896 bytes; its 978x1009 grid uses different
+longitude and latitude increments and the same 25 pressure levels. BRAMS also
+publishes f-003 through f-001; those are pre-analysis files, not forecast
+leads. Build the adapter from the record sidecars and reject a plan that falls
+back to whole-cycle transfer.
+
+### GeoSphere Austria C-LAEF
+
+Producer, licensing publisher, and direct API/bulk transport operator:
+**GeoSphere Austria**.
+
+- C-LAEF deterministic dataset:
+  <https://data.hub.geosphere.at/en/dataset/nwp-v2-1h-2500m>
+- Deterministic metadata/API:
+  <https://dataset.api.hub.geosphere.at/v1/grid/forecast/nwp-v1-1h-2500m/metadata>
+  and
+  `https://dataset.api.hub.geosphere.at/v1/grid/forecast/nwp-v1-1h-2500m`
+- Deterministic bulk listing:
+  <https://public.hub.geosphere.at/public/datahub.html?id=nwp-v1-1h-2500m/filelisting>
+- C-LAEF ensemble-statistics dataset:
+  <https://data.hub.geosphere.at/en/dataset/ensemble-v2-1h-2500m>
+- Ensemble metadata/API:
+  <https://dataset.api.hub.geosphere.at/v1/grid/forecast/ensemble-v1-1h-2500m/metadata>
+  and
+  `https://dataset.api.hub.geosphere.at/v1/grid/forecast/ensemble-v1-1h-2500m`
+- Ensemble bulk listing:
+  <https://public.hub.geosphere.at/public/datahub.html?id=ensemble-v1-1h-2500m/filelisting>
+
+Authentication is not required. Both datasets are CC BY 4.0. The
+deterministic dataset has DOI `10.60669/jft1-g709`; the ensemble-statistics
+dataset has DOI `10.60669/c1by-wh34`. The forecast API can return targeted
+NetCDF or GeoJSON selected by parameter, bounding box, time, and forecast
+offset. A one-parameter, one-cell, one-time NetCDF request was about 27 KB.
+The API is currently marked prerelease and exposes only a small rolling set of
+cycles, so discovery must not assume durable history.
+
+These are provider-generated regular WGS84 products at approximately 2.5 km,
+interpolated from native 1 km C-LAEF. Store that regridding provenance rather
+than calling them native 2.5 km model output. The deterministic product runs
+every three hours and is hourly through f060. The ensemble product runs at
+00/12Z and exposes p10, p50, and p90 for 13 logical fields from 16 perturbed
+runs plus the control; it does not expose raw members. The provider warns of a
+model/API transition in early 2027, so pin collection generation, parameter
+metadata, and geometry rather than relying only on the legacy API identifier.
+
+### MeteoGalicia WRF
+
+Producer and licensing publisher: **MeteoGalicia, Xunta de Galicia**. Direct
+transport is MeteoGalicia's THREDDS service.
+
+- Xunta open-data record and CC BY-SA 4.0 terms:
+  <https://abertos.xunta.gal/catalogo/medio-abiente/-/dataset/0485/servidor-thredds-meteogalicia>
+- Official THREDDS usage manual:
+  <https://meteo-estaticos.xunta.gal/datosred/infoweb/numerico/thredds/Manual_uso_Thredds.pdf>
+- Root catalogue:
+  <https://thredds.meteogalicia.gal/thredds/catalog/catalog.xml>
+- Deterministic file catalogues:
+  `https://thredds.meteogalicia.gal/thredds/catalog/wrf_2d_{36km|12km|04km}/fmrc/files/catalog.xml`
+- Raw-ensemble file catalogues:
+  `https://thredds.meteogalicia.gal/thredds/catalog/wrf_ens_2d_{12km|04km}/fmrc/files/catalog.xml`
+
+Authentication is not required. THREDDS exposes OPeNDAP, HTTP, WCS, NCSS,
+and WMS access; use OPeNDAP projection for bounded canonical acquisition. The
+three deterministic Lambert grids are 118x104 at 36 km, 171x138 at 12 km, and
+117x126 at 4 km. They run at 00/12Z with hourly output from f001 through f096
+at 00Z and f084 at 12Z. Current whole files are roughly 77-163 MB, while a
+one-scalar OPeNDAP projection was 324 bytes. The public inventory contains
+surface and derived fields plus only a small fixed upper-air subset; it is not
+a full pressure-level or model-level state.
+
+The 12 km and 4 km ensemble grids run daily at 00Z with 21 array members and
+hourly output to f216. Whole files are approximately 7.4 GB and 4.5 GB, but
+OPeNDAP can select a field, member, time, and cell. Dataset history refers to
+members `m00` through `m20`, yet the files do not expose an authoritative
+ensemble coordinate or control/perturbation mapping. Keep both raw-member
+lanes gated until MeteoGalicia documents that contract; never infer that the
+first array member is the control. Observed rolling catalogue depths are
+fixtures, not a retention promise.
+
+### Google DeepMind WeatherNext 2 historical data
+
+Producer: **Google**, through the WeatherNext catalogue and an operational
+Google DeepMind model. The historical licensing publisher is
+**Google/WeatherNext**; its required attribution names DeepMind Technologies
+Limited. For current data, the contracting licensor is Google Ireland Limited
+in the EEA/Switzerland and Google LLC elsewhere. Google Cloud Storage,
+BigQuery, and Google Earth Engine are transports, not independent producers.
+Use stable producer identity `google-weathernext` and persist the exact
+publisher, citation, third-party acknowledgements, and terms version.
+
+- Official dataset catalogue:
+  <https://developers.google.com/earth-engine/datasets/catalog/projects_gcp-public-data-weathernext_assets_weathernext_2_0_0>
+- Provider-published ensemble mean:
+  <https://developers.google.com/earth-engine/datasets/catalog/projects_gcp-public-data-weathernext_assets_weathernext_2_0_0_mean>
+- BigQuery access guide:
+  <https://developers.google.com/weathernext/guides/bigquery>
+- Current-data terms:
+  <https://storage.googleapis.com/weathernext-public/terms-of-use.pdf>
+- Historical Zarr roots after access approval:
+  `gs://weathernext/weathernext_2_0_0/zarr` and
+  `gs://weathernext/weathernext_2_0_0_mean/zarr`
+
+WeatherNext 2 is global at 0.25 degree, initializes at 00/06/12/18Z, and has
+64 members at six-hour steps through 15 days. It includes surface variables
+and temperature, humidity, winds, vertical velocity, and geopotential at 13
+pressure levels. The publisher also provides a 64-member mean. BigQuery,
+Earth Engine, and the raw historical Zarr path require a Google Cloud project
+and the provider's data-request/subscription flow.
+
+Only data older than 48 hours belong in this public backlog: Google publishes
+that historical portion under CC BY 4.0. The separate current-data terms are
+revocable and non-transferable and prohibit public sharing of raw/unmodified
+data; subsetting or format conversion alone does not make those bytes freely
+redistributable. A public RWS adapter must therefore enforce a server-side
+age gate, fail closed around the boundary, and never advertise a current or
+`latest` run. Start with the official mean, then add raw members only after
+the ensemble-member contract and bounded Zarr/BigQuery acquisition are ready.
+
 ### NOAA/NCEP CFSv2
 
 Producer/licensor: **NOAA National Centers for Environmental Prediction**.
@@ -591,6 +757,10 @@ are recorded.
 | `metcoop` via `fmi` | FMI publishes its MEPS feed under CC BY 4.0 | Credit MetCoOp as producer and FMI as licensing publisher; link licence and indicate changes | <https://en.ilmatieteenlaitos.fi/open-data-licence> |
 | `metcoop` via `smhi` | SMHI open data are published under CC BY 4.0 unless a dataset says otherwise | Credit MetCoOp as producer and SMHI as licensing publisher; link licence and indicate changes | <https://www.smhi.se/data/om-smhis-data/fragor-och-svar> |
 | `smn-argentina` | CC BY 2.5 Argentina permits sharing and adaptation, including commercial use | Servicio Meteorológico Nacional, dataset citation, and registry access date | <https://registry.opendata.aws/smn-ar-wrf-dataset/> |
+| `inpe-cptec` | INPE's current plan marks WRF 7 km and BRAMS 8 km open; Brazil's federal open-data definition permits free reuse subject to source credit | `INPE/CPTEC`, source URL, plan/version, and modification notice | [INPE open-data plan](https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/repositorio-de-arquivos/pda_inpe_25_27_v3_defesoeleitoral2026.pdf) and [Decreto 8.777/2016](https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2016/decreto/d8777.htm) |
+| `geosphere-austria` | C-LAEF deterministic and ensemble-statistics datasets are CC BY 4.0 | GeoSphere Austria, dataset DOI, licence link, provider-regridding and change indication | [deterministic dataset](https://data.hub.geosphere.at/en/dataset/nwp-v2-1h-2500m) and [ensemble dataset](https://data.hub.geosphere.at/en/dataset/ensemble-v2-1h-2500m) |
+| `meteogalicia` | MeteoGalicia THREDDS model results are CC BY-SA 4.0 | MeteoGalicia/Xunta de Galicia, source and licence links, change indication, and share-alike obligations | <https://abertos.xunta.gal/catalogo/medio-abiente/-/dataset/0485/servidor-thredds-meteogalicia> |
+| `google-weathernext` historical only | WeatherNext 2 data older than 48 hours are CC BY 4.0; current data are excluded from the public adapter because separate terms restrict redistribution | Persist the exact WeatherNext 2 citation naming DeepMind Technologies Limited, CC BY link, third-party acknowledgements, source, age at acquisition, and modifications | [dataset catalogue](https://developers.google.com/earth-engine/datasets/catalog/projects_gcp-public-data-weathernext_assets_weathernext_2_0_0) and [current-data terms](https://storage.googleapis.com/weathernext-public/terms-of-use.pdf) |
 | `noaa-ncep` | US federal NOAA data are generally public-domain; retain dataset-specific notices | NOAA/NCEP as producer and NOMADS or NCEI only as transport | <https://www.noaa.gov/disclaimer> |
 | `meteoswiss` | STAC collections declare CC BY | Federal Office of Meteorology and Climatology MeteoSwiss, licence link, and change indication | The `license` and provider fields in the [ICON-CH1 collection](https://data.geo.admin.ch/api/stac/v1/collections/ch.meteoschweiz.ogd-forecasting-icon-ch1) |
 | `knmi` | HARMONIE open data is CC BY 4.0 | KNMI, licence link, and change indication | <https://english.knmidata.nl/open-data/harmonie> |
@@ -678,6 +848,24 @@ Provider-specific minimum fixtures:
 - Argentina SMN: anonymous S3 listing, CF-NetCDF header, Lambert coordinate
   golden, one surface and one accumulation field, and an explicit inventory
   proving which public files lack model-level fields.
+- CPTEC/INPE: dated WRF and BRAMS listings plus `.inv`, `.grib2.idx`, and
+  `.ctl` sidecars. Range-select one surface, pressure, vector-wind, and
+  accumulation message; assert 1019x1081 versus 978x1009 geometry, unequal
+  BRAMS increments, 25 pressure levels, and rejection of BRAMS negative leads.
+- GeoSphere Austria: API metadata plus one-cell/one-time targeted NetCDF for
+  deterministic and percentile collections. Assert bbox, cycle/offset,
+  parameter generation, p10/p50/p90 identity, DOI/licence, provider regrid,
+  rolling-cycle fallback, and the announced 2027 transition boundary.
+- MeteoGalicia: THREDDS catalogue, DDS/DAS, and tiny OPeNDAP slices for all
+  three deterministic grids. Assert Lambert mapping, two-dimensional corner
+  and interior coordinates, cycle-dependent horizon, and public field limits.
+  For ensemble files, assert that member/control semantics are unavailable and
+  support remains disabled rather than guessing array order.
+- WeatherNext 2 historical: credential-stripped BigQuery schema and dry-run
+  with `maximumBytesBilled`, or Zarr metadata plus a bounded chunk selection;
+  fixture the provider mean and its 64-member statistic. Test the greater-than-
+  48-hour gate on both sides of the boundary, exact citation persistence, and
+  rejection of every current/`latest` discovery path before raw members.
 - CFSv2: `.idx` and selected message ranges from `flxf`, `pgbf`, and `ipvf`,
   with member and six-hour valid-time assertions.
 - MeteoSwiss: STAC collection and item, parameter CSV, static geometry asset,
@@ -687,7 +875,7 @@ Provider-specific minimum fixtures:
 
 ## Watchlist and access gates
 
-These feeds are not included in the 45-lane implementation count. Recheck them
+These feeds are not included in the 55-lane implementation count. Recheck them
 periodically, but do not build a production adapter until the named gate is
 closed with an official source and a live bounded fixture.
 
@@ -698,8 +886,12 @@ closed with an official source and a live bounded fixture.
 | Italy MeteoAM limited-area forecast | [WIS2 discovery record](https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn%3Awmo%3Amd%3Ait-meteoam%3Aforecast.short-range.deterministic.limited-area?f=html) | Metadata declares WMO core, but the advertised source endpoint repeatedly timed out and no bounded payload could be verified. | Pin a reachable official listing, retention, and GRIB fixture. |
 | Australia Bureau of Meteorology ACCESS | [ACCESS NWP products](https://www.bom.gov.au/nwp/doc/access/NWPData.shtml), [copyright notice](https://www.bom.gov.au/copyright), and [data licence agreement](https://www.bom.gov.au/sites/default/files/2026-07/bureau-of-meteorology-data-licence-agreement-june-2026.pdf) | Operational model files use a Registered User/subscriber channel. Default Bureau terms do not establish unrestricted third-party or commercial redistribution. | Obtain and record a licence that covers RWS redistribution and automated access. |
 | JMA GSM/MSM/LFM GPV | [official product catalogue](https://www.data.jma.go.jp/suishin/cgi-bin/catalogue/make_product_page.cgi?id=ZenModel), [JMBSC distribution](https://www.jmbsc.or.jp/en/index-e.html), and [official samples](https://www.data.jma.go.jp/developer/gpv_sample.html) | Operational GPV delivery is through the contracted/paid JMBSC service. Public sample files are suitable only as decoder fixtures and do not establish redistribution rights. | Establish an official operational access and redistribution contract; do not treat sample files as a live feed. |
-| CPTEC/INPE BAM | [official anonymous directory](https://ftp.cptec.inpe.br/modelos/tempo/BAM/) and [INPE 2025-2027 open-data plan](https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/repositorio-de-arquivos/pda_inpe_25_27_v3.pdf) | The current anonymous `singleLevel` GRIB2 tree is only a limited subset; the plan schedules global raw BAM grid output for June 2027 and current redistribution terms are not explicit enough. | Confirm a complete grid inventory and official reuse/redistribution terms. |
+| CPTEC/INPE BAM | [official anonymous directory](https://ftp.cptec.inpe.br/modelos/tempo/BAM/) and [INPE 2025-2027 open-data plan](https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/repositorio-de-arquivos/pda_inpe_25_27_v3_defesoeleitoral2026.pdf) | The current anonymous `singleLevel` GRIB2 tree is only a limited subset. The plan marks the base open but schedules complete global raw BAM grid output for June 2027. | Confirm the complete raw grid, inventory, and bounded transport after the scheduled opening; the remaining gate is technical completeness, not general INPE reuse permission. |
 | AEMET HARMONIE-AROME packages | [official catalogue](https://datos.gob.es/en/catalogo/e05068001-datos-del-modelo-harmonie-arome) and [AEMET legal notice](https://www.aemet.es/es/nota_legal) | Public packages are selected derived GeoTIFF/GeoJSON surface products, not a canonical full NWP state. Reuse is allowed with attribution, but counting it as full model normalization would overstate semantics. | Add only as an explicitly derived-product lane, or locate an official full-field feed. |
+| ICPAC WRF East Africa rainfall products | [official dataset API](https://floodwatch.icpac.net/api/datasets), [WRF total-rainfall metadata](https://floodwatch.icpac.net/api/metadata/2769c1e8-97cb-4144-a460-cfca2f97ce3f), and [WRF extreme-rainfall metadata](https://floodwatch.icpac.net/api/metadata/a3a96f87-a5b5-4fb1-9bd0-603959ef6b25) | The live public products are derived daily total/extreme-rainfall COG/tile layers, not the full WRF state, and both official metadata records have a null licence field. | Obtain an ICPAC reuse/redistribution statement tied to the products and either locate the raw model grid or define an explicitly derived-rainfall canonical lane. |
+| Colombia IDEAM WRF | [official model portal](https://bart.ideam.gov.co/wrfideam/) and [live NetCDF directory](https://bart.ideam.gov.co/wrfideam/new_modelo/WRF00COLOMBIA/netcdf/) | Anonymous WRF NetCDF is live, but whole aggregates are tens of GB, the transport offers no observed server-side subset/index contract, and the portal's requested citation is not an explicit redistribution licence. | Tie an official commercial/redistribution licence to this exact dataset and prove a bounded variable/time acquisition path. |
+| India NCMRWF NCUM/NEPS | [official NCMRWF model guidance](https://nwp.ncmrwf.gov.in/model-guidance) and [SWFDP product portal](https://nwp.ncmrwf.gov.in/HomePage/index.php) | Official guidance documents NCUM/NEPS, but the public portal exposes charts and derived forecast products rather than a licensed, machine-readable raw model feed. The separate research portal requires registration. | Pin an official raw-object/API contract, access terms, redistribution permission, and one bounded grid fixture. |
+| WeatherNext 2 current data (48 hours or newer) | [official catalogue](https://developers.google.com/earth-engine/datasets/catalog/projects_gcp-public-data-weathernext_assets_weathernext_2_0_0) and [current-data terms](https://storage.googleapis.com/weathernext-public/terms-of-use.pdf) | Current-data rights are revocable/non-transferable and prohibit public sharing of raw/unmodified data; subsetting or format conversion alone does not create an open redistribution route. This restriction does not apply to the separately queued historical slice older than 48 hours. | Obtain a Google agreement that expressly permits the proposed RWS current-data API, or keep the server-side age gate permanently fail-closed. |
 
 ## Deliberately deferred adjacent feeds
 
@@ -710,3 +902,12 @@ products. They are valuable, but they should be researched as separate
 canonical-domain lanes rather than being counted as atmospheric weather-model
 support. This prevents a large catalogue number from hiding missing semantics
 in the store and API.
+
+Open model weights or inference code are not themselves an operational public
+forecast feed. GraphCast/GenCast, FourCastNet, Pangu-Weather, Aurora, and
+similar research systems therefore remain outside the active count until a
+provider publishes a continuously advancing, licensed output grid or RWS owns
+a separately scoped inference service with licensed initial conditions,
+weights, runtime, output semantics, and reproducibility fixtures. The retired
+WeatherNext Graph and Gen catalogues are not additional lanes; WeatherNext 2
+is their provider-designated successor and is scoped above by legal age.
