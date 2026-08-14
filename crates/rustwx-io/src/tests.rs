@@ -1225,6 +1225,12 @@ fn component_bundle_is_ordered_source_bound_and_inventory_keyed() {
     };
     let first_bytes = grib(0, vec![250.0, 251.0]);
     let second_bytes = grib(1, vec![40.0, 50.0]);
+    let first_wmo_bulletin = [
+        b"\x01\r\r\n823\r\r\nYTRB50 RUMS 140000\r\r\n".as_slice(),
+        first_bytes.as_slice(),
+        b"\r\r\n\x03".as_slice(),
+    ]
+    .concat();
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1241,7 +1247,7 @@ fn component_bundle_is_ordered_source_bound_and_inventory_keyed() {
         variable_patterns: Vec::new(),
     };
     let components = [
-        ("AirTemp_IsbL-0500", first_bytes.clone()),
+        ("AirTemp_IsbL-0500", first_wmo_bulletin.clone()),
         ("RelativeHumidity_IsbL-0500", second_bytes.clone()),
     ];
     for (product, bytes) in &components {
@@ -1314,6 +1320,26 @@ fn component_bundle_is_ordered_source_bound_and_inventory_keyed() {
         assert!(
             parse_complete_grib2_stream(&malformed).is_err(),
             "component admission must reject non-exact GRIB2 streams"
+        );
+    }
+
+    assert_eq!(
+        grib2_component_payload(&first_wmo_bulletin).unwrap(),
+        first_bytes
+    );
+    for malformed in [
+        [b"junk\r\r\n".as_slice(), first_bytes.as_slice()].concat(),
+        [
+            b"\x01\r\r\n823\r\r\nYTRB50 RUMS 140000\r\r\n".as_slice(),
+            first_bytes.as_slice(),
+            b"\n\x03".as_slice(),
+        ]
+        .concat(),
+        first_wmo_bulletin[..first_wmo_bulletin.len() - 1].to_vec(),
+    ] {
+        assert!(
+            grib2_component_payload(&malformed).is_err(),
+            "only an exact WMO envelope may be stripped"
         );
     }
 

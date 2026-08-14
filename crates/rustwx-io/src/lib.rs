@@ -1101,6 +1101,100 @@ const MAX_COMPONENT_BUNDLE_OBJECTS: usize = 512;
 /// bounding RAM, cache, and spill exposure before any decode begins.
 const MAX_COMPONENT_BUNDLE_BYTES: usize = 512 * 1024 * 1024;
 
+/// Maximum accepted WMO/GTS abbreviated-heading envelope before the GRIB
+/// indicator. Operational bulletins are only a few dozen bytes; the bound
+/// prevents an arbitrary binary prefix from being scanned as a bulletin.
+const MAX_WMO_BULLETIN_HEADER_BYTES: usize = 1024;
+
+/// Return the exact GRIB2 message carried by either a bare component object or
+/// a WMO/GTS bulletin envelope (`SOH ... CR CR LF GRIB ... 7777 CR CR LF ETX`).
+///
+/// WIS2 publishers are allowed to expose the traditional bulletin bytes as the
+/// canonical object. `Grib2File::from_bytes` scans past that envelope, but the
+/// component-bundle admission path deliberately requires an exact stream. This
+/// seam removes only a structurally complete, bounded envelope; arbitrary
+/// leading/trailing bytes still fail closed.
+fn grib2_component_payload(bytes: &[u8]) -> Result<&[u8], IoError> {
+    if bytes.starts_with(b"GRIB") {
+        return Ok(bytes);
+    }
+    if bytes.first() != Some(&0x01) {
+        return Err(IoError::Grib(
+            "component is neither bare GRIB2 nor a WMO bulletin envelope".to_string(),
+        ));
+    }
+
+    let scan_end = bytes
+        .len()
+        .min(MAX_WMO_BULLETIN_HEADER_BYTES.saturating_add(4));
+    let grib_offset = bytes[..scan_end]
+        .windows(4)
+        .position(|window| window == b"GRIB")
+        .ok_or_else(|| {
+            IoError::Grib(format!(
+                "WMO bulletin has no GRIB indicator within {MAX_WMO_BULLETIN_HEADER_BYTES} header bytes"
+            ))
+        })?;
+    if grib_offset < 4 || bytes.get(grib_offset - 3..grib_offset) != Some(b"\r\r\n") {
+        return Err(IoError::Grib(
+            "WMO bulletin heading is not terminated by CR CR LF".to_string(),
+        ));
+    }
+    if bytes[1..grib_offset - 3]
+        .iter()
+        .any(|byte| !matches!(*byte, b' '..=b'~' | b'\r' | b'\n'))
+    {
+        return Err(IoError::Grib(
+            "WMO bulletin heading contains non-ASCII control bytes".to_string(),
+        ));
+    }
+    let indicator_end = grib_offset
+        .checked_add(16)
+        .ok_or_else(|| IoError::Grib("WMO bulletin GRIB offset overflow".to_string()))?;
+    if indicator_end > bytes.len() {
+        return Err(IoError::Grib(
+            "WMO bulletin ends inside the GRIB2 indicator section".to_string(),
+        ));
+    }
+    if bytes[grib_offset + 7] != 2 {
+        return Err(IoError::Grib(format!(
+            "WMO bulletin carries GRIB edition {} instead of edition 2",
+            bytes[grib_offset + 7]
+        )));
+    }
+    let message_len = u64::from_be_bytes(
+        bytes[grib_offset + 8..indicator_end]
+            .try_into()
+            .expect("16-byte indicator bounds checked"),
+    );
+    let message_len = usize::try_from(message_len)
+        .map_err(|_| IoError::Grib("WMO bulletin GRIB2 length exceeds usize".to_string()))?;
+    if message_len < 20 {
+        return Err(IoError::Grib(format!(
+            "WMO bulletin GRIB2 message declares invalid length {message_len}"
+        )));
+    }
+    let message_end = grib_offset
+        .checked_add(message_len)
+        .ok_or_else(|| IoError::Grib("WMO bulletin GRIB2 end offset overflow".to_string()))?;
+    if message_end > bytes.len() {
+        return Err(IoError::Grib(format!(
+            "WMO bulletin GRIB2 message declares {message_len} bytes but the object is truncated"
+        )));
+    }
+    if bytes.get(message_end - 4..message_end) != Some(b"7777") {
+        return Err(IoError::Grib(
+            "WMO bulletin GRIB2 message lacks the Section 8 terminator".to_string(),
+        ));
+    }
+    if bytes.get(message_end..) != Some(b"\r\r\n\x03") {
+        return Err(IoError::Grib(
+            "WMO bulletin does not end with CR CR LF ETX immediately after GRIB2".to_string(),
+        ));
+    }
+    Ok(&bytes[grib_offset..message_end])
+}
+
 /// Parse a GRIB2 stream only after proving it consists of one or more exact,
 /// adjacent messages. `Grib2File::from_bytes` is intentionally permissive for
 /// general meteorological files: it scans past leading junk and accepts an
@@ -1246,7 +1340,13 @@ pub fn fetch_component_bundle_with_cache(
             variable_patterns: Vec::new(),
         };
         let component = fetch_bytes_with_cache(&component_fetch, cache_root, use_cache)?;
-        parse_complete_grib2_stream(&component.result.bytes).map_err(|err| {
+        let component_payload =
+            grib2_component_payload(&component.result.bytes).map_err(|err| {
+                IoError::Grib(format!(
+                    "component '{product}' has an invalid envelope: {err}"
+                ))
+            })?;
+        parse_complete_grib2_stream(component_payload).map_err(|err| {
             IoError::Grib(format!(
                 "component '{product}' is not complete GRIB2: {err}"
             ))
@@ -1263,7 +1363,7 @@ pub fn fetch_component_bundle_with_cache(
         }
         let next_len = bytes
             .len()
-            .checked_add(component.result.bytes.len())
+            .checked_add(component_payload.len())
             .ok_or_else(|| {
                 IoError::Download("component bundle byte length overflow".to_string())
             })?;
@@ -1272,7 +1372,7 @@ pub fn fetch_component_bundle_with_cache(
                 "component bundle exceeds {MAX_COMPONENT_BUNDLE_BYTES} bytes at product '{product}'"
             )));
         }
-        bytes.extend_from_slice(&component.result.bytes);
+        bytes.extend_from_slice(component_payload);
     }
     parse_complete_grib2_stream(&bytes)
         .map_err(|err| IoError::Grib(format!("assembled component bundle is invalid: {err}")))?;

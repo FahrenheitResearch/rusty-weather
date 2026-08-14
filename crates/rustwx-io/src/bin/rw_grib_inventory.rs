@@ -22,7 +22,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     for (index, message) in grib.messages.iter().enumerate() {
         println!(
-            "{index:04} d/c/n={}/{}/{} {:<36} level={}:{} ({}) grid={} {}x{} scan=0x{:02x} resolution=0x{:02x} south_pole=({:.6},{:.6}) rotation={:.6} data_rep={} pdt={} forecast={}/{} ensemble={:?}/{:?}/{:?} derived={:?} percentile={:?} probability={:?}/{:?}/{:?}/{:?} statistics={:?}/{:?}/{:?}",
+            "{index:04} d/c/n={}/{}/{} {:<36} level={}:{} ({}) grid={} {}x{} \
+             first=({:.6},{:.6}) last=({:.6},{:.6}) step=({:.6},{:.6}) \
+             scan=0x{:02x} resolution=0x{:02x} south_pole=({:.6},{:.6}) rotation={:.6} \
+             data_rep={} pdt={} ref={} forecast={}/{} ensemble={:?}/{:?}/{:?} \
+             derived={:?} percentile={:?} probability={:?}/{:?}/{:?}/{:?} \
+             statistics={:?}/{:?}/{:?} end={:?}",
             message.discipline,
             message.product.parameter_category,
             message.product.parameter_number,
@@ -37,6 +42,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             message.grid.template,
             message.grid.nx,
             message.grid.ny,
+            message.grid.lat1,
+            message.grid.lon1,
+            message.grid.lat2,
+            message.grid.lon2,
+            message.grid.dx,
+            message.grid.dy,
             message.grid.scan_mode,
             message.grid.resolution_flags,
             message.grid.south_pole_lat,
@@ -44,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             message.grid.rotation_angle,
             message.data_rep.template,
             message.product.template,
+            message.reference_time,
             message.product.forecast_time,
             message.product.time_range_unit,
             message.product.ensemble_type,
@@ -61,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             message.product.statistical_process_type,
             message.product.statistical_time_range_unit,
             message.product.time_range_length,
+            message.product.end_of_interval,
         );
     }
     Ok(())
