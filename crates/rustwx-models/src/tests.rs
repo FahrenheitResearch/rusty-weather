@@ -891,6 +891,34 @@ fn latest_available_run_prefers_source_priority_within_same_cycle() {
 }
 
 #[test]
+fn latest_available_run_never_probes_future_cycles_on_the_current_day() {
+    let mut probed = Vec::new();
+    let latest = latest_available_run_for_products_with_probe_at_forecast_hour_as_of(
+        ModelId::Gfs,
+        None,
+        "20260414",
+        &["pgrb2.0p25"],
+        0,
+        "20260414",
+        10,
+        |resolved| {
+            let url = resolved.availability_probe_url().to_string();
+            probed.push(url.clone());
+            url.contains("gfs.t06z.pgrb2.0p25.f000")
+        },
+    )
+    .unwrap();
+
+    assert_eq!(latest.cycle.hour_utc, 6);
+    assert!(!probed.is_empty());
+    assert!(
+        probed
+            .iter()
+            .all(|url| !url.contains("t12z") && !url.contains("t18z"))
+    );
+}
+
+#[test]
 fn latest_available_run_probes_the_models_first_published_lead() {
     let mut probed = Vec::new();
     let latest = latest_available_run_with_probe(ModelId::Reps, None, "20260814", |resolved| {

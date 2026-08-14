@@ -17,6 +17,27 @@ const AIFS_INDEX_SAMPLE: &str = r#"{"domain": "g", "date": "20260810", "time": "
 {"domain": "g", "date": "20260810", "time": "0000", "expver": "0001", "class": "ai", "type": "fc", "stream": "oper", "step": "24", "levtype": "sfc", "param": "2t", "model": "aifs-single", "_offset": 82676279, "_length": 551319}
 "#;
 
+#[test]
+#[cfg(any(windows, target_os = "linux"))]
+fn fetch_cache_lock_recovers_a_dead_owner_without_waiting_for_age_expiry() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let lock_path = std::env::temp_dir().join(format!(
+        "rustwx-fetch-lock-{}-{nonce}.lock",
+        std::process::id()
+    ));
+
+    std::fs::write(&lock_path, format!("pid={}\n", std::process::id())).unwrap();
+    assert!(!fetch_cache_lock_pid_is_dead(&lock_path));
+
+    std::fs::write(&lock_path, format!("pid={}\n", u32::MAX)).unwrap();
+    assert!(fetch_cache_lock_pid_is_dead(&lock_path));
+
+    std::fs::remove_file(lock_path).unwrap();
+}
+
 const DWD_ICON_REGULAR_LATLON_INVENTORY: &str =
     include_str!("../tests/fixtures/dwd-icon-regular-latlon-20260814.inventory.txt");
 

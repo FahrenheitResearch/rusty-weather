@@ -6815,6 +6815,35 @@ fn latest_available_run_for_products_with_probe_at_forecast_hour<F>(
     date_yyyymmdd: &str,
     products: &[&str],
     forecast_hour: u16,
+    probe_available: F,
+) -> Result<LatestRun, ModelError>
+where
+    F: FnMut(&ResolvedUrl) -> bool,
+{
+    use chrono::Timelike;
+
+    let now = chrono::Utc::now();
+    latest_available_run_for_products_with_probe_at_forecast_hour_as_of(
+        model,
+        source,
+        date_yyyymmdd,
+        products,
+        forecast_hour,
+        &now.format("%Y%m%d").to_string(),
+        now.hour() as u8,
+        probe_available,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn latest_available_run_for_products_with_probe_at_forecast_hour_as_of<F>(
+    model: ModelId,
+    source: Option<SourceId>,
+    date_yyyymmdd: &str,
+    products: &[&str],
+    forecast_hour: u16,
+    as_of_date_yyyymmdd: &str,
+    as_of_hour_utc: u8,
     mut probe_available: F,
 ) -> Result<LatestRun, ModelError>
 where
@@ -6849,7 +6878,19 @@ where
     // after UTC rollover or during a publication delay.
     let candidate_dates = cycle_date_rollback_candidates(date_yyyymmdd);
     for candidate_date in &candidate_dates {
+        // `Latest` used to start at the final configured cycle of the
+        // requested date even when that cycle was still hours in the future.
+        // Hourly models could therefore make dozens of sequential provider
+        // probes before reaching the newest plausible run.  Historical dates
+        // remain unrestricted; today is bounded by the current UTC hour, and
+        // a future date is skipped rather than probed.
+        if candidate_date.as_str() > as_of_date_yyyymmdd {
+            continue;
+        }
         for hour_utc in summary.cycle_hours_utc.iter().rev().copied() {
+            if candidate_date == as_of_date_yyyymmdd && hour_utc > as_of_hour_utc {
+                continue;
+            }
             if !forecast_hour_supported(model, hour_utc, forecast_hour) {
                 continue;
             }

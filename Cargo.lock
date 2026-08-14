@@ -4482,6 +4482,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "windows-sys 0.61.2",
  "wx-core",
 ]
 
@@ -4489,6 +4490,7 @@ dependencies = [
 name = "rustwx-models"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "rayon",
  "rustls",
  "rustwx-core",

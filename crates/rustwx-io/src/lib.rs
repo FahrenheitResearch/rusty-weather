@@ -1612,6 +1612,33 @@ fn fetch_cache_lock_pid_is_dead(lock_path: &Path) -> bool {
     if pid == std::process::id() {
         return false;
     }
+
+    fetch_cache_lock_owner_is_dead(pid)
+}
+
+#[cfg(windows)]
+fn fetch_cache_lock_owner_is_dead(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // A lock can survive a forced app exit.  `/proc` does not exist on
+    // Windows, so the old implementation treated every such lock as live for
+    // 30 minutes (and made callers wait as long as 45 minutes).  Query the
+    // recorded PID directly.  Access-denied and other indeterminate errors
+    // fail closed: only ERROR_INVALID_PARAMETER proves that no such process
+    // exists.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_INVALID_PARAMETER;
+        }
+        let _ = CloseHandle(handle);
+        false
+    }
+}
+
+#[cfg(not(windows))]
+fn fetch_cache_lock_owner_is_dead(pid: u32) -> bool {
     let proc_root = Path::new("/proc");
     proc_root.exists() && !proc_root.join(pid.to_string()).exists()
 }
