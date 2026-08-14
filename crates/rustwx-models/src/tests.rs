@@ -817,6 +817,22 @@ fn ecmwf_summary_matches_current_open_data_cycles_and_horizon() {
     assert!(summary.description.contains("50r1"));
     assert_eq!(summary.cycle_hours_utc, &[0, 6, 12, 18]);
     assert_eq!(summary.max_forecast_hour, 360);
+    assert!(summary.sources[0].idx_available);
+
+    let request = ModelRunRequest::new(
+        ModelId::EcmwfOpenData,
+        CycleSpec::new("20260414", 12).unwrap(),
+        6,
+        "oper",
+    )
+    .unwrap();
+    let resolved = resolve_urls(&request).unwrap();
+    assert_eq!(
+        resolved[0].idx_url.as_deref(),
+        Some(
+            "https://data.ecmwf.int/forecasts/20260414/12z/ifs/0p25/oper/20260414120000-6h-oper-fc.index"
+        )
+    );
 }
 
 #[test]
@@ -969,13 +985,56 @@ fn gdps_cadence_and_component_urls_match_the_msc_datamart_contract() {
 
 #[test]
 fn gefs_supported_forecast_hours_follow_operational_high_hour_cadence() {
-    let hours = supported_forecast_hours(ModelId::Gefs, 12);
-    assert!(hours.contains(&0));
-    assert!(hours.contains(&240));
-    assert!(!hours.contains(&243));
-    assert!(hours.contains(&246));
-    assert!(!hours.contains(&249));
-    assert!(hours.contains(&384));
+    let hours_12z = supported_forecast_hours(ModelId::Gefs, 12);
+    assert!(hours_12z.contains(&0));
+    assert!(hours_12z.contains(&240));
+    assert!(!hours_12z.contains(&243));
+    assert!(hours_12z.contains(&246));
+    assert!(!hours_12z.contains(&249));
+    assert!(hours_12z.contains(&384));
+    assert!(!hours_12z.contains(&390));
+
+    let hours_00z = supported_forecast_hours(ModelId::Gefs, 0);
+    assert!(hours_00z.contains(&390));
+    assert!(hours_00z.contains(&840));
+    assert!(!hours_00z.contains(&837));
+    assert_eq!(model_summary(ModelId::Gefs).max_forecast_hour, 840);
+}
+
+#[test]
+fn operational_ai_model_schedules_and_ensemble_modes_match_published_products() {
+    assert_eq!(
+        supported_forecast_hours(ModelId::Aigfs, 0).first(),
+        Some(&0)
+    );
+    assert_eq!(
+        supported_forecast_hours(ModelId::Aigfs, 0).last(),
+        Some(&384)
+    );
+    assert_eq!(
+        supported_forecast_hours(ModelId::Aigefs, 0).first(),
+        Some(&6)
+    );
+    assert_eq!(
+        supported_forecast_hours(ModelId::Aigefs, 0).last(),
+        Some(&384)
+    );
+    assert_eq!(
+        supported_forecast_hours(ModelId::Hgefs, 0).first(),
+        Some(&0)
+    );
+    assert_eq!(
+        supported_forecast_hours(ModelId::Hgefs, 0).last(),
+        Some(&240)
+    );
+    assert_eq!(
+        model_summary(ModelId::Aigefs).ensemble_mode,
+        EnsembleMode::PostProcessedStatisticsGribFiles
+    );
+    assert_eq!(
+        model_summary(ModelId::Hgefs).ensemble_mode,
+        EnsembleMode::PostProcessedStatisticsGribFiles
+    );
 }
 
 #[test]
@@ -1378,6 +1437,22 @@ fn easy_ncep_model_urls_use_current_operational_layouts() {
 }
 
 #[test]
+fn operational_ai_url_builders_reject_unpublished_hours() {
+    let cycle = rustwx_core::CycleSpec::new("20260502", 0).unwrap();
+    for (model, hour, product) in [
+        (ModelId::Aigfs, 3, "pres"),
+        (ModelId::Aigefs, 0, "sfc/avg"),
+        (ModelId::Hgefs, 246, "pres/avg"),
+    ] {
+        let request = ModelRunRequest::new(model, cycle.clone(), hour, product).unwrap();
+        assert!(matches!(
+            build_grib_url(SourceId::Nomads, &request),
+            Err(ModelError::UnsupportedForecastHour { .. })
+        ));
+    }
+}
+
+#[test]
 fn aifs_supports_local_long_runs_and_ecmwf_open_data_urls() {
     let local = ModelRunRequest::new(
         ModelId::Aifs,
@@ -1482,7 +1557,7 @@ fn latest_available_run_at_forecast_hour_prefers_ecmwf_long_cycle_when_needed() 
         150,
         |resolved| {
             let url = resolved.availability_probe_url();
-            url.contains("/20260414/12z/ifs/0p25/oper/") && url.contains("150h-oper-fc.grib2")
+            url.contains("/20260414/12z/ifs/0p25/oper/") && url.contains("150h-oper-fc.index")
         },
     )
     .unwrap();

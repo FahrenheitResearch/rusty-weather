@@ -21,7 +21,10 @@ use rw_federation_proxy::{
     FEDERATION_HOP_HEADER, FEDERATION_LOCAL_OBJECT_PATH_PREFIX, FEDERATION_LOCAL_RESOLVE_PATH,
     FEDERATION_PROXY_PATH, FederationProxyError, FederationProxyRequest,
 };
-use rw_ingest::{IngestCapabilityLimitation, IngestSupportStatus, model_ingest_capability};
+use rw_ingest::{
+    IngestCapabilityLimitation, IngestSupportStatus, indexed_subset_available,
+    model_ingest_capability,
+};
 use rw_query::{
     GeographicBoundingBox, GeographicVerticalSelection, GeographicWindowLimits,
     GeographicWindowRequest, IndexWindow2DRequest, IntervalSupport, MissingPolicy,
@@ -173,6 +176,7 @@ pub enum ApiIngestCapabilityLimitation {
     AnalysisOnly,
     SurfaceOnly,
     EnsembleMeanOnly,
+    EnsembleControlMemberOnly,
     SparsePressureLevels,
     DerivedProductsDisabled,
     ConusOnly,
@@ -185,6 +189,9 @@ impl From<IngestCapabilityLimitation> for ApiIngestCapabilityLimitation {
             IngestCapabilityLimitation::AnalysisOnly => Self::AnalysisOnly,
             IngestCapabilityLimitation::SurfaceOnly => Self::SurfaceOnly,
             IngestCapabilityLimitation::EnsembleMeanOnly => Self::EnsembleMeanOnly,
+            IngestCapabilityLimitation::EnsembleControlMemberOnly => {
+                Self::EnsembleControlMemberOnly
+            }
             IngestCapabilityLimitation::SparsePressureLevels => Self::SparsePressureLevels,
             IngestCapabilityLimitation::DerivedProductsDisabled => Self::DerivedProductsDisabled,
             IngestCapabilityLimitation::ConusOnly => Self::ConusOnly,
@@ -1459,7 +1466,7 @@ async fn list_models(
                         product: product.product.to_string(),
                         surface_source: product.surface_source,
                         pressure_source: product.pressure_source,
-                        indexed_subset: !product.idx_patterns.is_empty(),
+                        indexed_subset: indexed_subset_available(summary.id, &product),
                     })
                     .collect();
                 result.push(ModelCapabilityResponse {
@@ -4735,9 +4742,50 @@ mod tests {
         for id in ["aigefs", "hgefs"] {
             assert_eq!(
                 model(id)["limitations"],
-                serde_json::json!(["ensemble_mean_only", "derived_products_disabled"])
+                serde_json::json!([
+                    "ensemble_mean_only",
+                    "sparse_pressure_levels",
+                    "derived_products_disabled"
+                ])
+            );
+            assert_eq!(model(id)["verification"], "live_verified");
+            assert!(
+                model(id)["products"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|product| product["indexed_subset"] == false)
             );
         }
+        assert_eq!(
+            model("gefs")["limitations"],
+            serde_json::json!([
+                "ensemble_control_member_only",
+                "sparse_pressure_levels",
+                "derived_products_disabled"
+            ])
+        );
+        assert_eq!(model("gefs")["verification"], "live_verified");
+        assert_eq!(model("gefs")["max_forecast_hour"], 840);
+        assert_eq!(model("gefs")["products"][0]["indexed_subset"], true);
+        for id in ["aigfs", "ecmwf-open-data"] {
+            assert_eq!(
+                model(id)["limitations"],
+                serde_json::json!(["sparse_pressure_levels", "derived_products_disabled"])
+            );
+            assert_eq!(model(id)["verification"], "live_verified");
+        }
+        assert!(
+            model("aigfs")["products"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|product| product["indexed_subset"] == false)
+        );
+        assert_eq!(
+            model("ecmwf-open-data")["products"][0]["indexed_subset"],
+            true
+        );
         assert_eq!(
             model("hiresw")["limitations"],
             serde_json::json!(["surface_only", "conus_only"])
@@ -6300,28 +6348,30 @@ mod tests {
             );
         }
 
-        let hrrr = models
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|model| model["id"] == "hrrr")
-            .expect("missing built-in HRRR capability");
-        let noaa = hrrr["provider_attributions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|attribution| {
-                attribution["provider"]
-                    .as_str()
-                    .is_some_and(|provider| provider.contains("NOAA"))
-            })
-            .expect("NOAA attribution");
-        assert!(
-            noaa["modification_notice"]
-                .as_str()
+        for id in ["hrrr", "gefs", "aigfs", "aigefs", "hgefs"] {
+            let model = models
+                .as_array()
                 .unwrap()
-                .contains("not an official NOAA/NWS product")
-        );
+                .iter()
+                .find(|model| model["id"] == id)
+                .unwrap_or_else(|| panic!("missing built-in {id} capability"));
+            let noaa = model["provider_attributions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|attribution| {
+                    attribution["provider"]
+                        .as_str()
+                        .is_some_and(|provider| provider.contains("NOAA"))
+                })
+                .expect("NOAA attribution");
+            assert!(
+                noaa["modification_notice"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not an official NOAA/NWS product")
+            );
+        }
     }
 
     #[tokio::test]

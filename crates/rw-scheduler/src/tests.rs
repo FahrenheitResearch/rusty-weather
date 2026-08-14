@@ -493,11 +493,32 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
     let profile = ensemble.profile_for(ModelId::Href).unwrap();
     assert!(!profile.derived && !profile.heavy);
 
-    for model in [ModelId::Aigefs, ModelId::Hgefs] {
+    for model in [
+        ModelId::Aigfs,
+        ModelId::Aigefs,
+        ModelId::Hgefs,
+        ModelId::EcmwfOpenData,
+    ] {
         let config = scheduler_config(&format!("ensemble-profile-{model}"), &[model.as_str()]);
         let profile = config.profile_for(model).unwrap();
         assert!(!profile.derived && !profile.heavy);
     }
+
+    let gefs = scheduler_config("gefs-control-profile", &["gefs"]);
+    let profile = gefs.profile_for(ModelId::Gefs).unwrap();
+    assert!(!profile.derived && !profile.heavy);
+    let plan = JobPlan::build_with_profile(ModelId::Gefs, cycle("20260731", 0), &profile)
+        .expect("GEFS control-member lane is schedulable");
+    assert!(
+        plan.capability_limitations
+            .contains(&"ensemble_control_member_only".to_string())
+    );
+    assert_eq!(
+        plan.expected_valid_times
+            .last()
+            .map(|time| time.forecast_hour),
+        Some(840)
+    );
 }
 
 #[test]

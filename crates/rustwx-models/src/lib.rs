@@ -31,6 +31,10 @@ pub enum ModelRuntimeFamily {
 pub enum EnsembleMode {
     Deterministic,
     MemberGribFiles,
+    /// The public acquisition lane exposes post-processed ensemble
+    /// statistics (for example mean/spread files), not independently
+    /// addressable member files.
+    PostProcessedStatisticsGribFiles,
     MemberDimensionNetcdf,
 }
 
@@ -551,14 +555,11 @@ const GEFS_SOURCES: &[SourceDescriptor] = &[
 
 const ECMWF_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
     id: SourceId::Ecmwf,
-    // ECMWF open-data doesn't publish `.grib2.idx` companion files, so
-    // HEAD-probing the `.idx` URL returns 404 and `latest_available_run`
-    // falsely concludes the run is unavailable. Flagging this source
-    // `idx_available=false` makes `availability_probe_url` fall back to
-    // the grib URL itself, which HEAD 200s correctly. The tradeoff: no
-    // idx-based range extraction, but ECMWF's open-data is served as
-    // single grib2 files that the fetcher already pulls whole.
-    idx_available: false,
+    // ECMWF publishes a newline-delimited JSON companion index by replacing
+    // `.grib2` with `.index`. The records carry explicit byte offsets and
+    // lengths, so the shared fetcher can range-subset the operational IFS
+    // files without downloading the complete global payload.
+    idx_available: true,
     priority: 1,
     max_age_hours: None,
     notes: "ECMWF open data",
@@ -677,10 +678,10 @@ const MODELS: &[ModelSummary] = &[
     },
     ModelSummary {
         id: ModelId::Gefs,
-        description: "GEFS global 0.5 degree ensemble forecast",
+        description: "GEFS global 0.5 degree ensemble forecast (00z extends to 35 days)",
         default_product: "pgrb2ap5/gec00",
         cycle_hours_utc: GEFS_CYCLE_HOURS,
-        max_forecast_hour: 384,
+        max_forecast_hour: 840,
         sources: GEFS_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::MemberGribFiles,
@@ -703,7 +704,7 @@ const MODELS: &[ModelSummary] = &[
         max_forecast_hour: 384,
         sources: NOMADS_ONLY_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
-        ensemble_mode: EnsembleMode::MemberGribFiles,
+        ensemble_mode: EnsembleMode::PostProcessedStatisticsGribFiles,
     },
     ModelSummary {
         id: ModelId::Hgefs,
@@ -713,7 +714,7 @@ const MODELS: &[ModelSummary] = &[
         max_forecast_hour: 240,
         sources: NOMADS_ONLY_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
-        ensemble_mode: EnsembleMode::MemberGribFiles,
+        ensemble_mode: EnsembleMode::PostProcessedStatisticsGribFiles,
     },
     ModelSummary {
         id: ModelId::EcmwfOpenData,
@@ -6001,9 +6002,18 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
         ModelId::Gefs => {
             let mut hours = (0..=240).step_by(3).collect::<Vec<u16>>();
             hours.extend((246..=384).step_by(6));
+            // The 00z atmosphere-only run continues from day 16 through day
+            // 35 at six-hour steps. Other cycles end at f384.
+            if cycle_hour_utc == 0 {
+                hours.extend((390..=840).step_by(6));
+            }
             hours
         }
-        ModelId::Aigfs | ModelId::Aigefs => (0..=384).step_by(6).collect(),
+        ModelId::Aigfs => (0..=384).step_by(6).collect(),
+        // AIGEFS pressure statistics include f000, but the surface mean used
+        // by the RWS two-role ingest starts at f006. Do not schedule a run
+        // hour whose required surface product does not exist.
+        ModelId::Aigefs => (6..=384).step_by(6).collect(),
         ModelId::Hgefs => (0..=240).step_by(6).collect(),
         // ECMWF Open Data currently publishes four daily IFS runs. The 00/12z
         // deterministic/ensemble open-data stream carries 3-hourly steps to
@@ -7044,7 +7054,7 @@ fn build_gefs_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
             model: request.model,
             cycle_hour: request.cycle.hour_utc,
             forecast_hour: request.forecast_hour,
-            reason: "GEFS pgrb2ap5 fields are expected every 3 hours through f384".to_string(),
+            reason: "GEFS pgrb2ap5 fields are 3-hourly through f240, 6-hourly through f384, and the 00z cycle continues 6-hourly through f840".to_string(),
         });
     }
     let product = gefs_product_from_product(&request.product)?;
@@ -7215,6 +7225,15 @@ fn build_aigfs_url(source: SourceId, request: &ModelRunRequest) -> Result<String
     if source != SourceId::Nomads {
         return Ok(unsupported_source(source, request.model));
     }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "AIGFS publishes 6-hourly steps from f000 through f384 on 00/06/12/18z cycles"
+                .to_string(),
+        });
+    }
     let family = match normalize_token(&request.product).as_str() {
         "sfc" | "surface" => "sfc",
         "pres" | "pressure" | "pgrb" | "pgrb2" => "pres",
@@ -7238,6 +7257,15 @@ fn build_aigfs_url(source: SourceId, request: &ModelRunRequest) -> Result<String
 fn build_aigefs_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
     if source != SourceId::Nomads {
         return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "the paired AIGEFS pressure/surface mean ingest publishes 6-hourly steps from f006 through f384 on 00/06/12/18z cycles"
+                .to_string(),
+        });
     }
     let token = normalize_token(&request.product);
     let family = if token.contains("pres") || token.contains("pressure") {
@@ -7263,6 +7291,15 @@ fn build_aigefs_url(source: SourceId, request: &ModelRunRequest) -> Result<Strin
 fn build_hgefs_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
     if source != SourceId::Nomads {
         return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "HGEFS mean products publish 6-hourly steps from f000 through f240 on 00/06/12/18z cycles"
+                .to_string(),
+        });
     }
     let token = normalize_token(&request.product);
     let family = if token.contains("pres") || token.contains("pressure") {

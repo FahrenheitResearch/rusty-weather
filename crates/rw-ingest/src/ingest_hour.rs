@@ -164,6 +164,60 @@ fn stored_surface_field_name(model: ModelId, name: &'static str) -> &'static str
     }
 }
 
+/// Give post-processed NOAA AI ensemble-mean files an explicit canonical
+/// statistic identity. Leaving these selectors at `default` lets the GRIB
+/// matcher find a mean record by fallback score, but loses the distinction in
+/// RWS metadata and can make downstream queries imply deterministic/member
+/// data that was never ingested.
+fn ingest_selector(model: ModelId, selector: FieldSelector) -> FieldSelector {
+    if matches!(model, ModelId::Aigefs | ModelId::Hgefs) && selector.product.is_default() {
+        selector.with_ensemble_mean()
+    } else {
+        selector
+    }
+}
+
+fn selector_store_metadata(
+    model: ModelId,
+    selector: FieldSelector,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut metadata = serde_json::to_value(selector)?;
+    if model == ModelId::Gefs {
+        metadata
+            .as_object_mut()
+            .expect("FieldSelector serializes as an object")
+            .insert(
+                "ensemble_member".to_string(),
+                serde_json::Value::String("control".to_string()),
+            );
+    }
+    Ok(metadata)
+}
+
+fn volume_store_metadata(model: ModelId, field: CanonicalField) -> serde_json::Value {
+    let selector = ingest_selector(model, FieldSelector::isobaric(field, 500));
+    let mut metadata = serde_json::json!({
+        "field": field.as_str(),
+        "vertical": "isobaric",
+    });
+    let object = metadata
+        .as_object_mut()
+        .expect("volume selector metadata is an object");
+    if !selector.product.is_default() {
+        object.insert(
+            "product".to_string(),
+            serde_json::to_value(selector.product).expect("FieldProduct is serializable"),
+        );
+    }
+    if model == ModelId::Gefs {
+        object.insert(
+            "ensemble_member".to_string(),
+            serde_json::Value::String("control".to_string()),
+        );
+    }
+    metadata
+}
+
 /// Compute the crop-at-ingest spec for this hour, or `None` for models with no
 /// crop box (HRRR/GFS — no-op) or whose grid already fits the box. The spec is
 /// the contiguous index block whose cells' geographic coordinates intersect the
@@ -277,6 +331,7 @@ fn direct_isobaric_plane_selectors(model: ModelId) -> Vec<FieldSelector> {
             continue;
         };
         for selector in plan.selectors() {
+            let selector = ingest_selector(model, selector);
             if matches!(selector.vertical, VerticalSelector::IsobaricHpa(_))
                 && selector.field != CanonicalField::AbsoluteVorticity
                 && !selectors.contains(&selector)
@@ -880,14 +935,17 @@ pub fn process_fetched_hour(
         Vec::with_capacity(volume_plan.len() * levels.len() + VORTICITY_PLAN.len());
     for (field, _) in &volume_plan {
         for &level in &levels {
-            prs_selectors.push(FieldSelector::isobaric(*field, level));
+            prs_selectors.push(ingest_selector(
+                config.model,
+                FieldSelector::isobaric(*field, level),
+            ));
         }
     }
     if include_full_2d {
         for (level, _) in VORTICITY_PLAN {
-            prs_selectors.push(FieldSelector::isobaric(
-                CanonicalField::AbsoluteVorticity,
-                *level,
+            prs_selectors.push(ingest_selector(
+                config.model,
+                FieldSelector::isobaric(CanonicalField::AbsoluteVorticity, *level),
             ));
         }
     }
@@ -1018,7 +1076,12 @@ pub fn process_fetched_hour(
     let rh_selectors: Vec<FieldSelector> = if dewpoint_planned {
         levels
             .iter()
-            .map(|&level| FieldSelector::isobaric(CanonicalField::RelativeHumidity, level))
+            .map(|&level| {
+                ingest_selector(
+                    config.model,
+                    FieldSelector::isobaric(CanonicalField::RelativeHumidity, level),
+                )
+            })
             .collect()
     } else {
         Vec::new()
@@ -1087,6 +1150,7 @@ pub fn process_fetched_hour(
     let surface_plan: Vec<(&'static str, FieldSelector)> = surface_plan()
         .into_iter()
         .filter(|(name, _)| profile.includes_surface_field(name))
+        .map(|(name, selector)| (name, ingest_selector(config.model, selector)))
         .collect();
     let sfc_selectors: Vec<FieldSelector> =
         surface_plan.iter().map(|(_, selector)| *selector).collect();
@@ -1357,7 +1421,7 @@ pub fn process_fetched_hour(
     {
         profile_scope!("ingest_encode_extracted");
         for (name, plane) in &mut fields_2d_owned {
-            let selector = serde_json::to_value(plane.selector)
+            let selector = selector_store_metadata(config.model, plane.selector)
                 .map_err(|err| other(format!("2D field '{name}': selector JSON: {err}")))?;
             hour_writer
                 .add_field_2d(name, &plane.units, selector, &plane.values)
@@ -1387,10 +1451,7 @@ pub fn process_fetched_hour(
                 .add_volume(
                     volume.name,
                     volume.units,
-                    serde_json::json!({
-                        "field": volume.field.as_str(),
-                        "vertical": "isobaric",
-                    }),
+                    volume_store_metadata(config.model, volume.field),
                     &levels,
                 )
                 .map_err(other)?;
@@ -2055,8 +2116,17 @@ fn forecast_hour_cadence_note(model: ModelId, cycle_hour_utc: u8, max: u16) -> S
         }
         ModelId::Gfs => "GFS is hourly to f120, then 3-hourly to f384".to_string(),
         ModelId::Gdas => "GDAS is hourly to f009".to_string(),
-        ModelId::Gefs => "GEFS is 3-hourly to f240, then 6-hourly to f384".to_string(),
-        ModelId::Aigfs | ModelId::Aigefs => "AI global feeds are 6-hourly".to_string(),
+        ModelId::Gefs => {
+            if cycle_hour_utc == 0 {
+                "GEFS is 3-hourly to f240, then 6-hourly to f840 on the 00z cycle".to_string()
+            } else {
+                "GEFS is 3-hourly to f240, then 6-hourly to f384 on 06/12/18z cycles".to_string()
+            }
+        }
+        ModelId::Aigfs => "AI-GFS is 6-hourly from f000 through f384".to_string(),
+        ModelId::Aigefs => {
+            "AI-GEFS paired pressure/surface means are 6-hourly from f006 through f384".to_string()
+        }
         ModelId::Hgefs => "HGEFS is 6-hourly to f240".to_string(),
         ModelId::EcmwfOpenData => {
             "ECMWF Open Data is 3-hourly to f144, then 6-hourly on 00/12z cycles".to_string()
@@ -2089,6 +2159,34 @@ fn forecast_hour_cadence_note(model: ModelId, cycle_hour_utc: u8, max: u16) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_ensemble_store_metadata_identifies_mean_and_control_lanes() {
+        let base = FieldSelector::isobaric(CanonicalField::Temperature, 500);
+        for model in [ModelId::Aigefs, ModelId::Hgefs] {
+            let selector = ingest_selector(model, base);
+            assert_eq!(selector.product, rustwx_core::FieldProduct::EnsembleMean);
+            let metadata = selector_store_metadata(model, selector).unwrap();
+            assert_eq!(metadata["product"], "ensemble_mean");
+            let volume = volume_store_metadata(model, CanonicalField::Temperature);
+            assert_eq!(volume["product"], "ensemble_mean");
+            assert!(volume.get("ensemble_member").is_none());
+        }
+
+        let selector = ingest_selector(ModelId::Gefs, base);
+        assert!(selector.product.is_default());
+        let metadata = selector_store_metadata(ModelId::Gefs, selector).unwrap();
+        assert_eq!(metadata["ensemble_member"], "control");
+        assert!(metadata.get("product").is_none());
+        let volume = volume_store_metadata(ModelId::Gefs, CanonicalField::Temperature);
+        assert_eq!(volume["ensemble_member"], "control");
+        assert!(volume.get("product").is_none());
+
+        assert!(
+            ingest_selector(ModelId::Aigfs, base).product.is_default(),
+            "deterministic AIGFS must remain a default product"
+        );
+    }
 
     #[test]
     fn moisture_volume_prefers_the_denser_usable_native_coordinate() {
@@ -2748,11 +2846,18 @@ mod tests {
         let err = validate_forecast_hours(ModelId::Aigefs, 0, &[1])
             .expect_err("AI-GEFS is 6-hourly, so f001 is invalid");
         let message = err.to_string();
-        assert!(message.contains("AI global feeds"), "got: {message}");
+        assert!(message.contains("from f006 through f384"), "got: {message}");
         assert!(
             !message.contains("GFS is hourly"),
             "AI-GEFS errors must not carry the GFS cadence note: {message}"
         );
+
+        validate_forecast_hours(ModelId::Gefs, 0, &[390, 840])
+            .expect("00z GEFS extends through day 35");
+        let message = validate_forecast_hours(ModelId::Gefs, 12, &[390])
+            .expect_err("non-00z GEFS ends at f384")
+            .to_string();
+        assert!(message.contains("6-hourly to f384"), "got: {message}");
     }
 
     /// The cycle must sit on the model's published cycle table: GFS runs only

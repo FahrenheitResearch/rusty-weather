@@ -12,6 +12,14 @@ available forever.
 | `rap.t00z.awp130pgrbf01.grib2.idx` | `https://noaa-rap-pds.s3.amazonaws.com/rap.20260812/rap.t00z.awp130pgrbf01.grib2.idx` | full, 19,281 bytes, SHA-256 `8C2A989EB62E52603342B2C98B71D6F6DC2423C21055EFE7DD725AAC79E7697C` |
 | `nam.t00z.awip3d01.tm00.grib2.idx` | `https://noaa-nam-pds.s3.amazonaws.com/nam.20260812/nam.t00z.awip3d01.tm00.grib2.idx` | full, 35,031 bytes, SHA-256 `2D7C798F7B8BE4C4553EB8B8B8B8576DEAB34330912D85A4722B8D6E4EECD4B7` |
 | `gdas.t00z.pgrb2.0p25.f003.idx` | `https://noaa-gfs-bdp-pds.s3.amazonaws.com/gdas.20260812/00/atmos/gdas.t00z.pgrb2.0p25.f003.idx` | full, 40,449 bytes, SHA-256 `67897D16CC086BE9E11252A828F25147AC4F1561956439FAE2A9A3E9F40FDD66` |
+| `gefs.20260812.t00z.f024.idx` | `https://nomads.ncep.noaa.gov/pub/data/nccf/com/gens/prod/gefs.20260812/00/atmos/pgrb2ap5/gec00.t00z.pgrb2a.0p50.f024.idx` | full control-member index, 5,816 bytes, SHA-256 `8027A02475BCD54BED0B460E480E1AE8133A4DC5171C071214B763F87B148238` |
+| `aigfs.20260812.t00z.f024.pres.idx` | `https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigfs/prod/aigfs.20260812/00/model/atmos/grib2/aigfs.t00z.pres.f024.grib2.idx` | full pressure index, 3,925 bytes, SHA-256 `5CB5E72499D98B7B2E13720C10A71EF18335D7350C090B257AF741C732532A98` |
+| `aigfs.20260812.t00z.f024.sfc.idx` | `https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigfs/prod/aigfs.20260812/00/model/atmos/grib2/aigfs.t00z.sfc.f024.grib2.idx` | full surface index, 340 bytes, SHA-256 `9C94D5582E282A18DD812E7E8C944483C9F516D9ADB2EDE48DF5C64DF2791D86` |
+| `aigefs.20260812.t00z.f024.pres.avg.idx` | `https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigefs/prod/aigefs.20260812/00/ensstat/products/atmos/grib2/aigefs.t00z.pres.avg.f024.grib2.idx` | full ensemble-mean pressure index, 4,546 bytes, SHA-256 `6BCAE30BDAC5BA0B55B266559B6FA82499EB0E66F5B1F95AC3172697939405AB` |
+| `aigefs.20260812.t00z.f024.sfc.avg.idx` | `https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigefs/prod/aigefs.20260812/00/ensstat/products/atmos/grib2/aigefs.t00z.sfc.avg.f024.grib2.idx` | full ensemble-mean surface index, 326 bytes, SHA-256 `42D26B218B6783E4BB3F617C1D461D3E082BBDB2C12729087ED2022444F082B4` |
+| `hgefs.20260812.t00z.f024.pres.avg.idx` | `https://nomads.ncep.noaa.gov/pub/data/nccf/com/hgefs/prod/hgefs.20260812/00/ensstat/products/atmos/grib2/hgefs.t00z.pres.avg.f024.grib2.idx` | full ensemble-mean pressure index, 4,545 bytes, SHA-256 `4F08DD7A0BB06A37B8D8E25E8FF86DCD0C7CE6FEEA8058FFA6EDF66C00516FD9` |
+| `hgefs.20260812.t00z.f024.sfc.avg.idx` | `https://nomads.ncep.noaa.gov/pub/data/nccf/com/hgefs/prod/hgefs.20260812/00/ensstat/products/atmos/grib2/hgefs.t00z.sfc.avg.f024.grib2.idx` | full ensemble-mean surface index, 326 bytes, SHA-256 `C96465577343855B3DFD1E058C06793FB07815B9F5C05F93D5909BE2CEA64A44` |
+| `ifs.20260812.t00z.f024.oper.index` | `https://data.ecmwf.int/forecasts/20260812/00z/ifs/0p25/oper/20260812000000-24h-oper-fc.index` | full line-delimited JSON index, 40,208 bytes, SHA-256 `8F44C5EE3BB8504DFFA8AA6927B05E2F64553BBADEFBF46725F12EA351848B59` |
 | `aifs-single.20260810T0000.f024.oper.index` | `https://data.ecmwf.int/forecasts/20260810/00z/aifs-single/0p25/oper/20260810000000-24h-oper-fc.index` | exact representative rows for every ingest-selected parameter plus every published `q` pressure level, excerpted from the 29,572-byte line-delimited JSON index; full-source SHA-256 `EDFED337AA2A077E510352FA6392BFC153E67A4D6B56A2EEF859082081AADFD3` |
 | `hiresw.t00z.arw_2p5km.f24.conus.grib2.idx` | `https://nomads.ncep.noaa.gov/pub/data/nccf/com/hiresw/prod/hiresw.20260810/hiresw.t00z.arw_2p5km.f24.conus.grib2.idx` | full, 5,121 bytes, SHA-256 `66C041E89BFCF489EC5A4708370C2A3215A53FDB57EABECA22C92D5A3EA895B9` |
 | `href.t00z.conus.mean.f24.grib2.idx` | `https://nomads.ncep.noaa.gov/pub/data/nccf/com/href/prod/href.20260810/ensprod/href.t00z.conus.mean.f24.grib2.idx` | full, 4,260 bytes, SHA-256 `BA04CCFF36A03DF40FB41D9D9B914F2E1FE62E0C07EB3CF4BD62D7DD0EAD0FD5` |
@@ -49,3 +57,32 @@ plus 37-level temperature/RH/wind/height volumes. Its six native pressure
 dewpoint levels remain pinned by the inventory, but the normalized sounding
 keeps the denser `rh_iso` coordinate. Missing NAM 2 m dewpoint is reported
 rather than synthesized.
+The GEFS fixture is explicitly the `gec00` low-resolution control member; it
+does not claim perturbed-member or ensemble-statistic RWS coverage. AIGEFS and
+HGEFS fixtures are explicitly post-processed mean (`avg`) products and do not
+claim individual-member or spread coverage. The IFS fixture pins the complete
+official JSON sidecar, including its 14 published pressure levels and exact
+range offsets. All are bounded inventory/cadence evidence, not a substitute
+for a full-payload ingest plus deep-store validation.
+
+## Bounded live store verification (2026-08-14)
+
+Each lane below fetched exactly one official 2026-08-12 00z f024 payload with
+the sounding profile at a 50 hPa candidate step, ran the ingest writer's
+`--verify` round trip, then passed `rws validate --deep`. No cycle-wide or
+unbounded global download was used.
+
+| Model lane | Acquired bytes | Realized RWS evidence |
+| --- | ---: | --- |
+| GEFS `gec00` control | 12.1 MiB, six AWS index ranges | 10 variables, 5,205 chunks, 22,677,975 payload bytes; sparse native levels and honest `rh_iso` fallback |
+| NOAA AI-GFS deterministic | 82.8 MiB pressure + 4.4 MiB surface from NOMADS | 9 variables, 20,772 chunks, 118,053,665 payload bytes; 11 levels in all five canonical volumes |
+| NOAA AI-GEFS `avg` | 66.8 MiB pressure + 3.1 MiB surface from NOMADS | 9 variables, 20,772 chunks, 115,840,724 payload bytes; selector metadata is `ensemble_mean` |
+| NOAA HGEFS `avg` | 62.0 MiB pressure + 2.9 MiB surface from NOMADS | 9 variables, 20,772 chunks, 115,321,280 payload bytes; selector metadata is `ensemble_mean` |
+| ECMWF IFS Open Data `oper` | 48.5 MiB, 22 JSON-index ranges (146.6 MiB source object) | 11 variables, 20,808 chunks, 111,375,300 payload bytes; 11 levels in all five canonical volumes |
+
+The NOAA AI surface products did not realize 2-m dewpoint, surface pressure,
+or orography; IFS did not realize orography; and GEFS did not realize 2-m
+dewpoint or orography. Capability metadata therefore disables derived/heavy
+products for these lanes until a verified static/surface join exists. The
+specific-humidity (`SPFH`/`q`) conversion did realize canonical pressure-level
+dewpoint byte paths for all four AI/IFS lanes.

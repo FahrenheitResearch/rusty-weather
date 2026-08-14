@@ -1761,8 +1761,8 @@ impl ParsedModelGrib {
                 }
             }
         }
-        if self.model == ModelId::Aifs {
-            synthesize_aifs_dewpoint_values(
+        if model_uses_specific_humidity_for_pressure_moisture(self.model) {
+            synthesize_pressure_dewpoint_values_from_specific_humidity(
                 &self.grib,
                 &mut extracted,
                 &mut missing,
@@ -1843,8 +1843,12 @@ pub fn extract_fields_partial_from_model_bytes_at_forecast_hour(
             } else {
                 extract_fields_from_grib2_partial(&grib, selectors)?
             };
-            if model == ModelId::Aifs {
-                synthesize_aifs_dewpoint_fields(&grib, &mut partial, forecast_hour)?;
+            if model_uses_specific_humidity_for_pressure_moisture(model) {
+                synthesize_pressure_dewpoint_fields_from_specific_humidity(
+                    &grib,
+                    &mut partial,
+                    forecast_hour,
+                )?;
             }
             if model == ModelId::Nbm {
                 synthesize_nbm_10m_wind_components_from_speed_direction(&grib, &mut partial)?;
@@ -2046,7 +2050,14 @@ fn synthesize_nbm_10m_wind_components_from_speed_direction(
     Ok(())
 }
 
-fn synthesize_aifs_dewpoint_values(
+fn model_uses_specific_humidity_for_pressure_moisture(model: ModelId) -> bool {
+    matches!(
+        model,
+        ModelId::Aigfs | ModelId::Aigefs | ModelId::Hgefs | ModelId::EcmwfOpenData | ModelId::Aifs
+    )
+}
+
+fn synthesize_pressure_dewpoint_values_from_specific_humidity(
     grib: &Grib2File,
     extracted: &mut Vec<ExtractedFieldValues>,
     missing: &mut Vec<FieldSelector>,
@@ -2062,7 +2073,7 @@ fn synthesize_aifs_dewpoint_values(
         if selector.field != CanonicalField::Dewpoint {
             continue;
         }
-        let Some(message) = aifs_specific_humidity_message(grib, selector, forecast_hour) else {
+        let Some(message) = specific_humidity_message(grib, selector, forecast_hour) else {
             continue;
         };
         let mut field = build_field_values(message, selector, "K", grid_memo)?;
@@ -2076,7 +2087,7 @@ fn synthesize_aifs_dewpoint_values(
     Ok(())
 }
 
-fn synthesize_aifs_dewpoint_fields(
+fn synthesize_pressure_dewpoint_fields_from_specific_humidity(
     grib: &Grib2File,
     partial: &mut PartialExtraction,
     forecast_hour: Option<u16>,
@@ -2091,7 +2102,7 @@ fn synthesize_aifs_dewpoint_fields(
         if selector.field != CanonicalField::Dewpoint {
             continue;
         }
-        let Some(message) = aifs_specific_humidity_message(grib, selector, forecast_hour) else {
+        let Some(message) = specific_humidity_message(grib, selector, forecast_hour) else {
             continue;
         };
         let mut field = build_selected_field(message, selector, "K", &mut grid_memo)?;
@@ -2107,7 +2118,7 @@ fn synthesize_aifs_dewpoint_fields(
     Ok(())
 }
 
-fn aifs_specific_humidity_message<'a>(
+fn specific_humidity_message<'a>(
     grib: &'a Grib2File,
     dewpoint_selector: FieldSelector,
     forecast_hour: Option<u16>,
@@ -2132,7 +2143,8 @@ fn aifs_specific_humidity_message<'a>(
 
 /// Convert pressure-level specific humidity to dewpoint using the standard
 /// mixing-ratio/vapor-pressure relation and Bolton saturation-vapor-pressure
-/// inversion. AIFS publishes `q`, not a direct pressure-level dewpoint field.
+/// inversion. These global AI/IFS products publish `q`/`SPFH`, not a direct
+/// pressure-level dewpoint field.
 fn dewpoint_k_from_specific_humidity(q_kgkg: f32, pressure_hpa: u16) -> f32 {
     let q = f64::from(q_kgkg);
     let pressure = f64::from(pressure_hpa);
@@ -2440,6 +2452,14 @@ fn should_use_parallel_whole_file_fetch(source: SourceId) -> bool {
 fn should_use_idx_subset_fetch(source: SourceId) -> bool {
     // NOMADS production fetches full GRIB files. The .idx sidecar is allowed
     // for availability probes only, not product subsetting.
+    source_supports_indexed_subset_fetch(source)
+}
+
+/// Whether this transport can honor GRIB message byte-range acquisition.
+/// NOMADS publishes useful `.idx` inventories but the operational fetch path
+/// intentionally uses whole-file GETs there, so capability surfaces must not
+/// advertise indexed subsetting merely because patterns are present.
+pub const fn source_supports_indexed_subset_fetch(source: SourceId) -> bool {
     matches!(source, SourceId::Aws | SourceId::Google | SourceId::Ecmwf)
 }
 

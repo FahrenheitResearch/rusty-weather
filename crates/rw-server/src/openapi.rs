@@ -2786,6 +2786,7 @@ mod tests {
                 "analysis_only",
                 "surface_only",
                 "ensemble_mean_only",
+                "ensemble_control_member_only",
                 "sparse_pressure_levels",
                 "derived_products_disabled",
                 "conus_only",

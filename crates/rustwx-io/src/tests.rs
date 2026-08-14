@@ -815,7 +815,7 @@ fn component_bundle_is_ordered_source_bound_and_inventory_keyed() {
 }
 
 #[test]
-fn aifs_specific_humidity_synthesizes_pressure_level_dewpoint() {
+fn global_specific_humidity_products_synthesize_pressure_level_dewpoint() {
     use wx_core::grib2::{
         Grib2Writer, GridDefinition as WxGridDefinition, MessageBuilder, PackingMethod,
         ProductDefinition as WxProductDefinition,
@@ -850,34 +850,43 @@ fn aifs_specific_humidity_synthesizes_pressure_level_dewpoint() {
     let bytes = Grib2Writer::new().add_message(q).to_bytes().unwrap();
     let selector = FieldSelector::isobaric(CanonicalField::Dewpoint, 850);
 
-    let parsed = ParsedModelGrib::from_model_bytes(ModelId::Aifs, &bytes).unwrap();
-    let values = parsed
-        .extract_field_values_partial_at_forecast_hour(&[selector], Some(6))
-        .unwrap();
-    assert!(values.missing.is_empty());
-    assert_eq!(values.extracted.len(), 1);
-    assert_eq!(values.extracted[0].selector, selector);
-    assert_eq!(values.extracted[0].units, "K");
-    assert!(
-        values.extracted[0]
-            .values
-            .iter()
-            .all(|value| value.is_finite() && (275.0..295.0).contains(value))
-    );
-
-    let fields = extract_fields_partial_from_model_bytes_at_forecast_hour(
+    for model in [
+        ModelId::Aigfs,
+        ModelId::Aigefs,
+        ModelId::Hgefs,
+        ModelId::EcmwfOpenData,
         ModelId::Aifs,
-        &bytes,
-        None,
-        &[selector],
-        Some(6),
-    )
-    .unwrap();
-    assert!(fields.missing.is_empty());
-    assert_eq!(fields.extracted.len(), 1);
-    assert_eq!(fields.extracted[0].selector, selector);
-    assert_eq!(fields.extracted[0].units, "K");
-    assert_eq!(fields.extracted[0].values, values.extracted[0].values);
+    ] {
+        let parsed = ParsedModelGrib::from_model_bytes(model, &bytes).unwrap();
+        let values = parsed
+            .extract_field_values_partial_at_forecast_hour(&[selector], Some(6))
+            .unwrap();
+        assert!(values.missing.is_empty(), "{model}");
+        assert_eq!(values.extracted.len(), 1, "{model}");
+        assert_eq!(values.extracted[0].selector, selector);
+        assert_eq!(values.extracted[0].units, "K");
+        assert!(
+            values.extracted[0]
+                .values
+                .iter()
+                .all(|value| value.is_finite() && (275.0..295.0).contains(value)),
+            "{model}"
+        );
+
+        let fields = extract_fields_partial_from_model_bytes_at_forecast_hour(
+            model,
+            &bytes,
+            None,
+            &[selector],
+            Some(6),
+        )
+        .unwrap();
+        assert!(fields.missing.is_empty(), "{model}");
+        assert_eq!(fields.extracted.len(), 1, "{model}");
+        assert_eq!(fields.extracted[0].selector, selector);
+        assert_eq!(fields.extracted[0].units, "K");
+        assert_eq!(fields.extracted[0].values, values.extracted[0].values);
+    }
 }
 
 #[test]

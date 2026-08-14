@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use rustwx_core::ModelId;
-use rw_ingest::{IngestSupportStatus, model_ingest_capability};
+use rw_ingest::{IngestSupportStatus, indexed_subset_available, model_ingest_capability};
 use rw_query::{QueryLimits, StoreCatalog};
 use rw_server::config::LogFormat;
 use rw_server::generation_replication::ServerGenerationReplication;
@@ -467,7 +467,7 @@ fn print_models(config_path: Option<&Path>) -> Result<(), AnyError> {
                     "name": product.product,
                     "surface_source": product.surface_source,
                     "pressure_source": product.pressure_source,
-                    "indexed_subset": !product.idx_patterns.is_empty(),
+                    "indexed_subset": indexed_subset_available(summary.id, product),
                 })).collect::<Vec<_>>(),
                 "stored_runs": stored.get(&summary.id.to_string()).copied().unwrap_or(0),
             })
