@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use wx_core::grib2::{Grib2File, level_name, parameter_name};
+use grib_core::grib2::{Grib2File, level_name, parameter_name};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = env::args_os()
@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     for (index, message) in grib.messages.iter().enumerate() {
         println!(
-            "{index:04} d/c/n={}/{}/{} {:<36} level={}:{} ({}) grid={} {}x{} data_rep={}",
+            "{index:04} d/c/n={}/{}/{} {:<36} level={}:{} ({}) grid={} {}x{} flags=0x{:02x} data_rep={} pdt={}",
             message.discipline,
             message.product.parameter_category,
             message.product.parameter_number,
@@ -37,7 +37,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             message.grid.template,
             message.grid.nx,
             message.grid.ny,
+            message.grid.resolution_flags,
             message.data_rep.template,
+            message.product.template,
         );
     }
     Ok(())

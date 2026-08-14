@@ -972,12 +972,12 @@ fn read_scaled_optional(
     if scale_factor == 255 || scaled_value == u32::MAX {
         return Ok(None);
     }
-    let value = if scale_factor < 128 {
-        scaled_value as f64 / 10.0_f64.powi(scale_factor as i32)
+    let scale_factor = if scale_factor & 0x80 == 0 {
+        i32::from(scale_factor)
     } else {
-        let neg_scale = 256 - scale_factor as i32;
-        scaled_value as f64 * 10.0_f64.powi(neg_scale)
+        -i32::from(scale_factor & 0x7f)
     };
+    let value = scaled_value as f64 * 10.0_f64.powi(-scale_factor);
     Ok(Some(value))
 }
 
@@ -1221,6 +1221,23 @@ mod tests {
         assert_eq!(product.total_number_of_probabilities, Some(26));
         assert_eq!(product.probability_type, Some(2));
         assert_eq!(product.probability_lower_limit, Some(305.372));
+        assert_eq!(product.probability_upper_limit, None);
+    }
+
+    #[test]
+    fn probability_threshold_scale_factor_uses_grib_sign_magnitude() {
+        let mut sec = vec![0_u8; 47];
+        seed_common_section4(&mut sec, 5);
+        sec[34] = 0;
+        sec[35] = 1;
+        sec[36] = 1;
+        sec[37] = 0x82;
+        sec[38..42].copy_from_slice(&3_u32.to_be_bytes());
+        sec[42] = 255;
+        sec[43..47].copy_from_slice(&u32::MAX.to_be_bytes());
+
+        let product = parse_section4(&sec).expect("section 4 should parse");
+        assert_eq!(product.probability_lower_limit, Some(300.0));
         assert_eq!(product.probability_upper_limit, None);
     }
 
