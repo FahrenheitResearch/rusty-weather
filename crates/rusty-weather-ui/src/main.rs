@@ -4431,7 +4431,8 @@ mod tests {
     fn default_hour_range_normalizes_to_model_cadence() {
         assert_eq!(
             normalize_hour_spec_for_model(rustwx_core::ModelId::Aigefs, 0, "0-6"),
-            Some("0,6".to_string())
+            Some("6".to_string()),
+            "AI-GEFS mean products start at f006"
         );
         assert_eq!(
             normalize_hour_spec_for_model(rustwx_core::ModelId::Gefs, 0, "0-6"),

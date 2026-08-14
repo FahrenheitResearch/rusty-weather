@@ -784,11 +784,11 @@ mod tests {
             spec.model = slug.to_string();
             spec.cycle = match expected {
                 ModelId::Gdas | ModelId::Nam => 0,
-                ModelId::Gefs
-                | ModelId::Aigfs
-                | ModelId::Aigefs
-                | ModelId::Hgefs
-                | ModelId::EcmwfOpenData => {
+                ModelId::Aigefs => {
+                    spec.hours = "6".to_string();
+                    0
+                }
+                ModelId::Gefs | ModelId::Aigfs | ModelId::Hgefs | ModelId::EcmwfOpenData => {
                     spec.hours = "0,6".to_string();
                     0
                 }
@@ -799,6 +799,8 @@ mod tests {
             assert_eq!(model, expected);
             let expected_hours = if spec.hours == "0,6" {
                 vec![0, 6]
+            } else if spec.hours == "6" {
+                vec![6]
             } else {
                 vec![4, 5, 6]
             };

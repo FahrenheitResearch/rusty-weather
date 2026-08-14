@@ -159,6 +159,8 @@ struct PublicationGate {
     store: Arc<StoreCatalog>,
     reload: Mutex<ReloadState>,
     view: RwLock<PublishedView>,
+    #[cfg(test)]
+    test_now_unix: std::sync::atomic::AtomicI64,
 }
 
 #[derive(Debug, Default)]
@@ -237,6 +239,8 @@ impl PublishedStoreCatalog {
                 } else {
                     PublishedView::disabled()
                 }),
+                #[cfg(test)]
+                test_now_unix: std::sync::atomic::AtomicI64::new(i64::MIN),
             }),
             replication: Arc::new(ServerGenerationReplication::default()),
         };
@@ -347,7 +351,7 @@ impl PublishedStoreCatalog {
 
     pub fn health_status(&self) -> OriginCatalogHealthStatus {
         self.refresh_if_due();
-        let now = now_unix();
+        let now = self.current_unix();
         // Preserve the reload -> view lock order used by reload_locked. Copy
         // the scalar before taking the view lock so status can never deadlock
         // a concurrent refresh.
@@ -446,7 +450,7 @@ impl PublishedStoreCatalog {
                 .view
                 .read()
                 .unwrap_or_else(|error| error.into_inner());
-            if !view.is_fresh(now_unix(), self.gate.config.max_age_seconds) {
+            if !view.is_fresh(self.current_unix(), self.gate.config.max_age_seconds) {
                 return Err(unavailable_query_error());
             }
             runs = view.runs.clone();
@@ -516,13 +520,31 @@ impl PublishedStoreCatalog {
             last.elapsed() >= Duration::from_secs(self.gate.config.refresh_seconds)
         });
         if due {
-            self.reload_locked(&mut reload, now_unix());
+            self.reload_locked(&mut reload, self.current_unix());
         }
+    }
+
+    fn current_unix(&self) -> i64 {
+        #[cfg(test)]
+        {
+            let injected = self
+                .gate
+                .test_now_unix
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if injected != i64::MIN {
+                return injected;
+            }
+        }
+        now_unix()
     }
 
     /// Force a synchronous reload for deterministic no-network tests; request
     /// handling uses the bounded cadence.
     fn force_reload_at(&self, current_unix: i64) {
+        #[cfg(test)]
+        self.gate
+            .test_now_unix
+            .store(current_unix, std::sync::atomic::Ordering::Relaxed);
         if !self.gate.config.enabled || !self.gate.config.publication_sources.requires_scheduler() {
             return;
         }
