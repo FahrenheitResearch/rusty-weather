@@ -224,6 +224,9 @@ pub struct DownloadPanel {
     cycle_options: Vec<u8>,
     source_options: Vec<String>,
     hours_hint: String,
+    /// Whether the Run row exposes the network-backed `Latest` action.
+    /// Hosts that require explicit date/cycle selection can hide it.
+    latest_action_visible: bool,
     estimate: Option<EstimateView>,
     /// Host-surfaced spec problem (e.g. profile validation, bad hours).
     /// Start stays disabled while set.
@@ -253,6 +256,7 @@ impl DownloadPanel {
             cycle_options: (0..24).collect(),
             source_options: vec!["auto".to_string()],
             hours_hint: String::new(),
+            latest_action_visible: true,
             estimate: None,
             spec_error: None,
             availability: None,
@@ -294,6 +298,15 @@ impl DownloadPanel {
     /// E.g. "supported: 0-48 (00z cycle)".
     pub fn set_hours_hint(&mut self, hint: String) {
         self.hours_hint = hint;
+    }
+
+    /// Show or hide the Run row's network-backed `Latest` action.
+    ///
+    /// The action is visible by default so existing hosts retain their current
+    /// behavior. Explicit-run workflows can disable it without replacing the
+    /// rest of the download panel.
+    pub fn set_latest_action_visible(&mut self, visible: bool) {
+        self.latest_action_visible = visible;
     }
 
     pub fn set_estimate(&mut self, estimate: EstimateView) {
@@ -516,14 +529,12 @@ impl DownloadPanel {
                         ui.selectable_value(&mut self.spec.cycle, cycle, format!("{cycle:02}z"));
                     }
                 });
-            if ui
-                .button("Latest")
-                .on_hover_text("probe for the newest available run and snap to it")
-                .clicked()
-            {
-                self.set_probing();
-                events.push(DownloadEvent::LatestRequested(self.spec.clone()));
-            }
+            let latest_clicked = self.latest_action_visible
+                && ui
+                    .button("Latest")
+                    .on_hover_text("probe for the newest available run and snap to it")
+                    .clicked();
+            self.push_latest_request_if_allowed(latest_clicked, events);
         });
 
         // --- hours + availability ---
@@ -627,6 +638,14 @@ impl DownloadPanel {
                     "raw GRIB byte cache; a warm cache makes the fetch stage a disk read",
                 );
         });
+    }
+
+    fn push_latest_request_if_allowed(&mut self, clicked: bool, events: &mut Vec<DownloadEvent>) {
+        if !self.latest_action_visible || !clicked {
+            return;
+        }
+        self.set_probing();
+        events.push(DownloadEvent::LatestRequested(self.spec.clone()));
     }
 
     fn estimate_ui(&mut self, ui: &mut Ui) {
@@ -1137,5 +1156,22 @@ mod tests {
         assert!(view.matches(&spec));
         spec.cycle = 6;
         assert!(!view.matches(&spec));
+    }
+
+    #[test]
+    fn latest_action_defaults_visible_and_can_be_disabled_without_emitting_an_event() {
+        let mut default_panel = panel();
+        let expected = default_panel.spec().clone();
+        let mut events = Vec::new();
+        default_panel.push_latest_request_if_allowed(true, &mut events);
+        assert_eq!(events, vec![DownloadEvent::LatestRequested(expected)]);
+        assert!(default_panel.probing);
+
+        let mut explicit_run_panel = panel();
+        explicit_run_panel.set_latest_action_visible(false);
+        let mut events = Vec::new();
+        explicit_run_panel.push_latest_request_if_allowed(true, &mut events);
+        assert!(events.is_empty());
+        assert!(!explicit_run_panel.probing);
     }
 }
