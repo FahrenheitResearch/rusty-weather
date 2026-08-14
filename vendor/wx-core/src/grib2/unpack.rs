@@ -75,6 +75,33 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    fn read_bits_checked(&mut self, n: usize, label: &str) -> Result<u64, String> {
+        validate_bit_width(n, label)?;
+        if self.remaining_bits() < n {
+            return Err(format!(
+                "truncated {label}: need {n} bits, have {}",
+                self.remaining_bits()
+            ));
+        }
+        Ok(self.read_bits(n))
+    }
+
+    fn read_signed_bits_checked(&mut self, n: usize, label: &str) -> Result<i64, String> {
+        let encoded = self.read_bits_checked(n, label)?;
+        if n == 0 {
+            return Ok(0);
+        }
+        let sign_mask = 1_u64 << (n - 1);
+        let magnitude = encoded & (sign_mask - 1);
+        let magnitude =
+            i64::try_from(magnitude).map_err(|_| format!("{label} magnitude exceeded i64"))?;
+        Ok(if encoded & sign_mask == 0 {
+            magnitude
+        } else {
+            -magnitude
+        })
+    }
+
     /// Align the bit position to the next byte boundary.
     pub fn align_to_byte(&mut self) {
         let rem = self.bit_pos % 8;
@@ -118,6 +145,37 @@ pub fn unpack_message(msg: &Grib2Message) -> crate::error::Result<Vec<f64>> {
             })
         }
     };
+
+    let values = if dr.bits_per_value == 0 && values.len() <= 1 && num_points > 1 {
+        let fill = values.first().copied().unwrap_or(dr.reference_value as f64);
+        vec![fill; num_points]
+    } else {
+        values
+    };
+
+    if matches!(dr.template, 2 | 3) {
+        let active_points = msg
+            .bitmap
+            .as_ref()
+            .map(|bitmap| bitmap.iter().filter(|present| **present).count())
+            .unwrap_or(num_points);
+        let declared = dr.section5_num_data_points as usize;
+        let expected = if declared == 0 {
+            active_points
+        } else if declared == active_points {
+            declared
+        } else {
+            return Err(crate::RustmetError::Unpack(format!(
+                "Section 5 declares {declared} coded values, but the grid/bitmap requires {active_points}"
+            )));
+        };
+        if values.len() != expected {
+            return Err(crate::RustmetError::Unpack(format!(
+                "complex packing decoded {} values, expected {expected}",
+                values.len()
+            )));
+        }
+    }
 
     // Apply bitmap if present
     let values = if let Some(ref bitmap) = msg.bitmap {
@@ -190,6 +248,340 @@ fn apply_scaling(raw: &[i64], dr: &DataRepresentation) -> Vec<f64> {
         .collect()
 }
 
+fn scale_raw_value(raw: i64, dr: &DataRepresentation) -> f64 {
+    let r = dr.reference_value as f64;
+    let two_e = 2.0_f64.powi(dr.binary_scale as i32);
+    let ten_neg_d = 10.0_f64.powi(-(dr.decimal_scale as i32));
+    (r + raw as f64 * two_e) * ten_neg_d
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackedComplexValue {
+    Present(i64),
+    PrimaryMissing,
+    SecondaryMissing,
+}
+
+struct ComplexGroups<'a> {
+    reader: BitReader<'a>,
+    group_refs: Vec<u64>,
+    group_widths: Vec<usize>,
+    group_lengths: Vec<usize>,
+    group_idx: usize,
+    value_idx_in_group: usize,
+    total_values: usize,
+    missing_value_management: u8,
+    group_reference_bits: usize,
+}
+
+impl<'a> ComplexGroups<'a> {
+    fn new(
+        data: &'a [u8],
+        dr: &DataRepresentation,
+        expected_values: Option<usize>,
+    ) -> Result<Self, String> {
+        let ng = dr.num_groups as usize;
+        if dr.missing_value_management > 2 {
+            return Err(format!(
+                "unsupported complex-packing missing-value management {}",
+                dr.missing_value_management
+            ));
+        }
+        if ng == 0 {
+            return Ok(Self {
+                reader: BitReader::new(data),
+                group_refs: Vec::new(),
+                group_widths: Vec::new(),
+                group_lengths: Vec::new(),
+                group_idx: 0,
+                value_idx_in_group: 0,
+                total_values: 0,
+                missing_value_management: dr.missing_value_management,
+                group_reference_bits: dr.bits_per_value as usize,
+            });
+        }
+
+        let mut reader = BitReader::new(data);
+        let bpv = dr.bits_per_value as usize;
+        validate_bit_width(bpv, "group reference")?;
+        let mut group_refs = Vec::with_capacity(ng);
+        for _ in 0..ng {
+            group_refs.push(reader.read_bits_checked(bpv, "group references")?);
+        }
+        reader.align_to_byte();
+
+        let gwb = dr.group_width_bits as usize;
+        validate_bit_width(gwb, "scaled group width")?;
+        let mut group_widths = Vec::with_capacity(ng);
+        for _ in 0..ng {
+            let encoded = usize::try_from(reader.read_bits_checked(gwb, "group widths")?)
+                .map_err(|_| "encoded group width did not fit usize".to_string())?;
+            let width = encoded
+                .checked_add(dr.group_width_ref as usize)
+                .ok_or_else(|| "complex-packing group width overflow".to_string())?;
+            validate_bit_width(width, "group value")?;
+            group_widths.push(width);
+        }
+        reader.align_to_byte();
+
+        let glb = dr.group_length_bits as usize;
+        validate_bit_width(glb, "scaled group length")?;
+        let mut group_lengths = Vec::with_capacity(ng);
+        for _ in 0..ng {
+            let stored = usize::try_from(reader.read_bits_checked(glb, "group lengths")?)
+                .map_err(|_| "encoded group length did not fit usize".to_string())?;
+            let length = stored
+                .checked_mul(dr.group_length_inc as usize)
+                .and_then(|value| value.checked_add(dr.group_length_ref as usize))
+                .ok_or_else(|| "complex-packing group length overflow".to_string())?;
+            group_lengths.push(length);
+        }
+        group_lengths[ng - 1] = dr.last_group_length as usize;
+        reader.align_to_byte();
+
+        let total_values = group_lengths.iter().try_fold(0usize, |total, length| {
+            total
+                .checked_add(*length)
+                .ok_or_else(|| "complex-packing value count overflow".to_string())
+        })?;
+        if let Some(expected) = expected_values {
+            if total_values != expected {
+                return Err(format!(
+                    "complex-packing group lengths describe {total_values} values, expected {expected}"
+                ));
+            }
+        }
+        let required_value_bits = group_widths.iter().zip(&group_lengths).try_fold(
+            0usize,
+            |total, (width, length)| {
+                width
+                    .checked_mul(*length)
+                    .and_then(|bits| total.checked_add(bits))
+                    .ok_or_else(|| "complex-packing data bit count overflow".to_string())
+            },
+        )?;
+        if reader.remaining_bits() < required_value_bits {
+            return Err(format!(
+                "complex-packing data truncated: need {required_value_bits} value bits, have {}",
+                reader.remaining_bits()
+            ));
+        }
+
+        Ok(Self {
+            reader,
+            group_refs,
+            group_widths,
+            group_lengths,
+            group_idx: 0,
+            value_idx_in_group: 0,
+            total_values,
+            missing_value_management: dr.missing_value_management,
+            group_reference_bits: bpv,
+        })
+    }
+
+    fn total_values(&self) -> usize {
+        self.total_values
+    }
+
+    fn next_packed(&mut self) -> Result<Option<PackedComplexValue>, String> {
+        while self.group_idx < self.group_lengths.len()
+            && self.value_idx_in_group >= self.group_lengths[self.group_idx]
+        {
+            self.group_idx += 1;
+            self.value_idx_in_group = 0;
+        }
+        if self.group_idx >= self.group_lengths.len() {
+            return Ok(None);
+        }
+
+        let width = self.group_widths[self.group_idx];
+        let gref = self.group_refs[self.group_idx];
+        self.value_idx_in_group += 1;
+        if width == 0 {
+            if let Some(missing) = classify_missing_code(
+                gref,
+                self.group_reference_bits,
+                self.missing_value_management,
+            ) {
+                Ok(Some(missing))
+            } else {
+                let value = i64::try_from(gref)
+                    .map_err(|_| "complex-packing group reference exceeded i64".to_string())?;
+                Ok(Some(PackedComplexValue::Present(value)))
+            }
+        } else {
+            let encoded = self.reader.read_bits_checked(width, "group values")?;
+            if let Some(missing) =
+                classify_missing_code(encoded, width, self.missing_value_management)
+            {
+                Ok(Some(missing))
+            } else {
+                let value = gref
+                    .checked_add(encoded)
+                    .ok_or_else(|| "complex-packing group value overflow".to_string())?;
+                let value = i64::try_from(value)
+                    .map_err(|_| "complex-packing group value exceeded i64".to_string())?;
+                Ok(Some(PackedComplexValue::Present(value)))
+            }
+        }
+    }
+}
+
+fn validate_bit_width(bits: usize, label: &str) -> Result<(), String> {
+    if bits > 64 {
+        Err(format!("{label} bit width {bits} exceeds 64"))
+    } else {
+        Ok(())
+    }
+}
+
+fn all_ones(bits: usize) -> u64 {
+    match bits {
+        0 => 0,
+        64 => u64::MAX,
+        _ => (1_u64 << bits) - 1,
+    }
+}
+
+fn classify_missing_code(encoded: u64, bits: usize, management: u8) -> Option<PackedComplexValue> {
+    if management == 0 {
+        return None;
+    }
+    let primary = all_ones(bits);
+    if encoded == primary {
+        return Some(PackedComplexValue::PrimaryMissing);
+    }
+    if management == 2 && primary.checked_sub(1) == Some(encoded) {
+        return Some(PackedComplexValue::SecondaryMissing);
+    }
+    None
+}
+
+fn packed_value_to_f64(packed: PackedComplexValue, dr: &DataRepresentation) -> Result<f64, String> {
+    match packed {
+        PackedComplexValue::Present(value) => Ok(scale_raw_value(value, dr)),
+        // Match bitmap-missing behavior: explicit primary/secondary codes
+        // become NaN, while their raw Section 5 substitutes remain available
+        // as metadata rather than entering meteorological arithmetic.
+        PackedComplexValue::PrimaryMissing | PackedComplexValue::SecondaryMissing => Ok(f64::NAN),
+    }
+}
+
+struct SpatialDifferencingDecoder<'a> {
+    groups: ComplexGroups<'a>,
+    dr: &'a DataRepresentation,
+    order: usize,
+    initial_values: Vec<i64>,
+    minimum: i64,
+    nonmissing_index: usize,
+    previous: Option<i64>,
+    previous_previous: Option<i64>,
+}
+
+impl<'a> SpatialDifferencingDecoder<'a> {
+    fn new(
+        data: &'a [u8],
+        dr: &'a DataRepresentation,
+        expected_values: Option<usize>,
+    ) -> Result<Self, String> {
+        let order = dr.spatial_diff_order as usize;
+        if !matches!(order, 1 | 2) {
+            return Err(format!(
+                "unsupported spatial-differencing order {order}; expected 1 or 2"
+            ));
+        }
+        let nbits = (dr.spatial_diff_bytes as usize)
+            .checked_mul(8)
+            .ok_or_else(|| "spatial-differencing descriptor width overflow".to_string())?;
+        validate_bit_width(nbits, "spatial-differencing descriptor")?;
+        let mut reader = BitReader::new(data);
+        let mut initial_values = Vec::with_capacity(order);
+        if nbits == 0 {
+            initial_values.resize(order, 0);
+        } else {
+            for _ in 0..order {
+                let value = reader.read_bits_checked(nbits, "spatial initial values")?;
+                initial_values.push(
+                    i64::try_from(value).map_err(|_| {
+                        "spatial-differencing initial value exceeded i64".to_string()
+                    })?,
+                );
+            }
+        }
+        let minimum = if nbits == 0 {
+            0
+        } else {
+            reader.read_signed_bits_checked(nbits, "spatial minimum")?
+        };
+        reader.align_to_byte();
+        let consumed_bytes = (reader.bit_pos + 7) / 8;
+        let remaining = data
+            .get(consumed_bytes..)
+            .ok_or_else(|| "spatial-differencing header exceeded data length".to_string())?;
+        let groups = ComplexGroups::new(remaining, dr, expected_values)?;
+        Ok(Self {
+            groups,
+            dr,
+            order,
+            initial_values,
+            minimum,
+            nonmissing_index: 0,
+            previous: None,
+            previous_previous: None,
+        })
+    }
+
+    fn total_values(&self) -> usize {
+        self.groups.total_values()
+    }
+
+    fn next_scaled(&mut self) -> Result<Option<f64>, String> {
+        let Some(packed) = self.groups.next_packed()? else {
+            return Ok(None);
+        };
+        let raw = match packed {
+            PackedComplexValue::PrimaryMissing => {
+                return Ok(Some(f64::NAN));
+            }
+            PackedComplexValue::SecondaryMissing => {
+                return Ok(Some(f64::NAN));
+            }
+            PackedComplexValue::Present(raw) => raw,
+        };
+
+        let reconstructed = if self.nonmissing_index < self.order {
+            self.initial_values[self.nonmissing_index]
+        } else {
+            let difference = raw.checked_add(self.minimum).ok_or_else(|| {
+                "spatial-differencing difference overflow while adding minimum".to_string()
+            })?;
+            match self.order {
+                1 => difference
+                    .checked_add(self.previous.expect("first-order history initialized"))
+                    .ok_or_else(|| "first-order spatial recurrence overflow".to_string())?,
+                2 => {
+                    let previous = self.previous.expect("second-order history initialized");
+                    let previous_previous = self
+                        .previous_previous
+                        .expect("second-order history initialized");
+                    previous
+                        .checked_mul(2)
+                        .and_then(|value| value.checked_sub(previous_previous))
+                        .and_then(|value| value.checked_add(difference))
+                        .ok_or_else(|| "second-order spatial recurrence overflow".to_string())?
+                }
+                _ => unreachable!(),
+            }
+        };
+
+        self.nonmissing_index += 1;
+        self.previous_previous = self.previous;
+        self.previous = Some(reconstructed);
+        Ok(Some(scale_raw_value(reconstructed, self.dr)))
+    }
+}
+
 /// Template 5.0: Simple packing.
 fn unpack_simple(data: &[u8], dr: &DataRepresentation) -> Result<Vec<f64>, String> {
     let bpv = dr.bits_per_value as usize;
@@ -212,177 +604,29 @@ fn unpack_simple(data: &[u8], dr: &DataRepresentation) -> Result<Vec<f64>, Strin
 
 /// Template 5.2: Complex packing.
 fn unpack_complex(data: &[u8], dr: &DataRepresentation) -> Result<Vec<f64>, String> {
-    let ng = dr.num_groups as usize;
-    if ng == 0 {
-        return Ok(Vec::new());
+    let expected = (dr.template == 2 && dr.section5_num_data_points != 0)
+        .then_some(dr.section5_num_data_points as usize);
+    let mut groups = ComplexGroups::new(data, dr, expected)?;
+    let mut values = Vec::with_capacity(groups.total_values());
+    while let Some(packed) = groups.next_packed()? {
+        values.push(packed_value_to_f64(packed, dr)?);
     }
-
-    let bpv = dr.bits_per_value as usize;
-    let mut reader = BitReader::new(data);
-
-    // 1. Read group reference values (each is bits_per_value bits)
-    let mut group_refs = Vec::with_capacity(ng);
-    for _ in 0..ng {
-        group_refs.push(reader.read_bits(bpv) as i64);
-    }
-    reader.align_to_byte();
-
-    // 2. Read group widths (each is group_width_bits bits)
-    let gwb = dr.group_width_bits as usize;
-    let mut group_widths = Vec::with_capacity(ng);
-    for _ in 0..ng {
-        group_widths.push(reader.read_bits(gwb) as usize + dr.group_width_ref as usize);
-    }
-    reader.align_to_byte();
-
-    // 3. Read group lengths — read ALL ng values, then overwrite last with DRS value
-    let glb = dr.group_length_bits as usize;
-    let mut group_lengths = Vec::with_capacity(ng);
-    for _ in 0..ng {
-        let stored = reader.read_bits(glb) as usize;
-        group_lengths.push(stored * dr.group_length_inc as usize + dr.group_length_ref as usize);
-    }
-    if ng > 0 {
-        group_lengths[ng - 1] = dr.last_group_length as usize;
-    }
-    reader.align_to_byte();
-
-    // 4. Unpack each group's values
-    let total_values: usize = group_lengths.iter().sum();
-    let mut raw = Vec::with_capacity(total_values);
-
-    for g in 0..ng {
-        let width = group_widths[g];
-        let length = group_lengths[g];
-        let gref = group_refs[g];
-
-        for _ in 0..length {
-            if width == 0 {
-                raw.push(gref);
-            } else {
-                let val = reader.read_bits(width) as i64;
-                raw.push(gref + val);
-            }
-        }
-    }
-
-    Ok(apply_scaling(&raw, dr))
+    Ok(values)
 }
 
 /// Template 5.3: Complex packing with spatial differencing.
 fn unpack_complex_spatial(data: &[u8], dr: &DataRepresentation) -> Result<Vec<f64>, String> {
-    let order = dr.spatial_diff_order as usize;
-    let extra_bytes = dr.spatial_diff_bytes as usize;
-
-    if order == 0 || extra_bytes == 0 {
+    if dr.spatial_diff_order == 0 {
         return unpack_complex(data, dr);
     }
-
-    let nbits = extra_bytes * 8;
-    let mut reader = BitReader::new(data);
-
-    // Read the initial values (1 for order=1, 2 for order=2)
-    let mut initial_values = Vec::with_capacity(order);
-    for _ in 0..order {
-        let val = reader.read_bits(nbits) as i64;
-        initial_values.push(val);
+    let expected =
+        (dr.section5_num_data_points != 0).then_some(dr.section5_num_data_points as usize);
+    let mut decoder = SpatialDifferencingDecoder::new(data, dr, expected)?;
+    let mut values = Vec::with_capacity(decoder.total_values());
+    while let Some(value) = decoder.next_scaled()? {
+        values.push(value);
     }
-
-    // Read the minimum value (sign-magnitude)
-    let sign = reader.read_bits(1);
-    let magnitude = reader.read_bits(nbits - 1) as i64;
-    let minimum = if sign == 1 { -magnitude } else { magnitude };
-
-    reader.align_to_byte();
-
-    // Now read the rest as complex-packed groups from current position
-    let consumed_bytes = (reader.bit_pos + 7) / 8;
-    let remaining_data = &data[consumed_bytes..];
-
-    let ng = dr.num_groups as usize;
-    if ng == 0 {
-        return Ok(Vec::new());
-    }
-
-    let bpv = dr.bits_per_value as usize;
-    let mut greader = BitReader::new(remaining_data);
-
-    // Read group references
-    let mut group_refs = Vec::with_capacity(ng);
-    for _ in 0..ng {
-        group_refs.push(greader.read_bits(bpv) as i64);
-    }
-    greader.align_to_byte();
-
-    // Read group widths
-    let gwb = dr.group_width_bits as usize;
-    let mut group_widths = Vec::with_capacity(ng);
-    for _ in 0..ng {
-        group_widths.push(greader.read_bits(gwb) as usize + dr.group_width_ref as usize);
-    }
-    greader.align_to_byte();
-
-    // Read group lengths — must read ALL ng values from the stream (not ng-1),
-    // then overwrite the last one with the true last group length from the DRS.
-    // This matches g2clib behavior and ensures correct bit alignment for packed data.
-    let glb = dr.group_length_bits as usize;
-    let mut group_lengths = Vec::with_capacity(ng);
-    for _ in 0..ng {
-        let stored = greader.read_bits(glb) as usize;
-        group_lengths.push(stored * dr.group_length_inc as usize + dr.group_length_ref as usize);
-    }
-    // Overwrite last group length with the true value from DRS
-    if ng > 0 {
-        group_lengths[ng - 1] = dr.last_group_length as usize;
-    }
-    greader.align_to_byte();
-
-    // Unpack group values
-    let total_values: usize = group_lengths.iter().sum();
-    let mut raw = Vec::with_capacity(total_values);
-
-    for g in 0..ng {
-        let width = group_widths[g];
-        let length = group_lengths[g];
-        let gref = group_refs[g];
-
-        for _ in 0..length {
-            if width == 0 {
-                raw.push(gref);
-            } else {
-                let val = greader.read_bits(width) as i64;
-                raw.push(gref + val);
-            }
-        }
-    }
-
-    // Add minimum to all values
-    for v in raw.iter_mut() {
-        *v += minimum;
-    }
-
-    // Reconstruct from spatial differencing.
-    // The complex-packed groups contain ALL n values (including positions 0..order).
-    // Replace the first `order` values with the actual initial values read from the header.
-    let mut reconstructed = raw;
-
-    for (i, &iv) in initial_values.iter().enumerate() {
-        if i < reconstructed.len() {
-            reconstructed[i] = iv;
-        }
-    }
-
-    if order == 1 {
-        for i in 1..reconstructed.len() {
-            reconstructed[i] += reconstructed[i - 1];
-        }
-    } else if order == 2 {
-        for i in 2..reconstructed.len() {
-            reconstructed[i] += 2 * reconstructed[i - 1] - reconstructed[i - 2];
-        }
-    }
-
-    Ok(apply_scaling(&reconstructed, dr))
+    Ok(values)
 }
 
 /// Template 5.40: JPEG2000 packing (stub for platforms without openjp2).
@@ -1105,6 +1349,86 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_complex_spatial_primary_and_secondary_missing_skip_recurrence() {
+        let dr = DataRepresentation {
+            template: 3,
+            missing_value_management: 2,
+            num_groups: 1,
+            group_width_ref: 3,
+            last_group_length: 6,
+            spatial_diff_order: 2,
+            spatial_diff_bytes: 1,
+            section5_num_data_points: 6,
+            ..make_default_dr()
+        };
+        let mut data = vec![10, 12, 0];
+        data.extend(pack_unsigned(&[0, 0, 7, 1, 6, 2], 3));
+        let values = unpack_complex_spatial(&data, &dr).unwrap();
+        assert_eq!(values[0], 10.0);
+        assert_eq!(values[1], 12.0);
+        assert!(values[2].is_nan());
+        assert_eq!(values[3], 15.0);
+        assert!(values[4].is_nan());
+        assert_eq!(values[5], 20.0);
+    }
+
+    #[test]
+    fn test_complex_width_zero_groups_classify_missing_codes() {
+        let dr = DataRepresentation {
+            template: 2,
+            bits_per_value: 2,
+            missing_value_management: 2,
+            num_groups: 3,
+            group_length_ref: 1,
+            last_group_length: 1,
+            section5_num_data_points: 3,
+            ..make_default_dr()
+        };
+        let values = unpack_complex(&[0b1110_0100], &dr).unwrap();
+        assert!(values[0].is_nan());
+        assert!(values[1].is_nan());
+        assert_eq!(values[2], 1.0);
+    }
+
+    #[test]
+    fn test_complex_spatial_recurrence_overflow_is_an_error() {
+        let dr = DataRepresentation {
+            template: 3,
+            num_groups: 1,
+            group_width_ref: 1,
+            last_group_length: 3,
+            spatial_diff_order: 2,
+            spatial_diff_bytes: 8,
+            section5_num_data_points: 3,
+            ..make_default_dr()
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(&i64::MAX.to_be_bytes());
+        data.extend_from_slice(&i64::MAX.to_be_bytes());
+        data.extend_from_slice(&0_i64.to_be_bytes());
+        data.extend(pack_unsigned(&[0, 0, 1], 1));
+        let error = unpack_complex_spatial(&data, &dr).unwrap_err();
+        assert!(
+            error.contains("second-order spatial recurrence overflow"),
+            "{error}"
+        );
+    }
+
+    fn pack_unsigned(values: &[u64], width: usize) -> Vec<u8> {
+        let mut packed = vec![0_u8; (values.len() * width).div_ceil(8)];
+        let mut bit = 0usize;
+        for value in values {
+            for shift in (0..width).rev() {
+                if value & (1_u64 << shift) != 0 {
+                    packed[bit / 8] |= 1 << (7 - bit % 8);
+                }
+                bit += 1;
+            }
+        }
+        packed
+    }
+
     // Helper to create a default DataRepresentation for testing
     fn make_default_dr() -> DataRepresentation {
         DataRepresentation {
@@ -1113,7 +1437,11 @@ mod tests {
             binary_scale: 0,
             decimal_scale: 0,
             bits_per_value: 0,
+            original_field_type: 0,
             group_splitting_method: 0,
+            missing_value_management: 0,
+            primary_missing_value_substitute: 0,
+            secondary_missing_value_substitute: 0,
             num_groups: 0,
             group_width_ref: 0,
             group_width_bits: 0,
@@ -1126,6 +1454,7 @@ mod tests {
             ccsds_flags: 0,
             ccsds_block_size: 0,
             ccsds_rsi: 0,
+            section5_num_data_points: 0,
         }
     }
 }
