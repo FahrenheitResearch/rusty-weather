@@ -5,7 +5,7 @@ document, not a claim that the feeds below are supported. Current support is
 reported only by [MODEL_SUPPORT.md](MODEL_SUPPORT.md) and the running service's
 `/v1/models` response.
 
-This inventory contains 74 deduplicated atmospheric model/domain lanes that
+This inventory contains 78 deduplicated atmospheric model/domain lanes that
 are not represented as working remote lanes in the current capability matrix.
 A lane is counted once even when it has both published statistics and raw
 members, or several delivery choices. Different resolutions of the same model
@@ -81,8 +81,9 @@ existing contract, `P2` needs a new bounded acquisition/format adapter, and
 
 Rank numbers are stable, append-only review identifiers so links and review
 notes do not churn. Rows 46-55 are the third discovery wave, rows 56-61 are the
-fourth, rows 62-70 are the fifth, and rows 71-74 are the sixth; use `Class` and
-the shared implementation sequence below for current execution priority.
+fourth, rows 62-70 are the fifth, rows 71-74 are the sixth, and rows 75-78 are
+the seventh; use `Class` and the shared implementation sequence below for
+current execution priority.
 
 | Rank | Lane | Class | Native schedule and domain | Public data and first implementation slice |
 | ---: | --- | --- | --- | --- |
@@ -132,7 +133,7 @@ the shared implementation sequence below for current execution priority.
 | 44 | KNMI HARMONIE Europe | P3 | Europe 5.5 km rotated lat/lon, hourly output to f060 | GRIB1 tar packages. Rolling ensemble is 30 members delivered as six hourly batches of five; preserve each member's reference time and accumulation reset. |
 | 45 | KNMI HARMONIE Caribbean | P3 | Caribbean 0.05-degree regular grid, hourly output to f060 | GRIB1 tar packages and API-key access; implement after the GRIB1 decision. |
 | 46 | CPTEC/INPE WRF South America 7 km | P1 | South America, 1019x1081 regular lat/lon at 0.07 degree, daily 00Z; hourly f000-f180 | Anonymous GRIB2 with `.inv`, `.grib2.idx`, and GrADS control sidecars. Select indexed surface and pressure messages; a whole cycle is roughly 34 GiB. |
-| 47 | CPTEC/INPE BRAMS South America 8 km | P1 | South America, 978x1009 regular lat/lon, daily 00Z; hourly f000-f180 | Anonymous indexed GRIB2. Exclude the three pre-analysis files from the forecast run and preserve the grid's unequal longitude/latitude increments. |
+| 47 | CPTEC/INPE BRAMS South America 8 km | P1 | South America, 978x1009 regular lat/lon, daily 00Z; hourly f000-f180 | Anonymous indexed GRIB2. Exclude the three pre-analysis files and preserve unequal longitude/latitude increments. Implementation is retracted until the generic order-two DRT 5.3 decoder passes physical-extrema and exact-value goldens. |
 | 48 | GeoSphere Austria C-LAEF deterministic 2.5 km | P2 | AlpeAdria, provider-regridded regular WGS84 grid; every three hours, hourly to f060 | Anonymous targeted NetCDF or GeoJSON API. Persist native-model generation and GeoSphere's 1 km-to-2.5 km interpolation provenance. |
 | 49 | GeoSphere Austria C-LAEF percentiles 2.5 km | P2 | AlpeAdria, 00/12Z, hourly to f060; 17-run ensemble summarized as p10/p50/p90 | Ingest only the provider-published percentiles. Raw members are not exposed by this dataset; never reconstruct or imply member states. |
 | 50 | MeteoGalicia WRF Galicia 4 km | P2 | Galicia and nearby Atlantic, 117x126 Lambert grid, 00/12Z; hourly f001-f096 at 00Z and f001-f084 at 12Z | THREDDS/OPeNDAP CF-NetCDF. Start a tiny projected surface slice and retain the two-dimensional latitude/longitude coordinates. |
@@ -160,10 +161,14 @@ the shared implementation sequence below for current execution priority.
 | 72 | NAEFS bias-corrected published statistics | P1/P2 | Global 720x361 regular lat/lon at 0.5 degree, 00/12Z; 3-hourly f003-f192 then 6-hourly f198-f384 | NCEP publishes provider-produced mean, spread, mode, p10, p50, and p90 fields for 50 forecasts. The GRIB2 objects accept ranges but have no `.idx`; scan each selected object once and never present these statistics as deterministic or raw members. |
 | 73 | NOAA HAFS-A v2.1 parent atmosphere | P3 | Active tropical cyclones, four cycles/day; 1681x1361 regular 0.06-degree parent output, 3-hourly f000-f126 | Indexed GRIB2 is public on NOMADS. The parent output grid is fixed within a storm run, but the store run key must first include basin/storm or ATCF identity so concurrent storms cannot collide. The 1001x801 0.02-degree storm nest moves at every lead and remains separately gated. |
 | 74 | NOAA HAFS-B v2.1 parent atmosphere | P3 | Active tropical cyclones, four cycles/day; 1681x1361 regular 0.06-degree parent output, 3-hourly f000-f126 | Same fixed-parent-first contract as HAFS-A, with a distinct configuration/model identity and physics. Persist storm identity before ingest; do not merge HAFS-B with HAFS-A or treat its independently moving storm nest as one static grid. |
+| 75 | ECCC GDPS-GEML | P1/P2 | Global 1440x721 regular lat/lon at 0.25 degree, 00/12Z; 6-hourly f000-f240 | Experimental operational AI forecast, anonymously split into 82 one-message GRIB2 fields per lead. Start 2 m/10 m/MSLP plus its complete 13-level temperature, height, humidity, vertical-velocity, and vector-wind suite; precipitation and orography are not published. |
+| 76 | ECCC HRDPS West 1 km | P1/P2 | British Columbia and western Alberta, 1330x1180 rotated lat/lon near 1 km, 00/12Z; hourly f000-f048 | Experimental operational GEM lane on DD-Alpha, with 338 one-message GRIB2 field/level objects per lead and 28 pressure levels. Reuse the ECCC per-field adapter, preserve experimental status, and rotate grid-relative vectors. |
+| 77 | FMI SILAM global surface air quality | P2 | Global 1800x897 regular lat/lon at 0.2 degree, daily; 120 published hourly valid times ending at f168 of the underlying run | Anonymous NetCDF4/HDF5 on FMI-owned public S3, split into five 24-time files for CO, NO, NO2, O3, PM10, PM2.5, SO2, and air density. Trust the CF time coordinate rather than the availability-date folder and preserve concentration/species identity. |
+| 78 | CPTEC/INPE Eta South America 8 km | P1 | 90W-20.08W, 55S-19.4N on an 875x931 regular 0.08-degree grid, daily 00Z; hourly f000-f264 | Anonymous GRIB2 with text `.inv`, binary `.grib2.idx`, and GrADS control sidecars. Range-select a sparse surface and 22-level pressure suite; reject three unresolved provider-local fields and never fetch the roughly 24 GiB cycle by default. |
 
 ### Shared implementation sequence
 
-Do not create 74 unrelated downloaders. Land the reusable contracts in this
+Do not create 78 unrelated downloaders. Land the reusable contracts in this
 order, then add thin provider manifests and canonical maps:
 
 1. Separate producer, licensing publisher, direct transport, and mirror in
@@ -171,12 +176,15 @@ order, then add thin provider manifests and canonical maps:
 2. Add a bounded remote GRIB inventory scanner that can use byte ranges when a
    provider lacks `.idx`, plus an explicit WMO bulletin-wrapper decoder. This
    unlocks CMA-GEPS, Roshydromet, CWA, CPTEC/INPE, ARPAE-SIMC, NOAA AQM,
-   NAEFS, and later large package feeds.
+   NAEFS, and later large package feeds. Before enabling CPTEC/INPE Eta or
+   BRAMS, add an ecCodes-refereed GRIB2 data-representation-template 5.3
+   order-two spatial-differencing golden; plausible metadata is not enough if
+   decoded values contain the known large outliers.
 3. Add one bounded CF-NetCDF/OPeNDAP acquisition contract with dimension,
    chunk, response, and decompression ceilings. Use it for GEOS-FP, GEOS-CF,
-   Met Office, MET Norway, Argentina SMN, GeoSphere Austria, MeteoGalicia, and
-   the contiguous CDF-1 variables in CMA-CW rather than provider-specific
-   NetCDF parsers.
+   FMI SILAM, Met Office, MET Norway, Argentina SMN, GeoSphere Austria,
+   MeteoGalicia, and the contiguous CDF-1 variables in CMA-CW rather than
+   provider-specific NetCDF parsers.
 4. Add LAEA geometry before claiming UKV or MOGREPS-UK. Keep provider-native
    coordinates and grid mapping; any regrid is a derived product.
 5. Add ensemble member plus reference-time identity before raw GEPS, ECMWF,
@@ -185,13 +193,14 @@ order, then add thin provider manifests and canonical maps:
 6. Add triangular topology before native global ICON, DWD ICON EPS, or
    MeteoSwiss ICON-CH. Do not silently substitute a local rectangular regrid.
 7. Decide whether GRIB1 is decoded in process or normalized by a separately
-   validated boundary tool before starting KNMI, CHMI, ARSO, or RMI. Add
-   bounded bzip2/ZIP inventory contracts and pin every provider-local table.
+   validated boundary tool before starting KNMI, CHMI, ARSO, RMI, CPTEC BAM,
+   or CPTEC Eta 40 km. Add bounded bzip2/ZIP inventory contracts and pin every
+   provider-local table.
 8. Add a fail-closed availability/licence-window policy before WeatherNext 2:
    historical objects older than 48 hours may enter the public adapter, while
    current data remain undiscoverable and unqueryable without different rights.
 9. Add the composition identity contract before RAQDPS, NOAA AQM, GEOS-CF,
-   CAMS, or CMA-CW. Require provider-table fixtures and distinct canonical
+   FMI SILAM, CAMS, or CMA-CW. Require provider-table fixtures and distinct canonical
    roles for surface concentration, mixing ratio, mole fraction, optical
    depth, column integral, averaging window, humidity basis, deposition, and
    bias correction.
@@ -226,6 +235,12 @@ alternate delivery host, not a different producer.
   and `https://dd.weather.gc.ca/today/model_caps/3km/{HH}/{hhh}/`
 - RAQDPS: <https://eccc-msc.github.io/open-data/msc-data/nwp_raqdps/readme_raqdps-datamart_en/>
   and `https://dd.weather.gc.ca/today/model_raqdps/10km/grib2/{HH}/{hhh}/`
+- GDPS-GEML:
+  <https://eccc-msc.github.io/open-data/msc-data/nwp_gdps/readme_gdps-geml-datamart_en/>
+  and `https://dd.weather.gc.ca/today/model_gdps-geml/25km/{HH}/{hhh}/`
+- Experimental HRDPS West 1 km:
+  <https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart-alpha_en/>
+  and `https://dd.alpha.weather.gc.ca/model_hrdps/west/1km/grib2/{HH}/{hhh}/`
 
 Authentication is not required. Dated DataMart roots retain roughly 30 days;
 `/today` is the current-day view. No companion record indexes are published,
@@ -234,6 +249,56 @@ members or products for one field). Whole-object GET is therefore the normal
 path. Enumerate a bounded directory, HEAD selected objects, and sum their
 lengths before acquisition. AMQP notification is the preferred follow
 mechanism after the initial HTTP adapter.
+
+GDPS-GEML is ECCC's Global Environmental eMuLator, an experimental AI
+forecast trained/refined from the GraphCast-compatible 0.25-degree state and
+used operationally as part of GDPS v10's large-scale nudging. It is still a
+separate provider output, not an alias for GDPS. Live output is 00/12Z with
+f000-f240 every six hours on a 1440x721 regular grid. Each lead has 82
+one-message GRIB2 objects: temperature, geopotential, specific humidity,
+vertical velocity, U, and V on 1000/925/850/700/600/500/400/300/250/200/150/
+100/50 hPa, plus T2m, U10m, V10m, and MSLP. No precipitation or surface
+geopotential is published, so those roles and diagnostics that require them
+must remain unavailable. The live directory omits the extra
+`grib2/lat_lon/` components shown in one English documentation example; use
+the observed path above and the dated
+`https://dd.weather.gc.ca/{YYYYMMDD}/WXO-DD/model_gdps-geml/25km/{HH}/{hhh}/`
+form. Dated ECCC DataMart storage has the same roughly 30-day retention as the
+other model trees.
+
+The 2026-08-14 00Z f006 listing was 19,689 bytes, SHA-256
+`d71d6e2d142561c387a760caa3cf28037dbcdcbc6aca65e76b542cba1558fd62`,
+and contained all 82 roles. Observed objects were 2,076,659 bytes each, making
+the complete 41-lead run about 6.5 GiB before selecting roles. The T2m object
+`20260814T00Z_MSC_GDPS-GEML_AirTemp_AGL-2m_LatLon0.25_PT006H.grib2`
+has SHA-256
+`8cf208be62dc33758491584761edb09668170d24bb39b6f3af1f2236f4751e07`;
+the paired
+`20260814T00Z_MSC_GDPS-GEML_SpecificHumidity_IsbL-0850_LatLon0.25_PT006H.grib2`
+object has SHA-256
+`fbcd556970162166545a263ece40ac3036e3dc33b8ab214ff1217547595086c5`.
+Both are single simple-packed template-0 messages with ECCC centre 54,
+process 47, north-to-south scan, and 1,038,240 points. Fixture a surface field,
+a scalar pressure field, and both components of one pressure wind before
+calling the role set complete.
+
+HRDPS West 1 km is an ECCC experimental operational GEM domain over most of
+British Columbia and western Alberta. It runs at 00/12Z with hourly f000-f048
+and only 24 hours of overwrite-style DD-Alpha history. Its 1330x1180 rotated
+grid has 0.00899-degree increments; the live f006 directory contained 338
+one-message objects, 47 variable names, and all 28 pressure levels from 1015
+through 50 hPa. The rounded directory sizes project an unfiltered 49-lead run
+near 9.5 GiB, but variable/level splitting makes sparse whole-object GETs
+bounded. The 85,288-byte f006 listing has SHA-256
+`fff46276a10f2333c4f43fa1ff4f35bb311932ef03b672ba9433e6266154d6e0`.
+The f006 T2m object
+`CMC_hrdps_west_TMP_TGL_2_rotated_latlon0.009x0.009_20260814T00Z_P006-00.grib2`
+is 1,211,420 bytes, ETag
+`"127c1c-658fcba029c00"`, and SHA-256
+`9a2ed009f284414e938346575c2d6fcd04ba730e514cf70a9f468eb629485d15`.
+It is JPEG-packed GRIB2 on the 1,569,400-cell rotated grid with southern pole
+33.443381S, 266.463574E. Preserve the experimental flag, rotate vectors, and
+require the complete requested role set before the next cycle overwrites it.
 
 REPS runs four times daily and publishes 3-hourly leads through f072 on a
 908x960 rotated grid. Its current naming table and live directories reach f072
@@ -769,6 +834,52 @@ retaining MET Norway, FMI, or SMHI as the licensing publisher and transport.
 Do not count the same MEPS run as several model lanes merely because several
 national services publish it.
 
+### FMI SILAM global surface air quality
+
+Producer and licensing publisher: **Finnish Meteorological Institute (FMI)**.
+Direct transport is FMI's public bucket hosted by **Amazon S3 in eu-west-1**;
+Amazon is not the producer or licensing publisher.
+
+- Official SILAM S3 description:
+  <https://en.ilmatieteenlaitos.fi/silam-opendata-on-aws-s3>
+- FMI open-data licence:
+  <https://en.ilmatieteenlaitos.fi/open-data-licence>
+- NetCDF bucket/list template:
+  `https://fmi-opendata-silam-surface-netcdf.s3.eu-west-1.amazonaws.com/?list-type=2&prefix=global/{YYYYMMDD}/&max-keys=1000`
+- Object template:
+  `https://fmi-opendata-silam-surface-netcdf.s3.eu-west-1.amazonaws.com/global/{YYYYMMDD}/silam_glob_v6_1_{YYYYMMDD}_{parameter}_d{day}.nc`
+
+FMI publishes an operational global 20 km SILAM forecast once daily under CC
+BY 4.0. The live v6.1 surface grid is 1800x897 regular 0.2 degree, longitude
+-179.8 through 180.0 and latitude -89.6 through 89.6. Each prefix has five
+24-time NetCDF4/HDF5 files for each of CO, NO, NO2, O3, PM10, PM2.5, SO2, and
+the auxiliary air-density field. The 2026-08-14 prefix had 40 objects totaling
+840,039,184 bytes; its 13,806-byte S3 XML listing has SHA-256
+`fc356dcc4660980dc707c3e2aa4be5660e2384a8a59bb9e07f9427536c459f72`.
+S3 supports byte ranges, but HDF5 chunk selection or a bounded whole-parameter
+day is required rather than treating an arbitrary range as a complete slab.
+
+Live timing is subtler than the filename. The observed d0 file's CF epoch was
+2026-08-12 00Z while its 24 coordinate values ran from 2026-08-14 01Z through
+2026-08-15 00Z; d0-d4 therefore publish exactly 120 values corresponding to
+f049-f168 of that underlying run. FMI's page describes 121 hourly steps, so
+the adapter must trust and fixture the actual CF time coordinate, persist the
+availability-prefix date separately, and never synthesize f048. The S3 object
+response declared lifecycle expiry on 2026-09-14, a 31-day transport retention
+for this sample. Do not assume an older prefix survives past its returned
+`x-amz-expiration` date.
+
+The bounded CO d0 fixture is 6,195,293 bytes, ETag
+`"fe8cd9221c15b71d47bbf1a7bb6ee412"`, and SHA-256
+`e94abf7a227f0afc8e7711e0b4a2a3142d2b69d89f6073acb395b46c10344491`.
+It has HDF5 magic despite the transport's misleading
+`application/x-compressed-tar` content type, dimensions time=24, lat=897,
+lon=1800, and zlib level-5 chunks of 1x723x1450. Its variable metadata says
+`ug/m3 (EU)` while the long name says volume mixing ratio; retain both raw
+metadata and do not silently choose a concentration basis. The documented
+pressure-level Zarr bucket returned no live objects during this survey and is
+not a second active lane.
+
 ### Argentina Servicio Meteorológico Nacional (SMN)
 
 Producer and licensing publisher: **Servicio Meteorológico Nacional,
@@ -798,7 +909,7 @@ was about 2.58 GiB per cycle. The public file inventory is mainly surface and
 derived fields; do not imply access to all 45 internal WRF model levels. Start
 with one hourly surface scalar, wind, and accumulated precipitation fixture.
 
-### Brazil CPTEC/INPE WRF and BRAMS
+### Brazil CPTEC/INPE WRF, BRAMS, Eta, and BAM
 
 Producer and licensing publisher: **Instituto Nacional de Pesquisas
 Espaciais (INPE), Centro de Previsão de Tempo e Estudos Climáticos (CPTEC)**.
@@ -815,12 +926,16 @@ mirror.
   `https://dataserver.cptec.inpe.br/dataserver_modelos/wrf/ams_07km/brutos/{YYYY}/{MM}/{DD}/00/`
 - BRAMS 8 km cycle template:
   `https://dataserver.cptec.inpe.br/dataserver_modelos/brams/ams_08km/brutos/{YYYY}/{MM}/{DD}/00/`
+- Eta South America 8 km cycle template:
+  `https://dataserver.cptec.inpe.br/dataserver_modelos/eta/ams_08km/brutos/{YYYY}/{MM}/{DD}/00/`
+- BAM global TQ0666L064 cycle template:
+  `https://dataserver.cptec.inpe.br/dataserver_modelos/bam/TQ0666L064/brutos/{YYYY}/{MM}/{DD}/00/`
 
 Authentication is not required. The current INPE open-data plan identifies
-the WRF South America 7 km and BRAMS South America 8 km bases as open and
-daily. Under Decreto 8.777, an open federal dataset permits free use and reuse,
-subject to source credit. This dataset basis is distinct from the copyright
-notice on the surrounding `gov.br` page.
+WRF South America, BRAMS South America, Eta South America, and BAM Global as
+open and daily. Under Decreto 8.777, an open federal dataset permits free use
+and reuse, subject to source credit. This dataset basis is distinct from the
+copyright notice on the surrounding `gov.br` page.
 
 Both directories retain dated cycles and publish one GRIB2 file per hourly
 lead with `.inv`, `.grib2.idx`, and `.ctl` sidecars. Byte ranges are supported.
@@ -831,7 +946,46 @@ BRAMS f000 object was 144,055,896 bytes; its 978x1009 grid uses different
 longitude and latitude increments and the same 25 pressure levels. BRAMS also
 publishes f-003 through f-001; those are pre-analysis files, not forecast
 leads. Build the adapter from the record sidecars and reject a plan that falls
-back to whole-cycle transfer.
+back to whole-cycle transfer. BRAMS and the Eta feed below exercise complex
+packing with order-two spatial differencing; neither may ship until the generic
+data representation template 5.3 decoder passes exact reference-value goldens.
+
+Eta 8 km publishes 265 hourly GRIB2 leads from f000 through f264 for a daily
+00Z run. The 875x931 regular grid spans 90W-20.08W and 55S-19.4N at 0.08
+degree. Its cycle control declares 46 roles and 22 pressure levels at
+1020/1000/950/925/900/850/800/750/700/650/600/550/500/450/400/350/300/250/
+200/150/100/50 hPa; three provider-local codes have no description and must
+remain unsupported. Every lead has a text `.inv`, a GrADS `.grib2.idx`, and a
+`.ctl` sidecar. The 2026-08-14 listing was 366,289 bytes, SHA-256
+`384dcb16891e438235a6236c68c68e886d09d9494775e8a5ecd17771910bc3f8`.
+The f000 object was 87,375,108 bytes, ETag
+`"5353d04-658fb35ae1cd0"`; all 265 lead objects total roughly 23.8 GiB from
+the rounded provider listing, so selected `.inv` ranges are mandatory. The
+3,790-byte cycle control has SHA-256
+`bde94e7df0269e0bb76972fa8877cb156b931f3a197d6579fb27ce27655787c2`.
+The dated tree exposed archives back through `2021/07/` at survey time, but
+INPE publishes no retention SLA; treat that as observed availability, not a
+promise that an old run will remain fetchable.
+
+The order-two DRT 5.3 acceptance fixture is the f000 T2m range from
+`Eta_ams_08km_2026081400_2026081400.grib2` and its exact text inventory
+`Eta_ams_08km_2026081400_2026081400.inv`, both below the dated cycle URL above.
+The GRIB range is 1,616,482-2,099,259 inclusive: 482,778 bytes, SHA-256
+`dbfc1ebdd827fef617d06fca0338c846791dbdbcee923b466e52cc782ad8e6e7`.
+An ecCodes referee decodes 814,625 finite values with min/max/mean
+255.0915985107422/307.7478485107422/290.0166320576196 K and little-endian
+float64 value SHA-256
+`e5d6aef32c995fbe3631822a39c63edca708345f71a2454d2aed904c0e856ffb`.
+The f006 total-precipitation fixture uses
+`Eta_ams_08km_2026081400_2026081406.grib2` and
+`Eta_ams_08km_2026081400_2026081406.inv`; range 7,015,788-7,392,372 is
+376,585 bytes,
+SHA-256
+`e3bf49750ad2bbc794470d611dbe8d0e24c5323cb0ad5ae3979313a59e2c6735`,
+and must decode as a template-8 f005-f006 accumulation with min/max
+0/6.888671875 kg m-2 and value SHA-256
+`adbb6b76f9eb6bfcc2b0fbfc0f52d82ca0e5a8081187b97e10fe8a3aa73ae835`.
+Reject the lane if either extrema, interval, or value hash differs.
 
 ### GeoSphere Austria C-LAEF
 
@@ -1319,9 +1473,10 @@ are recorded.
 | `dmi` | CC BY 4.0 permits sharing and adaptation for any purpose, including commercial | Danish Meteorological Institute/DMI, licence link, and change indication | <https://www.dmi.dk/friedata/dokumentation/terms-of-use> |
 | `met-norway` | NLOD 2.0 and CC BY 4.0 are offered for MET Norway data | Credit MET Norway and link the selected licence | <https://docs.api.met.no/doc/License.html> |
 | `metcoop` via `fmi` | FMI publishes its MEPS feed under CC BY 4.0 | Credit MetCoOp as producer and FMI as licensing publisher; link licence and indicate changes | <https://en.ilmatieteenlaitos.fi/open-data-licence> |
+| `fmi-silam` | FMI publishes the operational SILAM S3 feed under CC BY 4.0 | Credit Finnish Meteorological Institute/FMI, link the licence, and indicate changes; record Amazon S3 only as transport | [SILAM S3 record](https://en.ilmatieteenlaitos.fi/silam-opendata-on-aws-s3) and [FMI licence](https://en.ilmatieteenlaitos.fi/open-data-licence) |
 | `metcoop` via `smhi` | SMHI open data are published under CC BY 4.0 unless a dataset says otherwise | Credit MetCoOp as producer and SMHI as licensing publisher; link licence and indicate changes | <https://www.smhi.se/data/om-smhis-data/fragor-och-svar> |
 | `smn-argentina` | CC BY 2.5 Argentina permits sharing and adaptation, including commercial use | Servicio Meteorológico Nacional, dataset citation, and registry access date | <https://registry.opendata.aws/smn-ar-wrf-dataset/> |
-| `inpe-cptec` | INPE's current plan marks WRF 7 km and BRAMS 8 km open; Brazil's federal open-data definition permits free reuse subject to source credit | `INPE/CPTEC`, source URL, plan/version, and modification notice | [INPE open-data plan](https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/repositorio-de-arquivos/pda_inpe_25_27_v3_defesoeleitoral2026.pdf) and [Decreto 8.777/2016](https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2016/decreto/d8777.htm) |
+| `inpe-cptec` | INPE's current plan marks WRF, BRAMS, Eta, and BAM open; Brazil's federal open-data definition permits free reuse subject to source credit | `INPE/CPTEC`, source URL, plan/version, and modification notice | [INPE open-data plan](https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/repositorio-de-arquivos/pda_inpe_25_27_v3_defesoeleitoral2026.pdf) and [Decreto 8.777/2016](https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2016/decreto/d8777.htm) |
 | `geosphere-austria` | C-LAEF deterministic and ensemble-statistics datasets are CC BY 4.0 | GeoSphere Austria, dataset DOI, licence link, provider-regridding and change indication | [deterministic dataset](https://data.hub.geosphere.at/en/dataset/nwp-v2-1h-2500m) and [ensemble dataset](https://data.hub.geosphere.at/en/dataset/ensemble-v2-1h-2500m) |
 | `meteogalicia` | MeteoGalicia THREDDS model results are CC BY-SA 4.0 | MeteoGalicia/Xunta de Galicia, source and licence links, change indication, and share-alike obligations | <https://abertos.xunta.gal/catalogo/medio-abiente/-/dataset/0485/servidor-thredds-meteogalicia> |
 | `google-weathernext` historical only | WeatherNext 2 data older than 48 hours are CC BY 4.0; current data are excluded from the public adapter because separate terms restrict redistribution | Persist the exact WeatherNext 2 citation naming DeepMind Technologies Limited, CC BY link, third-party acknowledgements, source, age at acquisition, and modifications | [dataset catalogue](https://developers.google.com/earth-engine/datasets/catalog/projects_gcp-public-data-weathernext_assets_weathernext_2_0_0) and [current-data terms](https://storage.googleapis.com/weathernext-public/terms-of-use.pdf) |
@@ -1385,7 +1540,11 @@ Provider-specific minimum fixtures:
   a disabled member-contract fixture. CAPS must prove 2230x1830 rotated
   geometry, wind rotation, and experimental status. RAQDPS must fixture an
   official constituent-code table plus negative unknown-code and
-  surface-versus-column cases.
+  surface-versus-column cases. GDPS-GEML must assert exactly 82 roles, 13
+  pressure levels, simple packing, 1440x721 geometry, and explicit absence of
+  precipitation/orography roles. HRDPS West must assert the 338-role listing,
+  28 pressure levels, 1330x1180 rotated geometry/vector rotation, experimental
+  status, and completeness inside its 24-hour overwrite window.
 - DWD: `.bz2` surface and pressure objects, decompression ceiling, grid-template
   assertion, and deterministic rejection of native-mesh files in structured
   lanes.
@@ -1434,13 +1593,23 @@ Provider-specific minimum fixtures:
   GRIB2 equivalent, and producer/licensing-publisher assertions. Before raw
   ensemble support, pin an SMHI listing proving the live member set rather than
   assuming all documented members exist.
+- FMI SILAM: S3 prefix listing, object lifecycle header, NetCDF4/HDF5 magic,
+  chunk/filter metadata, all five day partitions, and exact CF time values.
+  Assert 1800x897 geometry, seven species plus air density, 120 live times,
+  availability-prefix versus run-time identity, and fail closed on the
+  long-name/`ug/m3 (EU)` concentration-basis conflict. Prove the Zarr bucket is
+  non-empty before ever advertising pressure-level SILAM.
 - Argentina SMN: anonymous S3 listing, CF-NetCDF header, Lambert coordinate
   golden, one surface and one accumulation field, and an explicit inventory
   proving which public files lack model-level fields.
-- CPTEC/INPE: dated WRF and BRAMS listings plus `.inv`, `.grib2.idx`, and
-  `.ctl` sidecars. Range-select one surface, pressure, vector-wind, and
-  accumulation message; assert 1019x1081 versus 978x1009 geometry, unequal
-  BRAMS increments, 25 pressure levels, and rejection of BRAMS negative leads.
+- CPTEC/INPE: dated WRF, BRAMS, and Eta 8 km listings plus `.inv`,
+  `.grib2.idx`, and `.ctl` sidecars. Range-select one surface, pressure,
+  vector-wind, and accumulation message; assert 1019x1081, 978x1009, and
+  875x931 geometry, unequal BRAMS increments, the 25- versus 22-level suites,
+  rejection of BRAMS negative leads, and fail-closed handling of Eta's three
+  unresolved local codes. For every order-two DRT 5.3 fixture, compare all
+  values and physical extrema to the pinned ecCodes hashes above; metadata-only
+  success or any 1e11-1e13 outlier is a hard decoder failure.
 - GeoSphere Austria: API metadata plus one-cell/one-time targeted NetCDF for
   deterministic and percentile collections. Assert bbox, cycle/offset,
   parameter generation, p10/p50/p90 identity, DOI/licence, provider regrid,
@@ -1503,7 +1672,7 @@ Provider-specific minimum fixtures:
 
 ## Watchlist and access gates
 
-These feeds are not included in the 74-lane implementation count. Recheck them
+These feeds are not included in the 78-lane implementation count. Recheck them
 periodically, but do not build a production adapter until the named gate is
 closed with an official source and a live bounded fixture.
 
@@ -1516,7 +1685,7 @@ closed with an official source and a live bounded fixture.
 | Australia Bureau of Meteorology ACCESS | [ACCESS NWP products](https://www.bom.gov.au/nwp/doc/access/NWPData.shtml), [copyright notice](https://www.bom.gov.au/copyright), and [data licence agreement](https://www.bom.gov.au/sites/default/files/2026-07/bureau-of-meteorology-data-licence-agreement-june-2026.pdf) | Operational model files use a Registered User/subscriber channel. Default Bureau terms do not establish unrestricted third-party or commercial redistribution. | Obtain and record a licence that covers RWS redistribution and automated access. |
 | JMA GSM/MSM/LFM GPV | [official product catalogue](https://www.data.jma.go.jp/suishin/cgi-bin/catalogue/make_product_page.cgi?id=ZenModel), [JMBSC distribution](https://www.jmbsc.or.jp/en/index-e.html), and [official samples](https://www.data.jma.go.jp/developer/gpv_sample.html) | Operational GPV delivery is through the contracted/paid JMBSC service. Public sample files are suitable only as decoder fixtures and do not establish redistribution rights. | Establish an official operational access and redistribution contract; do not treat sample files as a live feed. |
 | CPTEC/INPE BAM | [official anonymous directory](https://ftp.cptec.inpe.br/modelos/tempo/BAM/) and [INPE 2025-2027 open-data plan](https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/repositorio-de-arquivos/pda_inpe_25_27_v3_defesoeleitoral2026.pdf) | The current anonymous `singleLevel` GRIB2 tree is only a limited subset. The plan marks the base open but schedules complete global raw BAM grid output for June 2027. | Confirm the complete raw grid, inventory, and bounded transport after the scheduled opening; the remaining gate is technical completeness, not general INPE reuse permission. |
-| CPTEC/INPE ETA South America 40 km and RJ/SP 1 km | [official ETA directory](https://ftp.cptec.inpe.br/modelos/tempo/Eta/) and [INPE 2025-2027 open-data plan](https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/repositorio-de-arquivos/pda_inpe_25_27_v3_defesoeleitoral2026.pdf) | Fresh anonymous GRIB1 is live at `ams_40km/brutos/` and `rjsp_01km/brutos/`; 2026-08-14 f000 objects were 10,462,260 and 59,857,266 bytes and accepted byte ranges. The same official plan schedules ETA's formal opening for July 2027, so discoverability is not yet a sufficient redistribution grant. The advertised 8 km archive path was also broken for current 2026 data. | Wait for the scheduled opening or obtain written terms tied to these exact forecast objects, then pin provider GRIB1 tables, grids, schedules, and a bounded range inventory. |
+| CPTEC/INPE ETA South America 40 km and RJ/SP 1 km | [official ETA directory](https://ftp.cptec.inpe.br/modelos/tempo/Eta/) and [INPE 2025-2027 open-data plan](https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/repositorio-de-arquivos/pda_inpe_25_27_v3_defesoeleitoral2026.pdf) | Fresh anonymous GRIB1 is live at `ams_40km/brutos/` and `rjsp_01km/brutos/`; 2026-08-14 f000 objects were 10,462,260 and 59,857,266 bytes and accepted byte ranges. Although the plan's inventory marks the generic ETA base open, it schedules catalogue publication for July 2027 and does not identify these two legacy GRIB1 variants. The legacy FTP 8 km path was also broken; that is distinct from the live `dataserver_modelos/eta/ams_08km/` GRIB2 lane ranked above. | Wait for the scheduled catalogue or obtain written terms tied to these exact forecast objects, then pin provider GRIB1 tables, grids, schedules, and a bounded range inventory. |
 | Singapore MSS/ASMC smoke-haze dispersion model | [official WIS2 product record](https://wis2.asmc.asean.org/smoke-haze-dispersion-model/) and [live product API](https://z9ppn1a4nj.execute-api.ap-southeast-1.amazonaws.com/v1/collections/asmc_smoke_haze_dispersion/items/ASMC_SMOKE_HAZE_DISPERSION) | The record describes 3-hourly surface PM10 estimates through 24 hours, but the API returns only a 474,117-byte `GIF89a` animation (SHA-256 `0bdf91428bd7a55c462cbcf8204d0dbd259aaae6218ded99c3589ed0db4aa3a3`), not a machine-readable concentration grid. | Locate an official structured PM10 field with explicit reuse terms, or scope the GIF separately as a derived visualization rather than canonical model data. |
 | AEMET HARMONIE-AROME packages | [official catalogue](https://datos.gob.es/en/catalogo/e05068001-datos-del-modelo-harmonie-arome) and [AEMET legal notice](https://www.aemet.es/es/nota_legal) | Public packages are selected derived GeoTIFF/GeoJSON surface products, not a canonical full NWP state. Reuse is allowed with attribution, but counting it as full model normalization would overstate semantics. | Add only as an explicitly derived-product lane, or locate an official full-field feed. |
 | ICPAC WRF East Africa rainfall products | [official dataset API](https://floodwatch.icpac.net/api/datasets), [WRF total-rainfall metadata](https://floodwatch.icpac.net/api/metadata/2769c1e8-97cb-4144-a460-cfca2f97ce3f), and [WRF extreme-rainfall metadata](https://floodwatch.icpac.net/api/metadata/a3a96f87-a5b5-4fb1-9bd0-603959ef6b25) | The live public products are derived daily total/extreme-rainfall COG/tile layers, not the full WRF state, and both official metadata records have a null licence field. | Obtain an ICPAC reuse/redistribution statement tied to the products and either locate the raw model grid or define an explicitly derived-rainfall canonical lane. |
