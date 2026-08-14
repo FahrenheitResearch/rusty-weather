@@ -5,7 +5,7 @@ document, not a claim that the feeds below are supported. Current support is
 reported only by [MODEL_SUPPORT.md](MODEL_SUPPORT.md) and the running service's
 `/v1/models` response.
 
-This inventory contains 70 deduplicated atmospheric model/domain lanes that
+This inventory contains 74 deduplicated atmospheric model/domain lanes that
 are not represented as working remote lanes in the current capability matrix.
 A lane is counted once even when it has both published statistics and raw
 members, or several delivery choices. Different resolutions of the same model
@@ -81,8 +81,8 @@ existing contract, `P2` needs a new bounded acquisition/format adapter, and
 
 Rank numbers are stable, append-only review identifiers so links and review
 notes do not churn. Rows 46-55 are the third discovery wave, rows 56-61 are the
-fourth, and rows 62-70 are the fifth; use `Class` and the shared implementation
-sequence below for current execution priority.
+fourth, rows 62-70 are the fifth, and rows 71-74 are the sixth; use `Class` and
+the shared implementation sequence below for current execution priority.
 
 | Rank | Lane | Class | Native schedule and domain | Public data and first implementation slice |
 | ---: | --- | --- | --- | --- |
@@ -156,22 +156,27 @@ sequence below for current execution priority.
 | 68 | NASA GMAO GEOS-CF v2 | P2 | Global 0.25-degree 1440x721 grid, daily production with a five-day forecast; hourly surface and pressure-level composition collections | Anonymous NCCS OPeNDAP and public S3 Zarr. Treat it as a research composition forecast, preserve half-hour-centred average times and RH35 PM identity, and use only projected slices or bounded chunks. |
 | 69 | CAMS global atmospheric composition forecast | P2 | Global 0.4-degree regular grid, 00/12Z to five days; hourly single-level and provider-constrained multi-level output | Account/API-token ADS retrieval under CC BY 4.0. Use the anonymous STAC/form/cost endpoints to validate and budget a tightly targeted GRIB or zipped-NetCDF request before authenticated execution. |
 | 70 | CAMS European air-quality ensemble median | P2/P3 | Europe 25W-45E, 30N-72N at 0.1 degree, daily; hourly f000-f096 on surface through 5000 m | Ingest the provider-published 11-system ensemble median first. Individual system outputs and any locally derived spread need a durable model-member identity and remain P3. |
+| 71 | CMA-CW v1 Asian sand-and-dust forecast | P2 | Asia 25E-150E, 15N-60N on an 835x301 0.15-degree regular grid, 00/12Z; hourly f000-f072, 3-hourly f075-f120, then 6-hourly f126-f168 | Anonymous WIS2-core CDF-1 NetCDF, one roughly 112 MB all-field object per lead. Range-select the header and requested slabs; preserve PM10, dust concentration/load/flux/deposition/AOD identity and do not clamp provider-negative values. |
+| 72 | NAEFS bias-corrected published statistics | P1/P2 | Global 720x361 regular lat/lon at 0.5 degree, 00/12Z; 3-hourly f003-f192 then 6-hourly f198-f384 | NCEP publishes provider-produced mean, spread, mode, p10, p50, and p90 fields for 50 forecasts. The GRIB2 objects accept ranges but have no `.idx`; scan each selected object once and never present these statistics as deterministic or raw members. |
+| 73 | NOAA HAFS-A v2.1 parent atmosphere | P3 | Active tropical cyclones, four cycles/day; 1681x1361 regular 0.06-degree parent output, 3-hourly f000-f126 | Indexed GRIB2 is public on NOMADS. The parent output grid is fixed within a storm run, but the store run key must first include basin/storm or ATCF identity so concurrent storms cannot collide. The 1001x801 0.02-degree storm nest moves at every lead and remains separately gated. |
+| 74 | NOAA HAFS-B v2.1 parent atmosphere | P3 | Active tropical cyclones, four cycles/day; 1681x1361 regular 0.06-degree parent output, 3-hourly f000-f126 | Same fixed-parent-first contract as HAFS-A, with a distinct configuration/model identity and physics. Persist storm identity before ingest; do not merge HAFS-B with HAFS-A or treat its independently moving storm nest as one static grid. |
 
 ### Shared implementation sequence
 
-Do not create 70 unrelated downloaders. Land the reusable contracts in this
+Do not create 74 unrelated downloaders. Land the reusable contracts in this
 order, then add thin provider manifests and canonical maps:
 
 1. Separate producer, licensing publisher, direct transport, and mirror in
    provenance. Make licence/attribution visible at run and API level.
 2. Add a bounded remote GRIB inventory scanner that can use byte ranges when a
    provider lacks `.idx`, plus an explicit WMO bulletin-wrapper decoder. This
-   unlocks CMA, Roshydromet, CWA, CPTEC/INPE, ARPAE-SIMC, NOAA AQM, and later
-   large package feeds.
+   unlocks CMA-GEPS, Roshydromet, CWA, CPTEC/INPE, ARPAE-SIMC, NOAA AQM,
+   NAEFS, and later large package feeds.
 3. Add one bounded CF-NetCDF/OPeNDAP acquisition contract with dimension,
    chunk, response, and decompression ceilings. Use it for GEOS-FP, GEOS-CF,
-   Met Office, MET Norway, Argentina SMN, GeoSphere Austria, and MeteoGalicia
-   rather than provider-specific NetCDF parsers.
+   Met Office, MET Norway, Argentina SMN, GeoSphere Austria, MeteoGalicia, and
+   the contiguous CDF-1 variables in CMA-CW rather than provider-specific
+   NetCDF parsers.
 4. Add LAEA geometry before claiming UKV or MOGREPS-UK. Keep provider-native
    coordinates and grid mapping; any regrid is a derived product.
 5. Add ensemble member plus reference-time identity before raw GEPS, ECMWF,
@@ -185,10 +190,16 @@ order, then add thin provider manifests and canonical maps:
 8. Add a fail-closed availability/licence-window policy before WeatherNext 2:
    historical objects older than 48 hours may enter the public adapter, while
    current data remain undiscoverable and unqueryable without different rights.
-9. Add the composition identity contract before RAQDPS, NOAA AQM, GEOS-CF, or
-   CAMS. Require provider-table fixtures and distinct canonical roles for
-   surface concentration, mixing ratio, mole fraction, optical depth, column
-   integral, averaging window, humidity basis, and bias correction.
+9. Add the composition identity contract before RAQDPS, NOAA AQM, GEOS-CF,
+   CAMS, or CMA-CW. Require provider-table fixtures and distinct canonical
+   roles for surface concentration, mixing ratio, mole fraction, optical
+   depth, column integral, averaging window, humidity basis, deposition, and
+   bias correction.
+10. Add a run-instance/domain identity before HAFS. A HAFS cycle can contain
+    several storms with the same model/date/cycle, so basin plus storm/ATCF
+    identity must participate in discovery, store paths, manifests, and APIs.
+    Ingest only the fixed parent grid first; the moving 2 km postprocessed nest
+    additionally needs geometry per valid time rather than one grid per run.
 
 ## Authoritative access contracts
 
@@ -288,7 +299,7 @@ avoid decompressing the bzip2 member, so fetch only selected small objects with
 strict compressed and decompressed caps. The directory is a rolling current
 forecast service, not an archive contract.
 
-### WMO WIS2 core feeds: CMA-GEPS and Roshydromet ICON
+### WMO WIS2 core feeds: CMA-GEPS, CMA-CW, and Roshydromet ICON
 
 WIS2 metadata and notifications are the discovery layer. Model ownership and
 licensing remain with the publishing National Meteorological and Hydrological
@@ -302,6 +313,16 @@ Service; a WIS2 Global Cache is only a replicated transport.
   <https://wis2node.wis.cma.cn/oapi/collections/discovery-metadata/items/urn%3Awmo%3Amd%3Acn-cma%3Adata.core.weather.prediction.forecast.medium-range.probabilistic.global?f=json>
 - CMA source-object prefix:
   `https://wis2node.wis.cma.cn/data/{YYYY-MM-DD}/wis/urn:wmo:md:cn-cma:data.core.weather.prediction.forecast.medium-range.probabilistic.global/`
+- CMA-CW Global Discovery Catalogue record:
+  <https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn%3Awmo%3Amd%3Acn-cma%3Adata.core.weather.prediction.forecast.medium-range.deterministic.limited-area?f=json>
+- CMA-CW canonical source metadata:
+  <https://wis2node.wis.cma.cn/data/metadata/urn:wmo:md:cn-cma:data.core.weather.prediction.forecast.medium-range.deterministic.limited-area.json>
+- CMA-CW source notification listing:
+  <https://wis2node.wis.cma.cn/oapi/collections/messages/items?metadata_id=urn%3Awmo%3Amd%3Acn-cma%3Adata.core.weather.prediction.forecast.medium-range.deterministic.limited-area&sortby=-datetime&limit=2000&f=json>
+- CMA-CW operational specification:
+  <https://www.wmc-bj.net/publish/cms/view/wmcbj_25fbfc90e67d4f92a20ae98ba64a5f26.html>
+- CMA-CW source-object prefix:
+  `https://wis2node.wis.cma.cn/data/{YYYY-MM-DD}/wis/urn:wmo:md:cn-cma:data.core.weather.prediction.forecast.medium-range.deterministic.limited-area/`
 - Roshydromet ICON Global Discovery Catalogue record:
   <https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn%3Awmo%3Amd%3Aru-roshydromet%3Awipps-dc.forecast.short-range.deterministic.limited-area.icon?f=html>
 - Roshydromet source metadata:
@@ -309,15 +330,62 @@ Service; a WIS2 Global Cache is only a replicated transport.
 - Roshydromet source-object prefix:
   `http://wis2box.mecom.ru/data/{YYYY-MM-DD}/wis/urn:wmo:md:ru-roshydromet:wipps-dc.forecast.short-range.deterministic.limited-area.icon/`
 
-Both records declare `wmo:dataPolicy=core`: WMO defines core data as free and
-unrestricted, without charge or conditions on use. Authentication is not
-required at the observed source nodes or Global Caches. CMA source metadata
-declares 30-day retention; a Global Cache is only a 24-hour delivery cache.
-CMA-GEPS publishes 74 lead files per run and an observed complete run was about
-5.98 GB. Its files have no sidecar index, but individual messages observed at
-roughly 0.2-1.2 MB make a bounded HTTP range inventory practical. The current
-files use ensemble-derived, probability, and percentile product templates and
-declare 31 forecasts; no raw members were observed.
+All three records declare `wmo:dataPolicy=core`: WMO defines core data as free
+and unrestricted, without charge or conditions on use. Authentication is not
+required at the observed source nodes or Global Caches. CMA-GEPS source
+metadata declares 30-day retention; a Global Cache is only a 24-hour delivery
+cache. CMA-GEPS publishes 74 lead files per run and an observed complete run
+was about 5.98 GB. Its files have no sidecar index, but individual messages
+observed at roughly 0.2-1.2 MB make a bounded HTTP range inventory practical.
+The current files use ensemble-derived, probability, and percentile product
+templates and declare 31 forecasts; no raw members were observed.
+
+CMA-CW v1 is CMA's operational Asian sand-and-dust forecast, implemented on
+2025-06-16. The WIS2 record identifies CMA as producer and licensing publisher;
+the CMA source node is direct transport and a Global Cache remains a mirror.
+Subscribe to
+`cache/a/wis2/cn-cma/data/core/weather/prediction/forecast/medium-range/deterministic/limited-area`.
+The current 835x301 regular grid covers 25E-150E and 15N-60N. Each 00/12Z run
+has 97 expected lead objects: f000-f072 hourly, f075-f120 every three hours,
+and f126-f168 every six hours. An observed complete run was about 10.08 GiB;
+individual objects were about 111.6 MB, so whole-cycle acquisition is never a
+valid default.
+
+The objects are classic CDF-1 NetCDF with contiguous variables and byte-range
+support. They expose 26 pressure levels (1000, 975, 950, 925, 900, 850, 800,
+750, 700, 650, 600, 550, 500, 450, 400, 350, 300, 250, 200, 150, 100, 70, 50,
+30, 20, and 10 hPa) for wind, PM10, and dust concentration, plus dust load,
+surface concentration and flux, accumulated dry/wet deposition, dust AOD at
+550 nm, and precipitation. The files contain no time or forecast coordinate;
+derive reference/valid time only from the WIS2 notification `data_id` and
+filename, require both to agree, and reject unrecognized names. A warm restart
+means accumulated fields can legitimately be nonzero at f000. Current files
+also omit fill-value attributes and contain some negative PM10/dust cells;
+preserve the raw values and QA status instead of silently clamping or guessing
+missingness.
+
+Pin this exact bounded 2026-08-14 00Z f000 fixture before the rolling object
+expires:
+
+- Object:
+  `https://wis2node.wis.cma.cn/data/2026-08-14/wis/urn:wmo:md:cn-cma:data.core.weather.prediction.forecast.medium-range.deterministic.limited-area/Z_NAFP_C_BABJ_20260814000000_P_CEMC-CMA-CW-DUST_15KM_ASIA-00000.nc`
+- WIS2 notification ID `e606dc48-c4d1-4ff6-85d1-0a891078f257`, publication
+  time `2026-08-14T07:18:26Z`, length 111,603,912, ETag
+  `"56cb4d3a4c894b38a725953337da3892-11"`, and advertised SHA-512
+  `99a0835ad9f9b5ca9de18e45670b0b626c410d9a5416a5a5621c814c9f884039857525f0ce8b76a42e7a168ce6ce4a164db1f29c105aaa65411924f2c55db5b9`.
+- Header and coordinate range `0-11171` is 11,172 bytes, SHA-256
+  `e0e5aed314e82d3b8db37391c2873b694c5e52240edd8345b96f4066e58bcde4`.
+- First 1000 hPa PM10 slab range `52288852-53294191` is 1,005,340 bytes,
+  SHA-256
+  `38e21a2a0ad66ca9ba306507a7b871d0d1afd14f32d4adbdfbf76ab6d5686c4b`.
+- Full surface AOD550 range `109593232-110598571` is 1,005,340 bytes,
+  SHA-256
+  `383f628ca7b8f4ed9edfb9465c72539dec4f0a0c94ed875b5c005d446cf07733`.
+
+The source listing exposed several dates, but an object only nine days old was
+already gone during the survey; do not infer retention from metadata alone.
+Copy only selected fixture ranges promptly, and publish a run only after its
+requested lead/variable role set is complete.
 
 The first RWS lane is now implemented and live verified at one bounded lead:
 57 identified statistics were written bit-exactly and passed deep-store
@@ -941,6 +1009,114 @@ Each fixture's 72 messages describe exact one-hour average intervals from 0-1
 through 71-72 hours. Preserve those bounds and the native PM mass-concentration
 units rather than treating the fields as instantaneous valid-time snapshots.
 
+### NOAA/NCEP NAEFS statistics and HAFS tropical-cyclone forecasts
+
+NAEFS is jointly produced by the **Meteorological Service of Canada, United
+States National Weather Service, and National Meteorological Service of
+Mexico**. For the exact gridded products below, NOAA/NCEP is the licensing
+publisher and NCEP NOMADS is transport. The ECCC NAEFS page establishes the
+joint producer identity but ECCC's server licence governs ECCC-hosted copies,
+not NOMADS transport; provenance must not collapse either distinction.
+
+- Joint NAEFS description and ECCC access terms:
+  <https://eccc-msc.github.io/open-data/msc-data/nwp_naefs/readme_naefs_en/>
+- NCEP official product inventory:
+  <https://www.nco.ncep.noaa.gov/pmb/products/naefs/>
+- Exact provider mean inventory:
+  <https://www.nco.ncep.noaa.gov/pmb/products/naefs/naefs_geavg.t00z.pgrb2a.0p50_bcf006.shtml>
+- NOMADS template:
+  `https://nomads.ncep.noaa.gov/pub/data/nccf/com/naefs/prod/naefs.{YYYYMMDD}/{00|12}/pgrb2ap5_bc/`
+
+Authentication is not required. The 00Z and 12Z directories each publish 96
+leads per statistic: f003-f192 every three hours, then f198-f384 every six
+hours. The six provider products are `geavg`, `gespr`, `gemode`, `ge10pt`,
+`ge50pt`, and `ge90pt`; they are roles in one NAEFS lane, not six models. No
+bias-corrected files were present at 06Z or 18Z in the observed run. These are
+provider-produced statistics for 50 forecasts. Persist mean/spread/mode/
+percentile identity from GRIB product templates and never imply a deterministic
+state or a recoverable raw-member ensemble.
+
+The 0.5-degree regular grid has 720x361 points. The 51-message f006 mean
+contains height, temperature, and U/V wind at 1000, 925, 850, 700, 500, 250,
+200, 100, 50, and 10 hPa, plus surface pressure, MSLP, T2m, U/V10m,
+Tmax/Tmin, 850 hPa vertical velocity, DPT2m, RH2m, and 10 m wind speed. It does
+not contain pressure-level humidity and cannot provide a complete sounding.
+The objects accept byte ranges but publish no `.idx`; range-scan a selected
+object once, bound the scan and record count, cache the resulting offsets, and
+retain the NCO inventory as a separate provider-contract fixture.
+
+The 2026-08-13 00Z listing was 74,589 bytes, SHA-256
+`0192bb3ca0c182e54a239939836b6cfa7b400d11c8a1d295052ee255683c81b9`,
+and contained exactly 576 files: 96 for each of the six statistic roles. Pin
+this provider-mean object:
+`https://nomads.ncep.noaa.gov/pub/data/nccf/com/naefs/prod/naefs.20260813/00/pgrb2ap5_bc/naefs_geavg.t00z.pgrb2a.0p50_bcf006`.
+It is 11,404,831 bytes; first-record range `0-293381` is 293,382 bytes with
+SHA-256
+`7b43f8ee53d2cdea240ef9c8e6dec82965dd84acba138455273ee4cc3af89244`.
+That GRIB record uses NCEP centre 7, generating-process identifier 114,
+product-definition template 2, `numberOfForecasts=50`, and the 720x361 grid.
+Observed NOMADS retention was about two days, so fixtures must not depend on a
+live historic URL.
+
+HAFS-A and HAFS-B are distinct operational configurations produced and
+licensed by **NOAA/NWS/NCEP/EMC**; NOMADS is transport. Version 2.1 has been
+operational since 2025-07-29. Both run four cycles per day for active tropical
+cyclones and currently publish 43 three-hourly atmospheric leads from f000
+through f126.
+
+- Official HAFS implementation description:
+  <https://www.emc.ncep.noaa.gov/HAFS/HAFSEPS/about.php?branch=impl>
+- HAFSv2.1 Service Change Notice:
+  <https://www.weather.gov/media/notification/pdf_2025/scn25-48_HAFSv2.1.pdf>
+- NOMADS root:
+  <https://nomads.ncep.noaa.gov/pub/data/nccf/com/hafs/prod/>
+- Per-storm template:
+  `https://nomads.ncep.noaa.gov/pub/data/nccf/com/hafs/prod/{hfsa|hfsb}.{YYYYMMDD}/{HH}/{storm}.{YYYYMMDDHH}.{hfsa|hfsb}.{parent|storm}.atm.f{FFF}.grb2`
+
+The postprocessed `parent.atm` output is a GRIB regular-lat/lon grid, not the
+model's native ESG mesh. For 2026-08-14 00Z invest 94L, both configurations
+used a fixed 1681x1361 parent grid across f000, f006, f012, and f126, bounded
+by 25.799999S-55.799999N and 273.300003E-14.099998E across the 0/360-degree
+longitude seam.
+The `storm.atm` subset is a 1001x801 regular 0.02-degree grid whose geographic
+window moves with the storm. HAFS-A moved from 2.507N/318.751999E at f000 to
+2.188N/318.799999E at f006 and 2.154N/317.727001E at f012; HAFS-B used a
+different trajectory. One static grid per run would therefore corrupt the
+storm subset even though each individual GRIB message uses grid template 0.
+
+The current store key also identifies a run only by model/date/cycle. Several
+storms can coexist for the same HAFS configuration and cycle, so fixed-parent
+ingest is still P3 until basin plus storm/ATCF identity participates in source
+discovery, store paths, manifests, queries, and API IDs. The moving subset then
+needs a second contract for geometry per valid time. Implement the parent only
+after the first gate; never silently discard storm identity or substitute the
+moving grid.
+
+Pin these bounded 94L f006 parent fixtures:
+
+- HAFS-A object
+  `https://nomads.ncep.noaa.gov/pub/data/nccf/com/hafs/prod/hfsa.20260814/00/94l.2026081400.hfsa.parent.atm.f006.grb2`
+  is 857,296,403 bytes. Its 39,158-byte `.idx` has 749 records and SHA-256
+  `f3a2ee1bcc43b3fc68b9a46422b245800f90f8fec06fdde7fc495c561ecf7290`;
+  first-record range `0-1860972` has SHA-256
+  `3318d2a3610830fdfa58c4bf16c8094485cb3c88c8001c598f88251643b04a18`.
+- HAFS-B object
+  `https://nomads.ncep.noaa.gov/pub/data/nccf/com/hafs/prod/hfsb.20260814/00/94l.2026081400.hfsb.parent.atm.f006.grb2`
+  is 796,566,487 bytes. Its 39,149-byte `.idx` has 749 records and SHA-256
+  `e9ca15a95b1efa39749270591a6311cafb1eb8528bd30c795f9b4cbd48c59eed`;
+  first-record range `0-1721461` has SHA-256
+  `4cb0d357e2d9f667a8e9e8620c456911928cd4c26fadf3725a8f1e224363074b`.
+- Both nine-byte `storm_info` files contain `invest94l`, SHA-256
+  `c63bb8cedb3cf6de2dc7677ca6c549a8183b0f88560896a8c16673c18ab7e118`.
+  A negative fixture must include a second storm in the same cycle and prove
+  that the two run IDs and store paths cannot collide.
+- Retain one f000/f006/f012 `storm.atm` grid header for each configuration and
+  assert that its corners change. The HAFS-A f006 first-record range
+  `0-511041` has SHA-256
+  `812f8dbf922609b80e8db02116c3c969f50f364d9a626991af26db222092add8`;
+  HAFS-B range `0-498216` has SHA-256
+  `b8c090ba24cc87edf17f5a8d0134e6df2b887754b80b03fac124533646f19d2d`.
+
 ### MeteoSwiss
 
 Producer/licensor: **Federal Office of Meteorology and Climatology
@@ -1130,7 +1306,7 @@ are recorded.
 | --- | --- | --- | --- |
 | `eccc` | Worldwide, royalty-free copy, modify, publish, adapt, distribute, including commercial use, under ECCC's server licence | `Data Source: Environment and Climate Change Canada`; preserve any named third-party origin | <https://eccc-msc.github.io/open-data/licence/readme_en/> |
 | `dwd` | DWD open data is reusable under CC BY 4.0 / applicable German geodata terms | `Deutscher Wetterdienst (DWD)`, licence link, and modification notice | <https://www.dwd.de/DE/leistungen/opendata/faqs_opendata.html> |
-| `cma` | CMA-GEPS record declares WMO core: free and unrestricted, without charge or conditions on use | No WMO-core usage condition; retain CMA origin and WIS2 record as provenance | [CMA-GEPS discovery metadata](https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn%3Awmo%3Amd%3Acn-cma%3Adata.core.weather.prediction.forecast.medium-range.probabilistic.global?f=html) and [WMO policy](https://public.wmo.int/wmo-unified-data-policy-resolution-res1) |
+| `cma` | CMA-GEPS and CMA-CW records declare WMO core: free and unrestricted, without charge or conditions on use | No WMO-core usage condition; retain CMA plus the model-specific record as producer/licensing-publisher provenance and distinguish the source node from a Global Cache mirror | [CMA-GEPS metadata](https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn%3Awmo%3Amd%3Acn-cma%3Adata.core.weather.prediction.forecast.medium-range.probabilistic.global?f=html), [CMA-CW metadata](https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn%3Awmo%3Amd%3Acn-cma%3Adata.core.weather.prediction.forecast.medium-range.deterministic.limited-area?f=html), and [WMO policy](https://public.wmo.int/wmo-unified-data-policy-resolution-res1) |
 | `roshydromet` | ICON limited-area record declares WMO core: free and unrestricted, without charge or conditions on use | No WMO-core usage condition; retain Roshydromet/Hydrometcentre origin and WIS2 record as provenance | [Roshydromet discovery metadata](https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn%3Awmo%3Amd%3Aru-roshydromet%3Awipps-dc.forecast.short-range.deterministic.limited-area.icon?f=html) and [WMO policy](https://public.wmo.int/wmo-unified-data-policy-resolution-res1) |
 | `ecmwf` | Open subset may be redistributed and used commercially under CC BY 4.0 plus ECMWF terms | ECMWF attribution required by the terms; preserve licence and modification information | <https://www.ecmwf.int/en/forecasts/datasets/open-data> |
 | `cams-ecmwf-global` via `copernicus-eu` | CAMS STAC declares CC BY 4.0; the Copernicus licence permits worldwide reproduction, distribution, adaptation, and commercial use | Persist CAMS/ECMWF as producer, European Union represented by ECMWF as licensing publisher, the applicable `Generated using` or `Contains modified Copernicus Atmosphere Monitoring Service information [Year]` notice, and the required EC/ECMWF liability disclaimer | [global STAC](https://ads.atmosphere.copernicus.eu/api/catalogue/v1/collections/cams-global-atmospheric-composition-forecasts) and [Copernicus licence](https://ads.atmosphere.copernicus.eu/licences/licence-to-use-copernicus-products) |
@@ -1150,6 +1326,7 @@ are recorded.
 | `meteogalicia` | MeteoGalicia THREDDS model results are CC BY-SA 4.0 | MeteoGalicia/Xunta de Galicia, source and licence links, change indication, and share-alike obligations | <https://abertos.xunta.gal/catalogo/medio-abiente/-/dataset/0485/servidor-thredds-meteogalicia> |
 | `google-weathernext` historical only | WeatherNext 2 data older than 48 hours are CC BY 4.0; current data are excluded from the public adapter because separate terms restrict redistribution | Persist the exact WeatherNext 2 citation naming DeepMind Technologies Limited, CC BY link, third-party acknowledgements, source, age at acquisition, and modifications | [dataset catalogue](https://developers.google.com/earth-engine/datasets/catalog/projects_gcp-public-data-weathernext_assets_weathernext_2_0_0) and [current-data terms](https://storage.googleapis.com/weathernext-public/terms-of-use.pdf) |
 | `noaa-ncep` | US federal NOAA data are generally public-domain; retain dataset-specific notices | NOAA/NCEP as producer and NOMADS or NCEI only as transport | <https://www.noaa.gov/disclaimer> |
+| `naefs` via `noaa-ncep` | NCEP publishes the bias-corrected grids on NOMADS as NWS federal information with no dataset-specific restriction observed; NWS information is public domain unless specifically noted. ECCC separately grants redistribution rights to its own NAEFS publications, but that server licence is not transferred to NOMADS bytes. | Preserve MSC, NWS, and NMSM as joint producers; NOAA/NCEP as licensing publisher for the NOMADS copy; and NOMADS as transport. Do not relabel the joint product as a NOAA-only model. | [NCEP product inventory](https://www.nco.ncep.noaa.gov/pmb/products/naefs/), [joint NAEFS description](https://eccc-msc.github.io/open-data/msc-data/nwp_naefs/readme_naefs_en/), [NWS disclaimer](https://www.weather.gov/disclaimer/), and [ECCC server licence](https://eccc-msc.github.io/open-data/licence/readme_en/) |
 | `meteoswiss` | STAC collections declare CC BY | Federal Office of Meteorology and Climatology MeteoSwiss, licence link, and change indication | The `license` and provider fields in the [ICON-CH1 collection](https://data.geo.admin.ch/api/stac/v1/collections/ch.meteoschweiz.ogd-forecasting-icon-ch1) |
 | `knmi` | HARMONIE open data is CC BY 4.0 | KNMI, licence link, and change indication | <https://english.knmidata.nl/open-data/harmonie> |
 | `chmi` | CHMI open data are published under CC BY 4.0 | Czech Hydrometeorological Institute, licence link, and change indication | <https://www.chmi.cz/-/jak-mohu-pou%C5%BE%C3%ADvat-otev%C5%99en%C3%A1-data-%C4%8Dhm%C3%BA-> |
@@ -1216,6 +1393,12 @@ Provider-specific minimum fixtures:
   GRIB inventory, examples of probability/percentile/ensemble-derived product
   templates, forecast-count assertion, and a negative assertion that the
   fixture does not contain raw members.
+- CMA-CW: canonical WIS2 record, notification, CDF-1 header/coordinates, one
+  pressure slab and one surface slab from the pinned ranges above. Assert
+  835x301 geometry, 26 pressure levels, notification/filename time agreement,
+  complete requested roles, warm-restart accumulation behavior, species and
+  deposition identity, absent fill attributes, and preservation of negative
+  provider values. Reject whole-cycle acquisition and stale-object fallback.
 - Roshydromet ICON: WIS2 metadata and notification, a complete tiny bulletin
   object, wrapper-offset assertion, regular-grid corners across 180 degrees,
   and one pressure plus one accumulated surface message.
@@ -1274,10 +1457,23 @@ Provider-specific minimum fixtures:
   rejection of every current/`latest` discovery path before raw members.
 - CFSv2: `.idx` and selected message ranges from `flxf`, `pgbf`, and `ipvf`,
   with member and six-hour valid-time assertions.
+- NAEFS: official NCO inventory, one live 00Z and 12Z listing, absence check
+  for 06Z/18Z, and a bounded one-time inventory of mean/spread/mode/p10/p50/
+  p90 objects. Assert 50 forecasts, product-definition statistic, 720x361
+  geometry, 96 leads per role, the limited 51-message profile, joint producer
+  provenance, and a negative test that no statistic becomes deterministic or
+  a raw member.
 - NOAA AQM: one live directory listing and the pinned first-message ranges from
   grids 196, 198, and 227. Assert all three projections/dimensions, 72 exact
   one-hour intervals, raw-versus-bias-corrected identity, PM units, and absence
   of `.idx`; never fetch all variables to discover one field.
+- HAFS-A/HAFS-B: official implementation notice, same-cycle multi-storm
+  listing, `storm_info`, `.idx`, and selected parent ranges for each distinct
+  configuration. Assert fixed parent corners across at least four leads,
+  changing storm-grid corners across f000/f006/f012, longitude-seam handling,
+  basin/storm/ATCF run identity, configuration identity, and collision-free
+  store paths. Keep moving-grid ingestion disabled until geometry can vary by
+  valid time.
 - MeteoSwiss: STAC collection and item, parameter CSV, static geometry asset,
   and one bounded signed-asset range with the signature removed from fixtures.
 - KNMI: API manifest, safe tar inventory, and the smallest legal GRIB1 sample;
@@ -1307,13 +1503,14 @@ Provider-specific minimum fixtures:
 
 ## Watchlist and access gates
 
-These feeds are not included in the 70-lane implementation count. Recheck them
+These feeds are not included in the 74-lane implementation count. Recheck them
 periodically, but do not build a production adapter until the named gate is
 closed with an official source and a live bounded fixture.
 
 | Feed | Evidence | Why it is not in the active queue | Promotion gate |
 | --- | --- | --- | --- |
 | Roshydromet SL-AV global | [WIS2 discovery record](https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn%3Awmo%3Amd%3Aru-roshydromet%3Awmc-moscow.forecast.medium-range.deterministic.global.sl-av?f=html) | Metadata declares WMO core and documents SLAV10 output, but no current forecast objects were present at the source node during this survey. | Observe and pin one complete live cycle before calling the feed available. |
+| Roshydromet SL-AV subseasonal and seasonal products | [subseasonal WIS2 record](https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn%3Awmo%3Amd%3Aru-roshydromet%3Aneacc.forecast.subseasonal.probabilistic.global.sl-av?f=html) and [seasonal WIS2 record](https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn%3Awmo%3Amd%3Aru-roshydromet%3Aneacc.forecast.seasonal.probabilistic.global.sl-av?f=html) | Both records declare WMO core and describe global SL-AV anomalies/probabilities, but neither exposed a live WIS2 notification channel or structured object during the survey. Weekly/monthly climatological-category intervals also need explicit canonical semantics. | Observe a current bounded grid and pin its notification, interval/category definition, variable inventory, and retention before splitting these into active lanes. |
 | Cyprus Department of Meteorology WRF | [WIS2 discovery record](https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn%3Awmo%3Amd%3Acy-dom%3Aweather.prediction.deterministic.local?f=html) and [direct directory](https://www.dom.org.cy/wis2/data/core/weather/prediction/forecast/short-range/deterministic/limited-area/) | The five overwrite-style GRIB2 products were last modified 2026-01-06 during this 2026-08-14 survey. | Resume only after fresh, regularly advancing timestamps are observed. |
 | Italy MeteoAM limited-area forecast | [WIS2 discovery record](https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn%3Awmo%3Amd%3Ait-meteoam%3Aforecast.short-range.deterministic.limited-area?f=html) | Metadata declares WMO core, but the advertised source endpoint repeatedly timed out and no bounded payload could be verified. | Pin a reachable official listing, retention, and GRIB fixture. |
 | Australia Bureau of Meteorology ACCESS | [ACCESS NWP products](https://www.bom.gov.au/nwp/doc/access/NWPData.shtml), [copyright notice](https://www.bom.gov.au/copyright), and [data licence agreement](https://www.bom.gov.au/sites/default/files/2026-07/bureau-of-meteorology-data-licence-agreement-june-2026.pdf) | Operational model files use a Registered User/subscriber channel. Default Bureau terms do not establish unrestricted third-party or commercial redistribution. | Obtain and record a licence that covers RWS redistribution and automated access. |
@@ -1330,11 +1527,11 @@ closed with an official source and a live bounded fixture.
 
 ## Deliberately deferred adjacent feeds
 
-The same official catalogues expose ECCC CanSIPS/NAEFS and analysis systems,
-CMA-CW dust and chemistry products, and multiple ocean, ice, wave, surge, and
+The same official catalogues expose ECCC CanSIPS and analysis systems, other
+CMA chemistry products, and multiple ocean, ice, wave, surge, and
 climate-analysis products. They are valuable, but they should be researched as
 separate canonical-domain lanes rather than being counted as atmospheric
-weather-model support. Rows 64-70 are explicitly composition-domain lanes;
+weather-model support. Rows 64-71 are explicitly composition-domain lanes;
 their presence does not imply a complete meteorological state. This prevents a
 large catalogue number from hiding missing semantics in the store and API.
 
