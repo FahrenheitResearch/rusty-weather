@@ -57,7 +57,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rustwx_core::{
-    CanonicalField, CycleSpec, FieldSelector, ModelId, ModelRunRequest, SourceId, VerticalSelector,
+    CanonicalField, CycleSpec, FieldProduct, FieldSelector, ModelId, ModelRunRequest,
+    ProbabilitySelection, SourceId, VerticalSelector,
 };
 use rustwx_io::{
     CachedFetchResult, FetchRequest, ParsedModelGrib, SharedExtractionGrid, fetch_bytes_with_cache,
@@ -147,20 +148,20 @@ fn model_has_trailing_1h_window(model: ModelId) -> bool {
 /// The generic surface selector does not retain a GRIB interval in store
 /// metadata, so the stable variable name must distinguish interval amounts
 /// and maxima from cumulative or instantaneous fields.
-fn stored_surface_field_name(model: ModelId, name: &'static str) -> &'static str {
+fn stored_surface_field_name(model: ModelId, name: &str) -> String {
     match (model, name) {
         // The deterministic NBM core inventory places its native 1-hour APCP
         // before longer aggregation companions at every forecast file.
-        (ModelId::Nbm | ModelId::Href, "apcp_run_total") => "apcp_1h",
+        (ModelId::Nbm | ModelId::Href, "apcp_run_total") => "apcp_1h".to_string(),
         // SREF's mean_3hrly file publishes one 3-hour APCP amount per step.
-        (ModelId::Sref, "apcp_run_total") => "apcp_3h",
+        (ModelId::Sref, "apcp_run_total") => "apcp_3h".to_string(),
         // REFS changes the first APCP aggregation at 6-hour boundaries. Keep
         // the raw field available without falsely advertising it as a run
         // total or one fixed interval until explicit 1-hour selection lands.
-        (ModelId::Refs, "apcp_run_total") => "apcp_native_interval",
+        (ModelId::Refs, "apcp_run_total") => "apcp_native_interval".to_string(),
         // HIRESW's only 2-5 km UH message is a trailing one-hour maximum.
-        (ModelId::Hiresw, "uh_2to5km") => "uh_2to5km_max_1h",
-        _ => name,
+        (ModelId::Hiresw, "uh_2to5km") => "uh_2to5km_max_1h".to_string(),
+        _ => name.to_string(),
     }
 }
 
@@ -175,6 +176,184 @@ fn ingest_selector(model: ModelId, selector: FieldSelector) -> FieldSelector {
     } else {
         selector
     }
+}
+
+fn append_geps_products(
+    plan: &mut Vec<(String, FieldSelector)>,
+    name_prefix: Option<&str>,
+    base: FieldSelector,
+    products: &[FieldProduct],
+) {
+    for product in products {
+        let selector = base.with_product(*product);
+        let name = name_prefix
+            .map(|prefix| format!("{prefix}_{}", product.as_slug()))
+            .unwrap_or_else(|| selector.key());
+        plan.push((name, selector));
+    }
+}
+
+/// Typed RWS view of the provider-produced GEPS statistical messages. The
+/// selector retains ensemble identity (mean/spread/min/max/percentile/
+/// probability), while windowed products carry their temporal process in the
+/// stable variable name because `FieldSelector` intentionally has no time
+/// interval dimension.
+fn geps_published_statistics_plan(hour: u16) -> Vec<(String, FieldSelector)> {
+    const FULL_INSTANT_PRODUCTS: &[FieldProduct] = &[
+        FieldProduct::Percentile(10),
+        FieldProduct::Percentile(25),
+        FieldProduct::Percentile(50),
+        FieldProduct::Percentile(75),
+        FieldProduct::Percentile(90),
+        FieldProduct::EnsembleSpread,
+        FieldProduct::EnsembleMean,
+        FieldProduct::EnsembleMinimum,
+        FieldProduct::EnsembleMaximum,
+    ];
+    const CLOUD_PRODUCTS: &[FieldProduct] = &[
+        FieldProduct::Percentile(10),
+        FieldProduct::Percentile(25),
+        FieldProduct::Percentile(50),
+        FieldProduct::Percentile(75),
+        FieldProduct::Percentile(90),
+        FieldProduct::EnsembleMinimum,
+        FieldProduct::EnsembleMaximum,
+    ];
+    const MEAN_SPREAD_PRODUCTS: &[FieldProduct] =
+        &[FieldProduct::EnsembleMean, FieldProduct::EnsembleSpread];
+    const THREE_QUANTILE_PRODUCTS: &[FieldProduct] = &[
+        FieldProduct::Percentile(25),
+        FieldProduct::Percentile(50),
+        FieldProduct::Percentile(75),
+        FieldProduct::EnsembleMinimum,
+        FieldProduct::EnsembleMaximum,
+    ];
+    const PRESSURE_WIND_PRODUCTS: &[FieldProduct] = &[
+        FieldProduct::Percentile(25),
+        FieldProduct::Percentile(50),
+        FieldProduct::Percentile(75),
+        FieldProduct::EnsembleSpread,
+        FieldProduct::EnsembleMean,
+        FieldProduct::EnsembleMinimum,
+        FieldProduct::EnsembleMaximum,
+    ];
+
+    let mut plan = Vec::new();
+    append_geps_products(
+        &mut plan,
+        None,
+        FieldSelector::height_agl(CanonicalField::Temperature, 2),
+        FULL_INSTANT_PRODUCTS,
+    );
+    append_geps_products(
+        &mut plan,
+        None,
+        FieldSelector::height_agl(CanonicalField::WindSpeed, 10),
+        FULL_INSTANT_PRODUCTS,
+    );
+    append_geps_products(
+        &mut plan,
+        None,
+        FieldSelector::surface(CanonicalField::TotalCloudCover),
+        CLOUD_PRODUCTS,
+    );
+    append_geps_products(
+        &mut plan,
+        None,
+        FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel),
+        MEAN_SPREAD_PRODUCTS,
+    );
+    append_geps_products(
+        &mut plan,
+        None,
+        FieldSelector::isobaric(CanonicalField::GeopotentialHeight, 500),
+        MEAN_SPREAD_PRODUCTS,
+    );
+    append_geps_products(
+        &mut plan,
+        None,
+        FieldSelector::isobaric(CanonicalField::Temperature, 850),
+        THREE_QUANTILE_PRODUCTS,
+    );
+    for level in [250, 850] {
+        append_geps_products(
+            &mut plan,
+            None,
+            FieldSelector::isobaric(CanonicalField::WindSpeed, level),
+            PRESSURE_WIND_PRODUCTS,
+        );
+    }
+
+    let gust_window_hours = if hour < 192 { 3 } else { 6 };
+    let gust_prefix = format!("wind_gust_10m_max_{gust_window_hours}h");
+    let mut gust_products = vec![
+        FieldProduct::Probability(ProbabilitySelection::above_milli(15_000)),
+        FieldProduct::Probability(ProbabilitySelection::above_milli(25_000)),
+        FieldProduct::Probability(ProbabilitySelection::above_milli(35_000)),
+    ];
+    gust_products.extend_from_slice(THREE_QUANTILE_PRODUCTS);
+    append_geps_products(
+        &mut plan,
+        Some(&gust_prefix),
+        FieldSelector::height_agl(CanonicalField::WindGust, 10),
+        &gust_products,
+    );
+
+    if hour % 6 == 0 {
+        let mut precipitation_products = vec![
+            FieldProduct::Probability(ProbabilitySelection::above_milli(1_000)),
+            FieldProduct::Probability(ProbabilitySelection::above_milli(5_000)),
+            FieldProduct::Probability(ProbabilitySelection::above_milli(10_000)),
+            FieldProduct::Probability(ProbabilitySelection::above_milli(25_000)),
+            FieldProduct::Probability(ProbabilitySelection::above_milli(50_000)),
+            FieldProduct::Probability(ProbabilitySelection::above_milli(100_000)),
+        ];
+        precipitation_products.extend_from_slice(THREE_QUANTILE_PRODUCTS);
+        append_geps_products(
+            &mut plan,
+            Some("total_precipitation_6h"),
+            FieldSelector::surface(CanonicalField::TotalPrecipitation),
+            &precipitation_products,
+        );
+    }
+
+    if hour % 24 == 0 {
+        let maximum_probabilities = (243_140..=313_140)
+            .step_by(5_000)
+            .map(|threshold| {
+                FieldProduct::Probability(ProbabilitySelection::above_milli(threshold))
+            })
+            .collect::<Vec<_>>();
+        append_geps_products(
+            &mut plan,
+            Some("temperature_2m_max_24h"),
+            FieldSelector::height_agl(CanonicalField::Temperature, 2),
+            &maximum_probabilities,
+        );
+        let minimum_probabilities = (233_140..=298_140)
+            .step_by(5_000)
+            .map(|threshold| {
+                FieldProduct::Probability(ProbabilitySelection::below_milli(threshold))
+            })
+            .collect::<Vec<_>>();
+        append_geps_products(
+            &mut plan,
+            Some("temperature_2m_min_24h"),
+            FieldSelector::height_agl(CanonicalField::Temperature, 2),
+            &minimum_probabilities,
+        );
+    }
+    plan
+}
+
+fn geps_maximum_statistics_plan() -> Vec<(String, FieldSelector)> {
+    let mut plan = geps_published_statistics_plan(24);
+    for entry in geps_published_statistics_plan(192) {
+        if !plan.iter().any(|(name, _)| *name == entry.0) {
+            plan.push(entry);
+        }
+    }
+    plan
 }
 
 fn selector_store_metadata(
@@ -657,6 +836,40 @@ fn provider_component_products(
             rustwx_models::icon_ru_component_products(config.cycle, forecast_hour, logical_product)
                 .map(Some)
                 .map_err(other)
+        }
+        ModelId::Geps => {
+            if logical_product != "rws-published-statistics" {
+                return Err(other(format!(
+                    "{} fetch plan contains unknown logical product '{logical_product}'",
+                    config.model
+                )));
+            }
+            let mut components = vec![
+                "TEMP_TGL_2m".to_string(),
+                "WIND_TGL_10m".to_string(),
+                "TCDC_SFC_0".to_string(),
+                "PRMSL_MSL_0".to_string(),
+                "HGT_ISBL_0500".to_string(),
+                "TEMP_ISBL_0850".to_string(),
+                "WIND_ISBL_0250".to_string(),
+                "WIND_ISBL_0850".to_string(),
+                if forecast_hour < 192 {
+                    "GUST-Max-3h_TGL_10m".to_string()
+                } else {
+                    "GUST-Max-6h_TGL_10m".to_string()
+                },
+            ];
+            if forecast_hour % 6 == 0 {
+                components.push("TPRATE-Accum-6h_SFC_0".to_string());
+            }
+            if forecast_hour % 24 == 0 {
+                components.push("TEMP-Max-24h_TGL_2m".to_string());
+                components.push("TEMP-Min-24h_TGL_2m".to_string());
+            }
+            debug_assert!(components.iter().all(|component| {
+                rustwx_models::geps_published_statistic_components().contains(&component.as_str())
+            }));
+            Ok(Some(components))
         }
         _ => Ok(None),
     }
@@ -1300,11 +1513,15 @@ pub fn process_fetched_hour(
         hour,
         stage: IngestStage::ExtractSfc,
     });
-    let surface_plan: Vec<(&'static str, FieldSelector)> = model_surface_plan(config.model)
-        .into_iter()
-        .filter(|(name, _)| profile.includes_surface_field(name))
-        .map(|(name, selector)| (name, ingest_selector(config.model, selector)))
-        .collect();
+    let surface_plan: Vec<(String, FieldSelector)> = if config.model == ModelId::Geps {
+        geps_published_statistics_plan(hour)
+    } else {
+        model_surface_plan(config.model)
+            .into_iter()
+            .filter(|(name, _)| profile.includes_surface_field(name))
+            .map(|(name, selector)| (name.to_string(), ingest_selector(config.model, selector)))
+            .collect()
+    };
     let sfc_selectors: Vec<FieldSelector> =
         surface_plan.iter().map(|(_, selector)| *selector).collect();
     let extract_started = Instant::now();
@@ -1328,8 +1545,13 @@ pub fn process_fetched_hour(
         {
             Some(index) => {
                 let extracted = sfc_extraction.extracted.swap_remove(index);
+                let stored_name = if config.model == ModelId::Geps {
+                    name.clone()
+                } else {
+                    stored_surface_field_name(config.model, name)
+                };
                 fields_2d_owned.push((
-                    stored_surface_field_name(config.model, name).to_string(),
+                    stored_name,
                     FieldPlane2D {
                         selector: extracted.selector,
                         units: extracted.units,
@@ -2132,6 +2354,17 @@ pub struct PlannedStoreVariables {
 /// for HRRR's 25 hPa prs files) and the dewpoint volume keeps its planned
 /// `dewpoint_iso` name (the denser-rh choice is resolved per file).
 pub fn planned_store_variables(profile: &IngestProfile, model: ModelId) -> PlannedStoreVariables {
+    if model == ModelId::Geps {
+        return PlannedStoreVariables {
+            volumes: Vec::new(),
+            fields_2d: geps_maximum_statistics_plan()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect(),
+            derived: Vec::new(),
+            heavy: Vec::new(),
+        };
+    }
     let level_count = profile.candidate_levels().len();
     let volumes = volume_plan(profile)
         .iter()
@@ -2140,7 +2373,7 @@ pub fn planned_store_variables(profile: &IngestProfile, model: ModelId) -> Plann
     let mut fields_2d: Vec<String> = model_surface_plan(model)
         .iter()
         .filter(|(name, _)| profile.includes_surface_field(name))
-        .map(|(name, _)| stored_surface_field_name(model, name).to_string())
+        .map(|(name, _)| stored_surface_field_name(model, name))
         .collect();
     if profile.includes_full_2d() {
         // Trailing 1 h window fields ride only for models that carry them
@@ -3017,6 +3250,125 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn geps_component_bundle_is_bounded_lead_aware_and_statistics_only() {
+        let cycle = CycleSpec::new("20260814", 0).unwrap();
+        let profile = IngestProfile::surface();
+        let cancel = AtomicBool::new(false);
+        let sink = |_event: IngestEvent| {};
+        let config = IngestConfig {
+            model: ModelId::Geps,
+            cycle: &cycle,
+            source_override: Some(SourceId::Eccc),
+            cache_root: Path::new("unused-cache"),
+            use_cache: true,
+            store_root: Path::new("unused-store"),
+            model_slug: "geps",
+            run_slug: "20260814-00",
+            profile: &profile,
+            verify: true,
+            progress: &sink,
+            cancel: &cancel,
+        };
+
+        let f003 = provider_component_products(&config, 3, "rws-published-statistics")
+            .unwrap()
+            .unwrap();
+        assert_eq!(f003.len(), 9);
+        assert!(f003.contains(&"GUST-Max-3h_TGL_10m".to_string()));
+        assert!(!f003.iter().any(|component| component.contains("Accum-6h")));
+
+        let f024 = provider_component_products(&config, 24, "rws-published-statistics")
+            .unwrap()
+            .unwrap();
+        assert_eq!(f024.len(), 12);
+        for component in [
+            "GUST-Max-3h_TGL_10m",
+            "TPRATE-Accum-6h_SFC_0",
+            "TEMP-Max-24h_TGL_2m",
+            "TEMP-Min-24h_TGL_2m",
+        ] {
+            assert!(f024.contains(&component.to_string()), "{component}");
+        }
+
+        let f198 = provider_component_products(&config, 198, "rws-published-statistics")
+            .unwrap()
+            .unwrap();
+        assert_eq!(f198.len(), 10);
+        assert!(f198.contains(&"GUST-Max-6h_TGL_10m".to_string()));
+        assert!(!f198.contains(&"GUST-Max-3h_TGL_10m".to_string()));
+        for bundle in [&f003, &f024, &f198] {
+            assert_eq!(bundle.iter().collect::<HashSet<_>>().len(), bundle.len());
+            assert!(bundle.iter().all(|component| {
+                rustwx_models::geps_published_statistic_components().contains(&component.as_str())
+            }));
+            assert!(bundle.iter().all(|component| !component.contains("member")));
+        }
+    }
+
+    #[test]
+    fn geps_typed_plan_preserves_statistic_and_temporal_identity() {
+        let f003 = geps_published_statistics_plan(3);
+        let f024 = geps_published_statistics_plan(24);
+        let f192 = geps_published_statistics_plan(192);
+        assert_eq!(f003.len(), 56);
+        assert_eq!(f024.len(), 96);
+        assert_eq!(f192.len(), 96);
+        assert_eq!(
+            f024.iter()
+                .map(|(name, _)| name)
+                .collect::<HashSet<_>>()
+                .len(),
+            f024.len(),
+            "every stored statistic name must be collision-free"
+        );
+        assert_eq!(
+            f024.iter()
+                .filter(|(_, selector)| selector.product == FieldProduct::EnsembleSpread)
+                .count(),
+            6
+        );
+        assert!(
+            f024.iter().all(|(_, selector)| {
+                selector.product != FieldProduct::EnsembleStandardDeviation
+            })
+        );
+        assert!(f024.iter().any(|(name, selector)| {
+            name == "wind_gust_10m_max_3h_prob_gt_15000m"
+                && selector.product
+                    == FieldProduct::Probability(ProbabilitySelection::above_milli(15_000))
+        }));
+        assert!(
+            f192.iter()
+                .any(|(name, _)| { name == "wind_gust_10m_max_6h_prob_gt_15000m" })
+        );
+        assert!(f024.iter().any(|(name, selector)| {
+            name == "temperature_2m_max_24h_prob_gt_313140m"
+                && selector.product
+                    == FieldProduct::Probability(ProbabilitySelection::above_milli(313_140))
+        }));
+        assert!(f024.iter().any(|(name, selector)| {
+            name == "temperature_2m_min_24h_prob_lt_233140m"
+                && selector.product
+                    == FieldProduct::Probability(ProbabilitySelection::below_milli(233_140))
+        }));
+
+        let maximum = planned_store_variables(&IngestProfile::surface(), ModelId::Geps);
+        assert!(maximum.volumes.is_empty());
+        assert_eq!(maximum.fields_2d.len(), 104);
+        assert!(maximum.derived.is_empty() && maximum.heavy.is_empty());
+        assert!(
+            maximum
+                .fields_2d
+                .contains(&"wind_gust_10m_max_3h_p50".to_string())
+        );
+        assert!(
+            maximum
+                .fields_2d
+                .contains(&"wind_gust_10m_max_6h_p50".to_string())
+        );
     }
 
     #[test]

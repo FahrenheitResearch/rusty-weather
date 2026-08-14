@@ -90,7 +90,7 @@ fn provider_probe_agent_times_out_a_stalled_response_offline() {
 
 #[test]
 fn built_in_models_are_real() {
-    assert_eq!(built_in_models().len(), 30);
+    assert_eq!(built_in_models().len(), 31);
     assert_eq!(model_summary(ModelId::Gdps).default_product, "rws-surface");
     assert_eq!(model_summary(ModelId::CmaGeps).default_product, "stats");
     assert_eq!(model_summary(ModelId::CmaGeps).max_forecast_hour, 360);
@@ -112,6 +112,11 @@ fn built_in_models_are_real() {
     );
     assert_eq!(model_summary(ModelId::IconRu).cycle_hours_utc, &[0, 12]);
     assert_eq!(model_summary(ModelId::IconRu).max_forecast_hour, 72);
+    assert_eq!(
+        model_summary(ModelId::Geps).default_product,
+        "rws-published-statistics"
+    );
+    assert_eq!(model_summary(ModelId::Geps).max_forecast_hour, 384);
     assert_eq!(model_summary(ModelId::HrrrAk).default_product, "sfc");
     assert_eq!(model_summary(ModelId::Gdas).default_product, "pgrb2.0p25");
     assert_eq!(
@@ -170,6 +175,7 @@ fn catalog_exposes_the_user_facing_supported_models() {
         ModelId::IconEu,
         ModelId::IconD2,
         ModelId::IconRu,
+        ModelId::Geps,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -607,6 +613,7 @@ fn temperature_700_recipe_tracks_model_support() {
         ModelId::Hrrr,
         ModelId::HrrrAk,
         ModelId::Gfs,
+        ModelId::Geps,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -661,6 +668,8 @@ fn temperature_700_recipe_tracks_model_support() {
                     | ModelId::IconRu
             ) {
                 assert!(reason.contains("normalized RWS ingest/query"));
+            } else if model == ModelId::Geps {
+                assert!(reason.contains("provider-published statistics"));
             } else if model == ModelId::Href {
                 assert!(reason.contains("limited to explicit `href_sprd_*`"));
             } else if model == ModelId::Refs {
@@ -680,6 +689,9 @@ fn temperature_700_recipe_tracks_model_support() {
                 }
                 ModelId::IconRu => {
                     assert!(reason.contains("WIS2 per-bulletin component bundle"));
+                }
+                ModelId::Geps => {
+                    assert!(reason.contains("cannot imply a deterministic or raw-member field"))
                 }
                 ModelId::EcmwfOpenData | ModelId::WrfGdex => {
                     assert!(reason.contains("whole-file structured extraction"));
@@ -1298,6 +1310,77 @@ fn icon_ru_cadence_components_and_wis2_transports_match_the_published_contract()
             Err(ModelError::UnsupportedProduct { .. })
         ));
     }
+}
+
+#[test]
+fn geps_cadence_and_published_statistic_urls_match_the_msc_datamart_contract() {
+    let hours = supported_forecast_hours(ModelId::Geps, 0);
+    assert_eq!(hours.first(), Some(&3));
+    assert_eq!(hours.last(), Some(&384));
+    for published in [3, 24, 192, 198, 384] {
+        assert!(hours.contains(&published), "f{published:03} should exist");
+    }
+    for absent in [0, 193, 195, 201, 390, 936] {
+        assert!(!hours.contains(&absent), "f{absent:03} is not scheduled");
+    }
+    assert!(supported_forecast_hours(ModelId::Geps, 6).is_empty());
+
+    let cycle = rustwx_core::CycleSpec::new("20260814", 0).unwrap();
+    let temperature =
+        ModelRunRequest::new(ModelId::Geps, cycle.clone(), 24, "TEMP_TGL_2m").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::Eccc, &temperature).unwrap(),
+        "https://dd.weather.gc.ca/today/ensemble/geps/grib2/products/00/024/CMC_geps-prob_TEMP_TGL_2m_latlon0p5x0p5_2026081400_P024_all-products.grib2"
+    );
+    let probe =
+        ModelRunRequest::new(ModelId::Geps, cycle.clone(), 24, "rws-published-statistics").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::Eccc, &probe).unwrap(),
+        build_grib_url(SourceId::Eccc, &temperature).unwrap()
+    );
+    assert_eq!(geps_published_statistic_components().len(), 13);
+    assert!(geps_published_statistic_components().contains(&"GUST-Max-6h_TGL_10m"));
+    assert!(selector_supported_for_model(
+        FieldSelector::isobaric(CanonicalField::GeopotentialHeight, 500).with_ensemble_spread(),
+        ModelId::Geps,
+    ));
+    assert!(selector_supported_for_model(
+        FieldSelector::height_agl(CanonicalField::Temperature, 2)
+            .with_probability(rustwx_core::ProbabilitySelection::above_milli(313_140),),
+        ModelId::Geps,
+    ));
+    assert!(!selector_supported_for_model(
+        FieldSelector::isobaric(CanonicalField::Temperature, 700),
+        ModelId::Geps,
+    ));
+    assert!(!selector_supported_for_model(
+        FieldSelector::isobaric(CanonicalField::GeopotentialHeight, 500)
+            .with_ensemble_standard_deviation(),
+        ModelId::Geps,
+    ));
+
+    for invalid in [
+        "../TEMP_TGL_2m",
+        "WIND-Max-3h_TGL_10m",
+        "raw-member-01",
+        "TEMP-Max-24h_TGL_2m.grib2",
+    ] {
+        let request = ModelRunRequest::new(ModelId::Geps, cycle.clone(), 24, invalid).unwrap();
+        assert!(matches!(
+            build_grib_url(SourceId::Eccc, &request),
+            Err(ModelError::UnsupportedProduct { .. })
+        ));
+    }
+    let off_cadence =
+        ModelRunRequest::new(ModelId::Geps, cycle.clone(), 195, "TEMP_TGL_2m").unwrap();
+    assert!(matches!(
+        build_grib_url(SourceId::Eccc, &off_cadence),
+        Err(ModelError::UnsupportedForecastHour { .. })
+    ));
+    assert_eq!(
+        build_grib_url(SourceId::Nomads, &temperature).unwrap(),
+        "unsupported://nomads/geps"
+    );
 }
 
 #[test]

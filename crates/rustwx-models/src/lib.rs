@@ -411,6 +411,7 @@ const RDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const HRDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const DWD_ICON_CYCLE_HOURS: &[u8] = &[0, 3, 6, 9, 12, 15, 18, 21];
 const ICON_RU_CYCLE_HOURS: &[u8] = &[0, 12];
+const GEPS_CYCLE_HOURS: &[u8] = &[0, 12];
 const GDAS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const GEFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const AI_MODEL_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
@@ -772,6 +773,16 @@ const MODELS: &[ModelSummary] = &[
         sources: ICON_RU_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::Geps,
+        description: "ECCC GEPS global 0.5 degree provider-published ensemble statistics",
+        default_product: "rws-published-statistics",
+        cycle_hours_utc: GEPS_CYCLE_HOURS,
+        max_forecast_hour: 384,
+        sources: GDPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::PostProcessedStatisticsGribFiles,
     },
     ModelSummary {
         id: ModelId::Gdas,
@@ -5860,7 +5871,7 @@ pub fn built_in_models() -> &'static [ModelSummary] {
 /// [`built_in_models`] remains linked (`ModelId` match arms thread through
 /// rustwx-products), but every user-facing enumeration must go through this
 /// list.
-pub fn supported_models() -> [ModelId; 21] {
+pub fn supported_models() -> [ModelId; 22] {
     [
         ModelId::Hrrr,
         ModelId::HrrrAk,
@@ -5873,6 +5884,7 @@ pub fn supported_models() -> [ModelId; 21] {
         ModelId::IconEu,
         ModelId::IconD2,
         ModelId::IconRu,
+        ModelId::Geps,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -5918,6 +5930,9 @@ pub fn plot_recipe_fetch_blockers(
 }
 
 pub fn selector_supported_for_model(selector: FieldSelector, model: ModelId) -> bool {
+    if model == ModelId::Geps {
+        return geps_published_selector_supported(selector);
+    }
     if !selector.product.is_default() {
         match (model, selector.product) {
             (ModelId::Nbm, _) => {}
@@ -6082,6 +6097,85 @@ pub fn selector_supported_for_model(selector: FieldSelector, model: ModelId) -> 
     }
 }
 
+fn geps_published_selector_supported(selector: FieldSelector) -> bool {
+    let instant_full = matches!(
+        selector.product,
+        FieldProduct::Percentile(10 | 25 | 50 | 75 | 90)
+            | FieldProduct::EnsembleSpread
+            | FieldProduct::EnsembleMean
+            | FieldProduct::EnsembleMinimum
+            | FieldProduct::EnsembleMaximum
+    );
+    let three_quantile = matches!(
+        selector.product,
+        FieldProduct::Percentile(25 | 50 | 75)
+            | FieldProduct::EnsembleMinimum
+            | FieldProduct::EnsembleMaximum
+    );
+    let pressure_wind = three_quantile
+        || matches!(
+            selector.product,
+            FieldProduct::EnsembleSpread | FieldProduct::EnsembleMean
+        );
+    let above_threshold = |thresholds: &[i64]| match selector.product {
+        FieldProduct::Probability(selection) => {
+            selection
+                .lower_limit_milli
+                .is_some_and(|threshold| thresholds.contains(&threshold))
+                && selection.probability_type.is_none()
+                && selection.upper_limit_milli.is_none()
+        }
+        _ => false,
+    };
+    let below_threshold = |thresholds: &[i64]| match selector.product {
+        FieldProduct::Probability(selection) => {
+            selection
+                .upper_limit_milli
+                .is_some_and(|threshold| thresholds.contains(&threshold))
+                && selection.probability_type.is_none()
+                && selection.lower_limit_milli.is_none()
+        }
+        _ => false,
+    };
+
+    match (selector.field, selector.vertical) {
+        (CanonicalField::Temperature, VerticalSelector::HeightAboveGroundMeters(2)) => {
+            instant_full
+                || above_threshold(&[
+                    243_140, 248_140, 253_140, 258_140, 263_140, 268_140, 273_140, 278_140,
+                    283_140, 288_140, 293_140, 298_140, 303_140, 308_140, 313_140,
+                ])
+                || below_threshold(&[
+                    233_140, 238_140, 243_140, 248_140, 253_140, 258_140, 263_140, 268_140,
+                    273_140, 278_140, 283_140, 288_140, 293_140, 298_140,
+                ])
+        }
+        (CanonicalField::WindSpeed, VerticalSelector::HeightAboveGroundMeters(10)) => instant_full,
+        (CanonicalField::TotalCloudCover, VerticalSelector::Surface) => {
+            matches!(
+                selector.product,
+                FieldProduct::Percentile(10 | 25 | 50 | 75 | 90)
+                    | FieldProduct::EnsembleMinimum
+                    | FieldProduct::EnsembleMaximum
+            )
+        }
+        (CanonicalField::PressureReducedToMeanSeaLevel, VerticalSelector::MeanSeaLevel)
+        | (CanonicalField::GeopotentialHeight, VerticalSelector::IsobaricHpa(500)) => matches!(
+            selector.product,
+            FieldProduct::EnsembleMean | FieldProduct::EnsembleSpread
+        ),
+        (CanonicalField::Temperature, VerticalSelector::IsobaricHpa(850)) => three_quantile,
+        (CanonicalField::WindSpeed, VerticalSelector::IsobaricHpa(250 | 850)) => pressure_wind,
+        (CanonicalField::WindGust, VerticalSelector::HeightAboveGroundMeters(10)) => {
+            three_quantile || above_threshold(&[15_000, 25_000, 35_000])
+        }
+        (CanonicalField::TotalPrecipitation, VerticalSelector::Surface) => {
+            three_quantile || above_threshold(&[1_000, 5_000, 10_000, 25_000, 50_000, 100_000])
+        }
+        _ => false,
+    }
+}
+
 pub fn model_summary(model: ModelId) -> &'static ModelSummary {
     MODELS
         .iter()
@@ -6160,6 +6254,14 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
             } else {
                 Vec::new()
             }
+        }
+        ModelId::Geps => {
+            if !GEPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                return Vec::new();
+            }
+            let mut hours = (3..=192).step_by(3).collect::<Vec<u16>>();
+            hours.extend((198..=384).step_by(6));
+            hours
         }
         ModelId::Gdas => (0..=9).collect(),
         ModelId::Gefs => {
@@ -6322,6 +6424,7 @@ fn default_canonical_bundle_product(
         (ModelId::IconRu, CanonicalBundleDescriptor::SurfaceAnalysis) => "rws-surface",
         (ModelId::IconRu, CanonicalBundleDescriptor::PressureAnalysis) => "rws-pressure",
         (ModelId::IconRu, CanonicalBundleDescriptor::NativeAnalysis) => "rws-surface",
+        (ModelId::Geps, _) => "rws-published-statistics",
         (ModelId::Gdas, _) => "pgrb2.0p25",
         (ModelId::Gefs, _) => "pgrb2ap5/gec00",
         (ModelId::Aigfs, CanonicalBundleDescriptor::SurfaceAnalysis) => "sfc",
@@ -6794,6 +6897,7 @@ fn build_grib_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         ModelId::Hrdps => build_hrdps_url(source, request)?,
         ModelId::IconEu | ModelId::IconD2 => build_dwd_icon_url(source, request)?,
         ModelId::IconRu => build_icon_ru_url(source, request)?,
+        ModelId::Geps => build_geps_url(source, request)?,
         ModelId::Gdas => build_gdas_url(source, request)?,
         ModelId::Gefs => build_gefs_url(source, request)?,
         ModelId::Aigfs => build_aigfs_url(source, request)?,
@@ -7780,6 +7884,64 @@ fn build_icon_ru_url(source: SourceId, request: &ModelRunRequest) -> Result<Stri
     })
 }
 
+/// Provider-published GEPS statistical files currently normalized by the RWS
+/// lane. Every token is a complete filename identity between `geps-prob_` and
+/// `_latlon...`; keeping this allowlist exact prevents arbitrary path or raw
+/// member access through the product string.
+const GEPS_PUBLISHED_STATISTIC_COMPONENTS: &[&str] = &[
+    "GUST-Max-3h_TGL_10m",
+    "GUST-Max-6h_TGL_10m",
+    "HGT_ISBL_0500",
+    "PRMSL_MSL_0",
+    "TCDC_SFC_0",
+    "TEMP_ISBL_0850",
+    "TEMP_TGL_2m",
+    "TEMP-Max-24h_TGL_2m",
+    "TEMP-Min-24h_TGL_2m",
+    "TPRATE-Accum-6h_SFC_0",
+    "WIND_ISBL_0250",
+    "WIND_ISBL_0850",
+    "WIND_TGL_10m",
+];
+
+pub fn geps_published_statistic_components() -> &'static [&'static str] {
+    GEPS_PUBLISHED_STATISTIC_COMPONENTS
+}
+
+fn build_geps_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Eccc {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "GEPS published products run at 00Z/12Z every 3 hours through f192 and every 6 hours from f198 through f384; the twice-weekly f936 extension is not yet scheduled by RWS"
+                .to_string(),
+        });
+    }
+    let component = match request.product.as_str() {
+        "rws-published-statistics" => "TEMP_TGL_2m",
+        component if GEPS_PUBLISHED_STATISTIC_COMPONENTS.contains(&component) => component,
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    Ok(format!(
+        "https://dd.weather.gc.ca/today/ensemble/geps/grib2/products/{:02}/{:03}/CMC_geps-prob_{}_latlon0p5x0p5_{}{:02}_P{:03}_all-products.grib2",
+        request.cycle.hour_utc,
+        request.forecast_hour,
+        component,
+        request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
+        request.forecast_hour,
+    ))
+}
+
 fn build_gdas_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
     if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
         return Err(ModelError::UnsupportedForecastHour {
@@ -8713,6 +8875,16 @@ fn plot_recipe_field_blocker(
     field: &'static GribFieldSpec,
     model: ModelId,
 ) -> Option<PlotRecipeBlocker> {
+    if model == ModelId::Geps {
+        return Some(PlotRecipeBlocker {
+            field_key: field.key,
+            field_label: field.label,
+            reason: format!(
+                "{} for GEPS is available only as explicitly typed provider-published statistics through normalized RWS ingest/query; direct plot acquisition cannot imply a deterministic or raw-member field from that component bundle",
+                field.label,
+            ),
+        });
+    }
     // These providers publish one object per field/level. The normalized RWS
     // ingest path assembles those bounded component bundles, but the legacy
     // direct-GRIB plot path still assumes one family URL. Keep that path
@@ -8863,6 +9035,7 @@ fn plot_recipe_fetch_defaults(
         }
         (ModelId::IconRu, _, true) => ("rws-surface", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::IconRu, _, false) => ("rws-pressure", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::Geps, _, _) => ("rws-published-statistics", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::Gdas, _, _) => ("pgrb2.0p25", PlotRecipeFetchPolicy::PreferIndexedSubset),
         (ModelId::Gefs, _, _) if has_ensemble_spread_selector => {
             ("pgrb2ap5/gespr", PlotRecipeFetchPolicy::PreferIndexedSubset)

@@ -227,6 +227,59 @@ fn dwd_icon_plans_pin_component_bundles_native_cadence_and_source() {
 }
 
 #[test]
+fn geps_plan_pins_published_statistics_profile_and_invariant_cadence() {
+    let plan = JobPlan::build_with_profile_and_source(
+        ModelId::Geps,
+        cycle("20260814", 0),
+        &rw_ingest::ingest_profile::IngestProfile::surface(),
+        Some(SourceId::Eccc),
+    )
+    .unwrap();
+    let hours = plan
+        .expected_valid_times
+        .iter()
+        .map(|time| time.forecast_hour)
+        .collect::<Vec<_>>();
+    assert_eq!(hours.len(), 96);
+    assert_eq!(hours.first(), Some(&3));
+    assert_eq!(hours.last(), Some(&384));
+    assert!(hours.contains(&192));
+    assert!(hours.contains(&198));
+    assert!(!hours.contains(&195));
+    assert!(!hours.contains(&201));
+    assert_eq!(plan.source_override, Some(SourceId::Eccc));
+    assert_eq!(plan.ingest_products.len(), 1);
+    assert_eq!(plan.ingest_products[0].product, "rws-published-statistics");
+    assert!(plan.ingest_products[0].surface_source);
+    assert!(!plan.ingest_products[0].pressure_source);
+    assert_eq!(
+        plan.capability_limitations,
+        vec![
+            "provider_statistics_only".to_string(),
+            "sparse_pressure_levels".to_string(),
+            "two_dimensional_statistics_only".to_string(),
+            "derived_products_disabled".to_string(),
+            "extended_range_not_scheduled".to_string(),
+        ]
+    );
+    assert_eq!(
+        plan.ingest_profile.to_profile().unwrap(),
+        rw_ingest::ingest_profile::IngestProfile::surface()
+    );
+    plan.validate().unwrap();
+
+    assert!(JobPlan::build(ModelId::Geps, cycle("20260814", 6)).is_err());
+    assert!(
+        JobPlan::build_with_profile(
+            ModelId::Geps,
+            cycle("20260814", 0),
+            &rw_ingest::ingest_profile::IngestProfile::full(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn plan_rejects_a_cycle_the_model_does_not_publish() {
     let error = JobPlan::build(ModelId::Gfs, cycle("20260731", 1)).unwrap_err();
     assert!(matches!(
@@ -640,6 +693,15 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
             .map(|time| time.forecast_hour),
         Some(840)
     );
+
+    let geps = scheduler_config("geps-statistics-profile", &["geps"]);
+    let profile = geps.profile_for(ModelId::Geps).unwrap();
+    assert_eq!(profile, rw_ingest::ingest_profile::IngestProfile::surface());
+    let mut unsafe_geps = geps;
+    unsafe_geps
+        .model_profiles
+        .insert("geps".to_string(), "analysis".to_string());
+    assert!(unsafe_geps.validate().is_err());
 }
 
 #[test]
@@ -1210,7 +1272,7 @@ fn every_ready_model_has_a_valid_cadence_profile_and_remote_source() {
         );
         plan.validate().unwrap();
     }
-    assert_eq!(ready, 28);
+    assert_eq!(ready, 29);
 }
 
 #[test]

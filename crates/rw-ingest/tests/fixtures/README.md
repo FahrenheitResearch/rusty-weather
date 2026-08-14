@@ -31,6 +31,7 @@ remain available forever.
 | `urma2p5_2dvaranl_ndfd.idx` | `https://noaa-urma-pds.s3.amazonaws.com/urma2p5.20260810/urma2p5.t00z.2dvaranl_ndfd.grb2_wexp.idx` | exact ingest-selected analysis rows, 706 bytes, fixture SHA-256 `32E16EDD8D78F06586E4AB171F4A20F0F8745BEBF362D68BA683950FE677BB79` |
 | `rdps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/model_rdps/10km/00/024/` | exact representative filename rows and decoded grid/vector metadata from the 100,669-byte, 414-GRIB-object official listing; full-source SHA-256 `87BD53259734E95AEFEFF1DA7BBCD83332A5BD3AC6124DC46BD5AD6675952F10`; 2,675-byte fixture SHA-256 `644E6A32A0BE5DBECBCFE141523A3E25E48B828435985DEE3783228F1D355F94` |
 | `hrdps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/model_hrdps/continental/2.5km/00/024/` | exact representative filename rows and decoded grid/vector metadata from the 91,816-byte, 414-GRIB-object official listing; full-source SHA-256 `AF42B19E5A3D44C00AB0FDA2E1F18E052A2043319B997D0E8263D4B7B957EF8E`; 2,695-byte fixture SHA-256 `C4263EB72B5EE25468C89C1D98D2CFF32B62A25645142E8ECFEFC05B026DBBFC` |
+| `geps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/ensemble/geps/grib2/products/00/024/` | complete 36-object official listing plus exact identities for the bounded selected payloads; 9,714-byte source listing SHA-256 `ABC37D99EE4402ECDBDB30B5C46E8ECDC245EBE24BBCBCBFD64F7CF4C1E87E4E`; 5,839-byte fixture SHA-256 `53DB508A7970F50BF779ACE52E081DB599082F0A9B52F60550B4D4BA9E2219E4` |
 
 The SREF product is a run-wide file containing all native forecast steps, so
 the compact fixture deliberately includes its first, next, and final native
@@ -84,6 +85,7 @@ download was used.
 | ECMWF IFS Open Data `oper` | 48.5 MiB, 22 JSON-index ranges (146.6 MiB source object) | 11 variables, 20,808 chunks, 111,375,300 payload bytes; 11 levels in all five canonical volumes |
 | ECCC RDPS | 51.9 MB pressure + 2.8 MB surface component bundles | 11 variables, 23,910 chunks, 219,953,866 payload bytes; five 19-level volumes plus 6/7 sounding surface fields, with absent surface orography reported rather than invented |
 | ECCC HRDPS continental | 121.0 MB pressure + 16.7 MB surface component bundles | 12 variables, 64,815 chunks, 580,038,302 payload bytes; five 19-level volumes plus all seven sounding surface fields |
+| ECCC GEPS published statistics | 15,462,959 bytes across 12 surface component objects | 96 typed variables, 576 chunks, 31,291,495 payload bytes; provider percentiles, mean, WMO ensemble spread, and selected probabilities only, with no raw-member or standard-deviation claim |
 
 The NOAA AI surface products did not realize 2-m dewpoint, surface pressure,
 or orography; IFS did not realize orography; and GEFS did not realize 2-m
@@ -126,3 +128,15 @@ every finite cell, RDPS compared 2,382,600 earth-relative components with
 components with 0.006831 m/s RMS and 0.043763 m/s maximum error. Those bounds
 include the provider's direction quantization (1 degree for RDPS and 0.1
 degree for HRDPS), rather than comparing the decoder against itself.
+
+The GEPS fixture pins the exact 00/12z operational inventory, invariant
+3-hourly f003-f192 and 6-hourly f198-f384 scheduler horizon, selected component
+objects and hashes, probability thresholds, and WMO derived-product code 4
+identity as ensemble spread. It also preserves the current documentation/live
+grid drift (720x361 documented, 721x360 decoded). Its cyclic grid encodes
+180 degrees as both longitude endpoints, so the pinned 0.5-degree i increment
+is authoritative and prevents endpoint interpolation from collapsing the
+grid onto one meridian. The extended f936 Monday/Thursday products are
+recorded but not scheduled, and ambiguous
+`WIND-Max-*` thresholds are not normalized. This lane consumes only ECCC's
+published statistics and never claims individual ensemble members.

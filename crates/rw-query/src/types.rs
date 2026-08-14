@@ -181,6 +181,18 @@ pub fn roshydromet_provider_attribution() -> ProviderAttribution {
     }
 }
 
+/// Attribution for ECCC's provider-published GEPS statistical products.
+///
+/// The licence and required source notice are shared with the other ECCC
+/// Datamart products, but the product documentation URL must identify GEPS
+/// rather than the GDPS page used by the generic ECCC attribution.
+pub fn geps_provider_attribution() -> ProviderAttribution {
+    let mut attribution = eccc_provider_attribution();
+    attribution.source_url =
+        "https://eccc-msc.github.io/open-data/msc-data/nwp_geps/readme_geps-datamart_en/".into();
+    attribution
+}
+
 pub fn provider_attributions_for_provenance(
     sources: &[SourceProvenance],
 ) -> Vec<ProviderAttribution> {
@@ -212,7 +224,17 @@ pub fn provider_attributions_for_provenance(
         .iter()
         .any(|source| source.provider == "eccc-msc-datamart")
     {
-        attributions.push(eccc_provider_attribution());
+        if sources.iter().any(|source| {
+            source.provider == "eccc-msc-datamart"
+                && source
+                    .products
+                    .iter()
+                    .any(|product| product == "rws-published-statistics")
+        }) {
+            attributions.push(geps_provider_attribution());
+        } else {
+            attributions.push(eccc_provider_attribution());
+        }
     }
     if sources
         .iter()
@@ -466,6 +488,14 @@ mod tests {
         }
     }
 
+    fn provenance_with_product(provider: &str, product: &str) -> SourceProvenance {
+        SourceProvenance {
+            provider: provider.into(),
+            roles: vec!["surface".into()],
+            products: vec![product.into()],
+        }
+    }
+
     #[test]
     fn provider_attributions_cover_noaa_mirrors_and_ecmwf_without_duplicates() {
         let sources = vec![
@@ -563,5 +593,23 @@ mod tests {
                 .contains("WMO Unified Data Policy core")
         );
         assert!(attributions[0].modification_notice.contains("unwrapped"));
+    }
+
+    #[test]
+    fn geps_provenance_uses_the_exact_product_documentation_url() {
+        let attributions = provider_attributions_for_provenance(&[provenance_with_product(
+            "eccc-msc-datamart",
+            "rws-published-statistics",
+        )]);
+        assert_eq!(attributions, vec![geps_provider_attribution()]);
+        assert_eq!(
+            attributions[0].source_url,
+            "https://eccc-msc.github.io/open-data/msc-data/nwp_geps/readme_geps-datamart_en/"
+        );
+        assert_eq!(
+            attributions[0].notice,
+            "Data Source: Environment and Climate Change Canada"
+        );
+        assert!(attributions[0].license.contains("version 2.1"));
     }
 }

@@ -188,6 +188,15 @@ fn classify_base(meta: &RwsVariableMeta) -> VariableTemporalCapability {
         );
     }
 
+    if let Some(seconds) = provider_published_statistic_window_seconds(&name) {
+        return VariableTemporalCapability::unknown(
+            TemporalCapabilityBasis::ManualRequired,
+            format!(
+                "the variable name preserves a trailing {seconds}-second provider-published ensemble-statistic window, but the canonical selector has no interval/statistical-process dimension; raw point/window query is supported while temporal reduction requires explicit trusted semantics"
+            ),
+        );
+    }
+
     // A probability is a scalar probability at each valid time even when the
     // thresholded physical field is itself accumulated or categorical.
     if product.as_deref() == Some("probability") || is_probability_name(&name) {
@@ -508,6 +517,36 @@ fn is_probability_name(name: &str) -> bool {
         || name.contains("_probability_")
         || name.starts_with("prob_")
         || name.contains("_prob_")
+}
+
+fn provider_published_statistic_window_seconds(name: &str) -> Option<u64> {
+    fn embedded_hours(name: &str, marker: &str) -> Option<u64> {
+        let (_, rest) = name.split_once(marker)?;
+        let (token, statistic_suffix) = rest.split_once('_')?;
+        if statistic_suffix.is_empty() {
+            return None;
+        }
+        token
+            .strip_suffix('h')?
+            .parse::<u64>()
+            .ok()
+            .filter(|hours| *hours > 0 && *hours <= 24 * 31)
+    }
+
+    let hours = embedded_hours(name, "_max_")
+        .or_else(|| embedded_hours(name, "_min_"))
+        .or_else(|| {
+            name.strip_prefix("total_precipitation_")
+                .and_then(|rest| {
+                    let (token, statistic_suffix) = rest.split_once('_')?;
+                    if statistic_suffix.is_empty() {
+                        return None;
+                    }
+                    token.strip_suffix('h')?.parse::<u64>().ok()
+                })
+                .filter(|hours| *hours > 0 && *hours <= 24 * 31)
+        })?;
+    Some(hours * 3_600)
 }
 
 fn is_categorical(name: &str, field: Option<&str>) -> bool {
@@ -921,5 +960,37 @@ mod tests {
         let ambiguous_uh = variable_temporal_capability(&ambiguous_uh);
         assert_eq!(ambiguous_uh.value_class, TemporalValueClass::Unknown);
         assert!(ambiguous_uh.requires_manual_semantics);
+    }
+
+    #[test]
+    fn provider_published_window_statistics_remain_queryable_but_temporally_manual() {
+        for (name, expected_seconds) in [
+            ("wind_gust_10m_max_3h_prob_gt_15000m", 10_800),
+            ("total_precipitation_6h_p50", 21_600),
+            ("temperature_2m_min_24h_prob_lt_273140m", 86_400),
+        ] {
+            let capability = variable_temporal_capability(&meta(
+                name,
+                "%",
+                serde_json::json!({
+                    "field": "Temperature",
+                    "product": {"Probability": {"lower_limit_milli": 15000}}
+                }),
+            ));
+            assert_eq!(
+                capability.value_class,
+                TemporalValueClass::Unknown,
+                "{name}"
+            );
+            assert!(capability.requires_manual_semantics, "{name}");
+            assert!(capability.operations.is_empty(), "{name}");
+            assert!(
+                capability
+                    .note
+                    .contains(&format!("{expected_seconds}-second")),
+                "{}",
+                capability.note
+            );
+        }
     }
 }

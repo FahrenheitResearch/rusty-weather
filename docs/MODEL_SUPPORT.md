@@ -30,6 +30,7 @@ not automatically presented as live-verified.
 | DWD ICON-EU regular | Remote | Ingest beta | European deterministic regular lat/lon feed; eight 3-hourly cycles, main-cycle f000-f120 and short-cycle f000-f048 native cadence; exact bzip2 component bundles and 18 schema-requested native pressure levels are live ingest/store verified; derived/heavy disabled |
 | DWD ICON-D2 regular | Remote | Ingest beta | Germany deterministic regular lat/lon feed; eight 3-hourly cycles and hourly f000-f048; exact bzip2 component bundles and all 11 native pressure levels are live ingest/store verified; quarter-hour messages retain exact time semantics; derived/heavy disabled |
 | Roshydromet ICON-Ru13/6N29 | Remote | Ingest beta | North Eurasia 697x213 regular lat/lon forecast; 00/12z, three-hourly f003-f072; exact WIS2 bulletin-component acquisition, sparse pressure profile, dateline-safe normalization, and bounded f003 live ingest/store verification |
+| ECCC GEPS | Remote | Ingest beta | Provider-published 2-D statistics only, not raw ensemble members; 00/12z, 3-hourly f003-f192 then 6-hourly f198-f384; typed percentiles, mean, spread, and selected probabilities are live ingest/store verified; extended f936 Monday/Thursday products are not scheduled |
 | RRFS-A | Remote | Verified | Deterministic NA source cropped during ingest |
 | RAP | Remote | Ingest beta | Grid-130 `awp130pgrb` (13 km); hourly f000-f021, with 03/09/15/21z extended through f051; live ingest/store verified |
 | NAM | Remote | Ingest beta | Ingest is pinned to grid-212 `awip3d` (40 km), not the registry's separate `awip12` plotting product; hourly f000-f036 then 3-hourly through f084; live ingest/store verified |
@@ -81,7 +82,8 @@ The focused ingest fixtures pin inventories captured from the official
 [RRFS](https://www.nco.ncep.noaa.gov/pmb/products/rrfs/), and
 [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data),
 [ECCC RDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_rdps/readme_rdps-datamart_en/), and
-[ECCC HRDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart_en/) feeds.
+[ECCC HRDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart_en/), and
+[ECCC GEPS](https://eccc-msc.github.io/open-data/msc-data/nwp_geps/readme_geps-datamart_en/) feeds.
 Fixture source URLs and SHA-256 values are recorded beside the fixtures.
 
 GDPS was additionally exercised against the official
@@ -145,6 +147,21 @@ five-level pressure coordinate (four levels for relative humidity), disables
 derived/heavy products, and exposes Roshydromet/WMO-core attribution through
 the server. Exact inventory, object hashes, and live evidence are recorded in
 [ROSHYDROMET_ICON_RU.md](ROSHYDROMET_ICON_RU.md).
+
+GEPS was exercised against the official Datamart on 2026-08-14 with one
+bounded 00z f024 surface ingest. Twelve provider component objects totaling
+15,462,959 bytes realized 96 typed 2-D variables, passed exact writer
+verification, and passed deep validation at 576 chunks and 31,291,495 payload
+bytes. The live GRIB grid is 721x360; it remains authoritative over the
+documentation's current 720x361 declaration. The normalized identity keeps
+percentile, mean, probability threshold, and WMO code-4 ensemble spread
+distinct. It does not relabel spread as standard deviation or imply any raw
+member coverage. Published 3/6/24-hour statistical windows remain point- and
+window-queryable, but temporal reduction is manual-only until the canonical
+selector can carry both interval and statistical-process identity. Provider
+`WIND-Max-*` thresholds are excluded because their live units are ambiguous;
+the Monday/Thursday f936 extension is also excluded from automatic scheduling
+until scheduler cadence can express weekdays.
 
 For the NOAA deterministic wave, normalization follows the fields actually
 published. HRRR Alaska carries native pressure-level temperature, dewpoint,

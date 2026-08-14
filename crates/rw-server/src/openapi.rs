@@ -2789,9 +2789,11 @@ mod tests {
                 "provider_statistics_only",
                 "ensemble_control_member_only",
                 "sparse_pressure_levels",
+                "two_dimensional_statistics_only",
                 "derived_products_disabled",
                 "conus_only",
-                "pre_operational_feed"
+                "pre_operational_feed",
+                "extended_range_not_scheduled"
             ])
         );
     }

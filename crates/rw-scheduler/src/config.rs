@@ -385,10 +385,13 @@ impl SchedulerConfig {
                 .contains(&IngestCapabilityLimitation::ProviderStatisticsOnly)
             {
                 IngestProfile::surface_for_model(model)
-            } else if capability
-                .limitations
-                .contains(&IngestCapabilityLimitation::SurfaceOnly)
-            {
+            } else if capability.limitations.iter().any(|limitation| {
+                matches!(
+                    limitation,
+                    IngestCapabilityLimitation::SurfaceOnly
+                        | IngestCapabilityLimitation::TwoDimensionalStatisticsOnly
+                )
+            }) {
                 IngestProfile::surface()
             } else if capability
                 .limitations
@@ -416,11 +419,21 @@ impl SchedulerConfig {
                 IngestCapabilityLimitation::AnalysisOnly
                     | IngestCapabilityLimitation::SurfaceOnly
                     | IngestCapabilityLimitation::ProviderStatisticsOnly
+                    | IngestCapabilityLimitation::TwoDimensionalStatisticsOnly
             )
         });
         if surface_only && profile.needs_prs() {
             return Err(SchedulerError::InvalidConfig(format!(
                 "profile '{requested}' requires pressure data but model '{model}' is surface-only"
+            )));
+        }
+        if capability
+            .limitations
+            .contains(&IngestCapabilityLimitation::TwoDimensionalStatisticsOnly)
+            && profile != IngestProfile::surface()
+        {
+            return Err(SchedulerError::InvalidConfig(format!(
+                "profile '{requested}' is incompatible with model '{model}', which requires the complete surface profile for its typed 2-D statistics collection"
             )));
         }
         if capability

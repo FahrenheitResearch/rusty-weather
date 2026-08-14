@@ -179,9 +179,11 @@ pub enum ApiIngestCapabilityLimitation {
     ProviderStatisticsOnly,
     EnsembleControlMemberOnly,
     SparsePressureLevels,
+    TwoDimensionalStatisticsOnly,
     DerivedProductsDisabled,
     ConusOnly,
     PreOperationalFeed,
+    ExtendedRangeNotScheduled,
 }
 
 impl From<IngestCapabilityLimitation> for ApiIngestCapabilityLimitation {
@@ -195,9 +197,15 @@ impl From<IngestCapabilityLimitation> for ApiIngestCapabilityLimitation {
                 Self::EnsembleControlMemberOnly
             }
             IngestCapabilityLimitation::SparsePressureLevels => Self::SparsePressureLevels,
+            IngestCapabilityLimitation::TwoDimensionalStatisticsOnly => {
+                Self::TwoDimensionalStatisticsOnly
+            }
             IngestCapabilityLimitation::DerivedProductsDisabled => Self::DerivedProductsDisabled,
             IngestCapabilityLimitation::ConusOnly => Self::ConusOnly,
             IngestCapabilityLimitation::PreOperationalFeed => Self::PreOperationalFeed,
+            IngestCapabilityLimitation::ExtendedRangeNotScheduled => {
+                Self::ExtendedRangeNotScheduled
+            }
         }
     }
 }
@@ -226,7 +234,12 @@ fn provider_attributions(
         .iter()
         .any(|source| source.id == SourceId::Eccc)
     {
-        attributions.push(rw_query::eccc_provider_attribution().into());
+        let attribution = if summary.id == ModelId::Geps {
+            rw_query::geps_provider_attribution()
+        } else {
+            rw_query::eccc_provider_attribution()
+        };
+        attributions.push(attribution.into());
     }
     if summary
         .sources
@@ -4784,6 +4797,30 @@ mod tests {
                 "Data Source: Environment and Climate Change Canada"
             );
         }
+        let geps = model("geps");
+        assert_eq!(geps["ingest_status"], "ready");
+        assert_eq!(geps["verification"], "live_verified");
+        assert_eq!(
+            geps["limitations"],
+            serde_json::json!([
+                "provider_statistics_only",
+                "sparse_pressure_levels",
+                "two_dimensional_statistics_only",
+                "derived_products_disabled",
+                "extended_range_not_scheduled"
+            ])
+        );
+        assert_eq!(geps["products"][0]["product"], "rws-published-statistics");
+        assert_eq!(geps["products"][0]["surface_source"], true);
+        assert_eq!(geps["products"][0]["pressure_source"], false);
+        assert_eq!(
+            geps["provider_attributions"][0]["notice"],
+            "Data Source: Environment and Climate Change Canada"
+        );
+        assert_eq!(
+            geps["provider_attributions"][0]["source_url"],
+            "https://eccc-msc.github.io/open-data/msc-data/nwp_geps/readme_geps-datamart_en/"
+        );
 
         for id in ["icon-eu", "icon-d2"] {
             let icon = model(id);

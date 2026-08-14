@@ -131,10 +131,13 @@ impl JobPlan {
             .contains(&IngestCapabilityLimitation::ProviderStatisticsOnly)
         {
             IngestProfile::surface_for_model(model)
-        } else if capability
-            .limitations
-            .contains(&IngestCapabilityLimitation::SurfaceOnly)
-        {
+        } else if capability.limitations.iter().any(|limitation| {
+            matches!(
+                limitation,
+                IngestCapabilityLimitation::SurfaceOnly
+                    | IngestCapabilityLimitation::TwoDimensionalStatisticsOnly
+            )
+        }) {
             IngestProfile::surface()
         } else if capability
             .limitations
@@ -383,9 +386,11 @@ const KNOWN_LIMITATION_SLUGS: &[&str] = &[
     "provider_statistics_only",
     "ensemble_control_member_only",
     "sparse_pressure_levels",
+    "two_dimensional_statistics_only",
     "derived_products_disabled",
     "conus_only",
     "pre_operational_feed",
+    "extended_range_not_scheduled",
 ];
 
 fn limitation_slug(limitation: IngestCapabilityLimitation) -> &'static str {
@@ -396,9 +401,13 @@ fn limitation_slug(limitation: IngestCapabilityLimitation) -> &'static str {
         IngestCapabilityLimitation::ProviderStatisticsOnly => "provider_statistics_only",
         IngestCapabilityLimitation::EnsembleControlMemberOnly => "ensemble_control_member_only",
         IngestCapabilityLimitation::SparsePressureLevels => "sparse_pressure_levels",
+        IngestCapabilityLimitation::TwoDimensionalStatisticsOnly => {
+            "two_dimensional_statistics_only"
+        }
         IngestCapabilityLimitation::DerivedProductsDisabled => "derived_products_disabled",
         IngestCapabilityLimitation::ConusOnly => "conus_only",
         IngestCapabilityLimitation::PreOperationalFeed => "pre_operational_feed",
+        IngestCapabilityLimitation::ExtendedRangeNotScheduled => "extended_range_not_scheduled",
     }
 }
 
@@ -427,6 +436,13 @@ fn validate_profile_for_capability(
     if profile.needs_prs() && !has_pressure {
         return Err(SchedulerError::InvalidPlan(format!(
             "model '{model}' is surface-only but the selected profile requires pressure data"
+        )));
+    }
+    if limitations.contains(&IngestCapabilityLimitation::TwoDimensionalStatisticsOnly)
+        && profile != &IngestProfile::surface()
+    {
+        return Err(SchedulerError::InvalidPlan(format!(
+            "model '{model}' requires the complete surface profile for its typed 2-D statistics collection"
         )));
     }
     if limitations.contains(&IngestCapabilityLimitation::DerivedProductsDisabled)

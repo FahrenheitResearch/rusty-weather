@@ -2828,6 +2828,31 @@ fn extract_qmd_derived_mean_and_stddev_do_not_alias() {
 }
 
 #[test]
+fn wmo_derived_code_four_is_spread_and_never_standard_deviation() {
+    let mut spread = ieee_f32_message(PARAMETER_TMP[0], 103, 2.0, &[7.25], -99.0, -99.0);
+    spread.product.template = 2;
+    spread.product.derived_forecast_type = Some(4);
+    let grib = Grib2File {
+        messages: vec![spread],
+    };
+
+    let spread_field = extract_field_from_grib2(
+        &grib,
+        FieldSelector::height_agl(CanonicalField::Temperature, 2).with_ensemble_spread(),
+    )
+    .unwrap();
+    assert_eq!(spread_field.values, vec![7.25]);
+
+    let error = extract_field_from_grib2(
+        &grib,
+        FieldSelector::height_agl(CanonicalField::Temperature, 2)
+            .with_ensemble_standard_deviation(),
+    )
+    .expect_err("WMO spread code 4 must not be relabeled as standard deviation");
+    assert!(matches!(error, IoError::FieldNotFound { .. }));
+}
+
+#[test]
 fn ensemble_mean_selector_accepts_weighted_mean_product() {
     let mut weighted_mean = ieee_f32_message(PARAMETER_TMP[0], 103, 2.0, &[281.0], -99.0, -99.0);
     weighted_mean.product.template = 2;
@@ -3284,4 +3309,41 @@ fn icon_ru_dateline_crossing_rows_rotate_coordinates_and_values_together() {
         assert_eq!(values[start + 54], (row * 1_000) as f64);
         assert_eq!(values[start + NX - 1], (row * 1_000 + 642) as f64);
     }
+}
+
+#[test]
+fn eccc_cyclic_equal_endpoint_grid_retains_global_longitudes() {
+    let grid = GridDefinition {
+        template: 0,
+        nx: 721,
+        ny: 360,
+        lat1: -90.0,
+        lon1: 180.0,
+        lat2: 89.5,
+        lon2: 180.0,
+        dx: 0.5,
+        dy: 0.5,
+        scan_mode: 0x40,
+        ..Default::default()
+    };
+    let (mut lat, mut lon) = grid_latlon(&grid);
+    flip_rows(&mut lat, 721, 360);
+    flip_rows(&mut lon, 721, 360);
+    let row_wraps = normalize_and_rotate_longitude_grid_rows(&mut lat, &mut lon, 721, 360);
+
+    assert!(row_wraps.iter().all(|wrap| *wrap == 1));
+    assert_eq!(lat[0], 89.5);
+    assert_eq!(lat[721 * 359], -90.0);
+    assert_eq!(lon[0], -179.5);
+    assert_eq!(lon[359], 0.0);
+    assert_eq!(lon[719], 180.0);
+    assert_eq!(lon[720], 180.0);
+    assert!(lon[..721].windows(2).all(|pair| pair[1] >= pair[0]));
+    assert_eq!(
+        lon[..721]
+            .windows(2)
+            .filter(|pair| pair[1] > pair[0])
+            .count(),
+        719
+    );
 }

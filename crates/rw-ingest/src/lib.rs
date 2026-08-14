@@ -140,6 +140,9 @@ pub enum IngestCapabilityLimitation {
     /// The post-processed product publishes only a documented subset of
     /// pressure levels; manifests report the levels actually realized.
     SparsePressureLevels,
+    /// Published pressure-level statistics are individual 2-D products, not
+    /// a vertically complete pressure-volume coordinate.
+    TwoDimensionalStatisticsOnly,
     /// Derived/heavy diagnostics are disabled because the published source
     /// either has incompatible aggregation semantics or omits a required
     /// native input.
@@ -148,6 +151,9 @@ pub enum IngestCapabilityLimitation {
     ConusOnly,
     /// The upstream provider labels this feed preliminary/pre-operational.
     PreOperationalFeed,
+    /// A provider-specific, date-dependent extended forecast exists, but the
+    /// scheduler deliberately admits only the invariant operational horizon.
+    ExtendedRangeNotScheduled,
 }
 
 impl IngestCapabilityLimitation {
@@ -161,9 +167,11 @@ impl IngestCapabilityLimitation {
             Self::ProviderStatisticsOnly => "provider_statistics_only",
             Self::EnsembleControlMemberOnly => "ensemble_control_member_only",
             Self::SparsePressureLevels => "sparse_pressure_levels",
+            Self::TwoDimensionalStatisticsOnly => "two_dimensional_statistics_only",
             Self::DerivedProductsDisabled => "derived_products_disabled",
             Self::ConusOnly => "conus_only",
             Self::PreOperationalFeed => "pre_operational_feed",
+            Self::ExtendedRangeNotScheduled => "extended_range_not_scheduled",
         }
     }
 }
@@ -234,6 +242,16 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
         ]),
         ModelId::CmaGeps => Ok(vec![ProductFetch {
             product: "stats",
+            surface_source: true,
+            pressure_source: false,
+            idx_patterns: &[],
+        }]),
+        // GEPS published products are one GRIB2 object per meteorological
+        // family, with mean/spread/percentile/probability messages inside.
+        // The logical product expands to a bounded, lead-aware component
+        // bundle; no raw all-member object is part of this plan.
+        ModelId::Geps => Ok(vec![ProductFetch {
+            product: "rws-published-statistics",
             surface_source: true,
             pressure_source: false,
             idx_patterns: &[],
@@ -694,6 +712,11 @@ pub fn validate_ingest_profile_for_model(
     profile: &ingest_profile::IngestProfile,
 ) -> Result<(), IngestError> {
     profile.validate().map_err(events::other)?;
+    if model == rustwx_core::ModelId::Geps && profile != &ingest_profile::IngestProfile::surface() {
+        return Err(events::other(
+            "model 'geps' stores provider-published pressure-level and surface statistics as a typed 2-D collection; use --profile surface exactly",
+        ));
+    }
     let plan = fetch_plan(model)?;
     if !plan.iter().any(|product| product.surface_source) {
         return Err(events::other(format!(
@@ -887,6 +910,13 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
             IngestCapabilityLimitation::SparsePressureLevels,
             IngestCapabilityLimitation::DerivedProductsDisabled,
         ],
+        rustwx_core::ModelId::Geps => vec![
+            IngestCapabilityLimitation::ProviderStatisticsOnly,
+            IngestCapabilityLimitation::SparsePressureLevels,
+            IngestCapabilityLimitation::TwoDimensionalStatisticsOnly,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+            IngestCapabilityLimitation::ExtendedRangeNotScheduled,
+        ],
         _ => Vec::new(),
     };
     match fetch_plan(model) {
@@ -899,6 +929,7 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 | rustwx_core::ModelId::Rdps
                 | rustwx_core::ModelId::Hrdps
                 | rustwx_core::ModelId::IconRu
+                | rustwx_core::ModelId::Geps
                 | rustwx_core::ModelId::Rap
                 | rustwx_core::ModelId::Nam
                 | rustwx_core::ModelId::RrfsA
@@ -995,6 +1026,18 @@ mod tests {
             IngestCapabilityLimitation::EnsembleControlMemberOnly.as_str(),
             "ensemble_control_member_only"
         );
+        assert_eq!(
+            IngestCapabilityLimitation::ProviderStatisticsOnly.as_str(),
+            "provider_statistics_only"
+        );
+        assert_eq!(
+            IngestCapabilityLimitation::TwoDimensionalStatisticsOnly.as_str(),
+            "two_dimensional_statistics_only"
+        );
+        assert_eq!(
+            IngestCapabilityLimitation::ExtendedRangeNotScheduled.as_str(),
+            "extended_range_not_scheduled"
+        );
     }
 
     #[test]
@@ -1012,6 +1055,7 @@ mod tests {
             ModelId::IconEu,
             ModelId::IconD2,
             ModelId::IconRu,
+            ModelId::Geps,
             ModelId::Gdas,
             ModelId::Gefs,
             ModelId::Aigfs,
@@ -1228,6 +1272,24 @@ mod tests {
             );
         }
 
+        let geps = model_ingest_capability(ModelId::Geps);
+        assert_eq!(geps.status, IngestSupportStatus::Ready);
+        assert_eq!(geps.verification, IngestVerificationLevel::LiveVerified);
+        assert_eq!(geps.products.len(), 1);
+        assert_eq!(geps.products[0].product, "rws-published-statistics");
+        assert!(geps.products[0].surface_source);
+        assert!(!geps.products[0].pressure_source);
+        assert_eq!(
+            geps.limitations,
+            vec![
+                IngestCapabilityLimitation::ProviderStatisticsOnly,
+                IngestCapabilityLimitation::SparsePressureLevels,
+                IngestCapabilityLimitation::TwoDimensionalStatisticsOnly,
+                IngestCapabilityLimitation::DerivedProductsDisabled,
+                IngestCapabilityLimitation::ExtendedRangeNotScheduled,
+            ]
+        );
+
         let unsupported = model_ingest_capability(ModelId::WrfGdex);
         assert_eq!(unsupported.status, IngestSupportStatus::Unsupported);
         assert_eq!(
@@ -1270,6 +1332,7 @@ mod tests {
                 ModelId::IconEu,
                 ModelId::IconD2,
                 ModelId::IconRu,
+                ModelId::Geps,
                 ModelId::Gdas,
                 ModelId::Gefs,
                 ModelId::Aigfs,
@@ -1586,6 +1649,28 @@ mod tests {
         .expect_err("HIRESW has no isobaric source")
         .to_string();
         assert!(message.contains("surface-only"), "got: {message}");
+    }
+
+    #[test]
+    fn geps_requires_the_exact_typed_two_dimensional_statistics_profile() {
+        use rustwx_core::ModelId;
+
+        validate_ingest_profile_for_model(ModelId::Geps, &ingest_profile::IngestProfile::surface())
+            .expect("the complete surface preset selects the typed GEPS 2-D collection");
+        for profile in [
+            ingest_profile::IngestProfile::analysis(),
+            ingest_profile::IngestProfile::sounding(),
+            ingest_profile::IngestProfile::full(),
+        ] {
+            let message = validate_ingest_profile_for_model(ModelId::Geps, &profile)
+                .expect_err("no partial or pressure-volume profile may relabel GEPS statistics")
+                .to_string();
+            assert!(message.contains("provider-published"), "got: {message}");
+            assert!(
+                message.contains("--profile surface exactly"),
+                "got: {message}"
+            );
+        }
     }
 
     #[test]
@@ -2373,6 +2458,93 @@ mod tests {
         assert!(hrdps.contains("_UGRD_AGL-10m_"));
         assert!(hrdps.contains("_VGRD_AGL-10m_"));
         assert!(hrdps.contains("_HGT_Sfc_"));
+    }
+
+    #[test]
+    fn geps_fixture_pins_official_inventory_and_published_statistic_semantics() {
+        let fixture = include_str!("../tests/fixtures/geps.20260814.t00z.f024.inventory.txt");
+        assert_eq!(fixture_header(fixture, "source_bytes"), "9714");
+        assert_eq!(fixture_header(fixture, "source_grib2_links"), "36");
+        assert_eq!(
+            fixture_header(fixture, "source_sha256"),
+            "ABC37D99EE4402ECDBDB30B5C46E8ECDC245EBE24BBCBCBFD64F7CF4C1E87E4E"
+        );
+        assert_ne!(
+            fixture_header(fixture, "documentation_grid"),
+            fixture_header(fixture, "live_decoded_grid"),
+            "the live GEPS grid remains authoritative over the documentation drift"
+        );
+        assert_eq!(fixture_header(fixture, "live_decoded_grid"), "721x360");
+        assert_eq!(
+            fixture_header(fixture, "live_grid_first_lat_lon"),
+            "-90.0,180.0"
+        );
+        assert_eq!(
+            fixture_header(fixture, "live_grid_last_lat_lon"),
+            "89.5,180.0"
+        );
+        assert_eq!(
+            fixture_header(fixture, "live_grid_i_j_increment_deg"),
+            "0.5,0.5"
+        );
+        assert_eq!(
+            fixture_header(fixture, "cyclic_longitude_contract"),
+            "equal-endpoints-use-i-increment"
+        );
+        assert_eq!(
+            fixture_header(fixture, "live_derived_code_4"),
+            "ensemble_spread-not-standard_deviation"
+        );
+        assert_eq!(fixture_header(fixture, "scan_mode"), "0x40");
+        assert_eq!(
+            fixture_header(fixture, "resolution_and_component_flags"),
+            "0x30"
+        );
+
+        let filenames = fixture
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(filenames.len(), 36);
+        assert!(filenames.iter().all(|name| name.ends_with(".grib2")));
+        for component in rustwx_models::geps_published_statistic_components() {
+            assert!(
+                filenames.iter().any(|name| name.contains(component)),
+                "official f024 listing must contain {component}"
+            );
+        }
+        assert!(filenames.iter().any(|name| name.contains("WIND-Max-3h")));
+        assert!(
+            !rustwx_models::geps_published_statistic_components().contains(&"WIND-Max-3h_TGL_10m"),
+            "unresolved provider threshold units must remain outside the ingest allowlist"
+        );
+
+        let payloads = fixture
+            .lines()
+            .filter_map(|line| line.strip_prefix("# payload="))
+            .collect::<Vec<_>>();
+        assert_eq!(payloads.len(), 13);
+        for payload in payloads {
+            let parts = payload.split('|').collect::<Vec<_>>();
+            assert_eq!(parts.len(), 4, "{payload}");
+            assert!(parts[1].parse::<usize>().unwrap() > 0);
+            assert_eq!(parts[2].len(), 64);
+            assert!(parts[2].bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(parts[3].parse::<usize>().unwrap() > 0);
+        }
+
+        assert_eq!(
+            fixture_header(fixture, "max_temperature_24h_probability_thresholds_kelvin")
+                .split(',')
+                .count(),
+            15
+        );
+        assert_eq!(
+            fixture_header(fixture, "min_temperature_24h_probability_thresholds_kelvin")
+                .split(',')
+                .count(),
+            14
+        );
     }
 
     #[test]
