@@ -24,6 +24,7 @@ not automatically presented as live-verified.
 | HRRR Alaska | Remote | Ingest beta | Alaska `prs` + `sfc`; hourly f000-f018, with 00/06/12/18z extended through f048; official inventory fixture-verified |
 | GFS | Remote | Verified | Global deterministic products |
 | ECCC GDPS | Remote | Ingest beta | Global 0.15-degree deterministic 00/12z forecast; hourly f000-f084 then 3-hourly to f240; bounded per-field Datamart acquisition and a 19-level sounding profile are live ingest/store verified |
+| CMA GRAPES GEPS | Remote | Ingest beta | Global 0.25-degree provider-produced ensemble statistics; 00/12z, 3-hourly f000-f078 then 6-hourly to f360; mean/spread, percentile, and probability fields only—no raw member or deterministic sounding claim; live ingest/store verified |
 | RRFS-A | Remote | Verified | Deterministic NA source cropped during ingest |
 | RAP | Remote | Ingest beta | Grid-130 `awp130pgrb` (13 km); hourly f000-f021, with 03/09/15/21z extended through f051; live ingest/store verified |
 | NAM | Remote | Ingest beta | Ingest is pinned to grid-212 `awip3d` (40 km), not the registry's separate `awip12` plotting product; hourly f000-f036 then 3-hourly through f084; live ingest/store verified |
@@ -85,6 +86,16 @@ the writer's exact verification, and passed deep validation at 12 variables,
 57,350 chunks, and 477,280,099 payload bytes. The required ECCC attribution is
 persisted and exposed by the server; direct legacy whole-file plotting remains
 disabled rather than silently using the one-field availability probe.
+
+CMA GRAPES GEPS was exercised against the official WIS2 core-data source on
+2026-08-14 using the provider's 2026-08-13 00z f024 object. The bounded
+single-lead ingest realized all 57 scientifically identified provider
+statistics bit-exactly: ensemble mean/spread fields, five published
+percentiles across seven field families, seven wind/gust probabilities, and
+eleven precipitation percentile/probability fields. Deep validation passed at
+57 variables, 1,026 chunks, and 134,659,235 payload bytes. Unknown local CMA
+parameters remain excluded, and the API reports `provider_statistics_only`
+rather than implying access to the 31 underlying member forecasts.
 
 For the NOAA deterministic wave, normalization follows the fields actually
 published. HRRR Alaska carries native pressure-level temperature, dewpoint,

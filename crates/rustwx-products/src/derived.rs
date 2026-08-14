@@ -251,6 +251,7 @@ pub fn supported_derived_recipe_slugs(model: ModelId) -> Vec<String> {
             .map(|recipe| recipe.slug.to_string())
             .collect(),
         ModelId::Gdps
+        | ModelId::CmaGeps
         | ModelId::Rtma
         | ModelId::Urma
         | ModelId::Href

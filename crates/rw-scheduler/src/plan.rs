@@ -128,6 +128,11 @@ impl JobPlan {
             IngestProfile::analysis()
         } else if capability
             .limitations
+            .contains(&IngestCapabilityLimitation::ProviderStatisticsOnly)
+        {
+            IngestProfile::surface_for_model(model)
+        } else if capability
+            .limitations
             .contains(&IngestCapabilityLimitation::SurfaceOnly)
         {
             IngestProfile::surface()
@@ -375,6 +380,7 @@ const KNOWN_LIMITATION_SLUGS: &[&str] = &[
     "analysis_only",
     "surface_only",
     "ensemble_mean_only",
+    "provider_statistics_only",
     "ensemble_control_member_only",
     "sparse_pressure_levels",
     "derived_products_disabled",
@@ -387,6 +393,7 @@ fn limitation_slug(limitation: IngestCapabilityLimitation) -> &'static str {
         IngestCapabilityLimitation::AnalysisOnly => "analysis_only",
         IngestCapabilityLimitation::SurfaceOnly => "surface_only",
         IngestCapabilityLimitation::EnsembleMeanOnly => "ensemble_mean_only",
+        IngestCapabilityLimitation::ProviderStatisticsOnly => "provider_statistics_only",
         IngestCapabilityLimitation::EnsembleControlMemberOnly => "ensemble_control_member_only",
         IngestCapabilityLimitation::SparsePressureLevels => "sparse_pressure_levels",
         IngestCapabilityLimitation::DerivedProductsDisabled => "derived_products_disabled",

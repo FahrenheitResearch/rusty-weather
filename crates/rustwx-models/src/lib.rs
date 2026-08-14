@@ -406,6 +406,7 @@ const HRRR_CYCLE_HOURS: &[u8] = &[
 ];
 const GFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const GDPS_CYCLE_HOURS: &[u8] = &[0, 12];
+const CMA_GEPS_CYCLE_HOURS: &[u8] = &[0, 12];
 const GDAS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const GEFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const AI_MODEL_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
@@ -534,6 +535,17 @@ const GDPS_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
     priority: 1,
     max_age_hours: Some(36),
     notes: "Environment and Climate Change Canada MSC Datamart",
+}];
+
+const CMA_GEPS_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
+    id: SourceId::Cma,
+    // CMA publishes one complete GRIB2 statistics object per forecast lead
+    // through its WIS2 node. The source supports HTTP ranges but currently
+    // publishes no companion message index.
+    idx_available: false,
+    priority: 1,
+    max_age_hours: Some(24 * 30),
+    notes: "CMA WIS2 core-data node (GRAPES GEPS provider statistics)",
 }];
 
 const GEFS_SOURCES: &[SourceDescriptor] = &[
@@ -665,6 +677,16 @@ const MODELS: &[ModelSummary] = &[
         sources: GDPS_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::CmaGeps,
+        description: "CMA GRAPES GEPS v1.3 global 0.25 degree provider statistics",
+        default_product: "stats",
+        cycle_hours_utc: CMA_GEPS_CYCLE_HOURS,
+        max_forecast_hour: 360,
+        sources: CMA_GEPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::PostProcessedStatisticsGribFiles,
     },
     ModelSummary {
         id: ModelId::Gdas,
@@ -5753,13 +5775,14 @@ pub fn built_in_models() -> &'static [ModelSummary] {
 /// [`built_in_models`] remains linked (`ModelId` match arms thread through
 /// rustwx-products), but every user-facing enumeration must go through this
 /// list.
-pub fn supported_models() -> [ModelId; 15] {
+pub fn supported_models() -> [ModelId; 16] {
     [
         ModelId::Hrrr,
         ModelId::HrrrAk,
         ModelId::Rap,
         ModelId::Gfs,
         ModelId::Gdps,
+        ModelId::CmaGeps,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -5998,6 +6021,14 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
             hours.extend((87..=240).step_by(3));
             hours
         }
+        ModelId::CmaGeps => {
+            if !CMA_GEPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                return Vec::new();
+            }
+            let mut hours = (0..=78).step_by(3).collect::<Vec<u16>>();
+            hours.extend((84..=360).step_by(6));
+            hours
+        }
         ModelId::Gdas => (0..=9).collect(),
         ModelId::Gefs => {
             let mut hours = (0..=240).step_by(3).collect::<Vec<u16>>();
@@ -6139,6 +6170,7 @@ fn default_canonical_bundle_product(
         (ModelId::Gdps, CanonicalBundleDescriptor::SurfaceAnalysis) => "rws-surface",
         (ModelId::Gdps, CanonicalBundleDescriptor::PressureAnalysis) => "rws-pressure",
         (ModelId::Gdps, CanonicalBundleDescriptor::NativeAnalysis) => "rws-surface",
+        (ModelId::CmaGeps, _) => "stats",
         (ModelId::Gdas, _) => "pgrb2.0p25",
         (ModelId::Gefs, _) => "pgrb2ap5/gec00",
         (ModelId::Aigfs, CanonicalBundleDescriptor::SurfaceAnalysis) => "sfc",
@@ -6606,6 +6638,7 @@ fn build_grib_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         ModelId::HrrrAk => build_hrrr_ak_url(source, request),
         ModelId::Gfs => build_gfs_url(source, request)?,
         ModelId::Gdps => build_gdps_url(source, request)?,
+        ModelId::CmaGeps => build_cma_geps_url(source, request)?,
         ModelId::Gdas => build_gdas_url(source, request)?,
         ModelId::Gefs => build_gefs_url(source, request)?,
         ModelId::Aigfs => build_aigfs_url(source, request)?,
@@ -7004,6 +7037,33 @@ fn build_gdps_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         request.cycle.hour_utc,
         product,
         request.forecast_hour,
+    ))
+}
+
+fn build_cma_geps_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Cma {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "CMA GRAPES GEPS publishes three-hourly f000-f078 and six-hourly f084-f360 for 00Z/12Z cycles"
+                .to_string(),
+        });
+    }
+    if normalize_token(&request.product) != "stats" {
+        return Err(ModelError::UnsupportedProduct {
+            model: request.model,
+            product: request.product.clone(),
+        });
+    }
+    let day = &request.cycle.date_yyyymmdd;
+    let storage_day = format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]);
+    Ok(format!(
+        "https://wis2node.wis.cma.cn/data/{storage_day}/wis/urn:wmo:md:cn-cma:data.core.weather.prediction.forecast.medium-range.probabilistic.global/Z_NAFP_C_BABJ_{}{:02}0000_P_CMA-WIPPSGEPS-GLB-{:03}.grib2",
+        request.cycle.date_yyyymmdd, request.cycle.hour_utc, request.forecast_hour,
     ))
 }
 
@@ -7945,13 +8005,13 @@ fn plot_recipe_field_blocker(
     // direct-GRIB plot path still assumes one family URL. Keep that path
     // explicitly blocked instead of fetching only the representative probe
     // object and silently rendering an incomplete field set.
-    if model == ModelId::Gdps {
+    if matches!(model, ModelId::Gdps | ModelId::CmaGeps) {
         return Some(PlotRecipeBlocker {
             field_key: field.key,
             field_label: field.label,
             reason: format!(
-                "{} for GDPS is available through normalized RWS ingest/query; direct plot acquisition does not yet assemble the Datamart per-field component bundle",
-                field.label
+                "{} for {model} is available through normalized RWS ingest/query; the legacy direct plot path does not expose this provider-specific acquisition contract",
+                field.label,
             ),
         });
     }
@@ -8056,6 +8116,7 @@ fn plot_recipe_fetch_defaults(
         (ModelId::Gfs, _, _) => ("pgrb2.0p25", PlotRecipeFetchPolicy::PreferIndexedSubset),
         (ModelId::Gdps, _, true) => ("rws-surface", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::Gdps, _, false) => ("rws-pressure", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::CmaGeps, _, _) => ("stats", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::Gdas, _, _) => ("pgrb2.0p25", PlotRecipeFetchPolicy::PreferIndexedSubset),
         (ModelId::Gefs, _, _) if has_ensemble_spread_selector => {
             ("pgrb2ap5/gespr", PlotRecipeFetchPolicy::PreferIndexedSubset)

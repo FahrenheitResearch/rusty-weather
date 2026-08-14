@@ -136,10 +136,24 @@ pub fn eccc_provider_attribution() -> ProviderAttribution {
     }
 }
 
+pub fn cma_provider_attribution() -> ProviderAttribution {
+    ProviderAttribution {
+        provider: "China Meteorological Administration (CMA)".into(),
+        copyright_statement: "CMA is the producing centre for CMA GRAPES GEPS v1.3; its WMO discovery record declares the feed as WMO core data.".into(),
+        notice: "Data source: China Meteorological Administration (CMA), distributed through WIS2.".into(),
+        source_url: "https://wis2node.wis.cma.cn/oapi/collections/discovery-metadata/items/urn%3Awmo%3Amd%3Acn-cma%3Adata.core.weather.prediction.forecast.medium-range.probabilistic.global?f=json".into(),
+        license: "WMO Unified Data Policy core data: free and unrestricted international exchange without charge and with no conditions on use.".into(),
+        license_url: "https://public.wmo.int/wmo-unified-data-policy-resolution-res1".into(),
+        terms_url: "https://public.wmo.int/wmo-unified-data-policy-resolution-res1".into(),
+        modification_notice: "The CMA source statistics have been selected, normalized, and re-encoded by this service; this output is not an official CMA product.".into(),
+        disclaimer: "Availability and interpretation remain subject to the authoritative CMA/WMO metadata; this service supplies transformed output without implying CMA or WMO endorsement.".into(),
+    }
+}
+
 pub fn provider_attributions_for_provenance(
     sources: &[SourceProvenance],
 ) -> Vec<ProviderAttribution> {
-    let mut attributions = Vec::with_capacity(3);
+    let mut attributions = Vec::with_capacity(4);
     if sources
         .iter()
         .any(|source| source.provider == "ecmwf-open-data")
@@ -168,6 +182,12 @@ pub fn provider_attributions_for_provenance(
         .any(|source| source.provider == "eccc-msc-datamart")
     {
         attributions.push(eccc_provider_attribution());
+    }
+    if sources
+        .iter()
+        .any(|source| source.provider == "cma-wis2-core-data")
+    {
+        attributions.push(cma_provider_attribution());
     }
     attributions
 }
@@ -451,5 +471,22 @@ mod tests {
                 .contains("not an official")
         );
         assert!(attributions[0].license.contains("version 2.1"));
+    }
+
+    #[test]
+    fn cma_wis2_core_data_emits_owner_policy_and_transport_attribution() {
+        let attributions = provider_attributions_for_provenance(&[
+            provenance("cma-wis2-core-data"),
+            provenance("cma-wis2-core-data"),
+        ]);
+        assert_eq!(attributions, vec![cma_provider_attribution()]);
+        assert!(attributions[0].provider.contains("CMA"));
+        assert!(attributions[0].license.contains("WMO Unified Data Policy"));
+        assert!(attributions[0].notice.contains("WIS2"));
+        assert!(
+            attributions[0]
+                .modification_notice
+                .contains("not an official")
+        );
     }
 }

@@ -74,7 +74,7 @@ existing contract, `P2` needs a new bounded acquisition/format adapter, and
 | 3 | ECCC HRDPS continental 2.5 km | P1 | 2540x1290 rotated lat/lon, 00/06/12/18Z; hourly f000-f048 | Anonymous per-field GRIB2; surface plus up to 31 published pressure levels. |
 | 4 | DWD ICON-EU regular-grid output | P1 | Europe, 0.0625-degree regular lat/lon; 00/06/12/18Z to f120 and 03/09/15/21Z to f30 | Anonymous per-variable/level/lead bzip2-compressed GRIB2. Use the provider's regular-grid objects. |
 | 5 | DWD ICON-D2 regular-grid output | P1 | Germany and neighbors, about 2.2 km; eight cycles/day, hourly f000-f048 | The directory publishes both native icosahedral and regular-lat-lon objects. Select only filenames explicitly marked `regular-lat-lon`. |
-| 6 | CMA-GEPS published ensemble products | P1/P2 | Global 0.25-degree regular lat/lon, 00/12Z; 3-hourly to f078 then 6-hourly to f360 | Anonymous WIS2-core GRIB2. Current files expose probability, percentile, and ensemble-derived fields for 31 forecasts, not raw members. Add bounded GRIB inventory scanning because no sidecar index is published. |
+| 6 | CMA-GEPS published ensemble products | Implemented (live verified) | Global 0.25-degree regular lat/lon, 00/12Z; 3-hourly to f078 then 6-hourly to f360 | Anonymous WIS2-core GRIB2. The implemented lane preserves 57 identified probability, percentile, and ensemble-derived fields for 31 forecasts; it does not claim raw members or unknown local parameters. Whole-object acquisition is bounded to one 38-88 MB lead file because no sidecar index is published. |
 | 7 | Roshydromet ICON-Ru13/6N29 | P1 | North Eurasia, 697x213 regular lat/lon at 0.25 degree, 00/12Z to f072 | Anonymous WIS2-core single-message GRIB2 bulletins. Strip the WMO bulletin wrapper, preserve the dateline-crossing grid, and ingest the documented surface and pressure fields. |
 | 8 | ECCC GEPS published products | P1 | Global 0.5-degree regular lat/lon, 00/12Z; 3-hourly to f192 then 6-hourly to f384; extended to f936 Monday/Thursday 00Z | Ingest provider-produced mean, standard deviation, percentile, and probability messages first. Raw 20 perturbed members plus control are P3. |
 | 9 | ECMWF IFS ENS open subset | P1/P3 | Global 0.25 degree, four cycles/day; 00/12Z to f360 and 06/18Z to f144 | Reuse the existing ECMWF URL/index/range machinery for published `em`, `es`, and `ep` first. Control plus 50 perturbed members need the member contract. |
@@ -213,6 +213,12 @@ CMA-GEPS publishes 74 lead files per run and an observed complete run was about
 roughly 0.2-1.2 MB make a bounded HTTP range inventory practical. The current
 files use ensemble-derived, probability, and percentile product templates and
 declare 31 forecasts; no raw members were observed.
+
+The first RWS lane is now implemented and live verified at one bounded lead:
+57 identified statistics were written bit-exactly and passed deep-store
+validation. The scheduler fetches one lead object at a time and exposes the
+typed `provider_statistics_only` limitation. Message-range acquisition remains
+a future bandwidth optimization, not a prerequisite for bounded operation.
 
 Roshydromet publishes one small WMO-bulletin-wrapped GRIB2 message per object,
 roughly 500 MB/day across two runs in the observed listing. The grid spans

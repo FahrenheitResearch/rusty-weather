@@ -28,7 +28,7 @@
 //! that stores only a named surface subset (and therefore skips the prs
 //! 2D planes) excludes their inputs and must be rejected up front.
 
-use rustwx_core::{CanonicalField, FieldSelector};
+use rustwx_core::{CanonicalField, FieldSelector, ModelId, ProbabilitySelection};
 
 /// The two supported isobaric level steps (hPa) over the 100..=1000 range.
 pub const LEVEL_STEPS_HPA: [u16; 2] = [25, 50];
@@ -173,19 +173,27 @@ impl IngestProfile {
         }
     }
 
-    /// Complete direct-field pack for surface-only forecast products. A named
-    /// set deliberately avoids the pressure-sourced planes attached to
-    /// `FieldSet::All`, while retaining every surface selector the product can
-    /// actually realize (partial extraction skips absent selectors honestly).
+    /// Complete deterministic direct-field pack for surface-only forecast
+    /// products. A named set deliberately avoids the pressure-sourced planes
+    /// attached to `FieldSet::All`, while retaining every long-standing base
+    /// surface selector (partial extraction skips absent selectors honestly).
     pub fn surface() -> Self {
+        Self::surface_with_plan(base_surface_plan())
+    }
+
+    /// Complete direct-field pack for one model. Provider-statistics-only
+    /// systems use their exact typed inventory; deterministic models retain
+    /// the stable base surface preset.
+    pub fn surface_for_model(model: ModelId) -> Self {
+        Self::surface_with_plan(model_surface_plan(model))
+    }
+
+    fn surface_with_plan(plan: Vec<(&'static str, FieldSelector)>) -> Self {
         Self {
             volumes: Vec::new(),
             level_step_hpa: 25,
             surface_fields: FieldSet::Named(
-                surface_plan()
-                    .into_iter()
-                    .map(|(name, _)| name.to_string())
-                    .collect(),
+                plan.into_iter().map(|(name, _)| name.to_string()).collect(),
             ),
             derived: false,
             heavy: false,
@@ -363,7 +371,29 @@ pub fn resolve_profile(
     preset: &str,
     overrides: &ProfileOverrides,
 ) -> Result<IngestProfile, String> {
-    let mut profile = IngestProfile::preset(preset)?;
+    apply_profile_overrides(preset, IngestProfile::preset(preset)?, overrides)
+}
+
+/// Resolve a preset for one model. Only `surface` is model-specialized; all
+/// other named profiles intentionally keep their established semantics.
+pub fn resolve_profile_for_model(
+    preset: &str,
+    overrides: &ProfileOverrides,
+    model: ModelId,
+) -> Result<IngestProfile, String> {
+    let profile = if preset == "surface" {
+        IngestProfile::surface_for_model(model)
+    } else {
+        IngestProfile::preset(preset)?
+    };
+    apply_profile_overrides(preset, profile, overrides)
+}
+
+fn apply_profile_overrides(
+    preset: &str,
+    mut profile: IngestProfile,
+    overrides: &ProfileOverrides,
+) -> Result<IngestProfile, String> {
     if let Some(step) = overrides.level_step_hpa {
         if !LEVEL_STEPS_HPA.contains(&step) {
             return Err(format!(
@@ -403,7 +433,7 @@ pub fn resolve_profile(
 /// structured selector for it (HRRR exposes LTNG, a non-dimensional
 /// lightning flag, and LTNGSD strike density — not flash density), and the
 /// recipe catalog blocks the slug for HRRR for the same mislabeling reason.
-pub fn surface_plan() -> Vec<(&'static str, FieldSelector)> {
+fn base_surface_plan() -> Vec<(&'static str, FieldSelector)> {
     vec![
         (
             "temperature_2m",
@@ -517,6 +547,186 @@ pub fn surface_plan() -> Vec<(&'static str, FieldSelector)> {
     ]
 }
 
+/// Direct 2-D fields normalized for one model. Most deterministic models use
+/// the long-standing surface plan above. CMA GRAPES GEPS publishes only
+/// provider-computed ensemble statistics, so its plan names and selects every
+/// scientifically identified statistic instead of pretending those records
+/// are deterministic surface fields or raw ensemble members.
+fn cma_geps_statistics_surface_plan() -> Vec<(&'static str, FieldSelector)> {
+    let mut plan = vec![
+        (
+            "height_500hpa_ensemble_mean",
+            FieldSelector::isobaric(CanonicalField::GeopotentialHeight, 500).with_ensemble_mean(),
+        ),
+        (
+            "height_500hpa_ensemble_spread",
+            FieldSelector::isobaric(CanonicalField::GeopotentialHeight, 500).with_ensemble_spread(),
+        ),
+        (
+            "mslp_ensemble_mean",
+            FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel)
+                .with_ensemble_mean(),
+        ),
+        (
+            "mslp_ensemble_spread",
+            FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel)
+                .with_ensemble_spread(),
+        ),
+    ];
+
+    const PERCENTILES: [u8; 5] = [0, 25, 50, 75, 100];
+    const PERCENTILE_FAMILIES: [(&str, FieldSelector); 7] = [
+        (
+            "temperature_2m",
+            FieldSelector::height_agl(CanonicalField::Temperature, 2),
+        ),
+        (
+            "temperature_850hpa",
+            FieldSelector::isobaric(CanonicalField::Temperature, 850),
+        ),
+        (
+            "wind_speed_10m",
+            FieldSelector::height_agl(CanonicalField::WindSpeed, 10),
+        ),
+        (
+            "wind_speed_850hpa",
+            FieldSelector::isobaric(CanonicalField::WindSpeed, 850),
+        ),
+        (
+            "wind_speed_250hpa",
+            FieldSelector::isobaric(CanonicalField::WindSpeed, 250),
+        ),
+        (
+            "wind_gust_10m",
+            FieldSelector::height_agl(CanonicalField::WindGust, 10),
+        ),
+        (
+            "cloud_cover_total",
+            // CMA encodes the full-column statistic with GRIB level type 1
+            // (surface) even though parameter 0/6/1 remains total cloud
+            // cover. Preserve that provider contract explicitly.
+            FieldSelector::surface(CanonicalField::TotalCloudCover),
+        ),
+    ];
+    for (family, selector) in PERCENTILE_FAMILIES {
+        for percentile in PERCENTILES {
+            let name = match (family, percentile) {
+                ("temperature_2m", 0) => "temperature_2m_p00",
+                ("temperature_2m", 25) => "temperature_2m_p25",
+                ("temperature_2m", 50) => "temperature_2m_p50",
+                ("temperature_2m", 75) => "temperature_2m_p75",
+                ("temperature_2m", 100) => "temperature_2m_p100",
+                ("temperature_850hpa", 0) => "temperature_850hpa_p00",
+                ("temperature_850hpa", 25) => "temperature_850hpa_p25",
+                ("temperature_850hpa", 50) => "temperature_850hpa_p50",
+                ("temperature_850hpa", 75) => "temperature_850hpa_p75",
+                ("temperature_850hpa", 100) => "temperature_850hpa_p100",
+                ("wind_speed_10m", 0) => "wind_speed_10m_p00",
+                ("wind_speed_10m", 25) => "wind_speed_10m_p25",
+                ("wind_speed_10m", 50) => "wind_speed_10m_p50",
+                ("wind_speed_10m", 75) => "wind_speed_10m_p75",
+                ("wind_speed_10m", 100) => "wind_speed_10m_p100",
+                ("wind_speed_850hpa", 0) => "wind_speed_850hpa_p00",
+                ("wind_speed_850hpa", 25) => "wind_speed_850hpa_p25",
+                ("wind_speed_850hpa", 50) => "wind_speed_850hpa_p50",
+                ("wind_speed_850hpa", 75) => "wind_speed_850hpa_p75",
+                ("wind_speed_850hpa", 100) => "wind_speed_850hpa_p100",
+                ("wind_speed_250hpa", 0) => "wind_speed_250hpa_p00",
+                ("wind_speed_250hpa", 25) => "wind_speed_250hpa_p25",
+                ("wind_speed_250hpa", 50) => "wind_speed_250hpa_p50",
+                ("wind_speed_250hpa", 75) => "wind_speed_250hpa_p75",
+                ("wind_speed_250hpa", 100) => "wind_speed_250hpa_p100",
+                ("wind_gust_10m", 0) => "wind_gust_10m_p00",
+                ("wind_gust_10m", 25) => "wind_gust_10m_p25",
+                ("wind_gust_10m", 50) => "wind_gust_10m_p50",
+                ("wind_gust_10m", 75) => "wind_gust_10m_p75",
+                ("wind_gust_10m", 100) => "wind_gust_10m_p100",
+                ("cloud_cover_total", 0) => "cloud_cover_total_p00",
+                ("cloud_cover_total", 25) => "cloud_cover_total_p25",
+                ("cloud_cover_total", 50) => "cloud_cover_total_p50",
+                ("cloud_cover_total", 75) => "cloud_cover_total_p75",
+                ("cloud_cover_total", 100) => "cloud_cover_total_p100",
+                _ => unreachable!("complete CMA GEPS percentile name table"),
+            };
+            plan.push((name, selector.with_percentile(percentile)));
+        }
+    }
+
+    for (threshold_milli, name) in [
+        (10_000, "wind_speed_10m_probability_gt_10ms"),
+        (15_000, "wind_speed_10m_probability_gt_15ms"),
+        (20_000, "wind_speed_10m_probability_gt_20ms"),
+        (25_000, "wind_speed_10m_probability_gt_25ms"),
+    ] {
+        plan.push((
+            name,
+            FieldSelector::height_agl(CanonicalField::WindSpeed, 10).with_probability(
+                ProbabilitySelection::new(Some(3), Some(threshold_milli), None),
+            ),
+        ));
+    }
+    for (threshold_milli, name) in [
+        (15_000, "wind_gust_10m_probability_gt_15ms"),
+        (25_000, "wind_gust_10m_probability_gt_25ms"),
+        (35_000, "wind_gust_10m_probability_gt_35ms"),
+    ] {
+        plan.push((
+            name,
+            FieldSelector::height_agl(CanonicalField::WindGust, 10).with_probability(
+                ProbabilitySelection::new(Some(3), Some(threshold_milli), None),
+            ),
+        ));
+    }
+
+    for percentile in PERCENTILES {
+        let name = match percentile {
+            0 => "apcp_run_total_p00",
+            25 => "apcp_run_total_p25",
+            50 => "apcp_run_total_p50",
+            75 => "apcp_run_total_p75",
+            100 => "apcp_run_total_p100",
+            _ => unreachable!("fixed CMA GEPS percentile list"),
+        };
+        plan.push((
+            name,
+            FieldSelector::surface(CanonicalField::TotalPrecipitation).with_percentile(percentile),
+        ));
+    }
+    for (threshold_milli, name) in [
+        (1_000, "apcp_run_total_probability_gt_1mm"),
+        (5_000, "apcp_run_total_probability_gt_5mm"),
+        (10_000, "apcp_run_total_probability_gt_10mm"),
+        (25_000, "apcp_run_total_probability_gt_25mm"),
+        (50_000, "apcp_run_total_probability_gt_50mm"),
+        (100_000, "apcp_run_total_probability_gt_100mm"),
+    ] {
+        plan.push((
+            name,
+            FieldSelector::surface(CanonicalField::TotalPrecipitation).with_probability(
+                ProbabilitySelection::new(Some(3), Some(threshold_milli), None),
+            ),
+        ));
+    }
+    plan
+}
+
+/// Union of every stable direct-field name accepted by an ingest profile.
+/// Model-specific execution uses [`model_surface_plan`] so adding a provider
+/// statistics family does not inflate existing deterministic model stores.
+pub fn surface_plan() -> Vec<(&'static str, FieldSelector)> {
+    let mut plan = base_surface_plan();
+    plan.extend(cma_geps_statistics_surface_plan());
+    plan
+}
+
+pub fn model_surface_plan(model: ModelId) -> Vec<(&'static str, FieldSelector)> {
+    if model == ModelId::CmaGeps {
+        cma_geps_statistics_surface_plan()
+    } else {
+        base_surface_plan()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,13 +798,65 @@ mod tests {
         assert_eq!(
             surface.surface_fields,
             FieldSet::Named(
-                surface_plan()
+                base_surface_plan()
                     .into_iter()
                     .map(|(name, _)| name.to_string())
                     .collect()
             )
         );
         surface.validate().expect("surface preset validates");
+    }
+
+    #[test]
+    fn cma_geps_plan_is_an_exact_provider_statistics_inventory() {
+        use rustwx_core::{CanonicalField, FieldProduct, ProbabilitySelection, VerticalSelector};
+
+        let plan = model_surface_plan(ModelId::CmaGeps);
+        assert_eq!(plan.len(), 57);
+        let unique_names = plan
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique_names.len(), plan.len());
+        assert!(
+            plan.iter()
+                .all(|(_, selector)| selector.product != FieldProduct::Default),
+            "the CMA lane must never imply deterministic/raw-member fields"
+        );
+        assert!(plan.contains(&(
+            "temperature_2m_p50",
+            FieldSelector::height_agl(CanonicalField::Temperature, 2).with_percentile(50),
+        )));
+        assert!(plan.contains(&(
+            "cloud_cover_total_p100",
+            FieldSelector::surface(CanonicalField::TotalCloudCover).with_percentile(100),
+        )));
+        assert!(
+            plan.contains(&(
+                "wind_speed_10m_probability_gt_15ms",
+                FieldSelector::height_agl(CanonicalField::WindSpeed, 10)
+                    .with_probability(ProbabilitySelection::new(Some(3), Some(15_000), None)),
+            ))
+        );
+        assert!(plan.iter().any(|(name, selector)| {
+            *name == "wind_speed_850hpa_p25"
+                && selector.vertical == VerticalSelector::IsobaricHpa(850)
+                && selector.product == FieldProduct::Percentile(25)
+        }));
+        assert_eq!(
+            model_surface_plan(ModelId::Hrrr).len(),
+            base_surface_plan().len()
+        );
+
+        let cma_surface = IngestProfile::surface_for_model(ModelId::CmaGeps);
+        assert_eq!(
+            cma_surface.surface_fields,
+            FieldSet::Named(plan.iter().map(|(name, _)| (*name).to_string()).collect())
+        );
+        assert!(matches!(
+            IngestProfile::surface().surface_fields,
+            FieldSet::Named(ref names) if names.len() == 26
+        ));
     }
 
     #[test]
@@ -722,6 +984,21 @@ mod tests {
         )
         .expect("full --no-derived --no-heavy resolves");
         assert!(!profile.derived && !profile.heavy);
+
+        let cma_surface =
+            resolve_profile_for_model("surface", &ProfileOverrides::default(), ModelId::CmaGeps)
+                .expect("CMA surface profile resolves to its provider statistics");
+        assert!(matches!(
+            cma_surface.surface_fields,
+            FieldSet::Named(ref names) if names.len() == 57
+        ));
+        let hrrr_surface =
+            resolve_profile_for_model("surface", &ProfileOverrides::default(), ModelId::Hrrr)
+                .expect("deterministic surface profile keeps the base inventory");
+        assert!(matches!(
+            hrrr_surface.surface_fields,
+            FieldSet::Named(ref names) if names.len() == 26
+        ));
     }
 
     #[test]

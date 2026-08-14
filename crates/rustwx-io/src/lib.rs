@@ -2986,7 +2986,7 @@ fn time_value_to_hours(unit: u8, value: u32) -> Option<u32> {
 }
 
 fn product_template_match_score(selector: FieldSelector, message: &Grib2Message) -> Option<u8> {
-    match selector.product {
+    let score = match selector.product {
         FieldProduct::Default => default_product_template_match_score(selector, message),
         FieldProduct::EnsembleMean => derived_forecast_match_score(message, &[0, 1]),
         FieldProduct::EnsembleStandardDeviation => derived_forecast_match_score(message, &[2, 3]),
@@ -2995,6 +2995,21 @@ fn product_template_match_score(selector: FieldSelector, message: &Grib2Message)
         FieldProduct::EnsembleMaximum => derived_forecast_match_score(message, &[9]),
         FieldProduct::Percentile(percentile) => percentile_product_match_score(message, percentile),
         FieldProduct::Probability(selection) => probability_product_match_score(message, selection),
+    }?;
+    if selector.field == CanonicalField::TotalPrecipitation
+        && selector.product != FieldProduct::Default
+        && matches!(message.product.template, 9 | 10)
+    {
+        // Provider-statistics files may carry both 0→h run totals and
+        // trailing windows ending at h for the same percentile/probability.
+        // Keep the established APCP convention independent of file order.
+        let starts_at_run_start = time_value_to_hours(
+            message.product.time_range_unit,
+            message.product.forecast_time,
+        ) == Some(0);
+        Some(score.saturating_add(if starts_at_run_start { 0 } else { 2 }))
+    } else {
+        Some(score)
     }
 }
 
@@ -3283,6 +3298,15 @@ impl TryFrom<FieldSelector> for StructuredMessageSelector {
                 units: "m/s",
             }),
             FieldSelector {
+                field: CanonicalField::WindSpeed,
+                vertical: VerticalSelector::IsobaricHpa(level_hpa),
+                ..
+            } if is_supported_upper_air_level(level_hpa) => Ok(Self {
+                parameters: PARAMETER_WIND_SPEED,
+                level: LevelMatch::IsobaricHpa(level_hpa),
+                units: "m/s",
+            }),
+            FieldSelector {
                 field: CanonicalField::UWind,
                 vertical: VerticalSelector::HeightAboveGroundMeters(10),
                 ..
@@ -3382,6 +3406,15 @@ impl TryFrom<FieldSelector> for StructuredMessageSelector {
             } => Ok(Self {
                 parameters: PARAMETER_TOTAL_CLOUD_COVER,
                 level: LevelMatch::EntireAtmosphere,
+                units: "%",
+            }),
+            FieldSelector {
+                field: CanonicalField::TotalCloudCover,
+                vertical: VerticalSelector::Surface,
+                ..
+            } => Ok(Self {
+                parameters: PARAMETER_TOTAL_CLOUD_COVER,
+                level: LevelMatch::Surface,
                 units: "%",
             }),
             FieldSelector {

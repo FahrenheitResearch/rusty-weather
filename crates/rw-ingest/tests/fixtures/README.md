@@ -86,3 +86,18 @@ dewpoint or orography. Capability metadata therefore disables derived/heavy
 products for these lanes until a verified static/surface join exists. The
 specific-humidity (`SPFH`/`q`) conversion did realize canonical pressure-level
 dewpoint byte paths for all four AI/IFS lanes.
+
+## CMA provider-statistics live verification (2026-08-14)
+
+The official CMA GRAPES GEPS 2026-08-13 00z f024 WIS2 object was acquired as
+one bounded 76,819,073-byte lead file:
+
+`https://wis2node.wis.cma.cn/data/2026-08-13/wis/urn:wmo:md:cn-cma:data.core.weather.prediction.forecast.medium-range.probabilistic.global/Z_NAFP_C_BABJ_20260813000000_P_CMA-WIPPSGEPS-GLB-024.grib2`
+
+Its observed SHA-256 was
+`51b65f13f8d2d0cbb250c99786437d15db8cd1e775fd9c641ac75f5939a31ee1`.
+The model-specific surface-statistics profile realized all 57 declared
+provider products bit-exactly and `rws validate --deep` passed at 57 variables,
+1,026 chunks, and 134,659,235 payload bytes. This proof covers provider-produced
+means/spreads, percentiles, and probabilities only; it does not claim raw
+ensemble members or undocumented local CMA parameters.

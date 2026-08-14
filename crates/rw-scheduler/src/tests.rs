@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
 use rustwx_core::{CycleSpec, GridShape, LatLonGrid, ModelId, SourceId};
+use rw_ingest::ingest_profile::FieldSet;
 use rw_store::RwsExactTime;
 use rw_store::format::RwsWriterInfo;
 use rw_store::ingest::{DerivedFieldInput, write_hour_from_grid_with_derived_exact};
@@ -464,6 +465,7 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
     let expanded = all.expanded_models().unwrap();
     assert!(expanded.contains(&ModelId::Hrrr));
     assert!(expanded.contains(&ModelId::Rtma));
+    assert!(expanded.contains(&ModelId::CmaGeps));
 
     let surface = scheduler_config("surface-profile", &["hiresw"]);
     let profile = surface.profile_for(ModelId::Hiresw).unwrap();
@@ -477,6 +479,39 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
     assert!(!profile.needs_prs());
     assert!(profile.includes_surface_field("apcp_run_total"));
     assert!(profile.includes_surface_field("pwat"));
+
+    let cma_geps = scheduler_config("cma-geps-statistics-profile", &["cma-geps"]);
+    let profile = cma_geps.profile_for(ModelId::CmaGeps).unwrap();
+    assert!(!profile.needs_prs());
+    assert!(!profile.derived && !profile.heavy);
+    assert!(matches!(
+        profile.surface_fields,
+        FieldSet::Named(ref names) if names.len() == 57
+    ));
+    assert!(profile.includes_surface_field("temperature_2m_p50"));
+    assert!(profile.includes_surface_field("wind_speed_10m_probability_gt_15ms"));
+    let plan = JobPlan::build_with_profile_and_source(
+        ModelId::CmaGeps,
+        cycle("20260731", 0),
+        &profile,
+        Some(SourceId::Cma),
+    )
+    .expect("CMA provider-statistics lane is schedulable");
+    assert_eq!(
+        plan.ingest_profile.to_profile().unwrap().surface_fields,
+        profile.surface_fields
+    );
+    assert_eq!(plan.expected_valid_times.len(), 74);
+    assert_eq!(
+        plan.expected_valid_times
+            .last()
+            .map(|time| time.forecast_hour),
+        Some(360)
+    );
+    assert!(
+        plan.capability_limitations
+            .contains(&"provider_statistics_only".to_string())
+    );
 
     let mut unsafe_surface = scheduler_config("unsafe-surface-profile", &["hiresw"]);
     unsafe_surface
@@ -1089,7 +1124,7 @@ fn every_ready_model_has_a_valid_cadence_profile_and_remote_source() {
         );
         plan.validate().unwrap();
     }
-    assert_eq!(ready, 22);
+    assert_eq!(ready, 23);
 }
 
 #[test]

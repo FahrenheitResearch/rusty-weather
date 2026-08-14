@@ -176,6 +176,7 @@ pub enum ApiIngestCapabilityLimitation {
     AnalysisOnly,
     SurfaceOnly,
     EnsembleMeanOnly,
+    ProviderStatisticsOnly,
     EnsembleControlMemberOnly,
     SparsePressureLevels,
     DerivedProductsDisabled,
@@ -189,6 +190,7 @@ impl From<IngestCapabilityLimitation> for ApiIngestCapabilityLimitation {
             IngestCapabilityLimitation::AnalysisOnly => Self::AnalysisOnly,
             IngestCapabilityLimitation::SurfaceOnly => Self::SurfaceOnly,
             IngestCapabilityLimitation::EnsembleMeanOnly => Self::EnsembleMeanOnly,
+            IngestCapabilityLimitation::ProviderStatisticsOnly => Self::ProviderStatisticsOnly,
             IngestCapabilityLimitation::EnsembleControlMemberOnly => {
                 Self::EnsembleControlMemberOnly
             }
@@ -203,7 +205,7 @@ impl From<IngestCapabilityLimitation> for ApiIngestCapabilityLimitation {
 fn provider_attributions(
     summary: &rustwx_models::ModelSummary,
 ) -> Vec<ProviderAttributionResponse> {
-    let mut attributions = Vec::with_capacity(3);
+    let mut attributions = Vec::with_capacity(4);
     if summary
         .sources
         .iter()
@@ -225,6 +227,13 @@ fn provider_attributions(
         .any(|source| source.id == SourceId::Eccc)
     {
         attributions.push(rw_query::eccc_provider_attribution().into());
+    }
+    if summary
+        .sources
+        .iter()
+        .any(|source| source.id == SourceId::Cma)
+    {
+        attributions.push(rw_query::cma_provider_attribution().into());
     }
     attributions
 }
@@ -6391,6 +6400,56 @@ mod tests {
                     .contains("not an official NOAA/NWS product")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn model_catalog_exposes_cma_statistics_scope_and_wmo_policy() {
+        let (_directory, app) = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let model = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["id"] == "cma-geps")
+            .expect("CMA GEPS capability");
+        assert_eq!(model["verification"], "live_verified");
+        assert_eq!(
+            model["limitations"],
+            serde_json::json!([
+                "provider_statistics_only",
+                "sparse_pressure_levels",
+                "derived_products_disabled"
+            ])
+        );
+        let attribution = &model["provider_attributions"][0];
+        assert_eq!(
+            attribution["provider"],
+            "China Meteorological Administration (CMA)"
+        );
+        assert!(
+            attribution["license"]
+                .as_str()
+                .unwrap()
+                .contains("WMO Unified Data Policy")
+        );
+        assert!(
+            attribution["modification_notice"]
+                .as_str()
+                .unwrap()
+                .contains("not an official CMA product")
+        );
     }
 
     #[tokio::test]

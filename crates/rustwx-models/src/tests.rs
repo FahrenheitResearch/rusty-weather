@@ -90,8 +90,10 @@ fn provider_probe_agent_times_out_a_stalled_response_offline() {
 
 #[test]
 fn built_in_models_are_real() {
-    assert_eq!(built_in_models().len(), 24);
+    assert_eq!(built_in_models().len(), 25);
     assert_eq!(model_summary(ModelId::Gdps).default_product, "rws-surface");
+    assert_eq!(model_summary(ModelId::CmaGeps).default_product, "stats");
+    assert_eq!(model_summary(ModelId::CmaGeps).max_forecast_hour, 360);
     assert_eq!(model_summary(ModelId::HrrrAk).default_product, "sfc");
     assert_eq!(model_summary(ModelId::Gdas).default_product, "pgrb2.0p25");
     assert_eq!(
@@ -144,6 +146,7 @@ fn catalog_exposes_the_user_facing_supported_models() {
         ModelId::Rap,
         ModelId::Gfs,
         ModelId::Gdps,
+        ModelId::CmaGeps,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -624,7 +627,7 @@ fn temperature_700_recipe_tracks_model_support() {
             let reason = &blockers[0].reason;
             if matches!(model, ModelId::Rtma | ModelId::Urma | ModelId::Nbm) {
                 assert!(reason.contains("surface/core grids"));
-            } else if model == ModelId::Gdps {
+            } else if matches!(model, ModelId::Gdps | ModelId::CmaGeps) {
                 assert!(reason.contains("normalized RWS ingest/query"));
             } else if model == ModelId::Href {
                 assert!(reason.contains("limited to explicit `href_sprd_*`"));
@@ -636,6 +639,9 @@ fn temperature_700_recipe_tracks_model_support() {
             match model {
                 ModelId::Gdps => {
                     assert!(reason.contains("Datamart per-field component bundle"));
+                }
+                ModelId::CmaGeps => {
+                    assert!(reason.contains("provider-specific acquisition contract"));
                 }
                 ModelId::EcmwfOpenData | ModelId::WrfGdex => {
                     assert!(reason.contains("whole-file structured extraction"));
@@ -982,6 +988,35 @@ fn gdps_cadence_and_component_urls_match_the_msc_datamart_contract() {
             Err(ModelError::UnsupportedProduct { .. })
         ));
     }
+}
+
+#[test]
+fn cma_geps_cadence_and_urls_match_the_wis2_core_data_contract() {
+    let hours = supported_forecast_hours(ModelId::CmaGeps, 0);
+    for published in [0, 3, 78, 84, 90, 360] {
+        assert!(hours.contains(&published), "f{published:03} should exist");
+    }
+    for absent in [1, 79, 81, 87, 359, 361] {
+        assert!(!hours.contains(&absent), "f{absent:03} is off cadence");
+    }
+    assert!(supported_forecast_hours(ModelId::CmaGeps, 6).is_empty());
+
+    let cycle = rustwx_core::CycleSpec::new("20260813", 12).unwrap();
+    let request = ModelRunRequest::new(ModelId::CmaGeps, cycle.clone(), 84, "stats").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::Cma, &request).unwrap(),
+        "https://wis2node.wis.cma.cn/data/2026-08-13/wis/urn:wmo:md:cn-cma:data.core.weather.prediction.forecast.medium-range.probabilistic.global/Z_NAFP_C_BABJ_20260813120000_P_CMA-WIPPSGEPS-GLB-084.grib2"
+    );
+    let bad_product = ModelRunRequest::new(ModelId::CmaGeps, cycle.clone(), 84, "members").unwrap();
+    assert!(matches!(
+        build_grib_url(SourceId::Cma, &bad_product),
+        Err(ModelError::UnsupportedProduct { .. })
+    ));
+    let off_cadence = ModelRunRequest::new(ModelId::CmaGeps, cycle, 81, "stats").unwrap();
+    assert!(matches!(
+        build_grib_url(SourceId::Cma, &off_cadence),
+        Err(ModelError::UnsupportedForecastHour { .. })
+    ));
 }
 
 #[test]

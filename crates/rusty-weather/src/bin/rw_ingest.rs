@@ -3,7 +3,7 @@
 //! `src/ingest_hour.rs` for the full fetch/extract/derive/write story —
 //! `rw_batch` pipelines the same flow across hours).
 //!
-//! Profiles (`--profile full|sounding|view|analysis` plus the composable
+//! Profiles (`--profile full|sounding|view|surface|analysis` plus the composable
 //! `--level-step/--no-derived/--heavy/--no-heavy` overrides) choose what
 //! each hour fetches, extracts, computes, and stores; `--estimate` prices
 //! the planned ingest (per-variable breakdown + store/download totals)
@@ -15,7 +15,7 @@ use clap::Parser;
 use rustwx_core::{CycleSpec, ModelId, SourceId};
 use rustwx_products::cache::{default_proof_cache_dir, ensure_dir};
 
-use rw_ingest::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile};
+use rw_ingest::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile_for_model};
 use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate};
 use rw_ingest::throttle;
 use rw_ingest::{IngestConfig, NEVER_CANCEL, cache_state, parse_hours, print_event};
@@ -98,6 +98,7 @@ struct Args {
         default_value = "full",
         help = "Ingest profile: full (everything, today's default), sounding (5 volumes + 7 \
                 surface fields, no compute stages), view (all 2D incl. derived, no volumes), \
+                surface (all direct 2D fields published by this model), \
                 analysis (RTMA/URMA surface fields only)"
     )]
     profile: String,
@@ -171,7 +172,7 @@ fn profile_from_args(args: &Args) -> Result<IngestProfile, String> {
             None
         },
     };
-    resolve_profile(&args.profile, &overrides)
+    resolve_profile_for_model(&args.profile, &overrides, args.model)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

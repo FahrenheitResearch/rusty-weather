@@ -129,6 +129,10 @@ pub enum IngestCapabilityLimitation {
     /// Only the post-processed ensemble mean is ingested, not individual
     /// members, spread, probability, PMM/LPMM, or other statistics.
     EnsembleMeanOnly,
+    /// The provider publishes derived ensemble statistics rather than raw
+    /// member state. The RWS lane preserves the explicitly identified mean,
+    /// spread, percentile, and probability products only.
+    ProviderStatisticsOnly,
     /// The fetch plan ingests the unperturbed/control member only. The
     /// upstream ensemble also publishes perturbed members and statistics,
     /// but they are not represented by this RWS lane.
@@ -154,6 +158,7 @@ impl IngestCapabilityLimitation {
             Self::AnalysisOnly => "analysis_only",
             Self::SurfaceOnly => "surface_only",
             Self::EnsembleMeanOnly => "ensemble_mean_only",
+            Self::ProviderStatisticsOnly => "provider_statistics_only",
             Self::EnsembleControlMemberOnly => "ensemble_control_member_only",
             Self::SparsePressureLevels => "sparse_pressure_levels",
             Self::DerivedProductsDisabled => "derived_products_disabled",
@@ -227,6 +232,12 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
                 idx_patterns: &[],
             },
         ]),
+        ModelId::CmaGeps => Ok(vec![ProductFetch {
+            product: "stats",
+            surface_source: true,
+            pressure_source: false,
+            idx_patterns: &[],
+        }]),
         ModelId::Gefs => Ok(vec![ProductFetch {
             product: "pgrb2ap5/gec00",
             surface_source: true,
@@ -808,6 +819,11 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
         rustwx_core::ModelId::Gdps => {
             vec![IngestCapabilityLimitation::SparsePressureLevels]
         }
+        rustwx_core::ModelId::CmaGeps => vec![
+            IngestCapabilityLimitation::ProviderStatisticsOnly,
+            IngestCapabilityLimitation::SparsePressureLevels,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+        ],
         _ => Vec::new(),
     };
     match fetch_plan(model) {
@@ -816,6 +832,7 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 rustwx_core::ModelId::Hrrr
                 | rustwx_core::ModelId::Gfs
                 | rustwx_core::ModelId::Gdps
+                | rustwx_core::ModelId::CmaGeps
                 | rustwx_core::ModelId::Rap
                 | rustwx_core::ModelId::Nam
                 | rustwx_core::ModelId::RrfsA
@@ -921,6 +938,7 @@ mod tests {
             ModelId::Rap,
             ModelId::Gfs,
             ModelId::Gdps,
+            ModelId::CmaGeps,
             ModelId::Gdas,
             ModelId::Gefs,
             ModelId::Aigfs,
@@ -1002,6 +1020,20 @@ mod tests {
             gefs.limitations,
             vec![
                 IngestCapabilityLimitation::EnsembleControlMemberOnly,
+                IngestCapabilityLimitation::SparsePressureLevels,
+                IngestCapabilityLimitation::DerivedProductsDisabled,
+            ]
+        );
+
+        let cma_geps = model_ingest_capability(ModelId::CmaGeps);
+        assert_eq!(cma_geps.status, IngestSupportStatus::Ready);
+        assert_eq!(cma_geps.verification, IngestVerificationLevel::LiveVerified);
+        assert_eq!(cma_geps.products.len(), 1);
+        assert_eq!(cma_geps.products[0].product, "stats");
+        assert_eq!(
+            cma_geps.limitations,
+            vec![
+                IngestCapabilityLimitation::ProviderStatisticsOnly,
                 IngestCapabilityLimitation::SparsePressureLevels,
                 IngestCapabilityLimitation::DerivedProductsDisabled,
             ]
@@ -1144,6 +1176,7 @@ mod tests {
                 ModelId::HrrrAk,
                 ModelId::Gfs,
                 ModelId::Gdps,
+                ModelId::CmaGeps,
                 ModelId::Gdas,
                 ModelId::Gefs,
                 ModelId::Aigfs,
@@ -1190,6 +1223,7 @@ mod tests {
             ModelId::Gfs,
             ModelId::Gdas,
             ModelId::Nam,
+            ModelId::CmaGeps,
         ] {
             for entry in fetch_plan(model).expect("plan") {
                 assert!(

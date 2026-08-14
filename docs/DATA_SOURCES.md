@@ -74,6 +74,24 @@ For all packaged NOAA lanes:
 - cycle cadence and product scope are model-specific and are published through
   `/v1/models` and MODEL_SUPPORT.md rather than duplicated here.
 
+## CMA GRAPES GEPS through WIS2
+
+The `cma-wis2-core-data` lane reads CMA GRAPES GEPS v1.3 objects directly from
+the China Meteorological Administration's WIS2 node. CMA's authoritative
+[WCMP2 discovery record](https://wis2node.wis.cma.cn/oapi/collections/discovery-metadata/items/urn%3Awmo%3Amd%3Acn-cma%3Adata.core.weather.prediction.forecast.medium-range.probabilistic.global?f=json)
+declares the dataset as `wmo:dataPolicy=core`; reuse policy is governed by the
+[WMO Unified Data Policy](https://public.wmo.int/wmo-unified-data-policy-resolution-res1).
+A WIS2 Global Cache is a transport mirror, not a different producer or
+licensor.
+
+The packaged lane is anonymous and bounded to one global 0.25-degree lead
+object at a time. It preserves only scientifically identified provider-created
+mean/spread, percentile, and probability products. It does not infer the 31 raw
+members, decode undocumented local parameters, or relabel a statistic as a
+deterministic field. Stores and API responses identify CMA as the producer,
+retain the WIS2/WMO policy references, state that Rusty Weather transformed the
+data, and must not be represented as an official CMA product.
+
 ## ECMWF Open Data (IFS and AIFS)
 
 The public ECMWF lane uses the provider's

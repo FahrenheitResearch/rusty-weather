@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     for (index, message) in grib.messages.iter().enumerate() {
         println!(
-            "{index:04} d/c/n={}/{}/{} {:<36} level={}:{} ({}) grid={} {}x{} flags=0x{:02x} data_rep={} pdt={}",
+            "{index:04} d/c/n={}/{}/{} {:<36} level={}:{} ({}) grid={} {}x{} flags=0x{:02x} data_rep={} pdt={} forecast={}/{} ensemble={:?}/{:?}/{:?} derived={:?} percentile={:?} probability={:?}/{:?}/{:?}/{:?} statistics={:?}/{:?}/{:?}",
             message.discipline,
             message.product.parameter_category,
             message.product.parameter_number,
@@ -40,6 +40,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             message.grid.resolution_flags,
             message.data_rep.template,
             message.product.template,
+            message.product.forecast_time,
+            message.product.time_range_unit,
+            message.product.ensemble_type,
+            message.product.perturbation_number,
+            message.product.num_forecasts_in_ensemble,
+            message.product.derived_forecast_type,
+            message.product.percentile_value,
+            message.product.probability_number,
+            message.product.total_number_of_probabilities,
+            message.product.probability_type,
+            (
+                message.product.probability_lower_limit,
+                message.product.probability_upper_limit,
+            ),
+            message.product.statistical_process_type,
+            message.product.statistical_time_range_unit,
+            message.product.time_range_length,
         );
     }
     Ok(())

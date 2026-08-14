@@ -80,7 +80,7 @@ pub mod size_estimate;
 use crate::events::{IngestError, IngestEvent, IngestStage, other};
 use crate::{fetch_plan, profile_scope, validate_ingest_profile_for_model};
 use ingest_compute::DerivedGrid2D;
-use ingest_profile::{IngestProfile, VolumeChoice, surface_plan};
+use ingest_profile::{IngestProfile, VolumeChoice, model_surface_plan};
 
 /// The volume plan under one profile: `(field, store name)` pairs in the
 /// stable full-ingest order. Dewpoint falls back to RelativeHumidity
@@ -812,6 +812,7 @@ fn safe_provider_identity(source: SourceId) -> &'static str {
         SourceId::Azure => "noaa-microsoft-azure-public-data",
         SourceId::Ecmwf => "ecmwf-open-data",
         SourceId::Eccc => "eccc-msc-datamart",
+        SourceId::Cma => "cma-wis2-core-data",
         SourceId::Ncei => "noaa-ncei",
         SourceId::Gdex => "ucar-gdex",
         SourceId::AifsInference => "local-aifs-inference",
@@ -1147,7 +1148,7 @@ pub fn process_fetched_hour(
         hour,
         stage: IngestStage::ExtractSfc,
     });
-    let surface_plan: Vec<(&'static str, FieldSelector)> = surface_plan()
+    let surface_plan: Vec<(&'static str, FieldSelector)> = model_surface_plan(config.model)
         .into_iter()
         .filter(|(name, _)| profile.includes_surface_field(name))
         .map(|(name, selector)| (name, ingest_selector(config.model, selector)))
@@ -1984,7 +1985,7 @@ pub fn planned_store_variables(profile: &IngestProfile, model: ModelId) -> Plann
         .iter()
         .map(|(_, name)| (*name, level_count))
         .collect();
-    let mut fields_2d: Vec<String> = surface_plan()
+    let mut fields_2d: Vec<String> = model_surface_plan(model)
         .iter()
         .filter(|(name, _)| profile.includes_surface_field(name))
         .map(|(name, _)| stored_surface_field_name(model, name).to_string())
@@ -2116,6 +2117,9 @@ fn forecast_hour_cadence_note(model: ModelId, cycle_hour_utc: u8, max: u16) -> S
         }
         ModelId::Gfs => "GFS is hourly to f120, then 3-hourly to f384".to_string(),
         ModelId::Gdas => "GDAS is hourly to f009".to_string(),
+        ModelId::CmaGeps => {
+            "CMA GRAPES GEPS statistics are 3-hourly to f078, then 6-hourly to f360".to_string()
+        }
         ModelId::Gefs => {
             if cycle_hour_utc == 0 {
                 "GEFS is 3-hourly to f240, then 6-hourly to f840 on the 00z cycle".to_string()
@@ -2387,7 +2391,7 @@ mod tests {
         let model = ModelId::Hrrr;
         // (name, selector) for every planned 2D variable, mirroring
         // `process_fetched_hour`'s stored selectors exactly.
-        let mut planned: Vec<(String, FieldSelector)> = surface_plan()
+        let mut planned: Vec<(String, FieldSelector)> = ingest_profile::model_surface_plan(model)
             .into_iter()
             .map(|(name, selector)| (name.to_string(), selector))
             .collect();

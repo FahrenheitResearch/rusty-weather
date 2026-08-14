@@ -47,7 +47,7 @@ use rustwx_models::model_summary;
 use rustwx_products::cache::{default_proof_cache_dir, ensure_dir};
 use rustwx_products::places::{PlaceLabelDensityTier, default_place_label_overlay_for_domain};
 use rustwx_products::shared_context::DomainSpec;
-use rw_ingest::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile};
+use rw_ingest::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile_for_model};
 use rw_ingest::throttle;
 use rw_ingest::{
     IngestConfig, IngestedHour, NEVER_CANCEL, SpilledFetchedHour, cache_state, parse_hours,
@@ -276,6 +276,7 @@ struct Args {
         default_value = "full",
         help = "Ingest profile: full (everything, today's default), sounding (5 volumes + 7 \
                 surface fields, no compute stages), view (all 2D incl. derived, no volumes), \
+                surface (all direct 2D fields published by this model), \
                 analysis (RTMA/URMA surface fields only). \
                 Products whose store variables a profile excludes skip at render"
     )]
@@ -342,7 +343,7 @@ fn profile_from_args(args: &Args) -> Result<IngestProfile, String> {
             None
         },
     };
-    resolve_profile(&args.profile, &overrides)
+    resolve_profile_for_model(&args.profile, &overrides, args.model)
 }
 
 /// Process-wide CPU time (kernel + user) in milliseconds.

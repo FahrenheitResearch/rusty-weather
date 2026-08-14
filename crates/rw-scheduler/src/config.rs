@@ -382,6 +382,11 @@ impl SchedulerConfig {
                 IngestProfile::analysis()
             } else if capability
                 .limitations
+                .contains(&IngestCapabilityLimitation::ProviderStatisticsOnly)
+            {
+                IngestProfile::surface_for_model(model)
+            } else if capability
+                .limitations
                 .contains(&IngestCapabilityLimitation::SurfaceOnly)
             {
                 IngestProfile::surface()
@@ -396,6 +401,8 @@ impl SchedulerConfig {
             } else {
                 IngestProfile::view()
             }
+        } else if requested == "surface" {
+            IngestProfile::surface_for_model(model)
         } else {
             IngestProfile::preset(requested).map_err(SchedulerError::InvalidConfig)?
         };
@@ -406,7 +413,9 @@ impl SchedulerConfig {
         let surface_only = capability.limitations.iter().any(|limitation| {
             matches!(
                 limitation,
-                IngestCapabilityLimitation::AnalysisOnly | IngestCapabilityLimitation::SurfaceOnly
+                IngestCapabilityLimitation::AnalysisOnly
+                    | IngestCapabilityLimitation::SurfaceOnly
+                    | IngestCapabilityLimitation::ProviderStatisticsOnly
             )
         });
         if surface_only && profile.needs_prs() {

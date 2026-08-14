@@ -1360,6 +1360,21 @@ fn structured_selector_matches_supported_upper_air_subset() {
     );
     assert!(wind_selector.matches(&wind_message));
 
+    let wind_speed_850 = StructuredMessageSelector::try_from(FieldSelector::isobaric(
+        CanonicalField::WindSpeed,
+        850,
+    ))
+    .unwrap();
+    let wind_speed_850_message = ieee_f32_message(
+        PARAMETER_WIND_SPEED[0],
+        100,
+        85_000.0,
+        &[21.0],
+        -99.0,
+        -99.0,
+    );
+    assert!(wind_speed_850.matches(&wind_speed_850_message));
+
     let temp_700 = StructuredMessageSelector::try_from(FieldSelector::isobaric(
         CanonicalField::Temperature,
         700,
@@ -1615,6 +1630,20 @@ fn structured_selector_matches_supported_upper_air_subset() {
         -99.0,
     );
     assert!(tcdc.matches(&tcdc_message));
+
+    let surface_tcdc = StructuredMessageSelector::try_from(FieldSelector::surface(
+        CanonicalField::TotalCloudCover,
+    ))
+    .unwrap();
+    let surface_tcdc_message = ieee_f32_message(
+        PARAMETER_TOTAL_CLOUD_COVER[0],
+        1,
+        0.0,
+        &[76.0],
+        -99.0,
+        -99.0,
+    );
+    assert!(surface_tcdc.matches(&surface_tcdc_message));
 
     let lcdc = StructuredMessageSelector::try_from(FieldSelector::entire_atmosphere(
         CanonicalField::LowCloudCover,
@@ -1995,6 +2024,74 @@ fn qpf_run_total_prefers_zero_start_accumulation_in_either_file_order() {
             vec![1.5],
             "the h-1 re-select must still pick the trailing window"
         );
+    }
+}
+
+#[test]
+fn statistical_qpf_run_totals_are_not_selected_by_file_order() {
+    let make_percentile = |start_hour: u32, length: u32, value: f32| {
+        let mut message = ieee_f32_message(
+            PARAMETER_TOTAL_PRECIPITATION[0],
+            1,
+            0.0,
+            &[value],
+            -99.0,
+            -99.0,
+        );
+        message.product.template = 10;
+        message.product.percentile_value = Some(50);
+        message.product.time_range_unit = 1;
+        message.product.forecast_time = start_hour;
+        message.product.statistical_time_range_unit = Some(1);
+        message.product.time_range_length = Some(length);
+        message
+    };
+    let make_probability = |start_hour: u32, length: u32, value: f32| {
+        let mut message = ieee_f32_message(
+            PARAMETER_TOTAL_PRECIPITATION[0],
+            1,
+            0.0,
+            &[value],
+            -99.0,
+            -99.0,
+        );
+        message.product.template = 9;
+        message.product.probability_type = Some(3);
+        message.product.probability_lower_limit = Some(10.0);
+        message.product.time_range_unit = 1;
+        message.product.forecast_time = start_hour;
+        message.product.statistical_time_range_unit = Some(1);
+        message.product.time_range_length = Some(length);
+        message
+    };
+
+    let cases = [
+        (
+            FieldSelector::surface(CanonicalField::TotalPrecipitation).with_percentile(50),
+            make_percentile(1, 1, 1.5),
+            make_percentile(0, 2, 9.0),
+            9.0,
+        ),
+        (
+            FieldSelector::surface(CanonicalField::TotalPrecipitation)
+                .with_probability(ProbabilitySelection::new(Some(3), Some(10_000), None)),
+            make_probability(1, 1, 15.0),
+            make_probability(0, 2, 75.0),
+            75.0,
+        ),
+    ];
+    for (selector, window, run_total, expected) in cases {
+        for messages in [
+            vec![window.clone(), run_total.clone()],
+            vec![run_total.clone(), window.clone()],
+        ] {
+            let grib = Grib2File { messages };
+            let picked = extract_fields_from_grib2_partial_at_forecast_hour(&grib, &[selector], 2)
+                .unwrap()
+                .extracted
+                .swap_remove(0);
+            assert_eq!(picked.values, vec![expected]);
+        }
     }
 }
 

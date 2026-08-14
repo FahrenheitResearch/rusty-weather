@@ -1714,6 +1714,7 @@ pub enum ModelId {
     HrrrAk,
     Gfs,
     Gdps,
+    CmaGeps,
     Gdas,
     Gefs,
     Aigfs,
@@ -1743,6 +1744,7 @@ impl ModelId {
             Self::HrrrAk => "hrrr-ak",
             Self::Gfs => "gfs",
             Self::Gdps => "gdps",
+            Self::CmaGeps => "cma-geps",
             Self::Gdas => "gdas",
             Self::Gefs => "gefs",
             Self::Aigfs => "aigfs",
@@ -1783,6 +1785,9 @@ impl std::str::FromStr for ModelId {
             "gfs" | "gfs-0p25" | "gfs_0p25" | "gfs-0.25" | "gfs_0.25" => Ok(Self::Gfs),
             "gdps" | "gem" | "gem-global" | "gem_global" | "cmc-gdps" | "cmc_gdps" => {
                 Ok(Self::Gdps)
+            }
+            "cma-geps" | "cma_geps" | "cmageps" | "grapes-geps" | "grapes_geps" => {
+                Ok(Self::CmaGeps)
             }
             "gdas" | "gdas-0p25" | "gdas_0p25" | "gdas-0.25" | "gdas_0.25" => Ok(Self::Gdas),
             "gefs" | "gefs-ens" | "gefs_ens" | "gefs-ensemble" => Ok(Self::Gefs),
@@ -1961,6 +1966,7 @@ pub enum SourceId {
     Azure,
     Ecmwf,
     Eccc,
+    Cma,
     Ncei,
     Gdex,
     /// Local NetCDF archive populated by an active AIFS-v2 inference/dissemination harness.
@@ -1980,6 +1986,7 @@ impl SourceId {
             Self::Azure => "azure",
             Self::Ecmwf => "ecmwf",
             Self::Eccc => "eccc",
+            Self::Cma => "cma",
             Self::Ncei => "ncei",
             Self::Gdex => "gdex",
             Self::AifsInference => "aifs-inference",
@@ -2005,6 +2012,7 @@ impl std::str::FromStr for SourceId {
             "azure" => Ok(Self::Azure),
             "ecmwf" => Ok(Self::Ecmwf),
             "eccc" | "msc" | "cmc" | "msc-datamart" | "msc_datamart" => Ok(Self::Eccc),
+            "cma" | "cma-wis2" | "cma_wis2" | "wis2-cma" | "wis2_cma" => Ok(Self::Cma),
             "ncei" => Ok(Self::Ncei),
             "gdex" => Ok(Self::Gdex),
             "aifs-inference" | "aifs_inference" | "aifsinference" | "inferenced-aifs"
