@@ -280,6 +280,57 @@ fn geps_plan_pins_published_statistics_profile_and_invariant_cadence() {
 }
 
 #[test]
+fn cptec_south_america_plans_pin_hourly_indexed_leads_and_source() {
+    for model in [ModelId::WrfCptec7km, ModelId::BramsCptec8km] {
+        let profile = IngestProfile::sounding();
+        let plan = JobPlan::build_with_profile_and_source(
+            model,
+            cycle("20260814", 0),
+            &profile,
+            Some(SourceId::Cptec),
+        )
+        .unwrap();
+        let expected_first = if model == ModelId::WrfCptec7km { 0 } else { 1 };
+        let expected_count = if model == ModelId::WrfCptec7km {
+            181
+        } else {
+            180
+        };
+        assert_eq!(plan.expected_valid_times.len(), expected_count, "{model}");
+        assert_eq!(
+            plan.expected_valid_times.first().unwrap().forecast_hour,
+            expected_first
+        );
+        assert_eq!(plan.expected_valid_times.last().unwrap().forecast_hour, 180);
+        assert_eq!(plan.ingest_products.len(), 1);
+        assert_eq!(plan.ingest_products[0].product, "raw");
+        assert!(plan.ingest_products[0].surface_source);
+        assert!(plan.ingest_products[0].pressure_source);
+        assert!(!plan.ingest_products[0].idx_patterns.is_empty());
+        assert_eq!(plan.source_override, Some(SourceId::Cptec));
+        assert_eq!(
+            plan.capability_limitations,
+            vec![
+                "sparse_pressure_levels".to_string(),
+                "derived_products_disabled".to_string(),
+            ]
+        );
+        plan.validate().unwrap();
+
+        assert!(JobPlan::build(model, cycle("20260814", 6)).is_err());
+        assert!(
+            JobPlan::build_with_profile_and_source(
+                model,
+                cycle("20260814", 0),
+                &profile,
+                Some(SourceId::Nomads),
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn plan_rejects_a_cycle_the_model_does_not_publish() {
     let error = JobPlan::build(ModelId::Gfs, cycle("20260731", 1)).unwrap_err();
     assert!(matches!(
@@ -1290,7 +1341,7 @@ fn every_ready_model_has_a_valid_cadence_profile_and_remote_source() {
         );
         plan.validate().unwrap();
     }
-    assert_eq!(ready, 30);
+    assert_eq!(ready, 32);
 }
 
 #[test]

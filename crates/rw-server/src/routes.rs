@@ -263,6 +263,13 @@ fn provider_attributions(
     }) {
         attributions.push(rw_query::roshydromet_provider_attribution().into());
     }
+    if summary
+        .sources
+        .iter()
+        .any(|source| source.id == SourceId::Cptec)
+    {
+        attributions.push(rw_query::cptec_provider_attribution().into());
+    }
     attributions
 }
 
@@ -4747,7 +4754,7 @@ mod tests {
         let body = to_bytes(allowed.into_body(), 1024 * 1024).await.unwrap();
         let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let models = models.as_array().expect("models response must be an array");
-        assert_eq!(models.len(), 31);
+        assert_eq!(models.len(), 33);
         assert!(models.iter().all(|model| model["id"] != "rrfs-firewx"));
         let wrf = models
             .iter()
@@ -4878,6 +4885,40 @@ mod tests {
             icon_ru["provider_attributions"][0]["notice"],
             "Data source: Roshydromet WIPPS Designated Centre Moscow, distributed through WIS2."
         );
+
+        for id in ["wrf-cptec-7km", "brams-cptec-8km"] {
+            let cptec = model(id);
+            assert_eq!(cptec["ingest_status"], "ready");
+            assert_eq!(cptec["verification"], "live_verified");
+            assert_eq!(cptec["cycle_hours_utc"], serde_json::json!([0]));
+            assert_eq!(cptec["max_forecast_hour"], 180);
+            assert_eq!(
+                cptec["limitations"],
+                serde_json::json!(["sparse_pressure_levels", "derived_products_disabled"])
+            );
+            assert_eq!(cptec["products"][0]["product"], "raw");
+            assert_eq!(cptec["products"][0]["surface_source"], true);
+            assert_eq!(cptec["products"][0]["pressure_source"], true);
+            assert_eq!(cptec["products"][0]["indexed_subset"], true);
+            assert!(
+                cptec["provider_attributions"][0]["provider"]
+                    .as_str()
+                    .unwrap()
+                    .contains("CPTEC")
+            );
+            assert!(
+                cptec["provider_attributions"][0]["notice"]
+                    .as_str()
+                    .unwrap()
+                    .contains("CPTEC Data Server")
+            );
+            assert!(
+                cptec["provider_attributions"][0]["license"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no model-directory-specific")
+            );
+        }
 
         for id in ["rap", "nam"] {
             assert_eq!(model(id)["verification"], "live_verified");

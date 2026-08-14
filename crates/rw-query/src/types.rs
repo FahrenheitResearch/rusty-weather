@@ -201,6 +201,20 @@ pub fn geps_provider_attribution() -> ProviderAttribution {
     attribution
 }
 
+pub fn cptec_provider_attribution() -> ProviderAttribution {
+    ProviderAttribution {
+        provider: "Center for Weather Forecast and Climate Studies (CPTEC) / National Institute for Space Research (INPE), Brazil".into(),
+        copyright_statement: "CPTEC/INPE is the producing and publishing organization for these operational WRF and BRAMS forecast files.".into(),
+        notice: "Data source: CPTEC/INPE; transported from the official CPTEC Data Server.".into(),
+        source_url: "https://www3.cptec.inpe.br/dimnt/base-de-dados/previsoes-cptec/".into(),
+        license: "INPE's Open Data program describes Brazilian open-government data as freely reusable and not subject to licence, patent, or control restrictions; no model-directory-specific licence statement was observed, so users should verify current publisher terms for their use.".into(),
+        license_url: "https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/dados-abertos".into(),
+        terms_url: "https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/dados-abertos".into(),
+        modification_notice: "The CPTEC/INPE source messages have been byte-range selected, normalized, and re-encoded by this service; this output is not an official CPTEC/INPE product.".into(),
+        disclaimer: "Availability and interpretation remain subject to the authoritative CPTEC/INPE publication; this service supplies transformed output without implying CPTEC/INPE endorsement.".into(),
+    }
+}
+
 pub fn provider_attributions_for_provenance(
     sources: &[SourceProvenance],
 ) -> Vec<ProviderAttribution> {
@@ -269,6 +283,9 @@ pub fn provider_attributions_for_provenance(
         .any(|source| source.provider == "roshydromet-wipps-dc")
     {
         attributions.push(roshydromet_provider_attribution());
+    }
+    if sources.iter().any(|source| source.provider == "cptec-inpe") {
+        attributions.push(cptec_provider_attribution());
     }
     attributions
 }
@@ -647,5 +664,27 @@ mod tests {
             "Data Source: Environment and Climate Change Canada"
         );
         assert!(attributions[0].license.contains("version 2.1"));
+    }
+
+    #[test]
+    fn cptec_provenance_keeps_producer_transport_and_cautious_open_data_terms() {
+        let attributions = provider_attributions_for_provenance(&[
+            provenance("cptec-inpe"),
+            provenance("cptec-inpe"),
+        ]);
+        assert_eq!(attributions, vec![cptec_provider_attribution()]);
+        assert!(attributions[0].provider.contains("CPTEC"));
+        assert!(attributions[0].notice.contains("CPTEC Data Server"));
+        assert!(
+            attributions[0]
+                .license
+                .contains("no model-directory-specific")
+        );
+        assert!(!attributions[0].license.contains("CC BY"));
+        assert!(
+            attributions[0]
+                .modification_notice
+                .contains("not an official CPTEC/INPE product")
+        );
     }
 }

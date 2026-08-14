@@ -299,6 +299,22 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
                 idx_patterns: &[],
             },
         ]),
+        // CPTEC publishes each lead as one GRIB2 object with a text `.inv`
+        // companion carrying exact message offsets. The selected object
+        // serves both surface and pressure extraction roles; model-specific
+        // allowlists keep undocumented BRAMS local fields out of the lane.
+        ModelId::WrfCptec7km => Ok(vec![ProductFetch {
+            product: "raw",
+            surface_source: true,
+            pressure_source: true,
+            idx_patterns: CPTEC_WRF_7KM_IDX_PATTERNS,
+        }]),
+        ModelId::BramsCptec8km => Ok(vec![ProductFetch {
+            product: "raw",
+            surface_source: true,
+            pressure_source: true,
+            idx_patterns: CPTEC_BRAMS_8KM_IDX_PATTERNS,
+        }]),
         ModelId::Gefs => Ok(vec![ProductFetch {
             product: "pgrb2ap5/gec00",
             surface_source: true,
@@ -482,6 +498,47 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
 const GEFS_CONTROL_IDX_PATTERNS: &[&str] = &[
     "HGT", "TMP", "RH", "UGRD", "VGRD", "PRES", "PRMSL", "APCP", "PWAT", "TCDC", "CRAIN", "CSNOW",
     "CICEP", "CFRZR",
+];
+
+/// Standard WMO fields in CPTEC's operational WRF 7 km inventory. Bare
+/// pressure-family names intentionally select every published isobaric level;
+/// the level realization remains a decode/store concern. Local-table records
+/// are omitted unless the existing canonical decoder already names them.
+const CPTEC_WRF_7KM_IDX_PATTERNS: &[&str] = &[
+    "HGT",
+    "TMP",
+    "RH",
+    "UGRD",
+    "VGRD",
+    "DPT:2 m above ground",
+    "PRES:surface",
+    "PRMSL:mean sea level",
+    "MSLET:mean sea level",
+    "APCP:surface",
+    "PWAT:entire atmosphere",
+    "TCDC:entire atmosphere",
+    "LCDC",
+    "MCDC",
+    "HCDC",
+    "REFC",
+    "GUST:surface",
+    "VIS:surface",
+];
+
+/// Standard WMO fields in CPTEC's operational BRAMS 8 km inventory. BRAMS
+/// also publishes local parameter 228 (`VAPMRT`) and anomalously level-labelled
+/// water/cloud fields. They remain fail-closed here instead of being guessed
+/// into canonical humidity or column products.
+const CPTEC_BRAMS_8KM_IDX_PATTERNS: &[&str] = &[
+    "HGT",
+    "TMP",
+    "RH",
+    "UGRD",
+    "VGRD",
+    "DPT:2 m above ground",
+    "PRES:surface",
+    "PRMSL:mean sea level",
+    "APCP:surface",
 ];
 
 /// Shared pressure inventory for NOAA's operational AI model products.
@@ -769,6 +826,15 @@ pub fn validate_ingest_profile_for_model(
     }
     if matches!(
         model,
+        rustwx_core::ModelId::WrfCptec7km | rustwx_core::ModelId::BramsCptec8km
+    ) && (profile.derived || profile.heavy)
+    {
+        return Err(events::other(format!(
+            "model '{model}' is verified for bounded indexed canonical surface and pressure fields; derived/heavy diagnostics remain disabled until the complete CPTEC native-input contract is live-validated; use --profile sounding or disable both derived and heavy",
+        )));
+    }
+    if matches!(
+        model,
         rustwx_core::ModelId::Gefs
             | rustwx_core::ModelId::Aigfs
             | rustwx_core::ModelId::EcmwfOpenData
@@ -938,6 +1004,10 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
             IngestCapabilityLimitation::DerivedProductsDisabled,
             IngestCapabilityLimitation::ExtendedRangeNotScheduled,
         ],
+        rustwx_core::ModelId::WrfCptec7km | rustwx_core::ModelId::BramsCptec8km => vec![
+            IngestCapabilityLimitation::SparsePressureLevels,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+        ],
         _ => Vec::new(),
     };
     match fetch_plan(model) {
@@ -961,7 +1031,9 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 | rustwx_core::ModelId::Hgefs
                 | rustwx_core::ModelId::EcmwfOpenData
                 | rustwx_core::ModelId::IconEu
-                | rustwx_core::ModelId::IconD2 => IngestVerificationLevel::LiveVerified,
+                | rustwx_core::ModelId::IconD2
+                | rustwx_core::ModelId::WrfCptec7km
+                | rustwx_core::ModelId::BramsCptec8km => IngestVerificationLevel::LiveVerified,
                 rustwx_core::ModelId::HrrrAk
                 | rustwx_core::ModelId::Gdas
                 | rustwx_core::ModelId::Nbm
@@ -1079,6 +1151,8 @@ mod tests {
             ModelId::IconD2,
             ModelId::IconRu,
             ModelId::Geps,
+            ModelId::WrfCptec7km,
+            ModelId::BramsCptec8km,
             ModelId::Gdas,
             ModelId::Gefs,
             ModelId::Aigfs,
@@ -1185,6 +1259,25 @@ mod tests {
                 capability.verification,
                 IngestVerificationLevel::LiveVerified
             );
+            assert_eq!(
+                capability.limitations,
+                vec![
+                    IngestCapabilityLimitation::SparsePressureLevels,
+                    IngestCapabilityLimitation::DerivedProductsDisabled,
+                ]
+            );
+        }
+
+        for model in [ModelId::WrfCptec7km, ModelId::BramsCptec8km] {
+            let capability = model_ingest_capability(model);
+            assert_eq!(capability.status, IngestSupportStatus::Ready);
+            assert_eq!(
+                capability.verification,
+                IngestVerificationLevel::LiveVerified
+            );
+            assert_eq!(capability.products.len(), 1);
+            assert_eq!(capability.products[0].product, "raw");
+            assert!(indexed_subset_available(model, &capability.products[0]));
             assert_eq!(
                 capability.limitations,
                 vec![
@@ -1373,6 +1466,8 @@ mod tests {
                 ModelId::IconD2,
                 ModelId::IconRu,
                 ModelId::Geps,
+                ModelId::WrfCptec7km,
+                ModelId::BramsCptec8km,
                 ModelId::Gdas,
                 ModelId::Gefs,
                 ModelId::Aigfs,
@@ -1652,6 +1747,111 @@ mod tests {
             });
             assert!(matched, "{label} index has no row for {pattern}");
         }
+    }
+
+    #[test]
+    fn cptec_fetch_plans_match_full_official_text_inventories_and_fail_closed() {
+        use rustwx_core::ModelId;
+
+        let levels = vec![
+            50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 775, 800,
+            825, 850, 875, 900, 925, 950, 975, 1000,
+        ];
+        let cases = [
+            (
+                ModelId::WrfCptec7km,
+                CPTEC_WRF_7KM_IDX_PATTERNS,
+                include_str!("../tests/fixtures/wrf-cptec-7km.20260814.t00z.f001.inv"),
+                305,
+            ),
+            (
+                ModelId::BramsCptec8km,
+                CPTEC_BRAMS_8KM_IDX_PATTERNS,
+                include_str!("../tests/fixtures/brams-cptec-8km.20260813.t00z.f001.inv"),
+                268,
+            ),
+        ];
+        for (model, patterns, inventory, line_count) in cases {
+            assert_inventory_identity(
+                inventory,
+                line_count,
+                if model == ModelId::WrfCptec7km {
+                    "d=2026081400"
+                } else {
+                    "d=2026081300"
+                },
+            );
+            assert_eq!(pressure_levels(inventory, "TMP", 0), levels, "{model}");
+            let plan = fetch_plan(model).expect("CPTEC indexed plan");
+            assert_eq!(plan.len(), 1, "{model}");
+            assert_eq!(plan[0].product, "raw", "{model}");
+            assert!(plan[0].surface_source && plan[0].pressure_source, "{model}");
+            assert_eq!(plan[0].idx_patterns, patterns, "{model}");
+            assert_patterns_match_index(&model.to_string(), patterns, inventory);
+            assert!(indexed_subset_available(model, &plan[0]), "{model}");
+        }
+
+        let brams = cases[1].2;
+        assert!(
+            brams.contains(":VAPMRT:"),
+            "fixture must preserve the local field evidence"
+        );
+        assert!(
+            !CPTEC_BRAMS_8KM_IDX_PATTERNS
+                .iter()
+                .any(|pattern| pattern.contains("VAPMRT")),
+            "undocumented local BRAMS moisture must remain outside the canonical allowlist"
+        );
+        assert!(brams.contains(":PWAT:surface:"));
+        assert!(
+            !CPTEC_BRAMS_8KM_IDX_PATTERNS
+                .iter()
+                .any(|pattern| pattern.starts_with("PWAT"))
+        );
+
+        let time_semantics =
+            include_str!("../tests/fixtures/cptec-south-america.time-semantics.txt");
+        assert_eq!(
+            time_semantics
+                .lines()
+                .filter(|line| line.starts_with("SOURCE|"))
+                .count(),
+            8,
+            "WRF and BRAMS f000/f001/f002/f024 source identities are pinned"
+        );
+        for evidence in [
+            "ROW|WRF|001|258:166623624:d=2026081400:APCP:surface:0-1 hour acc fcst:",
+            "ROW|WRF|002|258:169689931:d=2026081400:APCP:surface:0-2 hour acc fcst:",
+            "ROW|WRF|024|258:171097593:d=2026081400:APCP:surface:0-1 day acc fcst:",
+            "ROW|BRAMS|001|10:3961703:d=2026081300:TMP:2 m above ground:0-1 hour max fcst:",
+            "ROW|BRAMS|001|11:4569366:d=2026081300:TMP:2 m above ground:0-1 hour min fcst:",
+            "ROW|BRAMS|002|10:3986580:d=2026081300:TMP:2 m above ground:1-2 hour max fcst:",
+            "ROW|BRAMS|002|11:4593588:d=2026081300:TMP:2 m above ground:1-2 hour min fcst:",
+            "ROW|BRAMS|024|10:4159412:d=2026081300:TMP:2 m above ground:23-24 hour max fcst:",
+            "ROW|BRAMS|024|11:4828424:d=2026081300:TMP:2 m above ground:23-24 hour min fcst:",
+        ] {
+            assert!(time_semantics.contains(evidence), "missing {evidence}");
+        }
+        assert_eq!(
+            time_semantics
+                .lines()
+                .filter(|line| line.starts_with("ROW|BRAMS|000|")
+                    && line.contains(":TMP:2 m above ground:anl:"))
+                .count(),
+            3,
+            "BRAMS f000 publishes three indistinguishable inventory rows"
+        );
+        assert_eq!(
+            time_semantics
+                .lines()
+                .filter(|line| line.starts_with("DECODED|BRAMS|000|")
+                    && line.ends_with("pdt=0;forecast=0/1;statistics=None;end=None"))
+                .count(),
+            3,
+            "all three BRAMS f000 temperatures also lose identity in decoded metadata"
+        );
+        assert!(!rustwx_models::supported_forecast_hours(ModelId::BramsCptec8km, 0).contains(&0));
+        assert!(rustwx_models::supported_forecast_hours(ModelId::BramsCptec8km, 0).contains(&1));
     }
 
     #[test]

@@ -90,7 +90,7 @@ fn provider_probe_agent_times_out_a_stalled_response_offline() {
 
 #[test]
 fn built_in_models_are_real() {
-    assert_eq!(built_in_models().len(), 32);
+    assert_eq!(built_in_models().len(), 34);
     assert_eq!(model_summary(ModelId::Gdps).default_product, "rws-surface");
     assert_eq!(model_summary(ModelId::CmaGeps).default_product, "stats");
     assert_eq!(model_summary(ModelId::CmaGeps).max_forecast_hour, 360);
@@ -122,6 +122,10 @@ fn built_in_models_are_real() {
         "rws-published-statistics"
     );
     assert_eq!(model_summary(ModelId::Geps).max_forecast_hour, 384);
+    assert_eq!(model_summary(ModelId::WrfCptec7km).default_product, "raw");
+    assert_eq!(model_summary(ModelId::WrfCptec7km).max_forecast_hour, 180);
+    assert_eq!(model_summary(ModelId::BramsCptec8km).default_product, "raw");
+    assert_eq!(model_summary(ModelId::BramsCptec8km).max_forecast_hour, 180);
     assert_eq!(model_summary(ModelId::HrrrAk).default_product, "sfc");
     assert_eq!(model_summary(ModelId::Gdas).default_product, "pgrb2.0p25");
     assert_eq!(
@@ -182,6 +186,8 @@ fn catalog_exposes_the_user_facing_supported_models() {
         ModelId::IconD2,
         ModelId::IconRu,
         ModelId::Geps,
+        ModelId::WrfCptec7km,
+        ModelId::BramsCptec8km,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -626,6 +632,8 @@ fn temperature_700_recipe_tracks_model_support() {
         ModelId::Aigefs,
         ModelId::EcmwfOpenData,
         ModelId::Aifs,
+        ModelId::WrfCptec7km,
+        ModelId::BramsCptec8km,
         ModelId::Rap,
         ModelId::Nam,
         ModelId::Hiresw,
@@ -720,7 +728,9 @@ fn temperature_700_recipe_tracks_model_support() {
                 | ModelId::Sref
                 | ModelId::RrfsA
                 | ModelId::RrfsPublic
-                | ModelId::RrfsFireWx => {
+                | ModelId::RrfsFireWx
+                | ModelId::WrfCptec7km
+                | ModelId::BramsCptec8km => {
                     assert!(reason.contains("idx subsetting can stage the GRIB messages"));
                 }
                 ModelId::Refs => {
@@ -1093,6 +1103,109 @@ fn cma_geps_cadence_and_urls_match_the_wis2_core_data_contract() {
         build_grib_url(SourceId::Cma, &off_cadence),
         Err(ModelError::UnsupportedForecastHour { .. })
     ));
+}
+
+#[test]
+fn cptec_south_america_cadence_urls_and_text_inventory_suffix_are_exact() {
+    for model in [ModelId::WrfCptec7km, ModelId::BramsCptec8km] {
+        assert!(supported_forecast_hours(model, 6).is_empty());
+        assert_eq!(model_summary(model).sources, CPTEC_SOURCES);
+        assert_eq!(
+            default_bundle_product(model, CanonicalBundleDescriptor::SurfaceAnalysis),
+            "raw"
+        );
+        assert_eq!(
+            default_bundle_product(model, CanonicalBundleDescriptor::PressureAnalysis),
+            "raw"
+        );
+    }
+    assert_eq!(
+        supported_forecast_hours(ModelId::WrfCptec7km, 0),
+        (0..=180).collect::<Vec<u16>>()
+    );
+    assert_eq!(
+        supported_forecast_hours(ModelId::BramsCptec8km, 0),
+        (1..=180).collect::<Vec<u16>>()
+    );
+
+    let wrf = ModelRunRequest::new(
+        ModelId::WrfCptec7km,
+        CycleSpec::new("20260814", 0).unwrap(),
+        25,
+        "raw",
+    )
+    .unwrap();
+    let wrf_urls = resolve_urls(&wrf).unwrap();
+    assert_eq!(wrf_urls.len(), 1);
+    assert_eq!(
+        wrf_urls[0].grib_url,
+        "https://dataserver.cptec.inpe.br/dataserver_modelos/wrf/ams_07km/brutos/2026/08/14/00/WRF_cpt_07KM_2026081400_2026081501.grib2"
+    );
+    assert_eq!(
+        wrf_urls[0].idx_url.as_deref(),
+        Some(
+            "https://dataserver.cptec.inpe.br/dataserver_modelos/wrf/ams_07km/brutos/2026/08/14/00/WRF_cpt_07KM_2026081400_2026081501.inv"
+        )
+    );
+    assert!(
+        !wrf_urls[0]
+            .idx_url
+            .as_deref()
+            .unwrap()
+            .ends_with(".grib2.idx")
+    );
+
+    let brams = ModelRunRequest::new(
+        ModelId::BramsCptec8km,
+        CycleSpec::new("20260813", 0).unwrap(),
+        180,
+        "raw",
+    )
+    .unwrap();
+    let brams_urls = resolve_urls(&brams).unwrap();
+    assert_eq!(
+        brams_urls[0].grib_url,
+        "https://dataserver.cptec.inpe.br/dataserver_modelos/brams/ams_08km/brutos/2026/08/13/00/BRAMS_ams_08km_2026081300_2026082012.grib2"
+    );
+    assert_eq!(
+        brams_urls[0].idx_url.as_deref(),
+        Some(
+            "https://dataserver.cptec.inpe.br/dataserver_modelos/brams/ams_08km/brutos/2026/08/13/00/BRAMS_ams_08km_2026081300_2026082012.inv"
+        )
+    );
+
+    let off_cycle = ModelRunRequest::new(
+        ModelId::WrfCptec7km,
+        CycleSpec::new("20260814", 6).unwrap(),
+        1,
+        "raw",
+    )
+    .unwrap();
+    assert!(matches!(
+        build_grib_url(SourceId::Cptec, &off_cycle),
+        Err(ModelError::UnsupportedForecastHour { .. })
+    ));
+    let unsafe_product = ModelRunRequest::new(
+        ModelId::BramsCptec8km,
+        CycleSpec::new("20260813", 0).unwrap(),
+        1,
+        "../raw",
+    )
+    .unwrap();
+    assert!(matches!(
+        build_grib_url(SourceId::Cptec, &unsafe_product),
+        Err(ModelError::UnsupportedProduct { .. })
+    ));
+    let ambiguous_brams_analysis = ModelRunRequest::new(
+        ModelId::BramsCptec8km,
+        CycleSpec::new("20260813", 0).unwrap(),
+        0,
+        "raw",
+    )
+    .unwrap();
+    let error = build_grib_url(SourceId::Cptec, &ambiguous_brams_analysis)
+        .expect_err("BRAMS f000 ambiguous temperature records must fail closed");
+    assert!(error.to_string().contains("indistinguishable"));
 }
 
 #[test]

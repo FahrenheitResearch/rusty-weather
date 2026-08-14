@@ -33,10 +33,20 @@ remain available forever.
 | `hrdps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/model_hrdps/continental/2.5km/00/024/` | exact representative filename rows and decoded grid/vector metadata from the 91,816-byte, 414-GRIB-object official listing; full-source SHA-256 `AF42B19E5A3D44C00AB0FDA2E1F18E052A2043319B997D0E8263D4B7B957EF8E`; 2,695-byte fixture SHA-256 `C4263EB72B5EE25468C89C1D98D2CFF32B62A25645142E8ECFEFC05B026DBBFC` |
 | `geps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/ensemble/geps/grib2/products/00/024/` | complete 36-object official listing plus exact identities for the bounded selected payloads; 9,714-byte source listing SHA-256 `ABC37D99EE4402ECDBDB30B5C46E8ECDC245EBE24BBCBCBFD64F7CF4C1E87E4E`; 5,839-byte fixture SHA-256 `53DB508A7970F50BF779ACE52E081DB599082F0A9B52F60550B4D4BA9E2219E4` |
 | `reps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/ensemble/reps/10km/grib2/00/024/` | exact selected provider-statistics objects and decoded statistical/grid metadata from the 24,022-byte, 103-GRIB-object official listing; full-source SHA-256 `29B48053BEA61ED7EC6DF4C4EBB974C029183B17C6298A350C39A5831501F0CF`; three bounded payload SHA-256 identities plus a disabled raw-member contract identity |
+| `wrf-cptec-7km.20260814.t00z.f001.inv` | `https://dataserver.cptec.inpe.br/dataserver_modelos/wrf/ams_07km/brutos/2026/08/14/00/WRF_cpt_07KM_2026081400_2026081401.inv` | full 305-message CPTEC text inventory, SHA-256 `445A7D218A1A3772CB2DCBB69DD2D08D2F21D03D75E5A773335B35D107CCED91` |
+| `brams-cptec-8km.20260813.t00z.f001.inv` | `https://dataserver.cptec.inpe.br/dataserver_modelos/brams/ams_08km/brutos/2026/08/13/00/BRAMS_ams_08km_2026081300_2026081301.inv` | full 268-message CPTEC text inventory, SHA-256 `718D6D67C1D8550602624267E44CB04FC174EC8C1EAA18215281C57388479D0D` |
+| `cptec-south-america.time-semantics.txt` | official WRF/BRAMS f000/f001/f002/f024 `.inv` URLs recorded in-fixture | exact temperature/precipitation rows plus source inventory byte lengths/SHA-256 identities and decoded BRAMS f000 PDT evidence; 3,795-byte fixture SHA-256 `2E081856DB8A56764BF8735067E1797593F3DBDEDFC5DC1FB9134AAAABD7857C` |
 
 The SREF product is a run-wide file containing all native forecast steps, so
 the compact fixture deliberately includes its first, next, and final native
 steps while preserving each selected source line byte-for-byte.
+
+The CPTEC fixtures are the official colon-delimited `.inv` companions used
+for byte-range acquisition. CPTEC also publishes a separate binary
+`.grib2.idx` object; it is opaque provider metadata, not a wgrib2 message
+inventory, and the adapter deliberately never sends it through the text index
+parser. BRAMS local parameter 228 (`VAPMRT`) and its anomalous surface-labelled
+column water/cloud records are preserved as evidence but remain fail-closed.
 
 The RRFS Public excerpts preserve one exact provider row for every selector
 used by each acquisition role. The surface excerpt also pins the published
@@ -160,3 +170,27 @@ and 40,986,270 payload bytes. The source provenance contains only
 object is retained in the fixture solely to prove the excluded upstream
 contract (one control plus 20 perturbed messages); no member object and no
 grid-relative U/V object is acquired or advertised by this lane.
+
+## CPTEC/INPE South America verification (2026-08-14)
+
+One official f001 object per lane was acquired through the provider's text
+`.inv` offsets with the sounding profile at a 50 hPa candidate step. Both
+writer `--verify` checks and both `rws validate --deep` runs passed:
+
+| Model lane | Bounded acquisition | Realized RWS evidence |
+| --- | --- | --- |
+| CPTEC WRF South America 7 km, 2026-08-14 00z f001 | 89,714,669 selected bytes in 58 ranges from a 192,378,474-byte object; subset-cache SHA-256 `C4155D44428BEE76FF61A2C1A89D16C8D96D6FDD13739EE55368122F3F0CA110` | all 7 sounding surface fields and five 19-level pressure volumes; 12 variables, 21,900 chunks, 163,380,250 payload bytes |
+| CPTEC BRAMS South America 8 km, 2026-08-13 00z f001 | 81,837,751 selected bytes in 5 coalesced ranges from a 144,450,301-byte object; subset-cache SHA-256 `952AA272237035B4C47C1DB76B54215ACA39399CAB6BFC567F9FE7ADD80BC5CB` | all 7 sounding surface fields and five 24-level pressure volumes; 12 variables, 19,952 chunks, 182,188,508 payload bytes |
+
+The five pressure volumes are temperature, RH, earth-relative U/V, and
+geopotential height. Native RH remains `rh_iso`; the verifier did not invent a
+pressure-dewpoint volume. Each run manifest records `cptec-inpe` for both the
+surface and pressure roles. The proof covers the bounded canonical sounding
+contract, not every native field or every f000-f180 lead.
+
+BRAMS uses GRIB2 template 5.3 with primary missing values. Its f001 2 m
+temperature was checked independently against ecCodes: the decoder reproduced
+the exact 34,408-cell missing mask and all 952,394 non-missing `f64` values.
+The stored field has the same valid count and a bounded 256.702728-306.546478 K
+range. Two no-missing Eta 8 km template-5.3 fields (temperature and accumulated
+precipitation) also matched ecCodes byte-for-byte across 814,625 values each.

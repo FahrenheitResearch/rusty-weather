@@ -413,6 +413,7 @@ const REPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const DWD_ICON_CYCLE_HOURS: &[u8] = &[0, 3, 6, 9, 12, 15, 18, 21];
 const ICON_RU_CYCLE_HOURS: &[u8] = &[0, 12];
 const GEPS_CYCLE_HOURS: &[u8] = &[0, 12];
+const CPTEC_CYCLE_HOURS: &[u8] = &[0];
 const GDAS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const GEFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const AI_MODEL_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
@@ -581,6 +582,18 @@ const ICON_RU_SOURCES: &[SourceDescriptor] = &[
         notes: "Roshydromet WIS2 canonical object transport (HTTP fallback)",
     },
 ];
+
+const CPTEC_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
+    id: SourceId::Cptec,
+    // CPTEC publishes a text wgrib2-style `.inv` companion with exact byte
+    // offsets beside each GRIB2 lead. A distinct binary `.grib2.idx` object
+    // also exists, but it is not a message inventory and must never be fed to
+    // the shared text-index parser.
+    idx_available: true,
+    priority: 1,
+    max_age_hours: None,
+    notes: "CPTEC/INPE operational model data server",
+}];
 
 const GEFS_SOURCES: &[SourceDescriptor] = &[
     SourceDescriptor {
@@ -794,6 +807,26 @@ const MODELS: &[ModelSummary] = &[
         sources: GDPS_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::PostProcessedStatisticsGribFiles,
+    },
+    ModelSummary {
+        id: ModelId::WrfCptec7km,
+        description: "CPTEC/INPE WRF 7 km South America deterministic forecast",
+        default_product: "raw",
+        cycle_hours_utc: CPTEC_CYCLE_HOURS,
+        max_forecast_hour: 180,
+        sources: CPTEC_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::BramsCptec8km,
+        description: "CPTEC/INPE BRAMS 8 km South America deterministic forecast",
+        default_product: "raw",
+        cycle_hours_utc: CPTEC_CYCLE_HOURS,
+        max_forecast_hour: 180,
+        sources: CPTEC_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
     },
     ModelSummary {
         id: ModelId::Gdas,
@@ -5882,7 +5915,7 @@ pub fn built_in_models() -> &'static [ModelSummary] {
 /// [`built_in_models`] remains linked (`ModelId` match arms thread through
 /// rustwx-products), but every user-facing enumeration must go through this
 /// list.
-pub fn supported_models() -> [ModelId; 23] {
+pub fn supported_models() -> [ModelId; 25] {
     [
         ModelId::Hrrr,
         ModelId::HrrrAk,
@@ -5897,6 +5930,8 @@ pub fn supported_models() -> [ModelId; 23] {
         ModelId::IconD2,
         ModelId::IconRu,
         ModelId::Geps,
+        ModelId::WrfCptec7km,
+        ModelId::BramsCptec8km,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -6312,6 +6347,13 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
                 Vec::new()
             }
         }
+        ModelId::WrfCptec7km => {
+            if CPTEC_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=180).collect()
+            } else {
+                Vec::new()
+            }
+        }
         ModelId::Geps => {
             if !GEPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
                 return Vec::new();
@@ -6319,6 +6361,13 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
             let mut hours = (3..=192).step_by(3).collect::<Vec<u16>>();
             hours.extend((198..=384).step_by(6));
             hours
+        }
+        ModelId::BramsCptec8km => {
+            if CPTEC_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (1..=180).collect()
+            } else {
+                Vec::new()
+            }
         }
         ModelId::Gdas => (0..=9).collect(),
         ModelId::Gefs => {
@@ -6483,6 +6532,7 @@ fn default_canonical_bundle_product(
         (ModelId::IconRu, CanonicalBundleDescriptor::PressureAnalysis) => "rws-pressure",
         (ModelId::IconRu, CanonicalBundleDescriptor::NativeAnalysis) => "rws-surface",
         (ModelId::Geps, _) => "rws-published-statistics",
+        (ModelId::WrfCptec7km | ModelId::BramsCptec8km, _) => "raw",
         (ModelId::Gdas, _) => "pgrb2.0p25",
         (ModelId::Gefs, _) => "pgrb2ap5/gec00",
         (ModelId::Aigfs, CanonicalBundleDescriptor::SurfaceAnalysis) => "sfc",
@@ -6605,6 +6655,12 @@ fn companion_index_url(source: SourceId, grib_url: &str) -> String {
             .strip_suffix(".grib2")
             .map(|base| format!("{base}.index"))
             .unwrap_or_else(|| format!("{grib_url}.index"));
+    }
+    if source == SourceId::Cptec {
+        return grib_url
+            .strip_suffix(".grib2")
+            .map(|base| format!("{base}.inv"))
+            .unwrap_or_else(|| format!("{grib_url}.inv"));
     }
     format!("{grib_url}.idx")
 }
@@ -6972,6 +7028,9 @@ fn build_grib_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         ModelId::IconEu | ModelId::IconD2 => build_dwd_icon_url(source, request)?,
         ModelId::IconRu => build_icon_ru_url(source, request)?,
         ModelId::Geps => build_geps_url(source, request)?,
+        ModelId::WrfCptec7km | ModelId::BramsCptec8km => {
+            build_cptec_south_america_url(source, request)?
+        }
         ModelId::Gdas => build_gdas_url(source, request)?,
         ModelId::Gefs => build_gefs_url(source, request)?,
         ModelId::Aigfs => build_aigfs_url(source, request)?,
@@ -7397,6 +7456,74 @@ fn build_cma_geps_url(source: SourceId, request: &ModelRunRequest) -> Result<Str
     Ok(format!(
         "https://wis2node.wis.cma.cn/data/{storage_day}/wis/urn:wmo:md:cn-cma:data.core.weather.prediction.forecast.medium-range.probabilistic.global/Z_NAFP_C_BABJ_{}{:02}0000_P_CMA-WIPPSGEPS-GLB-{:03}.grib2",
         request.cycle.date_yyyymmdd, request.cycle.hour_utc, request.forecast_hour,
+    ))
+}
+
+fn build_cptec_south_america_url(
+    source: SourceId,
+    request: &ModelRunRequest,
+) -> Result<String, ModelError> {
+    if source != SourceId::Cptec {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: match request.model {
+                ModelId::WrfCptec7km => {
+                    "CPTEC/INPE WRF publishes one 00Z cycle with hourly forecast leads f000-f180"
+                }
+                ModelId::BramsCptec8km => {
+                    "CPTEC/INPE BRAMS publishes one 00Z cycle; RWS admits f001-f180 because f000 collapses instantaneous/minimum/maximum 2 m temperature into indistinguishable analysis records"
+                }
+                _ => unreachable!("CPTEC URL builder called for a non-CPTEC model"),
+            }
+            .to_string(),
+        });
+    }
+    if normalize_token(&request.product) != "raw" {
+        return Err(ModelError::UnsupportedProduct {
+            model: request.model,
+            product: request.product.clone(),
+        });
+    }
+
+    let (valid_date, valid_hour) = advance_yyyymmddhh(
+        &request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
+        request.forecast_hour,
+    )
+    .ok_or_else(|| ModelError::UnsupportedForecastHour {
+        model: request.model,
+        cycle_hour: request.cycle.hour_utc,
+        forecast_hour: request.forecast_hour,
+        reason: "forecast valid time is outside the supported calendar range".to_string(),
+    })?;
+    let cycle = format!(
+        "{}{:02}",
+        request.cycle.date_yyyymmdd, request.cycle.hour_utc
+    );
+    let valid = format!("{valid_date}{valid_hour:02}");
+    let year = &request.cycle.date_yyyymmdd[0..4];
+    let month = &request.cycle.date_yyyymmdd[4..6];
+    let day = &request.cycle.date_yyyymmdd[6..8];
+    let hour = request.cycle.hour_utc;
+
+    let (family, filename) = match request.model {
+        ModelId::WrfCptec7km => (
+            "wrf/ams_07km",
+            format!("WRF_cpt_07KM_{cycle}_{valid}.grib2"),
+        ),
+        ModelId::BramsCptec8km => (
+            "brams/ams_08km",
+            format!("BRAMS_ams_08km_{cycle}_{valid}.grib2"),
+        ),
+        _ => unreachable!("CPTEC URL builder called for a non-CPTEC model"),
+    };
+    Ok(format!(
+        "https://dataserver.cptec.inpe.br/dataserver_modelos/{family}/brutos/{year}/{month}/{day}/{hour:02}/{filename}"
     ))
 }
 
@@ -9164,6 +9291,9 @@ fn plot_recipe_fetch_defaults(
         (ModelId::IconRu, _, true) => ("rws-surface", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::IconRu, _, false) => ("rws-pressure", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::Geps, _, _) => ("rws-published-statistics", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::WrfCptec7km | ModelId::BramsCptec8km, _, _) => {
+            ("raw", PlotRecipeFetchPolicy::PreferIndexedSubset)
+        }
         (ModelId::Gdas, _, _) => ("pgrb2.0p25", PlotRecipeFetchPolicy::PreferIndexedSubset),
         (ModelId::Gefs, _, _) if has_ensemble_spread_selector => {
             ("pgrb2ap5/gespr", PlotRecipeFetchPolicy::PreferIndexedSubset)

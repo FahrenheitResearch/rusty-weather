@@ -337,7 +337,8 @@ count matched the sum of bucket records.
 
 The remote acquisition and ingest catalog currently covers HRRR/HRRR Alaska,
 RAP, GFS, ECCC GDPS/RDPS/HRDPS, CMA GRAPES GEPS statistics, DWD
-ICON-EU/ICON-D2 regular grids, Roshydromet ICON-Ru13/6N29, GDAS, GEFS, NOAA
+ICON-EU/ICON-D2 regular grids, Roshydromet ICON-Ru13/6N29, CPTEC/INPE WRF
+7 km and BRAMS 8 km South America grids, GDAS, GEFS, NOAA
 AI-GFS/AI-GEFS/HGEFS, ECMWF IFS Open Data, ECMWF AIFS Single v2, NAM, RRFS-A,
 the public RRFS prototype, NBM, HIRESW, HREF, SREF, REFS, RTMA, and URMA.
 Local WRF/wrfout runs use the same store
@@ -440,10 +441,10 @@ plan for ≥48 GB RAM for full-profile RRFS-A ingests (HRRR peaks ~5 GB by compa
 
 HRRR, GFS, and RRFS-A have full live end-to-end validation. GDPS, CMA-GEPS
 provider statistics, RDPS, HRDPS, DWD ICON-EU and ICON-D2 regular grids,
-Roshydromet ICON-Ru, RAP,
-NAM, GEFS control, deterministic AI-GFS, AI-GEFS/HGEFS published means, and ECMWF
-IFS additionally have bounded official live acquisition, writer verification,
-and deep-store validation. Eleven further remote model/analysis families have
+Roshydromet ICON-Ru, RAP, NAM, CPTEC/INPE WRF 7 km and BRAMS 8 km, GEFS
+control, deterministic AI-GFS, AI-GEFS/HGEFS published means, and ECMWF IFS
+additionally have bounded official live acquisition, writer verification, and
+deep-store validation. Eleven further remote model/analysis families have
 typed fetch plans and focused inventory, cadence, extraction, and query
 contracts at the verification levels reported by `/v1/models`; they are not
 mislabeled as live-verified. Local WRF is reported as `local_import`, not as a

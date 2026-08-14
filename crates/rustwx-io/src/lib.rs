@@ -2971,7 +2971,10 @@ fn should_use_idx_subset_fetch(source: SourceId) -> bool {
 /// intentionally uses whole-file GETs there, so capability surfaces must not
 /// advertise indexed subsetting merely because patterns are present.
 pub const fn source_supports_indexed_subset_fetch(source: SourceId) -> bool {
-    matches!(source, SourceId::Aws | SourceId::Google | SourceId::Ecmwf)
+    matches!(
+        source,
+        SourceId::Aws | SourceId::Google | SourceId::Ecmwf | SourceId::Cptec
+    )
 }
 
 /// Pattern-list directive that excludes probabilistic companions sharing a

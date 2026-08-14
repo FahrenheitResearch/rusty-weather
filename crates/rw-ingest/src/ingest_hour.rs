@@ -1186,6 +1186,7 @@ fn safe_provider_identity(source: SourceId) -> &'static str {
         SourceId::Cma => "cma-wis2-core-data",
         SourceId::Dwd => "dwd-open-data",
         SourceId::RoshydrometWis2Cache | SourceId::RoshydrometWis2Origin => "roshydromet-wipps-dc",
+        SourceId::Cptec => "cptec-inpe",
         SourceId::Ncei => "noaa-ncei",
         SourceId::Gdex => "ucar-gdex",
         SourceId::AifsInference => "local-aifs-inference",
@@ -2518,6 +2519,12 @@ fn forecast_hour_cadence_note(model: ModelId, cycle_hour_utc: u8, max: u16) -> S
         ModelId::Gdas => "GDAS is hourly to f009".to_string(),
         ModelId::CmaGeps => {
             "CMA GRAPES GEPS statistics are 3-hourly to f078, then 6-hourly to f360".to_string()
+        }
+        ModelId::WrfCptec7km => {
+            "CPTEC/INPE WRF South America is hourly from f000 through f180".to_string()
+        }
+        ModelId::BramsCptec8km => {
+            "CPTEC/INPE BRAMS South America is hourly from f001 through f180; f000 is fail-closed because duplicate 2 m temperature analysis records lose min/max identity".to_string()
         }
         ModelId::Gefs => {
             if cycle_hour_utc == 0 {

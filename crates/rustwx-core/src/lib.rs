@@ -1722,6 +1722,8 @@ pub enum ModelId {
     IconD2,
     IconRu,
     Geps,
+    WrfCptec7km,
+    BramsCptec8km,
     Gdas,
     Gefs,
     Aigfs,
@@ -1759,6 +1761,8 @@ impl ModelId {
             Self::IconD2 => "icon-d2",
             Self::IconRu => "icon-ru",
             Self::Geps => "geps",
+            Self::WrfCptec7km => "wrf-cptec-7km",
+            Self::BramsCptec8km => "brams-cptec-8km",
             Self::Gdas => "gdas",
             Self::Gefs => "gefs",
             Self::Aigfs => "aigfs",
@@ -1816,6 +1820,10 @@ impl std::str::FromStr for ModelId {
             "icon-d2" | "icon_d2" | "icond2" | "dwd-icon-d2" | "dwd_icon_d2" => Ok(Self::IconD2),
             "icon-ru" | "icon_ru" | "iconru" | "icon-ru13" | "icon_ru13" => Ok(Self::IconRu),
             "geps" | "gem-ensemble" | "gem_ensemble" | "cmc-geps" | "cmc_geps" => Ok(Self::Geps),
+            "wrf-cptec-7km" | "wrf_cptec_7km" | "cptec-wrf" | "cptec_wrf" | "wrf-ams-07km"
+            | "wrf_ams_07km" => Ok(Self::WrfCptec7km),
+            "brams-cptec-8km" | "brams_cptec_8km" | "cptec-brams" | "cptec_brams"
+            | "brams-ams-08km" | "brams_ams_08km" => Ok(Self::BramsCptec8km),
             "gdas" | "gdas-0p25" | "gdas_0p25" | "gdas-0.25" | "gdas_0.25" => Ok(Self::Gdas),
             "gefs" | "gefs-ens" | "gefs_ens" | "gefs-ensemble" => Ok(Self::Gefs),
             "aigfs" | "ai-gfs" | "ai_gfs" => Ok(Self::Aigfs),
@@ -2001,6 +2009,7 @@ pub enum SourceId {
     /// Canonical Roshydromet WIS2 node transport. The current node advertises
     /// HTTP object links, so adapters prefer the Global Cache first.
     RoshydrometWis2Origin,
+    Cptec,
     Ncei,
     Gdex,
     /// Local NetCDF archive populated by an active AIFS-v2 inference/dissemination harness.
@@ -2024,6 +2033,7 @@ impl SourceId {
             Self::Dwd => "dwd",
             Self::RoshydrometWis2Cache => "roshydromet-wis2-cache",
             Self::RoshydrometWis2Origin => "roshydromet-wis2-origin",
+            Self::Cptec => "cptec",
             Self::Ncei => "ncei",
             Self::Gdex => "gdex",
             Self::AifsInference => "aifs-inference",
@@ -2057,6 +2067,7 @@ impl std::str::FromStr for SourceId {
             "roshydromet-wis2-origin" | "roshydromet_wis2_origin" | "roshydromet" => {
                 Ok(Self::RoshydrometWis2Origin)
             }
+            "cptec" | "cptec-inpe" | "cptec_inpe" | "inpe" => Ok(Self::Cptec),
             "ncei" => Ok(Self::Ncei),
             "gdex" => Ok(Self::Gdex),
             "aifs-inference" | "aifs_inference" | "aifsinference" | "inferenced-aifs"

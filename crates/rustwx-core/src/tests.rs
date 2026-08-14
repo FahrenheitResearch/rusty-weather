@@ -109,6 +109,14 @@ fn model_id_aliases_round_trip() {
     assert_eq!("aifs-v2".parse::<ModelId>().unwrap(), ModelId::Aifs);
     assert_eq!("dwd_icon_eu".parse::<ModelId>().unwrap(), ModelId::IconEu);
     assert_eq!("icond2".parse::<ModelId>().unwrap(), ModelId::IconD2);
+    assert_eq!(
+        "cptec-wrf".parse::<ModelId>().unwrap(),
+        ModelId::WrfCptec7km
+    );
+    assert_eq!(
+        "cptec-brams".parse::<ModelId>().unwrap(),
+        ModelId::BramsCptec8km
+    );
     assert_eq!("wrf".parse::<ModelId>().unwrap(), ModelId::WrfGdex);
     assert_eq!(ModelId::Hrrr.to_string(), "hrrr");
     assert_eq!(ModelId::Hgefs.to_string(), "hgefs");
@@ -118,11 +126,15 @@ fn model_id_aliases_round_trip() {
     assert_eq!(ModelId::WrfGdex.to_string(), "wrf");
     assert_eq!(ModelId::IconEu.to_string(), "icon-eu");
     assert_eq!(ModelId::IconD2.to_string(), "icon-d2");
+    assert_eq!(ModelId::WrfCptec7km.to_string(), "wrf-cptec-7km");
+    assert_eq!(ModelId::BramsCptec8km.to_string(), "brams-cptec-8km");
     assert_eq!("wrf-gdex".parse::<ModelId>().unwrap(), ModelId::WrfGdex);
     assert_eq!("gdex".parse::<SourceId>().unwrap(), SourceId::Gdex);
     assert_eq!(SourceId::Gdex.to_string(), "gdex");
     assert_eq!("dwd-open-data".parse::<SourceId>().unwrap(), SourceId::Dwd);
     assert_eq!(SourceId::Dwd.to_string(), "dwd");
+    assert_eq!("cptec-inpe".parse::<SourceId>().unwrap(), SourceId::Cptec);
+    assert_eq!(SourceId::Cptec.to_string(), "cptec");
     assert_eq!(
         "aifsv2-inference".parse::<SourceId>().unwrap(),
         SourceId::AifsInference

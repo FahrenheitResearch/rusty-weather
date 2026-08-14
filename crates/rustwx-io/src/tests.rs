@@ -1529,6 +1529,30 @@ fn aws_fetches_can_use_idx_subsets_and_parallel_whole_file_fallback() {
 }
 
 #[test]
+fn cptec_fetches_use_text_inventory_ranges_without_whole_file_parallelism() {
+    assert!(source_supports_indexed_subset_fetch(SourceId::Cptec));
+    assert!(should_use_idx_subset_fetch(SourceId::Cptec));
+    assert!(!should_use_parallel_whole_file_fetch(SourceId::Cptec));
+
+    let fetch = FetchRequest {
+        request: ModelRunRequest::new(
+            ModelId::WrfCptec7km,
+            rustwx_core::CycleSpec::new("20260814", 0).unwrap(),
+            1,
+            "raw",
+        )
+        .unwrap(),
+        source_override: Some(SourceId::Cptec),
+        variable_patterns: vec!["TMP:2 m above ground".to_string()],
+    };
+    let urls = filtered_urls(&fetch).expect("resolve CPTEC URL");
+    assert_eq!(urls.len(), 1);
+    assert!(urls[0].grib_url.ends_with(".grib2"));
+    assert!(urls[0].idx_url.as_deref().unwrap().ends_with(".inv"));
+    assert!(!urls[0].idx_url.as_deref().unwrap().contains(".grib2.idx"));
+}
+
+#[test]
 fn nomads_skips_idx_subsets_and_fetches_full_grib_files() {
     assert!(!should_use_idx_subset_fetch(SourceId::Nomads));
     assert!(!should_use_parallel_whole_file_fetch(SourceId::Nomads));

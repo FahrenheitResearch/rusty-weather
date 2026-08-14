@@ -32,6 +32,8 @@ not automatically presented as live-verified.
 | DWD ICON-D2 regular | Remote | Ingest beta | Germany deterministic regular lat/lon feed; eight 3-hourly cycles and hourly f000-f048; exact bzip2 component bundles and all 11 native pressure levels are live ingest/store verified; quarter-hour messages retain exact time semantics; derived/heavy disabled |
 | Roshydromet ICON-Ru13/6N29 | Remote | Ingest beta | North Eurasia 697x213 regular lat/lon forecast; 00/12z, three-hourly f003-f072; exact WIS2 bulletin-component acquisition, sparse pressure profile, dateline-safe normalization, and bounded f003 live ingest/store verification |
 | ECCC GEPS | Remote | Ingest beta | Provider-published 2-D statistics only, not raw ensemble members; 00/12z, 3-hourly f003-f192 then 6-hourly f198-f384; typed percentiles, mean, spread, and selected probabilities are live ingest/store verified; extended f936 Monday/Thursday products are not scheduled |
+| CPTEC/INPE WRF 7 km | Remote | Ingest beta | South America deterministic regular lat/lon feed; daily 00z, hourly f000-f180; official text `.inv` byte-range acquisition and a five-volume/7-surface-field sounding are live ingest/store verified; derived/heavy disabled |
+| CPTEC/INPE BRAMS 8 km | Remote | Ingest beta | South America deterministic regular lat/lon feed; daily 00z, hourly f001-f180; f000 is fail-closed because its instantaneous/min/max 2 m temperatures lose their statistical identity; official text `.inv` byte-range acquisition and a five-volume/7-surface-field sounding are live ingest/store verified; undocumented local and anomalously level-labelled fields remain fail-closed; derived/heavy disabled |
 | RRFS-A | Remote | Verified | Deterministic NA source cropped during ingest |
 | RAP | Remote | Ingest beta | Grid-130 `awp130pgrb` (13 km); hourly f000-f021, with 03/09/15/21z extended through f051; live ingest/store verified |
 | NAM | Remote | Ingest beta | Ingest is pinned to grid-212 `awip3d` (40 km), not the registry's separate `awip12` plotting product; hourly f000-f036 then 3-hourly through f084; live ingest/store verified |
@@ -175,6 +177,20 @@ selector can carry both interval and statistical-process identity. Provider
 `WIND-Max-*` thresholds are excluded because their live units are ambiguous;
 the Monday/Thursday f936 extension is also excluded from automatic scheduling
 until scheduler cadence can express weekdays.
+
+The CPTEC/INPE WRF 7 km and BRAMS 8 km lanes were exercised against the
+official CPTEC Data Server on 2026-08-14. One bounded f001 sounding ingest per
+model used the provider's text `.inv` offsets rather than downloading the full
+lead object. WRF selected 89,714,669 bytes in 58 ranges from a 192,378,474-byte
+object, realized all seven sounding surface variables plus temperature, RH,
+U, V, and height at 19 requested levels, and passed deep validation at 12
+variables, 21,900 chunks, and 163,380,250 payload bytes. BRAMS selected
+81,837,751 bytes in five coalesced ranges from a 144,450,301-byte object and
+passed the same writer checks plus deep validation at 12 variables, 19,952
+chunks, and 182,188,508 payload bytes. The separate binary `.grib2.idx` files
+are not treated as message indexes. See
+[the CPTEC adapter contract](CPTEC_SOUTH_AMERICA.md) for exact inventory,
+field, grid, and attribution boundaries.
 
 For the NOAA deterministic wave, normalization follows the fields actually
 published. HRRR Alaska carries native pressure-level temperature, dewpoint,
