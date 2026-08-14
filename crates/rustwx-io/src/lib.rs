@@ -3400,32 +3400,43 @@ impl PreparedSelector {
 }
 
 fn forecast_hour_match_score(message: &Grib2Message, expected_hour: u16) -> Option<u8> {
-    let start_hour = time_value_to_hours(
+    let expected_seconds = u64::from(expected_hour).checked_mul(3_600)?;
+    let start_seconds = time_value_to_seconds(
         message.product.time_range_unit,
         message.product.forecast_time,
     )?;
-    if start_hour == expected_hour as u32 {
+    if start_seconds == expected_seconds {
         return Some(0);
     }
-    let end_hour = message
+    let end_seconds = message
         .product
-        .statistical_time_range_hours()
-        .map(|length| start_hour.saturating_add(length as u32));
-    if end_hour == Some(expected_hour as u32) {
+        .statistical_time_range_seconds()
+        .and_then(|length| start_seconds.checked_add(length));
+    if end_seconds == Some(expected_seconds) {
         return Some(1);
     }
     None
 }
 
 fn time_value_to_hours(unit: u8, value: u32) -> Option<u32> {
+    let seconds = time_value_to_seconds(unit, value)?;
+    (seconds % 3_600 == 0)
+        .then(|| seconds / 3_600)
+        .and_then(|hours| u32::try_from(hours).ok())
+}
+
+fn time_value_to_seconds(unit: u8, value: u32) -> Option<u64> {
+    let value = u64::from(value);
     match unit {
-        // WMO Code Table 4.4: minute, hour, day, 3 hours, 6 hours, 12 hours.
-        0 => (value % 60 == 0).then_some(value / 60),
-        1 => Some(value),
-        2 => value.checked_mul(24),
-        10 => value.checked_mul(3),
-        11 => value.checked_mul(6),
-        12 => value.checked_mul(12),
+        // WMO Code Table 4.4 fixed-duration units. Calendar-relative units
+        // intentionally fail closed because no rounding is safe.
+        0 => value.checked_mul(60),
+        1 => value.checked_mul(3_600),
+        2 => value.checked_mul(86_400),
+        10 => value.checked_mul(10_800),
+        11 => value.checked_mul(21_600),
+        12 => value.checked_mul(43_200),
+        13 => Some(value),
         _ => None,
     }
 }

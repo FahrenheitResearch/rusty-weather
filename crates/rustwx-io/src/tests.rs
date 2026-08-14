@@ -2436,6 +2436,50 @@ fn partial_extract_at_forecast_hour_matches_statistical_window_end() {
     assert_eq!(partial.extracted[0].values, vec![7.5]);
 }
 
+/// DWD ICON-D2 hourly `TOT_PREC` objects contain four run-total messages at
+/// 15-minute endpoints. For the f001 object these are 60/75/90/105 minutes;
+/// for f002 they are 120/135/150/165 minutes. RWS stores an integer-hour time
+/// axis, so matching must select the exact hourly endpoint and must never
+/// truncate or round a later quarter-hour message back to that hour.
+#[test]
+fn dwd_d2_minute_statistical_endpoints_select_only_the_exact_hour() {
+    let make_run_total = |end_minutes: u32, value: f32| {
+        let mut message = ieee_f32_message(
+            PARAMETER_TOTAL_PRECIPITATION[1],
+            1,
+            0.0,
+            &[value],
+            -99.0,
+            -99.0,
+        );
+        message.product.template = 8;
+        message.product.time_range_unit = 0;
+        message.product.forecast_time = 0;
+        message.product.statistical_time_range_unit = Some(0);
+        message.product.time_range_length = Some(end_minutes);
+        message
+    };
+    let selector = FieldSelector::surface(CanonicalField::TotalPrecipitation);
+
+    for (expected_hour, endpoints, expected_value) in [
+        (1_u16, [60_u32, 75, 90, 105], 60.0_f32),
+        (2_u16, [120_u32, 135, 150, 165], 120.0_f32),
+    ] {
+        let grib = Grib2File {
+            messages: endpoints
+                .into_iter()
+                .map(|minutes| make_run_total(minutes, minutes as f32))
+                .collect(),
+        };
+        let partial =
+            extract_fields_from_grib2_partial_at_forecast_hour(&grib, &[selector], expected_hour)
+                .unwrap();
+        assert!(partial.missing.is_empty());
+        assert_eq!(partial.extracted.len(), 1);
+        assert_eq!(partial.extracted[0].values, vec![expected_value]);
+    }
+}
+
 /// REGRESSION (found live on RRFS-A f002, 2026-06-11): a surface file may
 /// carry BOTH the run-total (0→h) and the trailing-window ((h−1)→h) APCP
 /// accumulation, and both end at hour h so both tie on the end-hour forecast

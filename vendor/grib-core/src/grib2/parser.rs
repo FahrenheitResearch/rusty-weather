@@ -176,19 +176,44 @@ impl Default for GridDefinition {
 }
 
 impl ProductDefinition {
-    /// Returns the first statistical time range expressed in hours when PDT 4.8/4.11/4.12
-    /// provides an hourly window. Falls back to the forecast-time unit for callers that only
-    /// populated `time_range_length`.
-    pub fn statistical_time_range_hours(&self) -> Option<u16> {
+    /// Returns the first PDT 4.8/4.11/4.12 statistical time range as an exact
+    /// number of seconds for the fixed-duration WMO Code Table 4.4 units.
+    /// Falls back to the forecast-time unit for callers that only populated
+    /// `time_range_length`. Calendar-relative month/year units intentionally
+    /// return `None` because they cannot be represented without an anchor.
+    pub fn statistical_time_range_seconds(&self) -> Option<u64> {
         let unit = self
             .statistical_time_range_unit
             .unwrap_or(self.time_range_unit);
-        if unit != 1 {
-            return None;
-        }
-        self.time_range_length
+        let value = u64::from(self.time_range_length?);
+        fixed_time_value_to_seconds(unit, value)
+    }
+
+    /// Returns the first statistical time range as whole hours. Minute- and
+    /// second-valued provider intervals are accepted only when they are
+    /// exactly divisible by one hour; no rounding or truncation is allowed.
+    pub fn statistical_time_range_hours(&self) -> Option<u16> {
+        let seconds = self.statistical_time_range_seconds()?;
+        (seconds % 3_600 == 0)
+            .then(|| seconds / 3_600)
             .and_then(|hours| u16::try_from(hours).ok())
     }
+}
+
+fn fixed_time_value_to_seconds(unit: u8, value: u64) -> Option<u64> {
+    let seconds_per_unit = match unit {
+        // WMO Code Table 4.4 fixed-duration units.
+        0 => 60,
+        1 => 3_600,
+        2 => 86_400,
+        10 => 10_800,
+        11 => 21_600,
+        12 => 43_200,
+        13 => 1,
+        // Month, year, decade, normal and century require a calendar anchor.
+        _ => return None,
+    };
+    value.checked_mul(seconds_per_unit)
 }
 
 impl Default for ProductDefinition {
@@ -1325,5 +1350,21 @@ mod tests {
         assert_eq!(product.statistical_time_range_unit, Some(1));
         assert_eq!(product.time_range_length, Some(6));
         assert_eq!(product.statistical_time_range_hours(), Some(6));
+    }
+
+    #[test]
+    fn minute_statistical_ranges_preserve_exact_duration_without_rounding() {
+        let mut product = ProductDefinition {
+            time_range_unit: 0,
+            statistical_time_range_unit: Some(0),
+            time_range_length: Some(60),
+            ..ProductDefinition::default()
+        };
+        assert_eq!(product.statistical_time_range_seconds(), Some(3_600));
+        assert_eq!(product.statistical_time_range_hours(), Some(1));
+
+        product.time_range_length = Some(75);
+        assert_eq!(product.statistical_time_range_seconds(), Some(4_500));
+        assert_eq!(product.statistical_time_range_hours(), None);
     }
 }
