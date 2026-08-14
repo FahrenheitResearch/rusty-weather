@@ -1,0 +1,41 @@
+# Exact bounded excerpt from the official ECCC RDPS f024 directory listing.
+# source_url=https://dd.weather.gc.ca/today/model_rdps/10km/00/024/
+# source_bytes=100669
+# source_sha256=87BD53259734E95AEFEFF1DA7BBCD83332A5BD3AC6124DC46BD5AD6675952F10
+# source_grib2_links=414
+# documentation_url=https://eccc-msc.github.io/open-data/msc-data/nwp_rdps/readme_rdps-datamart_en/
+# documentation_grid=1102x1076
+# live_decoded_grid=1140x1045
+# scan_mode=0x40
+# resolution_and_component_flags=0x38
+# south_pole=-31.758312,267.597031
+# rotation_degrees=0.000000
+# common_five_field_isobaric_levels_hpa=10,20,30,50,100,150,175,200,225,250,275,300,350,400,450,500,550,600,650,700,750,800,850,875,900,925,950,970,985,1000,1015
+# u10_url=https://dd.weather.gc.ca/today/model_rdps/10km/00/024/20260814T00Z_MSC_RDPS_WindU_AGL-10m_RLatLon0.09_PT024H.grib2
+# u10_bytes=449419
+# u10_sha256=DBFCBFC5BA1817D3AE4E2C7A74A4275FC18E98F1356145416638BF30C6EED25C
+# v10_url=https://dd.weather.gc.ca/today/model_rdps/10km/00/024/20260814T00Z_MSC_RDPS_WindV_AGL-10m_RLatLon0.09_PT024H.grib2
+# v10_bytes=426612
+# v10_sha256=407BE3778A7681A39698DC31E625C3D71C0D0119B03EE399A118A6CB27BA2CA9
+# wind10_url=https://dd.weather.gc.ca/today/model_rdps/10km/00/024/20260814T00Z_MSC_RDPS_WindSpeed_AGL-10m_RLatLon0.09_PT024H.grib2
+# wind10_bytes=867338
+# wind10_sha256=0B831A33B0FB9A9BCB5EC2BE0CA258039944BBD81A5AD6CB068F1A9400E548C9
+# wdir10_url=https://dd.weather.gc.ca/today/model_rdps/10km/00/024/20260814T00Z_MSC_RDPS_WindDir_AGL-10m_RLatLon0.09_PT024H.grib2
+# wdir10_bytes=1015283
+# wdir10_sha256=D5DCB632C44B38DB01A7FE51FF81D69AA609DE39BADA9139BD6CEA4E25FD064A
+20260814T00Z_MSC_RDPS_AbsoluteVorticity_IsbL-0250_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_AirTemp_AGL-2m_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_AirTemp_IsbL-0100_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_DewPoint_AGL-2m_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_GeopotentialHeight_IsbL-1000_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_Precip-Accum_Sfc_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_Pressure_MSL_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_Pressure_Sfc_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_RelativeHumidity_AGL-2m_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_RelativeHumidity_IsbL-0100_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_TotalCloudCover_Sfc_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_WindGust_AGL-10m_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_WindU_AGL-10m_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_WindU_IsbL-0100_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_WindV_AGL-10m_RLatLon0.09_PT024H.grib2
+20260814T00Z_MSC_RDPS_WindV_IsbL-0100_RLatLon0.09_PT024H.grib2

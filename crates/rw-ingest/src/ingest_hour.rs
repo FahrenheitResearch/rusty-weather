@@ -622,7 +622,7 @@ fn fetch_product(
     };
     config.emit(IngestEvent::StageStarted { hour, stage });
     let fetch_started = Instant::now();
-    let components = gdps_component_products(config, product)?;
+    let components = eccc_component_products(config, product)?;
     let fetched = if let Some(components) = components {
         fetch_component_bundle_with_cache(&fetch, &components, config.cache_root, config.use_cache)
             .map_err(other)?
@@ -638,14 +638,16 @@ fn fetch_product(
     Ok((fetched, fetch_ms))
 }
 
-/// Expand one GDPS logical extraction family into the exact ordered Datamart
-/// objects needed by the requested RWS profile. Other models return `None`
-/// and retain their historical single/multi-family-file fetch behavior.
-fn gdps_component_products(
+/// Expand one ECCC logical extraction family into the exact ordered Datamart
+/// objects needed by the requested RWS profile. GDPS/RDPS use ECCC's long
+/// names and hyphenated level tokens; HRDPS uses the compact operational
+/// names and underscored level tokens. Other models return `None` and retain
+/// their historical single/multi-family-file fetch behavior.
+fn eccc_component_products(
     config: &IngestConfig<'_>,
     logical_product: &str,
 ) -> Result<Option<Vec<String>>, IngestError> {
-    if config.model != ModelId::Gdps {
+    if !matches!(config.model, ModelId::Gdps | ModelId::Rdps | ModelId::Hrdps) {
         return Ok(None);
     }
     let profile = config.profile;
@@ -653,32 +655,60 @@ fn gdps_component_products(
     match logical_product {
         "rws-pressure" => {
             // The current RWS pressure schema has five canonical volumes.
-            // GDPS publishes RH rather than direct dewpoint at isobaric
+            // ECCC publishes RH rather than direct dewpoint at isobaric
             // levels; the existing ingest fallback stores `rh_iso` honestly.
-            let families = [
-                "AirTemp",
-                "RelativeHumidity",
-                "WindU",
-                "WindV",
-                "GeopotentialHeight",
-            ];
+            let levels = match config.model {
+                ModelId::Gdps => rustwx_models::gdps_isobaric_levels_hpa(),
+                ModelId::Rdps => rustwx_models::rdps_isobaric_levels_hpa(),
+                ModelId::Hrdps => rustwx_models::hrdps_isobaric_levels_hpa(),
+                _ => unreachable!("ECCC component model was gated above"),
+            };
             for level in profile
                 .candidate_levels()
                 .into_iter()
-                .filter(|level| rustwx_models::gdps_isobaric_levels_hpa().contains(level))
+                .filter(|level| levels.contains(level))
             {
-                for family in families {
-                    components.push(format!("{family}_IsbL-{level:04}"));
+                match config.model {
+                    ModelId::Gdps | ModelId::Rdps => {
+                        for family in [
+                            "AirTemp",
+                            "RelativeHumidity",
+                            "WindU",
+                            "WindV",
+                            "GeopotentialHeight",
+                        ] {
+                            components.push(format!("{family}_IsbL-{level:04}"));
+                        }
+                    }
+                    ModelId::Hrdps => {
+                        for family in ["TMP", "RH", "UGRD", "VGRD", "HGT"] {
+                            components.push(format!("{family}_ISBL_{level:04}"));
+                        }
+                    }
+                    _ => unreachable!("ECCC component model was gated above"),
                 }
             }
             if profile.includes_full_2d() {
-                for level in [200_u16, 250, 500, 700, 850] {
-                    components.push(format!("AbsoluteVorticity_IsbL-{level:04}"));
+                let vorticity_levels: &[u16] = match config.model {
+                    ModelId::Gdps => &[200, 250, 500, 700, 850],
+                    ModelId::Rdps | ModelId::Hrdps => &[250, 500, 700, 850],
+                    _ => unreachable!("ECCC component model was gated above"),
+                };
+                for level in vorticity_levels {
+                    match config.model {
+                        ModelId::Gdps | ModelId::Rdps => {
+                            components.push(format!("AbsoluteVorticity_IsbL-{level:04}"))
+                        }
+                        ModelId::Hrdps => {
+                            components.push(format!("ABSV_ISBL_{level:04}"));
+                        }
+                        _ => unreachable!("ECCC component model was gated above"),
+                    }
                 }
             }
         }
         "rws-surface" => {
-            const SURFACE_COMPONENTS: &[(&str, &str)] = &[
+            const GDPS_SURFACE_COMPONENTS: &[(&str, &str)] = &[
                 ("temperature_2m", "AirTemp_AGL-2m"),
                 ("dewpoint_2m", "DewPoint_AGL-2m"),
                 ("u_10m", "WindU_AGL-10m"),
@@ -691,8 +721,39 @@ fn gdps_component_products(
                 ("apcp_run_total", "Precip-Accum_Sfc"),
                 ("cloud_cover_total", "TotalCloudCover_Sfc"),
             ];
+            const RDPS_SURFACE_COMPONENTS: &[(&str, &str)] = &[
+                ("temperature_2m", "AirTemp_AGL-2m"),
+                ("dewpoint_2m", "DewPoint_AGL-2m"),
+                ("u_10m", "WindU_AGL-10m"),
+                ("v_10m", "WindV_AGL-10m"),
+                ("mslp", "Pressure_MSL"),
+                ("rh_2m", "RelativeHumidity_AGL-2m"),
+                ("wind_gust_10m", "WindGust_AGL-10m"),
+                ("surface_pressure", "Pressure_Sfc"),
+                ("apcp_run_total", "Precip-Accum_Sfc"),
+                ("cloud_cover_total", "TotalCloudCover_Sfc"),
+            ];
+            const HRDPS_SURFACE_COMPONENTS: &[(&str, &str)] = &[
+                ("temperature_2m", "TMP_AGL-2m"),
+                ("dewpoint_2m", "DPT_AGL-2m"),
+                ("u_10m", "UGRD_AGL-10m"),
+                ("v_10m", "VGRD_AGL-10m"),
+                ("mslp", "PRMSL_MSL"),
+                ("rh_2m", "RH_AGL-2m"),
+                ("wind_gust_10m", "GUST_AGL-10m"),
+                ("surface_pressure", "PRES_Sfc"),
+                ("orography", "HGT_Sfc"),
+                ("apcp_run_total", "APCP_Sfc"),
+                ("cloud_cover_total", "TCDC_Sfc"),
+            ];
+            let surface_components = match config.model {
+                ModelId::Gdps => GDPS_SURFACE_COMPONENTS,
+                ModelId::Rdps => RDPS_SURFACE_COMPONENTS,
+                ModelId::Hrdps => HRDPS_SURFACE_COMPONENTS,
+                _ => unreachable!("ECCC component model was gated above"),
+            };
             components.extend(
-                SURFACE_COMPONENTS
+                surface_components
                     .iter()
                     .filter(|(field, _)| profile.includes_surface_field(field))
                     .map(|(_, component)| (*component).to_string()),
@@ -700,13 +761,15 @@ fn gdps_component_products(
         }
         unknown => {
             return Err(other(format!(
-                "GDPS fetch plan contains unknown logical product '{unknown}'"
+                "{} fetch plan contains unknown logical product '{unknown}'",
+                config.model
             )));
         }
     }
     if components.is_empty() {
         return Err(other(format!(
-            "GDPS logical product '{logical_product}' has no components for profile '{}'",
+            "{} logical product '{logical_product}' has no components for profile '{}'",
+            config.model,
             profile.describe()
         )));
     }
@@ -2632,7 +2695,7 @@ mod tests {
             cancel: &cancel,
         };
 
-        let pressure = gdps_component_products(&config, "rws-pressure")
+        let pressure = eccc_component_products(&config, "rws-pressure")
             .unwrap()
             .unwrap();
         assert_eq!(pressure.len(), 24 * 5);
@@ -2648,7 +2711,7 @@ mod tests {
             "component inventory must be duplicate-free"
         );
 
-        let surface = gdps_component_products(&config, "rws-surface")
+        let surface = eccc_component_products(&config, "rws-surface")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2661,6 +2724,86 @@ mod tests {
                 "Pressure_MSL",
                 "Pressure_Sfc",
                 "GeopotentialHeight_Sfc",
+            ]
+        );
+    }
+
+    #[test]
+    fn regional_eccc_sounding_bundles_are_exact_and_do_not_request_absent_rdps_orography() {
+        let cycle = CycleSpec::new("20260814", 0).unwrap();
+        let profile = IngestProfile::sounding();
+        let cancel = AtomicBool::new(false);
+        let sink = |_event: IngestEvent| {};
+        let mut config = IngestConfig {
+            model: ModelId::Rdps,
+            cycle: &cycle,
+            source_override: Some(SourceId::Eccc),
+            cache_root: Path::new("unused-cache"),
+            use_cache: true,
+            store_root: Path::new("unused-store"),
+            model_slug: "rdps",
+            run_slug: "20260814-00",
+            profile: &profile,
+            verify: true,
+            progress: &sink,
+            cancel: &cancel,
+        };
+
+        let rdps_pressure = eccc_component_products(&config, "rws-pressure")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rdps_pressure.len(), 24 * 5);
+        assert_eq!(rdps_pressure[0], "AirTemp_IsbL-0100");
+        assert_eq!(rdps_pressure[2], "WindU_IsbL-0100");
+        assert_eq!(rdps_pressure[3], "WindV_IsbL-0100");
+        assert_eq!(
+            rdps_pressure.last().unwrap(),
+            "GeopotentialHeight_IsbL-1000"
+        );
+        let rdps_surface = eccc_component_products(&config, "rws-surface")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rdps_surface,
+            vec![
+                "AirTemp_AGL-2m",
+                "DewPoint_AGL-2m",
+                "WindU_AGL-10m",
+                "WindV_AGL-10m",
+                "Pressure_MSL",
+                "Pressure_Sfc",
+            ]
+        );
+        assert!(
+            !rdps_surface
+                .iter()
+                .any(|component| component.contains("GeopotentialHeight")),
+            "the live RDPS Datamart has no surface geopotential-height object"
+        );
+
+        config.model = ModelId::Hrdps;
+        config.model_slug = "hrdps";
+        let hrdps_pressure = eccc_component_products(&config, "rws-pressure")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hrdps_pressure.len(), 24 * 5);
+        assert_eq!(hrdps_pressure[0], "TMP_ISBL_0100");
+        assert_eq!(hrdps_pressure[2], "UGRD_ISBL_0100");
+        assert_eq!(hrdps_pressure[3], "VGRD_ISBL_0100");
+        assert_eq!(hrdps_pressure.last().unwrap(), "HGT_ISBL_1000");
+        let hrdps_surface = eccc_component_products(&config, "rws-surface")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            hrdps_surface,
+            vec![
+                "TMP_AGL-2m",
+                "DPT_AGL-2m",
+                "UGRD_AGL-10m",
+                "VGRD_AGL-10m",
+                "PRMSL_MSL",
+                "PRES_Sfc",
+                "HGT_Sfc",
             ]
         );
     }

@@ -407,6 +407,8 @@ const HRRR_CYCLE_HOURS: &[u8] = &[
 const GFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const GDPS_CYCLE_HOURS: &[u8] = &[0, 12];
 const CMA_GEPS_CYCLE_HOURS: &[u8] = &[0, 12];
+const RDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
+const HRDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const GDAS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const GEFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const AI_MODEL_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
@@ -687,6 +689,26 @@ const MODELS: &[ModelSummary] = &[
         sources: CMA_GEPS_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::PostProcessedStatisticsGribFiles,
+    },
+    ModelSummary {
+        id: ModelId::Rdps,
+        description: "ECCC RDPS 10 km North American rotated-grid deterministic forecast",
+        default_product: "rws-surface",
+        cycle_hours_utc: RDPS_CYCLE_HOURS,
+        max_forecast_hour: 84,
+        sources: GDPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::Hrdps,
+        description: "ECCC HRDPS 2.5 km pan-Canadian rotated-grid deterministic forecast",
+        default_product: "rws-surface",
+        cycle_hours_utc: HRDPS_CYCLE_HOURS,
+        max_forecast_hour: 48,
+        sources: GDPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
     },
     ModelSummary {
         id: ModelId::Gdas,
@@ -5775,7 +5797,7 @@ pub fn built_in_models() -> &'static [ModelSummary] {
 /// [`built_in_models`] remains linked (`ModelId` match arms thread through
 /// rustwx-products), but every user-facing enumeration must go through this
 /// list.
-pub fn supported_models() -> [ModelId; 16] {
+pub fn supported_models() -> [ModelId; 18] {
     [
         ModelId::Hrrr,
         ModelId::HrrrAk,
@@ -5783,6 +5805,8 @@ pub fn supported_models() -> [ModelId; 16] {
         ModelId::Gfs,
         ModelId::Gdps,
         ModelId::CmaGeps,
+        ModelId::Rdps,
+        ModelId::Hrdps,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -6029,6 +6053,20 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
             hours.extend((84..=360).step_by(6));
             hours
         }
+        ModelId::Rdps => {
+            if RDPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=84).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ModelId::Hrdps => {
+            if HRDPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=48).collect()
+            } else {
+                Vec::new()
+            }
+        }
         ModelId::Gdas => (0..=9).collect(),
         ModelId::Gefs => {
             let mut hours = (0..=240).step_by(3).collect::<Vec<u16>>();
@@ -6171,6 +6209,13 @@ fn default_canonical_bundle_product(
         (ModelId::Gdps, CanonicalBundleDescriptor::PressureAnalysis) => "rws-pressure",
         (ModelId::Gdps, CanonicalBundleDescriptor::NativeAnalysis) => "rws-surface",
         (ModelId::CmaGeps, _) => "stats",
+        (
+            ModelId::Rdps | ModelId::Hrdps,
+            CanonicalBundleDescriptor::SurfaceAnalysis | CanonicalBundleDescriptor::NativeAnalysis,
+        ) => "rws-surface",
+        (ModelId::Rdps | ModelId::Hrdps, CanonicalBundleDescriptor::PressureAnalysis) => {
+            "rws-pressure"
+        }
         (ModelId::Gdas, _) => "pgrb2.0p25",
         (ModelId::Gefs, _) => "pgrb2ap5/gec00",
         (ModelId::Aigfs, CanonicalBundleDescriptor::SurfaceAnalysis) => "sfc",
@@ -6639,6 +6684,8 @@ fn build_grib_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         ModelId::Gfs => build_gfs_url(source, request)?,
         ModelId::Gdps => build_gdps_url(source, request)?,
         ModelId::CmaGeps => build_cma_geps_url(source, request)?,
+        ModelId::Rdps => build_rdps_url(source, request)?,
+        ModelId::Hrdps => build_hrdps_url(source, request)?,
         ModelId::Gdas => build_gdas_url(source, request)?,
         ModelId::Gefs => build_gefs_url(source, request)?,
         ModelId::Aigfs => build_aigfs_url(source, request)?,
@@ -7064,6 +7111,178 @@ fn build_cma_geps_url(source: SourceId, request: &ModelRunRequest) -> Result<Str
     Ok(format!(
         "https://wis2node.wis.cma.cn/data/{storage_day}/wis/urn:wmo:md:cn-cma:data.core.weather.prediction.forecast.medium-range.probabilistic.global/Z_NAFP_C_BABJ_{}{:02}0000_P_CMA-WIPPSGEPS-GLB-{:03}.grib2",
         request.cycle.date_yyyymmdd, request.cycle.hour_utc, request.forecast_hour,
+    ))
+}
+
+/// Exact live common inventory for RDPS temperature, relative humidity,
+/// paired wind, and geopotential height. Temperature/wind/height extend to
+/// 1 and 5 hPa, but RH starts at 10 hPa, so the five-field canonical bundle
+/// starts there.
+const RDPS_COMMON_ISOBARIC_LEVELS_HPA: &[u16] = &[
+    10, 20, 30, 50, 100, 150, 175, 200, 225, 250, 275, 300, 350, 400, 450, 500, 550, 600, 650, 700,
+    750, 800, 850, 875, 900, 925, 950, 970, 985, 1000, 1015,
+];
+
+/// Exact live common inventory for the same five HRDPS families. The current
+/// continental feed begins at 50 hPa; do not inherit RDPS's 10/20/30 hPa
+/// levels merely because the products share a provider and projection family.
+const HRDPS_COMMON_ISOBARIC_LEVELS_HPA: &[u16] = &[
+    50, 100, 150, 175, 200, 225, 250, 275, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800,
+    850, 875, 900, 925, 950, 970, 985, 1000, 1015,
+];
+
+pub fn rdps_isobaric_levels_hpa() -> &'static [u16] {
+    RDPS_COMMON_ISOBARIC_LEVELS_HPA
+}
+
+pub fn hrdps_isobaric_levels_hpa() -> &'static [u16] {
+    HRDPS_COMMON_ISOBARIC_LEVELS_HPA
+}
+
+fn exact_four_digit_level(product: &str, prefix: &str) -> Option<u16> {
+    let level = product.strip_prefix(prefix)?;
+    let parsed = level.parse::<u16>().ok()?;
+    (format!("{parsed:04}") == level).then_some(parsed)
+}
+
+fn rdps_component_is_supported(product: &str) -> bool {
+    const SURFACE_COMPONENTS: &[&str] = &[
+        "AirTemp_AGL-2m",
+        "DewPoint_AGL-2m",
+        "RelativeHumidity_AGL-2m",
+        "WindU_AGL-10m",
+        "WindV_AGL-10m",
+        "WindSpeed_AGL-10m",
+        "WindDir_AGL-10m",
+        "WindGust_AGL-10m",
+        "Pressure_Sfc",
+        "Pressure_MSL",
+        "Precip-Accum_Sfc",
+        "TotalCloudCover_Sfc",
+    ];
+    if SURFACE_COMPONENTS.contains(&product) {
+        return true;
+    }
+    for prefix in [
+        "AirTemp_IsbL-",
+        "RelativeHumidity_IsbL-",
+        "SpecificHumidity_IsbL-",
+        "WindU_IsbL-",
+        "WindV_IsbL-",
+        "GeopotentialHeight_IsbL-",
+    ] {
+        if exact_four_digit_level(product, prefix)
+            .is_some_and(|level| RDPS_COMMON_ISOBARIC_LEVELS_HPA.contains(&level))
+        {
+            return true;
+        }
+    }
+    exact_four_digit_level(product, "AbsoluteVorticity_IsbL-")
+        .is_some_and(|level| matches!(level, 250 | 500 | 700 | 850))
+}
+
+fn hrdps_component_is_supported(product: &str) -> bool {
+    const SURFACE_COMPONENTS: &[&str] = &[
+        "TMP_AGL-2m",
+        "DPT_AGL-2m",
+        "RH_AGL-2m",
+        "UGRD_AGL-10m",
+        "VGRD_AGL-10m",
+        "WIND_AGL-10m",
+        "WDIR_AGL-10m",
+        "GUST_AGL-10m",
+        "PRES_Sfc",
+        "PRMSL_MSL",
+        "HGT_Sfc",
+        "APCP_Sfc",
+        "TCDC_Sfc",
+    ];
+    if SURFACE_COMPONENTS.contains(&product) {
+        return true;
+    }
+    for prefix in [
+        "TMP_ISBL_",
+        "RH_ISBL_",
+        "SPFH_ISBL_",
+        "UGRD_ISBL_",
+        "VGRD_ISBL_",
+        "HGT_ISBL_",
+    ] {
+        if exact_four_digit_level(product, prefix)
+            .is_some_and(|level| HRDPS_COMMON_ISOBARIC_LEVELS_HPA.contains(&level))
+        {
+            return true;
+        }
+    }
+    exact_four_digit_level(product, "ABSV_ISBL_")
+        .is_some_and(|level| matches!(level, 250 | 500 | 700 | 850 | 1000))
+}
+
+fn build_rdps_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Eccc {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "RDPS publishes hourly f000-f084 for 00Z/06Z/12Z/18Z cycles".to_string(),
+        });
+    }
+    let product = match request.product.as_str() {
+        "rws-surface" | "rws-sounding" => "AirTemp_AGL-2m",
+        "rws-pressure" => "AirTemp_IsbL-0500",
+        product if rdps_component_is_supported(product) => product,
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    Ok(format!(
+        "https://dd.weather.gc.ca/today/model_rdps/10km/{:02}/{:03}/{}T{:02}Z_MSC_RDPS_{}_RLatLon0.09_PT{:03}H.grib2",
+        request.cycle.hour_utc,
+        request.forecast_hour,
+        request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
+        product,
+        request.forecast_hour,
+    ))
+}
+
+fn build_hrdps_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Eccc {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "HRDPS publishes hourly f000-f048 for 00Z/06Z/12Z/18Z cycles".to_string(),
+        });
+    }
+    let product = match request.product.as_str() {
+        "rws-surface" | "rws-sounding" => "TMP_AGL-2m",
+        "rws-pressure" => "TMP_ISBL_0500",
+        product if hrdps_component_is_supported(product) => product,
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    Ok(format!(
+        "https://dd.weather.gc.ca/today/model_hrdps/continental/2.5km/{:02}/{:03}/{}T{:02}Z_MSC_HRDPS_{}_RLatLon0.0225_PT{:03}H.grib2",
+        request.cycle.hour_utc,
+        request.forecast_hour,
+        request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
+        product,
+        request.forecast_hour,
     ))
 }
 
@@ -8005,7 +8224,10 @@ fn plot_recipe_field_blocker(
     // direct-GRIB plot path still assumes one family URL. Keep that path
     // explicitly blocked instead of fetching only the representative probe
     // object and silently rendering an incomplete field set.
-    if matches!(model, ModelId::Gdps | ModelId::CmaGeps) {
+    if matches!(
+        model,
+        ModelId::Gdps | ModelId::CmaGeps | ModelId::Rdps | ModelId::Hrdps
+    ) {
         return Some(PlotRecipeBlocker {
             field_key: field.key,
             field_label: field.label,
@@ -8117,6 +8339,12 @@ fn plot_recipe_fetch_defaults(
         (ModelId::Gdps, _, true) => ("rws-surface", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::Gdps, _, false) => ("rws-pressure", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::CmaGeps, _, _) => ("stats", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::Rdps | ModelId::Hrdps, _, true) => {
+            ("rws-surface", PlotRecipeFetchPolicy::WholeFile)
+        }
+        (ModelId::Rdps | ModelId::Hrdps, _, false) => {
+            ("rws-pressure", PlotRecipeFetchPolicy::WholeFile)
+        }
         (ModelId::Gdas, _, _) => ("pgrb2.0p25", PlotRecipeFetchPolicy::PreferIndexedSubset),
         (ModelId::Gefs, _, _) if has_ensemble_spread_selector => {
             ("pgrb2ap5/gespr", PlotRecipeFetchPolicy::PreferIndexedSubset)

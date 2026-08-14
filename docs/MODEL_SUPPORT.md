@@ -25,6 +25,8 @@ not automatically presented as live-verified.
 | GFS | Remote | Verified | Global deterministic products |
 | ECCC GDPS | Remote | Ingest beta | Global 0.15-degree deterministic 00/12z forecast; hourly f000-f084 then 3-hourly to f240; bounded per-field Datamart acquisition and a 19-level sounding profile are live ingest/store verified |
 | CMA GRAPES GEPS | Remote | Ingest beta | Global 0.25-degree provider-produced ensemble statistics; 00/12z, 3-hourly f000-f078 then 6-hourly to f360; mean/spread, percentile, and probability fields only—no raw member or deterministic sounding claim; live ingest/store verified |
+| ECCC RDPS | Remote | Ingest beta | North American 10 km rotated-grid deterministic forecast; 00/06/12/18z hourly f000-f084; bounded per-field acquisition and a 19-level sounding profile are live ingest/store verified; canonical U/V are paired and rotated to earth coordinates; derived/heavy disabled |
+| ECCC HRDPS continental | Remote | Ingest beta | Pan-Canadian 2.5 km rotated-grid deterministic forecast; 00/06/12/18z hourly f000-f048; bounded per-field acquisition and a 19-level sounding profile are live ingest/store verified; canonical U/V are paired and rotated to earth coordinates; derived/heavy disabled |
 | RRFS-A | Remote | Verified | Deterministic NA source cropped during ingest |
 | RAP | Remote | Ingest beta | Grid-130 `awp130pgrb` (13 km); hourly f000-f021, with 03/09/15/21z extended through f051; live ingest/store verified |
 | NAM | Remote | Ingest beta | Ingest is pinned to grid-212 `awip3d` (40 km), not the registry's separate `awip12` plotting product; hourly f000-f036 then 3-hourly through f084; live ingest/store verified |
@@ -74,7 +76,9 @@ The focused ingest fixtures pin inventories captured from the official
 [SREF](https://www.nco.ncep.noaa.gov/pmb/products/sref/),
 [REFS](https://www.nco.ncep.noaa.gov/pmb/products/refs/), and
 [RRFS](https://www.nco.ncep.noaa.gov/pmb/products/rrfs/), and
-[ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data) feeds.
+[ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data),
+[ECCC RDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_rdps/readme_rdps-datamart_en/), and
+[ECCC HRDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart_en/) feeds.
 Fixture source URLs and SHA-256 values are recorded beside the fixtures.
 
 GDPS was additionally exercised against the official
@@ -96,6 +100,28 @@ eleven precipitation percentile/probability fields. Deep validation passed at
 57 variables, 1,026 chunks, and 134,659,235 payload bytes. Unknown local CMA
 parameters remain excluded, and the API reports `provider_statistics_only`
 rather than implying access to the 31 underlying member forecasts.
+RDPS and HRDPS were exercised against the same official Datamart on
+2026-08-14 with one bounded 00z f024 sounding ingest each. RDPS realized six
+surface variables (the live feed has no surface-orography object) plus five
+19-level pressure volumes, passed writer verification, and passed deep store
+validation at 11 variables, 23,910 chunks, and 219,953,866 payload bytes.
+HRDPS realized all seven sounding surface variables plus the same five
+19-level pressure volumes, then passed both gates at 12 variables, 64,815
+chunks, and 580,038,302 payload bytes. The fixtures preserve the current RDPS
+documentation/payload dimension drift: documentation says 1102x1076, while
+the live U/V GRIB objects decode to 1140x1045; live normalized coordinates are
+authoritative. HRDPS documentation and payload both report 2540x1290.
+
+Both feeds declare U/V relative to their rotated grid, not geographic east and
+north. The regional decoder therefore requires each matching U/V pair, checks
+GRIB template 3.1 and its grid-relative component flag, derives the grid-i
+tangent from the normalized live coordinates, and rotates both components
+before canonical publication. Missing pairs, mismatched grids, or metadata
+drift fail closed. Independent comparison with ECCC's separately published
+speed/direction objects covered 2,382,600 RDPS and 6,553,200 HRDPS components;
+RMS differences were 0.063552 and 0.006831 m/s respectively, within provider
+direction quantization. Derived/heavy diagnostics remain disabled until every
+diagnostic path is explicitly proven to consume the normalized vectors.
 
 For the NOAA deterministic wave, normalization follows the fields actually
 published. HRRR Alaska carries native pressure-level temperature, dewpoint,

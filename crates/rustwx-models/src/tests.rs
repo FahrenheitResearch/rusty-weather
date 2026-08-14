@@ -90,10 +90,14 @@ fn provider_probe_agent_times_out_a_stalled_response_offline() {
 
 #[test]
 fn built_in_models_are_real() {
-    assert_eq!(built_in_models().len(), 25);
+    assert_eq!(built_in_models().len(), 27);
     assert_eq!(model_summary(ModelId::Gdps).default_product, "rws-surface");
     assert_eq!(model_summary(ModelId::CmaGeps).default_product, "stats");
     assert_eq!(model_summary(ModelId::CmaGeps).max_forecast_hour, 360);
+    assert_eq!(model_summary(ModelId::Rdps).default_product, "rws-surface");
+    assert_eq!(model_summary(ModelId::Rdps).max_forecast_hour, 84);
+    assert_eq!(model_summary(ModelId::Hrdps).default_product, "rws-surface");
+    assert_eq!(model_summary(ModelId::Hrdps).max_forecast_hour, 48);
     assert_eq!(model_summary(ModelId::HrrrAk).default_product, "sfc");
     assert_eq!(model_summary(ModelId::Gdas).default_product, "pgrb2.0p25");
     assert_eq!(
@@ -147,6 +151,8 @@ fn catalog_exposes_the_user_facing_supported_models() {
         ModelId::Gfs,
         ModelId::Gdps,
         ModelId::CmaGeps,
+        ModelId::Rdps,
+        ModelId::Hrdps,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -627,7 +633,10 @@ fn temperature_700_recipe_tracks_model_support() {
             let reason = &blockers[0].reason;
             if matches!(model, ModelId::Rtma | ModelId::Urma | ModelId::Nbm) {
                 assert!(reason.contains("surface/core grids"));
-            } else if matches!(model, ModelId::Gdps | ModelId::CmaGeps) {
+            } else if matches!(
+                model,
+                ModelId::Gdps | ModelId::CmaGeps | ModelId::Rdps | ModelId::Hrdps
+            ) {
                 assert!(reason.contains("normalized RWS ingest/query"));
             } else if model == ModelId::Href {
                 assert!(reason.contains("limited to explicit `href_sprd_*`"));
@@ -637,7 +646,7 @@ fn temperature_700_recipe_tracks_model_support() {
                 assert!(reason.contains("700 hPa temperature/height/wind selectors"));
             }
             match model {
-                ModelId::Gdps => {
+                ModelId::Gdps | ModelId::Rdps | ModelId::Hrdps => {
                     assert!(reason.contains("Datamart per-field component bundle"));
                 }
                 ModelId::CmaGeps => {
@@ -1017,6 +1026,86 @@ fn cma_geps_cadence_and_urls_match_the_wis2_core_data_contract() {
         build_grib_url(SourceId::Cma, &off_cadence),
         Err(ModelError::UnsupportedForecastHour { .. })
     ));
+}
+
+#[test]
+fn eccc_regional_cadence_and_component_urls_match_the_msc_datamart_contract() {
+    assert_eq!(rdps_isobaric_levels_hpa().first(), Some(&10));
+    assert_eq!(rdps_isobaric_levels_hpa().len(), 31);
+    assert_eq!(hrdps_isobaric_levels_hpa().first(), Some(&50));
+    assert_eq!(hrdps_isobaric_levels_hpa().len(), 28);
+    assert!(!hrdps_isobaric_levels_hpa().contains(&10));
+
+    for model in [ModelId::Rdps, ModelId::Hrdps] {
+        for cycle_hour in [0, 6, 12, 18] {
+            let hours = supported_forecast_hours(model, cycle_hour);
+            assert_eq!(hours.first(), Some(&0), "{model} {cycle_hour:02}z");
+            assert_eq!(
+                hours.last(),
+                Some(&model_summary(model).max_forecast_hour),
+                "{model} {cycle_hour:02}z"
+            );
+            assert_eq!(
+                hours.len(),
+                usize::from(model_summary(model).max_forecast_hour) + 1,
+                "{model} is hourly"
+            );
+        }
+        assert!(supported_forecast_hours(model, 3).is_empty());
+    }
+
+    let cycle = rustwx_core::CycleSpec::new("20260814", 0).unwrap();
+    let rdps = ModelRunRequest::new(ModelId::Rdps, cycle.clone(), 24, "WindU_IsbL-0850").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::Eccc, &rdps).unwrap(),
+        "https://dd.weather.gc.ca/today/model_rdps/10km/00/024/20260814T00Z_MSC_RDPS_WindU_IsbL-0850_RLatLon0.09_PT024H.grib2"
+    );
+    let hrdps = ModelRunRequest::new(ModelId::Hrdps, cycle.clone(), 24, "VGRD_ISBL_0850").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::Eccc, &hrdps).unwrap(),
+        "https://dd.weather.gc.ca/today/model_hrdps/continental/2.5km/00/024/20260814T00Z_MSC_HRDPS_VGRD_ISBL_0850_RLatLon0.0225_PT024H.grib2"
+    );
+    let rdps_probe = ModelRunRequest::new(ModelId::Rdps, cycle.clone(), 24, "rws-surface").unwrap();
+    assert!(
+        build_grib_url(SourceId::Eccc, &rdps_probe)
+            .unwrap()
+            .contains("_AirTemp_AGL-2m_")
+    );
+    let hrdps_probe =
+        ModelRunRequest::new(ModelId::Hrdps, cycle.clone(), 24, "rws-pressure").unwrap();
+    assert!(
+        build_grib_url(SourceId::Eccc, &hrdps_probe)
+            .unwrap()
+            .contains("_TMP_ISBL_0500_")
+    );
+
+    for (model, product) in [
+        (ModelId::Rdps, "../WindU_AGL-10m"),
+        (ModelId::Rdps, "WindU_IsbL-0125"),
+        (ModelId::Rdps, "WindU_IsbL-850"),
+        (ModelId::Rdps, "AbsoluteVorticity_IsbL-0200"),
+        (ModelId::Hrdps, "UGRD_ISBL_0125"),
+        (ModelId::Hrdps, "UGRD_ISBL_0010"),
+        (ModelId::Hrdps, "UGRD_ISBL_850"),
+        (ModelId::Hrdps, "ABSV_ISBL_0200"),
+    ] {
+        let request = ModelRunRequest::new(model, cycle.clone(), 24, product).unwrap();
+        assert!(
+            matches!(
+                build_grib_url(SourceId::Eccc, &request),
+                Err(ModelError::UnsupportedProduct { .. })
+            ),
+            "{model} admitted unsafe or absent component {product}"
+        );
+    }
+
+    for (model, off_end) in [(ModelId::Rdps, 85), (ModelId::Hrdps, 49)] {
+        let request = ModelRunRequest::new(model, cycle.clone(), off_end, "rws-surface").unwrap();
+        assert!(matches!(
+            build_grib_url(SourceId::Eccc, &request),
+            Err(ModelError::UnsupportedForecastHour { .. })
+        ));
+    }
 }
 
 #[test]

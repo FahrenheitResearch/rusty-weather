@@ -146,6 +146,41 @@ fn noaa_wave1_plans_pin_ingest_products_and_native_cadence() {
 }
 
 #[test]
+fn eccc_regional_plans_pin_logical_products_and_hourly_native_cadence() {
+    for (model, expected_count, expected_last) in
+        [(ModelId::Rdps, 85, 84), (ModelId::Hrdps, 49, 48)]
+    {
+        for cycle_hour in [0, 6, 12, 18] {
+            let plan = JobPlan::build(model, cycle("20260814", cycle_hour)).unwrap();
+            assert_eq!(plan.expected_valid_times.len(), expected_count, "{model}");
+            assert_eq!(
+                plan.expected_valid_times.last().unwrap().forecast_hour,
+                expected_last,
+                "{model} {cycle_hour:02}z horizon"
+            );
+            assert_eq!(
+                plan.ingest_products
+                    .iter()
+                    .map(|product| product.product.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["rws-pressure", "rws-surface"]
+            );
+            assert!(!plan.ingest_profile.derived);
+            assert!(!plan.ingest_profile.heavy);
+            assert_eq!(
+                plan.capability_limitations,
+                vec![
+                    "sparse_pressure_levels".to_string(),
+                    "derived_products_disabled".to_string(),
+                ]
+            );
+            plan.validate().unwrap();
+        }
+        assert!(JobPlan::build(model, cycle("20260814", 3)).is_err());
+    }
+}
+
+#[test]
 fn plan_rejects_a_cycle_the_model_does_not_publish() {
     let error = JobPlan::build(ModelId::Gfs, cycle("20260731", 1)).unwrap_err();
     assert!(matches!(
@@ -533,6 +568,8 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
         ModelId::Aigefs,
         ModelId::Hgefs,
         ModelId::EcmwfOpenData,
+        ModelId::Rdps,
+        ModelId::Hrdps,
     ] {
         let config = scheduler_config(&format!("ensemble-profile-{model}"), &[model.as_str()]);
         let profile = config.profile_for(model).unwrap();
@@ -1124,7 +1161,7 @@ fn every_ready_model_has_a_valid_cadence_profile_and_remote_source() {
         );
         plan.validate().unwrap();
     }
-    assert_eq!(ready, 23);
+    assert_eq!(ready, 25);
 }
 
 #[test]

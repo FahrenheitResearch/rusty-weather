@@ -4754,6 +4754,21 @@ mod tests {
             gdps["provider_attributions"][0]["notice"],
             "Data Source: Environment and Climate Change Canada"
         );
+        for id in ["rdps", "hrdps"] {
+            let regional = model(id);
+            assert_eq!(regional["ingest_status"], "ready");
+            assert_eq!(regional["verification"], "live_verified");
+            assert_eq!(
+                regional["limitations"],
+                serde_json::json!(["sparse_pressure_levels", "derived_products_disabled"])
+            );
+            assert_eq!(regional["products"][0]["product"], "rws-pressure");
+            assert_eq!(regional["products"][1]["product"], "rws-surface");
+            assert_eq!(
+                regional["provider_attributions"][0]["notice"],
+                "Data Source: Environment and Climate Change Canada"
+            );
+        }
 
         for id in ["rap", "nam"] {
             assert_eq!(model(id)["verification"], "live_verified");

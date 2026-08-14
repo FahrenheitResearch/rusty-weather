@@ -1715,6 +1715,8 @@ pub enum ModelId {
     Gfs,
     Gdps,
     CmaGeps,
+    Rdps,
+    Hrdps,
     Gdas,
     Gefs,
     Aigfs,
@@ -1745,6 +1747,8 @@ impl ModelId {
             Self::Gfs => "gfs",
             Self::Gdps => "gdps",
             Self::CmaGeps => "cma-geps",
+            Self::Rdps => "rdps",
+            Self::Hrdps => "hrdps",
             Self::Gdas => "gdas",
             Self::Gefs => "gefs",
             Self::Aigfs => "aigfs",
@@ -1788,6 +1792,10 @@ impl std::str::FromStr for ModelId {
             }
             "cma-geps" | "cma_geps" | "cmageps" | "grapes-geps" | "grapes_geps" => {
                 Ok(Self::CmaGeps)
+            }
+            "rdps" | "gem-regional" | "gem_regional" | "cmc-rdps" | "cmc_rdps" => Ok(Self::Rdps),
+            "hrdps" | "gem-high-resolution" | "gem_high_resolution" | "cmc-hrdps" | "cmc_hrdps" => {
+                Ok(Self::Hrdps)
             }
             "gdas" | "gdas-0p25" | "gdas_0p25" | "gdas-0.25" | "gdas_0.25" => Ok(Self::Gdas),
             "gefs" | "gefs-ens" | "gefs_ens" | "gefs-ensemble" => Ok(Self::Gefs),

@@ -252,6 +252,8 @@ pub fn supported_derived_recipe_slugs(model: ModelId) -> Vec<String> {
             .collect(),
         ModelId::Gdps
         | ModelId::CmaGeps
+        | ModelId::Rdps
+        | ModelId::Hrdps
         | ModelId::Rtma
         | ModelId::Urma
         | ModelId::Href

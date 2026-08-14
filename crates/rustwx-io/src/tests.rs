@@ -670,6 +670,280 @@ fn parsed_model_grib_repeated_passes_match_fresh_parse_results() {
     assert_same(&reused_alternate, &fresh_alternate);
 }
 
+fn regional_wind_message(parameter_number: u8, values: &[f32]) -> Grib2Message {
+    let mut message = ieee_f32_message(
+        ParameterCode {
+            discipline: 0,
+            category: 2,
+            number: parameter_number,
+        },
+        103,
+        10.0,
+        values,
+        0.0,
+        (values.len() - 1) as f64,
+    );
+    message.grid.template = 1;
+    message.grid.dx = 1.0;
+    message.grid.south_pole_lat = -90.0;
+    message.grid.south_pole_lon = 0.0;
+    message.grid.resolution_flags = 0x38;
+    message
+}
+
+#[test]
+fn regional_grid_relative_winds_are_paired_and_rotated_before_publication() {
+    let u_selector = FieldSelector::height_agl(CanonicalField::UWind, 10);
+    let v_selector = FieldSelector::height_agl(CanonicalField::VWind, 10);
+    let grib = Grib2File {
+        messages: vec![
+            regional_wind_message(2, &[3.0, 4.0, 5.0]),
+            regional_wind_message(3, &[4.0, 3.0, 0.0]),
+        ],
+    };
+    let parsed = ParsedModelGrib {
+        model: ModelId::Rdps,
+        grib,
+    };
+
+    let extracted = parsed
+        .extract_field_values_partial_at_forecast_hour(&[u_selector, v_selector], None)
+        .expect("identity rotated grid has a safe paired wind transform");
+    assert!(extracted.missing.is_empty());
+    for (actual, expected) in extracted.extracted[0]
+        .values
+        .iter()
+        .zip([3.0_f32, 4.0, 5.0])
+    {
+        assert!((actual - expected).abs() < 0.03);
+    }
+    for ((u, v), expected_speed) in extracted.extracted[0]
+        .values
+        .iter()
+        .zip(&extracted.extracted[1].values)
+        .zip([5.0_f32, 5.0, 5.0])
+    {
+        assert!((u.hypot(*v) - expected_speed).abs() < 1.0e-5);
+    }
+
+    let error = parsed
+        .extract_field_values_partial_at_forecast_hour(&[u_selector], None)
+        .expect_err("a native grid-relative U component cannot escape without V");
+    assert!(error.to_string().contains("matching 'v_wind@10m_agl'"));
+}
+
+#[test]
+fn regional_wind_normalization_fails_closed_on_metadata_or_grid_drift() {
+    let selectors = [
+        FieldSelector::height_agl(CanonicalField::UWind, 10),
+        FieldSelector::height_agl(CanonicalField::VWind, 10),
+    ];
+
+    let mut no_component_flag = regional_wind_message(2, &[1.0, 1.0]);
+    no_component_flag.grid.resolution_flags = 0x30;
+    let parsed = ParsedModelGrib {
+        model: ModelId::Hrdps,
+        grib: Grib2File {
+            messages: vec![no_component_flag, regional_wind_message(3, &[1.0, 1.0])],
+        },
+    };
+    assert!(
+        parsed
+            .extract_field_values_partial_at_forecast_hour(&selectors, None)
+            .unwrap_err()
+            .to_string()
+            .contains("does not declare grid-relative")
+    );
+
+    let mut mismatched_v = regional_wind_message(3, &[1.0, 1.0]);
+    mismatched_v.grid.south_pole_lon = 1.0;
+    let parsed = ParsedModelGrib {
+        model: ModelId::Hrdps,
+        grib: Grib2File {
+            messages: vec![regional_wind_message(2, &[1.0, 1.0]), mismatched_v],
+        },
+    };
+    assert!(
+        parsed
+            .extract_field_values_partial_at_forecast_hour(&selectors, None)
+            .unwrap_err()
+            .to_string()
+            .contains("different native grids")
+    );
+}
+
+#[test]
+fn normalized_grid_is_the_wind_rotation_authority_and_preserves_magnitude() {
+    let grid = LatLonGrid::new(
+        GridShape::new(3, 1).unwrap(),
+        vec![0.0, 1.0, 2.0],
+        vec![0.0, 1.0, 2.0],
+    )
+    .unwrap();
+    let coefficients = grid_i_to_earth_rotation_coefficients(ModelId::Rdps, &grid).unwrap();
+    let mut u = vec![10.0; 3];
+    let mut v = vec![0.0; 3];
+    rotate_grid_relative_wind_pair(
+        ModelId::Rdps,
+        FieldSelector::height_agl(CanonicalField::UWind, 10),
+        &mut u,
+        &mut v,
+        &coefficients,
+    )
+    .unwrap();
+
+    assert!(u[1] > 6.9 && u[1] < 7.2, "east component was {}", u[1]);
+    assert!(v[1] > 6.9 && v[1] < 7.2, "north component was {}", v[1]);
+    for (&earth_u, &earth_v) in u.iter().zip(&v) {
+        assert!((earth_u.hypot(earth_v) - 10.0).abs() < 1.0e-5);
+    }
+}
+
+#[test]
+fn regional_wind_tangent_ignores_the_artificial_noncyclic_dateline_seam() {
+    // A reduced version of the exact RDPS row where per-row longitude
+    // normalization moves the eastern piece ahead of the western piece.
+    // The middle adjacency is between the original regional row endpoints,
+    // not a physical grid-i step.
+    let grid = LatLonGrid::new(
+        GridShape::new(4, 1).unwrap(),
+        vec![45.231285, 45.154537, 41.015793, 41.09256],
+        vec![-4.017726, -3.968054, 176.58026, 176.62663],
+    )
+    .unwrap();
+    let coefficients = grid_i_to_earth_rotation_coefficients(ModelId::Rdps, &grid).unwrap();
+
+    assert!(coefficients[1].0 > 0.3 && coefficients[1].1 < -0.8);
+    assert!(coefficients[2].0 > 0.3 && coefficients[2].1 > 0.8);
+    assert!(
+        coefficients
+            .iter()
+            .all(|(east, north)| { (east.hypot(*north) - 1.0).abs() < 1.0e-6 })
+    );
+}
+
+#[test]
+#[ignore = "requires the four bounded official ECCC wind objects named in the ingest fixtures"]
+fn live_eccc_grid_wind_rotation_matches_provider_speed_and_direction() {
+    let fixture_dir = std::env::var("RUSTWX_ECCC_WIND_FIXTURE_DIR")
+        .expect("set RUSTWX_ECCC_WIND_FIXTURE_DIR to the bounded fixture directory");
+    for (model, prefix) in [(ModelId::Rdps, "rdps"), (ModelId::Hrdps, "hrdps")] {
+        let read = |suffix: &str| {
+            std::fs::read(PathBuf::from(&fixture_dir).join(format!("{prefix}-{suffix}.grib2")))
+                .unwrap_or_else(|error| panic!("read {prefix}-{suffix}: {error}"))
+        };
+        let mut paired_bytes = read("u10");
+        paired_bytes.extend(read("v10"));
+        let selectors = [
+            FieldSelector::height_agl(CanonicalField::UWind, 10),
+            FieldSelector::height_agl(CanonicalField::VWind, 10),
+        ];
+        let earth = ParsedModelGrib::from_model_bytes(model, &paired_bytes)
+            .unwrap()
+            .extract_field_values_partial_at_forecast_hour(&selectors, Some(24))
+            .unwrap();
+        assert!(earth.missing.is_empty(), "{model}");
+        assert_eq!(earth.extracted.len(), 2, "{model}");
+
+        let speed_grib = Grib2File::from_bytes(&read("wind")).unwrap();
+        let direction_grib = Grib2File::from_bytes(&read("wdir")).unwrap();
+        let mut grid_memo = GridMemo::new();
+        let speed = build_field_values(
+            &speed_grib.messages[0],
+            FieldSelector::height_agl(CanonicalField::WindSpeed, 10),
+            "m/s",
+            &mut grid_memo,
+        )
+        .unwrap();
+        let direction = build_field_values(
+            &direction_grib.messages[0],
+            FieldSelector::height_agl(CanonicalField::VWind, 10),
+            "deg",
+            &mut grid_memo,
+        )
+        .unwrap();
+        assert_eq!(speed.grid_index, direction.grid_index, "{model}");
+        assert_eq!(
+            earth.grids[earth.extracted[0].grid_index].grid,
+            grid_memo.slots[speed.grid_index].0.grid,
+            "{model} provider reference grid"
+        );
+
+        let mut compared = 0_u64;
+        let mut squared_error = 0.0_f64;
+        let mut max_component_error = 0.0_f32;
+        let mut max_error_sample = None;
+        let mut cell_errors = Vec::new();
+        for (index, (((&earth_u, &earth_v), &speed), &direction_deg)) in earth.extracted[0]
+            .values
+            .iter()
+            .zip(&earth.extracted[1].values)
+            .zip(&speed.values)
+            .zip(&direction.values)
+            .enumerate()
+        {
+            if !earth_u.is_finite()
+                || !earth_v.is_finite()
+                || !speed.is_finite()
+                || !direction_deg.is_finite()
+            {
+                continue;
+            }
+            let direction_rad = direction_deg.to_radians();
+            let reference_u = -speed * direction_rad.sin();
+            let reference_v = -speed * direction_rad.cos();
+            let u_error = (earth_u - reference_u).abs();
+            let v_error = (earth_v - reference_v).abs();
+            let cell_error = u_error.max(v_error);
+            cell_errors.push(cell_error);
+            if cell_error > max_component_error {
+                max_component_error = cell_error;
+                max_error_sample = Some((
+                    index,
+                    earth_u,
+                    earth_v,
+                    speed,
+                    direction_deg,
+                    reference_u,
+                    reference_v,
+                ));
+            }
+            squared_error += f64::from(u_error * u_error + v_error * v_error);
+            compared += 2;
+        }
+        let rms_component_error = (squared_error / compared as f64).sqrt();
+        cell_errors.sort_by(f32::total_cmp);
+        let percentile = |fraction: f64| {
+            cell_errors[((cell_errors.len() - 1) as f64 * fraction).round() as usize]
+        };
+        let (max_index, earth_u, earth_v, speed, direction, reference_u, reference_v) =
+            max_error_sample.unwrap();
+        let grid = &earth.grids[earth.extracted[0].grid_index].grid;
+        eprintln!(
+            "{model}: compared {compared} components, RMS error {rms_component_error:.6} m/s, p95/p99/p99.9 {}/{}/{}, max error {max_component_error:.6} m/s at {}x{} ({}, {}): earth=({earth_u},{earth_v}) reference=({reference_u},{reference_v}) speed={speed} direction={direction}",
+            percentile(0.95),
+            percentile(0.99),
+            percentile(0.999),
+            max_index % grid.shape.nx,
+            max_index / grid.shape.nx,
+            grid.lat_deg[max_index],
+            grid.lon_deg[max_index],
+        );
+        assert!(
+            compared > 1_000_000,
+            "{model}: too few finite reference cells"
+        );
+        assert!(
+            rms_component_error < 0.08,
+            "{model}: RMS component mismatch {rms_component_error} m/s"
+        );
+        assert!(
+            max_component_error < 0.25,
+            "{model}: max component mismatch {max_component_error} m/s"
+        );
+    }
+}
+
 #[test]
 fn component_bundle_is_ordered_source_bound_and_inventory_keyed() {
     use wx_core::grib2::{

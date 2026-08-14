@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     for (index, message) in grib.messages.iter().enumerate() {
         println!(
-            "{index:04} d/c/n={}/{}/{} {:<36} level={}:{} ({}) grid={} {}x{} flags=0x{:02x} data_rep={} pdt={} forecast={}/{} ensemble={:?}/{:?}/{:?} derived={:?} percentile={:?} probability={:?}/{:?}/{:?}/{:?} statistics={:?}/{:?}/{:?}",
+            "{index:04} d/c/n={}/{}/{} {:<36} level={}:{} ({}) grid={} {}x{} scan=0x{:02x} resolution=0x{:02x} south_pole=({:.6},{:.6}) rotation={:.6} data_rep={} pdt={} forecast={}/{} ensemble={:?}/{:?}/{:?} derived={:?} percentile={:?} probability={:?}/{:?}/{:?}/{:?} statistics={:?}/{:?}/{:?}",
             message.discipline,
             message.product.parameter_category,
             message.product.parameter_number,
@@ -37,7 +37,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             message.grid.template,
             message.grid.nx,
             message.grid.ny,
+            message.grid.scan_mode,
             message.grid.resolution_flags,
+            message.grid.south_pole_lat,
+            message.grid.south_pole_lon,
+            message.grid.rotation_angle,
             message.data_rep.template,
             message.product.template,
             message.product.forecast_time,

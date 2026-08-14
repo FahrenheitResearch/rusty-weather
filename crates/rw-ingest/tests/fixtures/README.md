@@ -1,9 +1,9 @@
 # Captured provider index fixtures
 
-These are immutable text inventories captured from official NOAA and ECMWF
-endpoints on 2026-08-11 and 2026-08-12. They are test evidence, not runtime
-data and not a promise that an upstream experimental feed will remain
-available forever.
+These are immutable text inventories captured from official NOAA, ECMWF, and
+ECCC endpoints from 2026-08-11 through 2026-08-14. They are test evidence,
+not runtime data and not a promise that an upstream experimental feed will
+remain available forever.
 
 | Fixture | Official source | Capture |
 | --- | --- | --- |
@@ -29,6 +29,8 @@ available forever.
 | `rrfs.t00z.2dfld.3km.f024.conus.grib2.excerpt.idx` | `https://noaa-rrfs-pds.s3.amazonaws.com/rrfs_public/rrfs.20260810/00/rrfs.t00z.2dfld.3km.f024.conus.grib2.idx` | exact selector-bearing rows excerpted from the 21,615-byte sidecar; full-source SHA-256 `A0F4E5110FC37B8D7F5DBEE0347A19FE4165CE6EFF3AF4904464B83FF074C75D` |
 | `rtma2p5_2dvaranl_ndfd.idx` | `https://noaa-rtma-pds.s3.amazonaws.com/rtma2p5.20260810/rtma2p5.t00z.2dvaranl_ndfd.grb2_wexp.idx` | exact ingest-selected analysis rows, 662 bytes, fixture SHA-256 `5CC6D510E52478FA5DC2D49E658AF6E9A66960B8387AB56AD55C171C2CBD7E82` |
 | `urma2p5_2dvaranl_ndfd.idx` | `https://noaa-urma-pds.s3.amazonaws.com/urma2p5.20260810/urma2p5.t00z.2dvaranl_ndfd.grb2_wexp.idx` | exact ingest-selected analysis rows, 706 bytes, fixture SHA-256 `32E16EDD8D78F06586E4AB171F4A20F0F8745BEBF362D68BA683950FE677BB79` |
+| `rdps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/model_rdps/10km/00/024/` | exact representative filename rows and decoded grid/vector metadata from the 100,669-byte, 414-GRIB-object official listing; full-source SHA-256 `87BD53259734E95AEFEFF1DA7BBCD83332A5BD3AC6124DC46BD5AD6675952F10`; 2,675-byte fixture SHA-256 `644E6A32A0BE5DBECBCFE141523A3E25E48B828435985DEE3783228F1D355F94` |
+| `hrdps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/model_hrdps/continental/2.5km/00/024/` | exact representative filename rows and decoded grid/vector metadata from the 91,816-byte, 414-GRIB-object official listing; full-source SHA-256 `AF42B19E5A3D44C00AB0FDA2E1F18E052A2043319B997D0E8263D4B7B957EF8E`; 2,695-byte fixture SHA-256 `C4263EB72B5EE25468C89C1D98D2CFF32B62A25645142E8ECFEFC05B026DBBFC` |
 
 The SREF product is a run-wide file containing all native forecast steps, so
 the compact fixture deliberately includes its first, next, and final native
@@ -67,10 +69,11 @@ for a full-payload ingest plus deep-store validation.
 
 ## Bounded live store verification (2026-08-14)
 
-Each lane below fetched exactly one official 2026-08-12 00z f024 payload with
-the sounding profile at a 50 hPa candidate step, ran the ingest writer's
-`--verify` round trip, then passed `rws validate --deep`. No cycle-wide or
-unbounded global download was used.
+Each lane below fetched exactly one official 00z f024 payload (2026-08-12 for
+the global wave and 2026-08-14 for the ECCC regional wave) with the sounding
+profile at a 50 hPa candidate step, ran the ingest writer's `--verify` round
+trip, then passed `rws validate --deep`. No cycle-wide or unbounded global
+download was used.
 
 | Model lane | Acquired bytes | Realized RWS evidence |
 | --- | ---: | --- |
@@ -79,6 +82,8 @@ unbounded global download was used.
 | NOAA AI-GEFS `avg` | 66.8 MiB pressure + 3.1 MiB surface from NOMADS | 9 variables, 20,772 chunks, 115,840,724 payload bytes; selector metadata is `ensemble_mean` |
 | NOAA HGEFS `avg` | 62.0 MiB pressure + 2.9 MiB surface from NOMADS | 9 variables, 20,772 chunks, 115,321,280 payload bytes; selector metadata is `ensemble_mean` |
 | ECMWF IFS Open Data `oper` | 48.5 MiB, 22 JSON-index ranges (146.6 MiB source object) | 11 variables, 20,808 chunks, 111,375,300 payload bytes; 11 levels in all five canonical volumes |
+| ECCC RDPS | 51.9 MB pressure + 2.8 MB surface component bundles | 11 variables, 23,910 chunks, 219,953,866 payload bytes; five 19-level volumes plus 6/7 sounding surface fields, with absent surface orography reported rather than invented |
+| ECCC HRDPS continental | 121.0 MB pressure + 16.7 MB surface component bundles | 12 variables, 64,815 chunks, 580,038,302 payload bytes; five 19-level volumes plus all seven sounding surface fields |
 
 The NOAA AI surface products did not realize 2-m dewpoint, surface pressure,
 or orography; IFS did not realize orography; and GEFS did not realize 2-m
@@ -101,3 +106,23 @@ provider products bit-exactly and `rws validate --deep` passed at 57 variables,
 1,026 chunks, and 134,659,235 payload bytes. This proof covers provider-produced
 means/spreads, percentiles, and probabilities only; it does not claim raw
 ensemble members or undocumented local CMA parameters.
+
+## ECCC regional verification (2026-08-14)
+
+The ECCC regional fixtures pin the provider's per-field-object identity,
+surface and pressure naming dialects, exact common five-field pressure-level
+inventories, and GRIB vector-component flag. They also preserve a real
+documentation/live-payload drift: the RDPS documentation still declares
+1102x1076, while both captured U/V objects decode to 1140x1045. The decoder
+therefore treats the normalized live GRIB grid as authoritative. Each fixture
+also records SHA-256 identities for the bounded U, V, speed, and direction
+objects used to independently check the grid-to-earth vector rotation; it is
+not a promise that ECCC retains `today/` objects indefinitely.
+
+The paired-vector normalization was also checked independently against the
+four bounded U/V/speed/direction objects identified in each fixture. Across
+every finite cell, RDPS compared 2,382,600 earth-relative components with
+0.063552 m/s RMS and 0.207682 m/s maximum error; HRDPS compared 6,553,200
+components with 0.006831 m/s RMS and 0.043763 m/s maximum error. Those bounds
+include the provider's direction quantization (1 degree for RDPS and 0.1
+degree for HRDPS), rather than comparing the decoder against itself.

@@ -120,6 +120,35 @@ data and products, link `www.ecmwf.int` and CC BY 4.0, and state that ECMWF
 accepts no liability for errors, omissions, availability, loss, or damage
 arising from use.
 
+## Environment and Climate Change Canada (ECCC/MSC)
+
+The public ECCC lane reads the provider's anonymous
+[MSC Datamart](https://eccc-msc.github.io/open-data/msc-datamart/readme_en/).
+The packaged remote scheduler currently limits that lane to the GDPS, RDPS,
+and continental HRDPS products and cadences published in MODEL_SUPPORT.md.
+Those products are split into one GRIB2 object per field, level, lead, and
+cycle; Rusty Weather acquires an explicit bounded component inventory and
+records ECCC as the provider without persisting source-object URLs.
+
+ECCC publishes these data under its
+[open-data server licence](https://eccc-msc.github.io/open-data/licence/readme_en/),
+which permits worldwide, royalty-free use, copying, modification,
+publication, translation, adaptation, distribution, and commercial use,
+subject to the stated conditions. Redistributed or derived products must
+retain the required notice `Data Source: Environment and Climate Change
+Canada`, must not imply ECCC endorsement, and must preserve any separately
+identified third-party rights or attribution. Rusty Weather surfaces that
+notice, a modification statement, the licence link, and the provider's
+accuracy/availability disclaimer through run and model capability responses.
+
+The generated `today/` URLs are a current operational distribution path, not
+a retention guarantee. Operators who require history must set an explicit
+cache/retention policy and re-check the licence and upstream service terms.
+RDPS and HRDPS vector components are normalized from their declared rotated
+grid-relative axes into canonical earth-relative U/V; downstream output is a
+transformed Rusty Weather product and must not be represented as an unmodified
+official ECCC product.
+
 ## User-provided and local-only sources
 
 WRF/wrfout import is local-only. The scheduler does not discover or download a

@@ -218,7 +218,7 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
         // These are logical extraction families: fetch_hour expands each into
         // an exact, profile-dependent ordered component bundle and caches both
         // the component objects and assembled message stream.
-        ModelId::Gdps => Ok(vec![
+        ModelId::Gdps | ModelId::Rdps | ModelId::Hrdps => Ok(vec![
             ProductFetch {
                 product: "rws-pressure",
                 surface_source: false,
@@ -697,6 +697,15 @@ pub fn validate_ingest_profile_for_model(
             "model '{model}' public ingest products do not publish native surface orography in each forecast file; derived/heavy diagnostics remain disabled until a verified static-field join exists; use --profile sounding or disable both derived and heavy",
         )));
     }
+    if matches!(
+        model,
+        rustwx_core::ModelId::Rdps | rustwx_core::ModelId::Hrdps
+    ) && (profile.derived || profile.heavy)
+    {
+        return Err(events::other(format!(
+            "model '{model}' publishes winds relative to its rotated grid; the paired U/V ingest lane safely rotates stored canonical winds, but derived/heavy diagnostics remain disabled until every diagnostic path consumes that normalized pair; use --profile sounding or disable both derived and heavy",
+        )));
+    }
     Ok(())
 }
 
@@ -824,6 +833,10 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
             IngestCapabilityLimitation::SparsePressureLevels,
             IngestCapabilityLimitation::DerivedProductsDisabled,
         ],
+        rustwx_core::ModelId::Rdps | rustwx_core::ModelId::Hrdps => vec![
+            IngestCapabilityLimitation::SparsePressureLevels,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+        ],
         _ => Vec::new(),
     };
     match fetch_plan(model) {
@@ -833,6 +846,8 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 | rustwx_core::ModelId::Gfs
                 | rustwx_core::ModelId::Gdps
                 | rustwx_core::ModelId::CmaGeps
+                | rustwx_core::ModelId::Rdps
+                | rustwx_core::ModelId::Hrdps
                 | rustwx_core::ModelId::Rap
                 | rustwx_core::ModelId::Nam
                 | rustwx_core::ModelId::RrfsA
@@ -939,6 +954,8 @@ mod tests {
             ModelId::Gfs,
             ModelId::Gdps,
             ModelId::CmaGeps,
+            ModelId::Rdps,
+            ModelId::Hrdps,
             ModelId::Gdas,
             ModelId::Gefs,
             ModelId::Aigfs,
@@ -1139,6 +1156,21 @@ mod tests {
                 "{model} has pinned official URL, cadence, and inventory evidence"
             );
         }
+        for model in [ModelId::Rdps, ModelId::Hrdps] {
+            let capability = model_ingest_capability(model);
+            assert_eq!(capability.status, IngestSupportStatus::Ready);
+            assert_eq!(
+                capability.verification,
+                IngestVerificationLevel::LiveVerified
+            );
+            assert_eq!(
+                capability.limitations,
+                vec![
+                    IngestCapabilityLimitation::SparsePressureLevels,
+                    IngestCapabilityLimitation::DerivedProductsDisabled,
+                ]
+            );
+        }
 
         let unsupported = model_ingest_capability(ModelId::WrfGdex);
         assert_eq!(unsupported.status, IngestSupportStatus::Unsupported);
@@ -1177,6 +1209,8 @@ mod tests {
                 ModelId::Gfs,
                 ModelId::Gdps,
                 ModelId::CmaGeps,
+                ModelId::Rdps,
+                ModelId::Hrdps,
                 ModelId::Gdas,
                 ModelId::Gefs,
                 ModelId::Aigfs,
@@ -1561,6 +1595,26 @@ mod tests {
     }
 
     #[test]
+    fn regional_eccc_models_accept_normalized_soundings_but_gate_derived_stages() {
+        use rustwx_core::ModelId;
+
+        for model in [ModelId::Rdps, ModelId::Hrdps] {
+            validate_ingest_profile_for_model(model, &ingest_profile::IngestProfile::sounding())
+                .expect("paired grid-relative winds are normalized for raw sounding ingest");
+            let message =
+                validate_ingest_profile_for_model(model, &ingest_profile::IngestProfile::full())
+                    .expect_err("derived paths must not consume native grid-relative vectors")
+                    .to_string();
+            assert!(
+                message.contains("relative to its rotated grid"),
+                "got: {message}"
+            );
+            assert!(message.contains("paired U/V ingest lane"), "got: {message}");
+            assert!(message.contains("--profile sounding"), "got: {message}");
+        }
+    }
+
+    #[test]
     fn rrfs_a_has_a_conus_crop_box_bounding_hrrr() {
         use rustwx_core::ModelId;
         let (w, e, s, n) = model_crop_box(ModelId::RrfsA).expect("RRFS-A crop box");
@@ -1909,14 +1963,29 @@ mod tests {
     }
 
     #[test]
-    fn fetch_plan_gdps_uses_ordered_logical_component_families() {
-        let plan = fetch_plan(rustwx_core::ModelId::Gdps).expect("GDPS plan");
-        assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0].product, "rws-pressure");
-        assert!(plan[0].pressure_source && !plan[0].surface_source);
-        assert_eq!(plan[1].product, "rws-surface");
-        assert!(plan[1].surface_source && !plan[1].pressure_source);
-        assert!(plan.iter().all(|product| product.idx_patterns.is_empty()));
+    fn fetch_plan_eccc_models_use_ordered_logical_component_families() {
+        for model in [
+            rustwx_core::ModelId::Gdps,
+            rustwx_core::ModelId::Rdps,
+            rustwx_core::ModelId::Hrdps,
+        ] {
+            let plan = fetch_plan(model).expect("ECCC component plan");
+            assert_eq!(plan.len(), 2, "{model}");
+            assert_eq!(plan[0].product, "rws-pressure", "{model}");
+            assert!(
+                plan[0].pressure_source && !plan[0].surface_source,
+                "{model}"
+            );
+            assert_eq!(plan[1].product, "rws-surface", "{model}");
+            assert!(
+                plan[1].surface_source && !plan[1].pressure_source,
+                "{model}"
+            );
+            assert!(
+                plan.iter().all(|product| product.idx_patterns.is_empty()),
+                "{model}"
+            );
+        }
 
         let capability = model_ingest_capability(rustwx_core::ModelId::Gdps);
         assert_eq!(capability.status, IngestSupportStatus::Ready);
@@ -2113,6 +2182,73 @@ mod tests {
                 10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000
             ]
         );
+    }
+
+    fn fixture_header<'a>(fixture: &'a str, key: &str) -> &'a str {
+        fixture
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("# {key}=")))
+            .unwrap_or_else(|| panic!("fixture is missing header {key}"))
+    }
+
+    #[test]
+    fn eccc_regional_fixtures_pin_inventory_grid_drift_and_vector_contract() {
+        let rdps = include_str!("../tests/fixtures/rdps.20260814.t00z.f024.inventory.txt");
+        let hrdps = include_str!("../tests/fixtures/hrdps.20260814.t00z.f024.inventory.txt");
+
+        assert_eq!(fixture_header(rdps, "source_grib2_links"), "414");
+        assert_eq!(fixture_header(hrdps, "source_grib2_links"), "414");
+        assert_eq!(
+            fixture_header(rdps, "source_sha256"),
+            "87BD53259734E95AEFEFF1DA7BBCD83332A5BD3AC6124DC46BD5AD6675952F10"
+        );
+        assert_eq!(
+            fixture_header(hrdps, "source_sha256"),
+            "AF42B19E5A3D44C00AB0FDA2E1F18E052A2043319B997D0E8263D4B7B957EF8E"
+        );
+
+        assert_eq!(fixture_header(rdps, "documentation_grid"), "1102x1076");
+        assert_eq!(fixture_header(rdps, "live_decoded_grid"), "1140x1045");
+        assert_ne!(
+            fixture_header(rdps, "documentation_grid"),
+            fixture_header(rdps, "live_decoded_grid"),
+            "the captured live GRIB must remain authoritative over stale documentation"
+        );
+        assert_eq!(fixture_header(hrdps, "documentation_grid"), "2540x1290");
+        assert_eq!(fixture_header(hrdps, "live_decoded_grid"), "2540x1290");
+        for fixture in [rdps, hrdps] {
+            assert_eq!(fixture_header(fixture, "scan_mode"), "0x40");
+            assert_eq!(
+                fixture_header(fixture, "resolution_and_component_flags"),
+                "0x38"
+            );
+            for key in ["u10_sha256", "v10_sha256", "wind10_sha256", "wdir10_sha256"] {
+                let sha = fixture_header(fixture, key);
+                assert_eq!(sha.len(), 64, "{key}");
+                assert!(sha.bytes().all(|byte| byte.is_ascii_hexdigit()), "{key}");
+            }
+        }
+
+        assert_eq!(
+            fixture_header(rdps, "common_five_field_isobaric_levels_hpa")
+                .split(',')
+                .map(|level| level.parse::<u16>().unwrap())
+                .collect::<Vec<_>>(),
+            rustwx_models::rdps_isobaric_levels_hpa()
+        );
+        assert_eq!(
+            fixture_header(hrdps, "common_five_field_isobaric_levels_hpa")
+                .split(',')
+                .map(|level| level.parse::<u16>().unwrap())
+                .collect::<Vec<_>>(),
+            rustwx_models::hrdps_isobaric_levels_hpa()
+        );
+        assert!(rdps.contains("_WindU_AGL-10m_"));
+        assert!(rdps.contains("_WindV_AGL-10m_"));
+        assert!(!rdps.contains("GeopotentialHeight_Sfc"));
+        assert!(hrdps.contains("_UGRD_AGL-10m_"));
+        assert!(hrdps.contains("_VGRD_AGL-10m_"));
+        assert!(hrdps.contains("_HGT_Sfc_"));
     }
 
     #[test]
