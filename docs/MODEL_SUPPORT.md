@@ -84,3 +84,6 @@ per-variable lineage.
 
 This document is a human-readable summary. The server's `/v1/models` response
 is the machine-readable authority for a running deployment.
+
+Potential additional official feeds and the core contracts that gate them are
+tracked separately in [PUBLIC_MODEL_BACKLOG.md](PUBLIC_MODEL_BACKLOG.md).
