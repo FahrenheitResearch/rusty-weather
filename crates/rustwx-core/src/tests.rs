@@ -107,6 +107,8 @@ fn model_id_aliases_round_trip() {
     assert_eq!("ecmwf".parse::<ModelId>().unwrap(), ModelId::EcmwfOpenData);
     assert_eq!("euro".parse::<ModelId>().unwrap(), ModelId::EcmwfOpenData);
     assert_eq!("aifs-v2".parse::<ModelId>().unwrap(), ModelId::Aifs);
+    assert_eq!("dwd_icon_eu".parse::<ModelId>().unwrap(), ModelId::IconEu);
+    assert_eq!("icond2".parse::<ModelId>().unwrap(), ModelId::IconD2);
     assert_eq!("wrf".parse::<ModelId>().unwrap(), ModelId::WrfGdex);
     assert_eq!(ModelId::Hrrr.to_string(), "hrrr");
     assert_eq!(ModelId::Hgefs.to_string(), "hgefs");
@@ -114,9 +116,13 @@ fn model_id_aliases_round_trip() {
     assert_eq!(ModelId::RrfsPublic.to_string(), "rrfs-public");
     assert_eq!(ModelId::Refs.to_string(), "refs");
     assert_eq!(ModelId::WrfGdex.to_string(), "wrf");
+    assert_eq!(ModelId::IconEu.to_string(), "icon-eu");
+    assert_eq!(ModelId::IconD2.to_string(), "icon-d2");
     assert_eq!("wrf-gdex".parse::<ModelId>().unwrap(), ModelId::WrfGdex);
     assert_eq!("gdex".parse::<SourceId>().unwrap(), SourceId::Gdex);
     assert_eq!(SourceId::Gdex.to_string(), "gdex");
+    assert_eq!("dwd-open-data".parse::<SourceId>().unwrap(), SourceId::Dwd);
+    assert_eq!(SourceId::Dwd.to_string(), "dwd");
     assert_eq!(
         "aifsv2-inference".parse::<SourceId>().unwrap(),
         SourceId::AifsInference

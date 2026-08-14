@@ -409,6 +409,7 @@ const GDPS_CYCLE_HOURS: &[u8] = &[0, 12];
 const CMA_GEPS_CYCLE_HOURS: &[u8] = &[0, 12];
 const RDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const HRDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
+const DWD_ICON_CYCLE_HOURS: &[u8] = &[0, 3, 6, 9, 12, 15, 18, 21];
 const GDAS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const GEFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const AI_MODEL_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
@@ -548,6 +549,17 @@ const CMA_GEPS_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
     priority: 1,
     max_age_hours: Some(24 * 30),
     notes: "CMA WIS2 core-data node (GRAPES GEPS provider statistics)",
+}];
+
+const DWD_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
+    id: SourceId::Dwd,
+    // DWD publishes one externally bzip2-compressed GRIB2 object per
+    // field/level/named forecast time. The ingest layer assembles an exact
+    // profile-dependent component bundle; there is no companion byte index.
+    idx_available: false,
+    priority: 1,
+    max_age_hours: Some(30),
+    notes: "Deutscher Wetterdienst Open Data",
 }];
 
 const GEFS_SOURCES: &[SourceDescriptor] = &[
@@ -707,6 +719,26 @@ const MODELS: &[ModelSummary] = &[
         cycle_hours_utc: HRDPS_CYCLE_HOURS,
         max_forecast_hour: 48,
         sources: GDPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::IconEu,
+        description: "DWD ICON-EU regular latitude/longitude deterministic forecast",
+        default_product: "rws-surface",
+        cycle_hours_utc: DWD_ICON_CYCLE_HOURS,
+        max_forecast_hour: 120,
+        sources: DWD_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::IconD2,
+        description: "DWD ICON-D2 regular latitude/longitude deterministic forecast",
+        default_product: "rws-surface",
+        cycle_hours_utc: DWD_ICON_CYCLE_HOURS,
+        max_forecast_hour: 48,
+        sources: DWD_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::Deterministic,
     },
@@ -5797,7 +5829,7 @@ pub fn built_in_models() -> &'static [ModelSummary] {
 /// [`built_in_models`] remains linked (`ModelId` match arms thread through
 /// rustwx-products), but every user-facing enumeration must go through this
 /// list.
-pub fn supported_models() -> [ModelId; 18] {
+pub fn supported_models() -> [ModelId; 20] {
     [
         ModelId::Hrrr,
         ModelId::HrrrAk,
@@ -5807,6 +5839,8 @@ pub fn supported_models() -> [ModelId; 18] {
         ModelId::CmaGeps,
         ModelId::Rdps,
         ModelId::Hrdps,
+        ModelId::IconEu,
+        ModelId::IconD2,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -6067,6 +6101,27 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
                 Vec::new()
             }
         }
+        ModelId::IconEu => {
+            if !DWD_ICON_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                return Vec::new();
+            }
+            if cycle_hour_utc % 6 == 0 {
+                let mut hours = (0..=78).collect::<Vec<u16>>();
+                hours.extend((81..=120).step_by(3));
+                hours
+            } else {
+                let mut hours = (0..=30).collect::<Vec<u16>>();
+                hours.extend([36, 42, 48]);
+                hours
+            }
+        }
+        ModelId::IconD2 => {
+            if DWD_ICON_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=48).collect()
+            } else {
+                Vec::new()
+            }
+        }
         ModelId::Gdas => (0..=9).collect(),
         ModelId::Gefs => {
             let mut hours = (0..=240).step_by(3).collect::<Vec<u16>>();
@@ -6215,6 +6270,15 @@ fn default_canonical_bundle_product(
         ) => "rws-surface",
         (ModelId::Rdps | ModelId::Hrdps, CanonicalBundleDescriptor::PressureAnalysis) => {
             "rws-pressure"
+        }
+        (ModelId::IconEu | ModelId::IconD2, CanonicalBundleDescriptor::SurfaceAnalysis) => {
+            "rws-surface"
+        }
+        (ModelId::IconEu | ModelId::IconD2, CanonicalBundleDescriptor::PressureAnalysis) => {
+            "rws-pressure"
+        }
+        (ModelId::IconEu | ModelId::IconD2, CanonicalBundleDescriptor::NativeAnalysis) => {
+            "rws-surface"
         }
         (ModelId::Gdas, _) => "pgrb2.0p25",
         (ModelId::Gefs, _) => "pgrb2ap5/gec00",
@@ -6686,6 +6750,7 @@ fn build_grib_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         ModelId::CmaGeps => build_cma_geps_url(source, request)?,
         ModelId::Rdps => build_rdps_url(source, request)?,
         ModelId::Hrdps => build_hrdps_url(source, request)?,
+        ModelId::IconEu | ModelId::IconD2 => build_dwd_icon_url(source, request)?,
         ModelId::Gdas => build_gdas_url(source, request)?,
         ModelId::Gefs => build_gefs_url(source, request)?,
         ModelId::Aigfs => build_aigfs_url(source, request)?,
@@ -7284,6 +7349,208 @@ fn build_hrdps_url(source: SourceId, request: &ModelRunRequest) -> Result<String
         product,
         request.forecast_hour,
     ))
+}
+
+const ICON_EU_REGULAR_ISOBARIC_LEVELS_HPA: &[u16] = &[
+    50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700, 775, 800, 825, 850, 875, 900, 925, 950,
+    1000,
+];
+const ICON_D2_REGULAR_ISOBARIC_LEVELS_HPA: &[u16] =
+    &[200, 250, 300, 400, 500, 600, 700, 850, 950, 975, 1000];
+
+pub fn icon_eu_regular_isobaric_levels_hpa() -> &'static [u16] {
+    ICON_EU_REGULAR_ISOBARIC_LEVELS_HPA
+}
+
+pub fn icon_d2_regular_isobaric_levels_hpa() -> &'static [u16] {
+    ICON_D2_REGULAR_ISOBARIC_LEVELS_HPA
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DwdIconComponent {
+    Surface {
+        directory: &'static str,
+        eu_token: &'static str,
+        d2_token: &'static str,
+        time_invariant: bool,
+    },
+    Pressure {
+        directory: &'static str,
+        eu_token: &'static str,
+        d2_token: &'static str,
+        level_hpa: u16,
+    },
+}
+
+fn dwd_icon_surface_component(product: &str) -> Option<DwdIconComponent> {
+    let (directory, eu_token, d2_token, time_invariant) = match product {
+        "dwd-surface-t2m" => ("t_2m", "T_2M", "t_2m", false),
+        "dwd-surface-td2m" => ("td_2m", "TD_2M", "td_2m", false),
+        "dwd-surface-rh2m" => ("relhum_2m", "RELHUM_2M", "relhum_2m", false),
+        "dwd-surface-u10m" => ("u_10m", "U_10M", "u_10m", false),
+        "dwd-surface-v10m" => ("v_10m", "V_10M", "v_10m", false),
+        "dwd-surface-pmsl" => ("pmsl", "PMSL", "pmsl", false),
+        "dwd-surface-ps" => ("ps", "PS", "ps", false),
+        "dwd-surface-hsurf" => ("hsurf", "HSURF", "hsurf", true),
+        "dwd-surface-tot-prec" => ("tot_prec", "TOT_PREC", "tot_prec", false),
+        _ => return None,
+    };
+    Some(DwdIconComponent::Surface {
+        directory,
+        eu_token,
+        d2_token,
+        time_invariant,
+    })
+}
+
+fn dwd_icon_pressure_component(model: ModelId, product: &str) -> Option<DwdIconComponent> {
+    let remainder = product.strip_prefix("dwd-pressure-")?;
+    let (family, level) = remainder.rsplit_once('-')?;
+    if level.len() != 4 || !level.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let level_hpa = level.parse::<u16>().ok()?;
+    let levels = match model {
+        ModelId::IconEu => ICON_EU_REGULAR_ISOBARIC_LEVELS_HPA,
+        ModelId::IconD2 => ICON_D2_REGULAR_ISOBARIC_LEVELS_HPA,
+        _ => return None,
+    };
+    if !levels.contains(&level_hpa) || format!("{level_hpa:04}") != level {
+        return None;
+    }
+    let (directory, eu_token, d2_token) = match family {
+        "t" => ("t", "T", "t"),
+        "rh" => ("relhum", "RELHUM", "relhum"),
+        "u" => ("u", "U", "u"),
+        "v" => ("v", "V", "v"),
+        "fi" => ("fi", "FI", "fi"),
+        _ => return None,
+    };
+    Some(DwdIconComponent::Pressure {
+        directory,
+        eu_token,
+        d2_token,
+        level_hpa,
+    })
+}
+
+fn build_dwd_icon_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Dwd {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        let reason = match request.model {
+            ModelId::IconEu => {
+                "ICON-EU regular-grid main cycles are hourly f000-f078 then three-hourly f081-f120; 03/09/15/21Z cycles are hourly f000-f030 then f036/f042/f048"
+            }
+            ModelId::IconD2 => {
+                "ICON-D2 regular-grid cycles are hourly f000-f048 at 00/03/06/09/12/15/18/21Z"
+            }
+            _ => "request is not a DWD ICON regular-grid model",
+        };
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: reason.to_string(),
+        });
+    }
+
+    let component = match request.product.as_str() {
+        "rws-surface" | "rws-sounding" => {
+            dwd_icon_surface_component("dwd-surface-t2m").expect("static probe component")
+        }
+        "rws-pressure" => dwd_icon_pressure_component(request.model, "dwd-pressure-t-0500")
+            .expect("500 hPa is available from both DWD regular-grid models"),
+        product => dwd_icon_surface_component(product)
+            .or_else(|| dwd_icon_pressure_component(request.model, product))
+            .ok_or_else(|| ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            })?,
+    };
+
+    let cycle = format!(
+        "{}{:02}",
+        request.cycle.date_yyyymmdd, request.cycle.hour_utc
+    );
+    let lead = request.forecast_hour;
+    let cycle_hour = request.cycle.hour_utc;
+    let url = match (request.model, component) {
+        (
+            ModelId::IconEu,
+            DwdIconComponent::Surface {
+                directory,
+                eu_token,
+                time_invariant: true,
+                ..
+            },
+        ) => format!(
+            "https://opendata.dwd.de/weather/nwp/icon-eu/grib/{cycle_hour:02}/{directory}/icon-eu_europe_regular-lat-lon_time-invariant_{cycle}_{eu_token}.grib2.bz2"
+        ),
+        (
+            ModelId::IconEu,
+            DwdIconComponent::Surface {
+                directory,
+                eu_token,
+                time_invariant: false,
+                ..
+            },
+        ) => format!(
+            "https://opendata.dwd.de/weather/nwp/icon-eu/grib/{cycle_hour:02}/{directory}/icon-eu_europe_regular-lat-lon_single-level_{cycle}_{lead:03}_{eu_token}.grib2.bz2"
+        ),
+        (
+            ModelId::IconEu,
+            DwdIconComponent::Pressure {
+                directory,
+                eu_token,
+                level_hpa,
+                ..
+            },
+        ) => format!(
+            "https://opendata.dwd.de/weather/nwp/icon-eu/grib/{cycle_hour:02}/{directory}/icon-eu_europe_regular-lat-lon_pressure-level_{cycle}_{lead:03}_{level_hpa}_{eu_token}.grib2.bz2"
+        ),
+        (
+            ModelId::IconD2,
+            DwdIconComponent::Surface {
+                directory,
+                d2_token,
+                time_invariant: true,
+                ..
+            },
+        ) => format!(
+            "https://opendata.dwd.de/weather/nwp/icon-d2/grib/{cycle_hour:02}/{directory}/icon-d2_germany_regular-lat-lon_time-invariant_{cycle}_000_0_{d2_token}.grib2.bz2"
+        ),
+        (
+            ModelId::IconD2,
+            DwdIconComponent::Surface {
+                directory,
+                d2_token,
+                time_invariant: false,
+                ..
+            },
+        ) => format!(
+            "https://opendata.dwd.de/weather/nwp/icon-d2/grib/{cycle_hour:02}/{directory}/icon-d2_germany_regular-lat-lon_single-level_{cycle}_{lead:03}_2d_{d2_token}.grib2.bz2"
+        ),
+        (
+            ModelId::IconD2,
+            DwdIconComponent::Pressure {
+                directory,
+                d2_token,
+                level_hpa,
+                ..
+            },
+        ) => format!(
+            "https://opendata.dwd.de/weather/nwp/icon-d2/grib/{cycle_hour:02}/{directory}/icon-d2_germany_regular-lat-lon_pressure-level_{cycle}_{lead:03}_{level_hpa}_{d2_token}.grib2.bz2"
+        ),
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    Ok(url)
 }
 
 fn build_gdas_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
@@ -8219,20 +8486,34 @@ fn plot_recipe_field_blocker(
     field: &'static GribFieldSpec,
     model: ModelId,
 ) -> Option<PlotRecipeBlocker> {
-    // GDPS is published as one object per field/level. The normalized RWS
+    // These providers publish one object per field/level. The normalized RWS
     // ingest path assembles those bounded component bundles, but the legacy
     // direct-GRIB plot path still assumes one family URL. Keep that path
     // explicitly blocked instead of fetching only the representative probe
     // object and silently rendering an incomplete field set.
     if matches!(
         model,
-        ModelId::Gdps | ModelId::CmaGeps | ModelId::Rdps | ModelId::Hrdps
+        ModelId::Gdps
+            | ModelId::CmaGeps
+            | ModelId::Rdps
+            | ModelId::Hrdps
+            | ModelId::IconEu
+            | ModelId::IconD2
     ) {
+        let provider = match model {
+            ModelId::Gdps | ModelId::Rdps | ModelId::Hrdps => {
+                "ECCC Datamart per-field component bundle"
+            }
+            ModelId::CmaGeps => "CMA WIS2 provider-specific acquisition contract",
+            ModelId::IconEu => "DWD ICON-EU Open Data per-field component bundle",
+            ModelId::IconD2 => "DWD ICON-D2 Open Data per-field component bundle",
+            _ => unreachable!(),
+        };
         return Some(PlotRecipeBlocker {
             field_key: field.key,
             field_label: field.label,
             reason: format!(
-                "{} for {model} is available through normalized RWS ingest/query; the legacy direct plot path does not expose this provider-specific acquisition contract",
+                "{} for {provider} is available through normalized RWS ingest/query; the legacy direct plot path does not assemble that acquisition contract",
                 field.label,
             ),
         });
@@ -8343,6 +8624,12 @@ fn plot_recipe_fetch_defaults(
             ("rws-surface", PlotRecipeFetchPolicy::WholeFile)
         }
         (ModelId::Rdps | ModelId::Hrdps, _, false) => {
+            ("rws-pressure", PlotRecipeFetchPolicy::WholeFile)
+        }
+        (ModelId::IconEu | ModelId::IconD2, _, true) => {
+            ("rws-surface", PlotRecipeFetchPolicy::WholeFile)
+        }
+        (ModelId::IconEu | ModelId::IconD2, _, false) => {
             ("rws-pressure", PlotRecipeFetchPolicy::WholeFile)
         }
         (ModelId::Gdas, _, _) => ("pgrb2.0p25", PlotRecipeFetchPolicy::PreferIndexedSubset),

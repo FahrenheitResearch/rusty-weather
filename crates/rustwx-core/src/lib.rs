@@ -1717,6 +1717,8 @@ pub enum ModelId {
     CmaGeps,
     Rdps,
     Hrdps,
+    IconEu,
+    IconD2,
     Gdas,
     Gefs,
     Aigfs,
@@ -1749,6 +1751,8 @@ impl ModelId {
             Self::CmaGeps => "cma-geps",
             Self::Rdps => "rdps",
             Self::Hrdps => "hrdps",
+            Self::IconEu => "icon-eu",
+            Self::IconD2 => "icon-d2",
             Self::Gdas => "gdas",
             Self::Gefs => "gefs",
             Self::Aigfs => "aigfs",
@@ -1797,6 +1801,8 @@ impl std::str::FromStr for ModelId {
             "hrdps" | "gem-high-resolution" | "gem_high_resolution" | "cmc-hrdps" | "cmc_hrdps" => {
                 Ok(Self::Hrdps)
             }
+            "icon-eu" | "icon_eu" | "iconeu" | "dwd-icon-eu" | "dwd_icon_eu" => Ok(Self::IconEu),
+            "icon-d2" | "icon_d2" | "icond2" | "dwd-icon-d2" | "dwd_icon_d2" => Ok(Self::IconD2),
             "gdas" | "gdas-0p25" | "gdas_0p25" | "gdas-0.25" | "gdas_0.25" => Ok(Self::Gdas),
             "gefs" | "gefs-ens" | "gefs_ens" | "gefs-ensemble" => Ok(Self::Gefs),
             "aigfs" | "ai-gfs" | "ai_gfs" => Ok(Self::Aigfs),
@@ -1975,6 +1981,7 @@ pub enum SourceId {
     Ecmwf,
     Eccc,
     Cma,
+    Dwd,
     Ncei,
     Gdex,
     /// Local NetCDF archive populated by an active AIFS-v2 inference/dissemination harness.
@@ -1995,6 +2002,7 @@ impl SourceId {
             Self::Ecmwf => "ecmwf",
             Self::Eccc => "eccc",
             Self::Cma => "cma",
+            Self::Dwd => "dwd",
             Self::Ncei => "ncei",
             Self::Gdex => "gdex",
             Self::AifsInference => "aifs-inference",
@@ -2021,6 +2029,7 @@ impl std::str::FromStr for SourceId {
             "ecmwf" => Ok(Self::Ecmwf),
             "eccc" | "msc" | "cmc" | "msc-datamart" | "msc_datamart" => Ok(Self::Eccc),
             "cma" | "cma-wis2" | "cma_wis2" | "wis2-cma" | "wis2_cma" => Ok(Self::Cma),
+            "dwd" | "dwd-open-data" | "dwd_open_data" | "deutscher-wetterdienst" => Ok(Self::Dwd),
             "ncei" => Ok(Self::Ncei),
             "gdex" => Ok(Self::Gdex),
             "aifs-inference" | "aifs_inference" | "aifsinference" | "inferenced-aifs"

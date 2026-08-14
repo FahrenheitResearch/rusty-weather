@@ -235,6 +235,13 @@ fn provider_attributions(
     {
         attributions.push(rw_query::cma_provider_attribution().into());
     }
+    if summary
+        .sources
+        .iter()
+        .any(|source| source.id == SourceId::Dwd)
+    {
+        attributions.push(rw_query::dwd_provider_attribution().into());
+    }
     attributions
 }
 
@@ -4767,6 +4774,26 @@ mod tests {
             assert_eq!(
                 regional["provider_attributions"][0]["notice"],
                 "Data Source: Environment and Climate Change Canada"
+            );
+        }
+
+        for id in ["icon-eu", "icon-d2"] {
+            let icon = model(id);
+            assert_eq!(icon["ingest_status"], "ready");
+            assert_eq!(icon["verification"], "fixture_verified");
+            assert_eq!(
+                icon["limitations"],
+                serde_json::json!(["sparse_pressure_levels", "derived_products_disabled"])
+            );
+            assert_eq!(icon["products"][0]["product"], "rws-pressure");
+            assert_eq!(icon["products"][1]["product"], "rws-surface");
+            assert_eq!(
+                icon["provider_attributions"][0]["notice"],
+                "Source: Deutscher Wetterdienst"
+            );
+            assert_eq!(
+                icon["provider_attributions"][0]["license"],
+                "Creative Commons Attribution 4.0 International (CC BY 4.0)."
             );
         }
 

@@ -90,7 +90,7 @@ fn provider_probe_agent_times_out_a_stalled_response_offline() {
 
 #[test]
 fn built_in_models_are_real() {
-    assert_eq!(built_in_models().len(), 27);
+    assert_eq!(built_in_models().len(), 29);
     assert_eq!(model_summary(ModelId::Gdps).default_product, "rws-surface");
     assert_eq!(model_summary(ModelId::CmaGeps).default_product, "stats");
     assert_eq!(model_summary(ModelId::CmaGeps).max_forecast_hour, 360);
@@ -98,6 +98,14 @@ fn built_in_models_are_real() {
     assert_eq!(model_summary(ModelId::Rdps).max_forecast_hour, 84);
     assert_eq!(model_summary(ModelId::Hrdps).default_product, "rws-surface");
     assert_eq!(model_summary(ModelId::Hrdps).max_forecast_hour, 48);
+    assert_eq!(
+        model_summary(ModelId::IconEu).default_product,
+        "rws-surface"
+    );
+    assert_eq!(
+        model_summary(ModelId::IconD2).default_product,
+        "rws-surface"
+    );
     assert_eq!(model_summary(ModelId::HrrrAk).default_product, "sfc");
     assert_eq!(model_summary(ModelId::Gdas).default_product, "pgrb2.0p25");
     assert_eq!(
@@ -153,6 +161,8 @@ fn catalog_exposes_the_user_facing_supported_models() {
         ModelId::CmaGeps,
         ModelId::Rdps,
         ModelId::Hrdps,
+        ModelId::IconEu,
+        ModelId::IconD2,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -635,7 +645,12 @@ fn temperature_700_recipe_tracks_model_support() {
                 assert!(reason.contains("surface/core grids"));
             } else if matches!(
                 model,
-                ModelId::Gdps | ModelId::CmaGeps | ModelId::Rdps | ModelId::Hrdps
+                ModelId::Gdps
+                    | ModelId::CmaGeps
+                    | ModelId::Rdps
+                    | ModelId::Hrdps
+                    | ModelId::IconEu
+                    | ModelId::IconD2
             ) {
                 assert!(reason.contains("normalized RWS ingest/query"));
             } else if model == ModelId::Href {
@@ -648,6 +663,9 @@ fn temperature_700_recipe_tracks_model_support() {
             match model {
                 ModelId::Gdps | ModelId::Rdps | ModelId::Hrdps => {
                     assert!(reason.contains("Datamart per-field component bundle"));
+                }
+                ModelId::IconEu | ModelId::IconD2 => {
+                    assert!(reason.contains("per-field component bundle"));
                 }
                 ModelId::CmaGeps => {
                     assert!(reason.contains("provider-specific acquisition contract"));
@@ -1104,6 +1122,94 @@ fn eccc_regional_cadence_and_component_urls_match_the_msc_datamart_contract() {
         assert!(matches!(
             build_grib_url(SourceId::Eccc, &request),
             Err(ModelError::UnsupportedForecastHour { .. })
+        ));
+    }
+}
+
+#[test]
+fn dwd_icon_regular_grid_cadence_urls_and_allowlists_are_exact() {
+    let eu_main = supported_forecast_hours(ModelId::IconEu, 0);
+    assert_eq!(eu_main.len(), 93);
+    for published in [0, 1, 78, 81, 120] {
+        assert!(eu_main.contains(&published));
+    }
+    for absent in [79, 80, 82, 119, 121] {
+        assert!(!eu_main.contains(&absent));
+    }
+    let eu_short = supported_forecast_hours(ModelId::IconEu, 3);
+    assert_eq!(eu_short.len(), 34);
+    assert!(eu_short.contains(&30));
+    assert!(eu_short.contains(&36));
+    assert!(eu_short.contains(&42));
+    assert!(eu_short.contains(&48));
+    assert!(!eu_short.contains(&31));
+    assert!(!eu_short.contains(&33));
+
+    let d2 = supported_forecast_hours(ModelId::IconD2, 21);
+    assert_eq!(d2, (0..=48).collect::<Vec<u16>>());
+    assert!(supported_forecast_hours(ModelId::IconD2, 2).is_empty());
+
+    assert_eq!(
+        icon_eu_regular_isobaric_levels_hpa(),
+        &[
+            50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700, 775, 800, 825, 850, 875, 900, 925,
+            950, 1000
+        ]
+    );
+    assert_eq!(
+        icon_d2_regular_isobaric_levels_hpa(),
+        &[200, 250, 300, 400, 500, 600, 700, 850, 950, 975, 1000]
+    );
+
+    let cycle = CycleSpec::new("20260814", 0).unwrap();
+    let cases = [
+        (
+            ModelId::IconEu,
+            "dwd-surface-t2m",
+            "https://opendata.dwd.de/weather/nwp/icon-eu/grib/00/t_2m/icon-eu_europe_regular-lat-lon_single-level_2026081400_000_T_2M.grib2.bz2",
+        ),
+        (
+            ModelId::IconEu,
+            "dwd-surface-hsurf",
+            "https://opendata.dwd.de/weather/nwp/icon-eu/grib/00/hsurf/icon-eu_europe_regular-lat-lon_time-invariant_2026081400_HSURF.grib2.bz2",
+        ),
+        (
+            ModelId::IconEu,
+            "dwd-pressure-fi-0500",
+            "https://opendata.dwd.de/weather/nwp/icon-eu/grib/00/fi/icon-eu_europe_regular-lat-lon_pressure-level_2026081400_000_500_FI.grib2.bz2",
+        ),
+        (
+            ModelId::IconD2,
+            "dwd-surface-t2m",
+            "https://opendata.dwd.de/weather/nwp/icon-d2/grib/00/t_2m/icon-d2_germany_regular-lat-lon_single-level_2026081400_000_2d_t_2m.grib2.bz2",
+        ),
+        (
+            ModelId::IconD2,
+            "dwd-surface-hsurf",
+            "https://opendata.dwd.de/weather/nwp/icon-d2/grib/00/hsurf/icon-d2_germany_regular-lat-lon_time-invariant_2026081400_000_0_hsurf.grib2.bz2",
+        ),
+        (
+            ModelId::IconD2,
+            "dwd-pressure-rh-0500",
+            "https://opendata.dwd.de/weather/nwp/icon-d2/grib/00/relhum/icon-d2_germany_regular-lat-lon_pressure-level_2026081400_000_500_relhum.grib2.bz2",
+        ),
+    ];
+    for (model, product, expected) in cases {
+        let request = ModelRunRequest::new(model, cycle.clone(), 0, product).unwrap();
+        assert_eq!(build_grib_url(SourceId::Dwd, &request).unwrap(), expected);
+    }
+
+    for (model, invalid) in [
+        (ModelId::IconEu, "dwd-pressure-t-0125"),
+        (ModelId::IconD2, "dwd-pressure-t-0775"),
+        (ModelId::IconEu, "dwd-pressure-t-500"),
+        (ModelId::IconD2, "../dwd-surface-t2m"),
+        (ModelId::IconEu, "dwd-surface-unknown"),
+    ] {
+        let request = ModelRunRequest::new(model, cycle.clone(), 0, invalid).unwrap();
+        assert!(matches!(
+            build_grib_url(SourceId::Dwd, &request),
+            Err(ModelError::UnsupportedProduct { .. })
         ));
     }
 }

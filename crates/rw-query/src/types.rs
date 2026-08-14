@@ -150,6 +150,23 @@ pub fn cma_provider_attribution() -> ProviderAttribution {
     }
 }
 
+pub fn dwd_provider_attribution() -> ProviderAttribution {
+    ProviderAttribution {
+        provider: "Deutscher Wetterdienst (DWD)".into(),
+        copyright_statement:
+            "DWD Open Data is made available under the Creative Commons Attribution 4.0 International licence."
+                .into(),
+        notice: "Source: Deutscher Wetterdienst".into(),
+        source_url:
+            "https://www.dwd.de/EN/ourservices/nwp_forecast_data/nwp_forecast_data.html".into(),
+        license: "Creative Commons Attribution 4.0 International (CC BY 4.0).".into(),
+        license_url: "https://creativecommons.org/licenses/by/4.0/".into(),
+        terms_url: "https://www.dwd.de/EN/service/legal_notice/legal_notice.html".into(),
+        modification_notice: "The DWD source objects have been selected, combined, normalized, and re-encoded by this service; this output is not an official DWD product.".into(),
+        disclaimer: "DWD Open Data is provided under the applicable licence and legal notice without any service guarantee; users remain responsible for checking fitness for their purpose.".into(),
+    }
+}
+
 pub fn provider_attributions_for_provenance(
     sources: &[SourceProvenance],
 ) -> Vec<ProviderAttribution> {
@@ -188,6 +205,12 @@ pub fn provider_attributions_for_provenance(
         .any(|source| source.provider == "cma-wis2-core-data")
     {
         attributions.push(cma_provider_attribution());
+    }
+    if sources
+        .iter()
+        .any(|source| source.provider == "dwd-open-data")
+    {
+        attributions.push(dwd_provider_attribution());
     }
     attributions
 }
@@ -487,6 +510,22 @@ mod tests {
             attributions[0]
                 .modification_notice
                 .contains("not an official")
+        );
+    }
+
+    #[test]
+    fn dwd_provenance_emits_cc_by_source_and_modification_notice_once() {
+        let attributions = provider_attributions_for_provenance(&[
+            provenance("dwd-open-data"),
+            provenance("dwd-open-data"),
+        ]);
+        assert_eq!(attributions, vec![dwd_provider_attribution()]);
+        assert_eq!(attributions[0].notice, "Source: Deutscher Wetterdienst");
+        assert!(attributions[0].license.contains("CC BY 4.0"));
+        assert!(
+            attributions[0]
+                .modification_notice
+                .contains("not an official DWD product")
         );
     }
 }

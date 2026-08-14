@@ -622,7 +622,7 @@ fn fetch_product(
     };
     config.emit(IngestEvent::StageStarted { hour, stage });
     let fetch_started = Instant::now();
-    let components = eccc_component_products(config, product)?;
+    let components = provider_component_products(config, product)?;
     let fetched = if let Some(components) = components {
         fetch_component_bundle_with_cache(&fetch, &components, config.cache_root, config.use_cache)
             .map_err(other)?
@@ -638,18 +638,28 @@ fn fetch_product(
     Ok((fetched, fetch_ms))
 }
 
-/// Expand one ECCC logical extraction family into the exact ordered Datamart
-/// objects needed by the requested RWS profile. GDPS/RDPS use ECCC's long
-/// names and hyphenated level tokens; HRDPS uses the compact operational
-/// names and underscored level tokens. Other models return `None` and retain
-/// their historical single/multi-family-file fetch behavior.
-fn eccc_component_products(
+/// Expand provider logical extraction families into exact ordered per-object
+/// inventories. Models that publish conventional family files return `None`
+/// and retain their historical fetch behavior.
+fn provider_component_products(
     config: &IngestConfig<'_>,
     logical_product: &str,
 ) -> Result<Option<Vec<String>>, IngestError> {
-    if !matches!(config.model, ModelId::Gdps | ModelId::Rdps | ModelId::Hrdps) {
-        return Ok(None);
+    match config.model {
+        ModelId::Gdps | ModelId::Rdps | ModelId::Hrdps => {
+            gdps_component_products(config, logical_product).map(Some)
+        }
+        ModelId::IconEu | ModelId::IconD2 => {
+            dwd_icon_component_products(config, logical_product).map(Some)
+        }
+        _ => Ok(None),
     }
+}
+
+fn gdps_component_products(
+    config: &IngestConfig<'_>,
+    logical_product: &str,
+) -> Result<Vec<String>, IngestError> {
     let profile = config.profile;
     let mut components = Vec::new();
     match logical_product {
@@ -773,7 +783,69 @@ fn eccc_component_products(
             profile.describe()
         )));
     }
-    Ok(Some(components))
+    Ok(components)
+}
+
+/// Expand one DWD ICON regular-grid logical family into the exact field/level
+/// object tokens accepted by rustwx-models. The two models deliberately keep
+/// distinct pressure inventories; known-absent levels are never probed.
+fn dwd_icon_component_products(
+    config: &IngestConfig<'_>,
+    logical_product: &str,
+) -> Result<Vec<String>, IngestError> {
+    let profile = config.profile;
+    let mut components = Vec::new();
+    match logical_product {
+        "rws-pressure" => {
+            let levels = match config.model {
+                ModelId::IconEu => rustwx_models::icon_eu_regular_isobaric_levels_hpa(),
+                ModelId::IconD2 => rustwx_models::icon_d2_regular_isobaric_levels_hpa(),
+                _ => unreachable!("DWD planner called for non-DWD model"),
+            };
+            for level in profile
+                .candidate_levels()
+                .into_iter()
+                .filter(|level| levels.contains(level))
+            {
+                for family in ["t", "rh", "u", "v", "fi"] {
+                    components.push(format!("dwd-pressure-{family}-{level:04}"));
+                }
+            }
+        }
+        "rws-surface" => {
+            const SURFACE_COMPONENTS: &[(&str, &str)] = &[
+                ("temperature_2m", "dwd-surface-t2m"),
+                ("dewpoint_2m", "dwd-surface-td2m"),
+                ("u_10m", "dwd-surface-u10m"),
+                ("v_10m", "dwd-surface-v10m"),
+                ("mslp", "dwd-surface-pmsl"),
+                ("rh_2m", "dwd-surface-rh2m"),
+                ("surface_pressure", "dwd-surface-ps"),
+                ("orography", "dwd-surface-hsurf"),
+                ("apcp_run_total", "dwd-surface-tot-prec"),
+            ];
+            components.extend(
+                SURFACE_COMPONENTS
+                    .iter()
+                    .filter(|(field, _)| profile.includes_surface_field(field))
+                    .map(|(_, component)| (*component).to_string()),
+            );
+        }
+        unknown => {
+            return Err(other(format!(
+                "{} fetch plan contains unknown logical product '{unknown}'",
+                config.model
+            )));
+        }
+    }
+    if components.is_empty() {
+        return Err(other(format!(
+            "{} logical product '{logical_product}' has no components for profile '{}'",
+            config.model,
+            profile.describe()
+        )));
+    }
+    Ok(components)
 }
 
 /// Fetch the per-model product file(s) for one hour (network or cache disk
@@ -800,6 +872,9 @@ pub fn fetch_hour(config: &IngestConfig<'_>, hour: u16) -> Result<FetchedHour, I
     // historical pressure-then-surface models unchanged; a surface-only
     // analysis emits no FetchPrs event.
     for product in &plan {
+        if product.pressure_source && !product.surface_source && !config.profile.needs_prs() {
+            continue;
+        }
         config.check_cancel()?;
         let stage = if product.pressure_source {
             IngestStage::FetchPrs
@@ -876,6 +951,7 @@ fn safe_provider_identity(source: SourceId) -> &'static str {
         SourceId::Ecmwf => "ecmwf-open-data",
         SourceId::Eccc => "eccc-msc-datamart",
         SourceId::Cma => "cma-wis2-core-data",
+        SourceId::Dwd => "dwd-open-data",
         SourceId::Ncei => "noaa-ncei",
         SourceId::Gdex => "ucar-gdex",
         SourceId::AifsInference => "local-aifs-inference",
@@ -2695,9 +2771,7 @@ mod tests {
             cancel: &cancel,
         };
 
-        let pressure = eccc_component_products(&config, "rws-pressure")
-            .unwrap()
-            .unwrap();
+        let pressure = gdps_component_products(&config, "rws-pressure").unwrap();
         assert_eq!(pressure.len(), 24 * 5);
         assert_eq!(pressure[0], "AirTemp_IsbL-0100");
         assert_eq!(pressure[1], "RelativeHumidity_IsbL-0100");
@@ -2711,9 +2785,7 @@ mod tests {
             "component inventory must be duplicate-free"
         );
 
-        let surface = eccc_component_products(&config, "rws-surface")
-            .unwrap()
-            .unwrap();
+        let surface = gdps_component_products(&config, "rws-surface").unwrap();
         assert_eq!(
             surface,
             vec![
@@ -2749,7 +2821,7 @@ mod tests {
             cancel: &cancel,
         };
 
-        let rdps_pressure = eccc_component_products(&config, "rws-pressure")
+        let rdps_pressure = provider_component_products(&config, "rws-pressure")
             .unwrap()
             .unwrap();
         assert_eq!(rdps_pressure.len(), 24 * 5);
@@ -2760,7 +2832,7 @@ mod tests {
             rdps_pressure.last().unwrap(),
             "GeopotentialHeight_IsbL-1000"
         );
-        let rdps_surface = eccc_component_products(&config, "rws-surface")
+        let rdps_surface = provider_component_products(&config, "rws-surface")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2783,7 +2855,7 @@ mod tests {
 
         config.model = ModelId::Hrdps;
         config.model_slug = "hrdps";
-        let hrdps_pressure = eccc_component_products(&config, "rws-pressure")
+        let hrdps_pressure = provider_component_products(&config, "rws-pressure")
             .unwrap()
             .unwrap();
         assert_eq!(hrdps_pressure.len(), 24 * 5);
@@ -2791,7 +2863,7 @@ mod tests {
         assert_eq!(hrdps_pressure[2], "UGRD_ISBL_0100");
         assert_eq!(hrdps_pressure[3], "VGRD_ISBL_0100");
         assert_eq!(hrdps_pressure.last().unwrap(), "HGT_ISBL_1000");
-        let hrdps_surface = eccc_component_products(&config, "rws-surface")
+        let hrdps_surface = provider_component_products(&config, "rws-surface")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2806,6 +2878,69 @@ mod tests {
                 "HGT_Sfc",
             ]
         );
+    }
+
+    #[test]
+    fn dwd_icon_sounding_bundles_preserve_each_models_exact_inventory() {
+        let cycle = CycleSpec::new("20260814", 0).unwrap();
+        let profile = IngestProfile::sounding();
+        let cancel = AtomicBool::new(false);
+        let sink = |_event: IngestEvent| {};
+
+        for (model, expected_levels) in [
+            (
+                ModelId::IconEu,
+                vec![
+                    100_u16, 150, 200, 250, 300, 400, 500, 600, 700, 775, 800, 825, 850, 875, 900,
+                    925, 950, 1000,
+                ],
+            ),
+            (
+                ModelId::IconD2,
+                vec![200_u16, 250, 300, 400, 500, 600, 700, 850, 950, 975, 1000],
+            ),
+        ] {
+            let config = IngestConfig {
+                model,
+                cycle: &cycle,
+                source_override: Some(SourceId::Dwd),
+                cache_root: Path::new("unused-cache"),
+                use_cache: true,
+                store_root: Path::new("unused-store"),
+                model_slug: model.as_str(),
+                run_slug: "20260814-00",
+                profile: &profile,
+                verify: true,
+                progress: &sink,
+                cancel: &cancel,
+            };
+
+            let pressure = dwd_icon_component_products(&config, "rws-pressure").unwrap();
+            assert_eq!(pressure.len(), expected_levels.len() * 5);
+            for (index, level) in expected_levels.iter().enumerate() {
+                let offset = index * 5;
+                assert_eq!(pressure[offset], format!("dwd-pressure-t-{level:04}"));
+                assert_eq!(pressure[offset + 1], format!("dwd-pressure-rh-{level:04}"));
+                assert_eq!(pressure[offset + 4], format!("dwd-pressure-fi-{level:04}"));
+            }
+            assert_eq!(
+                pressure.iter().collect::<HashSet<_>>().len(),
+                pressure.len()
+            );
+
+            assert_eq!(
+                dwd_icon_component_products(&config, "rws-surface").unwrap(),
+                vec![
+                    "dwd-surface-t2m",
+                    "dwd-surface-td2m",
+                    "dwd-surface-u10m",
+                    "dwd-surface-v10m",
+                    "dwd-surface-pmsl",
+                    "dwd-surface-ps",
+                    "dwd-surface-hsurf",
+                ]
+            );
+        }
     }
 
     #[test]

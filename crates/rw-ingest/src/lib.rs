@@ -238,6 +238,23 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
             pressure_source: false,
             idx_patterns: &[],
         }]),
+        // DWD's regular-grid ICON feeds use the same logical two-role shape
+        // as GDPS, but resolve through a distinct exact bzip2 component
+        // inventory in `ingest_hour`.
+        ModelId::IconEu | ModelId::IconD2 => Ok(vec![
+            ProductFetch {
+                product: "rws-pressure",
+                surface_source: false,
+                pressure_source: true,
+                idx_patterns: &[],
+            },
+            ProductFetch {
+                product: "rws-surface",
+                surface_source: true,
+                pressure_source: false,
+                idx_patterns: &[],
+            },
+        ]),
         ModelId::Gefs => Ok(vec![ProductFetch {
             product: "pgrb2ap5/gec00",
             surface_source: true,
@@ -687,6 +704,15 @@ pub fn validate_ingest_profile_for_model(
     }
     if matches!(
         model,
+        rustwx_core::ModelId::IconEu | rustwx_core::ModelId::IconD2
+    ) && (profile.derived || profile.heavy)
+    {
+        return Err(events::other(format!(
+            "model '{model}' regular-grid ingest is verified for normalized surface and sparse pressure fields; derived/heavy diagnostics remain disabled until their complete DWD input contract is live-validated; use --profile sounding or disable both derived and heavy",
+        )));
+    }
+    if matches!(
+        model,
         rustwx_core::ModelId::Gefs
             | rustwx_core::ModelId::Aigfs
             | rustwx_core::ModelId::EcmwfOpenData
@@ -837,6 +863,10 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
             IngestCapabilityLimitation::SparsePressureLevels,
             IngestCapabilityLimitation::DerivedProductsDisabled,
         ],
+        rustwx_core::ModelId::IconEu | rustwx_core::ModelId::IconD2 => vec![
+            IngestCapabilityLimitation::SparsePressureLevels,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+        ],
         _ => Vec::new(),
     };
     match fetch_plan(model) {
@@ -866,7 +896,9 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 | rustwx_core::ModelId::Sref
                 | rustwx_core::ModelId::Refs
                 | rustwx_core::ModelId::RrfsPublic
-                | rustwx_core::ModelId::Aifs => IngestVerificationLevel::FixtureVerified,
+                | rustwx_core::ModelId::Aifs
+                | rustwx_core::ModelId::IconEu
+                | rustwx_core::ModelId::IconD2 => IngestVerificationLevel::FixtureVerified,
                 _ => IngestVerificationLevel::ImplementedUnverified,
             };
             ModelIngestCapability {
@@ -956,6 +988,8 @@ mod tests {
             ModelId::CmaGeps,
             ModelId::Rdps,
             ModelId::Hrdps,
+            ModelId::IconEu,
+            ModelId::IconD2,
             ModelId::Gdas,
             ModelId::Gefs,
             ModelId::Aigfs,
@@ -1211,6 +1245,8 @@ mod tests {
                 ModelId::CmaGeps,
                 ModelId::Rdps,
                 ModelId::Hrdps,
+                ModelId::IconEu,
+                ModelId::IconD2,
                 ModelId::Gdas,
                 ModelId::Gefs,
                 ModelId::Aigfs,
@@ -1997,6 +2033,46 @@ mod tests {
             capability.limitations,
             vec![IngestCapabilityLimitation::SparsePressureLevels]
         );
+    }
+
+    #[test]
+    fn dwd_icon_fetch_plans_and_profile_gate_are_explicit() {
+        use rustwx_core::ModelId;
+
+        for model in [ModelId::IconEu, ModelId::IconD2] {
+            let plan = fetch_plan(model).expect("DWD ICON plan");
+            assert_eq!(plan.len(), 2);
+            assert_eq!(plan[0].product, "rws-pressure");
+            assert!(plan[0].pressure_source && !plan[0].surface_source);
+            assert_eq!(plan[1].product, "rws-surface");
+            assert!(plan[1].surface_source && !plan[1].pressure_source);
+            assert!(plan.iter().all(|product| product.idx_patterns.is_empty()));
+
+            validate_ingest_profile_for_model(model, &ingest_profile::IngestProfile::sounding())
+                .expect("normalized DWD sounding profile is supported");
+            let error =
+                validate_ingest_profile_for_model(model, &ingest_profile::IngestProfile::full())
+                    .expect_err("derived/heavy DWD profile stays gated");
+            assert!(
+                error
+                    .to_string()
+                    .contains("derived/heavy diagnostics remain disabled")
+            );
+
+            let capability = model_ingest_capability(model);
+            assert_eq!(capability.status, IngestSupportStatus::Ready);
+            assert_eq!(
+                capability.verification,
+                IngestVerificationLevel::FixtureVerified
+            );
+            assert_eq!(
+                capability.limitations,
+                vec![
+                    IngestCapabilityLimitation::SparsePressureLevels,
+                    IngestCapabilityLimitation::DerivedProductsDisabled,
+                ]
+            );
+        }
     }
 
     #[test]

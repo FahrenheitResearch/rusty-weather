@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
 use rustwx_core::{CycleSpec, GridShape, LatLonGrid, ModelId, SourceId};
-use rw_ingest::ingest_profile::FieldSet;
+use rw_ingest::ingest_profile::{FieldSet, IngestProfile};
 use rw_store::RwsExactTime;
 use rw_store::format::RwsWriterInfo;
 use rw_store::ingest::{DerivedFieldInput, write_hour_from_grid_with_derived_exact};
@@ -177,6 +177,52 @@ fn eccc_regional_plans_pin_logical_products_and_hourly_native_cadence() {
             plan.validate().unwrap();
         }
         assert!(JobPlan::build(model, cycle("20260814", 3)).is_err());
+    }
+}
+
+#[test]
+fn dwd_icon_plans_pin_component_bundles_native_cadence_and_source() {
+    let cases = [
+        (ModelId::IconEu, 0, 93, 120),
+        (ModelId::IconEu, 3, 34, 48),
+        (ModelId::IconD2, 0, 49, 48),
+        (ModelId::IconD2, 21, 49, 48),
+    ];
+    for (model, cycle_hour, expected_count, expected_last) in cases {
+        let profile = IngestProfile::sounding();
+        let plan = JobPlan::build_with_profile_and_source(
+            model,
+            cycle("20260814", cycle_hour),
+            &profile,
+            Some(SourceId::Dwd),
+        )
+        .unwrap();
+        assert_eq!(plan.expected_valid_times.len(), expected_count, "{model}");
+        assert_eq!(
+            plan.expected_valid_times.last().unwrap().forecast_hour,
+            expected_last,
+            "{model} {cycle_hour:02}z horizon"
+        );
+        assert_eq!(
+            plan.ingest_products
+                .iter()
+                .map(|product| product.product.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rws-pressure", "rws-surface"]
+        );
+        assert_eq!(plan.source_override, Some(SourceId::Dwd));
+        plan.validate().unwrap();
+
+        assert!(
+            JobPlan::build_with_profile_and_source(
+                model,
+                cycle("20260814", cycle_hour),
+                &profile,
+                Some(SourceId::Nomads),
+            )
+            .is_err(),
+            "{model} must not silently substitute a non-DWD transport"
+        );
     }
 }
 
@@ -570,6 +616,8 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
         ModelId::EcmwfOpenData,
         ModelId::Rdps,
         ModelId::Hrdps,
+        ModelId::IconEu,
+        ModelId::IconD2,
     ] {
         let config = scheduler_config(&format!("ensemble-profile-{model}"), &[model.as_str()]);
         let profile = config.profile_for(model).unwrap();
@@ -1161,7 +1209,7 @@ fn every_ready_model_has_a_valid_cadence_profile_and_remote_source() {
         );
         plan.validate().unwrap();
     }
-    assert_eq!(ready, 25);
+    assert_eq!(ready, 27);
 }
 
 #[test]
