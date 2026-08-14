@@ -854,13 +854,15 @@ fn parse_section4(sec: &[u8]) -> Result<ProductDefinition, String> {
         prod.level_type = read_u8(sec, 22)?;
         let scale_factor = read_u8(sec, 23)?;
         let scaled_value = read_u32(sec, 24)? as f64;
-        if scale_factor < 128 {
-            prod.level_value = scaled_value / 10.0_f64.powi(scale_factor as i32);
+        // Code Table 4.5 uses a signed sign-magnitude scale factor. 0x82 is
+        // therefore -2, not -126 as a two's-complement-style conversion would
+        // imply. ECCC uses negative factors for ordinary isobaric pressures.
+        let scale_factor = if scale_factor & 0x80 == 0 {
+            i32::from(scale_factor)
         } else {
-            // sign-magnitude: MSB set means negative scale factor
-            let neg_scale = 256 - scale_factor as i32;
-            prod.level_value = scaled_value * 10.0_f64.powi(neg_scale);
-        }
+            -i32::from(scale_factor & 0x7f)
+        };
+        prod.level_value = scaled_value * 10.0_f64.powi(-scale_factor);
     }
 
     // Template-specific parsing
@@ -1181,6 +1183,23 @@ mod tests {
         sec[spec_base] = 1;
         sec[spec_base + 2] = 1;
         sec[spec_base + 3..spec_base + 7].copy_from_slice(&length_hours.to_be_bytes());
+    }
+
+    #[test]
+    fn fixed_surface_scale_factor_uses_grib_sign_magnitude() {
+        let mut positive = vec![0_u8; 34];
+        seed_common_section4(&mut positive, 0);
+        positive[22] = 100;
+        positive[23] = 2;
+        positive[24..28].copy_from_slice(&50_000_u32.to_be_bytes());
+        assert_eq!(parse_section4(&positive).unwrap().level_value, 500.0);
+
+        let mut negative = vec![0_u8; 34];
+        seed_common_section4(&mut negative, 0);
+        negative[22] = 100;
+        negative[23] = 0x82;
+        negative[24..28].copy_from_slice(&5_u32.to_be_bytes());
+        assert_eq!(parse_section4(&negative).unwrap().level_value, 500.0);
     }
 
     #[test]

@@ -142,6 +142,7 @@ fn catalog_exposes_the_user_facing_supported_models() {
         ModelId::HrrrAk,
         ModelId::Rap,
         ModelId::Gfs,
+        ModelId::Gdps,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -622,6 +623,8 @@ fn temperature_700_recipe_tracks_model_support() {
             let reason = &blockers[0].reason;
             if matches!(model, ModelId::Rtma | ModelId::Urma | ModelId::Nbm) {
                 assert!(reason.contains("surface/core grids"));
+            } else if model == ModelId::Gdps {
+                assert!(reason.contains("normalized RWS ingest/query"));
             } else if model == ModelId::Href {
                 assert!(reason.contains("limited to explicit `href_sprd_*`"));
             } else if model == ModelId::Refs {
@@ -630,6 +633,9 @@ fn temperature_700_recipe_tracks_model_support() {
                 assert!(reason.contains("700 hPa temperature/height/wind selectors"));
             }
             match model {
+                ModelId::Gdps => {
+                    assert!(reason.contains("Datamart per-field component bundle"));
+                }
                 ModelId::EcmwfOpenData | ModelId::WrfGdex => {
                     assert!(reason.contains("whole-file structured extraction"));
                 }
@@ -914,6 +920,51 @@ fn ecmwf_supported_forecast_hours_follow_open_data_cadence() {
     assert!(!hours_06z.contains(&145));
     assert!(!hours_06z.contains(&150));
     assert!(!hours_06z.contains(&360));
+}
+
+#[test]
+fn gdps_cadence_and_component_urls_match_the_msc_datamart_contract() {
+    let hours = supported_forecast_hours(ModelId::Gdps, 12);
+    for published in [0, 1, 84, 87, 90, 240] {
+        assert!(hours.contains(&published), "f{published:03} should exist");
+    }
+    for absent in [85, 86, 88, 239, 241] {
+        assert!(!hours.contains(&absent), "f{absent:03} is off cadence");
+    }
+    assert!(supported_forecast_hours(ModelId::Gdps, 6).is_empty());
+
+    let cycle = rustwx_core::CycleSpec::new("20260814", 12).unwrap();
+    let pressure =
+        ModelRunRequest::new(ModelId::Gdps, cycle.clone(), 87, "AirTemp_IsbL-0500").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::Eccc, &pressure).unwrap(),
+        "https://dd.weather.gc.ca/today/model_gdps/15km/12/087/20260814T12Z_MSC_GDPS_AirTemp_IsbL-0500_LatLon0.15_PT087H.grib2"
+    );
+    let probe = ModelRunRequest::new(ModelId::Gdps, cycle.clone(), 87, "rws-surface").unwrap();
+    assert!(
+        build_grib_url(SourceId::Eccc, &probe)
+            .unwrap()
+            .ends_with("_AirTemp_AGL-2m_LatLon0.15_PT087H.grib2")
+    );
+
+    let off_cadence =
+        ModelRunRequest::new(ModelId::Gdps, cycle.clone(), 88, "rws-surface").unwrap();
+    assert!(matches!(
+        build_grib_url(SourceId::Eccc, &off_cadence),
+        Err(ModelError::UnsupportedForecastHour { .. })
+    ));
+    for invalid in [
+        "../AirTemp_AGL-2m",
+        "AirTemp_IsbL-0125",
+        "AirTemp_IsbL-500",
+        "Unknown_IsbL-0500",
+    ] {
+        let request = ModelRunRequest::new(ModelId::Gdps, cycle.clone(), 87, invalid).unwrap();
+        assert!(matches!(
+            build_grib_url(SourceId::Eccc, &request),
+            Err(ModelError::UnsupportedProduct { .. })
+        ));
+    }
 }
 
 #[test]

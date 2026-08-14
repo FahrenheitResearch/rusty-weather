@@ -122,10 +122,24 @@ pub fn noaa_provider_attribution() -> ProviderAttribution {
     }
 }
 
+pub fn eccc_provider_attribution() -> ProviderAttribution {
+    ProviderAttribution {
+        provider: "Environment and Climate Change Canada (ECCC) / Meteorological Service of Canada (MSC)".into(),
+        copyright_statement: "Contains information licenced under the Data Server End-use Licence of Environment and Climate Change Canada.".into(),
+        notice: "Data Source: Environment and Climate Change Canada".into(),
+        source_url: "https://eccc-msc.github.io/open-data/msc-data/nwp_gdps/readme_gdps-datamart_en/".into(),
+        license: "Environment and Climate Change Canada Data Servers End-use Licence, version 2.1; worldwide, royalty-free use including commercial copying, modification, publication, and distribution, subject to attribution and the licence terms.".into(),
+        license_url: "https://eccc-msc.github.io/open-data/licence/readme_en/".into(),
+        terms_url: "https://eccc-msc.github.io/open-data/licence/readme_en/".into(),
+        modification_notice: "The ECCC source objects have been selected, combined, normalized, and re-encoded by this service; this output is not an official ECCC/MSC product.".into(),
+        disclaimer: "The source information is licensed as-is without warranties; ECCC and other contributors disclaim liability to the maximum extent permitted by the licence.".into(),
+    }
+}
+
 pub fn provider_attributions_for_provenance(
     sources: &[SourceProvenance],
 ) -> Vec<ProviderAttribution> {
-    let mut attributions = Vec::with_capacity(2);
+    let mut attributions = Vec::with_capacity(3);
     if sources
         .iter()
         .any(|source| source.provider == "ecmwf-open-data")
@@ -148,6 +162,12 @@ pub fn provider_attributions_for_provenance(
         )
     }) {
         attributions.push(noaa_provider_attribution());
+    }
+    if sources
+        .iter()
+        .any(|source| source.provider == "eccc-msc-datamart")
+    {
+        attributions.push(eccc_provider_attribution());
     }
     attributions
 }
@@ -412,5 +432,24 @@ mod tests {
     fn legacy_noaa_mirror_identity_keeps_attribution() {
         let attributions = provider_attributions_for_provenance(&[provenance("aws-public-data")]);
         assert_eq!(attributions, vec![noaa_provider_attribution()]);
+    }
+
+    #[test]
+    fn eccc_provenance_emits_required_source_and_modification_notice_once() {
+        let attributions = provider_attributions_for_provenance(&[
+            provenance("eccc-msc-datamart"),
+            provenance("eccc-msc-datamart"),
+        ]);
+        assert_eq!(attributions, vec![eccc_provider_attribution()]);
+        assert_eq!(
+            attributions[0].notice,
+            "Data Source: Environment and Climate Change Canada"
+        );
+        assert!(
+            attributions[0]
+                .modification_notice
+                .contains("not an official")
+        );
+        assert!(attributions[0].license.contains("version 2.1"));
     }
 }

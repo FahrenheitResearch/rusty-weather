@@ -691,16 +691,46 @@ fn parse_section4(sec: &[u8]) -> Result<ProductDefinition, String> {
         prod.level_type = read_u8(sec, 22)?;
         let scale_factor = read_u8(sec, 23)?;
         let scaled_value = read_u32(sec, 24)? as f64;
-        if scale_factor < 128 {
-            prod.level_value = scaled_value / 10.0_f64.powi(scale_factor as i32);
+        // GRIB signed integers use sign-magnitude, not two's complement.
+        // For example 0x82 is -2 (not -126), and the physical value is
+        // scaled_value * 10^(-scale_factor). ECCC encodes isobaric levels such
+        // as 500 hPa as 5 * 10^2 Pa, so confusing these representations turns
+        // ordinary levels into enormous finite f64 values that never match a
+        // selector.
+        let scale_factor = if scale_factor & 0x80 == 0 {
+            i32::from(scale_factor)
         } else {
-            // sign-magnitude: MSB set means negative scale factor
-            let neg_scale = 256 - scale_factor as i32;
-            prod.level_value = scaled_value * 10.0_f64.powi(neg_scale);
-        }
+            -i32::from(scale_factor & 0x7f)
+        };
+        prod.level_value = scaled_value * 10.0_f64.powi(-scale_factor);
     }
 
     Ok(prod)
+}
+
+#[cfg(test)]
+mod section4_tests {
+    use super::parse_section4;
+
+    fn section4_with_level(scale_factor: u8, scaled_value: u32) -> Vec<u8> {
+        let mut section = vec![0_u8; 34];
+        section[0..4].copy_from_slice(&34_u32.to_be_bytes());
+        section[4] = 4;
+        section[7..9].copy_from_slice(&0_u16.to_be_bytes());
+        section[22] = 100;
+        section[23] = scale_factor;
+        section[24..28].copy_from_slice(&scaled_value.to_be_bytes());
+        section
+    }
+
+    #[test]
+    fn fixed_surface_scale_factor_uses_grib_sign_magnitude() {
+        let positive = parse_section4(&section4_with_level(2, 50_000)).unwrap();
+        assert_eq!(positive.level_value, 500.0);
+
+        let negative = parse_section4(&section4_with_level(0x82, 5)).unwrap();
+        assert_eq!(negative.level_value, 500.0);
+    }
 }
 
 /// Parse Section 5 (Data Representation).

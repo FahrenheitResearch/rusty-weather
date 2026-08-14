@@ -401,6 +401,7 @@ const HRRR_CYCLE_HOURS: &[u8] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
 ];
 const GFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
+const GDPS_CYCLE_HOURS: &[u8] = &[0, 12];
 const GDAS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const GEFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const AI_MODEL_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
@@ -519,6 +520,18 @@ const GFS_SOURCES: &[SourceDescriptor] = &[
     },
 ];
 
+const GDPS_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
+    id: SourceId::Eccc,
+    // MSC Datamart publishes one self-contained GRIB2 object per
+    // variable/level, rather than companion index files. The ingest layer
+    // composes the requested objects into one deterministic GRIB message
+    // bundle while retaining per-object fetch caching.
+    idx_available: false,
+    priority: 1,
+    max_age_hours: Some(36),
+    notes: "Environment and Climate Change Canada MSC Datamart",
+}];
+
 const GEFS_SOURCES: &[SourceDescriptor] = &[
     SourceDescriptor {
         id: SourceId::Nomads,
@@ -636,6 +649,19 @@ const MODELS: &[ModelSummary] = &[
         cycle_hours_utc: GFS_CYCLE_HOURS,
         max_forecast_hour: 384,
         sources: GFS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::Gdps,
+        description: "ECCC GDPS global 0.15 degree deterministic forecast",
+        // This logical product resolves to one small representative Datamart
+        // object for availability probes. rw-ingest expands it into the exact
+        // profile-dependent surface component bundle before extraction.
+        default_product: "rws-surface",
+        cycle_hours_utc: GDPS_CYCLE_HOURS,
+        max_forecast_hour: 240,
+        sources: GDPS_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::Deterministic,
     },
@@ -5726,12 +5752,13 @@ pub fn built_in_models() -> &'static [ModelSummary] {
 /// [`built_in_models`] remains linked (`ModelId` match arms thread through
 /// rustwx-products), but every user-facing enumeration must go through this
 /// list.
-pub fn supported_models() -> [ModelId; 14] {
+pub fn supported_models() -> [ModelId; 15] {
     [
         ModelId::Hrrr,
         ModelId::HrrrAk,
         ModelId::Rap,
         ModelId::Gfs,
+        ModelId::Gdps,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -5962,6 +5989,14 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
             hours.extend((123..=384).step_by(3));
             hours
         }
+        ModelId::Gdps => {
+            if !GDPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                return Vec::new();
+            }
+            let mut hours = (0..=84).collect::<Vec<u16>>();
+            hours.extend((87..=240).step_by(3));
+            hours
+        }
         ModelId::Gdas => (0..=9).collect(),
         ModelId::Gefs => {
             let mut hours = (0..=240).step_by(3).collect::<Vec<u16>>();
@@ -6091,6 +6126,9 @@ fn default_canonical_bundle_product(
         (ModelId::HrrrAk, CanonicalBundleDescriptor::PressureAnalysis) => "prs",
         (ModelId::HrrrAk, CanonicalBundleDescriptor::NativeAnalysis) => "nat",
         (ModelId::Gfs, _) => "pgrb2.0p25",
+        (ModelId::Gdps, CanonicalBundleDescriptor::SurfaceAnalysis) => "rws-surface",
+        (ModelId::Gdps, CanonicalBundleDescriptor::PressureAnalysis) => "rws-pressure",
+        (ModelId::Gdps, CanonicalBundleDescriptor::NativeAnalysis) => "rws-surface",
         (ModelId::Gdas, _) => "pgrb2.0p25",
         (ModelId::Gefs, _) => "pgrb2ap5/gec00",
         (ModelId::Aigfs, CanonicalBundleDescriptor::SurfaceAnalysis) => "sfc",
@@ -6557,6 +6595,7 @@ fn build_grib_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         ModelId::Hrrr => build_hrrr_url(source, request),
         ModelId::HrrrAk => build_hrrr_ak_url(source, request),
         ModelId::Gfs => build_gfs_url(source, request)?,
+        ModelId::Gdps => build_gdps_url(source, request)?,
         ModelId::Gdas => build_gdas_url(source, request)?,
         ModelId::Gefs => build_gefs_url(source, request)?,
         ModelId::Aigfs => build_aigfs_url(source, request)?,
@@ -6858,6 +6897,104 @@ fn build_gfs_url(source: SourceId, request: &ModelRunRequest) -> Result<String, 
         }
         other => unsupported_source(other, request.model),
     })
+}
+
+/// The exact isobaric levels published by the GDPS 15 km Datamart feed.
+/// Keeping this list next to URL construction makes arbitrary path fragments
+/// impossible and gives bundle planners one authoritative availability set.
+const GDPS_ISOBARIC_LEVELS_HPA: &[u16] = &[
+    1, 5, 10, 20, 30, 50, 100, 150, 175, 200, 225, 250, 275, 300, 350, 400, 450, 500, 550, 600,
+    650, 700, 750, 800, 850, 875, 900, 925, 950, 970, 985, 1000, 1015,
+];
+
+/// Exact pressure levels advertised by the GDPS 15 km Datamart contract.
+/// Bundle planners intersect this set with their requested RWS profile so
+/// they never probe known-absent per-level objects.
+pub fn gdps_isobaric_levels_hpa() -> &'static [u16] {
+    GDPS_ISOBARIC_LEVELS_HPA
+}
+
+/// Return whether a GDPS component token is an explicitly supported, safe
+/// Datamart object stem. The feed exposes one object per variable and level;
+/// accepting an allowlisted stem instead of a generic path component prevents
+/// URL injection while retaining a compact public request contract.
+fn gdps_component_is_supported(product: &str) -> bool {
+    const SURFACE_COMPONENTS: &[&str] = &[
+        "AirTemp_AGL-2m",
+        "DewPoint_AGL-2m",
+        "RelativeHumidity_AGL-2m",
+        "WindU_AGL-10m",
+        "WindV_AGL-10m",
+        "WindGust_AGL-10m",
+        "Pressure_Sfc",
+        "Pressure_MSL",
+        "GeopotentialHeight_Sfc",
+        "Precip-Accum_Sfc",
+        "Precip-Accum1h_Sfc",
+        "TotalCloudCover_Sfc",
+    ];
+    if SURFACE_COMPONENTS.contains(&product) {
+        return true;
+    }
+
+    const ISOBARIC_PREFIXES: &[&str] = &[
+        "AirTemp_IsbL-",
+        "RelativeHumidity_IsbL-",
+        "SpecificHumidity_IsbL-",
+        "WindU_IsbL-",
+        "WindV_IsbL-",
+        "GeopotentialHeight_IsbL-",
+        "AbsoluteVorticity_IsbL-",
+    ];
+    ISOBARIC_PREFIXES.iter().any(|prefix| {
+        product
+            .strip_prefix(prefix)
+            .and_then(|level| level.parse::<u16>().ok())
+            .is_some_and(|level| {
+                format!("{level:04}") == product[prefix.len()..]
+                    && GDPS_ISOBARIC_LEVELS_HPA.contains(&level)
+            })
+    })
+}
+
+fn build_gdps_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Eccc {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason:
+                "GDPS publishes hourly f000-f084 and every three hours f087-f240 for 00Z/12Z cycles"
+                    .to_string(),
+        });
+    }
+
+    // Logical bundle names are used by catalog/probe and ingest callers. A
+    // small, always-required component is their availability probe; bundle
+    // assembly fetches every exact component through this same URL builder.
+    let product = match request.product.as_str() {
+        "rws-surface" | "rws-sounding" => "AirTemp_AGL-2m",
+        "rws-pressure" => "AirTemp_IsbL-0500",
+        product if gdps_component_is_supported(product) => product,
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    Ok(format!(
+        "https://dd.weather.gc.ca/today/model_gdps/15km/{:02}/{:03}/{}T{:02}Z_MSC_GDPS_{}_LatLon0.15_PT{:03}H.grib2",
+        request.cycle.hour_utc,
+        request.forecast_hour,
+        request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
+        product,
+        request.forecast_hour,
+    ))
 }
 
 fn build_gdas_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
@@ -7766,6 +7903,21 @@ fn plot_recipe_field_blocker(
     field: &'static GribFieldSpec,
     model: ModelId,
 ) -> Option<PlotRecipeBlocker> {
+    // GDPS is published as one object per field/level. The normalized RWS
+    // ingest path assembles those bounded component bundles, but the legacy
+    // direct-GRIB plot path still assumes one family URL. Keep that path
+    // explicitly blocked instead of fetching only the representative probe
+    // object and silently rendering an incomplete field set.
+    if model == ModelId::Gdps {
+        return Some(PlotRecipeBlocker {
+            field_key: field.key,
+            field_label: field.label,
+            reason: format!(
+                "{} for GDPS is available through normalized RWS ingest/query; direct plot acquisition does not yet assemble the Datamart per-field component bundle",
+                field.label
+            ),
+        });
+    }
     if field.family == ProductFamily::Native {
         if let Some(reason) = native_field_gap_reason(field, model) {
             return Some(PlotRecipeBlocker {
@@ -7865,6 +8017,8 @@ fn plot_recipe_fetch_defaults(
         (ModelId::HrrrAk, false, true) => ("sfc", PlotRecipeFetchPolicy::PreferIndexedSubset),
         (ModelId::HrrrAk, false, false) => ("prs", PlotRecipeFetchPolicy::PreferIndexedSubset),
         (ModelId::Gfs, _, _) => ("pgrb2.0p25", PlotRecipeFetchPolicy::PreferIndexedSubset),
+        (ModelId::Gdps, _, true) => ("rws-surface", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::Gdps, _, false) => ("rws-pressure", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::Gdas, _, _) => ("pgrb2.0p25", PlotRecipeFetchPolicy::PreferIndexedSubset),
         (ModelId::Gefs, _, _) if has_ensemble_spread_selector => {
             ("pgrb2ap5/gespr", PlotRecipeFetchPolicy::PreferIndexedSubset)

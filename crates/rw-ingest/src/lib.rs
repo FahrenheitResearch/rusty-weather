@@ -202,6 +202,24 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
             pressure_source: true,
             idx_patterns: &[],
         }]),
+        // ECCC publishes GDPS as one complete GRIB2 object per field/level.
+        // These are logical extraction families: fetch_hour expands each into
+        // an exact, profile-dependent ordered component bundle and caches both
+        // the component objects and assembled message stream.
+        ModelId::Gdps => Ok(vec![
+            ProductFetch {
+                product: "rws-pressure",
+                surface_source: false,
+                pressure_source: true,
+                idx_patterns: &[],
+            },
+            ProductFetch {
+                product: "rws-surface",
+                surface_source: true,
+                pressure_source: false,
+                idx_patterns: &[],
+            },
+        ]),
         ModelId::Gefs => Ok(vec![ProductFetch {
             product: "pgrb2ap5/gec00",
             surface_source: true,
@@ -705,6 +723,9 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
             IngestCapabilityLimitation::SparsePressureLevels,
             IngestCapabilityLimitation::DerivedProductsDisabled,
         ],
+        rustwx_core::ModelId::Gdps => {
+            vec![IngestCapabilityLimitation::SparsePressureLevels]
+        }
         _ => Vec::new(),
     };
     match fetch_plan(model) {
@@ -712,6 +733,7 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
             let verification = match model {
                 rustwx_core::ModelId::Hrrr
                 | rustwx_core::ModelId::Gfs
+                | rustwx_core::ModelId::Gdps
                 | rustwx_core::ModelId::RrfsA => IngestVerificationLevel::LiveVerified,
                 rustwx_core::ModelId::Nbm
                 | rustwx_core::ModelId::Rtma
@@ -1436,6 +1458,28 @@ mod tests {
             assert_eq!(plan[1].product, surface);
             assert!(plan[1].surface_source && !plan[1].pressure_source);
         }
+    }
+
+    #[test]
+    fn fetch_plan_gdps_uses_ordered_logical_component_families() {
+        let plan = fetch_plan(rustwx_core::ModelId::Gdps).expect("GDPS plan");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].product, "rws-pressure");
+        assert!(plan[0].pressure_source && !plan[0].surface_source);
+        assert_eq!(plan[1].product, "rws-surface");
+        assert!(plan[1].surface_source && !plan[1].pressure_source);
+        assert!(plan.iter().all(|product| product.idx_patterns.is_empty()));
+
+        let capability = model_ingest_capability(rustwx_core::ModelId::Gdps);
+        assert_eq!(capability.status, IngestSupportStatus::Ready);
+        assert_eq!(
+            capability.verification,
+            IngestVerificationLevel::LiveVerified
+        );
+        assert_eq!(
+            capability.limitations,
+            vec![IngestCapabilityLimitation::SparsePressureLevels]
+        );
     }
 
     #[test]

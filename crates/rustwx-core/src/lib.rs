@@ -1713,6 +1713,7 @@ pub enum ModelId {
     Hrrr,
     HrrrAk,
     Gfs,
+    Gdps,
     Gdas,
     Gefs,
     Aigfs,
@@ -1741,6 +1742,7 @@ impl ModelId {
             Self::Hrrr => "hrrr",
             Self::HrrrAk => "hrrr-ak",
             Self::Gfs => "gfs",
+            Self::Gdps => "gdps",
             Self::Gdas => "gdas",
             Self::Gefs => "gefs",
             Self::Aigfs => "aigfs",
@@ -1779,6 +1781,9 @@ impl std::str::FromStr for ModelId {
             "hrrr" => Ok(Self::Hrrr),
             "hrrr-ak" | "hrrrak" | "hrrr_ak" | "hrrr-alaska" | "hrrr_alaska" => Ok(Self::HrrrAk),
             "gfs" | "gfs-0p25" | "gfs_0p25" | "gfs-0.25" | "gfs_0.25" => Ok(Self::Gfs),
+            "gdps" | "gem" | "gem-global" | "gem_global" | "cmc-gdps" | "cmc_gdps" => {
+                Ok(Self::Gdps)
+            }
             "gdas" | "gdas-0p25" | "gdas_0p25" | "gdas-0.25" | "gdas_0.25" => Ok(Self::Gdas),
             "gefs" | "gefs-ens" | "gefs_ens" | "gefs-ensemble" => Ok(Self::Gefs),
             "aigfs" | "ai-gfs" | "ai_gfs" => Ok(Self::Aigfs),
@@ -1955,6 +1960,7 @@ pub enum SourceId {
     Google,
     Azure,
     Ecmwf,
+    Eccc,
     Ncei,
     Gdex,
     /// Local NetCDF archive populated by an active AIFS-v2 inference/dissemination harness.
@@ -1973,6 +1979,7 @@ impl SourceId {
             Self::Google => "google",
             Self::Azure => "azure",
             Self::Ecmwf => "ecmwf",
+            Self::Eccc => "eccc",
             Self::Ncei => "ncei",
             Self::Gdex => "gdex",
             Self::AifsInference => "aifs-inference",
@@ -1997,6 +2004,7 @@ impl std::str::FromStr for SourceId {
             "google" => Ok(Self::Google),
             "azure" => Ok(Self::Azure),
             "ecmwf" => Ok(Self::Ecmwf),
+            "eccc" | "msc" | "cmc" | "msc-datamart" | "msc_datamart" => Ok(Self::Eccc),
             "ncei" => Ok(Self::Ncei),
             "gdex" => Ok(Self::Gdex),
             "aifs-inference" | "aifs_inference" | "aifsinference" | "inferenced-aifs"

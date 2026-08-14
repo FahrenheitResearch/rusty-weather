@@ -61,6 +61,7 @@ use rustwx_core::{
 };
 use rustwx_io::{
     CachedFetchResult, FetchRequest, ParsedModelGrib, SharedExtractionGrid, fetch_bytes_with_cache,
+    fetch_component_bundle_with_cache,
 };
 use rustwx_models::plot_recipe_fetch_plan;
 use rustwx_products::derived::{store_derived_recipe_slugs, store_heavy_recipe_slugs};
@@ -559,8 +560,13 @@ fn fetch_product(
     };
     config.emit(IngestEvent::StageStarted { hour, stage });
     let fetch_started = Instant::now();
-    let fetched =
-        fetch_bytes_with_cache(&fetch, config.cache_root, config.use_cache).map_err(other)?;
+    let components = gdps_component_products(config, product)?;
+    let fetched = if let Some(components) = components {
+        fetch_component_bundle_with_cache(&fetch, &components, config.cache_root, config.use_cache)
+            .map_err(other)?
+    } else {
+        fetch_bytes_with_cache(&fetch, config.cache_root, config.use_cache).map_err(other)?
+    };
     let fetch_ms = fetch_started.elapsed().as_millis();
     config.emit(IngestEvent::StageDone {
         hour,
@@ -568,6 +574,81 @@ fn fetch_product(
         ms: fetch_ms,
     });
     Ok((fetched, fetch_ms))
+}
+
+/// Expand one GDPS logical extraction family into the exact ordered Datamart
+/// objects needed by the requested RWS profile. Other models return `None`
+/// and retain their historical single/multi-family-file fetch behavior.
+fn gdps_component_products(
+    config: &IngestConfig<'_>,
+    logical_product: &str,
+) -> Result<Option<Vec<String>>, IngestError> {
+    if config.model != ModelId::Gdps {
+        return Ok(None);
+    }
+    let profile = config.profile;
+    let mut components = Vec::new();
+    match logical_product {
+        "rws-pressure" => {
+            // The current RWS pressure schema has five canonical volumes.
+            // GDPS publishes RH rather than direct dewpoint at isobaric
+            // levels; the existing ingest fallback stores `rh_iso` honestly.
+            let families = [
+                "AirTemp",
+                "RelativeHumidity",
+                "WindU",
+                "WindV",
+                "GeopotentialHeight",
+            ];
+            for level in profile
+                .candidate_levels()
+                .into_iter()
+                .filter(|level| rustwx_models::gdps_isobaric_levels_hpa().contains(level))
+            {
+                for family in families {
+                    components.push(format!("{family}_IsbL-{level:04}"));
+                }
+            }
+            if profile.includes_full_2d() {
+                for level in [200_u16, 250, 500, 700, 850] {
+                    components.push(format!("AbsoluteVorticity_IsbL-{level:04}"));
+                }
+            }
+        }
+        "rws-surface" => {
+            const SURFACE_COMPONENTS: &[(&str, &str)] = &[
+                ("temperature_2m", "AirTemp_AGL-2m"),
+                ("dewpoint_2m", "DewPoint_AGL-2m"),
+                ("u_10m", "WindU_AGL-10m"),
+                ("v_10m", "WindV_AGL-10m"),
+                ("mslp", "Pressure_MSL"),
+                ("rh_2m", "RelativeHumidity_AGL-2m"),
+                ("wind_gust_10m", "WindGust_AGL-10m"),
+                ("surface_pressure", "Pressure_Sfc"),
+                ("orography", "GeopotentialHeight_Sfc"),
+                ("apcp_run_total", "Precip-Accum_Sfc"),
+                ("cloud_cover_total", "TotalCloudCover_Sfc"),
+            ];
+            components.extend(
+                SURFACE_COMPONENTS
+                    .iter()
+                    .filter(|(field, _)| profile.includes_surface_field(field))
+                    .map(|(_, component)| (*component).to_string()),
+            );
+        }
+        unknown => {
+            return Err(other(format!(
+                "GDPS fetch plan contains unknown logical product '{unknown}'"
+            )));
+        }
+    }
+    if components.is_empty() {
+        return Err(other(format!(
+            "GDPS logical product '{logical_product}' has no components for profile '{}'",
+            profile.describe()
+        )));
+    }
+    Ok(Some(components))
 }
 
 /// Fetch the per-model product file(s) for one hour (network or cache disk
@@ -668,6 +749,7 @@ fn safe_provider_identity(source: SourceId) -> &'static str {
         SourceId::Google => "noaa-google-public-data",
         SourceId::Azure => "noaa-microsoft-azure-public-data",
         SourceId::Ecmwf => "ecmwf-open-data",
+        SourceId::Eccc => "eccc-msc-datamart",
         SourceId::Ncei => "noaa-ncei",
         SourceId::Gdex => "ucar-gdex",
         SourceId::AifsInference => "local-aifs-inference",
@@ -2392,6 +2474,60 @@ mod tests {
         );
         assert!(!view.derived.is_empty());
         assert!(view.heavy.is_empty());
+    }
+
+    #[test]
+    fn gdps_sounding_bundle_is_exact_ordered_and_known_available() {
+        let cycle = CycleSpec::new("20260814", 0).unwrap();
+        let profile = IngestProfile::sounding();
+        let cancel = AtomicBool::new(false);
+        let sink = |_event: IngestEvent| {};
+        let config = IngestConfig {
+            model: ModelId::Gdps,
+            cycle: &cycle,
+            source_override: Some(SourceId::Eccc),
+            cache_root: Path::new("unused-cache"),
+            use_cache: true,
+            store_root: Path::new("unused-store"),
+            model_slug: "gdps",
+            run_slug: "20260814-00",
+            profile: &profile,
+            verify: true,
+            progress: &sink,
+            cancel: &cancel,
+        };
+
+        let pressure = gdps_component_products(&config, "rws-pressure")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pressure.len(), 24 * 5);
+        assert_eq!(pressure[0], "AirTemp_IsbL-0100");
+        assert_eq!(pressure[1], "RelativeHumidity_IsbL-0100");
+        assert_eq!(pressure[4], "GeopotentialHeight_IsbL-0100");
+        assert_eq!(pressure.last().unwrap(), "GeopotentialHeight_IsbL-1000");
+        assert!(!pressure.iter().any(|product| product.contains("0125")));
+        assert!(!pressure.iter().any(|product| product.contains("0975")));
+        assert_eq!(
+            pressure.iter().collect::<HashSet<_>>().len(),
+            pressure.len(),
+            "component inventory must be duplicate-free"
+        );
+
+        let surface = gdps_component_products(&config, "rws-surface")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            surface,
+            vec![
+                "AirTemp_AGL-2m",
+                "DewPoint_AGL-2m",
+                "WindU_AGL-10m",
+                "WindV_AGL-10m",
+                "Pressure_MSL",
+                "Pressure_Sfc",
+                "GeopotentialHeight_Sfc",
+            ]
+        );
     }
 
     #[test]

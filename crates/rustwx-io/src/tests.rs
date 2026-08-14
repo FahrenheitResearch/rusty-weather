@@ -1,6 +1,8 @@
 use super::*;
 use grib_core::grib2::{DataRepresentation, GridDefinition, ProductDefinition};
+use rustwx_core::CycleSpec;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const SAMPLE_IDX: &str = "\
 1:0:d=2026041420:TMP:2 m above ground:anl:
@@ -653,6 +655,150 @@ fn parsed_model_grib_repeated_passes_match_fresh_parse_results() {
     };
     assert_same(&reused_primary, &fresh_primary);
     assert_same(&reused_alternate, &fresh_alternate);
+}
+
+#[test]
+fn component_bundle_is_ordered_source_bound_and_inventory_keyed() {
+    use wx_core::grib2::{
+        Grib2Writer, GridDefinition as WxGridDefinition, MessageBuilder, PackingMethod,
+        ProductDefinition as WxProductDefinition,
+    };
+
+    let grid = WxGridDefinition {
+        template: 0,
+        nx: 2,
+        ny: 1,
+        lat1: 40.0,
+        lon1: -105.0,
+        lat2: 40.0,
+        lon2: -104.0,
+        dx: 1.0,
+        dy: 1.0,
+        scan_mode: 0,
+        ..WxGridDefinition::default()
+    };
+    let grib = |parameter_number: u8, values: Vec<f64>| {
+        Grib2Writer::new()
+            .add_message(
+                MessageBuilder::new(0, values)
+                    .grid(grid.clone())
+                    .product(WxProductDefinition {
+                        template: 0,
+                        parameter_category: 0,
+                        parameter_number,
+                        generating_process: 2,
+                        forecast_time: 0,
+                        time_range_unit: 1,
+                        level_type: 100,
+                        level_value: 50_000.0,
+                    })
+                    .packing(PackingMethod::Simple { bits_per_value: 16 }),
+            )
+            .to_bytes()
+            .unwrap()
+    };
+    let first_bytes = grib(0, vec![250.0, 251.0]);
+    let second_bytes = grib(1, vec![40.0, 50.0]);
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let cache_root = std::env::temp_dir().join(format!(
+        "rustwx-component-bundle-{}-{nonce}",
+        std::process::id()
+    ));
+    let cycle = CycleSpec::new("20260814", 0).unwrap();
+    let logical = FetchRequest {
+        request: ModelRunRequest::new(ModelId::Gdps, cycle.clone(), 0, "rws-pressure").unwrap(),
+        source_override: Some(SourceId::Eccc),
+        variable_patterns: Vec::new(),
+    };
+    let components = [
+        ("AirTemp_IsbL-0500", first_bytes.clone()),
+        ("RelativeHumidity_IsbL-0500", second_bytes.clone()),
+    ];
+    for (product, bytes) in &components {
+        let request = FetchRequest {
+            request: ModelRunRequest::new(ModelId::Gdps, cycle.clone(), 0, *product).unwrap(),
+            source_override: Some(SourceId::Eccc),
+            variable_patterns: Vec::new(),
+        };
+        store_cached_fetch(
+            &cache_root,
+            &request,
+            &FetchResult {
+                source: SourceId::Eccc,
+                url: format!("https://dd.weather.gc.ca/{product}.grib2"),
+                bytes: bytes.clone(),
+            },
+        )
+        .unwrap();
+    }
+    let inventory = components
+        .iter()
+        .map(|(product, _)| (*product).to_string())
+        .collect::<Vec<_>>();
+    let first = fetch_component_bundle_with_cache(&logical, &inventory, &cache_root, true).unwrap();
+    assert!(!first.cache_hit);
+    assert_eq!(first.result.source, SourceId::Eccc);
+    assert!(first.result.url.starts_with("rws-bundle://eccc/gdps/"));
+    assert_eq!(
+        first.result.bytes,
+        [first_bytes.as_slice(), second_bytes.as_slice()].concat()
+    );
+    assert_eq!(
+        Grib2File::from_bytes(&first.result.bytes)
+            .unwrap()
+            .messages
+            .len(),
+        2
+    );
+
+    let warm = fetch_component_bundle_with_cache(&logical, &inventory, &cache_root, true).unwrap();
+    assert!(warm.cache_hit);
+    assert_eq!(warm.result.bytes, first.result.bytes);
+
+    let reversed = inventory.iter().rev().cloned().collect::<Vec<_>>();
+    let reordered =
+        fetch_component_bundle_with_cache(&logical, &reversed, &cache_root, true).unwrap();
+    assert!(
+        !reordered.cache_hit,
+        "inventory order is part of the cache key"
+    );
+    assert_eq!(
+        reordered.result.bytes,
+        [second_bytes.as_slice(), first_bytes.as_slice()].concat()
+    );
+
+    let exact_stream = [first_bytes.as_slice(), second_bytes.as_slice()].concat();
+    assert_eq!(
+        parse_complete_grib2_stream(&exact_stream)
+            .unwrap()
+            .messages
+            .len(),
+        2
+    );
+    for malformed in [
+        Vec::new(),
+        [b"junk".as_slice(), first_bytes.as_slice()].concat(),
+        [first_bytes.as_slice(), b"junk".as_slice()].concat(),
+        first_bytes[..first_bytes.len() - 1].to_vec(),
+    ] {
+        assert!(
+            parse_complete_grib2_stream(&malformed).is_err(),
+            "component admission must reject non-exact GRIB2 streams"
+        );
+    }
+
+    let duplicate = vec![inventory[0].clone(), inventory[0].clone()];
+    assert!(
+        fetch_component_bundle_with_cache(&logical, &duplicate, &cache_root, true)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate product")
+    );
+    let _ = std::fs::remove_dir_all(cache_root);
 }
 
 #[test]

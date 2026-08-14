@@ -1088,6 +1088,220 @@ pub fn fetch_bytes_with_cache(
     }
 }
 
+/// Maximum number of independently published GRIB2 objects admitted into one
+/// logical component bundle. Provider feeds such as ECCC's Datamart publish
+/// one object per variable/level; the bound keeps a malformed or accidentally
+/// expanded adapter from turning one ingest hour into unbounded request fanout.
+const MAX_COMPONENT_BUNDLE_OBJECTS: usize = 512;
+
+/// Maximum assembled bytes for one logical GRIB2 component bundle. The limit
+/// is intentionally larger than the expected GDPS sounding bundle while still
+/// bounding RAM, cache, and spill exposure before any decode begins.
+const MAX_COMPONENT_BUNDLE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Parse a GRIB2 stream only after proving it consists of one or more exact,
+/// adjacent messages. `Grib2File::from_bytes` is intentionally permissive for
+/// general meteorological files: it scans past leading junk and accepts an
+/// empty/trailing fragment. A provider component or cache artifact needs the
+/// stronger contract so a partial HTTP body cannot be admitted as a valid
+/// logical bundle.
+fn parse_complete_grib2_stream(bytes: &[u8]) -> Result<Grib2File, IoError> {
+    let mut offset = 0_usize;
+    let mut expected_messages = 0_usize;
+    while offset < bytes.len() {
+        let remaining = bytes.len() - offset;
+        if remaining < 20 {
+            return Err(IoError::Grib(format!(
+                "GRIB2 stream ends with a {remaining}-byte incomplete fragment"
+            )));
+        }
+        if bytes.get(offset..offset + 4) != Some(b"GRIB") {
+            return Err(IoError::Grib(format!(
+                "GRIB2 stream has non-message bytes at offset {offset}"
+            )));
+        }
+        if bytes[offset + 7] != 2 {
+            return Err(IoError::Grib(format!(
+                "GRIB2 stream message at offset {offset} has edition {}",
+                bytes[offset + 7]
+            )));
+        }
+        let total_length = u64::from_be_bytes(
+            bytes[offset + 8..offset + 16]
+                .try_into()
+                .expect("20-byte minimum includes the indicator length"),
+        );
+        let total_length = usize::try_from(total_length)
+            .map_err(|_| IoError::Grib("GRIB2 message length exceeds usize".to_string()))?;
+        if total_length < 20 {
+            return Err(IoError::Grib(format!(
+                "GRIB2 message at offset {offset} declares invalid length {total_length}"
+            )));
+        }
+        let end = offset
+            .checked_add(total_length)
+            .ok_or_else(|| IoError::Grib("GRIB2 message end offset overflow".to_string()))?;
+        if end > bytes.len() {
+            return Err(IoError::Grib(format!(
+                "GRIB2 message at offset {offset} declares {total_length} bytes but only {remaining} remain"
+            )));
+        }
+        if bytes.get(end - 4..end) != Some(b"7777") {
+            return Err(IoError::Grib(format!(
+                "GRIB2 message at offset {offset} lacks the Section 8 terminator"
+            )));
+        }
+        expected_messages += 1;
+        offset = end;
+    }
+    if expected_messages == 0 {
+        return Err(IoError::Grib(
+            "GRIB2 stream contains no messages".to_string(),
+        ));
+    }
+    let parsed = Grib2File::from_bytes(bytes).map_err(|err| IoError::Grib(err.to_string()))?;
+    if parsed.messages.len() != expected_messages {
+        return Err(IoError::Grib(format!(
+            "GRIB2 parser realized {} of {expected_messages} structurally complete messages",
+            parsed.messages.len()
+        )));
+    }
+    Ok(parsed)
+}
+
+/// Fetch an ordered set of self-contained GRIB2 objects and expose their
+/// concatenated message stream as one cache-coherent logical fetch.
+///
+/// This is the acquisition bridge for providers that publish one field per
+/// object instead of a multi-message family file. Every component goes through
+/// the ordinary source fallback and per-object raw/fetch cache. The logical
+/// cache key includes the exact ordered component inventory, so changing an
+/// adapter's field/level plan cannot reuse stale bundle bytes. Components must
+/// resolve through one provider source and each payload, plus the final stream,
+/// must parse as complete GRIB2 before being returned or persisted.
+pub fn fetch_component_bundle_with_cache(
+    logical_fetch: &FetchRequest,
+    component_products: &[String],
+    cache_root: &Path,
+    use_cache: bool,
+) -> Result<CachedFetchResult, IoError> {
+    if !logical_fetch.variable_patterns.is_empty() {
+        return Err(IoError::Download(
+            "component bundle logical request must not contain GRIB index patterns".to_string(),
+        ));
+    }
+    if component_products.is_empty() || component_products.len() > MAX_COMPONENT_BUNDLE_OBJECTS {
+        return Err(IoError::Download(format!(
+            "component bundle requires 1..={MAX_COMPONENT_BUNDLE_OBJECTS} objects (got {})",
+            component_products.len()
+        )));
+    }
+    let mut unique = HashSet::with_capacity(component_products.len());
+    for product in component_products {
+        if !unique.insert(product.as_str()) {
+            return Err(IoError::Download(format!(
+                "component bundle contains duplicate product '{product}'"
+            )));
+        }
+    }
+
+    // These strings are metadata-only cache-key material. They cannot be
+    // confused with `.idx` patterns because this logical request is never sent
+    // to a provider; component requests below have an empty pattern list.
+    let mut bundle_fetch = logical_fetch.clone();
+    bundle_fetch.variable_patterns = component_products
+        .iter()
+        .map(|product| format!("component:{product}"))
+        .collect();
+
+    if use_cache {
+        if let Some(cached) = load_cached_fetch(cache_root, &bundle_fetch)? {
+            return Ok(cached);
+        }
+    }
+    let _bundle_lock = if use_cache {
+        Some(acquire_fetch_cache_lock(cache_root, &bundle_fetch)?)
+    } else {
+        None
+    };
+    if use_cache {
+        if let Some(cached) = load_cached_fetch(cache_root, &bundle_fetch)? {
+            return Ok(cached);
+        }
+    }
+
+    let mut resolved_source = None;
+    let mut bytes = Vec::new();
+    for product in component_products {
+        let component_fetch = FetchRequest {
+            request: ModelRunRequest::new(
+                logical_fetch.request.model,
+                logical_fetch.request.cycle.clone(),
+                logical_fetch.request.forecast_hour,
+                product,
+            )?,
+            source_override: logical_fetch.source_override,
+            variable_patterns: Vec::new(),
+        };
+        let component = fetch_bytes_with_cache(&component_fetch, cache_root, use_cache)?;
+        parse_complete_grib2_stream(&component.result.bytes).map_err(|err| {
+            IoError::Grib(format!(
+                "component '{product}' is not complete GRIB2: {err}"
+            ))
+        })?;
+        match resolved_source {
+            None => resolved_source = Some(component.result.source),
+            Some(source) if source == component.result.source => {}
+            Some(source) => {
+                return Err(IoError::Download(format!(
+                    "component bundle crossed provider sources: first {source}, product '{product}' resolved through {}",
+                    component.result.source
+                )));
+            }
+        }
+        let next_len = bytes
+            .len()
+            .checked_add(component.result.bytes.len())
+            .ok_or_else(|| {
+                IoError::Download("component bundle byte length overflow".to_string())
+            })?;
+        if next_len > MAX_COMPONENT_BUNDLE_BYTES {
+            return Err(IoError::Download(format!(
+                "component bundle exceeds {MAX_COMPONENT_BUNDLE_BYTES} bytes at product '{product}'"
+            )));
+        }
+        bytes.extend_from_slice(&component.result.bytes);
+    }
+    parse_complete_grib2_stream(&bytes)
+        .map_err(|err| IoError::Grib(format!("assembled component bundle is invalid: {err}")))?;
+
+    let source = resolved_source.expect("non-empty component inventory resolves one source");
+    let result = FetchResult {
+        source,
+        url: format!(
+            "rws-bundle://{}/{}/{}T{:02}Z/f{:03}/{}",
+            source.as_str(),
+            logical_fetch.request.model.as_str(),
+            logical_fetch.request.cycle.date_yyyymmdd,
+            logical_fetch.request.cycle.hour_utc,
+            logical_fetch.request.forecast_hour,
+            logical_fetch.request.product,
+        ),
+        bytes,
+    };
+    if use_cache {
+        store_cached_fetch(cache_root, &bundle_fetch, &result)
+    } else {
+        let (bytes_path, metadata_path) = fetch_cache_paths(cache_root, &bundle_fetch);
+        Ok(CachedFetchResult {
+            result,
+            cache_hit: false,
+            bytes_path,
+            metadata_path,
+        })
+    }
+}
+
 fn load_cached_raw_full_fetch(
     cache_root: &std::path::Path,
     fetch: &FetchRequest,
