@@ -822,6 +822,24 @@ pub fn model_surface_plan(model: ModelId) -> Vec<(&'static str, FieldSelector)> 
     match model {
         ModelId::CmaGeps => cma_geps_statistics_surface_plan(),
         ModelId::Reps => reps_statistics_surface_plan(),
+        ModelId::GdpsGeml => vec![
+            (
+                "temperature_2m",
+                FieldSelector::height_agl(CanonicalField::Temperature, 2),
+            ),
+            (
+                "u_10m",
+                FieldSelector::height_agl(CanonicalField::UWind, 10),
+            ),
+            (
+                "v_10m",
+                FieldSelector::height_agl(CanonicalField::VWind, 10),
+            ),
+            (
+                "mslp",
+                FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel),
+            ),
+        ],
         _ => base_surface_plan(),
     }
 }

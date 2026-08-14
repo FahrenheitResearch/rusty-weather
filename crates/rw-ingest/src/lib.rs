@@ -226,7 +226,7 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
         // These are logical extraction families: fetch_hour expands each into
         // an exact, profile-dependent ordered component bundle and caches both
         // the component objects and assembled message stream.
-        ModelId::Gdps | ModelId::Rdps | ModelId::Hrdps => Ok(vec![
+        ModelId::Gdps | ModelId::GdpsGeml | ModelId::Rdps | ModelId::Hrdps => Ok(vec![
             ProductFetch {
                 product: "rws-pressure",
                 surface_source: false,
@@ -817,11 +817,13 @@ pub fn validate_ingest_profile_for_model(
     }
     if matches!(
         model,
-        rustwx_core::ModelId::IconEu | rustwx_core::ModelId::IconD2
+        rustwx_core::ModelId::GdpsGeml
+            | rustwx_core::ModelId::IconEu
+            | rustwx_core::ModelId::IconD2
     ) && (profile.derived || profile.heavy)
     {
         return Err(events::other(format!(
-            "model '{model}' regular-grid ingest is verified for normalized surface and sparse pressure fields; derived/heavy diagnostics remain disabled until their complete DWD input contract is live-validated; use --profile sounding or disable both derived and heavy",
+            "model '{model}' ingest is verified for normalized surface and sparse pressure fields; derived/heavy diagnostics remain disabled because the public input contract omits required native fields; use --profile sounding or disable both derived and heavy",
         )));
     }
     if matches!(
@@ -977,6 +979,11 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
         rustwx_core::ModelId::Gdps => {
             vec![IngestCapabilityLimitation::SparsePressureLevels]
         }
+        rustwx_core::ModelId::GdpsGeml => vec![
+            IngestCapabilityLimitation::SparsePressureLevels,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+            IngestCapabilityLimitation::PreOperationalFeed,
+        ],
         rustwx_core::ModelId::CmaGeps => vec![
             IngestCapabilityLimitation::ProviderStatisticsOnly,
             IngestCapabilityLimitation::SparsePressureLevels,
@@ -1016,6 +1023,7 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 rustwx_core::ModelId::Hrrr
                 | rustwx_core::ModelId::Gfs
                 | rustwx_core::ModelId::Gdps
+                | rustwx_core::ModelId::GdpsGeml
                 | rustwx_core::ModelId::CmaGeps
                 | rustwx_core::ModelId::Rdps
                 | rustwx_core::ModelId::Hrdps
@@ -1143,6 +1151,7 @@ mod tests {
             ModelId::Rap,
             ModelId::Gfs,
             ModelId::Gdps,
+            ModelId::GdpsGeml,
             ModelId::CmaGeps,
             ModelId::Rdps,
             ModelId::Hrdps,
@@ -1458,6 +1467,7 @@ mod tests {
                 ModelId::HrrrAk,
                 ModelId::Gfs,
                 ModelId::Gdps,
+                ModelId::GdpsGeml,
                 ModelId::CmaGeps,
                 ModelId::Rdps,
                 ModelId::Hrdps,
@@ -2350,6 +2360,7 @@ mod tests {
     fn fetch_plan_eccc_models_use_ordered_logical_component_families() {
         for model in [
             rustwx_core::ModelId::Gdps,
+            rustwx_core::ModelId::GdpsGeml,
             rustwx_core::ModelId::Rdps,
             rustwx_core::ModelId::Hrdps,
         ] {
@@ -2380,6 +2391,33 @@ mod tests {
         assert_eq!(
             capability.limitations,
             vec![IngestCapabilityLimitation::SparsePressureLevels]
+        );
+
+        let geml = model_ingest_capability(rustwx_core::ModelId::GdpsGeml);
+        assert_eq!(geml.status, IngestSupportStatus::Ready);
+        assert_eq!(geml.verification, IngestVerificationLevel::LiveVerified);
+        assert_eq!(
+            geml.limitations,
+            vec![
+                IngestCapabilityLimitation::SparsePressureLevels,
+                IngestCapabilityLimitation::DerivedProductsDisabled,
+                IngestCapabilityLimitation::PreOperationalFeed,
+            ]
+        );
+        validate_ingest_profile_for_model(
+            rustwx_core::ModelId::GdpsGeml,
+            &ingest_profile::IngestProfile::sounding(),
+        )
+        .expect("normalized GDPS-GEML sounding profile is supported");
+        let error = validate_ingest_profile_for_model(
+            rustwx_core::ModelId::GdpsGeml,
+            &ingest_profile::IngestProfile::full(),
+        )
+        .expect_err("GDPS-GEML derived/heavy profile stays gated");
+        assert!(
+            error
+                .to_string()
+                .contains("derived/heavy diagnostics remain disabled")
         );
     }
 
@@ -2638,6 +2676,53 @@ mod tests {
             .lines()
             .find_map(|line| line.strip_prefix(&format!("# {key}=")))
             .unwrap_or_else(|| panic!("fixture is missing header {key}"))
+    }
+
+    #[test]
+    fn gdps_geml_fixture_pins_complete_inventory_grid_and_decode_referees() {
+        let fixture = include_str!("../tests/fixtures/gdps-geml.20260814.t00z.f006.inventory.txt");
+        assert_eq!(fixture_header(fixture, "source_bytes"), "19689");
+        assert_eq!(fixture_header(fixture, "source_grib2_links"), "82");
+        assert_eq!(
+            fixture_header(fixture, "source_sha256"),
+            "D71D6E2D142561C387A760CAA3CF28037DBCDCBC6ACA65E76B542CBA1558FD62"
+        );
+        assert_eq!(fixture_header(fixture, "live_decoded_grid"), "1440x721");
+        assert_eq!(
+            fixture_header(fixture, "data_representation_template"),
+            "5.0-simple-packing"
+        );
+        assert_eq!(
+            fixture_header(fixture, "every_object_observed_bytes"),
+            "2076659"
+        );
+        assert!(fixture.contains("# payload=VerticalVelocity_IsbL-0500|2076659|A32D7B"));
+        assert!(fixture.contains("# payload=SpecificHumidity_IsbL-0850|2076659|FBCD55"));
+        assert_eq!(
+            fixture_header(fixture, "q_to_dewpoint_contract"),
+            "out-of-range-q-is-NaN-never-clamped-or-guessed"
+        );
+
+        let captured = fixture
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(captured.len(), 82);
+        let cycle = rustwx_core::CycleSpec::new("20260814", 0).unwrap();
+        for component in rustwx_models::gdps_geml_inventory_components() {
+            let request = rustwx_core::ModelRunRequest::new(
+                rustwx_core::ModelId::GdpsGeml,
+                cycle.clone(),
+                6,
+                component,
+            )
+            .unwrap();
+            let url = rustwx_models::resolve_urls(&request).unwrap()[0]
+                .grib_url
+                .clone();
+            let filename = url.rsplit('/').next().unwrap();
+            assert!(captured.contains(filename), "fixture is missing {filename}");
+        }
     }
 
     #[test]

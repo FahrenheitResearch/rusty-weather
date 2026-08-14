@@ -215,6 +215,17 @@ pub fn cptec_provider_attribution() -> ProviderAttribution {
     }
 }
 
+/// Attribution for ECCC's experimental GDPS-GEML AI-emulator feed. The
+/// licence and required notice are shared with Datamart, while this exact
+/// documentation URL keeps the experimental product identity unambiguous.
+pub fn gdps_geml_provider_attribution() -> ProviderAttribution {
+    let mut attribution = eccc_provider_attribution();
+    attribution.source_url =
+        "https://eccc-msc.github.io/open-data/msc-data/nwp_gdps/readme_gdps-geml-datamart_en/"
+            .into();
+    attribution
+}
+
 pub fn provider_attributions_for_provenance(
     sources: &[SourceProvenance],
 ) -> Vec<ProviderAttribution> {
@@ -265,6 +276,12 @@ pub fn provider_attributions_for_provenance(
         } else {
             attributions.push(eccc_provider_attribution());
         }
+    }
+    if sources
+        .iter()
+        .any(|source| source.provider == "eccc-msc-gdps-geml-datamart")
+    {
+        attributions.push(gdps_geml_provider_attribution());
     }
     if sources
         .iter()
@@ -686,5 +703,22 @@ mod tests {
                 .modification_notice
                 .contains("not an official CPTEC/INPE product")
         );
+    }
+
+    #[test]
+    fn gdps_geml_provenance_uses_the_exact_experimental_product_page() {
+        let attributions =
+            provider_attributions_for_provenance(&[provenance("eccc-msc-gdps-geml-datamart")]);
+        assert_eq!(attributions, vec![gdps_geml_provider_attribution()]);
+        assert_eq!(
+            attributions[0].source_url,
+            "https://eccc-msc.github.io/open-data/msc-data/nwp_gdps/readme_gdps-geml-datamart_en/"
+        );
+        assert_eq!(
+            attributions[0].notice,
+            "Data Source: Environment and Climate Change Canada"
+        );
+        assert!(attributions[0].license.contains("version 2.1"));
+        assert!(attributions[0].modification_notice.contains("normalized"));
     }
 }

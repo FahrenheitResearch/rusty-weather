@@ -181,6 +181,46 @@ fn eccc_regional_plans_pin_logical_products_and_hourly_native_cadence() {
 }
 
 #[test]
+fn gdps_geml_plan_pins_six_hour_cadence_and_complete_native_profile() {
+    let plan = JobPlan::build_with_profile_and_source(
+        ModelId::GdpsGeml,
+        cycle("20260814", 0),
+        &IngestProfile::sounding(),
+        Some(SourceId::Eccc),
+    )
+    .unwrap();
+    assert_eq!(plan.expected_valid_times.len(), 41);
+    assert_eq!(plan.expected_valid_times.first().unwrap().forecast_hour, 0);
+    assert_eq!(plan.expected_valid_times.last().unwrap().forecast_hour, 240);
+    assert!(
+        plan.expected_valid_times
+            .iter()
+            .all(|time| time.forecast_hour % 6 == 0)
+    );
+    assert_eq!(
+        plan.ingest_products
+            .iter()
+            .map(|product| product.product.as_str())
+            .collect::<Vec<_>>(),
+        vec!["rws-pressure", "rws-surface"]
+    );
+    assert_eq!(
+        plan.ingest_profile.to_profile().unwrap(),
+        IngestProfile::sounding()
+    );
+    assert_eq!(
+        plan.capability_limitations,
+        vec![
+            "sparse_pressure_levels".to_string(),
+            "derived_products_disabled".to_string(),
+            "pre_operational_feed".to_string(),
+        ]
+    );
+    plan.validate().unwrap();
+    assert!(JobPlan::build(ModelId::GdpsGeml, cycle("20260814", 6)).is_err());
+}
+
+#[test]
 fn dwd_icon_plans_pin_component_bundles_native_cadence_and_source() {
     let cases = [
         (ModelId::IconEu, 0, 93, 120),
@@ -652,6 +692,7 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
     assert!(expanded.contains(&ModelId::IconRu));
     assert!(expanded.contains(&ModelId::Rtma));
     assert!(expanded.contains(&ModelId::CmaGeps));
+    assert!(expanded.contains(&ModelId::GdpsGeml));
 
     let surface = scheduler_config("surface-profile", &["hiresw"]);
     let profile = surface.profile_for(ModelId::Hiresw).unwrap();
@@ -697,6 +738,12 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
     assert!(
         plan.capability_limitations
             .contains(&"provider_statistics_only".to_string())
+    );
+
+    let geml = scheduler_config("gdps-geml-profile", &["gdps-geml"]);
+    assert_eq!(
+        geml.profile_for(ModelId::GdpsGeml).unwrap(),
+        IngestProfile::sounding()
     );
 
     let mut unsafe_surface = scheduler_config("unsafe-surface-profile", &["hiresw"]);
@@ -1341,7 +1388,7 @@ fn every_ready_model_has_a_valid_cadence_profile_and_remote_source() {
         );
         plan.validate().unwrap();
     }
-    assert_eq!(ready, 32);
+    assert_eq!(ready, 33);
 }
 
 #[test]

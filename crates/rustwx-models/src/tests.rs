@@ -90,7 +90,7 @@ fn provider_probe_agent_times_out_a_stalled_response_offline() {
 
 #[test]
 fn built_in_models_are_real() {
-    assert_eq!(built_in_models().len(), 34);
+    assert_eq!(built_in_models().len(), 35);
     assert_eq!(model_summary(ModelId::Gdps).default_product, "rws-surface");
     assert_eq!(model_summary(ModelId::CmaGeps).default_product, "stats");
     assert_eq!(model_summary(ModelId::CmaGeps).max_forecast_hour, 360);
@@ -178,6 +178,7 @@ fn catalog_exposes_the_user_facing_supported_models() {
         ModelId::Rap,
         ModelId::Gfs,
         ModelId::Gdps,
+        ModelId::GdpsGeml,
         ModelId::CmaGeps,
         ModelId::Rdps,
         ModelId::Hrdps,
@@ -674,6 +675,7 @@ fn temperature_700_recipe_tracks_model_support() {
             } else if matches!(
                 model,
                 ModelId::Gdps
+                    | ModelId::GdpsGeml
                     | ModelId::CmaGeps
                     | ModelId::Rdps
                     | ModelId::Hrdps
@@ -693,7 +695,7 @@ fn temperature_700_recipe_tracks_model_support() {
                 assert!(reason.contains("700 hPa temperature/height/wind selectors"));
             }
             match model {
-                ModelId::Gdps | ModelId::Rdps | ModelId::Hrdps => {
+                ModelId::Gdps | ModelId::GdpsGeml | ModelId::Rdps | ModelId::Hrdps => {
                     assert!(reason.contains("Datamart per-field component bundle"));
                 }
                 ModelId::IconEu | ModelId::IconD2 => {
@@ -1069,6 +1071,82 @@ fn gdps_cadence_and_component_urls_match_the_msc_datamart_contract() {
         "Unknown_IsbL-0500",
     ] {
         let request = ModelRunRequest::new(ModelId::Gdps, cycle.clone(), 87, invalid).unwrap();
+        assert!(matches!(
+            build_grib_url(SourceId::Eccc, &request),
+            Err(ModelError::UnsupportedProduct { .. })
+        ));
+    }
+}
+
+#[test]
+fn gdps_geml_cadence_inventory_and_urls_match_the_msc_datamart_contract() {
+    let summary = model_summary(ModelId::GdpsGeml);
+    assert_eq!(summary.cycle_hours_utc, &[0, 12]);
+    assert_eq!(summary.max_forecast_hour, 240);
+    assert_eq!(summary.default_product, "rws-surface");
+    assert!(summary.description.contains("Experimental"));
+
+    let hours = supported_forecast_hours(ModelId::GdpsGeml, 0);
+    assert_eq!(hours, (0..=240).step_by(6).collect::<Vec<_>>());
+    assert!(supported_forecast_hours(ModelId::GdpsGeml, 6).is_empty());
+
+    assert_eq!(
+        gdps_geml_isobaric_levels_hpa(),
+        &[
+            50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000
+        ]
+    );
+    let inventory = gdps_geml_inventory_components();
+    assert_eq!(inventory.len(), 82);
+    assert_eq!(
+        inventory
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        82,
+        "the bounded contract must not contain duplicate objects"
+    );
+    for component in gdps_geml_surface_components() {
+        assert!(inventory.iter().any(|have| have == component));
+    }
+    assert!(inventory.iter().any(|value| value == "AirTemp_IsbL-0050"));
+    assert!(
+        inventory
+            .iter()
+            .any(|value| value == "VerticalVelocity_IsbL-1000")
+    );
+
+    let cycle = rustwx_core::CycleSpec::new("20260814", 0).unwrap();
+    let t2 = ModelRunRequest::new(ModelId::GdpsGeml, cycle.clone(), 6, "AirTemp_AGL-2m").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::Eccc, &t2).unwrap(),
+        "https://dd.weather.gc.ca/today/model_gdps-geml/25km/00/006/20260814T00Z_MSC_GDPS-GEML_AirTemp_AGL-2m_LatLon0.25_PT006H.grib2"
+    );
+    let omega = ModelRunRequest::new(
+        ModelId::GdpsGeml,
+        cycle.clone(),
+        6,
+        "VerticalVelocity_IsbL-0500",
+    )
+    .unwrap();
+    assert!(
+        build_grib_url(SourceId::Eccc, &omega)
+            .unwrap()
+            .ends_with("_VerticalVelocity_IsbL-0500_LatLon0.25_PT006H.grib2")
+    );
+    let off_cadence =
+        ModelRunRequest::new(ModelId::GdpsGeml, cycle.clone(), 3, "rws-surface").unwrap();
+    assert!(matches!(
+        build_grib_url(SourceId::Eccc, &off_cadence),
+        Err(ModelError::UnsupportedForecastHour { .. })
+    ));
+    for invalid in [
+        "../AirTemp_AGL-2m",
+        "GeopotentialHeight_IsbL-0500",
+        "VerticalVelocity_IsbL-0750",
+        "WindU_IsbL-500",
+    ] {
+        let request = ModelRunRequest::new(ModelId::GdpsGeml, cycle.clone(), 6, invalid).unwrap();
         assert!(matches!(
             build_grib_url(SourceId::Eccc, &request),
             Err(ModelError::UnsupportedProduct { .. })

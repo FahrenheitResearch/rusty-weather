@@ -237,6 +237,7 @@ fn provider_attributions(
         let attribution = match summary.id {
             ModelId::Geps => rw_query::geps_provider_attribution(),
             ModelId::Reps => rw_query::reps_provider_attribution(),
+            ModelId::GdpsGeml => rw_query::gdps_geml_provider_attribution(),
             _ => rw_query::eccc_provider_attribution(),
         };
         attributions.push(attribution.into());
@@ -4754,7 +4755,7 @@ mod tests {
         let body = to_bytes(allowed.into_body(), 1024 * 1024).await.unwrap();
         let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let models = models.as_array().expect("models response must be an array");
-        assert_eq!(models.len(), 33);
+        assert_eq!(models.len(), 34);
         assert!(models.iter().all(|model| model["id"] != "rrfs-firewx"));
         let wrf = models
             .iter()
@@ -4788,6 +4789,23 @@ mod tests {
         assert_eq!(
             gdps["provider_attributions"][0]["notice"],
             "Data Source: Environment and Climate Change Canada"
+        );
+        let geml = model("gdps-geml");
+        assert_eq!(geml["ingest_status"], "ready");
+        assert_eq!(geml["verification"], "live_verified");
+        assert_eq!(
+            geml["limitations"],
+            serde_json::json!([
+                "sparse_pressure_levels",
+                "derived_products_disabled",
+                "pre_operational_feed"
+            ])
+        );
+        assert_eq!(geml["products"][0]["product"], "rws-pressure");
+        assert_eq!(geml["products"][1]["product"], "rws-surface");
+        assert_eq!(
+            geml["provider_attributions"][0]["source_url"],
+            "https://eccc-msc.github.io/open-data/msc-data/nwp_gdps/readme_gdps-geml-datamart_en/"
         );
         for id in ["rdps", "hrdps"] {
             let regional = model(id);

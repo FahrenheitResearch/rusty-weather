@@ -406,6 +406,7 @@ const HRRR_CYCLE_HOURS: &[u8] = &[
 ];
 const GFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const GDPS_CYCLE_HOURS: &[u8] = &[0, 12];
+const GDPS_GEML_CYCLE_HOURS: &[u8] = &[0, 12];
 const CMA_GEPS_CYCLE_HOURS: &[u8] = &[0, 12];
 const RDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const HRDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
@@ -720,6 +721,19 @@ const MODELS: &[ModelSummary] = &[
         // profile-dependent surface component bundle before extraction.
         default_product: "rws-surface",
         cycle_hours_utc: GDPS_CYCLE_HOURS,
+        max_forecast_hour: 240,
+        sources: GDPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::GdpsGeml,
+        description: "Experimental ECCC GDPS-GEML global 0.25 degree AI emulator forecast",
+        // Datamart publishes one one-message GRIB2 object per field/level.
+        // This logical product is an availability probe; rw-ingest expands
+        // the selected profile into the exact bounded component inventory.
+        default_product: "rws-surface",
+        cycle_hours_utc: GDPS_GEML_CYCLE_HOURS,
         max_forecast_hour: 240,
         sources: GDPS_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
@@ -5915,13 +5929,14 @@ pub fn built_in_models() -> &'static [ModelSummary] {
 /// [`built_in_models`] remains linked (`ModelId` match arms thread through
 /// rustwx-products), but every user-facing enumeration must go through this
 /// list.
-pub fn supported_models() -> [ModelId; 25] {
+pub fn supported_models() -> [ModelId; 26] {
     [
         ModelId::Hrrr,
         ModelId::HrrrAk,
         ModelId::Rap,
         ModelId::Gfs,
         ModelId::Gdps,
+        ModelId::GdpsGeml,
         ModelId::CmaGeps,
         ModelId::Rdps,
         ModelId::Hrdps,
@@ -6025,6 +6040,9 @@ pub fn selector_supported_for_model(selector: FieldSelector, model: ModelId) -> 
         return false;
     }
     match (selector.field, selector.vertical) {
+        (CanonicalField::VerticalVelocity, VerticalSelector::IsobaricHpa(level_hpa)) => {
+            model == ModelId::GdpsGeml && GDPS_GEML_ISOBARIC_LEVELS_HPA.contains(&level_hpa)
+        }
         (
             CanonicalField::GeopotentialHeight
             | CanonicalField::Temperature
@@ -6290,6 +6308,13 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
             hours.extend((87..=240).step_by(3));
             hours
         }
+        ModelId::GdpsGeml => {
+            if GDPS_GEML_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=240).step_by(6).collect()
+            } else {
+                Vec::new()
+            }
+        }
         ModelId::CmaGeps => {
             if !CMA_GEPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
                 return Vec::new();
@@ -6510,6 +6535,9 @@ fn default_canonical_bundle_product(
         (ModelId::Gdps, CanonicalBundleDescriptor::SurfaceAnalysis) => "rws-surface",
         (ModelId::Gdps, CanonicalBundleDescriptor::PressureAnalysis) => "rws-pressure",
         (ModelId::Gdps, CanonicalBundleDescriptor::NativeAnalysis) => "rws-surface",
+        (ModelId::GdpsGeml, CanonicalBundleDescriptor::SurfaceAnalysis) => "rws-surface",
+        (ModelId::GdpsGeml, CanonicalBundleDescriptor::PressureAnalysis) => "rws-pressure",
+        (ModelId::GdpsGeml, CanonicalBundleDescriptor::NativeAnalysis) => "rws-surface",
         (ModelId::CmaGeps, _) => "stats",
         (
             ModelId::Rdps | ModelId::Hrdps,
@@ -7021,6 +7049,7 @@ fn build_grib_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         ModelId::HrrrAk => build_hrrr_ak_url(source, request),
         ModelId::Gfs => build_gfs_url(source, request)?,
         ModelId::Gdps => build_gdps_url(source, request)?,
+        ModelId::GdpsGeml => build_gdps_geml_url(source, request)?,
         ModelId::CmaGeps => build_cma_geps_url(source, request)?,
         ModelId::Rdps => build_rdps_url(source, request)?,
         ModelId::Hrdps => build_hrdps_url(source, request)?,
@@ -7423,6 +7452,98 @@ fn build_gdps_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
     };
     Ok(format!(
         "https://dd.weather.gc.ca/today/model_gdps/15km/{:02}/{:03}/{}T{:02}Z_MSC_GDPS_{}_LatLon0.15_PT{:03}H.grib2",
+        request.cycle.hour_utc,
+        request.forecast_hour,
+        request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
+        product,
+        request.forecast_hour,
+    ))
+}
+
+/// Exact pressure-level inventory published by the experimental GDPS-GEML
+/// Datamart feed. Unlike operational GDPS, GEML is six-hourly and publishes
+/// this deliberately sparse thirteen-level set.
+const GDPS_GEML_ISOBARIC_LEVELS_HPA: &[u16] = &[
+    50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000,
+];
+
+const GDPS_GEML_SURFACE_COMPONENTS: &[&str] = &[
+    "AirTemp_AGL-2m",
+    "WindU_AGL-10m",
+    "WindV_AGL-10m",
+    "Pressure_MSL",
+];
+
+const GDPS_GEML_PRESSURE_FAMILIES: &[&str] = &[
+    "AirTemp",
+    "Geopotential",
+    "SpecificHumidity",
+    "VerticalVelocity",
+    "WindU",
+    "WindV",
+];
+
+pub fn gdps_geml_isobaric_levels_hpa() -> &'static [u16] {
+    GDPS_GEML_ISOBARIC_LEVELS_HPA
+}
+
+pub fn gdps_geml_surface_components() -> &'static [&'static str] {
+    GDPS_GEML_SURFACE_COMPONENTS
+}
+
+/// The complete live object contract for one GDPS-GEML forecast lead: four
+/// surface messages plus six families at thirteen pressure levels (82 total).
+pub fn gdps_geml_inventory_components() -> Vec<String> {
+    let mut components = GDPS_GEML_SURFACE_COMPONENTS
+        .iter()
+        .map(|component| (*component).to_string())
+        .collect::<Vec<_>>();
+    for family in GDPS_GEML_PRESSURE_FAMILIES {
+        for level in GDPS_GEML_ISOBARIC_LEVELS_HPA {
+            components.push(format!("{family}_IsbL-{level:04}"));
+        }
+    }
+    components
+}
+
+fn gdps_geml_component_is_supported(product: &str) -> bool {
+    if GDPS_GEML_SURFACE_COMPONENTS.contains(&product) {
+        return true;
+    }
+    GDPS_GEML_PRESSURE_FAMILIES.iter().any(|family| {
+        let prefix = format!("{family}_IsbL-");
+        exact_four_digit_level(product, &prefix)
+            .is_some_and(|level| GDPS_GEML_ISOBARIC_LEVELS_HPA.contains(&level))
+    })
+}
+
+fn build_gdps_geml_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Eccc {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "GDPS-GEML publishes six-hourly f000-f240 for 00Z/12Z cycles".to_string(),
+        });
+    }
+
+    let product = match request.product.as_str() {
+        "rws-surface" | "rws-sounding" => "AirTemp_AGL-2m",
+        "rws-pressure" => "AirTemp_IsbL-0500",
+        product if gdps_geml_component_is_supported(product) => product,
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    Ok(format!(
+        "https://dd.weather.gc.ca/today/model_gdps-geml/25km/{:02}/{:03}/{}T{:02}Z_MSC_GDPS-GEML_{}_LatLon0.25_PT{:03}H.grib2",
         request.cycle.hour_utc,
         request.forecast_hour,
         request.cycle.date_yyyymmdd,
@@ -9142,6 +9263,7 @@ fn plot_recipe_field_blocker(
     if matches!(
         model,
         ModelId::Gdps
+            | ModelId::GdpsGeml
             | ModelId::CmaGeps
             | ModelId::Rdps
             | ModelId::Hrdps
@@ -9151,7 +9273,7 @@ fn plot_recipe_field_blocker(
             | ModelId::IconRu
     ) {
         let provider = match model {
-            ModelId::Gdps | ModelId::Rdps | ModelId::Hrdps => {
+            ModelId::Gdps | ModelId::GdpsGeml | ModelId::Rdps | ModelId::Hrdps => {
                 "ECCC Datamart per-field component bundle"
             }
             ModelId::CmaGeps => "CMA WIS2 provider-specific acquisition contract",
@@ -9271,6 +9393,8 @@ fn plot_recipe_fetch_defaults(
         (ModelId::Gfs, _, _) => ("pgrb2.0p25", PlotRecipeFetchPolicy::PreferIndexedSubset),
         (ModelId::Gdps, _, true) => ("rws-surface", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::Gdps, _, false) => ("rws-pressure", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::GdpsGeml, _, true) => ("rws-surface", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::GdpsGeml, _, false) => ("rws-pressure", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::CmaGeps, _, _) => ("stats", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::Rdps | ModelId::Hrdps, _, true) => {
             ("rws-surface", PlotRecipeFetchPolicy::WholeFile)

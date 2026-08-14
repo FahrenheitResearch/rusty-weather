@@ -394,6 +394,7 @@ impl std::fmt::Display for ProductKey {
 pub enum CanonicalField {
     Pressure,
     GeopotentialHeight,
+    VerticalVelocity,
     Temperature,
     RelativeHumidity,
     Dewpoint,
@@ -431,6 +432,7 @@ impl CanonicalField {
         match self {
             Self::Pressure => "pressure",
             Self::GeopotentialHeight => "geopotential_height",
+            Self::VerticalVelocity => "vertical_velocity",
             Self::Temperature => "temperature",
             Self::RelativeHumidity => "relative_humidity",
             Self::Dewpoint => "dewpoint",
@@ -470,6 +472,7 @@ impl CanonicalField {
         match self {
             Self::Pressure => "Pressure",
             Self::GeopotentialHeight => "Geopotential Height",
+            Self::VerticalVelocity => "Vertical Velocity",
             Self::Temperature => "Temperature",
             Self::RelativeHumidity => "Relative Humidity",
             Self::Dewpoint => "Dewpoint",
@@ -509,6 +512,7 @@ impl CanonicalField {
         match self {
             Self::Pressure => "Pa",
             Self::GeopotentialHeight => "gpm",
+            Self::VerticalVelocity => "Pa/s",
             Self::Temperature => "K",
             Self::RelativeHumidity => "%",
             Self::Dewpoint => "K",
@@ -1714,6 +1718,7 @@ pub enum ModelId {
     HrrrAk,
     Gfs,
     Gdps,
+    GdpsGeml,
     CmaGeps,
     Rdps,
     Hrdps,
@@ -1753,6 +1758,7 @@ impl ModelId {
             Self::HrrrAk => "hrrr-ak",
             Self::Gfs => "gfs",
             Self::Gdps => "gdps",
+            Self::GdpsGeml => "gdps-geml",
             Self::CmaGeps => "cma-geps",
             Self::Rdps => "rdps",
             Self::Hrdps => "hrdps",
@@ -1803,6 +1809,9 @@ impl std::str::FromStr for ModelId {
             "gfs" | "gfs-0p25" | "gfs_0p25" | "gfs-0.25" | "gfs_0.25" => Ok(Self::Gfs),
             "gdps" | "gem" | "gem-global" | "gem_global" | "cmc-gdps" | "cmc_gdps" => {
                 Ok(Self::Gdps)
+            }
+            "gdps-geml" | "gdps_geml" | "gdpsgeml" | "geml" | "cmc-gdps-geml" | "cmc_gdps_geml" => {
+                Ok(Self::GdpsGeml)
             }
             "cma-geps" | "cma_geps" | "cmageps" | "grapes-geps" | "grapes_geps" => {
                 Ok(Self::CmaGeps)

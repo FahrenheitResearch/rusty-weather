@@ -93,11 +93,35 @@ use ingest_profile::{IngestProfile, VolumeChoice, model_surface_plan};
 /// which has no CanonicalField) plus pressure — `dewpoint_iso` here and
 /// `dewpoint_2m` + `surface_pressure` on the 2D side cover it, so no
 /// dedicated moisture volume is needed.
-fn volume_plan(profile: &IngestProfile) -> Vec<(CanonicalField, &'static str)> {
-    VolumeChoice::ALL
+fn volume_plan(profile: &IngestProfile, model: ModelId) -> Vec<(CanonicalField, &'static str)> {
+    let mut plan = VolumeChoice::ALL
         .iter()
         .filter(|choice| profile.volumes.contains(choice))
         .map(|choice| (choice.field(), choice.store_name()))
+        .collect::<Vec<_>>();
+    // GDPS-GEML is the first public lane whose complete published pressure
+    // state includes omega. Preserve that sixth native family whenever the
+    // standard complete five-volume request is selected, without changing
+    // the established profile surface for every other model.
+    if model == ModelId::GdpsGeml && profile.volumes.as_slice() == VolumeChoice::ALL.as_slice() {
+        plan.push((CanonicalField::VerticalVelocity, "vertical_velocity_iso"));
+    }
+    plan
+}
+
+fn pressure_levels(profile: &IngestProfile, model: ModelId) -> Vec<u16> {
+    if model != ModelId::GdpsGeml {
+        return profile.candidate_levels();
+    }
+    rustwx_models::gdps_geml_isobaric_levels_hpa()
+        .iter()
+        .copied()
+        .filter(|level| {
+            // GEML uniquely includes 50 hPa above the generic 100..1000
+            // profile coordinate. Retain it for either supported level step;
+            // below 100 hPa there is no conflicting step origin.
+            *level == 50 || (*level >= 100 && (*level - 100) % profile.level_step_hpa == 0)
+        })
         .collect()
 }
 
@@ -843,6 +867,7 @@ fn provider_component_products(
                     .collect(),
             ))
         }
+        ModelId::GdpsGeml => gdps_geml_component_products(config, logical_product).map(Some),
         ModelId::IconEu | ModelId::IconD2 => {
             dwd_icon_component_products(config, logical_product).map(Some)
         }
@@ -887,6 +912,63 @@ fn provider_component_products(
         }
         _ => Ok(None),
     }
+}
+
+fn gdps_geml_component_products(
+    config: &IngestConfig<'_>,
+    logical_product: &str,
+) -> Result<Vec<String>, IngestError> {
+    let mut components = Vec::new();
+    match logical_product {
+        "rws-pressure" => {
+            let families = volume_plan(config.profile, config.model)
+                .into_iter()
+                .map(|(field, _)| match field {
+                    CanonicalField::Temperature => "AirTemp",
+                    CanonicalField::Dewpoint => "SpecificHumidity",
+                    CanonicalField::UWind => "WindU",
+                    CanonicalField::VWind => "WindV",
+                    CanonicalField::GeopotentialHeight => "Geopotential",
+                    CanonicalField::VerticalVelocity => "VerticalVelocity",
+                    _ => unreachable!("GDPS-GEML volume plan contains a non-GEML family"),
+                })
+                .collect::<Vec<_>>();
+            let levels = pressure_levels(config.profile, config.model);
+            for family in families {
+                for level in &levels {
+                    components.push(format!("{family}_IsbL-{level:04}"));
+                }
+            }
+        }
+        "rws-surface" => {
+            const SURFACE_COMPONENTS: &[(&str, &str)] = &[
+                ("temperature_2m", "AirTemp_AGL-2m"),
+                ("u_10m", "WindU_AGL-10m"),
+                ("v_10m", "WindV_AGL-10m"),
+                ("mslp", "Pressure_MSL"),
+            ];
+            components.extend(
+                SURFACE_COMPONENTS
+                    .iter()
+                    .filter(|(field, _)| config.profile.includes_surface_field(field))
+                    .map(|(_, component)| (*component).to_string()),
+            );
+        }
+        unknown => {
+            return Err(other(format!(
+                "{} fetch plan contains unknown logical product '{unknown}'",
+                config.model
+            )));
+        }
+    }
+    if components.is_empty() {
+        return Err(other(format!(
+            "{} logical product '{logical_product}' has no components for profile '{}'",
+            config.model,
+            config.profile.describe()
+        )));
+    }
+    Ok(components)
 }
 
 fn gdps_component_products(
@@ -1175,22 +1257,27 @@ const PASS_PRS: usize = 0;
 const PASS_SFC: usize = 1;
 const PASS_TRAILING: usize = 2;
 
-fn safe_provider_identity(source: SourceId) -> &'static str {
-    match source {
-        SourceId::Aws => "noaa-aws-public-data",
-        SourceId::Nomads => "noaa-nomads",
-        SourceId::Google => "noaa-google-public-data",
-        SourceId::Azure => "noaa-microsoft-azure-public-data",
-        SourceId::Ecmwf => "ecmwf-open-data",
-        SourceId::Eccc => "eccc-msc-datamart",
-        SourceId::Cma => "cma-wis2-core-data",
-        SourceId::Dwd => "dwd-open-data",
-        SourceId::RoshydrometWis2Cache | SourceId::RoshydrometWis2Origin => "roshydromet-wipps-dc",
-        SourceId::Cptec => "cptec-inpe",
-        SourceId::Ncei => "noaa-ncei",
-        SourceId::Gdex => "ucar-gdex",
-        SourceId::AifsInference => "local-aifs-inference",
-        SourceId::Earth2Archive => "local-earth2-archive",
+fn safe_provider_identity(model: ModelId, source: SourceId) -> &'static str {
+    match (model, source) {
+        (ModelId::GdpsGeml, SourceId::Eccc) => "eccc-msc-gdps-geml-datamart",
+        (_, source) => match source {
+            SourceId::Aws => "noaa-aws-public-data",
+            SourceId::Nomads => "noaa-nomads",
+            SourceId::Google => "noaa-google-public-data",
+            SourceId::Azure => "noaa-microsoft-azure-public-data",
+            SourceId::Ecmwf => "ecmwf-open-data",
+            SourceId::Eccc => "eccc-msc-datamart",
+            SourceId::Cma => "cma-wis2-core-data",
+            SourceId::Dwd => "dwd-open-data",
+            SourceId::RoshydrometWis2Cache | SourceId::RoshydrometWis2Origin => {
+                "roshydromet-wipps-dc"
+            }
+            SourceId::Cptec => "cptec-inpe",
+            SourceId::Ncei => "noaa-ncei",
+            SourceId::Gdex => "ucar-gdex",
+            SourceId::AifsInference => "local-aifs-inference",
+            SourceId::Earth2Archive => "local-earth2-archive",
+        },
     }
 }
 
@@ -1243,7 +1330,7 @@ fn resolved_source_provenance(
         }
         provenance.push(
             RwsSourceProvenance::new(
-                safe_provider_identity(fetched.result.source),
+                safe_provider_identity(model, fetched.result.source),
                 roles,
                 vec![safe_product_identity(product.product)],
             )
@@ -1304,8 +1391,8 @@ pub fn process_fetched_hour(
     // The profile picks the volumes and level step; the render-grade 2D
     // planes (vorticity + direct-recipe) ride only with a full-2D profile.
     let profile = config.profile;
-    let levels = profile.candidate_levels();
-    let volume_plan = volume_plan(profile);
+    let levels = pressure_levels(profile, config.model);
+    let volume_plan = volume_plan(profile, config.model);
     let include_full_2d = profile.includes_full_2d();
     let direct_planes = if include_full_2d {
         direct_isobaric_plane_selectors(config.model)
@@ -2380,8 +2467,8 @@ pub fn planned_store_variables(profile: &IngestProfile, model: ModelId) -> Plann
             heavy: Vec::new(),
         };
     }
-    let level_count = profile.candidate_levels().len();
-    let volumes = volume_plan(profile)
+    let level_count = pressure_levels(profile, model).len();
+    let volumes = volume_plan(profile, model)
         .iter()
         .map(|(_, name)| (*name, level_count))
         .collect();
@@ -3079,6 +3166,88 @@ mod tests {
     }
 
     #[test]
+    fn gdps_geml_sounding_bundle_preserves_all_82_published_roles() {
+        let cycle = CycleSpec::new("20260814", 0).unwrap();
+        let profile = IngestProfile::sounding();
+        let cancel = AtomicBool::new(false);
+        let sink = |_event: IngestEvent| {};
+        let config = IngestConfig {
+            model: ModelId::GdpsGeml,
+            cycle: &cycle,
+            source_override: Some(SourceId::Eccc),
+            cache_root: Path::new("unused-cache"),
+            use_cache: true,
+            store_root: Path::new("unused-store"),
+            model_slug: "gdps-geml",
+            run_slug: "20260814_00z",
+            profile: &profile,
+            verify: true,
+            progress: &sink,
+            cancel: &cancel,
+        };
+
+        let pressure = provider_component_products(&config, 6, "rws-pressure")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pressure.len(), 6 * 13);
+        assert_eq!(pressure.first().unwrap(), "AirTemp_IsbL-0050");
+        assert!(
+            pressure
+                .iter()
+                .any(|value| value == "SpecificHumidity_IsbL-0850")
+        );
+        assert!(
+            pressure
+                .iter()
+                .any(|value| value == "Geopotential_IsbL-0500")
+        );
+        assert!(
+            pressure
+                .iter()
+                .any(|value| value == "VerticalVelocity_IsbL-0500")
+        );
+        assert_eq!(pressure.last().unwrap(), "VerticalVelocity_IsbL-1000");
+
+        let surface = provider_component_products(&config, 6, "rws-surface")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            surface,
+            vec![
+                "AirTemp_AGL-2m",
+                "WindU_AGL-10m",
+                "WindV_AGL-10m",
+                "Pressure_MSL",
+            ]
+        );
+        let planned = pressure
+            .iter()
+            .chain(&surface)
+            .cloned()
+            .collect::<HashSet<_>>();
+        assert_eq!(planned.len(), 82);
+        assert_eq!(
+            planned,
+            rustwx_models::gdps_geml_inventory_components()
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
+
+        let store = planned_store_variables(&profile, ModelId::GdpsGeml);
+        assert_eq!(store.volumes.len(), 6);
+        assert!(store.volumes.iter().all(|(_, levels)| *levels == 13));
+        assert!(store.volumes.contains(&("vertical_velocity_iso", 13)));
+        assert_eq!(
+            store.fields_2d,
+            vec!["temperature_2m", "u_10m", "v_10m", "mslp"]
+        );
+        assert_eq!(
+            safe_provider_identity(ModelId::GdpsGeml, SourceId::Eccc),
+            "eccc-msc-gdps-geml-datamart"
+        );
+    }
+
+    #[test]
     fn regional_eccc_sounding_bundles_are_exact_and_do_not_request_absent_rdps_orography() {
         let cycle = CycleSpec::new("20260814", 0).unwrap();
         let profile = IngestProfile::sounding();
@@ -3245,11 +3414,11 @@ mod tests {
             Some("A_YERD98RUMS120000_C_RUMS_20260812000000")
         );
         assert_eq!(
-            safe_provider_identity(SourceId::RoshydrometWis2Cache),
+            safe_provider_identity(ModelId::IconRu, SourceId::RoshydrometWis2Cache),
             "roshydromet-wipps-dc"
         );
         assert_eq!(
-            safe_provider_identity(SourceId::RoshydrometWis2Origin),
+            safe_provider_identity(ModelId::IconRu, SourceId::RoshydrometWis2Origin),
             "roshydromet-wipps-dc"
         );
     }

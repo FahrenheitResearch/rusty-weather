@@ -111,6 +111,23 @@ fn dwd_regular_latlon_fixture_pins_schedule_and_canonical_object_inventory() {
 }
 
 #[test]
+fn vertical_velocity_selector_admits_geml_50hpa_and_wmo_omega() {
+    let selector = FieldSelector::isobaric(CanonicalField::VerticalVelocity, 50);
+    let prepared = PreparedSelector::new(selector).expect("50 hPa omega selector");
+    assert_eq!(prepared.message.parameters, PARAMETER_VERTICAL_VELOCITY);
+    assert_eq!(prepared.message.level, LevelMatch::IsobaricHpa(50));
+    assert_eq!(prepared.message.units, "Pa/s");
+    assert_eq!(selector.native_units(), "Pa/s");
+    assert!(
+        PreparedSelector::new(FieldSelector::isobaric(
+            CanonicalField::VerticalVelocity,
+            25,
+        ))
+        .is_err()
+    );
+}
+
+#[test]
 fn dwd_regular_latlon_fixture_pins_bounded_live_payload_evidence() {
     let payloads = dwd_inventory_rows("PAYLOAD");
     assert_eq!(payloads.len(), 30);

@@ -24,6 +24,7 @@ not automatically presented as live-verified.
 | HRRR Alaska | Remote | Ingest beta | Alaska `prs` + `sfc`; hourly f000-f018, with 00/06/12/18z extended through f048; official inventory fixture-verified |
 | GFS | Remote | Verified | Global deterministic products |
 | ECCC GDPS | Remote | Ingest beta | Global 0.15-degree deterministic 00/12z forecast; hourly f000-f084 then 3-hourly to f240; bounded per-field Datamart acquisition and a 19-level sounding profile are live ingest/store verified |
+| ECCC GDPS-GEML | Remote | Ingest beta | Experimental global 0.25-degree AI emulator; 00/12z, six-hourly f000-f240; exact 82-object contract (4 surface fields plus temperature, specific humidity, U/V, geopotential, and omega on 13 pressure levels); derived/heavy disabled because precipitation, surface moisture/pressure, and orography are absent |
 | CMA GRAPES GEPS | Remote | Ingest beta | Global 0.25-degree provider-produced ensemble statistics; 00/12z, 3-hourly f000-f078 then 6-hourly to f360; mean/spread, percentile, and probability fields only—no raw member or deterministic sounding claim; live ingest/store verified |
 | ECCC RDPS | Remote | Ingest beta | North American 10 km rotated-grid deterministic forecast; 00/06/12/18z hourly f000-f084; bounded per-field acquisition and a 19-level sounding profile are live ingest/store verified; canonical U/V are paired and rotated to earth coordinates; derived/heavy disabled |
 | ECCC HRDPS continental | Remote | Ingest beta | Pan-Canadian 2.5 km rotated-grid deterministic forecast; 00/06/12/18z hourly f000-f048; bounded per-field acquisition and a 19-level sounding profile are live ingest/store verified; canonical U/V are paired and rotated to earth coordinates; derived/heavy disabled |
@@ -86,6 +87,7 @@ The focused ingest fixtures pin inventories captured from the official
 [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data),
 [ECCC RDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_rdps/readme_rdps-datamart_en/), and
 [ECCC HRDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart_en/), and
+[ECCC GDPS-GEML](https://eccc-msc.github.io/open-data/msc-data/nwp_gdps/readme_gdps-geml-datamart_en/), and
 [ECCC GEPS](https://eccc-msc.github.io/open-data/msc-data/nwp_geps/readme_geps-datamart_en/), and
 [ECCC REPS](https://eccc-msc.github.io/open-data/msc-data/nwp_reps/readme_reps-datamart_en/) feeds.
 Fixture source URLs and SHA-256 values are recorded beside the fixtures.
@@ -99,6 +101,24 @@ the writer's exact verification, and passed deep validation at 12 variables,
 57,350 chunks, and 477,280,099 payload bytes. The required ECCC attribution is
 persisted and exposed by the server; direct legacy whole-file plotting remains
 disabled rather than silently using the one-field availability probe.
+
+GDPS-GEML's official 2026-08-14 00z f006 directory contained exactly 82
+one-message GRIB2 objects on a 1440x721 regular 0.25-degree grid: four surface
+objects and six pressure families at 50, 100, 150, 200, 250, 300, 400, 500,
+600, 700, 850, 925, and 1000 hPa. The bounded fixture pins the 19,689-byte
+directory listing hash and independent object/value hashes for temperature,
+specific humidity, geopotential, omega, U, V, and MSLP. Specific humidity is
+normalized to dewpoint by the shared thermodynamic path; provider values
+outside the physical [0,1) kg/kg range become NaN and are never clamped or
+guessed. Omega is preserved as `vertical_velocity_iso` in Pa/s, while WMO
+geopotential is converted to canonical geopotential height. The model is
+explicitly marked experimental/pre-operational, uses the standard scheduler
+retention policy, and retains ECCC's required source notice plus its exact
+GDPS-GEML documentation URL in store/query/server provenance. The complete
+f006 sounding ingest fetched 162.3 MiB of source messages, realized all four
+surface fields and all six 13-level volumes, passed writer `--verify`, and
+passed deep RWS validation at 10 variables, 24,912 chunks, and 166,368,311
+payload bytes.
 
 CMA GRAPES GEPS was exercised against the official WIS2 core-data source on
 2026-08-14 using the provider's 2026-08-13 00z f024 object. The bounded

@@ -2531,7 +2531,12 @@ fn synthesize_nbm_10m_wind_components_from_speed_direction(
 fn model_uses_specific_humidity_for_pressure_moisture(model: ModelId) -> bool {
     matches!(
         model,
-        ModelId::Aigfs | ModelId::Aigefs | ModelId::Hgefs | ModelId::EcmwfOpenData | ModelId::Aifs
+        ModelId::GdpsGeml
+            | ModelId::Aigfs
+            | ModelId::Aigefs
+            | ModelId::Hgefs
+            | ModelId::EcmwfOpenData
+            | ModelId::Aifs
     )
 }
 
@@ -3330,6 +3335,12 @@ const PARAMETER_VGRD: &[ParameterCode] = &[ParameterCode {
     category: 2,
     number: 3,
 }];
+const PARAMETER_VERTICAL_VELOCITY: &[ParameterCode] = &[ParameterCode {
+    // Pressure vertical velocity (omega), WMO GRIB2 0/2/8.
+    discipline: 0,
+    category: 2,
+    number: 8,
+}];
 const PARAMETER_WIND_DIRECTION: &[ParameterCode] = &[ParameterCode {
     discipline: 0,
     category: 2,
@@ -3784,6 +3795,15 @@ impl TryFrom<FieldSelector> for StructuredMessageSelector {
                 units: "gpm",
             }),
             FieldSelector {
+                field: CanonicalField::VerticalVelocity,
+                vertical: VerticalSelector::IsobaricHpa(level_hpa),
+                ..
+            } if is_supported_upper_air_level(level_hpa) => Ok(Self {
+                parameters: PARAMETER_VERTICAL_VELOCITY,
+                level: LevelMatch::IsobaricHpa(level_hpa),
+                units: "Pa/s",
+            }),
+            FieldSelector {
                 field: CanonicalField::GeopotentialHeight,
                 vertical: VerticalSelector::Surface,
                 ..
@@ -4158,7 +4178,7 @@ impl TryFrom<FieldSelector> for StructuredMessageSelector {
 /// semantics ({200,250,300,500,700,850}): this one is what extraction can
 /// admit; that one is what recipe validation/UI exposes.
 fn is_supported_upper_air_level(level_hpa: u16) -> bool {
-    (100..=1000).contains(&level_hpa) && level_hpa % 25 == 0
+    (50..=1000).contains(&level_hpa) && level_hpa % 25 == 0
 }
 
 impl LevelMatch {

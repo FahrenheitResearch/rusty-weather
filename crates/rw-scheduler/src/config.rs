@@ -375,7 +375,12 @@ impl SchedulerConfig {
             .map(String::as_str)
             .unwrap_or(&self.profile);
         let profile = if requested == "auto" {
-            if capability
+            if model == ModelId::GdpsGeml {
+                // GEML's complete native contract is the sounding-shaped
+                // six-volume/4-surface inventory; it has no inputs for the
+                // render-grade full-2D or derived stages.
+                IngestProfile::sounding()
+            } else if capability
                 .limitations
                 .contains(&IngestCapabilityLimitation::AnalysisOnly)
             {

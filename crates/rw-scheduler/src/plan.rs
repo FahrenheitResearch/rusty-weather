@@ -121,7 +121,9 @@ pub struct JobPlan {
 impl JobPlan {
     pub fn build(model: ModelId, cycle: CycleSpec) -> SchedulerResult<Self> {
         let capability = model_ingest_capability(model);
-        let profile = if capability
+        let profile = if model == ModelId::GdpsGeml {
+            IngestProfile::sounding()
+        } else if capability
             .limitations
             .contains(&IngestCapabilityLimitation::AnalysisOnly)
         {
