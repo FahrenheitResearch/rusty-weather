@@ -3391,12 +3391,38 @@ impl PreparedSelector {
     fn match_score(self, message: &Grib2Message, forecast_hour: Option<u16>) -> Option<u8> {
         let product_score = product_template_match_score(self.selector, message)?;
         let forecast_score = if let Some(forecast_hour) = forecast_hour {
-            forecast_hour_match_score(message, forecast_hour)?
+            forecast_hour_match_score(message, forecast_hour).or_else(|| {
+                static_surface_field_match_score(self.selector, message, forecast_hour)
+            })?
         } else {
             0
         };
         Some(product_score.saturating_add(forecast_score))
     }
+}
+
+/// Surface orography is cycle-static even when a provider publishes it as a
+/// separate time-invariant object whose GRIB forecast time remains zero.
+/// Reuse that plane at later valid times, but only for the physically static
+/// surface-height selector and only for a non-statistical zero-time message.
+fn static_surface_field_match_score(
+    selector: FieldSelector,
+    message: &Grib2Message,
+    expected_hour: u16,
+) -> Option<u8> {
+    if expected_hour == 0
+        || selector.field != CanonicalField::GeopotentialHeight
+        || selector.vertical != VerticalSelector::Surface
+        || message.product.time_range_length.is_some()
+        || time_value_to_seconds(
+            message.product.time_range_unit,
+            message.product.forecast_time,
+        )? != 0
+    {
+        return None;
+    }
+    // Prefer a provider's exact valid-time message if one exists.
+    Some(2)
 }
 
 fn forecast_hour_match_score(message: &Grib2Message, expected_hour: u16) -> Option<u8> {

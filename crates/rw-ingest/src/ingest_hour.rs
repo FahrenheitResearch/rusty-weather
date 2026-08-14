@@ -974,43 +974,48 @@ fn safe_product_identity(product: &str) -> String {
 
 fn resolved_source_provenance(
     model: ModelId,
+    include_pressure: bool,
     prs: Option<&CachedFetchResult>,
     sfc: &CachedFetchResult,
 ) -> Result<Vec<RwsSourceProvenance>, IngestError> {
-    fetch_plan(model)?
-        .into_iter()
-        .map(|product| {
-            let fetched = match (product.pressure_source, product.surface_source) {
-                (true, true) => prs.unwrap_or(sfc),
-                (true, false) => prs.ok_or_else(|| {
-                    other(format!(
-                        "fetch plan product '{}' has a pressure role but no resolved pressure source",
-                        product.product
-                    ))
-                })?,
-                (false, true) => sfc,
-                (false, false) => {
-                    return Err(other(format!(
-                        "fetch plan product '{}' has no extraction role",
-                        product.product
-                    )));
-                }
-            };
-            let mut roles = Vec::with_capacity(2);
-            if product.pressure_source {
-                roles.push("pressure".to_string());
+    let mut provenance = Vec::new();
+    for product in fetch_plan(model)? {
+        if product.pressure_source && !product.surface_source && !include_pressure {
+            continue;
+        }
+        let fetched = match (product.pressure_source, product.surface_source) {
+            (true, true) => prs.unwrap_or(sfc),
+            (true, false) => prs.ok_or_else(|| {
+                other(format!(
+                    "fetch plan product '{}' has a pressure role but no resolved pressure source",
+                    product.product
+                ))
+            })?,
+            (false, true) => sfc,
+            (false, false) => {
+                return Err(other(format!(
+                    "fetch plan product '{}' has no extraction role",
+                    product.product
+                )));
             }
-            if product.surface_source {
-                roles.push("surface".to_string());
-            }
+        };
+        let mut roles = Vec::with_capacity(2);
+        if product.pressure_source && include_pressure {
+            roles.push("pressure".to_string());
+        }
+        if product.surface_source {
+            roles.push("surface".to_string());
+        }
+        provenance.push(
             RwsSourceProvenance::new(
                 safe_provider_identity(fetched.result.source),
                 roles,
                 vec![safe_product_identity(product.product)],
             )
-            .map_err(other)
-        })
-        .collect()
+            .map_err(other)?,
+        );
+    }
+    Ok(provenance)
 }
 
 /// The CPU half of one hour: extract both files, compute derived/heavy
@@ -1057,7 +1062,8 @@ pub fn process_fetched_hour(
     } else {
         sfc.result.bytes.len() as f64 / (1024.0 * 1024.0)
     };
-    let source_provenance = resolved_source_provenance(config.model, prs.as_ref(), &sfc)?;
+    let source_provenance =
+        resolved_source_provenance(config.model, config.profile.needs_prs(), prs.as_ref(), &sfc)?;
 
     // --- prs product file: 3D isobaric superset, one decode pass ---
     // The profile picks the volumes and level step; the render-grade 2D
@@ -2389,7 +2395,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (fetched, _, _) = fetched_hour_fixture(&dir, false);
         let provenance =
-            resolved_source_provenance(ModelId::Hrrr, fetched.prs.as_ref(), &fetched.sfc).unwrap();
+            resolved_source_provenance(ModelId::Hrrr, true, fetched.prs.as_ref(), &fetched.sfc)
+                .unwrap();
         assert_eq!(provenance.len(), 2);
         assert_eq!(provenance[0].provider, "noaa-aws-public-data");
         assert_eq!(provenance[0].roles, vec!["pressure"]);
@@ -2400,6 +2407,12 @@ mod tests {
         let serialized = serde_json::to_string(&provenance).unwrap();
         assert!(!serialized.contains("example.invalid"));
         assert!(!serialized.contains("https://"));
+
+        let surface_only =
+            resolved_source_provenance(ModelId::Hrrr, false, None, &fetched.sfc).unwrap();
+        assert_eq!(surface_only.len(), 1);
+        assert_eq!(surface_only[0].roles, vec!["surface"]);
+        assert_eq!(surface_only[0].products, vec!["sfc"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

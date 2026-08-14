@@ -131,7 +131,10 @@ validation with seven 2-D variables plus temperature, RH, U, V, and height at
 18 ICON-EU and 11 ICON-D2 levels. DWD ownership, CC BY 4.0 attribution, and the
 normalization notice persist through manifests and server responses. Exact
 minute-unit regression coverage prevents ICON-D2's 75/90/105 and
-135/150/165-minute messages from being rounded onto hourly samples.
+135/150/165-minute messages from being rounded onto hourly samples. Live
+f001-f002 surface ingests additionally verified all nine available direct
+fields, including exact run-total precipitation and cycle-static orography,
+without fetching or claiming a pressure bundle.
 
 For the NOAA deterministic wave, normalization follows the fields actually
 published. HRRR Alaska carries native pressure-level temperature, dewpoint,

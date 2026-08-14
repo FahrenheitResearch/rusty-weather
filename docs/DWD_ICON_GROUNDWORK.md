@@ -95,6 +95,12 @@ objects. The shared selector now compares exact seconds and refuses to round
 or truncate a quarter-hour endpoint onto the integer-hour RWS axis. Regression
 coverage pins all four endpoints in each object and selects only 60 or 120
 minutes respectively. The field remains honestly named `apcp_run_total`.
+An additional bounded ICON-D2 f001-f002 surface ingest exercised those live
+multi-message objects: both hours exact-verified all nine published 2-D
+variables, including `apcp_run_total` and the cycle-static `orography` plane,
+then deep-validated 270 chunks and 25,474,796 payload bytes. Surface-only
+ingest omits the pressure bundle and its provenance instead of claiming an
+unfetched role.
 
 On 2026-08-14, bounded official 00z f000 sounding ingests for both models ran
 through DWD acquisition, bzip2 decode, canonical extraction, writer exact

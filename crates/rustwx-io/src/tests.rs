@@ -270,6 +270,34 @@ fn wmo_surface_geometric_height_maps_to_canonical_orography_without_conversion()
 }
 
 #[test]
+fn cycle_static_surface_height_is_reused_at_later_forecast_hours() {
+    let geometric_height = ieee_f32_message(
+        ParameterCode {
+            discipline: 0,
+            category: 3,
+            number: 6,
+        },
+        1,
+        0.0,
+        &[0.0, 326.5, 2_962.25],
+        -99.0,
+        -98.0,
+    );
+    let selector = FieldSelector::surface(CanonicalField::GeopotentialHeight);
+    let partial = extract_fields_from_grib2_partial_at_forecast_hour(
+        &Grib2File {
+            messages: vec![geometric_height],
+        },
+        &[selector],
+        2,
+    )
+    .expect("time-invariant orography should be reusable throughout its cycle");
+
+    assert!(partial.missing.is_empty());
+    assert_eq!(partial.extracted[0].values, vec![0.0, 326.5, 2_962.25]);
+}
+
+#[test]
 fn mrms_latest_product_url_rejects_pathlike_tokens() {
     assert_eq!(
         mrms_latest_product_url("ReflectivityAtLowestAltitude").unwrap(),
