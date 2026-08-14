@@ -622,7 +622,7 @@ fn fetch_product(
     };
     config.emit(IngestEvent::StageStarted { hour, stage });
     let fetch_started = Instant::now();
-    let components = provider_component_products(config, product)?;
+    let components = provider_component_products(config, hour, product)?;
     let fetched = if let Some(components) = components {
         fetch_component_bundle_with_cache(&fetch, &components, config.cache_root, config.use_cache)
             .map_err(other)?
@@ -643,6 +643,7 @@ fn fetch_product(
 /// and retain their historical fetch behavior.
 fn provider_component_products(
     config: &IngestConfig<'_>,
+    forecast_hour: u16,
     logical_product: &str,
 ) -> Result<Option<Vec<String>>, IngestError> {
     match config.model {
@@ -651,6 +652,11 @@ fn provider_component_products(
         }
         ModelId::IconEu | ModelId::IconD2 => {
             dwd_icon_component_products(config, logical_product).map(Some)
+        }
+        ModelId::IconRu => {
+            rustwx_models::icon_ru_component_products(config.cycle, forecast_hour, logical_product)
+                .map(Some)
+                .map_err(other)
         }
         _ => Ok(None),
     }
@@ -952,6 +958,7 @@ fn safe_provider_identity(source: SourceId) -> &'static str {
         SourceId::Eccc => "eccc-msc-datamart",
         SourceId::Cma => "cma-wis2-core-data",
         SourceId::Dwd => "dwd-open-data",
+        SourceId::RoshydrometWis2Cache | SourceId::RoshydrometWis2Origin => "roshydromet-wipps-dc",
         SourceId::Ncei => "noaa-ncei",
         SourceId::Gdex => "ucar-gdex",
         SourceId::AifsInference => "local-aifs-inference",
@@ -2784,7 +2791,9 @@ mod tests {
             cancel: &cancel,
         };
 
-        let pressure = gdps_component_products(&config, "rws-pressure").unwrap();
+        let pressure = provider_component_products(&config, 0, "rws-pressure")
+            .unwrap()
+            .unwrap();
         assert_eq!(pressure.len(), 24 * 5);
         assert_eq!(pressure[0], "AirTemp_IsbL-0100");
         assert_eq!(pressure[1], "RelativeHumidity_IsbL-0100");
@@ -2798,7 +2807,9 @@ mod tests {
             "component inventory must be duplicate-free"
         );
 
-        let surface = gdps_component_products(&config, "rws-surface").unwrap();
+        let surface = provider_component_products(&config, 0, "rws-surface")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             surface,
             vec![
@@ -2834,7 +2845,7 @@ mod tests {
             cancel: &cancel,
         };
 
-        let rdps_pressure = provider_component_products(&config, "rws-pressure")
+        let rdps_pressure = provider_component_products(&config, 0, "rws-pressure")
             .unwrap()
             .unwrap();
         assert_eq!(rdps_pressure.len(), 24 * 5);
@@ -2845,7 +2856,7 @@ mod tests {
             rdps_pressure.last().unwrap(),
             "GeopotentialHeight_IsbL-1000"
         );
-        let rdps_surface = provider_component_products(&config, "rws-surface")
+        let rdps_surface = provider_component_products(&config, 0, "rws-surface")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2868,7 +2879,7 @@ mod tests {
 
         config.model = ModelId::Hrdps;
         config.model_slug = "hrdps";
-        let hrdps_pressure = provider_component_products(&config, "rws-pressure")
+        let hrdps_pressure = provider_component_products(&config, 0, "rws-pressure")
             .unwrap()
             .unwrap();
         assert_eq!(hrdps_pressure.len(), 24 * 5);
@@ -2876,7 +2887,7 @@ mod tests {
         assert_eq!(hrdps_pressure[2], "UGRD_ISBL_0100");
         assert_eq!(hrdps_pressure[3], "VGRD_ISBL_0100");
         assert_eq!(hrdps_pressure.last().unwrap(), "HGT_ISBL_1000");
-        let hrdps_surface = provider_component_products(&config, "rws-surface")
+        let hrdps_surface = provider_component_products(&config, 0, "rws-surface")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2890,6 +2901,58 @@ mod tests {
                 "PRES_Sfc",
                 "HGT_Sfc",
             ]
+        );
+    }
+
+    #[test]
+    fn icon_ru_sounding_bundle_uses_exact_wis2_object_stems() {
+        let cycle = CycleSpec::new("20260812", 0).unwrap();
+        let profile = IngestProfile::sounding();
+        let cancel = AtomicBool::new(false);
+        let sink = |_event: IngestEvent| {};
+        let config = IngestConfig {
+            model: ModelId::IconRu,
+            cycle: &cycle,
+            source_override: Some(SourceId::RoshydrometWis2Origin),
+            cache_root: Path::new("unused-cache"),
+            use_cache: true,
+            store_root: Path::new("unused-store"),
+            model_slug: "icon_ru",
+            run_slug: "20260812_00z",
+            profile: &profile,
+            verify: true,
+            progress: &sink,
+            cancel: &cancel,
+        };
+
+        let pressure = provider_component_products(&config, 3, "rws-pressure")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pressure.len(), 24);
+        assert_eq!(
+            pressure.first().map(String::as_str),
+            Some("A_YTRB25RUMS120000_C_RUMS_20260812000000")
+        );
+        assert_eq!(
+            pressure.iter().collect::<HashSet<_>>().len(),
+            pressure.len()
+        );
+
+        let surface = provider_component_products(&config, 3, "rws-surface")
+            .unwrap()
+            .unwrap();
+        assert_eq!(surface.len(), 10);
+        assert_eq!(
+            surface.last().map(String::as_str),
+            Some("A_YERD98RUMS120000_C_RUMS_20260812000000")
+        );
+        assert_eq!(
+            safe_provider_identity(SourceId::RoshydrometWis2Cache),
+            "roshydromet-wipps-dc"
+        );
+        assert_eq!(
+            safe_provider_identity(SourceId::RoshydrometWis2Origin),
+            "roshydromet-wipps-dc"
         );
     }
 

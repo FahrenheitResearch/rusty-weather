@@ -255,6 +255,23 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
                 idx_patterns: &[],
             },
         ]),
+        // Roshydromet publishes ICON-Ru as one WMO-bulletin-wrapped GRIB2
+        // object per field/level. These logical products expand to the exact
+        // bounded object stems in `rustwx-models`.
+        ModelId::IconRu => Ok(vec![
+            ProductFetch {
+                product: "rws-pressure",
+                surface_source: false,
+                pressure_source: true,
+                idx_patterns: &[],
+            },
+            ProductFetch {
+                product: "rws-surface",
+                surface_source: true,
+                pressure_source: false,
+                idx_patterns: &[],
+            },
+        ]),
         ModelId::Gefs => Ok(vec![ProductFetch {
             product: "pgrb2ap5/gec00",
             surface_source: true,
@@ -717,6 +734,7 @@ pub fn validate_ingest_profile_for_model(
             | rustwx_core::ModelId::Aigfs
             | rustwx_core::ModelId::EcmwfOpenData
             | rustwx_core::ModelId::Aifs
+            | rustwx_core::ModelId::IconRu
     ) && (profile.derived || profile.heavy)
     {
         return Err(events::other(format!(
@@ -863,7 +881,9 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
             IngestCapabilityLimitation::SparsePressureLevels,
             IngestCapabilityLimitation::DerivedProductsDisabled,
         ],
-        rustwx_core::ModelId::IconEu | rustwx_core::ModelId::IconD2 => vec![
+        rustwx_core::ModelId::IconEu
+        | rustwx_core::ModelId::IconD2
+        | rustwx_core::ModelId::IconRu => vec![
             IngestCapabilityLimitation::SparsePressureLevels,
             IngestCapabilityLimitation::DerivedProductsDisabled,
         ],
@@ -878,6 +898,7 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 | rustwx_core::ModelId::CmaGeps
                 | rustwx_core::ModelId::Rdps
                 | rustwx_core::ModelId::Hrdps
+                | rustwx_core::ModelId::IconRu
                 | rustwx_core::ModelId::Rap
                 | rustwx_core::ModelId::Nam
                 | rustwx_core::ModelId::RrfsA
@@ -990,6 +1011,7 @@ mod tests {
             ModelId::Hrdps,
             ModelId::IconEu,
             ModelId::IconD2,
+            ModelId::IconRu,
             ModelId::Gdas,
             ModelId::Gefs,
             ModelId::Aigfs,
@@ -1247,6 +1269,7 @@ mod tests {
                 ModelId::Hrdps,
                 ModelId::IconEu,
                 ModelId::IconD2,
+                ModelId::IconRu,
                 ModelId::Gdas,
                 ModelId::Gefs,
                 ModelId::Aigfs,
@@ -2073,6 +2096,31 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn fetch_plan_icon_ru_is_live_verified_and_explicitly_sparse() {
+        let plan = fetch_plan(rustwx_core::ModelId::IconRu).expect("ICON-Ru plan");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].product, "rws-pressure");
+        assert!(plan[0].pressure_source && !plan[0].surface_source);
+        assert_eq!(plan[1].product, "rws-surface");
+        assert!(plan[1].surface_source && !plan[1].pressure_source);
+        assert!(plan.iter().all(|product| product.idx_patterns.is_empty()));
+
+        let capability = model_ingest_capability(rustwx_core::ModelId::IconRu);
+        assert_eq!(capability.status, IngestSupportStatus::Ready);
+        assert_eq!(
+            capability.verification,
+            IngestVerificationLevel::LiveVerified
+        );
+        assert_eq!(
+            capability.limitations,
+            vec![
+                IngestCapabilityLimitation::SparsePressureLevels,
+                IngestCapabilityLimitation::DerivedProductsDisabled,
+            ]
+        );
     }
 
     #[test]

@@ -29,6 +29,7 @@ not automatically presented as live-verified.
 | ECCC HRDPS continental | Remote | Ingest beta | Pan-Canadian 2.5 km rotated-grid deterministic forecast; 00/06/12/18z hourly f000-f048; bounded per-field acquisition and a 19-level sounding profile are live ingest/store verified; canonical U/V are paired and rotated to earth coordinates; derived/heavy disabled |
 | DWD ICON-EU regular | Remote | Ingest beta | European deterministic regular lat/lon feed; eight 3-hourly cycles, main-cycle f000-f120 and short-cycle f000-f048 native cadence; exact bzip2 component bundles and 18 schema-requested native pressure levels are live ingest/store verified; derived/heavy disabled |
 | DWD ICON-D2 regular | Remote | Ingest beta | Germany deterministic regular lat/lon feed; eight 3-hourly cycles and hourly f000-f048; exact bzip2 component bundles and all 11 native pressure levels are live ingest/store verified; quarter-hour messages retain exact time semantics; derived/heavy disabled |
+| Roshydromet ICON-Ru13/6N29 | Remote | Ingest beta | North Eurasia 697x213 regular lat/lon forecast; 00/12z, three-hourly f003-f072; exact WIS2 bulletin-component acquisition, sparse pressure profile, dateline-safe normalization, and bounded f003 live ingest/store verification |
 | RRFS-A | Remote | Verified | Deterministic NA source cropped during ingest |
 | RAP | Remote | Ingest beta | Grid-130 `awp130pgrb` (13 km); hourly f000-f021, with 03/09/15/21z extended through f051; live ingest/store verified |
 | NAM | Remote | Ingest beta | Ingest is pinned to grid-212 `awip3d` (40 km), not the registry's separate `awip12` plotting product; hourly f000-f036 then 3-hourly through f084; live ingest/store verified |
@@ -135,6 +136,15 @@ minute-unit regression coverage prevents ICON-D2's 75/90/105 and
 f001-f002 surface ingests additionally verified all nine available direct
 fields, including exact run-total precipitation and cycle-static orography,
 without fetching or claiming a pressure bundle.
+ICON-Ru13/6N29 was exercised against Roshydromet's official WIS2 source on
+2026-08-14. A bounded f003 sounding ingest assembled 24 pressure and ten
+surface bulletin objects, validated their exact WMO wrappers, normalized the
+697x213 dateline-crossing grid, passed writer verification, and passed deep
+RWS validation at ten variables and 3,095 chunks. The lane retains its native
+five-level pressure coordinate (four levels for relative humidity), disables
+derived/heavy products, and exposes Roshydromet/WMO-core attribution through
+the server. Exact inventory, object hashes, and live evidence are recorded in
+[ROSHYDROMET_ICON_RU.md](ROSHYDROMET_ICON_RU.md).
 
 For the NOAA deterministic wave, normalization follows the fields actually
 published. HRRR Alaska carries native pressure-level temperature, dewpoint,

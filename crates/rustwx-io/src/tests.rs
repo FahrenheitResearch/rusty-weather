@@ -3251,3 +3251,37 @@ fn normalize_and_rotate_longitude_rows_keeps_rows_monotone() {
     assert_eq!(lat[..4], [40.0, 40.0, 40.0, 40.0]);
     assert_eq!(lat[4..], [39.0, 39.0, 39.0, 39.0]);
 }
+
+#[test]
+fn icon_ru_dateline_crossing_rows_rotate_coordinates_and_values_together() {
+    const NX: usize = 697;
+    const NY: usize = 2;
+    let mut lat = Vec::with_capacity(NX * NY);
+    let mut lon = Vec::with_capacity(NX * NY);
+    let mut values = Vec::with_capacity(NX * NY);
+    for row in 0..NY {
+        for column in 0..NX {
+            lat.push(35.0 + row as f64 * 0.25);
+            lon.push(19.5 + column as f64 * 0.25);
+            values.push((row * 1_000 + column) as f64);
+        }
+    }
+
+    let row_wraps = normalize_and_rotate_longitude_grid_rows(&mut lat, &mut lon, NX, NY);
+    rotate_rows_left(&mut values, NX, &row_wraps);
+
+    assert_eq!(row_wraps, [643, 643]);
+    for row in 0..NY {
+        let start = row * NX;
+        let lon_row = &lon[start..start + NX];
+        assert!(lon_row.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(lon_row.first(), Some(&-179.75));
+        assert_eq!(lon_row.get(53), Some(&-166.5));
+        assert_eq!(lon_row.get(54), Some(&19.5));
+        assert_eq!(lon_row.last(), Some(&180.0));
+        assert_eq!(values[start], (row * 1_000 + 643) as f64);
+        assert_eq!(values[start + 53], (row * 1_000 + 696) as f64);
+        assert_eq!(values[start + 54], (row * 1_000) as f64);
+        assert_eq!(values[start + NX - 1], (row * 1_000 + 642) as f64);
+    }
+}

@@ -545,6 +545,7 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
     let all = scheduler_config("all-ready", &["all_ready"]);
     let expanded = all.expanded_models().unwrap();
     assert!(expanded.contains(&ModelId::Hrrr));
+    assert!(expanded.contains(&ModelId::IconRu));
     assert!(expanded.contains(&ModelId::Rtma));
     assert!(expanded.contains(&ModelId::CmaGeps));
 
@@ -1209,7 +1210,7 @@ fn every_ready_model_has_a_valid_cadence_profile_and_remote_source() {
         );
         plan.validate().unwrap();
     }
-    assert_eq!(ready, 27);
+    assert_eq!(ready, 28);
 }
 
 #[test]

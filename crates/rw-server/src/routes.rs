@@ -242,6 +242,14 @@ fn provider_attributions(
     {
         attributions.push(rw_query::dwd_provider_attribution().into());
     }
+    if summary.sources.iter().any(|source| {
+        matches!(
+            source.id,
+            SourceId::RoshydrometWis2Cache | SourceId::RoshydrometWis2Origin
+        )
+    }) {
+        attributions.push(rw_query::roshydromet_provider_attribution().into());
+    }
     attributions
 }
 
@@ -4726,7 +4734,7 @@ mod tests {
         let body = to_bytes(allowed.into_body(), 1024 * 1024).await.unwrap();
         let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let models = models.as_array().expect("models response must be an array");
-        assert!(!models.is_empty());
+        assert_eq!(models.len(), 24);
         assert!(models.iter().all(|model| model["id"] != "rrfs-firewx"));
         let wrf = models
             .iter()
@@ -4796,6 +4804,21 @@ mod tests {
                 "Creative Commons Attribution 4.0 International (CC BY 4.0)."
             );
         }
+
+        let icon_ru = model("icon-ru");
+        assert_eq!(icon_ru["ingest_status"], "ready");
+        assert_eq!(icon_ru["verification"], "live_verified");
+        assert_eq!(icon_ru["registry_source_count"], 2);
+        assert_eq!(
+            icon_ru["limitations"],
+            serde_json::json!(["sparse_pressure_levels", "derived_products_disabled"])
+        );
+        assert_eq!(icon_ru["products"][0]["product"], "rws-pressure");
+        assert_eq!(icon_ru["products"][1]["product"], "rws-surface");
+        assert_eq!(
+            icon_ru["provider_attributions"][0]["notice"],
+            "Data source: Roshydromet WIPPS Designated Centre Moscow, distributed through WIS2."
+        );
 
         for id in ["rap", "nam"] {
             assert_eq!(model(id)["verification"], "live_verified");

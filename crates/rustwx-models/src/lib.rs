@@ -410,6 +410,7 @@ const CMA_GEPS_CYCLE_HOURS: &[u8] = &[0, 12];
 const RDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const HRDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const DWD_ICON_CYCLE_HOURS: &[u8] = &[0, 3, 6, 9, 12, 15, 18, 21];
+const ICON_RU_CYCLE_HOURS: &[u8] = &[0, 12];
 const GDAS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const GEFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const AI_MODEL_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
@@ -561,6 +562,23 @@ const DWD_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
     max_age_hours: Some(30),
     notes: "Deutscher Wetterdienst Open Data",
 }];
+
+const ICON_RU_SOURCES: &[SourceDescriptor] = &[
+    SourceDescriptor {
+        id: SourceId::RoshydrometWis2Cache,
+        idx_available: false,
+        priority: 1,
+        max_age_hours: Some(24),
+        notes: "WIS2 Global Cache HTTPS object transport (preferred when cached)",
+    },
+    SourceDescriptor {
+        id: SourceId::RoshydrometWis2Origin,
+        idx_available: false,
+        priority: 2,
+        max_age_hours: Some(48),
+        notes: "Roshydromet WIS2 canonical object transport (HTTP fallback)",
+    },
+];
 
 const GEFS_SOURCES: &[SourceDescriptor] = &[
     SourceDescriptor {
@@ -739,6 +757,19 @@ const MODELS: &[ModelSummary] = &[
         cycle_hours_utc: DWD_ICON_CYCLE_HOURS,
         max_forecast_hour: 48,
         sources: DWD_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::IconRu,
+        description: "Roshydromet ICON-Ru13/6N29 North Eurasia deterministic forecast",
+        // WIS2 publishes one WMO-bulletin-wrapped GRIB2 object per field and
+        // level. rw-ingest expands this logical product into a bounded exact
+        // component inventory.
+        default_product: "rws-surface",
+        cycle_hours_utc: ICON_RU_CYCLE_HOURS,
+        max_forecast_hour: 72,
+        sources: ICON_RU_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::Deterministic,
     },
@@ -5829,7 +5860,7 @@ pub fn built_in_models() -> &'static [ModelSummary] {
 /// [`built_in_models`] remains linked (`ModelId` match arms thread through
 /// rustwx-products), but every user-facing enumeration must go through this
 /// list.
-pub fn supported_models() -> [ModelId; 20] {
+pub fn supported_models() -> [ModelId; 21] {
     [
         ModelId::Hrrr,
         ModelId::HrrrAk,
@@ -5841,6 +5872,7 @@ pub fn supported_models() -> [ModelId; 20] {
         ModelId::Hrdps,
         ModelId::IconEu,
         ModelId::IconD2,
+        ModelId::IconRu,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -6122,6 +6154,13 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
                 Vec::new()
             }
         }
+        ModelId::IconRu => {
+            if ICON_RU_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (3..=72).step_by(3).collect()
+            } else {
+                Vec::new()
+            }
+        }
         ModelId::Gdas => (0..=9).collect(),
         ModelId::Gefs => {
             let mut hours = (0..=240).step_by(3).collect::<Vec<u16>>();
@@ -6280,6 +6319,9 @@ fn default_canonical_bundle_product(
         (ModelId::IconEu | ModelId::IconD2, CanonicalBundleDescriptor::NativeAnalysis) => {
             "rws-surface"
         }
+        (ModelId::IconRu, CanonicalBundleDescriptor::SurfaceAnalysis) => "rws-surface",
+        (ModelId::IconRu, CanonicalBundleDescriptor::PressureAnalysis) => "rws-pressure",
+        (ModelId::IconRu, CanonicalBundleDescriptor::NativeAnalysis) => "rws-surface",
         (ModelId::Gdas, _) => "pgrb2.0p25",
         (ModelId::Gefs, _) => "pgrb2ap5/gec00",
         (ModelId::Aigfs, CanonicalBundleDescriptor::SurfaceAnalysis) => "sfc",
@@ -6751,6 +6793,7 @@ fn build_grib_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         ModelId::Rdps => build_rdps_url(source, request)?,
         ModelId::Hrdps => build_hrdps_url(source, request)?,
         ModelId::IconEu | ModelId::IconD2 => build_dwd_icon_url(source, request)?,
+        ModelId::IconRu => build_icon_ru_url(source, request)?,
         ModelId::Gdas => build_gdas_url(source, request)?,
         ModelId::Gefs => build_gefs_url(source, request)?,
         ModelId::Aigfs => build_aigfs_url(source, request)?,
@@ -7551,6 +7594,190 @@ fn build_dwd_icon_url(source: SourceId, request: &ModelRunRequest) -> Result<Str
         }
     };
     Ok(url)
+}
+
+/// Exact isobaric coordinate advertised and observed in the ICON-Ru WIS2
+/// bulletin inventory. Relative humidity omits 250 hPa; the other canonical
+/// sounding families publish every level in this list.
+const ICON_RU_ISOBARIC_LEVELS_HPA: &[u16] = &[250, 500, 700, 850, 925];
+
+pub fn icon_ru_isobaric_levels_hpa() -> &'static [u16] {
+    ICON_RU_ISOBARIC_LEVELS_HPA
+}
+
+fn icon_ru_lead_letter(forecast_hour: u16) -> Option<char> {
+    if !(3..=72).contains(&forecast_hour) || forecast_hour % 3 != 0 {
+        return None;
+    }
+    let step = u8::try_from(forecast_hour / 3).ok()?;
+    Some(char::from(b'A'.checked_add(step)?))
+}
+
+fn icon_ru_precip_designator(forecast_hour: u16) -> Option<(char, &'static str)> {
+    match forecast_hour {
+        1..=24 => Some((
+            char::from(b'B'.checked_add(u8::try_from(forecast_hour - 1).ok()?)?),
+            "RUMS",
+        )),
+        25..=48 => Some((
+            char::from(b'B'.checked_add(u8::try_from(forecast_hour - 25).ok()?)?),
+            "RUMC",
+        )),
+        51..=72 if forecast_hour % 3 == 0 => Some((icon_ru_lead_letter(forecast_hour)?, "RUWC")),
+        _ => None,
+    }
+}
+
+fn icon_ru_level_code(level_hpa: u16) -> Option<u8> {
+    match level_hpa {
+        250 => Some(25),
+        500 => Some(50),
+        700 => Some(70),
+        850 => Some(85),
+        925 => Some(92),
+        _ => None,
+    }
+}
+
+fn icon_ru_object_stem(
+    cycle: &CycleSpec,
+    family: char,
+    lead: char,
+    level_code: u8,
+    bulletin_centre: &str,
+) -> String {
+    let day = &cycle.date_yyyymmdd[6..8];
+    format!(
+        "A_Y{family}R{lead}{level_code:02}{bulletin_centre}{day}{:02}00_C_RUMS_{}{:02}0000",
+        cycle.hour_utc, cycle.date_yyyymmdd, cycle.hour_utc
+    )
+}
+
+/// Exact, bounded WIS2 object inventory needed for one normalized RWS family.
+/// Component strings are complete object stems, not user-controlled path
+/// fragments. The URL builder accepts only stems regenerated by this helper.
+pub fn icon_ru_component_products(
+    cycle: &CycleSpec,
+    forecast_hour: u16,
+    logical_product: &str,
+) -> Result<Vec<String>, ModelError> {
+    if !forecast_hour_supported(ModelId::IconRu, cycle.hour_utc, forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: ModelId::IconRu,
+            cycle_hour: cycle.hour_utc,
+            forecast_hour,
+            reason:
+                "ICON-Ru WIS2 publishes 00Z/12Z cycles every three hours from f003 through f072"
+                    .to_string(),
+        });
+    }
+    let lead = icon_ru_lead_letter(forecast_hour).expect("supported ICON-Ru lead");
+    let mut components = Vec::new();
+    match logical_product {
+        "rws-pressure" => {
+            for &level_hpa in ICON_RU_ISOBARIC_LEVELS_HPA {
+                let level_code = icon_ru_level_code(level_hpa).expect("pinned ICON-Ru level");
+                for family in ['T', 'U', 'V', 'H'] {
+                    components.push(icon_ru_object_stem(cycle, family, lead, level_code, "RUMS"));
+                }
+                if level_hpa != 250 {
+                    components.push(icon_ru_object_stem(cycle, 'R', lead, level_code, "RUMS"));
+                }
+            }
+        }
+        "rws-surface" | "rws-sounding" => {
+            // Canonical fields only. The feed also publishes convective
+            // precipitation, min/max temperature, CAPE, precipitation type,
+            // divergence, and relative vorticity, but RWS has no matching
+            // canonical selector for those semantics today.
+            for (family, level_code) in [
+                ('T', 98), // 2 m temperature
+                ('Q', 98), // 2 m dewpoint
+                ('U', 98), // 10 m U
+                ('V', 98), // 10 m V
+                ('P', 89), // MSLP
+                ('W', 98), // trailing 3 h wind gust maximum
+                ('B', 0),  // total cloud
+                ('L', 85), // low cloud
+                ('F', 50), // middle cloud
+            ] {
+                components.push(icon_ru_object_stem(cycle, family, lead, level_code, "RUMS"));
+            }
+            let (precip_lead, precip_centre) = icon_ru_precip_designator(forecast_hour)
+                .expect("supported ICON-Ru forecast has precipitation");
+            components.push(icon_ru_object_stem(
+                cycle,
+                'E',
+                precip_lead,
+                98,
+                precip_centre,
+            ));
+        }
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: ModelId::IconRu,
+                product: logical_product.to_string(),
+            });
+        }
+    }
+    Ok(components)
+}
+
+fn build_icon_ru_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason:
+                "ICON-Ru WIS2 publishes 00Z/12Z cycles every three hours from f003 through f072"
+                    .to_string(),
+        });
+    }
+
+    let product = match request.product.as_str() {
+        "rws-surface" | "rws-sounding" => {
+            icon_ru_component_products(&request.cycle, request.forecast_hour, "rws-surface")?
+                .into_iter()
+                .next()
+                .expect("surface component inventory is non-empty")
+        }
+        "rws-pressure" => {
+            icon_ru_component_products(&request.cycle, request.forecast_hour, "rws-pressure")?
+                .into_iter()
+                .next()
+                .expect("pressure component inventory is non-empty")
+        }
+        candidate => {
+            let allowed = ["rws-surface", "rws-pressure"]
+                .into_iter()
+                .flat_map(|logical| {
+                    icon_ru_component_products(&request.cycle, request.forecast_hour, logical)
+                        .expect("validated ICON-Ru cycle/hour")
+                })
+                .any(|allowed| allowed == candidate);
+            if !allowed {
+                return Err(ModelError::UnsupportedProduct {
+                    model: request.model,
+                    product: request.product.clone(),
+                });
+            }
+            candidate.to_string()
+        }
+    };
+
+    Ok(match source {
+        SourceId::RoshydrometWis2Cache => format!(
+            "https://wis2globalcache.s3.amazonaws.com/data/ru-roshydromet/data/core/weather/prediction/forecast/short-range/deterministic/limited-area/{product}.grib2"
+        ),
+        SourceId::RoshydrometWis2Origin => format!(
+            "http://wis2box.mecom.ru/data/{}-{}-{}/wis/urn:wmo:md:ru-roshydromet:wipps-dc.forecast.short-range.deterministic.limited-area.icon/{product}.grib2",
+            &request.cycle.date_yyyymmdd[..4],
+            &request.cycle.date_yyyymmdd[4..6],
+            &request.cycle.date_yyyymmdd[6..8],
+        ),
+        other => unsupported_source(other, request.model),
+    })
 }
 
 fn build_gdas_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
@@ -8499,6 +8726,7 @@ fn plot_recipe_field_blocker(
             | ModelId::Hrdps
             | ModelId::IconEu
             | ModelId::IconD2
+            | ModelId::IconRu
     ) {
         let provider = match model {
             ModelId::Gdps | ModelId::Rdps | ModelId::Hrdps => {
@@ -8507,6 +8735,7 @@ fn plot_recipe_field_blocker(
             ModelId::CmaGeps => "CMA WIS2 provider-specific acquisition contract",
             ModelId::IconEu => "DWD ICON-EU Open Data per-field component bundle",
             ModelId::IconD2 => "DWD ICON-D2 Open Data per-field component bundle",
+            ModelId::IconRu => "Roshydromet WIS2 per-bulletin component bundle",
             _ => unreachable!(),
         };
         return Some(PlotRecipeBlocker {
@@ -8632,6 +8861,8 @@ fn plot_recipe_fetch_defaults(
         (ModelId::IconEu | ModelId::IconD2, _, false) => {
             ("rws-pressure", PlotRecipeFetchPolicy::WholeFile)
         }
+        (ModelId::IconRu, _, true) => ("rws-surface", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::IconRu, _, false) => ("rws-pressure", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::Gdas, _, _) => ("pgrb2.0p25", PlotRecipeFetchPolicy::PreferIndexedSubset),
         (ModelId::Gefs, _, _) if has_ensemble_spread_selector => {
             ("pgrb2ap5/gespr", PlotRecipeFetchPolicy::PreferIndexedSubset)

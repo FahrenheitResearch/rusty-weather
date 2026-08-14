@@ -167,6 +167,20 @@ pub fn dwd_provider_attribution() -> ProviderAttribution {
     }
 }
 
+pub fn roshydromet_provider_attribution() -> ProviderAttribution {
+    ProviderAttribution {
+        provider: "Federal Service for Hydrometeorology and Environmental Monitoring (Roshydromet)".into(),
+        copyright_statement: "Roshydromet is the producing centre for ICON-Ru13/6N29; its WMO discovery record declares the feed as WMO core data.".into(),
+        notice: "Data source: Roshydromet WIPPS Designated Centre Moscow, distributed through WIS2.".into(),
+        source_url: "https://meteoinfo.ru/en/wis2-srf-products-of-wipps-dc-moscow".into(),
+        license: "WMO Unified Data Policy core data: free and unrestricted international exchange without charge and with no conditions on use.".into(),
+        license_url: "https://public.wmo.int/wmo-unified-data-policy-resolution-res1".into(),
+        terms_url: "https://public.wmo.int/wmo-unified-data-policy-resolution-res1".into(),
+        modification_notice: "The Roshydromet source bulletins have been selected, unwrapped, combined, normalized, and re-encoded by this service; this output is not an official Roshydromet or WMO product.".into(),
+        disclaimer: "Availability and interpretation remain subject to the authoritative Roshydromet/WMO metadata; this service supplies transformed output without implying Roshydromet or WMO endorsement.".into(),
+    }
+}
+
 pub fn provider_attributions_for_provenance(
     sources: &[SourceProvenance],
 ) -> Vec<ProviderAttribution> {
@@ -211,6 +225,12 @@ pub fn provider_attributions_for_provenance(
         .any(|source| source.provider == "dwd-open-data")
     {
         attributions.push(dwd_provider_attribution());
+    }
+    if sources
+        .iter()
+        .any(|source| source.provider == "roshydromet-wipps-dc")
+    {
+        attributions.push(roshydromet_provider_attribution());
     }
     attributions
 }
@@ -527,5 +547,21 @@ mod tests {
                 .modification_notice
                 .contains("not an official DWD product")
         );
+    }
+
+    #[test]
+    fn roshydromet_provenance_emits_wmo_core_policy_once() {
+        let attributions = provider_attributions_for_provenance(&[
+            provenance("roshydromet-wipps-dc"),
+            provenance("roshydromet-wipps-dc"),
+        ]);
+        assert_eq!(attributions, vec![roshydromet_provider_attribution()]);
+        assert!(attributions[0].notice.contains("Roshydromet"));
+        assert!(
+            attributions[0]
+                .license
+                .contains("WMO Unified Data Policy core")
+        );
+        assert!(attributions[0].modification_notice.contains("unwrapped"));
     }
 }

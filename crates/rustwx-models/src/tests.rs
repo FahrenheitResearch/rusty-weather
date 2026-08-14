@@ -90,7 +90,7 @@ fn provider_probe_agent_times_out_a_stalled_response_offline() {
 
 #[test]
 fn built_in_models_are_real() {
-    assert_eq!(built_in_models().len(), 29);
+    assert_eq!(built_in_models().len(), 30);
     assert_eq!(model_summary(ModelId::Gdps).default_product, "rws-surface");
     assert_eq!(model_summary(ModelId::CmaGeps).default_product, "stats");
     assert_eq!(model_summary(ModelId::CmaGeps).max_forecast_hour, 360);
@@ -106,6 +106,12 @@ fn built_in_models_are_real() {
         model_summary(ModelId::IconD2).default_product,
         "rws-surface"
     );
+    assert_eq!(
+        model_summary(ModelId::IconRu).default_product,
+        "rws-surface"
+    );
+    assert_eq!(model_summary(ModelId::IconRu).cycle_hours_utc, &[0, 12]);
+    assert_eq!(model_summary(ModelId::IconRu).max_forecast_hour, 72);
     assert_eq!(model_summary(ModelId::HrrrAk).default_product, "sfc");
     assert_eq!(model_summary(ModelId::Gdas).default_product, "pgrb2.0p25");
     assert_eq!(
@@ -163,6 +169,7 @@ fn catalog_exposes_the_user_facing_supported_models() {
         ModelId::Hrdps,
         ModelId::IconEu,
         ModelId::IconD2,
+        ModelId::IconRu,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -651,6 +658,7 @@ fn temperature_700_recipe_tracks_model_support() {
                     | ModelId::Hrdps
                     | ModelId::IconEu
                     | ModelId::IconD2
+                    | ModelId::IconRu
             ) {
                 assert!(reason.contains("normalized RWS ingest/query"));
             } else if model == ModelId::Href {
@@ -669,6 +677,9 @@ fn temperature_700_recipe_tracks_model_support() {
                 }
                 ModelId::CmaGeps => {
                     assert!(reason.contains("provider-specific acquisition contract"));
+                }
+                ModelId::IconRu => {
+                    assert!(reason.contains("WIS2 per-bulletin component bundle"));
                 }
                 ModelId::EcmwfOpenData | ModelId::WrfGdex => {
                     assert!(reason.contains("whole-file structured extraction"));
@@ -1209,6 +1220,81 @@ fn dwd_icon_regular_grid_cadence_urls_and_allowlists_are_exact() {
         let request = ModelRunRequest::new(model, cycle.clone(), 0, invalid).unwrap();
         assert!(matches!(
             build_grib_url(SourceId::Dwd, &request),
+            Err(ModelError::UnsupportedProduct { .. })
+        ));
+    }
+}
+
+#[test]
+fn icon_ru_cadence_components_and_wis2_transports_match_the_published_contract() {
+    let hours = supported_forecast_hours(ModelId::IconRu, 0);
+    assert_eq!(hours.len(), 24);
+    assert_eq!(hours.first(), Some(&3));
+    assert_eq!(hours.last(), Some(&72));
+    for absent in [0, 1, 2, 4, 71, 73] {
+        assert!(!hours.contains(&absent), "f{absent:03} is not an RWS step");
+    }
+    assert!(supported_forecast_hours(ModelId::IconRu, 6).is_empty());
+
+    let cycle = rustwx_core::CycleSpec::new("20260812", 0).unwrap();
+    let pressure = icon_ru_component_products(&cycle, 3, "rws-pressure").unwrap();
+    assert_eq!(pressure.len(), 24);
+    assert_eq!(
+        pressure.first().map(String::as_str),
+        Some("A_YTRB25RUMS120000_C_RUMS_20260812000000")
+    );
+    assert!(pressure.contains(&"A_YRRB92RUMS120000_C_RUMS_20260812000000".to_string()));
+    assert!(!pressure.iter().any(|name| name.starts_with("A_YRRB25")));
+
+    let surface_f003 = icon_ru_component_products(&cycle, 3, "rws-surface").unwrap();
+    assert_eq!(surface_f003.len(), 10);
+    assert_eq!(
+        surface_f003.last().map(String::as_str),
+        Some("A_YERD98RUMS120000_C_RUMS_20260812000000")
+    );
+    assert_eq!(
+        icon_ru_component_products(&cycle, 27, "rws-surface")
+            .unwrap()
+            .last()
+            .map(String::as_str),
+        Some("A_YERD98RUMC120000_C_RUMS_20260812000000")
+    );
+    assert_eq!(
+        icon_ru_component_products(&cycle, 51, "rws-surface")
+            .unwrap()
+            .last()
+            .map(String::as_str),
+        Some("A_YERR98RUWC120000_C_RUMS_20260812000000")
+    );
+
+    let component = ModelRunRequest::new(
+        ModelId::IconRu,
+        cycle.clone(),
+        3,
+        "A_YTRB25RUMS120000_C_RUMS_20260812000000",
+    )
+    .unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::RoshydrometWis2Cache, &component).unwrap(),
+        "https://wis2globalcache.s3.amazonaws.com/data/ru-roshydromet/data/core/weather/prediction/forecast/short-range/deterministic/limited-area/A_YTRB25RUMS120000_C_RUMS_20260812000000.grib2"
+    );
+    assert_eq!(
+        build_grib_url(SourceId::RoshydrometWis2Origin, &component).unwrap(),
+        "http://wis2box.mecom.ru/data/2026-08-12/wis/urn:wmo:md:ru-roshydromet:wipps-dc.forecast.short-range.deterministic.limited-area.icon/A_YTRB25RUMS120000_C_RUMS_20260812000000.grib2"
+    );
+    let summary = model_summary(ModelId::IconRu);
+    assert_eq!(summary.default_product, "rws-surface");
+    assert_eq!(summary.sources[0].id, SourceId::RoshydrometWis2Cache);
+    assert_eq!(summary.sources[1].id, SourceId::RoshydrometWis2Origin);
+
+    for invalid in [
+        "../A_YTRB25RUMS120000_C_RUMS_20260812000000",
+        "A_YTRB20RUMS120000_C_RUMS_20260812000000",
+        "A_YGRB25RUMS120000_C_RUMS_20260812000000",
+    ] {
+        let request = ModelRunRequest::new(ModelId::IconRu, cycle.clone(), 3, invalid).unwrap();
+        assert!(matches!(
+            build_grib_url(SourceId::RoshydrometWis2Origin, &request),
             Err(ModelError::UnsupportedProduct { .. })
         ));
     }

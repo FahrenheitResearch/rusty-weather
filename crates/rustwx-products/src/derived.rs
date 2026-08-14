@@ -256,6 +256,7 @@ pub fn supported_derived_recipe_slugs(model: ModelId) -> Vec<String> {
         | ModelId::Hrdps
         | ModelId::IconEu
         | ModelId::IconD2
+        | ModelId::IconRu
         | ModelId::Rtma
         | ModelId::Urma
         | ModelId::Href

@@ -1719,6 +1719,7 @@ pub enum ModelId {
     Hrdps,
     IconEu,
     IconD2,
+    IconRu,
     Gdas,
     Gefs,
     Aigfs,
@@ -1753,6 +1754,7 @@ impl ModelId {
             Self::Hrdps => "hrdps",
             Self::IconEu => "icon-eu",
             Self::IconD2 => "icon-d2",
+            Self::IconRu => "icon-ru",
             Self::Gdas => "gdas",
             Self::Gefs => "gefs",
             Self::Aigfs => "aigfs",
@@ -1803,6 +1805,7 @@ impl std::str::FromStr for ModelId {
             }
             "icon-eu" | "icon_eu" | "iconeu" | "dwd-icon-eu" | "dwd_icon_eu" => Ok(Self::IconEu),
             "icon-d2" | "icon_d2" | "icond2" | "dwd-icon-d2" | "dwd_icon_d2" => Ok(Self::IconD2),
+            "icon-ru" | "icon_ru" | "iconru" | "icon-ru13" | "icon_ru13" => Ok(Self::IconRu),
             "gdas" | "gdas-0p25" | "gdas_0p25" | "gdas-0.25" | "gdas_0.25" => Ok(Self::Gdas),
             "gefs" | "gefs-ens" | "gefs_ens" | "gefs-ensemble" => Ok(Self::Gefs),
             "aigfs" | "ai-gfs" | "ai_gfs" => Ok(Self::Aigfs),
@@ -1982,6 +1985,12 @@ pub enum SourceId {
     Eccc,
     Cma,
     Dwd,
+    /// HTTPS object transport through the WIS2 Global Cache network for
+    /// Roshydromet's WMO-core ICON-Ru feed.
+    RoshydrometWis2Cache,
+    /// Canonical Roshydromet WIS2 node transport. The current node advertises
+    /// HTTP object links, so adapters prefer the Global Cache first.
+    RoshydrometWis2Origin,
     Ncei,
     Gdex,
     /// Local NetCDF archive populated by an active AIFS-v2 inference/dissemination harness.
@@ -2003,6 +2012,8 @@ impl SourceId {
             Self::Eccc => "eccc",
             Self::Cma => "cma",
             Self::Dwd => "dwd",
+            Self::RoshydrometWis2Cache => "roshydromet-wis2-cache",
+            Self::RoshydrometWis2Origin => "roshydromet-wis2-origin",
             Self::Ncei => "ncei",
             Self::Gdex => "gdex",
             Self::AifsInference => "aifs-inference",
@@ -2030,6 +2041,12 @@ impl std::str::FromStr for SourceId {
             "eccc" | "msc" | "cmc" | "msc-datamart" | "msc_datamart" => Ok(Self::Eccc),
             "cma" | "cma-wis2" | "cma_wis2" | "wis2-cma" | "wis2_cma" => Ok(Self::Cma),
             "dwd" | "dwd-open-data" | "dwd_open_data" | "deutscher-wetterdienst" => Ok(Self::Dwd),
+            "roshydromet-wis2-cache" | "roshydromet_wis2_cache" | "wis2-global-cache" => {
+                Ok(Self::RoshydrometWis2Cache)
+            }
+            "roshydromet-wis2-origin" | "roshydromet_wis2_origin" | "roshydromet" => {
+                Ok(Self::RoshydrometWis2Origin)
+            }
             "ncei" => Ok(Self::Ncei),
             "gdex" => Ok(Self::Gdex),
             "aifs-inference" | "aifs_inference" | "aifsinference" | "inferenced-aifs"
