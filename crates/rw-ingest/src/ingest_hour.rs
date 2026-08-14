@@ -829,6 +829,20 @@ fn provider_component_products(
         ModelId::Gdps | ModelId::Rdps | ModelId::Hrdps => {
             gdps_component_products(config, logical_product).map(Some)
         }
+        ModelId::Reps => {
+            if logical_product != "rws-reps-provider-statistics" {
+                return Err(other(format!(
+                    "{} fetch plan contains unknown logical product '{logical_product}'",
+                    config.model
+                )));
+            }
+            Ok(Some(
+                rustwx_models::reps_provider_statistic_components()
+                    .iter()
+                    .map(|component| (*component).to_string())
+                    .collect(),
+            ))
+        }
         ModelId::IconEu | ModelId::IconD2 => {
             dwd_icon_component_products(config, logical_product).map(Some)
         }
@@ -3135,6 +3149,50 @@ mod tests {
                 "HGT_Sfc",
             ]
         );
+    }
+
+    #[test]
+    fn reps_bundle_is_bounded_scalar_and_member_free() {
+        let cycle = CycleSpec::new("20260814", 0).unwrap();
+        let profile = IngestProfile::surface_for_model(ModelId::Reps);
+        let cancel = AtomicBool::new(false);
+        let sink = |_event: IngestEvent| {};
+        let config = IngestConfig {
+            model: ModelId::Reps,
+            cycle: &cycle,
+            source_override: Some(SourceId::Eccc),
+            cache_root: Path::new("unused-cache"),
+            use_cache: true,
+            store_root: Path::new("unused-store"),
+            model_slug: "reps",
+            run_slug: "20260814_00z",
+            profile: &profile,
+            verify: true,
+            progress: &sink,
+            cancel: &cancel,
+        };
+        let components = provider_component_products(&config, 24, "rws-reps-provider-statistics")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            components,
+            vec![
+                "TMP-Prob_AGL-2m",
+                "WIND-Prob_AGL-10m",
+                "TPRATE-Accum3h-Prob_SFC",
+            ]
+        );
+        assert!(components.iter().all(|component| {
+            !component.contains("UGRD")
+                && !component.contains("VGRD")
+                && !component.contains("member")
+        }));
+        assert!(provider_component_products(&config, 24, "members").is_err());
+
+        let planned = planned_store_variables(&profile, ModelId::Reps);
+        assert!(planned.volumes.is_empty());
+        assert_eq!(planned.fields_2d.len(), 37);
+        assert!(planned.derived.is_empty() && planned.heavy.is_empty());
     }
 
     #[test]

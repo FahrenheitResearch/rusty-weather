@@ -32,6 +32,7 @@ remain available forever.
 | `rdps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/model_rdps/10km/00/024/` | exact representative filename rows and decoded grid/vector metadata from the 100,669-byte, 414-GRIB-object official listing; full-source SHA-256 `87BD53259734E95AEFEFF1DA7BBCD83332A5BD3AC6124DC46BD5AD6675952F10`; 2,675-byte fixture SHA-256 `644E6A32A0BE5DBECBCFE141523A3E25E48B828435985DEE3783228F1D355F94` |
 | `hrdps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/model_hrdps/continental/2.5km/00/024/` | exact representative filename rows and decoded grid/vector metadata from the 91,816-byte, 414-GRIB-object official listing; full-source SHA-256 `AF42B19E5A3D44C00AB0FDA2E1F18E052A2043319B997D0E8263D4B7B957EF8E`; 2,695-byte fixture SHA-256 `C4263EB72B5EE25468C89C1D98D2CFF32B62A25645142E8ECFEFC05B026DBBFC` |
 | `geps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/ensemble/geps/grib2/products/00/024/` | complete 36-object official listing plus exact identities for the bounded selected payloads; 9,714-byte source listing SHA-256 `ABC37D99EE4402ECDBDB30B5C46E8ECDC245EBE24BBCBCBFD64F7CF4C1E87E4E`; 5,839-byte fixture SHA-256 `53DB508A7970F50BF779ACE52E081DB599082F0A9B52F60550B4D4BA9E2219E4` |
+| `reps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/ensemble/reps/10km/grib2/00/024/` | exact selected provider-statistics objects and decoded statistical/grid metadata from the 24,022-byte, 103-GRIB-object official listing; full-source SHA-256 `29B48053BEA61ED7EC6DF4C4EBB974C029183B17C6298A350C39A5831501F0CF`; three bounded payload SHA-256 identities plus a disabled raw-member contract identity |
 
 The SREF product is a run-wide file containing all native forecast steps, so
 the compact fixture deliberately includes its first, next, and final native
@@ -140,3 +141,22 @@ grid onto one meridian. The extended f936 Monday/Thursday products are
 recorded but not scheduled, and ambiguous
 `WIND-Max-*` thresholds are not normalized. This lane consumes only ECCC's
 published statistics and never claims individual ensemble members.
+
+## ECCC REPS provider-statistics verification (2026-08-14)
+
+The REPS lane fetched exactly three official 2026-08-14 00z f024 scalar
+statistics objects: 2-m temperature, 10-m wind speed, and trailing 3-hour
+precipitation. The bounded bundle totaled 15,308,713 bytes and 37 GRIB
+messages on the 908x960 rotated grid. It preserved p10/p25/p50/p75/p90,
+spread (WMO derived-forecast code 4), unweighted mean, minimum, maximum, and
+the ten published precipitation thresholds. The f024 precipitation messages
+start at f021 and end at f024; their RWS variable names retain that 3-hour
+support.
+
+`rw_ingest --profile surface --verify` realized all 37 typed 2-D variables
+bit-exactly. `rws validate --deep` then passed with 37 variables, 592 chunks,
+and 40,986,270 payload bytes. The source provenance contains only
+`rws-reps-provider-statistics`. A separate bounded 9,108,868-byte TMP member
+object is retained in the fixture solely to prove the excluded upstream
+contract (one control plus 20 perturbed messages); no member object and no
+grid-relative U/V object is acquired or advertised by this lane.

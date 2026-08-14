@@ -136,6 +136,14 @@ pub fn eccc_provider_attribution() -> ProviderAttribution {
     }
 }
 
+/// Attribution for ECCC's Regional Ensemble Prediction System (REPS).
+pub fn reps_provider_attribution() -> ProviderAttribution {
+    let mut attribution = eccc_provider_attribution();
+    attribution.source_url =
+        "https://eccc-msc.github.io/open-data/msc-data/nwp_reps/readme_reps-datamart_en/".into();
+    attribution
+}
+
 pub fn cma_provider_attribution() -> ProviderAttribution {
     ProviderAttribution {
         provider: "China Meteorological Administration (CMA)".into(),
@@ -232,6 +240,14 @@ pub fn provider_attributions_for_provenance(
                     .any(|product| product == "rws-published-statistics")
         }) {
             attributions.push(geps_provider_attribution());
+        } else if sources.iter().any(|source| {
+            source.provider == "eccc-msc-datamart"
+                && source
+                    .products
+                    .iter()
+                    .any(|product| product == "rws-reps-provider-statistics")
+        }) {
+            attributions.push(reps_provider_attribution());
         } else {
             attributions.push(eccc_provider_attribution());
         }
@@ -542,6 +558,26 @@ mod tests {
             attributions[0]
                 .modification_notice
                 .contains("not an official")
+        );
+        assert!(attributions[0].license.contains("version 2.1"));
+    }
+
+    #[test]
+    fn reps_provenance_uses_the_exact_product_documentation_url() {
+        let sources = [SourceProvenance {
+            provider: "eccc-msc-datamart".into(),
+            roles: vec!["surface".into()],
+            products: vec!["rws-reps-provider-statistics".into()],
+        }];
+        let attributions = provider_attributions_for_provenance(&sources);
+        assert_eq!(attributions, vec![reps_provider_attribution()]);
+        assert_eq!(
+            attributions[0].source_url,
+            "https://eccc-msc.github.io/open-data/msc-data/nwp_reps/readme_reps-datamart_en/"
+        );
+        assert_eq!(
+            attributions[0].notice,
+            "Data Source: Environment and Climate Change Canada"
         );
         assert!(attributions[0].license.contains("version 2.1"));
     }

@@ -234,10 +234,10 @@ fn provider_attributions(
         .iter()
         .any(|source| source.id == SourceId::Eccc)
     {
-        let attribution = if summary.id == ModelId::Geps {
-            rw_query::geps_provider_attribution()
-        } else {
-            rw_query::eccc_provider_attribution()
+        let attribution = match summary.id {
+            ModelId::Geps => rw_query::geps_provider_attribution(),
+            ModelId::Reps => rw_query::reps_provider_attribution(),
+            _ => rw_query::eccc_provider_attribution(),
         };
         attributions.push(attribution.into());
     }
@@ -4747,7 +4747,7 @@ mod tests {
         let body = to_bytes(allowed.into_body(), 1024 * 1024).await.unwrap();
         let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let models = models.as_array().expect("models response must be an array");
-        assert_eq!(models.len(), 30);
+        assert_eq!(models.len(), 31);
         assert!(models.iter().all(|model| model["id"] != "rrfs-firewx"));
         let wrf = models
             .iter()
@@ -4820,6 +4820,28 @@ mod tests {
         assert_eq!(
             geps["provider_attributions"][0]["source_url"],
             "https://eccc-msc.github.io/open-data/msc-data/nwp_geps/readme_geps-datamart_en/"
+        );
+
+        let reps = model("reps");
+        assert_eq!(reps["ingest_status"], "ready");
+        assert_eq!(reps["verification"], "live_verified");
+        assert_eq!(
+            reps["limitations"],
+            serde_json::json!([
+                "provider_statistics_only",
+                "surface_only",
+                "derived_products_disabled"
+            ])
+        );
+        assert_eq!(
+            reps["products"][0]["product"],
+            "rws-reps-provider-statistics"
+        );
+        assert_eq!(reps["products"][0]["surface_source"], true);
+        assert_eq!(reps["products"][0]["pressure_source"], false);
+        assert_eq!(
+            reps["provider_attributions"][0]["source_url"],
+            "https://eccc-msc.github.io/open-data/msc-data/nwp_reps/readme_reps-datamart_en/"
         );
 
         for id in ["icon-eu", "icon-d2"] {

@@ -993,4 +993,26 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn reps_three_hour_statistics_are_queryable_but_temporally_manual() {
+        for (name, units) in [
+            ("total_precipitation_3h_p50", "kg/m^2"),
+            ("total_precipitation_3h_ensemble_mean", "kg/m^2"),
+            ("total_precipitation_3h_probability_gt_10mm", "%"),
+        ] {
+            let capability = variable_temporal_capability(&meta(
+                name,
+                units,
+                serde_json::json!({
+                    "field":"TotalPrecipitation",
+                    "product":{"Percentile":50}
+                }),
+            ));
+            assert_eq!(capability.value_class, TemporalValueClass::Unknown);
+            assert!(capability.requires_manual_semantics);
+            assert!(capability.operations.is_empty());
+            assert!(capability.note.contains("10800-second"));
+        }
+    }
 }

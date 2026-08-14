@@ -27,6 +27,7 @@ not automatically presented as live-verified.
 | CMA GRAPES GEPS | Remote | Ingest beta | Global 0.25-degree provider-produced ensemble statistics; 00/12z, 3-hourly f000-f078 then 6-hourly to f360; mean/spread, percentile, and probability fields only—no raw member or deterministic sounding claim; live ingest/store verified |
 | ECCC RDPS | Remote | Ingest beta | North American 10 km rotated-grid deterministic forecast; 00/06/12/18z hourly f000-f084; bounded per-field acquisition and a 19-level sounding profile are live ingest/store verified; canonical U/V are paired and rotated to earth coordinates; derived/heavy disabled |
 | ECCC HRDPS continental | Remote | Ingest beta | Pan-Canadian 2.5 km rotated-grid deterministic forecast; 00/06/12/18z hourly f000-f048; bounded per-field acquisition and a 19-level sounding profile are live ingest/store verified; canonical U/V are paired and rotated to earth coordinates; derived/heavy disabled |
+| ECCC REPS | Remote | Ingest beta | Regional 10 km provider-produced scalar ensemble statistics; 00/06/12/18z, three-hourly f003-f072; p10/p25/p50/p75/p90, spread, mean, min/max, and trailing 3-hour precipitation probabilities only; no raw members or grid-relative U/V claim; live ingest/store verified |
 | DWD ICON-EU regular | Remote | Ingest beta | European deterministic regular lat/lon feed; eight 3-hourly cycles, main-cycle f000-f120 and short-cycle f000-f048 native cadence; exact bzip2 component bundles and 18 schema-requested native pressure levels are live ingest/store verified; derived/heavy disabled |
 | DWD ICON-D2 regular | Remote | Ingest beta | Germany deterministic regular lat/lon feed; eight 3-hourly cycles and hourly f000-f048; exact bzip2 component bundles and all 11 native pressure levels are live ingest/store verified; quarter-hour messages retain exact time semantics; derived/heavy disabled |
 | Roshydromet ICON-Ru13/6N29 | Remote | Ingest beta | North Eurasia 697x213 regular lat/lon forecast; 00/12z, three-hourly f003-f072; exact WIS2 bulletin-component acquisition, sparse pressure profile, dateline-safe normalization, and bounded f003 live ingest/store verification |
@@ -83,7 +84,8 @@ The focused ingest fixtures pin inventories captured from the official
 [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data),
 [ECCC RDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_rdps/readme_rdps-datamart_en/), and
 [ECCC HRDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart_en/), and
-[ECCC GEPS](https://eccc-msc.github.io/open-data/msc-data/nwp_geps/readme_geps-datamart_en/) feeds.
+[ECCC GEPS](https://eccc-msc.github.io/open-data/msc-data/nwp_geps/readme_geps-datamart_en/), and
+[ECCC REPS](https://eccc-msc.github.io/open-data/msc-data/nwp_reps/readme_reps-datamart_en/) feeds.
 Fixture source URLs and SHA-256 values are recorded beside the fixtures.
 
 GDPS was additionally exercised against the official
@@ -105,6 +107,17 @@ eleven precipitation percentile/probability fields. Deep validation passed at
 57 variables, 1,026 chunks, and 134,659,235 payload bytes. Unknown local CMA
 parameters remain excluded, and the API reports `provider_statistics_only`
 rather than implying access to the 31 underlying member forecasts.
+
+REPS was exercised against the official ECCC Datamart on 2026-08-14 using
+one bounded 00z f024 bundle. Three scalar statistics objects totaling
+15,308,713 bytes realized all 37 typed 2-D variables bit-exactly on the
+908x960 rotated grid. Deep validation passed at 37 variables, 592 chunks, and
+40,986,270 payload bytes. The lane starts at f003 because the live f000
+directory contains no provider-statistics objects. Wind is ingested only as
+scalar speed; raw members and grid-relative U/V remain excluded. WMO
+derived-forecast code 4 is preserved as spread, and precipitation names retain
+their f021-f024 trailing 3-hour support.
+
 RDPS and HRDPS were exercised against the same official Datamart on
 2026-08-14 with one bounded 00z f024 sounding ingest each. RDPS realized six
 surface variables (the live feed has no surface-orography object) plus five

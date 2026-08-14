@@ -90,7 +90,7 @@ fn provider_probe_agent_times_out_a_stalled_response_offline() {
 
 #[test]
 fn built_in_models_are_real() {
-    assert_eq!(built_in_models().len(), 31);
+    assert_eq!(built_in_models().len(), 32);
     assert_eq!(model_summary(ModelId::Gdps).default_product, "rws-surface");
     assert_eq!(model_summary(ModelId::CmaGeps).default_product, "stats");
     assert_eq!(model_summary(ModelId::CmaGeps).max_forecast_hour, 360);
@@ -98,6 +98,11 @@ fn built_in_models_are_real() {
     assert_eq!(model_summary(ModelId::Rdps).max_forecast_hour, 84);
     assert_eq!(model_summary(ModelId::Hrdps).default_product, "rws-surface");
     assert_eq!(model_summary(ModelId::Hrdps).max_forecast_hour, 48);
+    assert_eq!(
+        model_summary(ModelId::Reps).default_product,
+        "rws-reps-provider-statistics"
+    );
+    assert_eq!(model_summary(ModelId::Reps).max_forecast_hour, 72);
     assert_eq!(
         model_summary(ModelId::IconEu).default_product,
         "rws-surface"
@@ -172,6 +177,7 @@ fn catalog_exposes_the_user_facing_supported_models() {
         ModelId::CmaGeps,
         ModelId::Rdps,
         ModelId::Hrdps,
+        ModelId::Reps,
         ModelId::IconEu,
         ModelId::IconD2,
         ModelId::IconRu,
@@ -663,6 +669,7 @@ fn temperature_700_recipe_tracks_model_support() {
                     | ModelId::CmaGeps
                     | ModelId::Rdps
                     | ModelId::Hrdps
+                    | ModelId::Reps
                     | ModelId::IconEu
                     | ModelId::IconD2
                     | ModelId::IconRu
@@ -686,6 +693,9 @@ fn temperature_700_recipe_tracks_model_support() {
                 }
                 ModelId::CmaGeps => {
                     assert!(reason.contains("provider-specific acquisition contract"));
+                }
+                ModelId::Reps => {
+                    assert!(reason.contains("REPS provider-statistics component bundle"));
                 }
                 ModelId::IconRu => {
                     assert!(reason.contains("WIS2 per-bulletin component bundle"));
@@ -1147,6 +1157,79 @@ fn eccc_regional_cadence_and_component_urls_match_the_msc_datamart_contract() {
             Err(ModelError::UnsupportedForecastHour { .. })
         ));
     }
+}
+
+#[test]
+fn reps_provider_statistics_cadence_urls_and_typed_selectors_are_exact() {
+    for cycle_hour in [0, 6, 12, 18] {
+        let hours = supported_forecast_hours(ModelId::Reps, cycle_hour);
+        assert_eq!(hours.len(), 24);
+        assert_eq!(hours.first(), Some(&3));
+        assert_eq!(hours.last(), Some(&72));
+        assert!(hours.iter().all(|hour| hour % 3 == 0));
+    }
+    assert!(supported_forecast_hours(ModelId::Reps, 3).is_empty());
+
+    let cycle = CycleSpec::new("20260814", 0).unwrap();
+    let temperature = ModelRunRequest::new(
+        ModelId::Reps,
+        cycle.clone(),
+        24,
+        "rws-reps-provider-statistics",
+    )
+    .unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::Eccc, &temperature).unwrap(),
+        "https://dd.weather.gc.ca/today/ensemble/reps/10km/grib2/00/024/20260814T00Z_MSC_REPS_TMP-Prob_AGL-2m_RLatLon0.09x0.09_PT024H.grib2"
+    );
+    let precipitation =
+        ModelRunRequest::new(ModelId::Reps, cycle.clone(), 24, "TPRATE-Accum3h-Prob_SFC").unwrap();
+    assert!(
+        build_grib_url(SourceId::Eccc, &precipitation)
+            .unwrap()
+            .ends_with("_TPRATE-Accum3h-Prob_SFC_RLatLon0.09x0.09_PT024H.grib2")
+    );
+    for product in ["members", "UGRD-Prob_AGL-10m", "../TMP-Prob_AGL-2m"] {
+        let request = ModelRunRequest::new(ModelId::Reps, cycle.clone(), 24, product).unwrap();
+        assert!(matches!(
+            build_grib_url(SourceId::Eccc, &request),
+            Err(ModelError::UnsupportedProduct { .. })
+        ));
+    }
+    for hour in [0, 1, 4, 73] {
+        let request = ModelRunRequest::new(
+            ModelId::Reps,
+            cycle.clone(),
+            hour,
+            "rws-reps-provider-statistics",
+        )
+        .unwrap();
+        assert!(matches!(
+            build_grib_url(SourceId::Eccc, &request),
+            Err(ModelError::UnsupportedForecastHour { .. })
+        ));
+    }
+
+    let p50 = FieldSelector::height_agl(CanonicalField::Temperature, 2).with_percentile(50);
+    let spread = FieldSelector::height_agl(CanonicalField::WindSpeed, 10)
+        .with_product(FieldProduct::EnsembleSpread);
+    let precip_probability = FieldSelector::surface(CanonicalField::TotalPrecipitation)
+        .with_probability(ProbabilitySelection::new(Some(3), Some(2_500), None));
+    assert!(selector_supported_for_model(p50, ModelId::Reps));
+    assert!(selector_supported_for_model(spread, ModelId::Reps));
+    assert!(selector_supported_for_model(
+        precip_probability,
+        ModelId::Reps
+    ));
+    assert!(!selector_supported_for_model(
+        FieldSelector::height_agl(CanonicalField::UWind, 10).with_ensemble_mean(),
+        ModelId::Reps
+    ));
+    assert!(!selector_supported_for_model(
+        FieldSelector::surface(CanonicalField::TotalPrecipitation)
+            .with_probability(ProbabilitySelection::new(Some(3), Some(100_000), None)),
+        ModelId::Reps
+    ));
 }
 
 #[test]

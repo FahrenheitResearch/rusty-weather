@@ -1717,6 +1717,7 @@ pub enum ModelId {
     CmaGeps,
     Rdps,
     Hrdps,
+    Reps,
     IconEu,
     IconD2,
     IconRu,
@@ -1753,6 +1754,7 @@ impl ModelId {
             Self::CmaGeps => "cma-geps",
             Self::Rdps => "rdps",
             Self::Hrdps => "hrdps",
+            Self::Reps => "reps",
             Self::IconEu => "icon-eu",
             Self::IconD2 => "icon-d2",
             Self::IconRu => "icon-ru",
@@ -1805,6 +1807,11 @@ impl std::str::FromStr for ModelId {
             "hrdps" | "gem-high-resolution" | "gem_high_resolution" | "cmc-hrdps" | "cmc_hrdps" => {
                 Ok(Self::Hrdps)
             }
+            "reps"
+            | "gem-regional-ensemble"
+            | "gem_regional_ensemble"
+            | "cmc-reps"
+            | "cmc_reps" => Ok(Self::Reps),
             "icon-eu" | "icon_eu" | "iconeu" | "dwd-icon-eu" | "dwd_icon_eu" => Ok(Self::IconEu),
             "icon-d2" | "icon_d2" | "icond2" | "dwd-icon-d2" | "dwd_icon_d2" => Ok(Self::IconD2),
             "icon-ru" | "icon_ru" | "iconru" | "icon-ru13" | "icon_ru13" => Ok(Self::IconRu),

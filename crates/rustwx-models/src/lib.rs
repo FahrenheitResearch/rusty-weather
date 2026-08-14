@@ -409,6 +409,7 @@ const GDPS_CYCLE_HOURS: &[u8] = &[0, 12];
 const CMA_GEPS_CYCLE_HOURS: &[u8] = &[0, 12];
 const RDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const HRDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
+const REPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const DWD_ICON_CYCLE_HOURS: &[u8] = &[0, 3, 6, 9, 12, 15, 18, 21];
 const ICON_RU_CYCLE_HOURS: &[u8] = &[0, 12];
 const GEPS_CYCLE_HOURS: &[u8] = &[0, 12];
@@ -740,6 +741,16 @@ const MODELS: &[ModelSummary] = &[
         sources: GDPS_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::Reps,
+        description: "ECCC REPS 10 km regional provider-published ensemble statistics",
+        default_product: "rws-reps-provider-statistics",
+        cycle_hours_utc: REPS_CYCLE_HOURS,
+        max_forecast_hour: 72,
+        sources: GDPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::PostProcessedStatisticsGribFiles,
     },
     ModelSummary {
         id: ModelId::IconEu,
@@ -5871,7 +5882,7 @@ pub fn built_in_models() -> &'static [ModelSummary] {
 /// [`built_in_models`] remains linked (`ModelId` match arms thread through
 /// rustwx-products), but every user-facing enumeration must go through this
 /// list.
-pub fn supported_models() -> [ModelId; 22] {
+pub fn supported_models() -> [ModelId; 23] {
     [
         ModelId::Hrrr,
         ModelId::HrrrAk,
@@ -5881,6 +5892,7 @@ pub fn supported_models() -> [ModelId; 22] {
         ModelId::CmaGeps,
         ModelId::Rdps,
         ModelId::Hrdps,
+        ModelId::Reps,
         ModelId::IconEu,
         ModelId::IconD2,
         ModelId::IconRu,
@@ -5932,6 +5944,9 @@ pub fn plot_recipe_fetch_blockers(
 pub fn selector_supported_for_model(selector: FieldSelector, model: ModelId) -> bool {
     if model == ModelId::Geps {
         return geps_published_selector_supported(selector);
+    }
+    if model == ModelId::Reps {
+        return reps_provider_selector_supported(selector);
     }
     if !selector.product.is_default() {
         match (model, selector.product) {
@@ -6176,6 +6191,41 @@ fn geps_published_selector_supported(selector: FieldSelector) -> bool {
     }
 }
 
+fn reps_provider_selector_supported(selector: FieldSelector) -> bool {
+    let full_statistics = matches!(
+        selector.product,
+        FieldProduct::Percentile(10 | 25 | 50 | 75 | 90)
+            | FieldProduct::EnsembleSpread
+            | FieldProduct::EnsembleMean
+            | FieldProduct::EnsembleMinimum
+            | FieldProduct::EnsembleMaximum
+    );
+    let precipitation_probability = match selector.product {
+        FieldProduct::Probability(selection) => {
+            selection.probability_type == Some(3)
+                && selection.upper_limit_milli.is_none()
+                && selection.lower_limit_milli.is_some_and(|threshold| {
+                    [
+                        1_000, 2_500, 5_000, 10_000, 15_000, 20_000, 25_000, 30_000, 40_000, 50_000,
+                    ]
+                    .contains(&threshold)
+                })
+        }
+        _ => false,
+    };
+
+    match (selector.field, selector.vertical) {
+        (CanonicalField::Temperature, VerticalSelector::HeightAboveGroundMeters(2))
+        | (CanonicalField::WindSpeed, VerticalSelector::HeightAboveGroundMeters(10)) => {
+            full_statistics
+        }
+        (CanonicalField::TotalPrecipitation, VerticalSelector::Surface) => {
+            full_statistics || precipitation_probability
+        }
+        _ => false,
+    }
+}
+
 pub fn model_summary(model: ModelId) -> &'static ModelSummary {
     MODELS
         .iter()
@@ -6223,6 +6273,13 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
         ModelId::Hrdps => {
             if HRDPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
                 (0..=48).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ModelId::Reps => {
+            if REPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (3..=72).step_by(3).collect()
             } else {
                 Vec::new()
             }
@@ -6412,6 +6469,7 @@ fn default_canonical_bundle_product(
         (ModelId::Rdps | ModelId::Hrdps, CanonicalBundleDescriptor::PressureAnalysis) => {
             "rws-pressure"
         }
+        (ModelId::Reps, _) => "rws-reps-provider-statistics",
         (ModelId::IconEu | ModelId::IconD2, CanonicalBundleDescriptor::SurfaceAnalysis) => {
             "rws-surface"
         }
@@ -6895,6 +6953,7 @@ fn build_grib_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         ModelId::CmaGeps => build_cma_geps_url(source, request)?,
         ModelId::Rdps => build_rdps_url(source, request)?,
         ModelId::Hrdps => build_hrdps_url(source, request)?,
+        ModelId::Reps => build_reps_url(source, request)?,
         ModelId::IconEu | ModelId::IconD2 => build_dwd_icon_url(source, request)?,
         ModelId::IconRu => build_icon_ru_url(source, request)?,
         ModelId::Geps => build_geps_url(source, request)?,
@@ -7494,6 +7553,54 @@ fn build_hrdps_url(source: SourceId, request: &ModelRunRequest) -> Result<String
         request.cycle.date_yyyymmdd,
         request.cycle.hour_utc,
         product,
+        request.forecast_hour,
+    ))
+}
+
+/// Exact REPS provider-statistics objects normalized by RWS. These scalar
+/// products contain percentile, spread, mean, minimum, maximum, and (for
+/// precipitation) threshold-probability messages. Raw control/perturbed
+/// member objects and grid-relative U/V objects are deliberately absent.
+const REPS_PROVIDER_STATISTIC_COMPONENTS: &[&str] = &[
+    "TMP-Prob_AGL-2m",
+    "WIND-Prob_AGL-10m",
+    "TPRATE-Accum3h-Prob_SFC",
+];
+
+pub fn reps_provider_statistic_components() -> &'static [&'static str] {
+    REPS_PROVIDER_STATISTIC_COMPONENTS
+}
+
+fn build_reps_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Eccc {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "REPS provider-statistics objects are published every three hours from f003 through f072 for 00Z/06Z/12Z/18Z cycles; f000 currently contains raw-member objects but no provider-statistics objects"
+                .to_string(),
+        });
+    }
+    let component = match request.product.as_str() {
+        "rws-reps-provider-statistics" => "TMP-Prob_AGL-2m",
+        component if REPS_PROVIDER_STATISTIC_COMPONENTS.contains(&component) => component,
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    Ok(format!(
+        "https://dd.weather.gc.ca/today/ensemble/reps/10km/grib2/{:02}/{:03}/{}T{:02}Z_MSC_REPS_{}_RLatLon0.09x0.09_PT{:03}H.grib2",
+        request.cycle.hour_utc,
+        request.forecast_hour,
+        request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
+        component,
         request.forecast_hour,
     ))
 }
@@ -8896,6 +9003,7 @@ fn plot_recipe_field_blocker(
             | ModelId::CmaGeps
             | ModelId::Rdps
             | ModelId::Hrdps
+            | ModelId::Reps
             | ModelId::IconEu
             | ModelId::IconD2
             | ModelId::IconRu
@@ -8905,6 +9013,7 @@ fn plot_recipe_field_blocker(
                 "ECCC Datamart per-field component bundle"
             }
             ModelId::CmaGeps => "CMA WIS2 provider-specific acquisition contract",
+            ModelId::Reps => "ECCC REPS provider-statistics component bundle",
             ModelId::IconEu => "DWD ICON-EU Open Data per-field component bundle",
             ModelId::IconD2 => "DWD ICON-D2 Open Data per-field component bundle",
             ModelId::IconRu => "Roshydromet WIS2 per-bulletin component bundle",
@@ -9027,6 +9136,10 @@ fn plot_recipe_fetch_defaults(
         (ModelId::Rdps | ModelId::Hrdps, _, false) => {
             ("rws-pressure", PlotRecipeFetchPolicy::WholeFile)
         }
+        (ModelId::Reps, _, _) => (
+            "rws-reps-provider-statistics",
+            PlotRecipeFetchPolicy::WholeFile,
+        ),
         (ModelId::IconEu | ModelId::IconD2, _, true) => {
             ("rws-surface", PlotRecipeFetchPolicy::WholeFile)
         }

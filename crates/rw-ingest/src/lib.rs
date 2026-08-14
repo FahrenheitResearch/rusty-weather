@@ -256,6 +256,15 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
             pressure_source: false,
             idx_patterns: &[],
         }]),
+        // REPS publishes each scalar statistics family as one bounded GRIB2
+        // object. ingest_hour assembles the exact three-object bundle; raw
+        // control/perturbed members and grid-relative U/V are not admitted.
+        ModelId::Reps => Ok(vec![ProductFetch {
+            product: "rws-reps-provider-statistics",
+            surface_source: true,
+            pressure_source: false,
+            idx_patterns: &[],
+        }]),
         // DWD's regular-grid ICON feeds use the same logical two-role shape
         // as GDPS, but resolve through a distinct exact bzip2 component
         // inventory in `ingest_hour`.
@@ -717,6 +726,13 @@ pub fn validate_ingest_profile_for_model(
             "model 'geps' stores provider-published pressure-level and surface statistics as a typed 2-D collection; use --profile surface exactly",
         ));
     }
+    if model == rustwx_core::ModelId::Reps
+        && profile != &ingest_profile::IngestProfile::surface_for_model(model)
+    {
+        return Err(events::other(
+            "model 'reps' exposes only its exact typed provider-statistics inventory; use --profile surface exactly",
+        ));
+    }
     let plan = fetch_plan(model)?;
     if !plan.iter().any(|product| product.surface_source) {
         return Err(events::other(format!(
@@ -900,6 +916,11 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
             IngestCapabilityLimitation::SparsePressureLevels,
             IngestCapabilityLimitation::DerivedProductsDisabled,
         ],
+        rustwx_core::ModelId::Reps => vec![
+            IngestCapabilityLimitation::ProviderStatisticsOnly,
+            IngestCapabilityLimitation::SurfaceOnly,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+        ],
         rustwx_core::ModelId::Rdps | rustwx_core::ModelId::Hrdps => vec![
             IngestCapabilityLimitation::SparsePressureLevels,
             IngestCapabilityLimitation::DerivedProductsDisabled,
@@ -928,6 +949,7 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 | rustwx_core::ModelId::CmaGeps
                 | rustwx_core::ModelId::Rdps
                 | rustwx_core::ModelId::Hrdps
+                | rustwx_core::ModelId::Reps
                 | rustwx_core::ModelId::IconRu
                 | rustwx_core::ModelId::Geps
                 | rustwx_core::ModelId::Rap
@@ -1052,6 +1074,7 @@ mod tests {
             ModelId::CmaGeps,
             ModelId::Rdps,
             ModelId::Hrdps,
+            ModelId::Reps,
             ModelId::IconEu,
             ModelId::IconD2,
             ModelId::IconRu,
@@ -1290,6 +1313,22 @@ mod tests {
             ]
         );
 
+        let reps = model_ingest_capability(ModelId::Reps);
+        assert_eq!(reps.status, IngestSupportStatus::Ready);
+        assert_eq!(reps.verification, IngestVerificationLevel::LiveVerified);
+        assert_eq!(reps.products.len(), 1);
+        assert_eq!(reps.products[0].product, "rws-reps-provider-statistics");
+        assert!(reps.products[0].surface_source);
+        assert!(!reps.products[0].pressure_source);
+        assert_eq!(
+            reps.limitations,
+            vec![
+                IngestCapabilityLimitation::ProviderStatisticsOnly,
+                IngestCapabilityLimitation::SurfaceOnly,
+                IngestCapabilityLimitation::DerivedProductsDisabled,
+            ]
+        );
+
         let unsupported = model_ingest_capability(ModelId::WrfGdex);
         assert_eq!(unsupported.status, IngestSupportStatus::Unsupported);
         assert_eq!(
@@ -1329,6 +1368,7 @@ mod tests {
                 ModelId::CmaGeps,
                 ModelId::Rdps,
                 ModelId::Hrdps,
+                ModelId::Reps,
                 ModelId::IconEu,
                 ModelId::IconD2,
                 ModelId::IconRu,
@@ -2545,6 +2585,59 @@ mod tests {
                 .count(),
             14
         );
+    }
+
+    #[test]
+    fn reps_fixture_pins_provider_statistics_and_excluded_member_contracts() {
+        let fixture = include_str!("../tests/fixtures/reps.20260814.t00z.f024.inventory.txt");
+        assert_eq!(fixture_header(fixture, "directory_listing_bytes"), "24022");
+        assert_eq!(fixture_header(fixture, "directory_grib2_links"), "103");
+        assert_eq!(
+            fixture_header(fixture, "directory_listing_sha256"),
+            "29b48053bea61ed7ec6df4c4ebb974c029183b17c6298a350c39a5831501f0cf"
+        );
+        assert_eq!(fixture_header(fixture, "live_decoded_grid"), "908x960");
+        assert_eq!(fixture_header(fixture, "selected_source_bytes"), "15308713");
+        assert_eq!(fixture_header(fixture, "selected_message_count"), "37");
+        assert_eq!(
+            fixture_header(fixture, "derived_code_4"),
+            "ensemble_spread-not-standard_deviation"
+        );
+        assert_eq!(
+            fixture_header(fixture, "precipitation_window"),
+            "start_f021,end_f024,length_3h,statistical_process_1"
+        );
+        assert_eq!(
+            fixture_header(fixture, "raw_member_policy"),
+            "disabled-contract-evidence-only"
+        );
+        assert_eq!(fixture_header(fixture, "raw_member_bytes"), "9108868");
+
+        let filenames = fixture
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(filenames.len(), 3);
+        for component in rustwx_models::reps_provider_statistic_components() {
+            assert!(filenames.iter().any(|name| name.contains(component)));
+        }
+        assert!(filenames.iter().all(|name| {
+            !name.contains("UGRD") && !name.contains("VGRD") && name.contains("-Prob_")
+        }));
+
+        let payloads = fixture
+            .lines()
+            .filter_map(|line| line.strip_prefix("# payload="))
+            .collect::<Vec<_>>();
+        assert_eq!(payloads.len(), 3);
+        for payload in payloads {
+            let parts = payload.split('|').collect::<Vec<_>>();
+            assert_eq!(parts.len(), 4);
+            assert!(parts[1].parse::<usize>().unwrap() > 0);
+            assert_eq!(parts[2].len(), 64);
+            assert!(parts[2].bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(parts[3].parse::<usize>().unwrap() > 0);
+        }
     }
 
     #[test]

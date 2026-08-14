@@ -1272,7 +1272,46 @@ fn every_ready_model_has_a_valid_cadence_profile_and_remote_source() {
         );
         plan.validate().unwrap();
     }
-    assert_eq!(ready, 29);
+    assert_eq!(ready, 30);
+}
+
+#[test]
+fn reps_plan_schedules_only_provider_statistics_from_f003_through_f072() {
+    let plan = JobPlan::build(ModelId::Reps, cycle("20260814", 0)).unwrap();
+    assert_eq!(plan.expected_valid_times.len(), 24);
+    assert_eq!(plan.expected_valid_times.first().unwrap().forecast_hour, 3);
+    assert_eq!(plan.expected_valid_times.last().unwrap().forecast_hour, 72);
+    assert!(
+        plan.expected_valid_times
+            .iter()
+            .all(|valid| valid.forecast_hour % 3 == 0)
+    );
+    assert_eq!(plan.ingest_products.len(), 1);
+    assert_eq!(
+        plan.ingest_products[0].product,
+        "rws-reps-provider-statistics"
+    );
+    assert!(plan.ingest_products[0].surface_source);
+    assert!(!plan.ingest_products[0].pressure_source);
+    assert_eq!(
+        plan.capability_limitations,
+        vec![
+            "provider_statistics_only",
+            "surface_only",
+            "derived_products_disabled",
+        ]
+    );
+    assert!(plan.ingest_profile.volumes.is_empty());
+    assert_eq!(
+        plan.ingest_profile
+            .surface_fields
+            .as_ref()
+            .expect("REPS persists an exact named statistics set")
+            .len(),
+        37
+    );
+    assert!(!plan.ingest_profile.derived && !plan.ingest_profile.heavy);
+    plan.validate().unwrap();
 }
 
 #[test]

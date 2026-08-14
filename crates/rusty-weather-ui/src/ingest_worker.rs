@@ -228,7 +228,11 @@ fn resolve_spec(
             supported.join(", ")
         ));
     }
-    let mut profile = IngestProfile::preset(&spec.profile)?;
+    let mut profile = if spec.profile == "surface" {
+        IngestProfile::surface_for_model(model)
+    } else {
+        IngestProfile::preset(&spec.profile)?
+    };
     profile.level_step_hpa = spec.level_step_hpa;
     profile.derived = spec.derived;
     profile.heavy = spec.heavy;

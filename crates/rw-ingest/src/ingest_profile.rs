@@ -28,7 +28,7 @@
 //! that stores only a named surface subset (and therefore skips the prs
 //! 2D planes) excludes their inputs and must be rejected up front.
 
-use rustwx_core::{CanonicalField, FieldSelector, ModelId, ProbabilitySelection};
+use rustwx_core::{CanonicalField, FieldProduct, FieldSelector, ModelId, ProbabilitySelection};
 
 /// The two supported isobaric level steps (hPa) over the 100..=1000 range.
 pub const LEVEL_STEPS_HPA: [u16; 2] = [25, 50];
@@ -710,20 +710,119 @@ fn cma_geps_statistics_surface_plan() -> Vec<(&'static str, FieldSelector)> {
     plan
 }
 
+fn append_reps_full_statistics(
+    plan: &mut Vec<(&'static str, FieldSelector)>,
+    names: [&'static str; 9],
+    selector: FieldSelector,
+) {
+    const PRODUCTS: [FieldProduct; 9] = [
+        FieldProduct::Percentile(10),
+        FieldProduct::Percentile(25),
+        FieldProduct::Percentile(50),
+        FieldProduct::Percentile(75),
+        FieldProduct::Percentile(90),
+        FieldProduct::EnsembleSpread,
+        FieldProduct::EnsembleMean,
+        FieldProduct::EnsembleMinimum,
+        FieldProduct::EnsembleMaximum,
+    ];
+    plan.extend(
+        names
+            .into_iter()
+            .zip(PRODUCTS)
+            .map(|(name, product)| (name, selector.with_product(product))),
+    );
+}
+
+/// Exact scalar statistics inventory admitted from ECCC REPS. Wind is the
+/// provider's scalar WIND product, so no grid-relative vector is mislabeled
+/// earth-relative. Every selector is explicitly statistical; raw members and
+/// deterministic/default selectors cannot enter this plan.
+fn reps_statistics_surface_plan() -> Vec<(&'static str, FieldSelector)> {
+    let mut plan = Vec::with_capacity(37);
+    append_reps_full_statistics(
+        &mut plan,
+        [
+            "temperature_2m_p10",
+            "temperature_2m_p25",
+            "temperature_2m_p50",
+            "temperature_2m_p75",
+            "temperature_2m_p90",
+            "temperature_2m_ensemble_spread",
+            "temperature_2m_ensemble_mean",
+            "temperature_2m_ensemble_min",
+            "temperature_2m_ensemble_max",
+        ],
+        FieldSelector::height_agl(CanonicalField::Temperature, 2),
+    );
+    append_reps_full_statistics(
+        &mut plan,
+        [
+            "wind_speed_10m_p10",
+            "wind_speed_10m_p25",
+            "wind_speed_10m_p50",
+            "wind_speed_10m_p75",
+            "wind_speed_10m_p90",
+            "wind_speed_10m_ensemble_spread",
+            "wind_speed_10m_ensemble_mean",
+            "wind_speed_10m_ensemble_min",
+            "wind_speed_10m_ensemble_max",
+        ],
+        FieldSelector::height_agl(CanonicalField::WindSpeed, 10),
+    );
+    append_reps_full_statistics(
+        &mut plan,
+        [
+            "total_precipitation_3h_p10",
+            "total_precipitation_3h_p25",
+            "total_precipitation_3h_p50",
+            "total_precipitation_3h_p75",
+            "total_precipitation_3h_p90",
+            "total_precipitation_3h_ensemble_spread",
+            "total_precipitation_3h_ensemble_mean",
+            "total_precipitation_3h_ensemble_min",
+            "total_precipitation_3h_ensemble_max",
+        ],
+        FieldSelector::surface(CanonicalField::TotalPrecipitation),
+    );
+    for (threshold_milli, name) in [
+        (1_000, "total_precipitation_3h_probability_gt_1mm"),
+        (2_500, "total_precipitation_3h_probability_gt_2p5mm"),
+        (5_000, "total_precipitation_3h_probability_gt_5mm"),
+        (10_000, "total_precipitation_3h_probability_gt_10mm"),
+        (15_000, "total_precipitation_3h_probability_gt_15mm"),
+        (20_000, "total_precipitation_3h_probability_gt_20mm"),
+        (25_000, "total_precipitation_3h_probability_gt_25mm"),
+        (30_000, "total_precipitation_3h_probability_gt_30mm"),
+        (40_000, "total_precipitation_3h_probability_gt_40mm"),
+        (50_000, "total_precipitation_3h_probability_gt_50mm"),
+    ] {
+        plan.push((
+            name,
+            FieldSelector::surface(CanonicalField::TotalPrecipitation).with_probability(
+                ProbabilitySelection::new(Some(3), Some(threshold_milli), None),
+            ),
+        ));
+    }
+    debug_assert_eq!(plan.len(), 37);
+    plan
+}
+
 /// Union of every stable direct-field name accepted by an ingest profile.
 /// Model-specific execution uses [`model_surface_plan`] so adding a provider
 /// statistics family does not inflate existing deterministic model stores.
 pub fn surface_plan() -> Vec<(&'static str, FieldSelector)> {
     let mut plan = base_surface_plan();
     plan.extend(cma_geps_statistics_surface_plan());
+    plan.extend(reps_statistics_surface_plan());
     plan
 }
 
 pub fn model_surface_plan(model: ModelId) -> Vec<(&'static str, FieldSelector)> {
-    if model == ModelId::CmaGeps {
-        cma_geps_statistics_surface_plan()
-    } else {
-        base_surface_plan()
+    match model {
+        ModelId::CmaGeps => cma_geps_statistics_surface_plan(),
+        ModelId::Reps => reps_statistics_surface_plan(),
+        _ => base_surface_plan(),
     }
 }
 
@@ -857,6 +956,55 @@ mod tests {
             IngestProfile::surface().surface_fields,
             FieldSet::Named(ref names) if names.len() == 26
         ));
+    }
+
+    #[test]
+    fn reps_plan_is_scalar_statistics_only_and_preserves_the_three_hour_window() {
+        let plan = model_surface_plan(ModelId::Reps);
+        assert_eq!(plan.len(), 37);
+        assert_eq!(
+            plan.iter()
+                .map(|(name, _)| *name)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            plan.len()
+        );
+        assert!(
+            plan.iter()
+                .all(|(_, selector)| selector.product != FieldProduct::Default)
+        );
+        assert!(plan.iter().all(|(_, selector)| !matches!(
+            selector.field,
+            CanonicalField::UWind | CanonicalField::VWind
+        )));
+        assert!(
+            plan.contains(&(
+                "temperature_2m_ensemble_spread",
+                FieldSelector::height_agl(CanonicalField::Temperature, 2)
+                    .with_product(FieldProduct::EnsembleSpread),
+            ))
+        );
+        assert!(plan.contains(&(
+            "total_precipitation_3h_p50",
+            FieldSelector::surface(CanonicalField::TotalPrecipitation).with_percentile(50),
+        )));
+        assert!(
+            plan.contains(&(
+                "total_precipitation_3h_probability_gt_2p5mm",
+                FieldSelector::surface(CanonicalField::TotalPrecipitation)
+                    .with_probability(ProbabilitySelection::new(Some(3), Some(2_500), None),),
+            ))
+        );
+        assert!(
+            plan.iter()
+                .filter(|(name, _)| name.starts_with("total_precipitation_3h_"))
+                .count()
+                == 19
+        );
+        assert_eq!(
+            IngestProfile::surface_for_model(ModelId::Reps).surface_fields,
+            FieldSet::Named(plan.iter().map(|(name, _)| (*name).to_string()).collect())
+        );
     }
 
     #[test]
