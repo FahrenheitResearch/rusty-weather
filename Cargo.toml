@@ -36,6 +36,7 @@ exclude = [
     "vendor/grib-core",
     "vendor/metrust",
     "vendor/netcrust/vendor/hdf5-reader",
+    "vendor/openjp2",
     "vendor/sharprs",
     "vendor/sharppyrs",
     "vendor/wx-core",
@@ -65,6 +66,10 @@ ureq = { version = "3", default-features = false, features = ["rustls-no-provide
 # package. Patches only apply from the workspace root, so the pin lives here.
 [patch.crates-io]
 hdf5-reader = { path = "vendor/netcrust/vendor/hdf5-reader" }
+# openjp2 0.6.1 stores a Rust `Layout` inside code blocks allocated and
+# zero-initialized by its C-style allocator.  Keep the decoder on the audited
+# local patch until that undefined behavior is fixed in a published release.
+openjp2 = { path = "vendor/openjp2" }
 
 # The WRF ECAPE golden corpus is pinned to ecape-rs 8292253. Keep that
 # algorithm revision while resolving its meteorology support crates to this

@@ -3545,8 +3545,6 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "openjp2"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8940f4ff209130c7b374730e83cc7e31062706520e3960001e7eedc982bc554"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
