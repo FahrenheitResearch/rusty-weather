@@ -5,7 +5,7 @@ document, not a claim that the feeds below are supported. Current support is
 reported only by [MODEL_SUPPORT.md](MODEL_SUPPORT.md) and the running service's
 `/v1/models` response.
 
-This inventory contains 55 deduplicated atmospheric model/domain lanes that
+This inventory contains 61 deduplicated atmospheric model/domain lanes that
 are not represented as working remote lanes in the current capability matrix.
 A lane is counted once even when it has both published statistics and raw
 members, or several delivery choices. Different resolutions of the same model
@@ -68,8 +68,9 @@ existing contract, `P2` needs a new bounded acquisition/format adapter, and
 `P3` is gated by a core storage or topology extension.
 
 Rank numbers are stable, append-only review identifiers so links and review
-notes do not churn. Rows 46-55 are the third discovery wave; use `Class` and
-the shared implementation sequence below for current execution priority.
+notes do not churn. Rows 46-55 are the third discovery wave and rows 56-61 are
+the fourth; use `Class` and the shared implementation sequence below for
+current execution priority.
 
 | Rank | Lane | Class | Native schedule and domain | Public data and first implementation slice |
 | ---: | --- | --- | --- | --- |
@@ -128,17 +129,24 @@ the shared implementation sequence below for current execution priority.
 | 53 | MeteoGalicia WRF ensemble Galicia 4 km | P3 | Galicia, daily 00Z, 21 raw members, hourly f001-f216 | OPeNDAP makes the multi-GB NetCDF files sliceable, but the dataset exposes no authoritative control/perturbed-member coordinate. Gate on an official member contract. |
 | 54 | MeteoGalicia WRF ensemble Iberia 12 km | P3 | Iberia and Bay of Biscay, daily 00Z, 21 raw members, hourly f001-f216 | Same member-identity gate as the 4 km ensemble; never guess that array index zero is the control. |
 | 55 | Google DeepMind WeatherNext 2 historical | P2/P3 | Global 0.25 degree, 00/06/12/18Z; 64 members and published mean, 6-hourly to 15 days | Scope the first adapter to data older than 48 hours and the published mean. Historical data are CC BY 4.0; current data have separate terms that prohibit an open RWS redistribution path. Raw members remain P3. |
+| 56 | CHMI ALADIN CZ1K | P3 | Czech Republic and nearby areas, 501x290 regular lat/lon near 1 km, 00/06/12/18Z; hourly f001-f072 | Anonymous one-variable cycle aggregates compressed with bzip2. The surface/derived-only feed is GRIB1 and uses local parameter 230 for precipitation type; ship the provider tables with the fixture and never guess unknown parameters. |
+| 57 | CHMI ALADIN Lambert 2.3 km | P3 | Central Europe, 1053x837 Lambert grid at 2325 m, 00/06/12/18Z; hourly f001-f072 | Anonymous per-variable GRIB1 aggregates, including a documented 17-level pressure suite. A complete current cycle is about 7.6 GiB compressed, so select field objects before transfer and enforce both bzip2 limits. |
+| 58 | ARSO ALADIN Slovenia 4 km | P3 | Slovenia and surroundings, 111x71 regular lat/lon near 4 km, 00/06/12/18Z; hourly f000-f072 | Anonymous ZIP containing 73 GRIB1 leads and a bounded surface/four-pressure-level inventory. Whole-package transfer is about 30 MB; preserve the ZIP manifest and cumulative-precipitation window. |
+| 59 | ARPAE-SIMC ICON-2I Emilia-Romagna crop | P2 | Emilia-Romagna, 153x81 regular lat/lon, 00/12Z; hourly f000-f072 | Anonymous single-cycle GRIB2, about 169 MB and 7,521 messages, with six pressure levels. No sidecar index is published: range-scan once, cache exact message offsets, and fail closed on provider-local unknown fields. |
+| 60 | RMI ALARO Belgium 4 km | P3 | Belgium and surroundings, 177x177 regular lat/lon near 4 km, 00/06/12/18Z; hourly f000-f060 | Anonymous per-variable GRIB1, about 362 MB for a current full run. Pressure fields carry 15 levels; provider local tables are mandatory for precipitation and other local concepts. |
+| 61 | UWC-West DINI-EPS Ireland | P3 | Ireland regional 2 km Lambert grids, hourly cycling; control to f060 and lagged 31-member ensemble to f054 | Met Eireann's near-real-time API delivers GRIB2 CCSDS. Five perturbed members arrive each hour and the full ensemble spans six reference times; preserve reference time, perturbation number, and accumulation resets, and never route duplicated filenames alone. |
 
 ### Shared implementation sequence
 
-Do not create 55 unrelated downloaders. Land the reusable contracts in this
+Do not create 61 unrelated downloaders. Land the reusable contracts in this
 order, then add thin provider manifests and canonical maps:
 
 1. Separate producer, licensing publisher, direct transport, and mirror in
    provenance. Make licence/attribution visible at run and API level.
 2. Add a bounded remote GRIB inventory scanner that can use byte ranges when a
    provider lacks `.idx`, plus an explicit WMO bulletin-wrapper decoder. This
-   unlocks CMA, Roshydromet, CWA, CPTEC/INPE, and later large package feeds.
+   unlocks CMA, Roshydromet, CWA, CPTEC/INPE, ARPAE-SIMC, and later large
+   package feeds.
 3. Add one bounded CF-NetCDF/OPeNDAP acquisition contract with dimension,
    chunk, response, and decompression ceilings. Use it for GEOS-FP, Met Office,
    MET Norway, Argentina SMN, GeoSphere Austria, and MeteoGalicia rather than
@@ -146,12 +154,13 @@ order, then add thin provider manifests and canonical maps:
 4. Add LAEA geometry before claiming UKV or MOGREPS-UK. Keep provider-native
    coordinates and grid mapping; any regrid is a derived product.
 5. Add ensemble member plus reference-time identity before raw GEPS, ECMWF,
-   MOGREPS, CFSv2, PEARP, SMHI MEPS, MeteoGalicia WRF, WeatherNext 2, or ICON
-   EPS members.
+   MOGREPS, CFSv2, PEARP, SMHI MEPS, MeteoGalicia WRF, WeatherNext 2,
+   DINI-EPS, or ICON EPS members.
 6. Add triangular topology before native global ICON, DWD ICON EPS, or
    MeteoSwiss ICON-CH. Do not silently substitute a local rectangular regrid.
 7. Decide whether GRIB1 is decoded in process or normalized by a separately
-   validated boundary tool before starting the three KNMI lanes.
+   validated boundary tool before starting KNMI, CHMI, ARSO, or RMI. Add
+   bounded bzip2/ZIP inventory contracts and pin every provider-local table.
 8. Add a fail-closed availability/licence-window policy before WeatherNext 2:
    historical objects older than 48 hours may enter the public adapter, while
    current data remain undiscoverable and unqueryable without different rights.
@@ -734,6 +743,149 @@ about 72 hours. The Netherlands deterministic archive began in 2026. Ensemble
 delivery is a rolling lagged ensemble, so member reference times and
 accumulation resets are part of the data model, not incidental metadata.
 
+### Czech Hydrometeorological Institute (CHMI) ALADIN
+
+Producer and licensing publisher: **Czech Hydrometeorological Institute
+(CHMI/CHMU)**. Transport is CHMI's `opendata.chmi.cz` host.
+
+- Official model root:
+  <https://opendata.chmi.cz/meteorology/weather/nwp_aladin/>
+- CZ1K cycles:
+  `https://opendata.chmi.cz/meteorology/weather/nwp_aladin/CZ_1km/{00|06|12|18}/`
+- Lambert cycles:
+  `https://opendata.chmi.cz/meteorology/weather/nwp_aladin/Lambert_2.3km/{00|06|12|18}/`
+- Official content workbook:
+  <https://opendata.chmi.cz/meteorology/weather/nwp_aladin/Popis_obsahu.xlsx>
+- Official open-data terms:
+  <https://www.chmi.cz/-/jak-mohu-pou%C5%BE%C3%ADvat-otev%C5%99en%C3%A1-data-%C4%8Dhm%C3%BA->
+
+Authentication is not required. Both feeds are bzip2-compressed GRIB1 split by
+variable and cycle, so HTTP byte ranges cannot select a GRIB message inside a
+compressed object. The 2026-08-14 listing retained two or three runs per cycle,
+roughly 48-72 hours. The newest CZ1K run had 31 objects totaling 230,578,224
+compressed bytes; the Lambert run had 154 totaling 8,132,319,060 bytes. The
+workbook defines CZ1K as a surface/derived product and Lambert as a larger
+native computational-domain product with 17 pressure levels.
+
+The bounded CZ1K precipitation-type fixture is
+`ALADCZ1K4opendata_2026081400_PRECIP_TYPE.grb.bz2`: 50,465 compressed bytes,
+SHA-256 `fdd24802551b200d9303a12cffafea1e664f28761963bb5d991bb102bb2a1b75`;
+20,978,496 decompressed bytes, SHA-256
+`1391cde07f96161c5a8abd37cb9e3b308058bc69383ffe30b7e664f01b46e625`.
+It contains 72 messages on a 501x290 regular grid and uses CHMI local parameter
+230. The provider's `gribtab` and `grib2table` are part of the decoding
+contract. A compact Lambert geometry fixture is
+`ALADLAMB4opendata_2026081400_SURFIND_TERREMER.grb.bz2`: one 1053x837 Lambert
+message, 13,019 compressed bytes, SHA-256
+`e86f810db630bcf9bb72107b487aa2104e46ed6e398a86bb1088d5b4bd756c7a`.
+
+### Slovenian Environment Agency (ARSO) ALADIN
+
+Producer and licensing publisher: **Slovenian Environment Agency (ARSO)**.
+Transport is ARSO's `meteo.arso.gov.si` host.
+
+- Official technical description:
+  <https://meteo.arso.gov.si/uploads/meteo/help/sl/NumericniRezultatiGRIB.html>
+- Direct model directory:
+  <https://meteo.arso.gov.si/uploads/probase/www/model/data/>
+- Official reuse statement:
+  <https://meteo.arso.gov.si/uploads/meteo/help/en/copyright.html>
+
+Authentication is not required. ARSO documents a 4 km Slovenia-domain ALADIN
+feed, refreshed every six hours, with f000-f072 hourly and a rolling 24-hour
+window. Each cycle is one ZIP with 73 GRIB1 files. The 2026-08-14 00Z package
+was 29,960,273 bytes, SHA-256
+`d98f7fb4d7516d29befaf5250989d0ff53b80968fda95022ee6e7529a903f7f4`;
+the archive expands to 34,403,440 bytes. Its f000 file contains 28 messages on
+a 111x71 regular grid, including a surface suite and 925/850/700/500 hPa
+fields. ZIP byte ranges are not a safe per-entry acquisition contract, but the
+whole package is small enough for an explicitly budgeted transfer. Preserve
+the f072 total-precipitation interval. Public reuse requires the exact source
+credit `Source: ARSO`.
+
+### ARPAE-SIMC ICON-2I
+
+Producer: **ARPAE-SIMC under the LAMI operational arrangement with the Italian
+Air Force Meteorological Service and ARPA Piemonte**. Licensing publisher:
+**ARPAE Emilia-Romagna**. Transport is `dati-simc.arpae.it`; do not derive the
+producer from the GRIB centre identifier.
+
+- Official catalogue:
+  <https://dati.arpae.it/it/dataset/previsioni-meteorologiche-numeriche-emilia-romagna>
+- Machine-readable catalogue record:
+  <https://dati.arpae.it/api/3/action/package_show?id=previsioni-meteorologiche-numeriche-emilia-romagna>
+- Direct cycle directory: <https://dati-simc.arpae.it/opendata/icon_2I/>
+
+The catalogue declares Creative Commons Attribution (`cc-by`, version not
+specified), describes ICON-2I over Italy at about 2.2 km, and publishes a
+regular-grid crop over Emilia-Romagna at 00/12Z through f072. Authentication is
+not required and the live directory retained about three days. The 2026-08-14
+00Z object was 176,815,667 bytes, SHA-256
+`38a8a877cab16ede8fdadf10722b2f833cb4ed52054ab11e8503879261e09cd4`.
+It contains 7,521 GRIB2 messages for 73 leads on a 153x81 grid, including six
+pressure levels. The host supports byte ranges but publishes no sidecar index;
+perform one bounded inventory scan, cache exact message offsets, and keep
+unresolved local fields unknown rather than mapping by resemblance.
+
+### Royal Meteorological Institute of Belgium (RMI/KMI) ALARO
+
+Producer and licensing publisher: **Royal Meteorological Institute of Belgium
+(RMI/KMI)**. Direct transport is `opendata.meteo.be`; the metadata also names
+`opendata24-me.oma.be` as an FTP transport, not a different producer.
+
+- Official ISO metadata:
+  <https://opendata.meteo.be/geonetwork/srv/eng/csw?request=GetRecordById&service=CSW&version=2.0.2&resultType=results&outputSchema=http://www.isotc211.org/2005/gmd&elementSetName=full&id=RMI_DATASET_ALARO>
+- Documentation: <https://opendata.meteo.be/documentation/?dataset=alaro&lang=en>
+- Direct run directory: <https://opendata.meteo.be/ftp/forecasts/alaro_40l/>
+- WCS capabilities:
+  <https://opendata.meteo.be/service/alaro/wcs?service=WCS&version=1.1.1&request=GetCapabilities>
+
+The official metadata declares CC BY 4.0 and a 4 km ALARO domain. Anonymous
+run directories publish 00/06/12/18Z, f000-f060 hourly, with about 24 hours of
+retention. A current run contained 34 per-variable GRIB1 files totaling
+379,572,710 bytes. The bounded 2 m temperature fixture was 2,871,758 bytes,
+SHA-256 `37e69437fb6e9fbe34cbe3deb8159f838a1fe99e91b9912507640bcbc50a8261`,
+and contains 61 messages on a 177x177 grid. The temperature file has 15
+pressure levels from 1000 through 100 hPa. Local tables such as
+`params227-1.tab` and `params227-228.tab` are mandatory: stock GRIB concepts can
+misclassify precipitation timing. If WCS is used as a bounded bridge, prove
+numerical and interval equivalence to the raw GRIB1 source.
+
+### UWC-West DINI-EPS through Met Eireann
+
+Producer: **UWC-West/DINI collaboration of Met Eireann, DMI, the Icelandic Met
+Office, and KNMI**. Licensing publisher: **Met Eireann**. Transport is
+`opendata.met.ie`; `opendata2.met.ie` is a second Met Eireann host, not a
+different producer.
+
+- Official high-value dataset record:
+  <https://data.gov.ie/dataset/numerical-weather-prediction-data/resource/1fefad43-8aa9-46cb-88f6-053e712cdafa>
+- Portal documentation: <https://opendata.met.ie/documentation>
+- Official collaboration description:
+  <https://www.met.ie/joining-forces-in-weather-forecasting-and-climate-research>
+- Near-real-time listing template:
+  `https://opendata.met.ie/data-portal/near-realtime/nwp?from={ISO}&to={ISO}`
+- Download template:
+  `https://opendata.met.ie/data-portal/near-realtime/download/nwp?files={files}`
+
+The public near-real-time API is anonymous but restricts listing queries to a
+small recent window; older archive preparation requires registration. Met
+Eireann documents the current DINI-EPS as HARMONIE-AROME 43h2.2.1 on 2 km
+Lambert grids with 90 vertical levels and hourly cycling. The control reaches
+f060; five perturbed members are delivered each hour through f054, so the
+31-member lagged ensemble spans six reference times. Products are GRIB2 with
+CCSDS packing and several nested domains/field suites.
+
+The bounded `fc2026081406+000grib2_enIoI` download was a 6,377,967-byte ZIP,
+SHA-256 `71e76a8e3986391e5d701daaeea6487189b4ffcf6de88331dbfdb24e14f89b22`.
+Its single 6,576,520-byte GRIB2 member has SHA-256
+`32c76bc5815d31fffb1d5ea5d54b45785002993311cd3fa0f1c984257029d1c5`,
+64 messages, a 229x386 Lambert grid, `perturbationNumber=1`, and
+`numberOfForecastsInEnsemble=31`. The listing can repeat a filename for
+different members, so validate the GRIB ensemble metadata after every download
+and persist the original reference time. The public record and portal declare
+CC BY 4.0 for Met Eireann's distributed product.
+
 ## Licence and attribution matrix
 
 Open download and permission to redistribute are separate checks. An adapter
@@ -764,6 +916,11 @@ are recorded.
 | `noaa-ncep` | US federal NOAA data are generally public-domain; retain dataset-specific notices | NOAA/NCEP as producer and NOMADS or NCEI only as transport | <https://www.noaa.gov/disclaimer> |
 | `meteoswiss` | STAC collections declare CC BY | Federal Office of Meteorology and Climatology MeteoSwiss, licence link, and change indication | The `license` and provider fields in the [ICON-CH1 collection](https://data.geo.admin.ch/api/stac/v1/collections/ch.meteoschweiz.ogd-forecasting-icon-ch1) |
 | `knmi` | HARMONIE open data is CC BY 4.0 | KNMI, licence link, and change indication | <https://english.knmidata.nl/open-data/harmonie> |
+| `chmi` | CHMI open data are published under CC BY 4.0 | Czech Hydrometeorological Institute, licence link, and change indication | <https://www.chmi.cz/-/jak-mohu-pou%C5%BE%C3%ADvat-otev%C5%99en%C3%A1-data-%C4%8Dhm%C3%BA-> |
+| `arso` | The official public-data statement permits reuse of the published meteorological products | Preserve the exact credit `Source: ARSO` with the source URL | <https://meteo.arso.gov.si/uploads/meteo/help/en/copyright.html> |
+| `arpae-simc` | The dataset catalogue declares Creative Commons Attribution; the record does not specify a version | ARPAE Emilia-Romagna as licensing publisher, ARPAE-SIMC/LAMI production provenance, catalogue URL, and change indication | <https://dati.arpae.it/it/dataset/previsioni-meteorologiche-numeriche-emilia-romagna> |
+| `rmi-belgium` | ALARO metadata declares CC BY 4.0 | Royal Meteorological Institute of Belgium, licence link, and change indication | [official ISO metadata](https://opendata.meteo.be/geonetwork/srv/eng/csw?request=GetRecordById&service=CSW&version=2.0.2&resultType=results&outputSchema=http://www.isotc211.org/2005/gmd&elementSetName=full&id=RMI_DATASET_ALARO) |
+| `uwc-west-dini` via `met-eireann` | Met Eireann's NWP dataset record declares CC BY 4.0 | UWC-West/DINI collaboration as producer, Met Eireann as licensing publisher, licence link, and change indication | <https://data.gov.ie/dataset/numerical-weather-prediction-data/resource/1fefad43-8aa9-46cb-88f6-053e712cdafa> |
 
 ## Adapter and fixture acceptance gates
 
@@ -872,10 +1029,32 @@ Provider-specific minimum fixtures:
   and one bounded signed-asset range with the signature removed from fixtures.
 - KNMI: API manifest, safe tar inventory, and the smallest legal GRIB1 sample;
   no support claim until edition-1 decode and rolling-member timing pass.
+- CHMI: dated listings for both grids, the pinned compressed and decompressed
+  hashes above, provider tables, CZ1K 501x290 and Lambert 1053x837 geometry,
+  bzip2 ceilings, and a negative plan proving the adapter will not fetch the
+  roughly 7.6 GiB Lambert cycle when only a sparse profile was requested.
+- ARSO: one four-cycle listing, ZIP central-directory inventory, compressed and
+  expanded ceilings, the 28-message f000 inventory, four pressure levels, and
+  an f072 accumulation golden. Reject missing, duplicate, or traversal entries
+  before extraction.
+- ARPAE-SIMC: catalogue JSON plus live cycle listing, bounded range inventory
+  of the 7,521-message GRIB2 object, 153x81 geometry, exact offsets for a small
+  surface/pressure/accumulation suite, and a negative map for every unresolved
+  local parameter.
+- RMI ALARO: metadata and run listing, 177x177 geometry, the 15-level pressure
+  suite, and precipitation decoded with the published local tables. If WCS is
+  the acquisition path, compare its values, missing cells, units, and interval
+  semantics against byte-identical roles from raw GRIB1.
+- DINI-EPS: a minimal near-real-time listing window and one explicitly selected
+  download. Assert GRIB `perturbationNumber`, forecast-count, reference time,
+  CCSDS decode, Lambert geometry, and accumulation start; include a negative
+  listing with duplicate filenames proving member routing never trusts the
+  filename. Do not expand the request window or infer the full lagged ensemble
+  until all expected reference-time/member roles have arrived.
 
 ## Watchlist and access gates
 
-These feeds are not included in the 55-lane implementation count. Recheck them
+These feeds are not included in the 61-lane implementation count. Recheck them
 periodically, but do not build a production adapter until the named gate is
 closed with an official source and a live bounded fixture.
 
@@ -891,6 +1070,7 @@ closed with an official source and a live bounded fixture.
 | ICPAC WRF East Africa rainfall products | [official dataset API](https://floodwatch.icpac.net/api/datasets), [WRF total-rainfall metadata](https://floodwatch.icpac.net/api/metadata/2769c1e8-97cb-4144-a460-cfca2f97ce3f), and [WRF extreme-rainfall metadata](https://floodwatch.icpac.net/api/metadata/a3a96f87-a5b5-4fb1-9bd0-603959ef6b25) | The live public products are derived daily total/extreme-rainfall COG/tile layers, not the full WRF state, and both official metadata records have a null licence field. | Obtain an ICPAC reuse/redistribution statement tied to the products and either locate the raw model grid or define an explicitly derived-rainfall canonical lane. |
 | Colombia IDEAM WRF | [official model portal](https://bart.ideam.gov.co/wrfideam/) and [live NetCDF directory](https://bart.ideam.gov.co/wrfideam/new_modelo/WRF00COLOMBIA/netcdf/) | Anonymous WRF NetCDF is live, but whole aggregates are tens of GB, the transport offers no observed server-side subset/index contract, and the portal's requested citation is not an explicit redistribution licence. | Tie an official commercial/redistribution licence to this exact dataset and prove a bounded variable/time acquisition path. |
 | India NCMRWF NCUM/NEPS | [official NCMRWF model guidance](https://nwp.ncmrwf.gov.in/model-guidance) and [SWFDP product portal](https://nwp.ncmrwf.gov.in/HomePage/index.php) | Official guidance documents NCUM/NEPS, but the public portal exposes charts and derived forecast products rather than a licensed, machine-readable raw model feed. The separate research portal requires registration. | Pin an official raw-object/API contract, access terms, redistribution permission, and one bounded grid fixture. |
+| HungaroMet AROME and WRF | [official NWP root](https://odp.met.hu/weather/nwp/), [AROME description](https://odp.met.hu/weather/nwp/AROME/Description_shortrange_forecast-AROME-en.pdf), [WRF description](https://odp.met.hu/weather/nwp/WRF/Description_shortrange_forecast-WRF-en.pdf), and [current terms](https://odp.met.hu/ODP_General_Term_of_Use.pdf) | Anonymous single-variable/single-lead ZIP-compressed NetCDF is live for four cycles daily: AROME to f048 on a 0.025-degree grid and WRF to f036 on a 499x394 grid. The current terms allow unmodified use but require prior written consent for modifications; RWS unit normalization and store-format conversion are modifications, so open download is not sufficient. | Obtain written permission covering automated normalization, adaptation, storage, and redistribution, or wait for revised terms. Persist the required source text `Database: Meteorological Database, HungaroMet Nonprofit Zrt.` |
 | WeatherNext 2 current data (48 hours or newer) | [official catalogue](https://developers.google.com/earth-engine/datasets/catalog/projects_gcp-public-data-weathernext_assets_weathernext_2_0_0) and [current-data terms](https://storage.googleapis.com/weathernext-public/terms-of-use.pdf) | Current-data rights are revocable/non-transferable and prohibit public sharing of raw/unmodified data; subsetting or format conversion alone does not create an open redistribution route. This restriction does not apply to the separately queued historical slice older than 48 hours. | Obtain a Google agreement that expressly permits the proposed RWS current-data API, or keep the server-side age gate permanently fail-closed. |
 
 ## Deliberately deferred adjacent feeds
