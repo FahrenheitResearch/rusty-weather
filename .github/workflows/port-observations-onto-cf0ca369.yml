@@ -115,11 +115,11 @@ jobs:
         run: |
           set -euo pipefail
           cargo +1.92.0 fmt --all
-          cargo +1.92.0 check --locked -p rw-observations -p rw-query -p rw-server --all-targets
-          cargo +1.92.0 test --locked -p rw-observations
-          cargo +1.92.0 test --locked -p rw-query
-          cargo +1.92.0 test --locked -p rw-server --lib
-          cargo +1.92.0 clippy --locked \
+          cargo +1.92.0 check -p rw-observations -p rw-query -p rw-server --all-targets
+          cargo +1.92.0 test -p rw-observations
+          cargo +1.92.0 test -p rw-query
+          cargo +1.92.0 test -p rw-server --lib
+          cargo +1.92.0 clippy \
             -p rw-observations -p rw-query -p rw-server \
             --all-targets --no-deps -- -D warnings
 
