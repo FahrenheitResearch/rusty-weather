@@ -1,0 +1,222 @@
+name: Port observations onto cf0ca369 v3
+
+on:
+  pull_request:
+    branches: [codex/windows-fetch-lock-fix-20260814]
+    paths:
+      - '.github/workflows/port-observations-cf0ca369-v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: port-observations-cf0ca369-v3
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  port-build-test-commit:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out exact final branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          ref: feat/rw-server-observations-satellite-final
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Verify exact requested base
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor cf0ca3693650153ff0f79a0e60c3ec2da7d0af01 HEAD
+          test "$(git merge-base cf0ca3693650153ff0f79a0e60c3ec2da7d0af01 HEAD)" = cf0ca3693650153ff0f79a0e60c3ec2da7d0af01
+          test "$(git rev-parse codex/windows-fetch-lock-fix-20260814)" = cf0ca3693650153ff0f79a0e60c3ec2da7d0af01
+
+      - name: Install Linux dependencies and Rust 1.92
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libgl1-mesa-dev libwayland-dev libx11-dev libxi-dev libxkbcommon-dev
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
+
+      - name: Recover observations patch
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/observations.patch.b64"
+          for part in $(seq -w 0 10); do
+            curl --fail --silent --show-error --location \
+              "https://raw.githubusercontent.com/FahrenheitResearch/rusty-weather/feat/unified-observations-rw-server/.github/bootstrap/unified-observations.patch.part-${part}" \
+              >> "$RUNNER_TEMP/observations.patch.b64"
+          done
+          base64 --decode "$RUNNER_TEMP/observations.patch.b64" \
+            | gzip --decompress > "$RUNNER_TEMP/observations.patch"
+          test -s "$RUNNER_TEMP/observations.patch"
+          grep -q 'crates/rw-observations/src/lib.rs' "$RUNNER_TEMP/observations.patch"
+
+      - name: Apply every clean implementation hunk
+        shell: bash {0}
+        run: |
+          set +e
+          git apply --reject --whitespace=fix "$RUNNER_TEMP/observations.patch"
+          status=$?
+          echo "git apply partial status=$status"
+          find . -name '*.rej' -print | sort
+          exit 0
+
+      - name: Resolve only the newer-tree integration seams
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/resolve_port.py" <<'PY'
+          from pathlib import Path
+
+          root = Path.cwd()
+          rejects = {path.relative_to(root) for path in root.rglob('*.rej')}
+          allowed = {
+              Path('Cargo.toml.rej'),
+              Path('crates/rw-query/src/lib.rs.rej'),
+              Path('crates/rw-server/src/lib.rs.rej'),
+              Path('crates/rw-server/src/routes.rs.rej'),
+          }
+          print('rejects:', sorted(map(str, rejects)), flush=True)
+          unexpected = rejects - allowed
+          if unexpected:
+              raise RuntimeError(f'unexpected rejected hunks: {sorted(map(str, unexpected))}')
+
+          def load(path: str) -> str:
+              return (root / path).read_text(encoding='utf-8')
+
+          def save(path: str, text: str) -> None:
+              (root / path).write_text(text, encoding='utf-8')
+
+          cargo = load('Cargo.toml')
+          member = '    "crates/rw-observations",\n'
+          if member not in cargo:
+              anchor = '    "crates/rw-query",\n'
+              if anchor not in cargo:
+                  raise RuntimeError('workspace rw-query member anchor missing')
+              cargo = cargo.replace(anchor, anchor + member, 1)
+              save('Cargo.toml', cargo)
+          print('workspace member resolved', flush=True)
+
+          query_lib = load('crates/rw-query/src/lib.rs')
+          old_export = 'pub use time::parse_legacy_run_origin_unix;'
+          new_export = (
+              'pub use time::{\n'
+              '    parse_legacy_observation_day_origin_unix, '
+              'parse_legacy_observation_hhmm_slot,\n'
+              '    parse_legacy_run_origin_unix,\n'
+              '};'
+          )
+          if new_export not in query_lib:
+              if old_export not in query_lib:
+                  raise RuntimeError('rw-query time export anchor missing')
+              query_lib = query_lib.replace(old_export, new_export, 1)
+              save('crates/rw-query/src/lib.rs', query_lib)
+          if 'query_profile_cycle_with_cancel' not in query_lib:
+              raise RuntimeError('newer profile-cycle API was lost')
+          print('rw-query exports resolved and profile-cycle preserved', flush=True)
+
+          server_lib = load('crates/rw-server/src/lib.rs')
+          module = 'pub mod observations;\n'
+          if module not in server_lib:
+              anchors = ('pub mod metrics;\n', 'pub mod jobs;\n')
+              for anchor in anchors:
+                  if anchor in server_lib:
+                      server_lib = server_lib.replace(anchor, anchor + module, 1)
+                      break
+              else:
+                  raise RuntimeError('rw-server module insertion anchor missing')
+              save('crates/rw-server/src/lib.rs', server_lib)
+          print('rw-server module resolved', flush=True)
+
+          routes = load('crates/rw-server/src/routes.rs')
+          private_request = 'struct RequestId(Uuid);'
+          shared_request = 'pub(crate) struct RequestId(pub(crate) Uuid);'
+          if shared_request not in routes:
+              if private_request not in routes:
+                  raise RuntimeError('RequestId anchor missing')
+              routes = routes.replace(private_request, shared_request, 1)
+
+          read_merge = '        .merge(crate::observations::read_router())\n'
+          if read_merge not in routes:
+              anchor = '        .route("/v1/analytics/spatial-series", post(spatial_series))\n'
+              if anchor not in routes:
+                  raise RuntimeError('operational router anchor missing')
+              routes = routes.replace(anchor, anchor + read_merge, 1)
+
+          write_merge = '        .merge(crate::observations::write_router())\n'
+          if write_merge not in routes:
+              anchor = '    let protected = Router::new()\n        .merge(operational)\n'
+              if anchor not in routes:
+                  raise RuntimeError('protected router anchor missing')
+              routes = routes.replace(anchor, anchor + write_merge, 1)
+
+          for preserved in (
+              '.route("/v1/models/{model}/latest-run", get(latest_run))',
+              '.route("/v1/profile-cycle", post(profile_cycle))',
+          ):
+              if preserved not in routes:
+                  raise RuntimeError(f'newer server API was lost: {preserved}')
+          save('crates/rw-server/src/routes.rs', routes)
+          print('rw-server routes resolved; latest-run/profile-cycle preserved', flush=True)
+
+          for reject in rejects:
+              (root / reject).unlink()
+
+          required = (
+              'crates/rw-observations/Cargo.toml',
+              'crates/rw-observations/src/lib.rs',
+              'crates/rw-observations/src/mrms.rs',
+              'crates/rw-observations/src/nexrad.rs',
+              'crates/rw-observations/src/mosaic.rs',
+              'crates/rw-server/src/observations.rs',
+              'docs/RW-SERVER-OBSERVATIONS.md',
+          )
+          missing = [path for path in required if not (root / path).is_file()]
+          if missing:
+              raise RuntimeError(f'missing ported implementation files: {missing}')
+          print('all normal source files present', flush=True)
+          PY
+          python3 -u "$RUNNER_TEMP/resolve_port.py"
+          leftovers="$(find . \( -name '*.rej' -o -name '*.orig' \) -print)"
+          test -z "$leftovers"
+          git diff --check
+
+      - name: Format and refresh lockfile
+        run: |
+          set -euo pipefail
+          cargo +1.92.0 fmt --all
+          cargo +1.92.0 check -p rw-observations -p rw-query -p rw-server --all-targets
+
+      - name: Locked compile, tests, and clippy
+        run: |
+          set -euo pipefail
+          cargo +1.92.0 check --locked -p rw-observations -p rw-query -p rw-server --all-targets
+          cargo +1.92.0 test --locked -p rw-observations
+          cargo +1.92.0 test --locked -p rw-query
+          cargo +1.92.0 test --locked -p rw-server --lib
+          cargo +1.92.0 clippy --locked \
+            -p rw-observations -p rw-query -p rw-server \
+            --all-targets --no-deps -- -D warnings
+
+      - name: Commit ordinary source and remove all temporary port workflows
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/port-observations-cf0ca369.yml
+          rm -f .github/workflows/port-observations-cf0ca369-v2.yml
+          rm -f .github/workflows/port-observations-cf0ca369-v3.yml
+          git add -A
+          git diff --cached --check
+          test ! -e .github/bootstrap
+          test -f crates/rw-observations/src/lib.rs
+          test -f crates/rw-server/src/observations.rs
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "feat: port unified observations onto cf0ca369"
+          git push origin HEAD:feat/rw-server-observations-satellite-final
