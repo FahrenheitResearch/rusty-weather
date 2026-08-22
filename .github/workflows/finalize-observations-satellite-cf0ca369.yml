@@ -1,0 +1,109 @@
+name: Finalize observations and satellite v2 on cf0ca369
+
+on:
+  push:
+    branches:
+      - feat/final-observations-satellite-v2-cf0ca369
+    paths:
+      - .github/workflows/finalize-observations-satellite-cf0ca369.yml
+      - .github/port-final/finalize.py
+
+permissions:
+  actions: read
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BASE_SHA: cf0ca3693650153ff0f79a0e60c3ec2da7d0af01
+  FINAL_BRANCH: feat/final-observations-satellite-v2-cf0ca369
+
+concurrency:
+  group: finalize-observations-satellite-cf0ca369
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out staging branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: feat/final-observations-satellite-v2-cf0ca369
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Preserve the source-port script
+        run: cp .github/port-final/finalize.py "$RUNNER_TEMP/finalize.py"
+
+      - name: Download correct-base observations source
+        uses: actions/download-artifact@v4
+        with:
+          name: rusty-weather-final-source
+          path: ${{ runner.temp }}/artifact
+          github-token: ${{ github.token }}
+          repository: FahrenheitResearch/rusty-weather
+          run-id: 32603137359
+
+      - name: Install correct-base observations checkout
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source"
+          tar -xzf "$RUNNER_TEMP/artifact/rusty-weather-final-source.tar.gz" -C "$RUNNER_TEMP/source"
+          rsync -a --delete --exclude=.git "$RUNNER_TEMP/source/" ./
+          git reset --mixed "$BASE_SHA"
+          python3 "$RUNNER_TEMP/finalize.py"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxi-dev \
+            libxkbcommon-dev
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
+
+      - name: Format and refresh the lock file
+        run: |
+          set -euo pipefail
+          cargo +1.92.0 fmt --all
+          cargo +1.92.0 generate-lockfile
+          cargo +1.92.0 fmt --all -- --check
+
+      - name: Publish a clean normal-source commit
+        run: |
+          set -euo pipefail
+          rm -rf .github/port-final
+          rm -f .github/workflows/finalize-observations-satellite-cf0ca369.yml
+          rm -f .github/workflows/port-observations-onto-cf0ca369.yml
+          rm -f .github/workflows/export-final-source.yml
+          rm -rf .github/bootstrap
+          git add -A
+          git diff --cached --check
+          test -f crates/rw-observations/src/lib.rs
+          test -f crates/rw-sat/src/products.rs
+          test -f crates/rw-server/src/satellite.rs
+          test -f .github/workflows/final-observations-satellite-ci.yml
+          test ! -e .github/port-final
+          test ! -e .github/bootstrap
+          tree=$(git write-tree)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          commit=$(printf '%s\n' 'feat: unified observations and satellite v2 on cf0ca369' | git commit-tree "$tree" -p "$BASE_SHA")
+          git reset --hard "$commit"
+          git push --force origin "HEAD:$FINAL_BRANCH"
+          echo "FINAL_SOURCE_SHA=$commit" >> "$GITHUB_ENV"
+
+      - name: Validate exact published source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          cargo +1.92.0 check --locked --workspace --all-targets
+          cargo +1.92.0 test --locked -p rw-sat -p rw-observations -p rw-query -p rw-server
+          cargo +1.92.0 clippy --locked \
+            -p rw-sat -p rw-observations -p rw-query -p rw-server \
+            --all-targets --no-deps -- -D warnings
+          echo "validated source commit $FINAL_SOURCE_SHA"
