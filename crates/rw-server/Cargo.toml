@@ -27,6 +27,7 @@ rw-ingest = { path = "../rw-ingest" }
 rw-observations = { path = "../rw-observations" }
 rw-query = { path = "../rw-query" }
 rw-scheduler = { path = "../rw-scheduler" }
+rw-sat = { path = "../rw-sat" }
 rw-store = { path = "../rw-store" }
 rustwx-core = { path = "../rustwx-core" }
 rustwx-models = { path = "../rustwx-models" }

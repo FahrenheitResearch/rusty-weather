@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Timelike, Utc};
 
 use crate::abi::read_goes_abi_field;
+use crate::archive::{archive_goes_source, automatic_preview_stride, prune_native_archive};
 use crate::events::{SatError, SatEvent, other};
 use crate::goes::{GoesSatellite, parse_goes_abi_filename};
 use crate::s3::{
@@ -55,7 +56,7 @@ pub struct FollowConfig {
     pub poll_interval: Option<Duration>,
     /// +/- jitter fraction applied to every sleep (default 0.2).
     pub jitter_frac: f64,
-    /// Per-band stride decimation before storing (1 = native).
+    /// Preview stride: 0 chooses an automatic bounded preview; native source is always retained.
     pub downsample: usize,
     pub window: WindowConfig,
     /// Stop after this many poll cycles (`None` = run until cancelled).
@@ -76,7 +77,7 @@ impl FollowConfig {
             cache_dir: PathBuf::from("cache"),
             poll_interval: None,
             jitter_frac: 0.2,
-            downsample: 1,
+            downsample: 0,
             window: WindowConfig::default(),
             max_polls: None,
             max_frames: None,
@@ -300,7 +301,18 @@ pub fn fetch_and_ingest(
     });
 
     let field = read_goes_abi_field(&download.path, "CMI").map_err(to_send_sync)?;
-    let field = downsample_field(field, downsample);
+    archive_goes_source(store_root, &download.path, &field.scene, &object.key)
+        .map_err(to_send_sync)?;
+    let preview_stride = if downsample == 0 {
+        automatic_preview_stride(
+            field.scene.fixed_grid.nx,
+            field.scene.fixed_grid.ny,
+            8_000_000,
+        )
+    } else {
+        downsample
+    };
+    let field = downsample_field(field, preview_stride);
     let frame = write_band_frame(store_root, &field, written_unix).map_err(to_send_sync)?;
     sink(SatEvent::FrameWritten {
         model: frame.model.clone(),
@@ -533,6 +545,29 @@ pub fn follow(
                         Ok(_) => {}
                         Err(err) => sink(SatEvent::Warning {
                             message: format!("window eviction: {err}"),
+                        }),
+                    }
+                    let archive_max_bytes = config
+                        .window
+                        .max_bytes
+                        .map(|bytes| bytes.saturating_mul(config.bands.len().max(1) as u64));
+                    match prune_native_archive(
+                        &config.store_root,
+                        &frame.model,
+                        config.sector.slug(),
+                        Utc::now(),
+                        config.window.max_age_minutes,
+                        archive_max_bytes,
+                    ) {
+                        Ok(report) if report.removed_frames > 0 => sink(SatEvent::Info {
+                            message: format!(
+                                "native archive pruned: {} frame(s), {} bytes",
+                                report.removed_frames, report.removed_bytes
+                            ),
+                        }),
+                        Ok(_) => {}
+                        Err(err) => sink(SatEvent::Warning {
+                            message: format!("native archive eviction: {err}"),
                         }),
                     }
                     Ok(())

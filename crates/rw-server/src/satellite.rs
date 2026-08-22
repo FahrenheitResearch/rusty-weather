@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use rw_sat::{
-    DEFAULT_TILE_SIZE, MAXIMUM_TILE_ZOOM, GoesAbiProduct, SatelliteEnhancement,
+    DEFAULT_TILE_SIZE, GoesAbiProduct, MAXIMUM_TILE_ZOOM, SatelliteEnhancement,
     SatelliteProductDescriptor, SatelliteSectorDescriptor, list_native_frames, product_catalog,
     render_native_xyz_tile, sector_catalog,
 };
@@ -308,15 +308,15 @@ async fn tile(
                 path.y,
                 DEFAULT_TILE_SIZE,
             )
+            .map_err(|error| error.to_string())
         })
         .await;
     match result {
         Ok(Ok(tile)) => {
             let mut response = Response::new(Body::from(tile.png));
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("image/png"),
-            );
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
             response.headers_mut().insert(
                 header::CACHE_CONTROL,
                 HeaderValue::from_static(if requested_latest {
@@ -326,14 +326,10 @@ async fn tile(
                 }),
             );
             if let Ok(value) = HeaderValue::from_str(&tile.frame_id) {
-                response
-                    .headers_mut()
-                    .insert("x-rw-satellite-frame", value);
+                response.headers_mut().insert("x-rw-satellite-frame", value);
             }
             if let Ok(value) = HeaderValue::from_str(&tile.valid_unix.to_string()) {
-                response
-                    .headers_mut()
-                    .insert("x-rw-valid-unix", value);
+                response.headers_mut().insert("x-rw-valid-unix", value);
             }
             response
         }
@@ -358,9 +354,26 @@ fn satellite_io_problem(error: io::Error, request_id: uuid::Uuid) -> Response {
     }
 }
 
-fn satellite_render_problem(error: Box<dyn std::error::Error>, request_id: uuid::Uuid) -> Response {
-    if let Some(error) = error.downcast_ref::<io::Error>() {
-        return satellite_io_problem(io::Error::new(error.kind(), error.to_string()), request_id);
+fn satellite_render_problem(error: String, request_id: uuid::Uuid) -> Response {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("not found")
+        || normalized.contains("no complete satellite frame")
+        || normalized.contains("is incomplete")
+        || normalized.contains("has no abi")
+    {
+        return ProblemDetails::not_found(request_id).into_response();
+    }
+    if normalized.contains("invalid")
+        || normalized.contains("outside")
+        || normalized.contains("exceeds")
+        || normalized.contains("must be")
+    {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "INVALID_SATELLITE_TILE",
+            "The satellite tile request is invalid.",
+            request_id,
+        );
     }
     error!(%request_id, %error, "satellite tile render failed");
     ProblemDetails::internal(request_id).into_response()
@@ -384,6 +397,12 @@ fn problem(
     detail: &'static str,
     request_id: uuid::Uuid,
 ) -> Response {
-    ProblemDetails::new(status, code, "Satellite request rejected", detail, request_id)
-        .into_response()
+    ProblemDetails::new(
+        status,
+        code,
+        "Satellite request rejected",
+        detail,
+        request_id,
+    )
+    .into_response()
 }

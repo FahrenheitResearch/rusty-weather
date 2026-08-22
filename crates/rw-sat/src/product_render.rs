@@ -19,12 +19,7 @@ where
     F: FnMut(u8) -> Result<f32, Box<dyn Error>>,
 {
     if product == GoesAbiProduct::GeoColor {
-        return render_geocolor_pixel(
-            valid_unix,
-            latitude_deg,
-            longitude_deg,
-            &mut band_value,
-        );
+        return render_geocolor_pixel(valid_unix, latitude_deg, longitude_deg, &mut band_value);
     }
     if product == GoesAbiProduct::TrueColor {
         return render_true_color_pixel(&mut band_value);
@@ -49,8 +44,8 @@ fn render_geocolor_pixel<F>(
 where
     F: FnMut(u8) -> Result<f32, Box<dyn Error>>,
 {
-    let solar_elevation = solar_elevation_deg(valid_unix, latitude_deg, longitude_deg)
-        .unwrap_or(-90.0);
+    let solar_elevation =
+        solar_elevation_deg(valid_unix, latitude_deg, longitude_deg).unwrap_or(-90.0);
     let day_weight = daylight_weight(solar_elevation);
 
     let night = geocolor_night(band_value(13)?);
@@ -69,11 +64,7 @@ fn render_true_color_pixel<F>(band_value: &mut F) -> Result<Rgba, Box<dyn Error>
 where
     F: FnMut(u8) -> Result<f32, Box<dyn Error>>,
 {
-    Ok(geocolor_day(
-        band_value(1)?,
-        band_value(2)?,
-        band_value(3)?,
-    ))
+    Ok(geocolor_day(band_value(1)?, band_value(2)?, band_value(3)?))
 }
 
 fn geocolor_day(c01: f32, c02: f32, c03: f32) -> Rgba {

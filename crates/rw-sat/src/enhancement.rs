@@ -244,8 +244,14 @@ mod tests {
 
     #[test]
     fn visible_and_ir_have_expected_orientation() {
-        assert!(SatelliteEnhancement::Visible.color(0.8)[0] > SatelliteEnhancement::Visible.color(0.1)[0]);
-        assert!(SatelliteEnhancement::InfraredGrayscale.color(200.0)[0] > SatelliteEnhancement::InfraredGrayscale.color(310.0)[0]);
+        assert!(
+            SatelliteEnhancement::Visible.color(0.8)[0]
+                > SatelliteEnhancement::Visible.color(0.1)[0]
+        );
+        assert!(
+            SatelliteEnhancement::InfraredGrayscale.color(200.0)[0]
+                > SatelliteEnhancement::InfraredGrayscale.color(310.0)[0]
+        );
         assert_eq!(SatelliteEnhancement::Visible.color(f32::NAN), TRANSPARENT);
     }
 }

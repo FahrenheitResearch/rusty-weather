@@ -28,9 +28,9 @@ pub mod tile;
 pub mod window;
 
 pub use archive::{
-    NATIVE_SOURCE_ARCHIVE_DIR, NativeArchivePruneReport, NativeSatelliteFrame,
-    archive_goes_source, automatic_preview_stride, list_native_frames, native_archive_root,
-    prune_native_archive, resolve_native_frame,
+    NATIVE_SOURCE_ARCHIVE_DIR, NativeArchivePruneReport, NativeSatelliteFrame, archive_goes_source,
+    automatic_preview_stride, list_native_frames, native_archive_root, prune_native_archive,
+    resolve_native_frame,
 };
 pub use enhancement::{SatelliteEnhancement, default_enhancement_for_channel};
 pub use events::{NEVER_CANCEL, SatError, SatEvent, print_event};

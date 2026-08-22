@@ -1036,6 +1036,7 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
         .route("/v1/geographic-window", post(geographic_window))
         .route("/v1/analytics/spatial-series", post(spatial_series))
         .merge(crate::observations::read_router())
+        .merge(crate::satellite::read_router())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_origin_catalog_ready,

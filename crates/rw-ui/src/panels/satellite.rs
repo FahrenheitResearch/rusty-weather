@@ -26,8 +26,7 @@ pub struct SatFollowSpec {
     pub satellite: String,
     /// Sector slug: "conus" | "full_disk" | "meso1" | "meso2".
     pub sector: String,
-    /// Layer slug: a band ("c13") or an RGB composite ("geocolor" — the
-    /// host expands it to the required bands).
+    /// User-facing product slug such as "geocolor", "clean_ir", or "c13".
     pub layer: String,
     /// Poll on the sector's default interval.
     pub auto_interval: bool,
@@ -39,7 +38,7 @@ pub struct SatFollowSpec {
     /// Rolling window: evict oldest frames beyond `max_gb` per band.
     pub size_enabled: bool,
     pub max_gb: f32,
-    /// Stride decimation before storing (1 = native resolution).
+    /// Internal preview stride (0 = automatic); native source is retained separately.
     pub downsample: usize,
     /// Raw NetCDF byte cache directory.
     pub cache_dir: String,
@@ -50,14 +49,14 @@ impl Default for SatFollowSpec {
         Self {
             satellite: "goes19".to_string(),
             sector: "conus".to_string(),
-            layer: "c13".to_string(),
+            layer: "geocolor".to_string(),
             auto_interval: true,
             interval_secs: 30,
             keep_enabled: true,
             keep_hours: 6.0,
             size_enabled: true,
             max_gb: 2.0,
-            downsample: 1,
+            downsample: 0,
             cache_dir: "out/cache".to_string(),
         }
     }
@@ -424,7 +423,7 @@ impl SatellitePanel {
                 .unwrap_or_else(|| self.spec.sector.clone());
             ComboBox::from_id_salt("rw-ui-sat-sector")
                 .selected_text(selected)
-                .width(120.0)
+                .width(180.0)
                 .show_ui(ui, |ui| {
                     for option in &self.sector_options {
                         ui.selectable_value(
@@ -494,24 +493,14 @@ impl SatellitePanel {
                     .weak(),
                 );
             }
-            ui.label("Detail");
-            ComboBox::from_id_salt("rw-ui-sat-downsample")
-                .selected_text(downsample_label(self.spec.downsample))
-                .width(110.0)
-                .show_ui(ui, |ui| {
-                    for step in [1usize, 2, 4] {
-                        ui.selectable_value(
-                            &mut self.spec.downsample,
-                            step,
-                            downsample_label(step),
-                        );
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "stride decimation before storing — keeps hi-res visible \
-                     bands (C02 is 0.5 km) at a sane store size",
-                );
+            ui.label(
+                RichText::new("Native source retained · preview optimized automatically")
+                    .small()
+                    .weak(),
+            )
+            .on_hover_text(
+                "Full-resolution NetCDF remains available to rw-server; the desktop preview chooses a bounded stride automatically.",
+            );
         });
 
         ui.horizontal(|ui| {
@@ -688,13 +677,6 @@ impl SatellitePanel {
                         });
                 });
         }
-    }
-}
-
-fn downsample_label(step: usize) -> String {
-    match step {
-        1 => "native".to_string(),
-        step => format!("1/{step} res"),
     }
 }
 

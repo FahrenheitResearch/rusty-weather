@@ -12,7 +12,7 @@ use std::path::Path;
 use image::ImageEncoder;
 
 use crate::abi::{GoesAbiField, GoesAbiScene, read_goes_abi_field_window, read_goes_abi_scene};
-use crate::archive::{NativeSatelliteFrame, resolve_native_frame};
+use crate::archive::resolve_native_frame;
 use crate::composite::{TRANSPARENT, bilinear_f32, bracket_axis};
 use crate::geostationary::lat_lon_to_scan_angles_fast;
 use crate::product::GoesAbiProduct;
@@ -262,8 +262,7 @@ fn tile_coordinates(zoom: u8, tile_x: u32, tile_y: u32, tile_size: u32) -> Vec<(
             .to_degrees()
             .clamp(-85.051_128_78, 85.051_128_78);
         for pixel_x in 0..tile_size {
-            let world_x =
-                (f64::from(tile_x) + (f64::from(pixel_x) + 0.5) / tile_size_f64) / scale;
+            let world_x = (f64::from(tile_x) + (f64::from(pixel_x) + 0.5) / tile_size_f64) / scale;
             let longitude = world_x * 360.0 - 180.0;
             coordinates.push((latitude as f32, longitude as f32));
         }

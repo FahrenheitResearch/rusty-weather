@@ -97,18 +97,12 @@ impl GoesAbiProduct {
         }
         match normalized.as_str() {
             "geocolor" | "geo_color" | "visible_ir" => Some(Self::GeoColor),
-            "true_color" | "truecolour" | "true_colour" | "natural_color" => {
-                Some(Self::TrueColor)
-            }
+            "true_color" | "truecolour" | "true_colour" | "natural_color" => Some(Self::TrueColor),
             "clean_ir" | "ir" | "infrared" | "clean_window" | "cmi_c13" => {
                 Some(Self::CleanInfrared)
             }
-            "enhanced_ir" | "enhanced_infrared" | "ir_enhanced" => {
-                Some(Self::EnhancedInfrared)
-            }
-            "shortwave_ir" | "shortwave_infrared" | "swir" => {
-                Some(Self::ShortwaveInfrared)
-            }
+            "enhanced_ir" | "enhanced_infrared" | "ir_enhanced" => Some(Self::EnhancedInfrared),
+            "shortwave_ir" | "shortwave_infrared" | "swir" => Some(Self::ShortwaveInfrared),
             "upper_water_vapor" | "upper_wv" | "wv_upper" => Some(Self::UpperWaterVapor),
             "mid_water_vapor" | "middle_water_vapor" | "mid_wv" | "water_vapor" | "wv" => {
                 Some(Self::MidWaterVapor)
@@ -118,9 +112,9 @@ impl GoesAbiProduct {
             "dust" | "dust_rgb" => Some(Self::Dust),
             "fire_temperature" | "fire_temp" | "fire_rgb" => Some(Self::FireTemperature),
             "day_cloud_phase" | "cloud_phase_rgb" => Some(Self::DayCloudPhase),
-            "day_night_cloud_microphysics" | "day_night_cloud_micro_combo" | "cloud_microphysics" => {
-                Some(Self::DayNightCloudMicrophysics)
-            }
+            "day_night_cloud_microphysics"
+            | "day_night_cloud_micro_combo"
+            | "cloud_microphysics" => Some(Self::DayNightCloudMicrophysics),
             "sandwich" | "sandwich_rgb" => Some(Self::Sandwich),
             "cloud_phase" | "cloud_top_phase" => Some(Self::CloudPhase),
             "ozone" => Some(Self::Ozone),
@@ -189,15 +183,25 @@ impl GoesAbiProduct {
                 "Pseudo-natural daytime color blended smoothly into clean-window infrared at night."
             }
             Self::TrueColor => "Daylight pseudo-true-color imagery from ABI C01, C02, and C03.",
-            Self::CleanInfrared => "10.3 µm clean-window brightness temperature in familiar grayscale.",
-            Self::EnhancedInfrared => "10.3 µm clean-window infrared with cold-cloud-top enhancement.",
-            Self::ShortwaveInfrared => "3.9 µm shortwave infrared for low cloud, fog, and hot spots.",
+            Self::CleanInfrared => {
+                "10.3 µm clean-window brightness temperature in familiar grayscale."
+            }
+            Self::EnhancedInfrared => {
+                "10.3 µm clean-window infrared with cold-cloud-top enhancement."
+            }
+            Self::ShortwaveInfrared => {
+                "3.9 µm shortwave infrared for low cloud, fog, and hot spots."
+            }
             Self::UpperWaterVapor => "6.2 µm upper-tropospheric water vapor.",
             Self::MidWaterVapor => "6.9 µm mid-tropospheric water vapor.",
             Self::LowerWaterVapor => "7.3 µm lower-tropospheric water vapor.",
-            Self::AirMass => "Air-mass RGB emphasizing stratospheric intrusions and thermal contrasts.",
+            Self::AirMass => {
+                "Air-mass RGB emphasizing stratospheric intrusions and thermal contrasts."
+            }
             Self::Dust => "Dust RGB using split-window and thermal differences.",
-            Self::FireTemperature => "Fire-temperature RGB for active hot spots and burn intensity.",
+            Self::FireTemperature => {
+                "Fire-temperature RGB for active hot spots and burn intensity."
+            }
             Self::DayCloudPhase => "Daylight cloud phase and particle-size RGB.",
             Self::DayNightCloudMicrophysics => "Twenty-four-hour cloud microphysics RGB.",
             Self::Sandwich => "Visible texture combined with infrared cloud-top temperature.",
@@ -206,15 +210,15 @@ impl GoesAbiProduct {
             Self::LongwaveInfrared => "11.2 µm longwave infrared.",
             Self::DirtyInfrared => "12.3 µm dirty-window infrared.",
             Self::Co2Infrared => "13.3 µm CO₂ longwave infrared.",
-            Self::RawChannel(_) => "Calibrated native ABI channel with its conventional default enhancement.",
+            Self::RawChannel(_) => {
+                "Calibrated native ABI channel with its conventional default enhancement."
+            }
         }
     }
 
     pub const fn category(self) -> SatelliteProductCategory {
         match self {
-            Self::GeoColor | Self::CleanInfrared | Self::EnhancedInfrared | Self::MidWaterVapor => {
-                SatelliteProductCategory::Favorites
-            }
+            Self::GeoColor => SatelliteProductCategory::Favorites,
             Self::TrueColor => SatelliteProductCategory::Visible,
             Self::CleanInfrared
             | Self::EnhancedInfrared
@@ -373,21 +377,26 @@ pub fn product_catalog(include_raw_channels: bool) -> Vec<SatelliteProductDescri
 }
 
 pub fn sector_catalog() -> Vec<SatelliteSectorDescriptor> {
-    [Sector::FullDisk, Sector::Conus, Sector::Meso1, Sector::Meso2]
-        .into_iter()
-        .map(|sector| SatelliteSectorDescriptor {
-            id: sector.slug().to_string(),
-            title: match sector {
-                Sector::FullDisk => "Full Disk · 10 minute",
-                Sector::Conus => "CONUS · 5 minute",
-                Sector::Meso1 => "Mesoscale 1 · 1 minute",
-                Sector::Meso2 => "Mesoscale 2 · 1 minute",
-            }
-            .to_string(),
-            cadence_seconds: sector.cadence_secs(),
-            default_poll_seconds: sector.default_poll_secs(),
-        })
-        .collect()
+    [
+        Sector::FullDisk,
+        Sector::Conus,
+        Sector::Meso1,
+        Sector::Meso2,
+    ]
+    .into_iter()
+    .map(|sector| SatelliteSectorDescriptor {
+        id: sector.slug().to_string(),
+        title: match sector {
+            Sector::FullDisk => "Full Disk · 10 minute",
+            Sector::Conus => "CONUS · 5 minute",
+            Sector::Meso1 => "Mesoscale 1 · 1 minute",
+            Sector::Meso2 => "Mesoscale 2 · 1 minute",
+        }
+        .to_string(),
+        cadence_seconds: sector.cadence_secs(),
+        default_poll_seconds: sector.default_poll_secs(),
+    })
+    .collect()
 }
 
 pub const fn channel_resolution_km(channel: u8) -> f32 {
@@ -421,7 +430,22 @@ pub const fn abi_channel_name(channel: u8) -> &'static str {
 }
 
 const RAW_CHANNELS: [[u8; 1]; 16] = [
-    [1], [2], [3], [4], [5], [6], [7], [8], [9], [10], [11], [12], [13], [14], [15], [16],
+    [1],
+    [2],
+    [3],
+    [4],
+    [5],
+    [6],
+    [7],
+    [8],
+    [9],
+    [10],
+    [11],
+    [12],
+    [13],
+    [14],
+    [15],
+    [16],
 ];
 
 const fn raw_channel_slice(channel: u8) -> &'static [u8] {
@@ -438,10 +462,22 @@ mod tests {
 
     #[test]
     fn aliases_resolve_to_expected_products() {
-        assert_eq!(GoesAbiProduct::parse("visible-ir"), Some(GoesAbiProduct::GeoColor));
-        assert_eq!(GoesAbiProduct::parse("ir"), Some(GoesAbiProduct::CleanInfrared));
-        assert_eq!(GoesAbiProduct::parse("water vapor"), Some(GoesAbiProduct::MidWaterVapor));
-        assert_eq!(GoesAbiProduct::parse("C13"), Some(GoesAbiProduct::RawChannel(13)));
+        assert_eq!(
+            GoesAbiProduct::parse("visible-ir"),
+            Some(GoesAbiProduct::GeoColor)
+        );
+        assert_eq!(
+            GoesAbiProduct::parse("ir"),
+            Some(GoesAbiProduct::CleanInfrared)
+        );
+        assert_eq!(
+            GoesAbiProduct::parse("water vapor"),
+            Some(GoesAbiProduct::MidWaterVapor)
+        );
+        assert_eq!(
+            GoesAbiProduct::parse("C13"),
+            Some(GoesAbiProduct::RawChannel(13))
+        );
     }
 
     #[test]

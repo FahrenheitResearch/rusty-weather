@@ -137,7 +137,10 @@ pub fn archive_goes_source(
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("native frame identity mismatch at {}", manifest_path.display()),
+            format!(
+                "native frame identity mismatch at {}",
+                manifest_path.display()
+            ),
         ));
     }
     let relative_path = target
@@ -237,7 +240,10 @@ pub fn resolve_native_frame(
     if !manifest.is_complete_for(product) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("satellite frame {frame} is incomplete for {}", product.slug()),
+            format!(
+                "satellite frame {frame} is incomplete for {}",
+                product.slug()
+            ),
         ));
     }
     Ok(manifest)
@@ -318,7 +324,9 @@ pub fn prune_native_archive(
         report.removed_frames += 1;
         report.removed_bytes = report.removed_bytes.saturating_add(bytes);
         if let Some(day) = path.parent()
-            && day.read_dir().is_ok_and(|mut entries| entries.next().is_none())
+            && day
+                .read_dir()
+                .is_ok_and(|mut entries| entries.next().is_none())
         {
             let _ = fs::remove_dir(day);
         }
@@ -340,13 +348,12 @@ fn frame_id(time: DateTime<Utc>) -> String {
 }
 
 fn valid_frame_id(value: &str) -> bool {
-    value.len() == 13
-        && value.as_bytes()[8] == b'T'
-        && value[..8].bytes().all(|byte| byte.is_ascii_digit())
-        && value[9..].bytes().all(|byte| byte.is_ascii_digit())
-        && Utc
-            .datetime_from_str(value, "%Y%m%dT%H%M")
-            .is_ok()
+    let bytes = value.as_bytes();
+    bytes.len() == 13
+        && bytes[8] == b'T'
+        && bytes[..8].iter().all(u8::is_ascii_digit)
+        && bytes[9..].iter().all(u8::is_ascii_digit)
+        && chrono::NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M").is_ok()
 }
 
 fn normalize_component(value: &str) -> io::Result<String> {

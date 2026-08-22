@@ -20,6 +20,7 @@ pub mod openapi;
 pub mod origin_catalog;
 pub mod problem;
 pub mod routes;
+pub mod satellite;
 pub mod state;
 
 pub use auth::{AuthError, TokenSet};

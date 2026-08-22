@@ -18,9 +18,12 @@ pub fn solar_elevation_deg(valid_unix: i64, latitude_deg: f64, longitude_deg: f6
     let hour = f64::from(time.hour())
         + f64::from(time.minute()) / 60.0
         + f64::from(time.second()) / 3600.0;
-    let days = if time.year_ce().1 % 4 == 0 { 366.0 } else { 365.0 };
-    let gamma = std::f64::consts::TAU / days
-        * (f64::from(time.ordinal0()) + (hour - 12.0) / 24.0);
+    let days = if time.year_ce().1 % 4 == 0 {
+        366.0
+    } else {
+        365.0
+    };
+    let gamma = std::f64::consts::TAU / days * (f64::from(time.ordinal0()) + (hour - 12.0) / 24.0);
 
     let equation_of_time_minutes = 229.18
         * (0.000_075 + 0.001_868 * gamma.cos()

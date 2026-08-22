@@ -83,8 +83,8 @@ struct SourceArgs {
     /// Download cache directory.
     #[arg(long, default_value = "cache")]
     cache: PathBuf,
-    /// Stride-decimate frames before storing (1 = native resolution).
-    #[arg(long, default_value_t = 1)]
+    /// Preview stride (0 = automatic bounded preview; native source is retained).
+    #[arg(long, default_value_t = 0)]
     downsample: usize,
 }
 
@@ -101,8 +101,8 @@ enum Command {
         /// the newest scan that has every required channel.
         #[arg(long)]
         composite: Option<String>,
-        /// Extra stride decimation applied to the composite base grid.
-        #[arg(long, default_value_t = 4)]
+        /// Optional extra stride for a one-off composite quicklook.
+        #[arg(long, default_value_t = 1)]
         composite_downsample: usize,
     },
     /// Poll the live bucket continuously and ingest frames as they land.
