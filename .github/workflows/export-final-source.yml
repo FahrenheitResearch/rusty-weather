@@ -1,0 +1,28 @@
+name: Export final source checkout
+
+on:
+  push:
+    branches:
+      - feat/final-observations-satellite-v2-cf0ca369
+    paths:
+      - .github/workflows/export-final-source.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          ref: feat/final-observations-satellite-v2-cf0ca369
+          fetch-depth: 0
+      - name: Build exact checkout archive
+        run: tar --exclude=.git --exclude=target -czf "$RUNNER_TEMP/rusty-weather-final-source.tar.gz" .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rusty-weather-final-source
+          path: ${{ runner.temp }}/rusty-weather-final-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
