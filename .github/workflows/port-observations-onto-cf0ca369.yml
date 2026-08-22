@@ -39,7 +39,63 @@ jobs:
         run: |
           set -euo pipefail
           git merge-base --is-ancestor cf0ca3693650153ff0f79a0e60c3ec2da7d0af01 HEAD
-          test "$(git rev-list --max-parents=0 HEAD | wc -l)" -ge 1
+
+      - name: Reconstruct and merge the reviewed observations patch
+        run: |
+          set -euo pipefail
+          git fetch origin feat/unified-observations-rw-server
+          : > "$RUNNER_TEMP/observations.patch.b64"
+          for part in $(seq -w 0 10); do
+            git show "origin/feat/unified-observations-rw-server:.github/bootstrap/unified-observations.patch.part-${part}" \
+              >> "$RUNNER_TEMP/observations.patch.b64"
+          done
+          base64 --decode "$RUNNER_TEMP/observations.patch.b64" \
+            | gzip --decompress > "$RUNNER_TEMP/observations.patch"
+
+          git apply --index --whitespace=nowarn \
+            --exclude=Cargo.toml \
+            --exclude=crates/rw-query/src/lib.rs \
+            --exclude=crates/rw-server/src/lib.rs \
+            --exclude=crates/rw-server/src/routes.rs \
+            "$RUNNER_TEMP/observations.patch"
+
+          python3 - "$RUNNER_TEMP/observations.patch" "$RUNNER_TEMP/conflicts" <<'PY'
+          from pathlib import Path
+          import sys
+
+          patch = Path(sys.argv[1]).read_text()
+          out = Path(sys.argv[2])
+          out.mkdir(parents=True, exist_ok=True)
+          wanted = {
+              "Cargo.toml",
+              "crates/rw-query/src/lib.rs",
+              "crates/rw-server/src/lib.rs",
+              "crates/rw-server/src/routes.rs",
+          }
+          sections = patch.split("diff --git ")
+          for section in sections[1:]:
+              first = section.splitlines()[0]
+              left = first.split(" b/", 1)[0]
+              path = left.removeprefix("a/")
+              if path in wanted:
+                  (out / (path.replace("/", "__") + ".patch")).write_text("diff --git " + section)
+          missing = [path for path in wanted if not (out / (path.replace("/", "__") + ".patch")).exists()]
+          if missing:
+              raise SystemExit(f"missing conflict sections: {missing}")
+          PY
+
+          failed=0
+          for conflict in "$RUNNER_TEMP"/conflicts/*.patch; do
+            echo "Applying conflict section: $conflict"
+            patch --batch --forward --fuzz=3 -p1 < "$conflict" || failed=1
+          done
+          git add Cargo.toml crates/rw-query/src/lib.rs crates/rw-server/src/lib.rs crates/rw-server/src/routes.rs
+          if find . -name '*.rej' -print -quit | grep -q .; then
+            find . -name '*.rej' -print -exec cat {} \;
+            exit 1
+          fi
+          test "$failed" -eq 0
+          git diff --cached --check
 
       - name: Install system dependencies
         run: |
@@ -54,20 +110,6 @@ jobs:
 
       - name: Install Rust 1.92
         run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
-
-      - name: Reconstruct and three-way apply the reviewed observations patch
-        run: |
-          set -euo pipefail
-          git fetch origin feat/unified-observations-rw-server
-          : > "$RUNNER_TEMP/observations.patch.b64"
-          for part in $(seq -w 0 10); do
-            git show "origin/feat/unified-observations-rw-server:.github/bootstrap/unified-observations.patch.part-${part}" \
-              >> "$RUNNER_TEMP/observations.patch.b64"
-          done
-          base64 --decode "$RUNNER_TEMP/observations.patch.b64" \
-            | gzip --decompress > "$RUNNER_TEMP/observations.patch"
-          git apply --3way --index --whitespace=nowarn "$RUNNER_TEMP/observations.patch"
-          git diff --cached --check
 
       - name: Format and validate the observations port
         run: |
@@ -85,6 +127,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -f .github/workflows/port-observations-onto-cf0ca369.yml
+          find . -name '*.orig' -delete
           git add -A
           git diff --cached --check
           test -f crates/rw-observations/src/lib.rs
