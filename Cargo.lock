@@ -4753,6 +4753,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rw-observations"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "grib-core",
+ "rayon",
+ "rustwx-core",
+ "rustwx-io",
+ "rw-query",
+ "rw-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "wx-radar",
+]
+
+[[package]]
 name = "rw-odim"
 version = "0.1.0"
 dependencies = [
@@ -4858,7 +4876,9 @@ dependencies = [
  "rw-federation-proxy",
  "rw-generation-replication",
  "rw-ingest",
+ "rw-observations",
  "rw-query",
+ "rw-sat",
  "rw-scheduler",
  "rw-store",
  "schemars",

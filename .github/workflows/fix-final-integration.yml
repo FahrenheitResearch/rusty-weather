@@ -1,0 +1,79 @@
+name: Validate final integration on radar-app base
+
+on:
+  pull_request:
+    branches: [codex/windows-fetch-lock-fix-20260814]
+    paths:
+      - '.github/workflows/fix-final-integration.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: validate-final-integration-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate-and-clean:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'feat/rw-server-observations-satellite-final'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out the current final branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          ref: feat/rw-server-observations-satellite-final
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxi-dev \
+            libxkbcommon-dev
+
+      - name: Install Rust 1.92
+        run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
+
+      - name: Verify formatting
+        run: cargo +1.92.0 fmt --all -- --check
+
+      - name: Compile the complete workspace
+        run: cargo +1.92.0 check --locked --workspace --all-targets
+
+      - name: Test satellite delivery
+        run: cargo +1.92.0 test --locked -p rw-sat
+
+      - name: Test unified observations
+        run: cargo +1.92.0 test --locked -p rw-observations
+
+      - name: Test server integration
+        run: cargo +1.92.0 test --locked -p rw-server --lib
+
+      - name: Deny warnings in changed service crates
+        run: |
+          cargo +1.92.0 clippy --locked \
+            -p rw-sat \
+            -p rw-observations \
+            -p rw-server \
+            --all-targets --no-deps -- -D warnings
+
+      - name: Remove temporary validation workflow and commit clean source
+        run: |
+          rm -f .github/workflows/fix-final-integration.yml
+          git add -A
+          git diff --cached --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "ci: finalize validated observation and satellite integration"
+          git push origin HEAD:feat/rw-server-observations-satellite-final

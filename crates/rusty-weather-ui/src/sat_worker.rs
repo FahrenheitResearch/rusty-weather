@@ -22,14 +22,14 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use egui::{Color32, ColorImage};
-use rw_sat::composite::GoesAbiRgbCompositeStyle;
 use rw_sat::events::{SatError, SatEvent};
 use rw_sat::follow::FollowConfig;
 use rw_sat::goes::{GoesSatellite, parse_goes_abi_filename};
-use rw_sat::palette::{anchor_color, band_anchors};
+use rw_sat::palette::band_color;
 use rw_sat::s3::{Sector, bucket_for_satellite, object_filename};
 use rw_sat::store::{run_day, selector_band};
 use rw_sat::window::WindowConfig;
+use rw_sat::{GoesAbiProduct, product_catalog};
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
 use rw_store::run::RwsRunManifest;
@@ -186,10 +186,10 @@ pub fn sector_options() -> Vec<SatSectorOption> {
     .map(|sector| SatSectorOption {
         slug: sector.slug().to_string(),
         label: match sector {
-            Sector::Conus => "CONUS".to_string(),
-            Sector::FullDisk => "Full disk".to_string(),
-            Sector::Meso1 => "Meso 1".to_string(),
-            Sector::Meso2 => "Meso 2".to_string(),
+            Sector::Conus => "CONUS · 5 minute".to_string(),
+            Sector::FullDisk => "Full Disk · 10 minute".to_string(),
+            Sector::Meso1 => "Mesoscale 1 · 1 minute".to_string(),
+            Sector::Meso2 => "Mesoscale 2 · 1 minute".to_string(),
         },
         default_poll_secs: sector.default_poll_secs(),
         cadence_secs: sector.cadence_secs(),
@@ -197,76 +197,32 @@ pub fn sector_options() -> Vec<SatSectorOption> {
     .collect()
 }
 
-/// ABI band display names (UI copy; the science lives in rw-sat).
-const BAND_NAMES: [&str; 16] = [
-    "Blue 0.47 µm",
-    "Red 0.64 µm",
-    "Veggie 0.86 µm",
-    "Cirrus 1.37 µm",
-    "Snow/Ice 1.6 µm",
-    "Cloud Particle Size 2.2 µm",
-    "Shortwave Window 3.9 µm",
-    "Upper-Level Water Vapor 6.2 µm",
-    "Mid-Level Water Vapor 6.9 µm",
-    "Lower-Level Water Vapor 7.3 µm",
-    "Cloud-Top Phase 8.4 µm",
-    "Ozone 9.6 µm",
-    "Clean IR Window 10.3 µm",
-    "IR Longwave 11.2 µm",
-    "Dirty IR Window 12.3 µm",
-    "CO2 Longwave 13.3 µm",
-];
-
-/// Layer picker entries: every ABI band, then every RGB composite (a
-/// composite follow ingests its required bands; each band run plays in
-/// the frame player).
+/// User-facing product picker. Required channels stay an implementation detail.
 pub fn layer_options() -> Vec<SatLayerOption> {
-    let mut options: Vec<SatLayerOption> = (1u8..=16)
-        .map(|band| SatLayerOption {
-            slug: format!("c{band:02}"),
-            label: format!("C{band:02} · {}", BAND_NAMES[usize::from(band - 1)]),
-            note: String::new(),
+    product_catalog(true)
+        .into_iter()
+        .map(|product| {
+            let daylight = if product.daylight_only {
+                " · daylight"
+            } else {
+                " · 24 hour"
+            };
+            SatLayerOption {
+                slug: product.id,
+                label: product.title,
+                note: format!(
+                    "{} · {:.1} km native{}",
+                    product.description, product.native_resolution_km, daylight
+                ),
+            }
         })
-        .collect();
-    for style in GoesAbiRgbCompositeStyle::ALL {
-        let bands = style
-            .required_channels()
-            .iter()
-            .map(|band| format!("C{band:02}"))
-            .collect::<Vec<_>>()
-            .join("+");
-        options.push(SatLayerOption {
-            slug: style.slug().to_string(),
-            label: format!("RGB · {}", style.title()),
-            note: format!("follows {bands}; each band run plays in the player"),
-        });
-    }
-    options
+        .collect()
 }
 
-/// Layer slug -> the ABI bands it follows, plus a description for the
-/// summary line. Bands: "c13"; composites by slug ("geocolor").
 fn resolve_layer(layer: &str) -> Result<(Vec<u8>, String), String> {
-    let normalized = layer.trim().to_ascii_lowercase();
-    if let Some(band) = normalized
-        .strip_prefix('c')
-        .and_then(|raw| raw.parse::<u8>().ok())
-    {
-        if (1..=16).contains(&band) {
-            return Ok((vec![band], format!("C{band:02}")));
-        }
-        return Err(format!("ABI band out of range: C{band:02} (1-16)"));
-    }
-    if let Some(style) = GoesAbiRgbCompositeStyle::parse(&normalized) {
-        let bands = style.required_channels().to_vec();
-        let list = bands
-            .iter()
-            .map(|band| format!("C{band:02}"))
-            .collect::<Vec<_>>()
-            .join("+");
-        return Ok((bands, format!("{} [{list}]", style.title())));
-    }
-    Err(format!("unknown layer '{layer}'"))
+    let product = GoesAbiProduct::parse(layer)
+        .ok_or_else(|| format!("unknown satellite product '{layer}'"))?;
+    Ok((product.required_channels().to_vec(), product.title()))
 }
 
 /// Validated pieces of a follow spec.
@@ -283,8 +239,11 @@ fn resolve_spec(spec: &SatFollowSpec) -> Result<ResolvedSpec, String> {
     let sector =
         Sector::parse(&spec.sector).ok_or_else(|| format!("unknown sector '{}'", spec.sector))?;
     let (bands, layer_desc) = resolve_layer(&spec.layer)?;
-    if ![1usize, 2, 4].contains(&spec.downsample) {
-        return Err(format!("unsupported detail stride {}", spec.downsample));
+    if spec.downsample > 16 {
+        return Err(format!(
+            "preview stride {} exceeds the supported maximum of 16",
+            spec.downsample
+        ));
     }
     Ok(ResolvedSpec {
         model: GoesSatellite::parse(&spec.satellite)
@@ -313,8 +272,9 @@ fn spec_summary(spec: &SatFollowSpec) -> Result<String, String> {
         (None, None) => "unbounded window".to_string(),
     };
     let detail = match spec.downsample {
-        1 => String::new(),
-        step => format!(" · 1/{step} res"),
+        0 => " · native source retained; preview optimized automatically".to_string(),
+        1 => " · native preview".to_string(),
+        step => format!(" · explicit 1/{step} preview"),
     };
     Ok(format!(
         "{} {} · {} · poll ~{interval} s (frames ~{} s apart) · {window}{detail}",
@@ -516,7 +476,6 @@ fn load_frame(
     let (nx, ny) = (meta.nx, meta.ny);
     let name = variable.name.clone();
     let values = reader.read_full_2d(&name).map_err(|err| err.to_string())?;
-    let anchors = band_anchors(band);
     let mut pixels = Vec::with_capacity(nx * ny);
     for image_row in 0..ny {
         let grid_row = if grid.flip_rows {
@@ -525,7 +484,7 @@ fn load_frame(
             image_row
         };
         for &value in &values[grid_row * nx..(grid_row + 1) * nx] {
-            let [r, g, b, a] = anchor_color(value, anchors);
+            let [r, g, b, a] = band_color(band, value);
             pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a));
         }
     }
@@ -789,7 +748,7 @@ mod tests {
     #[test]
     fn layer_options_cover_all_bands_and_composites() {
         let options = layer_options();
-        assert_eq!(options.len(), 16 + GoesAbiRgbCompositeStyle::ALL.len());
+        assert_eq!(options.len(), product_catalog(true).len());
         for option in &options {
             resolve_layer(&option.slug).expect("every picker entry resolves");
         }
