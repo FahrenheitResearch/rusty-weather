@@ -6,6 +6,11 @@ on:
       - feat/final-observations-satellite-v2-cf0ca369
     paths:
       - .github/workflows/export-final-source.yml
+  pull_request:
+    branches:
+      - codex/windows-fetch-lock-fix-20260814
+    paths:
+      - .github/workflows/export-final-source.yml
 
 permissions:
   contents: read
@@ -16,6 +21,7 @@ concurrency:
 
 jobs:
   export:
+    if: github.event_name == 'push' || github.event.pull_request.head.ref == 'feat/final-observations-satellite-v2-cf0ca369'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
