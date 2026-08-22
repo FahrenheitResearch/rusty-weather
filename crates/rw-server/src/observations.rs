@@ -43,7 +43,7 @@ pub(crate) fn read_router() -> Router<AppState> {
             get(observation_grid_binary),
         )
         .route(
-            "/v1/observations/{model}/{run}/frames/{storage_slot}/{variable}.bin",
+            "/v1/observations/{model}/{run}/frames/{storage_slot}/{variable}",
             get(observation_plane_binary),
         )
 }
@@ -310,6 +310,14 @@ async fn observation_plane_binary(
     if observation_kind_for_model(&path.model).is_none() {
         return ProblemDetails::not_found(request_id.0).into_response();
     }
+    let Some(variable_name) = path
+        .variable
+        .strip_suffix(".bin")
+        .filter(|variable| !variable.is_empty())
+        .map(str::to_owned)
+    else {
+        return ProblemDetails::not_found(request_id.0).into_response();
+    };
     let catalog = state.catalog.clone();
     match state
         .run_heavy_sync(move || {
@@ -327,11 +335,11 @@ async fn observation_plane_binary(
                 .join(&entry.file);
             let reader = HourReader::open(&file)?;
             let variable = reader
-                .variable(&path.variable)
-                .ok_or_else(|| QueryError::UnknownVariable(path.variable.clone()))?;
+                .variable(&variable_name)
+                .ok_or_else(|| QueryError::UnknownVariable(variable_name.clone()))?;
             if variable.kind != "surface2d" {
                 return Err(QueryError::WrongVariableKind {
-                    variable: path.variable,
+                    variable: variable_name,
                     expected: "surface2d",
                     actual: variable.kind.clone(),
                 });
@@ -831,4 +839,14 @@ fn job_problem(error: JobError, request_id: Uuid) -> ProblemDetails {
         ),
     };
     ProblemDetails::new(status, code, title, error.to_string(), request_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observation_routes_accept_filename_suffixes_under_axum_08() {
+        let _ = read_router();
+    }
 }

@@ -302,7 +302,7 @@ pub fn fetch_and_ingest(
 
     let field = read_goes_abi_field(&download.path, "CMI").map_err(to_send_sync)?;
     archive_goes_source(store_root, &download.path, &field.scene, &object.key)
-        .map_err(to_send_sync)?;
+        .map_err(|error| other(error.to_string()))?;
     let preview_stride = if downsample == 0 {
         automatic_preview_stride(
             field.scene.fixed_grid.nx,

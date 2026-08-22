@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use rw_query::RunSnapshot;
 use rw_store::atomic::atomic_write_bytes;
 use rw_store::format::{RwsExactTime, RwsWriterInfo};

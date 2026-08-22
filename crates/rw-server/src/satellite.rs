@@ -32,7 +32,7 @@ pub(crate) fn read_router() -> Router<AppState> {
             get(tilejson),
         )
         .route(
-            "/v1/satellite/{platform}/{sector}/{product}/{frame}/tiles/{z}/{x}/{y}.png",
+            "/v1/satellite/{platform}/{sector}/{product}/{frame}/tiles/{z}/{x}/{y}",
             get(tile),
         )
 }
@@ -276,7 +276,7 @@ struct TilePath {
     frame: String,
     z: u8,
     x: u32,
-    y: u32,
+    y: String,
 }
 
 async fn tile(
@@ -289,6 +289,18 @@ async fn tile(
     };
     let Some(sector) = rw_sat::s3::Sector::parse(&path.sector) else {
         return ProblemDetails::not_found(request_id.0).into_response();
+    };
+    let Some(tile_y) = path
+        .y
+        .strip_suffix(".png")
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "INVALID_SATELLITE_TILE",
+            "The satellite tile request is invalid.",
+            request_id.0,
+        );
     };
     let requested_latest = path.frame.eq_ignore_ascii_case("latest");
     let store_root = state.config.server.store_root.clone();
@@ -305,7 +317,7 @@ async fn tile(
                 &frame,
                 path.z,
                 path.x,
-                path.y,
+                tile_y,
                 DEFAULT_TILE_SIZE,
             )
             .map_err(|error| error.to_string())
@@ -405,4 +417,14 @@ fn problem(
         request_id,
     )
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn satellite_routes_accept_png_filename_suffixes_under_axum_08() {
+        let _ = read_router();
+    }
 }

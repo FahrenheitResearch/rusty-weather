@@ -12,7 +12,9 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
+#[cfg(test)]
+use chrono::TimeZone;
+use chrono::{DateTime, Utc};
 use rw_store::atomic::{atomic_write_bytes, atomic_write_with};
 use rw_store::lock::RunLock;
 use serde::{Deserialize, Serialize};

@@ -476,7 +476,6 @@ fn load_frame(
     let (nx, ny) = (meta.nx, meta.ny);
     let name = variable.name.clone();
     let values = reader.read_full_2d(&name).map_err(|err| err.to_string())?;
-    let anchors = band_anchors(band);
     let mut pixels = Vec::with_capacity(nx * ny);
     for image_row in 0..ny {
         let grid_row = if grid.flip_rows {
@@ -749,7 +748,7 @@ mod tests {
     #[test]
     fn layer_options_cover_all_bands_and_composites() {
         let options = layer_options();
-        assert_eq!(options.len(), 16 + GoesAbiRgbCompositeStyle::ALL.len());
+        assert_eq!(options.len(), product_catalog(true).len());
         for option in &options {
             resolve_layer(&option.slug).expect("every picker entry resolves");
         }
