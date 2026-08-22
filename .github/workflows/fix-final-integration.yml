@@ -52,13 +52,15 @@ jobs:
 
           follow = Path('crates/rw-sat/src/follow.rs')
           text = follow.read_text()
-          old = '''    archive_goes_source(store_root, &download.path, &field.scene, &object.key)
-              .map_err(to_send_sync)?;'''
-          new = '''    archive_goes_source(store_root, &download.path, &field.scene, &object.key)
-              .map_err(|error| other(error.to_string()))?;'''
-          if old not in text:
+          call = 'archive_goes_source(store_root, &download.path, &field.scene, &object.key)'
+          if call not in text:
+              raise SystemExit('expected archive_goes_source call was not found')
+          head, tail = text.split(call, 1)
+          old = '.map_err(to_send_sync)?;'
+          new = '.map_err(|error| other(error.to_string()))?;'
+          if old not in tail:
               raise SystemExit('expected archive_goes_source error mapping was not found')
-          follow.write_text(text.replace(old, new, 1))
+          follow.write_text(head + call + tail.replace(old, new, 1))
 
           archive = Path('crates/rw-sat/src/archive.rs')
           text = archive.read_text()
