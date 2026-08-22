@@ -1,6 +1,10 @@
 name: Port observations onto cf0ca369
 
 on:
+  pull_request:
+    branches: [codex/windows-fetch-lock-fix-20260814]
+    paths:
+      - '.github/workflows/port-observations-cf0ca369.yml'
   push:
     branches: [feat/rw-server-observations-satellite-final]
     paths:
@@ -19,6 +23,7 @@ env:
 
 jobs:
   port-build-test-commit:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
