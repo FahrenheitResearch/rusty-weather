@@ -1,0 +1,85 @@
+name: Port observations onto cf0ca369
+
+on:
+  push:
+    branches:
+      - feat/final-observations-satellite-v2-cf0ca369
+    paths:
+      - .github/workflows/port-observations-onto-cf0ca369.yml
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  port-build-test-commit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out the correct-base branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          ref: feat/final-observations-satellite-v2-cf0ca369
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Verify exact base
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "cf0ca3693650153ff0f79a0e60c3ec2da7d0af01"
+          git merge-base --is-ancestor cf0ca3693650153ff0f79a0e60c3ec2da7d0af01 HEAD
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxi-dev \
+            libxkbcommon-dev
+
+      - name: Install Rust 1.92
+        run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
+
+      - name: Reconstruct and three-way apply the reviewed observations patch
+        run: |
+          set -euo pipefail
+          git fetch origin feat/unified-observations-rw-server
+          : > "$RUNNER_TEMP/observations.patch.b64"
+          for part in $(seq -w 0 10); do
+            git show "origin/feat/unified-observations-rw-server:.github/bootstrap/unified-observations.patch.part-${part}" \
+              >> "$RUNNER_TEMP/observations.patch.b64"
+          done
+          base64 --decode "$RUNNER_TEMP/observations.patch.b64" \
+            | gzip --decompress > "$RUNNER_TEMP/observations.patch"
+          git apply --3way --index --whitespace=nowarn "$RUNNER_TEMP/observations.patch"
+          git diff --cached --check
+
+      - name: Format and validate the observations port
+        run: |
+          set -euo pipefail
+          cargo +1.92.0 fmt --all
+          cargo +1.92.0 check --locked -p rw-observations -p rw-query -p rw-server --all-targets
+          cargo +1.92.0 test --locked -p rw-observations
+          cargo +1.92.0 test --locked -p rw-query
+          cargo +1.92.0 test --locked -p rw-server --lib
+          cargo +1.92.0 clippy --locked \
+            -p rw-observations -p rw-query -p rw-server \
+            --all-targets --no-deps -- -D warnings
+
+      - name: Publish normal reviewed Rust source
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/port-observations-onto-cf0ca369.yml
+          git add -A
+          git diff --cached --check
+          test -f crates/rw-observations/src/lib.rs
+          test ! -e .github/bootstrap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "feat: port unified observations onto cf0ca369"
+          git push origin HEAD:feat/final-observations-satellite-v2-cf0ca369
