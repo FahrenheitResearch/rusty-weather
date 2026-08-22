@@ -52,8 +52,58 @@ jobs:
           cat .github/bootstrap/unified-observations.patch.part-* \
             | base64 --decode \
             | gzip --decompress > "$RUNNER_TEMP/unified-observations.patch"
-          git apply --check "$RUNNER_TEMP/unified-observations.patch"
-          git apply "$RUNNER_TEMP/unified-observations.patch"
+
+          excluded=(
+            --exclude=crates/rw-query/src/lib.rs
+            --exclude=crates/rw-server/src/lib.rs
+            --exclude=crates/rw-server/src/routes.rs
+          )
+          git apply --check "${excluded[@]}" "$RUNNER_TEMP/unified-observations.patch"
+          git apply "${excluded[@]}" "$RUNNER_TEMP/unified-observations.patch"
+
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one integration anchor, found {count}: {old!r}")
+              target.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          replace_once(
+              "crates/rw-query/src/lib.rs",
+              "pub use time::parse_legacy_run_origin_unix;",
+              "pub use time::{\n"
+              "    parse_legacy_observation_day_origin_unix, parse_legacy_observation_hhmm_slot,\n"
+              "    parse_legacy_run_origin_unix,\n"
+              "};",
+          )
+          replace_once(
+              "crates/rw-server/src/lib.rs",
+              "pub mod openapi;",
+              "pub mod observations;\npub mod openapi;",
+          )
+          replace_once(
+              "crates/rw-server/src/routes.rs",
+              "struct RequestId(Uuid);",
+              "pub(crate) struct RequestId(pub(crate) Uuid);",
+          )
+          replace_once(
+              "crates/rw-server/src/routes.rs",
+              '        .route("/v1/analytics/spatial-series", post(spatial_series))\n',
+              '        .route("/v1/analytics/spatial-series", post(spatial_series))\n'
+              '        .merge(crate::observations::read_router())\n',
+          )
+          replace_once(
+              "crates/rw-server/src/routes.rs",
+              "    let protected = Router::new()\n        .merge(operational)\n",
+              "    let protected = Router::new()\n"
+              "        .merge(operational)\n"
+              "        .merge(crate::observations::write_router())\n",
+          )
+          PY
 
       - name: Format and validate the implementation
         run: |
