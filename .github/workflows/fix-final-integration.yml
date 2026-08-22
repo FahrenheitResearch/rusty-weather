@@ -1,4 +1,4 @@
-name: Diagnose final server integration
+name: Validate final integration on radar-app base
 
 on:
   pull_request:
@@ -7,90 +7,73 @@ on:
       - '.github/workflows/fix-final-integration.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: diagnose-final-integration-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: validate-final-integration-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: full
 
 jobs:
-  representative-server-route:
+  validate-and-clean:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.head.ref == 'feat/rw-server-observations-satellite-final'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
-      - name: Check out final source branch
+      - name: Check out the current final branch
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
         with:
           ref: feat/rw-server-observations-satellite-final
-          persist-credentials: false
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Install Linux desktop dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libgl1-mesa-dev libwayland-dev libx11-dev libxi-dev libxkbcommon-dev
+            pkg-config \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxi-dev \
+            libxkbcommon-dev
 
       - name: Install Rust 1.92
-        run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt
+        run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
 
-      - name: Apply the pending normal-source fixes
+      - name: Verify formatting
+        run: cargo +1.92.0 fmt --all -- --check
+
+      - name: Compile the complete workspace
+        run: cargo +1.92.0 check --locked --workspace --all-targets
+
+      - name: Test satellite delivery
+        run: cargo +1.92.0 test --locked -p rw-sat
+
+      - name: Test unified observations
+        run: cargo +1.92.0 test --locked -p rw-observations
+
+      - name: Test server integration
+        run: cargo +1.92.0 test --locked -p rw-server --lib
+
+      - name: Deny warnings in changed service crates
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
+          cargo +1.92.0 clippy --locked \
+            -p rw-sat \
+            -p rw-observations \
+            -p rw-server \
+            --all-targets --no-deps -- -D warnings
 
-          follow = Path('crates/rw-sat/src/follow.rs')
-          text = follow.read_text()
-          call = 'archive_goes_source(store_root, &download.path, &field.scene, &object.key)'
-          head, tail = text.split(call, 1)
-          follow.write_text(head + call + tail.replace(
-              '.map_err(to_send_sync)?;',
-              '.map_err(|error| other(error.to_string()))?;',
-              1,
-          ))
-
-          archive = Path('crates/rw-sat/src/archive.rs')
-          archive.write_text(archive.read_text().replace(
-              'use chrono::{DateTime, TimeZone, Utc};',
-              'use chrono::{DateTime, Utc};\n#[cfg(test)]\nuse chrono::TimeZone;',
-              1,
-          ))
-
-          sat_worker = Path('crates/rusty-weather-ui/src/sat_worker.rs')
-          text = sat_worker.read_text()
-          text = text.replace('    let anchors = band_anchors(band);\n', '', 1)
-          text = text.replace(
-              'assert_eq!(options.len(), 16 + GoesAbiRgbCompositeStyle::ALL.len());',
-              'assert_eq!(options.len(), product_catalog(true).len());',
-              1,
-          )
-          sat_worker.write_text(text)
-
-          store = Path('crates/rw-observations/src/store.rs')
-          store.write_text(store.read_text().replace(
-              'use chrono::{DateTime, Datelike, Timelike, Utc};',
-              'use chrono::{DateTime, Datelike, Utc};',
-              1,
-          ))
-
-          observations = Path('crates/rw-server/src/observations.rs')
-          old = '"/v1/observations/{model}/{run}/frames/{storage_slot}/{variable}.bin",'
-          new = '"/v1/observations/{model}/{run}/frames/{storage_slot}/{variable}",'
-          text = observations.read_text()
-          if old not in text:
-              raise SystemExit('expected invalid Axum observation route was not found')
-          observations.write_text(text.replace(old, new, 1))
-          PY
-          cargo +1.92.0 fmt --all
-
-      - name: Run one previously failing route test alone
+      - name: Remove temporary validation workflow and commit clean source
         run: |
-          cargo +1.92.0 test --locked -p rw-server \
-            routes::tests::health_is_public_but_data_routes_require_a_token \
-            -- --nocapture --test-threads=1
+          rm -f .github/workflows/fix-final-integration.yml
+          git add -A
+          git diff --cached --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "ci: finalize validated observation and satellite integration"
+          git push origin HEAD:feat/rw-server-observations-satellite-final
