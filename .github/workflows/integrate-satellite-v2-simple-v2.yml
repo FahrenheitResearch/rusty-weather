@@ -1,0 +1,86 @@
+name: Integrate satellite v2 source v2
+
+on:
+  push:
+    branches: [feat/rw-server-observations-satellite-final]
+    paths:
+      - '.github/workflows/integrate-satellite-v2-simple-v2.yml'
+  pull_request:
+    branches: [codex/windows-fetch-lock-fix-20260814]
+    paths:
+      - '.github/workflows/integrate-satellite-v2-simple-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: integrate-satellite-v2-source-v2
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          ref: feat/rw-server-observations-satellite-final
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Verify exact radar-app base
+        run: |
+          set -euo pipefail
+          test "$(git merge-base cf0ca3693650153ff0f79a0e60c3ec2da7d0af01 HEAD)" = cf0ca3693650153ff0f79a0e60c3ec2da7d0af01
+          test "$(git rev-parse origin/codex/windows-fetch-lock-fix-20260814)" = cf0ca3693650153ff0f79a0e60c3ec2da7d0af01
+
+      - name: Install Linux dependencies and Rust 1.92
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libgl1-mesa-dev libwayland-dev libx11-dev libxi-dev libxkbcommon-dev
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy
+
+      - name: Integrate normal source
+        run: |
+          set -euo pipefail
+          python3 -u .github/scripts/fix_integrator.py
+          python3 -u .github/scripts/integrate_satellite_v2.py
+          git diff --check
+          cargo +1.92.0 fmt --all
+
+      - name: Compile integrated crates
+        id: compile
+        continue-on-error: true
+        run: |
+          cargo +1.92.0 check \
+            -p rw-sat -p rw-observations -p rw-query -p rw-server -p rusty-weather-ui \
+            --all-targets
+
+      - name: Publish integrated ordinary Rust source
+        run: |
+          set -euo pipefail
+          rm -f .github/scripts/fix_integrator.py
+          rm -f .github/scripts/integrate_satellite_v2.py
+          rm -f .github/workflows/integrate-satellite-v2-cf0ca369.yml
+          rm -f .github/workflows/integrate-satellite-v2-simple.yml
+          rm -f .github/workflows/integrate-satellite-v2-simple-v2.yml
+          rm -f .github/workflows/kick-integrate-satellite-v2.yml
+          rmdir .github/scripts 2>/dev/null || true
+          git add -A
+          git diff --cached --check
+          test ! -e .github/bootstrap
+          test -f crates/rw-server/src/satellite.rs
+          test -f crates/rw-sat/src/archive.rs
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "feat: integrate native full-disk satellite delivery"
+          git push origin HEAD:feat/rw-server-observations-satellite-final
+
+      - name: Propagate compile result
+        if: steps.compile.outcome == 'failure'
+        run: exit 1
