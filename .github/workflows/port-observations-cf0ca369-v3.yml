@@ -35,7 +35,7 @@ jobs:
           set -euo pipefail
           git merge-base --is-ancestor cf0ca3693650153ff0f79a0e60c3ec2da7d0af01 HEAD
           test "$(git merge-base cf0ca3693650153ff0f79a0e60c3ec2da7d0af01 HEAD)" = cf0ca3693650153ff0f79a0e60c3ec2da7d0af01
-          test "$(git rev-parse codex/windows-fetch-lock-fix-20260814)" = cf0ca3693650153ff0f79a0e60c3ec2da7d0af01
+          test "$(git rev-parse origin/codex/windows-fetch-lock-fix-20260814)" = cf0ca3693650153ff0f79a0e60c3ec2da7d0af01
 
       - name: Install Linux dependencies and Rust 1.92
         run: |
