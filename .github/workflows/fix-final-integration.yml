@@ -69,6 +69,26 @@ jobs:
           if old not in text:
               raise SystemExit('expected archive chrono import was not found')
           archive.write_text(text.replace(old, new, 1))
+
+          sat_worker = Path('crates/rusty-weather-ui/src/sat_worker.rs')
+          text = sat_worker.read_text()
+          old = '    let anchors = band_anchors(band);\n'
+          if old not in text:
+              raise SystemExit('expected stale band_anchors line was not found')
+          text = text.replace(old, '', 1)
+          old = 'assert_eq!(options.len(), 16 + GoesAbiRgbCompositeStyle::ALL.len());'
+          new = 'assert_eq!(options.len(), product_catalog(true).len());'
+          if old not in text:
+              raise SystemExit('expected stale satellite catalog assertion was not found')
+          sat_worker.write_text(text.replace(old, new, 1))
+
+          observation_store = Path('crates/rw-observations/src/store.rs')
+          text = observation_store.read_text()
+          old = 'use chrono::{DateTime, Datelike, Timelike, Utc};'
+          new = 'use chrono::{DateTime, Datelike, Utc};'
+          if old not in text:
+              raise SystemExit('expected observation chrono import was not found')
+          observation_store.write_text(text.replace(old, new, 1))
           PY
 
       - name: Format and compile the complete workspace
