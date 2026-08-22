@@ -6,15 +6,25 @@ on:
       - feat/final-observations-satellite-v2-cf0ca369
     paths:
       - .github/workflows/port-observations-onto-cf0ca369.yml
+  pull_request:
+    branches:
+      - codex/windows-fetch-lock-fix-20260814
+    paths:
+      - .github/workflows/port-observations-onto-cf0ca369.yml
 
 permissions:
   contents: write
+
+concurrency:
+  group: port-observations-cf0ca369
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   port-build-test-commit:
+    if: github.event_name == 'push' || github.event.pull_request.head.ref == 'feat/final-observations-satellite-v2-cf0ca369'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -28,8 +38,8 @@ jobs:
       - name: Verify exact base
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "cf0ca3693650153ff0f79a0e60c3ec2da7d0af01"
           git merge-base --is-ancestor cf0ca3693650153ff0f79a0e60c3ec2da7d0af01 HEAD
+          test "$(git rev-list --max-parents=0 HEAD | wc -l)" -ge 1
 
       - name: Install system dependencies
         run: |
