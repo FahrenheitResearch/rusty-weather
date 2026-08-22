@@ -15,6 +15,7 @@ pub mod federation_proxy;
 pub mod generation_replication;
 pub mod jobs;
 pub mod metrics;
+pub mod observations;
 pub mod openapi;
 pub mod origin_catalog;
 pub mod problem;

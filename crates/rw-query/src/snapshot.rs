@@ -15,8 +15,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     GridPoint, QueryError, QueryLimits, QueryResult, RunDescriptor, SourceProvenance,
-    TemporalReducer, TimePoint, TimeRange, VariableCapability, parse_legacy_run_origin_unix,
-    provider_attributions_for_provenance, variable_temporal_capabilities,
+    TemporalReducer, TimePoint, TimeRange, VariableCapability,
+    parse_legacy_observation_day_origin_unix, parse_legacy_observation_hhmm_slot,
+    parse_legacy_run_origin_unix, provider_attributions_for_provenance,
+    variable_temporal_capabilities,
 };
 
 pub(crate) const DEFAULT_READER_POOL_BYTES: u64 = 64 * 1024 * 1024;
@@ -692,12 +694,49 @@ fn build_time_axis(manifest: &RwsRunManifest) -> QueryResult<(Vec<TimePoint>, Op
         return Ok((axis, origin));
     }
 
-    let origin = parse_legacy_run_origin_unix(&manifest.run)?;
+    if let Ok(origin) = parse_legacy_run_origin_unix(&manifest.run) {
+        let axis = manifest
+            .hours
+            .iter()
+            .map(|(&storage_slot, entry)| {
+                let lead_seconds = u64::from(storage_slot) * 3_600;
+                let valid_unix = origin.checked_add(lead_seconds as i64).ok_or_else(|| {
+                    QueryError::InvalidLegacyRunSlug {
+                        run: manifest.run.clone(),
+                        reason: format!("slot {storage_slot} valid time overflows i64"),
+                    }
+                })?;
+                Ok(TimePoint {
+                    storage_slot,
+                    lead_seconds,
+                    valid_unix,
+                    file: entry.file.clone(),
+                })
+            })
+            .collect::<QueryResult<Vec<_>>>()?;
+        return Ok((axis, Some(origin)));
+    }
+
+    // Legacy rw-sat and SimSat stores predate exact-time v2. They encode one
+    // real UTC day in the run name and HHMM in both the map key and tHHMM.rws
+    // filename. Require the complete shape before interpreting a key as time;
+    // arbitrary v1 model runs still fail rather than receiving a guessed axis.
+    let origin = parse_legacy_observation_day_origin_unix(&manifest.run)?;
     let axis = manifest
         .hours
         .iter()
         .map(|(&storage_slot, entry)| {
-            let lead_seconds = u64::from(storage_slot) * 3_600;
+            let expected_file = format!("t{storage_slot:04}.rws");
+            if entry.file != expected_file {
+                return Err(QueryError::InvalidLegacyRunSlug {
+                    run: manifest.run.clone(),
+                    reason: format!(
+                        "observation slot {storage_slot} file '{}' must be '{expected_file}'",
+                        entry.file
+                    ),
+                });
+            }
+            let lead_seconds = parse_legacy_observation_hhmm_slot(&manifest.run, storage_slot)?;
             let valid_unix = origin.checked_add(lead_seconds as i64).ok_or_else(|| {
                 QueryError::InvalidLegacyRunSlug {
                     run: manifest.run.clone(),

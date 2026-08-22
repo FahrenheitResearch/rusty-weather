@@ -67,7 +67,7 @@ const RETIRED_MODEL_ID: ModelId = ModelId::RrfsFireWx;
 const RETIRED_VARIABLE_NAME: &str = "fire_weather_composite";
 
 #[derive(Debug, Clone, Copy)]
-struct RequestId(Uuid);
+pub(crate) struct RequestId(pub(crate) Uuid);
 
 #[derive(Debug, Clone)]
 struct AuthPrincipal(String);
@@ -1035,6 +1035,7 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
         .route("/v1/window", post(window))
         .route("/v1/geographic-window", post(geographic_window))
         .route("/v1/analytics/spatial-series", post(spatial_series))
+        .merge(crate::observations::read_router())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_origin_catalog_ready,
@@ -1042,6 +1043,7 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
 
     let protected = Router::new()
         .merge(operational)
+        .merge(crate::observations::write_router())
         .route("/v1/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/v1/artifacts/{hash}/{file}", get(artifact))
         .route(

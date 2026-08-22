@@ -27,5 +27,8 @@ pub use profile::{query_profile, query_profile_cycle, query_profile_cycle_with_c
 pub use reduce::reduce_scalar_temporal;
 pub use snapshot::RunSnapshot;
 pub use temporal::*;
-pub use time::parse_legacy_run_origin_unix;
+pub use time::{
+    parse_legacy_observation_day_origin_unix, parse_legacy_observation_hhmm_slot,
+    parse_legacy_run_origin_unix,
+};
 pub use types::*;
