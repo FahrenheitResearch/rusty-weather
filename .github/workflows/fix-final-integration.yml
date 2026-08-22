@@ -65,7 +65,7 @@ jobs:
           archive = Path('crates/rw-sat/src/archive.rs')
           text = archive.read_text()
           old = 'use chrono::{DateTime, TimeZone, Utc};'
-          new = 'use chrono::{DateTime, Utc};'
+          new = 'use chrono::{DateTime, Utc};\n#[cfg(test)]\nuse chrono::TimeZone;'
           if old not in text:
               raise SystemExit('expected archive chrono import was not found')
           archive.write_text(text.replace(old, new, 1))
