@@ -1,0 +1,69 @@
+name: Export final source checkout
+
+on:
+  push:
+    branches:
+      - feat/final-observations-satellite-v2-cf0ca369
+    paths:
+      - .github/workflows/export-final-source.yml
+  pull_request:
+    branches:
+      - codex/windows-fetch-lock-fix-20260814
+    paths:
+      - .github/workflows/export-final-source.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: export-final-source
+  cancel-in-progress: true
+
+jobs:
+  export:
+    if: github.event_name == 'push' || github.event.pull_request.head.ref == 'feat/final-observations-satellite-v2-cf0ca369'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          ref: feat/final-observations-satellite-v2-cf0ca369
+          fetch-depth: 0
+      - name: Merge observations into the correct-base checkout
+        run: |
+          set -euo pipefail
+          git fetch origin feat/unified-observations-rw-server
+          : > "$RUNNER_TEMP/observations.patch.b64"
+          for part in $(seq -w 0 10); do
+            git show "origin/feat/unified-observations-rw-server:.github/bootstrap/unified-observations.patch.part-${part}" >> "$RUNNER_TEMP/observations.patch.b64"
+          done
+          base64 --decode "$RUNNER_TEMP/observations.patch.b64" | gzip -d > "$RUNNER_TEMP/observations.patch"
+          git apply --whitespace=nowarn \
+            --exclude=Cargo.toml \
+            --exclude=crates/rw-query/src/lib.rs \
+            --exclude=crates/rw-server/src/lib.rs \
+            --exclude=crates/rw-server/src/routes.rs \
+            "$RUNNER_TEMP/observations.patch"
+          python3 - "$RUNNER_TEMP/observations.patch" "$RUNNER_TEMP/conflicts" <<'PY'
+          from pathlib import Path
+          import sys
+          patch = Path(sys.argv[1]).read_text()
+          out = Path(sys.argv[2]); out.mkdir(parents=True, exist_ok=True)
+          wanted = {"Cargo.toml", "crates/rw-query/src/lib.rs", "crates/rw-server/src/lib.rs", "crates/rw-server/src/routes.rs"}
+          for section in patch.split("diff --git ")[1:]:
+              path = section.splitlines()[0].split(" b/", 1)[0].removeprefix("a/")
+              if path in wanted:
+                  (out / (path.replace("/", "__") + ".patch")).write_text("diff --git " + section)
+          PY
+          for conflict in "$RUNNER_TEMP"/conflicts/*.patch; do
+            patch --batch --forward --fuzz=3 -p1 < "$conflict"
+          done
+          find . -name '*.orig' -delete
+          cargo fmt --all
+      - name: Build exact merged checkout archive
+        run: tar --exclude=.git --exclude=target -czf "$RUNNER_TEMP/rusty-weather-final-source.tar.gz" .
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rusty-weather-final-source
+          path: ${{ runner.temp }}/rusty-weather-final-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
