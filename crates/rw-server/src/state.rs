@@ -217,7 +217,8 @@ impl AppState {
         )
         .map_err(|error| {
             JobError::Invalid(format!(
-                "failed to initialize durable satellite tile cache: {error}"
+                "failed to initialize durable satellite tile cache under {}: {error}",
+                config.server.cache_root.display()
             ))
         })?;
         let satellite_prewarm_status = SatellitePrewarmStatusHandle::new(&config.satellite_prewarm);
@@ -232,7 +233,8 @@ impl AppState {
             .transpose()
             .map_err(|error| {
                 JobError::Invalid(format!(
-                    "failed to initialize durable storm-frame cache: {error}"
+                    "failed to initialize durable storm-frame cache under {}: {error}",
+                    config.server.cache_root.display()
                 ))
             })?;
         let storm_prewarm_status = StormPrewarmStatusHandle::new(&config.storm_prewarm);
