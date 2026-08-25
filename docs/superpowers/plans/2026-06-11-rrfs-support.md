@@ -9,10 +9,10 @@
 **Goal:** `rw_ingest --model rrfs-a` works end-to-end (fetch → store → derived → render →
 soundings → UI) with the HRRR/GFS verification bar.
 
-**Status: DECISION TAKEN — crop-at-ingest (2026-06-11, Drew).** The recon below falsified
+**Status: DECISION TAKEN — crop-at-ingest (2026-06-11).** The recon below falsified
 the clean "one-file like GFS" hypothesis AND the "two-file CONUS pair" fallback: the only
 files carrying RRFS surface fields are the **all-NA** pair (`prslev.na` + `natlev.na`), both
-on the same 14.5M-cell grid. Drew approved the path the recon recommended as a follow-up,
+on the same 14.5M-cell grid. The owner approved the path the recon recommended as a follow-up,
 with one addition that keeps the store HRRR-class instead of NA-sized: **ingest the NA pair
 but CROP to a CONUS box at extraction**, storing a consistent ~HRRR-sized grid. Combined
 with **.idx message-subset fetch** (mandatory — see the measured GB sizes below), this is
@@ -156,7 +156,7 @@ real scope change the controller must approve:
 - Every CONUS-oriented assumption in the brief (Lambert 1799×1059 grid-mapper note, the
   selector-gating tests, the "same dims as HRRR" expectation) does not apply.
 
-**Drew's call (2026-06-11):** take this NA pair, but **crop to CONUS at ingest** so the store
+**Owner's call (2026-06-11):** take this NA pair, but **crop to CONUS at ingest** so the store
 stays HRRR-class. The design that realizes that is below.
 
 ---
@@ -224,7 +224,7 @@ gracefully skip with warnings, as GFS already does for fields it lacks.)
 ## Task checklist (UN-GATED — crop-at-ingest approved)
 
 - [x] **Recon**: real `.idx` + grid headers; fetch-plan + trailing-window settled (this doc).
-- [x] **DECISION (Drew, 2026-06-11):** ingest the NA pair, crop to CONUS at ingest, subset
+- [x] **DECISION (owner, 2026-06-11):** ingest the NA pair, crop to CONUS at ingest, subset
       fetch via .idx. Recorded above; checklist un-gated.
 - [x] **Engine — fetch plan + subset patterns**: `fetch_plan(RrfsA) = [prs-na (pressure),
       nat-na (surface)]`, each carrying its `.idx` `variable_patterns`; `fetch_hour` wires
@@ -278,7 +278,7 @@ gracefully skip with warnings, as GFS already does for fields it lacks.)
         `apcp_run_total` (f002 planes byte-identical, caught by tile-stat comparison).
         Scoring now prefers the 0-start accumulation; HRRR/GFS selections unchanged;
         regression test covers both file orders; f002/f003 re-ingested with the fix.
-      - **Node re-derivation (20260612 01z f000-f003, node3 = Ubuntu, 24-core, 91 GB,
+      - **Node re-derivation (20260612 01z f000-f003, the Linux build node,
         cargo 1.93.1, Linux release build at 02094f0, `--full-throttle --verify`):**
         independently reproduces the above on a fresh cycle + a different platform. Crop
         `4881x2961 -> 2938x1739` every hour; `grid.rwg` 34,861,339 B (bit-identical to the
@@ -308,7 +308,7 @@ gracefully skip with warnings, as GFS already does for fields it lacks.)
 - [x] **Render**: rw_render f000 conus 2m_temperature / composite_reflectivity / sbcape —
       PNGs READ: Great Lakes / coastlines / state lines / terrain stripes all aligned,
       derived sbcape in lock-step → **crop did not shift georeferencing**.
-- [x] **Batch** (node3, 20260612 01z f000-f003, `--no-heavy --products all --region conus`,
+- [x] **Batch** (the Linux build node, 20260612 01z f000-f003, `--no-heavy --products all --region conus`,
       `--full-throttle`): **312 products rendered, 49 skipped/blocked** — MORE than GFS's
       290 exactly as predicted (RRFS-A adds hourly QPF + UH-max/wind-max trailing windows +
       composite reflectivity). Per-hour renders f000 74 / f001 77 / f002 77 / f003 77;
@@ -334,8 +334,8 @@ gracefully skip with warnings, as GFS already does for fields it lacks.)
       `fetch_plan_rrfs_a_is_the_na_pair_with_subset_patterns`,
       `rrfs_a_has_a_conus_crop_box_bounding_hrrr`,
       `hrrr_full_profile_estimate_is_unchanged_after_gfs_table_added`) + 3 integration tests;
-      the 3 live-store accuracy tests stay `#[ignore]`d. Release builds clean on node3
-      (Linux, `cargo build --release -p rusty-weather`). The **full `cargo test --workspace`
+      the 3 live-store accuracy tests stay `#[ignore]`d. Release builds clean on the Linux build node
+      (`cargo build --release -p rusty-weather`). The **full `cargo test --workspace`
       + fmt/clippy gate is deferred to merge time** (per the integration plan: the merge gate
       runs on Windows), NOT run in this node-compute session. Branch pushed to
       origin/rrfs-support (no merge).

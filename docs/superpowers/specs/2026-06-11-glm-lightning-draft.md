@@ -111,5 +111,5 @@ quality flag.
 After this spec converges: plan doc → subagent-driven build (lean review for
 the engine; full adversarial for the `.rwl` format module, same bar as
 rw-store) → golden fixture + FORMAT.md section for `.rwl` → live validation
-against a real storm day. Runs AFTER or alongside multi-model per Drew's
+against a real storm day. Runs AFTER or alongside multi-model per the owner's
 priority; no file overlap with the multi-model track.
