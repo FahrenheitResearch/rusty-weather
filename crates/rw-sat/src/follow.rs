@@ -17,15 +17,20 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Timelike, Utc};
 
-use crate::abi::read_goes_abi_field;
-use crate::events::{SatError, SatEvent, other};
-use crate::goes::{GoesSatellite, parse_goes_abi_filename};
-use crate::s3::{
-    DownloadedObject, S3Object, Sector, abi_filename_product_matches_request, band_hour_prefix,
-    bucket_for_satellite, build_agent, cached_object_path, download_object, list_s3_objects,
-    object_filename, prune_object_cache,
+use crate::abi::{read_goes_abi_field_strided_from_scene, read_goes_abi_scene};
+use crate::archive::{
+    NativeSatelliteFrame, archive_goes_source, automatic_preview_stride, list_native_frames,
+    prune_native_archive,
 };
-use crate::store::{WrittenFrame, downsample_field, frame_time, write_band_frame};
+use crate::events::{NEVER_CANCEL, SatError, SatEvent, other};
+use crate::goes::{GoesSatellite, parse_goes_abi_filename};
+use crate::product::GoesAbiProduct;
+use crate::s3::{
+    DownloadedObject, ObjectDownloadError, S3Object, Sector, abi_filename_product_matches_request,
+    band_hour_prefix, bucket_for_satellite, build_agent, cached_object_path,
+    download_object_with_control, list_s3_objects, object_filename, prune_object_cache,
+};
+use crate::store::{WrittenFrame, frame_time, write_band_frame};
 use crate::window::{WindowConfig, enforce_window};
 use rw_store::run::{RwsRunManifest, validate_store_component};
 
@@ -39,6 +44,9 @@ const MAX_BACKOFF_SECS: u64 = 300;
 const MAX_INGEST_ATTEMPTS: u32 = 5;
 /// Cancel-flag check granularity while sleeping.
 const SLEEP_SLICE_MS: u64 = 100;
+/// Compact `.rws` previews stay below this many cells even when a caller asks
+/// for stride 1. Native NetCDF archival is unaffected.
+const MAXIMUM_PREVIEW_CELLS: usize = 8_000_000;
 
 #[derive(Debug, Clone)]
 pub struct FollowConfig {
@@ -55,7 +63,7 @@ pub struct FollowConfig {
     pub poll_interval: Option<Duration>,
     /// +/- jitter fraction applied to every sleep (default 0.2).
     pub jitter_frac: f64,
-    /// Per-band stride decimation before storing (1 = native).
+    /// Preview stride: 0 chooses an automatic bounded preview; native source is always retained.
     pub downsample: usize,
     pub window: WindowConfig,
     /// Stop after this many poll cycles (`None` = run until cancelled).
@@ -76,7 +84,7 @@ impl FollowConfig {
             cache_dir: PathBuf::from("cache"),
             poll_interval: None,
             jitter_frac: 0.2,
-            downsample: 1,
+            downsample: 0,
             window: WindowConfig::default(),
             max_polls: None,
             max_frames: None,
@@ -98,6 +106,15 @@ pub struct FollowSummary {
     pub downloaded_keys: Vec<String>,
     pub evicted_frames: usize,
     pub evicted_bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct IngestedObject {
+    pub download: DownloadedObject,
+    pub native_frame: NativeSatelliteFrame,
+    /// Compact `.rws` preview. Native archival remains a successful ingest
+    /// when this optional derivative cannot be decoded or written.
+    pub preview_frame: Option<WrittenFrame>,
 }
 
 /// The hour prefixes one poll must cover: the current scan hour, preceded
@@ -183,10 +200,10 @@ fn scan_minute(start: DateTime<Utc>) -> DateTime<Utc> {
         .unwrap_or(start)
 }
 
-/// Dedup state rebuilt from the run manifests already in the store, so a
-/// restarted session never re-downloads or re-ingests frames the rolling
-/// window already holds (the whole current-hour prefix is re-listed after
-/// a restart because `start-after` state is session-local).
+/// Dedup state rebuilt from both retained native manifests and compact `.rws`
+/// run manifests. Native manifests are authoritative when a derivative
+/// preview could not be written, so restarting cannot redownload the same
+/// successfully archived source.
 pub fn primed_seen_scans(
     store_root: &std::path::Path,
     model: &str,
@@ -196,6 +213,21 @@ pub fn primed_seen_scans(
     let mut seen = SeenScans::default();
     if validate_store_component("model", model).is_err() {
         return seen;
+    }
+    for &band in bands {
+        if let Ok(frames) = list_native_frames(
+            store_root,
+            model,
+            sector_slug,
+            GoesAbiProduct::RawChannel(band),
+            usize::MAX,
+        ) {
+            for frame in frames {
+                if let Some(time) = DateTime::<Utc>::from_timestamp(frame.scan_start_unix, 0) {
+                    seen.insert(band, time);
+                }
+            }
+        }
     }
     let Ok(root) = std::fs::canonicalize(store_root) else {
         return seen;
@@ -271,8 +303,12 @@ impl JitterRng {
     }
 }
 
-/// Download one object and ingest it as a store frame. Shared by the
-/// follow loop and the one-shot `latest` CLI flow.
+/// Download one object, retain its native source, and derive a bounded store
+/// preview. Shared by the follow loop and the one-shot `latest` CLI flow.
+///
+/// Native archival is the durable ingest boundary. A preview-only failure is
+/// reported as a warning and returns `preview_frame: None`; retrying the same
+/// large NOAA object cannot repair a deterministic preview decoder failure.
 #[allow(clippy::too_many_arguments)]
 pub fn fetch_and_ingest(
     agent: &ureq::Agent,
@@ -284,14 +320,61 @@ pub fn fetch_and_ingest(
     use_cache: bool,
     written_unix: u64,
     sink: &mut dyn FnMut(SatEvent),
-) -> Result<(DownloadedObject, WrittenFrame), SatError> {
+) -> Result<IngestedObject, SatError> {
+    fetch_and_ingest_with_cancel(
+        agent,
+        bucket,
+        cache_dir,
+        store_root,
+        object,
+        downsample,
+        use_cache,
+        written_unix,
+        &NEVER_CANCEL,
+        sink,
+    )
+}
+
+/// Cancellation-aware form used by live follow sessions. The cancel flag is
+/// observed between socket reads, so Stop does not wait for a Full Disk body
+/// to finish downloading.
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_and_ingest_with_cancel(
+    agent: &ureq::Agent,
+    bucket: &str,
+    cache_dir: &std::path::Path,
+    store_root: &std::path::Path,
+    object: &S3Object,
+    downsample: usize,
+    use_cache: bool,
+    written_unix: u64,
+    cancel: &AtomicBool,
+    sink: &mut dyn FnMut(SatEvent),
+) -> Result<IngestedObject, SatError> {
     sink(SatEvent::DownloadStarted {
         key: object.key.clone(),
         bytes: object.size_bytes,
     });
     let started = Instant::now();
-    let download =
-        download_object(agent, bucket, cache_dir, object, use_cache).map_err(to_send_sync)?;
+    let download = download_object_with_control(
+        agent,
+        bucket,
+        cache_dir,
+        object,
+        use_cache,
+        cancel,
+        &mut |progress| {
+            sink(SatEvent::DownloadProgress {
+                key: object.key.clone(),
+                received_bytes: progress.received_bytes,
+                total_bytes: progress.total_bytes,
+            });
+        },
+    )
+    .map_err(|error| match error {
+        ObjectDownloadError::Cancelled => SatError::Cancelled,
+        error => other(error),
+    })?;
     sink(SatEvent::DownloadDone {
         key: object.key.clone(),
         bytes: object.size_bytes,
@@ -299,19 +382,73 @@ pub fn fetch_and_ingest(
         cache_hit: download.cache_hit,
     });
 
-    let field = read_goes_abi_field(&download.path, "CMI").map_err(to_send_sync)?;
-    let field = downsample_field(field, downsample);
-    let frame = write_band_frame(store_root, &field, written_unix).map_err(to_send_sync)?;
-    sink(SatEvent::FrameWritten {
-        model: frame.model.clone(),
-        run: frame.run.clone(),
-        hhmm: frame.hhmm,
-        scan_time_utc: frame.scan_time_utc,
-        path: frame.path.clone(),
-        bytes: frame.bytes,
-        encode_ms: frame.encode_ms,
+    // Scene metadata reads only the 1-D fixed-grid axes and projection. In
+    // particular, it does not materialize Full Disk C02's 470,716,416-cell
+    // CMI plane. Retain the exact NOAA bytes before attempting any derivative.
+    let scene = read_goes_abi_scene(&download.path).map_err(to_send_sync)?;
+    let channel = scene
+        .channel
+        .ok_or_else(|| other("cannot ingest a GOES source without a channel"))?;
+    let native_frame = archive_goes_source(store_root, &download.path, &scene, &object.key)
+        .map_err(|error| other(error.to_string()))?;
+    sink(SatEvent::NativeFrameUpdated {
+        frame: native_frame.clone(),
+        committed_channel: channel,
     });
-    Ok((download, frame))
+
+    let preview_stride =
+        bounded_preview_stride(scene.fixed_grid.nx, scene.fixed_grid.ny, downsample);
+    if downsample > 0 && preview_stride > downsample {
+        sink(SatEvent::Info {
+            message: format!(
+                "compact C{channel:02} preview stride raised from {downsample} to {preview_stride} to stay within {MAXIMUM_PREVIEW_CELLS} cells; native source remains full resolution"
+            ),
+        });
+    }
+
+    let preview = (|| -> Result<WrittenFrame, Box<dyn std::error::Error>> {
+        let mut archived_scene = scene;
+        archived_scene.path = native_frame.channel_path(store_root, channel)?;
+        let field = read_goes_abi_field_strided_from_scene(&archived_scene, "CMI", preview_stride)?;
+        write_band_frame(store_root, &field, written_unix)
+    })();
+    let preview_frame = match preview {
+        Ok(frame) => {
+            sink(SatEvent::FrameWritten {
+                model: frame.model.clone(),
+                run: frame.run.clone(),
+                hhmm: frame.hhmm,
+                scan_time_utc: frame.scan_time_utc,
+                path: frame.path.clone(),
+                bytes: frame.bytes,
+                encode_ms: frame.encode_ms,
+            });
+            Some(frame)
+        }
+        Err(error) => {
+            sink(SatEvent::Warning {
+                message: format!(
+                    "native ABI source retained for {} C{channel:02}; compact preview unavailable and will not trigger a source redownload: {error}",
+                    native_frame.frame_id
+                ),
+            });
+            None
+        }
+    };
+    Ok(IngestedObject {
+        download,
+        native_frame,
+        preview_frame,
+    })
+}
+
+fn bounded_preview_stride(nx: usize, ny: usize, requested: usize) -> usize {
+    let automatic = automatic_preview_stride(nx, ny, MAXIMUM_PREVIEW_CELLS);
+    if requested == 0 {
+        automatic
+    } else {
+        requested.max(automatic)
+    }
 }
 
 /// Process one prefix's freshly listed objects in key order, advancing the
@@ -482,7 +619,7 @@ pub fn follow(
                     .map(|minutes| Utc::now() - chrono::Duration::minutes(i64::from(minutes)));
                 let mut ingest = |object: &S3Object| -> Result<(), SatError> {
                     let written_unix = Utc::now().timestamp().max(0) as u64;
-                    let result = fetch_and_ingest(
+                    let result = fetch_and_ingest_with_cancel(
                         &agent,
                         &bucket,
                         &config.cache_dir,
@@ -491,16 +628,15 @@ pub fn follow(
                         config.downsample,
                         config.use_cache,
                         written_unix,
+                        cancel,
                         &mut *sink,
                     );
-                    // The store frame is the artifact of record; the raw
-                    // cached object never helps this session again
-                    // (SeenScans dedups) nor a restart (manifest-primed
-                    // dedup skips the fetch entirely). Dropping it on
-                    // success keeps the cache footprint bounded; dropping
-                    // it on failure makes the retry refetch fresh bytes
-                    // instead of replaying a size-matched corrupt cache
-                    // hit.
+                    // The retained native source is the artifact of record;
+                    // the raw staging copy never helps this session again.
+                    // Dropping it on failure makes retryable download/scene/
+                    // archive failures refetch rather than replay corrupt
+                    // size-matched bytes. Preview-only failures are returned
+                    // as successful native ingests and are not retried.
                     if !matches!(result, Err(SatError::Cancelled)) {
                         let _ = std::fs::remove_file(cached_object_path(
                             &config.cache_dir,
@@ -508,31 +644,57 @@ pub fn follow(
                             &object.key,
                         ));
                     }
-                    let (_download, frame) = result?;
+                    let outcome = result?;
+                    let model = outcome.native_frame.platform.clone();
                     summary.downloaded_keys.push(object.key.clone());
-                    summary.frames.push(frame.clone());
                     ingested_this_poll += 1;
-                    // Scope eviction to this followed band's runs.
-                    let run_prefix = format!("{}_c{band:02}", config.sector.slug());
-                    match enforce_window(
-                        &config.store_root,
-                        &frame.model,
-                        &run_prefix,
-                        Utc::now(),
-                        &config.window,
-                    ) {
-                        Ok(report) if report.removed_frames > 0 => {
-                            summary.evicted_frames += report.removed_frames;
-                            summary.evicted_bytes += report.removed_bytes;
-                            sink(SatEvent::Evicted {
-                                model: frame.model.clone(),
-                                frames: report.removed_frames,
-                                bytes: report.removed_bytes,
-                            });
+                    if let Some(frame) = outcome.preview_frame {
+                        summary.frames.push(frame.clone());
+                        // Scope preview eviction to this followed band's runs.
+                        let run_prefix = format!("{}_c{band:02}", config.sector.slug());
+                        match enforce_window(
+                            &config.store_root,
+                            &frame.model,
+                            &run_prefix,
+                            Utc::now(),
+                            &config.window,
+                        ) {
+                            Ok(report) if report.removed_frames > 0 => {
+                                summary.evicted_frames += report.removed_frames;
+                                summary.evicted_bytes += report.removed_bytes;
+                                sink(SatEvent::Evicted {
+                                    model: frame.model.clone(),
+                                    frames: report.removed_frames,
+                                    bytes: report.removed_bytes,
+                                });
+                            }
+                            Ok(_) => {}
+                            Err(err) => sink(SatEvent::Warning {
+                                message: format!("window eviction: {err}"),
+                            }),
                         }
+                    }
+                    let archive_max_bytes = config
+                        .window
+                        .max_bytes
+                        .map(|bytes| bytes.saturating_mul(config.bands.len().max(1) as u64));
+                    match prune_native_archive(
+                        &config.store_root,
+                        &model,
+                        config.sector.slug(),
+                        Utc::now(),
+                        config.window.max_age_minutes,
+                        archive_max_bytes,
+                    ) {
+                        Ok(report) if report.removed_frames > 0 => sink(SatEvent::Info {
+                            message: format!(
+                                "native archive pruned: {} frame(s), {} bytes",
+                                report.removed_frames, report.removed_bytes
+                            ),
+                        }),
                         Ok(_) => {}
                         Err(err) => sink(SatEvent::Warning {
-                            message: format!("window eviction: {err}"),
+                            message: format!("native archive eviction: {err}"),
                         }),
                     }
                     Ok(())
@@ -606,7 +768,7 @@ pub fn follow(
         }
         if config
             .max_frames
-            .is_some_and(|max| summary.frames.len() as u32 >= max)
+            .is_some_and(|max| summary.downloaded_keys.len() as u32 >= max)
         {
             return Ok(summary);
         }
@@ -649,6 +811,67 @@ fn to_send_sync(err: Box<dyn std::error::Error>) -> SatError {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn full_disk_c02_preview_is_bounded_even_when_stride_one_is_requested() {
+        let stride = bounded_preview_stride(21_696, 21_696, 1);
+        assert_eq!(stride, 8);
+        assert!(
+            21_696usize.div_ceil(stride) * 21_696usize.div_ceil(stride) <= MAXIMUM_PREVIEW_CELLS
+        );
+        assert_eq!(bounded_preview_stride(21_696, 21_696, 16), 16);
+    }
+
+    #[test]
+    fn retained_native_manifest_primes_restart_dedup_without_a_preview() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "rw-sat-native-dedup-{}-{nonce}",
+            std::process::id()
+        ));
+        let frame_dir = root
+            .join(crate::archive::NATIVE_SOURCE_ARCHIVE_DIR)
+            .join("g18")
+            .join("fulldisk")
+            .join("20260823")
+            .join("20260823T0200");
+        std::fs::create_dir_all(&frame_dir).unwrap();
+        let scan = Utc.with_ymd_and_hms(2026, 8, 23, 2, 0, 21).unwrap();
+        let manifest = NativeSatelliteFrame {
+            schema: crate::archive::NATIVE_FRAME_SCHEMA.to_string(),
+            platform: "g18".to_string(),
+            sector: "fulldisk".to_string(),
+            frame_id: "20260823T0200".to_string(),
+            scan_start_unix: scan.timestamp(),
+            scan_end_unix: scan.timestamp() + 571,
+            channels: std::collections::BTreeMap::from([(
+                2,
+                crate::archive::NativeChannelSource {
+                    channel: 2,
+                    object_key: "ABI-L2-CMIPF/2026/235/02/OR_ABI-L2-CMIPF-M6C02_G18_s20262350200211_e20262350209519_c20262350209578.nc".to_string(),
+                    relative_path: ".rw-satellite-sources/g18/fulldisk/20260823/20260823T0200/c02.nc".to_string(),
+                    byte_size: 335_834_639,
+                    content_blake3: None,
+                    scan_start_unix: scan.timestamp(),
+                    scan_end_unix: scan.timestamp() + 571,
+                },
+            )]),
+        };
+        std::fs::write(
+            frame_dir.join("frame.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let seen = primed_seen_scans(&root, "g18", "fulldisk", &[2]);
+        assert!(seen.contains(2, scan));
+        assert!(!root.join("g18").exists(), "test must have no .rws preview");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn poll_prefixes_cover_hour_rollover_grace() {
@@ -778,6 +1001,7 @@ mod tests {
             key: key.into(),
             size_bytes: 1,
             last_modified: String::new(),
+            etag: None,
         }
     }
 

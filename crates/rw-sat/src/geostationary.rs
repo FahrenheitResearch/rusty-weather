@@ -122,6 +122,10 @@ pub fn lat_lon_to_scan_angles(
     let earth_y = -radius * cos_geocentric_lat * lon_delta.sin();
     let earth_z = radius * sin_geocentric_lat;
 
+    if !point_is_visible(h, a, b, earth_x, earth_y, earth_z) {
+        return None;
+    }
+
     let sat_x = h - earth_x;
     let sat_y = earth_y;
     let sat_z = earth_z;
@@ -194,6 +198,12 @@ pub fn lat_lon_to_scan_angles_fast(
     let earth_y = -radius * cos_geocentric_lat * lon_delta.sin();
     let earth_z = radius * sin_geocentric_lat;
 
+    // Finite scan angles do not prove visibility: a far-hemisphere point can
+    // otherwise fold back onto the near-side disk in the hot tile path.
+    if !point_is_visible(h, a, b, earth_x, earth_y, earth_z) {
+        return None;
+    }
+
     let sat_x = h - earth_x;
     let sat_y = earth_y;
     let sat_z = earth_z;
@@ -213,6 +223,24 @@ pub fn lat_lon_to_scan_angles_fast(
         return None;
     }
     Some((x, y))
+}
+
+#[inline]
+fn point_is_visible(
+    satellite_height_from_center_m: f64,
+    semi_major_axis_m: f64,
+    semi_minor_axis_m: f64,
+    earth_x: f64,
+    earth_y: f64,
+    earth_z: f64,
+) -> bool {
+    // GOES-R fixed-grid tangent-plane visibility condition.
+    let polar_ratio_squared =
+        (semi_major_axis_m * semi_major_axis_m) / (semi_minor_axis_m * semi_minor_axis_m);
+    let visibility = satellite_height_from_center_m * earth_x
+        - earth_y * earth_y
+        - polar_ratio_squared * earth_z * earth_z;
+    visibility.is_finite() && visibility >= 0.0
 }
 
 fn normalize_longitude_deg(lon: f64) -> f64 {
@@ -282,5 +310,11 @@ mod tests {
             assert!((actual.0 - expected.0).abs() < 1.0e-12);
             assert!((actual.1 - expected.1).abs() < 1.0e-12);
         }
+    }
+
+    #[test]
+    fn fast_lat_lon_to_scan_angles_rejects_far_side_points() {
+        let point = lat_lon_to_scan_angles_fast(H, A, B, LON0, SweepAngleAxis::X, 0.0, 40.0);
+        assert!(point.is_none());
     }
 }
