@@ -35,12 +35,14 @@ store_volume="${container}-store"
 artifact_volume="${container}-artifacts"
 community_volume="${container}-community"
 federation_volume="${container}-federation"
+cache_volume="${container}-cache"
 
 cleanup() {
   docker rm -f "${container}" >/dev/null 2>&1 || true
   for volume in \
     "${store_volume}" "${artifact_volume}" \
-    "${community_volume}" "${federation_volume}"
+    "${community_volume}" "${federation_volume}" \
+    "${cache_volume}"
   do
     docker volume rm "${volume}" >/dev/null 2>&1 || true
   done
@@ -71,7 +73,8 @@ test "$(docker image inspect --format '{{ .Config.User }}' "${image}")" = '65532
 
 for volume in \
   "${store_volume}" "${artifact_volume}" \
-  "${community_volume}" "${federation_volume}"
+  "${community_volume}" "${federation_volume}" \
+  "${cache_volume}"
 do
   docker volume create "${volume}" >/dev/null
 done
@@ -87,6 +90,7 @@ docker run --detach --name "${container}" \
   --env RW_LISTEN=0.0.0.0:8788 \
   --env RW_STORE_ROOT=/var/lib/rusty-weather/store \
   --env RW_ARTIFACT_ROOT=/var/lib/rusty-weather/artifacts \
+  --env RW_CACHE_ROOT=/var/cache/rusty-weather/server \
   --env RW_DOCKER_TOKEN_SOURCE=/run/secrets/rw_api_tokens \
   --mount "type=bind,src=${candidate_source}/config/rusty-weather.example.toml,dst=/etc/rusty-weather/rusty-weather.toml,readonly" \
   --mount "type=bind,src=${runtime_dir}/api-tokens.txt,dst=/run/secrets/rw_api_tokens,readonly" \
@@ -94,6 +98,7 @@ docker run --detach --name "${container}" \
   --mount "type=volume,src=${artifact_volume},dst=/var/lib/rusty-weather/artifacts" \
   --mount "type=volume,src=${community_volume},dst=/var/lib/rusty-weather/community-cache" \
   --mount "type=volume,src=${federation_volume},dst=/var/lib/rusty-weather/federation" \
+  --mount "type=volume,src=${cache_volume},dst=/var/cache/rusty-weather/server" \
   "${image}" >/dev/null
 
 attempt=0

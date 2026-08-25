@@ -357,9 +357,9 @@ async fn serve(config_path: Option<&Path>) -> Result<(), AnyError> {
     }
     initialize_tracing(&config)?;
 
-    fs::create_dir_all(&config.server.store_root)?;
-    fs::create_dir_all(&config.server.artifact_root)?;
-    fs::create_dir_all(&config.server.cache_root)?;
+    create_configured_directory(&config.server.store_root, "store_root")?;
+    create_configured_directory(&config.server.artifact_root, "artifact_root")?;
+    create_configured_directory(&config.server.cache_root, "cache_root")?;
     ensure_real_directory(&config.server.store_root, "store_root")?;
     ensure_real_directory(&config.server.artifact_root, "artifact_root")?;
     ensure_real_directory(&config.server.cache_root, "cache_root")?;
@@ -371,7 +371,10 @@ async fn serve(config_path: Option<&Path>) -> Result<(), AnyError> {
     }
     if config.nexrad_level2_ingest.enabled {
         probe_writable_directory(&config.server.store_root)?;
-        fs::create_dir_all(&config.nexrad_level2_ingest.state_root)?;
+        create_configured_directory(
+            &config.nexrad_level2_ingest.state_root,
+            "nexrad_level2_ingest.state_root",
+        )?;
         ensure_real_directory(
             &config.nexrad_level2_ingest.state_root,
             "nexrad_level2_ingest.state_root",
@@ -385,7 +388,10 @@ async fn serve(config_path: Option<&Path>) -> Result<(), AnyError> {
         }
     }
     if config.satellite_ingest.enabled {
-        fs::create_dir_all(&config.satellite_ingest.raw_cache_root)?;
+        create_configured_directory(
+            &config.satellite_ingest.raw_cache_root,
+            "satellite_ingest.raw_cache_root",
+        )?;
         ensure_real_directory(
             &config.satellite_ingest.raw_cache_root,
             "satellite_ingest.raw_cache_root",
@@ -405,7 +411,7 @@ async fn serve(config_path: Option<&Path>) -> Result<(), AnyError> {
         }
     }
     if config.community.enabled {
-        fs::create_dir_all(&config.community.root)?;
+        create_configured_directory(&config.community.root, "community.root")?;
         ensure_real_directory(&config.community.root, "community.root")?;
         ensure_distinct_roots(&config.server.store_root, &config.community.root)?;
         ensure_distinct_roots(&config.server.artifact_root, &config.community.root)?;
@@ -424,7 +430,10 @@ async fn serve(config_path: Option<&Path>) -> Result<(), AnyError> {
         }
     }
     if config.generation_replication.enabled {
-        fs::create_dir_all(&config.generation_replication.control_root)?;
+        create_configured_directory(
+            &config.generation_replication.control_root,
+            "generation_replication.control_root",
+        )?;
         ensure_real_directory(
             &config.generation_replication.control_root,
             "generation_replication.control_root",
@@ -456,7 +465,7 @@ async fn serve(config_path: Option<&Path>) -> Result<(), AnyError> {
         }
     }
     if config.operations.enabled {
-        fs::create_dir_all(&config.operations.root)?;
+        create_configured_directory(&config.operations.root, "operations.root")?;
         ensure_real_directory(&config.operations.root, "operations.root")?;
         ensure_distinct_roots(&config.server.store_root, &config.operations.root)?;
         ensure_distinct_roots(&config.server.artifact_root, &config.operations.root)?;
@@ -1129,13 +1138,36 @@ fn connectable_address(address: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Wrap a startup filesystem failure so the operator sees which operation
+/// failed on which path. A bare `std::io::Error` renders as e.g. "Read-only
+/// file system (os error 30)", which names nothing an operator can act on.
+fn startup_io_error(operation: &str, path: &Path, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!("{operation} {}: {error}", path.display()),
+    )
+}
+
+fn create_configured_directory(path: &Path, label: &str) -> Result<(), AnyError> {
+    fs::create_dir_all(path)
+        .map_err(|error| startup_io_error(&format!("creating {label} directory"), path, error))?;
+    Ok(())
+}
+
+fn canonical_configured_root(path: &Path) -> Result<PathBuf, AnyError> {
+    fs::canonicalize(path)
+        .map_err(|error| startup_io_error("resolving configured root", path, error).into())
+}
+
 fn ensure_distinct_roots(first_root: &Path, second_root: &Path) -> Result<(), AnyError> {
-    let first = fs::canonicalize(first_root)?;
-    let second = fs::canonicalize(second_root)?;
+    let first = canonical_configured_root(first_root)?;
+    let second = canonical_configured_root(second_root)?;
     if first == second || first.starts_with(&second) || second.starts_with(&first) {
-        return Err(std::io::Error::other(
-            "configured roots must be separate, non-nested directories",
-        )
+        return Err(std::io::Error::other(format!(
+            "configured roots must be separate, non-nested directories: {} and {}",
+            first.display(),
+            second.display()
+        ))
         .into());
     }
     Ok(())
@@ -1151,10 +1183,12 @@ fn ensure_all_distinct_roots<const N: usize>(roots: [&Path; N]) -> Result<(), An
 }
 
 fn ensure_real_directory(path: &Path, label: &str) -> Result<(), AnyError> {
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| startup_io_error(&format!("inspecting {label} directory"), path, error))?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
         return Err(std::io::Error::other(format!(
-            "{label} must be a real directory, not a symlink"
+            "{label} must be a real directory, not a symlink: {}",
+            path.display()
         ))
         .into());
     }
@@ -1175,6 +1209,11 @@ fn check_directory(name: &'static str, path: &Path) -> DoctorCheck {
 }
 
 fn probe_writable_directory(path: &Path) -> std::io::Result<()> {
+    write_probe_directory(path)
+        .map_err(|error| startup_io_error("write-probing directory", path, error))
+}
+
+fn write_probe_directory(path: &Path) -> std::io::Result<()> {
     let probe = path.join(format!(".rw-server-write-probe-{}", std::process::id()));
     let mut file = fs::OpenOptions::new()
         .write(true)

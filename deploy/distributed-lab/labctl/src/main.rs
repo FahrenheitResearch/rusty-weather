@@ -493,14 +493,17 @@ fn provision(root: &Path) -> LabResult<()> {
     for path in [
         "data/authority/store",
         "data/authority/artifacts",
+        "data/authority/cache",
         "data/authority/community",
         "data/authority/federation",
         "data/alpha/store",
         "data/alpha/artifacts",
+        "data/alpha/cache",
         "data/alpha/community",
         "data/alpha/replication",
         "data/beta/store",
         "data/beta/artifacts",
+        "data/beta/cache",
         "data/beta/community",
         "data/beta/replication",
         "data/r2",
@@ -791,6 +794,7 @@ fn common_server(prefix: &str) -> String {
 listen = "0.0.0.0:8788"
 store_root = "/var/lib/rusty-weather/store"
 artifact_root = "/var/lib/rusty-weather/artifacts"
+cache_root = "/var/cache/rusty-weather/server"
 allow_unauthenticated_public_bind = false
 
 [auth]

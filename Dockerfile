@@ -33,6 +33,7 @@ RUN apt-get update \
         /var/lib/rusty-weather/store /var/lib/rusty-weather/artifacts \
         /var/lib/rusty-weather/community-cache /var/lib/rusty-weather/federation \
         /var/lib/rusty-weather/scheduler /var/cache/rusty-weather/ingest \
+        /var/cache/rusty-weather/server \
     && install -d -o root -g "${RW_GID}" -m 0750 /etc/rusty-weather
 
 COPY --from=builder /src/target/release/rw-server /usr/local/bin/rw-server
