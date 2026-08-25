@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
 use rustwx_core::{CycleSpec, GridShape, LatLonGrid, ModelId, SourceId};
+use rw_ingest::ingest_profile::{FieldSet, IngestProfile};
 use rw_store::RwsExactTime;
 use rw_store::format::RwsWriterInfo;
 use rw_store::ingest::{DerivedFieldInput, write_hour_from_grid_with_derived_exact};
@@ -105,6 +106,268 @@ fn nbm_plan_preserves_native_irregular_cadence_and_exact_times() {
         );
     }
     assert_eq!(plan.ingest_products[0].product, "core/co");
+}
+
+#[test]
+fn noaa_wave1_plans_pin_ingest_products_and_native_cadence() {
+    let cases = [
+        (ModelId::HrrrAk, 0, 49, 48, vec!["prs", "sfc"]),
+        (ModelId::HrrrAk, 1, 19, 18, vec!["prs", "sfc"]),
+        (ModelId::Rap, 0, 22, 21, vec!["awp130pgrb"]),
+        (ModelId::Rap, 3, 52, 51, vec!["awp130pgrb"]),
+        (ModelId::Nam, 0, 53, 84, vec!["awip3d"]),
+        (ModelId::Gdas, 0, 10, 9, vec!["pgrb2.0p25"]),
+    ];
+    for (model, cycle_hour, expected_count, expected_last, products) in cases {
+        let plan = JobPlan::build(model, cycle("20260812", cycle_hour)).unwrap();
+        assert_eq!(plan.expected_valid_times.len(), expected_count, "{model}");
+        assert_eq!(
+            plan.expected_valid_times.last().unwrap().forecast_hour,
+            expected_last,
+            "{model} {cycle_hour:02}z horizon"
+        );
+        assert_eq!(
+            plan.ingest_products
+                .iter()
+                .map(|product| product.product.as_str())
+                .collect::<Vec<_>>(),
+            products,
+            "{model} scheduler product contract"
+        );
+        for (slot, expected) in plan.expected_valid_times.iter().enumerate() {
+            assert_eq!(usize::from(expected.storage_slot), slot);
+            assert_eq!(
+                expected.lead_seconds,
+                u64::from(expected.forecast_hour) * 3_600
+            );
+        }
+        plan.validate().unwrap();
+    }
+}
+
+#[test]
+fn eccc_regional_plans_pin_logical_products_and_hourly_native_cadence() {
+    for (model, expected_count, expected_last) in
+        [(ModelId::Rdps, 85, 84), (ModelId::Hrdps, 49, 48)]
+    {
+        for cycle_hour in [0, 6, 12, 18] {
+            let plan = JobPlan::build(model, cycle("20260814", cycle_hour)).unwrap();
+            assert_eq!(plan.expected_valid_times.len(), expected_count, "{model}");
+            assert_eq!(
+                plan.expected_valid_times.last().unwrap().forecast_hour,
+                expected_last,
+                "{model} {cycle_hour:02}z horizon"
+            );
+            assert_eq!(
+                plan.ingest_products
+                    .iter()
+                    .map(|product| product.product.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["rws-pressure", "rws-surface"]
+            );
+            assert!(!plan.ingest_profile.derived);
+            assert!(!plan.ingest_profile.heavy);
+            assert_eq!(
+                plan.capability_limitations,
+                vec![
+                    "sparse_pressure_levels".to_string(),
+                    "derived_products_disabled".to_string(),
+                ]
+            );
+            plan.validate().unwrap();
+        }
+        assert!(JobPlan::build(model, cycle("20260814", 3)).is_err());
+    }
+}
+
+#[test]
+fn gdps_geml_plan_pins_six_hour_cadence_and_complete_native_profile() {
+    let plan = JobPlan::build_with_profile_and_source(
+        ModelId::GdpsGeml,
+        cycle("20260814", 0),
+        &IngestProfile::sounding(),
+        Some(SourceId::Eccc),
+    )
+    .unwrap();
+    assert_eq!(plan.expected_valid_times.len(), 41);
+    assert_eq!(plan.expected_valid_times.first().unwrap().forecast_hour, 0);
+    assert_eq!(plan.expected_valid_times.last().unwrap().forecast_hour, 240);
+    assert!(
+        plan.expected_valid_times
+            .iter()
+            .all(|time| time.forecast_hour % 6 == 0)
+    );
+    assert_eq!(
+        plan.ingest_products
+            .iter()
+            .map(|product| product.product.as_str())
+            .collect::<Vec<_>>(),
+        vec!["rws-pressure", "rws-surface"]
+    );
+    assert_eq!(
+        plan.ingest_profile.to_profile().unwrap(),
+        IngestProfile::sounding()
+    );
+    assert_eq!(
+        plan.capability_limitations,
+        vec![
+            "sparse_pressure_levels".to_string(),
+            "derived_products_disabled".to_string(),
+            "pre_operational_feed".to_string(),
+        ]
+    );
+    plan.validate().unwrap();
+    assert!(JobPlan::build(ModelId::GdpsGeml, cycle("20260814", 6)).is_err());
+}
+
+#[test]
+fn dwd_icon_plans_pin_component_bundles_native_cadence_and_source() {
+    let cases = [
+        (ModelId::IconEu, 0, 93, 120),
+        (ModelId::IconEu, 3, 34, 48),
+        (ModelId::IconD2, 0, 49, 48),
+        (ModelId::IconD2, 21, 49, 48),
+    ];
+    for (model, cycle_hour, expected_count, expected_last) in cases {
+        let profile = IngestProfile::sounding();
+        let plan = JobPlan::build_with_profile_and_source(
+            model,
+            cycle("20260814", cycle_hour),
+            &profile,
+            Some(SourceId::Dwd),
+        )
+        .unwrap();
+        assert_eq!(plan.expected_valid_times.len(), expected_count, "{model}");
+        assert_eq!(
+            plan.expected_valid_times.last().unwrap().forecast_hour,
+            expected_last,
+            "{model} {cycle_hour:02}z horizon"
+        );
+        assert_eq!(
+            plan.ingest_products
+                .iter()
+                .map(|product| product.product.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rws-pressure", "rws-surface"]
+        );
+        assert_eq!(plan.source_override, Some(SourceId::Dwd));
+        plan.validate().unwrap();
+
+        assert!(
+            JobPlan::build_with_profile_and_source(
+                model,
+                cycle("20260814", cycle_hour),
+                &profile,
+                Some(SourceId::Nomads),
+            )
+            .is_err(),
+            "{model} must not silently substitute a non-DWD transport"
+        );
+    }
+}
+
+#[test]
+fn geps_plan_pins_published_statistics_profile_and_invariant_cadence() {
+    let plan = JobPlan::build_with_profile_and_source(
+        ModelId::Geps,
+        cycle("20260814", 0),
+        &rw_ingest::ingest_profile::IngestProfile::surface(),
+        Some(SourceId::Eccc),
+    )
+    .unwrap();
+    let hours = plan
+        .expected_valid_times
+        .iter()
+        .map(|time| time.forecast_hour)
+        .collect::<Vec<_>>();
+    assert_eq!(hours.len(), 96);
+    assert_eq!(hours.first(), Some(&3));
+    assert_eq!(hours.last(), Some(&384));
+    assert!(hours.contains(&192));
+    assert!(hours.contains(&198));
+    assert!(!hours.contains(&195));
+    assert!(!hours.contains(&201));
+    assert_eq!(plan.source_override, Some(SourceId::Eccc));
+    assert_eq!(plan.ingest_products.len(), 1);
+    assert_eq!(plan.ingest_products[0].product, "rws-published-statistics");
+    assert!(plan.ingest_products[0].surface_source);
+    assert!(!plan.ingest_products[0].pressure_source);
+    assert_eq!(
+        plan.capability_limitations,
+        vec![
+            "provider_statistics_only".to_string(),
+            "sparse_pressure_levels".to_string(),
+            "two_dimensional_statistics_only".to_string(),
+            "derived_products_disabled".to_string(),
+            "extended_range_not_scheduled".to_string(),
+        ]
+    );
+    assert_eq!(
+        plan.ingest_profile.to_profile().unwrap(),
+        rw_ingest::ingest_profile::IngestProfile::surface()
+    );
+    plan.validate().unwrap();
+
+    assert!(JobPlan::build(ModelId::Geps, cycle("20260814", 6)).is_err());
+    assert!(
+        JobPlan::build_with_profile(
+            ModelId::Geps,
+            cycle("20260814", 0),
+            &rw_ingest::ingest_profile::IngestProfile::full(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn cptec_south_america_plans_pin_hourly_indexed_leads_and_source() {
+    for model in [ModelId::WrfCptec7km, ModelId::BramsCptec8km] {
+        let profile = IngestProfile::sounding();
+        let plan = JobPlan::build_with_profile_and_source(
+            model,
+            cycle("20260814", 0),
+            &profile,
+            Some(SourceId::Cptec),
+        )
+        .unwrap();
+        let expected_first = if model == ModelId::WrfCptec7km { 0 } else { 1 };
+        let expected_count = if model == ModelId::WrfCptec7km {
+            181
+        } else {
+            180
+        };
+        assert_eq!(plan.expected_valid_times.len(), expected_count, "{model}");
+        assert_eq!(
+            plan.expected_valid_times.first().unwrap().forecast_hour,
+            expected_first
+        );
+        assert_eq!(plan.expected_valid_times.last().unwrap().forecast_hour, 180);
+        assert_eq!(plan.ingest_products.len(), 1);
+        assert_eq!(plan.ingest_products[0].product, "raw");
+        assert!(plan.ingest_products[0].surface_source);
+        assert!(plan.ingest_products[0].pressure_source);
+        assert!(!plan.ingest_products[0].idx_patterns.is_empty());
+        assert_eq!(plan.source_override, Some(SourceId::Cptec));
+        assert_eq!(
+            plan.capability_limitations,
+            vec![
+                "sparse_pressure_levels".to_string(),
+                "derived_products_disabled".to_string(),
+            ]
+        );
+        plan.validate().unwrap();
+
+        assert!(JobPlan::build(model, cycle("20260814", 6)).is_err());
+        assert!(
+            JobPlan::build_with_profile_and_source(
+                model,
+                cycle("20260814", 0),
+                &profile,
+                Some(SourceId::Nomads),
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]
@@ -426,7 +689,10 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
     let all = scheduler_config("all-ready", &["all_ready"]);
     let expanded = all.expanded_models().unwrap();
     assert!(expanded.contains(&ModelId::Hrrr));
+    assert!(expanded.contains(&ModelId::IconRu));
     assert!(expanded.contains(&ModelId::Rtma));
+    assert!(expanded.contains(&ModelId::CmaGeps));
+    assert!(expanded.contains(&ModelId::GdpsGeml));
 
     let surface = scheduler_config("surface-profile", &["hiresw"]);
     let profile = surface.profile_for(ModelId::Hiresw).unwrap();
@@ -441,6 +707,45 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
     assert!(profile.includes_surface_field("apcp_run_total"));
     assert!(profile.includes_surface_field("pwat"));
 
+    let cma_geps = scheduler_config("cma-geps-statistics-profile", &["cma-geps"]);
+    let profile = cma_geps.profile_for(ModelId::CmaGeps).unwrap();
+    assert!(!profile.needs_prs());
+    assert!(!profile.derived && !profile.heavy);
+    assert!(matches!(
+        profile.surface_fields,
+        FieldSet::Named(ref names) if names.len() == 57
+    ));
+    assert!(profile.includes_surface_field("temperature_2m_p50"));
+    assert!(profile.includes_surface_field("wind_speed_10m_probability_gt_15ms"));
+    let plan = JobPlan::build_with_profile_and_source(
+        ModelId::CmaGeps,
+        cycle("20260731", 0),
+        &profile,
+        Some(SourceId::Cma),
+    )
+    .expect("CMA provider-statistics lane is schedulable");
+    assert_eq!(
+        plan.ingest_profile.to_profile().unwrap().surface_fields,
+        profile.surface_fields
+    );
+    assert_eq!(plan.expected_valid_times.len(), 74);
+    assert_eq!(
+        plan.expected_valid_times
+            .last()
+            .map(|time| time.forecast_hour),
+        Some(360)
+    );
+    assert!(
+        plan.capability_limitations
+            .contains(&"provider_statistics_only".to_string())
+    );
+
+    let geml = scheduler_config("gdps-geml-profile", &["gdps-geml"]);
+    assert_eq!(
+        geml.profile_for(ModelId::GdpsGeml).unwrap(),
+        IngestProfile::sounding()
+    );
+
     let mut unsafe_surface = scheduler_config("unsafe-surface-profile", &["hiresw"]);
     unsafe_surface
         .model_profiles
@@ -452,15 +757,96 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
         .insert("HRRR".to_string(), "view".to_string());
     assert!(typo.validate().is_err());
 
+    // view_profiles: the view 2D pack plus all 5 sounding volumes, heavy
+    // stays off (the node's HRRR shape — Skew-Ts without the ECAPE cost).
+    let mut view_profiles = scheduler_config("view-profiles-profile", &["hrrr"]);
+    view_profiles
+        .model_profiles
+        .insert("hrrr".to_string(), "view_profiles".to_string());
+    view_profiles
+        .validate()
+        .expect("hrrr view_profiles validates");
+    let profile = view_profiles.profile_for(ModelId::Hrrr).unwrap();
+    assert_eq!(profile, IngestProfile::view_profiles());
+    assert_eq!(profile.volumes.len(), 5);
+    assert!(profile.includes_full_2d());
+    assert!(profile.derived && !profile.heavy);
+    let plan = JobPlan::build_with_profile(ModelId::Hrrr, cycle("20260731", 0), &profile)
+        .expect("HRRR view_profiles lane is schedulable");
+    let persisted = plan.ingest_profile.to_profile().unwrap();
+    assert_eq!(persisted, IngestProfile::view_profiles());
+    assert_eq!(
+        plan.ingest_profile.volumes,
+        vec![
+            "temperature_iso",
+            "dewpoint_iso",
+            "u_iso",
+            "v_iso",
+            "height_iso"
+        ]
+    );
+
     let ensemble = scheduler_config("ensemble-profile", &["href"]);
     let profile = ensemble.profile_for(ModelId::Href).unwrap();
     assert!(!profile.derived && !profile.heavy);
 
-    for model in [ModelId::Aigefs, ModelId::Hgefs] {
+    for model in [
+        ModelId::Aigfs,
+        ModelId::Aigefs,
+        ModelId::Hgefs,
+        ModelId::EcmwfOpenData,
+        ModelId::Rdps,
+        ModelId::Hrdps,
+        ModelId::IconEu,
+        ModelId::IconD2,
+    ] {
         let config = scheduler_config(&format!("ensemble-profile-{model}"), &[model.as_str()]);
         let profile = config.profile_for(model).unwrap();
         assert!(!profile.derived && !profile.heavy);
     }
+
+    let gefs = scheduler_config("gefs-control-profile", &["gefs"]);
+    let profile = gefs.profile_for(ModelId::Gefs).unwrap();
+    assert!(!profile.derived && !profile.heavy);
+    let plan = JobPlan::build_with_profile(ModelId::Gefs, cycle("20260731", 0), &profile)
+        .expect("GEFS control-member lane is schedulable");
+    assert!(
+        plan.capability_limitations
+            .contains(&"ensemble_control_member_only".to_string())
+    );
+    assert_eq!(
+        plan.expected_valid_times
+            .last()
+            .map(|time| time.forecast_hour),
+        Some(840)
+    );
+
+    let geps = scheduler_config("geps-statistics-profile", &["geps"]);
+    let profile = geps.profile_for(ModelId::Geps).unwrap();
+    assert_eq!(profile, rw_ingest::ingest_profile::IngestProfile::surface());
+    let mut unsafe_geps = geps;
+    unsafe_geps
+        .model_profiles
+        .insert("geps".to_string(), "analysis".to_string());
+    assert!(unsafe_geps.validate().is_err());
+
+    let reps = scheduler_config("reps-statistics-profile", &["reps"]);
+    let profile = reps.profile_for(ModelId::Reps).unwrap();
+    assert_eq!(
+        profile,
+        rw_ingest::ingest_profile::IngestProfile::surface_for_model(ModelId::Reps)
+    );
+    let mut unsafe_reps = reps;
+    unsafe_reps
+        .model_profiles
+        .insert("reps".to_string(), "analysis".to_string());
+    assert!(unsafe_reps.validate().is_err());
+
+    let mut unsafe_cma = scheduler_config("cma-statistics-profile", &["cma-geps"]);
+    unsafe_cma
+        .model_profiles
+        .insert("cma-geps".to_string(), "analysis".to_string());
+    assert!(unsafe_cma.validate().is_err());
 }
 
 #[test]
@@ -1031,7 +1417,61 @@ fn every_ready_model_has_a_valid_cadence_profile_and_remote_source() {
         );
         plan.validate().unwrap();
     }
-    assert_eq!(ready, 21);
+    assert_eq!(ready, 33);
+}
+
+#[test]
+fn reps_plan_schedules_only_provider_statistics_from_f003_through_f072() {
+    let plan = JobPlan::build(ModelId::Reps, cycle("20260814", 0)).unwrap();
+    assert_eq!(plan.expected_valid_times.len(), 24);
+    assert_eq!(plan.expected_valid_times.first().unwrap().forecast_hour, 3);
+    assert_eq!(plan.expected_valid_times.last().unwrap().forecast_hour, 72);
+    assert!(
+        plan.expected_valid_times
+            .iter()
+            .all(|valid| valid.forecast_hour % 3 == 0)
+    );
+    assert_eq!(plan.ingest_products.len(), 1);
+    assert_eq!(
+        plan.ingest_products[0].product,
+        "rws-reps-provider-statistics"
+    );
+    assert!(plan.ingest_products[0].surface_source);
+    assert!(!plan.ingest_products[0].pressure_source);
+    assert_eq!(
+        plan.capability_limitations,
+        vec![
+            "provider_statistics_only",
+            "surface_only",
+            "derived_products_disabled",
+        ]
+    );
+    assert!(plan.ingest_profile.volumes.is_empty());
+    assert_eq!(
+        plan.ingest_profile
+            .surface_fields
+            .as_ref()
+            .expect("REPS persists an exact named statistics set")
+            .len(),
+        37
+    );
+    assert!(!plan.ingest_profile.derived && !plan.ingest_profile.heavy);
+    plan.validate().unwrap();
+
+    assert!(
+        JobPlan::build_with_profile(
+            ModelId::Reps,
+            cycle("20260814", 0),
+            &rw_ingest::ingest_profile::IngestProfile::analysis(),
+        )
+        .is_err()
+    );
+
+    let mut tampered = plan.clone();
+    tampered.ingest_profile =
+        PersistedIngestProfile::from_profile(&rw_ingest::ingest_profile::IngestProfile::analysis())
+            .unwrap();
+    assert!(tampered.validate().is_err());
 }
 
 #[test]

@@ -1,0 +1,41 @@
+# schema=rusty-weather.provider-inventory.v1
+# provider=Environment and Climate Change Canada (ECCC) / Meteorological Service of Canada (MSC)
+# model=REPS
+# official_documentation_url=https://eccc-msc.github.io/open-data/msc-data/nwp_reps/readme_reps-datamart_en/
+# official_directory_url=https://dd.weather.gc.ca/today/ensemble/reps/10km/grib2/00/024/
+# directory_listing_bytes=24022
+# directory_listing_sha256=29b48053bea61ed7ec6df4c4ebb974c029183b17c6298a350c39a5831501f0cf
+# directory_grib2_links=103
+# directory_provider_statistic_links=25
+# forecast_hour=024
+# live_decoded_grid=908x960
+# grid_template=1
+# raw_grid_first_lat_lon=-50.760002,312.289478
+# raw_grid_last_lat_lon=35.550003,33.919483
+# grid_i_j_increment_deg=0.09,0.09
+# scan_mode=0x40
+# resolution_and_component_flags=0x38
+# south_pole_lat_lon=-25.647280,269.555534
+# rotation_angle_deg=0.0
+# selected_component_count=3
+# selected_source_bytes=15308713
+# selected_message_count=37
+# provider_statistic_population=20
+# percentile_values=10,25,50,75,90
+# derived_code_4=ensemble_spread-not-standard_deviation
+# derived_codes=4:spread,0:unweighted_mean,8:minimum,9:maximum
+# precipitation_window=start_f021,end_f024,length_3h,statistical_process_1
+# precipitation_probability_type=3
+# precipitation_probability_thresholds_kg_m-2=1,2.5,5,10,15,20,25,30,40,50
+# raw_member_policy=disabled-contract-evidence-only
+# raw_member_url=https://dd.weather.gc.ca/today/ensemble/reps/10km/grib2/00/024/20260814T00Z_MSC_REPS_TMP_AGL-2m_RLatLon0.09x0.09_PT024H.grib2
+# raw_member_bytes=9108868
+# raw_member_sha256=c70292b8829c83721395fa525853f0b94f10602467601974b68e2846bc938926
+# raw_member_messages=21-control-plus-20-perturbed
+# payload=20260814T00Z_MSC_REPS_TMP-Prob_AGL-2m_RLatLon0.09x0.09_PT024H.grib2|4602451|1cb07165788e942d1c3a9b6680078f54b494f16243032157ae5f5c00b5952259|9
+# payload=20260814T00Z_MSC_REPS_WIND-Prob_AGL-10m_RLatLon0.09x0.09_PT024H.grib2|7021499|1c55fe4d965715fca760cfe06236245505c9d0320d22890b2679b87519cf84ec|9
+# payload=20260814T00Z_MSC_REPS_TPRATE-Accum3h-Prob_SFC_RLatLon0.09x0.09_PT024H.grib2|3684763|4d9b41638df7fb5466494f0e6aef4ee8ab20ce301b33b1685f3128f0666f244d|19
+
+20260814T00Z_MSC_REPS_TMP-Prob_AGL-2m_RLatLon0.09x0.09_PT024H.grib2
+20260814T00Z_MSC_REPS_WIND-Prob_AGL-10m_RLatLon0.09x0.09_PT024H.grib2
+20260814T00Z_MSC_REPS_TPRATE-Accum3h-Prob_SFC_RLatLon0.09x0.09_PT024H.grib2

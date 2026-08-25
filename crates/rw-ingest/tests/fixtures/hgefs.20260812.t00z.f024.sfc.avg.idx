@@ -1,0 +1,5 @@
+1:0:d=2026081200:UGRD:10 m above ground:24 hour fcst:ens mean
+2:726118:d=2026081200:VGRD:10 m above ground:24 hour fcst:ens mean
+3:1446176:d=2026081200:TMP:2 m above ground:24 hour fcst:ens mean
+4:1842830:d=2026081200:PRMSL:mean sea level:24 hour fcst:ens mean
+5:2738013:d=2026081200:APCP:surface:18-24 hour acc fcst:ens mean

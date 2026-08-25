@@ -28,7 +28,8 @@ pub struct SchedulerConfig {
     pub models: Vec<String>,
     pub source: Option<String>,
     pub model_sources: BTreeMap<String, String>,
-    /// `auto`, `full`, `view`, `sounding`, or `analysis`.
+    /// `auto`, `full`, `view`, `view_profiles`, `sounding`, `surface`, or
+    /// `analysis`.
     pub profile: String,
     pub model_profiles: BTreeMap<String, String>,
     pub use_cache: bool,
@@ -375,15 +376,28 @@ impl SchedulerConfig {
             .map(String::as_str)
             .unwrap_or(&self.profile);
         let profile = if requested == "auto" {
-            if capability
+            if model == ModelId::GdpsGeml {
+                // GEML's complete native contract is the sounding-shaped
+                // six-volume/4-surface inventory; it has no inputs for the
+                // render-grade full-2D or derived stages.
+                IngestProfile::sounding()
+            } else if capability
                 .limitations
                 .contains(&IngestCapabilityLimitation::AnalysisOnly)
             {
                 IngestProfile::analysis()
             } else if capability
                 .limitations
-                .contains(&IngestCapabilityLimitation::SurfaceOnly)
+                .contains(&IngestCapabilityLimitation::ProviderStatisticsOnly)
             {
+                IngestProfile::surface_for_model(model)
+            } else if capability.limitations.iter().any(|limitation| {
+                matches!(
+                    limitation,
+                    IngestCapabilityLimitation::SurfaceOnly
+                        | IngestCapabilityLimitation::TwoDimensionalStatisticsOnly
+                )
+            }) {
                 IngestProfile::surface()
             } else if capability
                 .limitations
@@ -396,6 +410,8 @@ impl SchedulerConfig {
             } else {
                 IngestProfile::view()
             }
+        } else if requested == "surface" {
+            IngestProfile::surface_for_model(model)
         } else {
             IngestProfile::preset(requested).map_err(SchedulerError::InvalidConfig)?
         };
@@ -406,12 +422,33 @@ impl SchedulerConfig {
         let surface_only = capability.limitations.iter().any(|limitation| {
             matches!(
                 limitation,
-                IngestCapabilityLimitation::AnalysisOnly | IngestCapabilityLimitation::SurfaceOnly
+                IngestCapabilityLimitation::AnalysisOnly
+                    | IngestCapabilityLimitation::SurfaceOnly
+                    | IngestCapabilityLimitation::ProviderStatisticsOnly
+                    | IngestCapabilityLimitation::TwoDimensionalStatisticsOnly
             )
         });
         if surface_only && profile.needs_prs() {
             return Err(SchedulerError::InvalidConfig(format!(
                 "profile '{requested}' requires pressure data but model '{model}' is surface-only"
+            )));
+        }
+        if capability
+            .limitations
+            .contains(&IngestCapabilityLimitation::TwoDimensionalStatisticsOnly)
+            && profile != IngestProfile::surface()
+        {
+            return Err(SchedulerError::InvalidConfig(format!(
+                "profile '{requested}' is incompatible with model '{model}', which requires the complete surface profile for its typed 2-D statistics collection"
+            )));
+        }
+        if capability
+            .limitations
+            .contains(&IngestCapabilityLimitation::ProviderStatisticsOnly)
+            && profile != IngestProfile::surface_for_model(model)
+        {
+            return Err(SchedulerError::InvalidConfig(format!(
+                "profile '{requested}' is incompatible with model '{model}', which requires its complete typed provider-statistics profile"
             )));
         }
         if capability
