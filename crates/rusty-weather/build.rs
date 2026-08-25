@@ -10,10 +10,10 @@ fn main() {
     // HEAD alone goes stale: same-branch commits rewrite the ref file (not
     // HEAD), so also watch the ref HEAD points at, plus the index so
     // staged/dirty transitions refresh the -dirty flag.
-    if let Ok(head) = std::fs::read_to_string("../../.git/HEAD") {
-        if let Some(reference) = head.strip_prefix("ref: ") {
-            println!("cargo:rerun-if-changed=../../.git/{}", reference.trim());
-        }
+    if let Ok(head) = std::fs::read_to_string("../../.git/HEAD")
+        && let Some(reference) = head.strip_prefix("ref: ")
+    {
+        println!("cargo:rerun-if-changed=../../.git/{}", reference.trim());
     }
     println!("cargo:rerun-if-changed=../../.git/index");
     let sha = build_sha().unwrap_or_else(|| "unknown".to_string());

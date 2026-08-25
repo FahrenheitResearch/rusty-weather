@@ -6,6 +6,11 @@
     "auth": {
       "$ref": "#/$defs/AuthConfig",
       "default": {
+        "legacy_api_tokens_are_operations_admins": false,
+        "ops_admin_token_file": null,
+        "ops_ingest_token_file": null,
+        "ops_read_token_file": null,
+        "ops_write_token_file": null,
         "protect_metrics": true,
         "token_file": null
       }
@@ -202,11 +207,14 @@
         "job_timeout_seconds": 300,
         "json_grid_values": 250000,
         "light_concurrency": 32,
+        "observation_generated_upload_bytes": 201326592,
+        "observation_level2_upload_bytes": 268435456,
         "points_per_query": 100,
         "queued_jobs": 64,
         "reader_cache_bytes": 268435456,
         "request_body_bytes": 2097152,
         "response_cache_bytes": 134217728,
+        "satellite_tile_cache_bytes": 68719476736,
         "sync_result_values": 2000000,
         "sync_timeout_seconds": 10,
         "temporal_frames": 120,
@@ -222,6 +230,67 @@
         "format": "json"
       }
     },
+    "mrms_ingest": {
+      "description": "Optional server-owned continuous NOAA MRMS ingest. This is disabled by\ndefault and writes through the same exact-time observation pipeline as\nexplicit MRMS jobs.",
+      "$ref": "#/$defs/MrmsIngestConfig",
+      "default": {
+        "concurrency": 1,
+        "enabled": false,
+        "gate_server_readiness": false,
+        "maximum_backoff_seconds": 900,
+        "poll_interval_seconds": 60,
+        "products": [
+          {
+            "collection": "conus",
+            "product": "ReflectivityAtLowestAltitude",
+            "stale_after_seconds": null,
+            "variable": "mrms_reflectivity_lowest_altitude"
+          }
+        ],
+        "request_retries": 1,
+        "request_timeout_seconds": 90,
+        "retention_hours": 72,
+        "stale_after_seconds": 600
+      }
+    },
+    "nexrad_level2_ingest": {
+      "description": "Optional server-owned acquisition of complete NEXRAD Level II volumes.\nSites are an explicit allowlist and the worker writes through the same\nexact-time observation store used by authenticated client uploads.",
+      "$ref": "#/$defs/NexradLevel2IngestConfig",
+      "default": {
+        "catch_up_hours": 2,
+        "concurrency": 1,
+        "enabled": false,
+        "gate_server_readiness": false,
+        "maximum_backoff_seconds": 900,
+        "maximum_listing_bytes": 33554432,
+        "maximum_object_bytes": 536870912,
+        "poll_interval_seconds": 60,
+        "providers": [
+          {
+            "allow_http": false,
+            "attribution": "NOAA/NWS NEXRAD Level II via the Unidata public archive",
+            "id": "unidata-nexrad-level2",
+            "listing_base_url": "https://unidata-nexrad-level2.s3.amazonaws.com",
+            "object_base_url": "https://unidata-nexrad-level2.s3.amazonaws.com"
+          }
+        ],
+        "request_retries": 1,
+        "request_timeout_seconds": 120,
+        "retention_hours": 168,
+        "sites": [],
+        "stale_after_seconds": 900,
+        "state_root": "./nexrad-level2-state"
+      }
+    },
+    "operations": {
+      "description": "Authenticated storm-analysis operations state and APIs. This is an\nexplicit opt-in and uses a writable root independent of scientific\ndata stores.",
+      "$ref": "#/$defs/OperationsConfig",
+      "default": {
+        "enabled": false,
+        "request_body_bytes": 67108864,
+        "root": "./operations"
+      }
+    },
     "origin_catalog": {
       "description": "Optional scheduler-controlled publication boundary for the conventional\nHTTPS origin. When enabled, only active and previous generations from\nthe validated origin catalog are visible.",
       "$ref": "#/$defs/OriginCatalogConfig",
@@ -232,14 +301,48 @@
         "refresh_seconds": 5
       }
     },
+    "satellite_ingest": {
+      "description": "Optional server-owned continuous GOES ABI ingest. This is deliberately\ndisabled by default; HTTP requests never start or steer ingestion.",
+      "$ref": "#/$defs/SatelliteIngestConfig",
+      "default": {
+        "enabled": false,
+        "followers": [],
+        "raw_cache_root": "./satellite-staging"
+      }
+    },
+    "satellite_prewarm": {
+      "description": "Optional bounded warming policy for immutable native satellite tiles.\nThis is a resource policy, not a delivery-resolution limit: requests\noutside the warm plan remain available through normal tile rendering.",
+      "$ref": "#/$defs/SatellitePrewarmConfig",
+      "default": {
+        "enabled": false,
+        "maximum_tiles_per_product_frame": 50000,
+        "reconcile_seconds": 60,
+        "sources": []
+      }
+    },
     "server": {
       "$ref": "#/$defs/ServerConfig",
       "default": {
         "allow_unauthenticated_public_bind": false,
         "artifact_root": "./artifacts",
+        "cache_root": "./cache",
         "cors_origins": [],
         "listen": "127.0.0.1:8788",
+        "public_base_url": null,
         "store_root": "./store"
+      }
+    },
+    "storm_prewarm": {
+      "description": "Optional request-independent deterministic storm-cell derivation for\nstored MRMS reflectivity. Results live below `server.cache_root`, so a\nproduction deployment should place that root on its persistent data\nvolume rather than the operating-system disk.",
+      "$ref": "#/$defs/StormPrewarmConfig",
+      "default": {
+        "backfill_frames": 24,
+        "enabled": false,
+        "retention": {
+          "frames_per_source": 576,
+          "mode": "bounded"
+        },
+        "stale_after_seconds": 600
       }
     }
   },
@@ -281,11 +384,49 @@
     "AuthConfig": {
       "type": "object",
       "properties": {
+        "legacy_api_tokens_are_operations_admins": {
+          "description": "Backward-compatibility gate that elevates every general API token to an\noperations administrator. Keep false for multi-operator deployments.",
+          "type": "boolean",
+          "default": false
+        },
+        "ops_admin_token_file": {
+          "description": "Operations-only administrator credentials.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "ops_ingest_token_file": {
+          "description": "Operations-only adapter credentials. They can submit and read ingested\nrecords, but cannot create or change owned records.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "ops_read_token_file": {
+          "description": "Operations-only read credentials. They cannot ingest or mutate state.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "ops_write_token_file": {
+          "description": "Owner-mapped operations write credentials. Each line is\n`<owner-id><TAB><bearer-token>` so token rotation does not change the\ndurable operations record owner. They can read and mutate only that\nowner's records.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "protect_metrics": {
           "type": "boolean",
           "default": true
         },
         "token_file": {
+          "description": "General weather-data API credentials. They do not authorize operations\nAPIs unless the explicit legacy compatibility gate is enabled.",
           "type": [
             "string",
             "null"
@@ -1432,6 +1573,20 @@
           "default": 32,
           "minimum": 0
         },
+        "observation_generated_upload_bytes": {
+          "description": "Maximum authenticated generated-grid JSON request body. JSON decoding\ntemporarily expands beyond the wire size, so operators should size\nthis independently from the raw Level-II bound.",
+          "type": "integer",
+          "format": "uint",
+          "default": 201326592,
+          "minimum": 0
+        },
+        "observation_level2_upload_bytes": {
+          "description": "Maximum authenticated raw Archive-II request body. The Level-II\ndecoder currently receives the complete body in memory, so this is an\noperator-set memory/abuse boundary rather than a radar product limit.",
+          "type": "integer",
+          "format": "uint",
+          "default": 268435456,
+          "minimum": 0
+        },
         "points_per_query": {
           "type": "integer",
           "format": "uint",
@@ -1460,6 +1615,13 @@
           "type": "integer",
           "format": "uint64",
           "default": 134217728,
+          "minimum": 0
+        },
+        "satellite_tile_cache_bytes": {
+          "description": "Maximum bytes retained by the restart-reusable native satellite PNG\ncache below `server.cache_root`. Exact immutable tiles are pruned by\nleast-recent use when this bound is reached.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 68719476736,
           "minimum": 0
         },
         "sync_result_values": {
@@ -1520,6 +1682,346 @@
         "format": {
           "$ref": "#/$defs/LogFormat",
           "default": "json"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MrmsFollowSpec": {
+      "type": "object",
+      "properties": {
+        "collection": {
+          "description": "Stable collection label used in rw-store run identity.",
+          "type": "string"
+        },
+        "product": {
+          "description": "Exact product token from NOAA's operational MRMS 2D directory.",
+          "type": "string"
+        },
+        "stale_after_seconds": {
+          "description": "Optional per-product freshness window overriding the worker-level\n`mrms_ingest.stale_after_seconds`. NOAA publishes some products with a\nstructural latency (multi-sensor QPE pass 2 lags its window by about\ntwo hours), so one worker-wide window would mark such a product\npermanently stale and hold subsystem health at degraded even while\nevery fetch succeeds. This override must state the product's honest\npublication cadence; it never relabels genuinely late data as fresh.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "variable": {
+          "description": "Stable variable name presented to clients. Units always come from the\ndecoded GRIB metadata; this configuration cannot invent them.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "product",
+        "collection",
+        "variable"
+      ]
+    },
+    "MrmsIngestConfig": {
+      "description": "Bounded, request-independent NOAA MRMS acquisition.",
+      "type": "object",
+      "properties": {
+        "concurrency": {
+          "description": "Maximum simultaneous fetch/decode/write cycles across all products.",
+          "type": "integer",
+          "format": "uint",
+          "default": 1,
+          "minimum": 0
+        },
+        "enabled": {
+          "description": "No network work, worker, retention pass, or private route is created\nunless this explicit operator gate is true.",
+          "type": "boolean",
+          "default": false
+        },
+        "gate_server_readiness": {
+          "description": "When true, stale or missing configured MRMS products make\n`/v1/health/ready` fail. Leave this false for a multi-service\nnode: the authenticated MRMS status endpoint still reports exact\nfreshness, while unrelated model, satellite, and operations traffic\nremains available during an upstream outage.",
+          "type": "boolean",
+          "default": false
+        },
+        "maximum_backoff_seconds": {
+          "description": "Maximum exponential retry delay after repeated upstream failures.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 900,
+          "minimum": 0
+        },
+        "poll_interval_seconds": {
+          "description": "Normal interval between checks of each configured `latest` product.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 60,
+          "minimum": 0
+        },
+        "products": {
+          "description": "Selected official products followed independently. The default is\nNOAA's lowest-altitude reflectivity product.",
+          "type": "array",
+          "default": [
+            {
+              "collection": "conus",
+              "product": "ReflectivityAtLowestAltitude",
+              "stale_after_seconds": null,
+              "variable": "mrms_reflectivity_lowest_altitude"
+            }
+          ],
+          "items": {
+            "$ref": "#/$defs/MrmsFollowSpec"
+          }
+        },
+        "request_retries": {
+          "description": "Retries inside one acquisition cycle before outer exponential backoff.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
+        },
+        "request_timeout_seconds": {
+          "description": "Per-HTTP-attempt deadline for the official MRMS download.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 90,
+          "minimum": 0
+        },
+        "retention_hours": {
+          "description": "Fully expired MRMS UTC-day runs older than this age are removed after a\nsuccessful cycle. Current-day runs are never modified by retention.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 72,
+          "minimum": 0
+        },
+        "stale_after_seconds": {
+          "description": "A product is stale after this many seconds beyond its upstream GRIB\nvalid time. Staleness degrades subsystem health; it fails whole-node\nreadiness only when `gate_server_readiness` is true.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 600,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "NexradLevel2IngestConfig": {
+      "description": "Request-independent, exact-volume NEXRAD Level II acquisition.\n\nThe source adapters are intentionally data-only configuration. They do not\ngrant a provider permission to choose sites, grid resolution, retention, or\nreadiness policy. Those remain operator-owned fields on this service.",
+      "type": "object",
+      "properties": {
+        "catch_up_hours": {
+          "description": "On first start or after a long outage, ingest every volume in this time\nwindow. This time-based resource policy never subsamples resolution.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 2,
+          "minimum": 0
+        },
+        "concurrency": {
+          "description": "Simultaneous site listing/download/decode/write cycles.",
+          "type": "integer",
+          "format": "uint",
+          "default": 1,
+          "minimum": 0
+        },
+        "enabled": {
+          "description": "No network work, state directory, retention pass, or status route is\ncreated unless this explicit operator gate is true.",
+          "type": "boolean",
+          "default": false
+        },
+        "gate_server_readiness": {
+          "description": "Promote missing/stale configured sites to whole-service readiness.",
+          "type": "boolean",
+          "default": false
+        },
+        "maximum_backoff_seconds": {
+          "description": "Exponential retry ceiling following network, decode, or store failure.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 900,
+          "minimum": 0
+        },
+        "maximum_listing_bytes": {
+          "description": "Explicit bound for one provider listing document. This is a network\nbody guard, not a limit on the number of sites or volumes followed.",
+          "type": "integer",
+          "format": "uint",
+          "default": 33554432,
+          "minimum": 0
+        },
+        "maximum_object_bytes": {
+          "description": "Explicit bound for one compressed source object. Decoded grid size is\ngoverned only by each site's requested resolution and radius.",
+          "type": "integer",
+          "format": "uint",
+          "default": 536870912,
+          "minimum": 0
+        },
+        "poll_interval_seconds": {
+          "description": "Normal listing interval per configured site.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 60,
+          "minimum": 0
+        },
+        "providers": {
+          "description": "Named public or operator-managed archives. Site entries select one by\nid, keeping the lifecycle independent of a particular bucket host.",
+          "type": "array",
+          "default": [
+            {
+              "allow_http": false,
+              "attribution": "NOAA/NWS NEXRAD Level II via the Unidata public archive",
+              "id": "unidata-nexrad-level2",
+              "listing_base_url": "https://unidata-nexrad-level2.s3.amazonaws.com",
+              "object_base_url": "https://unidata-nexrad-level2.s3.amazonaws.com"
+            }
+          ],
+          "items": {
+            "$ref": "#/$defs/NexradLevel2ProviderConfig"
+          }
+        },
+        "request_retries": {
+          "description": "Immediate retries for one request before outer worker backoff.",
+          "type": "integer",
+          "format": "uint32",
+          "default": 1,
+          "minimum": 0
+        },
+        "request_timeout_seconds": {
+          "description": "Deadline for each listing or object request.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 120,
+          "minimum": 0
+        },
+        "retention_hours": {
+          "description": "Retire follower-owned exact-time runs older than this age.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 168,
+          "minimum": 0
+        },
+        "sites": {
+          "description": "Explicit site allowlist. There is deliberately no implicit all-sites\nmode and no hidden maximum number of configured sites.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/NexradLevel2SiteConfig"
+          }
+        },
+        "stale_after_seconds": {
+          "description": "Source-volume age after which the site is reported stale.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 900,
+          "minimum": 0
+        },
+        "state_root": {
+          "description": "Durable cursor/state root. A commit is recorded only after the exact\ndownloaded volume has decoded, entered rw-store, and reopened.",
+          "type": "string",
+          "default": "./nexrad-level2-state"
+        }
+      },
+      "additionalProperties": false
+    },
+    "NexradLevel2ProviderConfig": {
+      "type": "object",
+      "properties": {
+        "allow_http": {
+          "description": "Explicitly permits plain HTTP for an operator-managed private mirror.\nPublic providers should always leave this false.",
+          "type": "boolean",
+          "default": false
+        },
+        "attribution": {
+          "description": "Human-readable source attribution retained in the scientific selector.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Stable provenance id written beside every stored source object.",
+          "type": "string"
+        },
+        "listing_base_url": {
+          "description": "S3-compatible ListObjectsV2 endpoint, without query or fragment.",
+          "type": "string"
+        },
+        "object_base_url": {
+          "description": "Public object endpoint. The exact listed key is appended as a path.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "listing_base_url",
+        "object_base_url",
+        "attribution"
+      ]
+    },
+    "NexradLevel2SiteConfig": {
+      "type": "object",
+      "properties": {
+        "elevation_m": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "latitude": {
+          "description": "Unknown/mobile site identifiers must provide all three coordinates;\nfixed WSR-88D sites may leave all three absent for the built-in table.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "longitude": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "provider_id": {
+          "type": "string"
+        },
+        "radius_km": {
+          "type": "number",
+          "format": "double"
+        },
+        "resolution_m": {
+          "description": "Cartesian output spacing. No follower-specific resolution ceiling or\nfallback downsampling is applied.",
+          "type": "number",
+          "format": "double"
+        },
+        "site_id": {
+          "description": "Radar archive/site id. This is uppercased before provider requests.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "site_id",
+        "provider_id",
+        "resolution_m",
+        "radius_km"
+      ]
+    },
+    "OperationsConfig": {
+      "description": "Durable state and request bounds for the authenticated operations APIs.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "No operations routes or state are opened unless this is true.",
+          "type": "boolean",
+          "default": false
+        },
+        "request_body_bytes": {
+          "description": "Independent body bound for one operations request.",
+          "type": "integer",
+          "format": "uint",
+          "default": 67108864,
+          "minimum": 0
+        },
+        "root": {
+          "description": "Writable durable root for derived operations state. Keep it separate\nfrom a read-only scientific `server.store_root` deployment.",
+          "type": "string",
+          "default": "./operations"
         }
       },
       "additionalProperties": false
@@ -1598,6 +2100,211 @@
         }
       ]
     },
+    "SatelliteFollowSpec": {
+      "type": "object",
+      "properties": {
+        "bands": {
+          "description": "Union of ABI bands this platform/sector must retain (1 through 16).",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          }
+        },
+        "platform": {
+          "description": "Public NOAA GOES platform (`goes18`, `goes19`, ...).",
+          "type": "string",
+          "default": "goes19"
+        },
+        "poll_interval_seconds": {
+          "description": "Poll cadence. `None` uses rw-sat's sector-specific operational default.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "retention_max_age_minutes": {
+          "description": "Retain frames no older than this many minutes.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 0
+        },
+        "retention_max_bytes": {
+          "description": "Retain no more than this many bytes per followed band.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "sector": {
+          "$ref": "#/$defs/SatelliteSectorConfig",
+          "default": "full_disk"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SatelliteHotRegionConfig": {
+      "description": "Geographic bounds for higher-zoom warming. `west > east` intentionally\ndenotes an antimeridian-crossing region.",
+      "type": "object",
+      "properties": {
+        "east": {
+          "type": "number",
+          "format": "double",
+          "default": -66.0
+        },
+        "max_zoom": {
+          "type": "integer",
+          "format": "uint8",
+          "default": 6,
+          "maximum": 255,
+          "minimum": 0
+        },
+        "north": {
+          "type": "number",
+          "format": "double",
+          "default": 50.0
+        },
+        "south": {
+          "type": "number",
+          "format": "double",
+          "default": 24.0
+        },
+        "west": {
+          "type": "number",
+          "format": "double",
+          "default": -125.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "SatelliteIngestConfig": {
+      "description": "Server-owned continuous GOES ABI ingest. Exact NOAA source files and\ncompact previews are written below `server.store_root`; `raw_cache_root`\nis only bounded staging for downloads in progress.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "The supervisor does no work unless this explicit gate is true.",
+          "type": "boolean",
+          "default": false
+        },
+        "followers": {
+          "description": "One follower per unique platform/sector. Put the union of every band\nneeded for that source in its single `bands` list.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SatelliteFollowSpec"
+          }
+        },
+        "raw_cache_root": {
+          "description": "Server-owned raw-object staging root, separate from durable stores and\njob artifacts. Each platform/sector follower receives its own child.",
+          "type": "string",
+          "default": "./satellite-staging"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SatellitePrewarmConfig": {
+      "description": "Bounded, operator-selected native satellite tile warming. The worker is\ndeliberately disabled by default. `maximum_tiles_per_product_frame`\nlimits eager work only; it never lowers the HTTP renderer's maximum zoom.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "The prewarm worker does no work unless this explicit gate is true.",
+          "type": "boolean",
+          "default": false
+        },
+        "maximum_tiles_per_product_frame": {
+          "description": "Exact upper bound for one product/frame plan. Operators may raise this\nwithout changing the native renderer's supported resolution.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 50000,
+          "minimum": 0
+        },
+        "reconcile_seconds": {
+          "description": "Periodic archive reconciliation catches missed/coalesced ingest events\nand external writers that do not share this process's wake signal.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 60,
+          "minimum": 0
+        },
+        "sources": {
+          "description": "One policy per canonical platform/sector source.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SatellitePrewarmSourceConfig"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SatellitePrewarmSourceConfig": {
+      "description": "Products and geographic coverage warmed for one native archive source.",
+      "type": "object",
+      "properties": {
+        "frames_per_product": {
+          "description": "Number of newest complete frames kept warm for each configured product.",
+          "type": "integer",
+          "format": "uint",
+          "default": 3,
+          "minimum": 0
+        },
+        "hot_regions": {
+          "description": "Optional regions warmed from `overview_max_zoom + 1` through each\nregion's `max_zoom`.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SatelliteHotRegionConfig"
+          }
+        },
+        "overview_max_zoom": {
+          "description": "Warm the complete Web-Mercator world through this zoom. Higher zooms\nremain available on demand even when no hot region includes them.",
+          "type": "integer",
+          "format": "uint8",
+          "default": 1,
+          "maximum": 255,
+          "minimum": 0
+        },
+        "platform": {
+          "description": "Public NOAA GOES platform (`goes18`, `goes19`, ...).",
+          "type": "string",
+          "default": "goes19"
+        },
+        "products": {
+          "description": "Named or raw-channel product slugs accepted by `GoesAbiProduct`.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "sector": {
+          "$ref": "#/$defs/SatelliteSectorConfig",
+          "default": "full_disk"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SatelliteSectorConfig": {
+      "type": "string",
+      "enum": [
+        "conus",
+        "full_disk",
+        "meso1",
+        "meso2"
+      ]
+    },
     "ServerConfig": {
       "type": "object",
       "properties": {
@@ -1608,6 +2315,11 @@
         "artifact_root": {
           "type": "string",
           "default": "./artifacts"
+        },
+        "cache_root": {
+          "description": "Mutable derived-data cache. Keep this separate from a read-only\nscientific store so restart-reusable tiles can be written safely.",
+          "type": "string",
+          "default": "./cache"
         },
         "cors_origins": {
           "type": "array",
@@ -1620,9 +2332,87 @@
           "type": "string",
           "default": "127.0.0.1:8788"
         },
+        "public_base_url": {
+          "description": "Canonical external HTTPS base used in absolute links. Configure this\nbehind a TLS-terminating proxy instead of trusting forwarded headers.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "store_root": {
           "type": "string",
           "default": "./store"
+        }
+      },
+      "additionalProperties": false
+    },
+    "StormCacheRetention": {
+      "description": "Retention policy for complete canonical/GeoJSON storm-frame pairs.\n\nThis is an explicit storage policy, never a contour-complexity or source-\nresolution limit. `unlimited` is useful on an operator-managed archive;\n`bounded` retains the newest exact frames independently for each source\nproduct.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "frames_per_source": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "mode": {
+              "type": "string",
+              "const": "bounded"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "frames_per_source"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "unlimited"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ]
+        }
+      ]
+    },
+    "StormPrewarmConfig": {
+      "description": "Request-independent MRMS storm-cell analysis and durable result caching.",
+      "type": "object",
+      "properties": {
+        "backfill_frames": {
+          "description": "Number of newest compatible stored frames reconciled at startup and\nafter a coalesced commit notification. This controls background work,\nnot what clients may request or what geometry may contain.",
+          "type": "integer",
+          "format": "uint",
+          "default": 24,
+          "minimum": 0
+        },
+        "enabled": {
+          "description": "Start the restart reconciler and subscribe it to committed MRMS frames.",
+          "type": "boolean",
+          "default": false
+        },
+        "retention": {
+          "$ref": "#/$defs/StormCacheRetention",
+          "default": {
+            "frames_per_source": 576,
+            "mode": "bounded"
+          }
+        },
+        "stale_after_seconds": {
+          "description": "A cached result is reported stale after this many seconds past its\nsource valid time. Stale results remain exact and requestable.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 600,
+          "minimum": 0
         }
       },
       "additionalProperties": false

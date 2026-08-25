@@ -9,11 +9,12 @@ builder, and runtime base images are pinned by multi-platform digest; review
 and deliberately update those pins when taking upstream security updates.
 
 1. Create the bind-mount directories. The container runs as numeric UID/GID
-   `65532:65532`, so the API artifact directory and scheduler store/cache/state
-   directories must be writable by that identity:
+   `65532:65532`, so the API artifact/derived-cache directories and scheduler
+   store/cache/state directories must be writable by that identity:
 
        sudo install -d -o 65532 -g 65532 -m 0750 \
          deploy/docker/data/store deploy/docker/data/artifacts \
+         deploy/docker/data/server-cache \
          deploy/docker/data/community-cache deploy/docker/data/federation \
          deploy/docker/data/scheduler-cache deploy/docker/data/scheduler-state
        install -d -m 0700 deploy/docker/secrets
@@ -82,6 +83,12 @@ and deliberately update those pins when taking upstream security updates.
        docker compose -f deploy/docker/compose.yaml exec api \
          rw-server --config /etc/rusty-weather/rusty-weather.toml healthcheck
 
+The Compose probe treats both `ready` and `degraded` JSON states as healthy
+because each is HTTP 200 and the core server remains usable. Monitor the body
+and authenticated MRMS/NEXRAD status routes separately; only a core failure
+or an explicitly enabled subsystem readiness gate makes the container
+unhealthy.
+
 The example publishes only to host loopback. Put a TLS reverse proxy on the
 same host when remote clients need access. The container root filesystem is
 read-only, all Linux capabilities are removed, the model store is mounted
@@ -97,6 +104,19 @@ ordinary API needs only a read-only store. Use the separately reviewed
 replication deployment overlay and its capacity/rights controls when that
 advanced feature is enabled; never change the base API store mount to
 read-write merely to make a configuration error disappear.
+
+Continuous MRMS ingest is also default-off because it is a server-owned store
+writer. After configuring authenticated `[mrms_ingest]` products and retention
+in an external TOML, add only the checked-in MRMS overlay:
+
+    RW_BUILD_SHA=$(git rev-parse HEAD) \
+      RW_SERVER_CONFIG_PATH=/absolute/path/rusty-weather.toml \
+      docker compose -f deploy/docker/compose.yaml \
+        -f deploy/docker/compose.mrms-ingest.yaml up -d --build
+
+The overlay changes only the API store bind mount to read-write and sets the
+non-secret enable gate. It creates no second processing service: one bounded
+follower writes exact-time frames which all authenticated clients reuse.
 
 ### Advanced generation-replication overlay
 

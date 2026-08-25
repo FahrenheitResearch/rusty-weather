@@ -159,6 +159,8 @@ struct PublicationGate {
     store: Arc<StoreCatalog>,
     reload: Mutex<ReloadState>,
     view: RwLock<PublishedView>,
+    #[cfg(test)]
+    test_now_unix: std::sync::atomic::AtomicI64,
 }
 
 #[derive(Debug, Default)]
@@ -237,6 +239,8 @@ impl PublishedStoreCatalog {
                 } else {
                     PublishedView::disabled()
                 }),
+                #[cfg(test)]
+                test_now_unix: std::sync::atomic::AtomicI64::new(i64::MIN),
             }),
             replication: Arc::new(ServerGenerationReplication::default()),
         };
@@ -323,6 +327,23 @@ impl PublishedStoreCatalog {
         Ok(runs.into_values().collect())
     }
 
+    /// Resolve the newest visible run for one model by physical cycle origin.
+    ///
+    /// This deliberately selects from the same publication-gated view as the
+    /// model/run catalog. It never scans around an enabled gate, and it reopens
+    /// the selected immutable snapshot before returning it. Run identity is a
+    /// deterministic tie-break only; a missing physical origin fails closed
+    /// instead of treating a lexical run slug as scientific time.
+    pub fn latest_run(&self, model: &str) -> QueryResult<RunSnapshot> {
+        let runs = self.list_runs(model)?;
+        let run = select_latest_run_id(runs.iter())?.ok_or_else(|| {
+            // An existing but empty model directory is not a useful public
+            // identity. Keep it indistinguishable from an unknown model.
+            QueryError::UnknownModel(model.to_string())
+        })?;
+        self.snapshot(model, &run)
+    }
+
     pub fn snapshot(&self, model: &str, run: &str) -> QueryResult<RunSnapshot> {
         self.authorize(model, run)?;
         self.store.snapshot(model, run)
@@ -330,7 +351,7 @@ impl PublishedStoreCatalog {
 
     pub fn health_status(&self) -> OriginCatalogHealthStatus {
         self.refresh_if_due();
-        let now = now_unix();
+        let now = self.current_unix();
         // Preserve the reload -> view lock order used by reload_locked. Copy
         // the scalar before taking the view lock so status can never deadlock
         // a concurrent refresh.
@@ -429,7 +450,7 @@ impl PublishedStoreCatalog {
                 .view
                 .read()
                 .unwrap_or_else(|error| error.into_inner());
-            if !view.is_fresh(now_unix(), self.gate.config.max_age_seconds) {
+            if !view.is_fresh(self.current_unix(), self.gate.config.max_age_seconds) {
                 return Err(unavailable_query_error());
             }
             runs = view.runs.clone();
@@ -499,13 +520,31 @@ impl PublishedStoreCatalog {
             last.elapsed() >= Duration::from_secs(self.gate.config.refresh_seconds)
         });
         if due {
-            self.reload_locked(&mut reload, now_unix());
+            self.reload_locked(&mut reload, self.current_unix());
         }
+    }
+
+    fn current_unix(&self) -> i64 {
+        #[cfg(test)]
+        {
+            let injected = self
+                .gate
+                .test_now_unix
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if injected != i64::MIN {
+                return injected;
+            }
+        }
+        now_unix()
     }
 
     /// Force a synchronous reload for deterministic no-network tests; request
     /// handling uses the bounded cadence.
     fn force_reload_at(&self, current_unix: i64) {
+        #[cfg(test)]
+        self.gate
+            .test_now_unix
+            .store(current_unix, std::sync::atomic::Ordering::Relaxed);
         if !self.gate.config.enabled || !self.gate.config.publication_sources.requires_scheduler() {
             return;
         }
@@ -543,6 +582,24 @@ impl PublishedStoreCatalog {
             .write()
             .unwrap_or_else(|error| error.into_inner()) = next;
     }
+}
+
+fn select_latest_run_id<'a>(
+    runs: impl IntoIterator<Item = &'a RunCatalogEntry>,
+) -> QueryResult<Option<String>> {
+    let mut latest: Option<(i64, &str)> = None;
+    for entry in runs {
+        let origin_unix = entry.run.origin_unix.ok_or_else(|| {
+            QueryError::InvalidRequest(
+                "a visible run lacks a physical cycle origin and cannot be ordered".to_string(),
+            )
+        })?;
+        let candidate = (origin_unix, entry.run.run.as_str());
+        if latest.is_none_or(|current| candidate > current) {
+            latest = Some(candidate);
+        }
+    }
+    Ok(latest.map(|(_, run)| run.to_string()))
 }
 
 fn load_catalog_document(root: &Path) -> Result<Option<OriginCatalogState>, String> {
@@ -888,7 +945,9 @@ mod tests {
         let root = directory.path().join("store");
         fs::create_dir_all(&root).unwrap();
         let previous = write_run(&root, "20260811", 23);
-        let hidden = write_run(&root, "20260811", 22);
+        // Deliberately newer than the published active run. A broad store scan
+        // would select it and leak an unpublished run through the pointer.
+        let hidden = write_run(&root, "20260812", 1);
         let active = write_run(&root, "20260812", 0);
         save(
             &root,
@@ -899,6 +958,10 @@ mod tests {
 
         assert_eq!(catalog.list_models().unwrap()[0].run_count, 2);
         assert_eq!(catalog.list_runs("hrrr").unwrap().len(), 2);
+        assert_eq!(
+            catalog.latest_run("hrrr").unwrap().descriptor().run,
+            active.run_id
+        );
         assert!(catalog.snapshot("hrrr", &active.run_id).is_ok());
         assert!(catalog.snapshot("hrrr", &previous.run_id).is_ok());
         assert!(matches!(
@@ -997,11 +1060,61 @@ mod tests {
 
         assert_eq!(catalog.health_status().state, "pending");
         assert!(catalog.list_models().is_err());
+        assert!(catalog.latest_run("hrrr").is_err());
 
         let active = write_run(&root, "20260812", 0);
         save(&root, &catalog_state(active, None, NOW));
         catalog.force_reload_at(NOW);
         assert_eq!(catalog.health_status().state, "ready");
+    }
+
+    #[test]
+    fn latest_run_order_is_physical_and_ties_are_deterministic() {
+        fn entry(run: &str, origin_unix: Option<i64>) -> RunCatalogEntry {
+            RunCatalogEntry {
+                run: rw_query::RunDescriptor {
+                    model: "hrrr".to_string(),
+                    run: run.to_string(),
+                    schema: "rws-run-v1".to_string(),
+                    snapshot_id: format!("snapshot-{run}"),
+                    grid_hash: "grid".to_string(),
+                    nx: 1,
+                    ny: 1,
+                    exact_time_axis: true,
+                    origin_unix,
+                    sample_count: 1,
+                    first_valid_unix: origin_unix,
+                    last_valid_unix: origin_unix,
+                    source_provenance: Vec::new(),
+                    provider_attributions: Vec::new(),
+                },
+                variable_count: 1,
+            }
+        }
+
+        let older_with_later_slug = entry("zz-older", Some(NOW - 3_600));
+        let tied_a = entry("cycle-a", Some(NOW));
+        let tied_b = entry("cycle-b", Some(NOW));
+        let forward = [&older_with_later_slug, &tied_a, &tied_b];
+        let reverse = [&tied_b, &tied_a, &older_with_later_slug];
+        assert_eq!(
+            select_latest_run_id(forward).unwrap().as_deref(),
+            Some("cycle-b")
+        );
+        assert_eq!(
+            select_latest_run_id(reverse).unwrap().as_deref(),
+            Some("cycle-b")
+        );
+        assert_eq!(
+            select_latest_run_id(std::iter::empty::<&RunCatalogEntry>()).unwrap(),
+            None
+        );
+
+        let unordered = entry("unknown-cycle", None);
+        assert!(matches!(
+            select_latest_run_id([&tied_a, &unordered]),
+            Err(QueryError::InvalidRequest(_))
+        ));
     }
 
     #[test]

@@ -4,10 +4,31 @@ use utoipa::openapi::OpenApi as OpenApiDocument;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
+use rw_nexrad_storm::{
+    AzimuthRange, Compression, CoordinateProvenance, ForecastPoint, GeographicPoint,
+    HeightQualifier, NexradStormProduct, ProductIdentity, ProductProvenance, QualifiedHeight,
+    RadarRelativePosition, SiteIdentity, SiteIdentitySource, SpecificationReferenceOwned,
+    StormMotion, StormStructureCell, StormStructureProduct, StormTrackingProduct, SuppliedGeometry,
+    TrackPoint, TrackedStormCell, TransportIdentity, ValidationNotice,
+};
+use rw_ops_protocol::{
+    ContourRing, GeoPoint, ModelInputSource, StormCell, StormCellFrame, StormMethodCatalog,
+    StormMethodIdentity, StormMethodKind, StormModelBackend, StormModelInput, StormModelManifest,
+    StormSource,
+};
+
 use crate::federation_proxy::{FederationProxyKillSwitchRequest, FederationProxyStatusResponse};
 use crate::generation_replication::{
     ReplicationGarbageCollectionResponse, ReplicationKillSwitchRequest, ReplicationOwnerResponse,
     ReplicationStatusResponse,
+};
+use crate::mrms_ingest::{
+    MrmsIngestStatus, MrmsProductPhase, MrmsProductStatus, MrmsRefreshResponse,
+    MrmsStoredFrameStatus,
+};
+use crate::nexrad_level2_ingest::{
+    NexradLevel2IngestStatus, NexradLevel2RefreshResponse, NexradLevel2SitePhase,
+    NexradLevel2SiteStatus, NexradLevel2SourceObjectStatus, NexradLevel2StoredFrameStatus,
 };
 use crate::origin_catalog::OriginCatalogHealthStatus;
 use crate::problem::ProblemDetails;
@@ -17,9 +38,9 @@ use crate::routes::{
     ApiTemporalValueClass, ApiTemporalVerticalSelection, ApiTemporalWindow, ApiTimeExpectation,
     CoordinateRequest, GeographicVerticalApiSelection, GeographicWindowApiRequest, HealthResponse,
     ModelCapabilityResponse, PointQueryRequest, PointsRequest, ProductCapabilityResponse,
-    ProfileApiRequest, ProviderAttributionResponse, SpatialSeriesApiRequest,
-    TemporalGridApiRequest, VariableCapabilityResponse, VariableTemporalCapabilityResponse,
-    VersionResponse, WindowApiRequest,
+    ProfileApiRequest, ProfileCycleApiRequest, ProviderAttributionResponse,
+    SpatialSeriesApiRequest, TemporalGridApiRequest, VariableCapabilityResponse,
+    VariableTemporalCapabilityResponse, VersionResponse, WindowApiRequest,
 };
 use crate::{ArtifactRef, JobStatus, JobView};
 
@@ -62,6 +83,764 @@ struct TimePointResponse {
     storage_slot: u16,
     lead_seconds: u64,
     valid_unix: i64,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum ObservationKindDoc {
+    Satellite,
+    SimulatedSatellite,
+    Mrms,
+    Radar,
+    RadarMosaic,
+    SimulatedRadar,
+    Generated,
+}
+
+#[derive(utoipa::ToSchema)]
+struct ObservationCapabilitiesResponseDoc {
+    /// `rw-server.observation-capabilities.v1`.
+    schema: String,
+    satellite_store_delivery: bool,
+    simsat_store_delivery: bool,
+    arbitrary_generated_grid_import: bool,
+    mrms_latest_ingest: bool,
+    nexrad_level2_ingest: bool,
+    single_site_composite: bool,
+    multi_source_mosaic: bool,
+    wrf_composite_reflectivity: bool,
+    wrf_pressure_level_reflectivity: bool,
+    wrf_echo_top: bool,
+    wrf_vil: bool,
+    wrf_virtual_radar_ppi: bool,
+    maximum_grid_cells: usize,
+    maximum_mosaic_inputs: usize,
+    maximum_level2_upload_bytes: usize,
+    maximum_generated_upload_bytes: usize,
+    binary_grid_content_type: String,
+    binary_plane_content_type: String,
+    display_metadata: bool,
+    curvilinear_grid_mesh: bool,
+    non_finite_transparency: bool,
+}
+
+#[derive(utoipa::ToSchema)]
+struct ObservationRunSummaryDoc {
+    kind: ObservationKindDoc,
+    run: RunDescriptorResponse,
+    variable_count: usize,
+}
+
+#[derive(utoipa::ToSchema)]
+struct ObservationCatalogResponseDoc {
+    /// `rw-server.observation-catalog.v1`.
+    schema: String,
+    runs: Vec<ObservationRunSummaryDoc>,
+    /// True only when the caller supplied `limit` and more runs existed.
+    truncated: bool,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum ObservationValueSemanticsDoc {
+    Reflectivity,
+    RadialVelocity,
+    SpectrumWidth,
+    DifferentialReflectivity,
+    CorrelationCoefficient,
+    DifferentialPhase,
+    SpecificDifferentialPhase,
+    HydrometeorClassification,
+    EchoTop,
+    VerticallyIntegratedLiquid,
+    BrightnessTemperature,
+    Reflectance,
+    Precipitation,
+    Rgba,
+    GenericScalar,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum ObservationInterpolationDoc {
+    Linear,
+    Nearest,
+    CircularDegrees,
+    VelocityFoldAware,
+}
+
+#[derive(utoipa::ToSchema)]
+struct ObservationDisplayHintDoc {
+    semantics: ObservationValueSemanticsDoc,
+    palette: String,
+    interpolation: ObservationInterpolationDoc,
+    transparent_non_finite: bool,
+    preferred_range: Option<[f32; 2]>,
+    discontinuity_threshold: Option<f32>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct ObservationVariableSummaryDoc {
+    name: String,
+    units: String,
+    kind: String,
+    selector: serde_json::Value,
+    display: ObservationDisplayHintDoc,
+    available_slots: Vec<u16>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct ObservationFramesResponseDoc {
+    /// `rw-server.observation-frames.v1`.
+    schema: String,
+    kind: ObservationKindDoc,
+    run: RunDescriptorResponse,
+    frames: Vec<TimePointResponse>,
+    variables: Vec<ObservationVariableSummaryDoc>,
+}
+
+/// `RWOBGRID` binary grid geometry. See the observation capabilities response
+/// for the versioned media type.
+#[derive(utoipa::ToSchema)]
+#[schema(value_type = String, format = Binary)]
+struct ObservationGridBinaryDoc(Vec<u8>);
+
+/// `RWOBF32` calibrated observation plane. Missing/non-coverage cells are
+/// encoded as non-finite values and must remain transparent.
+#[derive(utoipa::ToSchema)]
+#[schema(value_type = String, format = Binary)]
+struct ObservationPlaneBinaryDoc(Vec<u8>);
+
+/// One complete model forecast plane in the same versioned `RWOBF32` f32
+/// container as observation planes: little-endian header (`RWOBF32\0`, version,
+/// `nx`, `ny`, `valid_unix`, variable/unit lengths, reserved word), the
+/// variable and unit strings, then exactly `nx * ny` row-major `f32` cells.
+/// Non-finite cells are absent values and must remain transparent.
+#[derive(utoipa::ToSchema)]
+#[schema(value_type = String, format = Binary)]
+struct ModelPlaneBinaryDoc(Vec<u8>);
+
+/// Caller-supplied NEXRAD Archive-II volume.
+#[derive(utoipa::ToSchema)]
+#[schema(value_type = String, format = Binary)]
+struct NexradLevel2ArchiveDoc(Vec<u8>);
+
+#[derive(utoipa::ToSchema)]
+struct MrmsMessageSelectorDoc {
+    discipline: Option<u8>,
+    parameter_category: Option<u8>,
+    parameter_number: Option<u8>,
+    level_type: Option<u8>,
+    message_index: Option<usize>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct MrmsIngestRequestDoc {
+    product: String,
+    collection: Option<String>,
+    variable: Option<String>,
+    units: Option<String>,
+    #[serde(default)]
+    selector: MrmsMessageSelectorDoc,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StoredObservationPlaneRefDoc {
+    model: String,
+    run: String,
+    storage_slot: u16,
+    variable: String,
+}
+
+#[derive(utoipa::ToSchema)]
+struct GeographicObservationGridSpecDoc {
+    west_longitude: f64,
+    south_latitude: f64,
+    east_longitude: f64,
+    north_latitude: f64,
+    resolution_km: f64,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum ObservationMosaicMethodDoc {
+    Maximum,
+    Mean,
+    Latest,
+}
+
+#[derive(utoipa::ToSchema)]
+struct RadarMosaicRequestDoc {
+    inputs: Vec<StoredObservationPlaneRefDoc>,
+    target: GeographicObservationGridSpecDoc,
+    method: ObservationMosaicMethodDoc,
+    collection: Option<String>,
+    product: Option<String>,
+    variable: Option<String>,
+    units: Option<String>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StoredObservationVariableRefDoc {
+    model: String,
+    run: String,
+    storage_slot: u16,
+    variable: String,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum ObservationBeamAggregationDoc {
+    Center,
+    Maximum,
+    Mean,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SimulatedRadarOperationDoc {
+    PassThrough,
+    CompositeMax,
+    PressureLevel {
+        level_hpa: u16,
+    },
+    EchoTop {
+        threshold_dbz: f32,
+        height_variable: String,
+    },
+    Vil {
+        height_variable: String,
+    },
+    BeamPpi {
+        height_variable: String,
+        radar_latitude: f64,
+        radar_longitude: f64,
+        radar_elevation_m: f64,
+        tilt_deg: f64,
+        #[serde(default)]
+        beam_width_deg: f64,
+        #[serde(default)]
+        earth_radius_factor: f64,
+        #[serde(default)]
+        max_range_km: f64,
+        #[serde(default)]
+        aggregation: ObservationBeamAggregationDoc,
+        minimum_dbz: Option<f32>,
+    },
+}
+
+#[derive(utoipa::ToSchema)]
+struct SimulatedRadarRequestDoc {
+    source: StoredObservationVariableRefDoc,
+    operation: SimulatedRadarOperationDoc,
+    collection: Option<String>,
+    product: Option<String>,
+    variable: Option<String>,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum ObservationFamilyDoc {
+    Satellite,
+    Mrms,
+    Radar,
+    RadarMosaic,
+    SimulatedRadar,
+    SimulatedSatellite,
+    Generated,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct GeneratedObservationPlaneRequestDoc {
+    name: String,
+    units: String,
+    #[serde(default)]
+    selector: serde_json::Value,
+    /// One value per grid cell. Null means missing/no coverage and is stored as NaN.
+    values: Vec<Option<f32>>,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct GeneratedObservationFrameRequestDoc {
+    family: ObservationFamilyDoc,
+    collection: String,
+    product: String,
+    valid_unix: i64,
+    nx: usize,
+    ny: usize,
+    /// Row-major cell-center latitudes. Null means the coordinate is unavailable.
+    latitudes: Vec<Option<f32>>,
+    /// Row-major cell-center longitudes. Null means the coordinate is unavailable.
+    longitudes: Vec<Option<f32>>,
+    projection: Option<GridProjectionResponse>,
+    planes: Vec<GeneratedObservationPlaneRequestDoc>,
+    /// Exact upstream/provider identity; empty means the caller supplied none.
+    #[serde(default)]
+    provenance_provider: String,
+    #[serde(default)]
+    provenance_roles: Vec<String>,
+    #[serde(default)]
+    provenance_products: Vec<String>,
+}
+
+/// Artifact schema written when an accepted observation job succeeds.
+#[derive(utoipa::ToSchema)]
+struct StoredObservationFrameRefDoc {
+    schema: String,
+    model: String,
+    run: String,
+    storage_slot: u16,
+    valid_unix: i64,
+    variables: Vec<String>,
+    grid_hash: String,
+    frame_file: String,
+    bytes: u64,
+    duplicate: bool,
+}
+
+/// Immutable JSON artifact emitted by one of the currently registered job
+/// submission families.
+#[derive(utoipa::ToSchema)]
+#[serde(untagged)]
+enum JobArtifactDoc {
+    TemporalGrid(Box<TemporalGridResponse>),
+    Observation(StoredObservationFrameRefDoc),
+}
+
+#[derive(utoipa::ToSchema)]
+struct SatellitePlatformDescriptorDoc {
+    id: String,
+    title: String,
+    role: String,
+}
+
+#[derive(utoipa::ToSchema)]
+struct SatelliteSectorDescriptorDoc {
+    id: String,
+    title: String,
+    cadence_seconds: u64,
+    default_poll_seconds: u64,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum SatelliteProductCategoryDoc {
+    Favorites,
+    Visible,
+    Infrared,
+    WaterVapor,
+    RgbComposite,
+    Fire,
+    Advanced,
+}
+
+#[derive(utoipa::ToSchema)]
+struct SatelliteProductDescriptorDoc {
+    id: String,
+    title: String,
+    description: String,
+    category: SatelliteProductCategoryDoc,
+    required_channels: Vec<u8>,
+    base_channel: u8,
+    native_resolution_km: f32,
+    daylight_only: bool,
+    enhancement: Option<String>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct SatelliteEnhancementStopDoc {
+    value: f32,
+    rgb: [u8; 3],
+}
+
+#[derive(utoipa::ToSchema)]
+struct SatelliteEnhancementDescriptorDoc {
+    id: String,
+    title: String,
+    value_units: String,
+    stops: Vec<SatelliteEnhancementStopDoc>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct SatelliteCatalogResponseDoc {
+    /// `rw-server.satellite-catalog.v3`.
+    schema: String,
+    platforms: Vec<SatellitePlatformDescriptorDoc>,
+    sectors: Vec<SatelliteSectorDescriptorDoc>,
+    products: Vec<SatelliteProductDescriptorDoc>,
+    enhancements: Vec<SatelliteEnhancementDescriptorDoc>,
+    native_source_archive: bool,
+    full_disk_native_window_reads: bool,
+    latest_frame_alias: String,
+    maximum_tile_zoom: u8,
+    tile_size: u32,
+    renderer_recipe: String,
+    geocolor_note: String,
+}
+
+#[derive(utoipa::ToSchema)]
+struct SatelliteFrameDescriptorDoc {
+    id: String,
+    /// BLAKE3 content identity of the complete required-channel native frame.
+    source_revision: String,
+    scan_start_unix: i64,
+    scan_end_unix: i64,
+    channels: Vec<u8>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct SatelliteFramesResponseDoc {
+    /// `rw-server.satellite-frames.v3`.
+    schema: String,
+    platform: String,
+    sector: String,
+    product: SatelliteProductDescriptorDoc,
+    cadence_seconds: u64,
+    frames: Vec<SatelliteFrameDescriptorDoc>,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SatelliteTileJsonResponseDoc {
+    tilejson: String,
+    name: String,
+    description: String,
+    scheme: String,
+    tiles: Vec<String>,
+    minzoom: u8,
+    maxzoom: u8,
+    bounds: [f64; 4],
+    attribution: String,
+    tile_size: u32,
+    renderer_recipe: String,
+    frame: String,
+    source_revision: String,
+}
+
+#[derive(utoipa::ToSchema)]
+#[schema(value_type = String, format = Binary)]
+struct SatellitePngTileDoc(Vec<u8>);
+
+#[derive(utoipa::ToSchema)]
+struct SatellitePrewarmWorkKeyDoc {
+    renderer_recipe: String,
+    platform: String,
+    sector: String,
+    product: String,
+    minute_frame_id: String,
+    source_revision: String,
+    plan_digest: String,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum SatellitePrewarmPhaseDoc {
+    Disabled,
+    WaitingForSource,
+    Reconciling,
+    Rendering,
+    Ready,
+    Degraded,
+    Stopped,
+}
+
+#[derive(utoipa::ToSchema)]
+struct SatellitePrewarmStatusDoc {
+    /// `rw-server.satellite-prewarm-status.v1`.
+    schema: String,
+    enabled: bool,
+    ready: bool,
+    phase: SatellitePrewarmPhaseDoc,
+    active_work: Option<SatellitePrewarmWorkKeyDoc>,
+    configured_sources: usize,
+    waiting_sources: usize,
+    reconcile_count: u64,
+    planned_tiles: u64,
+    completed_tiles: u64,
+    failed_tiles: u64,
+    completed_product_frames: u64,
+    last_reconcile_unix_ms: Option<i64>,
+    last_success_unix_ms: Option<i64>,
+    last_error: Option<String>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StoredStormGridRefDoc {
+    model: String,
+    run: String,
+    /// Exact immutable generation required by this request.
+    expected_snapshot_id: String,
+    /// Exact native-grid identity required by this request.
+    expected_grid_hash: String,
+    storage_slot: u16,
+    variable: String,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum ConnectivityRequestDoc {
+    Four,
+    Eight,
+}
+
+#[derive(utoipa::ToSchema)]
+struct DetectionRequestDoc {
+    #[serde(default)]
+    threshold_dbz: f32,
+    #[serde(default)]
+    minimum_valid_dbz: f32,
+    #[serde(default)]
+    maximum_valid_dbz: f32,
+    #[serde(default)]
+    minimum_gate_count: usize,
+    #[serde(default)]
+    minimum_area_km2: f64,
+    #[serde(default)]
+    connectivity: ConnectivityRequestDoc,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StormMethodRequestDoc {
+    /// Prefer a compatible active compiled-Rust model, then honestly fall
+    /// back to deterministic contours when no such model is executable.
+    Auto {
+        #[serde(default)]
+        deterministic: DetectionRequestDoc,
+    },
+    Deterministic {
+        #[serde(default)]
+        config: DetectionRequestDoc,
+    },
+    MachineLearning {
+        model_id: String,
+        model_version: Option<String>,
+        #[serde(default)]
+        input_variables: std::collections::BTreeMap<String, String>,
+        supplied_mask_variable: Option<String>,
+    },
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum StormResponseFormatDoc {
+    Canonical,
+    Geojson,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StormCellsRequestDoc {
+    /// Must be `rw.server.storm-cells-request.v1`.
+    schema: String,
+    grid: StoredStormGridRefDoc,
+    /// Scientific source identity that must agree with the stored grid.
+    source: StormSource,
+    method: StormMethodRequestDoc,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum StormDistributionGrantDoc {
+    NodeOnly,
+    CompanyInternal,
+    Public,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StormModelUsePolicyDoc {
+    artifact_distribution: StormDistributionGrantDoc,
+    derived_output_distribution: StormDistributionGrantDoc,
+    /// Attribution downstream clients must preserve.
+    required_attribution: String,
+    /// License, contract, or internal approval used for auditing.
+    rights_reference: String,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StormModelStatusDoc {
+    manifest: StormModelManifest,
+    policy: StormModelUsePolicyDoc,
+    enabled: bool,
+    active: bool,
+    executable_on_this_node: bool,
+    /// `compiled_rust_backend`, `stored_probability_mask`, or
+    /// `executor_not_compiled`.
+    execution_mode: String,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StormModelCatalogDoc {
+    /// `rw.server.storm-model-catalog.v1`.
+    schema: String,
+    generated_at_unix_ms: i64,
+    models: Vec<StormModelStatusDoc>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StormDiskCacheHealthDoc {
+    ready: bool,
+    cache_revision: String,
+    entries: u64,
+    bytes: u64,
+    recovered_staging_entries: u64,
+    recovered_invalid_entries: u64,
+    disk_hits: u64,
+    atomic_store_writes: u64,
+    last_hit_unix_ms: Option<i64>,
+    last_store_unix_ms: Option<i64>,
+    last_error_unix_ms: Option<i64>,
+    last_error: Option<String>,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum StormCacheRetentionDoc {
+    Bounded { frames_per_source: usize },
+    Unlimited,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum StormPrewarmPhaseDoc {
+    Disabled,
+    Starting,
+    WaitingForSource,
+    Reconciling,
+    Ready,
+    Degraded,
+    Stopped,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StormPrewarmSourceStatusDoc {
+    product: String,
+    variable: String,
+    model: String,
+    run: String,
+    snapshot_id: String,
+    grid_hash: String,
+    storage_slot: u16,
+    valid_at_unix_ms: i64,
+    cache_key: String,
+    method: String,
+    cache_revision: String,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StormPrewarmStatusDoc {
+    schema: String,
+    enabled: bool,
+    ready: bool,
+    phase: StormPrewarmPhaseDoc,
+    checked_at_unix_ms: i64,
+    cache_revision: String,
+    backfill_frames: usize,
+    retention: StormCacheRetentionDoc,
+    trigger_epoch: u64,
+    coalesced_triggers: u64,
+    in_flight: bool,
+    restart_reconciled: bool,
+    last_attempt_unix_ms: Option<i64>,
+    last_success_unix_ms: Option<i64>,
+    last_source_valid_unix_ms: Option<i64>,
+    stale: bool,
+    reconciled_frames: u64,
+    latest_source: Option<StormPrewarmSourceStatusDoc>,
+    last_error_unix_ms: Option<i64>,
+    last_error: Option<String>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StormSourceLinkageStatusDoc {
+    source: String,
+    available: bool,
+    /// Whether geometry is authoritative, derived, and/or absent upstream.
+    geometry: String,
+    /// Human-readable provenance and capability limitation.
+    detail: String,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StormServiceStatusDoc {
+    /// `rw.server.storm-service-status.v1`.
+    schema: String,
+    generated_at_unix_ms: i64,
+    ready: bool,
+    stored_source_execution: bool,
+    direct_client_grid_uploads: bool,
+    exact_frame_single_flight: bool,
+    frame_cache_scope: String,
+    frame_cache_revision: String,
+    frame_cache_max_bytes: u64,
+    durable_cache: Option<StormDiskCacheHealthDoc>,
+    prewarm: StormPrewarmStatusDoc,
+    source_linkage: Vec<StormSourceLinkageStatusDoc>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StormGeoJsonGeometryDoc {
+    /// `Polygon` or `MultiPolygon`.
+    r#type: String,
+    /// RFC 7946 longitude/latitude coordinate arrays, including contour holes.
+    coordinates: serde_json::Value,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StormGeoJsonPropertiesDoc {
+    cell_id: String,
+    track_id: Option<String>,
+    centroid: GeoPoint,
+    area_km2: f64,
+    maximum_reflectivity_dbz: Option<f64>,
+    echo_top_m: Option<f64>,
+    confidence: Option<f64>,
+    attributes: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StormGeoJsonFeatureDoc {
+    r#type: String,
+    id: String,
+    geometry: StormGeoJsonGeometryDoc,
+    properties: StormGeoJsonPropertiesDoc,
+}
+
+#[derive(utoipa::ToSchema)]
+struct StormGeoJsonFeatureCollectionDoc {
+    r#type: String,
+    /// `rw.ops.storm-cell-geojson.v1`.
+    schema: String,
+    generated_at_unix_ms: i64,
+    source: StormSource,
+    method: StormMethodIdentity,
+    partial: bool,
+    warnings: Vec<String>,
+    features: Vec<StormGeoJsonFeatureDoc>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct NexradLevel3StormDecodeRequestDoc {
+    /// Must be `rw.server.nexrad-level3-storm-decode-request.v1`.
+    schema: String,
+    /// Optional four-character radar identifier used only when transport
+    /// metadata does not identify the site.
+    site_hint: Option<String>,
+    /// Canonical base64 for one supplied Level III message 58 or 62 product.
+    product_base64: String,
+}
+
+#[derive(utoipa::ToSchema)]
+struct NexradLevel3StormDecodeResponseDoc {
+    /// `rw.ops.nexrad-level3-storm-product.v1`.
+    schema: String,
+    generated_at_unix_ms: i64,
+    method: StormMethodIdentity,
+    product: NexradStormProduct,
+    /// Explicit statement of geometry supplied by NOAA and geometry absent
+    /// from the product; downstream displays must retain it.
+    geometry_statement: String,
 }
 
 #[derive(utoipa::ToSchema)]
@@ -109,6 +888,49 @@ struct ProfileResponse {
     point: GridPointResponse,
     time: TimePointResponse,
     variables: Vec<PressureProfileResponse>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct TimeRangeResponse {
+    start_unix: Option<i64>,
+    end_unix: Option<i64>,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum ProfileCycleSampleStatusResponse {
+    Complete,
+    Partial,
+    Gap,
+}
+
+#[derive(utoipa::ToSchema)]
+struct ProfileCycleSampleResponse {
+    time: TimePointResponse,
+    source_provenance: Vec<SourceProvenanceResponse>,
+    status: ProfileCycleSampleStatusResponse,
+    variables: Vec<PressureProfileResponse>,
+    missing_variables: Vec<String>,
+    surface_samples: Vec<ProfileSurfaceSampleResponse>,
+    missing_surface_variables: Vec<String>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct ProfileSurfaceSampleResponse {
+    variable: String,
+    units: String,
+    value: Option<f32>,
+}
+
+#[derive(utoipa::ToSchema)]
+struct ProfileCycleResponse {
+    run: RunDescriptorResponse,
+    point: GridPointResponse,
+    requested_variables: Vec<String>,
+    requested_surface_variables: Vec<String>,
+    requested_time: TimeRangeResponse,
+    missing_policy: ApiMissingPolicy,
+    samples: Vec<ProfileCycleSampleResponse>,
 }
 
 #[derive(utoipa::ToSchema)]
@@ -868,20 +1690,44 @@ struct CancelledRunGenerationDoc {
     info(
         title = "Rusty Weather API",
         version = "1.0.0",
-        description = "Self-hosted model catalog, point/profile queries, and exact-time temporal analytics."
+        description = "Self-hosted model and observation catalogs, exact-time queries and analytics, native satellite delivery, bounded jobs, controlled sharing, and authenticated storm-analysis operations."
     ),
     paths(
         live_doc,
         ready_doc,
         version_doc,
         openapi_doc,
+        observation_capabilities_doc,
+        observation_catalog_doc,
+        observation_frames_doc,
+        observation_grid_doc,
+        observation_plane_doc,
+        submit_mrms_latest_doc,
+        submit_nexrad_level2_doc,
+        submit_radar_mosaic_doc,
+        submit_simulated_radar_doc,
+        submit_generated_observation_doc,
+        mrms_ingest_status_doc,
+        mrms_ingest_refresh_doc,
+        nexrad_level2_ingest_status_doc,
+        nexrad_level2_ingest_refresh_doc,
+        satellite_catalog_doc,
+        satellite_prewarm_status_doc,
+        satellite_frames_doc,
+        satellite_tilejson_doc,
+        satellite_legacy_tile_doc,
+        satellite_versioned_tile_doc,
+        satellite_revisioned_tile_doc,
         models_doc,
         runs_doc,
+        latest_run_doc,
         run_doc,
         variables_doc,
+        model_plane_doc,
         point_doc,
         points_doc,
         profile_doc,
+        profile_cycle_doc,
         window_doc,
         geographic_window_doc,
         spatial_series_doc,
@@ -932,6 +1778,11 @@ struct CancelledRunGenerationDoc {
         generation_replication_operator_status_doc,
         generation_replication_kill_switch_doc,
         generation_replication_gc_doc,
+        storm_status_doc,
+        storm_methods_doc,
+        storm_models_doc,
+        storm_cells_doc,
+        nexrad_level3_storm_decode_doc,
         metrics_doc,
     ),
     components(schemas(
@@ -946,6 +1797,7 @@ struct CancelledRunGenerationDoc {
         PointQueryRequest,
         PointsRequest,
         ProfileApiRequest,
+        ProfileCycleApiRequest,
         WindowApiRequest,
         GeographicVerticalApiSelection,
         GeographicWindowApiRequest,
@@ -970,11 +1822,58 @@ struct CancelledRunGenerationDoc {
         RunDescriptorResponse,
         RunCatalogEntryResponse,
         TimePointResponse,
+        ObservationKindDoc,
+        ObservationCapabilitiesResponseDoc,
+        ObservationRunSummaryDoc,
+        ObservationCatalogResponseDoc,
+        ObservationValueSemanticsDoc,
+        ObservationInterpolationDoc,
+        ObservationDisplayHintDoc,
+        ObservationVariableSummaryDoc,
+        ObservationFramesResponseDoc,
+        ObservationGridBinaryDoc,
+        ObservationPlaneBinaryDoc,
+        ModelPlaneBinaryDoc,
+        NexradLevel2ArchiveDoc,
+        MrmsMessageSelectorDoc,
+        MrmsIngestRequestDoc,
+        StoredObservationPlaneRefDoc,
+        GeographicObservationGridSpecDoc,
+        ObservationMosaicMethodDoc,
+        RadarMosaicRequestDoc,
+        StoredObservationVariableRefDoc,
+        ObservationBeamAggregationDoc,
+        SimulatedRadarOperationDoc,
+        SimulatedRadarRequestDoc,
+        ObservationFamilyDoc,
+        GeneratedObservationPlaneRequestDoc,
+        GeneratedObservationFrameRequestDoc,
+        StoredObservationFrameRefDoc,
+        JobArtifactDoc,
+        SatellitePlatformDescriptorDoc,
+        SatelliteSectorDescriptorDoc,
+        SatelliteProductCategoryDoc,
+        SatelliteProductDescriptorDoc,
+        SatelliteEnhancementStopDoc,
+        SatelliteEnhancementDescriptorDoc,
+        SatelliteCatalogResponseDoc,
+        SatelliteFrameDescriptorDoc,
+        SatelliteFramesResponseDoc,
+        SatelliteTileJsonResponseDoc,
+        SatellitePngTileDoc,
+        SatellitePrewarmWorkKeyDoc,
+        SatellitePrewarmPhaseDoc,
+        SatellitePrewarmStatusDoc,
         GridPointResponse,
         PointVariableSeriesResponse,
         PointSeriesResponse,
         PressureProfileResponse,
         ProfileResponse,
+        TimeRangeResponse,
+        ProfileCycleSampleStatusResponse,
+        ProfileSurfaceSampleResponse,
+        ProfileCycleSampleResponse,
+        ProfileCycleResponse,
         IndexWindowResponse,
         NativeGridEnvelopeResponse,
         GeographicBoundingBoxResponse,
@@ -1055,18 +1954,91 @@ struct CancelledRunGenerationDoc {
         RunGenerationOwnerRecordDoc,
         RunGenerationOwnerListPageDoc,
         CancelledRunGenerationDoc,
+        MrmsProductPhase,
+        MrmsStoredFrameStatus,
+        MrmsProductStatus,
+        MrmsIngestStatus,
+        MrmsRefreshResponse,
+        NexradLevel2SitePhase,
+        NexradLevel2SourceObjectStatus,
+        NexradLevel2StoredFrameStatus,
+        NexradLevel2SiteStatus,
+        NexradLevel2IngestStatus,
+        NexradLevel2RefreshResponse,
+        StoredStormGridRefDoc,
+        ConnectivityRequestDoc,
+        DetectionRequestDoc,
+        StormMethodRequestDoc,
+        StormResponseFormatDoc,
+        StormCellsRequestDoc,
+        StormDistributionGrantDoc,
+        StormModelUsePolicyDoc,
+        StormModelStatusDoc,
+        StormModelCatalogDoc,
+        StormDiskCacheHealthDoc,
+        StormCacheRetentionDoc,
+        StormPrewarmPhaseDoc,
+        StormPrewarmSourceStatusDoc,
+        StormPrewarmStatusDoc,
+        StormSourceLinkageStatusDoc,
+        StormServiceStatusDoc,
+        StormGeoJsonGeometryDoc,
+        StormGeoJsonPropertiesDoc,
+        StormGeoJsonFeatureDoc,
+        StormGeoJsonFeatureCollectionDoc,
+        NexradLevel3StormDecodeRequestDoc,
+        NexradLevel3StormDecodeResponseDoc,
+        GeoPoint,
+        StormSource,
+        StormMethodKind,
+        StormMethodIdentity,
+        ContourRing,
+        StormCell,
+        StormCellFrame,
+        StormMethodCatalog,
+        StormModelBackend,
+        ModelInputSource,
+        StormModelInput,
+        StormModelManifest,
+        NexradStormProduct,
+        ProductIdentity,
+        ValidationNotice,
+        SiteIdentity,
+        SiteIdentitySource,
+        TransportIdentity,
+        Compression,
+        ProductProvenance,
+        SpecificationReferenceOwned,
+        SuppliedGeometry,
+        GeographicPoint,
+        RadarRelativePosition,
+        StormTrackingProduct,
+        TrackedStormCell,
+        TrackPoint,
+        ForecastPoint,
+        CoordinateProvenance,
+        AzimuthRange,
+        StormMotion,
+        StormStructureProduct,
+        StormStructureCell,
+        QualifiedHeight,
+        HeightQualifier,
     )),
     modifiers(&SecurityAddon),
     tags(
         (name = "health", description = "Process and store readiness"),
         (name = "catalog", description = "Models, runs, and variables"),
+        (name = "observations", description = "Exact stored observation catalogs, calibrated native grids, and bounded ingestion jobs"),
+        (name = "satellite", description = "Native-source satellite frame discovery, provenance-bound TileJSON, immutable revisioned PNG tiles, and prewarm status"),
         (name = "query", description = "Bounded synchronous queries"),
         (name = "analytics", description = "Exact-time and diurnal analytics"),
         (name = "jobs", description = "Bounded asynchronous work and immutable artifacts"),
         (name = "community", description = "Opt-in signed Community Cache objects and deliberate case publication"),
         (name = "federation", description = "Operator-approved signed discovery for deliberately public institutional HTTPS origins"),
         (name = "generation-replication", description = "Advanced default-off owner publication of complete immutable rw-store generations"),
-        (name = "operations", description = "Operator metrics")
+        (name = "operations", description = "Authenticated private operations: storm analysis and operator metrics"),
+        (name = "mrms-ingest", description = "Private status and coalesced control for default-off server-owned NOAA MRMS ingest"),
+        (name = "nexrad-level2-ingest", description = "Private status and coalesced control for explicit-site, provider-configurable NEXRAD Level II acquisition")
     )
 )]
 pub struct ApiDoc;
@@ -1102,6 +2074,27 @@ impl Modify for SecurityAddon {
                         .build(),
                 ),
             );
+            for (name, description) in [
+                (
+                    "operations_read_auth",
+                    "Operations read, write, ingest, or admin token; response is private and no-store",
+                ),
+                (
+                    "operations_admin_auth",
+                    "Dedicated operations admin token, or a general API token only when the default-off legacy elevation gate is explicit",
+                ),
+            ] {
+                components.add_security_scheme(
+                    name,
+                    SecurityScheme::Http(
+                        HttpBuilder::new()
+                            .scheme(HttpAuthScheme::Bearer)
+                            .bearer_format("opaque")
+                            .description(Some(description))
+                            .build(),
+                    ),
+                );
+            }
         }
     }
 }
@@ -1121,8 +2114,9 @@ fn live_doc() {}
     get,
     path = "/v1/health/ready",
     tag = "health",
+    description = "Probe the core query executor, configured scientific store, and optional publication catalog. HTTP 200 means core traffic is usable; status `degraded` names optional MRMS or NEXRAD Level II followers that are warming, stale, or in backoff. Optional-source degradation returns 503 only when the operator explicitly enables that subsystem's deployment-wide readiness gate.",
     responses(
-        (status = 200, description = "Store and query executor are ready", body = HealthResponse),
+        (status = 200, description = "Core store, catalog, and query executor are usable; body status is ready or degraded", body = HealthResponse),
         (status = 500, description = "Unexpected readiness failure", content_type = "application/problem+json", body = ProblemDetails),
         (status = 503, description = "Store is unreadable, service is busy, or shutdown is in progress", content_type = "application/problem+json", body = ProblemDetails),
         (status = 504, description = "Readiness check exceeded its execution deadline", content_type = "application/problem+json", body = ProblemDetails)
@@ -1151,6 +2145,543 @@ fn version_doc() {}
     )
 )]
 fn openapi_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/observations/capabilities",
+    tag = "observations",
+    security(("bearer_auth" = [])),
+    description = "Describe the live observation boundary, native-grid limits, accepted derivations, display metadata, and exact binary media types. The route is publication-gated with the other data reads and carries no server-assigned cache lifetime.",
+    responses(
+        (status = 200, description = "Observation delivery and ingestion capabilities", body = ObservationCapabilitiesResponseDoc),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn observation_capabilities_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/observations",
+    tag = "observations",
+    security(("bearer_auth" = [])),
+    params(
+        ("model" = Option<String>, Query, description = "Optional exact stored observation model id"),
+        ("limit" = Option<usize>, Query, minimum = 1, description = "Optional positive caller-selected run limit; omission returns every enumerable observation run")
+    ),
+    description = "Enumerate the complete stored observation-run catalog, optionally filtered by model. Every run descriptor includes its exact snapshot/grid identity, time extent, source provenance, and provider attribution. The response carries no server-assigned cache lifetime.",
+    responses(
+        (status = 200, description = "Complete or explicitly caller-limited observation catalog", body = ObservationCatalogResponseDoc),
+        (status = 400, description = "The requested limit or stored catalog entry is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "A configured catalog/allocation limit was exceeded", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Catalog I/O, metadata, allocation, or serialization failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog is unavailable, the service is busy, or shutdown is in progress", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Catalog work exceeded its execution deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn observation_catalog_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/observations/{model}/{run}/frames",
+    tag = "observations",
+    security(("bearer_auth" = [])),
+    params(
+        ("model" = String, Path, description = "Exact stored observation model id"),
+        ("run" = String, Path, description = "Exact immutable observation run id")
+    ),
+    description = "Resolve one immutable observation snapshot into its exact time axis and variable inventory. Variable selectors and display metadata state calibrated-value semantics, safe interpolation, palette family, transparency, preferred range, and discontinuity behavior. The embedded run descriptor carries source provenance and provider attribution.",
+    responses(
+        (status = 200, description = "Snapshot-bound observation frames and variables", body = ObservationFramesResponseDoc),
+        (status = 400, description = "The stored run or variable metadata is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "The observation family, model, or run is unavailable", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "A configured snapshot/allocation limit was exceeded", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Run metadata or store I/O failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog is unavailable, the service is busy, or shutdown is in progress", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Snapshot work exceeded its execution deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn observation_frames_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/observations/{model}/{run}/grid.bin",
+    tag = "observations",
+    security(("bearer_auth" = [])),
+    params(
+        ("model" = String, Path, description = "Exact stored observation model id"),
+        ("run" = String, Path, description = "Exact immutable observation run id")
+    ),
+    description = "Return the snapshot's native cell-center grid as the versioned `RWOBGRID` binary format. The ETag is derived from the immutable snapshot id and the response is safe for long-lived shared caching.",
+    responses(
+        (status = 200, description = "Immutable native observation grid", body = ObservationGridBinaryDoc, content_type = "application/vnd.rusty-weather.observation-grid+f32",
+            headers(
+                ("Cache-Control" = String, description = "Always public, max-age=31536000, immutable"),
+                ("ETag" = String, description = "Strong snapshot-bound grid validator")
+            )
+        ),
+        (status = 400, description = "The stored grid metadata is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "The observation family, model, or run is unavailable", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "A configured snapshot/allocation limit was exceeded", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Run metadata or store I/O failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog is unavailable, the service is busy, or shutdown is in progress", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Grid work exceeded its execution deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn observation_grid_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/observations/{model}/{run}/frames/{storage_slot}/{variable}",
+    tag = "observations",
+    security(("bearer_auth" = [])),
+    params(
+        ("model" = String, Path, description = "Exact stored observation model id"),
+        ("run" = String, Path, description = "Exact immutable observation run id"),
+        ("storage_slot" = u16, Path, description = "Exact slot from the frame catalog"),
+        ("variable" = String, Path, description = "Exact surface-plane variable filename, including the required .bin suffix")
+    ),
+    description = "Return one calibrated row-major plane as the versioned `RWOBF32` binary format. The strong ETag binds snapshot, slot, and stored variable identity. Scientific semantics are repeated in response headers; authoritative source provenance remains in the frames/run descriptor rather than being fabricated in the binary payload.",
+    responses(
+        (status = 200, description = "Immutable calibrated observation plane", body = ObservationPlaneBinaryDoc, content_type = "application/vnd.rusty-weather.observation-plane+f32",
+            headers(
+                ("Cache-Control" = String, description = "Always public, max-age=31536000, immutable"),
+                ("ETag" = String, description = "Strong snapshot, slot, and variable validator"),
+                ("x-rw-observation-semantics" = String, description = "Calibrated value semantics"),
+                ("x-rw-observation-interpolation" = String, description = "Safe interpolation rule"),
+                ("x-rw-observation-palette" = String, description = "Semantic palette family"),
+                ("x-rw-nodata" = String, description = "Non-finite transparency contract"),
+                ("x-rw-preferred-range" = String, description = "Optional comma-separated calibrated display range"),
+                ("x-rw-discontinuity-threshold" = String, description = "Optional discontinuity threshold")
+            )
+        ),
+        (status = 400, description = "The stored plane metadata is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "The observation family, model, run, slot, or variable is unavailable", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "A configured snapshot or allocation limit was exceeded", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Run metadata or store I/O failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog is unavailable, the service is busy, or shutdown is in progress", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Plane work exceeded its execution deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn observation_plane_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/observations/mrms/latest",
+    tag = "observations",
+    security(("bearer_auth" = [])),
+    description = "Submit a bounded asynchronous fetch/decode/store job for the caller-selected current NOAA MRMS product. No example URL, credential, or source identity is invented. A successful job publishes a `StoredObservationFrameRefDoc` JSON artifact through the normal job/artifact APIs.",
+    request_body(content = MrmsIngestRequestDoc, content_type = "application/json"),
+    responses(
+        (status = 202, description = "Observation job accepted", body = JobView),
+        (status = 400, description = "The JSON syntax, selector, or job request is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 413, description = "The request exceeds the configured body limit", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 415, description = "The request is not JSON", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "The JSON shape could not be deserialized", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "The job record or request fingerprint could not be created", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog or job capacity is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn submit_mrms_latest_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/observations/nexrad/level2",
+    tag = "observations",
+    security(("bearer_auth" = [])),
+    params(
+        ("site" = Option<String>, Query, description = "Optional radar site id; otherwise decoded or explicit coordinates identify the site"),
+        ("site_latitude" = Option<f64>, Query, description = "Optional explicit radar latitude"),
+        ("site_longitude" = Option<f64>, Query, description = "Optional explicit radar longitude"),
+        ("site_elevation_m" = Option<f64>, Query, description = "Optional explicit radar elevation in metres"),
+        ("moment" = Option<String>, Query, description = "Radar moment: reflectivity/ref, velocity/vel, spectrum_width/sw, zdr, correlation_coefficient/rho/cc, differential_phase/phi/phidp, kdp, or hca"),
+        ("mode" = Option<String>, Query, description = "Grid mode: lowest (default), composite, or sweep"),
+        ("sweep_index" = Option<u16>, Query, description = "Required only for mode=sweep"),
+        ("resolution_m" = Option<f64>, Query, description = "Output Cartesian cell resolution in metres; default 1000"),
+        ("radius_km" = Option<f64>, Query, description = "Output radius in kilometres; default 230"),
+        ("collection" = Option<String>, Query, description = "Optional stored collection override"),
+        ("variable" = Option<String>, Query, description = "Optional stored variable override")
+    ),
+    description = "Submit one caller-supplied NEXRAD Archive-II volume for asynchronous decode and storage. The upload route deliberately assigns no upstream archive provenance; server-owned follower provenance is exposed by the separate ingest status route. A successful job publishes a `StoredObservationFrameRefDoc` JSON artifact.",
+    request_body(content = NexradLevel2ArchiveDoc, content_type = "application/octet-stream"),
+    responses(
+        (status = 202, description = "Observation job accepted", body = JobView),
+        (status = 400, description = "Query options are invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 413, description = "The Archive-II body is empty or exceeds the dedicated Level-II upload limit", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "The job record or request fingerprint could not be created", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog or job capacity is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn submit_nexrad_level2_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/observations/radar/mosaic",
+    tag = "observations",
+    security(("bearer_auth" = [])),
+    description = "Submit an asynchronous mosaic over exact stored source planes. The resulting frame records every source plane identity in its selector/provenance metadata and never claims an authoritative upstream polygon product. A successful job publishes a `StoredObservationFrameRefDoc` JSON artifact.",
+    request_body(content = RadarMosaicRequestDoc, content_type = "application/json"),
+    responses(
+        (status = 202, description = "Observation job accepted", body = JobView),
+        (status = 400, description = "The JSON syntax or job request is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 413, description = "The request exceeds the configured body limit", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 415, description = "The request is not JSON", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "The JSON shape could not be deserialized", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "The job record or request fingerprint could not be created", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog or job capacity is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn submit_radar_mosaic_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/observations/wrf-radar/derive",
+    tag = "observations",
+    security(("bearer_auth" = [])),
+    description = "Submit an asynchronous deterministic radar derivation from one exact stored model variable. The source model/run/slot/variable identity is preserved in the output selector and provenance metadata. A successful job publishes a `StoredObservationFrameRefDoc` JSON artifact.",
+    request_body(content = SimulatedRadarRequestDoc, content_type = "application/json"),
+    responses(
+        (status = 202, description = "Observation job accepted", body = JobView),
+        (status = 400, description = "The JSON syntax or job request is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 413, description = "The request exceeds the configured body limit", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 415, description = "The request is not JSON", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "The JSON shape could not be deserialized", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "The job record or request fingerprint could not be created", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog or job capacity is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn submit_simulated_radar_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/observations/generated",
+    tag = "observations",
+    security(("bearer_auth" = [])),
+    description = "Submit one arbitrary calibrated native grid for asynchronous validation and storage. Null coordinates/values become non-finite missing cells; callers supply honest provider, role, and product provenance or leave those fields empty. A successful job publishes a `StoredObservationFrameRefDoc` JSON artifact.",
+    request_body(content = GeneratedObservationFrameRequestDoc, content_type = "application/json"),
+    responses(
+        (status = 202, description = "Observation job accepted", body = JobView),
+        (status = 400, description = "The JSON syntax, grid, values, provenance, or job request is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 413, description = "The request exceeds the dedicated generated-observation upload limit", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 415, description = "The request is not JSON", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "The JSON shape could not be deserialized", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "The job record or request fingerprint could not be created", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog or job capacity is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn submit_generated_observation_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/observations/mrms/ingest/status",
+    tag = "mrms-ingest",
+    security(("bearer_auth" = [])),
+    description = "Private, no-store snapshot of configured MRMS products, bounded worker state, latest exact stored identities, and source-valid-time freshness. The route exists only when background MRMS ingest is enabled.",
+    responses(
+        (status = 200, description = "Current private MRMS follower status", body = MrmsIngestStatus),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Background MRMS ingest is disabled", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn mrms_ingest_status_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/observations/mrms/ingest/refresh",
+    tag = "mrms-ingest",
+    security(("bearer_auth" = [])),
+    description = "Advance the follower's coalescing wake epoch. Any number of client requests received before the workers observe the epoch cause one immediate cycle per configured product, not one upstream job per request.",
+    responses(
+        (status = 202, description = "Refresh wake accepted and coalesced", body = MrmsRefreshResponse),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Background MRMS ingest is disabled", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn mrms_ingest_refresh_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/observations/nexrad/level2/ingest/status",
+    tag = "nexrad-level2-ingest",
+    security(("bearer_auth" = [])),
+    description = "Private, no-store status for every explicitly allowed radar site. Exact provider object identity, SHA-256, decoded valid time, canonical stored snapshot, freshness, retry state, and operator resource controls are reported. The route exists only when background Level II ingest is enabled.",
+    responses(
+        (status = 200, description = "Current private NEXRAD Level II follower status", body = NexradLevel2IngestStatus),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Background NEXRAD Level II ingest is disabled", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn nexrad_level2_ingest_status_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/observations/nexrad/level2/ingest/refresh",
+    tag = "nexrad-level2-ingest",
+    security(("bearer_auth" = [])),
+    description = "Advance one coalescing wake epoch. Concurrent client or operator requests produce one immediate cycle per configured site rather than one archive fetch per request.",
+    responses(
+        (status = 202, description = "Refresh wake accepted and coalesced", body = NexradLevel2RefreshResponse),
+        (status = 401, description = "Bearer authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Background NEXRAD Level II ingest is disabled", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn nexrad_level2_ingest_refresh_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/satellite/catalog",
+    tag = "satellite",
+    security(("bearer_auth" = [])),
+    params(
+        ("include_raw_channels" = Option<bool>, Query, description = "Include all raw ABI C01-C16 products in addition to named recipes; default false")
+    ),
+    description = "Return the native GOES platform, sector, product, enhancement, renderer-recipe, and attribution contract. Required channels and daylight-only flags are explicit. The response carries no server-assigned cache lifetime.",
+    responses(
+        (status = 200, description = "Native satellite product catalog", body = SatelliteCatalogResponseDoc),
+        (status = 400, description = "The query parameters could not be decoded", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Catalog serialization failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn satellite_catalog_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/satellite/prewarm/status",
+    tag = "satellite",
+    security(("bearer_auth" = [])),
+    description = "Return current request-independent satellite tile prewarm state, exact active work identity, bounded counters, and the latest sanitized failure. This live status response carries no validator or server-assigned cache lifetime.",
+    responses(
+        (status = 200, description = "Current satellite prewarm status", body = SatellitePrewarmStatusDoc),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Status serialization failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn satellite_prewarm_status_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/satellite/{platform}/{sector}/{product}/frames",
+    tag = "satellite",
+    security(("bearer_auth" = [])),
+    params(
+        ("platform" = String, Path, description = "Native satellite platform id from the catalog"),
+        ("sector" = String, Path, description = "Native ABI sector id from the catalog"),
+        ("product" = String, Path, description = "Named or raw-channel product id from the catalog"),
+        ("limit" = Option<usize>, Query, minimum = 1, description = "Optional positive caller-selected page size; omission returns every retained complete frame")
+    ),
+    description = "List complete retained native-source frames. Each frame carries exact scan bounds, present channels, and a BLAKE3 source_revision computed from the committed required-channel content. Incomplete native frames are excluded. The response carries no server-assigned cache lifetime.",
+    responses(
+        (status = 200, description = "Complete native frames in newest-first archive order", body = SatelliteFramesResponseDoc),
+        (status = 400, description = "The limit, platform, sector, product, or archive identity is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "The product, sector, or native frame archive is unavailable", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Native archive I/O failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog or satellite worker is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn satellite_frames_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/satellite/{platform}/{sector}/{product}/{frame}/tilejson.json",
+    tag = "satellite",
+    security(("bearer_auth" = [])),
+    params(
+        ("platform" = String, Path, description = "Native satellite platform id"),
+        ("sector" = String, Path, description = "Native ABI sector id"),
+        ("product" = String, Path, description = "Named or raw-channel product id"),
+        ("frame" = String, Path, description = "Exact YYYYMMDDTHHMM native frame id or the mutable latest alias"),
+        ("If-None-Match" = Option<String>, Header, description = "Conditional validator from an earlier response")
+    ),
+    description = "Resolve one frame (or `latest`) and return TileJSON 3.0 pointing only at the renderer-recipe plus exact source-revision tile route. Exact source provenance is repeated in the body and `x-rw-satellite-source-revision`. Exact-frame TileJSON is revalidated after five minutes; `latest` is always revalidated and never treated as immutable.",
+    responses(
+        (status = 200, description = "TileJSON bound to an exact resolved native source revision", body = SatelliteTileJsonResponseDoc, content_type = "application/json",
+            headers(
+                ("Cache-Control" = String, description = "latest: no-cache, max-age=0, must-revalidate; exact frame: public, max-age=300, must-revalidate"),
+                ("ETag" = String, description = "Strong response-body validator"),
+                ("Vary" = String, description = "Always host"),
+                ("x-rw-satellite-frame" = String, description = "Exact resolved native frame id"),
+                ("x-rw-satellite-recipe" = String, description = "Exact renderer recipe"),
+                ("x-rw-satellite-source-revision" = String, description = "Exact native required-channel content revision")
+            )
+        ),
+        (status = 304, description = "If-None-Match matched; body omitted",
+            headers(
+                ("Cache-Control" = String, description = "Same policy as the selected frame"),
+                ("ETag" = String, description = "Matching strong validator"),
+                ("Vary" = String, description = "Always host"),
+                ("x-rw-satellite-frame" = String, description = "Exact resolved native frame id"),
+                ("x-rw-satellite-recipe" = String, description = "Exact renderer recipe"),
+                ("x-rw-satellite-source-revision" = String, description = "Exact native required-channel content revision")
+            )
+        ),
+        (status = 400, description = "The path, public request origin, or native archive identity is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "The product, sector, frame, or complete native source is unavailable", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Native archive I/O or serialization failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog or satellite worker is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn satellite_tilejson_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/satellite/{platform}/{sector}/{product}/{frame}/tiles/{z}/{x}/{y}",
+    tag = "satellite",
+    security(("bearer_auth" = [])),
+    params(
+        ("platform" = String, Path, description = "Native satellite platform id"),
+        ("sector" = String, Path, description = "Native ABI sector id"),
+        ("product" = String, Path, description = "Named or raw-channel product id"),
+        ("frame" = String, Path, description = "Exact YYYYMMDDTHHMM native frame id or the mutable latest alias"),
+        ("z" = u8, Path, description = "XYZ zoom, bounded by the satellite catalog maximum"),
+        ("x" = u32, Path, description = "XYZ tile column"),
+        ("y" = String, Path, description = "XYZ tile row including the required .png suffix"),
+        ("If-None-Match" = Option<String>, Header, description = "Conditional validator from an earlier response")
+    ),
+    description = "Compatibility tile route without renderer/source revisions in the URL. The body and provenance headers still bind the resolved frame, current renderer recipe, exact valid time, and exact native source revision. Exact frames must revalidate; `latest` is no-store. New consumers should follow TileJSON to the fully revisioned route.",
+    responses(
+        (status = 200, description = "Rendered satellite PNG", body = SatellitePngTileDoc, content_type = "image/png",
+            headers(
+                ("Cache-Control" = String, description = "latest: no-store; exact frame: public, max-age=0, must-revalidate"),
+                ("ETag" = String, description = "Strong rendered-byte validator"),
+                ("Vary" = String, description = "Always host"),
+                ("x-rw-satellite-frame" = String, description = "Exact resolved native frame id"),
+                ("x-rw-valid-unix" = String, description = "Exact frame valid time"),
+                ("x-rw-satellite-recipe" = String, description = "Exact renderer recipe"),
+                ("x-rw-satellite-source-revision" = String, description = "Exact native required-channel content revision")
+            )
+        ),
+        (status = 304, description = "If-None-Match matched; body omitted",
+            headers(
+                ("Cache-Control" = String, description = "latest: no-store; exact frame: public, max-age=0, must-revalidate"),
+                ("ETag" = String, description = "Matching strong validator"),
+                ("Vary" = String, description = "Always host"),
+                ("x-rw-satellite-frame" = String, description = "Exact resolved native frame id"),
+                ("x-rw-valid-unix" = String, description = "Exact frame valid time"),
+                ("x-rw-satellite-recipe" = String, description = "Exact renderer recipe"),
+                ("x-rw-satellite-source-revision" = String, description = "Exact native required-channel content revision")
+            )
+        ),
+        (status = 400, description = "The frame or XYZ request is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "The product, sector, frame, native source, or tile is unavailable", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Native archive or tile-cache I/O failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog or satellite worker is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn satellite_legacy_tile_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/satellite/{platform}/{sector}/{product}/{frame}/tiles/{recipe}/{z}/{x}/{y}",
+    tag = "satellite",
+    security(("bearer_auth" = [])),
+    params(
+        ("platform" = String, Path, description = "Native satellite platform id"),
+        ("sector" = String, Path, description = "Native ABI sector id"),
+        ("product" = String, Path, description = "Named or raw-channel product id"),
+        ("frame" = String, Path, description = "Exact YYYYMMDDTHHMM native frame id or the mutable latest alias"),
+        ("recipe" = String, Path, description = "Exact renderer recipe advertised by the satellite catalog"),
+        ("z" = u8, Path, description = "XYZ zoom, bounded by the satellite catalog maximum"),
+        ("x" = u32, Path, description = "XYZ tile column"),
+        ("y" = String, Path, description = "XYZ tile row including the required .png suffix"),
+        ("If-None-Match" = Option<String>, Header, description = "Conditional validator from an earlier response")
+    ),
+    description = "Renderer-versioned tile route without a native source revision in the URL. Exact frames still require revalidation because required native channels can be replaced under the same minute id; `latest` is no-store. The resolved source revision is always returned in provenance headers.",
+    responses(
+        (status = 200, description = "Rendered satellite PNG", body = SatellitePngTileDoc, content_type = "image/png",
+            headers(
+                ("Cache-Control" = String, description = "latest: no-store; exact frame: public, max-age=0, must-revalidate"),
+                ("ETag" = String, description = "Strong rendered-byte validator"),
+                ("Vary" = String, description = "Always host"),
+                ("x-rw-satellite-frame" = String, description = "Exact resolved native frame id"),
+                ("x-rw-valid-unix" = String, description = "Exact frame valid time"),
+                ("x-rw-satellite-recipe" = String, description = "Exact renderer recipe"),
+                ("x-rw-satellite-source-revision" = String, description = "Exact native required-channel content revision")
+            )
+        ),
+        (status = 304, description = "If-None-Match matched; body omitted",
+            headers(
+                ("Cache-Control" = String, description = "latest: no-store; exact frame: public, max-age=0, must-revalidate"),
+                ("ETag" = String, description = "Matching strong validator"),
+                ("Vary" = String, description = "Always host"),
+                ("x-rw-satellite-frame" = String, description = "Exact resolved native frame id"),
+                ("x-rw-valid-unix" = String, description = "Exact frame valid time"),
+                ("x-rw-satellite-recipe" = String, description = "Exact renderer recipe"),
+                ("x-rw-satellite-source-revision" = String, description = "Exact native required-channel content revision")
+            )
+        ),
+        (status = 400, description = "The frame or XYZ request is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "The recipe, product, sector, frame, native source, or tile is unavailable", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Native archive or tile-cache I/O failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog or satellite worker is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn satellite_versioned_tile_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/satellite/{platform}/{sector}/{product}/{frame}/tiles/{recipe}/{source_revision}/{z}/{x}/{y}",
+    tag = "satellite",
+    security(("bearer_auth" = [])),
+    params(
+        ("platform" = String, Path, description = "Native satellite platform id"),
+        ("sector" = String, Path, description = "Native ABI sector id"),
+        ("product" = String, Path, description = "Named or raw-channel product id"),
+        ("frame" = String, Path, description = "Exact YYYYMMDDTHHMM native frame id; latest remains accepted but no-store"),
+        ("recipe" = String, Path, description = "Exact renderer recipe advertised by the satellite catalog"),
+        ("source_revision" = String, Path, min_length = 64, max_length = 64, pattern = "^[0-9a-f]{64}$", description = "Exact 64-character lowercase BLAKE3 required-channel content revision"),
+        ("z" = u8, Path, description = "XYZ zoom, bounded by the satellite catalog maximum"),
+        ("x" = u32, Path, description = "XYZ tile column"),
+        ("y" = String, Path, description = "XYZ tile row including the required .png suffix"),
+        ("If-None-Match" = Option<String>, Header, description = "Conditional validator from an earlier response")
+    ),
+    description = "Fully provenance-bound tile route used by generated TileJSON. For an exact frame, recipe plus source_revision is the complete immutable render identity and may be cached for one year even after raw-source retention expires when the durable tile cache still holds the bytes. The mutable `latest` alias remains no-store.",
+    responses(
+        (status = 200, description = "Rendered provenance-bound satellite PNG", body = SatellitePngTileDoc, content_type = "image/png",
+            headers(
+                ("Cache-Control" = String, description = "exact frame: public, max-age=31536000, immutable; latest: no-store"),
+                ("ETag" = String, description = "Strong rendered-byte validator"),
+                ("Vary" = String, description = "Always host"),
+                ("x-rw-satellite-frame" = String, description = "Exact resolved native frame id"),
+                ("x-rw-valid-unix" = String, description = "Exact frame valid time"),
+                ("x-rw-satellite-recipe" = String, description = "Exact renderer recipe"),
+                ("x-rw-satellite-source-revision" = String, description = "Exact native required-channel content revision")
+            )
+        ),
+        (status = 304, description = "If-None-Match matched; body omitted",
+            headers(
+                ("Cache-Control" = String, description = "exact frame: public, max-age=31536000, immutable; latest: no-store"),
+                ("ETag" = String, description = "Matching strong validator"),
+                ("Vary" = String, description = "Always host"),
+                ("x-rw-satellite-frame" = String, description = "Exact resolved native frame id"),
+                ("x-rw-valid-unix" = String, description = "Exact frame valid time"),
+                ("x-rw-satellite-recipe" = String, description = "Exact renderer recipe"),
+                ("x-rw-satellite-source-revision" = String, description = "Exact native required-channel content revision")
+            )
+        ),
+        (status = 400, description = "The frame or XYZ request is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "The recipe, source revision, product, sector, frame, or tile is unavailable", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Native archive or tile-cache I/O failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog or satellite worker is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn satellite_revisioned_tile_doc() {}
 
 #[utoipa::path(
     get,
@@ -1187,6 +2718,27 @@ fn models_doc() {}
     )
 )]
 fn runs_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/models/{model}/latest-run",
+    tag = "catalog",
+    security(("bearer_auth" = [])),
+    params(("model" = String, Path, description = "Canonical stored model id")),
+    description = "Resolve the newest visible, authorized run by physical cycle origin. The mutable pointer is deterministic, private, and no-store; clients should bind subsequent queries to the returned immutable run and snapshot identities.",
+    responses(
+        (status = 200, description = "Newest visible immutable run descriptor; private no-store", body = RunDescriptorResponse),
+        (status = 400, description = "Model id or visible run ordering metadata is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "No visible run is available for the model", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 409, description = "The selected run changed while its snapshot was resolved", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Configured catalog or snapshot limit was exceeded", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Catalog, run metadata, or store I/O failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Publication catalog is unavailable, service is busy, or shutdown is in progress", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Latest-run resolution exceeded its execution deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn latest_run_doc() {}
 
 #[utoipa::path(
     get,
@@ -1231,6 +2783,49 @@ fn run_doc() {}
     )
 )]
 fn variables_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/models/{model}/runs/{run}/planes/{storage_slot}/{variable}",
+    tag = "catalog",
+    security(("bearer_auth" = [])),
+    params(
+        ("model" = String, Path, description = "Canonical stored model id"),
+        ("run" = String, Path, description = "Explicit immutable run id"),
+        ("storage_slot" = u16, Path, description = "Exact storage slot from the run's time axis"),
+        ("variable" = String, Path, description = "Exact stored variable filename, including the required .bin suffix"),
+        ("expected_snapshot_id" = String, Query, description = "Required. The snapshot_id this plane must belong to; a mismatch fails instead of silently following an atomic republication of the same run name"),
+        ("expected_grid_hash" = String, Query, description = "Required. The grid_hash this plane must belong to"),
+        ("level_hpa" = Option<u16>, Query, description = "Omit for a surface2d variable; supply one exact stored pressure level for a pressure3d variable. There is no default level and no implicit vertical reduction")
+    ),
+    description = "Return one complete forecast plane as binary f32 for the named run generation. The whole native grid is returned: no cell ceiling, no downsampling, and no truncation by the synchronous query budgets that bound the JSON window routes. \
+Because the URL pins snapshot_id and grid_hash it names one immutable body, which is what makes the long-lived immutable cache directive true. \
+The payload uses the same versioned RWOBF32 container as observation planes under its own media type. Surface variables are stored as lossless zstd1_f32; pressure levels are stored as zstd1_affine_i16 and are therefore dequantized approximations, so the exact stored codec ships in x-rw-model-codec rather than letting an f32 payload imply losslessness. \
+No palette, semantics, or interpolation hints are emitted: model variables carry no stored display metadata, and the authoritative styling inputs (selector, kind, levels_hpa, available_slots) stay on /v1/models/{model}/runs/{run}/variables.",
+    responses(
+        (status = 200, description = "Immutable full-grid model forecast plane", body = ModelPlaneBinaryDoc, content_type = "application/vnd.rusty-weather.model-plane+f32",
+            headers(
+                ("Cache-Control" = String, description = "Always public, max-age=31536000, immutable; the URL's snapshot/grid guards make the body immutable"),
+                ("ETag" = String, description = "Strong snapshot, slot, variable, and level validator"),
+                ("x-rw-model-variable" = String, description = "Exact stored variable name"),
+                ("x-rw-model-units" = String, description = "Exact stored units"),
+                ("x-rw-model-codec" = String, description = "Exact stored codec: zstd1_f32 (lossless surface) or zstd1_affine_i16 (dequantized pressure level)"),
+                ("x-rw-valid-unix" = i64, description = "Valid time of the plane in Unix seconds"),
+                ("x-rw-model-level-hpa" = u16, description = "Present only for a pressure level; absent on surface planes"),
+                ("x-rw-nodata" = String, description = "Non-finite transparency contract for absent cells")
+            )
+        ),
+        (status = 400, description = "The identity guards are missing or do not match the resolved run, a query parameter is unsupported, or the stored plane metadata is invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "The model, run, storage slot, variable, pressure level, or .bin filename is absent", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 409, description = "Run changed while the plane was decoded", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "The variable kind does not match the requested vertical selection, or a configured snapshot limit was exceeded", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Run metadata, store I/O, or allocation failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "The publication catalog is unavailable, the service is busy, or shutdown is in progress", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Plane decoding exceeded its execution deadline", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn model_plane_doc() {}
 
 #[utoipa::path(
     get,
@@ -1295,6 +2890,28 @@ fn points_doc() {}
     )
 )]
 fn profile_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/profile-cycle",
+    tag = "query",
+    security(("bearer_auth" = [])),
+    request_body = ProfileCycleApiRequest,
+    responses(
+        (status = 200, description = "Deterministically ordered pressure profiles, colocated surface samples, and explicit gaps for every selected stored time in one immutable run", body = ProfileCycleResponse),
+        (status = 400, description = "Request body, coordinates, variables, or half-open time range are invalid", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "The run or a variable absent from the complete selection was not found", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 409, description = "Run changed while the query was executing", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 413, description = "Request body exceeds the configured byte limit", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 415, description = "Request is not application/json", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "Variable, selected-time, decoded-value, or strict missing-data limit was not satisfied", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Store, metadata, allocation, or serialization failure", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Service is busy, shutting down, or the authoritative publication catalog is unavailable", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "Query exceeded its execution deadline and cooperative cancellation was requested", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn profile_cycle_doc() {}
 
 #[utoipa::path(
     post,
@@ -1452,7 +3069,11 @@ fn cancel_job_doc() {}
         ("file" = String, Path, description = "Artifact filename from JobView")
     ),
     responses(
-        (status = 200, description = "Immutable temporal-grid JSON artifact", content_type = "application/json", body = TemporalGridResponse),
+        (status = 200, description = "Immutable temporal-grid or stored-observation JSON artifact", content_type = "application/json", body = JobArtifactDoc,
+            headers(
+                ("Cache-Control" = String, description = "Always private, max-age=31536000, immutable")
+            )
+        ),
         (status = 400, description = "Artifact hash or filename is invalid", content_type = "application/problem+json", body = ProblemDetails),
         (status = 401, description = "Bearer authentication failed when tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
         (status = 404, description = "Artifact was not found", content_type = "application/problem+json", body = ProblemDetails),
@@ -2209,12 +3830,114 @@ fn generation_replication_gc_doc() {}
 
 #[utoipa::path(
     get,
+    path = "/v1/ops/storms/status",
+    tag = "operations",
+    description = "Return the private storm runtime, exact-frame memory/disk cache, request-independent MRMS prewarm, and source-linkage status. The route exists only when private operations state is enabled. Every success and failure response is authenticated, `Cache-Control: no-store, private`, has `Pragma: no-cache`, and carries no ETag.",
+    security(("operations_read_auth" = [])),
+    responses(
+        (status = 200, description = "Current private storm service status and honest upstream/derived geometry linkage", body = StormServiceStatusDoc),
+        (status = 401, description = "Operations authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 403, description = "Operations read scope is insufficient", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Private operations/storm state is disabled", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn storm_status_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/ops/storms/methods",
+    tag = "operations",
+    description = "Discover every storm method the node can identify: authoritative NOAA Level III products, deterministic Rust contours, and installed machine-learning manifests. Catalog entries expose method, upstream product, model, version, parameters, and geometry provenance. Responses are authenticated, private, and no-store.",
+    security(("operations_read_auth" = [])),
+    responses(
+        (status = 200, description = "Versioned storm method catalog", body = StormMethodCatalog),
+        (status = 401, description = "Operations authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 403, description = "Operations read scope is insufficient", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Private operations/storm state is disabled", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "The catalog failed its own wire-contract validation", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Storm runtime is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn storm_methods_doc() {}
+
+#[utoipa::path(
+    get,
+    path = "/v1/ops/storms/models",
+    tag = "operations",
+    description = "List immutable storm-model manifests, artifact and derived-output distribution policy, activation state, and whether a trusted Rust execution path exists on this node. HTTP clients cannot install or upload model artifacts. Responses are authenticated, private, and no-store.",
+    security(("operations_read_auth" = [])),
+    responses(
+        (status = 200, description = "Installed private storm-model catalog and execution readiness", body = StormModelCatalogDoc),
+        (status = 401, description = "Operations authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 403, description = "Operations read scope is insufficient", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Private operations/storm state is disabled", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Model registry state could not be read", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Storm runtime is unavailable", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn storm_models_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/ops/storms/cells",
+    tag = "operations",
+    description = "Derive or retrieve one exact storm-cell frame from a snapshot-bound field already present in the validated RW store. Clients provide source identity and a deterministic, automatic, or installed-model method; raw grids and executable model artifacts are never uploaded. `format=geojson` returns RFC 7946 contour geometry while preserving the same source, method, partial-result, warning, and provenance fields as canonical JSON. Every response is authenticated, private, and no-store.",
+    security(("operations_read_auth" = [])),
+    params(
+        ("format" = Option<StormResponseFormatDoc>, Query, description = "canonical (default application/json) or geojson (application/geo+json)")
+    ),
+    request_body(content = StormCellsRequestDoc, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Exact cached or newly computed storm-cell frame in the requested representation", content(
+            (StormCellFrame = "application/json"),
+            (StormGeoJsonFeatureCollectionDoc = "application/geo+json")
+        )),
+        (status = 400, description = "The query or JSON syntax is malformed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Operations authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 403, description = "Operations read scope is insufficient", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "The exact stored generation, field, time, or requested model is unavailable", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 409, description = "The stored generation differs from expected_snapshot_id; refresh its descriptor before retrying", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 413, description = "The JSON request exceeds the endpoint body boundary", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 415, description = "The request content type is not JSON", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "The schema, source identity, grid, method, model policy, or scientific values are not executable", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Storm processing failed without exposing private internals", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Storm workers are busy, shutting down, or unavailable", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "The configured heavy-job deadline expired", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn storm_cells_doc() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/ops/storms/authoritative/nexrad-level3/decode",
+    tag = "operations",
+    description = "Decode one caller-supplied authoritative NOAA/RPG NEXRAD Level III message 58 (NST/STI tracking) or message 62 (SS/NSS structure) product with the pure-Rust decoder. The response preserves product identity, ROC specification references, transport identity, validation notices, and an explicit geometry statement: message 58 supplies centroids/tracks but no polygons; message 62 supplies centroids/structure attributes but neither polygons nor tracks. Every response is authenticated, private, and no-store.",
+    security(("operations_read_auth" = [])),
+    request_body(content = NexradLevel3StormDecodeRequestDoc, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Authoritative decoded Level III storm product with complete identity and geometry provenance", body = NexradLevel3StormDecodeResponseDoc),
+        (status = 400, description = "The JSON syntax is malformed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 401, description = "Operations authentication failed", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 403, description = "Operations read scope is insufficient", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 404, description = "Private operations/storm state is disabled", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 413, description = "The encoded request exceeds the endpoint body boundary", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 415, description = "The request content type is not JSON", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 422, description = "The schema, base64, structural bounds, or Level III product are invalid or unsupported", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 500, description = "Decoding failed without exposing private internals", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 503, description = "Lightweight workers are busy, shutting down, or unavailable", content_type = "application/problem+json", body = ProblemDetails),
+        (status = 504, description = "The configured lightweight-job deadline expired", content_type = "application/problem+json", body = ProblemDetails)
+    )
+)]
+fn nexrad_level3_storm_decode_doc() {}
+
+#[utoipa::path(
+    get,
     path = "/metrics",
     tag = "operations",
     description = "OpenMetrics endpoint. It is protected by bearer authentication by default (auth.protect_metrics = true); operators may explicitly opt out with auth.protect_metrics = false. When no tokens are configured, authentication middleware permits local requests.",
     security(("bearer_auth" = [])),
     responses(
-        (status = 200, description = "OpenMetrics text exposition", content_type = "application/openmetrics-text", body = String),
+        (status = 200, description = "OpenMetrics text exposition", content_type = "application/openmetrics-text; version=1.0.0; charset=utf-8", body = String),
         (status = 401, description = "Bearer authentication failed when metrics protection and tokens are configured", content_type = "application/problem+json", body = ProblemDetails),
         (status = 500, description = "Metrics encoding failed", content_type = "application/problem+json", body = ProblemDetails)
     )
@@ -2278,7 +4001,9 @@ mod tests {
             "/v1/health/live",
             "/v1/openapi.json",
             "/v1/models",
+            "/v1/models/{model}/latest-run",
             "/v1/point",
+            "/v1/profile-cycle",
             "/v1/window",
             "/v1/analytics/spatial-series",
             "/v1/analytics/temporal-grid",
@@ -2290,6 +4015,10 @@ mod tests {
         ] {
             assert!(paths.contains_key(path), "missing OpenAPI path {path}");
         }
+        assert!(
+            !paths.contains_key("/v1/models/{model}/runs/latest"),
+            "latest-run pointer must not reserve the legal run ID 'latest'"
+        );
         assert!(
             paths["/v1/window"]["post"]["responses"]
                 .get("501")
@@ -2321,11 +4050,178 @@ mod tests {
             "#/components/schemas/OriginCatalogHealthStatus",
             false,
         );
+        let latest = operation(&value, "/v1/models/{model}/latest-run", "get");
+        assert_eq!(latest["security"][0]["bearer_auth"], serde_json::json!([]));
+        assert!(latest["responses"]["401"].is_object());
+        assert!(
+            latest["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("no-store"))
+        );
         let submit_responses = &paths["/v1/jobs/temporal-grid"]["post"]["responses"];
         for status in ["404", "409", "503", "504"] {
             assert!(
                 submit_responses[status].is_object(),
                 "job submission must document runtime status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn storm_contracts_are_complete_authenticated_and_browser_discoverable() {
+        let value = serde_json::to_value(document()).unwrap();
+        let routes = [
+            ("/v1/ops/storms/status", "get"),
+            ("/v1/ops/storms/methods", "get"),
+            ("/v1/ops/storms/models", "get"),
+            ("/v1/ops/storms/cells", "post"),
+            ("/v1/ops/storms/authoritative/nexrad-level3/decode", "post"),
+        ];
+        for (path, method) in routes {
+            let operation = operation(&value, path, method);
+            assert_eq!(
+                operation["security"][0]["operations_read_auth"],
+                serde_json::json!([]),
+                "{method} {path} must require a private operations bearer credential"
+            );
+            assert!(
+                operation["responses"]["401"].is_object(),
+                "{method} {path} must document authentication failure"
+            );
+            let description = operation["description"].as_str().unwrap();
+            assert!(description.contains("private"), "{method} {path}");
+            assert!(description.contains("no-store"), "{method} {path}");
+        }
+
+        let auth = &value["components"]["securitySchemes"]["operations_read_auth"];
+        assert_eq!(auth["type"], "http");
+        assert_eq!(auth["scheme"], "bearer");
+
+        assert_response_ref(
+            &value,
+            "/v1/ops/storms/status",
+            "get",
+            "#/components/schemas/StormServiceStatusDoc",
+            false,
+        );
+        assert_response_ref(
+            &value,
+            "/v1/ops/storms/methods",
+            "get",
+            "#/components/schemas/StormMethodCatalog",
+            false,
+        );
+        assert_response_ref(
+            &value,
+            "/v1/ops/storms/models",
+            "get",
+            "#/components/schemas/StormModelCatalogDoc",
+            false,
+        );
+
+        let cells = operation(&value, "/v1/ops/storms/cells", "post");
+        assert_eq!(
+            cells["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/StormCellsRequestDoc"
+        );
+        assert_eq!(
+            cells["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/StormCellFrame"
+        );
+        assert_eq!(
+            cells["responses"]["200"]["content"]["application/geo+json"]["schema"]["$ref"],
+            "#/components/schemas/StormGeoJsonFeatureCollectionDoc"
+        );
+        assert!(
+            cells["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|parameter| parameter["name"] == "format")
+        );
+        for status in ["409", "422", "503"] {
+            assert!(
+                cells["responses"][status].is_object(),
+                "storm cells must document {status}"
+            );
+        }
+
+        let level3 = operation(
+            &value,
+            "/v1/ops/storms/authoritative/nexrad-level3/decode",
+            "post",
+        );
+        assert_eq!(
+            level3["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/NexradLevel3StormDecodeRequestDoc"
+        );
+        assert_eq!(
+            level3["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/NexradLevel3StormDecodeResponseDoc"
+        );
+        for status in ["422", "503"] {
+            assert!(
+                level3["responses"][status].is_object(),
+                "Level III decode must document {status}"
+            );
+        }
+
+        let schemas = &value["components"]["schemas"];
+        for field in ["expected_snapshot_id", "expected_grid_hash", "storage_slot"] {
+            assert!(
+                schemas["StoredStormGridRefDoc"]["properties"][field].is_object(),
+                "stored storm request must expose {field}"
+            );
+        }
+        for field in [
+            "upstream_product",
+            "model_id",
+            "model_version",
+            "parameters",
+        ] {
+            assert!(
+                schemas["StormMethodIdentity"]["properties"][field].is_object(),
+                "storm method provenance must expose {field}"
+            );
+        }
+        for field in ["source", "method", "partial", "warnings", "cells"] {
+            assert!(
+                schemas["StormCellFrame"]["properties"][field].is_object(),
+                "canonical storm frame must expose {field}"
+            );
+        }
+        for field in ["source", "method", "partial", "warnings", "features"] {
+            assert!(
+                schemas["StormGeoJsonFeatureCollectionDoc"]["properties"][field].is_object(),
+                "GeoJSON storm frame must preserve {field}"
+            );
+        }
+        for field in [
+            "artifact_sha256",
+            "producer",
+            "license",
+            "training_provenance",
+        ] {
+            assert!(
+                schemas["StormModelManifest"]["properties"][field].is_object(),
+                "model manifest provenance must expose {field}"
+            );
+        }
+        for field in [
+            "format_specification",
+            "product_specification",
+            "supplied_geometry",
+            "geometry_statement",
+        ] {
+            assert!(
+                schemas["ProductProvenance"]["properties"][field].is_object(),
+                "authoritative product provenance must expose {field}"
+            );
+        }
+        for field in ["method", "product", "geometry_statement"] {
+            assert!(
+                schemas["NexradLevel3StormDecodeResponseDoc"]["properties"][field].is_object(),
+                "Level III response must expose {field}"
             );
         }
     }
@@ -2563,6 +4459,12 @@ mod tests {
                 true,
             ),
             (
+                "/v1/models/{model}/latest-run",
+                "get",
+                "#/components/schemas/RunDescriptorResponse",
+                false,
+            ),
+            (
                 "/v1/models/{model}/runs/{run}",
                 "get",
                 "#/components/schemas/RunDescriptorResponse",
@@ -2590,6 +4492,12 @@ mod tests {
                 "/v1/profile",
                 "post",
                 "#/components/schemas/ProfileResponse",
+                false,
+            ),
+            (
+                "/v1/profile-cycle",
+                "post",
+                "#/components/schemas/ProfileCycleResponse",
                 false,
             ),
             (
@@ -2633,6 +4541,23 @@ mod tests {
             schemas["ModelCapabilityResponse"]["properties"]["provider_attributions"]["items"]["$ref"],
             "#/components/schemas/ProviderAttributionResponse"
         );
+        assert_eq!(
+            schemas["ProfileCycleSampleResponse"]["properties"]["source_provenance"]["items"]["$ref"],
+            "#/components/schemas/SourceProvenanceResponse"
+        );
+        assert_eq!(
+            schemas["ProfileCycleSampleResponse"]["properties"]["surface_samples"]["items"]["$ref"],
+            "#/components/schemas/ProfileSurfaceSampleResponse"
+        );
+        assert!(
+            schemas["ProfileCycleResponse"]["properties"]["requested_surface_variables"]
+                .is_object()
+        );
+        assert_eq!(
+            schemas["ProfileCycleSampleStatusResponse"]["enum"],
+            serde_json::json!(["complete", "partial", "gap"])
+        );
+        assert!(schemas["VariableCapabilityResponse"]["properties"]["profile_cycle"].is_object());
     }
 
     #[test]
@@ -2649,10 +4574,14 @@ mod tests {
                 "analysis_only",
                 "surface_only",
                 "ensemble_mean_only",
+                "provider_statistics_only",
+                "ensemble_control_member_only",
                 "sparse_pressure_levels",
+                "two_dimensional_statistics_only",
                 "derived_products_disabled",
                 "conus_only",
-                "pre_operational_feed"
+                "pre_operational_feed",
+                "extended_range_not_scheduled"
             ])
         );
     }
@@ -2708,7 +4637,7 @@ mod tests {
         let value = serde_json::to_value(document()).unwrap();
         let paths = value["paths"].as_object().unwrap();
         for (path, path_item) in paths {
-            for method in ["get", "post", "delete"] {
+            for method in ["get", "post", "put", "delete"] {
                 let Some(operation) = path_item.get(method) else {
                     continue;
                 };

@@ -2074,6 +2074,8 @@ fn protocol_attributions(descriptor: &rw_query::RunDescriptor) -> Vec<Attributio
                     (attribution.provider.contains("ECMWF") && source.provider == "ecmwf-open-data")
                         || (attribution.provider.contains("NOAA")
                             && source.provider.starts_with("noaa-"))
+                        || (attribution.provider.contains("DWD")
+                            && source.provider == "dwd-open-data")
                 })
                 .map(|source| source.provider.clone())
                 .unwrap_or_else(|| attribution.provider.clone()),

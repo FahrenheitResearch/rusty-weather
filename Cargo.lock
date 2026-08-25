@@ -2961,10 +2961,13 @@ version = "0.12.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4293f18e7567a1caf3c584855554377025c65e0aa445344d04171f5ad63d19b9"
 dependencies = [
+ "async-lock",
  "crossbeam-channel",
  "crossbeam-epoch",
  "crossbeam-utils",
  "equivalent",
+ "event-listener",
+ "futures-util",
  "parking_lot",
  "portable-atomic",
  "smallvec",
@@ -3545,8 +3548,6 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "openjp2"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8940f4ff209130c7b374730e83cc7e31062706520e3960001e7eedc982bc554"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
@@ -4473,6 +4474,7 @@ name = "rustwx-io"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "bzip2",
  "chrono",
  "flate2",
  "grib-core",
@@ -4483,6 +4485,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "windows-sys 0.61.2",
  "wx-core",
 ]
 
@@ -4490,6 +4493,7 @@ dependencies = [
 name = "rustwx-models"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "rayon",
  "rustls",
  "rustwx-core",
@@ -4752,6 +4756,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "rw-nexrad-storm"
+version = "0.1.0"
+dependencies = [
+ "bzip2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "utoipa",
+]
+
+[[package]]
+name = "rw-observations"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "grib-core",
+ "rayon",
+ "rustwx-core",
+ "rustwx-io",
+ "rw-query",
+ "rw-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "wx-radar",
+]
+
+[[package]]
+name = "rw-odim"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "hdf5-reader",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "rw-ops-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "utoipa",
+]
+
+[[package]]
 name = "rw-query"
 version = "0.1.0"
 dependencies = [
@@ -4771,6 +4826,7 @@ name = "rw-sat"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "blake3",
  "bzip2",
  "chrono",
  "clap",
@@ -4784,6 +4840,7 @@ dependencies = [
  "rw-store",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "ureq",
  "zip",
@@ -4837,6 +4894,7 @@ dependencies = [
  "http",
  "moka",
  "prometheus-client",
+ "quick-xml",
  "rustls",
  "rustwx-core",
  "rustwx-models",
@@ -4845,9 +4903,15 @@ dependencies = [
  "rw-federation-proxy",
  "rw-generation-replication",
  "rw-ingest",
+ "rw-nexrad-storm",
+ "rw-observations",
+ "rw-ops-protocol",
  "rw-query",
+ "rw-sat",
  "rw-scheduler",
  "rw-store",
+ "rw-storm",
+ "rw-storm-ml",
  "schemars",
  "serde",
  "serde_json",
@@ -4882,6 +4946,28 @@ dependencies = [
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
  "zstd",
+]
+
+[[package]]
+name = "rw-storm"
+version = "0.1.0"
+dependencies = [
+ "rw-ops-protocol",
+ "thiserror 2.0.18",
+ "weather-contours",
+]
+
+[[package]]
+name = "rw-storm-ml"
+version = "0.1.0"
+dependencies = [
+ "rw-ops-protocol",
+ "rw-store",
+ "rw-storm",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -6291,6 +6377,10 @@ dependencies = [
  "once_cell",
  "pkg-config",
 ]
+
+[[package]]
+name = "weather-contours"
+version = "0.2.0"
 
 [[package]]
 name = "web-sys"

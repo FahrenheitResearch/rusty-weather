@@ -4,17 +4,130 @@
 listen = "127.0.0.1:8788"
 store_root = "./store"
 artifact_root = "./artifacts"
+cache_root = "./cache"
+# Required behind a TLS-terminating proxy when responses contain absolute URLs.
+# public_base_url = "https://weather.example.edu/api"
 allow_unauthenticated_public_bind = false
+# Exact browser origins only. Wildcards and credential-bearing origins are rejected.
 cors_origins = []
+
+# Optional server-owned continuous GOES ABI ingest. This is independent of
+# HTTP clients: requests never trigger downloads. NOAA's public S3 buckets do
+# not require credentials. Native source files land under server.store_root;
+# this separate root holds only bounded raw downloads in progress.
+[satellite_ingest]
+enabled = false
+raw_cache_root = "./satellite-staging"
+
+# When enabling, configure one entry per platform/sector and put the union of
+# every required ABI band in that entry. At least one age or byte retention
+# bound is mandatory. Additional [[satellite_ingest.followers]] entries may
+# follow for GOES-West, CONUS, or either mesoscale sector.
+# [[satellite_ingest.followers]]
+# platform = "goes19"
+# sector = "full_disk"
+# bands = [1, 2, 3, 7, 8, 9, 10, 13]
+# poll_interval_seconds = 60
+# retention_max_age_minutes = 1440
+# retention_max_bytes = 107374182400
+
+# Optional continuous NOAA MRMS ingest. The service fetches each official
+# `latest` product once per cadence, decodes and stores it at native resolution,
+# and lets all authenticated clients share the same exact-time frames. Enabling
+# requires API tokens and write access to server.store_root.
+[mrms_ingest]
+enabled = false
+# Shared-node default: report stale/warming MRMS as degraded without taking
+# unrelated model, satellite, or storm APIs out of service. Set true only for a
+# dedicated node whose traffic must require fresh MRMS.
+gate_server_readiness = false
+poll_interval_seconds = 60
+stale_after_seconds = 600
+maximum_backoff_seconds = 900
+request_timeout_seconds = 90
+request_retries = 1
+concurrency = 1
+retention_hours = 72
+
+# Lowest-altitude reflectivity is configured by default. Add another table for
+# each selected official NOAA MRMS 2D directory product. Units are always read
+# from GRIB metadata and cannot be overridden here.
+[[mrms_ingest.products]]
+product = "ReflectivityAtLowestAltitude"
+collection = "conus"
+variable = "mrms_reflectivity_lowest_altitude"
+
+# Optional deterministic storm-object precompute. The worker reconciles stored
+# lowest-altitude reflectivity once at restart and thereafter wakes only when
+# the MRMS follower commits a new immutable frame. Canonical JSON and GeoJSON
+# are installed atomically below server.cache_root/.rw-storm-frame-cache, so
+# put server.cache_root on the weather node's persistent data volume.
+[storm_prewarm]
+enabled = false
+backfill_frames = 24
+stale_after_seconds = 600
+# The default retains two days at five-minute cadence independently per source.
+retention = { mode = "bounded", frames_per_source = 576 }
+# For an operator-managed archive with its own capacity monitoring:
+# retention = { mode = "unlimited" }
+
+# Authenticated storm-analysis operations APIs. Routes and state are absent
+# unless enabled. This must remain a writable root separate from the scientific
+# store, artifacts, caches, and replication control state.
+[operations]
+enabled = false
+root = "./operations"
+request_body_bytes = 67108864
+
+# Optional background rendering for the newest committed native frames. This
+# changes first-view latency only: all native zoom levels remain available on
+# demand, including tiles outside these regions. The example warms global
+# overviews and native-detail tiles over North America for three recent frames.
+[satellite_prewarm]
+enabled = false
+maximum_tiles_per_product_frame = 50000
+reconcile_seconds = 60
+
+# [[satellite_prewarm.sources]]
+# platform = "goes19"
+# sector = "full_disk"
+# products = ["geocolor", "clean_ir"]
+# frames_per_product = 3
+# overview_max_zoom = 3
+# [[satellite_prewarm.sources.hot_regions]]
+# west = -170.0
+# south = 5.0
+# east = -50.0
+# north = 75.0
+# max_zoom = 7
 
 [auth]
 # Prefer RW_API_TOKEN_FILE in production. The file contains one token per line
 # and must be readable only by the service account.
 # token_file = "/etc/rusty-weather/api-tokens.txt"
+# Optional operations-only least-privilege credentials. Read/ingest/admin files
+# contain one token per line. The write file contains
+# `<owner-id><TAB><bearer-token>` per line; keep the owner ID unchanged while
+# overlapping old/new tokens during rotation. Every file must have private
+# permissions and must not reuse bearer values across scopes. General data API
+# tokens are not operations credentials unless the compatibility gate below is
+# explicitly enabled.
+# ops_read_token_file = "/etc/rusty-weather/ops-read-tokens.txt"
+# ops_write_token_file = "/etc/rusty-weather/ops-write-tokens.txt"
+# ops_ingest_token_file = "/etc/rusty-weather/ops-ingest-tokens.txt"
+# ops_admin_token_file = "/etc/rusty-weather/ops-admin-tokens.txt"
+# Unsafe for ordinary deployments. This elevates every general API
+# token to operations admin solely for legacy compatibility.
+legacy_api_tokens_are_operations_admins = false
 protect_metrics = true
 
 [limits]
 request_body_bytes = 2097152
+# These two authenticated upload guards protect server memory while handlers
+# buffer request bodies. They are operator-configurable resource boundaries,
+# not scientific grid or radar-volume resolution limits.
+observation_level2_upload_bytes = 268435456
+observation_generated_upload_bytes = 201326592
 variables_per_query = 32
 points_per_query = 100
 sync_result_values = 2000000
@@ -39,6 +152,10 @@ job_retention_seconds = 604800
 job_result_bytes = 536870912
 reader_cache_bytes = 268435456
 response_cache_bytes = 134217728
+# Restart-reusable exact-frame native satellite PNG tiles. This is a retention
+# bound, not a render-resolution limit; production origins should size it for
+# their prewarmed frame/product/zoom policy.
+satellite_tile_cache_bytes = 68719476736
 
 [catalog]
 response_cache_seconds = 300

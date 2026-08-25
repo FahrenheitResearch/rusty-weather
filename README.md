@@ -16,7 +16,10 @@ The June 2026 design record is retained for history, but it predates the
 implemented service. The current contracts are
 [`docs/SERVICE_V1.md`](docs/SERVICE_V1.md),
 [`docs/MODEL_SUPPORT.md`](docs/MODEL_SUPPORT.md), and
-[`docs/REDUCTIONS.md`](docs/REDUCTIONS.md).
+[`docs/REDUCTIONS.md`](docs/REDUCTIONS.md). Every new measured or forecast
+source must also pass the
+[`dataset adapter and publication contract`](docs/DATASET_ADAPTER_CONTRACT.md)
+before it is advertised as production-ready.
 
 BowEcho's opt-in Community Cache is specified separately in
 [`docs/COMMUNITY_CACHE_PROTOCOL.md`](docs/COMMUNITY_CACHE_PROTOCOL.md) and its
@@ -43,9 +46,14 @@ distributed product is called complete is recorded in
 
 ## Self-hosted data service
 
-`rw-server` exposes bounded catalog, point, profile, arbitrary geographic-domain
-plots (including explicit pressure levels), and temporal analytics over
-validated stores without requiring the desktop application. Start with
+`rw-server` exposes bounded catalog, point, single-time profile, whole-cycle
+profile, arbitrary geographic-domain plots (including explicit pressure
+levels), and temporal analytics over validated stores without requiring the
+desktop application. `POST /v1/profile-cycle` returns one deterministically
+ordered entry per selected stored time, including explicit pressure-field gaps
+plus a typed colocated surface bundle and sanitized per-time source provenance,
+while retaining the immutable run/snapshot/grid and requested/native point
+identity. Start with
 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), then use
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for health checks, backup, upgrades,
 and rollback. The versioned HTTP contract is documented in
@@ -331,17 +339,21 @@ count matched the sum of bucket records.
 ## Model support
 
 The remote acquisition and ingest catalog currently covers HRRR/HRRR Alaska,
-RAP, GFS, GDAS, GEFS, NOAA AI-GFS/AI-GEFS/HGEFS, ECMWF IFS Open Data,
-ECMWF AIFS Single v2, NAM, RRFS-A, the public RRFS prototype, NBM, HIRESW,
-HREF, SREF, REFS, RTMA, and URMA. Local WRF/wrfout runs use the same store
+RAP, GFS, ECCC GDPS/GDPS-GEML/RDPS/HRDPS, CMA GRAPES GEPS statistics, DWD
+ICON-EU/ICON-D2 regular grids, Roshydromet ICON-Ru13/6N29, CPTEC/INPE WRF
+7 km and BRAMS 8 km South America grids, GDAS, GEFS, NOAA
+AI-GFS/AI-GEFS/HGEFS, ECMWF IFS Open Data, ECMWF AIFS Single v2, NAM, RRFS-A,
+the public RRFS prototype, NBM, HIRESW, HREF, SREF, REFS, RTMA, and URMA.
+Local WRF/wrfout runs use the same store
 and exact-time query engine. Model-specific products, cadence, pressure
 levels, and verification maturity are intentionally reported independently;
 the service never substitutes a similarly named field or ensemble statistic.
 
 See [the model capability matrix](docs/MODEL_SUPPORT.md) for the human-readable
-scope and use `GET /v1/models` plus each run's `/variables` resource as the
-machine-readable authority. Source-specific missing products are omitted
-rather than fabricated.
+scope and use `GET /v1/models`, the authenticated no-store
+`GET /v1/models/{model}/latest-run` pointer, and each selected run's
+`/variables` resource as the machine-readable authority. Source-specific
+missing products are omitted rather than fabricated.
 
 **GFS ingest examples:**
 
@@ -430,11 +442,16 @@ plan for ≥48 GB RAM for full-profile RRFS-A ingests (HRRR peaks ~5 GB by compa
 
 ## Status
 
-HRRR, GFS, and RRFS-A have full live end-to-end validation. Eighteen additional
-remote model/analysis families have typed fetch plans and focused inventory,
-cadence, extraction, and query contracts at the verification levels reported by
-`/v1/models`; they are not mislabeled as live-verified. Local WRF is reported as
-`local_import`, not as a remote acquisition source. See
+HRRR, GFS, and RRFS-A have full live end-to-end validation. GDPS, CMA-GEPS
+provider statistics, RDPS, HRDPS, DWD ICON-EU and ICON-D2 regular grids,
+Roshydromet ICON-Ru, RAP, NAM, CPTEC/INPE WRF 7 km and BRAMS 8 km, GEFS
+control, deterministic AI-GFS, AI-GEFS/HGEFS published means, and ECMWF IFS
+additionally have bounded official live acquisition, writer verification, and
+deep-store validation. Eleven further remote model/analysis families have
+typed fetch plans and focused inventory, cadence, extraction, and query
+contracts at the verification levels reported by `/v1/models`; they are not
+mislabeled as live-verified. Local WRF is reported as `local_import`, not as a
+remote acquisition source. See
 [`docs/MODEL_SUPPORT.md`](docs/MODEL_SUPPORT.md) for the exact current matrix.
 
     # HRRR quick smoke test

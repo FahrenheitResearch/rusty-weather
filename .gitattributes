@@ -1,8 +1,11 @@
 crates/rw-store/tests/golden/** -text
 crates/rw-glm/tests/golden/** -text
+# Classic-netCDF writer goldens — binary NetCDF, byte-compared by the writer tests.
+crates/rw-store/tests/goldens/*.nc -text -diff
 # Real NOAA GLM granule fixture — binary NetCDF, must stay byte-identical.
 crates/rw-glm/tests/fixtures/*.nc -text -diff
 crates/rusty-weather/tests/fixtures/*.grib2 -text binary
 *.sh text eol=lf
 Dockerfile text eol=lf
 *.service text eol=lf
+config/rusty-weather.openapi.json text eol=lf

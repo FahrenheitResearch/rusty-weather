@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -31,6 +32,30 @@ pub enum ConfigError {
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
     pub server: ServerConfig,
+    /// Optional server-owned continuous GOES ABI ingest. This is deliberately
+    /// disabled by default; HTTP requests never start or steer ingestion.
+    pub satellite_ingest: SatelliteIngestConfig,
+    /// Optional server-owned continuous NOAA MRMS ingest. This is disabled by
+    /// default and writes through the same exact-time observation pipeline as
+    /// explicit MRMS jobs.
+    pub mrms_ingest: MrmsIngestConfig,
+    /// Optional server-owned acquisition of complete NEXRAD Level II volumes.
+    /// Sites are an explicit allowlist and the worker writes through the same
+    /// exact-time observation store used by authenticated client uploads.
+    pub nexrad_level2_ingest: NexradLevel2IngestConfig,
+    /// Optional request-independent deterministic storm-cell derivation for
+    /// stored MRMS reflectivity. Results live below `server.cache_root`, so a
+    /// production deployment should place that root on its persistent data
+    /// volume rather than the operating-system disk.
+    pub storm_prewarm: StormPrewarmConfig,
+    /// Authenticated storm-analysis operations state and APIs. This is an
+    /// explicit opt-in and uses a writable root independent of scientific
+    /// data stores.
+    pub operations: OperationsConfig,
+    /// Optional bounded warming policy for immutable native satellite tiles.
+    /// This is a resource policy, not a delivery-resolution limit: requests
+    /// outside the warm plan remain available through normal tile rendering.
+    pub satellite_prewarm: SatellitePrewarmConfig,
     pub auth: AuthConfig,
     pub limits: LimitsConfig,
     pub catalog: CatalogConfig,
@@ -78,8 +103,46 @@ impl AppConfig {
         if let Some(value) = env_nonempty("RW_ARTIFACT_ROOT") {
             self.server.artifact_root = PathBuf::from(value);
         }
+        if let Some(value) = env_nonempty("RW_CACHE_ROOT") {
+            self.server.cache_root = PathBuf::from(value);
+        }
+        if let Some(value) = env_nonempty("RW_PUBLIC_BASE_URL") {
+            self.server.public_base_url = Some(value);
+        }
         if let Some(value) = env_nonempty("RW_API_TOKEN_FILE") {
             self.auth.token_file = Some(PathBuf::from(value));
+        }
+        if let Some(value) = env_nonempty("RW_OPS_READ_TOKEN_FILE") {
+            self.auth.ops_read_token_file = Some(PathBuf::from(value));
+        }
+        if let Some(value) = env_nonempty("RW_OPS_WRITE_TOKEN_FILE") {
+            self.auth.ops_write_token_file = Some(PathBuf::from(value));
+        }
+        if let Some(value) = env_nonempty("RW_OPS_INGEST_TOKEN_FILE") {
+            self.auth.ops_ingest_token_file = Some(PathBuf::from(value));
+        }
+        if let Some(value) = env_nonempty("RW_OPS_ADMIN_TOKEN_FILE") {
+            self.auth.ops_admin_token_file = Some(PathBuf::from(value));
+        }
+        if let Some(value) = env_nonempty("RW_LEGACY_API_TOKENS_ARE_OPERATIONS_ADMINS") {
+            self.auth.legacy_api_tokens_are_operations_admins =
+                parse_env("RW_LEGACY_API_TOKENS_ARE_OPERATIONS_ADMINS", &value)?;
+        }
+        if let Some(value) = env_nonempty("RW_OPERATIONS_ENABLED") {
+            self.operations.enabled = parse_env("RW_OPERATIONS_ENABLED", &value)?;
+        }
+        if let Some(value) = env_nonempty("RW_MRMS_INGEST_ENABLED") {
+            self.mrms_ingest.enabled = parse_env("RW_MRMS_INGEST_ENABLED", &value)?;
+        }
+        if let Some(value) = env_nonempty("RW_NEXRAD_LEVEL2_INGEST_ENABLED") {
+            self.nexrad_level2_ingest.enabled =
+                parse_env("RW_NEXRAD_LEVEL2_INGEST_ENABLED", &value)?;
+        }
+        if let Some(value) = env_nonempty("RW_STORM_PREWARM_ENABLED") {
+            self.storm_prewarm.enabled = parse_env("RW_STORM_PREWARM_ENABLED", &value)?;
+        }
+        if let Some(value) = env_nonempty("RW_OPERATIONS_ROOT") {
+            self.operations.root = PathBuf::from(value);
         }
         if let Some(value) = env_nonempty("RW_ALLOW_UNAUTHENTICATED_PUBLIC_BIND") {
             self.server.allow_unauthenticated_public_bind =
@@ -233,6 +296,59 @@ impl AppConfig {
                 "artifact_root must not be empty".into(),
             ));
         }
+        if self.server.cache_root.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid("cache_root must not be empty".into()));
+        }
+        if let Some(url) = &self.server.public_base_url {
+            validate_https_url("server.public_base_url", url)?;
+        }
+        if self.server.cors_origins.len() > 64
+            || self
+                .server
+                .cors_origins
+                .iter()
+                .any(|origin| !valid_browser_origin(origin))
+        {
+            return Err(ConfigError::Invalid(
+                "server.cors_origins must contain at most 64 exact HTTP(S) browser origins without wildcards, credentials, paths, queries, or fragments"
+                    .into(),
+            ));
+        }
+        self.satellite_ingest.validate()?;
+        self.mrms_ingest.validate()?;
+        if self.mrms_ingest.enabled && !has_tokens {
+            return Err(ConfigError::Invalid(
+                "enabled MRMS background ingest requires authenticated API tokens".into(),
+            ));
+        }
+        self.nexrad_level2_ingest.validate()?;
+        if self.nexrad_level2_ingest.enabled && !has_tokens {
+            return Err(ConfigError::Invalid(
+                "enabled NEXRAD Level II background ingest requires authenticated API tokens"
+                    .into(),
+            ));
+        }
+        self.storm_prewarm.validate()?;
+        if self.storm_prewarm.enabled && !self.operations.enabled {
+            return Err(ConfigError::Invalid(
+                "storm_prewarm requires operations.enabled so derived cells remain private and authenticated"
+                    .into(),
+            ));
+        }
+        self.operations.validate()?;
+        if self.operations.enabled
+            && !(has_tokens && self.auth.legacy_api_tokens_are_operations_admins)
+            && self.auth.ops_read_token_file.is_none()
+            && self.auth.ops_write_token_file.is_none()
+            && self.auth.ops_ingest_token_file.is_none()
+            && self.auth.ops_admin_token_file.is_none()
+        {
+            return Err(ConfigError::Invalid(
+                "enabled operations APIs require an explicitly elevated legacy API token or at least one operations-scoped token file"
+                    .into(),
+            ));
+        }
+        self.satellite_prewarm.validate()?;
         self.limits.validate()?;
         if self.catalog.response_cache_seconds == 0 {
             return Err(ConfigError::Invalid(
@@ -290,6 +406,969 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+/// Retention policy for complete canonical/GeoJSON storm-frame pairs.
+///
+/// This is an explicit storage policy, never a contour-complexity or source-
+/// resolution limit. `unlimited` is useful on an operator-managed archive;
+/// `bounded` retains the newest exact frames independently for each source
+/// product.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StormCacheRetention {
+    Bounded { frames_per_source: usize },
+    Unlimited,
+}
+
+impl Default for StormCacheRetention {
+    fn default() -> Self {
+        // Two days at the normal five-minute MRMS cadence. The upstream MRMS
+        // store has its own independently configured retention policy.
+        Self::Bounded {
+            frames_per_source: 576,
+        }
+    }
+}
+
+/// Request-independent MRMS storm-cell analysis and durable result caching.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct StormPrewarmConfig {
+    /// Start the restart reconciler and subscribe it to committed MRMS frames.
+    pub enabled: bool,
+    /// Number of newest compatible stored frames reconciled at startup and
+    /// after a coalesced commit notification. This controls background work,
+    /// not what clients may request or what geometry may contain.
+    pub backfill_frames: usize,
+    /// A cached result is reported stale after this many seconds past its
+    /// source valid time. Stale results remain exact and requestable.
+    pub stale_after_seconds: u64,
+    pub retention: StormCacheRetention,
+}
+
+impl Default for StormPrewarmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backfill_frames: 24,
+            stale_after_seconds: 10 * 60,
+            retention: StormCacheRetention::default(),
+        }
+    }
+}
+
+impl StormPrewarmConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.backfill_frames == 0 {
+            return Err(ConfigError::Invalid(
+                "storm_prewarm.backfill_frames must be greater than zero".into(),
+            ));
+        }
+        if self.stale_after_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "storm_prewarm.stale_after_seconds must be greater than zero".into(),
+            ));
+        }
+        if matches!(
+            self.retention,
+            StormCacheRetention::Bounded {
+                frames_per_source: 0
+            }
+        ) {
+            return Err(ConfigError::Invalid(
+                "storm_prewarm.retention.frames_per_source must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Bounded, request-independent NOAA MRMS acquisition.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct MrmsIngestConfig {
+    /// No network work, worker, retention pass, or private route is created
+    /// unless this explicit operator gate is true.
+    pub enabled: bool,
+    /// When true, stale or missing configured MRMS products make
+    /// `/v1/health/ready` fail. Leave this false for a multi-service
+    /// node: the authenticated MRMS status endpoint still reports exact
+    /// freshness, while unrelated model, satellite, and operations traffic
+    /// remains available during an upstream outage.
+    pub gate_server_readiness: bool,
+    /// Normal interval between checks of each configured `latest` product.
+    pub poll_interval_seconds: u64,
+    /// A product is stale after this many seconds beyond its upstream GRIB
+    /// valid time. Staleness degrades subsystem health; it fails whole-node
+    /// readiness only when `gate_server_readiness` is true.
+    pub stale_after_seconds: u64,
+    /// Maximum exponential retry delay after repeated upstream failures.
+    pub maximum_backoff_seconds: u64,
+    /// Per-HTTP-attempt deadline for the official MRMS download.
+    pub request_timeout_seconds: u64,
+    /// Retries inside one acquisition cycle before outer exponential backoff.
+    pub request_retries: u32,
+    /// Maximum simultaneous fetch/decode/write cycles across all products.
+    pub concurrency: usize,
+    /// Fully expired MRMS UTC-day runs older than this age are removed after a
+    /// successful cycle. Current-day runs are never modified by retention.
+    pub retention_hours: u64,
+    /// Selected official products followed independently. The default is
+    /// NOAA's lowest-altitude reflectivity product.
+    pub products: Vec<MrmsFollowSpec>,
+}
+
+impl Default for MrmsIngestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gate_server_readiness: false,
+            poll_interval_seconds: 60,
+            stale_after_seconds: 10 * 60,
+            maximum_backoff_seconds: 15 * 60,
+            request_timeout_seconds: 90,
+            request_retries: 1,
+            concurrency: 1,
+            retention_hours: 72,
+            products: vec![MrmsFollowSpec::reflectivity_at_lowest_altitude()],
+        }
+    }
+}
+
+impl MrmsIngestConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(15..=60 * 60).contains(&self.poll_interval_seconds) {
+            return Err(ConfigError::Invalid(
+                "mrms_ingest.poll_interval_seconds must be between 15 and 3600".into(),
+            ));
+        }
+        if self.stale_after_seconds < self.poll_interval_seconds
+            || self.stale_after_seconds > 24 * 60 * 60
+        {
+            return Err(ConfigError::Invalid(
+                "mrms_ingest.stale_after_seconds must be at least poll_interval_seconds and at most 86400".into(),
+            ));
+        }
+        if self.maximum_backoff_seconds < self.poll_interval_seconds
+            || self.maximum_backoff_seconds > 24 * 60 * 60
+        {
+            return Err(ConfigError::Invalid(
+                "mrms_ingest.maximum_backoff_seconds must be at least poll_interval_seconds and at most 86400".into(),
+            ));
+        }
+        if !(10..=10 * 60).contains(&self.request_timeout_seconds) {
+            return Err(ConfigError::Invalid(
+                "mrms_ingest.request_timeout_seconds must be between 10 and 600".into(),
+            ));
+        }
+        if self.request_retries > 3 {
+            return Err(ConfigError::Invalid(
+                "mrms_ingest.request_retries must be between 0 and 3".into(),
+            ));
+        }
+        if !(1..=8).contains(&self.concurrency) {
+            return Err(ConfigError::Invalid(
+                "mrms_ingest.concurrency must be between 1 and 8".into(),
+            ));
+        }
+        if !(24..=366 * 24).contains(&self.retention_hours) {
+            return Err(ConfigError::Invalid(
+                "mrms_ingest.retention_hours must be between 24 and 8784".into(),
+            ));
+        }
+        if self.enabled && self.products.is_empty() {
+            return Err(ConfigError::Invalid(
+                "enabled mrms_ingest requires at least one product".into(),
+            ));
+        }
+        if self.products.len() > 16 {
+            return Err(ConfigError::Invalid(
+                "mrms_ingest supports at most 16 products per server process".into(),
+            ));
+        }
+        let mut identities = BTreeSet::new();
+        for (index, product) in self.products.iter().enumerate() {
+            product.validate(index)?;
+            if let Some(stale_after_seconds) = product.stale_after_seconds
+                && (stale_after_seconds < self.poll_interval_seconds
+                    || stale_after_seconds > 24 * 60 * 60)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "mrms_ingest.products[{index}].stale_after_seconds must be at least poll_interval_seconds and at most 86400"
+                )));
+            }
+            if !identities.insert((
+                product.product.to_ascii_lowercase(),
+                product.collection.to_ascii_lowercase(),
+                product.variable.to_ascii_lowercase(),
+            )) {
+                return Err(ConfigError::Invalid(format!(
+                    "mrms_ingest.products[{index}] duplicates an earlier product identity"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MrmsFollowSpec {
+    /// Exact product token from NOAA's operational MRMS 2D directory.
+    pub product: String,
+    /// Stable collection label used in rw-store run identity.
+    pub collection: String,
+    /// Stable variable name presented to clients. Units always come from the
+    /// decoded GRIB metadata; this configuration cannot invent them.
+    pub variable: String,
+    /// Optional per-product freshness window overriding the worker-level
+    /// `mrms_ingest.stale_after_seconds`. NOAA publishes some products with a
+    /// structural latency (multi-sensor QPE pass 2 lags its window by about
+    /// two hours), so one worker-wide window would mark such a product
+    /// permanently stale and hold subsystem health at degraded even while
+    /// every fetch succeeds. This override must state the product's honest
+    /// publication cadence; it never relabels genuinely late data as fresh.
+    #[serde(default)]
+    pub stale_after_seconds: Option<u64>,
+}
+
+impl MrmsFollowSpec {
+    pub fn reflectivity_at_lowest_altitude() -> Self {
+        Self {
+            product: "ReflectivityAtLowestAltitude".into(),
+            collection: "conus".into(),
+            variable: "mrms_reflectivity_lowest_altitude".into(),
+            stale_after_seconds: None,
+        }
+    }
+
+    fn validate(&self, index: usize) -> Result<(), ConfigError> {
+        if self.product.is_empty()
+            || self.product.len() > 96
+            || !self
+                .product
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(ConfigError::Invalid(format!(
+                "mrms_ingest.products[{index}].product must be a 1..=96 byte NOAA product token using only ASCII letters, digits, or '_'"
+            )));
+        }
+        for (field, value) in [
+            ("collection", self.collection.as_str()),
+            ("variable", self.variable.as_str()),
+        ] {
+            if value.trim() != value || value.is_empty() || value.len() > 128 {
+                return Err(ConfigError::Invalid(format!(
+                    "mrms_ingest.products[{index}].{field} must be a non-empty trimmed value of at most 128 bytes"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Request-independent, exact-volume NEXRAD Level II acquisition.
+///
+/// The source adapters are intentionally data-only configuration. They do not
+/// grant a provider permission to choose sites, grid resolution, retention, or
+/// readiness policy. Those remain operator-owned fields on this service.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct NexradLevel2IngestConfig {
+    /// No network work, state directory, retention pass, or status route is
+    /// created unless this explicit operator gate is true.
+    pub enabled: bool,
+    /// Promote missing/stale configured sites to whole-service readiness.
+    pub gate_server_readiness: bool,
+    /// Durable cursor/state root. A commit is recorded only after the exact
+    /// downloaded volume has decoded, entered rw-store, and reopened.
+    pub state_root: PathBuf,
+    /// Normal listing interval per configured site.
+    pub poll_interval_seconds: u64,
+    /// Source-volume age after which the site is reported stale.
+    pub stale_after_seconds: u64,
+    /// Exponential retry ceiling following network, decode, or store failure.
+    pub maximum_backoff_seconds: u64,
+    /// Deadline for each listing or object request.
+    pub request_timeout_seconds: u64,
+    /// Immediate retries for one request before outer worker backoff.
+    pub request_retries: u32,
+    /// Simultaneous site listing/download/decode/write cycles.
+    pub concurrency: usize,
+    /// Explicit bound for one provider listing document. This is a network
+    /// body guard, not a limit on the number of sites or volumes followed.
+    pub maximum_listing_bytes: usize,
+    /// Explicit bound for one compressed source object. Decoded grid size is
+    /// governed only by each site's requested resolution and radius.
+    pub maximum_object_bytes: usize,
+    /// On first start or after a long outage, ingest every volume in this time
+    /// window. This time-based resource policy never subsamples resolution.
+    pub catch_up_hours: u64,
+    /// Retire follower-owned exact-time runs older than this age.
+    pub retention_hours: u64,
+    /// Named public or operator-managed archives. Site entries select one by
+    /// id, keeping the lifecycle independent of a particular bucket host.
+    pub providers: Vec<NexradLevel2ProviderConfig>,
+    /// Explicit site allowlist. There is deliberately no implicit all-sites
+    /// mode and no hidden maximum number of configured sites.
+    pub sites: Vec<NexradLevel2SiteConfig>,
+}
+
+impl Default for NexradLevel2IngestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gate_server_readiness: false,
+            state_root: PathBuf::from("./nexrad-level2-state"),
+            poll_interval_seconds: 60,
+            stale_after_seconds: 15 * 60,
+            maximum_backoff_seconds: 15 * 60,
+            request_timeout_seconds: 120,
+            request_retries: 1,
+            concurrency: 1,
+            maximum_listing_bytes: 32 * 1024 * 1024,
+            maximum_object_bytes: 512 * 1024 * 1024,
+            catch_up_hours: 2,
+            retention_hours: 7 * 24,
+            providers: vec![NexradLevel2ProviderConfig::unidata_public_archive()],
+            sites: Vec::new(),
+        }
+    }
+}
+
+impl NexradLevel2IngestConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.state_root.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                "nexrad_level2_ingest.state_root must not be empty".into(),
+            ));
+        }
+        if self.poll_interval_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "nexrad_level2_ingest.poll_interval_seconds must be greater than zero".into(),
+            ));
+        }
+        if self.stale_after_seconds < self.poll_interval_seconds {
+            return Err(ConfigError::Invalid(
+                "nexrad_level2_ingest.stale_after_seconds must be at least poll_interval_seconds"
+                    .into(),
+            ));
+        }
+        if self.maximum_backoff_seconds < self.poll_interval_seconds {
+            return Err(ConfigError::Invalid(
+                "nexrad_level2_ingest.maximum_backoff_seconds must be at least poll_interval_seconds"
+                    .into(),
+            ));
+        }
+        if self.request_timeout_seconds == 0
+            || self.concurrency == 0
+            || self.maximum_listing_bytes == 0
+            || self.maximum_object_bytes == 0
+            || self.catch_up_hours == 0
+            || self.retention_hours == 0
+        {
+            return Err(ConfigError::Invalid(
+                "NEXRAD Level II timeouts, concurrency, body bounds, catch-up, and retention must be greater than zero"
+                    .into(),
+            ));
+        }
+        if self.enabled && (self.providers.is_empty() || self.sites.is_empty()) {
+            return Err(ConfigError::Invalid(
+                "enabled nexrad_level2_ingest requires at least one provider and one explicitly allowed site"
+                    .into(),
+            ));
+        }
+
+        let mut provider_ids = BTreeSet::new();
+        for (index, provider) in self.providers.iter().enumerate() {
+            provider.validate(index)?;
+            if !provider_ids.insert(provider.id.to_ascii_lowercase()) {
+                return Err(ConfigError::Invalid(format!(
+                    "nexrad_level2_ingest.providers[{index}].id is duplicated"
+                )));
+            }
+        }
+        let mut sites = BTreeSet::new();
+        for (index, site) in self.sites.iter().enumerate() {
+            site.validate(index)?;
+            if !provider_ids.contains(&site.provider_id.to_ascii_lowercase()) {
+                return Err(ConfigError::Invalid(format!(
+                    "nexrad_level2_ingest.sites[{index}].provider_id does not name a configured provider"
+                )));
+            }
+            if !sites.insert(site.site_id.to_ascii_uppercase()) {
+                return Err(ConfigError::Invalid(format!(
+                    "nexrad_level2_ingest.sites[{index}].site_id is duplicated"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NexradLevel2ProviderConfig {
+    /// Stable provenance id written beside every stored source object.
+    pub id: String,
+    /// S3-compatible ListObjectsV2 endpoint, without query or fragment.
+    pub listing_base_url: String,
+    /// Public object endpoint. The exact listed key is appended as a path.
+    pub object_base_url: String,
+    /// Human-readable source attribution retained in the scientific selector.
+    pub attribution: String,
+    /// Explicitly permits plain HTTP for an operator-managed private mirror.
+    /// Public providers should always leave this false.
+    #[serde(default)]
+    pub allow_http: bool,
+}
+
+impl NexradLevel2ProviderConfig {
+    pub fn unidata_public_archive() -> Self {
+        Self {
+            id: "unidata-nexrad-level2".into(),
+            listing_base_url: "https://unidata-nexrad-level2.s3.amazonaws.com".into(),
+            object_base_url: "https://unidata-nexrad-level2.s3.amazonaws.com".into(),
+            attribution: "NOAA/NWS NEXRAD Level II via the Unidata public archive".into(),
+            allow_http: false,
+        }
+    }
+
+    fn validate(&self, index: usize) -> Result<(), ConfigError> {
+        validate_config_id("nexrad_level2_ingest.providers.id", &self.id, 96)?;
+        for (field, value) in [
+            ("listing_base_url", self.listing_base_url.as_str()),
+            ("object_base_url", self.object_base_url.as_str()),
+        ] {
+            let uri = value.parse::<http::Uri>().map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "nexrad_level2_ingest.providers[{index}].{field} is not a valid URL"
+                ))
+            })?;
+            let scheme = uri.scheme_str().unwrap_or_default();
+            if scheme != "https" && !(scheme == "http" && self.allow_http) {
+                return Err(ConfigError::Invalid(format!(
+                    "nexrad_level2_ingest.providers[{index}].{field} requires HTTPS unless allow_http is explicit"
+                )));
+            }
+            if uri.authority().is_none()
+                || uri
+                    .authority()
+                    .is_some_and(|authority| authority.as_str().contains('@'))
+                || uri.query().is_some()
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "nexrad_level2_ingest.providers[{index}].{field} must be an absolute credential-free base URL without a query"
+                )));
+            }
+        }
+        if self.attribution.trim() != self.attribution
+            || self.attribution.is_empty()
+            || self.attribution.len() > 512
+        {
+            return Err(ConfigError::Invalid(format!(
+                "nexrad_level2_ingest.providers[{index}].attribution must be a trimmed non-empty value of at most 512 bytes"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NexradLevel2SiteConfig {
+    /// Radar archive/site id. This is uppercased before provider requests.
+    pub site_id: String,
+    pub provider_id: String,
+    /// Cartesian output spacing. No follower-specific resolution ceiling or
+    /// fallback downsampling is applied.
+    pub resolution_m: f64,
+    pub radius_km: f64,
+    /// Unknown/mobile site identifiers must provide all three coordinates;
+    /// fixed WSR-88D sites may leave all three absent for the built-in table.
+    #[serde(default)]
+    pub latitude: Option<f64>,
+    #[serde(default)]
+    pub longitude: Option<f64>,
+    #[serde(default)]
+    pub elevation_m: Option<f64>,
+}
+
+impl NexradLevel2SiteConfig {
+    fn validate(&self, index: usize) -> Result<(), ConfigError> {
+        let site = self.site_id.as_bytes();
+        if site.is_empty()
+            || site.len() > 16
+            || !site
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "nexrad_level2_ingest.sites[{index}].site_id must be a 1..=16 byte ASCII radar id"
+            )));
+        }
+        validate_config_id(
+            "nexrad_level2_ingest.sites.provider_id",
+            &self.provider_id,
+            96,
+        )?;
+        if !self.resolution_m.is_finite()
+            || self.resolution_m <= 0.0
+            || !self.radius_km.is_finite()
+            || self.radius_km <= 0.0
+        {
+            return Err(ConfigError::Invalid(format!(
+                "nexrad_level2_ingest.sites[{index}] resolution_m and radius_km must be finite and greater than zero"
+            )));
+        }
+        match (self.latitude, self.longitude, self.elevation_m) {
+            (None, None, None) => {}
+            (Some(latitude), Some(longitude), Some(elevation))
+                if latitude.is_finite()
+                    && longitude.is_finite()
+                    && elevation.is_finite()
+                    && (-90.0..=90.0).contains(&latitude)
+                    && (-180.0..=180.0).contains(&longitude) => {}
+            _ => {
+                return Err(ConfigError::Invalid(format!(
+                    "nexrad_level2_ingest.sites[{index}] must omit all coordinates or supply valid latitude, longitude, and elevation_m together"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Durable state and request bounds for the authenticated operations APIs.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct OperationsConfig {
+    /// No operations routes or state are opened unless this is true.
+    pub enabled: bool,
+    /// Writable durable root for derived operations state. Keep it separate
+    /// from a read-only scientific `server.store_root` deployment.
+    pub root: PathBuf,
+    /// Independent body bound for one operations request.
+    pub request_body_bytes: usize,
+}
+
+impl Default for OperationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            root: PathBuf::from("./operations"),
+            request_body_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl OperationsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.root.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                "operations.root must not be empty".into(),
+            ));
+        }
+        if !(1024..=256 * 1024 * 1024).contains(&self.request_body_bytes) {
+            return Err(ConfigError::Invalid(
+                "operations.request_body_bytes must be between 1 KiB and 256 MiB".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Server-owned continuous GOES ABI ingest. Exact NOAA source files and
+/// compact previews are written below `server.store_root`; `raw_cache_root`
+/// is only bounded staging for downloads in progress.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct SatelliteIngestConfig {
+    /// The supervisor does no work unless this explicit gate is true.
+    pub enabled: bool,
+    /// Server-owned raw-object staging root, separate from durable stores and
+    /// job artifacts. Each platform/sector follower receives its own child.
+    pub raw_cache_root: PathBuf,
+    /// One follower per unique platform/sector. Put the union of every band
+    /// needed for that source in its single `bands` list.
+    pub followers: Vec<SatelliteFollowSpec>,
+}
+
+impl Default for SatelliteIngestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            raw_cache_root: PathBuf::from("./satellite-staging"),
+            followers: Vec::new(),
+        }
+    }
+}
+
+impl SatelliteIngestConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.raw_cache_root.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                "satellite_ingest.raw_cache_root must not be empty".into(),
+            ));
+        }
+        if self.enabled && self.followers.is_empty() {
+            return Err(ConfigError::Invalid(
+                "enabled satellite_ingest requires at least one follower".into(),
+            ));
+        }
+        if self.followers.len() > 64 {
+            return Err(ConfigError::Invalid(
+                "satellite_ingest supports at most 64 followers per server process".into(),
+            ));
+        }
+
+        let mut sources = BTreeSet::new();
+        for (index, follower) in self.followers.iter().enumerate() {
+            follower.validate(index)?;
+            let source = (
+                normalized_satellite_source(&follower.platform),
+                follower.sector,
+            );
+            if !sources.insert(source) {
+                return Err(ConfigError::Invalid(format!(
+                    "satellite_ingest.followers[{index}] duplicates a platform/sector source; use one follower with the union of required bands"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Bounded, operator-selected native satellite tile warming. The worker is
+/// deliberately disabled by default. `maximum_tiles_per_product_frame`
+/// limits eager work only; it never lowers the HTTP renderer's maximum zoom.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct SatellitePrewarmConfig {
+    /// The prewarm worker does no work unless this explicit gate is true.
+    pub enabled: bool,
+    /// Exact upper bound for one product/frame plan. Operators may raise this
+    /// without changing the native renderer's supported resolution.
+    pub maximum_tiles_per_product_frame: u64,
+    /// Periodic archive reconciliation catches missed/coalesced ingest events
+    /// and external writers that do not share this process's wake signal.
+    pub reconcile_seconds: u64,
+    /// One policy per canonical platform/sector source.
+    pub sources: Vec<SatellitePrewarmSourceConfig>,
+}
+
+impl Default for SatellitePrewarmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            maximum_tiles_per_product_frame: 50_000,
+            reconcile_seconds: 60,
+            sources: Vec::new(),
+        }
+    }
+}
+
+impl SatellitePrewarmConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.maximum_tiles_per_product_frame == 0 {
+            return Err(ConfigError::Invalid(
+                "satellite_prewarm.maximum_tiles_per_product_frame must be greater than zero"
+                    .into(),
+            ));
+        }
+        if !(5..=3_600).contains(&self.reconcile_seconds) {
+            return Err(ConfigError::Invalid(
+                "satellite_prewarm.reconcile_seconds must be between 5 and 3600".into(),
+            ));
+        }
+        if self.enabled && self.sources.is_empty() {
+            return Err(ConfigError::Invalid(
+                "enabled satellite_prewarm requires at least one source".into(),
+            ));
+        }
+        if self.sources.len() > 64 {
+            return Err(ConfigError::Invalid(
+                "satellite_prewarm supports at most 64 platform/sector sources per server process"
+                    .into(),
+            ));
+        }
+
+        let mut sources = BTreeSet::new();
+        for (index, source) in self.sources.iter().enumerate() {
+            source.validate(index)?;
+            let identity = (normalized_satellite_source(&source.platform), source.sector);
+            if !sources.insert(identity) {
+                return Err(ConfigError::Invalid(format!(
+                    "satellite_prewarm.sources[{index}] duplicates a platform/sector policy; put the union of products and hot regions in one source"
+                )));
+            }
+
+            let plan = crate::satellite_prewarm::TilePlan::for_source(source);
+            let tile_count = plan.tile_count();
+            if tile_count > self.maximum_tiles_per_product_frame {
+                return Err(ConfigError::Invalid(format!(
+                    "satellite_prewarm.sources[{index}] plans {tile_count} tiles per product/frame, exceeding maximum_tiles_per_product_frame {}",
+                    self.maximum_tiles_per_product_frame
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Products and geographic coverage warmed for one native archive source.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct SatellitePrewarmSourceConfig {
+    /// Public NOAA GOES platform (`goes18`, `goes19`, ...).
+    pub platform: String,
+    pub sector: SatelliteSectorConfig,
+    /// Named or raw-channel product slugs accepted by `GoesAbiProduct`.
+    pub products: Vec<String>,
+    /// Number of newest complete frames kept warm for each configured product.
+    pub frames_per_product: usize,
+    /// Warm the complete Web-Mercator world through this zoom. Higher zooms
+    /// remain available on demand even when no hot region includes them.
+    pub overview_max_zoom: u8,
+    /// Optional regions warmed from `overview_max_zoom + 1` through each
+    /// region's `max_zoom`.
+    pub hot_regions: Vec<SatelliteHotRegionConfig>,
+}
+
+impl Default for SatellitePrewarmSourceConfig {
+    fn default() -> Self {
+        Self {
+            platform: "goes19".into(),
+            sector: SatelliteSectorConfig::FullDisk,
+            products: Vec::new(),
+            frames_per_product: 3,
+            overview_max_zoom: 1,
+            hot_regions: Vec::new(),
+        }
+    }
+}
+
+impl SatellitePrewarmSourceConfig {
+    fn validate(&self, index: usize) -> Result<(), ConfigError> {
+        let prefix = format!("satellite_prewarm.sources[{index}]");
+        if self.platform.trim().is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "{prefix}.platform must not be empty"
+            )));
+        }
+        rw_sat::s3::bucket_for_satellite(&self.platform).map_err(|error| {
+            ConfigError::Invalid(format!(
+                "{prefix}.platform is not a public GOES source: {error}"
+            ))
+        })?;
+        if self.products.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "{prefix}.products must contain at least one satellite product"
+            )));
+        }
+        if !(1..=120).contains(&self.frames_per_product) {
+            return Err(ConfigError::Invalid(format!(
+                "{prefix}.frames_per_product must be between 1 and 120"
+            )));
+        }
+        let mut products = BTreeSet::new();
+        for product in &self.products {
+            let parsed = rw_sat::GoesAbiProduct::parse(product).ok_or_else(|| {
+                ConfigError::Invalid(format!(
+                    "{prefix}.products contains unsupported satellite product {product:?}"
+                ))
+            })?;
+            let canonical = parsed.slug();
+            if !products.insert(canonical.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "{prefix}.products contains duplicate canonical product {canonical}"
+                )));
+            }
+        }
+        if self.overview_max_zoom > rw_sat::MAXIMUM_TILE_ZOOM {
+            return Err(ConfigError::Invalid(format!(
+                "{prefix}.overview_max_zoom exceeds the native renderer maximum zoom {}",
+                rw_sat::MAXIMUM_TILE_ZOOM
+            )));
+        }
+        if self.hot_regions.len() > 256 {
+            return Err(ConfigError::Invalid(format!(
+                "{prefix}.hot_regions supports at most 256 regions"
+            )));
+        }
+        for (region_index, region) in self.hot_regions.iter().enumerate() {
+            region.validate(&prefix, region_index, self.overview_max_zoom)?;
+        }
+        Ok(())
+    }
+}
+
+/// Geographic bounds for higher-zoom warming. `west > east` intentionally
+/// denotes an antimeridian-crossing region.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct SatelliteHotRegionConfig {
+    pub west: f64,
+    pub south: f64,
+    pub east: f64,
+    pub north: f64,
+    pub max_zoom: u8,
+}
+
+impl Default for SatelliteHotRegionConfig {
+    fn default() -> Self {
+        Self {
+            west: -125.0,
+            south: 24.0,
+            east: -66.0,
+            north: 50.0,
+            max_zoom: 6,
+        }
+    }
+}
+
+impl SatelliteHotRegionConfig {
+    fn validate(
+        &self,
+        source_prefix: &str,
+        index: usize,
+        overview_max_zoom: u8,
+    ) -> Result<(), ConfigError> {
+        const WEB_MERCATOR_MAX_LATITUDE: f64 = 85.051_128_78;
+        let prefix = format!("{source_prefix}.hot_regions[{index}]");
+        if !self.west.is_finite()
+            || !self.east.is_finite()
+            || !(-180.0..=180.0).contains(&self.west)
+            || !(-180.0..=180.0).contains(&self.east)
+            || self.west == self.east
+        {
+            return Err(ConfigError::Invalid(format!(
+                "{prefix} requires distinct finite west/east longitudes within -180..=180; west > east denotes antimeridian crossing"
+            )));
+        }
+        if !self.south.is_finite()
+            || !self.north.is_finite()
+            || !(-WEB_MERCATOR_MAX_LATITUDE..=WEB_MERCATOR_MAX_LATITUDE).contains(&self.south)
+            || !(-WEB_MERCATOR_MAX_LATITUDE..=WEB_MERCATOR_MAX_LATITUDE).contains(&self.north)
+            || self.south >= self.north
+        {
+            return Err(ConfigError::Invalid(format!(
+                "{prefix} requires south < north within Web-Mercator latitude bounds +/-{WEB_MERCATOR_MAX_LATITUDE}"
+            )));
+        }
+        if self.max_zoom <= overview_max_zoom || self.max_zoom > rw_sat::MAXIMUM_TILE_ZOOM {
+            return Err(ConfigError::Invalid(format!(
+                "{prefix}.max_zoom must be greater than overview_max_zoom ({overview_max_zoom}) and no greater than the native renderer maximum ({})",
+                rw_sat::MAXIMUM_TILE_ZOOM
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct SatelliteFollowSpec {
+    /// Public NOAA GOES platform (`goes18`, `goes19`, ...).
+    pub platform: String,
+    pub sector: SatelliteSectorConfig,
+    /// Union of ABI bands this platform/sector must retain (1 through 16).
+    pub bands: Vec<u8>,
+    /// Poll cadence. `None` uses rw-sat's sector-specific operational default.
+    pub poll_interval_seconds: Option<u64>,
+    /// Retain frames no older than this many minutes.
+    pub retention_max_age_minutes: Option<u32>,
+    /// Retain no more than this many bytes per followed band.
+    pub retention_max_bytes: Option<u64>,
+}
+
+impl Default for SatelliteFollowSpec {
+    fn default() -> Self {
+        Self {
+            platform: "goes19".into(),
+            sector: SatelliteSectorConfig::FullDisk,
+            bands: Vec::new(),
+            poll_interval_seconds: None,
+            retention_max_age_minutes: None,
+            retention_max_bytes: None,
+        }
+    }
+}
+
+impl SatelliteFollowSpec {
+    fn validate(&self, index: usize) -> Result<(), ConfigError> {
+        let prefix = format!("satellite_ingest.followers[{index}]");
+        if self.platform.trim().is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "{prefix}.platform must not be empty"
+            )));
+        }
+        rw_sat::s3::bucket_for_satellite(&self.platform).map_err(|error| {
+            ConfigError::Invalid(format!(
+                "{prefix}.platform is not a public GOES source: {error}"
+            ))
+        })?;
+        if self.bands.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "{prefix}.bands must contain at least one ABI band"
+            )));
+        }
+        let mut bands = BTreeSet::new();
+        for &band in &self.bands {
+            if !(1..=16).contains(&band) {
+                return Err(ConfigError::Invalid(format!(
+                    "{prefix}.bands contains out-of-range ABI band {band}; expected 1 through 16"
+                )));
+            }
+            if !bands.insert(band) {
+                return Err(ConfigError::Invalid(format!(
+                    "{prefix}.bands contains duplicate ABI band {band}"
+                )));
+            }
+        }
+        if let Some(seconds) = self.poll_interval_seconds
+            && !(5..=3_600).contains(&seconds)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "{prefix}.poll_interval_seconds must be between 5 and 3600"
+            )));
+        }
+        if self.retention_max_age_minutes == Some(0) {
+            return Err(ConfigError::Invalid(format!(
+                "{prefix}.retention_max_age_minutes must be greater than zero"
+            )));
+        }
+        if self.retention_max_bytes == Some(0) {
+            return Err(ConfigError::Invalid(format!(
+                "{prefix}.retention_max_bytes must be greater than zero"
+            )));
+        }
+        if self.retention_max_age_minutes.is_none() && self.retention_max_bytes.is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "{prefix} requires an age or byte retention bound"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SatelliteSectorConfig {
+    Conus,
+    #[default]
+    FullDisk,
+    Meso1,
+    Meso2,
+}
+
+fn normalized_satellite_source(value: &str) -> String {
+    rw_sat::s3::bucket_for_satellite(value)
+        .unwrap_or_else(|_| value.trim().to_ascii_lowercase().replace('-', ""))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1532,12 +2611,37 @@ fn validate_https_url(name: &'static str, value: &str) -> Result<(), ConfigError
     Ok(())
 }
 
+fn valid_browser_origin(value: &str) -> bool {
+    let parsed = value.parse::<http::Uri>().ok();
+    parsed.as_ref().is_some_and(|uri| {
+        let Some(authority) = uri.authority() else {
+            return false;
+        };
+        matches!(uri.scheme_str(), Some("http" | "https"))
+            && !value.contains(['\r', '\n', '\\', '#', '*'])
+            && value.len() <= 512
+            && value.is_ascii()
+            && !value.bytes().any(|byte| byte.is_ascii_whitespace())
+            && !authority.as_str().contains('@')
+            && !authority.host().is_empty()
+            && uri.path() == "/"
+            && !value.ends_with('/')
+            && uri.query().is_none()
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: SocketAddr,
     pub store_root: PathBuf,
     pub artifact_root: PathBuf,
+    /// Mutable derived-data cache. Keep this separate from a read-only
+    /// scientific store so restart-reusable tiles can be written safely.
+    pub cache_root: PathBuf,
+    /// Canonical external HTTPS base used in absolute links. Configure this
+    /// behind a TLS-terminating proxy instead of trusting forwarded headers.
+    pub public_base_url: Option<String>,
     pub allow_unauthenticated_public_bind: bool,
     pub cors_origins: Vec<String>,
 }
@@ -1548,6 +2652,8 @@ impl Default for ServerConfig {
             listen: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8788),
             store_root: PathBuf::from("./store"),
             artifact_root: PathBuf::from("./artifacts"),
+            cache_root: PathBuf::from("./cache"),
+            public_base_url: None,
             allow_unauthenticated_public_bind: false,
             cors_origins: Vec::new(),
         }
@@ -1557,7 +2663,24 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
+    /// General weather-data API credentials. They do not authorize operations
+    /// APIs unless the explicit legacy compatibility gate is enabled.
     pub token_file: Option<PathBuf>,
+    /// Operations-only read credentials. They cannot ingest or mutate state.
+    pub ops_read_token_file: Option<PathBuf>,
+    /// Owner-mapped operations write credentials. Each line is
+    /// `<owner-id><TAB><bearer-token>` so token rotation does not change the
+    /// durable operations record owner. They can read and mutate only that
+    /// owner's records.
+    pub ops_write_token_file: Option<PathBuf>,
+    /// Operations-only adapter credentials. They can submit and read ingested
+    /// records, but cannot create or change owned records.
+    pub ops_ingest_token_file: Option<PathBuf>,
+    /// Operations-only administrator credentials.
+    pub ops_admin_token_file: Option<PathBuf>,
+    /// Backward-compatibility gate that elevates every general API token to an
+    /// operations administrator. Keep false for multi-operator deployments.
+    pub legacy_api_tokens_are_operations_admins: bool,
     pub protect_metrics: bool,
 }
 
@@ -1565,6 +2688,11 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             token_file: None,
+            ops_read_token_file: None,
+            ops_write_token_file: None,
+            ops_ingest_token_file: None,
+            ops_admin_token_file: None,
+            legacy_api_tokens_are_operations_admins: false,
             protect_metrics: true,
         }
     }
@@ -1574,6 +2702,14 @@ impl Default for AuthConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
     pub request_body_bytes: usize,
+    /// Maximum authenticated raw Archive-II request body. The Level-II
+    /// decoder currently receives the complete body in memory, so this is an
+    /// operator-set memory/abuse boundary rather than a radar product limit.
+    pub observation_level2_upload_bytes: usize,
+    /// Maximum authenticated generated-grid JSON request body. JSON decoding
+    /// temporarily expands beyond the wire size, so operators should size
+    /// this independently from the raw Level-II bound.
+    pub observation_generated_upload_bytes: usize,
     pub variables_per_query: usize,
     pub points_per_query: usize,
     pub sync_result_values: usize,
@@ -1599,12 +2735,18 @@ pub struct LimitsConfig {
     pub job_result_bytes: u64,
     pub reader_cache_bytes: u64,
     pub response_cache_bytes: u64,
+    /// Maximum bytes retained by the restart-reusable native satellite PNG
+    /// cache below `server.cache_root`. Exact immutable tiles are pruned by
+    /// least-recent use when this bound is reached.
+    pub satellite_tile_cache_bytes: u64,
 }
 
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             request_body_bytes: 2 * 1024 * 1024,
+            observation_level2_upload_bytes: 256 * 1024 * 1024,
+            observation_generated_upload_bytes: 192 * 1024 * 1024,
             variables_per_query: 32,
             points_per_query: 100,
             sync_result_values: 2_000_000,
@@ -1625,6 +2767,7 @@ impl Default for LimitsConfig {
             job_result_bytes: 512 * 1024 * 1024,
             reader_cache_bytes: 256 * 1024 * 1024,
             response_cache_bytes: 128 * 1024 * 1024,
+            satellite_tile_cache_bytes: 64 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -1633,6 +2776,14 @@ impl LimitsConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         let positive = [
             ("request_body_bytes", self.request_body_bytes),
+            (
+                "observation_level2_upload_bytes",
+                self.observation_level2_upload_bytes,
+            ),
+            (
+                "observation_generated_upload_bytes",
+                self.observation_generated_upload_bytes,
+            ),
             ("variables_per_query", self.variables_per_query),
             ("points_per_query", self.points_per_query),
             ("sync_result_values", self.sync_result_values),
@@ -1677,6 +2828,11 @@ impl LimitsConfig {
         if self.request_body_bytes > 64 * 1024 * 1024 {
             return Err(ConfigError::Invalid(
                 "limits.request_body_bytes may not exceed 64 MiB".into(),
+            ));
+        }
+        if self.satellite_tile_cache_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "limits.satellite_tile_cache_bytes must be greater than zero".into(),
             ));
         }
         Ok(())
@@ -1756,7 +2912,193 @@ mod tests {
     fn loopback_default_is_safe_without_tokens() {
         let config = AppConfig::default();
         assert!(!config.origin_catalog.enabled);
+        assert!(!config.satellite_ingest.enabled);
+        assert!(config.satellite_ingest.followers.is_empty());
+        assert!(!config.mrms_ingest.enabled);
+        assert!(!config.mrms_ingest.gate_server_readiness);
+        assert_eq!(config.mrms_ingest.products.len(), 1);
         config.validate(false).unwrap();
+    }
+
+    #[test]
+    fn mrms_background_ingest_is_authenticated_and_bounded() {
+        let mut config = AppConfig::default();
+        config.mrms_ingest.enabled = true;
+        assert!(matches!(
+            config.validate(false),
+            Err(ConfigError::Invalid(detail)) if detail.contains("authenticated API tokens")
+        ));
+        config.validate(true).unwrap();
+
+        config.mrms_ingest.concurrency = 0;
+        assert!(matches!(
+            config.validate(true),
+            Err(ConfigError::Invalid(detail)) if detail.contains("concurrency")
+        ));
+        config.mrms_ingest.concurrency = 1;
+        config
+            .mrms_ingest
+            .products
+            .push(config.mrms_ingest.products[0].clone());
+        assert!(matches!(
+            config.validate(true),
+            Err(ConfigError::Invalid(detail)) if detail.contains("duplicates")
+        ));
+    }
+
+    #[test]
+    fn storm_prewarm_is_private_and_supports_explicit_unlimited_retention() {
+        let mut config = AppConfig::default();
+        assert!(!config.storm_prewarm.enabled);
+        assert_eq!(
+            config.storm_prewarm.retention,
+            StormCacheRetention::Bounded {
+                frames_per_source: 576
+            }
+        );
+        config.storm_prewarm.enabled = true;
+        assert!(matches!(
+            config.validate(true),
+            Err(ConfigError::Invalid(detail)) if detail.contains("operations.enabled")
+        ));
+        config.operations.enabled = true;
+        config.auth.ops_read_token_file = Some(PathBuf::from("ops-read.tokens"));
+        config.storm_prewarm.retention = StormCacheRetention::Unlimited;
+        config.validate(true).unwrap();
+
+        let parsed: AppConfig = toml::from_str(
+            r#"
+                [storm_prewarm]
+                enabled = false
+                retention = { mode = "unlimited" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.storm_prewarm.retention,
+            StormCacheRetention::Unlimited
+        );
+    }
+
+    #[test]
+    fn satellite_ingest_requires_explicit_valid_bounded_followers() {
+        let mut config = AppConfig::default();
+        config.satellite_ingest.enabled = true;
+        assert!(matches!(
+            config.validate(false),
+            Err(ConfigError::Invalid(detail)) if detail.contains("at least one follower")
+        ));
+
+        config.satellite_ingest.followers = vec![SatelliteFollowSpec {
+            platform: "goes19".into(),
+            sector: SatelliteSectorConfig::FullDisk,
+            bands: vec![1, 2, 3, 13],
+            poll_interval_seconds: Some(60),
+            retention_max_age_minutes: Some(24 * 60),
+            retention_max_bytes: None,
+        }];
+        config.validate(false).unwrap();
+
+        config.satellite_ingest.followers[0].retention_max_age_minutes = None;
+        assert!(matches!(
+            config.validate(false),
+            Err(ConfigError::Invalid(detail)) if detail.contains("retention bound")
+        ));
+    }
+
+    #[test]
+    fn satellite_ingest_rejects_duplicate_bands_and_duplicate_source_writers() {
+        let mut config = AppConfig::default();
+        config.satellite_ingest.followers = vec![SatelliteFollowSpec {
+            platform: "goes19".into(),
+            sector: SatelliteSectorConfig::FullDisk,
+            bands: vec![2, 2],
+            poll_interval_seconds: None,
+            retention_max_age_minutes: Some(60),
+            retention_max_bytes: None,
+        }];
+        assert!(matches!(
+            config.validate(false),
+            Err(ConfigError::Invalid(detail)) if detail.contains("duplicate ABI band 2")
+        ));
+
+        config.satellite_ingest.followers[0].bands = vec![2];
+        config.satellite_ingest.followers.push(SatelliteFollowSpec {
+            platform: "G-19".into(),
+            sector: SatelliteSectorConfig::FullDisk,
+            bands: vec![13],
+            poll_interval_seconds: None,
+            retention_max_age_minutes: Some(60),
+            retention_max_bytes: None,
+        });
+        assert!(matches!(
+            config.validate(false),
+            Err(ConfigError::Invalid(detail)) if detail.contains("union of required bands")
+        ));
+    }
+
+    fn prewarm_source() -> SatellitePrewarmSourceConfig {
+        SatellitePrewarmSourceConfig {
+            platform: "goes19".into(),
+            sector: SatelliteSectorConfig::FullDisk,
+            products: vec!["geocolor".into(), "clean_ir".into()],
+            frames_per_product: 3,
+            overview_max_zoom: 1,
+            hot_regions: vec![SatelliteHotRegionConfig {
+                west: 170.0,
+                south: -20.0,
+                east: -170.0,
+                north: 20.0,
+                max_zoom: 4,
+            }],
+        }
+    }
+
+    #[test]
+    fn satellite_prewarm_is_default_off_and_requires_a_bounded_valid_plan() {
+        let mut config = AppConfig::default();
+        assert!(!config.satellite_prewarm.enabled);
+        assert!(config.satellite_prewarm.sources.is_empty());
+
+        config.satellite_prewarm.enabled = true;
+        assert!(matches!(
+            config.validate(false),
+            Err(ConfigError::Invalid(detail)) if detail.contains("at least one source")
+        ));
+
+        config.satellite_prewarm.sources = vec![prewarm_source()];
+        config.validate(false).unwrap();
+
+        config.satellite_prewarm.maximum_tiles_per_product_frame = 1;
+        assert!(matches!(
+            config.validate(false),
+            Err(ConfigError::Invalid(detail)) if detail.contains("tiles per product/frame")
+        ));
+    }
+
+    #[test]
+    fn satellite_prewarm_rejects_alias_duplicates_and_invalid_geography() {
+        let mut config = AppConfig::default();
+        config.satellite_prewarm.sources = vec![prewarm_source()];
+        config.satellite_prewarm.sources[0].products = vec!["clean_ir".into(), "infrared".into()];
+        assert!(matches!(
+            config.validate(false),
+            Err(ConfigError::Invalid(detail)) if detail.contains("duplicate canonical product clean_ir")
+        ));
+
+        config.satellite_prewarm.sources[0].products = vec!["geocolor".into()];
+        config.satellite_prewarm.sources[0].hot_regions[0].north = 90.0;
+        assert!(matches!(
+            config.validate(false),
+            Err(ConfigError::Invalid(detail)) if detail.contains("Web-Mercator latitude bounds")
+        ));
+
+        config.satellite_prewarm.sources[0].hot_regions[0].north = 20.0;
+        config.satellite_prewarm.sources[0].hot_regions[0].max_zoom = 1;
+        assert!(matches!(
+            config.validate(false),
+            Err(ConfigError::Invalid(detail)) if detail.contains("greater than overview_max_zoom")
+        ));
     }
 
     #[test]
@@ -1972,6 +3314,38 @@ mod tests {
     }
 
     #[test]
+    fn satellite_public_base_and_browser_cors_are_exact_and_canonical() {
+        let mut config = AppConfig::default();
+        config.server.public_base_url = Some("https://weather.example.edu/api".into());
+        config.server.cors_origins = vec![
+            "https://radar.example.edu".into(),
+            "http://localhost:5173".into(),
+        ];
+        config.validate(false).unwrap();
+
+        for invalid_base in [
+            "http://weather.example.edu",
+            "https://weather.example.edu/",
+            "https://weather.example.edu/api?tenant=other",
+        ] {
+            config.server.public_base_url = Some(invalid_base.into());
+            assert!(config.validate(false).is_err(), "accepted {invalid_base}");
+        }
+
+        config.server.public_base_url = Some("https://weather.example.edu".into());
+        for invalid_origin in [
+            "*",
+            "https://*.example.edu",
+            "https://user@example.edu",
+            "https://radar.example.edu/",
+            "https://radar.example.edu/app",
+        ] {
+            config.server.cors_origins = vec![invalid_origin.into()];
+            assert!(config.validate(false).is_err(), "accepted {invalid_origin}");
+        }
+    }
+
+    #[test]
     fn async_temporal_defaults_cover_full_hrrr_vector_results() {
         let limits = LimitsConfig::default();
         let hrrr_cells = 1_799usize * 1_059usize;
@@ -1979,5 +3353,49 @@ mod tests {
         assert!(limits.temporal_output_values >= hrrr_cells * 13);
         assert!(limits.json_grid_values < hrrr_cells);
         assert!(limits.sync_result_values < hrrr_cells * 13);
+    }
+
+    #[test]
+    fn observation_upload_memory_guards_are_positive_and_operator_configurable() {
+        let mut config = AppConfig::default();
+        config.limits.observation_level2_upload_bytes = 0;
+        assert!(matches!(
+            config.validate(false),
+            Err(ConfigError::Invalid(detail))
+                if detail.contains("observation_level2_upload_bytes")
+        ));
+
+        config.limits.observation_level2_upload_bytes = usize::MAX;
+        config.limits.observation_generated_upload_bytes = usize::MAX;
+        config.validate(false).unwrap();
+    }
+
+    #[test]
+    fn operations_are_default_off_and_require_bounded_authenticated_configuration() {
+        let mut config = AppConfig::default();
+        assert!(!config.operations.enabled);
+        assert!(!config.auth.legacy_api_tokens_are_operations_admins);
+        config.validate(false).unwrap();
+
+        config.operations.enabled = true;
+        assert!(matches!(
+            config.validate(false),
+            Err(ConfigError::Invalid(detail)) if detail.contains("operations-scoped token")
+        ));
+        assert!(matches!(
+            config.validate(true),
+            Err(ConfigError::Invalid(detail)) if detail.contains("operations-scoped token")
+        ));
+        config.auth.legacy_api_tokens_are_operations_admins = true;
+        config.validate(true).unwrap();
+        config.auth.legacy_api_tokens_are_operations_admins = false;
+
+        config.auth.ops_read_token_file = Some(PathBuf::from("ops-read.tokens"));
+        config.validate(false).unwrap();
+        config.operations.request_body_bytes = 512;
+        assert!(matches!(
+            config.validate(false),
+            Err(ConfigError::Invalid(detail)) if detail.contains("request_body_bytes")
+        ));
     }
 }

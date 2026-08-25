@@ -27,11 +27,13 @@ versioned API.
 - `GET /v1/version`
 - `GET /v1/models`
 - `GET /v1/models/{model}/runs`
+- `GET /v1/models/{model}/latest-run`
 - `GET /v1/models/{model}/runs/{run}`
 - `GET /v1/models/{model}/runs/{run}/variables`
 - `GET /v1/point`
 - `POST /v1/points`
 - `POST /v1/profile`
+- `POST /v1/profile-cycle`
 - `POST /v1/window`
 - `POST /v1/geographic-window`
 - `POST /v1/analytics/spatial-series`
@@ -52,10 +54,51 @@ versioned API.
 - `GET /v1/openapi.json`
 - `GET /metrics`
 
-Every request names an explicit run. The durable scheduler exposes safe
-latest/latest-available/latest-covering selection primitives, but the v1 HTTP
-surface does not silently resolve mutable aliases. Applications should resolve
-a run from the catalog once, then use that immutable run ID for the query.
+`GET /v1/health/ready` uses HTTP status for traffic admission and its JSON body
+for quality state. HTTP 200 with `status = "ready"` or `"degraded"` means the
+core store, publication catalog, and query executor are usable. A degraded
+response names only optional subsystem classes in `degraded_subsystems`; MRMS
+and NEXRAD Level II details remain on authenticated status endpoints. HTTP 503 means
+the core probe failed or an operator deliberately promoted an optional
+subsystem to a deployment-wide readiness requirement.
+
+Every data request names an explicit run. The one explicit mutable pointer,
+`GET /v1/models/{model}/latest-run`, selects only from the authenticated
+visible catalog by physical cycle origin, uses the canonical run ID only as a
+deterministic tie-break, and is returned with `Cache-Control: no-store,
+private`. Applications should resolve that pointer once, then bind subsequent
+requests to the returned immutable run and snapshot identities. No data query
+silently resolves an alias.
+
+`POST /v1/profile-cycle` is the bounded multi-time sounding primitive. With no
+time bounds it selects the complete immutable run; optional `start_unix`
+(inclusive) and `end_unix` (exclusive) narrow that physical-time axis. The
+response binds the run, snapshot, grid, requested latitude/longitude, resolved
+native point, requested fields, and missing policy. It retains one entry per
+selected stored time in deterministic order. Each entry contains its exact
+time, sanitized hour-specific source provenance, available pressure profiles
+with their own level axes, and an ordered `surface_samples` bundle for the
+requested colocated native-grid fields. Surface entries use the same typed
+`variable`/`units`/nullable-`value` shape as published profile objects.
+Separate ordered pressure and surface missing-field lists plus a
+`complete`/`partial`/`gap` status make every incomplete sounding explicit.
+Strict mode rejects the first missing field or non-finite surface value;
+partial mode never hides a missing timestep. `variables` selects pressure
+profiles and `surface_variables` selects bounded surface fields such as 2 m
+temperature/dewpoint, 10 m wind components, and surface pressure.
+
+Like the other operational query routes, this endpoint is bearer-authenticated
+when tokens are configured and is protected by the authoritative publication
+catalog gate. A missing, stale, or inconsistent published catalog fails closed
+instead of exposing an otherwise readable unpublished store run.
+
+The endpoint uses the heavy synchronous worker pool and cooperative
+cancellation checkpoints. `limits.variables_per_query`,
+`limits.temporal_frames`, and `limits.sync_result_values` bound fields, selected
+times, and decoded pressure plus surface values across the entire response;
+`limits.request_body_bytes` and `limits.sync_timeout_seconds` bound the HTTP
+body and shared admission/execution deadline. A request exceeding a count cap
+fails before allocating the value that would cross it.
 
 ## Safe defaults
 
@@ -90,6 +133,11 @@ rectangular envelope, cropped lat/lon arrays, exact projection metadata, and a
 mask that prevents curvilinear envelope cells outside the requested bbox from
 being plotted as selected data. Antimeridian-crossing eastward arcs and
 explicit, unreduced pressure levels are first-class.
+
+Stored `pressure3d` variables independently advertise
+`pressure_profile=true` for a single stored time and `profile_cycle=true` for
+the bounded multi-time contract. Availability slots and coverage remain the
+authoritative guide to whether partial requests will contain explicit gaps.
 
 Local valid stores are queryable even when their model identifier is not built
 into the registry. This keeps private WRF, ArWen, and other compatible output

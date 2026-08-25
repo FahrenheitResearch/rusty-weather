@@ -10,8 +10,8 @@
 //! the engine polls the live bucket. Responses stream back as plain data
 //! and every response fires the `notify` hook (`ctx.request_repaint`).
 //! Cancellation bypasses the queue: [`SatWorker::stop_follow`] flips a
-//! shared `AtomicBool` the follow engine observes at poll/frame
-//! boundaries.
+//! shared `AtomicBool` the follow engine observes at poll boundaries and
+//! between download-body reads.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,14 +22,14 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use egui::{Color32, ColorImage};
-use rw_sat::composite::GoesAbiRgbCompositeStyle;
 use rw_sat::events::{SatError, SatEvent};
 use rw_sat::follow::FollowConfig;
 use rw_sat::goes::{GoesSatellite, parse_goes_abi_filename};
-use rw_sat::palette::{anchor_color, band_anchors};
+use rw_sat::palette::band_color;
 use rw_sat::s3::{Sector, bucket_for_satellite, object_filename};
 use rw_sat::store::{run_day, selector_band};
 use rw_sat::window::WindowConfig;
+use rw_sat::{GoesAbiProduct, product_catalog};
 use rw_store::grid::GridFile;
 use rw_store::reader::HourReader;
 use rw_store::run::RwsRunManifest;
@@ -68,6 +68,11 @@ pub enum SatResponse {
         id: String,
         label: String,
         bytes: u64,
+    },
+    DownloadProgress {
+        id: String,
+        received_bytes: u64,
+        total_bytes: Option<u64>,
     },
     DownloadDone {
         id: String,
@@ -151,9 +156,8 @@ impl SatWorker {
         self.rx.try_recv().ok()
     }
 
-    /// Request the running follow session to stop. Takes effect at the
-    /// next poll/frame boundary (the in-flight download completes first);
-    /// bypasses the request queue.
+    /// Request the running follow session to stop. Active downloads observe
+    /// this between bounded socket reads; bypasses the request queue.
     pub fn stop_follow(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -186,10 +190,10 @@ pub fn sector_options() -> Vec<SatSectorOption> {
     .map(|sector| SatSectorOption {
         slug: sector.slug().to_string(),
         label: match sector {
-            Sector::Conus => "CONUS".to_string(),
-            Sector::FullDisk => "Full disk".to_string(),
-            Sector::Meso1 => "Meso 1".to_string(),
-            Sector::Meso2 => "Meso 2".to_string(),
+            Sector::Conus => "CONUS · 5 minute".to_string(),
+            Sector::FullDisk => "Full Disk · 10 minute".to_string(),
+            Sector::Meso1 => "Mesoscale 1 · 1 minute".to_string(),
+            Sector::Meso2 => "Mesoscale 2 · 1 minute".to_string(),
         },
         default_poll_secs: sector.default_poll_secs(),
         cadence_secs: sector.cadence_secs(),
@@ -197,76 +201,32 @@ pub fn sector_options() -> Vec<SatSectorOption> {
     .collect()
 }
 
-/// ABI band display names (UI copy; the science lives in rw-sat).
-const BAND_NAMES: [&str; 16] = [
-    "Blue 0.47 µm",
-    "Red 0.64 µm",
-    "Veggie 0.86 µm",
-    "Cirrus 1.37 µm",
-    "Snow/Ice 1.6 µm",
-    "Cloud Particle Size 2.2 µm",
-    "Shortwave Window 3.9 µm",
-    "Upper-Level Water Vapor 6.2 µm",
-    "Mid-Level Water Vapor 6.9 µm",
-    "Lower-Level Water Vapor 7.3 µm",
-    "Cloud-Top Phase 8.4 µm",
-    "Ozone 9.6 µm",
-    "Clean IR Window 10.3 µm",
-    "IR Longwave 11.2 µm",
-    "Dirty IR Window 12.3 µm",
-    "CO2 Longwave 13.3 µm",
-];
-
-/// Layer picker entries: every ABI band, then every RGB composite (a
-/// composite follow ingests its required bands; each band run plays in
-/// the frame player).
+/// User-facing product picker. Required channels stay an implementation detail.
 pub fn layer_options() -> Vec<SatLayerOption> {
-    let mut options: Vec<SatLayerOption> = (1u8..=16)
-        .map(|band| SatLayerOption {
-            slug: format!("c{band:02}"),
-            label: format!("C{band:02} · {}", BAND_NAMES[usize::from(band - 1)]),
-            note: String::new(),
+    product_catalog(true)
+        .into_iter()
+        .map(|product| {
+            let daylight = if product.daylight_only {
+                " · daylight"
+            } else {
+                " · 24 hour"
+            };
+            SatLayerOption {
+                slug: product.id,
+                label: product.title,
+                note: format!(
+                    "{} · {:.1} km native{}",
+                    product.description, product.native_resolution_km, daylight
+                ),
+            }
         })
-        .collect();
-    for style in GoesAbiRgbCompositeStyle::ALL {
-        let bands = style
-            .required_channels()
-            .iter()
-            .map(|band| format!("C{band:02}"))
-            .collect::<Vec<_>>()
-            .join("+");
-        options.push(SatLayerOption {
-            slug: style.slug().to_string(),
-            label: format!("RGB · {}", style.title()),
-            note: format!("follows {bands}; each band run plays in the player"),
-        });
-    }
-    options
+        .collect()
 }
 
-/// Layer slug -> the ABI bands it follows, plus a description for the
-/// summary line. Bands: "c13"; composites by slug ("geocolor").
 fn resolve_layer(layer: &str) -> Result<(Vec<u8>, String), String> {
-    let normalized = layer.trim().to_ascii_lowercase();
-    if let Some(band) = normalized
-        .strip_prefix('c')
-        .and_then(|raw| raw.parse::<u8>().ok())
-    {
-        if (1..=16).contains(&band) {
-            return Ok((vec![band], format!("C{band:02}")));
-        }
-        return Err(format!("ABI band out of range: C{band:02} (1-16)"));
-    }
-    if let Some(style) = GoesAbiRgbCompositeStyle::parse(&normalized) {
-        let bands = style.required_channels().to_vec();
-        let list = bands
-            .iter()
-            .map(|band| format!("C{band:02}"))
-            .collect::<Vec<_>>()
-            .join("+");
-        return Ok((bands, format!("{} [{list}]", style.title())));
-    }
-    Err(format!("unknown layer '{layer}'"))
+    let product = GoesAbiProduct::parse(layer)
+        .ok_or_else(|| format!("unknown satellite product '{layer}'"))?;
+    Ok((product.required_channels().to_vec(), product.title()))
 }
 
 /// Validated pieces of a follow spec.
@@ -283,8 +243,11 @@ fn resolve_spec(spec: &SatFollowSpec) -> Result<ResolvedSpec, String> {
     let sector =
         Sector::parse(&spec.sector).ok_or_else(|| format!("unknown sector '{}'", spec.sector))?;
     let (bands, layer_desc) = resolve_layer(&spec.layer)?;
-    if ![1usize, 2, 4].contains(&spec.downsample) {
-        return Err(format!("unsupported detail stride {}", spec.downsample));
+    if spec.downsample > 16 {
+        return Err(format!(
+            "preview stride {} exceeds the supported maximum of 16",
+            spec.downsample
+        ));
     }
     Ok(ResolvedSpec {
         model: GoesSatellite::parse(&spec.satellite)
@@ -313,8 +276,9 @@ fn spec_summary(spec: &SatFollowSpec) -> Result<String, String> {
         (None, None) => "unbounded window".to_string(),
     };
     let detail = match spec.downsample {
-        1 => String::new(),
-        step => format!(" · 1/{step} res"),
+        0 => " · native source retained; preview optimized automatically".to_string(),
+        1 => " · native preview".to_string(),
+        step => format!(" · explicit 1/{step} preview"),
     };
     Ok(format!(
         "{} {} · {} · poll ~{interval} s (frames ~{} s apart) · {window}{detail}",
@@ -516,7 +480,6 @@ fn load_frame(
     let (nx, ny) = (meta.nx, meta.ny);
     let name = variable.name.clone();
     let values = reader.read_full_2d(&name).map_err(|err| err.to_string())?;
-    let anchors = band_anchors(band);
     let mut pixels = Vec::with_capacity(nx * ny);
     for image_row in 0..ny {
         let grid_row = if grid.flip_rows {
@@ -525,7 +488,7 @@ fn load_frame(
             image_row
         };
         for &value in &values[grid_row * nx..(grid_row + 1) * nx] {
-            let [r, g, b, a] = anchor_color(value, anchors);
+            let [r, g, b, a] = band_color(band, value);
             pixels.push(Color32::from_rgba_unmultiplied(r, g, b, a));
         }
     }
@@ -555,6 +518,15 @@ fn map_event(event: SatEvent, current_key: &mut Option<String>) -> Vec<SatRespon
                 bytes,
             }]
         }
+        SatEvent::DownloadProgress {
+            key,
+            received_bytes,
+            total_bytes,
+        } => vec![SatResponse::DownloadProgress {
+            id: key,
+            received_bytes,
+            total_bytes,
+        }],
         SatEvent::DownloadDone {
             key, ms, cache_hit, ..
         } => vec![SatResponse::DownloadDone {
@@ -562,6 +534,7 @@ fn map_event(event: SatEvent, current_key: &mut Option<String>) -> Vec<SatRespon
             ms,
             cache_hit,
         }],
+        SatEvent::NativeFrameUpdated { .. } => Vec::new(),
         SatEvent::FrameWritten {
             run,
             hhmm,
@@ -730,14 +703,15 @@ mod tests {
     fn layer_resolution_handles_bands_and_composites() {
         let (bands, desc) = resolve_layer("c13").expect("band layer");
         assert_eq!(bands, vec![13]);
-        assert_eq!(desc, "C13");
+        assert_eq!(desc, "C13 · Clean Window 10.3 µm");
 
         let (bands, desc) = resolve_layer("geocolor").expect("composite layer");
+        assert_eq!(bands, vec![1, 2, 3, 13]);
+        assert_eq!(desc, "GeoColor");
+
+        let (bands, desc) = resolve_layer("true_color").expect("daylight composite layer");
         assert_eq!(bands, vec![1, 2, 3]);
-        assert!(
-            desc.contains("GeoColor") && desc.contains("C01+C02+C03"),
-            "got: {desc}"
-        );
+        assert_eq!(desc, "True Color");
 
         assert!(resolve_layer("c0").is_err());
         assert!(resolve_layer("c17").is_err());
@@ -749,9 +723,13 @@ mod tests {
         let summary = spec_summary(&spec()).expect("default spec is valid");
         assert!(summary.contains("g19"), "got: {summary}");
         assert!(summary.contains("conus"), "got: {summary}");
-        assert!(summary.contains("C13"), "got: {summary}");
+        assert!(summary.contains("GeoColor"), "got: {summary}");
         assert!(summary.contains("poll ~30 s"), "got: {summary}");
         assert!(summary.contains("keep 6.0 h"), "got: {summary}");
+        assert!(
+            summary.contains("preview optimized automatically"),
+            "got: {summary}"
+        );
 
         let mut bad = spec();
         bad.sector = "antarctica".to_string();
@@ -769,7 +747,7 @@ mod tests {
         spec.layer = "geocolor".to_string();
         spec.downsample = 2;
         let config = follow_config(&spec, Path::new("sat-root")).expect("valid spec");
-        assert_eq!(config.bands, vec![1, 2, 3]);
+        assert_eq!(config.bands, vec![1, 2, 3, 13]);
         assert_eq!(config.sector, Sector::Conus);
         assert_eq!(
             config.poll_interval,
@@ -783,17 +761,28 @@ mod tests {
 
         let (model, prefixes) = run_prefixes(&spec).unwrap();
         assert_eq!(model, "g19");
-        assert_eq!(prefixes, vec!["conus_c01", "conus_c02", "conus_c03"]);
+        assert_eq!(
+            prefixes,
+            vec!["conus_c01", "conus_c02", "conus_c03", "conus_c13"]
+        );
     }
 
     #[test]
     fn layer_options_cover_all_bands_and_composites() {
         let options = layer_options();
-        assert_eq!(options.len(), 16 + GoesAbiRgbCompositeStyle::ALL.len());
+        assert_eq!(options.len(), product_catalog(true).len());
         for option in &options {
             resolve_layer(&option.slug).expect("every picker entry resolves");
         }
-        assert!(options[12].label.contains("Clean IR"), "C13 label");
+        let c13 = options
+            .iter()
+            .find(|option| option.slug == "c13")
+            .expect("raw C13 product is present");
+        assert!(
+            c13.label.contains("C13") && c13.label.contains("Clean Window"),
+            "C13 label: {}",
+            c13.label
+        );
     }
 
     /// Small synthetic CONUS-ish scene near the sub-satellite point (same
@@ -949,6 +938,23 @@ mod tests {
             if id == &key && label == "C13 19:21:18Z")
         );
 
+        let progress = map_event(
+            SatEvent::DownloadProgress {
+                key: key.clone(),
+                received_bytes: 21,
+                total_bytes: Some(42),
+            },
+            &mut current,
+        );
+        assert!(matches!(
+            &progress[0],
+            SatResponse::DownloadProgress {
+                id,
+                received_bytes: 21,
+                total_bytes: Some(42)
+            } if id == &key
+        ));
+
         let written = map_event(
             SatEvent::FrameWritten {
                 model: "g19".to_string(),
@@ -981,7 +987,10 @@ mod tests {
             .expect("worker responds");
         match response {
             SatResponse::FollowFinished(Err(message)) => {
-                assert!(message.contains("ABI band out of range"), "got: {message}");
+                assert!(
+                    message.contains("unknown satellite product 'c99'"),
+                    "got: {message}"
+                );
             }
             other => panic!("expected FollowFinished(Err), got {other:?}"),
         }
@@ -1000,7 +1009,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("validate responds")
         {
-            SatResponse::SpecStatus(Ok(summary)) => assert!(summary.contains("C13")),
+            SatResponse::SpecStatus(Ok(summary)) => assert!(summary.contains("GeoColor")),
             other => panic!("expected SpecStatus, got {other:?}"),
         }
         match worker

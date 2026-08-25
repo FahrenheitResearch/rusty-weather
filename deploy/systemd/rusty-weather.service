@@ -23,8 +23,12 @@ StateDirectory=rusty-weather
 StateDirectoryMode=0750
 LogsDirectory=rusty-weather
 LogsDirectoryMode=0750
+CacheDirectory=rusty-weather/server
+CacheDirectoryMode=0750
 ReadOnlyPaths=/var/lib/rusty-weather/store
 ReadWritePaths=/var/lib/rusty-weather/artifacts
+ReadWritePaths=/var/cache/rusty-weather/server
+ReadWritePaths=-/var/lib/rusty-weather/operations
 # Optional distributed features remain disabled by default. When explicitly
 # enabled, keep their control/cache state beneath these service-owned paths;
 # the leading '-' lets the base service start before an operator creates them.

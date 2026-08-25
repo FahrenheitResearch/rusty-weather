@@ -8,11 +8,17 @@ members = [
     "crates/rw-federation-proxy",
     "crates/rw-generation-replication",
     "crates/rw-ingest",
+    "crates/rw-odim",
     "crates/rw-query",
+    "crates/rw-observations",
+    "crates/rw-nexrad-storm",
+    "crates/rw-ops-protocol",
     "crates/rw-server",
     "crates/rw-scheduler",
     "crates/rw-sat",
     "crates/rw-sat-check",
+    "crates/rw-storm",
+    "crates/rw-storm-ml",
     "crates/rw-store",
     "crates/rw-ui",
     "crates/rustwx-calc",
@@ -27,6 +33,7 @@ members = [
     "crates/rusty-weather",
     "crates/rusty-weather-ui",
     "vendor/netcrust",
+    "vendor/weather-contours",
     "vendor/wrf-rust/crates/wrf-core",
     "vendor/wrf-rust/crates/wrf-formula",
 ]
@@ -35,6 +42,7 @@ exclude = [
     "vendor/grib-core",
     "vendor/metrust",
     "vendor/netcrust/vendor/hdf5-reader",
+    "vendor/openjp2",
     "vendor/sharprs",
     "vendor/sharppyrs",
     "vendor/wx-core",
@@ -55,7 +63,11 @@ clap = { version = "4.5", features = ["derive"] }
 rayon = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip is required for honest metadata provenance: stored selector
+# floats (for example f32-promoted NEXRAD nyquist/elevation values) must
+# re-parse to the identical f64, or the store's post-write metadata-equality
+# validation rejects its own frames and wedges background followers.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "2"
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "rustls-webpki-roots"] }
 
@@ -64,6 +76,10 @@ ureq = { version = "3", default-features = false, features = ["rustls-no-provide
 # package. Patches only apply from the workspace root, so the pin lives here.
 [patch.crates-io]
 hdf5-reader = { path = "vendor/netcrust/vendor/hdf5-reader" }
+# openjp2 0.6.1 stores a Rust `Layout` inside code blocks allocated and
+# zero-initialized by its C-style allocator.  Keep the decoder on the audited
+# local patch until that undefined behavior is fixed in a published release.
+openjp2 = { path = "vendor/openjp2" }
 
 # The WRF ECAPE golden corpus is pinned to ecape-rs 8292253. Keep that
 # algorithm revision while resolving its meteorology support crates to this

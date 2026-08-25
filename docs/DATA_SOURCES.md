@@ -74,6 +74,41 @@ For all packaged NOAA lanes:
 - cycle cadence and product scope are model-specific and are published through
   `/v1/models` and MODEL_SUPPORT.md rather than duplicated here.
 
+## NOAA / NWS NEXRAD Level II via Unidata
+
+NEXRAD Level II is produced and quality controlled by NOAA/NWS. The packaged
+background follower reads complete volume objects from UCAR/Unidata's public
+`unidata-nexrad-level2` archive bucket; Unidata is the transport/hosting
+provider and is credited separately from the government data producer. The
+default provider requires no credential, follows only operator-allowlisted
+sites, and does not imply that Rusty Weather output is an official NOAA/NWS
+product.
+
+Every decoded frame retains the configured provider id and attribution, exact
+archive object key, advertised and received byte length, upstream modification
+time when supplied, and SHA-256 of the downloaded bytes. The object URL itself
+and network credentials are not persisted. A provider-compatible private
+mirror may be configured explicitly; its operator is responsible for its data
+rights, attribution, and redistribution policy.
+
+## CMA GRAPES GEPS through WIS2
+
+The `cma-wis2-core-data` lane reads CMA GRAPES GEPS v1.3 objects directly from
+the China Meteorological Administration's WIS2 node. CMA's authoritative
+[WCMP2 discovery record](https://wis2node.wis.cma.cn/oapi/collections/discovery-metadata/items/urn%3Awmo%3Amd%3Acn-cma%3Adata.core.weather.prediction.forecast.medium-range.probabilistic.global?f=json)
+declares the dataset as `wmo:dataPolicy=core`; reuse policy is governed by the
+[WMO Unified Data Policy](https://public.wmo.int/wmo-unified-data-policy-resolution-res1).
+A WIS2 Global Cache is a transport mirror, not a different producer or
+licensor.
+
+The packaged lane is anonymous and bounded to one global 0.25-degree lead
+object at a time. It preserves only scientifically identified provider-created
+mean/spread, percentile, and probability products. It does not infer the 31 raw
+members, decode undocumented local parameters, or relabel a statistic as a
+deterministic field. Stores and API responses identify CMA as the producer,
+retain the WIS2/WMO policy references, state that Rusty Weather transformed the
+data, and must not be represented as an official CMA product.
+
 ## ECMWF Open Data (IFS and AIFS)
 
 The public ECMWF lane uses the provider's
@@ -101,6 +136,35 @@ source and disclaimer elements: identify that the service is based on ECMWF
 data and products, link `www.ecmwf.int` and CC BY 4.0, and state that ECMWF
 accepts no liability for errors, omissions, availability, loss, or damage
 arising from use.
+
+## Environment and Climate Change Canada (ECCC/MSC)
+
+The public ECCC lane reads the provider's anonymous
+[MSC Datamart](https://eccc-msc.github.io/open-data/msc-datamart/readme_en/).
+The packaged remote scheduler currently limits that lane to the GDPS, RDPS,
+and continental HRDPS products and cadences published in MODEL_SUPPORT.md.
+Those products are split into one GRIB2 object per field, level, lead, and
+cycle; Rusty Weather acquires an explicit bounded component inventory and
+records ECCC as the provider without persisting source-object URLs.
+
+ECCC publishes these data under its
+[open-data server licence](https://eccc-msc.github.io/open-data/licence/readme_en/),
+which permits worldwide, royalty-free use, copying, modification,
+publication, translation, adaptation, distribution, and commercial use,
+subject to the stated conditions. Redistributed or derived products must
+retain the required notice `Data Source: Environment and Climate Change
+Canada`, must not imply ECCC endorsement, and must preserve any separately
+identified third-party rights or attribution. Rusty Weather surfaces that
+notice, a modification statement, the licence link, and the provider's
+accuracy/availability disclaimer through run and model capability responses.
+
+The generated `today/` URLs are a current operational distribution path, not
+a retention guarantee. Operators who require history must set an explicit
+cache/retention policy and re-check the licence and upstream service terms.
+RDPS and HRDPS vector components are normalized from their declared rotated
+grid-relative axes into canonical earth-relative U/V; downstream output is a
+transformed Rusty Weather product and must not be represented as an unmodified
+official ECCC product.
 
 ## User-provided and local-only sources
 

@@ -3,8 +3,16 @@
 ## Health and diagnostics
 
 `GET /v1/health/live` answers when the process can serve HTTP. `GET
-/v1/health/ready` additionally checks the configured store and should gate
-traffic. Both are deliberately unauthenticated and return no secret paths.
+/v1/health/ready` additionally exercises the bounded query executor and checks
+the configured scientific store plus the optional publication catalog. It
+returns HTTP 200 with `status = "ready"` when all enabled followers are healthy,
+or HTTP 200 with `status = "degraded"` and a bounded
+`degraded_subsystems` list when optional MRMS or NEXRAD Level II acquisition is
+warming, stale, or backing off. Both 200 states may receive core traffic. HTTP
+503 is reserved for a failed core probe or an operator's explicit
+`gate_server_readiness = true` policy. Both routes are deliberately
+unauthenticated and return no secret paths, source URLs, or data identities;
+use each authenticated subsystem status route for details.
 
 Use the built-in probe from the same network namespace as the service:
 
@@ -13,6 +21,11 @@ Use the built-in probe from the same network namespace as the service:
 For HTTP monitoring:
 
     curl --fail --silent --show-error http://127.0.0.1:8788/v1/health/ready
+
+The built-in healthcheck and shipped service/container probes intentionally
+accept both `ready` and `degraded`, because both are HTTP 200. Alert on the body
+status and authenticated subsystem freshness separately; do not restart or
+disconnect a multi-service node merely because one upstream feed is stale.
 
 Run `doctor` after configuration, credential, permission, binary, or store
 changes. It validates configuration safety, token loading, directory isolation,

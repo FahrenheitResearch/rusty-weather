@@ -12,7 +12,9 @@ Create `data\store`, `data\artifacts`, `logs`, and `secrets`. Put one random
 API token of at least 32 bytes per line in `secrets\api-tokens.txt`. If a
 distributed feature is explicitly enabled, also create only the corresponding
 `data\community-cache`, `data\federation`, or
-`data\generation-replication` control directory. These are service state, not
+`data\generation-replication` control directory. Server-owned satellite ingest
+instead uses a separate `data\satellite-staging` raw-download directory. These
+are service state, not
 arbitrary upload directories, and `data\store` remains read-only to the API in
 normal scheduler-origin mode.
 
@@ -41,8 +43,20 @@ capacity/security gates and publication-source policy have been reviewed:
     # Advanced replication-only/union origin:
     # icacls .\data\store /grant:r "${serviceSid}:(OI)(CI)(M)"
 
-Keep Community, relay, federation, and generation signing keys plus provider
-tokens as separate regular files under `secrets`. Remove inherited ACLs and
+When `satellite_ingest.enabled = true`, grant modify access only to its staging
+root and the shared store; client requests still cannot start ingestion:
+
+    icacls .\data\satellite-staging /grant:r "${serviceSid}:(OI)(CI)(M)"
+    icacls .\data\store /grant:r "${serviceSid}:(OI)(CI)(M)"
+
+When `mrms_ingest.enabled = true`, no separate staging directory is used. Grant
+the same narrowly scoped modify access to `data\store`, retain API tokens, and
+monitor the authenticated MRMS status route. One server follower supplies the
+stored frames shared by every client; client requests do not each download or
+decode MRMS.
+
+Keep Community, relay, federation, operations, and generation signing keys plus
+provider tokens as separate regular files under `secrets`. Remove inherited ACLs and
 grant read only to `NetworkService` and full control to `SYSTEM`, using the
 same pattern as `api-tokens.txt`; never put secret text in the XML or TOML.
 
@@ -60,6 +74,13 @@ Install and validate:
     .\rusty-weather-service.exe start
     .\rusty-weather-service.exe status
     .\rw-server.exe --config .\rusty-weather.toml healthcheck
+
+The service healthcheck succeeds for both `ready` and `degraded` HTTP 200
+responses. Degraded means an optional MRMS or NEXRAD Level II feed is warming, stale,
+or backing off while core model, satellite, query, and operations traffic is
+still usable. Monitor the JSON body and authenticated subsystem status routes
+separately; do not restart the Windows service solely for degraded upstream
+data.
 
 For upgrades, stop the service, back up the configuration and store manifests,
 replace only the versioned application files, run `doctor`, then start it. Keep
