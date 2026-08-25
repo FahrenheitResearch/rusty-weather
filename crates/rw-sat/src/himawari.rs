@@ -1282,6 +1282,7 @@ mod tests {
             key: String::new(),
             size_bytes: 0,
             last_modified: String::new(),
+            etag: None,
         };
         let segment = |index| HimawariSegment {
             object: object.clone(),

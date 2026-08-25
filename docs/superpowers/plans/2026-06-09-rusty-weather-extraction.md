@@ -824,4 +824,4 @@ git tag extraction-complete
 1. **Plan 2 — rw-store:** the unified format (per-hour `.rws`, windowed 2D tiles, column-chunked 3D), TDD'd against synthetic grids, then wired to ingest; includes building the committed GRIB fixture for CI smoke. Chunk-shape tuning uses Task 10's timing baseline.
 2. **Plan 3 — pipeline + scheduler:** the global rayon pool, job model, `fetch`/`render` subcommands replacing the smoke bins, per-stage timing into `run.json`, build-hash stamping.
 3. **Plan 4 — rw-server + frontend:** axum API + SSE + embedded static UI + click-for-sounding.
-4. **Plan 5 — node validation:** deploy to node3/node4, same-cycle comparison vs rustwx, the 3-concurrent-models ≤1.5× acceptance test, deep-prune of dead model registry code.
+4. **Plan 5 — node validation:** deploy to the Linux build nodes, same-cycle comparison vs rustwx, the 3-concurrent-models ≤1.5× acceptance test, deep-prune of dead model registry code.

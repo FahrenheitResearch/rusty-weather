@@ -250,7 +250,23 @@ pub fn supported_derived_recipe_slugs(model: ModelId) -> Vec<String> {
             .filter(|recipe| derived_recipe_supported_for_model(recipe, model))
             .map(|recipe| recipe.slug.to_string())
             .collect(),
-        ModelId::Rtma | ModelId::Urma | ModelId::Href | ModelId::Nbm | ModelId::Refs => Vec::new(),
+        ModelId::Gdps
+        | ModelId::GdpsGeml
+        | ModelId::CmaGeps
+        | ModelId::Rdps
+        | ModelId::Hrdps
+        | ModelId::Reps
+        | ModelId::IconEu
+        | ModelId::IconD2
+        | ModelId::IconRu
+        | ModelId::Geps
+        | ModelId::WrfCptec7km
+        | ModelId::BramsCptec8km
+        | ModelId::Rtma
+        | ModelId::Urma
+        | ModelId::Href
+        | ModelId::Nbm
+        | ModelId::Refs => Vec::new(),
     }
 }
 

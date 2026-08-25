@@ -155,6 +155,43 @@ fn rectilinear_window_returns_only_the_minimal_cropped_grid_and_projection() {
 }
 
 #[test]
+fn default_geographic_query_returns_more_than_the_old_250000_cell_cap() {
+    let (nx, ny) = (501, 500);
+    let cells = nx * ny;
+    let latitudes = (0..cells)
+        .map(|index| 30.0 + (index / nx) as f32 * 0.01)
+        .collect::<Vec<_>>();
+    let longitudes = (0..cells)
+        .map(|index| -110.0 + (index % nx) as f32 * 0.01)
+        .collect::<Vec<_>>();
+    let (_dir, snapshot) = store(
+        "above-old-default-cap",
+        nx,
+        ny,
+        latitudes,
+        longitudes,
+        Some(GridProjection::Geographic),
+    );
+    let result = query_geographic_window(
+        &snapshot,
+        &request(
+            &snapshot,
+            &["temperature_2m"],
+            GeographicBoundingBox {
+                west_longitude: -180.0,
+                south_latitude: -90.0,
+                east_longitude: 180.0,
+                north_latitude: 90.0,
+            },
+            GeographicVerticalSelection::Surface2d,
+        ),
+    )
+    .expect("direct query defaults must preserve the complete native grid");
+    assert_eq!(result.envelope.nx * result.envelope.ny, cells);
+    assert!(cells > 250_000);
+}
+
+#[test]
 fn curvilinear_envelope_masks_cells_outside_the_requested_bbox() {
     let (_dir, snapshot) = store(
         "curvilinear-mask",

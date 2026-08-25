@@ -1,0 +1,74 @@
+# Exact bounded capture from the official ECCC GEPS published-products directory.
+# source_url=https://dd.weather.gc.ca/today/ensemble/geps/grib2/products/00/024/
+# source_bytes=9714
+# source_sha256=ABC37D99EE4402ECDBDB30B5C46E8ECDC245EBE24BBCBCBFD64F7CF4C1E87E4E
+# source_grib2_links=36
+# documentation_url=https://eccc-msc.github.io/open-data/msc-data/nwp_geps/readme_geps-datamart_en/
+# documentation_grid=720x361
+# live_decoded_grid=721x360
+# grid_template=0
+# live_grid_first_lat_lon=-90.0,180.0
+# live_grid_last_lat_lon=89.5,180.0
+# live_grid_i_j_increment_deg=0.5,0.5
+# cyclic_longitude_contract=equal-endpoints-use-i-increment
+# scan_mode=0x40
+# resolution_and_component_flags=0x30
+# cycles_utc=00,12
+# invariant_rws_horizon=f003-f192/3h,f198-f384/6h
+# extended_provider_horizon=f936-Monday-and-Thursday-00z-not-scheduled
+# product_semantics=provider-published-statistics-only-no-raw-member-claim
+# live_derived_code_4=ensemble_spread-not-standard_deviation
+# instant_temperature_2m_products=p10,p25,p50,p75,p90,spread,mean,min,max
+# gust_max_3h_products=prob_gt_15mps,prob_gt_25mps,prob_gt_35mps,p25,p50,p75,min,max
+# total_precipitation_6h_products=prob_gt_1kgm2,prob_gt_5kgm2,prob_gt_10kgm2,prob_gt_25kgm2,prob_gt_50kgm2,prob_gt_100kgm2,p25,p50,p75,min,max
+# max_temperature_24h_probability_thresholds_kelvin=243.14,248.14,253.14,258.14,263.14,268.14,273.14,278.14,283.14,288.14,293.14,298.14,303.14,308.14,313.14
+# min_temperature_24h_probability_thresholds_kelvin=233.14,238.14,243.14,248.14,253.14,258.14,263.14,268.14,273.14,278.14,283.14,288.14,293.14,298.14
+# payload=GUST-Max-3h_TGL_10m|1363848|6C3BCB20E6AB5B5ED7BD57D6572175ACA0F254905831D74A18FFF347BB15A554|8
+# payload=GUST-Max-6h_TGL_10m-f198|1491130|1A9618EFDC3336C1C894C92271491CE57ADF7B3642792EF2547095DCF79195D9|8
+# payload=HGT_ISBL_0500|235107|6A1C140880519BD125F35A1E35B502E8E1986844DECD97283C45BF89EAB5FCD5|2
+# payload=PRMSL_MSL_0|276865|DD23C177D17E78EB8AB851C10A1F78E0E2B059C7C74E2A38EE62EF0CBE5A7E59|2
+# payload=TCDC_SFC_0|2086689|16015E4D617E1EA8DBA4F1C778339DB4A009EAE8EDCD9F58DCB443647700FCA2|7
+# payload=TEMP_ISBL_0850|804143|244C45A52AB17EDF12654123FE296D1CE6D72644D7AB0464FABD635160CF99A0|5
+# payload=TEMP_TGL_2m|1401116|AC0F2AD2879F3EBE6F01E37BBAC4A775350C315FF808BB711114EDDDA40F3A3D|9
+# payload=TEMP-Max-24h_TGL_2m|1606267|10793D37E7797D017F6E6B9B842AC42EB2AFBBF6822857FA989AE642DD9A6DE3|24
+# payload=TEMP-Min-24h_TGL_2m|1679823|A5150841BD893057AECA19D92534A3A78E9E928B0FC9DEC65551F811D6C684F2|23
+# payload=TPRATE-Accum-6h_SFC_0|880837|78808D5872ECE461B5ED97CEC911E03ECFB90AE9BD8E155EA2854FFF0CD42E18|11
+# payload=WIND_ISBL_0250|1328808|85C36497B1209EAD14A4C3B8057D9BB0EA55427884D6E59EFC621CB69E7FC31B|7
+# payload=WIND_ISBL_0850|1645747|2135B4933E7303E1ECB14DA53F43441D4F5D2736CD0552A97E1A71DBCBA9AAAE|7
+# payload=WIND_TGL_10m|2153709|168CD0492FCC22F2D51A20CE6FD985212B845D90F46D2CF58844DA5E4B8A4E03|9
+CMC_geps-prob_FPRATE-Accum-12h_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_FPRATE-Accum-24h_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_GUST-Max-12h_TGL_10m_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_GUST-Max-3h_TGL_10m_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_GUST-Max-6h_TGL_10m_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_HEATX_TGL_2m_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_HEATX-Max-24h_TGL_2m_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_HGT_ISBL_0500_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_IPRATE-Accum-12h_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_IPRATE-Accum-24h_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_IPRATE-Accum-6h_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_MUCAPE_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_PRMSL_MSL_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_RPRATE-Accum-12h_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_RPRATE-Accum-24h_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_SPRATE-Accum-12h_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_SPRATE-Accum-24h_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_SPRATE-Accum-6h_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_TCDC_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_TEMP_ISBL_0850_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_TEMP_TGL_2m_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_TEMP-Max-24h_TGL_2m_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_TEMP-Min-24h_TGL_2m_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_TPRATE-Accum-12h_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_TPRATE-Accum-24h_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_TPRATE-Accum-6h_SFC_0_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_VWSH_ISBL_850-250_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_VWSH_ISBL_925-700_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_WCF_TGL_2m_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_WCF-Min-24h_TGL_2m_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_WIND_ISBL_0250_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_WIND_ISBL_0850_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_WIND_TGL_10m_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_WIND-Max-12h_TGL_10m_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_WIND-Max-3h_TGL_10m_latlon0p5x0p5_2026081400_P024_all-products.grib2
+CMC_geps-prob_WIND-Max-6h_TGL_10m_latlon0p5x0p5_2026081400_P024_all-products.grib2

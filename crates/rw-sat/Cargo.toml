@@ -9,6 +9,7 @@ description = "Continuous GOES ABI ingest: live S3 follow -> NetCDF decode -> rw
 
 [dependencies]
 base64 = "0.22"
+blake3 = "1.8.6"
 bzip2 = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap.workspace = true
@@ -34,3 +35,6 @@ rw-store = { path = "../rw-store" }
 [[bin]]
 name = "rw_sat"
 path = "src/bin/rw_sat.rs"
+
+[dev-dependencies]
+tempfile = "3"

@@ -66,9 +66,10 @@ keep_latest_per_model = 3
 # disk_budget_bytes = <set only from the completed capacity audit>
 # max_concurrent_jobs = <set only from the completed capacity audit>
 
-# Optional canonical per-model overrides:
+# Optional canonical per-model overrides ("view_profiles" = view's complete
+# 2D pack plus the 5 isobaric sounding volumes, heavy still off):
 # [model_profiles]
-# hrrr = "view"
+# hrrr = "view_profiles"
 # rtma = "analysis"
 # nbm = "surface"
 #

@@ -27,7 +27,7 @@ pub struct DownloadSpec {
     pub cycle: u8,
     /// Forecast hours in the `parse_hours` grammar: "7", "0-6", "0,3,6".
     pub hours: String,
-    /// Profile preset name: full | sounding | view | surface | analysis.
+    /// Profile preset name: full | sounding | view | view_profiles | surface | analysis.
     pub profile: String,
     /// Isobaric level step (25 or 50 hPa).
     pub level_step_hpa: u16,
@@ -224,6 +224,9 @@ pub struct DownloadPanel {
     cycle_options: Vec<u8>,
     source_options: Vec<String>,
     hours_hint: String,
+    /// Whether the Run row exposes the network-backed `Latest` action.
+    /// Hosts that require explicit date/cycle selection can hide it.
+    latest_action_visible: bool,
     estimate: Option<EstimateView>,
     /// Host-surfaced spec problem (e.g. profile validation, bad hours).
     /// Start stays disabled while set.
@@ -253,6 +256,7 @@ impl DownloadPanel {
             cycle_options: (0..24).collect(),
             source_options: vec!["auto".to_string()],
             hours_hint: String::new(),
+            latest_action_visible: true,
             estimate: None,
             spec_error: None,
             availability: None,
@@ -294,6 +298,15 @@ impl DownloadPanel {
     /// E.g. "supported: 0-48 (00z cycle)".
     pub fn set_hours_hint(&mut self, hint: String) {
         self.hours_hint = hint;
+    }
+
+    /// Show or hide the Run row's network-backed `Latest` action.
+    ///
+    /// The action is visible by default so existing hosts retain their current
+    /// behavior. Explicit-run workflows can disable it without replacing the
+    /// rest of the download panel.
+    pub fn set_latest_action_visible(&mut self, visible: bool) {
+        self.latest_action_visible = visible;
     }
 
     pub fn set_estimate(&mut self, estimate: EstimateView) {
@@ -441,7 +454,10 @@ impl DownloadPanel {
         let running = self.is_running();
         let before = self.spec.clone();
 
-        ui.add_enabled_ui(!running, |ui| {
+        // A provider probe owns the exact visible spec until it resolves.
+        // Disabling the pickers prevents duplicate Latest/availability tasks
+        // and prevents a Download from racing a late lookup result.
+        ui.add_enabled_ui(!running && !self.probing, |ui| {
             self.pickers_ui(ui, &mut events);
         });
 
@@ -516,14 +532,12 @@ impl DownloadPanel {
                         ui.selectable_value(&mut self.spec.cycle, cycle, format!("{cycle:02}z"));
                     }
                 });
-            if ui
-                .button("Latest")
-                .on_hover_text("probe for the newest available run and snap to it")
-                .clicked()
-            {
-                self.set_probing();
-                events.push(DownloadEvent::LatestRequested(self.spec.clone()));
-            }
+            let latest_clicked = self.latest_action_visible
+                && ui
+                    .button("Latest")
+                    .on_hover_text("probe for the newest available run and snap to it")
+                    .clicked();
+            self.push_latest_request_if_allowed(latest_clicked, events);
         });
 
         // --- hours + availability ---
@@ -567,7 +581,14 @@ impl DownloadPanel {
                 .selected_text(&self.spec.profile)
                 .width(100.0)
                 .show_ui(ui, |ui| {
-                    for preset in ["full", "sounding", "view", "surface", "analysis"] {
+                    for preset in [
+                        "full",
+                        "sounding",
+                        "view",
+                        "view_profiles",
+                        "surface",
+                        "analysis",
+                    ] {
                         ui.selectable_value(&mut self.spec.profile, preset.to_string(), preset);
                     }
                 });
@@ -627,6 +648,14 @@ impl DownloadPanel {
                     "raw GRIB byte cache; a warm cache makes the fetch stage a disk read",
                 );
         });
+    }
+
+    fn push_latest_request_if_allowed(&mut self, clicked: bool, events: &mut Vec<DownloadEvent>) {
+        if !self.latest_action_visible || !clicked || self.probing {
+            return;
+        }
+        self.set_probing();
+        events.push(DownloadEvent::LatestRequested(self.spec.clone()));
     }
 
     fn estimate_ui(&mut self, ui: &mut Ui) {
@@ -704,7 +733,8 @@ impl DownloadPanel {
                     );
                 }
                 state => {
-                    let can_start = self.spec_error.is_none() && self.estimate.is_some();
+                    let can_start =
+                        !self.probing && self.spec_error.is_none() && self.estimate.is_some();
                     if ui
                         .add_enabled(can_start, egui::Button::new("⬇ Download"))
                         .clicked()
@@ -789,7 +819,7 @@ fn apply_profile_preset_defaults(spec: &mut DownloadSpec) {
     spec.derived = !matches!(spec.profile.as_str(), "sounding" | "surface" | "analysis");
     if matches!(
         spec.profile.as_str(),
-        "sounding" | "view" | "surface" | "analysis"
+        "sounding" | "view" | "view_profiles" | "surface" | "analysis"
     ) {
         spec.heavy = false;
     }
@@ -1137,5 +1167,24 @@ mod tests {
         assert!(view.matches(&spec));
         spec.cycle = 6;
         assert!(!view.matches(&spec));
+    }
+
+    #[test]
+    fn latest_action_defaults_visible_and_can_be_disabled_without_emitting_an_event() {
+        let mut default_panel = panel();
+        let expected = default_panel.spec().clone();
+        let mut events = Vec::new();
+        default_panel.push_latest_request_if_allowed(true, &mut events);
+        assert_eq!(events, vec![DownloadEvent::LatestRequested(expected)]);
+        assert!(default_panel.probing);
+        default_panel.push_latest_request_if_allowed(true, &mut events);
+        assert_eq!(events.len(), 1, "a probe already in flight owns the spec");
+
+        let mut explicit_run_panel = panel();
+        explicit_run_panel.set_latest_action_visible(false);
+        let mut events = Vec::new();
+        explicit_run_panel.push_latest_request_if_allowed(true, &mut events);
+        assert!(events.is_empty());
+        assert!(!explicit_run_panel.probing);
     }
 }

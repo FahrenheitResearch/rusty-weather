@@ -1784,7 +1784,7 @@ impl App {
                 spec.derived = false;
                 spec.heavy = false;
             }
-            "view" => {
+            "view" | "view_profiles" => {
                 spec.derived = true;
                 spec.heavy = false;
             }
@@ -3110,6 +3110,13 @@ impl App {
                 SatResponse::DownloadStarted { id, label, bytes } => {
                     self.sat_panel.apply_download_started(id, label, bytes);
                 }
+                SatResponse::DownloadProgress {
+                    id,
+                    received_bytes,
+                    total_bytes,
+                } => self
+                    .sat_panel
+                    .apply_download_progress(&id, received_bytes, total_bytes),
                 SatResponse::DownloadDone { id, ms, cache_hit } => {
                     self.worker.stats().record("sat.download", ms as f32);
                     self.sat_panel.apply_download_done(&id, ms, cache_hit);
@@ -4431,7 +4438,8 @@ mod tests {
     fn default_hour_range_normalizes_to_model_cadence() {
         assert_eq!(
             normalize_hour_spec_for_model(rustwx_core::ModelId::Aigefs, 0, "0-6"),
-            Some("0,6".to_string())
+            Some("6".to_string()),
+            "AI-GEFS mean products start at f006"
         );
         assert_eq!(
             normalize_hour_spec_for_model(rustwx_core::ModelId::Gefs, 0, "0-6"),

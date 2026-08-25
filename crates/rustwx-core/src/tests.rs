@@ -7,7 +7,7 @@ fn grid_shape_len_matches() {
 }
 
 #[test]
-fn grid_shape_rejects_overflow_ceiling_and_invalid_deserialization() {
+fn grid_shape_rejects_overflow_and_structural_limit_but_accepts_large_grids() {
     let unchecked_overflow = GridShape {
         nx: usize::MAX,
         ny: 2,
@@ -34,8 +34,12 @@ fn grid_shape_rejects_overflow_ceiling_and_invalid_deserialization() {
         }) if cells == MAX_GRID_CELLS + 1
     ));
 
-    let largest_square = GridShape::new(5_000, 5_000).expect("ceiling is accepted");
-    assert_eq!(largest_square.len(), MAX_GRID_CELLS);
+    let above_old_ceiling =
+        GridShape::new(25_000_001, 1).expect("large grids have no operational ceiling");
+    assert_eq!(above_old_ceiling.len(), 25_000_001);
+    let structural_maximum =
+        GridShape::new(MAX_GRID_CELLS, 1).expect("structural maximum is accepted");
+    assert_eq!(structural_maximum.len(), MAX_GRID_CELLS);
 
     #[derive(serde::Serialize)]
     struct UncheckedShape {
@@ -65,8 +69,13 @@ fn grid_shape_rejects_overflow_ceiling_and_invalid_deserialization() {
 }
 
 #[test]
-fn dense_volume_products_are_checked_and_bounded() {
+fn dense_volume_products_are_checked_by_addressability_not_the_old_policy() {
     assert_eq!(checked_volume_elements(37, 1_000).unwrap(), 37_000);
+    let above_old_ceiling = 128 * 1024 * 1024 + 1;
+    assert_eq!(
+        checked_volume_elements(1, above_old_ceiling).unwrap(),
+        above_old_ceiling
+    );
     let max_37_level_cells = MAX_VOLUME_ELEMENTS / 37;
     assert_eq!(
         checked_volume_elements(37, max_37_level_cells).unwrap(),
@@ -107,6 +116,16 @@ fn model_id_aliases_round_trip() {
     assert_eq!("ecmwf".parse::<ModelId>().unwrap(), ModelId::EcmwfOpenData);
     assert_eq!("euro".parse::<ModelId>().unwrap(), ModelId::EcmwfOpenData);
     assert_eq!("aifs-v2".parse::<ModelId>().unwrap(), ModelId::Aifs);
+    assert_eq!("dwd_icon_eu".parse::<ModelId>().unwrap(), ModelId::IconEu);
+    assert_eq!("icond2".parse::<ModelId>().unwrap(), ModelId::IconD2);
+    assert_eq!(
+        "cptec-wrf".parse::<ModelId>().unwrap(),
+        ModelId::WrfCptec7km
+    );
+    assert_eq!(
+        "cptec-brams".parse::<ModelId>().unwrap(),
+        ModelId::BramsCptec8km
+    );
     assert_eq!("wrf".parse::<ModelId>().unwrap(), ModelId::WrfGdex);
     assert_eq!(ModelId::Hrrr.to_string(), "hrrr");
     assert_eq!(ModelId::Hgefs.to_string(), "hgefs");
@@ -114,9 +133,17 @@ fn model_id_aliases_round_trip() {
     assert_eq!(ModelId::RrfsPublic.to_string(), "rrfs-public");
     assert_eq!(ModelId::Refs.to_string(), "refs");
     assert_eq!(ModelId::WrfGdex.to_string(), "wrf");
+    assert_eq!(ModelId::IconEu.to_string(), "icon-eu");
+    assert_eq!(ModelId::IconD2.to_string(), "icon-d2");
+    assert_eq!(ModelId::WrfCptec7km.to_string(), "wrf-cptec-7km");
+    assert_eq!(ModelId::BramsCptec8km.to_string(), "brams-cptec-8km");
     assert_eq!("wrf-gdex".parse::<ModelId>().unwrap(), ModelId::WrfGdex);
     assert_eq!("gdex".parse::<SourceId>().unwrap(), SourceId::Gdex);
     assert_eq!(SourceId::Gdex.to_string(), "gdex");
+    assert_eq!("dwd-open-data".parse::<SourceId>().unwrap(), SourceId::Dwd);
+    assert_eq!(SourceId::Dwd.to_string(), "dwd");
+    assert_eq!("cptec-inpe".parse::<SourceId>().unwrap(), SourceId::Cptec);
+    assert_eq!(SourceId::Cptec.to_string(), "cptec");
     assert_eq!(
         "aifsv2-inference".parse::<SourceId>().unwrap(),
         SourceId::AifsInference

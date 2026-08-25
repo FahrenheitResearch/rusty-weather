@@ -8,12 +8,19 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use rustwx_core::ModelId;
-use rw_ingest::{IngestSupportStatus, model_ingest_capability};
+use rw_ingest::{IngestSupportStatus, indexed_subset_available, model_ingest_capability};
+use rw_ops_protocol::StormModelManifest;
 use rw_query::{QueryLimits, StoreCatalog};
 use rw_server::config::LogFormat;
 use rw_server::generation_replication::ServerGenerationReplication;
+use rw_server::mrms_ingest::MrmsIngestSupervisor;
+use rw_server::nexrad_level2_ingest::NexradLevel2IngestSupervisor;
 use rw_server::origin_catalog::PublishedStoreCatalog;
+use rw_server::satellite_ingest::SatelliteIngestSupervisor;
+use rw_server::satellite_prewarm::SatellitePrewarmSupervisor;
+use rw_server::storm_prewarm::StormPrewarmSupervisor;
 use rw_server::{AppConfig, AppState, TokenSet, build_router};
+use rw_storm_ml::{ModelKey, ModelLimits, ModelRegistry, ModelUsePolicy};
 use serde::Serialize;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -49,12 +56,83 @@ enum Command {
     Openapi,
     /// Print built-in and stored model capabilities as JSON.
     Models,
+    /// Install and atomically select private storm-segmentation model versions.
+    StormModels {
+        #[command(subcommand)]
+        command: StormModelCommand,
+    },
     /// Probe the configured readiness endpoint without requiring authentication.
     Healthcheck {
         /// Connection timeout in seconds.
         #[arg(long, default_value_t = 5)]
         timeout_seconds: u64,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum StormModelCommand {
+    /// List installed versions, enablement, active selection, and rights metadata.
+    List,
+    /// Install one immutable version from local manifest, policy, and artifact files.
+    Install {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        artifact: PathBuf,
+    },
+    /// Verify every installed artifact, or one exact model version, against its digest.
+    Verify {
+        #[arg(long, requires = "model_version")]
+        model_id: Option<String>,
+        #[arg(long, requires = "model_id")]
+        model_version: Option<String>,
+    },
+    /// Permit an installed version to execute. This does not make it active.
+    Enable {
+        #[arg(long)]
+        model_id: String,
+        #[arg(long)]
+        model_version: String,
+    },
+    /// Prevent an installed version from executing; an active version is deselected.
+    Disable {
+        #[arg(long)]
+        model_id: String,
+        #[arg(long)]
+        model_version: String,
+    },
+    /// Atomically make an enabled version active for its model ID.
+    Activate {
+        #[arg(long)]
+        model_id: String,
+        #[arg(long)]
+        model_version: String,
+    },
+    /// Atomically return a model ID to its most recently active enabled version.
+    Rollback {
+        #[arg(long)]
+        model_id: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct StormModelRecord<'a> {
+    model_id: &'a str,
+    model_version: &'a str,
+    enabled: bool,
+    active: bool,
+    backend: rw_ops_protocol::StormModelBackend,
+    artifact_sha256: &'a str,
+    display_name: &'a str,
+    producer: &'a str,
+    license: Option<&'a str>,
+    training_provenance: Option<&'a str>,
+    artifact_distribution: rw_storm_ml::DistributionGrant,
+    derived_output_distribution: rw_storm_ml::DistributionGrant,
+    required_attribution: &'a str,
+    rights_reference: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,28 +175,253 @@ async fn run() -> Result<(), AnyError> {
             Ok(())
         }
         Command::Models => print_models(cli.config.as_deref()),
+        Command::StormModels { command } => manage_storm_models(cli.config.as_deref(), command),
         Command::Healthcheck { timeout_seconds } => {
             healthcheck(cli.config.as_deref(), Duration::from_secs(timeout_seconds))
         }
     }
 }
 
+fn manage_storm_models(
+    config_path: Option<&Path>,
+    command: StormModelCommand,
+) -> Result<(), AnyError> {
+    let config = AppConfig::load(config_path)?;
+    if !config.operations.enabled {
+        return Err(std::io::Error::other(
+            "storm-model administration requires operations.enabled=true so the registry root is explicit",
+        )
+        .into());
+    }
+    let root = std::path::absolute(&config.operations.root)?.join("storm-models");
+    let limits = ModelLimits::default();
+    let mut registry = ModelRegistry::open(&root, limits)?;
+
+    let output = match command {
+        StormModelCommand::List => serde_json::json!({
+            "schema": "rw.server.storm-model-admin.v1",
+            "action": "list",
+            "registry_root": root,
+            "models": storm_model_records(&registry),
+        }),
+        StormModelCommand::Install {
+            manifest,
+            policy,
+            artifact,
+        } => {
+            let manifest: StormModelManifest =
+                read_bounded_json(&manifest, limits.max_manifest_bytes, "model manifest")?;
+            let policy: ModelUsePolicy =
+                read_bounded_json(&policy, limits.max_manifest_bytes, "model policy")?;
+            let artifact_file = fs::File::open(&artifact)?;
+            let installed = registry.install(manifest, policy, artifact_file)?;
+            serde_json::json!({
+                "schema": "rw.server.storm-model-admin.v1",
+                "action": "install",
+                "model_id": installed.key.model_id,
+                "model_version": installed.key.model_version,
+                "artifact_sha256": installed.manifest.artifact_sha256,
+                "enabled": false,
+                "active": false,
+                "restart_required_for_running_server": true,
+            })
+        }
+        StormModelCommand::Verify {
+            model_id,
+            model_version,
+        } => {
+            let keys = if let (Some(model_id), Some(model_version)) = (model_id, model_version) {
+                vec![ModelKey::new(model_id, model_version)?]
+            } else {
+                registry
+                    .installed()
+                    .map(|model| model.key.clone())
+                    .collect()
+            };
+            for key in &keys {
+                registry.get(key)?.open_verified_artifact(limits)?;
+            }
+            serde_json::json!({
+                "schema": "rw.server.storm-model-admin.v1",
+                "action": "verify",
+                "verified": keys,
+            })
+        }
+        StormModelCommand::Enable {
+            model_id,
+            model_version,
+        } => {
+            let key = ModelKey::new(model_id, model_version)?;
+            registry.enable(&key)?;
+            storm_model_action("enable", &key)
+        }
+        StormModelCommand::Disable {
+            model_id,
+            model_version,
+        } => {
+            let key = ModelKey::new(model_id, model_version)?;
+            registry.disable(&key)?;
+            storm_model_action("disable", &key)
+        }
+        StormModelCommand::Activate {
+            model_id,
+            model_version,
+        } => {
+            let key = ModelKey::new(model_id, model_version)?;
+            registry.activate(&key)?;
+            storm_model_action("activate", &key)
+        }
+        StormModelCommand::Rollback { model_id } => {
+            let selected = registry.rollback(&model_id)?;
+            storm_model_action("rollback", &selected.key)
+        }
+    };
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+fn storm_model_action(action: &'static str, key: &ModelKey) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "rw.server.storm-model-admin.v1",
+        "action": action,
+        "model_id": key.model_id,
+        "model_version": key.model_version,
+        "restart_required_for_running_server": true,
+    })
+}
+
+fn storm_model_records(registry: &ModelRegistry) -> Vec<StormModelRecord<'_>> {
+    registry
+        .installed()
+        .map(|model| StormModelRecord {
+            model_id: &model.key.model_id,
+            model_version: &model.key.model_version,
+            enabled: registry.is_enabled(&model.key),
+            active: registry
+                .active(&model.key.model_id)
+                .is_ok_and(|active| active.key == model.key),
+            backend: model.manifest.backend,
+            artifact_sha256: &model.manifest.artifact_sha256,
+            display_name: &model.manifest.display_name,
+            producer: &model.manifest.producer,
+            license: model.manifest.license.as_deref(),
+            training_provenance: model.manifest.training_provenance.as_deref(),
+            artifact_distribution: model.policy.artifact_distribution,
+            derived_output_distribution: model.policy.derived_output_distribution,
+            required_attribution: &model.policy.required_attribution,
+            rights_reference: &model.policy.rights_reference,
+        })
+        .collect()
+}
+
+fn read_bounded_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    maximum_bytes: u64,
+    resource: &'static str,
+) -> Result<T, AnyError> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(format!(
+            "{resource} is not a regular file: {}",
+            path.display()
+        ))
+        .into());
+    }
+    if metadata.len() > maximum_bytes {
+        return Err(std::io::Error::other(format!(
+            "{resource} is {} bytes; configured maximum is {maximum_bytes}",
+            metadata.len()
+        ))
+        .into());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    fs::File::open(path)?
+        .take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > maximum_bytes {
+        return Err(std::io::Error::other(format!(
+            "{resource} grew beyond configured maximum {maximum_bytes} while being read"
+        ))
+        .into());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 async fn serve(config_path: Option<&Path>) -> Result<(), AnyError> {
     let config = AppConfig::load(config_path)?;
     let tokens = TokenSet::load(&config.auth)?;
     config.validate(!tokens.is_empty())?;
+    if config.operations.enabled {
+        tokens.operations_credential_count(&config.auth)?;
+    }
     initialize_tracing(&config)?;
 
     fs::create_dir_all(&config.server.store_root)?;
     fs::create_dir_all(&config.server.artifact_root)?;
+    fs::create_dir_all(&config.server.cache_root)?;
     ensure_real_directory(&config.server.store_root, "store_root")?;
     ensure_real_directory(&config.server.artifact_root, "artifact_root")?;
+    ensure_real_directory(&config.server.cache_root, "cache_root")?;
     ensure_distinct_roots(&config.server.store_root, &config.server.artifact_root)?;
+    ensure_distinct_roots(&config.server.store_root, &config.server.cache_root)?;
+    ensure_distinct_roots(&config.server.artifact_root, &config.server.cache_root)?;
+    if config.mrms_ingest.enabled {
+        probe_writable_directory(&config.server.store_root)?;
+    }
+    if config.nexrad_level2_ingest.enabled {
+        probe_writable_directory(&config.server.store_root)?;
+        fs::create_dir_all(&config.nexrad_level2_ingest.state_root)?;
+        ensure_real_directory(
+            &config.nexrad_level2_ingest.state_root,
+            "nexrad_level2_ingest.state_root",
+        )?;
+        for root in [
+            &config.server.store_root,
+            &config.server.artifact_root,
+            &config.server.cache_root,
+        ] {
+            ensure_distinct_roots(root, &config.nexrad_level2_ingest.state_root)?;
+        }
+    }
+    if config.satellite_ingest.enabled {
+        fs::create_dir_all(&config.satellite_ingest.raw_cache_root)?;
+        ensure_real_directory(
+            &config.satellite_ingest.raw_cache_root,
+            "satellite_ingest.raw_cache_root",
+        )?;
+        for root in [
+            &config.server.store_root,
+            &config.server.artifact_root,
+            &config.server.cache_root,
+        ] {
+            ensure_distinct_roots(root, &config.satellite_ingest.raw_cache_root)?;
+        }
+        if config.nexrad_level2_ingest.enabled {
+            ensure_distinct_roots(
+                &config.nexrad_level2_ingest.state_root,
+                &config.satellite_ingest.raw_cache_root,
+            )?;
+        }
+    }
     if config.community.enabled {
         fs::create_dir_all(&config.community.root)?;
         ensure_real_directory(&config.community.root, "community.root")?;
         ensure_distinct_roots(&config.server.store_root, &config.community.root)?;
         ensure_distinct_roots(&config.server.artifact_root, &config.community.root)?;
+        ensure_distinct_roots(&config.server.cache_root, &config.community.root)?;
+        if config.satellite_ingest.enabled {
+            ensure_distinct_roots(
+                &config.satellite_ingest.raw_cache_root,
+                &config.community.root,
+            )?;
+        }
+        if config.nexrad_level2_ingest.enabled {
+            ensure_distinct_roots(
+                &config.nexrad_level2_ingest.state_root,
+                &config.community.root,
+            )?;
+        }
     }
     if config.generation_replication.enabled {
         fs::create_dir_all(&config.generation_replication.control_root)?;
@@ -126,13 +429,57 @@ async fn serve(config_path: Option<&Path>) -> Result<(), AnyError> {
             &config.generation_replication.control_root,
             "generation_replication.control_root",
         )?;
-        for root in [&config.server.store_root, &config.server.artifact_root] {
+        for root in [
+            &config.server.store_root,
+            &config.server.artifact_root,
+            &config.server.cache_root,
+        ] {
             ensure_distinct_roots(root, &config.generation_replication.control_root)?;
         }
         if config.community.enabled {
             ensure_distinct_roots(
                 &config.community.root,
                 &config.generation_replication.control_root,
+            )?;
+        }
+        if config.satellite_ingest.enabled {
+            ensure_distinct_roots(
+                &config.satellite_ingest.raw_cache_root,
+                &config.generation_replication.control_root,
+            )?;
+        }
+        if config.nexrad_level2_ingest.enabled {
+            ensure_distinct_roots(
+                &config.nexrad_level2_ingest.state_root,
+                &config.generation_replication.control_root,
+            )?;
+        }
+    }
+    if config.operations.enabled {
+        fs::create_dir_all(&config.operations.root)?;
+        ensure_real_directory(&config.operations.root, "operations.root")?;
+        ensure_distinct_roots(&config.server.store_root, &config.operations.root)?;
+        ensure_distinct_roots(&config.server.artifact_root, &config.operations.root)?;
+        ensure_distinct_roots(&config.server.cache_root, &config.operations.root)?;
+        if config.satellite_ingest.enabled {
+            ensure_distinct_roots(
+                &config.satellite_ingest.raw_cache_root,
+                &config.operations.root,
+            )?;
+        }
+        if config.community.enabled {
+            ensure_distinct_roots(&config.community.root, &config.operations.root)?;
+        }
+        if config.generation_replication.enabled {
+            ensure_distinct_roots(
+                &config.generation_replication.control_root,
+                &config.operations.root,
+            )?;
+        }
+        if config.nexrad_level2_ingest.enabled {
+            ensure_distinct_roots(
+                &config.nexrad_level2_ingest.state_root,
+                &config.operations.root,
             )?;
         }
     }
@@ -144,14 +491,66 @@ async fn serve(config_path: Option<&Path>) -> Result<(), AnyError> {
         );
     }
     let listen = config.server.listen;
+    let satellite_ingest_config = config.satellite_ingest.clone();
+    let satellite_prewarm_config = config.satellite_prewarm.clone();
+    let mrms_ingest_config = config.mrms_ingest.clone();
+    let nexrad_level2_ingest_config = config.nexrad_level2_ingest.clone();
+    let storm_prewarm_config = config.storm_prewarm.clone();
+    let store_root = config.server.store_root.clone();
     let state = AppState::new(config, tokens)?;
-    let federation_health_monitor = state.federation.start_health_monitor(state.metrics.clone());
-    let router = build_router(state)?;
+    let router = build_router(state.clone())?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
+    let mut satellite_ingest =
+        SatelliteIngestSupervisor::start(&satellite_ingest_config, &store_root)?;
+    let mut satellite_prewarm = SatellitePrewarmSupervisor::start(
+        satellite_prewarm_config,
+        state.clone(),
+        satellite_ingest.update_signal(),
+    );
+    let federation_health_monitor = state.federation.start_health_monitor(state.metrics.clone());
+    if satellite_ingest.worker_count() > 0 {
+        info!(
+            followers = satellite_ingest.worker_count(),
+            "server-owned satellite ingest enabled"
+        );
+    }
+    let mut mrms_ingest = MrmsIngestSupervisor::start(
+        &mrms_ingest_config,
+        &store_root,
+        state.mrms_ingest_monitor(),
+    );
+    let mut nexrad_level2_ingest = NexradLevel2IngestSupervisor::start(
+        &nexrad_level2_ingest_config,
+        &store_root,
+        state.nexrad_level2_ingest_monitor(),
+    )
+    .map_err(std::io::Error::other)?;
+    let mut storm_prewarm = StormPrewarmSupervisor::start(
+        storm_prewarm_config,
+        state.clone(),
+        state.mrms_ingest_monitor().committed_receiver(),
+    );
+    if mrms_ingest.worker_count() > 0 {
+        info!(
+            products = mrms_ingest.worker_count(),
+            "server-owned MRMS ingest enabled"
+        );
+    }
+    if nexrad_level2_ingest.worker_count() > 0 {
+        info!(
+            sites = nexrad_level2_ingest.worker_count(),
+            "server-owned NEXRAD Level II ingest enabled"
+        );
+    }
     info!(address = %listener.local_addr()?, "Rusty Weather service listening");
     let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await;
+    satellite_prewarm.shutdown().await;
+    satellite_ingest.shutdown().await;
+    mrms_ingest.shutdown().await;
+    nexrad_level2_ingest.shutdown().await;
+    storm_prewarm.shutdown().await;
     if let Some(task) = federation_health_monitor {
         task.abort();
         let _ = task.await;
@@ -192,6 +591,15 @@ fn doctor(config_path: Option<&Path>) -> Result<(), AnyError> {
         Ok(()) => checks.push(ok("safety_policy", "bind and resource limits are valid")),
         Err(error) => checks.push(fail("safety_policy", error.to_string())),
     }
+    if config.operations.enabled {
+        match tokens.operations_credential_count(&config.auth) {
+            Ok(count) => checks.push(ok(
+                "operations_authentication",
+                format!("{count} disjoint operations credential(s) loaded"),
+            )),
+            Err(error) => checks.push(fail("operations_authentication", error.to_string())),
+        }
+    }
     if config.federation.proxy.enabled
         || config.federation.proxy.accept_local_resolve
         || config.federation.health_monitor_enabled
@@ -209,12 +617,112 @@ fn doctor(config_path: Option<&Path>) -> Result<(), AnyError> {
         "artifact_root",
         &config.server.artifact_root,
     ));
-    match ensure_distinct_roots(&config.server.store_root, &config.server.artifact_root) {
+    checks.push(check_directory("cache_root", &config.server.cache_root));
+    match ensure_all_distinct_roots([
+        config.server.store_root.as_path(),
+        config.server.artifact_root.as_path(),
+        config.server.cache_root.as_path(),
+    ]) {
         Ok(()) => checks.push(ok(
             "root_isolation",
-            "store and artifact roots are distinct",
+            "store, artifact, and cache roots are distinct",
         )),
         Err(error) => checks.push(fail("root_isolation", error.to_string())),
+    }
+    if config.satellite_ingest.enabled {
+        checks.push(check_directory(
+            "satellite_ingest.raw_cache_root",
+            &config.satellite_ingest.raw_cache_root,
+        ));
+        for (name, root) in [
+            ("satellite_store_isolation", &config.server.store_root),
+            ("satellite_artifact_isolation", &config.server.artifact_root),
+            ("satellite_cache_isolation", &config.server.cache_root),
+        ] {
+            match ensure_distinct_roots(root, &config.satellite_ingest.raw_cache_root) {
+                Ok(()) => checks.push(ok(name, "satellite raw staging root is isolated")),
+                Err(error) => checks.push(fail(name, error.to_string())),
+            }
+        }
+        checks.push(ok(
+            "satellite_ingest",
+            format!(
+                "{} server-owned follower(s) configured; NOAA public S3 requires no credentials",
+                config.satellite_ingest.followers.len()
+            ),
+        ));
+    }
+    if config.mrms_ingest.enabled {
+        checks.push(match probe_writable_directory(&config.server.store_root) {
+            Ok(()) => ok(
+                "mrms_ingest",
+                format!(
+                    "{} authenticated bounded product follower(s) configured; store is writable",
+                    config.mrms_ingest.products.len()
+                ),
+            ),
+            Err(error) => fail("mrms_ingest", error.to_string()),
+        });
+    }
+    if config.nexrad_level2_ingest.enabled {
+        checks.push(check_directory(
+            "nexrad_level2_ingest.state_root",
+            &config.nexrad_level2_ingest.state_root,
+        ));
+        checks.push(match probe_writable_directory(&config.server.store_root) {
+            Ok(()) => ok(
+                "nexrad_level2_ingest",
+                format!(
+                    "{} explicit site follower(s), {} provider adapter(s); exact-time store is writable",
+                    config.nexrad_level2_ingest.sites.len(),
+                    config.nexrad_level2_ingest.providers.len()
+                ),
+            ),
+            Err(error) => fail("nexrad_level2_ingest", error.to_string()),
+        });
+        for (name, root) in [
+            ("nexrad_state_store_isolation", &config.server.store_root),
+            (
+                "nexrad_state_artifact_isolation",
+                &config.server.artifact_root,
+            ),
+            ("nexrad_state_cache_isolation", &config.server.cache_root),
+        ] {
+            match ensure_distinct_roots(root, &config.nexrad_level2_ingest.state_root) {
+                Ok(()) => checks.push(ok(name, "NEXRAD cursor state root is isolated")),
+                Err(error) => checks.push(fail(name, error.to_string())),
+            }
+        }
+    }
+    if config.operations.enabled {
+        checks.push(check_directory("operations.root", &config.operations.root));
+        for (name, root) in [
+            ("operations_store_isolation", &config.server.store_root),
+            (
+                "operations_artifact_isolation",
+                &config.server.artifact_root,
+            ),
+            ("operations_cache_isolation", &config.server.cache_root),
+        ] {
+            match ensure_distinct_roots(root, &config.operations.root) {
+                Ok(()) => checks.push(ok(name, "operations root is isolated and writable")),
+                Err(error) => checks.push(fail(name, error.to_string())),
+            }
+        }
+        if config.nexrad_level2_ingest.enabled {
+            match ensure_distinct_roots(
+                &config.nexrad_level2_ingest.state_root,
+                &config.operations.root,
+            ) {
+                Ok(()) => checks.push(ok(
+                    "nexrad_state_operations_isolation",
+                    "NEXRAD cursor state root is isolated",
+                )),
+                Err(error) => {
+                    checks.push(fail("nexrad_state_operations_isolation", error.to_string()))
+                }
+            }
+        }
     }
     if config.community.enabled {
         checks.push(check_directory("community.root", &config.community.root));
@@ -229,10 +737,41 @@ fn doctor(config_path: Option<&Path>) -> Result<(), AnyError> {
                 config.server.artifact_root.as_path(),
                 config.community.root.as_path(),
             ),
+            (
+                "community_cache_isolation",
+                config.server.cache_root.as_path(),
+                config.community.root.as_path(),
+            ),
         ] {
             match ensure_distinct_roots(first, second) {
                 Ok(()) => checks.push(ok(name, "Community Cache root is isolated")),
                 Err(error) => checks.push(fail(name, error.to_string())),
+            }
+        }
+        if config.satellite_ingest.enabled {
+            match ensure_distinct_roots(
+                &config.satellite_ingest.raw_cache_root,
+                &config.community.root,
+            ) {
+                Ok(()) => checks.push(ok(
+                    "satellite_community_isolation",
+                    "satellite raw staging root is isolated",
+                )),
+                Err(error) => checks.push(fail("satellite_community_isolation", error.to_string())),
+            }
+        }
+        if config.nexrad_level2_ingest.enabled {
+            match ensure_distinct_roots(
+                &config.nexrad_level2_ingest.state_root,
+                &config.community.root,
+            ) {
+                Ok(()) => checks.push(ok(
+                    "nexrad_state_community_isolation",
+                    "NEXRAD cursor state root is isolated",
+                )),
+                Err(error) => {
+                    checks.push(fail("nexrad_state_community_isolation", error.to_string()))
+                }
             }
         }
         match rw_server::community::CommunityService::open(&config.community) {
@@ -274,10 +813,26 @@ fn doctor(config_path: Option<&Path>) -> Result<(), AnyError> {
                 "replication_artifact_isolation",
                 &config.server.artifact_root,
             ),
+            ("replication_cache_isolation", &config.server.cache_root),
         ] {
             match ensure_distinct_roots(root, &config.generation_replication.control_root) {
                 Ok(()) => checks.push(ok(name, "replication control root is isolated")),
                 Err(error) => checks.push(fail(name, error.to_string())),
+            }
+        }
+        if config.nexrad_level2_ingest.enabled {
+            match ensure_distinct_roots(
+                &config.nexrad_level2_ingest.state_root,
+                &config.generation_replication.control_root,
+            ) {
+                Ok(()) => checks.push(ok(
+                    "nexrad_state_replication_isolation",
+                    "NEXRAD cursor state root is isolated",
+                )),
+                Err(error) => checks.push(fail(
+                    "nexrad_state_replication_isolation",
+                    error.to_string(),
+                )),
             }
         }
         if config.community.enabled {
@@ -291,6 +846,20 @@ fn doctor(config_path: Option<&Path>) -> Result<(), AnyError> {
                 )),
                 Err(error) => {
                     checks.push(fail("replication_community_isolation", error.to_string()))
+                }
+            }
+        }
+        if config.satellite_ingest.enabled {
+            match ensure_distinct_roots(
+                &config.satellite_ingest.raw_cache_root,
+                &config.generation_replication.control_root,
+            ) {
+                Ok(()) => checks.push(ok(
+                    "satellite_replication_isolation",
+                    "satellite raw staging root is isolated",
+                )),
+                Err(error) => {
+                    checks.push(fail("satellite_replication_isolation", error.to_string()))
                 }
             }
         }
@@ -358,7 +927,10 @@ fn doctor(config_path: Option<&Path>) -> Result<(), AnyError> {
         let catalog = StoreCatalog::with_limits(
             &config.server.store_root,
             QueryLimits {
-                max_catalog_entries: 10_000,
+                // Match the live server: the doctor must validate the entire
+                // catalog instead of declaring a large store unhealthy at an
+                // arbitrary entry count.
+                max_catalog_entries: usize::MAX,
                 max_time_points: config.limits.catalog_time_points,
                 max_selected_time_points: config.limits.temporal_frames,
                 max_variables: config.limits.variables_per_query,
@@ -467,7 +1039,7 @@ fn print_models(config_path: Option<&Path>) -> Result<(), AnyError> {
                     "name": product.product,
                     "surface_source": product.surface_source,
                     "pressure_source": product.pressure_source,
-                    "indexed_subset": !product.idx_patterns.is_empty(),
+                    "indexed_subset": indexed_subset_available(summary.id, product),
                 })).collect::<Vec<_>>(),
                 "stored_runs": stored.get(&summary.id.to_string()).copied().unwrap_or(0),
             })
@@ -557,14 +1129,23 @@ fn connectable_address(address: SocketAddr) -> SocketAddr {
     }
 }
 
-fn ensure_distinct_roots(store_root: &Path, artifact_root: &Path) -> Result<(), AnyError> {
-    let store = fs::canonicalize(store_root)?;
-    let artifact = fs::canonicalize(artifact_root)?;
-    if store == artifact || store.starts_with(&artifact) || artifact.starts_with(&store) {
+fn ensure_distinct_roots(first_root: &Path, second_root: &Path) -> Result<(), AnyError> {
+    let first = fs::canonicalize(first_root)?;
+    let second = fs::canonicalize(second_root)?;
+    if first == second || first.starts_with(&second) || second.starts_with(&first) {
         return Err(std::io::Error::other(
-            "store_root and artifact_root must be separate, non-nested directories",
+            "configured roots must be separate, non-nested directories",
         )
         .into());
+    }
+    Ok(())
+}
+
+fn ensure_all_distinct_roots<const N: usize>(roots: [&Path; N]) -> Result<(), AnyError> {
+    for first in 0..N {
+        for second in (first + 1)..N {
+            ensure_distinct_roots(roots[first], roots[second])?;
+        }
     }
     Ok(())
 }
@@ -593,6 +1174,22 @@ fn check_directory(name: &'static str, path: &Path) -> DoctorCheck {
     }
 }
 
+fn probe_writable_directory(path: &Path) -> std::io::Result<()> {
+    let probe = path.join(format!(".rw-server-write-probe-{}", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)?;
+    let result = (|| {
+        file.write_all(b"rw-server-writable-v1\n")?;
+        file.sync_all()
+    })();
+    drop(file);
+    let cleanup = fs::remove_file(&probe);
+    result?;
+    cleanup
+}
+
 fn ok(name: &'static str, detail: impl Into<String>) -> DoctorCheck {
     DoctorCheck {
         name,
@@ -606,5 +1203,154 @@ fn fail(name: &'static str, detail: impl Into<String>) -> DoctorCheck {
         name,
         ok: false,
         detail: detail.into(),
+    }
+}
+
+#[cfg(test)]
+mod storm_model_cli_tests {
+    use super::*;
+    use rw_ops_protocol::{
+        ModelInputSource, STORM_MODEL_MANIFEST_SCHEMA, StormModelBackend, StormModelInput,
+    };
+    use rw_storm_ml::DistributionGrant;
+    use sha2::{Digest, Sha256};
+
+    fn manifest(version: &str, artifact: &[u8]) -> StormModelManifest {
+        StormModelManifest {
+            schema: STORM_MODEL_MANIFEST_SCHEMA.into(),
+            model_id: "example-cell-segmentation".into(),
+            model_version: version.into(),
+            backend: StormModelBackend::SuppliedMask,
+            artifact_sha256: format!("{:x}", Sha256::digest(artifact)),
+            display_name: "Example storm segmentation".into(),
+            description: "Test-only supplied-mask model for the offline administration CLI.".into(),
+            inputs: vec![StormModelInput {
+                name: "reflectivity".into(),
+                source: ModelInputSource::MrmsProduct,
+                field: "mrms_reflectivity_lowest_altitude".into(),
+                units: "dBZ".into(),
+                minimum: Some(-20.0),
+                maximum: Some(80.0),
+                missing_value: None,
+            }],
+            output_name: "storm_probability".into(),
+            probability_threshold: 0.5,
+            minimum_area_km2: Some(1.0),
+            producer: "Fahrenheit Research test suite".into(),
+            license: Some("Private test fixture; not for redistribution".into()),
+            training_provenance: Some("Synthetic fixture; no learned weights".into()),
+        }
+    }
+
+    #[test]
+    fn clap_exposes_exact_offline_model_lifecycle() {
+        for arguments in [
+            vec!["rw-server", "storm-models", "list"],
+            vec![
+                "rw-server",
+                "storm-models",
+                "enable",
+                "--model-id",
+                "cell",
+                "--model-version",
+                "1",
+            ],
+            vec![
+                "rw-server",
+                "storm-models",
+                "rollback",
+                "--model-id",
+                "cell",
+            ],
+        ] {
+            Cli::try_parse_from(arguments).unwrap();
+        }
+    }
+
+    #[test]
+    fn offline_cli_installs_verifies_activates_and_rolls_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let operations_root = directory.path().join("operations");
+        let config_path = directory.path().join("rusty-weather.toml");
+        let mut config = AppConfig::default();
+        config.operations.enabled = true;
+        config.operations.root = operations_root.clone();
+        fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+        let policy = ModelUsePolicy {
+            artifact_distribution: DistributionGrant::NodeOnly,
+            derived_output_distribution: DistributionGrant::CompanyInternal,
+            required_attribution: "Fahrenheit Research test fixture".into(),
+            rights_reference: "example-test-rights-v1".into(),
+        };
+        let policy_path = directory.path().join("policy.json");
+        fs::write(&policy_path, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+
+        for (version, artifact) in [
+            ("1.0.0", b"fixture-v1".as_slice()),
+            ("2.0.0", b"fixture-v2"),
+        ] {
+            let manifest_path = directory.path().join(format!("manifest-{version}.json"));
+            let artifact_path = directory.path().join(format!("artifact-{version}.bin"));
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest(version, artifact)).unwrap(),
+            )
+            .unwrap();
+            fs::write(&artifact_path, artifact).unwrap();
+            manage_storm_models(
+                Some(&config_path),
+                StormModelCommand::Install {
+                    manifest: manifest_path,
+                    policy: policy_path.clone(),
+                    artifact: artifact_path,
+                },
+            )
+            .unwrap();
+            manage_storm_models(
+                Some(&config_path),
+                StormModelCommand::Enable {
+                    model_id: "example-cell-segmentation".into(),
+                    model_version: version.into(),
+                },
+            )
+            .unwrap();
+            manage_storm_models(
+                Some(&config_path),
+                StormModelCommand::Activate {
+                    model_id: "example-cell-segmentation".into(),
+                    model_version: version.into(),
+                },
+            )
+            .unwrap();
+        }
+
+        manage_storm_models(
+            Some(&config_path),
+            StormModelCommand::Verify {
+                model_id: None,
+                model_version: None,
+            },
+        )
+        .unwrap();
+        manage_storm_models(
+            Some(&config_path),
+            StormModelCommand::Rollback {
+                model_id: "example-cell-segmentation".into(),
+            },
+        )
+        .unwrap();
+
+        let registry =
+            ModelRegistry::open(operations_root.join("storm-models"), ModelLimits::default())
+                .unwrap();
+        assert_eq!(
+            registry
+                .active_for_execution("example-cell-segmentation")
+                .unwrap()
+                .key
+                .model_version,
+            "1.0.0"
+        );
     }
 }

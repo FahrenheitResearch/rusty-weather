@@ -1,0 +1,38 @@
+# Exact CPTEC/INPE inventory rows and decoded f000 ambiguity evidence.
+# Format: SOURCE|model|lead|bytes|sha256|url, ROW|model|lead|verbatim row,
+# or DECODED|model|lead|message|metadata.
+SOURCE|WRF|000|13725|a80f0526a1aa4b74a7678ba8b1a0a5c98c9f192c1f7e195acf96d0fe66ad8935|https://dataserver.cptec.inpe.br/dataserver_modelos/wrf/ams_07km/brutos/2026/08/14/00/WRF_cpt_07KM_2026081400_2026081400.inv
+SOURCE|WRF|001|16159|445a7d218a1a3772cb2dcbb69dd2d08d2f21d03d75e5a773335b35d107cced91|https://dataserver.cptec.inpe.br/dataserver_modelos/wrf/ams_07km/brutos/2026/08/14/00/WRF_cpt_07KM_2026081400_2026081401.inv
+SOURCE|WRF|002|16161|29a5f766ad108d83657f4a20a8202ee4a913cdd01da6a51f6cf92af88a4afbee|https://dataserver.cptec.inpe.br/dataserver_modelos/wrf/ams_07km/brutos/2026/08/14/00/WRF_cpt_07KM_2026081400_2026081402.inv
+SOURCE|WRF|024|16454|64fc6e029955f522ea89ed725d8c951018258ad575c686dd2f9d85a345fec143|https://dataserver.cptec.inpe.br/dataserver_modelos/wrf/ams_07km/brutos/2026/08/14/00/WRF_cpt_07KM_2026081400_2026081500.inv
+ROW|WRF|000|252:138956619:d=2026081400:TMP:2 m above ground:anl:
+ROW|WRF|000|258:142663221:d=2026081400:APCP:surface:0-0 day acc fcst:
+ROW|WRF|001|252:162423459:d=2026081400:TMP:2 m above ground:1 hour fcst:
+ROW|WRF|001|258:166623624:d=2026081400:APCP:surface:0-1 hour acc fcst:
+ROW|WRF|002|252:165397745:d=2026081400:TMP:2 m above ground:2 hour fcst:
+ROW|WRF|002|258:169689931:d=2026081400:APCP:surface:0-2 hour acc fcst:
+ROW|WRF|024|252:166551176:d=2026081400:TMP:2 m above ground:24 hour fcst:
+ROW|WRF|024|258:171097593:d=2026081400:APCP:surface:0-1 day acc fcst:
+SOURCE|BRAMS|000|11581|86f6d3048e9784fd0733b636f26a353da2383c551af6787a4f071ac8b64292b0|https://dataserver.cptec.inpe.br/dataserver_modelos/brams/ams_08km/brutos/2026/08/13/00/BRAMS_ams_08km_2026081300_2026081300.inv
+SOURCE|BRAMS|001|13743|718d6d67c1d8550602624267e44cb04fc174ec8c1eaa18215281c57388479d0d|https://dataserver.cptec.inpe.br/dataserver_modelos/brams/ams_08km/brutos/2026/08/13/00/BRAMS_ams_08km_2026081300_2026081301.inv
+SOURCE|BRAMS|002|13742|ca3543e83c5d3eb3b3a73aa8de6360654d6d9123acbd076f2222b39ff6509493|https://dataserver.cptec.inpe.br/dataserver_modelos/brams/ams_08km/brutos/2026/08/13/00/BRAMS_ams_08km_2026081300_2026081302.inv
+SOURCE|BRAMS|024|14009|52086336e85e131672cb759a6eb7876179f809508edaf5f7bbcbc638d07ff006|https://dataserver.cptec.inpe.br/dataserver_modelos/brams/ams_08km/brutos/2026/08/13/00/BRAMS_ams_08km_2026081300_2026081400.inv
+ROW|BRAMS|000|3:769858:d=2026081300:APCP:surface:anl:
+ROW|BRAMS|000|9:3286932:d=2026081300:TMP:2 m above ground:anl:
+ROW|BRAMS|000|10:3933065:d=2026081300:TMP:2 m above ground:anl:
+ROW|BRAMS|000|11:4541504:d=2026081300:TMP:2 m above ground:anl:
+DECODED|BRAMS|000|9|pdt=0;forecast=0/1;statistics=None;end=None
+DECODED|BRAMS|000|10|pdt=0;forecast=0/1;statistics=None;end=None
+DECODED|BRAMS|000|11|pdt=0;forecast=0/1;statistics=None;end=None
+ROW|BRAMS|001|3:761308:d=2026081300:APCP:surface:0-1 hour acc fcst:
+ROW|BRAMS|001|9:3309438:d=2026081300:TMP:2 m above ground:1 hour fcst:
+ROW|BRAMS|001|10:3961703:d=2026081300:TMP:2 m above ground:0-1 hour max fcst:
+ROW|BRAMS|001|11:4569366:d=2026081300:TMP:2 m above ground:0-1 hour min fcst:
+ROW|BRAMS|002|3:749668:d=2026081300:APCP:surface:0-2 hour acc fcst:
+ROW|BRAMS|002|9:3331626:d=2026081300:TMP:2 m above ground:2 hour fcst:
+ROW|BRAMS|002|10:3986580:d=2026081300:TMP:2 m above ground:1-2 hour max fcst:
+ROW|BRAMS|002|11:4593588:d=2026081300:TMP:2 m above ground:1-2 hour min fcst:
+ROW|BRAMS|024|3:752966:d=2026081300:APCP:surface:0-1 day acc fcst:
+ROW|BRAMS|024|9:3479290:d=2026081300:TMP:2 m above ground:24 hour fcst:
+ROW|BRAMS|024|10:4159412:d=2026081300:TMP:2 m above ground:23-24 hour max fcst:
+ROW|BRAMS|024|11:4828424:d=2026081300:TMP:2 m above ground:23-24 hour min fcst:

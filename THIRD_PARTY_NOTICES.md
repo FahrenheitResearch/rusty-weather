@@ -44,6 +44,10 @@ distributions containing the embedded font.
   `vendor/netcrust/LICENSE-MIT` and `vendor/netcrust/LICENSE-APACHE`.
 - `vendor/netcrust/vendor/hdf5-reader`: MIT OR Apache-2.0; covered by the
   bundled netcrust license copies.
+- `vendor/weather-contours`: MIT; the complete license is bundled at
+  `vendor/weather-contours/LICENSE`, its import record is in
+  `vendor/weather-contours/PATCHES.md`, and the supplied archive is retained
+  under `vendor/weather-contours/upstream`.
 - `vendor/wrf-rust` (`wrf-core` and `wrf-formula`): MIT; pinned source
   provenance is recorded in `vendor/wrf-rust/PROVENANCE.md` and the complete
   text is bundled at `vendor/wrf-rust/LICENSE`.

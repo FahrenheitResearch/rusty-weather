@@ -707,7 +707,12 @@ impl DownloadClient {
         let data = response
             .body_mut()
             .with_config()
-            .limit(MAX_BODY_SIZE)
+            // ureq's body limit is an exclusive overflow sentinel: a body
+            // whose length is exactly the configured value is reported as
+            // "larger than request limit". Read one sentinel byte beyond the
+            // largest allowed payload so an exactly-MAX_BODY_SIZE object is
+            // accepted while a larger one still fails closed.
+            .limit(body_read_limit(MAX_BODY_SIZE))
             .read_to_vec()
             .map_err(|err| crate::RustmetError::Http(format!("failed to read {}: {}", url, err)))?;
 
@@ -795,7 +800,10 @@ impl DownloadClient {
         } else {
             Some(finite_range_len(start, end)?)
         };
-        let body_limit = expected_len.unwrap_or(MAX_BODY_SIZE);
+        // `BodyWithConfig::limit` is exclusive. Every finite range is
+        // validated for exact length below, so allow one sentinel byte here;
+        // otherwise a perfectly sized 16 MiB full-file chunk is rejected.
+        let body_limit = body_read_limit(expected_len.unwrap_or(MAX_BODY_SIZE));
         let key = DiskCache::cache_key(url, Some((start, end)));
 
         // Try cache first
@@ -989,6 +997,10 @@ fn finite_range_len(start: u64, end: u64) -> crate::error::Result<u64> {
         )));
     }
     Ok(len)
+}
+
+fn body_read_limit(max_allowed: u64) -> u64 {
+    max_allowed.saturating_add(1)
 }
 
 fn validate_range_request_shape(ranges: &[(u64, u64)]) -> crate::error::Result<bool> {
@@ -1189,6 +1201,18 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("redirect response missing Location header"));
         assert!(!message.contains("protocol: missing a location header"));
+    }
+
+    #[test]
+    fn finite_range_accepts_a_body_exactly_as_large_as_the_requested_range() {
+        let base = spawn_http_server(vec![
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/4\r\nContent-Length: 4\r\nConnection: close\r\n\r\nGRIB"
+                .to_vec(),
+        ]);
+        let body = test_client()
+            .get_range(&format!("{base}/field.grib2"), 0, 3)
+            .expect("an exact-size range body must not trip ureq's overflow sentinel");
+        assert_eq!(body, b"GRIB");
     }
 
     #[test]

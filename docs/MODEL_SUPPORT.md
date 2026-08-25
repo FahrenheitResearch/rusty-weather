@@ -21,12 +21,24 @@ not automatically presented as live-verified.
 | Model family | Acquisition | Current status | Important scope |
 | --- | --- | --- | --- |
 | HRRR CONUS | Remote | Verified | Deterministic surface and pressure products |
-| HRRR Alaska | Remote | Ingest beta | Regional deterministic products |
+| HRRR Alaska | Remote | Ingest beta | Alaska `prs` + `sfc`; hourly f000-f018, with 00/06/12/18z extended through f048; official inventory fixture-verified |
 | GFS | Remote | Verified | Global deterministic products |
+| ECCC GDPS | Remote | Ingest beta | Global 0.15-degree deterministic 00/12z forecast; hourly f000-f084 then 3-hourly to f240; bounded per-field Datamart acquisition and a 19-level sounding profile are live ingest/store verified |
+| ECCC GDPS-GEML | Remote | Ingest beta | Experimental global 0.25-degree AI emulator; 00/12z, six-hourly f000-f240; exact 82-object contract (4 surface fields plus temperature, specific humidity, U/V, geopotential, and omega on 13 pressure levels); derived/heavy disabled because precipitation, surface moisture/pressure, and orography are absent |
+| CMA GRAPES GEPS | Remote | Ingest beta | Global 0.25-degree provider-produced ensemble statistics; 00/12z, 3-hourly f000-f078 then 6-hourly to f360; mean/spread, percentile, and probability fields only—no raw member or deterministic sounding claim; live ingest/store verified |
+| ECCC RDPS | Remote | Ingest beta | North American 10 km rotated-grid deterministic forecast; 00/06/12/18z hourly f000-f084; bounded per-field acquisition and a 19-level sounding profile are live ingest/store verified; canonical U/V are paired and rotated to earth coordinates; derived/heavy disabled |
+| ECCC HRDPS continental | Remote | Ingest beta | Pan-Canadian 2.5 km rotated-grid deterministic forecast; 00/06/12/18z hourly f000-f048; bounded per-field acquisition and a 19-level sounding profile are live ingest/store verified; canonical U/V are paired and rotated to earth coordinates; derived/heavy disabled |
+| ECCC REPS | Remote | Ingest beta | Regional 10 km provider-produced scalar ensemble statistics; 00/06/12/18z, three-hourly f003-f072; p10/p25/p50/p75/p90, spread, mean, min/max, and trailing 3-hour precipitation probabilities only; no raw members or grid-relative U/V claim; live ingest/store verified |
+| DWD ICON-EU regular | Remote | Ingest beta | European deterministic regular lat/lon feed; eight 3-hourly cycles, main-cycle f000-f120 and short-cycle f000-f048 native cadence; exact bzip2 component bundles and 18 schema-requested native pressure levels are live ingest/store verified; derived/heavy disabled |
+| DWD ICON-D2 regular | Remote | Ingest beta | Germany deterministic regular lat/lon feed; eight 3-hourly cycles and hourly f000-f048; exact bzip2 component bundles and all 11 native pressure levels are live ingest/store verified; quarter-hour messages retain exact time semantics; derived/heavy disabled |
+| Roshydromet ICON-Ru13/6N29 | Remote | Ingest beta | North Eurasia 697x213 regular lat/lon forecast; 00/12z, three-hourly f003-f072; exact WIS2 bulletin-component acquisition, sparse pressure profile, dateline-safe normalization, and bounded f003 live ingest/store verification |
+| ECCC GEPS | Remote | Ingest beta | Provider-published 2-D statistics only, not raw ensemble members; 00/12z, 3-hourly f003-f192 then 6-hourly f198-f384; typed percentiles, mean, spread, and selected probabilities are live ingest/store verified; extended f936 Monday/Thursday products are not scheduled |
+| CPTEC/INPE WRF 7 km | Remote | Ingest beta | South America deterministic regular lat/lon feed; daily 00z, hourly f000-f180; official text `.inv` byte-range acquisition and a five-volume/7-surface-field sounding are live ingest/store verified; derived/heavy disabled |
+| CPTEC/INPE BRAMS 8 km | Remote | Ingest beta | South America deterministic regular lat/lon feed; daily 00z, hourly f001-f180; f000 is fail-closed because its instantaneous/min/max 2 m temperatures lose their statistical identity; official text `.inv` byte-range acquisition and a five-volume/7-surface-field sounding are live ingest/store verified; undocumented local and anomalously level-labelled fields remain fail-closed; derived/heavy disabled |
 | RRFS-A | Remote | Verified | Deterministic NA source cropped during ingest |
-| RAP | Remote | Ingest beta | North American deterministic products |
-| NAM | Remote | Ingest beta | Regional deterministic products |
-| GDAS | Remote | Ingest beta | Global analysis/short forecast |
+| RAP | Remote | Ingest beta | Grid-130 `awp130pgrb` (13 km); hourly f000-f021, with 03/09/15/21z extended through f051; live ingest/store verified |
+| NAM | Remote | Ingest beta | Ingest is pinned to grid-212 `awip3d` (40 km), not the registry's separate `awip12` plotting product; hourly f000-f036 then 3-hourly through f084; live ingest/store verified |
+| GDAS | Remote | Ingest beta | Global 0.25-degree `pgrb2.0p25`; f000-f009 each 00/06/12/18z cycle; official inventory fixture-verified |
 | GEFS | Remote | Ingest beta | Control/statistical product route; not full member ingestion |
 | NOAA AI-GFS | Remote | Ingest beta | Deterministic pressure and surface products |
 | NOAA AI-GEFS | Remote | Ingest beta | Average/statistical products only; not full member ingestion; nonlinear derived/heavy diagnostics disabled |
@@ -63,13 +75,153 @@ until an explicit fixed-window selector is implemented. This prevents a
 native interval from being advertised as a cumulative run total.
 
 The focused ingest fixtures pin inventories captured from the official
+[HRRR](https://www.nco.ncep.noaa.gov/pmb/products/hrrr/),
+[RAP](https://www.nco.ncep.noaa.gov/pmb/products/rap/),
+[NAM](https://www.nco.ncep.noaa.gov/pmb/products/nam/),
+[GFS/GDAS](https://www.nco.ncep.noaa.gov/pmb/products/gfs/),
 [HIRESW](https://www.nco.ncep.noaa.gov/pmb/products/hiresw/),
 [HREF](https://www.nco.ncep.noaa.gov/pmb/products/href/),
 [SREF](https://www.nco.ncep.noaa.gov/pmb/products/sref/),
 [REFS](https://www.nco.ncep.noaa.gov/pmb/products/refs/), and
 [RRFS](https://www.nco.ncep.noaa.gov/pmb/products/rrfs/), and
-[ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data) feeds.
+[ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data),
+[ECCC RDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_rdps/readme_rdps-datamart_en/), and
+[ECCC HRDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart_en/), and
+[ECCC GDPS-GEML](https://eccc-msc.github.io/open-data/msc-data/nwp_gdps/readme_gdps-geml-datamart_en/), and
+[ECCC GEPS](https://eccc-msc.github.io/open-data/msc-data/nwp_geps/readme_geps-datamart_en/), and
+[ECCC REPS](https://eccc-msc.github.io/open-data/msc-data/nwp_reps/readme_reps-datamart_en/) feeds.
 Fixture source URLs and SHA-256 values are recorded beside the fixtures.
+
+GDPS was additionally exercised against the official
+[ECCC MSC Datamart](https://eccc-msc.github.io/open-data/msc-data/nwp_gdps/readme_gdps-datamart_en/)
+on 2026-08-14. A bounded f000 sounding ingest assembled the selected
+per-field objects, realized seven surface variables plus temperature, relative
+humidity, u, v, and height at all 19 requested levels from 100-1000 hPa, passed
+the writer's exact verification, and passed deep validation at 12 variables,
+57,350 chunks, and 477,280,099 payload bytes. The required ECCC attribution is
+persisted and exposed by the server; direct legacy whole-file plotting remains
+disabled rather than silently using the one-field availability probe.
+
+GDPS-GEML's official 2026-08-14 00z f006 directory contained exactly 82
+one-message GRIB2 objects on a 1440x721 regular 0.25-degree grid: four surface
+objects and six pressure families at 50, 100, 150, 200, 250, 300, 400, 500,
+600, 700, 850, 925, and 1000 hPa. The bounded fixture pins the 19,689-byte
+directory listing hash and independent object/value hashes for temperature,
+specific humidity, geopotential, omega, U, V, and MSLP. Specific humidity is
+normalized to dewpoint by the shared thermodynamic path; provider values
+outside the physical [0,1) kg/kg range become NaN and are never clamped or
+guessed. Omega is preserved as `vertical_velocity_iso` in Pa/s, while WMO
+geopotential is converted to canonical geopotential height. The model is
+explicitly marked experimental/pre-operational, uses the standard scheduler
+retention policy, and retains ECCC's required source notice plus its exact
+GDPS-GEML documentation URL in store/query/server provenance. The complete
+f006 sounding ingest fetched 162.3 MiB of source messages, realized all four
+surface fields and all six 13-level volumes, passed writer `--verify`, and
+passed deep RWS validation at 10 variables, 24,912 chunks, and 166,368,311
+payload bytes.
+
+CMA GRAPES GEPS was exercised against the official WIS2 core-data source on
+2026-08-14 using the provider's 2026-08-13 00z f024 object. The bounded
+single-lead ingest realized all 57 scientifically identified provider
+statistics bit-exactly: ensemble mean/spread fields, five published
+percentiles across seven field families, seven wind/gust probabilities, and
+eleven precipitation percentile/probability fields. Deep validation passed at
+57 variables, 1,026 chunks, and 134,659,235 payload bytes. Unknown local CMA
+parameters remain excluded, and the API reports `provider_statistics_only`
+rather than implying access to the 31 underlying member forecasts.
+
+REPS was exercised against the official ECCC Datamart on 2026-08-14 using
+one bounded 00z f024 bundle. Three scalar statistics objects totaling
+15,308,713 bytes realized all 37 typed 2-D variables bit-exactly on the
+908x960 rotated grid. Deep validation passed at 37 variables, 592 chunks, and
+40,986,270 payload bytes. The lane starts at f003 because the live f000
+directory contains no provider-statistics objects. Wind is ingested only as
+scalar speed; raw members and grid-relative U/V remain excluded. WMO
+derived-forecast code 4 is preserved as spread, and precipitation names retain
+their f021-f024 trailing 3-hour support.
+
+RDPS and HRDPS were exercised against the same official Datamart on
+2026-08-14 with one bounded 00z f024 sounding ingest each. RDPS realized six
+surface variables (the live feed has no surface-orography object) plus five
+19-level pressure volumes, passed writer verification, and passed deep store
+validation at 11 variables, 23,910 chunks, and 219,953,866 payload bytes.
+HRDPS realized all seven sounding surface variables plus the same five
+19-level pressure volumes, then passed both gates at 12 variables, 64,815
+chunks, and 580,038,302 payload bytes. The fixtures preserve the current RDPS
+documentation/payload dimension drift: documentation says 1102x1076, while
+the live U/V GRIB objects decode to 1140x1045; live normalized coordinates are
+authoritative. HRDPS documentation and payload both report 2540x1290.
+
+Both feeds declare U/V relative to their rotated grid, not geographic east and
+north. The regional decoder therefore requires each matching U/V pair, checks
+GRIB template 3.1 and its grid-relative component flag, derives the grid-i
+tangent from the normalized live coordinates, and rotates both components
+before canonical publication. Missing pairs, mismatched grids, or metadata
+drift fail closed. Independent comparison with ECCC's separately published
+speed/direction objects covered 2,382,600 RDPS and 6,553,200 HRDPS components;
+RMS differences were 0.063552 and 0.006831 m/s respectively, within provider
+direction quantization. Derived/heavy diagnostics remain disabled until every
+diagnostic path is explicitly proven to consume the normalized vectors.
+ICON-EU and ICON-D2 regular-grid lanes were exercised against official
+[DWD Open Data](https://opendata.dwd.de/weather/nwp/) on 2026-08-14. Bounded
+00z f000 sounding ingests passed exact writer verification and deep store
+validation with seven 2-D variables plus temperature, RH, U, V, and height at
+18 ICON-EU and 11 ICON-D2 levels. DWD ownership, CC BY 4.0 attribution, and the
+normalization notice persist through manifests and server responses. Exact
+minute-unit regression coverage prevents ICON-D2's 75/90/105 and
+135/150/165-minute messages from being rounded onto hourly samples. Live
+f001-f002 surface ingests additionally verified all nine available direct
+fields, including exact run-total precipitation and cycle-static orography,
+without fetching or claiming a pressure bundle.
+ICON-Ru13/6N29 was exercised against Roshydromet's official WIS2 source on
+2026-08-14. A bounded f003 sounding ingest assembled 24 pressure and ten
+surface bulletin objects, validated their exact WMO wrappers, normalized the
+697x213 dateline-crossing grid, passed writer verification, and passed deep
+RWS validation at ten variables and 3,095 chunks. The lane retains its native
+five-level pressure coordinate (four levels for relative humidity), disables
+derived/heavy products, and exposes Roshydromet/WMO-core attribution through
+the server. Exact inventory, object hashes, and live evidence are recorded in
+[ROSHYDROMET_ICON_RU.md](ROSHYDROMET_ICON_RU.md).
+
+GEPS was exercised against the official Datamart on 2026-08-14 with one
+bounded 00z f024 surface ingest. Twelve provider component objects totaling
+15,462,959 bytes realized 96 typed 2-D variables, passed exact writer
+verification, and passed deep validation at 576 chunks and 31,291,495 payload
+bytes. The live GRIB grid is 721x360; it remains authoritative over the
+documentation's current 720x361 declaration. The normalized identity keeps
+percentile, mean, probability threshold, and WMO code-4 ensemble spread
+distinct. It does not relabel spread as standard deviation or imply any raw
+member coverage. Published 3/6/24-hour statistical windows remain point- and
+window-queryable, but temporal reduction is manual-only until the canonical
+selector can carry both interval and statistical-process identity. Provider
+`WIND-Max-*` thresholds are excluded because their live units are ambiguous;
+the Monday/Thursday f936 extension is also excluded from automatic scheduling
+until scheduler cadence can express weekdays.
+
+The CPTEC/INPE WRF 7 km and BRAMS 8 km lanes were exercised against the
+official CPTEC Data Server on 2026-08-14. One bounded f001 sounding ingest per
+model used the provider's text `.inv` offsets rather than downloading the full
+lead object. WRF selected 89,714,669 bytes in 58 ranges from a 192,378,474-byte
+object, realized all seven sounding surface variables plus temperature, RH,
+U, V, and height at 19 requested levels, and passed deep validation at 12
+variables, 21,900 chunks, and 163,380,250 payload bytes. BRAMS selected
+81,837,751 bytes in five coalesced ranges from a 144,450,301-byte object and
+passed the same writer checks plus deep validation at 12 variables, 19,952
+chunks, and 182,188,508 payload bytes. The separate binary `.grib2.idx` files
+are not treated as message indexes. See
+[the CPTEC adapter contract](CPTEC_SOUTH_AMERICA.md) for exact inventory,
+field, grid, and attribution boundaries.
+
+For the NOAA deterministic wave, normalization follows the fields actually
+published. HRRR Alaska carries native pressure-level temperature, dewpoint,
+RH, winds, and height every 25 hPa from 50-1000 hPa. RAP carries the same
+100-1000 hPa temperature/RH/wind/height grid but no native isobaric dewpoint,
+so the store retains `rh_iso` rather than inventing `dewpoint_iso`. NAM's
+`awip3d` carries temperature/RH/wind/height every 25 hPa from 50-1000 hPa,
+while dewpoint is native only at 300/400/500/700/850/1000 hPa and 2 m moisture
+is RH rather than dewpoint. GDAS likewise publishes pressure-level RH rather
+than pressure-level dewpoint. Manifests and query capability report realized
+variables and levels per run, so these distinctions remain visible.
 
 ## Product availability
 
@@ -84,3 +236,6 @@ per-variable lineage.
 
 This document is a human-readable summary. The server's `/v1/models` response
 is the machine-readable authority for a running deployment.
+
+Potential additional official feeds and the core contracts that gate them are
+tracked separately in [PUBLIC_MODEL_BACKLOG.md](PUBLIC_MODEL_BACKLOG.md).

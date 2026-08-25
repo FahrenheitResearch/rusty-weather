@@ -270,6 +270,11 @@ fn rrfs_public_and_firewx_expose_model_agnostic_derived_inventory() {
 }
 
 #[test]
+fn cma_provider_statistics_do_not_imply_deterministic_derived_products() {
+    assert!(supported_derived_recipe_slugs(ModelId::CmaGeps).is_empty());
+}
+
+#[test]
 fn native_contour_config_covers_multiple_real_products() {
     for recipe in [
         DerivedRecipe::StpFixed,

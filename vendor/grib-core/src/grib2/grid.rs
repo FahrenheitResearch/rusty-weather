@@ -80,7 +80,18 @@ fn latlon_grid(grid: &GridDefinition, nx: usize, ny: usize, n: usize) -> (Vec<f6
     } else {
         grid.lon2
     };
-    let dlon = if nx > 1 {
+    let dlon = if nx > 1 && grid.dx.is_finite() && grid.dx > 0.0 {
+        // Template 3.0 carries an explicit unsigned i-direction increment.
+        // Prefer it whenever present: cyclic grids may encode identical first
+        // and last longitudes (for example 180 -> 180 over 721 half-degree
+        // points), so endpoint interpolation would otherwise collapse every
+        // longitude onto one meridian. Scan-mode bit 1 selects -i.
+        if grid.scan_mode & 0x80 != 0 {
+            -grid.dx
+        } else {
+            grid.dx
+        }
+    } else if nx > 1 {
         (lon2_unwrapped - grid.lon1) / (nx as f64 - 1.0)
     } else {
         0.0
@@ -614,6 +625,33 @@ mod tests {
         assert!((lons[1] - 270.0).abs() < 1e-6);
         assert!((lons[2] - 360.0).abs() < 1e-6);
         assert!((lons[3] - 90.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_latlon_grid_uses_increment_for_equal_endpoint_cyclic_grid() {
+        let grid = GridDefinition {
+            template: 0,
+            nx: 721,
+            ny: 360,
+            lat1: -90.0,
+            lon1: 180.0,
+            lat2: 89.5,
+            lon2: 180.0,
+            dx: 0.5,
+            dy: 0.5,
+            scan_mode: 0x40,
+            ..Default::default()
+        };
+        let (lats, lons) = grid_latlon(&grid);
+        assert_eq!(lats.len(), 721 * 360);
+        assert_eq!(lons.len(), 721 * 360);
+        assert!((lons[0] - 180.0).abs() < 1e-10);
+        assert!((lons[1] - 180.5).abs() < 1e-10);
+        assert!((lons[360] - 360.0).abs() < 1e-10);
+        assert!((lons[361] - 0.5).abs() < 1e-10);
+        assert!((lons[720] - 180.0).abs() < 1e-10);
+        assert!((lats[0] - (-90.0)).abs() < 1e-10);
+        assert!((lats[721 * 359] - 89.5).abs() < 1e-10);
     }
 
     // ---- Template 30: Lambert Conformal ----

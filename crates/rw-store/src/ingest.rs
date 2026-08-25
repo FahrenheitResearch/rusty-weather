@@ -21,10 +21,7 @@ use crate::format::{RwsExactTime, RwsWriterInfo};
 use crate::grid::{GridFile, encode_grid_bytes};
 use crate::lock::RunLock;
 use crate::reader::HourReader;
-use crate::run::{
-    MAX_SOURCE_PROVENANCE_PER_HOUR, RwsHourEntry, RwsRunManifest, RwsSourceProvenance,
-    normalize_source_provenance,
-};
+use crate::run::{RwsHourEntry, RwsRunManifest, RwsSourceProvenance, normalize_source_provenance};
 use crate::writer::HourWriter;
 
 /// How long [`HourIngestWriter::begin`] waits for the run-dir advisory lock
@@ -642,12 +639,6 @@ impl HourIngestWriter {
     /// credentials, and free-form text are rejected by the manifest token
     /// validator.
     pub fn set_source_provenance(&mut self, provenance: Vec<RwsSourceProvenance>) -> RwResult<()> {
-        if provenance.len() > MAX_SOURCE_PROVENANCE_PER_HOUR {
-            return Err(RwStoreError::Meta(format!(
-                "hour source provenance contains {} entries; limit is {MAX_SOURCE_PROVENANCE_PER_HOUR}",
-                provenance.len(),
-            )));
-        }
         self.source_provenance = normalize_source_provenance(provenance)?;
         Ok(())
     }
@@ -922,10 +913,11 @@ mod dimension_tests {
     use rustwx_core::MAX_GRID_CELLS;
 
     #[test]
-    fn store_grid_boundary_rejects_overflow_and_desktop_ceiling() {
+    fn store_grid_boundary_rejects_overflow_and_accepts_large_native_grids() {
         assert!(validated_grid_cells(usize::MAX, 2).is_err());
         assert!(validated_grid_cells(MAX_GRID_CELLS + 1, 1).is_err());
-        assert_eq!(validated_grid_cells(5_000, 5_000), Ok(MAX_GRID_CELLS));
+        assert_eq!(validated_grid_cells(7_000, 3_500), Ok(24_500_000));
+        assert_eq!(validated_grid_cells(25_000_001, 1), Ok(25_000_001));
     }
 
     #[test]

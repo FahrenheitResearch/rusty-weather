@@ -41,6 +41,8 @@ pub enum QueryError {
     UnknownRun { model: String, run: String },
     #[error("variable '{0}' is not present in the selected data")]
     UnknownVariable(String),
+    #[error("variable '{variable}' does not store a {level_hpa} hPa level")]
+    UnknownPressureLevel { variable: String, level_hpa: u16 },
     #[error("variable '{variable}' has kind '{actual}', expected '{expected}'")]
     WrongVariableKind {
         variable: String,

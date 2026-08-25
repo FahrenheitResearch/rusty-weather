@@ -10,8 +10,8 @@
 //! gets this panel for free without any satellite wiring.
 //!
 //! Stop semantics are honest: the cancel flag is observed at poll/frame
-//! boundaries, so an in-flight download completes first; frame writes are
-//! atomic, so no partial files.
+//! boundaries and between bounded download reads; frame writes and object
+//! installs are atomic, so no partial files.
 
 use std::time::Instant;
 
@@ -26,8 +26,7 @@ pub struct SatFollowSpec {
     pub satellite: String,
     /// Sector slug: "conus" | "full_disk" | "meso1" | "meso2".
     pub sector: String,
-    /// Layer slug: a band ("c13") or an RGB composite ("geocolor" — the
-    /// host expands it to the required bands).
+    /// User-facing product slug such as "geocolor", "clean_ir", or "c13".
     pub layer: String,
     /// Poll on the sector's default interval.
     pub auto_interval: bool,
@@ -39,7 +38,7 @@ pub struct SatFollowSpec {
     /// Rolling window: evict oldest frames beyond `max_gb` per band.
     pub size_enabled: bool,
     pub max_gb: f32,
-    /// Stride decimation before storing (1 = native resolution).
+    /// Internal preview stride (0 = automatic); native source is retained separately.
     pub downsample: usize,
     /// Raw NetCDF byte cache directory.
     pub cache_dir: String,
@@ -50,14 +49,14 @@ impl Default for SatFollowSpec {
         Self {
             satellite: "goes19".to_string(),
             sector: "conus".to_string(),
-            layer: "c13".to_string(),
+            layer: "geocolor".to_string(),
             auto_interval: true,
             interval_secs: 30,
             keep_enabled: true,
             keep_hours: 6.0,
             size_enabled: true,
             max_gb: 2.0,
-            downsample: 1,
+            downsample: 0,
             cache_dir: "out/cache".to_string(),
         }
     }
@@ -126,7 +125,7 @@ pub enum SatFollowState {
     #[default]
     Idle,
     Running,
-    /// Stop requested; the in-flight download/ingest completes first.
+    /// Stop requested; active downloads stop at the next bounded read.
     Stopping,
     Finished(String),
     Failed(String),
@@ -136,7 +135,8 @@ pub enum SatFollowState {
 #[derive(Debug, Clone, PartialEq)]
 enum SatFrameStage {
     Downloading {
-        bytes: u64,
+        received_bytes: u64,
+        total_bytes: u64,
     },
     Storing {
         download_ms: u128,
@@ -292,11 +292,35 @@ impl SatellitePanel {
         self.rows.push(SatFrameRow {
             id,
             label,
-            stage: SatFrameStage::Downloading { bytes },
+            stage: SatFrameStage::Downloading {
+                received_bytes: 0,
+                total_bytes: bytes,
+            },
         });
         if self.rows.len() > MAX_FRAME_ROWS {
             let drop = self.rows.len() - MAX_FRAME_ROWS;
             self.rows.drain(..drop);
+        }
+    }
+
+    /// Update the newest row for this object. The listed size from Started is
+    /// retained when an HTTP body does not expose a trustworthy total.
+    pub fn apply_download_progress(
+        &mut self,
+        id: &str,
+        received_bytes: u64,
+        total_bytes: Option<u64>,
+    ) {
+        if let Some(row) = self.rows.iter_mut().rev().find(|row| row.id == id)
+            && let SatFrameStage::Downloading {
+                received_bytes: received,
+                total_bytes: total,
+            } = &mut row.stage
+        {
+            *received = (*received).max(received_bytes);
+            if let Some(new_total) = total_bytes.filter(|bytes| *bytes > 0) {
+                *total = new_total;
+            }
         }
     }
 
@@ -424,7 +448,7 @@ impl SatellitePanel {
                 .unwrap_or_else(|| self.spec.sector.clone());
             ComboBox::from_id_salt("rw-ui-sat-sector")
                 .selected_text(selected)
-                .width(120.0)
+                .width(180.0)
                 .show_ui(ui, |ui| {
                     for option in &self.sector_options {
                         ui.selectable_value(
@@ -494,43 +518,33 @@ impl SatellitePanel {
                     .weak(),
                 );
             }
-            ui.label("Detail");
-            ComboBox::from_id_salt("rw-ui-sat-downsample")
-                .selected_text(downsample_label(self.spec.downsample))
-                .width(110.0)
-                .show_ui(ui, |ui| {
-                    for step in [1usize, 2, 4] {
-                        ui.selectable_value(
-                            &mut self.spec.downsample,
-                            step,
-                            downsample_label(step),
-                        );
-                    }
-                })
-                .response
-                .on_hover_text(
-                    "stride decimation before storing — keeps hi-res visible \
-                     bands (C02 is 0.5 km) at a sane store size",
-                );
+            ui.label(
+                RichText::new("Native source retained · preview optimized automatically")
+                    .small()
+                    .weak(),
+            )
+            .on_hover_text(
+                "Full-resolution NetCDF remains available to rw-server; the desktop preview chooses a bounded stride automatically.",
+            );
         });
 
         ui.horizontal(|ui| {
             ui.label("Window");
             ui.checkbox(&mut self.spec.keep_enabled, "keep")
-                .on_hover_text("evict frames older than this");
+                .on_hover_text("evict frames older than this; uncheck for no age limit");
             ui.add_enabled(
                 self.spec.keep_enabled,
                 DragValue::new(&mut self.spec.keep_hours)
-                    .range(0.5..=72.0)
                     .speed(0.5)
                     .suffix(" h"),
             );
             ui.checkbox(&mut self.spec.size_enabled, "max")
-                .on_hover_text("evict oldest frames beyond this total size per band");
+                .on_hover_text(
+                    "evict oldest frames beyond this total size per band; uncheck for no byte limit",
+                );
             ui.add_enabled(
                 self.spec.size_enabled,
                 DragValue::new(&mut self.spec.max_gb)
-                    .range(0.1..=64.0)
                     .speed(0.1)
                     .suffix(" GB"),
             );
@@ -584,7 +598,7 @@ impl SatellitePanel {
                     ui.spinner();
                     ui.label(
                         RichText::new(
-                            "stopping — the in-flight frame completes first; \
+                            "stopping — active downloads stop at the next read; \
                              no partial files are left behind",
                         )
                         .small()
@@ -691,21 +705,27 @@ impl SatellitePanel {
     }
 }
 
-fn downsample_label(step: usize) -> String {
-    match step {
-        1 => "native".to_string(),
-        step => format!("1/{step} res"),
-    }
-}
-
 /// One frame row: label + stage chip.
 fn frame_row_ui(ui: &mut Ui, row: &SatFrameRow) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(&row.label).small().monospace());
         match &row.stage {
-            SatFrameStage::Downloading { bytes } => {
+            SatFrameStage::Downloading {
+                received_bytes,
+                total_bytes,
+            } => {
+                let status = if *total_bytes > 0 {
+                    format!(
+                        "▼ downloading {} / {} ({:.0}%)",
+                        format_bytes(*received_bytes),
+                        format_bytes(*total_bytes),
+                        *received_bytes as f64 * 100.0 / *total_bytes as f64
+                    )
+                } else {
+                    format!("▼ downloading {}", format_bytes(*received_bytes))
+                };
                 ui.label(
-                    RichText::new(format!("▼ downloading {}", format_bytes(*bytes)))
+                    RichText::new(status)
                         .small()
                         .color(Color32::from_rgb(255, 200, 80)),
                 );
@@ -784,7 +804,19 @@ mod tests {
         assert_eq!(panel.rows.len(), 1);
         assert!(matches!(
             panel.rows[0].stage,
-            SatFrameStage::Downloading { bytes: 4_000_000 }
+            SatFrameStage::Downloading {
+                received_bytes: 0,
+                total_bytes: 4_000_000
+            }
+        ));
+
+        panel.apply_download_progress("key-1", 2_000_000, Some(4_000_000));
+        assert!(matches!(
+            panel.rows[0].stage,
+            SatFrameStage::Downloading {
+                received_bytes: 2_000_000,
+                total_bytes: 4_000_000
+            }
         ));
 
         panel.apply_download_done("key-1", 5_600, false);

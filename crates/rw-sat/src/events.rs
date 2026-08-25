@@ -8,6 +8,8 @@ use std::sync::atomic::AtomicBool;
 
 use chrono::{DateTime, Utc};
 
+use crate::archive::NativeSatelliteFrame;
+
 /// One progress event from the GOES follow / ingest flow.
 #[derive(Debug, Clone)]
 pub enum SatEvent {
@@ -28,13 +30,30 @@ pub enum SatEvent {
         key: String,
         bytes: u64,
     },
+    /// Streaming progress for an object body. `total_bytes` is present when
+    /// S3 supplied a trustworthy listed size or response Content-Length.
+    DownloadProgress {
+        key: String,
+        received_bytes: u64,
+        total_bytes: Option<u64>,
+    },
     DownloadDone {
         key: String,
         bytes: u64,
         ms: u128,
         cache_hit: bool,
     },
-    /// One frame landed in the store.
+    /// One native source channel and the frame manifest that names it were
+    /// atomically committed. This is the durable ingest boundary. Consumers
+    /// that build derivatives must reconcile against `frame`; the later
+    /// `FrameWritten` event only describes an optional compact preview. The
+    /// minute-granularity `frame_id` is not a source revision: derivative
+    /// identity must include the exact required-channel source revisions.
+    NativeFrameUpdated {
+        frame: NativeSatelliteFrame,
+        committed_channel: u8,
+    },
+    /// One optional compact `.rws` preview landed in the store.
     FrameWritten {
         model: String,
         run: String,
@@ -76,6 +95,17 @@ pub fn print_event(event: &SatEvent) {
         SatEvent::DownloadStarted { key, bytes } => {
             println!("get {key} ({bytes} bytes)");
         }
+        SatEvent::DownloadProgress {
+            key,
+            received_bytes,
+            total_bytes,
+        } => match total_bytes {
+            Some(total) if *total > 0 => println!(
+                "get {key}: {received_bytes}/{total} bytes ({:.0}%)",
+                *received_bytes as f64 * 100.0 / *total as f64
+            ),
+            _ => println!("get {key}: {received_bytes} bytes"),
+        },
         SatEvent::DownloadDone {
             key,
             bytes,
@@ -84,6 +114,21 @@ pub fn print_event(event: &SatEvent) {
         } => {
             let cached = if *cache_hit { " (cache hit)" } else { "" };
             println!("got {key} ({bytes} bytes, {ms} ms){cached}");
+        }
+        SatEvent::NativeFrameUpdated {
+            frame,
+            committed_channel,
+        } => {
+            let channels = frame
+                .channels
+                .keys()
+                .map(|channel| format!("C{channel:02}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            println!(
+                "native frame {}/{}/{} committed C{committed_channel:02} (available: {channels})",
+                frame.platform, frame.sector, frame.frame_id
+            );
         }
         SatEvent::FrameWritten {
             model,

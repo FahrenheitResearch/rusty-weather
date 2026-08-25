@@ -54,8 +54,11 @@ daemon can eventually consume its free-space reserve and stop admitting work.
 `profile = "auto"` selects the narrow `analysis` pack for analysis feeds, the
 complete direct-field `surface` pack for surface-only forecasts, disables
 derived/heavy diagnostics for products whose typed capability forbids them,
-and otherwise selects `view`. Explicit incompatible overrides fail config
-validation before any network or store work.
+and otherwise selects `view`. A `model_profiles` entry of `view_profiles`
+adds the 5 isobaric sounding volumes on top of the complete `view` 2D pack
+(heavy still off) — the shape for a node that serves both draped maps and
+point soundings. Explicit incompatible overrides fail config validation
+before any network or store work.
 
 ## Commands
 

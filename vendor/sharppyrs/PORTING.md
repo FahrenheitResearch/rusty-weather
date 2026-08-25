@@ -9,7 +9,7 @@ Python sources: vendored SHARPpy 1.4.0a5 wheel at
 `<scratchpad>/sharppy-whl/sharppy/viz/*.py`, repo overlays at
 `<scratchpad>/sharppy-src/sharpmod/viz/*.py`, derived params at
 `<scratchpad>/sharppy-src/sharpmod/sharptab/{derived,ecape}.py`.
-(scratchpad = C:\Users\drew\AppData\Local\Temp\claude\C--Users-drew-sharppyrs\0714356c-ffbc-4806-906b-3a662c9e727c\scratchpad)
+(`<scratchpad>` = the local session scratchpad directory; not checked in.)
 Reference render regen: `python -m sharpmod.render <npz> out.png` (deps installed --user).
 
 ## Window layout (from vendored SPCWidget + sharpmod mount_products)
@@ -64,7 +64,5 @@ Reference render regen: `python -m sharpmod.render <npz> out.png` (deps installe
 - [ ] full-window composite widget `SoundingView` with grid layout + brand text
 
 ### Verification
-- [x] skew-T snapshot vs reference (artifact iteration 3)
-- [ ] full-window snapshot vs reference_render.png; update artifact
-      https://claude.ai/code/artifact/b65623c0-5e12-4a8b-839e-821fab12f05b
-      (update via same file path `<scratchpad>/compare.html` in this convo)
+- [x] skew-T snapshot vs reference (iteration 3)
+- [ ] full-window snapshot vs reference_render.png

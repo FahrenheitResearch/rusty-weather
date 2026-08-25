@@ -49,11 +49,12 @@ pub struct ResolvedTemporalWindow {
 }
 
 /// How expected valid times are established.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "basis", rename_all = "snake_case")]
 pub enum TimeExpectation {
     /// Only times declared by the immutable run manifest are expected. This
     /// cannot detect a timestep that was never inventoried by the producer.
+    #[default]
     ManifestAxis,
     /// A caller-declared cadence. If `anchor_unix` is absent, the resolved
     /// window start is the phase anchor.
@@ -61,12 +62,6 @@ pub enum TimeExpectation {
         step_seconds: u64,
         anchor_unix: Option<i64>,
     },
-}
-
-impl Default for TimeExpectation {
-    fn default() -> Self {
-        Self::ManifestAxis
-    }
 }
 
 /// Where an interval-valued sample sits relative to its valid timestamp.
@@ -913,12 +908,11 @@ fn validate_temporal_request(
     if let TemporalSemantics::CumulativeFromOrigin {
         reset_tolerance, ..
     } = request.semantics
+        && (!reset_tolerance.is_finite() || reset_tolerance < 0.0)
     {
-        if !reset_tolerance.is_finite() || reset_tolerance < 0.0 {
-            return Err(QueryError::InvalidRequest(
-                "cumulative reset_tolerance must be finite and non-negative".to_string(),
-            ));
-        }
+        return Err(QueryError::InvalidRequest(
+            "cumulative reset_tolerance must be finite and non-negative".to_string(),
+        ));
     }
     if let TemporalSemantics::IntervalRate {
         seconds_per_rate_unit,

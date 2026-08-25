@@ -1,0 +1,9 @@
+# Explicit overlay for a node that runs rw-server's authenticated, continuous
+# NOAA MRMS follower. The base service keeps the store read-only; this reviewed
+# overlay grants only the store write required by exact-time observation ingest.
+services:
+  api:
+    environment:
+      RW_MRMS_INGEST_ENABLED: "true"
+    volumes:
+      - ./data/store:/var/lib/rusty-weather/store:rw

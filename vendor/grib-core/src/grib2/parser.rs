@@ -119,7 +119,18 @@ pub struct DataRepresentation {
     pub binary_scale: i16,
     pub decimal_scale: i16,
     pub bits_per_value: u8,
+    /// Type of original field values from GRIB2 Code Table 5.1.
+    pub original_field_type: u8,
     pub group_splitting_method: u8,
+    /// Missing-value management from GRIB2 Code Table 5.5.
+    ///
+    /// `0` means no explicit missing values, `1` means primary missing values,
+    /// and `2` means primary plus secondary missing values.
+    pub missing_value_management: u8,
+    /// IEEE-754 bit pattern supplied for primary missing values by Section 5.
+    pub primary_missing_value_substitute: u32,
+    /// IEEE-754 bit pattern supplied for secondary missing values by Section 5.
+    pub secondary_missing_value_substitute: u32,
     pub num_groups: u32,
     pub group_width_ref: u8,
     pub group_width_bits: u8,
@@ -176,19 +187,44 @@ impl Default for GridDefinition {
 }
 
 impl ProductDefinition {
-    /// Returns the first statistical time range expressed in hours when PDT 4.8/4.11/4.12
-    /// provides an hourly window. Falls back to the forecast-time unit for callers that only
-    /// populated `time_range_length`.
-    pub fn statistical_time_range_hours(&self) -> Option<u16> {
+    /// Returns the first PDT 4.8/4.11/4.12 statistical time range as an exact
+    /// number of seconds for the fixed-duration WMO Code Table 4.4 units.
+    /// Falls back to the forecast-time unit for callers that only populated
+    /// `time_range_length`. Calendar-relative month/year units intentionally
+    /// return `None` because they cannot be represented without an anchor.
+    pub fn statistical_time_range_seconds(&self) -> Option<u64> {
         let unit = self
             .statistical_time_range_unit
             .unwrap_or(self.time_range_unit);
-        if unit != 1 {
-            return None;
-        }
-        self.time_range_length
+        let value = u64::from(self.time_range_length?);
+        fixed_time_value_to_seconds(unit, value)
+    }
+
+    /// Returns the first statistical time range as whole hours. Minute- and
+    /// second-valued provider intervals are accepted only when they are
+    /// exactly divisible by one hour; no rounding or truncation is allowed.
+    pub fn statistical_time_range_hours(&self) -> Option<u16> {
+        let seconds = self.statistical_time_range_seconds()?;
+        (seconds % 3_600 == 0)
+            .then(|| seconds / 3_600)
             .and_then(|hours| u16::try_from(hours).ok())
     }
+}
+
+fn fixed_time_value_to_seconds(unit: u8, value: u64) -> Option<u64> {
+    let seconds_per_unit = match unit {
+        // WMO Code Table 4.4 fixed-duration units.
+        0 => 60,
+        1 => 3_600,
+        2 => 86_400,
+        10 => 10_800,
+        11 => 21_600,
+        12 => 43_200,
+        13 => 1,
+        // Month, year, decade, normal and century require a calendar anchor.
+        _ => return None,
+    };
+    value.checked_mul(seconds_per_unit)
 }
 
 impl Default for ProductDefinition {
@@ -228,7 +264,11 @@ impl Default for DataRepresentation {
             binary_scale: 0,
             decimal_scale: 0,
             bits_per_value: 0,
+            original_field_type: 0,
             group_splitting_method: 0,
+            missing_value_management: 0,
+            primary_missing_value_substitute: 0,
+            secondary_missing_value_substitute: 0,
             num_groups: 0,
             group_width_ref: 0,
             group_width_bits: 0,
@@ -854,13 +894,15 @@ fn parse_section4(sec: &[u8]) -> Result<ProductDefinition, String> {
         prod.level_type = read_u8(sec, 22)?;
         let scale_factor = read_u8(sec, 23)?;
         let scaled_value = read_u32(sec, 24)? as f64;
-        if scale_factor < 128 {
-            prod.level_value = scaled_value / 10.0_f64.powi(scale_factor as i32);
+        // Code Table 4.5 uses a signed sign-magnitude scale factor. 0x82 is
+        // therefore -2, not -126 as a two's-complement-style conversion would
+        // imply. ECCC uses negative factors for ordinary isobaric pressures.
+        let scale_factor = if scale_factor & 0x80 == 0 {
+            i32::from(scale_factor)
         } else {
-            // sign-magnitude: MSB set means negative scale factor
-            let neg_scale = 256 - scale_factor as i32;
-            prod.level_value = scaled_value * 10.0_f64.powi(neg_scale);
-        }
+            -i32::from(scale_factor & 0x7f)
+        };
+        prod.level_value = scaled_value * 10.0_f64.powi(-scale_factor);
     }
 
     // Template-specific parsing
@@ -970,12 +1012,12 @@ fn read_scaled_optional(
     if scale_factor == 255 || scaled_value == u32::MAX {
         return Ok(None);
     }
-    let value = if scale_factor < 128 {
-        scaled_value as f64 / 10.0_f64.powi(scale_factor as i32)
+    let scale_factor = if scale_factor & 0x80 == 0 {
+        i32::from(scale_factor)
     } else {
-        let neg_scale = 256 - scale_factor as i32;
-        scaled_value as f64 * 10.0_f64.powi(neg_scale)
+        -i32::from(scale_factor & 0x7f)
     };
+    let value = scaled_value as f64 * 10.0_f64.powi(-scale_factor);
     Ok(Some(value))
 }
 
@@ -1075,7 +1117,11 @@ fn parse_drtemplate_complex(sec: &[u8], dr: &mut DataRepresentation) -> Result<(
     if sec.len() < 47 {
         return Err("Section 5 complex packing too short".into());
     }
+    dr.original_field_type = read_u8(sec, 20)?;
     dr.group_splitting_method = read_u8(sec, 21)?;
+    dr.missing_value_management = read_u8(sec, 22)?;
+    dr.primary_missing_value_substitute = read_u32(sec, 23)?;
+    dr.secondary_missing_value_substitute = read_u32(sec, 27)?;
     dr.num_groups = read_u32(sec, 31)?;
     dr.group_width_ref = read_u8(sec, 35)?;
     dr.group_width_bits = read_u8(sec, 36)?;
@@ -1184,6 +1230,23 @@ mod tests {
     }
 
     #[test]
+    fn fixed_surface_scale_factor_uses_grib_sign_magnitude() {
+        let mut positive = vec![0_u8; 34];
+        seed_common_section4(&mut positive, 0);
+        positive[22] = 100;
+        positive[23] = 2;
+        positive[24..28].copy_from_slice(&50_000_u32.to_be_bytes());
+        assert_eq!(parse_section4(&positive).unwrap().level_value, 500.0);
+
+        let mut negative = vec![0_u8; 34];
+        seed_common_section4(&mut negative, 0);
+        negative[22] = 100;
+        negative[23] = 0x82;
+        negative[24..28].copy_from_slice(&5_u32.to_be_bytes());
+        assert_eq!(parse_section4(&negative).unwrap().level_value, 500.0);
+    }
+
+    #[test]
     fn parse_section4_probability_template_captures_threshold() {
         let mut sec = vec![0u8; 47];
         seed_common_section4(&mut sec, 5);
@@ -1202,6 +1265,23 @@ mod tests {
         assert_eq!(product.total_number_of_probabilities, Some(26));
         assert_eq!(product.probability_type, Some(2));
         assert_eq!(product.probability_lower_limit, Some(305.372));
+        assert_eq!(product.probability_upper_limit, None);
+    }
+
+    #[test]
+    fn probability_threshold_scale_factor_uses_grib_sign_magnitude() {
+        let mut sec = vec![0_u8; 47];
+        seed_common_section4(&mut sec, 5);
+        sec[34] = 0;
+        sec[35] = 1;
+        sec[36] = 1;
+        sec[37] = 0x82;
+        sec[38..42].copy_from_slice(&3_u32.to_be_bytes());
+        sec[42] = 255;
+        sec[43..47].copy_from_slice(&u32::MAX.to_be_bytes());
+
+        let product = parse_section4(&sec).expect("section 4 should parse");
+        assert_eq!(product.probability_lower_limit, Some(300.0));
         assert_eq!(product.probability_upper_limit, None);
     }
 
@@ -1289,5 +1369,21 @@ mod tests {
         assert_eq!(product.statistical_time_range_unit, Some(1));
         assert_eq!(product.time_range_length, Some(6));
         assert_eq!(product.statistical_time_range_hours(), Some(6));
+    }
+
+    #[test]
+    fn minute_statistical_ranges_preserve_exact_duration_without_rounding() {
+        let mut product = ProductDefinition {
+            time_range_unit: 0,
+            statistical_time_range_unit: Some(0),
+            time_range_length: Some(60),
+            ..ProductDefinition::default()
+        };
+        assert_eq!(product.statistical_time_range_seconds(), Some(3_600));
+        assert_eq!(product.statistical_time_range_hours(), Some(1));
+
+        product.time_range_length = Some(75);
+        assert_eq!(product.statistical_time_range_seconds(), Some(4_500));
+        assert_eq!(product.statistical_time_range_hours(), None);
     }
 }

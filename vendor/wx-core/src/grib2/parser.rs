@@ -80,7 +80,18 @@ pub struct DataRepresentation {
     pub binary_scale: i16,
     pub decimal_scale: i16,
     pub bits_per_value: u8,
+    /// Type of original field values from GRIB2 Code Table 5.1.
+    pub original_field_type: u8,
     pub group_splitting_method: u8,
+    /// Missing-value management from GRIB2 Code Table 5.5.
+    ///
+    /// `0` means no explicit missing values, `1` means primary missing values,
+    /// and `2` means primary plus secondary missing values.
+    pub missing_value_management: u8,
+    /// IEEE-754 bit pattern supplied for primary missing values by Section 5.
+    pub primary_missing_value_substitute: u32,
+    /// IEEE-754 bit pattern supplied for secondary missing values by Section 5.
+    pub secondary_missing_value_substitute: u32,
     pub num_groups: u32,
     pub group_width_ref: u8,
     pub group_width_bits: u8,
@@ -96,6 +107,8 @@ pub struct DataRepresentation {
     pub ccsds_block_size: u16,
     /// CCSDS (Template 5.42): reference sample interval.
     pub ccsds_rsi: u16,
+    /// Number of coded data points declared by Section 5 (octets 6-9).
+    pub section5_num_data_points: u32,
 }
 
 impl Default for GridDefinition {
@@ -152,7 +165,11 @@ impl Default for DataRepresentation {
             binary_scale: 0,
             decimal_scale: 0,
             bits_per_value: 0,
+            original_field_type: 0,
             group_splitting_method: 0,
+            missing_value_management: 0,
+            primary_missing_value_substitute: 0,
+            secondary_missing_value_substitute: 0,
             num_groups: 0,
             group_width_ref: 0,
             group_width_bits: 0,
@@ -165,6 +182,7 @@ impl Default for DataRepresentation {
             ccsds_flags: 0,
             ccsds_block_size: 0,
             ccsds_rsi: 0,
+            section5_num_data_points: 0,
         }
     }
 }
@@ -691,16 +709,46 @@ fn parse_section4(sec: &[u8]) -> Result<ProductDefinition, String> {
         prod.level_type = read_u8(sec, 22)?;
         let scale_factor = read_u8(sec, 23)?;
         let scaled_value = read_u32(sec, 24)? as f64;
-        if scale_factor < 128 {
-            prod.level_value = scaled_value / 10.0_f64.powi(scale_factor as i32);
+        // GRIB signed integers use sign-magnitude, not two's complement.
+        // For example 0x82 is -2 (not -126), and the physical value is
+        // scaled_value * 10^(-scale_factor). ECCC encodes isobaric levels such
+        // as 500 hPa as 5 * 10^2 Pa, so confusing these representations turns
+        // ordinary levels into enormous finite f64 values that never match a
+        // selector.
+        let scale_factor = if scale_factor & 0x80 == 0 {
+            i32::from(scale_factor)
         } else {
-            // sign-magnitude: MSB set means negative scale factor
-            let neg_scale = 256 - scale_factor as i32;
-            prod.level_value = scaled_value * 10.0_f64.powi(neg_scale);
-        }
+            -i32::from(scale_factor & 0x7f)
+        };
+        prod.level_value = scaled_value * 10.0_f64.powi(-scale_factor);
     }
 
     Ok(prod)
+}
+
+#[cfg(test)]
+mod section4_tests {
+    use super::parse_section4;
+
+    fn section4_with_level(scale_factor: u8, scaled_value: u32) -> Vec<u8> {
+        let mut section = vec![0_u8; 34];
+        section[0..4].copy_from_slice(&34_u32.to_be_bytes());
+        section[4] = 4;
+        section[7..9].copy_from_slice(&0_u16.to_be_bytes());
+        section[22] = 100;
+        section[23] = scale_factor;
+        section[24..28].copy_from_slice(&scaled_value.to_be_bytes());
+        section
+    }
+
+    #[test]
+    fn fixed_surface_scale_factor_uses_grib_sign_magnitude() {
+        let positive = parse_section4(&section4_with_level(2, 50_000)).unwrap();
+        assert_eq!(positive.level_value, 500.0);
+
+        let negative = parse_section4(&section4_with_level(0x82, 5)).unwrap();
+        assert_eq!(negative.level_value, 500.0);
+    }
 }
 
 /// Parse Section 5 (Data Representation).
@@ -711,6 +759,7 @@ fn parse_section5(sec: &[u8]) -> Result<DataRepresentation, String> {
     let template = read_u16(sec, 9)?;
     let mut dr = DataRepresentation::default();
     dr.template = template;
+    dr.section5_num_data_points = read_u32(sec, 5)?;
 
     match template {
         0 => parse_drtemplate_simple(sec, &mut dr)?,
@@ -751,7 +800,11 @@ fn parse_drtemplate_complex(sec: &[u8], dr: &mut DataRepresentation) -> Result<(
     if sec.len() < 47 {
         return Err("Section 5 complex packing too short".into());
     }
+    dr.original_field_type = read_u8(sec, 20)?;
     dr.group_splitting_method = read_u8(sec, 21)?;
+    dr.missing_value_management = read_u8(sec, 22)?;
+    dr.primary_missing_value_substitute = read_u32(sec, 23)?;
+    dr.secondary_missing_value_substitute = read_u32(sec, 27)?;
     dr.num_groups = read_u32(sec, 31)?;
     dr.group_width_ref = read_u8(sec, 35)?;
     dr.group_width_bits = read_u8(sec, 36)?;

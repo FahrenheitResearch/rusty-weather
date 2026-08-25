@@ -206,7 +206,8 @@ In particular, create/chown the bind mounts before Compose starts them:
 
     sudo install -d -o 65532 -g 65532 -m 0750 \
       deploy/docker/data/store deploy/docker/data/artifacts \
-      deploy/docker/data/scheduler-cache deploy/docker/data/scheduler-state
+      deploy/docker/data/server-cache deploy/docker/data/scheduler-cache \
+      deploy/docker/data/scheduler-state
 
 The published port is loopback-only. When a reverse proxy is added, configure
 its public hostname and TLS at the proxy. Artifact links are deliberately
@@ -221,8 +222,13 @@ The hardened unit assumes these paths:
 - binary: `/usr/local/bin/rw-server`
 - configuration: `/etc/rusty-weather/rusty-weather.toml`
 - token file: `/etc/rusty-weather/api-tokens.txt`
+- optional owner-mapped operations write credentials:
+  `/etc/rusty-weather/ops-write-tokens.txt`
 - store: `/var/lib/rusty-weather/store`
 - artifacts: `/var/lib/rusty-weather/artifacts`
+- restart-reusable derived cache: `/var/cache/rusty-weather/server`
+- optional server-owned satellite raw staging:
+  `/var/lib/rusty-weather/satellite-staging`
 - optional Community cache/control state:
   `/var/lib/rusty-weather/community-cache`
 - optional federation health/accounting state:
@@ -235,24 +241,26 @@ Example installation as root:
     useradd --system --home-dir /var/lib/rusty-weather --shell /usr/sbin/nologin rusty-weather
     install -d -o rusty-weather -g rusty-weather -m 0750 /var/lib/rusty-weather/store
     install -d -o rusty-weather -g rusty-weather -m 0750 /var/lib/rusty-weather/artifacts
+    install -d -o rusty-weather -g rusty-weather -m 0750 /var/cache/rusty-weather/server
     install -d -o root -g rusty-weather -m 0750 /etc/rusty-weather
     install -o root -g root -m 0755 rw-server /usr/local/bin/rw-server
     install -o root -g rusty-weather -m 0640 config/rusty-weather.example.toml /etc/rusty-weather/rusty-weather.toml
     install -o root -g rusty-weather -m 0640 deploy/systemd/rusty-weather.env /etc/default/rusty-weather
     install -o root -g root -m 0644 deploy/systemd/rusty-weather.service /etc/systemd/system/rusty-weather.service
 
-Create `/etc/rusty-weather/api-tokens.txt` separately, owned by
-`rusty-weather:rusty-weather` with mode `0600`. The server intentionally
-rejects any Unix token file with group or other permission bits.
+Create `/etc/rusty-weather/api-tokens.txt` and every operations credential file
+separately, owned by `rusty-weather:rusty-weather` with mode `0600`. The server
+intentionally rejects any Unix token file with group or other permission bits.
 
 Create an optional state directory only when its feature is deliberately
 enabled, and keep every signing key/provider token as a distinct `0600`
 regular file under `/etc/rusty-weather`. The systemd unit grants those bounded
 state locations write access while its more-specific `ReadOnlyPaths` rule keeps
-the operational model store read-only. Advanced generation replication is the
-only mode that also needs a separately reviewed writable-store policy. The
-packaged `rusty-weather-generation-replication.conf` is that narrowly scoped
-systemd drop-in: it resets the base store's read-only path rule and grants write
+the operational model store read-only. Any explicitly enabled server-owned
+writer needs a separately reviewed writable-store policy. The packaged
+`rusty-weather-generation-replication.conf` is generation replication's
+narrowly scoped systemd drop-in: it resets the base store's read-only path rule
+and grants write
 access only to the model store and the replication control root. Install it
 only after the security/capacity gates and configuration in
 [`GENERATION_REPLICATION.md`](GENERATION_REPLICATION.md) have been reviewed:
@@ -268,6 +276,125 @@ only after the security/capacity gates and configuration in
 Do not install the drop-in on an ordinary operational API node. Its filesystem
 permission alone does not enable replication: the feature remains default-off,
 requires its distinct signing key and operator gates, and starts kill-switched.
+
+Server-owned satellite ingest also writes the model store, but does not use the
+replication control plane. When `satellite_ingest.enabled = true`, set
+`satellite_ingest.raw_cache_root = "/var/lib/rusty-weather/satellite-staging"`,
+create that service-owned staging directory, and install its narrower drop-in:
+
+    install -d -o rusty-weather -g rusty-weather -m 0750 \
+      /var/lib/rusty-weather/satellite-staging
+    install -d -o root -g root -m 0755 \
+      /etc/systemd/system/rusty-weather.service.d
+    install -o root -g root -m 0644 \
+      deploy/systemd/rusty-weather-satellite-ingest.conf \
+      /etc/systemd/system/rusty-weather.service.d/50-satellite-ingest.conf
+
+This permission does not start ingestion. The explicitly enabled, validated
+follower list is the only startup gate; clients never trigger downloads. The
+server uses NOAA public S3 without credentials and cancels and joins every
+follower during graceful shutdown.
+
+When `satellite_prewarm.enabled = true`, the same process reconciles each
+configured product after startup, on native-manifest updates, and on the
+bounded periodic interval. It renders the newest configured frames in XYZ
+breadth-first order, so global overview tiles become ready before regional
+detail. The plan is a latency policy only: it never lowers the native
+renderer’s maximum zoom or prevents an unplanned tile from rendering on
+demand. Keep `server.cache_root` on a persistent writable volume and the
+scientific `server.store_root` read-only unless server-owned ingest is also
+enabled. Authenticated operators can inspect
+`GET /v1/satellite/prewarm/status`; `ready = true` means the current reconcile
+completed without a tile failure, while `waiting_for_source` means no complete
+configured native frame exists yet.
+
+Continuous MRMS ingest is a separate default-off writer. It follows NOAA's
+official realtime 2D `latest` products through the existing observation
+decoder/store pipeline; lowest-altitude reflectivity is the default selection.
+It preserves the GRIB valid time and units, normalizes only the documented MRMS
+missing/no-coverage sentinels, and never lets configuration invent values or
+units. Configure `[mrms_ingest]`, retain API authentication, and install the
+MRMS-specific writable-store drop-in:
+
+    install -d -o root -g root -m 0755 \
+      /etc/systemd/system/rusty-weather.service.d
+    install -o root -g root -m 0644 \
+      deploy/systemd/rusty-weather-mrms-ingest.conf \
+      /etc/systemd/system/rusty-weather.service.d/50-mrms-ingest.conf
+
+One worker exists per selected product, but the shared semaphore caps actual
+download/decode/write concurrency. The first check runs at startup. Later
+checks use the configured cadence, capped exponential failure backoff, and a
+bounded HTTP timeout/retry policy. Matching GRIB valid times are not encoded a
+second time. Age retention removes only complete expired runs belonging to the
+configured follower products after a run lock and same-filesystem retirement
+rename; current data, other MRMS products, and non-MRMS runs are never
+candidates. `GET /v1/observations/mrms/ingest/status` reports exact
+freshness and latest stored identities. For a fresh product, combine the
+product-level `variable` with `latest.model`, `latest.run`,
+`latest.storage_slot`, `latest.valid_unix`, `latest.grid_hash`, and
+`latest.snapshot_id`. The snapshot ID is computed by opening and validating
+the published `rw-store` run, so snapshot-bound analysis can consume that
+native plane directly without a second catalog lookup or upstream download.
+Before the first successful frame, `latest` is `null` and `fresh` is false;
+after a fetch error, the last identity remains visible while `phase` becomes
+`degraded` and timestamp-derived freshness continues to age honestly.
+`POST .../refresh` advances one coalescing wake epoch, so simultaneous
+client refreshes do not create
+simultaneous upstream jobs. Both routes require the normal bearer token and
+return `Cache-Control: no-store, private`. With the default
+`mrms_ingest.gate_server_readiness = false`, enabled stale or missing products
+make the public readiness body `degraded` while it remains HTTP 200, so model,
+satellite, and unrelated storm traffic stays connected. Set
+the gate true only for a dedicated deployment whose traffic is scientifically
+invalid without a fresh frame for every configured MRMS product. Even then,
+the public probe exposes only a bounded subsystem reason; exact status remains
+authenticated.
+
+The source endpoint and product inventory are NOAA/NSSL's operational MRMS
+service: <https://mrms.ncep.noaa.gov/2D/>. Monitor free disk space alongside
+the configured retention horizon; retention is age-bounded and deliberately
+does not pretend to be a byte quota.
+
+Authenticated storm-analysis operations are one explicit gate:
+`operations.enabled = true` opens the durable operations root and the
+`/v1/ops/storms/*` routes. Keep
+`operations.root = "/var/lib/rusty-weather/operations"` on a persistent,
+service-owned volume. Authenticated HTTP request bodies remain an explicit
+byte-security boundary applied at ingress and reported by configuration rather
+than silently truncating retained data.
+
+Operations credentials expose private, `no-store` APIs:
+
+- Operations-read can inspect private derived data but cannot mutate or ingest.
+- Operations-write can read plus create/update and delete only its stable
+  owner's records. It cannot ingest adapter payloads or perform administrative
+  actions.
+- Operations-ingest can read and submit source-bound payloads but cannot mutate
+  owned records. Dedicated operations-admin credentials retain all operations
+  permissions.
+- General `RW_API_TOKEN_FILE` weather-data credentials have no operations
+  access by default. `auth.legacy_api_tokens_are_operations_admins = true` (or
+  `RW_LEGACY_API_TOKENS_ARE_OPERATIONS_ADMINS=true`) restores the old all-access
+  mapping for compatibility, but must remain false on a multi-operator node
+  because it elevates every general data token to Operations Admin.
+- Configure write credentials with `auth.ops_write_token_file` or
+  `RW_OPS_WRITE_TOKEN_FILE`. Each non-comment line is exactly
+  `<owner-id><TAB><bearer-token>`. Owner IDs are 1-128 ASCII letters, digits,
+  `.`, `_`, `-`, `:`, `@`, or `+`; bearer tokens remain at least 32 bytes.
+  The server stores only domain-separated hashes. To rotate without losing
+  access, add the new token beside the old token using the **same owner ID**,
+  restart and validate, then remove the old line and restart again. Reusing a
+  bearer token in another scope or mapping one token to two owners fails
+  startup. Changing the owner ID deliberately creates a different private
+  owner and does not migrate data.
+
+- `GET /v1/ops/storms/status`, `/methods`, and `/models` describe the storm
+  runtime, its registered detection methods, and any registered native models.
+- `POST /v1/ops/storms/cells` derives storm cells from a stored, snapshot-bound
+  native grid reference; raw grids are never accepted over the route.
+- `POST /v1/ops/storms/authoritative/nexrad-level3/decode` decodes an
+  authoritative NEXRAD Level III storm product.
 
 Then validate and start:
 
@@ -292,10 +419,15 @@ preferred in managed environments.
 ## Public exposure checklist
 
 - Terminate TLS in a maintained reverse proxy or load balancer.
+- Set `server.public_base_url` to the canonical external HTTPS origin (and any
+  fixed path prefix). `rw-server` deliberately does not trust forwarded-host or
+  forwarded-protocol headers when constructing absolute satellite TileJSON URLs.
 - Keep API tokens enabled and rotate them without publishing them in logs.
 - Bind directly to a private interface only when network policy also restricts
   clients; otherwise retain a loopback bind behind the proxy.
-- Set exact `cors_origins`; never use a wildcard for credentialed browser use.
+- Set exact `cors_origins`; wildcards, userinfo, and URL paths are rejected.
+  Browser GETs may send bearer authorization and conditional-cache headers, but
+  CORS does not enable cookie credentials.
 - Protect `/metrics` unless the metrics collector is isolated and trusted.
 - Keep the store read-only and artifact output on a separate writable volume.
 - Monitor readiness, request failures, admission rejections, queue depth,

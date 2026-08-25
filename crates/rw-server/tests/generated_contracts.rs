@@ -30,7 +30,7 @@ fn assert_contract_current(
 }
 
 #[test]
-fn checked_in_config_and_openapi_contracts_match_generators() {
+fn checked_in_config_contract_matches_generator() {
     assert_contract_current(
         "configuration schema",
         "config/rusty-weather.schema.json",
@@ -38,11 +38,20 @@ fn checked_in_config_and_openapi_contracts_match_generators() {
             .expect("configuration schema must serialize"),
         "cargo run --locked -p rw-server -- config-schema > config/rusty-weather.schema.json",
     );
-    assert_contract_current(
-        "OpenAPI",
-        "config/rusty-weather.openapi.json",
-        serde_json::to_value(rw_server::openapi::document())
-            .expect("OpenAPI document must serialize"),
-        "cargo run --locked -p rw-server -- openapi > config/rusty-weather.openapi.json",
+}
+
+#[test]
+fn checked_in_openapi_contract_matches_generator() {
+    let relative_path = "config/rusty-weather.openapi.json";
+    let path = repository_root().join(relative_path);
+    let checked_in = fs::read(&path)
+        .unwrap_or_else(|error| panic!("failed to read checked-in {}: {error}", path.display()));
+    let mut generated = serde_json::to_vec_pretty(&rw_server::openapi::document())
+        .expect("OpenAPI document must serialize");
+    generated.push(b'\n');
+    assert!(
+        checked_in == generated,
+        "OpenAPI contract is not byte-equal to rw-server's generator: {relative_path}.\n\
+         Regenerate it with:\n  cargo run --locked -p rw-server -- openapi > {relative_path}"
     );
 }

@@ -24,7 +24,9 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 
 use rw_sat::abi::read_goes_abi_field;
-use rw_sat::composite::{GoesAbiRgbCompositeStyle, values_on_base_grid};
+use rw_sat::composite::{
+    GoesAbiRgbCompositeStyle, values_on_base_grid, variance_encode_visible_field,
+};
 use rw_sat::events::{NEVER_CANCEL, SatEvent, print_event};
 use rw_sat::export::{export_frame_png, render_composite_image};
 use rw_sat::fci::{FciChannel, FciValueMode, assemble_fci_chunks};
@@ -83,8 +85,8 @@ struct SourceArgs {
     /// Download cache directory.
     #[arg(long, default_value = "cache")]
     cache: PathBuf,
-    /// Stride-decimate frames before storing (1 = native resolution).
-    #[arg(long, default_value_t = 1)]
+    /// Preview stride (0 = automatic bounded preview; native source is retained).
+    #[arg(long, default_value_t = 0)]
     downsample: usize,
 }
 
@@ -101,8 +103,8 @@ enum Command {
         /// the newest scan that has every required channel.
         #[arg(long)]
         composite: Option<String>,
-        /// Extra stride decimation applied to the composite base grid.
-        #[arg(long, default_value_t = 4)]
+        /// Optional extra stride for a one-off composite quicklook.
+        #[arg(long, default_value_t = 1)]
         composite_downsample: usize,
     },
     /// Poll the live bucket continuously and ingest frames as they land.
@@ -1099,7 +1101,7 @@ fn run_latest(
             newest.last_modified
         );
         let written_unix = Utc::now().timestamp().max(0) as u64;
-        let (_download, frame) = fetch_and_ingest(
+        let outcome = fetch_and_ingest(
             &agent,
             &bucket,
             &source.cache,
@@ -1111,6 +1113,15 @@ fn run_latest(
             &mut sink,
         )
         .map_err(|err| -> Box<dyn Error> { err.to_string().into() })?;
+        let Some(frame) = outcome.preview_frame else {
+            println!(
+                "native {}/{}/{} retained; compact preview was unavailable",
+                outcome.native_frame.platform,
+                outcome.native_frame.sector,
+                outcome.native_frame.frame_id
+            );
+            continue;
+        };
         let png_path = png_dir.join(format!(
             "{}_{}_t{:04}_{}.png",
             frame.model, frame.run, frame.hhmm, frame.variable
@@ -1202,6 +1213,18 @@ fn run_latest_composite(
     let base = fields
         .remove(&style.base_channel())
         .ok_or("missing base channel after download")?;
+    if style == GoesAbiRgbCompositeStyle::GeoColor {
+        // GeoColor's dayside is built on the native 0.5 km C02 grid. Apply
+        // Miller et al. (2020) variance encoding before any requested output
+        // decimation and before pseudo-green construction. `natural_color`
+        // intentionally remains the legacy/basic unsharpened export.
+        for channel in [1, 3] {
+            let coarse = fields
+                .remove(&channel)
+                .ok_or_else(|| format!("missing C{channel:02} for GeoColor sharpening"))?;
+            fields.insert(channel, variance_encode_visible_field(&coarse, &base)?);
+        }
+    }
     let base = downsample_field(base, downsample.max(1));
     let (nx, ny) = (base.scene.fixed_grid.nx, base.scene.fixed_grid.ny);
     let mut bands: HashMap<u8, Vec<f32>> = HashMap::new();

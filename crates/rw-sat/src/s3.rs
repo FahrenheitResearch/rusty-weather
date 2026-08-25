@@ -10,13 +10,15 @@
 //! GETs for objects, with TLS through rustls and its portable ring provider.
 
 use std::error::Error;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
 
-use rw_store::atomic::atomic_write_bytes;
+use rw_store::RwStoreError;
+use rw_store::atomic::atomic_write_with;
 
 use crate::goes::{GoesSatellite, parse_goes_abi_filename};
 
@@ -26,6 +28,10 @@ pub struct S3Object {
     pub key: String,
     pub size_bytes: u64,
     pub last_modified: String,
+    /// Normalized S3 entity tag from `ListObjectsV2`, without quotes.
+    /// Multipart tags retain their `-N` suffix and are identity tokens, not
+    /// incorrectly treated as whole-object MD5 digests.
+    pub etag: Option<String>,
 }
 
 /// A downloaded (or cache-hit) object on local disk.
@@ -34,6 +40,29 @@ pub struct DownloadedObject {
     pub object: S3Object,
     pub path: PathBuf,
     pub cache_hit: bool,
+}
+
+/// Bounded, monotonic progress from a streaming object download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectDownloadProgress {
+    pub received_bytes: u64,
+    pub total_bytes: Option<u64>,
+}
+
+/// A streaming download failure. Cancellation remains typed so the follow
+/// engine can stop immediately without treating it as a retryable S3 error.
+#[derive(Debug, thiserror::Error)]
+pub enum ObjectDownloadError {
+    #[error("satellite object download cancelled")]
+    Cancelled,
+    #[error("HTTP download failed: {0}")]
+    Http(#[from] ureq::Error),
+    #[error("download I/O failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("atomic cache install failed: {0}")]
+    Store(#[from] RwStoreError),
+    #[error("download integrity check failed: {0}")]
+    Integrity(String),
 }
 
 /// The ABI sectors the follow engine knows. Mesoscale sectors share the
@@ -223,8 +252,12 @@ pub fn cached_object_path(cache_dir: &Path, bucket: &str, key: &str) -> PathBuf 
     cache_dir.join("satellite").join(bucket).join(key)
 }
 
-/// Download `object` into [`cached_object_path`] (atomic write); a cache
-/// hit is an existing file with the exact listed byte size.
+/// Download `object` into [`cached_object_path`] using a bounded streaming
+/// atomic write; a cache hit is an existing file with the exact listed byte
+/// size.
+///
+/// This compatibility entry point has no cancellation or progress consumer.
+/// Long-running follow sessions use [`download_object_with_control`].
 pub fn download_object(
     agent: &ureq::Agent,
     bucket: &str,
@@ -232,6 +265,43 @@ pub fn download_object(
     object: &S3Object,
     use_cache: bool,
 ) -> Result<DownloadedObject, Box<dyn Error>> {
+    static NEVER_CANCEL_DOWNLOAD: AtomicBool = AtomicBool::new(false);
+    download_object_with_control(
+        agent,
+        bucket,
+        cache_dir,
+        object,
+        use_cache,
+        &NEVER_CANCEL_DOWNLOAD,
+        &mut |_| {},
+    )
+    .map_err(|error| Box::new(error) as Box<dyn Error>)
+}
+
+/// Stream one S3 object directly into a same-directory temporary file, then
+/// fsync and atomically install it at [`cached_object_path`]. The destination
+/// is never a partial response and an older destination is preserved on any
+/// read, validation, cancellation, or install failure.
+///
+/// This adapts SimSat's first-party `.part` streaming/install pattern while
+/// using Rusty Weather's stronger [`atomic_write_with`] primitive: unique
+/// partial names, Windows-safe replacement, durable metadata, and automatic
+/// cleanup. It intentionally does not transfer SimSat's Blue Marble SHA
+/// manifest contract; dynamic NOAA objects are instead bound to their listed
+/// byte count and S3 ETag identity.
+#[allow(clippy::too_many_arguments)]
+pub fn download_object_with_control(
+    agent: &ureq::Agent,
+    bucket: &str,
+    cache_dir: &Path,
+    object: &S3Object,
+    use_cache: bool,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(ObjectDownloadProgress),
+) -> Result<DownloadedObject, ObjectDownloadError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(ObjectDownloadError::Cancelled);
+    }
     let target = cached_object_path(cache_dir, bucket, &object.key);
     if use_cache && target.exists() && target.metadata()?.len() == object.size_bytes {
         return Ok(DownloadedObject {
@@ -241,30 +311,171 @@ pub fn download_object(
         });
     }
     let url = object_url(bucket, &object.key);
-    let mut response = agent.get(&url).call()?;
+    // Keep transfer counts comparable to S3's object size and ETag. Transparent
+    // content decoding would make Content-Length describe different bytes.
+    let mut response = agent
+        .get(&url)
+        .header("Accept-Encoding", "identity")
+        .call()?;
+    validate_response_etag(
+        object,
+        response.headers().get("etag").and_then(|v| v.to_str().ok()),
+    )?;
+
+    let response_length = response.body().content_length();
     let limit = object
         .size_bytes
         .saturating_add(16 * 1024 * 1024)
         .max(32 * 1024 * 1024);
-    let bytes = response
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_vec()?;
-    if object.size_bytes > 0 && bytes.len() as u64 != object.size_bytes {
-        return Err(boxed_error(format!(
-            "downloaded byte count mismatch for {}: expected {}, got {}",
-            object.key,
-            object.size_bytes,
-            bytes.len()
+    if response_length.is_some_and(|bytes| bytes > limit) {
+        return Err(ObjectDownloadError::Integrity(format!(
+            "Content-Length {} exceeds the {} byte safety bound for {}",
+            response_length.unwrap_or_default(),
+            limit,
+            object.key
         )));
     }
-    atomic_write_bytes(&target, &bytes)?;
+    if object.size_bytes > 0 && response_length.is_some_and(|bytes| bytes != object.size_bytes) {
+        return Err(ObjectDownloadError::Integrity(format!(
+            "Content-Length mismatch for {}: listed {}, response {}",
+            object.key,
+            object.size_bytes,
+            response_length.unwrap_or_default()
+        )));
+    }
+    let expected_bytes = if object.size_bytes > 0 {
+        Some(object.size_bytes)
+    } else {
+        response_length
+    };
+    let mut reader = response.body_mut().as_reader();
+    stream_reader_atomically(
+        &target,
+        &mut reader,
+        expected_bytes,
+        limit,
+        cancel,
+        progress,
+    )?;
     Ok(DownloadedObject {
         object: object.clone(),
         path: target,
         cache_hit: false,
     })
+}
+
+const DOWNLOAD_BUFFER_BYTES: usize = 256 * 1024;
+const UNKNOWN_LENGTH_PROGRESS_BYTES: u64 = 4 * 1024 * 1024;
+
+fn stream_reader_atomically<R: Read>(
+    target: &Path,
+    reader: &mut R,
+    expected_bytes: Option<u64>,
+    hard_limit: u64,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(ObjectDownloadProgress),
+) -> Result<u64, ObjectDownloadError> {
+    let mut received = 0_u64;
+    let mut cancelled = false;
+    let mut last_reported = 0_u64;
+    let progress_step = expected_bytes
+        .filter(|bytes| *bytes > 0)
+        .map(|bytes| (bytes / 20).max(1024 * 1024))
+        .unwrap_or(UNKNOWN_LENGTH_PROGRESS_BYTES);
+
+    let result = atomic_write_with(target, |writer| {
+        let mut buffer = [0_u8; DOWNLOAD_BUFFER_BYTES];
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                cancelled = true;
+                return Err(
+                    io::Error::new(io::ErrorKind::Interrupted, "download cancelled").into(),
+                );
+            }
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            let next = received.checked_add(count as u64).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "download byte count overflow")
+            })?;
+            let maximum = expected_bytes.unwrap_or(hard_limit).min(hard_limit);
+            if next > maximum {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("download exceeded its {maximum} byte bound"),
+                )
+                .into());
+            }
+            writer.write_all(&buffer[..count])?;
+            received = next;
+            if received.saturating_sub(last_reported) >= progress_step
+                || expected_bytes == Some(received)
+            {
+                progress(ObjectDownloadProgress {
+                    received_bytes: received,
+                    total_bytes: expected_bytes,
+                });
+                last_reported = received;
+            }
+        }
+        if expected_bytes.is_some_and(|expected| received != expected) {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "downloaded byte count mismatch: expected {}, got {received}",
+                    expected_bytes.unwrap_or_default()
+                ),
+            )
+            .into());
+        }
+        if received != last_reported {
+            progress(ObjectDownloadProgress {
+                received_bytes: received,
+                total_bytes: expected_bytes,
+            });
+        }
+        if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "download cancelled").into());
+        }
+        Ok(())
+    });
+    if cancelled {
+        return Err(ObjectDownloadError::Cancelled);
+    }
+    result?;
+    Ok(received)
+}
+
+fn validate_response_etag(
+    object: &S3Object,
+    response_etag: Option<&str>,
+) -> Result<(), ObjectDownloadError> {
+    let Some(expected) = object.etag.as_deref() else {
+        return Ok(());
+    };
+    let actual = response_etag.and_then(normalize_etag).ok_or_else(|| {
+        ObjectDownloadError::Integrity(format!(
+            "response for {} omitted its listed ETag {expected}",
+            object.key
+        ))
+    })?;
+    // An HTTP entity tag is an opaque, case-sensitive identity token. Even
+    // when S3's usual value resembles a hexadecimal digest, do not normalize
+    // its bytes or reinterpret multipart tags as hashes.
+    if actual != expected {
+        return Err(ObjectDownloadError::Integrity(format!(
+            "ETag mismatch for {}: listed {expected}, response {actual}",
+            object.key
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_etag(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_matches('"').trim();
+    (!normalized.is_empty()).then(|| normalized.to_string())
 }
 
 /// What one [`prune_object_cache`] pass removed.
@@ -358,10 +569,12 @@ fn parse_s3_list_xml(xml: &str) -> S3ListPage {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
         let last_modified = extract_xml_tag(block, "LastModified").unwrap_or_default();
+        let etag = extract_xml_tag(block, "ETag").and_then(|value| normalize_etag(&value));
         objects.push(S3Object {
             key,
             size_bytes,
             last_modified,
+            etag,
         });
     }
     S3ListPage {
@@ -451,15 +664,172 @@ fn boxed_error(message: impl Into<String>) -> Box<dyn Error> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::io::Cursor;
+
+    fn download_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rw-sat-stream-download-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn directory_names(dir: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
 
     #[test]
     fn s3_xml_parser_reads_continuation_token() {
-        let xml = "<ListBucketResult><Contents><Key>a.nc</Key><Size>42</Size><LastModified>x</LastModified></Contents><NextContinuationToken>abc&amp;123</NextContinuationToken></ListBucketResult>";
+        let xml = "<ListBucketResult><Contents><Key>a.nc</Key><Size>42</Size><LastModified>x</LastModified><ETag>&quot;0123abcd-2&quot;</ETag></Contents><NextContinuationToken>abc&amp;123</NextContinuationToken></ListBucketResult>";
         let page = parse_s3_list_xml(xml);
         assert_eq!(page.objects.len(), 1);
         assert_eq!(page.objects[0].key, "a.nc");
         assert_eq!(page.objects[0].size_bytes, 42);
+        assert_eq!(page.objects[0].etag.as_deref(), Some("0123abcd-2"));
         assert_eq!(page.next_continuation_token.as_deref(), Some("abc&123"));
+    }
+
+    #[test]
+    fn streaming_atomic_install_replaces_only_after_complete_validation() {
+        let dir = download_test_dir("complete");
+        let target = dir.join("full-disk.nc");
+        std::fs::write(&target, b"old bytes stay visible until commit").unwrap();
+        let payload = (0..(DOWNLOAD_BUFFER_BYTES * 3 + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let cancel = AtomicBool::new(false);
+        let mut reports = Vec::new();
+        let received = stream_reader_atomically(
+            &target,
+            &mut Cursor::new(&payload),
+            Some(payload.len() as u64),
+            payload.len() as u64,
+            &cancel,
+            &mut |report| reports.push(report),
+        )
+        .unwrap();
+
+        assert_eq!(received, payload.len() as u64);
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+        assert!(reports.windows(2).all(|pair| {
+            pair[0].received_bytes < pair[1].received_bytes
+                && pair[0].total_bytes == pair[1].total_bytes
+        }));
+        assert_eq!(
+            reports.last(),
+            Some(&ObjectDownloadProgress {
+                received_bytes: received,
+                total_bytes: Some(received),
+            })
+        );
+        assert_eq!(directory_names(&dir), vec!["full-disk.nc"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_or_oversized_stream_never_replaces_the_cache_entry() {
+        for (name, payload, expected, limit) in [
+            ("truncated", b"short".as_slice(), 20_u64, 20_u64),
+            ("oversized", b"one byte too many".as_slice(), 16_u64, 16_u64),
+        ] {
+            let dir = download_test_dir(name);
+            let target = dir.join("object.nc");
+            std::fs::write(&target, b"known-good-old-object").unwrap();
+            let error = stream_reader_atomically(
+                &target,
+                &mut Cursor::new(payload),
+                Some(expected),
+                limit,
+                &AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("byte count mismatch")
+                    || error.to_string().contains("exceeded"),
+                "unexpected {name} error: {error}"
+            );
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                b"known-good-old-object",
+                "{name} response replaced the destination"
+            );
+            assert_eq!(directory_names(&dir), vec!["object.nc"]);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn cancellation_during_stream_is_typed_and_cleans_the_partial() {
+        let dir = download_test_dir("cancel");
+        let target = dir.join("object.nc");
+        std::fs::write(&target, b"old").unwrap();
+        let payload = vec![7_u8; DOWNLOAD_BUFFER_BYTES * 4];
+        let cancel = AtomicBool::new(false);
+        let error = stream_reader_atomically(
+            &target,
+            &mut Cursor::new(payload),
+            Some((DOWNLOAD_BUFFER_BYTES * 4) as u64),
+            (DOWNLOAD_BUFFER_BYTES * 4) as u64,
+            &cancel,
+            &mut |_| cancel.store(true, Ordering::Relaxed),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ObjectDownloadError::Cancelled));
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert_eq!(directory_names(&dir), vec!["object.nc"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_size_cache_hit_never_starts_network_or_progress() {
+        let dir = download_test_dir("cache-hit");
+        let object = S3Object {
+            key: "ABI-L2-CMIPF/example.nc".to_string(),
+            size_bytes: 4,
+            last_modified: String::new(),
+            etag: Some("listed-etag".to_string()),
+        };
+        let target = cached_object_path(&dir, "not-a-real-bucket", &object.key);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"CMI!").unwrap();
+        let mut progress_calls = 0;
+        let downloaded = download_object_with_control(
+            &build_agent(),
+            "not-a-real-bucket",
+            &dir,
+            &object,
+            true,
+            &AtomicBool::new(false),
+            &mut |_| progress_calls += 1,
+        )
+        .unwrap();
+        assert!(downloaded.cache_hit);
+        assert_eq!(downloaded.path, target);
+        assert_eq!(progress_calls, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn response_etag_is_compared_as_an_identity_not_a_digest() {
+        let object = S3Object {
+            key: "multipart.nc".to_string(),
+            size_bytes: 1,
+            last_modified: String::new(),
+            etag: Some("abcdef-17".to_string()),
+        };
+        validate_response_etag(&object, Some("\"abcdef-17\"")).unwrap();
+        assert!(validate_response_etag(&object, Some("\"ABCDEF-17\"")).is_err());
+        assert!(validate_response_etag(&object, Some("\"different\"")).is_err());
+        assert!(validate_response_etag(&object, None).is_err());
     }
 
     #[test]

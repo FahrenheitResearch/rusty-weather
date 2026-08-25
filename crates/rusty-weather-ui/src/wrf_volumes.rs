@@ -839,10 +839,22 @@ mod tests {
 
     #[test]
     fn volume_preflight_checks_store_and_owned_working_set_ceilings_without_allocating() {
+        // A grid that fits the desktop working set is accepted and reports the
+        // known owned byte total.
+        let accepted = preflight_iso_volume_shape(STANDARD_LEVEL_COUNT, 512 * 512)
+            .expect("a 512x512 37-level volume fits the desktop ceiling");
+        assert!(u128::from(accepted) < MAX_WRF_VOLUME_OWNED_BYTES);
+
+        // The shared store ceiling is a structural addressability bound, not a
+        // memory budget, so a grid that merely saturates it is rejected here by
+        // the aggregate working-set ceiling — computed from the shape alone,
+        // with nothing allocated.
         let largest_supported_grid = rustwx_core::MAX_VOLUME_ELEMENTS / STANDARD_LEVEL_COUNT;
+        let working_set_error = preflight_iso_volume_shape(2, largest_supported_grid)
+            .expect_err("a grid that saturates the store ceiling cannot fit 4 GiB");
         assert!(
-            u128::from(preflight_iso_volume_shape(2, largest_supported_grid).unwrap())
-                < MAX_WRF_VOLUME_OWNED_BYTES
+            working_set_error.contains("4 GiB"),
+            "unexpected working-set error: {working_set_error}"
         );
 
         let error = preflight_iso_volume_shape(2, largest_supported_grid + 1)

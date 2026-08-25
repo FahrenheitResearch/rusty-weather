@@ -10,7 +10,14 @@
   <env name="RW_LISTEN" value="127.0.0.1:8788" />
   <env name="RW_STORE_ROOT" value="%BASE%\data\store" />
   <env name="RW_ARTIFACT_ROOT" value="%BASE%\data\artifacts" />
+  <env name="RW_CACHE_ROOT" value="%BASE%\data\cache" />
+  <env name="RW_OPERATIONS_ROOT" value="%BASE%\data\operations" />
   <env name="RW_API_TOKEN_FILE" value="%BASE%\secrets\api-tokens.txt" />
+  <!-- Optional owner-mapped token file: <owner-id><TAB><bearer-token>. -->
+  <!-- <env name="RW_OPS_WRITE_TOKEN_FILE" value="%BASE%\secrets\ops-write-tokens.txt" /> -->
+  <env name="RW_LEGACY_API_TOKENS_ARE_OPERATIONS_ADMINS" value="false" />
+  <!-- Set true only after granting NetworkService modify access to data\store. -->
+  <env name="RW_MRMS_INGEST_ENABLED" value="false" />
   <env name="RW_LOG" value="rw_server=info,tower_http=info" />
 
   <serviceaccount>

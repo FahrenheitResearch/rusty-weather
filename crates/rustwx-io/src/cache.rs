@@ -1084,6 +1084,32 @@ mod tests {
     }
 
     #[test]
+    fn raw_fetch_cache_keys_a_bzip2_url_but_persists_decoded_grib_bytes() {
+        let cache_root = temp_cache_root();
+        let fetch = sample_fetch_request();
+        let url = "https://opendata.dwd.de/weather/nwp/icon-d2/grib/00/t_2m/icon-d2.grib2.bz2";
+        let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::best());
+        encoder.write_all(b"GRIBdecoded").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let decoded = crate::maybe_decompress_grib_payload(url, compressed).unwrap();
+        let result = FetchResult {
+            source: SourceId::Aws,
+            url: url.to_string(),
+            bytes: decoded,
+        };
+
+        store_cached_raw_fetch(&cache_root, &fetch, &result).unwrap();
+        let loaded = load_cached_raw_fetch(&cache_root, SourceId::Aws, url)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.result.bytes, b"GRIBdecoded");
+        assert!(loaded.cache_hit);
+        assert!(loaded.result.url.ends_with(".grib2.bz2"));
+
+        fs::remove_dir_all(cache_root).ok();
+    }
+
+    #[test]
     fn load_cached_selected_field_reads_legacy_embedded_field_payload() {
         let cache_root = temp_cache_root();
         let fetch = sample_fetch_request();

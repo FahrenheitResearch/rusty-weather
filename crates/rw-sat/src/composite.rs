@@ -19,6 +19,196 @@ pub type Rgba = [u8; 4];
 /// Fully transparent pixel (off-earth / missing data).
 pub const TRANSPARENT: Rgba = [0, 0, 0, 0];
 
+/// Transfer the sub-pixel brightness structure from one native ABI C02
+/// (0.5 km) 2x2 cell into a colocated C01/C03 (1 km) reflectance value.
+///
+/// This is the variance-encoding sharpening described by Miller et al. (2020),
+/// *GeoColor: A Blending Technique for Satellite Imagery*, J. Atmos. Oceanic
+/// Technol., 37, 429-448, <https://doi.org/10.1175/JTECH-D-19-0134.1>,
+/// appendix section b.
+/// It must run on reflectance before atmospheric correction and synthetic
+/// green construction. The four returned values have `coarse_reflectance` as
+/// their arithmetic mean (apart from floating-point roundoff).
+///
+/// In an incomplete C02 block, finite targets fall back to the unsharpened
+/// coarse value while each missing/off-disk target remains missing. Dark
+/// blocks whose mean cannot support a stable ratio also remain unsharpened.
+/// This preserves radiometry without fabricating texture or extending the
+/// Earth mask at the limb. A missing coarse value remains missing.
+pub fn variance_encode_2x2(coarse_reflectance: f32, c02: [f32; 4]) -> [f32; 4] {
+    if !coarse_reflectance.is_finite() {
+        return [f32::NAN; 4];
+    }
+    if c02.iter().any(|value| !value.is_finite()) {
+        return c02.map(|value| {
+            if value.is_finite() {
+                coarse_reflectance
+            } else {
+                f32::NAN
+            }
+        });
+    }
+
+    let mean = (c02[0] + c02[1] + c02[2] + c02[3]) * 0.25;
+    if !mean.is_finite() || mean <= 1.0e-6 {
+        return [coarse_reflectance; 4];
+    }
+
+    let sharpened = c02.map(|value| coarse_reflectance * (value / mean));
+    if sharpened.iter().all(|value| value.is_finite()) {
+        sharpened
+    } else {
+        [coarse_reflectance; 4]
+    }
+}
+
+/// Expand a native 1 km visible plane onto its colocated native C02 grid via
+/// [`variance_encode_2x2`]. The dimensions must describe ABI's exact 2:1
+/// nested relationship; this function never silently interpolates an
+/// unrelated grid and calls it sharpening.
+pub fn variance_encode_visible_plane(
+    coarse: &[f32],
+    coarse_nx: usize,
+    coarse_ny: usize,
+    c02: &[f32],
+    c02_nx: usize,
+    c02_ny: usize,
+) -> Result<Vec<f32>, Box<dyn Error>> {
+    if coarse_nx.saturating_mul(coarse_ny) != coarse.len() {
+        return Err(boxed_error(
+            "coarse visible plane dimensions do not match its values",
+        ));
+    }
+    if c02_nx.saturating_mul(c02_ny) != c02.len() {
+        return Err(boxed_error(
+            "ABI C02 plane dimensions do not match its values",
+        ));
+    }
+    if c02_nx != coarse_nx.saturating_mul(2) || c02_ny != coarse_ny.saturating_mul(2) {
+        return Err(boxed_error(format!(
+            "variance encoding requires an exact 2:1 C02 grid; coarse is {coarse_nx}x{coarse_ny}, C02 is {c02_nx}x{c02_ny}"
+        )));
+    }
+
+    let mut sharpened = vec![f32::NAN; c02.len()];
+    for coarse_y in 0..coarse_ny {
+        let red_y = coarse_y * 2;
+        for coarse_x in 0..coarse_nx {
+            let red_x = coarse_x * 2;
+            let c02_index = |y: usize, x: usize| y * c02_nx + x;
+            let block = variance_encode_2x2(
+                coarse[coarse_y * coarse_nx + coarse_x],
+                [
+                    c02[c02_index(red_y, red_x)],
+                    c02[c02_index(red_y, red_x + 1)],
+                    c02[c02_index(red_y + 1, red_x)],
+                    c02[c02_index(red_y + 1, red_x + 1)],
+                ],
+            );
+            sharpened[c02_index(red_y, red_x)] = block[0];
+            sharpened[c02_index(red_y, red_x + 1)] = block[1];
+            sharpened[c02_index(red_y + 1, red_x)] = block[2];
+            sharpened[c02_index(red_y + 1, red_x + 1)] = block[3];
+        }
+    }
+    Ok(sharpened)
+}
+
+/// Variance-encode a native 1 km ABI visible field onto the native C02 grid.
+/// This is the whole-plane companion to the bounded XYZ-window path.
+pub fn variance_encode_visible_field(
+    coarse: &GoesAbiField,
+    c02: &GoesAbiField,
+) -> Result<GoesAbiField, Box<dyn Error>> {
+    validate_variance_encoding_grids(&coarse.scene, &c02.scene)?;
+    let values = variance_encode_visible_plane(
+        &coarse.values,
+        coarse.scene.fixed_grid.nx,
+        coarse.scene.fixed_grid.ny,
+        &c02.values,
+        c02.scene.fixed_grid.nx,
+        c02.scene.fixed_grid.ny,
+    )?;
+    let mut scene = coarse.scene.clone();
+    scene.projection = c02.scene.projection.clone();
+    scene.fixed_grid = c02.scene.fixed_grid.clone();
+    Ok(GoesAbiField {
+        scene,
+        variable_name: coarse.variable_name.clone(),
+        units: coarse.units.clone(),
+        values,
+    })
+}
+
+pub(crate) fn validate_variance_encoding_grids(
+    coarse: &GoesAbiScene,
+    c02: &GoesAbiScene,
+) -> Result<(), Box<dyn Error>> {
+    if !matches!(coarse.channel, Some(1 | 3)) || c02.channel != Some(2) {
+        return Err(boxed_error(
+            "variance encoding requires ABI C01 or C03 as coarse input and ABI C02 as detail input",
+        ));
+    }
+    if c02.fixed_grid.nx != coarse.fixed_grid.nx.saturating_mul(2)
+        || c02.fixed_grid.ny != coarse.fixed_grid.ny.saturating_mul(2)
+    {
+        return Err(boxed_error(format!(
+            "variance encoding requires an exact 2:1 C02 grid; coarse is {}x{}, C02 is {}x{}",
+            coarse.fixed_grid.nx, coarse.fixed_grid.ny, c02.fixed_grid.nx, c02.fixed_grid.ny
+        )));
+    }
+    if coarse.satellite != c02.satellite
+        || coarse.projection.sweep_angle_axis != c02.projection.sweep_angle_axis
+        || !nearly_equal(
+            coarse.projection.longitude_of_projection_origin_deg,
+            c02.projection.longitude_of_projection_origin_deg,
+            1.0e-9,
+        )
+        || !nearly_equal(
+            coarse.projection.perspective_point_height_m,
+            c02.projection.perspective_point_height_m,
+            1.0e-7,
+        )
+        || !nearly_equal(
+            coarse.projection.semi_major_axis_m,
+            c02.projection.semi_major_axis_m,
+            1.0e-9,
+        )
+        || !nearly_equal(
+            coarse.projection.semi_minor_axis_m,
+            c02.projection.semi_minor_axis_m,
+            1.0e-9,
+        )
+        || !nested_axis(&coarse.fixed_grid.x_scan_rad, &c02.fixed_grid.x_scan_rad)
+        || !nested_axis(&coarse.fixed_grid.y_scan_rad, &c02.fixed_grid.y_scan_rad)
+    {
+        return Err(boxed_error(
+            "ABI C01/C03 and C02 grids are not colocated 2x2 fixed grids",
+        ));
+    }
+    Ok(())
+}
+
+fn nested_axis(coarse: &[f64], fine: &[f64]) -> bool {
+    if fine.len() != coarse.len().saturating_mul(2) || fine.len() < 2 {
+        return false;
+    }
+    coarse.iter().enumerate().all(|(index, &coarse_value)| {
+        let fine_index = index * 2;
+        let center = (fine[fine_index] + fine[fine_index + 1]) * 0.5;
+        let spacing = (fine[fine_index + 1] - fine[fine_index]).abs();
+        coarse_value.is_finite()
+            && center.is_finite()
+            && (coarse_value - center).abs() <= spacing * 0.02 + 1.0e-10
+    })
+}
+
+fn nearly_equal(left: f64, right: f64, relative_tolerance: f64) -> bool {
+    left.is_finite()
+        && right.is_finite()
+        && (left - right).abs() <= relative_tolerance * left.abs().max(right.abs()).max(1.0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoesAbiRgbCompositeStyle {
     GeoColor,
@@ -422,6 +612,61 @@ fn boxed_error(message: impl Into<String>) -> Box<dyn Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variance_encoding_transfers_c02_ratios_and_preserves_the_coarse_mean() {
+        let encoded = variance_encode_2x2(0.4, [0.1, 0.2, 0.3, 0.4]);
+        let expected = [0.16, 0.32, 0.48, 0.64];
+        for (actual, expected) in encoded.into_iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+        assert!((encoded.into_iter().sum::<f32>() * 0.25 - 0.4).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn variance_encoding_falls_back_without_inventing_missing_or_dark_detail() {
+        let missing = variance_encode_2x2(0.4, [0.1, f32::NAN, 0.3, 0.4]);
+        assert_eq!(missing[0], 0.4);
+        assert!(missing[1].is_nan(), "C02's off-disk mask must survive");
+        assert_eq!(missing[2..], [0.4, 0.4]);
+        assert_eq!(variance_encode_2x2(0.4, [0.0; 4]), [0.4; 4]);
+        assert!(
+            variance_encode_2x2(f32::NAN, [0.1; 4])
+                .into_iter()
+                .all(|value| value.is_nan())
+        );
+    }
+
+    #[test]
+    fn variance_encoding_expands_each_coarse_cell_on_the_native_c02_grid() {
+        let coarse = [0.4, 0.8];
+        let c02 = [0.1, 0.2, 0.2, 0.2, 0.3, 0.4, 0.4, 0.4];
+        let encoded = variance_encode_visible_plane(&coarse, 2, 1, &c02, 4, 2).unwrap();
+        assert_eq!(encoded.len(), 8);
+        let left_mean = (encoded[0] + encoded[1] + encoded[4] + encoded[5]) * 0.25;
+        let right_mean = (encoded[2] + encoded[3] + encoded[6] + encoded[7]) * 0.25;
+        assert!((left_mean - coarse[0]).abs() < 1.0e-6);
+        assert!((right_mean - coarse[1]).abs() < 1.0e-6);
+        assert_ne!(encoded[0], encoded[1]);
+        assert_ne!(encoded[2], encoded[6]);
+    }
+
+    #[test]
+    fn variance_encoded_plane_preserves_the_native_c02_limb_mask() {
+        let encoded =
+            variance_encode_visible_plane(&[0.4], 1, 1, &[0.1, 0.2, f32::NAN, 0.4], 2, 2).unwrap();
+        assert_eq!(encoded[0..2], [0.4, 0.4]);
+        assert!(encoded[2].is_nan());
+        assert_eq!(encoded[3], 0.4);
+    }
+
+    #[test]
+    fn variance_encoding_rejects_non_nested_dimensions() {
+        let error = variance_encode_visible_plane(&[0.4], 1, 1, &[0.1; 6], 3, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exact 2:1 C02 grid"));
+    }
 
     #[test]
     fn rgb_styles_advertise_required_channels() {

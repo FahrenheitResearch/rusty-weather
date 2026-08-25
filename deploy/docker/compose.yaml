@@ -23,6 +23,8 @@ services:
       RW_LISTEN: 0.0.0.0:8788
       RW_STORE_ROOT: /var/lib/rusty-weather/store
       RW_ARTIFACT_ROOT: /var/lib/rusty-weather/artifacts
+      RW_CACHE_ROOT: /var/cache/rusty-weather/server
+      RW_OPERATIONS_ROOT: /var/lib/rusty-weather/operations
       RW_DOCKER_TOKEN_SOURCE: /run/secrets/rw_api_tokens
       RW_API_TOKEN_FILE: /tmp/rusty-weather-api-tokens
       RW_LOG: rw_server=info,tower_http=info
@@ -31,6 +33,8 @@ services:
     volumes:
       - ./data/store:/var/lib/rusty-weather/store:ro
       - ./data/artifacts:/var/lib/rusty-weather/artifacts:rw
+      - ./data/server-cache:/var/cache/rusty-weather/server:rw
+      - ./data/operations:/var/lib/rusty-weather/operations:rw
       # Disabled features do not write these mounts. They exist so an audited
       # Community Cache/federation configuration can persist state while the
       # container root filesystem remains read-only.

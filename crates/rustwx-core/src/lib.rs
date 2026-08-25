@@ -3,23 +3,27 @@ use thiserror::Error;
 
 const AIFS_MAX_FORECAST_HOUR: u16 = 43_848;
 
-/// Largest horizontal grid accepted by the shared desktop data model. One
-/// f32 plane at this ceiling is about 95 MiB; a lat/lon grid plus one field is
-/// already about 286 MiB. Rejecting larger metadata before allocation keeps a
-/// corrupt local file from turning a shape header into a multi-gigabyte job.
-pub const MAX_GRID_CELLS: usize = 25_000_000;
+/// Structural horizontal-grid maximum for the shared data model.
+///
+/// This is derived from Rust's per-allocation `isize::MAX` byte boundary for
+/// the minimum complete scalar grid representation (latitude, longitude, and
+/// one `f32` plane). It is not an operational or resolution safety ceiling;
+/// practical grids are limited by available memory and fallible allocation at
+/// their owning boundary.
+pub const MAX_GRID_CELLS: usize = (isize::MAX as usize) / (3 * std::mem::size_of::<f32>());
 
-/// Largest dense 3-D value buffer accepted by the shared data model. This is
-/// independent of [`MAX_GRID_CELLS`]: a reasonable horizontal grid paired
-/// with a hostile level count must still fail before the level×cell product
-/// wraps or authorizes an impractical allocation.
-pub const MAX_VOLUME_ELEMENTS: usize = 128 * 1024 * 1024;
+/// Structural maximum for one dense `f32` 3-D value allocation.
+///
+/// This is Rust's per-allocation addressability boundary, not an operational
+/// model-resolution policy. Owning readers/builders reserve actual buffers
+/// fallibly; hosts may apply explicit admission budgets before calling them.
+pub const MAX_VOLUME_ELEMENTS: usize = (isize::MAX as usize) / std::mem::size_of::<f32>();
 
 #[derive(Debug, Error)]
 pub enum RustwxError {
     #[error("invalid grid shape: nx={nx}, ny={ny}")]
     InvalidGridShape { nx: usize, ny: usize },
-    #[error("grid shape nx={nx}, ny={ny} has {cells} cells; supported maximum is {max_cells}")]
+    #[error("grid shape nx={nx}, ny={ny} has {cells} cells; addressable maximum is {max_cells}")]
     GridTooLarge {
         nx: usize,
         ny: usize,
@@ -123,11 +127,11 @@ impl<'de> Deserialize<'de> for GridShape {
     }
 }
 
-/// Validate a dense level-by-cell volume against the shared desktop ceiling.
+/// Validate a dense level-by-cell volume against structural addressability.
 ///
 /// Call this before reading or allocating a dense 3-D product. Both arithmetic
-/// overflow and products larger than [`MAX_VOLUME_ELEMENTS`] fail closed with
-/// [`RustwxError::VolumeTooLarge`].
+/// overflow and values that cannot fit one Rust `f32` allocation fail closed
+/// with [`RustwxError::VolumeTooLarge`].
 pub fn checked_volume_elements(levels: usize, cells: usize) -> Result<usize, RustwxError> {
     let elements = levels
         .checked_mul(cells)
@@ -394,6 +398,7 @@ impl std::fmt::Display for ProductKey {
 pub enum CanonicalField {
     Pressure,
     GeopotentialHeight,
+    VerticalVelocity,
     Temperature,
     RelativeHumidity,
     Dewpoint,
@@ -431,6 +436,7 @@ impl CanonicalField {
         match self {
             Self::Pressure => "pressure",
             Self::GeopotentialHeight => "geopotential_height",
+            Self::VerticalVelocity => "vertical_velocity",
             Self::Temperature => "temperature",
             Self::RelativeHumidity => "relative_humidity",
             Self::Dewpoint => "dewpoint",
@@ -470,6 +476,7 @@ impl CanonicalField {
         match self {
             Self::Pressure => "Pressure",
             Self::GeopotentialHeight => "Geopotential Height",
+            Self::VerticalVelocity => "Vertical Velocity",
             Self::Temperature => "Temperature",
             Self::RelativeHumidity => "Relative Humidity",
             Self::Dewpoint => "Dewpoint",
@@ -509,6 +516,7 @@ impl CanonicalField {
         match self {
             Self::Pressure => "Pa",
             Self::GeopotentialHeight => "gpm",
+            Self::VerticalVelocity => "Pa/s",
             Self::Temperature => "K",
             Self::RelativeHumidity => "%",
             Self::Dewpoint => "K",
@@ -1713,6 +1721,18 @@ pub enum ModelId {
     Hrrr,
     HrrrAk,
     Gfs,
+    Gdps,
+    GdpsGeml,
+    CmaGeps,
+    Rdps,
+    Hrdps,
+    Reps,
+    IconEu,
+    IconD2,
+    IconRu,
+    Geps,
+    WrfCptec7km,
+    BramsCptec8km,
     Gdas,
     Gefs,
     Aigfs,
@@ -1741,6 +1761,18 @@ impl ModelId {
             Self::Hrrr => "hrrr",
             Self::HrrrAk => "hrrr-ak",
             Self::Gfs => "gfs",
+            Self::Gdps => "gdps",
+            Self::GdpsGeml => "gdps-geml",
+            Self::CmaGeps => "cma-geps",
+            Self::Rdps => "rdps",
+            Self::Hrdps => "hrdps",
+            Self::Reps => "reps",
+            Self::IconEu => "icon-eu",
+            Self::IconD2 => "icon-d2",
+            Self::IconRu => "icon-ru",
+            Self::Geps => "geps",
+            Self::WrfCptec7km => "wrf-cptec-7km",
+            Self::BramsCptec8km => "brams-cptec-8km",
             Self::Gdas => "gdas",
             Self::Gefs => "gefs",
             Self::Aigfs => "aigfs",
@@ -1779,6 +1811,32 @@ impl std::str::FromStr for ModelId {
             "hrrr" => Ok(Self::Hrrr),
             "hrrr-ak" | "hrrrak" | "hrrr_ak" | "hrrr-alaska" | "hrrr_alaska" => Ok(Self::HrrrAk),
             "gfs" | "gfs-0p25" | "gfs_0p25" | "gfs-0.25" | "gfs_0.25" => Ok(Self::Gfs),
+            "gdps" | "gem" | "gem-global" | "gem_global" | "cmc-gdps" | "cmc_gdps" => {
+                Ok(Self::Gdps)
+            }
+            "gdps-geml" | "gdps_geml" | "gdpsgeml" | "geml" | "cmc-gdps-geml" | "cmc_gdps_geml" => {
+                Ok(Self::GdpsGeml)
+            }
+            "cma-geps" | "cma_geps" | "cmageps" | "grapes-geps" | "grapes_geps" => {
+                Ok(Self::CmaGeps)
+            }
+            "rdps" | "gem-regional" | "gem_regional" | "cmc-rdps" | "cmc_rdps" => Ok(Self::Rdps),
+            "hrdps" | "gem-high-resolution" | "gem_high_resolution" | "cmc-hrdps" | "cmc_hrdps" => {
+                Ok(Self::Hrdps)
+            }
+            "reps"
+            | "gem-regional-ensemble"
+            | "gem_regional_ensemble"
+            | "cmc-reps"
+            | "cmc_reps" => Ok(Self::Reps),
+            "icon-eu" | "icon_eu" | "iconeu" | "dwd-icon-eu" | "dwd_icon_eu" => Ok(Self::IconEu),
+            "icon-d2" | "icon_d2" | "icond2" | "dwd-icon-d2" | "dwd_icon_d2" => Ok(Self::IconD2),
+            "icon-ru" | "icon_ru" | "iconru" | "icon-ru13" | "icon_ru13" => Ok(Self::IconRu),
+            "geps" | "gem-ensemble" | "gem_ensemble" | "cmc-geps" | "cmc_geps" => Ok(Self::Geps),
+            "wrf-cptec-7km" | "wrf_cptec_7km" | "cptec-wrf" | "cptec_wrf" | "wrf-ams-07km"
+            | "wrf_ams_07km" => Ok(Self::WrfCptec7km),
+            "brams-cptec-8km" | "brams_cptec_8km" | "cptec-brams" | "cptec_brams"
+            | "brams-ams-08km" | "brams_ams_08km" => Ok(Self::BramsCptec8km),
             "gdas" | "gdas-0p25" | "gdas_0p25" | "gdas-0.25" | "gdas_0.25" => Ok(Self::Gdas),
             "gefs" | "gefs-ens" | "gefs_ens" | "gefs-ensemble" => Ok(Self::Gefs),
             "aigfs" | "ai-gfs" | "ai_gfs" => Ok(Self::Aigfs),
@@ -1955,6 +2013,16 @@ pub enum SourceId {
     Google,
     Azure,
     Ecmwf,
+    Eccc,
+    Cma,
+    Dwd,
+    /// HTTPS object transport through the WIS2 Global Cache network for
+    /// Roshydromet's WMO-core ICON-Ru feed.
+    RoshydrometWis2Cache,
+    /// Canonical Roshydromet WIS2 node transport. The current node advertises
+    /// HTTP object links, so adapters prefer the Global Cache first.
+    RoshydrometWis2Origin,
+    Cptec,
     Ncei,
     Gdex,
     /// Local NetCDF archive populated by an active AIFS-v2 inference/dissemination harness.
@@ -1973,6 +2041,12 @@ impl SourceId {
             Self::Google => "google",
             Self::Azure => "azure",
             Self::Ecmwf => "ecmwf",
+            Self::Eccc => "eccc",
+            Self::Cma => "cma",
+            Self::Dwd => "dwd",
+            Self::RoshydrometWis2Cache => "roshydromet-wis2-cache",
+            Self::RoshydrometWis2Origin => "roshydromet-wis2-origin",
+            Self::Cptec => "cptec",
             Self::Ncei => "ncei",
             Self::Gdex => "gdex",
             Self::AifsInference => "aifs-inference",
@@ -1997,6 +2071,16 @@ impl std::str::FromStr for SourceId {
             "google" => Ok(Self::Google),
             "azure" => Ok(Self::Azure),
             "ecmwf" => Ok(Self::Ecmwf),
+            "eccc" | "msc" | "cmc" | "msc-datamart" | "msc_datamart" => Ok(Self::Eccc),
+            "cma" | "cma-wis2" | "cma_wis2" | "wis2-cma" | "wis2_cma" => Ok(Self::Cma),
+            "dwd" | "dwd-open-data" | "dwd_open_data" | "deutscher-wetterdienst" => Ok(Self::Dwd),
+            "roshydromet-wis2-cache" | "roshydromet_wis2_cache" | "wis2-global-cache" => {
+                Ok(Self::RoshydrometWis2Cache)
+            }
+            "roshydromet-wis2-origin" | "roshydromet_wis2_origin" | "roshydromet" => {
+                Ok(Self::RoshydrometWis2Origin)
+            }
+            "cptec" | "cptec-inpe" | "cptec_inpe" | "inpe" => Ok(Self::Cptec),
             "ncei" => Ok(Self::Ncei),
             "gdex" => Ok(Self::Gdex),
             "aifs-inference" | "aifs_inference" | "aifsinference" | "inferenced-aifs"

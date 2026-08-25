@@ -17,15 +17,22 @@ chrono-tz = { version = "0.10.4", features = ["serde"] }
 clap = { workspace = true, features = ["env"] }
 http = "1.5.0"
 ed25519-dalek = "2.2"
-moka = { version = "0.12.16", features = ["sync"] }
+moka = { version = "0.12.16", features = ["future", "sync"] }
 prometheus-client = "0.25.0"
+quick-xml = { version = "0.41", features = ["serialize"] }
 rw-community-protocol = { path = "../rw-community-protocol" }
 rw-community-relay = { path = "../rw-community-relay" }
 rw-federation-proxy = { path = "../rw-federation-proxy" }
 rw-generation-replication = { path = "../rw-generation-replication" }
 rw-ingest = { path = "../rw-ingest" }
+rw-observations = { path = "../rw-observations" }
+rw-nexrad-storm = { path = "../rw-nexrad-storm", features = ["openapi"] }
+rw-ops-protocol = { path = "../rw-ops-protocol", features = ["openapi"] }
 rw-query = { path = "../rw-query" }
 rw-scheduler = { path = "../rw-scheduler" }
+rw-sat = { path = "../rw-sat" }
+rw-storm = { path = "../rw-storm" }
+rw-storm-ml = { path = "../rw-storm-ml" }
 rw-store = { path = "../rw-store" }
 rustwx-core = { path = "../rustwx-core" }
 rustwx-models = { path = "../rustwx-models" }

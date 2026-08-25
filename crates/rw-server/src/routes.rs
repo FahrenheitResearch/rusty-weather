@@ -21,17 +21,21 @@ use rw_federation_proxy::{
     FEDERATION_HOP_HEADER, FEDERATION_LOCAL_OBJECT_PATH_PREFIX, FEDERATION_LOCAL_RESOLVE_PATH,
     FEDERATION_PROXY_PATH, FederationProxyError, FederationProxyRequest,
 };
-use rw_ingest::{IngestCapabilityLimitation, IngestSupportStatus, model_ingest_capability};
+use rw_ingest::{
+    IngestCapabilityLimitation, IngestSupportStatus, indexed_subset_available,
+    model_ingest_capability,
+};
+use rw_observations::encode_plane_blob;
 use rw_query::{
     GeographicBoundingBox, GeographicVerticalSelection, GeographicWindowLimits,
     GeographicWindowRequest, IndexWindow2DRequest, IntervalSupport, MissingPolicy,
-    PointSeriesRequest, PointSeriesResult, ProfileRequest, QueryError, SpatialStatsSeriesRequest,
-    TemporalCapabilityBasis, TemporalGridRequest, TemporalOperation, TemporalReducer,
-    TemporalReductionLimits, TemporalSemantics, TemporalValueClass, TemporalVerticalSelection,
-    TemporalWindow, TimeExpectation, TimeRange, VariableCapability,
+    PointSeriesRequest, PointSeriesResult, ProfileCycleRequest, ProfileRequest, QueryError,
+    SpatialStatsSeriesRequest, TemporalCapabilityBasis, TemporalGridRequest, TemporalOperation,
+    TemporalReducer, TemporalReductionLimits, TemporalSemantics, TemporalValueClass,
+    TemporalVerticalSelection, TemporalWindow, TimeExpectation, TimeRange, VariableCapability,
     query_geographic_window_with_cancel, query_point_series, query_profile,
-    query_spatial_stats_series, query_window_2d, reduce_temporal_grid_with_cancel,
-    reduce_temporal_grid_with_cancel_and_limits,
+    query_profile_cycle_with_cancel, query_spatial_stats_series, query_window_2d,
+    reduce_temporal_grid_with_cancel, reduce_temporal_grid_with_cancel_and_limits,
 };
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
@@ -62,9 +66,148 @@ use crate::{AppState, CancellationToken, ExecutionError, JobError, JobStatus};
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const RETIRED_MODEL_ID: ModelId = ModelId::RrfsFireWx;
 const RETIRED_VARIABLE_NAME: &str = "fire_weather_composite";
+/// Model forecast planes ship in the same versioned `RWOBF32` f32 container as
+/// observation planes, under their own media type so the payload's domain is
+/// never inferred from the container alone.
+const MODEL_PLANE_CONTENT_TYPE: &str = "application/vnd.rusty-weather.model-plane+f32";
+
+/// Every explicitly registered production HTTP operation in [`build_router`]
+/// and its merged route modules. Axum's automatic `HEAD` companions for `GET`,
+/// the configured CORS layer's `OPTIONS` handling, and the catch-all fallback
+/// are protocol mechanics rather than separately documented operations.
+///
+/// Keep this independent inventory byte-for-byte aligned with the router. The
+/// generated-contract tests compare it to OpenAPI so a documented operation
+/// cannot be left as an acceptance follow-up.
+pub const PRODUCTION_ROUTE_MANIFEST: &[(&str, &str)] = &[
+    ("GET", "/metrics"),
+    ("POST", "/v1/analytics/spatial-series"),
+    ("POST", "/v1/analytics/temporal-grid"),
+    ("GET", "/v1/artifacts/{hash}/{file}"),
+    ("POST", "/v1/community/artifacts"),
+    ("POST", "/v1/community/artifacts/{sha256}/revoke"),
+    ("GET", "/v1/community/cases"),
+    ("POST", "/v1/community/cases"),
+    ("GET", "/v1/community/cases/{case_id}"),
+    ("POST", "/v1/community/cases/{case_id}/revoke"),
+    ("GET", "/v1/community/generation-replication/capabilities"),
+    ("POST", "/v1/community/generation-replication/operator/gc"),
+    (
+        "POST",
+        "/v1/community/generation-replication/operator/kill-switch",
+    ),
+    (
+        "GET",
+        "/v1/community/generation-replication/operator/status",
+    ),
+    ("GET", "/v1/community/generation-replication/owner"),
+    ("GET", "/v1/community/generations"),
+    ("POST", "/v1/community/generations"),
+    ("DELETE", "/v1/community/generations/{generation_id}"),
+    ("GET", "/v1/community/generations/{generation_id}"),
+    (
+        "POST",
+        "/v1/community/generations/{generation_id}/chunks/{sha256}",
+    ),
+    ("POST", "/v1/community/generations/{generation_id}/finalize"),
+    ("GET", "/v1/community/generations/{generation_id}/missing"),
+    (
+        "GET",
+        "/v1/community/generations/{generation_id}/publication",
+    ),
+    ("POST", "/v1/community/generations/{generation_id}/revoke"),
+    ("GET", "/v1/community/objects/{sha256}"),
+    ("POST", "/v1/community/objects/resolve"),
+    ("POST", "/v1/community/relay/advertisements"),
+    ("POST", "/v1/community/relay/grants/next"),
+    ("POST", "/v1/community/relay/historical/lookups"),
+    ("POST", "/v1/community/relay/operator/kill-switch"),
+    ("GET", "/v1/community/relay/operator/status"),
+    ("POST", "/v1/community/relay/routes"),
+    (
+        "POST",
+        "/v1/community/relay/sessions/{session_id}/grants/{role}",
+    ),
+    ("POST", "/v1/community/relay/sessions/complete"),
+    ("POST", "/v1/community/relay/sessions/fail"),
+    ("POST", "/v1/community/relay/sessions/revoke"),
+    ("POST", "/v1/community/relay/transport"),
+    ("GET", "/v1/federation/health"),
+    ("GET", "/v1/federation/objects/{sha256}"),
+    ("POST", "/v1/federation/objects/resolve"),
+    ("POST", "/v1/federation/objects/resolve-local"),
+    ("GET", "/v1/federation/origins"),
+    ("GET", "/v1/federation/origins/{origin_id}"),
+    ("POST", "/v1/federation/proxy/operator/kill-switch"),
+    ("GET", "/v1/federation/proxy/operator/status"),
+    ("POST", "/v1/geographic-window"),
+    ("GET", "/v1/health/live"),
+    ("GET", "/v1/health/ready"),
+    ("DELETE", "/v1/jobs/{id}"),
+    ("GET", "/v1/jobs/{id}"),
+    ("POST", "/v1/jobs/temporal-grid"),
+    ("GET", "/v1/models"),
+    ("GET", "/v1/models/{model}/latest-run"),
+    ("GET", "/v1/models/{model}/runs"),
+    ("GET", "/v1/models/{model}/runs/{run}"),
+    (
+        "GET",
+        "/v1/models/{model}/runs/{run}/planes/{storage_slot}/{variable}",
+    ),
+    ("GET", "/v1/models/{model}/runs/{run}/variables"),
+    ("GET", "/v1/observations"),
+    ("GET", "/v1/observations/{model}/{run}/frames"),
+    (
+        "GET",
+        "/v1/observations/{model}/{run}/frames/{storage_slot}/{variable}",
+    ),
+    ("GET", "/v1/observations/{model}/{run}/grid.bin"),
+    ("GET", "/v1/observations/capabilities"),
+    ("POST", "/v1/observations/generated"),
+    ("POST", "/v1/observations/mrms/ingest/refresh"),
+    ("GET", "/v1/observations/mrms/ingest/status"),
+    ("POST", "/v1/observations/mrms/latest"),
+    ("POST", "/v1/observations/nexrad/level2"),
+    ("POST", "/v1/observations/nexrad/level2/ingest/refresh"),
+    ("GET", "/v1/observations/nexrad/level2/ingest/status"),
+    ("POST", "/v1/observations/radar/mosaic"),
+    ("POST", "/v1/observations/wrf-radar/derive"),
+    ("GET", "/v1/openapi.json"),
+    ("POST", "/v1/ops/storms/authoritative/nexrad-level3/decode"),
+    ("POST", "/v1/ops/storms/cells"),
+    ("GET", "/v1/ops/storms/methods"),
+    ("GET", "/v1/ops/storms/models"),
+    ("GET", "/v1/ops/storms/status"),
+    ("GET", "/v1/origin-catalog/status"),
+    ("GET", "/v1/point"),
+    ("POST", "/v1/points"),
+    ("POST", "/v1/profile"),
+    ("POST", "/v1/profile-cycle"),
+    (
+        "GET",
+        "/v1/satellite/{platform}/{sector}/{product}/{frame}/tilejson.json",
+    ),
+    (
+        "GET",
+        "/v1/satellite/{platform}/{sector}/{product}/{frame}/tiles/{recipe}/{source_revision}/{z}/{x}/{y}",
+    ),
+    (
+        "GET",
+        "/v1/satellite/{platform}/{sector}/{product}/{frame}/tiles/{recipe}/{z}/{x}/{y}",
+    ),
+    (
+        "GET",
+        "/v1/satellite/{platform}/{sector}/{product}/{frame}/tiles/{z}/{x}/{y}",
+    ),
+    ("GET", "/v1/satellite/{platform}/{sector}/{product}/frames"),
+    ("GET", "/v1/satellite/catalog"),
+    ("GET", "/v1/satellite/prewarm/status"),
+    ("GET", "/v1/version"),
+    ("POST", "/v1/window"),
+];
 
 #[derive(Debug, Clone, Copy)]
-struct RequestId(Uuid);
+pub(crate) struct RequestId(pub(crate) Uuid);
 
 #[derive(Debug, Clone)]
 struct AuthPrincipal(String);
@@ -103,8 +246,12 @@ fn reject_retired_selection<'a>(
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {
+    /// `ready` and `degraded` both mean the core server can accept traffic.
+    /// Degraded identifies optional data followers only; HTTP 503 is reserved
+    /// for a failed core probe or an explicit operator readiness gate.
     status: &'static str,
     uptime_seconds: u64,
+    degraded_subsystems: Vec<&'static str>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -173,10 +320,14 @@ pub enum ApiIngestCapabilityLimitation {
     AnalysisOnly,
     SurfaceOnly,
     EnsembleMeanOnly,
+    ProviderStatisticsOnly,
+    EnsembleControlMemberOnly,
     SparsePressureLevels,
+    TwoDimensionalStatisticsOnly,
     DerivedProductsDisabled,
     ConusOnly,
     PreOperationalFeed,
+    ExtendedRangeNotScheduled,
 }
 
 impl From<IngestCapabilityLimitation> for ApiIngestCapabilityLimitation {
@@ -185,10 +336,20 @@ impl From<IngestCapabilityLimitation> for ApiIngestCapabilityLimitation {
             IngestCapabilityLimitation::AnalysisOnly => Self::AnalysisOnly,
             IngestCapabilityLimitation::SurfaceOnly => Self::SurfaceOnly,
             IngestCapabilityLimitation::EnsembleMeanOnly => Self::EnsembleMeanOnly,
+            IngestCapabilityLimitation::ProviderStatisticsOnly => Self::ProviderStatisticsOnly,
+            IngestCapabilityLimitation::EnsembleControlMemberOnly => {
+                Self::EnsembleControlMemberOnly
+            }
             IngestCapabilityLimitation::SparsePressureLevels => Self::SparsePressureLevels,
+            IngestCapabilityLimitation::TwoDimensionalStatisticsOnly => {
+                Self::TwoDimensionalStatisticsOnly
+            }
             IngestCapabilityLimitation::DerivedProductsDisabled => Self::DerivedProductsDisabled,
             IngestCapabilityLimitation::ConusOnly => Self::ConusOnly,
             IngestCapabilityLimitation::PreOperationalFeed => Self::PreOperationalFeed,
+            IngestCapabilityLimitation::ExtendedRangeNotScheduled => {
+                Self::ExtendedRangeNotScheduled
+            }
         }
     }
 }
@@ -196,7 +357,7 @@ impl From<IngestCapabilityLimitation> for ApiIngestCapabilityLimitation {
 fn provider_attributions(
     summary: &rustwx_models::ModelSummary,
 ) -> Vec<ProviderAttributionResponse> {
-    let mut attributions = Vec::with_capacity(2);
+    let mut attributions = Vec::with_capacity(4);
     if summary
         .sources
         .iter()
@@ -211,6 +372,48 @@ fn provider_attributions(
         )
     }) {
         attributions.push(rw_query::noaa_provider_attribution().into());
+    }
+    if summary
+        .sources
+        .iter()
+        .any(|source| source.id == SourceId::Eccc)
+    {
+        let attribution = match summary.id {
+            ModelId::Geps => rw_query::geps_provider_attribution(),
+            ModelId::Reps => rw_query::reps_provider_attribution(),
+            ModelId::GdpsGeml => rw_query::gdps_geml_provider_attribution(),
+            _ => rw_query::eccc_provider_attribution(),
+        };
+        attributions.push(attribution.into());
+    }
+    if summary
+        .sources
+        .iter()
+        .any(|source| source.id == SourceId::Cma)
+    {
+        attributions.push(rw_query::cma_provider_attribution().into());
+    }
+    if summary
+        .sources
+        .iter()
+        .any(|source| source.id == SourceId::Dwd)
+    {
+        attributions.push(rw_query::dwd_provider_attribution().into());
+    }
+    if summary.sources.iter().any(|source| {
+        matches!(
+            source.id,
+            SourceId::RoshydrometWis2Cache | SourceId::RoshydrometWis2Origin
+        )
+    }) {
+        attributions.push(rw_query::roshydromet_provider_attribution().into());
+    }
+    if summary
+        .sources
+        .iter()
+        .any(|source| source.id == SourceId::Cptec)
+    {
+        attributions.push(rw_query::cptec_provider_attribution().into());
     }
     attributions
 }
@@ -405,6 +608,21 @@ pub struct ProfileApiRequest {
     longitude: f64,
     storage_slot: u16,
     variables: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct ProfileCycleApiRequest {
+    model: String,
+    run: String,
+    latitude: f64,
+    longitude: f64,
+    variables: Vec<String>,
+    #[serde(default)]
+    surface_variables: Vec<String>,
+    start_unix: Option<i64>,
+    end_unix: Option<i64>,
+    #[serde(default)]
+    missing_policy: ApiMissingPolicy,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -705,6 +923,7 @@ pub struct VariableCapabilityResponse {
     coverage: f64,
     point_series: bool,
     pressure_profile: bool,
+    profile_cycle: bool,
     geographic_window: bool,
     scalar_temporal_reduction: bool,
     temporal: VariableTemporalCapabilityResponse,
@@ -726,6 +945,7 @@ impl From<VariableCapability> for VariableCapabilityResponse {
             coverage: value.coverage,
             point_series: value.point_series,
             pressure_profile: value.pressure_profile,
+            profile_cycle: value.profile_cycle,
             geographic_window: value.geographic_window,
             scalar_temporal_reduction: value.scalar_temporal_reduction,
             temporal: VariableTemporalCapabilityResponse {
@@ -812,6 +1032,29 @@ struct ModelPath {
 struct RunPath {
     model: String,
     run: String,
+}
+
+/// `{variable}` captures the whole filename, including its required `.bin`
+/// suffix, because matchit 0.8 (axum 0.8) does not support dynamic suffixes:
+/// a `{variable}.bin` template would panic at router construction. The
+/// observation plane route uses the same shape for the same reason.
+#[derive(Debug, Deserialize)]
+struct ModelPlanePath {
+    model: String,
+    run: String,
+    storage_slot: u16,
+    variable: String,
+}
+
+/// The identity guards are modelled as optional here only so a missing one
+/// answers with `application/problem+json` like every other invalid request,
+/// instead of axum's plain-text query rejection. The handler requires both.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelPlaneQuery {
+    expected_snapshot_id: Option<String>,
+    expected_grid_hash: Option<String>,
+    level_hpa: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -944,7 +1187,12 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
     let operational = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/models/{model}/runs", get(list_runs))
+        .route("/v1/models/{model}/latest-run", get(latest_run))
         .route("/v1/models/{model}/runs/{run}", get(run_detail))
+        .route(
+            "/v1/models/{model}/runs/{run}/planes/{storage_slot}/{variable}",
+            get(model_plane_binary),
+        )
         .route(
             "/v1/models/{model}/runs/{run}/variables",
             get(run_variables),
@@ -952,11 +1200,14 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
         .route("/v1/point", get(point))
         .route("/v1/points", post(points))
         .route("/v1/profile", post(profile))
+        .route("/v1/profile-cycle", post(profile_cycle))
         .route("/v1/analytics/temporal-grid", post(temporal_grid))
         .route("/v1/jobs/temporal-grid", post(submit_temporal_grid_job))
         .route("/v1/window", post(window))
         .route("/v1/geographic-window", post(geographic_window))
         .route("/v1/analytics/spatial-series", post(spatial_series))
+        .merge(crate::observations::read_router())
+        .merge(crate::satellite::read_router())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_origin_catalog_ready,
@@ -964,6 +1215,7 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
 
     let protected = Router::new()
         .merge(operational)
+        .merge(crate::observations::write_router(&state.config.limits))
         .route("/v1/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/v1/artifacts/{hash}/{file}", get(artifact))
         .route(
@@ -1108,6 +1360,8 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
             "/v1/community/generation-replication/operator/gc",
             post(run_generation_replication_gc),
         )
+        .merge(crate::mrms_ingest::router(state.clone()))
+        .merge(crate::nexrad_level2_ingest::router(state.clone()))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_authentication,
@@ -1142,6 +1396,7 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
 
     let mut router = public
         .merge(protected)
+        .merge(crate::operations::router(state.clone()))
         .merge(federation_origin)
         .merge(metrics)
         .fallback(fallback)
@@ -1171,18 +1426,60 @@ pub fn build_router(state: AppState) -> Result<Router, ConfigError> {
             .cors_origins
             .iter()
             .map(|origin| {
+                let uri = origin
+                    .parse::<http::Uri>()
+                    .map_err(|_| ConfigError::Invalid(format!("invalid CORS origin '{origin}'")))?;
+                if origin == "*"
+                    || !matches!(uri.scheme_str(), Some("http" | "https"))
+                    || uri.authority().is_none()
+                    || uri.path() != "/"
+                    || origin.ends_with('/')
+                    || uri.query().is_some()
+                    || uri
+                        .authority()
+                        .is_some_and(|authority| authority.as_str().contains('@'))
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "CORS origin must be an exact HTTP(S) origin: '{origin}'"
+                    )));
+                }
                 HeaderValue::from_str(origin)
                     .map_err(|_| ConfigError::Invalid(format!("invalid CORS origin '{origin}'")))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        router = router.layer(
-            CorsLayer::new()
-                .allow_origin(AllowOrigin::list(origins))
-                .allow_methods([Method::GET, Method::POST, Method::DELETE])
-                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
-        );
+        router = router.layer(browser_cors_layer(origins));
     }
     Ok(router)
+}
+
+fn browser_cors_layer(origins: Vec<HeaderValue>) -> CorsLayer {
+    // Bearer authorization is explicitly allowed, but cookie credentials stay
+    // disabled. In particular, this must never become wildcard + credentials.
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+        ])
+        .allow_headers([
+            header::ACCEPT,
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::IF_NONE_MATCH,
+        ])
+        .expose_headers([
+            header::CACHE_CONTROL,
+            header::ETAG,
+            header::HeaderName::from_static("x-request-id"),
+            header::HeaderName::from_static("x-rw-satellite-frame"),
+            header::HeaderName::from_static("x-rw-satellite-recipe"),
+            header::HeaderName::from_static("x-rw-satellite-source-revision"),
+            header::HeaderName::from_static("x-rw-valid-unix"),
+        ])
+        .max_age(Duration::from_secs(10 * 60))
 }
 
 async fn request_context(
@@ -1208,6 +1505,12 @@ async fn request_context(
 
 fn normalize_framework_error(response: Response, request_id: Uuid) -> Response {
     let status = response.status();
+    // Route-local privacy middleware runs before this final framework-error
+    // normalization. Preserve its cache policy when replacing an extractor or
+    // body-limit response with RFC 9457 JSON; otherwise a private route's 4xx
+    // response can accidentally lose `no-store` at the outermost boundary.
+    let cache_control = response.headers().get(header::CACHE_CONTROL).cloned();
+    let pragma = response.headers().get(header::PRAGMA).cloned();
     let is_problem = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -1254,7 +1557,16 @@ fn normalize_framework_error(response: Response, request_id: Uuid) -> Response {
             request_id,
         ),
     };
-    problem.into_response()
+    let mut normalized = problem.into_response();
+    if let Some(value) = cache_control {
+        normalized
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, value);
+    }
+    if let Some(value) = pragma {
+        normalized.headers_mut().insert(header::PRAGMA, value);
+    }
+    normalized
 }
 
 async fn require_authentication(
@@ -1350,6 +1662,7 @@ async fn health_live(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "live",
         uptime_seconds: state.uptime().as_secs(),
+        degraded_subsystems: Vec::new(),
     })
 }
 
@@ -1357,23 +1670,63 @@ async fn health_ready(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
 ) -> Response {
+    // Prove the real query/catalog path first. Optional upstream state must not
+    // hide a failed durable store, an unavailable publication catalog, or a
+    // saturated/shutting-down query executor.
     let catalog = state.catalog.clone();
     match state.run_light(move || catalog.probe_readable()).await {
-        Ok(Ok(())) => Json(HealthResponse {
-            status: "ready",
-            uptime_seconds: state.uptime().as_secs(),
-        })
-        .into_response(),
-        Ok(Err(_)) => ProblemDetails::new(
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return ProblemDetails::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "NOT_READY",
+                "Service is not ready",
+                "The configured store or origin publication catalog is not currently ready.",
+                request_id.0,
+            )
+            .into_response();
+        }
+        Err(error) => return execution_problem(error, request_id.0).into_response(),
+    }
+
+    if !state.mrms_ingest.server_readiness_ok() {
+        return ProblemDetails::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "NOT_READY",
+            "MRMS_INGEST_NOT_READY",
             "Service is not ready",
-            "The configured store or origin publication catalog is not currently ready.",
+            "The enabled MRMS follower has not produced a fresh frame for every configured product.",
             request_id.0,
         )
-        .into_response(),
-        Err(error) => execution_problem(error, request_id.0).into_response(),
+        .into_response();
     }
+    if !state.nexrad_level2_ingest.server_readiness_ok() {
+        return ProblemDetails::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "NEXRAD_LEVEL2_INGEST_NOT_READY",
+            "Service is not ready",
+            "The enabled NEXRAD Level II follower has not stored a fresh exact volume for every configured site.",
+            request_id.0,
+        )
+        .into_response();
+    }
+    let mut degraded_subsystems = Vec::with_capacity(2);
+    if state.mrms_ingest.is_degraded() {
+        degraded_subsystems.push("mrms_ingest");
+    }
+    if state.nexrad_level2_ingest.is_degraded() {
+        degraded_subsystems.push("nexrad_level2_ingest");
+    }
+    let status = if degraded_subsystems.is_empty() {
+        "ready"
+    } else {
+        "degraded"
+    };
+    Json(HealthResponse {
+        status,
+        uptime_seconds: state.uptime().as_secs(),
+        degraded_subsystems,
+    })
+    .into_response()
 }
 
 async fn origin_catalog_status(
@@ -1440,7 +1793,7 @@ async fn list_models(
                         product: product.product.to_string(),
                         surface_source: product.surface_source,
                         pressure_source: product.pressure_source,
-                        indexed_subset: !product.idx_patterns.is_empty(),
+                        indexed_subset: indexed_subset_available(summary.id, &product),
                     })
                     .collect();
                 result.push(ModelCapabilityResponse {
@@ -1526,6 +1879,31 @@ async fn list_runs(
     }
 }
 
+async fn latest_run(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(path): Path<ModelPath>,
+) -> Response {
+    if let Some(response) = reject_retired_selection(
+        &state,
+        request_id.0,
+        &path.model,
+        std::iter::empty::<&str>(),
+    ) {
+        return private_no_store(response);
+    }
+    let catalog = state.catalog.clone();
+    let response = match state
+        .run_light(move || catalog.latest_run(&path.model))
+        .await
+    {
+        Ok(Ok(snapshot)) => json_no_store(StatusCode::OK, snapshot.descriptor(), request_id.0),
+        Ok(Err(error)) => query_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    };
+    private_no_store(response)
+}
+
 async fn run_detail(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
@@ -1581,6 +1959,177 @@ async fn run_variables(
         Ok(Err(error)) => query_problem(error, request_id.0).into_response(),
         Err(error) => execution_problem(error, request_id.0).into_response(),
     }
+}
+
+/// One decoded model plane plus the stored facts the response advertises.
+struct ModelPlane {
+    bytes: Vec<u8>,
+    etag: String,
+    variable: String,
+    units: String,
+    codec: String,
+    valid_unix: i64,
+    level_hpa: Option<u16>,
+}
+
+/// Serve one complete forecast plane as binary f32.
+///
+/// This is the model sibling of the observation plane route: same `RWOBF32`
+/// container, same immutable caching contract, same authentication scope. It
+/// differs in two deliberate ways.
+///
+/// The URL carries `expected_snapshot_id`/`expected_grid_hash` the way
+/// `/v1/geographic-window` does. Run names are reused across atomic
+/// republication, so without the guard the URL would not identify one
+/// immutable body and `Cache-Control: immutable` would be false.
+///
+/// It publishes no palette or interpolation hints. Model variables carry no
+/// stored display metadata, and inventing observation-shaped semantics for
+/// them would be a fabricated claim. Styling inputs — selector, kind,
+/// `levels_hpa`, `available_slots` — stay on
+/// `/v1/models/{model}/runs/{run}/variables`, which is authoritative.
+async fn model_plane_binary(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(path): Path<ModelPlanePath>,
+    Query(query): Query<ModelPlaneQuery>,
+) -> Response {
+    let Some(variable_name) = path
+        .variable
+        .strip_suffix(".bin")
+        .filter(|variable| !variable.is_empty())
+        .map(str::to_owned)
+    else {
+        return ProblemDetails::not_found(request_id.0).into_response();
+    };
+    if let Some(response) = reject_retired_selection(
+        &state,
+        request_id.0,
+        &path.model,
+        std::iter::once(variable_name.as_str()),
+    ) {
+        return response;
+    }
+    let (Some(expected_snapshot_id), Some(expected_grid_hash)) =
+        (query.expected_snapshot_id, query.expected_grid_hash)
+    else {
+        return ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_QUERY",
+            "Invalid query",
+            "expected_snapshot_id and expected_grid_hash are required so the plane URL names one immutable run generation.",
+            request_id.0,
+        )
+        .into_response();
+    };
+    let level_hpa = query.level_hpa;
+    let catalog = state.catalog.clone();
+    match state
+        .run_heavy_sync(move || {
+            let snapshot = catalog.snapshot(&path.model, &path.run)?;
+            let descriptor = snapshot.descriptor();
+            if expected_snapshot_id != descriptor.snapshot_id
+                || expected_grid_hash != descriptor.grid_hash
+            {
+                return Err(QueryError::InvalidRequest(
+                    "model plane snapshot_id/grid_hash does not match the resolved immutable run"
+                        .into(),
+                ));
+            }
+            let (time, metadata, values) = match level_hpa {
+                None => {
+                    let field = snapshot.read_surface_2d(path.storage_slot, &variable_name)?;
+                    (field.time, field.metadata, field.values)
+                }
+                Some(level_hpa) => {
+                    let field = snapshot.read_pressure_level_2d(
+                        path.storage_slot,
+                        &variable_name,
+                        level_hpa,
+                    )?;
+                    (field.time, field.metadata, field.values)
+                }
+            };
+            let grid = snapshot.grid();
+            let bytes = encode_plane_blob(
+                &metadata.name,
+                &metadata.units,
+                time.valid_unix,
+                grid.nx,
+                grid.ny,
+                &values,
+            )
+            .map_err(|error| QueryError::InvalidRequest(error.to_string()))?;
+            let etag = format!(
+                "\"{}-{}-{}-{}\"",
+                descriptor.snapshot_id,
+                path.storage_slot,
+                metadata.id,
+                level_hpa.map_or_else(|| "surface".to_owned(), |level| format!("{level}hpa"))
+            );
+            Ok::<_, QueryError>(ModelPlane {
+                bytes,
+                etag,
+                variable: metadata.name,
+                units: metadata.units,
+                codec: metadata.codec,
+                valid_unix: time.valid_unix,
+                level_hpa,
+            })
+        })
+        .await
+    {
+        Ok(Ok(plane)) => model_plane_response(plane),
+        Ok(Err(error)) => query_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+fn model_plane_response(plane: ModelPlane) -> Response {
+    let mut response = Response::new(Body::from(plane.bytes));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(MODEL_PLANE_CONTENT_TYPE),
+    );
+    // The identity guards in the URL pin one immutable run generation, so the
+    // body at this URL can never change.
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    // Non-finite cells are absent values, not zero. This is a value-domain
+    // contract the stored f32 payload genuinely carries, unlike palette or
+    // interpolation hints, which models do not store.
+    headers.insert(
+        "x-rw-nodata",
+        HeaderValue::from_static("non-finite-transparent"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&plane.etag) {
+        headers.insert(header::ETAG, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&plane.variable) {
+        headers.insert("x-rw-model-variable", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&plane.units) {
+        headers.insert("x-rw-model-units", value);
+    }
+    // `zstd1_affine_i16` pressure planes are dequantized approximations of the
+    // ingested field; `zstd1_f32` surface planes are exact. Publishing the
+    // stored codec keeps that difference visible instead of implying that
+    // every f32 payload is lossless.
+    if let Ok(value) = HeaderValue::from_str(&plane.codec) {
+        headers.insert("x-rw-model-codec", value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&plane.valid_unix.to_string()) {
+        headers.insert("x-rw-valid-unix", value);
+    }
+    if let Some(level_hpa) = plane.level_hpa
+        && let Ok(value) = HeaderValue::from_str(&level_hpa.to_string())
+    {
+        headers.insert("x-rw-model-level-hpa", value);
+    }
+    response
 }
 
 async fn point(
@@ -1759,6 +2308,68 @@ async fn profile(
         })
         .await
     {
+        Ok(Ok(bytes)) => json_bytes_with_etag(StatusCode::OK, bytes),
+        Ok(Err(error)) => response_work_problem(error, request_id.0).into_response(),
+        Err(error) => execution_problem(error, request_id.0).into_response(),
+    }
+}
+
+async fn profile_cycle(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(request): Json<ProfileCycleApiRequest>,
+) -> Response {
+    if let Some(response) = reject_retired_selection(
+        &state,
+        request_id.0,
+        &request.model,
+        request
+            .variables
+            .iter()
+            .chain(request.surface_variables.iter())
+            .map(String::as_str),
+    ) {
+        return response;
+    }
+    let catalog = state.catalog.clone();
+    let cache = state.response_cache.clone();
+    let metrics = state.metrics.clone();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = cancellation.clone();
+    let result = state
+        .run_heavy_sync(move || {
+            let snapshot = catalog.snapshot(&request.model, &request.run)?;
+            let query = ProfileCycleRequest {
+                latitude: request.latitude,
+                longitude: request.longitude,
+                variables: request.variables.clone(),
+                surface_variables: request.surface_variables.clone(),
+                time: TimeRange {
+                    start_unix: request.start_unix,
+                    end_unix: request.end_unix,
+                },
+                missing_policy: request.missing_policy.into(),
+            };
+            cache_or_compute(
+                &cache,
+                &metrics,
+                "profile_cycle_v1",
+                &snapshot.descriptor().snapshot_id,
+                &request,
+                || {
+                    query_profile_cycle_with_cancel(&snapshot, &query, || {
+                        worker_cancellation.load(Ordering::Acquire)
+                    })
+                },
+            )
+        })
+        .await;
+    if matches!(result, Err(ExecutionError::ExecutionTimeout)) {
+        // Dropping a spawn_blocking handle does not preempt it. Profile-cycle
+        // queries check this flag at every time/variable/decode boundary.
+        cancellation.store(true, Ordering::Release);
+    }
+    match result {
         Ok(Ok(bytes)) => json_bytes_with_etag(StatusCode::OK, bytes),
         Ok(Err(error)) => response_work_problem(error, request_id.0).into_response(),
         Err(error) => execution_problem(error, request_id.0).into_response(),
@@ -3218,6 +3829,18 @@ fn secret_json_response(status: StatusCode, body: Vec<u8>) -> Response {
     response
 }
 
+fn private_no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private"),
+    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response.headers_mut().remove(header::ETAG);
+    response
+}
+
 fn json_bytes_with_etag(status: StatusCode, body: Bytes) -> Response {
     let digest = blake3::hash(&body).to_hex();
     let etag = format!("{digest:?}");
@@ -3282,7 +3905,8 @@ fn query_problem(error: QueryError, request_id: Uuid) -> ProblemDetails {
         QueryError::UnknownModel(_)
         | QueryError::UnknownRun { .. }
         | QueryError::UnknownStorageSlot(_)
-        | QueryError::UnknownVariable(_) => ProblemDetails::new(
+        | QueryError::UnknownVariable(_)
+        | QueryError::UnknownPressureLevel { .. } => ProblemDetails::new(
             StatusCode::NOT_FOUND,
             "DATA_NOT_FOUND",
             "Requested data was not found",
@@ -3894,6 +4518,7 @@ mod tests {
         let mut config = crate::AppConfig::default();
         config.server.store_root = directory.path().join("store");
         config.server.artifact_root = directory.path().join("artifacts");
+        config.server.cache_root = directory.path().join("cache");
         fs::create_dir_all(&config.server.store_root).unwrap();
         fs::create_dir_all(&config.server.artifact_root).unwrap();
         let tokens = crate::TokenSet::from_tokens([TOKEN]).unwrap();
@@ -3921,6 +4546,7 @@ mod tests {
         let mut config = crate::AppConfig::default();
         config.server.store_root = directory.path().join("store");
         config.server.artifact_root = directory.path().join("artifacts");
+        config.server.cache_root = directory.path().join("cache");
         fs::create_dir_all(&config.server.store_root).unwrap();
         fs::create_dir_all(&config.server.artifact_root).unwrap();
         config.community.enabled = true;
@@ -4025,6 +4651,7 @@ mod tests {
         let mut config = crate::AppConfig::default();
         config.server.store_root = directory.path().join("store");
         config.server.artifact_root = directory.path().join("artifacts");
+        config.server.cache_root = directory.path().join("cache");
         fs::create_dir_all(&config.server.store_root).unwrap();
         fs::create_dir_all(&config.server.artifact_root).unwrap();
         let tokens = crate::TokenSet::from_tokens([TOKEN, RELAY_REQUESTER_TOKEN]).unwrap();
@@ -4086,6 +4713,7 @@ mod tests {
         let mut config = crate::AppConfig::default();
         config.server.store_root = directory.path().join("store");
         config.server.artifact_root = directory.path().join("artifacts");
+        config.server.cache_root = directory.path().join("cache");
         fs::create_dir_all(&config.server.store_root).unwrap();
         fs::create_dir_all(&config.server.artifact_root).unwrap();
         let tokens =
@@ -4192,6 +4820,7 @@ mod tests {
         config.limits.sync_result_values = sync_result_values;
         config.server.store_root = directory.path().join("store");
         config.server.artifact_root = directory.path().join("artifacts");
+        config.server.cache_root = directory.path().join("cache");
         fs::create_dir_all(&config.server.store_root).unwrap();
         fs::create_dir_all(&config.server.artifact_root).unwrap();
         let grid = LatLonGrid::new(
@@ -4218,12 +4847,22 @@ mod tests {
             ];
             let pressure_850 = [280.0 + slot as f32; 4];
             let pressure_500 = [250.0 + slot as f32; 4];
-            let volumes = [PressureVolumeInput {
+            let optional_850 = [270.0 + slot as f32; 4];
+            let optional_500 = [240.0 + slot as f32; 4];
+            let mut volumes = vec![PressureVolumeInput {
                 name: "temperature_iso",
                 units: "K",
                 selector_template: serde_json::json!({"fixture": "temperature_iso"}),
                 levels: vec![(850, &pressure_850), (500, &pressure_500)],
             }];
+            if slot == 1 {
+                volumes.push(PressureVolumeInput {
+                    name: "optional_pressure_iso",
+                    units: "K",
+                    selector_template: serde_json::json!({"fixture": "optional_pressure_iso"}),
+                    levels: vec![(850, &optional_850), (500, &optional_500)],
+                });
+            }
             write_hour_from_grid_with_derived_exact(
                 &config.server.store_root,
                 FIXTURE_MODEL,
@@ -4505,6 +5144,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_cors_supports_map_tiles_and_conditional_get_without_credentials() {
+        let origin = HeaderValue::from_static("https://radar.example.edu");
+        let app = Router::new()
+            .route(
+                "/tile",
+                get(|| async {
+                    let mut response = Response::new(Body::from("tile"));
+                    response
+                        .headers_mut()
+                        .insert(header::ETAG, HeaderValue::from_static("\"fixture\""));
+                    response
+                }),
+            )
+            .layer(browser_cors_layer(vec![origin.clone()]));
+
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/tile")
+                    .header(header::ORIGIN, origin.clone())
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(
+                        header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "authorization,if-none-match",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        assert_eq!(
+            preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            origin
+        );
+        let allowed_headers = preflight.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(allowed_headers.contains("authorization"));
+        assert!(allowed_headers.contains("if-none-match"));
+        assert!(
+            !preflight
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+        );
+
+        let get_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tile")
+                    .header(header::ORIGIN, "https://radar.example.edu")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let exposed = get_response.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS]
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(exposed.contains("etag"));
+        assert!(exposed.contains("x-rw-satellite-frame"));
+        assert!(exposed.contains("x-rw-satellite-source-revision"));
+        assert!(
+            !get_response
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+        );
+    }
+
+    #[tokio::test]
     async fn health_is_public_but_data_routes_require_a_token() {
         let (directory, app) = test_app();
         // Legacy private namespace presence must not reintroduce the retired
@@ -4539,6 +5252,20 @@ mod tests {
             crate::problem::PROBLEM_CONTENT_TYPE
         );
 
+        let denied_profile_cycle = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/profile-cycle")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied_profile_cycle.status(), StatusCode::UNAUTHORIZED);
+
         let allowed = app
             .oneshot(
                 Request::builder()
@@ -4554,7 +5281,7 @@ mod tests {
         let body = to_bytes(allowed.into_body(), 1024 * 1024).await.unwrap();
         let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let models = models.as_array().expect("models response must be an array");
-        assert!(!models.is_empty());
+        assert_eq!(models.len(), 34);
         assert!(models.iter().all(|model| model["id"] != "rrfs-firewx"));
         let wrf = models
             .iter()
@@ -4578,12 +5305,224 @@ mod tests {
         assert_eq!(nbm["products"][0]["surface_source"], true);
         assert_eq!(nbm["products"][0]["pressure_source"], false);
 
+        let gdps = model("gdps");
+        assert_eq!(gdps["ingest_status"], "ready");
+        assert_eq!(gdps["verification"], "live_verified");
+        assert_eq!(
+            gdps["limitations"],
+            serde_json::json!(["sparse_pressure_levels"])
+        );
+        assert_eq!(
+            gdps["provider_attributions"][0]["notice"],
+            "Data Source: Environment and Climate Change Canada"
+        );
+        let geml = model("gdps-geml");
+        assert_eq!(geml["ingest_status"], "ready");
+        assert_eq!(geml["verification"], "live_verified");
+        assert_eq!(
+            geml["limitations"],
+            serde_json::json!([
+                "sparse_pressure_levels",
+                "derived_products_disabled",
+                "pre_operational_feed"
+            ])
+        );
+        assert_eq!(geml["products"][0]["product"], "rws-pressure");
+        assert_eq!(geml["products"][1]["product"], "rws-surface");
+        assert_eq!(
+            geml["provider_attributions"][0]["source_url"],
+            "https://eccc-msc.github.io/open-data/msc-data/nwp_gdps/readme_gdps-geml-datamart_en/"
+        );
+        for id in ["rdps", "hrdps"] {
+            let regional = model(id);
+            assert_eq!(regional["ingest_status"], "ready");
+            assert_eq!(regional["verification"], "live_verified");
+            assert_eq!(
+                regional["limitations"],
+                serde_json::json!(["sparse_pressure_levels", "derived_products_disabled"])
+            );
+            assert_eq!(regional["products"][0]["product"], "rws-pressure");
+            assert_eq!(regional["products"][1]["product"], "rws-surface");
+            assert_eq!(
+                regional["provider_attributions"][0]["notice"],
+                "Data Source: Environment and Climate Change Canada"
+            );
+        }
+        let geps = model("geps");
+        assert_eq!(geps["ingest_status"], "ready");
+        assert_eq!(geps["verification"], "live_verified");
+        assert_eq!(
+            geps["limitations"],
+            serde_json::json!([
+                "provider_statistics_only",
+                "sparse_pressure_levels",
+                "two_dimensional_statistics_only",
+                "derived_products_disabled",
+                "extended_range_not_scheduled"
+            ])
+        );
+        assert_eq!(geps["products"][0]["product"], "rws-published-statistics");
+        assert_eq!(geps["products"][0]["surface_source"], true);
+        assert_eq!(geps["products"][0]["pressure_source"], false);
+        assert_eq!(
+            geps["provider_attributions"][0]["notice"],
+            "Data Source: Environment and Climate Change Canada"
+        );
+        assert_eq!(
+            geps["provider_attributions"][0]["source_url"],
+            "https://eccc-msc.github.io/open-data/msc-data/nwp_geps/readme_geps-datamart_en/"
+        );
+
+        let reps = model("reps");
+        assert_eq!(reps["ingest_status"], "ready");
+        assert_eq!(reps["verification"], "live_verified");
+        assert_eq!(
+            reps["limitations"],
+            serde_json::json!([
+                "provider_statistics_only",
+                "surface_only",
+                "derived_products_disabled"
+            ])
+        );
+        assert_eq!(
+            reps["products"][0]["product"],
+            "rws-reps-provider-statistics"
+        );
+        assert_eq!(reps["products"][0]["surface_source"], true);
+        assert_eq!(reps["products"][0]["pressure_source"], false);
+        assert_eq!(
+            reps["provider_attributions"][0]["source_url"],
+            "https://eccc-msc.github.io/open-data/msc-data/nwp_reps/readme_reps-datamart_en/"
+        );
+
+        for id in ["icon-eu", "icon-d2"] {
+            let icon = model(id);
+            assert_eq!(icon["ingest_status"], "ready");
+            assert_eq!(icon["verification"], "live_verified");
+            assert_eq!(
+                icon["limitations"],
+                serde_json::json!(["sparse_pressure_levels", "derived_products_disabled"])
+            );
+            assert_eq!(icon["products"][0]["product"], "rws-pressure");
+            assert_eq!(icon["products"][1]["product"], "rws-surface");
+            assert_eq!(
+                icon["provider_attributions"][0]["notice"],
+                "Source: Deutscher Wetterdienst"
+            );
+            assert_eq!(
+                icon["provider_attributions"][0]["license"],
+                "Creative Commons Attribution 4.0 International (CC BY 4.0)."
+            );
+        }
+
+        let icon_ru = model("icon-ru");
+        assert_eq!(icon_ru["ingest_status"], "ready");
+        assert_eq!(icon_ru["verification"], "live_verified");
+        assert_eq!(icon_ru["registry_source_count"], 2);
+        assert_eq!(
+            icon_ru["limitations"],
+            serde_json::json!(["sparse_pressure_levels", "derived_products_disabled"])
+        );
+        assert_eq!(icon_ru["products"][0]["product"], "rws-pressure");
+        assert_eq!(icon_ru["products"][1]["product"], "rws-surface");
+        assert_eq!(
+            icon_ru["provider_attributions"][0]["notice"],
+            "Data source: Roshydromet WIPPS Designated Centre Moscow, distributed through WIS2."
+        );
+
+        for id in ["wrf-cptec-7km", "brams-cptec-8km"] {
+            let cptec = model(id);
+            assert_eq!(cptec["ingest_status"], "ready");
+            assert_eq!(cptec["verification"], "live_verified");
+            assert_eq!(cptec["cycle_hours_utc"], serde_json::json!([0]));
+            assert_eq!(cptec["max_forecast_hour"], 180);
+            assert_eq!(
+                cptec["limitations"],
+                serde_json::json!(["sparse_pressure_levels", "derived_products_disabled"])
+            );
+            assert_eq!(cptec["products"][0]["product"], "raw");
+            assert_eq!(cptec["products"][0]["surface_source"], true);
+            assert_eq!(cptec["products"][0]["pressure_source"], true);
+            assert_eq!(cptec["products"][0]["indexed_subset"], true);
+            assert!(
+                cptec["provider_attributions"][0]["provider"]
+                    .as_str()
+                    .unwrap()
+                    .contains("CPTEC")
+            );
+            assert!(
+                cptec["provider_attributions"][0]["notice"]
+                    .as_str()
+                    .unwrap()
+                    .contains("CPTEC Data Server")
+            );
+            assert!(
+                cptec["provider_attributions"][0]["license"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no model-directory-specific")
+            );
+        }
+
+        for id in ["rap", "nam"] {
+            assert_eq!(model(id)["verification"], "live_verified");
+        }
+        for id in ["hrrr-ak", "gdas"] {
+            assert_eq!(model(id)["verification"], "fixture_verified");
+        }
+        assert_eq!(model("hrrr-ak")["products"][0]["product"], "prs");
+        assert_eq!(model("hrrr-ak")["products"][1]["product"], "sfc");
+        assert_eq!(model("rap")["products"][0]["product"], "awp130pgrb");
+        assert_eq!(model("nam")["products"][0]["product"], "awip3d");
+        assert_eq!(model("gdas")["products"][0]["product"], "pgrb2.0p25");
+
         for id in ["aigefs", "hgefs"] {
             assert_eq!(
                 model(id)["limitations"],
-                serde_json::json!(["ensemble_mean_only", "derived_products_disabled"])
+                serde_json::json!([
+                    "ensemble_mean_only",
+                    "sparse_pressure_levels",
+                    "derived_products_disabled"
+                ])
+            );
+            assert_eq!(model(id)["verification"], "live_verified");
+            assert!(
+                model(id)["products"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|product| product["indexed_subset"] == false)
             );
         }
+        assert_eq!(
+            model("gefs")["limitations"],
+            serde_json::json!([
+                "ensemble_control_member_only",
+                "sparse_pressure_levels",
+                "derived_products_disabled"
+            ])
+        );
+        assert_eq!(model("gefs")["verification"], "live_verified");
+        assert_eq!(model("gefs")["max_forecast_hour"], 840);
+        assert_eq!(model("gefs")["products"][0]["indexed_subset"], true);
+        for id in ["aigfs", "ecmwf-open-data"] {
+            assert_eq!(
+                model(id)["limitations"],
+                serde_json::json!(["sparse_pressure_levels", "derived_products_disabled"])
+            );
+            assert_eq!(model(id)["verification"], "live_verified");
+        }
+        assert!(
+            model("aigfs")["products"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|product| product["indexed_subset"] == false)
+        );
+        assert_eq!(
+            model("ecmwf-open-data")["products"][0]["indexed_subset"],
+            true
+        );
         assert_eq!(
             model("hiresw")["limitations"],
             serde_json::json!(["surface_only", "conus_only"])
@@ -4609,6 +5548,47 @@ mod tests {
                 "pre_operational_feed"
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn latest_run_pointer_is_authenticated_and_never_cached() {
+        let (_directory, app) = test_app_with_store();
+        let path = format!("/v1/models/{FIXTURE_MODEL}/latest-run");
+
+        let denied = app
+            .clone()
+            .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let latest = get_with_token(app.clone(), &path).await;
+        assert_eq!(latest.status(), StatusCode::OK);
+        assert_eq!(latest.headers()[header::CACHE_CONTROL], "no-store, private");
+        assert_eq!(latest.headers()[header::PRAGMA], "no-cache");
+        assert!(!latest.headers().contains_key(header::ETAG));
+        let latest = response_json(latest).await;
+        assert_eq!(latest["model"], FIXTURE_MODEL);
+        assert_eq!(latest["run"], FIXTURE_RUN);
+        assert_eq!(latest["origin_unix"], FIXTURE_ORIGIN);
+
+        // `latest` remains a legal run ID. The old colliding spelling now
+        // dispatches through the ordinary run-detail route, not the pointer.
+        let literal_run = get_with_token(
+            app.clone(),
+            &format!("/v1/models/{FIXTURE_MODEL}/runs/latest"),
+        )
+        .await;
+        assert_eq!(literal_run.status(), StatusCode::NOT_FOUND);
+
+        let missing = get_with_token(app, "/v1/models/not-present/latest-run").await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing.headers()[header::CACHE_CONTROL],
+            "no-store, private"
+        );
+        assert_eq!(missing.headers()[header::PRAGMA], "no-cache");
+        assert_eq!(response_json(missing).await["code"], "DATA_NOT_FOUND");
     }
 
     #[tokio::test]
@@ -4832,6 +5812,7 @@ mod tests {
         let mut config = crate::AppConfig::default();
         config.server.store_root = directory.path().join("store");
         config.server.artifact_root = directory.path().join("artifacts");
+        config.server.cache_root = directory.path().join("cache");
         config.generation_replication.limits.maximum_chunk_bytes = 4;
         fs::create_dir_all(&config.server.store_root).unwrap();
         fs::create_dir_all(&config.server.artifact_root).unwrap();
@@ -4904,6 +5885,7 @@ mod tests {
         let mut config = crate::AppConfig::default();
         config.server.store_root = directory.path().join("store");
         config.server.artifact_root = directory.path().join("artifacts");
+        config.server.cache_root = directory.path().join("cache");
         config.origin_catalog.enabled = true;
         config.origin_catalog.publication_sources =
             crate::origin_catalog::PublicationSourceMode::Replication;
@@ -4997,6 +5979,7 @@ mod tests {
         let mut config = crate::AppConfig::default();
         config.server.store_root = directory.path().join("store");
         config.server.artifact_root = directory.path().join("artifacts");
+        config.server.cache_root = directory.path().join("cache");
         config.origin_catalog.enabled = true;
         config.origin_catalog.publication_sources =
             crate::origin_catalog::PublicationSourceMode::Replication;
@@ -5664,6 +6647,16 @@ mod tests {
                 }),
             ),
             (
+                "/v1/profile-cycle",
+                serde_json::json!({
+                    "model": LEGACY_RETIRED_MODEL,
+                    "run": FIXTURE_RUN,
+                    "latitude": 40.0,
+                    "longitude": -100.0,
+                    "variables": ["scalar"]
+                }),
+            ),
+            (
                 "/v1/window",
                 serde_json::json!({
                     "model": LEGACY_RETIRED_MODEL,
@@ -5708,7 +6701,7 @@ mod tests {
         assert_eq!(runs.status(), StatusCode::OK);
         let runs = response_json(runs).await;
         assert_eq!(
-            runs[0]["variable_count"], 2,
+            runs[0]["variable_count"], 3,
             "the public count excludes the retired compatibility variable"
         );
         let variables = get_with_token(
@@ -5747,6 +6740,16 @@ mod tests {
                     "latitude": 40.0,
                     "longitude": -100.0,
                     "storage_slot": 0,
+                    "variables": [RETIRED_VARIABLE_NAME]
+                }),
+            ),
+            (
+                "/v1/profile-cycle",
+                serde_json::json!({
+                    "model": FIXTURE_MODEL,
+                    "run": FIXTURE_RUN,
+                    "latitude": 40.0,
+                    "longitude": -100.0,
                     "variables": [RETIRED_VARIABLE_NAME]
                 }),
             ),
@@ -5816,6 +6819,7 @@ mod tests {
         let mut config = crate::AppConfig::default();
         config.server.store_root = directory.path().join("store");
         config.server.artifact_root = directory.path().join("artifacts");
+        config.server.cache_root = directory.path().join("cache");
         config.origin_catalog.enabled = true;
         fs::create_dir_all(&config.server.store_root).unwrap();
         fs::create_dir_all(&config.server.artifact_root).unwrap();
@@ -5866,6 +6870,24 @@ mod tests {
         assert!(!serialized.contains("hidden-model"));
         assert!(!serialized.contains("hidden-run"));
 
+        let profile_cycle = post_json(
+            app.clone(),
+            "/v1/profile-cycle",
+            serde_json::json!({
+                "model": "hidden-model",
+                "run": "hidden-run",
+                "latitude": 40.0,
+                "longitude": -100.0,
+                "variables": ["temperature"]
+            }),
+        )
+        .await;
+        assert_eq!(profile_cycle.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_json(profile_cycle).await["code"],
+            "ORIGIN_CATALOG_UNAVAILABLE"
+        );
+
         let status = get_with_token(app, "/v1/origin-catalog/status").await;
         assert_eq!(status.status(), StatusCode::OK);
         assert_eq!(status.headers()[header::CACHE_CONTROL], "no-store, private");
@@ -5883,6 +6905,7 @@ mod tests {
         let mut config = crate::AppConfig::default();
         config.server.store_root = directory.path().join("store");
         config.server.artifact_root = directory.path().join("artifacts");
+        config.server.cache_root = directory.path().join("cache");
         config.origin_catalog.enabled = true;
         fs::create_dir_all(&config.server.store_root).unwrap();
         fs::create_dir_all(&config.server.artifact_root).unwrap();
@@ -5962,6 +6985,7 @@ mod tests {
         let mut config = crate::AppConfig::default();
         config.server.store_root = directory.path().join("store");
         config.server.artifact_root = directory.path().join("artifacts");
+        config.server.cache_root = directory.path().join("cache");
         config.limits.request_body_bytes = 64;
         fs::create_dir_all(&config.server.store_root).unwrap();
         fs::create_dir_all(&config.server.artifact_root).unwrap();
@@ -5972,7 +6996,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/v1/points")
+                    .uri("/v1/profile-cycle")
                     .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(vec![b'x'; 128]))
@@ -6067,27 +7091,79 @@ mod tests {
             );
         }
 
-        let hrrr = models
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|model| model["id"] == "hrrr")
-            .expect("missing built-in HRRR capability");
-        let noaa = hrrr["provider_attributions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|attribution| {
-                attribution["provider"]
+        for id in ["hrrr", "gefs", "aigfs", "aigefs", "hgefs"] {
+            let model = models
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["id"] == id)
+                .unwrap_or_else(|| panic!("missing built-in {id} capability"));
+            let noaa = model["provider_attributions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|attribution| {
+                    attribution["provider"]
+                        .as_str()
+                        .is_some_and(|provider| provider.contains("NOAA"))
+                })
+                .expect("NOAA attribution");
+            assert!(
+                noaa["modification_notice"]
                     .as_str()
-                    .is_some_and(|provider| provider.contains("NOAA"))
-            })
-            .expect("NOAA attribution");
+                    .unwrap()
+                    .contains("not an official NOAA/NWS product")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_catalog_exposes_cma_statistics_scope_and_wmo_policy() {
+        let (_directory, app) = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let model = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["id"] == "cma-geps")
+            .expect("CMA GEPS capability");
+        assert_eq!(model["verification"], "live_verified");
+        assert_eq!(
+            model["limitations"],
+            serde_json::json!([
+                "provider_statistics_only",
+                "sparse_pressure_levels",
+                "derived_products_disabled"
+            ])
+        );
+        let attribution = &model["provider_attributions"][0];
+        assert_eq!(
+            attribution["provider"],
+            "China Meteorological Administration (CMA)"
+        );
         assert!(
-            noaa["modification_notice"]
+            attribution["license"]
                 .as_str()
                 .unwrap()
-                .contains("not an official NOAA/NWS product")
+                .contains("WMO Unified Data Policy")
+        );
+        assert!(
+            attribution["modification_notice"]
+                .as_str()
+                .unwrap()
+                .contains("not an official CMA product")
         );
     }
 
@@ -6151,6 +7227,27 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
         let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["code"], "QUERY_LIMIT");
+    }
+
+    #[tokio::test]
+    async fn profile_cycle_shares_one_decoded_level_value_budget_across_times() {
+        let (_directory, app) = test_app_with_store_limit(3);
+        let response = post_json(
+            app,
+            "/v1/profile-cycle",
+            serde_json::json!({
+                "model": FIXTURE_MODEL,
+                "run": FIXTURE_RUN,
+                "latitude": 40.0,
+                "longitude": -100.0,
+                "variables": ["temperature_iso"],
+                "missing_policy": "partial"
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let problem = response_json(response).await;
         assert_eq!(problem["code"], "QUERY_LIMIT");
     }
 
@@ -6329,6 +7426,341 @@ mod tests {
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Decode the `RWOBF32` plane container the model plane route shares with
+    /// the observation plane route.
+    fn decode_plane_blob(bytes: &[u8]) -> (usize, usize, i64, String, String, Vec<f32>) {
+        assert_eq!(&bytes[0..8], b"RWOBF32\0", "plane magic");
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1);
+        let nx = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let ny = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        let valid_unix = i64::from_le_bytes(bytes[20..28].try_into().unwrap());
+        let variable_len = u16::from_le_bytes(bytes[28..30].try_into().unwrap()) as usize;
+        let unit_len = u16::from_le_bytes(bytes[30..32].try_into().unwrap()) as usize;
+        assert_eq!(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 0);
+        let variable = String::from_utf8(bytes[36..36 + variable_len].to_vec()).unwrap();
+        let units =
+            String::from_utf8(bytes[36 + variable_len..36 + variable_len + unit_len].to_vec())
+                .unwrap();
+        let values_offset = 36 + variable_len + unit_len;
+        let values = bytes[values_offset..]
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), nx * ny, "plane carries exactly nx*ny values");
+        (nx, ny, valid_unix, variable, units, values)
+    }
+
+    fn model_plane_uri(
+        descriptor: &rw_query::RunDescriptor,
+        storage_slot: u16,
+        variable: &str,
+        level_hpa: Option<u16>,
+    ) -> String {
+        let mut uri = format!(
+            "/v1/models/{FIXTURE_MODEL}/runs/{FIXTURE_RUN}/planes/{storage_slot}/{variable}\
+             ?expected_snapshot_id={}&expected_grid_hash={}",
+            descriptor.snapshot_id, descriptor.grid_hash
+        );
+        if let Some(level_hpa) = level_hpa {
+            uri.push_str(&format!("&level_hpa={level_hpa}"));
+        }
+        uri
+    }
+
+    fn fixture_descriptor(state: &AppState) -> rw_query::RunDescriptor {
+        state
+            .catalog
+            .snapshot(FIXTURE_MODEL, FIXTURE_RUN)
+            .unwrap()
+            .descriptor()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn model_surface_plane_is_authenticated_snapshot_bound_and_immutable() {
+        let (_directory, state) = test_state_with_store_limit(2_000_000);
+        let descriptor = fixture_descriptor(&state);
+        let app = build_router(state).unwrap();
+        let uri = model_plane_uri(&descriptor, 0, "scalar.bin", None);
+
+        let denied = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let response = get_with_token(app.clone(), &uri).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/vnd.rusty-weather.model-plane+f32"
+        );
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        let etag = response.headers()[header::ETAG]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            etag.starts_with(&format!("\"{}-0-", descriptor.snapshot_id)),
+            "ETag must bind the immutable snapshot and slot: {etag}"
+        );
+        assert!(etag.ends_with("-surface\""), "ETag names the level: {etag}");
+        assert_eq!(response.headers()["x-rw-model-variable"], "scalar");
+        assert_eq!(response.headers()["x-rw-model-units"], "K");
+        assert_eq!(response.headers()["x-rw-model-codec"], "zstd1_f32");
+        assert_eq!(
+            response.headers()["x-rw-valid-unix"],
+            FIXTURE_ORIGIN.to_string()
+        );
+        assert_eq!(response.headers()["x-rw-nodata"], "non-finite-transparent");
+        assert!(
+            !response.headers().contains_key("x-rw-model-level-hpa"),
+            "a surface plane must not claim a pressure level"
+        );
+
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let (nx, ny, valid_unix, variable, units, values) = decode_plane_blob(&body);
+        assert_eq!((nx, ny), (descriptor.nx, descriptor.ny));
+        assert_eq!(valid_unix, FIXTURE_ORIGIN);
+        assert_eq!(variable, "scalar");
+        assert_eq!(units, "K");
+        assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0]);
+
+        // The second slot is a distinct immutable resource with its own ETag.
+        let later = get_with_token(app, &model_plane_uri(&descriptor, 1, "scalar.bin", None)).await;
+        assert_eq!(later.status(), StatusCode::OK);
+        assert_ne!(later.headers()[header::ETAG], etag.as_str());
+        assert_eq!(
+            later.headers()["x-rw-valid-unix"],
+            (FIXTURE_ORIGIN + 900).to_string()
+        );
+        let body = to_bytes(later.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(decode_plane_blob(&body).5, vec![2.0, 3.0, 4.0, 5.0]);
+    }
+
+    /// A run name is not an immutable identity: publishers replace runs
+    /// atomically under the same name. The plane URL therefore has to name the
+    /// snapshot it means, exactly like `/v1/geographic-window`, or the
+    /// `immutable` cache directive above would be a lie.
+    #[tokio::test]
+    async fn model_plane_requires_and_enforces_the_snapshot_identity_guard() {
+        let (_directory, state) = test_state_with_store_limit(2_000_000);
+        let descriptor = fixture_descriptor(&state);
+        let app = build_router(state).unwrap();
+
+        for uri in [
+            format!("/v1/models/{FIXTURE_MODEL}/runs/{FIXTURE_RUN}/planes/0/scalar.bin"),
+            format!(
+                "/v1/models/{FIXTURE_MODEL}/runs/{FIXTURE_RUN}/planes/0/scalar.bin?expected_snapshot_id={}",
+                descriptor.snapshot_id
+            ),
+            format!(
+                "/v1/models/{FIXTURE_MODEL}/runs/{FIXTURE_RUN}/planes/0/scalar.bin?expected_grid_hash={}",
+                descriptor.grid_hash
+            ),
+        ] {
+            let response = get_with_token(app.clone(), &uri).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "missing identity guard must fail explicitly: {uri}"
+            );
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/problem+json"
+            );
+        }
+
+        let mut stale = descriptor.clone();
+        stale.snapshot_id = "0".repeat(64);
+        let rejected =
+            get_with_token(app.clone(), &model_plane_uri(&stale, 0, "scalar.bin", None)).await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        let mut wrong_grid = descriptor.clone();
+        wrong_grid.grid_hash = "1".repeat(64);
+        let rejected = get_with_token(
+            app.clone(),
+            &model_plane_uri(&wrong_grid, 0, "scalar.bin", None),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        // Unknown query parameters are refused rather than silently ignored.
+        let unknown = get_with_token(
+            app,
+            &format!(
+                "{}&unsupported=1",
+                model_plane_uri(&descriptor, 0, "scalar.bin", None)
+            ),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn model_pressure_plane_serves_one_exact_level_and_says_it_is_quantized() {
+        let (_directory, state) = test_state_with_store_limit(2_000_000);
+        let descriptor = fixture_descriptor(&state);
+        let app = build_router(state).unwrap();
+
+        let response = get_with_token(
+            app.clone(),
+            &model_plane_uri(&descriptor, 1, "temperature_iso.bin", Some(850)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-rw-model-level-hpa"], "850");
+        assert_eq!(
+            response.headers()["x-rw-model-codec"],
+            "zstd1_affine_i16",
+            "pressure planes are dequantized, and the response must say so"
+        );
+        let etag = response.headers()[header::ETAG]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(etag.ends_with("-850hpa\""), "ETag names the level: {etag}");
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let (_, _, valid_unix, variable, units, values) = decode_plane_blob(&body);
+        assert_eq!(valid_unix, FIXTURE_ORIGIN + 900);
+        assert_eq!(variable, "temperature_iso");
+        assert_eq!(units, "K");
+        for value in &values {
+            assert!(
+                (value - 281.0).abs() < 0.01,
+                "{value} is not the stored 850 hPa level"
+            );
+        }
+
+        let upper = get_with_token(
+            app.clone(),
+            &model_plane_uri(&descriptor, 1, "temperature_iso.bin", Some(500)),
+        )
+        .await;
+        assert_eq!(upper.status(), StatusCode::OK);
+        assert_ne!(upper.headers()[header::ETAG], etag.as_str());
+        let body = to_bytes(upper.into_body(), 1024 * 1024).await.unwrap();
+        for value in &decode_plane_blob(&body).5 {
+            assert!(
+                (value - 251.0).abs() < 0.01,
+                "{value} is not the 500 hPa level"
+            );
+        }
+
+        // A level this run does not store is missing data, not a server fault.
+        let absent = get_with_token(
+            app.clone(),
+            &model_plane_uri(&descriptor, 1, "temperature_iso.bin", Some(700)),
+        )
+        .await;
+        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+
+        // Kind mismatches stay explicit in both directions.
+        let surface_with_level = get_with_token(
+            app.clone(),
+            &model_plane_uri(&descriptor, 0, "scalar.bin", Some(850)),
+        )
+        .await;
+        assert_eq!(
+            surface_with_level.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let pressure_without_level = get_with_token(
+            app,
+            &model_plane_uri(&descriptor, 1, "temperature_iso.bin", None),
+        )
+        .await;
+        assert_eq!(
+            pressure_without_level.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn model_plane_failures_are_explicit_and_never_leak_retired_identities() {
+        let (_directory, state) = test_state_with_store_limit(2_000_000);
+        let descriptor = fixture_descriptor(&state);
+        let app = build_router(state).unwrap();
+
+        for (label, uri) in [
+            (
+                "unknown slot",
+                model_plane_uri(&descriptor, 9, "scalar.bin", None),
+            ),
+            (
+                "unknown variable",
+                model_plane_uri(&descriptor, 0, "absent.bin", None),
+            ),
+            (
+                "missing .bin suffix",
+                model_plane_uri(&descriptor, 0, "scalar", None),
+            ),
+            (
+                "bare .bin filename",
+                model_plane_uri(&descriptor, 0, ".bin", None),
+            ),
+            (
+                "retired variable",
+                model_plane_uri(&descriptor, 0, "fire_weather_composite.bin", None),
+            ),
+        ] {
+            let response = get_with_token(app.clone(), &uri).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{label} must be an explicit 404"
+            );
+        }
+
+        let retired_model = get_with_token(
+            app,
+            &format!(
+                "/v1/models/{LEGACY_RETIRED_MODEL}/runs/{FIXTURE_RUN}/planes/0/scalar.bin\
+                 ?expected_snapshot_id={}&expected_grid_hash={}",
+                descriptor.snapshot_id, descriptor.grid_hash
+            ),
+        )
+        .await;
+        assert_eq!(retired_model.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(retired_model.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains(LEGACY_RETIRED_MODEL),
+            "the retired model name must never be echoed: {text}"
+        );
+    }
+
+    /// The plane route exists so a whole forecast field can be scrubbed. It
+    /// must therefore return the complete native grid, and no synchronous
+    /// query budget may quietly truncate it the way the JSON window path caps
+    /// cells.
+    #[tokio::test]
+    async fn model_plane_returns_the_full_native_grid_under_the_tightest_query_budget() {
+        let (_directory, state) = test_state_with_store_limit(1);
+        let descriptor = fixture_descriptor(&state);
+        let cells = descriptor.nx * descriptor.ny;
+        let app = build_router(state).unwrap();
+
+        let response =
+            get_with_token(app, &model_plane_uri(&descriptor, 0, "scalar.bin", None)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let (nx, ny, _, _, _, values) = decode_plane_blob(&body);
+        assert_eq!((nx, ny), (descriptor.nx, descriptor.ny));
+        assert_eq!(
+            values.len(),
+            cells,
+            "the plane route must not inherit sync_result_values as a hidden cell ceiling"
+        );
+    }
+
     #[tokio::test]
     async fn production_api_surface_round_trips_catalog_queries_cache_jobs_and_artifacts() {
         let (directory, app) = test_app_with_store();
@@ -6379,7 +7811,9 @@ mod tests {
                 .any(|variable| variable["name"] == "scalar" && variable["point_series"] == true)
         );
         assert!(variables.as_array().unwrap().iter().any(|variable| {
-            variable["name"] == "temperature_iso" && variable["pressure_profile"] == true
+            variable["name"] == "temperature_iso"
+                && variable["pressure_profile"] == true
+                && variable["profile_cycle"] == true
         }));
 
         let point_path = format!(
@@ -6445,6 +7879,68 @@ mod tests {
         assert_eq!(
             profile["variables"][0]["values"],
             serde_json::json!([280.0, 250.0])
+        );
+
+        let profile_cycle = post_json(
+            app.clone(),
+            "/v1/profile-cycle",
+            serde_json::json!({
+                "model": FIXTURE_MODEL,
+                "run": FIXTURE_RUN,
+                "latitude": 40.5,
+                "longitude": -99.5,
+                "variables": ["optional_pressure_iso"],
+                "surface_variables": ["scalar"],
+                "missing_policy": "partial"
+            }),
+        )
+        .await;
+        assert_eq!(profile_cycle.status(), StatusCode::OK);
+        assert!(profile_cycle.headers().contains_key(header::ETAG));
+        let profile_cycle = response_json(profile_cycle).await;
+        assert_eq!(profile_cycle["run"]["run"], FIXTURE_RUN);
+        assert_eq!(profile_cycle["run"]["sample_count"], 2);
+        assert_eq!(
+            profile_cycle["point"]["requested_latitude"],
+            serde_json::json!(40.5)
+        );
+        assert_eq!(
+            profile_cycle["requested_variables"],
+            serde_json::json!(["optional_pressure_iso"])
+        );
+        assert_eq!(
+            profile_cycle["requested_surface_variables"],
+            serde_json::json!(["scalar"])
+        );
+        assert_eq!(profile_cycle["missing_policy"], "partial");
+        assert_eq!(profile_cycle["samples"].as_array().unwrap().len(), 2);
+        assert_eq!(profile_cycle["samples"][0]["time"]["storage_slot"], 0);
+        assert_eq!(profile_cycle["samples"][0]["status"], "partial");
+        assert_eq!(
+            profile_cycle["samples"][0]["missing_variables"],
+            serde_json::json!(["optional_pressure_iso"])
+        );
+        assert_eq!(
+            profile_cycle["samples"][0]["source_provenance"][0]["provider"],
+            "ecmwf-open-data"
+        );
+        assert_eq!(
+            profile_cycle["samples"][0]["surface_samples"][0],
+            serde_json::json!({"variable": "scalar", "units": "K", "value": 4.0})
+        );
+        assert_eq!(
+            profile_cycle["samples"][0]["missing_surface_variables"],
+            serde_json::json!([])
+        );
+        assert_eq!(profile_cycle["samples"][1]["time"]["storage_slot"], 1);
+        assert_eq!(profile_cycle["samples"][1]["status"], "complete");
+        assert_eq!(
+            profile_cycle["samples"][1]["variables"][0]["levels_hpa"],
+            serde_json::json!([850, 500])
+        );
+        assert_eq!(
+            profile_cycle["samples"][1]["variables"][0]["values"],
+            serde_json::json!([271.0, 241.0])
         );
 
         let job_response = post_json(
@@ -6516,7 +8012,7 @@ mod tests {
         let metrics = to_bytes(metrics.into_body(), 256 * 1024).await.unwrap();
         let metrics = String::from_utf8(metrics.to_vec()).unwrap();
         assert!(metrics.contains("rw_response_cache_hits_total 1"));
-        assert!(metrics.contains("rw_response_cache_misses_total 4"));
+        assert!(metrics.contains("rw_response_cache_misses_total 5"));
     }
 
     #[tokio::test]

@@ -15,8 +15,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     GridPoint, QueryError, QueryLimits, QueryResult, RunDescriptor, SourceProvenance,
-    TemporalReducer, TimePoint, TimeRange, VariableCapability, parse_legacy_run_origin_unix,
-    provider_attributions_for_provenance, variable_temporal_capabilities,
+    TemporalReducer, TimePoint, TimeRange, VariableCapability,
+    parse_legacy_observation_day_origin_unix, parse_legacy_observation_hhmm_slot,
+    parse_legacy_run_origin_unix, provider_attributions_for_provenance,
+    variable_temporal_capabilities,
 };
 
 pub(crate) const DEFAULT_READER_POOL_BYTES: u64 = 64 * 1024 * 1024;
@@ -166,6 +168,27 @@ pub struct RunSnapshot {
     reader_pool: Arc<ReaderPool>,
 }
 
+/// One surface field read from the exact immutable run generation pinned by a
+/// [`RunSnapshot`]. The reader, hour metadata, backing path, and manifest are
+/// revalidated before this value is returned.
+#[derive(Debug)]
+pub struct SurfaceField2D {
+    pub time: TimePoint,
+    pub metadata: RwsVariableMeta,
+    pub values: Vec<f32>,
+}
+
+/// One exact pressure level of a 3-D field, decoded as a complete 2-D plane
+/// from the immutable run generation pinned by a [`RunSnapshot`], with the same
+/// reader/path/manifest revalidation as [`SurfaceField2D`].
+#[derive(Debug)]
+pub struct PressureLevelField2D {
+    pub time: TimePoint,
+    pub metadata: RwsVariableMeta,
+    pub level_hpa: u16,
+    pub values: Vec<f32>,
+}
+
 impl RunSnapshot {
     pub fn open(store_root: impl AsRef<Path>, model: &str, run: &str) -> QueryResult<Self> {
         Self::open_with_limits(store_root, model, run, QueryLimits::default())
@@ -297,6 +320,81 @@ impl RunSnapshot {
             .ok_or(QueryError::UnknownStorageSlot(storage_slot))
     }
 
+    /// Decode one complete 2-D field without weakening snapshot identity.
+    ///
+    /// Server-side derived products use this instead of reconstructing hour
+    /// paths themselves, which would otherwise create a time-of-check/time-of-
+    /// use gap around atomically replaced runs.
+    pub fn read_surface_2d(
+        &self,
+        storage_slot: u16,
+        variable: &str,
+    ) -> QueryResult<SurfaceField2D> {
+        let time = self.timepoint(storage_slot)?;
+        let (reader, path) = self.open_reader(&time)?;
+        let metadata = reader
+            .variable(variable)
+            .ok_or_else(|| QueryError::UnknownVariable(variable.to_owned()))?
+            .clone();
+        if metadata.kind != "surface2d" {
+            return Err(QueryError::WrongVariableKind {
+                variable: variable.to_owned(),
+                expected: "surface2d",
+                actual: metadata.kind,
+            });
+        }
+        let values = reader.read_full_2d(variable)?;
+        self.ensure_source(&reader, &path, storage_slot)?;
+        self.ensure_manifest_current()?;
+        Ok(SurfaceField2D {
+            time,
+            metadata,
+            values,
+        })
+    }
+
+    /// Decode one exact pressure level as a complete 2-D plane.
+    ///
+    /// The level is checked against the stored inventory here rather than
+    /// inside the reader so that "this run has no 700 hPa level" surfaces as an
+    /// explicit `UnknownPressureLevel`, in the same family as an unknown slot
+    /// or variable, instead of collapsing into an opaque store error.
+    pub fn read_pressure_level_2d(
+        &self,
+        storage_slot: u16,
+        variable: &str,
+        level_hpa: u16,
+    ) -> QueryResult<PressureLevelField2D> {
+        let time = self.timepoint(storage_slot)?;
+        let (reader, path) = self.open_reader(&time)?;
+        let metadata = reader
+            .variable(variable)
+            .ok_or_else(|| QueryError::UnknownVariable(variable.to_owned()))?
+            .clone();
+        if metadata.kind != "pressure3d" {
+            return Err(QueryError::WrongVariableKind {
+                variable: variable.to_owned(),
+                expected: "pressure3d",
+                actual: metadata.kind,
+            });
+        }
+        if !metadata.levels_hpa.contains(&level_hpa) {
+            return Err(QueryError::UnknownPressureLevel {
+                variable: variable.to_owned(),
+                level_hpa,
+            });
+        }
+        let values = reader.read_level_3d(variable, level_hpa)?;
+        self.ensure_source(&reader, &path, storage_slot)?;
+        self.ensure_manifest_current()?;
+        Ok(PressureLevelField2D {
+            time,
+            metadata,
+            level_hpa,
+            values,
+        })
+    }
+
     pub fn select_timepoints(&self, range: TimeRange) -> QueryResult<Vec<TimePoint>> {
         if range
             .start_unix
@@ -406,6 +504,7 @@ impl RunSnapshot {
                     coverage: ratio(available, expected),
                     point_series: kind == "surface2d",
                     pressure_profile: kind == "pressure3d",
+                    profile_cycle: kind == "pressure3d",
                     geographic_window: matches!(kind.as_str(), "surface2d" | "pressure3d"),
                     scalar_temporal_reduction: temporal
                         .supported_reducers
@@ -640,12 +739,22 @@ pub(crate) fn ensure_compatible(
     expected: &RwsVariableMeta,
     actual: &RwsVariableMeta,
 ) -> QueryResult<()> {
+    ensure_variable_metadata_compatible(expected, actual)
+}
+
+/// Enforce the same scientific-variable identity used while constructing a
+/// run snapshot. Writers call this before appending so incompatible metadata
+/// starts a new run instead of making an existing run unreadable.
+pub fn ensure_variable_metadata_compatible(
+    expected: &RwsVariableMeta,
+    actual: &RwsVariableMeta,
+) -> QueryResult<()> {
     if expected.name != actual.name
         || expected.units != actual.units
         || expected.kind != actual.kind
         || expected.codec != actual.codec
         || expected.levels_hpa != actual.levels_hpa
-        || expected.selector != actual.selector
+        || compatibility_selector(&expected.selector) != compatibility_selector(&actual.selector)
     {
         return Err(QueryError::InconsistentVariable {
             variable: expected.name.clone(),
@@ -653,6 +762,50 @@ pub(crate) fn ensure_compatible(
         });
     }
     Ok(())
+}
+
+/// Reduce a stored selector to the fields that define scientific identity.
+///
+/// Observation selectors historically included presentation hints and two
+/// values that legitimately change for every frame: the valid timestamp and
+/// the number of MRMS sentinel cells normalized to NaN. Existing stores must
+/// remain queryable across those frames. The remaining selector is still
+/// compared exactly, so product, parameter, level, and other scientific source
+/// metadata cannot change silently. Grid identity is validated separately by
+/// the run manifest before any hour is opened.
+fn compatibility_selector(selector: &serde_json::Value) -> serde_json::Value {
+    let mut selector = selector.clone();
+    let Some(root) = selector.as_object_mut() else {
+        return selector;
+    };
+    // Model selectors and other legacy variable metadata retain exact equality.
+    // Only the structured wrapper written by rw-observations has this contract.
+    if !root.contains_key("observation") {
+        return selector;
+    }
+    root.remove("display");
+    root.remove("grid_display");
+
+    if let Some(observation) = root
+        .get_mut("observation")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        observation.remove("valid_unix");
+    }
+    remove_mrms_normalized_cell_count(root.get_mut("source_selector"));
+    selector
+}
+
+fn remove_mrms_normalized_cell_count(selector: Option<&mut serde_json::Value>) {
+    let Some(selector) = selector else {
+        return;
+    };
+    if let Some(contract) = selector
+        .pointer_mut("/mrms/missing_value_contract")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        contract.remove("normalized_cells");
+    }
 }
 
 pub(crate) fn ratio(numerator: usize, denominator: usize) -> f64 {
@@ -691,12 +844,49 @@ fn build_time_axis(manifest: &RwsRunManifest) -> QueryResult<(Vec<TimePoint>, Op
         return Ok((axis, origin));
     }
 
-    let origin = parse_legacy_run_origin_unix(&manifest.run)?;
+    if let Ok(origin) = parse_legacy_run_origin_unix(&manifest.run) {
+        let axis = manifest
+            .hours
+            .iter()
+            .map(|(&storage_slot, entry)| {
+                let lead_seconds = u64::from(storage_slot) * 3_600;
+                let valid_unix = origin.checked_add(lead_seconds as i64).ok_or_else(|| {
+                    QueryError::InvalidLegacyRunSlug {
+                        run: manifest.run.clone(),
+                        reason: format!("slot {storage_slot} valid time overflows i64"),
+                    }
+                })?;
+                Ok(TimePoint {
+                    storage_slot,
+                    lead_seconds,
+                    valid_unix,
+                    file: entry.file.clone(),
+                })
+            })
+            .collect::<QueryResult<Vec<_>>>()?;
+        return Ok((axis, Some(origin)));
+    }
+
+    // Legacy rw-sat and SimSat stores predate exact-time v2. They encode one
+    // real UTC day in the run name and HHMM in both the map key and tHHMM.rws
+    // filename. Require the complete shape before interpreting a key as time;
+    // arbitrary v1 model runs still fail rather than receiving a guessed axis.
+    let origin = parse_legacy_observation_day_origin_unix(&manifest.run)?;
     let axis = manifest
         .hours
         .iter()
         .map(|(&storage_slot, entry)| {
-            let lead_seconds = u64::from(storage_slot) * 3_600;
+            let expected_file = format!("t{storage_slot:04}.rws");
+            if entry.file != expected_file {
+                return Err(QueryError::InvalidLegacyRunSlug {
+                    run: manifest.run.clone(),
+                    reason: format!(
+                        "observation slot {storage_slot} file '{}' must be '{expected_file}'",
+                        entry.file
+                    ),
+                });
+            }
+            let lead_seconds = parse_legacy_observation_hhmm_slot(&manifest.run, storage_slot)?;
             let valid_unix = origin.checked_add(lead_seconds as i64).ok_or_else(|| {
                 QueryError::InvalidLegacyRunSlug {
                     run: manifest.run.clone(),
@@ -753,4 +943,83 @@ fn validate_coordinates(latitude: f64, longitude: f64) -> QueryResult<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mrms_meta(valid_unix: i64, normalized_cells: usize) -> RwsVariableMeta {
+        RwsVariableMeta {
+            id: 0,
+            name: "mrms_reflectivity_lowest_altitude".to_string(),
+            units: "dBZ".to_string(),
+            kind: "surface2d".to_string(),
+            codec: "zstd1_f32".to_string(),
+            levels_hpa: Vec::new(),
+            selector: serde_json::json!({
+                "observation": {
+                    "family": "mrms",
+                    "collection": "conus",
+                    "product": "ReflectivityAtLowestAltitude",
+                    "valid_unix": valid_unix,
+                },
+                "grid_display": {"mask": "non_finite_values"},
+                "display": {
+                    "semantics": "reflectivity",
+                    "palette": "reflectivity",
+                    "preferred_range": [-32.0, 95.0],
+                },
+                "source_selector": {
+                    "mrms": {
+                        "discipline": 209,
+                        "parameter_category": 3,
+                        "parameter_number": 57,
+                        "level_type": 102,
+                        "level_value": 500.0,
+                        "missing_value_contract": {
+                            "missing": -99.0,
+                            "no_coverage": -999.0,
+                            "normalized_to": "NaN",
+                            "normalized_cells": normalized_cells,
+                        },
+                    },
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn compatibility_ignores_only_volatile_observation_metadata() {
+        let first = mrms_meta(1_787_452_602, 23_539_883);
+        let mut second = mrms_meta(1_787_454_882, 23_541_914);
+        second.selector["display"]["preferred_range"] = serde_json::json!([-20.0, 80.0]);
+        assert!(ensure_compatible(&first, &second).is_ok());
+    }
+
+    #[test]
+    fn compatibility_rejects_scientific_metadata_changes() {
+        let expected = mrms_meta(1_787_452_602, 23_539_883);
+
+        let mut changed_units = expected.clone();
+        changed_units.units = "mm/h".to_string();
+        assert!(ensure_compatible(&expected, &changed_units).is_err());
+
+        let mut changed_kind = expected.clone();
+        changed_kind.kind = "pressure3d".to_string();
+        assert!(ensure_compatible(&expected, &changed_kind).is_err());
+
+        let mut changed_codec = expected.clone();
+        changed_codec.codec = "raw_f32".to_string();
+        assert!(ensure_compatible(&expected, &changed_codec).is_err());
+
+        let mut changed_levels = expected.clone();
+        changed_levels.levels_hpa = vec![500];
+        assert!(ensure_compatible(&expected, &changed_levels).is_err());
+
+        let mut changed_parameter = expected.clone();
+        changed_parameter.selector["source_selector"]["mrms"]["parameter_number"] =
+            serde_json::json!(58);
+        assert!(ensure_compatible(&expected, &changed_parameter).is_err());
+    }
 }
