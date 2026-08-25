@@ -61,6 +61,7 @@ services:
       - ./runtime/secrets/authority-scoped:/run/scoped-federation-secrets:ro
       - ./runtime/data/authority/store:/var/lib/rusty-weather/store
       - ./runtime/data/authority/artifacts:/var/lib/rusty-weather/artifacts
+      - ./runtime/data/authority/cache:/var/cache/rusty-weather/server
       - ./runtime/data/authority/community:/var/lib/rusty-weather/community-cache
       - ./runtime/data/authority/federation:/var/lib/rusty-weather/federation
     networks:
@@ -84,6 +85,7 @@ services:
       - ./runtime/configs/alpha.toml:/etc/rusty-weather/rusty-weather.toml:ro
       - ./runtime/data/alpha/store:/var/lib/rusty-weather/store
       - ./runtime/data/alpha/artifacts:/var/lib/rusty-weather/artifacts
+      - ./runtime/data/alpha/cache:/var/cache/rusty-weather/server
       - ./runtime/data/alpha/community:/var/lib/rusty-weather/community-cache
       - ./runtime/data/alpha/replication:/var/lib/rusty-weather/generation-replication
     networks:
@@ -107,6 +109,7 @@ services:
       - ./runtime/configs/beta.toml:/etc/rusty-weather/rusty-weather.toml:ro
       - ./runtime/data/beta/store:/var/lib/rusty-weather/store
       - ./runtime/data/beta/artifacts:/var/lib/rusty-weather/artifacts
+      - ./runtime/data/beta/cache:/var/cache/rusty-weather/server
       - ./runtime/data/beta/community:/var/lib/rusty-weather/community-cache
       - ./runtime/data/beta/replication:/var/lib/rusty-weather/generation-replication
     networks:
