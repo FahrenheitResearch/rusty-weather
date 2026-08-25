@@ -707,11 +707,11 @@ mod tests {
 
         let (bands, desc) = resolve_layer("geocolor").expect("composite layer");
         assert_eq!(bands, vec![1, 2, 3, 13]);
-        assert_eq!(desc, "GeoColor");
+        assert_eq!(desc, "GeoColor · variance-sharpened");
 
         let (bands, desc) = resolve_layer("true_color").expect("daylight composite layer");
         assert_eq!(bands, vec![1, 2, 3]);
-        assert_eq!(desc, "True Color");
+        assert_eq!(desc, "True Color · basic");
 
         assert!(resolve_layer("c0").is_err());
         assert!(resolve_layer("c17").is_err());

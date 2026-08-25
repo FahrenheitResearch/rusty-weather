@@ -2205,40 +2205,67 @@ mod tests {
 
     #[test]
     fn pressure_volume_over_supported_ceiling_is_reported() {
-        let meta_json = r#"{
+        // The check is metadata-only, so the descriptor is built from declared
+        // dimensions and nothing of this size is ever allocated. `nx * ny` is
+        // held just under the grid-cell sanity bound so the volume ceiling is
+        // the bound under test; the level count alone decides which side of
+        // `MAX_VOLUME_ELEMENTS` the declared volume falls on.
+        const SIDE: usize = 876_000_000;
+        assert!(SIDE * SIDE <= MAX_GRID_CELLS, "grid bound must not fire");
+        assert!(SIDE * SIDE * 3 <= MAX_VOLUME_ELEMENTS);
+        assert!(SIDE * SIDE * 6 > MAX_VOLUME_ELEMENTS);
+
+        fn report_for(levels: &str) -> ValidationReport {
+            let meta_json = format!(
+                r#"{{
             "schema": "rw-store.hour.v1",
             "model": "hrrr",
             "run": "20260610_00z",
             "forecast_hour": 3,
-            "nx": 5000,
-            "ny": 5000,
+            "nx": {SIDE},
+            "ny": {SIDE},
             "grid_hash": "aaaa",
-            "variables": [{
+            "variables": [{{
                 "id": 0,
                 "name": "temperature",
                 "units": "K",
                 "kind": "pressure3d",
                 "codec": "zstd1_affine_i16",
-                "levels_hpa": [1000, 900, 800, 700, 600, 500],
-                "selector": {}
-            }],
-            "chunking": {"tile_y": 256, "tile_x": 256, "col_y": 16, "col_x": 16},
-            "writer": {"name": "test", "version": "0", "build": "0"}
-        }"#;
-        let bytes = build_file_with_meta(meta_json);
-        let dir = test_dir("volume-ceiling");
-        let path = write_corrupt(&dir, "volume-ceiling.rws", &bytes);
-
-        let report = validate_hour_file(&path, ValidateDepth::Structural).unwrap();
-        assert!(
+                "levels_hpa": [{levels}],
+                "selector": {{}}
+            }}],
+            "chunking": {{"tile_y": 256, "tile_x": 256, "col_y": 16, "col_x": 16}},
+            "writer": {{"name": "test", "version": "0", "build": "0"}}
+        }}"#
+            );
+            let bytes = build_file_with_meta(&meta_json);
+            let dir = test_dir("volume-ceiling");
+            let path = write_corrupt(&dir, "volume-ceiling.rws", &bytes);
+            let report = validate_hour_file(&path, ValidateDepth::Structural).unwrap();
+            let _ = fs::remove_dir_all(&dir);
             report
-                .errors
+        }
+
+        let over = report_for("1000, 900, 800, 700, 600, 500");
+        assert!(
+            over.errors
                 .iter()
                 .any(|error| error.contains("volume ceiling")),
             "unexpected errors: {:?}",
-            report.errors
+            over.errors
         );
-        let _ = fs::remove_dir_all(&dir);
+
+        // The same grid one third of the way down the level ladder declares a
+        // volume inside the ceiling, so this bound stays silent.
+        let under = report_for("1000, 900, 800");
+        assert!(
+            !under
+                .errors
+                .iter()
+                .any(|error| error.contains("volume ceiling")),
+            "under-ceiling volume must not report the ceiling: {:?}",
+            under.errors
+        );
     }
 
     /// nx = ny = 18_000_000_000_000_000_000 (fits u64; passes the nx>0 guard but
