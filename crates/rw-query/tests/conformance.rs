@@ -4,16 +4,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustwx_core::{GridShape, LatLonGrid};
 use rw_query::{
-    MissingPolicy, PointSeriesRequest, ProfileRequest, QueryError, QueryLimits, RunSnapshot,
-    ScalarTemporalRequest, StoreCatalog, TimeRange, query_point_series, query_profile,
-    reduce_scalar_temporal,
+    MissingPolicy, PointSeriesRequest, ProfileCycleRequest, ProfileCycleSampleStatus,
+    ProfileRequest, QueryError, QueryLimits, RunSnapshot, ScalarTemporalRequest, StoreCatalog,
+    TimeRange, query_point_series, query_profile, query_profile_cycle,
+    query_profile_cycle_with_cancel, reduce_scalar_temporal,
 };
-use rw_store::RwsExactTime;
 use rw_store::ingest::{
     DerivedFieldInput, PressureVolumeInput, write_hour_from_grid_with_derived,
     write_hour_from_grid_with_derived_exact,
 };
 use rw_store::run::RwsRunManifest;
+use rw_store::{RwsExactTime, RwsSourceProvenance};
 
 const MODEL: &str = "fixture-model";
 const RUN: &str = "exact-fixture";
@@ -74,12 +75,22 @@ fn exact_store() -> (TestDir, PathBuf) {
         }
         let pressure_1000 = [280.0 + index as f32, 281.0, 282.0, 283.0];
         let pressure_900 = [270.0 + index as f32, 271.0, 272.0, 273.0];
-        let volumes = [PressureVolumeInput {
+        let optional_1000 = [260.0 + index as f32; 4];
+        let optional_900 = [250.0 + index as f32; 4];
+        let mut volumes = vec![PressureVolumeInput {
             name: "temperature",
             units: "K",
             selector_template: serde_json::json!({"parameter": "temperature"}),
             levels: vec![(1000, &pressure_1000), (900, &pressure_900)],
         }];
+        if slot == 1 {
+            volumes.push(PressureVolumeInput {
+                name: "optional_pressure",
+                units: "K",
+                selector_template: serde_json::json!({"parameter": "optional_pressure"}),
+                levels: vec![(1000, &optional_1000), (900, &optional_900)],
+            });
+        }
         write_hour_from_grid_with_derived_exact(
             &root,
             MODEL,
@@ -96,6 +107,19 @@ fn exact_store() -> (TestDir, PathBuf) {
         )
         .unwrap();
     }
+    let manifest_path = root.join(MODEL).join(RUN).join("run.json");
+    let mut manifest = RwsRunManifest::load(&manifest_path).unwrap();
+    for slot in [0u16, 1, 2] {
+        manifest.hours.get_mut(&slot).unwrap().source_provenance = vec![
+            RwsSourceProvenance::new(
+                format!("fixture-provider-{slot}"),
+                vec!["pressure".into()],
+                vec![format!("product-{slot}")],
+            )
+            .unwrap(),
+        ];
+    }
+    manifest.save(&manifest_path).unwrap();
     (dir, root)
 }
 
@@ -122,7 +146,7 @@ fn exact_snapshot_catalog_capabilities_point_and_profile_conform() {
     let runs = catalog.list_runs(MODEL).unwrap();
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].run.run, RUN);
-    assert_eq!(runs[0].variable_count, 3);
+    assert_eq!(runs[0].variable_count, 4);
 
     let snapshot = catalog.snapshot(MODEL, RUN).unwrap();
     assert!(snapshot.descriptor().exact_time_axis);
@@ -161,6 +185,7 @@ fn exact_snapshot_catalog_capabilities_point_and_profile_conform() {
         .find(|capability| capability.name == "temperature")
         .unwrap();
     assert!(pressure.pressure_profile);
+    assert!(pressure.profile_cycle);
     assert!(!pressure.scalar_temporal_reduction);
     assert_eq!(
         pressure.temporal.basis,
@@ -212,6 +237,365 @@ fn exact_snapshot_catalog_capabilities_point_and_profile_conform() {
     assert_eq!(profile.variables[0].available_levels, 2);
     assert!((profile.variables[0].values[0].unwrap() - 281.0).abs() < 0.05);
     assert!((profile.variables[0].values[1].unwrap() - 271.0).abs() < 0.05);
+}
+
+#[test]
+fn profile_cycle_binds_every_time_gap_level_point_snapshot_and_provenance() {
+    let (_dir, root) = exact_store();
+    let snapshot = RunSnapshot::open(&root, MODEL, RUN).unwrap();
+    let request = ProfileCycleRequest {
+        latitude: 40.0,
+        longitude: -100.0,
+        variables: vec!["temperature".into(), "optional_pressure".into()],
+        surface_variables: vec!["scalar".into()],
+        time: TimeRange::default(),
+        missing_policy: MissingPolicy::Partial,
+    };
+    let cycle = query_profile_cycle(&snapshot, &request).unwrap();
+
+    assert_eq!(cycle.run, snapshot.descriptor().clone());
+    assert_eq!(cycle.point.requested_latitude, request.latitude);
+    assert_eq!(cycle.point.requested_longitude, request.longitude);
+    assert_eq!((cycle.point.x, cycle.point.y), (0, 0));
+    assert_eq!(cycle.requested_variables, request.variables);
+    assert_eq!(cycle.requested_surface_variables, request.surface_variables);
+    assert_eq!(cycle.requested_time, TimeRange::default());
+    assert_eq!(cycle.missing_policy, MissingPolicy::Partial);
+    assert_eq!(
+        cycle
+            .samples
+            .iter()
+            .map(|sample| {
+                (
+                    sample.time.storage_slot,
+                    sample.time.valid_unix,
+                    sample.status,
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (0, ORIGIN, ProfileCycleSampleStatus::Partial),
+            (1, ORIGIN + 900, ProfileCycleSampleStatus::Complete),
+            (2, ORIGIN + 2_700, ProfileCycleSampleStatus::Partial),
+        ]
+    );
+    assert_eq!(
+        cycle.samples[0].missing_variables,
+        vec!["optional_pressure"]
+    );
+    assert_eq!(cycle.samples[0].variables[0].name, "temperature");
+    assert_eq!(cycle.samples[0].variables[0].levels_hpa, vec![1000, 900]);
+    assert_eq!(cycle.samples[0].surface_samples[0].variable, "scalar");
+    assert_eq!(cycle.samples[0].surface_samples[0].units, "K");
+    assert_eq!(cycle.samples[0].surface_samples[0].value, Some(5.0));
+    assert!(cycle.samples[0].missing_surface_variables.is_empty());
+    assert_eq!(cycle.samples[1].variables.len(), 2);
+    assert_eq!(cycle.samples[1].missing_variables, Vec::<String>::new());
+    assert_eq!(
+        cycle.samples[2].source_provenance[0].provider,
+        "fixture-provider-2"
+    );
+    assert_eq!(
+        cycle.samples[2].source_provenance[0].roles,
+        vec!["pressure"]
+    );
+    assert!(
+        serde_json::to_value(&cycle).unwrap()["samples"][0]["time"]
+            .get("file")
+            .is_none()
+    );
+
+    let canonical = query_profile(
+        &snapshot,
+        &ProfileRequest {
+            latitude: request.latitude,
+            longitude: request.longitude,
+            storage_slot: 1,
+            variables: request.variables.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(cycle.samples[1].variables, canonical.variables);
+
+    let gaps = query_profile_cycle(
+        &snapshot,
+        &ProfileCycleRequest {
+            variables: vec!["optional_pressure".into()],
+            surface_variables: Vec::new(),
+            ..request.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        gaps.samples
+            .iter()
+            .map(|sample| sample.status)
+            .collect::<Vec<_>>(),
+        vec![
+            ProfileCycleSampleStatus::Gap,
+            ProfileCycleSampleStatus::Complete,
+            ProfileCycleSampleStatus::Gap,
+        ]
+    );
+    assert!(gaps.samples[0].variables.is_empty());
+    assert_eq!(gaps.samples[0].missing_variables, vec!["optional_pressure"]);
+
+    let window = query_profile_cycle(
+        &snapshot,
+        &ProfileCycleRequest {
+            variables: vec!["temperature".into()],
+            time: TimeRange {
+                start_unix: Some(ORIGIN + 900),
+                end_unix: Some(ORIGIN + 2_701),
+            },
+            ..request
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        window
+            .samples
+            .iter()
+            .map(|sample| sample.time.storage_slot)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn profile_cycle_surface_bundle_preserves_order_missing_values_kinds_and_shared_caps() {
+    let (_dir, root) = exact_store();
+    let snapshot = RunSnapshot::open(&root, MODEL, RUN).unwrap();
+    let request = ProfileCycleRequest {
+        latitude: 40.0,
+        longitude: -100.0,
+        variables: vec!["temperature".into()],
+        surface_variables: vec!["scalar".into(), "optional".into()],
+        time: TimeRange::default(),
+        missing_policy: MissingPolicy::Partial,
+    };
+    let cycle = query_profile_cycle(&snapshot, &request).unwrap();
+
+    assert_eq!(cycle.requested_surface_variables, request.surface_variables);
+    assert_eq!(cycle.samples[0].status, ProfileCycleSampleStatus::Partial);
+    assert_eq!(cycle.samples[0].missing_surface_variables, vec!["optional"]);
+    assert_eq!(
+        cycle.samples[0]
+            .surface_samples
+            .iter()
+            .map(|sample| (
+                sample.variable.as_str(),
+                sample.units.as_str(),
+                sample.value
+            ))
+            .collect::<Vec<_>>(),
+        vec![("scalar", "K", Some(5.0)), ("optional", "1", None)]
+    );
+    assert_eq!(cycle.samples[1].status, ProfileCycleSampleStatus::Complete);
+    assert_eq!(cycle.samples[1].surface_samples[1].value, Some(9.0));
+    assert_eq!(cycle.samples[2].missing_surface_variables, vec!["optional"]);
+
+    let strict_error = query_profile_cycle(
+        &snapshot,
+        &ProfileCycleRequest {
+            missing_policy: MissingPolicy::Strict,
+            ..request.clone()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        strict_error,
+        QueryError::MissingVariable {
+            variable,
+            slot: 0
+        } if variable == "optional"
+    ));
+
+    let wrong_kind = query_profile_cycle(
+        &snapshot,
+        &ProfileCycleRequest {
+            surface_variables: vec!["optional_pressure".into()],
+            ..request.clone()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(wrong_kind, QueryError::WrongVariableKind { .. }));
+
+    let unknown = query_profile_cycle(
+        &snapshot,
+        &ProfileCycleRequest {
+            surface_variables: vec!["not_present".into()],
+            ..request.clone()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(unknown, QueryError::UnknownVariable(name) if name == "not_present"));
+
+    let value_limited = RunSnapshot::open_with_limits(
+        &root,
+        MODEL,
+        RUN,
+        QueryLimits {
+            max_point_values: 8,
+            ..QueryLimits::default()
+        },
+    )
+    .unwrap();
+    let cap_error = query_profile_cycle(
+        &value_limited,
+        &ProfileCycleRequest {
+            surface_variables: vec!["scalar".into()],
+            ..request.clone()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        cap_error,
+        QueryError::LimitExceeded {
+            what: "profile-cycle values",
+            requested: 9,
+            limit: 8
+        }
+    ));
+
+    let variable_limited = RunSnapshot::open_with_limits(
+        &root,
+        MODEL,
+        RUN,
+        QueryLimits {
+            max_variables: 2,
+            ..QueryLimits::default()
+        },
+    )
+    .unwrap();
+    let variable_error = query_profile_cycle(&variable_limited, &request).unwrap_err();
+    assert!(matches!(
+        variable_error,
+        QueryError::LimitExceeded {
+            what: "variables",
+            requested: 3,
+            limit: 2
+        }
+    ));
+}
+
+#[test]
+fn profile_cycle_enforces_missing_kind_count_time_and_cancellation_gates() {
+    let (_dir, root) = exact_store();
+    let request = |variables: Vec<String>, missing_policy| ProfileCycleRequest {
+        latitude: 40.0,
+        longitude: -100.0,
+        variables,
+        surface_variables: Vec::new(),
+        time: TimeRange::default(),
+        missing_policy,
+    };
+    let snapshot = RunSnapshot::open(&root, MODEL, RUN).unwrap();
+
+    let strict = query_profile_cycle(
+        &snapshot,
+        &request(vec!["optional_pressure".into()], MissingPolicy::Strict),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        strict,
+        QueryError::MissingVariable {
+            variable,
+            slot: 0
+        } if variable == "optional_pressure"
+    ));
+    let unknown = query_profile_cycle(
+        &snapshot,
+        &request(vec!["not_present".into()], MissingPolicy::Partial),
+    )
+    .unwrap_err();
+    assert!(matches!(unknown, QueryError::UnknownVariable(name) if name == "not_present"));
+    let wrong_kind = query_profile_cycle(
+        &snapshot,
+        &request(vec!["scalar".into()], MissingPolicy::Partial),
+    )
+    .unwrap_err();
+    assert!(matches!(wrong_kind, QueryError::WrongVariableKind { .. }));
+    let mut cancellation_checks = 0;
+    let cancelled = query_profile_cycle_with_cancel(
+        &snapshot,
+        &request(vec!["temperature".into()], MissingPolicy::Partial),
+        || {
+            cancellation_checks += 1;
+            cancellation_checks >= 5
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(cancelled, QueryError::Cancelled));
+    assert_eq!(cancellation_checks, 5);
+
+    let mut invalid_range = request(vec!["temperature".into()], MissingPolicy::Partial);
+    invalid_range.time = TimeRange {
+        start_unix: Some(ORIGIN + 900),
+        end_unix: Some(ORIGIN + 900),
+    };
+    assert!(matches!(
+        query_profile_cycle(&snapshot, &invalid_range),
+        Err(QueryError::InvalidTimeRange { .. })
+    ));
+    assert!(matches!(
+        query_profile_cycle(
+            &snapshot,
+            &request(
+                vec!["temperature".into(), "temperature".into()],
+                MissingPolicy::Partial,
+            ),
+        ),
+        Err(QueryError::InvalidRequest(_))
+    ));
+
+    let value_limited = RunSnapshot::open_with_limits(
+        &root,
+        MODEL,
+        RUN,
+        QueryLimits {
+            max_point_values: 5,
+            ..QueryLimits::default()
+        },
+    )
+    .unwrap();
+    let error = query_profile_cycle(
+        &value_limited,
+        &request(vec!["temperature".into()], MissingPolicy::Partial),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        QueryError::LimitExceeded {
+            what: "profile-cycle values",
+            requested: 6,
+            limit: 5
+        }
+    ));
+
+    let time_limited = RunSnapshot::open_with_limits(
+        &root,
+        MODEL,
+        RUN,
+        QueryLimits {
+            max_selected_time_points: 2,
+            ..QueryLimits::default()
+        },
+    )
+    .unwrap();
+    let error = query_profile_cycle(
+        &time_limited,
+        &request(vec!["temperature".into()], MissingPolicy::Partial),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        QueryError::LimitExceeded {
+            what: "selected time points",
+            requested: 3,
+            limit: 2
+        }
+    ));
 }
 
 #[test]

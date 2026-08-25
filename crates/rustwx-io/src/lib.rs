@@ -27,7 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use wx_core::download::client::MAX_BODY_SIZE;
-use wx_core::download::{DownloadClient, byte_ranges, find_entries, parse_idx};
+use wx_core::download::{DownloadClient, DownloadConfig, byte_ranges, find_entries, parse_idx};
 
 const FETCH_CACHE_LOCK_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 const FETCH_CACHE_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(45 * 60);
@@ -51,6 +51,8 @@ pub enum IoError {
     UnsupportedStructuredSelector { selector: FieldSelector },
     #[error("grid coordinates could not be derived for selector '{selector}'")]
     MissingGridCoordinates { selector: FieldSelector },
+    #[error("unsafe grid-relative wind for {model}: {detail}")]
+    UnsafeGridRelativeWind { model: ModelId, detail: String },
     #[error("wrf error: {0}")]
     Wrf(String),
     #[error("ODIM HDF5 error: {0}")]
@@ -247,6 +249,26 @@ pub fn fetch_mrms_latest_product(product: &str) -> Result<Vec<u8>, IoError> {
     maybe_decompress_grib_payload(&url, bytes).map_err(IoError::Download)
 }
 
+/// Fetch an official MRMS `latest` product with an explicit per-request
+/// timeout and retry count. Long-running services use this instead of process
+/// environment defaults so their shutdown and backoff envelopes stay bounded.
+pub fn fetch_mrms_latest_product_with_policy(
+    product: &str,
+    timeout: Duration,
+    max_retries: u32,
+) -> Result<Vec<u8>, IoError> {
+    let url = mrms_latest_product_url(product)?;
+    let client = DownloadClient::new_with_config(DownloadConfig {
+        timeout,
+        max_retries,
+    })
+    .map_err(|error| IoError::Download(error.to_string()))?;
+    let bytes = client
+        .get_bytes(&url)
+        .map_err(|error| IoError::Download(error.to_string()))?;
+    maybe_decompress_grib_payload(&url, bytes).map_err(IoError::Download)
+}
+
 pub fn extract_mrms_latest_reflectivity_at_lowest_altitude() -> Result<SelectedField2D, IoError> {
     let bytes = fetch_mrms_latest_product("ReflectivityAtLowestAltitude")?;
     extract_field_from_bytes(
@@ -349,7 +371,79 @@ pub fn fetch_eumetnet_opera_odim_h5(url: &str) -> Result<Vec<u8>, IoError> {
         .map_err(|err| IoError::Download(err.to_string()))
 }
 
+/// What a no-echo (`undetect`) cell is worth, in dBZ.
+///
+/// ODIM declares two sentinels and they mean opposite things. `nodata` is *no
+/// radar coverage* — genuinely unobserved. `undetect` is *no echo* — the
+/// network looked and found nothing, which is an observation, and on a live
+/// composite it is the single most common true one. On a measured frame
+/// (`OPERA@20260812T1930@0@DBZH.h5`, 3800x4400, 16 720 000 cells) `nodata`
+/// covered 49.7 % of cells and `undetect` 46.2 %, with 4.1 % carrying a
+/// measurement: collapsing the two discards nearly half the frame, and what
+/// it discards is every correct negative a skill score is built on.
+///
+/// The value sits below the -32.0 dBZ floor real data was measured at on that
+/// frame, so a clear-air cell scores as clear air rather than as weak echo.
+pub const OPERA_NO_ECHO_DBZ: f32 = -35.0;
+
+/// Which of the three states ODIM defines a decoded composite cell is in.
+///
+/// Carried beside the values rather than encoded into them. A caller that has
+/// to tell a clear-air negative from an unobserved cell should not have to
+/// compare a float against a magic number, and [`OPERA_NO_ECHO_DBZ`] is a
+/// legal reflectivity that a calibrated measurement could in principle also
+/// land on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperaCellClass {
+    /// `nodata`, or a non-finite stored value: no radar covered this cell.
+    /// Its value is NaN, and NaN now means only this.
+    NoCoverage,
+    /// `undetect`: covered, and nothing was detected. This is an observation,
+    /// and its value is the frame's no-echo reflectivity.
+    NoEcho,
+    /// A calibrated reflectivity measurement.
+    Echo,
+}
+
+/// A decoded OPERA composite together with the sentinel distinction the
+/// archive draws and the counts that prove it was drawn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperaDbzhField {
+    pub field: SelectedField2D,
+    /// One entry per cell, in the same row-major order as `field.values`.
+    pub classes: Vec<OperaCellClass>,
+    pub no_echo_dbz: f32,
+    /// The sentinels the frame itself declared, recorded so a reader can see
+    /// which distinction was available rather than assuming one.
+    pub nodata_raw: Option<f64>,
+    pub undetect_raw: Option<f64>,
+    pub no_coverage_cells: usize,
+    pub no_echo_cells: usize,
+    pub echo_cells: usize,
+}
+
+impl OperaDbzhField {
+    /// Fraction of cells the network actually observed: echo plus no-echo.
+    pub fn observed_fraction(&self) -> f64 {
+        let cells = self.classes.len();
+        if cells == 0 {
+            return 0.0;
+        }
+        (self.no_echo_cells + self.echo_cells) as f64 / cells as f64
+    }
+}
+
+/// Decode an OPERA composite, keeping the two ODIM sentinels apart.
+///
+/// [`extract_eumetnet_opera_dbzh_from_odim_h5`] is this function's field
+/// alone, for callers that only want the grid and the numbers.
 pub fn extract_eumetnet_opera_dbzh_from_odim_h5(bytes: &[u8]) -> Result<SelectedField2D, IoError> {
+    Ok(extract_eumetnet_opera_dbzh_classified_from_odim_h5(bytes)?.field)
+}
+
+pub fn extract_eumetnet_opera_dbzh_classified_from_odim_h5(
+    bytes: &[u8],
+) -> Result<OperaDbzhField, IoError> {
     let file = Hdf5File::from_bytes(bytes).map_err(|err| IoError::Odim(err.to_string()))?;
     let dataset = file
         .dataset("/dataset1/data1/data")
@@ -380,19 +474,8 @@ pub fn extract_eumetnet_opera_dbzh_from_odim_h5(bytes: &[u8]) -> Result<Selected
     let undetect = hdf5_group_attr_f64_optional(&data_what, "undetect")?;
 
     let raw = hdf5_dataset_values_f64(&dataset)?;
-    let values = raw
-        .into_iter()
-        .map(|value| {
-            let missing = !value.is_finite()
-                || nodata.is_some_and(|sentinel| (value - sentinel).abs() < 0.5)
-                || undetect.is_some_and(|sentinel| (value - sentinel).abs() < 0.5);
-            if missing {
-                f32::NAN
-            } else {
-                (value * gain + offset) as f32
-            }
-        })
-        .collect::<Vec<_>>();
+    let (values, classes, counts) =
+        classify_opera_dbzh_slab(&raw, gain, offset, nodata, undetect, OPERA_NO_ECHO_DBZ);
 
     let meta = opera_radar_meta_from_hdf5(&file)?;
     if meta.xsize != nx || meta.ysize != ny {
@@ -402,13 +485,73 @@ pub fn extract_eumetnet_opera_dbzh_from_odim_h5(bytes: &[u8]) -> Result<Selected
         )));
     }
     let grid = opera_laea_latlon_grid(&meta)?;
-    SelectedField2D::new(
+    let field = SelectedField2D::new(
         FieldSelector::entire_atmosphere(CanonicalField::CompositeReflectivity),
         "dBZ",
         grid,
         values,
-    )
-    .map_err(Into::into)
+    )?;
+    Ok(OperaDbzhField {
+        field,
+        classes,
+        no_echo_dbz: OPERA_NO_ECHO_DBZ,
+        nodata_raw: nodata,
+        undetect_raw: undetect,
+        no_coverage_cells: counts[0],
+        no_echo_cells: counts[1],
+        echo_cells: counts[2],
+    })
+}
+
+/// Sort one ODIM slab's stored values into the three states ODIM defines,
+/// calibrating the measurements only.
+///
+/// Returns the values, the per-cell classes and the
+/// `[no_coverage, no_echo, echo]` counts. Split out of the HDF5 reader so the
+/// distinction can be proved against a synthetic slab without a file or a
+/// network.
+///
+/// `nodata` is tested first: were a frame ever to declare both sentinels at
+/// the same value, the cell reads as unobserved rather than as a fabricated
+/// observation. A frame that declares no `undetect` at all simply has no
+/// no-echo cells — nothing is being collapsed in that case, so nothing is
+/// refused.
+fn classify_opera_dbzh_slab(
+    raw: &[f64],
+    gain: f64,
+    offset: f64,
+    nodata: Option<f64>,
+    undetect: Option<f64>,
+    no_echo_dbz: f32,
+) -> (Vec<f32>, Vec<OperaCellClass>, [usize; 3]) {
+    let mut values = Vec::with_capacity(raw.len());
+    let mut classes = Vec::with_capacity(raw.len());
+    let mut counts = [0usize; 3];
+    for &stored in raw {
+        if !stored.is_finite() || is_opera_sentinel(stored, nodata) {
+            values.push(f32::NAN);
+            classes.push(OperaCellClass::NoCoverage);
+            counts[0] += 1;
+        } else if is_opera_sentinel(stored, undetect) {
+            values.push(no_echo_dbz);
+            classes.push(OperaCellClass::NoEcho);
+            counts[1] += 1;
+        } else {
+            values.push((stored * gain + offset) as f32);
+            classes.push(OperaCellClass::Echo);
+            counts[2] += 1;
+        }
+    }
+    (values, classes, counts)
+}
+
+/// ODIM states its sentinels as raw storage values, so the comparison is
+/// against the stored value and not the calibrated one. The half-unit window
+/// is what an integer-stored frame needs and what a float-stored one
+/// tolerates; the measured frame declared -9999000 and -8888000, which are
+/// nine million apart and in no danger from it.
+fn is_opera_sentinel(stored: f64, sentinel: Option<f64>) -> bool {
+    sentinel.is_some_and(|value| (stored - value).abs() < 0.5)
 }
 
 fn parse_eumetnet_opera_dbzh_coverage_json(bytes: &[u8]) -> Result<OperaDbzhCoverage, IoError> {
@@ -488,7 +631,114 @@ fn opera_radar_meta_from_hdf5(file: &Hdf5File) -> Result<OperaRadarMeta, IoError
     })
 }
 
-fn opera_laea_latlon_grid(meta: &OperaRadarMeta) -> Result<LatLonGrid, IoError> {
+/// How far a corner derived here may sit from the corner the frame declares,
+/// in degrees, before the frame is refused.
+///
+/// The frame states its own four corner coordinates, so the geometry has an
+/// oracle inside it. Measured agreement with the ellipsoidal inversion below
+/// is ~6e-14 deg at all four corners of a live frame; the spherical inversion
+/// this screen exists to catch misses by 2.2e-1 deg. A 1e-4 deg ceiling —
+/// about 11 m — is nine orders clear of the noise and three orders inside the
+/// error, so it is a real screen rather than a formality.
+pub const OPERA_CORNER_TOLERANCE_DEG: f64 = 1.0e-4;
+
+/// Inverse Lambert azimuthal equal-area on an ellipsoid (USGS Professional
+/// Paper 1395, *Map Projections — A Working Manual*, eqs. 24-30 .. 24-33 with
+/// the authalic latitude series 3-18).
+///
+/// OPERA's `projdef` declares `+ellps=WGS84`, so this is the inversion the
+/// declaration asks for. Inverting it on a sphere instead — an authalic
+/// radius in place of the ellipsoid — displaces the northern corners of the
+/// published 3800x4400 composite by ~0.216 deg of longitude, about 9.4 km at
+/// 67 N, nine cells on a 1 km grid, with every cell in between displaced by
+/// some part of that. [`OPERA_CORNER_TOLERANCE_DEG`] keeps the distinction
+/// proved on each frame rather than merely asserted here.
+struct OperaLaea {
+    lat0: f64,
+    lon0: f64,
+    false_easting: f64,
+    false_northing: f64,
+    /// First eccentricity squared: the only ellipsoid constant the inverse
+    /// still needs once `rq`, `beta0` and `d` are precomputed.
+    e2: f64,
+    rq: f64,
+    beta0: f64,
+    d: f64,
+}
+
+/// WGS84, the ellipsoid OPERA's `projdef` names.
+const OPERA_WGS84_A: f64 = 6_378_137.0;
+const OPERA_WGS84_F: f64 = 1.0 / 298.257_223_563;
+
+impl OperaLaea {
+    fn new(lat0: f64, lon0: f64, false_easting: f64, false_northing: f64) -> Self {
+        let e2 = OPERA_WGS84_F * (2.0 - OPERA_WGS84_F);
+        let e = e2.sqrt();
+        let q = |phi: f64| -> f64 {
+            let s = phi.sin();
+            (1.0 - e2)
+                * (s / (1.0 - e2 * s * s)
+                    - (1.0 / (2.0 * e)) * ((1.0 - e * s) / (1.0 + e * s)).ln())
+        };
+        let qp = q(std::f64::consts::FRAC_PI_2);
+        let rq = OPERA_WGS84_A * (qp / 2.0).sqrt();
+        let beta0 = (q(lat0) / qp).asin();
+        let d = OPERA_WGS84_A * lat0.cos()
+            / (1.0 - e2 * lat0.sin().powi(2)).sqrt()
+            / (rq * beta0.cos());
+        Self {
+            lat0,
+            lon0,
+            false_easting,
+            false_northing,
+            e2,
+            rq,
+            beta0,
+            d,
+        }
+    }
+
+    /// Authalic latitude to geodetic latitude, eq. 3-18 of the same manual.
+    fn geodetic_from_authalic(&self, beta: f64) -> f64 {
+        let e2 = self.e2;
+        let e4 = e2 * e2;
+        let e6 = e4 * e2;
+        beta + (e2 / 3.0 + 31.0 * e4 / 180.0 + 517.0 * e6 / 5040.0) * (2.0 * beta).sin()
+            + (23.0 * e4 / 360.0 + 251.0 * e6 / 3780.0) * (4.0 * beta).sin()
+            + (761.0 * e6 / 45360.0) * (6.0 * beta).sin()
+    }
+
+    /// Projected metres to `(lat_deg, lon_deg)`.
+    fn inverse(&self, x: f64, y: f64) -> (f64, f64) {
+        let dx = x - self.false_easting;
+        let dy = y - self.false_northing;
+        let rho = ((dx / self.d).powi(2) + (self.d * dy).powi(2)).sqrt();
+        if rho <= f64::EPSILON {
+            return (
+                self.lat0.to_degrees(),
+                normalize_longitude(self.lon0.to_degrees()),
+            );
+        }
+        let ce = 2.0 * (rho / (2.0 * self.rq)).clamp(-1.0, 1.0).asin();
+        let sin_ce = ce.sin();
+        let cos_ce = ce.cos();
+        let beta = (cos_ce * self.beta0.sin() + self.d * dy * sin_ce * self.beta0.cos() / rho)
+            .clamp(-1.0, 1.0)
+            .asin();
+        let lambda = self.lon0
+            + (dx * sin_ce).atan2(
+                self.d * rho * self.beta0.cos() * cos_ce
+                    - self.d * self.d * dy * self.beta0.sin() * sin_ce,
+            );
+        (
+            self.geodetic_from_authalic(beta).to_degrees(),
+            normalize_longitude(lambda.to_degrees()),
+        )
+    }
+}
+
+/// Build the projection the frame declares.
+fn opera_laea_projection(meta: &OperaRadarMeta) -> Result<OperaLaea, IoError> {
     if !meta
         .projdef
         .split_whitespace()
@@ -499,16 +749,88 @@ fn opera_laea_latlon_grid(meta: &OperaRadarMeta) -> Result<LatLonGrid, IoError> 
             meta.projdef
         )));
     }
-    let lat0 = projdef_value(&meta.projdef, "+lat_0=")
-        .ok_or_else(|| IoError::Odim(format!("missing +lat_0 in {}", meta.projdef)))?
-        .to_radians();
-    let lon0 = projdef_value(&meta.projdef, "+lon_0=")
-        .ok_or_else(|| IoError::Odim(format!("missing +lon_0 in {}", meta.projdef)))?
-        .to_radians();
-    let false_easting = projdef_value(&meta.projdef, "+x_0=")
-        .ok_or_else(|| IoError::Odim(format!("missing +x_0 in {}", meta.projdef)))?;
-    let false_northing = projdef_value(&meta.projdef, "+y_0=")
-        .ok_or_else(|| IoError::Odim(format!("missing +y_0 in {}", meta.projdef)))?;
+    let need = |key: &str| -> Result<f64, IoError> {
+        projdef_value(&meta.projdef, key)
+            .ok_or_else(|| IoError::Odim(format!("missing {key} in {}", meta.projdef)))
+    };
+    Ok(OperaLaea::new(
+        need("+lat_0=")?.to_radians(),
+        need("+lon_0=")?.to_radians(),
+        need("+x_0=")?,
+        need("+y_0=")?,
+    ))
+}
+
+/// The four grid-edge corners this module derives, as LL, UL, UR, LR pairs of
+/// `(lat_deg, lon_deg)`, beside the ones the frame declares.
+///
+/// The `/where` corners are the grid's outer edges — projected `(0,0)`,
+/// `(0,ny)`, `(nx,ny)`, `(nx,0)` — not cell centres, and this is written
+/// against the edges for that reason.
+type OperaCorner = (f64, f64);
+type OperaCorners = [OperaCorner; 4];
+
+fn opera_laea_corners(
+    meta: &OperaRadarMeta,
+    projection: &OperaLaea,
+) -> (OperaCorners, OperaCorners) {
+    let nx = meta.xsize as f64;
+    let ny = meta.ysize as f64;
+    let edges = [
+        (0.0, -ny * meta.yscale_m),
+        (0.0, 0.0),
+        (nx * meta.xscale_m, 0.0),
+        (nx * meta.xscale_m, -ny * meta.yscale_m),
+    ];
+    let derived = edges.map(|(x, y)| projection.inverse(x, y));
+    let declared = [
+        (meta.ll_lat_deg, meta.ll_lon_deg),
+        (meta.ul_lat_deg, meta.ul_lon_deg),
+        (meta.ur_lat_deg, meta.ur_lon_deg),
+        (meta.lr_lat_deg, meta.lr_lon_deg),
+    ];
+    (derived, declared)
+}
+
+const OPERA_CORNER_NAMES: [&str; 4] = ["LL", "UL", "UR", "LR"];
+
+/// How far the derived corners sit from the declared ones, worst case, in
+/// degrees.
+fn opera_corner_offset_deg(meta: &OperaRadarMeta, projection: &OperaLaea) -> f64 {
+    let (derived, declared) = opera_laea_corners(meta, projection);
+    derived
+        .iter()
+        .zip(declared.iter())
+        .map(|((lat, lon), (want_lat, want_lon))| {
+            (lat - want_lat).abs().max((lon - want_lon).abs())
+        })
+        .fold(0.0f64, f64::max)
+}
+
+fn opera_laea_latlon_grid(meta: &OperaRadarMeta) -> Result<LatLonGrid, IoError> {
+    let projection = opera_laea_projection(meta)?;
+
+    // Prove the georeference against the frame's own statement of it before
+    // any cell is placed with it. A georeference nobody checked is the kind of
+    // wrong number that looks like a right one for a whole campaign, and every
+    // observation in the file would be assimilated at the wrong place.
+    let worst = opera_corner_offset_deg(meta, &projection);
+    if !worst.is_finite() || worst > OPERA_CORNER_TOLERANCE_DEG {
+        let (derived, declared) = opera_laea_corners(meta, &projection);
+        let detail = OPERA_CORNER_NAMES
+            .iter()
+            .zip(derived.iter().zip(declared.iter()))
+            .map(|(name, ((lat, lon), (want_lat, want_lon)))| {
+                format!("{name} derived {lat:.6},{lon:.6} declared {want_lat:.6},{want_lon:.6}")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(IoError::Odim(format!(
+            "OPERA grid misses the corners the frame declares by up to {worst:.6} deg, past the \
+             {OPERA_CORNER_TOLERANCE_DEG} deg ceiling: {detail}"
+        )));
+    }
+
     let shape = GridShape::new(meta.xsize, meta.ysize)?;
     let mut lat_deg = Vec::with_capacity(shape.len());
     let mut lon_deg = Vec::with_capacity(shape.len());
@@ -516,44 +838,12 @@ fn opera_laea_latlon_grid(meta: &OperaRadarMeta) -> Result<LatLonGrid, IoError> 
         let projected_y = -((y as f64) + 0.5) * meta.yscale_m;
         for x in 0..meta.xsize {
             let projected_x = ((x as f64) + 0.5) * meta.xscale_m;
-            let (lat, lon) = inverse_spherical_laea(
-                projected_x,
-                projected_y,
-                lat0,
-                lon0,
-                false_easting,
-                false_northing,
-            );
+            let (lat, lon) = projection.inverse(projected_x, projected_y);
             lat_deg.push(lat as f32);
             lon_deg.push(lon as f32);
         }
     }
     LatLonGrid::new(shape, lat_deg, lon_deg).map_err(Into::into)
-}
-
-fn inverse_spherical_laea(
-    x: f64,
-    y: f64,
-    lat0: f64,
-    lon0: f64,
-    false_easting: f64,
-    false_northing: f64,
-) -> (f64, f64) {
-    const AUTHALIC_RADIUS_M: f64 = 6_371_007.181;
-    let dx = x - false_easting;
-    let dy = y - false_northing;
-    let rho = dx.hypot(dy);
-    if rho <= f64::EPSILON {
-        return (lat0.to_degrees(), normalize_longitude(lon0.to_degrees()));
-    }
-    let c = 2.0 * (rho / (2.0 * AUTHALIC_RADIUS_M)).clamp(-1.0, 1.0).asin();
-    let sin_c = c.sin();
-    let cos_c = c.cos();
-    let sin_lat0 = lat0.sin();
-    let cos_lat0 = lat0.cos();
-    let lat = (cos_c * sin_lat0 + dy * sin_c * cos_lat0 / rho).asin();
-    let lon = lon0 + (dx * sin_c).atan2(rho * cos_lat0 * cos_c - dy * sin_lat0 * sin_c);
-    (lat.to_degrees(), normalize_longitude(lon.to_degrees()))
 }
 
 fn projdef_value(projdef: &str, key: &str) -> Option<f64> {
@@ -820,6 +1110,320 @@ pub fn fetch_bytes_with_cache(
     }
 }
 
+/// Maximum number of independently published GRIB2 objects admitted into one
+/// logical component bundle. Provider feeds such as ECCC's Datamart publish
+/// one object per variable/level; the bound keeps a malformed or accidentally
+/// expanded adapter from turning one ingest hour into unbounded request fanout.
+const MAX_COMPONENT_BUNDLE_OBJECTS: usize = 512;
+
+/// Maximum assembled bytes for one logical GRIB2 component bundle. The limit
+/// is intentionally larger than the expected GDPS sounding bundle while still
+/// bounding RAM, cache, and spill exposure before any decode begins.
+const MAX_COMPONENT_BUNDLE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Maximum accepted WMO/GTS abbreviated-heading envelope before the GRIB
+/// indicator. Operational bulletins are only a few dozen bytes; the bound
+/// prevents an arbitrary binary prefix from being scanned as a bulletin.
+const MAX_WMO_BULLETIN_HEADER_BYTES: usize = 1024;
+
+/// Return the exact GRIB2 message carried by either a bare component object or
+/// a WMO/GTS bulletin envelope (`SOH ... CR CR LF GRIB ... 7777 CR CR LF ETX`).
+///
+/// WIS2 publishers are allowed to expose the traditional bulletin bytes as the
+/// canonical object. `Grib2File::from_bytes` scans past that envelope, but the
+/// component-bundle admission path deliberately requires an exact stream. This
+/// seam removes only a structurally complete, bounded envelope; arbitrary
+/// leading/trailing bytes still fail closed.
+fn grib2_component_payload(bytes: &[u8]) -> Result<&[u8], IoError> {
+    if bytes.starts_with(b"GRIB") {
+        return Ok(bytes);
+    }
+    if bytes.first() != Some(&0x01) {
+        return Err(IoError::Grib(
+            "component is neither bare GRIB2 nor a WMO bulletin envelope".to_string(),
+        ));
+    }
+
+    let scan_end = bytes
+        .len()
+        .min(MAX_WMO_BULLETIN_HEADER_BYTES.saturating_add(4));
+    let grib_offset = bytes[..scan_end]
+        .windows(4)
+        .position(|window| window == b"GRIB")
+        .ok_or_else(|| {
+            IoError::Grib(format!(
+                "WMO bulletin has no GRIB indicator within {MAX_WMO_BULLETIN_HEADER_BYTES} header bytes"
+            ))
+        })?;
+    if grib_offset < 4 || bytes.get(grib_offset - 3..grib_offset) != Some(b"\r\r\n") {
+        return Err(IoError::Grib(
+            "WMO bulletin heading is not terminated by CR CR LF".to_string(),
+        ));
+    }
+    if bytes[1..grib_offset - 3]
+        .iter()
+        .any(|byte| !matches!(*byte, b' '..=b'~' | b'\r' | b'\n'))
+    {
+        return Err(IoError::Grib(
+            "WMO bulletin heading contains non-ASCII control bytes".to_string(),
+        ));
+    }
+    let indicator_end = grib_offset
+        .checked_add(16)
+        .ok_or_else(|| IoError::Grib("WMO bulletin GRIB offset overflow".to_string()))?;
+    if indicator_end > bytes.len() {
+        return Err(IoError::Grib(
+            "WMO bulletin ends inside the GRIB2 indicator section".to_string(),
+        ));
+    }
+    if bytes[grib_offset + 7] != 2 {
+        return Err(IoError::Grib(format!(
+            "WMO bulletin carries GRIB edition {} instead of edition 2",
+            bytes[grib_offset + 7]
+        )));
+    }
+    let message_len = u64::from_be_bytes(
+        bytes[grib_offset + 8..indicator_end]
+            .try_into()
+            .expect("16-byte indicator bounds checked"),
+    );
+    let message_len = usize::try_from(message_len)
+        .map_err(|_| IoError::Grib("WMO bulletin GRIB2 length exceeds usize".to_string()))?;
+    if message_len < 20 {
+        return Err(IoError::Grib(format!(
+            "WMO bulletin GRIB2 message declares invalid length {message_len}"
+        )));
+    }
+    let message_end = grib_offset
+        .checked_add(message_len)
+        .ok_or_else(|| IoError::Grib("WMO bulletin GRIB2 end offset overflow".to_string()))?;
+    if message_end > bytes.len() {
+        return Err(IoError::Grib(format!(
+            "WMO bulletin GRIB2 message declares {message_len} bytes but the object is truncated"
+        )));
+    }
+    if bytes.get(message_end - 4..message_end) != Some(b"7777") {
+        return Err(IoError::Grib(
+            "WMO bulletin GRIB2 message lacks the Section 8 terminator".to_string(),
+        ));
+    }
+    if bytes.get(message_end..) != Some(b"\r\r\n\x03") {
+        return Err(IoError::Grib(
+            "WMO bulletin does not end with CR CR LF ETX immediately after GRIB2".to_string(),
+        ));
+    }
+    Ok(&bytes[grib_offset..message_end])
+}
+
+/// Parse a GRIB2 stream only after proving it consists of one or more exact,
+/// adjacent messages. `Grib2File::from_bytes` is intentionally permissive for
+/// general meteorological files: it scans past leading junk and accepts an
+/// empty/trailing fragment. A provider component or cache artifact needs the
+/// stronger contract so a partial HTTP body cannot be admitted as a valid
+/// logical bundle.
+fn parse_complete_grib2_stream(bytes: &[u8]) -> Result<Grib2File, IoError> {
+    let mut offset = 0_usize;
+    let mut expected_messages = 0_usize;
+    while offset < bytes.len() {
+        let remaining = bytes.len() - offset;
+        if remaining < 20 {
+            return Err(IoError::Grib(format!(
+                "GRIB2 stream ends with a {remaining}-byte incomplete fragment"
+            )));
+        }
+        if bytes.get(offset..offset + 4) != Some(b"GRIB") {
+            return Err(IoError::Grib(format!(
+                "GRIB2 stream has non-message bytes at offset {offset}"
+            )));
+        }
+        if bytes[offset + 7] != 2 {
+            return Err(IoError::Grib(format!(
+                "GRIB2 stream message at offset {offset} has edition {}",
+                bytes[offset + 7]
+            )));
+        }
+        let total_length = u64::from_be_bytes(
+            bytes[offset + 8..offset + 16]
+                .try_into()
+                .expect("20-byte minimum includes the indicator length"),
+        );
+        let total_length = usize::try_from(total_length)
+            .map_err(|_| IoError::Grib("GRIB2 message length exceeds usize".to_string()))?;
+        if total_length < 20 {
+            return Err(IoError::Grib(format!(
+                "GRIB2 message at offset {offset} declares invalid length {total_length}"
+            )));
+        }
+        let end = offset
+            .checked_add(total_length)
+            .ok_or_else(|| IoError::Grib("GRIB2 message end offset overflow".to_string()))?;
+        if end > bytes.len() {
+            return Err(IoError::Grib(format!(
+                "GRIB2 message at offset {offset} declares {total_length} bytes but only {remaining} remain"
+            )));
+        }
+        if bytes.get(end - 4..end) != Some(b"7777") {
+            return Err(IoError::Grib(format!(
+                "GRIB2 message at offset {offset} lacks the Section 8 terminator"
+            )));
+        }
+        expected_messages += 1;
+        offset = end;
+    }
+    if expected_messages == 0 {
+        return Err(IoError::Grib(
+            "GRIB2 stream contains no messages".to_string(),
+        ));
+    }
+    let parsed = Grib2File::from_bytes(bytes).map_err(|err| IoError::Grib(err.to_string()))?;
+    if parsed.messages.len() != expected_messages {
+        return Err(IoError::Grib(format!(
+            "GRIB2 parser realized {} of {expected_messages} structurally complete messages",
+            parsed.messages.len()
+        )));
+    }
+    Ok(parsed)
+}
+
+/// Fetch an ordered set of self-contained GRIB2 objects and expose their
+/// concatenated message stream as one cache-coherent logical fetch.
+///
+/// This is the acquisition bridge for providers that publish one field per
+/// object instead of a multi-message family file. Every component goes through
+/// the ordinary source fallback and per-object raw/fetch cache. The logical
+/// cache key includes the exact ordered component inventory, so changing an
+/// adapter's field/level plan cannot reuse stale bundle bytes. Components must
+/// resolve through one provider source and each payload, plus the final stream,
+/// must parse as complete GRIB2 before being returned or persisted.
+pub fn fetch_component_bundle_with_cache(
+    logical_fetch: &FetchRequest,
+    component_products: &[String],
+    cache_root: &Path,
+    use_cache: bool,
+) -> Result<CachedFetchResult, IoError> {
+    if !logical_fetch.variable_patterns.is_empty() {
+        return Err(IoError::Download(
+            "component bundle logical request must not contain GRIB index patterns".to_string(),
+        ));
+    }
+    if component_products.is_empty() || component_products.len() > MAX_COMPONENT_BUNDLE_OBJECTS {
+        return Err(IoError::Download(format!(
+            "component bundle requires 1..={MAX_COMPONENT_BUNDLE_OBJECTS} objects (got {})",
+            component_products.len()
+        )));
+    }
+    let mut unique = HashSet::with_capacity(component_products.len());
+    for product in component_products {
+        if !unique.insert(product.as_str()) {
+            return Err(IoError::Download(format!(
+                "component bundle contains duplicate product '{product}'"
+            )));
+        }
+    }
+
+    // These strings are metadata-only cache-key material. They cannot be
+    // confused with `.idx` patterns because this logical request is never sent
+    // to a provider; component requests below have an empty pattern list.
+    let mut bundle_fetch = logical_fetch.clone();
+    bundle_fetch.variable_patterns = component_products
+        .iter()
+        .map(|product| format!("component:{product}"))
+        .collect();
+
+    if use_cache {
+        if let Some(cached) = load_cached_fetch(cache_root, &bundle_fetch)? {
+            return Ok(cached);
+        }
+    }
+    let _bundle_lock = if use_cache {
+        Some(acquire_fetch_cache_lock(cache_root, &bundle_fetch)?)
+    } else {
+        None
+    };
+    if use_cache {
+        if let Some(cached) = load_cached_fetch(cache_root, &bundle_fetch)? {
+            return Ok(cached);
+        }
+    }
+
+    let mut resolved_source = None;
+    let mut bytes = Vec::new();
+    for product in component_products {
+        let component_fetch = FetchRequest {
+            request: ModelRunRequest::new(
+                logical_fetch.request.model,
+                logical_fetch.request.cycle.clone(),
+                logical_fetch.request.forecast_hour,
+                product,
+            )?,
+            source_override: logical_fetch.source_override,
+            variable_patterns: Vec::new(),
+        };
+        let component = fetch_bytes_with_cache(&component_fetch, cache_root, use_cache)?;
+        let component_payload =
+            grib2_component_payload(&component.result.bytes).map_err(|err| {
+                IoError::Grib(format!(
+                    "component '{product}' has an invalid envelope: {err}"
+                ))
+            })?;
+        parse_complete_grib2_stream(component_payload).map_err(|err| {
+            IoError::Grib(format!(
+                "component '{product}' is not complete GRIB2: {err}"
+            ))
+        })?;
+        match resolved_source {
+            None => resolved_source = Some(component.result.source),
+            Some(source) if source == component.result.source => {}
+            Some(source) => {
+                return Err(IoError::Download(format!(
+                    "component bundle crossed provider sources: first {source}, product '{product}' resolved through {}",
+                    component.result.source
+                )));
+            }
+        }
+        let next_len = bytes
+            .len()
+            .checked_add(component_payload.len())
+            .ok_or_else(|| {
+                IoError::Download("component bundle byte length overflow".to_string())
+            })?;
+        if next_len > MAX_COMPONENT_BUNDLE_BYTES {
+            return Err(IoError::Download(format!(
+                "component bundle exceeds {MAX_COMPONENT_BUNDLE_BYTES} bytes at product '{product}'"
+            )));
+        }
+        bytes.extend_from_slice(component_payload);
+    }
+    parse_complete_grib2_stream(&bytes)
+        .map_err(|err| IoError::Grib(format!("assembled component bundle is invalid: {err}")))?;
+
+    let source = resolved_source.expect("non-empty component inventory resolves one source");
+    let result = FetchResult {
+        source,
+        url: format!(
+            "rws-bundle://{}/{}/{}T{:02}Z/f{:03}/{}",
+            source.as_str(),
+            logical_fetch.request.model.as_str(),
+            logical_fetch.request.cycle.date_yyyymmdd,
+            logical_fetch.request.cycle.hour_utc,
+            logical_fetch.request.forecast_hour,
+            logical_fetch.request.product,
+        ),
+        bytes,
+    };
+    if use_cache {
+        store_cached_fetch(cache_root, &bundle_fetch, &result)
+    } else {
+        let (bytes_path, metadata_path) = fetch_cache_paths(cache_root, &bundle_fetch);
+        Ok(CachedFetchResult {
+            result,
+            cache_hit: false,
+            bytes_path,
+            metadata_path,
+        })
+    }
+}
+
 fn load_cached_raw_full_fetch(
     cache_root: &std::path::Path,
     fetch: &FetchRequest,
@@ -1028,6 +1632,33 @@ fn fetch_cache_lock_pid_is_dead(lock_path: &Path) -> bool {
     if pid == std::process::id() {
         return false;
     }
+
+    fetch_cache_lock_owner_is_dead(pid)
+}
+
+#[cfg(windows)]
+fn fetch_cache_lock_owner_is_dead(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // A lock can survive a forced app exit.  `/proc` does not exist on
+    // Windows, so the old implementation treated every such lock as live for
+    // 30 minutes (and made callers wait as long as 45 minutes).  Query the
+    // recorded PID directly.  Access-denied and other indeterminate errors
+    // fail closed: only ERROR_INVALID_PARAMETER proves that no such process
+    // exists.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_INVALID_PARAMETER;
+        }
+        let _ = CloseHandle(handle);
+        false
+    }
+}
+
+#[cfg(not(windows))]
+fn fetch_cache_lock_owner_is_dead(pid: u32) -> bool {
     let proc_root = Path::new("/proc");
     proc_root.exists() && !proc_root.join(pid.to_string()).exists()
 }
@@ -1269,18 +1900,26 @@ impl ParsedModelGrib {
             let matched = match_prepared_selectors(&self.grib, &prepared, forecast_hour);
             for (prepared_selector, message) in prepared.iter().zip(matched.into_iter()) {
                 match message {
-                    Some((message, _)) => extracted.push(build_field_values(
-                        message,
-                        prepared_selector.selector,
-                        prepared_selector.selector.native_units(),
-                        &mut grid_memo,
-                    )?),
+                    Some((message, _)) => {
+                        validate_regional_grid_relative_wind_message(
+                            self.model,
+                            prepared_selector.selector,
+                            message,
+                        )?;
+                        extracted.push(build_field_values(
+                            message,
+                            prepared_selector.selector,
+                            prepared_selector.selector.native_units(),
+                            &mut grid_memo,
+                        )?)
+                    }
                     None => missing.push(prepared_selector.selector),
                 }
             }
         }
-        if self.model == ModelId::Aifs {
-            synthesize_aifs_dewpoint_values(
+        rotate_regional_grid_relative_wind_values(self.model, &mut extracted, &grid_memo)?;
+        if model_uses_specific_humidity_for_pressure_moisture(self.model) {
+            synthesize_pressure_dewpoint_values_from_specific_humidity(
                 &self.grib,
                 &mut extracted,
                 &mut missing,
@@ -1301,6 +1940,31 @@ impl ParsedModelGrib {
             missing,
             grids: grid_memo.into_shared_grids(),
         })
+    }
+
+    /// Return the selectors backed by native messages without unpacking their
+    /// grids. This is intentionally a native-inventory probe: synthesized
+    /// fields (for example AIFS `q` -> dewpoint) remain the responsibility of
+    /// the extraction method above.
+    pub fn matching_native_field_selectors_at_forecast_hour(
+        &self,
+        selectors: &[FieldSelector],
+        forecast_hour: Option<u16>,
+    ) -> Result<Vec<FieldSelector>, IoError> {
+        let prepared = selectors
+            .iter()
+            .copied()
+            .map(PreparedSelector::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(prepared
+            .iter()
+            .zip(match_prepared_selectors(
+                &self.grib,
+                &prepared,
+                forecast_hour,
+            ))
+            .filter_map(|(prepared, matched)| matched.is_some().then_some(prepared.selector))
+            .collect())
     }
 }
 
@@ -1336,8 +2000,14 @@ pub fn extract_fields_partial_from_model_bytes_at_forecast_hour(
             } else {
                 extract_fields_from_grib2_partial(&grib, selectors)?
             };
-            if model == ModelId::Aifs {
-                synthesize_aifs_dewpoint_fields(&grib, &mut partial, forecast_hour)?;
+            validate_regional_grid_relative_wind_messages(model, &grib, selectors, forecast_hour)?;
+            rotate_regional_grid_relative_wind_fields(model, &mut partial.extracted)?;
+            if model_uses_specific_humidity_for_pressure_moisture(model) {
+                synthesize_pressure_dewpoint_fields_from_specific_humidity(
+                    &grib,
+                    &mut partial,
+                    forecast_hour,
+                )?;
             }
             if model == ModelId::Nbm {
                 synthesize_nbm_10m_wind_components_from_speed_direction(&grib, &mut partial)?;
@@ -1362,6 +2032,372 @@ pub fn extract_field_values_partial_from_model_bytes_at_forecast_hour(
 ) -> Result<PartialValuesExtraction, IoError> {
     ParsedModelGrib::from_model_bytes(model, bytes)?
         .extract_field_values_partial_at_forecast_hour(selectors, forecast_hour)
+}
+
+fn regional_model_has_grid_relative_winds(model: ModelId) -> bool {
+    matches!(model, ModelId::Rdps | ModelId::Hrdps)
+}
+
+fn is_horizontal_wind_component(selector: FieldSelector) -> bool {
+    matches!(
+        selector.field,
+        CanonicalField::UWind | CanonicalField::VWind
+    )
+}
+
+fn paired_horizontal_wind_selector(selector: FieldSelector) -> Option<FieldSelector> {
+    let field = match selector.field {
+        CanonicalField::UWind => CanonicalField::VWind,
+        CanonicalField::VWind => CanonicalField::UWind,
+        _ => return None,
+    };
+    Some(FieldSelector {
+        field,
+        vertical: selector.vertical,
+        product: selector.product,
+    })
+}
+
+/// RDPS and HRDPS encode U/V relative to their rotated grid axes (GRIB2
+/// Table 3.3 component flag `0x08`). Canonical RWS U/V are earth-relative,
+/// so fail closed if the native message stops declaring that contract or if
+/// the feed unexpectedly changes grid template.
+fn validate_regional_grid_relative_wind_message(
+    model: ModelId,
+    selector: FieldSelector,
+    message: &Grib2Message,
+) -> Result<(), IoError> {
+    if !regional_model_has_grid_relative_winds(model) || !is_horizontal_wind_component(selector) {
+        return Ok(());
+    }
+    if message.grid.template != 1 {
+        return Err(IoError::UnsafeGridRelativeWind {
+            model,
+            detail: format!(
+                "selector '{selector}' uses grid template {}, expected rotated latitude/longitude template 1",
+                message.grid.template
+            ),
+        });
+    }
+    if message.grid.resolution_flags & 0x08 == 0 {
+        return Err(IoError::UnsafeGridRelativeWind {
+            model,
+            detail: format!(
+                "selector '{selector}' does not declare grid-relative vector components (resolution flags {:#04x})",
+                message.grid.resolution_flags
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_regional_grid_relative_wind_messages(
+    model: ModelId,
+    grib: &Grib2File,
+    selectors: &[FieldSelector],
+    forecast_hour: Option<u16>,
+) -> Result<(), IoError> {
+    if !regional_model_has_grid_relative_winds(model) {
+        return Ok(());
+    }
+    let prepared = selectors
+        .iter()
+        .copied()
+        .map(PreparedSelector::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    for (prepared, matched) in
+        prepared
+            .iter()
+            .zip(match_prepared_selectors(grib, &prepared, forecast_hour))
+    {
+        if let Some((message, _)) = matched {
+            validate_regional_grid_relative_wind_message(model, prepared.selector, message)?;
+        }
+    }
+    Ok(())
+}
+
+fn wind_pair_error(model: ModelId, selector: FieldSelector) -> IoError {
+    let pair = paired_horizontal_wind_selector(selector)
+        .expect("wind-pair errors are only constructed for U/V selectors");
+    IoError::UnsafeGridRelativeWind {
+        model,
+        detail: format!(
+            "selector '{selector}' cannot be normalized without its matching '{pair}' component"
+        ),
+    }
+}
+
+fn rotate_regional_grid_relative_wind_values(
+    model: ModelId,
+    extracted: &mut [ExtractedFieldValues],
+    grid_memo: &GridMemo,
+) -> Result<(), IoError> {
+    if !regional_model_has_grid_relative_winds(model) {
+        return Ok(());
+    }
+
+    let mut pairs: HashMap<(VerticalSelector, FieldProduct), [Option<usize>; 2]> = HashMap::new();
+    for (index, field) in extracted.iter().enumerate() {
+        let slot = match field.selector.field {
+            CanonicalField::UWind => 0,
+            CanonicalField::VWind => 1,
+            _ => continue,
+        };
+        let pair = pairs
+            .entry((field.selector.vertical, field.selector.product))
+            .or_insert([None, None]);
+        if pair[slot].replace(index).is_some() {
+            return Err(IoError::UnsafeGridRelativeWind {
+                model,
+                detail: format!("duplicate canonical selector '{}'", field.selector),
+            });
+        }
+    }
+
+    let mut coefficients: HashMap<usize, Vec<(f32, f32)>> = HashMap::new();
+    for pair in pairs.values() {
+        let (Some(u_index), Some(v_index)) = (pair[0], pair[1]) else {
+            let index = pair[0].or(pair[1]).expect("pair contains one component");
+            return Err(wind_pair_error(model, extracted[index].selector));
+        };
+        let u_grid_index = extracted[u_index].grid_index;
+        let v_grid_index = extracted[v_index].grid_index;
+        if u_grid_index != v_grid_index {
+            return Err(IoError::UnsafeGridRelativeWind {
+                model,
+                detail: format!(
+                    "wind pair '{}' and '{}' use different native grids",
+                    extracted[u_index].selector, extracted[v_index].selector
+                ),
+            });
+        }
+        let grid = &grid_memo
+            .slots
+            .get(u_grid_index)
+            .ok_or_else(|| IoError::UnsafeGridRelativeWind {
+                model,
+                detail: format!("wind pair references missing grid slot {u_grid_index}"),
+            })?
+            .0
+            .grid;
+        let coefficients = match coefficients.entry(u_grid_index) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                entry.insert(grid_i_to_earth_rotation_coefficients(model, grid)?)
+            }
+        };
+        let (u, v) = two_mut(extracted, u_index, v_index);
+        rotate_grid_relative_wind_pair(
+            model,
+            u.selector,
+            &mut u.values,
+            &mut v.values,
+            coefficients,
+        )?;
+    }
+    Ok(())
+}
+
+fn rotate_regional_grid_relative_wind_fields(
+    model: ModelId,
+    extracted: &mut [SelectedField2D],
+) -> Result<(), IoError> {
+    if !regional_model_has_grid_relative_winds(model) {
+        return Ok(());
+    }
+
+    let mut pairs: HashMap<(VerticalSelector, FieldProduct), [Option<usize>; 2]> = HashMap::new();
+    for (index, field) in extracted.iter().enumerate() {
+        let slot = match field.selector.field {
+            CanonicalField::UWind => 0,
+            CanonicalField::VWind => 1,
+            _ => continue,
+        };
+        let pair = pairs
+            .entry((field.selector.vertical, field.selector.product))
+            .or_insert([None, None]);
+        if pair[slot].replace(index).is_some() {
+            return Err(IoError::UnsafeGridRelativeWind {
+                model,
+                detail: format!("duplicate canonical selector '{}'", field.selector),
+            });
+        }
+    }
+
+    for pair in pairs.values() {
+        let (Some(u_index), Some(v_index)) = (pair[0], pair[1]) else {
+            let index = pair[0].or(pair[1]).expect("pair contains one component");
+            return Err(wind_pair_error(model, extracted[index].selector));
+        };
+        let (u, v) = two_mut(extracted, u_index, v_index);
+        if u.grid != v.grid {
+            return Err(IoError::UnsafeGridRelativeWind {
+                model,
+                detail: format!(
+                    "wind pair '{}' and '{}' use different native grids",
+                    u.selector, v.selector
+                ),
+            });
+        }
+        let coefficients = grid_i_to_earth_rotation_coefficients(model, &u.grid)?;
+        rotate_grid_relative_wind_pair(
+            model,
+            u.selector,
+            &mut u.values,
+            &mut v.values,
+            &coefficients,
+        )?;
+    }
+    Ok(())
+}
+
+fn two_mut<T>(values: &mut [T], first: usize, second: usize) -> (&mut T, &mut T) {
+    debug_assert_ne!(first, second);
+    if first < second {
+        let (left, right) = values.split_at_mut(second);
+        (&mut left[first], &mut right[0])
+    } else {
+        let (left, right) = values.split_at_mut(first);
+        (&mut right[0], &mut left[second])
+    }
+}
+
+/// Derive the positive-grid-i unit vector in the local east/north tangent
+/// plane from the already-normalized geographic grid. This deliberately does
+/// not trust catalog dimensions or re-derive the rotated-pole transform: the
+/// same coordinates RWS stores are the orientation authority.
+fn grid_i_to_earth_rotation_coefficients(
+    model: ModelId,
+    grid: &LatLonGrid,
+) -> Result<Vec<(f32, f32)>, IoError> {
+    let nx = grid.shape.nx;
+    let ny = grid.shape.ny;
+    if nx < 2 || grid.lat_deg.len() != nx * ny || grid.lon_deg.len() != nx * ny {
+        return Err(IoError::UnsafeGridRelativeWind {
+            model,
+            detail: format!(
+                "normalized grid {}x{} cannot define a positive-i tangent",
+                nx, ny
+            ),
+        });
+    }
+
+    let mut out = Vec::with_capacity(grid.shape.len());
+    for row in 0..ny {
+        for column in 0..nx {
+            let center = row * nx + column;
+            let before = row * nx + column.saturating_sub(1);
+            let after = row * nx + (column + 1).min(nx - 1);
+            let lat = f64::from(grid.lat_deg[center]).to_radians();
+            let lon = f64::from(grid.lon_deg[center]).to_radians();
+            let before_xyz = geographic_unit_vector(
+                f64::from(grid.lat_deg[before]),
+                f64::from(grid.lon_deg[before]),
+            );
+            let center_xyz = geographic_unit_vector(
+                f64::from(grid.lat_deg[center]),
+                f64::from(grid.lon_deg[center]),
+            );
+            let after_xyz = geographic_unit_vector(
+                f64::from(grid.lat_deg[after]),
+                f64::from(grid.lon_deg[after]),
+            );
+            let backward_delta = subtract3(center_xyz, before_xyz);
+            let forward_delta = subtract3(after_xyz, center_xyz);
+            let backward_length = norm3(backward_delta);
+            let forward_length = norm3(forward_delta);
+            // Per-row longitude normalization can move one part of a
+            // non-cyclic regional row across the dateline. Values and
+            // coordinates remain aligned, but that creates one artificial
+            // adjacency between the original row endpoints. At either side
+            // of that seam, use the short physical neighbor rather than
+            // differentiating across a continent. Normal cells retain the
+            // lower-noise centered tangent.
+            let delta = if backward_length <= 1.0e-12 {
+                forward_delta
+            } else if forward_length <= 1.0e-12 {
+                backward_delta
+            } else if backward_length > forward_length * 4.0 {
+                forward_delta
+            } else if forward_length > backward_length * 4.0 {
+                backward_delta
+            } else {
+                add3(backward_delta, forward_delta)
+            };
+            let east = [-lon.sin(), lon.cos(), 0.0];
+            let north = [-lat.sin() * lon.cos(), -lat.sin() * lon.sin(), lat.cos()];
+            let grid_i_east = dot3(delta, east);
+            let grid_i_north = dot3(delta, north);
+            let norm = grid_i_east.hypot(grid_i_north);
+            if !norm.is_finite() || norm <= 1.0e-12 {
+                return Err(IoError::UnsafeGridRelativeWind {
+                    model,
+                    detail: format!(
+                        "normalized grid has no finite positive-i tangent at row {row}, column {column}"
+                    ),
+                });
+            }
+            out.push(((grid_i_east / norm) as f32, (grid_i_north / norm) as f32));
+        }
+    }
+    Ok(out)
+}
+
+fn geographic_unit_vector(lat_deg: f64, lon_deg: f64) -> [f64; 3] {
+    let lat = lat_deg.to_radians();
+    let lon = lon_deg.to_radians();
+    [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
+}
+
+fn dot3(left: [f64; 3], right: [f64; 3]) -> f64 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+}
+
+fn add3(left: [f64; 3], right: [f64; 3]) -> [f64; 3] {
+    [left[0] + right[0], left[1] + right[1], left[2] + right[2]]
+}
+
+fn subtract3(left: [f64; 3], right: [f64; 3]) -> [f64; 3] {
+    [left[0] - right[0], left[1] - right[1], left[2] - right[2]]
+}
+
+fn norm3(vector: [f64; 3]) -> f64 {
+    dot3(vector, vector).sqrt()
+}
+
+fn rotate_grid_relative_wind_pair(
+    model: ModelId,
+    selector: FieldSelector,
+    grid_u: &mut [f32],
+    grid_v: &mut [f32],
+    coefficients: &[(f32, f32)],
+) -> Result<(), IoError> {
+    if grid_u.len() != grid_v.len() || grid_u.len() != coefficients.len() {
+        return Err(IoError::UnsafeGridRelativeWind {
+            model,
+            detail: format!(
+                "wind pair for '{selector}' has inconsistent value/grid lengths ({}, {}, {})",
+                grid_u.len(),
+                grid_v.len(),
+                coefficients.len()
+            ),
+        });
+    }
+    for ((u, v), &(cos_angle, sin_angle)) in
+        grid_u.iter_mut().zip(grid_v.iter_mut()).zip(coefficients)
+    {
+        if !u.is_finite() || !v.is_finite() {
+            *u = f32::NAN;
+            *v = f32::NAN;
+            continue;
+        }
+        let grid_u = *u;
+        let grid_v = *v;
+        *u = grid_u * cos_angle - grid_v * sin_angle;
+        *v = grid_u * sin_angle + grid_v * cos_angle;
+    }
+    Ok(())
 }
 
 /// Values-lane twin of
@@ -1539,7 +2575,19 @@ fn synthesize_nbm_10m_wind_components_from_speed_direction(
     Ok(())
 }
 
-fn synthesize_aifs_dewpoint_values(
+fn model_uses_specific_humidity_for_pressure_moisture(model: ModelId) -> bool {
+    matches!(
+        model,
+        ModelId::GdpsGeml
+            | ModelId::Aigfs
+            | ModelId::Aigefs
+            | ModelId::Hgefs
+            | ModelId::EcmwfOpenData
+            | ModelId::Aifs
+    )
+}
+
+fn synthesize_pressure_dewpoint_values_from_specific_humidity(
     grib: &Grib2File,
     extracted: &mut Vec<ExtractedFieldValues>,
     missing: &mut Vec<FieldSelector>,
@@ -1555,7 +2603,7 @@ fn synthesize_aifs_dewpoint_values(
         if selector.field != CanonicalField::Dewpoint {
             continue;
         }
-        let Some(message) = aifs_specific_humidity_message(grib, selector, forecast_hour) else {
+        let Some(message) = specific_humidity_message(grib, selector, forecast_hour) else {
             continue;
         };
         let mut field = build_field_values(message, selector, "K", grid_memo)?;
@@ -1569,7 +2617,7 @@ fn synthesize_aifs_dewpoint_values(
     Ok(())
 }
 
-fn synthesize_aifs_dewpoint_fields(
+fn synthesize_pressure_dewpoint_fields_from_specific_humidity(
     grib: &Grib2File,
     partial: &mut PartialExtraction,
     forecast_hour: Option<u16>,
@@ -1584,7 +2632,7 @@ fn synthesize_aifs_dewpoint_fields(
         if selector.field != CanonicalField::Dewpoint {
             continue;
         }
-        let Some(message) = aifs_specific_humidity_message(grib, selector, forecast_hour) else {
+        let Some(message) = specific_humidity_message(grib, selector, forecast_hour) else {
             continue;
         };
         let mut field = build_selected_field(message, selector, "K", &mut grid_memo)?;
@@ -1600,7 +2648,7 @@ fn synthesize_aifs_dewpoint_fields(
     Ok(())
 }
 
-fn aifs_specific_humidity_message<'a>(
+fn specific_humidity_message<'a>(
     grib: &'a Grib2File,
     dewpoint_selector: FieldSelector,
     forecast_hour: Option<u16>,
@@ -1625,7 +2673,8 @@ fn aifs_specific_humidity_message<'a>(
 
 /// Convert pressure-level specific humidity to dewpoint using the standard
 /// mixing-ratio/vapor-pressure relation and Bolton saturation-vapor-pressure
-/// inversion. AIFS publishes `q`, not a direct pressure-level dewpoint field.
+/// inversion. These global AI/IFS products publish `q`/`SPFH`, not a direct
+/// pressure-level dewpoint field.
 fn dewpoint_k_from_specific_humidity(q_kgkg: f32, pressure_hpa: u16) -> f32 {
     let q = f64::from(q_kgkg);
     let pressure = f64::from(pressure_hpa);
@@ -1891,15 +2940,54 @@ fn try_fetch_one(
 }
 
 fn maybe_decompress_grib_payload(url: &str, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
-    let is_gzip = url.to_ascii_lowercase().ends_with(".gz")
-        || bytes
-            .get(0..2)
-            .is_some_and(|magic| magic == [0x1f_u8, 0x8b_u8]);
-    if !is_gzip {
-        return Ok(bytes);
+    let lowercase_url = url.to_ascii_lowercase();
+    let gzip_magic = bytes
+        .get(0..2)
+        .is_some_and(|magic| magic == [0x1f_u8, 0x8b_u8]);
+    let bzip2_magic = bytes.get(0..3).is_some_and(|magic| magic == b"BZh");
+
+    // Prefer an explicit wire-format signature to the URL suffix. This keeps
+    // redirected or extensionless provider objects decodable and makes a
+    // mislabeled response fail in the decoder for the bytes it actually
+    // carries rather than in the decoder implied by its name.
+    if gzip_magic {
+        return decompress_gzip_payload_with_limit(url, &bytes, MAX_BODY_SIZE);
+    }
+    if bzip2_magic {
+        return decompress_bzip2_payload_with_limit(url, &bytes, MAX_BODY_SIZE);
+    }
+    if lowercase_url.ends_with(".gz") {
+        return decompress_gzip_payload_with_limit(url, &bytes, MAX_BODY_SIZE);
+    }
+    if lowercase_url.ends_with(".bz2") {
+        return decompress_bzip2_payload_with_limit(url, &bytes, MAX_BODY_SIZE);
     }
 
-    decompress_gzip_payload_with_limit(url, &bytes, MAX_BODY_SIZE)
+    Ok(bytes)
+}
+
+fn read_decompressed_payload_with_limit(
+    format: &str,
+    url: &str,
+    decoder: impl Read,
+    max_output_size: u64,
+) -> Result<Vec<u8>, String> {
+    let read_limit = max_output_size
+        .checked_add(1)
+        .ok_or_else(|| format!("{format} decompress {url}: output limit overflow"))?;
+    let mut bounded = decoder.take(read_limit);
+    let mut decompressed = Vec::new();
+    bounded
+        .read_to_end(&mut decompressed)
+        .map_err(|err| format!("{format} decompress {url}: {err}"))?;
+    let decompressed_len = u64::try_from(decompressed.len())
+        .map_err(|_| format!("{format} decompress {url}: output length cannot be represented"))?;
+    if decompressed_len > max_output_size {
+        return Err(format!(
+            "{format} decompress {url}: expanded payload exceeds the {max_output_size} byte limit"
+        ));
+    }
+    Ok(decompressed)
 }
 
 fn decompress_gzip_payload_with_limit(
@@ -1907,23 +2995,17 @@ fn decompress_gzip_payload_with_limit(
     bytes: &[u8],
     max_output_size: u64,
 ) -> Result<Vec<u8>, String> {
-    let read_limit = max_output_size
-        .checked_add(1)
-        .ok_or_else(|| format!("gzip decompress {url}: output limit overflow"))?;
     let decoder = flate2::read::GzDecoder::new(bytes);
-    let mut bounded = decoder.take(read_limit);
-    let mut decompressed = Vec::new();
-    bounded
-        .read_to_end(&mut decompressed)
-        .map_err(|err| format!("gzip decompress {url}: {err}"))?;
-    let decompressed_len = u64::try_from(decompressed.len())
-        .map_err(|_| format!("gzip decompress {url}: output length cannot be represented"))?;
-    if decompressed_len > max_output_size {
-        return Err(format!(
-            "gzip decompress {url}: expanded payload exceeds the {max_output_size} byte limit"
-        ));
-    }
-    Ok(decompressed)
+    read_decompressed_payload_with_limit("gzip", url, decoder, max_output_size)
+}
+
+fn decompress_bzip2_payload_with_limit(
+    url: &str,
+    bytes: &[u8],
+    max_output_size: u64,
+) -> Result<Vec<u8>, String> {
+    let decoder = bzip2::read::MultiBzDecoder::new(bytes);
+    read_decompressed_payload_with_limit("bzip2", url, decoder, max_output_size)
 }
 
 fn should_use_parallel_whole_file_fetch(source: SourceId) -> bool {
@@ -1933,7 +3015,18 @@ fn should_use_parallel_whole_file_fetch(source: SourceId) -> bool {
 fn should_use_idx_subset_fetch(source: SourceId) -> bool {
     // NOMADS production fetches full GRIB files. The .idx sidecar is allowed
     // for availability probes only, not product subsetting.
-    matches!(source, SourceId::Aws | SourceId::Google | SourceId::Ecmwf)
+    source_supports_indexed_subset_fetch(source)
+}
+
+/// Whether this transport can honor GRIB message byte-range acquisition.
+/// NOMADS publishes useful `.idx` inventories but the operational fetch path
+/// intentionally uses whole-file GETs there, so capability surfaces must not
+/// advertise indexed subsetting merely because patterns are present.
+pub const fn source_supports_indexed_subset_fetch(source: SourceId) -> bool {
+    matches!(
+        source,
+        SourceId::Aws | SourceId::Google | SourceId::Ecmwf | SourceId::Cptec
+    )
 }
 
 /// Pattern-list directive that excludes probabilistic companions sharing a
@@ -2147,11 +3240,45 @@ struct PreparedSelector {
     message: StructuredMessageSelector,
 }
 
-const PARAMETER_HGT: &[ParameterCode] = &[ParameterCode {
-    discipline: 0,
-    category: 3,
-    number: 5,
-}];
+const PARAMETER_HGT: &[ParameterCode] = &[
+    // Geopotential height (gpm), used by NOAA products.
+    ParameterCode {
+        discipline: 0,
+        category: 3,
+        number: 5,
+    },
+    // Geopotential (m^2 s^-2), used by DWD ICON `FI` pressure objects.
+    // `build_field_values` converts this alternative to canonical gpm.
+    ParameterCode {
+        discipline: 0,
+        category: 3,
+        number: 4,
+    },
+];
+const PARAMETER_SURFACE_HEIGHT: &[ParameterCode] = &[
+    // Surface orography can be encoded as geopotential height, geopotential,
+    // or geometric height. Pressure-level selectors intentionally keep using
+    // `PARAMETER_HGT`; geometric height is only a valid canonical alternative
+    // for the surface-orography lane.
+    ParameterCode {
+        discipline: 0,
+        category: 3,
+        number: 5,
+    },
+    ParameterCode {
+        discipline: 0,
+        category: 3,
+        number: 4,
+    },
+    // DWD ICON `HSURF`: geometric height in metres. RWS surface-orography
+    // consumers already treat gpm and metres as height values; unlike WMO
+    // geopotential (0/3/4), this representation needs no gravity conversion.
+    ParameterCode {
+        discipline: 0,
+        category: 3,
+        number: 6,
+    },
+];
 const PARAMETER_PRESSURE: &[ParameterCode] = &[ParameterCode {
     discipline: 0,
     category: 3,
@@ -2254,6 +3381,12 @@ const PARAMETER_VGRD: &[ParameterCode] = &[ParameterCode {
     discipline: 0,
     category: 2,
     number: 3,
+}];
+const PARAMETER_VERTICAL_VELOCITY: &[ParameterCode] = &[ParameterCode {
+    // Pressure vertical velocity (omega), WMO GRIB2 0/2/8.
+    discipline: 0,
+    category: 2,
+    number: 8,
 }];
 const PARAMETER_WIND_DIRECTION: &[ParameterCode] = &[ParameterCode {
     discipline: 0,
@@ -2419,7 +3552,9 @@ impl PreparedSelector {
     fn match_score(self, message: &Grib2Message, forecast_hour: Option<u16>) -> Option<u8> {
         let product_score = product_template_match_score(self.selector, message)?;
         let forecast_score = if let Some(forecast_hour) = forecast_hour {
-            forecast_hour_match_score(message, forecast_hour)?
+            forecast_hour_match_score(message, forecast_hour).or_else(|| {
+                static_surface_field_match_score(self.selector, message, forecast_hour)
+            })?
         } else {
             0
         };
@@ -2427,39 +3562,74 @@ impl PreparedSelector {
     }
 }
 
+/// Surface orography is cycle-static even when a provider publishes it as a
+/// separate time-invariant object whose GRIB forecast time remains zero.
+/// Reuse that plane at later valid times, but only for the physically static
+/// surface-height selector and only for a non-statistical zero-time message.
+fn static_surface_field_match_score(
+    selector: FieldSelector,
+    message: &Grib2Message,
+    expected_hour: u16,
+) -> Option<u8> {
+    if expected_hour == 0
+        || selector.field != CanonicalField::GeopotentialHeight
+        || selector.vertical != VerticalSelector::Surface
+        || message.product.time_range_length.is_some()
+        || time_value_to_seconds(
+            message.product.time_range_unit,
+            message.product.forecast_time,
+        )? != 0
+    {
+        return None;
+    }
+    // Prefer a provider's exact valid-time message if one exists.
+    Some(2)
+}
+
 fn forecast_hour_match_score(message: &Grib2Message, expected_hour: u16) -> Option<u8> {
-    let start_hour = time_value_to_hours(
+    let expected_seconds = u64::from(expected_hour).checked_mul(3_600)?;
+    let start_seconds = time_value_to_seconds(
         message.product.time_range_unit,
         message.product.forecast_time,
     )?;
-    if start_hour == expected_hour as u32 {
+    if start_seconds == expected_seconds {
         return Some(0);
     }
-    let end_hour = message
+    let end_seconds = message
         .product
-        .statistical_time_range_hours()
-        .map(|length| start_hour.saturating_add(length as u32));
-    if end_hour == Some(expected_hour as u32) {
+        .statistical_time_range_seconds()
+        .and_then(|length| start_seconds.checked_add(length));
+    if end_seconds == Some(expected_seconds) {
         return Some(1);
     }
     None
 }
 
 fn time_value_to_hours(unit: u8, value: u32) -> Option<u32> {
+    let seconds = time_value_to_seconds(unit, value)?;
+    (seconds % 3_600 == 0)
+        .then(|| seconds / 3_600)
+        .and_then(|hours| u32::try_from(hours).ok())
+}
+
+fn time_value_to_seconds(unit: u8, value: u32) -> Option<u64> {
+    let value = u64::from(value);
     match unit {
-        // WMO Code Table 4.4: minute, hour, day, 3 hours, 6 hours, 12 hours.
-        0 => (value % 60 == 0).then_some(value / 60),
-        1 => Some(value),
-        2 => value.checked_mul(24),
-        10 => value.checked_mul(3),
-        11 => value.checked_mul(6),
-        12 => value.checked_mul(12),
+        // WMO Code Table 4.4 fixed-duration units. Calendar-relative units
+        // intentionally fail closed because no rounding is safe.
+        0 => value.checked_mul(60),
+        1 => value.checked_mul(3_600),
+        2 => value.checked_mul(86_400),
+        10 => value.checked_mul(10_800),
+        11 => value.checked_mul(21_600),
+        12 => value.checked_mul(43_200),
+        13 => Some(value),
         _ => None,
     }
 }
 
 fn product_template_match_score(selector: FieldSelector, message: &Grib2Message) -> Option<u8> {
-    match selector.product {
+    let score = match selector.product {
         FieldProduct::Default => default_product_template_match_score(selector, message),
         FieldProduct::EnsembleMean => derived_forecast_match_score(message, &[0, 1]),
         FieldProduct::EnsembleStandardDeviation => derived_forecast_match_score(message, &[2, 3]),
@@ -2468,6 +3638,21 @@ fn product_template_match_score(selector: FieldSelector, message: &Grib2Message)
         FieldProduct::EnsembleMaximum => derived_forecast_match_score(message, &[9]),
         FieldProduct::Percentile(percentile) => percentile_product_match_score(message, percentile),
         FieldProduct::Probability(selection) => probability_product_match_score(message, selection),
+    }?;
+    if selector.field == CanonicalField::TotalPrecipitation
+        && selector.product != FieldProduct::Default
+        && matches!(message.product.template, 9 | 10)
+    {
+        // Provider-statistics files may carry both 0→h run totals and
+        // trailing windows ending at h for the same percentile/probability.
+        // Keep the established APCP convention independent of file order.
+        let starts_at_run_start = time_value_to_hours(
+            message.product.time_range_unit,
+            message.product.forecast_time,
+        ) == Some(0);
+        Some(score.saturating_add(if starts_at_run_start { 0 } else { 2 }))
+    } else {
+        Some(score)
     }
 }
 
@@ -2657,11 +3842,20 @@ impl TryFrom<FieldSelector> for StructuredMessageSelector {
                 units: "gpm",
             }),
             FieldSelector {
+                field: CanonicalField::VerticalVelocity,
+                vertical: VerticalSelector::IsobaricHpa(level_hpa),
+                ..
+            } if is_supported_upper_air_level(level_hpa) => Ok(Self {
+                parameters: PARAMETER_VERTICAL_VELOCITY,
+                level: LevelMatch::IsobaricHpa(level_hpa),
+                units: "Pa/s",
+            }),
+            FieldSelector {
                 field: CanonicalField::GeopotentialHeight,
                 vertical: VerticalSelector::Surface,
                 ..
             } => Ok(Self {
-                parameters: PARAMETER_HGT,
+                parameters: PARAMETER_SURFACE_HEIGHT,
                 level: LevelMatch::Surface,
                 units: "gpm",
             }),
@@ -2752,6 +3946,15 @@ impl TryFrom<FieldSelector> for StructuredMessageSelector {
                 ..
             } if is_supported_upper_air_level(level_hpa) => Ok(Self {
                 parameters: PARAMETER_VGRD,
+                level: LevelMatch::IsobaricHpa(level_hpa),
+                units: "m/s",
+            }),
+            FieldSelector {
+                field: CanonicalField::WindSpeed,
+                vertical: VerticalSelector::IsobaricHpa(level_hpa),
+                ..
+            } if is_supported_upper_air_level(level_hpa) => Ok(Self {
+                parameters: PARAMETER_WIND_SPEED,
                 level: LevelMatch::IsobaricHpa(level_hpa),
                 units: "m/s",
             }),
@@ -2855,6 +4058,15 @@ impl TryFrom<FieldSelector> for StructuredMessageSelector {
             } => Ok(Self {
                 parameters: PARAMETER_TOTAL_CLOUD_COVER,
                 level: LevelMatch::EntireAtmosphere,
+                units: "%",
+            }),
+            FieldSelector {
+                field: CanonicalField::TotalCloudCover,
+                vertical: VerticalSelector::Surface,
+                ..
+            } => Ok(Self {
+                parameters: PARAMETER_TOTAL_CLOUD_COVER,
+                level: LevelMatch::Surface,
                 units: "%",
             }),
             FieldSelector {
@@ -3013,7 +4225,7 @@ impl TryFrom<FieldSelector> for StructuredMessageSelector {
 /// semantics ({200,250,300,500,700,850}): this one is what extraction can
 /// admit; that one is what recipe validation/UI exposes.
 fn is_supported_upper_air_level(level_hpa: u16) -> bool {
-    (100..=1000).contains(&level_hpa) && level_hpa % 25 == 0
+    (50..=1000).contains(&level_hpa) && level_hpa % 25 == 0
 }
 
 impl LevelMatch {
@@ -3236,6 +4448,7 @@ fn build_field_values(
         flip_rows(&mut values, nx, ny);
     }
     rotate_rows_left(&mut values, nx, &entry.row_wraps);
+    normalize_canonical_field_values(message, selector, &mut values);
 
     let values: Vec<f32> = values.into_iter().map(|value| value as f32).collect();
     if values.len() != entry.grid.shape.len() {
@@ -3252,6 +4465,27 @@ fn build_field_values(
         values,
         grid_index,
     })
+}
+
+/// Normalize provider alternatives that share a canonical selector but not
+/// its units. WMO parameter 0/3/4 is geopotential in m^2 s^-2; RWS exposes
+/// canonical geopotential height in geopotential metres, so divide by the
+/// conventional standard gravity. Parameter 0/3/5 already carries gpm and is
+/// intentionally left bit-for-bit unchanged.
+fn normalize_canonical_field_values(
+    message: &Grib2Message,
+    selector: FieldSelector,
+    values: &mut [f64],
+) {
+    const STANDARD_GRAVITY_M_S2: f64 = 9.806_65;
+    let is_geopotential = message.discipline == 0
+        && message.product.parameter_category == 3
+        && message.product.parameter_number == 4;
+    if selector.field == CanonicalField::GeopotentialHeight && is_geopotential {
+        for value in values.iter_mut().filter(|value| value.is_finite()) {
+            *value /= STANDARD_GRAVITY_M_S2;
+        }
+    }
 }
 
 /// Build one `SelectedField2D`: [`build_field_values`] plus a per-field

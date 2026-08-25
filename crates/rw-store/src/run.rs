@@ -6,8 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Read;
+use std::mem::size_of;
 use std::path::{Component, Path};
 
+use rustwx_core::MAX_GRID_CELLS;
 use serde::{Deserialize, Serialize};
 
 use crate::atomic::atomic_write_bytes;
@@ -25,13 +27,10 @@ pub const SCHEMA_RUN_V2: &str = "rw-store.run.v2";
 /// unbounded allocation before JSON parsing begins.
 pub const MAX_RUN_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The grid reader applies the same ceiling to each decompressed f32
-/// coordinate array. Reject impossible manifest geometry before a consumer
-/// uses it to size work or compares it with an hour/grid file.
-const MAX_GRID_COORD_RAW_BYTES: u64 = 1 << 31;
-pub(crate) const MAX_SOURCE_PROVENANCE_PER_HOUR: usize = 8;
-const MAX_SOURCE_ROLES: usize = 8;
-const MAX_SOURCE_PRODUCTS: usize = 16;
+/// The grid reader applies the same address-space-derived cell boundary to
+/// each decompressed f32 coordinate array. This used to be an unrelated 2 GiB
+/// policy ceiling that rejected otherwise representable native grids.
+const MAX_GRID_COORD_RAW_BYTES: u64 = MAX_GRID_CELLS as u64 * size_of::<f32>() as u64;
 const MAX_SOURCE_TOKEN_BYTES: usize = 96;
 
 /// Sanitized acquisition provenance for one resolved provider.
@@ -64,26 +63,24 @@ impl RwsSourceProvenance {
 
 fn normalize_source_entry(mut entry: RwsSourceProvenance) -> RwResult<RwsSourceProvenance> {
     entry.provider = normalize_source_token("provider", &entry.provider)?;
-    entry.roles = normalize_source_tokens("role", entry.roles, MAX_SOURCE_ROLES)?;
-    entry.products = normalize_source_tokens("product", entry.products, MAX_SOURCE_PRODUCTS)?;
+    entry.roles = normalize_source_tokens("role", entry.roles)?;
+    entry.products = normalize_source_tokens("product", entry.products)?;
     Ok(entry)
 }
 
-fn normalize_source_tokens(
-    label: &str,
-    values: Vec<String>,
-    limit: usize,
-) -> RwResult<Vec<String>> {
-    if values.len() > limit {
-        return Err(RwStoreError::Meta(format!(
-            "source provenance contains {} {label} labels; limit is {limit}",
-            values.len()
-        )));
+fn normalize_source_tokens(label: &str, values: Vec<String>) -> RwResult<Vec<String>> {
+    let mut normalized = Vec::new();
+    normalized
+        .try_reserve_exact(values.len())
+        .map_err(|error| {
+            RwStoreError::Meta(format!(
+                "cannot allocate {} source provenance {label} labels: {error}",
+                values.len()
+            ))
+        })?;
+    for value in values {
+        normalized.push(normalize_source_token(label, &value)?);
     }
-    let mut normalized = values
-        .into_iter()
-        .map(|value| normalize_source_token(label, &value))
-        .collect::<RwResult<Vec<_>>>()?;
     normalized.sort();
     normalized.dedup();
     Ok(normalized)
@@ -114,14 +111,43 @@ pub(crate) fn normalize_source_provenance(
         roles.extend(entry.roles);
         products.extend(entry.products);
     }
-    Ok(merged
-        .into_iter()
-        .map(|(provider, (roles, products))| RwsSourceProvenance {
+    let mut normalized = Vec::new();
+    normalized
+        .try_reserve_exact(merged.len())
+        .map_err(|error| {
+            RwStoreError::Meta(format!(
+                "cannot allocate {} normalized source provenance entries: {error}",
+                merged.len()
+            ))
+        })?;
+    for (provider, (roles, products)) in merged {
+        let mut normalized_roles = Vec::new();
+        normalized_roles
+            .try_reserve_exact(roles.len())
+            .map_err(|error| {
+                RwStoreError::Meta(format!(
+                    "cannot allocate {} normalized roles for provider '{provider}': {error}",
+                    roles.len()
+                ))
+            })?;
+        normalized_roles.extend(roles);
+        let mut normalized_products = Vec::new();
+        normalized_products
+            .try_reserve_exact(products.len())
+            .map_err(|error| {
+                RwStoreError::Meta(format!(
+                    "cannot allocate {} normalized products for provider '{provider}': {error}",
+                    products.len()
+                ))
+            })?;
+        normalized_products.extend(products);
+        normalized.push(RwsSourceProvenance {
             provider,
-            roles: roles.into_iter().collect(),
-            products: products.into_iter().collect(),
-        })
-        .collect())
+            roles: normalized_roles,
+            products: normalized_products,
+        });
+    }
+    Ok(normalized)
 }
 
 /// Require a store identity or persisted child filename to be exactly one
@@ -319,12 +345,27 @@ impl RwsRunManifest {
     /// Deduplicated union of the sanitized providers, roles, and products
     /// recorded by all hours in this run.
     pub fn source_provenance(&self) -> RwResult<Vec<RwsSourceProvenance>> {
-        normalize_source_provenance(
+        let count = self
+            .hours
+            .values()
+            .try_fold(0usize, |count, entry| {
+                count.checked_add(entry.source_provenance.len())
+            })
+            .ok_or_else(|| {
+                RwStoreError::Meta("source provenance entry count overflows usize".into())
+            })?;
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(count).map_err(|error| {
+            RwStoreError::Meta(format!(
+                "cannot allocate {count} run source provenance entries: {error}"
+            ))
+        })?;
+        entries.extend(
             self.hours
                 .values()
-                .flat_map(|entry| entry.source_provenance.iter().cloned())
-                .collect(),
-        )
+                .flat_map(|entry| entry.source_provenance.iter().cloned()),
+        );
+        normalize_source_provenance(entries)
     }
 
     /// Validate one registered hour file's metadata against this manifest,
@@ -444,12 +485,6 @@ impl RwsRunManifest {
         let mut origin_unix = None;
         for (&slot, entry) in &self.hours {
             validate_store_component(&format!("manifest slot {slot} file"), &entry.file)?;
-            if entry.source_provenance.len() > MAX_SOURCE_PROVENANCE_PER_HOUR {
-                return Err(RwStoreError::Meta(format!(
-                    "manifest slot {slot} has {} source provenance entries; limit is {MAX_SOURCE_PROVENANCE_PER_HOUR}",
-                    entry.source_provenance.len()
-                )));
-            }
             let normalized_sources = normalize_source_provenance(entry.source_provenance.clone())?;
             if normalized_sources != entry.source_provenance {
                 return Err(RwStoreError::Meta(format!(
@@ -731,6 +766,46 @@ mod tests {
                 products: vec!["oper".into()],
             }]
         );
+    }
+
+    #[test]
+    fn provenance_inventories_exceed_old_provider_role_and_product_caps() {
+        let roles = (0..12)
+            .map(|index| format!("role-{index:02}"))
+            .collect::<Vec<_>>();
+        let products = (0..20)
+            .map(|index| format!("product-{index:02}"))
+            .collect::<Vec<_>>();
+        let sources = (0..20)
+            .map(|index| {
+                RwsSourceProvenance::new(
+                    format!("provider-{index:02}"),
+                    roles.clone(),
+                    products.clone(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let mut manifest = exact_manifest();
+        manifest.hours.get_mut(&0).unwrap().source_provenance = sources;
+        manifest.validate_contents().unwrap();
+        let union = manifest.source_provenance().unwrap();
+        assert_eq!(union.len(), 20);
+        assert_eq!(union[0].roles.len(), 12);
+        assert_eq!(union[0].products.len(), 20);
+    }
+
+    #[test]
+    fn manifest_geometry_exceeds_the_old_two_gibibyte_coordinate_policy() {
+        let mut manifest = exact_manifest();
+        manifest.nx = 25_000;
+        manifest.ny = 25_000;
+        manifest
+            .validate_contents()
+            .expect("representable native geometry must not inherit the old byte policy");
+        let coordinate_bytes = manifest.nx as u64 * manifest.ny as u64 * 4;
+        assert!(coordinate_bytes > 2 * 1024 * 1024 * 1024);
     }
 
     #[test]

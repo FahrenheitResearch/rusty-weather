@@ -31,6 +31,10 @@ pub enum ModelRuntimeFamily {
 pub enum EnsembleMode {
     Deterministic,
     MemberGribFiles,
+    /// The public acquisition lane exposes post-processed ensemble
+    /// statistics (for example mean/spread files), not independently
+    /// addressable member files.
+    PostProcessedStatisticsGribFiles,
     MemberDimensionNetcdf,
 }
 
@@ -401,6 +405,16 @@ const HRRR_CYCLE_HOURS: &[u8] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
 ];
 const GFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
+const GDPS_CYCLE_HOURS: &[u8] = &[0, 12];
+const GDPS_GEML_CYCLE_HOURS: &[u8] = &[0, 12];
+const CMA_GEPS_CYCLE_HOURS: &[u8] = &[0, 12];
+const RDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
+const HRDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
+const REPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
+const DWD_ICON_CYCLE_HOURS: &[u8] = &[0, 3, 6, 9, 12, 15, 18, 21];
+const ICON_RU_CYCLE_HOURS: &[u8] = &[0, 12];
+const GEPS_CYCLE_HOURS: &[u8] = &[0, 12];
+const CPTEC_CYCLE_HOURS: &[u8] = &[0];
 const GDAS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const GEFS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const AI_MODEL_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
@@ -519,6 +533,69 @@ const GFS_SOURCES: &[SourceDescriptor] = &[
     },
 ];
 
+const GDPS_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
+    id: SourceId::Eccc,
+    // MSC Datamart publishes one self-contained GRIB2 object per
+    // variable/level, rather than companion index files. The ingest layer
+    // composes the requested objects into one deterministic GRIB message
+    // bundle while retaining per-object fetch caching.
+    idx_available: false,
+    priority: 1,
+    max_age_hours: Some(36),
+    notes: "Environment and Climate Change Canada MSC Datamart",
+}];
+
+const CMA_GEPS_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
+    id: SourceId::Cma,
+    // CMA publishes one complete GRIB2 statistics object per forecast lead
+    // through its WIS2 node. The source supports HTTP ranges but currently
+    // publishes no companion message index.
+    idx_available: false,
+    priority: 1,
+    max_age_hours: Some(24 * 30),
+    notes: "CMA WIS2 core-data node (GRAPES GEPS provider statistics)",
+}];
+
+const DWD_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
+    id: SourceId::Dwd,
+    // DWD publishes one externally bzip2-compressed GRIB2 object per
+    // field/level/named forecast time. The ingest layer assembles an exact
+    // profile-dependent component bundle; there is no companion byte index.
+    idx_available: false,
+    priority: 1,
+    max_age_hours: Some(30),
+    notes: "Deutscher Wetterdienst Open Data",
+}];
+
+const ICON_RU_SOURCES: &[SourceDescriptor] = &[
+    SourceDescriptor {
+        id: SourceId::RoshydrometWis2Cache,
+        idx_available: false,
+        priority: 1,
+        max_age_hours: Some(24),
+        notes: "WIS2 Global Cache HTTPS object transport (preferred when cached)",
+    },
+    SourceDescriptor {
+        id: SourceId::RoshydrometWis2Origin,
+        idx_available: false,
+        priority: 2,
+        max_age_hours: Some(48),
+        notes: "Roshydromet WIS2 canonical object transport (HTTP fallback)",
+    },
+];
+
+const CPTEC_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
+    id: SourceId::Cptec,
+    // CPTEC publishes a text wgrib2-style `.inv` companion with exact byte
+    // offsets beside each GRIB2 lead. A distinct binary `.grib2.idx` object
+    // also exists, but it is not a message inventory and must never be fed to
+    // the shared text-index parser.
+    idx_available: true,
+    priority: 1,
+    max_age_hours: None,
+    notes: "CPTEC/INPE operational model data server",
+}];
+
 const GEFS_SOURCES: &[SourceDescriptor] = &[
     SourceDescriptor {
         id: SourceId::Nomads,
@@ -538,14 +615,11 @@ const GEFS_SOURCES: &[SourceDescriptor] = &[
 
 const ECMWF_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
     id: SourceId::Ecmwf,
-    // ECMWF open-data doesn't publish `.grib2.idx` companion files, so
-    // HEAD-probing the `.idx` URL returns 404 and `latest_available_run`
-    // falsely concludes the run is unavailable. Flagging this source
-    // `idx_available=false` makes `availability_probe_url` fall back to
-    // the grib URL itself, which HEAD 200s correctly. The tradeoff: no
-    // idx-based range extraction, but ECMWF's open-data is served as
-    // single grib2 files that the fetcher already pulls whole.
-    idx_available: false,
+    // ECMWF publishes a newline-delimited JSON companion index by replacing
+    // `.grib2` with `.index`. The records carry explicit byte offsets and
+    // lengths, so the shared fetcher can range-subset the operational IFS
+    // files without downloading the complete global payload.
+    idx_available: true,
     priority: 1,
     max_age_hours: None,
     notes: "ECMWF open data",
@@ -640,6 +714,135 @@ const MODELS: &[ModelSummary] = &[
         ensemble_mode: EnsembleMode::Deterministic,
     },
     ModelSummary {
+        id: ModelId::Gdps,
+        description: "ECCC GDPS global 0.15 degree deterministic forecast",
+        // This logical product resolves to one small representative Datamart
+        // object for availability probes. rw-ingest expands it into the exact
+        // profile-dependent surface component bundle before extraction.
+        default_product: "rws-surface",
+        cycle_hours_utc: GDPS_CYCLE_HOURS,
+        max_forecast_hour: 240,
+        sources: GDPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::GdpsGeml,
+        description: "Experimental ECCC GDPS-GEML global 0.25 degree AI emulator forecast",
+        // Datamart publishes one one-message GRIB2 object per field/level.
+        // This logical product is an availability probe; rw-ingest expands
+        // the selected profile into the exact bounded component inventory.
+        default_product: "rws-surface",
+        cycle_hours_utc: GDPS_GEML_CYCLE_HOURS,
+        max_forecast_hour: 240,
+        sources: GDPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::CmaGeps,
+        description: "CMA GRAPES GEPS v1.3 global 0.25 degree provider statistics",
+        default_product: "stats",
+        cycle_hours_utc: CMA_GEPS_CYCLE_HOURS,
+        max_forecast_hour: 360,
+        sources: CMA_GEPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::PostProcessedStatisticsGribFiles,
+    },
+    ModelSummary {
+        id: ModelId::Rdps,
+        description: "ECCC RDPS 10 km North American rotated-grid deterministic forecast",
+        default_product: "rws-surface",
+        cycle_hours_utc: RDPS_CYCLE_HOURS,
+        max_forecast_hour: 84,
+        sources: GDPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::Hrdps,
+        description: "ECCC HRDPS 2.5 km pan-Canadian rotated-grid deterministic forecast",
+        default_product: "rws-surface",
+        cycle_hours_utc: HRDPS_CYCLE_HOURS,
+        max_forecast_hour: 48,
+        sources: GDPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::Reps,
+        description: "ECCC REPS 10 km regional provider-published ensemble statistics",
+        default_product: "rws-reps-provider-statistics",
+        cycle_hours_utc: REPS_CYCLE_HOURS,
+        max_forecast_hour: 72,
+        sources: GDPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::PostProcessedStatisticsGribFiles,
+    },
+    ModelSummary {
+        id: ModelId::IconEu,
+        description: "DWD ICON-EU regular latitude/longitude deterministic forecast",
+        default_product: "rws-surface",
+        cycle_hours_utc: DWD_ICON_CYCLE_HOURS,
+        max_forecast_hour: 120,
+        sources: DWD_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::IconD2,
+        description: "DWD ICON-D2 regular latitude/longitude deterministic forecast",
+        default_product: "rws-surface",
+        cycle_hours_utc: DWD_ICON_CYCLE_HOURS,
+        max_forecast_hour: 48,
+        sources: DWD_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::IconRu,
+        description: "Roshydromet ICON-Ru13/6N29 North Eurasia deterministic forecast",
+        // WIS2 publishes one WMO-bulletin-wrapped GRIB2 object per field and
+        // level. rw-ingest expands this logical product into a bounded exact
+        // component inventory.
+        default_product: "rws-surface",
+        cycle_hours_utc: ICON_RU_CYCLE_HOURS,
+        max_forecast_hour: 72,
+        sources: ICON_RU_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::Geps,
+        description: "ECCC GEPS global 0.5 degree provider-published ensemble statistics",
+        default_product: "rws-published-statistics",
+        cycle_hours_utc: GEPS_CYCLE_HOURS,
+        max_forecast_hour: 384,
+        sources: GDPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::PostProcessedStatisticsGribFiles,
+    },
+    ModelSummary {
+        id: ModelId::WrfCptec7km,
+        description: "CPTEC/INPE WRF 7 km South America deterministic forecast",
+        default_product: "raw",
+        cycle_hours_utc: CPTEC_CYCLE_HOURS,
+        max_forecast_hour: 180,
+        sources: CPTEC_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::BramsCptec8km,
+        description: "CPTEC/INPE BRAMS 8 km South America deterministic forecast",
+        default_product: "raw",
+        cycle_hours_utc: CPTEC_CYCLE_HOURS,
+        max_forecast_hour: 180,
+        sources: CPTEC_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
         id: ModelId::Gdas,
         description: "GDAS global data-assimilation analysis/forecast grids",
         default_product: "pgrb2.0p25",
@@ -651,10 +854,10 @@ const MODELS: &[ModelSummary] = &[
     },
     ModelSummary {
         id: ModelId::Gefs,
-        description: "GEFS global 0.5 degree ensemble forecast",
+        description: "GEFS global 0.5 degree ensemble forecast (00z extends to 35 days)",
         default_product: "pgrb2ap5/gec00",
         cycle_hours_utc: GEFS_CYCLE_HOURS,
-        max_forecast_hour: 384,
+        max_forecast_hour: 840,
         sources: GEFS_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::MemberGribFiles,
@@ -677,7 +880,7 @@ const MODELS: &[ModelSummary] = &[
         max_forecast_hour: 384,
         sources: NOMADS_ONLY_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
-        ensemble_mode: EnsembleMode::MemberGribFiles,
+        ensemble_mode: EnsembleMode::PostProcessedStatisticsGribFiles,
     },
     ModelSummary {
         id: ModelId::Hgefs,
@@ -687,7 +890,7 @@ const MODELS: &[ModelSummary] = &[
         max_forecast_hour: 240,
         sources: NOMADS_ONLY_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
-        ensemble_mode: EnsembleMode::MemberGribFiles,
+        ensemble_mode: EnsembleMode::PostProcessedStatisticsGribFiles,
     },
     ModelSummary {
         id: ModelId::EcmwfOpenData,
@@ -5726,12 +5929,24 @@ pub fn built_in_models() -> &'static [ModelSummary] {
 /// [`built_in_models`] remains linked (`ModelId` match arms thread through
 /// rustwx-products), but every user-facing enumeration must go through this
 /// list.
-pub fn supported_models() -> [ModelId; 14] {
+pub fn supported_models() -> [ModelId; 26] {
     [
         ModelId::Hrrr,
         ModelId::HrrrAk,
         ModelId::Rap,
         ModelId::Gfs,
+        ModelId::Gdps,
+        ModelId::GdpsGeml,
+        ModelId::CmaGeps,
+        ModelId::Rdps,
+        ModelId::Hrdps,
+        ModelId::Reps,
+        ModelId::IconEu,
+        ModelId::IconD2,
+        ModelId::IconRu,
+        ModelId::Geps,
+        ModelId::WrfCptec7km,
+        ModelId::BramsCptec8km,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -5777,6 +5992,12 @@ pub fn plot_recipe_fetch_blockers(
 }
 
 pub fn selector_supported_for_model(selector: FieldSelector, model: ModelId) -> bool {
+    if model == ModelId::Geps {
+        return geps_published_selector_supported(selector);
+    }
+    if model == ModelId::Reps {
+        return reps_provider_selector_supported(selector);
+    }
     if !selector.product.is_default() {
         match (model, selector.product) {
             (ModelId::Nbm, _) => {}
@@ -5819,6 +6040,9 @@ pub fn selector_supported_for_model(selector: FieldSelector, model: ModelId) -> 
         return false;
     }
     match (selector.field, selector.vertical) {
+        (CanonicalField::VerticalVelocity, VerticalSelector::IsobaricHpa(level_hpa)) => {
+            model == ModelId::GdpsGeml && GDPS_GEML_ISOBARIC_LEVELS_HPA.contains(&level_hpa)
+        }
         (
             CanonicalField::GeopotentialHeight
             | CanonicalField::Temperature
@@ -5941,6 +6165,120 @@ pub fn selector_supported_for_model(selector: FieldSelector, model: ModelId) -> 
     }
 }
 
+fn geps_published_selector_supported(selector: FieldSelector) -> bool {
+    let instant_full = matches!(
+        selector.product,
+        FieldProduct::Percentile(10 | 25 | 50 | 75 | 90)
+            | FieldProduct::EnsembleSpread
+            | FieldProduct::EnsembleMean
+            | FieldProduct::EnsembleMinimum
+            | FieldProduct::EnsembleMaximum
+    );
+    let three_quantile = matches!(
+        selector.product,
+        FieldProduct::Percentile(25 | 50 | 75)
+            | FieldProduct::EnsembleMinimum
+            | FieldProduct::EnsembleMaximum
+    );
+    let pressure_wind = three_quantile
+        || matches!(
+            selector.product,
+            FieldProduct::EnsembleSpread | FieldProduct::EnsembleMean
+        );
+    let above_threshold = |thresholds: &[i64]| match selector.product {
+        FieldProduct::Probability(selection) => {
+            selection
+                .lower_limit_milli
+                .is_some_and(|threshold| thresholds.contains(&threshold))
+                && selection.probability_type.is_none()
+                && selection.upper_limit_milli.is_none()
+        }
+        _ => false,
+    };
+    let below_threshold = |thresholds: &[i64]| match selector.product {
+        FieldProduct::Probability(selection) => {
+            selection
+                .upper_limit_milli
+                .is_some_and(|threshold| thresholds.contains(&threshold))
+                && selection.probability_type.is_none()
+                && selection.lower_limit_milli.is_none()
+        }
+        _ => false,
+    };
+
+    match (selector.field, selector.vertical) {
+        (CanonicalField::Temperature, VerticalSelector::HeightAboveGroundMeters(2)) => {
+            instant_full
+                || above_threshold(&[
+                    243_140, 248_140, 253_140, 258_140, 263_140, 268_140, 273_140, 278_140,
+                    283_140, 288_140, 293_140, 298_140, 303_140, 308_140, 313_140,
+                ])
+                || below_threshold(&[
+                    233_140, 238_140, 243_140, 248_140, 253_140, 258_140, 263_140, 268_140,
+                    273_140, 278_140, 283_140, 288_140, 293_140, 298_140,
+                ])
+        }
+        (CanonicalField::WindSpeed, VerticalSelector::HeightAboveGroundMeters(10)) => instant_full,
+        (CanonicalField::TotalCloudCover, VerticalSelector::Surface) => {
+            matches!(
+                selector.product,
+                FieldProduct::Percentile(10 | 25 | 50 | 75 | 90)
+                    | FieldProduct::EnsembleMinimum
+                    | FieldProduct::EnsembleMaximum
+            )
+        }
+        (CanonicalField::PressureReducedToMeanSeaLevel, VerticalSelector::MeanSeaLevel)
+        | (CanonicalField::GeopotentialHeight, VerticalSelector::IsobaricHpa(500)) => matches!(
+            selector.product,
+            FieldProduct::EnsembleMean | FieldProduct::EnsembleSpread
+        ),
+        (CanonicalField::Temperature, VerticalSelector::IsobaricHpa(850)) => three_quantile,
+        (CanonicalField::WindSpeed, VerticalSelector::IsobaricHpa(250 | 850)) => pressure_wind,
+        (CanonicalField::WindGust, VerticalSelector::HeightAboveGroundMeters(10)) => {
+            three_quantile || above_threshold(&[15_000, 25_000, 35_000])
+        }
+        (CanonicalField::TotalPrecipitation, VerticalSelector::Surface) => {
+            three_quantile || above_threshold(&[1_000, 5_000, 10_000, 25_000, 50_000, 100_000])
+        }
+        _ => false,
+    }
+}
+
+fn reps_provider_selector_supported(selector: FieldSelector) -> bool {
+    let full_statistics = matches!(
+        selector.product,
+        FieldProduct::Percentile(10 | 25 | 50 | 75 | 90)
+            | FieldProduct::EnsembleSpread
+            | FieldProduct::EnsembleMean
+            | FieldProduct::EnsembleMinimum
+            | FieldProduct::EnsembleMaximum
+    );
+    let precipitation_probability = match selector.product {
+        FieldProduct::Probability(selection) => {
+            selection.probability_type == Some(3)
+                && selection.upper_limit_milli.is_none()
+                && selection.lower_limit_milli.is_some_and(|threshold| {
+                    [
+                        1_000, 2_500, 5_000, 10_000, 15_000, 20_000, 25_000, 30_000, 40_000, 50_000,
+                    ]
+                    .contains(&threshold)
+                })
+        }
+        _ => false,
+    };
+
+    match (selector.field, selector.vertical) {
+        (CanonicalField::Temperature, VerticalSelector::HeightAboveGroundMeters(2))
+        | (CanonicalField::WindSpeed, VerticalSelector::HeightAboveGroundMeters(10)) => {
+            full_statistics
+        }
+        (CanonicalField::TotalPrecipitation, VerticalSelector::Surface) => {
+            full_statistics || precipitation_probability
+        }
+        _ => false,
+    }
+}
+
 pub fn model_summary(model: ModelId) -> &'static ModelSummary {
     MODELS
         .iter()
@@ -5962,13 +6300,116 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
             hours.extend((123..=384).step_by(3));
             hours
         }
+        ModelId::Gdps => {
+            if !GDPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                return Vec::new();
+            }
+            let mut hours = (0..=84).collect::<Vec<u16>>();
+            hours.extend((87..=240).step_by(3));
+            hours
+        }
+        ModelId::GdpsGeml => {
+            if GDPS_GEML_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=240).step_by(6).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ModelId::CmaGeps => {
+            if !CMA_GEPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                return Vec::new();
+            }
+            let mut hours = (0..=78).step_by(3).collect::<Vec<u16>>();
+            hours.extend((84..=360).step_by(6));
+            hours
+        }
+        ModelId::Rdps => {
+            if RDPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=84).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ModelId::Hrdps => {
+            if HRDPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=48).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ModelId::Reps => {
+            if REPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (3..=72).step_by(3).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ModelId::IconEu => {
+            if !DWD_ICON_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                return Vec::new();
+            }
+            if cycle_hour_utc % 6 == 0 {
+                let mut hours = (0..=78).collect::<Vec<u16>>();
+                hours.extend((81..=120).step_by(3));
+                hours
+            } else {
+                let mut hours = (0..=30).collect::<Vec<u16>>();
+                hours.extend([36, 42, 48]);
+                hours
+            }
+        }
+        ModelId::IconD2 => {
+            if DWD_ICON_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=48).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ModelId::IconRu => {
+            if ICON_RU_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (3..=72).step_by(3).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ModelId::WrfCptec7km => {
+            if CPTEC_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=180).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ModelId::Geps => {
+            if !GEPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                return Vec::new();
+            }
+            let mut hours = (3..=192).step_by(3).collect::<Vec<u16>>();
+            hours.extend((198..=384).step_by(6));
+            hours
+        }
+        ModelId::BramsCptec8km => {
+            if CPTEC_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (1..=180).collect()
+            } else {
+                Vec::new()
+            }
+        }
         ModelId::Gdas => (0..=9).collect(),
         ModelId::Gefs => {
             let mut hours = (0..=240).step_by(3).collect::<Vec<u16>>();
             hours.extend((246..=384).step_by(6));
+            // The 00z atmosphere-only run continues from day 16 through day
+            // 35 at six-hour steps. Other cycles end at f384.
+            if cycle_hour_utc == 0 {
+                hours.extend((390..=840).step_by(6));
+            }
             hours
         }
-        ModelId::Aigfs | ModelId::Aigefs => (0..=384).step_by(6).collect(),
+        ModelId::Aigfs => (0..=384).step_by(6).collect(),
+        // AIGEFS pressure statistics include f000, but the surface mean used
+        // by the RWS two-role ingest starts at f006. Do not schedule a run
+        // hour whose required surface product does not exist.
+        ModelId::Aigefs => (6..=384).step_by(6).collect(),
         ModelId::Hgefs => (0..=240).step_by(6).collect(),
         // ECMWF Open Data currently publishes four daily IFS runs. The 00/12z
         // deterministic/ensemble open-data stream carries 3-hourly steps to
@@ -6091,6 +6532,35 @@ fn default_canonical_bundle_product(
         (ModelId::HrrrAk, CanonicalBundleDescriptor::PressureAnalysis) => "prs",
         (ModelId::HrrrAk, CanonicalBundleDescriptor::NativeAnalysis) => "nat",
         (ModelId::Gfs, _) => "pgrb2.0p25",
+        (ModelId::Gdps, CanonicalBundleDescriptor::SurfaceAnalysis) => "rws-surface",
+        (ModelId::Gdps, CanonicalBundleDescriptor::PressureAnalysis) => "rws-pressure",
+        (ModelId::Gdps, CanonicalBundleDescriptor::NativeAnalysis) => "rws-surface",
+        (ModelId::GdpsGeml, CanonicalBundleDescriptor::SurfaceAnalysis) => "rws-surface",
+        (ModelId::GdpsGeml, CanonicalBundleDescriptor::PressureAnalysis) => "rws-pressure",
+        (ModelId::GdpsGeml, CanonicalBundleDescriptor::NativeAnalysis) => "rws-surface",
+        (ModelId::CmaGeps, _) => "stats",
+        (
+            ModelId::Rdps | ModelId::Hrdps,
+            CanonicalBundleDescriptor::SurfaceAnalysis | CanonicalBundleDescriptor::NativeAnalysis,
+        ) => "rws-surface",
+        (ModelId::Rdps | ModelId::Hrdps, CanonicalBundleDescriptor::PressureAnalysis) => {
+            "rws-pressure"
+        }
+        (ModelId::Reps, _) => "rws-reps-provider-statistics",
+        (ModelId::IconEu | ModelId::IconD2, CanonicalBundleDescriptor::SurfaceAnalysis) => {
+            "rws-surface"
+        }
+        (ModelId::IconEu | ModelId::IconD2, CanonicalBundleDescriptor::PressureAnalysis) => {
+            "rws-pressure"
+        }
+        (ModelId::IconEu | ModelId::IconD2, CanonicalBundleDescriptor::NativeAnalysis) => {
+            "rws-surface"
+        }
+        (ModelId::IconRu, CanonicalBundleDescriptor::SurfaceAnalysis) => "rws-surface",
+        (ModelId::IconRu, CanonicalBundleDescriptor::PressureAnalysis) => "rws-pressure",
+        (ModelId::IconRu, CanonicalBundleDescriptor::NativeAnalysis) => "rws-surface",
+        (ModelId::Geps, _) => "rws-published-statistics",
+        (ModelId::WrfCptec7km | ModelId::BramsCptec8km, _) => "raw",
         (ModelId::Gdas, _) => "pgrb2.0p25",
         (ModelId::Gefs, _) => "pgrb2ap5/gec00",
         (ModelId::Aigfs, CanonicalBundleDescriptor::SurfaceAnalysis) => "sfc",
@@ -6214,6 +6684,12 @@ fn companion_index_url(source: SourceId, grib_url: &str) -> String {
             .map(|base| format!("{base}.index"))
             .unwrap_or_else(|| format!("{grib_url}.index"));
     }
+    if source == SourceId::Cptec {
+        return grib_url
+            .strip_suffix(".grib2")
+            .map(|base| format!("{base}.inv"))
+            .unwrap_or_else(|| format!("{grib_url}.inv"));
+    }
     format!("{grib_url}.idx")
 }
 
@@ -6288,12 +6764,13 @@ fn latest_available_run_with_probe<F>(
 where
     F: FnMut(&ResolvedUrl) -> bool,
 {
+    let forecast_hour = earliest_supported_forecast_hour(model)?;
     latest_available_run_for_products_with_probe_at_forecast_hour(
         model,
         source,
         date_yyyymmdd,
         &[model_summary(model).default_product],
-        0,
+        forecast_hour,
         probe_available,
     )
 }
@@ -6308,14 +6785,28 @@ fn latest_available_run_for_products_with_probe<F>(
 where
     F: FnMut(&ResolvedUrl) -> bool,
 {
+    let forecast_hour = earliest_supported_forecast_hour(model)?;
     latest_available_run_for_products_with_probe_at_forecast_hour(
         model,
         source,
         date_yyyymmdd,
         products,
-        0,
+        forecast_hour,
         probe_available,
     )
+}
+
+fn earliest_supported_forecast_hour(model: ModelId) -> Result<u16, ModelError> {
+    model_summary(model)
+        .cycle_hours_utc
+        .iter()
+        .filter_map(|cycle_hour| {
+            supported_forecast_hours(model, *cycle_hour)
+                .first()
+                .copied()
+        })
+        .min()
+        .ok_or(ModelError::NoAvailableRun { model })
 }
 
 fn latest_available_run_for_products_with_probe_at_forecast_hour<F>(
@@ -6324,6 +6815,35 @@ fn latest_available_run_for_products_with_probe_at_forecast_hour<F>(
     date_yyyymmdd: &str,
     products: &[&str],
     forecast_hour: u16,
+    probe_available: F,
+) -> Result<LatestRun, ModelError>
+where
+    F: FnMut(&ResolvedUrl) -> bool,
+{
+    use chrono::Timelike;
+
+    let now = chrono::Utc::now();
+    latest_available_run_for_products_with_probe_at_forecast_hour_as_of(
+        model,
+        source,
+        date_yyyymmdd,
+        products,
+        forecast_hour,
+        &now.format("%Y%m%d").to_string(),
+        now.hour() as u8,
+        probe_available,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn latest_available_run_for_products_with_probe_at_forecast_hour_as_of<F>(
+    model: ModelId,
+    source: Option<SourceId>,
+    date_yyyymmdd: &str,
+    products: &[&str],
+    forecast_hour: u16,
+    as_of_date_yyyymmdd: &str,
+    as_of_hour_utc: u8,
     mut probe_available: F,
 ) -> Result<LatestRun, ModelError>
 where
@@ -6358,7 +6878,19 @@ where
     // after UTC rollover or during a publication delay.
     let candidate_dates = cycle_date_rollback_candidates(date_yyyymmdd);
     for candidate_date in &candidate_dates {
+        // `Latest` used to start at the final configured cycle of the
+        // requested date even when that cycle was still hours in the future.
+        // Hourly models could therefore make dozens of sequential provider
+        // probes before reaching the newest plausible run.  Historical dates
+        // remain unrestricted; today is bounded by the current UTC hour, and
+        // a future date is skipped rather than probed.
+        if candidate_date.as_str() > as_of_date_yyyymmdd {
+            continue;
+        }
         for hour_utc in summary.cycle_hours_utc.iter().rev().copied() {
+            if candidate_date == as_of_date_yyyymmdd && hour_utc > as_of_hour_utc {
+                continue;
+            }
             if !forecast_hour_supported(model, hour_utc, forecast_hour) {
                 continue;
             }
@@ -6557,6 +7089,18 @@ fn build_grib_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         ModelId::Hrrr => build_hrrr_url(source, request),
         ModelId::HrrrAk => build_hrrr_ak_url(source, request),
         ModelId::Gfs => build_gfs_url(source, request)?,
+        ModelId::Gdps => build_gdps_url(source, request)?,
+        ModelId::GdpsGeml => build_gdps_geml_url(source, request)?,
+        ModelId::CmaGeps => build_cma_geps_url(source, request)?,
+        ModelId::Rdps => build_rdps_url(source, request)?,
+        ModelId::Hrdps => build_hrdps_url(source, request)?,
+        ModelId::Reps => build_reps_url(source, request)?,
+        ModelId::IconEu | ModelId::IconD2 => build_dwd_icon_url(source, request)?,
+        ModelId::IconRu => build_icon_ru_url(source, request)?,
+        ModelId::Geps => build_geps_url(source, request)?,
+        ModelId::WrfCptec7km | ModelId::BramsCptec8km => {
+            build_cptec_south_america_url(source, request)?
+        }
         ModelId::Gdas => build_gdas_url(source, request)?,
         ModelId::Gefs => build_gefs_url(source, request)?,
         ModelId::Aigfs => build_aigfs_url(source, request)?,
@@ -6860,6 +7404,955 @@ fn build_gfs_url(source: SourceId, request: &ModelRunRequest) -> Result<String, 
     })
 }
 
+/// The exact isobaric levels published by the GDPS 15 km Datamart feed.
+/// Keeping this list next to URL construction makes arbitrary path fragments
+/// impossible and gives bundle planners one authoritative availability set.
+const GDPS_ISOBARIC_LEVELS_HPA: &[u16] = &[
+    1, 5, 10, 20, 30, 50, 100, 150, 175, 200, 225, 250, 275, 300, 350, 400, 450, 500, 550, 600,
+    650, 700, 750, 800, 850, 875, 900, 925, 950, 970, 985, 1000, 1015,
+];
+
+/// Exact pressure levels advertised by the GDPS 15 km Datamart contract.
+/// Bundle planners intersect this set with their requested RWS profile so
+/// they never probe known-absent per-level objects.
+pub fn gdps_isobaric_levels_hpa() -> &'static [u16] {
+    GDPS_ISOBARIC_LEVELS_HPA
+}
+
+/// Return whether a GDPS component token is an explicitly supported, safe
+/// Datamart object stem. The feed exposes one object per variable and level;
+/// accepting an allowlisted stem instead of a generic path component prevents
+/// URL injection while retaining a compact public request contract.
+fn gdps_component_is_supported(product: &str) -> bool {
+    const SURFACE_COMPONENTS: &[&str] = &[
+        "AirTemp_AGL-2m",
+        "DewPoint_AGL-2m",
+        "RelativeHumidity_AGL-2m",
+        "WindU_AGL-10m",
+        "WindV_AGL-10m",
+        "WindGust_AGL-10m",
+        "Pressure_Sfc",
+        "Pressure_MSL",
+        "GeopotentialHeight_Sfc",
+        "Precip-Accum_Sfc",
+        "Precip-Accum1h_Sfc",
+        "TotalCloudCover_Sfc",
+    ];
+    if SURFACE_COMPONENTS.contains(&product) {
+        return true;
+    }
+
+    const ISOBARIC_PREFIXES: &[&str] = &[
+        "AirTemp_IsbL-",
+        "RelativeHumidity_IsbL-",
+        "SpecificHumidity_IsbL-",
+        "WindU_IsbL-",
+        "WindV_IsbL-",
+        "GeopotentialHeight_IsbL-",
+        "AbsoluteVorticity_IsbL-",
+    ];
+    ISOBARIC_PREFIXES.iter().any(|prefix| {
+        product
+            .strip_prefix(prefix)
+            .and_then(|level| level.parse::<u16>().ok())
+            .is_some_and(|level| {
+                format!("{level:04}") == product[prefix.len()..]
+                    && GDPS_ISOBARIC_LEVELS_HPA.contains(&level)
+            })
+    })
+}
+
+fn build_gdps_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Eccc {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason:
+                "GDPS publishes hourly f000-f084 and every three hours f087-f240 for 00Z/12Z cycles"
+                    .to_string(),
+        });
+    }
+
+    // Logical bundle names are used by catalog/probe and ingest callers. A
+    // small, always-required component is their availability probe; bundle
+    // assembly fetches every exact component through this same URL builder.
+    let product = match request.product.as_str() {
+        "rws-surface" | "rws-sounding" => "AirTemp_AGL-2m",
+        "rws-pressure" => "AirTemp_IsbL-0500",
+        product if gdps_component_is_supported(product) => product,
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    Ok(format!(
+        "https://dd.weather.gc.ca/today/model_gdps/15km/{:02}/{:03}/{}T{:02}Z_MSC_GDPS_{}_LatLon0.15_PT{:03}H.grib2",
+        request.cycle.hour_utc,
+        request.forecast_hour,
+        request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
+        product,
+        request.forecast_hour,
+    ))
+}
+
+/// Exact pressure-level inventory published by the experimental GDPS-GEML
+/// Datamart feed. Unlike operational GDPS, GEML is six-hourly and publishes
+/// this deliberately sparse thirteen-level set.
+const GDPS_GEML_ISOBARIC_LEVELS_HPA: &[u16] = &[
+    50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000,
+];
+
+const GDPS_GEML_SURFACE_COMPONENTS: &[&str] = &[
+    "AirTemp_AGL-2m",
+    "WindU_AGL-10m",
+    "WindV_AGL-10m",
+    "Pressure_MSL",
+];
+
+const GDPS_GEML_PRESSURE_FAMILIES: &[&str] = &[
+    "AirTemp",
+    "Geopotential",
+    "SpecificHumidity",
+    "VerticalVelocity",
+    "WindU",
+    "WindV",
+];
+
+pub fn gdps_geml_isobaric_levels_hpa() -> &'static [u16] {
+    GDPS_GEML_ISOBARIC_LEVELS_HPA
+}
+
+pub fn gdps_geml_surface_components() -> &'static [&'static str] {
+    GDPS_GEML_SURFACE_COMPONENTS
+}
+
+/// The complete live object contract for one GDPS-GEML forecast lead: four
+/// surface messages plus six families at thirteen pressure levels (82 total).
+pub fn gdps_geml_inventory_components() -> Vec<String> {
+    let mut components = GDPS_GEML_SURFACE_COMPONENTS
+        .iter()
+        .map(|component| (*component).to_string())
+        .collect::<Vec<_>>();
+    for family in GDPS_GEML_PRESSURE_FAMILIES {
+        for level in GDPS_GEML_ISOBARIC_LEVELS_HPA {
+            components.push(format!("{family}_IsbL-{level:04}"));
+        }
+    }
+    components
+}
+
+fn gdps_geml_component_is_supported(product: &str) -> bool {
+    if GDPS_GEML_SURFACE_COMPONENTS.contains(&product) {
+        return true;
+    }
+    GDPS_GEML_PRESSURE_FAMILIES.iter().any(|family| {
+        let prefix = format!("{family}_IsbL-");
+        exact_four_digit_level(product, &prefix)
+            .is_some_and(|level| GDPS_GEML_ISOBARIC_LEVELS_HPA.contains(&level))
+    })
+}
+
+fn build_gdps_geml_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Eccc {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "GDPS-GEML publishes six-hourly f000-f240 for 00Z/12Z cycles".to_string(),
+        });
+    }
+
+    let product = match request.product.as_str() {
+        "rws-surface" | "rws-sounding" => "AirTemp_AGL-2m",
+        "rws-pressure" => "AirTemp_IsbL-0500",
+        product if gdps_geml_component_is_supported(product) => product,
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    Ok(format!(
+        "https://dd.weather.gc.ca/today/model_gdps-geml/25km/{:02}/{:03}/{}T{:02}Z_MSC_GDPS-GEML_{}_LatLon0.25_PT{:03}H.grib2",
+        request.cycle.hour_utc,
+        request.forecast_hour,
+        request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
+        product,
+        request.forecast_hour,
+    ))
+}
+
+fn build_cma_geps_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Cma {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "CMA GRAPES GEPS publishes three-hourly f000-f078 and six-hourly f084-f360 for 00Z/12Z cycles"
+                .to_string(),
+        });
+    }
+    if normalize_token(&request.product) != "stats" {
+        return Err(ModelError::UnsupportedProduct {
+            model: request.model,
+            product: request.product.clone(),
+        });
+    }
+    let day = &request.cycle.date_yyyymmdd;
+    let storage_day = format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]);
+    Ok(format!(
+        "https://wis2node.wis.cma.cn/data/{storage_day}/wis/urn:wmo:md:cn-cma:data.core.weather.prediction.forecast.medium-range.probabilistic.global/Z_NAFP_C_BABJ_{}{:02}0000_P_CMA-WIPPSGEPS-GLB-{:03}.grib2",
+        request.cycle.date_yyyymmdd, request.cycle.hour_utc, request.forecast_hour,
+    ))
+}
+
+fn build_cptec_south_america_url(
+    source: SourceId,
+    request: &ModelRunRequest,
+) -> Result<String, ModelError> {
+    if source != SourceId::Cptec {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: match request.model {
+                ModelId::WrfCptec7km => {
+                    "CPTEC/INPE WRF publishes one 00Z cycle with hourly forecast leads f000-f180"
+                }
+                ModelId::BramsCptec8km => {
+                    "CPTEC/INPE BRAMS publishes one 00Z cycle; RWS admits f001-f180 because f000 collapses instantaneous/minimum/maximum 2 m temperature into indistinguishable analysis records"
+                }
+                _ => unreachable!("CPTEC URL builder called for a non-CPTEC model"),
+            }
+            .to_string(),
+        });
+    }
+    if normalize_token(&request.product) != "raw" {
+        return Err(ModelError::UnsupportedProduct {
+            model: request.model,
+            product: request.product.clone(),
+        });
+    }
+
+    let (valid_date, valid_hour) = advance_yyyymmddhh(
+        &request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
+        request.forecast_hour,
+    )
+    .ok_or_else(|| ModelError::UnsupportedForecastHour {
+        model: request.model,
+        cycle_hour: request.cycle.hour_utc,
+        forecast_hour: request.forecast_hour,
+        reason: "forecast valid time is outside the supported calendar range".to_string(),
+    })?;
+    let cycle = format!(
+        "{}{:02}",
+        request.cycle.date_yyyymmdd, request.cycle.hour_utc
+    );
+    let valid = format!("{valid_date}{valid_hour:02}");
+    let year = &request.cycle.date_yyyymmdd[0..4];
+    let month = &request.cycle.date_yyyymmdd[4..6];
+    let day = &request.cycle.date_yyyymmdd[6..8];
+    let hour = request.cycle.hour_utc;
+
+    let (family, filename) = match request.model {
+        ModelId::WrfCptec7km => (
+            "wrf/ams_07km",
+            format!("WRF_cpt_07KM_{cycle}_{valid}.grib2"),
+        ),
+        ModelId::BramsCptec8km => (
+            "brams/ams_08km",
+            format!("BRAMS_ams_08km_{cycle}_{valid}.grib2"),
+        ),
+        _ => unreachable!("CPTEC URL builder called for a non-CPTEC model"),
+    };
+    Ok(format!(
+        "https://dataserver.cptec.inpe.br/dataserver_modelos/{family}/brutos/{year}/{month}/{day}/{hour:02}/{filename}"
+    ))
+}
+
+/// Exact live common inventory for RDPS temperature, relative humidity,
+/// paired wind, and geopotential height. Temperature/wind/height extend to
+/// 1 and 5 hPa, but RH starts at 10 hPa, so the five-field canonical bundle
+/// starts there.
+const RDPS_COMMON_ISOBARIC_LEVELS_HPA: &[u16] = &[
+    10, 20, 30, 50, 100, 150, 175, 200, 225, 250, 275, 300, 350, 400, 450, 500, 550, 600, 650, 700,
+    750, 800, 850, 875, 900, 925, 950, 970, 985, 1000, 1015,
+];
+
+/// Exact live common inventory for the same five HRDPS families. The current
+/// continental feed begins at 50 hPa; do not inherit RDPS's 10/20/30 hPa
+/// levels merely because the products share a provider and projection family.
+const HRDPS_COMMON_ISOBARIC_LEVELS_HPA: &[u16] = &[
+    50, 100, 150, 175, 200, 225, 250, 275, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800,
+    850, 875, 900, 925, 950, 970, 985, 1000, 1015,
+];
+
+pub fn rdps_isobaric_levels_hpa() -> &'static [u16] {
+    RDPS_COMMON_ISOBARIC_LEVELS_HPA
+}
+
+pub fn hrdps_isobaric_levels_hpa() -> &'static [u16] {
+    HRDPS_COMMON_ISOBARIC_LEVELS_HPA
+}
+
+fn exact_four_digit_level(product: &str, prefix: &str) -> Option<u16> {
+    let level = product.strip_prefix(prefix)?;
+    let parsed = level.parse::<u16>().ok()?;
+    (format!("{parsed:04}") == level).then_some(parsed)
+}
+
+fn rdps_component_is_supported(product: &str) -> bool {
+    const SURFACE_COMPONENTS: &[&str] = &[
+        "AirTemp_AGL-2m",
+        "DewPoint_AGL-2m",
+        "RelativeHumidity_AGL-2m",
+        "WindU_AGL-10m",
+        "WindV_AGL-10m",
+        "WindSpeed_AGL-10m",
+        "WindDir_AGL-10m",
+        "WindGust_AGL-10m",
+        "Pressure_Sfc",
+        "Pressure_MSL",
+        "Precip-Accum_Sfc",
+        "TotalCloudCover_Sfc",
+    ];
+    if SURFACE_COMPONENTS.contains(&product) {
+        return true;
+    }
+    for prefix in [
+        "AirTemp_IsbL-",
+        "RelativeHumidity_IsbL-",
+        "SpecificHumidity_IsbL-",
+        "WindU_IsbL-",
+        "WindV_IsbL-",
+        "GeopotentialHeight_IsbL-",
+    ] {
+        if exact_four_digit_level(product, prefix)
+            .is_some_and(|level| RDPS_COMMON_ISOBARIC_LEVELS_HPA.contains(&level))
+        {
+            return true;
+        }
+    }
+    exact_four_digit_level(product, "AbsoluteVorticity_IsbL-")
+        .is_some_and(|level| matches!(level, 250 | 500 | 700 | 850))
+}
+
+fn hrdps_component_is_supported(product: &str) -> bool {
+    const SURFACE_COMPONENTS: &[&str] = &[
+        "TMP_AGL-2m",
+        "DPT_AGL-2m",
+        "RH_AGL-2m",
+        "UGRD_AGL-10m",
+        "VGRD_AGL-10m",
+        "WIND_AGL-10m",
+        "WDIR_AGL-10m",
+        "GUST_AGL-10m",
+        "PRES_Sfc",
+        "PRMSL_MSL",
+        "HGT_Sfc",
+        "APCP_Sfc",
+        "TCDC_Sfc",
+    ];
+    if SURFACE_COMPONENTS.contains(&product) {
+        return true;
+    }
+    for prefix in [
+        "TMP_ISBL_",
+        "RH_ISBL_",
+        "SPFH_ISBL_",
+        "UGRD_ISBL_",
+        "VGRD_ISBL_",
+        "HGT_ISBL_",
+    ] {
+        if exact_four_digit_level(product, prefix)
+            .is_some_and(|level| HRDPS_COMMON_ISOBARIC_LEVELS_HPA.contains(&level))
+        {
+            return true;
+        }
+    }
+    exact_four_digit_level(product, "ABSV_ISBL_")
+        .is_some_and(|level| matches!(level, 250 | 500 | 700 | 850 | 1000))
+}
+
+fn build_rdps_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Eccc {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "RDPS publishes hourly f000-f084 for 00Z/06Z/12Z/18Z cycles".to_string(),
+        });
+    }
+    let product = match request.product.as_str() {
+        "rws-surface" | "rws-sounding" => "AirTemp_AGL-2m",
+        "rws-pressure" => "AirTemp_IsbL-0500",
+        product if rdps_component_is_supported(product) => product,
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    Ok(format!(
+        "https://dd.weather.gc.ca/today/model_rdps/10km/{:02}/{:03}/{}T{:02}Z_MSC_RDPS_{}_RLatLon0.09_PT{:03}H.grib2",
+        request.cycle.hour_utc,
+        request.forecast_hour,
+        request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
+        product,
+        request.forecast_hour,
+    ))
+}
+
+fn build_hrdps_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Eccc {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "HRDPS publishes hourly f000-f048 for 00Z/06Z/12Z/18Z cycles".to_string(),
+        });
+    }
+    let product = match request.product.as_str() {
+        "rws-surface" | "rws-sounding" => "TMP_AGL-2m",
+        "rws-pressure" => "TMP_ISBL_0500",
+        product if hrdps_component_is_supported(product) => product,
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    Ok(format!(
+        "https://dd.weather.gc.ca/today/model_hrdps/continental/2.5km/{:02}/{:03}/{}T{:02}Z_MSC_HRDPS_{}_RLatLon0.0225_PT{:03}H.grib2",
+        request.cycle.hour_utc,
+        request.forecast_hour,
+        request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
+        product,
+        request.forecast_hour,
+    ))
+}
+
+/// Exact REPS provider-statistics objects normalized by RWS. These scalar
+/// products contain percentile, spread, mean, minimum, maximum, and (for
+/// precipitation) threshold-probability messages. Raw control/perturbed
+/// member objects and grid-relative U/V objects are deliberately absent.
+const REPS_PROVIDER_STATISTIC_COMPONENTS: &[&str] = &[
+    "TMP-Prob_AGL-2m",
+    "WIND-Prob_AGL-10m",
+    "TPRATE-Accum3h-Prob_SFC",
+];
+
+pub fn reps_provider_statistic_components() -> &'static [&'static str] {
+    REPS_PROVIDER_STATISTIC_COMPONENTS
+}
+
+fn build_reps_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Eccc {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "REPS provider-statistics objects are published every three hours from f003 through f072 for 00Z/06Z/12Z/18Z cycles; f000 currently contains raw-member objects but no provider-statistics objects"
+                .to_string(),
+        });
+    }
+    let component = match request.product.as_str() {
+        "rws-reps-provider-statistics" => "TMP-Prob_AGL-2m",
+        component if REPS_PROVIDER_STATISTIC_COMPONENTS.contains(&component) => component,
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    Ok(format!(
+        "https://dd.weather.gc.ca/today/ensemble/reps/10km/grib2/{:02}/{:03}/{}T{:02}Z_MSC_REPS_{}_RLatLon0.09x0.09_PT{:03}H.grib2",
+        request.cycle.hour_utc,
+        request.forecast_hour,
+        request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
+        component,
+        request.forecast_hour,
+    ))
+}
+
+const ICON_EU_REGULAR_ISOBARIC_LEVELS_HPA: &[u16] = &[
+    50, 70, 100, 150, 200, 250, 300, 400, 500, 600, 700, 775, 800, 825, 850, 875, 900, 925, 950,
+    1000,
+];
+const ICON_D2_REGULAR_ISOBARIC_LEVELS_HPA: &[u16] =
+    &[200, 250, 300, 400, 500, 600, 700, 850, 950, 975, 1000];
+
+pub fn icon_eu_regular_isobaric_levels_hpa() -> &'static [u16] {
+    ICON_EU_REGULAR_ISOBARIC_LEVELS_HPA
+}
+
+pub fn icon_d2_regular_isobaric_levels_hpa() -> &'static [u16] {
+    ICON_D2_REGULAR_ISOBARIC_LEVELS_HPA
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DwdIconComponent {
+    Surface {
+        directory: &'static str,
+        eu_token: &'static str,
+        d2_token: &'static str,
+        time_invariant: bool,
+    },
+    Pressure {
+        directory: &'static str,
+        eu_token: &'static str,
+        d2_token: &'static str,
+        level_hpa: u16,
+    },
+}
+
+fn dwd_icon_surface_component(product: &str) -> Option<DwdIconComponent> {
+    let (directory, eu_token, d2_token, time_invariant) = match product {
+        "dwd-surface-t2m" => ("t_2m", "T_2M", "t_2m", false),
+        "dwd-surface-td2m" => ("td_2m", "TD_2M", "td_2m", false),
+        "dwd-surface-rh2m" => ("relhum_2m", "RELHUM_2M", "relhum_2m", false),
+        "dwd-surface-u10m" => ("u_10m", "U_10M", "u_10m", false),
+        "dwd-surface-v10m" => ("v_10m", "V_10M", "v_10m", false),
+        "dwd-surface-pmsl" => ("pmsl", "PMSL", "pmsl", false),
+        "dwd-surface-ps" => ("ps", "PS", "ps", false),
+        "dwd-surface-hsurf" => ("hsurf", "HSURF", "hsurf", true),
+        "dwd-surface-tot-prec" => ("tot_prec", "TOT_PREC", "tot_prec", false),
+        _ => return None,
+    };
+    Some(DwdIconComponent::Surface {
+        directory,
+        eu_token,
+        d2_token,
+        time_invariant,
+    })
+}
+
+fn dwd_icon_pressure_component(model: ModelId, product: &str) -> Option<DwdIconComponent> {
+    let remainder = product.strip_prefix("dwd-pressure-")?;
+    let (family, level) = remainder.rsplit_once('-')?;
+    if level.len() != 4 || !level.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let level_hpa = level.parse::<u16>().ok()?;
+    let levels = match model {
+        ModelId::IconEu => ICON_EU_REGULAR_ISOBARIC_LEVELS_HPA,
+        ModelId::IconD2 => ICON_D2_REGULAR_ISOBARIC_LEVELS_HPA,
+        _ => return None,
+    };
+    if !levels.contains(&level_hpa) || format!("{level_hpa:04}") != level {
+        return None;
+    }
+    let (directory, eu_token, d2_token) = match family {
+        "t" => ("t", "T", "t"),
+        "rh" => ("relhum", "RELHUM", "relhum"),
+        "u" => ("u", "U", "u"),
+        "v" => ("v", "V", "v"),
+        "fi" => ("fi", "FI", "fi"),
+        _ => return None,
+    };
+    Some(DwdIconComponent::Pressure {
+        directory,
+        eu_token,
+        d2_token,
+        level_hpa,
+    })
+}
+
+fn build_dwd_icon_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Dwd {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        let reason = match request.model {
+            ModelId::IconEu => {
+                "ICON-EU regular-grid main cycles are hourly f000-f078 then three-hourly f081-f120; 03/09/15/21Z cycles are hourly f000-f030 then f036/f042/f048"
+            }
+            ModelId::IconD2 => {
+                "ICON-D2 regular-grid cycles are hourly f000-f048 at 00/03/06/09/12/15/18/21Z"
+            }
+            _ => "request is not a DWD ICON regular-grid model",
+        };
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: reason.to_string(),
+        });
+    }
+
+    let component = match request.product.as_str() {
+        "rws-surface" | "rws-sounding" => {
+            dwd_icon_surface_component("dwd-surface-t2m").expect("static probe component")
+        }
+        "rws-pressure" => dwd_icon_pressure_component(request.model, "dwd-pressure-t-0500")
+            .expect("500 hPa is available from both DWD regular-grid models"),
+        product => dwd_icon_surface_component(product)
+            .or_else(|| dwd_icon_pressure_component(request.model, product))
+            .ok_or_else(|| ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            })?,
+    };
+
+    let cycle = format!(
+        "{}{:02}",
+        request.cycle.date_yyyymmdd, request.cycle.hour_utc
+    );
+    let lead = request.forecast_hour;
+    let cycle_hour = request.cycle.hour_utc;
+    let url = match (request.model, component) {
+        (
+            ModelId::IconEu,
+            DwdIconComponent::Surface {
+                directory,
+                eu_token,
+                time_invariant: true,
+                ..
+            },
+        ) => format!(
+            "https://opendata.dwd.de/weather/nwp/icon-eu/grib/{cycle_hour:02}/{directory}/icon-eu_europe_regular-lat-lon_time-invariant_{cycle}_{eu_token}.grib2.bz2"
+        ),
+        (
+            ModelId::IconEu,
+            DwdIconComponent::Surface {
+                directory,
+                eu_token,
+                time_invariant: false,
+                ..
+            },
+        ) => format!(
+            "https://opendata.dwd.de/weather/nwp/icon-eu/grib/{cycle_hour:02}/{directory}/icon-eu_europe_regular-lat-lon_single-level_{cycle}_{lead:03}_{eu_token}.grib2.bz2"
+        ),
+        (
+            ModelId::IconEu,
+            DwdIconComponent::Pressure {
+                directory,
+                eu_token,
+                level_hpa,
+                ..
+            },
+        ) => format!(
+            "https://opendata.dwd.de/weather/nwp/icon-eu/grib/{cycle_hour:02}/{directory}/icon-eu_europe_regular-lat-lon_pressure-level_{cycle}_{lead:03}_{level_hpa}_{eu_token}.grib2.bz2"
+        ),
+        (
+            ModelId::IconD2,
+            DwdIconComponent::Surface {
+                directory,
+                d2_token,
+                time_invariant: true,
+                ..
+            },
+        ) => format!(
+            "https://opendata.dwd.de/weather/nwp/icon-d2/grib/{cycle_hour:02}/{directory}/icon-d2_germany_regular-lat-lon_time-invariant_{cycle}_000_0_{d2_token}.grib2.bz2"
+        ),
+        (
+            ModelId::IconD2,
+            DwdIconComponent::Surface {
+                directory,
+                d2_token,
+                time_invariant: false,
+                ..
+            },
+        ) => format!(
+            "https://opendata.dwd.de/weather/nwp/icon-d2/grib/{cycle_hour:02}/{directory}/icon-d2_germany_regular-lat-lon_single-level_{cycle}_{lead:03}_2d_{d2_token}.grib2.bz2"
+        ),
+        (
+            ModelId::IconD2,
+            DwdIconComponent::Pressure {
+                directory,
+                d2_token,
+                level_hpa,
+                ..
+            },
+        ) => format!(
+            "https://opendata.dwd.de/weather/nwp/icon-d2/grib/{cycle_hour:02}/{directory}/icon-d2_germany_regular-lat-lon_pressure-level_{cycle}_{lead:03}_{level_hpa}_{d2_token}.grib2.bz2"
+        ),
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    Ok(url)
+}
+
+/// Exact isobaric coordinate advertised and observed in the ICON-Ru WIS2
+/// bulletin inventory. Relative humidity omits 250 hPa; the other canonical
+/// sounding families publish every level in this list.
+const ICON_RU_ISOBARIC_LEVELS_HPA: &[u16] = &[250, 500, 700, 850, 925];
+
+pub fn icon_ru_isobaric_levels_hpa() -> &'static [u16] {
+    ICON_RU_ISOBARIC_LEVELS_HPA
+}
+
+fn icon_ru_lead_letter(forecast_hour: u16) -> Option<char> {
+    if !(3..=72).contains(&forecast_hour) || forecast_hour % 3 != 0 {
+        return None;
+    }
+    let step = u8::try_from(forecast_hour / 3).ok()?;
+    Some(char::from(b'A'.checked_add(step)?))
+}
+
+fn icon_ru_precip_designator(forecast_hour: u16) -> Option<(char, &'static str)> {
+    match forecast_hour {
+        1..=24 => Some((
+            char::from(b'B'.checked_add(u8::try_from(forecast_hour - 1).ok()?)?),
+            "RUMS",
+        )),
+        25..=48 => Some((
+            char::from(b'B'.checked_add(u8::try_from(forecast_hour - 25).ok()?)?),
+            "RUMC",
+        )),
+        51..=72 if forecast_hour % 3 == 0 => Some((icon_ru_lead_letter(forecast_hour)?, "RUWC")),
+        _ => None,
+    }
+}
+
+fn icon_ru_level_code(level_hpa: u16) -> Option<u8> {
+    match level_hpa {
+        250 => Some(25),
+        500 => Some(50),
+        700 => Some(70),
+        850 => Some(85),
+        925 => Some(92),
+        _ => None,
+    }
+}
+
+fn icon_ru_object_stem(
+    cycle: &CycleSpec,
+    family: char,
+    lead: char,
+    level_code: u8,
+    bulletin_centre: &str,
+) -> String {
+    let day = &cycle.date_yyyymmdd[6..8];
+    format!(
+        "A_Y{family}R{lead}{level_code:02}{bulletin_centre}{day}{:02}00_C_RUMS_{}{:02}0000",
+        cycle.hour_utc, cycle.date_yyyymmdd, cycle.hour_utc
+    )
+}
+
+/// Exact, bounded WIS2 object inventory needed for one normalized RWS family.
+/// Component strings are complete object stems, not user-controlled path
+/// fragments. The URL builder accepts only stems regenerated by this helper.
+pub fn icon_ru_component_products(
+    cycle: &CycleSpec,
+    forecast_hour: u16,
+    logical_product: &str,
+) -> Result<Vec<String>, ModelError> {
+    if !forecast_hour_supported(ModelId::IconRu, cycle.hour_utc, forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: ModelId::IconRu,
+            cycle_hour: cycle.hour_utc,
+            forecast_hour,
+            reason:
+                "ICON-Ru WIS2 publishes 00Z/12Z cycles every three hours from f003 through f072"
+                    .to_string(),
+        });
+    }
+    let lead = icon_ru_lead_letter(forecast_hour).expect("supported ICON-Ru lead");
+    let mut components = Vec::new();
+    match logical_product {
+        "rws-pressure" => {
+            for &level_hpa in ICON_RU_ISOBARIC_LEVELS_HPA {
+                let level_code = icon_ru_level_code(level_hpa).expect("pinned ICON-Ru level");
+                for family in ['T', 'U', 'V', 'H'] {
+                    components.push(icon_ru_object_stem(cycle, family, lead, level_code, "RUMS"));
+                }
+                if level_hpa != 250 {
+                    components.push(icon_ru_object_stem(cycle, 'R', lead, level_code, "RUMS"));
+                }
+            }
+        }
+        "rws-surface" | "rws-sounding" => {
+            // Canonical fields only. The feed also publishes convective
+            // precipitation, min/max temperature, CAPE, precipitation type,
+            // divergence, and relative vorticity, but RWS has no matching
+            // canonical selector for those semantics today.
+            for (family, level_code) in [
+                ('T', 98), // 2 m temperature
+                ('Q', 98), // 2 m dewpoint
+                ('U', 98), // 10 m U
+                ('V', 98), // 10 m V
+                ('P', 89), // MSLP
+                ('W', 98), // trailing 3 h wind gust maximum
+                ('B', 0),  // total cloud
+                ('L', 85), // low cloud
+                ('F', 50), // middle cloud
+            ] {
+                components.push(icon_ru_object_stem(cycle, family, lead, level_code, "RUMS"));
+            }
+            let (precip_lead, precip_centre) = icon_ru_precip_designator(forecast_hour)
+                .expect("supported ICON-Ru forecast has precipitation");
+            components.push(icon_ru_object_stem(
+                cycle,
+                'E',
+                precip_lead,
+                98,
+                precip_centre,
+            ));
+        }
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: ModelId::IconRu,
+                product: logical_product.to_string(),
+            });
+        }
+    }
+    Ok(components)
+}
+
+fn build_icon_ru_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason:
+                "ICON-Ru WIS2 publishes 00Z/12Z cycles every three hours from f003 through f072"
+                    .to_string(),
+        });
+    }
+
+    let product = match request.product.as_str() {
+        "rws-surface" | "rws-sounding" => {
+            icon_ru_component_products(&request.cycle, request.forecast_hour, "rws-surface")?
+                .into_iter()
+                .next()
+                .expect("surface component inventory is non-empty")
+        }
+        "rws-pressure" => {
+            icon_ru_component_products(&request.cycle, request.forecast_hour, "rws-pressure")?
+                .into_iter()
+                .next()
+                .expect("pressure component inventory is non-empty")
+        }
+        candidate => {
+            let allowed = ["rws-surface", "rws-pressure"]
+                .into_iter()
+                .flat_map(|logical| {
+                    icon_ru_component_products(&request.cycle, request.forecast_hour, logical)
+                        .expect("validated ICON-Ru cycle/hour")
+                })
+                .any(|allowed| allowed == candidate);
+            if !allowed {
+                return Err(ModelError::UnsupportedProduct {
+                    model: request.model,
+                    product: request.product.clone(),
+                });
+            }
+            candidate.to_string()
+        }
+    };
+
+    Ok(match source {
+        SourceId::RoshydrometWis2Cache => format!(
+            "https://wis2globalcache.s3.amazonaws.com/data/ru-roshydromet/data/core/weather/prediction/forecast/short-range/deterministic/limited-area/{product}.grib2"
+        ),
+        SourceId::RoshydrometWis2Origin => format!(
+            "http://wis2box.mecom.ru/data/{}-{}-{}/wis/urn:wmo:md:ru-roshydromet:wipps-dc.forecast.short-range.deterministic.limited-area.icon/{product}.grib2",
+            &request.cycle.date_yyyymmdd[..4],
+            &request.cycle.date_yyyymmdd[4..6],
+            &request.cycle.date_yyyymmdd[6..8],
+        ),
+        other => unsupported_source(other, request.model),
+    })
+}
+
+/// Provider-published GEPS statistical files currently normalized by the RWS
+/// lane. Every token is a complete filename identity between `geps-prob_` and
+/// `_latlon...`; keeping this allowlist exact prevents arbitrary path or raw
+/// member access through the product string.
+const GEPS_PUBLISHED_STATISTIC_COMPONENTS: &[&str] = &[
+    "GUST-Max-3h_TGL_10m",
+    "GUST-Max-6h_TGL_10m",
+    "HGT_ISBL_0500",
+    "PRMSL_MSL_0",
+    "TCDC_SFC_0",
+    "TEMP_ISBL_0850",
+    "TEMP_TGL_2m",
+    "TEMP-Max-24h_TGL_2m",
+    "TEMP-Min-24h_TGL_2m",
+    "TPRATE-Accum-6h_SFC_0",
+    "WIND_ISBL_0250",
+    "WIND_ISBL_0850",
+    "WIND_TGL_10m",
+];
+
+pub fn geps_published_statistic_components() -> &'static [&'static str] {
+    GEPS_PUBLISHED_STATISTIC_COMPONENTS
+}
+
+fn build_geps_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Eccc {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "GEPS published products run at 00Z/12Z every 3 hours through f192 and every 6 hours from f198 through f384; the twice-weekly f936 extension is not yet scheduled by RWS"
+                .to_string(),
+        });
+    }
+    let component = match request.product.as_str() {
+        "rws-published-statistics" => "TEMP_TGL_2m",
+        component if GEPS_PUBLISHED_STATISTIC_COMPONENTS.contains(&component) => component,
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    Ok(format!(
+        "https://dd.weather.gc.ca/today/ensemble/geps/grib2/products/{:02}/{:03}/CMC_geps-prob_{}_latlon0p5x0p5_{}{:02}_P{:03}_all-products.grib2",
+        request.cycle.hour_utc,
+        request.forecast_hour,
+        component,
+        request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
+        request.forecast_hour,
+    ))
+}
+
 fn build_gdas_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
     if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
         return Err(ModelError::UnsupportedForecastHour {
@@ -6907,7 +8400,7 @@ fn build_gefs_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
             model: request.model,
             cycle_hour: request.cycle.hour_utc,
             forecast_hour: request.forecast_hour,
-            reason: "GEFS pgrb2ap5 fields are expected every 3 hours through f384".to_string(),
+            reason: "GEFS pgrb2ap5 fields are 3-hourly through f240, 6-hourly through f384, and the 00z cycle continues 6-hourly through f840".to_string(),
         });
     }
     let product = gefs_product_from_product(&request.product)?;
@@ -7078,6 +8571,15 @@ fn build_aigfs_url(source: SourceId, request: &ModelRunRequest) -> Result<String
     if source != SourceId::Nomads {
         return Ok(unsupported_source(source, request.model));
     }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "AIGFS publishes 6-hourly steps from f000 through f384 on 00/06/12/18z cycles"
+                .to_string(),
+        });
+    }
     let family = match normalize_token(&request.product).as_str() {
         "sfc" | "surface" => "sfc",
         "pres" | "pressure" | "pgrb" | "pgrb2" => "pres",
@@ -7101,6 +8603,15 @@ fn build_aigfs_url(source: SourceId, request: &ModelRunRequest) -> Result<String
 fn build_aigefs_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
     if source != SourceId::Nomads {
         return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "the paired AIGEFS pressure/surface mean ingest publishes 6-hourly steps from f006 through f384 on 00/06/12/18z cycles"
+                .to_string(),
+        });
     }
     let token = normalize_token(&request.product);
     let family = if token.contains("pres") || token.contains("pressure") {
@@ -7126,6 +8637,15 @@ fn build_aigefs_url(source: SourceId, request: &ModelRunRequest) -> Result<Strin
 fn build_hgefs_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
     if source != SourceId::Nomads {
         return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "HGEFS mean products publish 6-hourly steps from f000 through f240 on 00/06/12/18z cycles"
+                .to_string(),
+        });
     }
     let token = normalize_token(&request.product);
     let family = if token.contains("pres") || token.contains("pressure") {
@@ -7766,6 +9286,53 @@ fn plot_recipe_field_blocker(
     field: &'static GribFieldSpec,
     model: ModelId,
 ) -> Option<PlotRecipeBlocker> {
+    if model == ModelId::Geps {
+        return Some(PlotRecipeBlocker {
+            field_key: field.key,
+            field_label: field.label,
+            reason: format!(
+                "{} for GEPS is available only as explicitly typed provider-published statistics through normalized RWS ingest/query; direct plot acquisition cannot imply a deterministic or raw-member field from that component bundle",
+                field.label,
+            ),
+        });
+    }
+    // These providers publish one object per field/level. The normalized RWS
+    // ingest path assembles those bounded component bundles, but the legacy
+    // direct-GRIB plot path still assumes one family URL. Keep that path
+    // explicitly blocked instead of fetching only the representative probe
+    // object and silently rendering an incomplete field set.
+    if matches!(
+        model,
+        ModelId::Gdps
+            | ModelId::GdpsGeml
+            | ModelId::CmaGeps
+            | ModelId::Rdps
+            | ModelId::Hrdps
+            | ModelId::Reps
+            | ModelId::IconEu
+            | ModelId::IconD2
+            | ModelId::IconRu
+    ) {
+        let provider = match model {
+            ModelId::Gdps | ModelId::GdpsGeml | ModelId::Rdps | ModelId::Hrdps => {
+                "ECCC Datamart per-field component bundle"
+            }
+            ModelId::CmaGeps => "CMA WIS2 provider-specific acquisition contract",
+            ModelId::Reps => "ECCC REPS provider-statistics component bundle",
+            ModelId::IconEu => "DWD ICON-EU Open Data per-field component bundle",
+            ModelId::IconD2 => "DWD ICON-D2 Open Data per-field component bundle",
+            ModelId::IconRu => "Roshydromet WIS2 per-bulletin component bundle",
+            _ => unreachable!(),
+        };
+        return Some(PlotRecipeBlocker {
+            field_key: field.key,
+            field_label: field.label,
+            reason: format!(
+                "{} for {provider} is available through normalized RWS ingest/query; the legacy direct plot path does not assemble that acquisition contract",
+                field.label,
+            ),
+        });
+    }
     if field.family == ProductFamily::Native {
         if let Some(reason) = native_field_gap_reason(field, model) {
             return Some(PlotRecipeBlocker {
@@ -7865,6 +9432,33 @@ fn plot_recipe_fetch_defaults(
         (ModelId::HrrrAk, false, true) => ("sfc", PlotRecipeFetchPolicy::PreferIndexedSubset),
         (ModelId::HrrrAk, false, false) => ("prs", PlotRecipeFetchPolicy::PreferIndexedSubset),
         (ModelId::Gfs, _, _) => ("pgrb2.0p25", PlotRecipeFetchPolicy::PreferIndexedSubset),
+        (ModelId::Gdps, _, true) => ("rws-surface", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::Gdps, _, false) => ("rws-pressure", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::GdpsGeml, _, true) => ("rws-surface", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::GdpsGeml, _, false) => ("rws-pressure", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::CmaGeps, _, _) => ("stats", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::Rdps | ModelId::Hrdps, _, true) => {
+            ("rws-surface", PlotRecipeFetchPolicy::WholeFile)
+        }
+        (ModelId::Rdps | ModelId::Hrdps, _, false) => {
+            ("rws-pressure", PlotRecipeFetchPolicy::WholeFile)
+        }
+        (ModelId::Reps, _, _) => (
+            "rws-reps-provider-statistics",
+            PlotRecipeFetchPolicy::WholeFile,
+        ),
+        (ModelId::IconEu | ModelId::IconD2, _, true) => {
+            ("rws-surface", PlotRecipeFetchPolicy::WholeFile)
+        }
+        (ModelId::IconEu | ModelId::IconD2, _, false) => {
+            ("rws-pressure", PlotRecipeFetchPolicy::WholeFile)
+        }
+        (ModelId::IconRu, _, true) => ("rws-surface", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::IconRu, _, false) => ("rws-pressure", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::Geps, _, _) => ("rws-published-statistics", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::WrfCptec7km | ModelId::BramsCptec8km, _, _) => {
+            ("raw", PlotRecipeFetchPolicy::PreferIndexedSubset)
+        }
         (ModelId::Gdas, _, _) => ("pgrb2.0p25", PlotRecipeFetchPolicy::PreferIndexedSubset),
         (ModelId::Gefs, _, _) if has_ensemble_spread_selector => {
             ("pgrb2ap5/gespr", PlotRecipeFetchPolicy::PreferIndexedSubset)

@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use rustwx_core::GridProjection;
+use rustwx_core::{GridProjection, MAX_GRID_CELLS};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -73,8 +73,8 @@ pub struct GeographicWindowLimits {
 impl Default for GeographicWindowLimits {
     fn default() -> Self {
         Self {
-            max_native_cells: 250_000,
-            max_output_values: 2_000_000,
+            max_native_cells: MAX_GRID_CELLS,
+            max_output_values: usize::MAX,
         }
     }
 }
@@ -148,7 +148,10 @@ struct ValidatedBounds {
     longitude_span: f64,
 }
 
-/// Extract a geographic domain with conservative default output budgets.
+/// Extract a geographic domain without an implicit operational output cap.
+/// Shape arithmetic and every result vector allocation remain checked and
+/// fallible; servers use [`query_geographic_window_with_cancel`] with explicit
+/// admission budgets.
 pub fn query_geographic_window(
     snapshot: &RunSnapshot,
     request: &GeographicWindowRequest,
@@ -400,9 +403,9 @@ fn validate_vertical(vertical: &GeographicVerticalSelection) -> QueryResult<Opti
     match vertical {
         GeographicVerticalSelection::Surface2d => Ok(None),
         GeographicVerticalSelection::PressureLevels { levels_hpa } => {
-            if levels_hpa.is_empty() || levels_hpa.len() > 256 {
+            if levels_hpa.is_empty() {
                 return Err(QueryError::InvalidRequest(
-                    "pressure geographic windows require 1..=256 explicit levels".into(),
+                    "pressure geographic windows require at least one explicit level".into(),
                 ));
             }
             let mut unique = BTreeSet::new();
@@ -571,5 +574,17 @@ mod tests {
         ] {
             assert!(validate_bbox(bbox).is_err());
         }
+    }
+
+    #[test]
+    fn every_physical_pressure_level_can_be_requested_without_a_hidden_count_cap() {
+        let levels_hpa = (1..=1_200).collect::<Vec<u16>>();
+        assert_eq!(
+            validate_vertical(&GeographicVerticalSelection::PressureLevels {
+                levels_hpa: levels_hpa.clone(),
+            })
+            .unwrap(),
+            Some(levels_hpa)
+        );
     }
 }

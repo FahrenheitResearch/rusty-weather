@@ -78,6 +78,12 @@ impl StoreCatalog {
                     limit: self.limits.max_catalog_entries,
                 });
             }
+            models
+                .try_reserve(1)
+                .map_err(|error| QueryError::Allocation {
+                    what: "catalog model list",
+                    detail: error.to_string(),
+                })?;
             models.push(ModelCatalogEntry {
                 run_count: self.count_runs(&entry.path(), &mut remaining)?,
                 model,
@@ -141,6 +147,11 @@ impl StoreCatalog {
                     limit: self.limits.max_catalog_entries,
                 });
             }
+            runs.try_reserve(1)
+                .map_err(|error| QueryError::Allocation {
+                    what: "catalog run list",
+                    detail: error.to_string(),
+                })?;
             runs.push(RunCatalogEntry {
                 run: snapshot.descriptor().clone(),
                 variable_count,
