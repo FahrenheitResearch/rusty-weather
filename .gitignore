@@ -11,6 +11,9 @@
 /work/
 vendor/*/target/
 vendor/*/Cargo.lock
+# The CI-gated decoder crates pin their dependency resolution.
+!vendor/grib-core/Cargo.lock
+!vendor/wx-core/Cargo.lock
 crates/rustwx-render/verify/Cargo.lock
 *.tmp
 .cargo/
