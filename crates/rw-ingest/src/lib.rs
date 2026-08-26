@@ -315,6 +315,12 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
             pressure_source: true,
             idx_patterns: CPTEC_BRAMS_8KM_IDX_PATTERNS,
         }]),
+        ModelId::EtaCptec8km => Ok(vec![ProductFetch {
+            product: "raw",
+            surface_source: true,
+            pressure_source: true,
+            idx_patterns: CPTEC_ETA_8KM_IDX_PATTERNS,
+        }]),
         ModelId::Gefs => Ok(vec![ProductFetch {
             product: "pgrb2ap5/gec00",
             surface_source: true,
@@ -536,6 +542,26 @@ const CPTEC_BRAMS_8KM_IDX_PATTERNS: &[&str] = &[
     "UGRD",
     "VGRD",
     "DPT:2 m above ground",
+    "PRES:surface",
+    "PRMSL:mean sea level",
+    "APCP:surface",
+];
+
+/// Canonical, unambiguous fields in CPTEC's operational Eta South America
+/// 8 km inventory. Exact level substrings deliberately exclude 100 m winds,
+/// surface-labelled PWAT/cloud fields, and three undocumented local-table
+/// parameters. Eta publishes no surface-orography message in each lead.
+const CPTEC_ETA_8KM_IDX_PATTERNS: &[&str] = &[
+    "HGT:mb",
+    "TMP:mb",
+    "RH:mb",
+    "UGRD:mb",
+    "VGRD:mb",
+    "TMP:2 m above ground",
+    "DPT:2 m above ground",
+    "RH:2 m above ground",
+    "UGRD:10 m above ground",
+    "VGRD:10 m above ground",
     "PRES:surface",
     "PRMSL:mean sea level",
     "APCP:surface",
@@ -825,7 +851,9 @@ pub fn validate_ingest_profile_for_model(
     }
     if matches!(
         model,
-        rustwx_core::ModelId::WrfCptec7km | rustwx_core::ModelId::BramsCptec8km
+        rustwx_core::ModelId::WrfCptec7km
+            | rustwx_core::ModelId::BramsCptec8km
+            | rustwx_core::ModelId::EtaCptec8km
     ) && (profile.derived || profile.heavy)
     {
         return Err(events::other(format!(
@@ -1008,7 +1036,9 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
             IngestCapabilityLimitation::DerivedProductsDisabled,
             IngestCapabilityLimitation::ExtendedRangeNotScheduled,
         ],
-        rustwx_core::ModelId::WrfCptec7km | rustwx_core::ModelId::BramsCptec8km => vec![
+        rustwx_core::ModelId::WrfCptec7km
+        | rustwx_core::ModelId::BramsCptec8km
+        | rustwx_core::ModelId::EtaCptec8km => vec![
             IngestCapabilityLimitation::SparsePressureLevels,
             IngestCapabilityLimitation::DerivedProductsDisabled,
         ],
@@ -1039,6 +1069,7 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 | rustwx_core::ModelId::IconD2
                 | rustwx_core::ModelId::WrfCptec7km
                 | rustwx_core::ModelId::BramsCptec8km => IngestVerificationLevel::LiveVerified,
+                rustwx_core::ModelId::EtaCptec8km => IngestVerificationLevel::FixtureVerified,
                 rustwx_core::ModelId::HrrrAk
                 | rustwx_core::ModelId::Gdas
                 | rustwx_core::ModelId::Nbm
@@ -1159,6 +1190,7 @@ mod tests {
             ModelId::Geps,
             ModelId::WrfCptec7km,
             ModelId::BramsCptec8km,
+            ModelId::EtaCptec8km,
             ModelId::Gdas,
             ModelId::Gefs,
             ModelId::Aigfs,
@@ -1274,12 +1306,23 @@ mod tests {
             );
         }
 
-        for model in [ModelId::WrfCptec7km, ModelId::BramsCptec8km] {
+        for model in [
+            ModelId::WrfCptec7km,
+            ModelId::BramsCptec8km,
+            ModelId::EtaCptec8km,
+        ] {
             let capability = model_ingest_capability(model);
             assert_eq!(capability.status, IngestSupportStatus::Ready);
             assert_eq!(
                 capability.verification,
-                IngestVerificationLevel::LiveVerified
+                if model == ModelId::EtaCptec8km {
+                    // Eta's pinned provider inventory and template-5.3
+                    // decoder goldens are reproducible against the live
+                    // publication, but no store round trip is recorded here.
+                    IngestVerificationLevel::FixtureVerified
+                } else {
+                    IngestVerificationLevel::LiveVerified
+                }
             );
             assert_eq!(capability.products.len(), 1);
             assert_eq!(capability.products[0].product, "raw");
@@ -1475,6 +1518,7 @@ mod tests {
                 ModelId::Geps,
                 ModelId::WrfCptec7km,
                 ModelId::BramsCptec8km,
+                ModelId::EtaCptec8km,
                 ModelId::Gdas,
                 ModelId::Gefs,
                 ModelId::Aigfs,
@@ -1764,31 +1808,48 @@ mod tests {
             50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 775, 800,
             825, 850, 875, 900, 925, 950, 975, 1000,
         ];
+        let eta_levels = vec![
+            50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850,
+            900, 925, 950, 1000,
+        ];
         let cases = [
             (
                 ModelId::WrfCptec7km,
                 CPTEC_WRF_7KM_IDX_PATTERNS,
                 include_str!("../tests/fixtures/wrf-cptec-7km.20260814.t00z.f001.inv"),
                 305,
+                levels.as_slice(),
             ),
             (
                 ModelId::BramsCptec8km,
                 CPTEC_BRAMS_8KM_IDX_PATTERNS,
                 include_str!("../tests/fixtures/brams-cptec-8km.20260813.t00z.f001.inv"),
                 268,
+                levels.as_slice(),
+            ),
+            (
+                ModelId::EtaCptec8km,
+                CPTEC_ETA_8KM_IDX_PATTERNS,
+                include_str!("../tests/fixtures/eta-cptec-8km.20260814.t00z.f001.inv"),
+                258,
+                eta_levels.as_slice(),
             ),
         ];
-        for (model, patterns, inventory, line_count) in cases {
+        for (model, patterns, inventory, line_count, expected_levels) in cases {
             assert_inventory_identity(
                 inventory,
                 line_count,
-                if model == ModelId::WrfCptec7km {
-                    "d=2026081400"
-                } else {
+                if model == ModelId::BramsCptec8km {
                     "d=2026081300"
+                } else {
+                    "d=2026081400"
                 },
             );
-            assert_eq!(pressure_levels(inventory, "TMP", 0), levels, "{model}");
+            assert_eq!(
+                pressure_levels(inventory, "TMP", 0),
+                expected_levels,
+                "{model}"
+            );
             let plan = fetch_plan(model).expect("CPTEC indexed plan");
             assert_eq!(plan.len(), 1, "{model}");
             assert_eq!(plan[0].product, "raw", "{model}");
@@ -1815,6 +1876,61 @@ mod tests {
                 .iter()
                 .any(|pattern| pattern.starts_with("PWAT"))
         );
+
+        let eta = cases[2].2;
+        assert!(idx_has_row(eta, "TMP", "1020 mb"));
+        assert_eq!(
+            pressure_levels(eta, "TMP", 0).len(),
+            21,
+            "the provider's 1020 hPa plane stays pinned in the fixture but outside the canonical <=1000 hPa volume"
+        );
+        for local in [
+            "parmcat=2 parm=238",
+            "parmcat=2 parm=239",
+            "parmcat=0 parm=194",
+        ] {
+            assert!(eta.contains(local), "Eta fixture must preserve {local}");
+        }
+        assert!(eta.contains(":PWAT:surface:"));
+        assert!(eta.contains(":LCDC:surface:"));
+        for excluded in ["var discipline=", "PWAT", "LCDC", "MCDC", "HCDC"] {
+            assert!(
+                !CPTEC_ETA_8KM_IDX_PATTERNS
+                    .iter()
+                    .any(|pattern| pattern.starts_with(excluded)),
+                "Eta ambiguous field {excluded} must remain fail-closed"
+            );
+        }
+
+        let control = include_str!("../tests/fixtures/eta-cptec-8km.20260814.t00z.ctl");
+        for contract in [
+            "ydef 931 linear -55.000000 0.08",
+            "xdef 875 linear 270.000000 0.08",
+            "tdef   265 linear 00Z14Aug2026 1hr",
+            "zdef 22 levels 102000 100000 95000 92500 90000 85000 80000 75000 70000 65000 60000 55000 50000 45000 40000 35000 30000 25000 20000 15000 10000 5000",
+            "vars 46",
+        ] {
+            assert!(
+                control.contains(contract),
+                "missing Eta control contract: {contract}"
+            );
+        }
+
+        let goldens = include_str!("../tests/fixtures/eta-cptec-8km.20260814.decoder-goldens.txt");
+        for evidence in [
+            "range=1616482-2099259|bytes=482778|message_sha256=dbfc1ebdd827fef617d06fca0338c846791dbdbcee923b466e52cc782ad8e6e7",
+            "drt=5.3|order=2|missing=0|count=814625|min=255.0915985107422|max=307.7478485107422|mean=290.0166320576196",
+            "f64le_sha256=e5d6aef32c995fbe3631822a39c63edca708345f71a2454d2aed904c0e856ffb",
+            "range=7015788-7392372|bytes=376585|message_sha256=e3bf49750ad2bbc794470d611dbe8d0e24c5323cb0ad5ae3979313a59e2c6735",
+            "drt=5.3|order=2|missing=0|count=814625|min=0|max=6.888671875|mean=0.13333162546",
+            "f64le_sha256=adbb6b76f9eb6bfcc2b0fbfc0f52d82ca0e5a8081187b97e10fe8a3aa73ae835",
+            "POLICY|the text .inv is the byte-range authority; the binary .grib2.idx is never parsed as an inventory",
+        ] {
+            assert!(
+                goldens.contains(evidence),
+                "missing Eta decoder evidence: {evidence}"
+            );
+        }
 
         let time_semantics =
             include_str!("../tests/fixtures/cptec-south-america.time-semantics.txt");

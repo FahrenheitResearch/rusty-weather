@@ -321,7 +321,11 @@ fn geps_plan_pins_published_statistics_profile_and_invariant_cadence() {
 
 #[test]
 fn cptec_south_america_plans_pin_hourly_indexed_leads_and_source() {
-    for model in [ModelId::WrfCptec7km, ModelId::BramsCptec8km] {
+    for model in [
+        ModelId::WrfCptec7km,
+        ModelId::BramsCptec8km,
+        ModelId::EtaCptec8km,
+    ] {
         let profile = IngestProfile::sounding();
         let plan = JobPlan::build_with_profile_and_source(
             model,
@@ -330,18 +334,21 @@ fn cptec_south_america_plans_pin_hourly_indexed_leads_and_source() {
             Some(SourceId::Cptec),
         )
         .unwrap();
-        let expected_first = if model == ModelId::WrfCptec7km { 0 } else { 1 };
-        let expected_count = if model == ModelId::WrfCptec7km {
-            181
-        } else {
-            180
+        let (expected_first, expected_last, expected_count) = match model {
+            ModelId::WrfCptec7km => (0, 180, 181),
+            ModelId::BramsCptec8km => (1, 180, 180),
+            ModelId::EtaCptec8km => (0, 264, 265),
+            _ => unreachable!(),
         };
         assert_eq!(plan.expected_valid_times.len(), expected_count, "{model}");
         assert_eq!(
             plan.expected_valid_times.first().unwrap().forecast_hour,
             expected_first
         );
-        assert_eq!(plan.expected_valid_times.last().unwrap().forecast_hour, 180);
+        assert_eq!(
+            plan.expected_valid_times.last().unwrap().forecast_hour,
+            expected_last
+        );
         assert_eq!(plan.ingest_products.len(), 1);
         assert_eq!(plan.ingest_products[0].product, "raw");
         assert!(plan.ingest_products[0].surface_source);
@@ -693,6 +700,7 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
     assert!(expanded.contains(&ModelId::Rtma));
     assert!(expanded.contains(&ModelId::CmaGeps));
     assert!(expanded.contains(&ModelId::GdpsGeml));
+    assert!(expanded.contains(&ModelId::EtaCptec8km));
 
     let surface = scheduler_config("surface-profile", &["hiresw"]);
     let profile = surface.profile_for(ModelId::Hiresw).unwrap();
@@ -743,6 +751,11 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
     let geml = scheduler_config("gdps-geml-profile", &["gdps-geml"]);
     assert_eq!(
         geml.profile_for(ModelId::GdpsGeml).unwrap(),
+        IngestProfile::sounding()
+    );
+    let eta = scheduler_config("eta-cptec-profile", &["eta-cptec-8km"]);
+    assert_eq!(
+        eta.profile_for(ModelId::EtaCptec8km).unwrap(),
         IngestProfile::sounding()
     );
 
@@ -1417,7 +1430,7 @@ fn every_ready_model_has_a_valid_cadence_profile_and_remote_source() {
         );
         plan.validate().unwrap();
     }
-    assert_eq!(ready, 33);
+    assert_eq!(ready, 34);
 }
 
 #[test]

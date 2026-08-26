@@ -5281,7 +5281,7 @@ mod tests {
         let body = to_bytes(allowed.into_body(), 1024 * 1024).await.unwrap();
         let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let models = models.as_array().expect("models response must be an array");
-        assert_eq!(models.len(), 34);
+        assert_eq!(models.len(), 35);
         assert!(models.iter().all(|model| model["id"] != "rrfs-firewx"));
         let wrf = models
             .iter()
@@ -5430,12 +5430,23 @@ mod tests {
             "Data source: Roshydromet WIPPS Designated Centre Moscow, distributed through WIS2."
         );
 
-        for id in ["wrf-cptec-7km", "brams-cptec-8km"] {
+        for (id, max_forecast_hour) in [
+            ("wrf-cptec-7km", 180),
+            ("brams-cptec-8km", 180),
+            ("eta-cptec-8km", 264),
+        ] {
             let cptec = model(id);
             assert_eq!(cptec["ingest_status"], "ready");
-            assert_eq!(cptec["verification"], "live_verified");
+            assert_eq!(
+                cptec["verification"],
+                if id == "eta-cptec-8km" {
+                    "fixture_verified"
+                } else {
+                    "live_verified"
+                }
+            );
             assert_eq!(cptec["cycle_hours_utc"], serde_json::json!([0]));
-            assert_eq!(cptec["max_forecast_hour"], 180);
+            assert_eq!(cptec["max_forecast_hour"], max_forecast_hour);
             assert_eq!(
                 cptec["limitations"],
                 serde_json::json!(["sparse_pressure_levels", "derived_products_disabled"])

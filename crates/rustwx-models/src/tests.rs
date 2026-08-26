@@ -90,7 +90,7 @@ fn provider_probe_agent_times_out_a_stalled_response_offline() {
 
 #[test]
 fn built_in_models_are_real() {
-    assert_eq!(built_in_models().len(), 35);
+    assert_eq!(built_in_models().len(), 36);
     assert_eq!(model_summary(ModelId::Gdps).default_product, "rws-surface");
     assert_eq!(model_summary(ModelId::CmaGeps).default_product, "stats");
     assert_eq!(model_summary(ModelId::CmaGeps).max_forecast_hour, 360);
@@ -126,6 +126,8 @@ fn built_in_models_are_real() {
     assert_eq!(model_summary(ModelId::WrfCptec7km).max_forecast_hour, 180);
     assert_eq!(model_summary(ModelId::BramsCptec8km).default_product, "raw");
     assert_eq!(model_summary(ModelId::BramsCptec8km).max_forecast_hour, 180);
+    assert_eq!(model_summary(ModelId::EtaCptec8km).default_product, "raw");
+    assert_eq!(model_summary(ModelId::EtaCptec8km).max_forecast_hour, 264);
     assert_eq!(model_summary(ModelId::HrrrAk).default_product, "sfc");
     assert_eq!(model_summary(ModelId::Gdas).default_product, "pgrb2.0p25");
     assert_eq!(
@@ -189,6 +191,7 @@ fn catalog_exposes_the_user_facing_supported_models() {
         ModelId::Geps,
         ModelId::WrfCptec7km,
         ModelId::BramsCptec8km,
+        ModelId::EtaCptec8km,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -635,6 +638,7 @@ fn temperature_700_recipe_tracks_model_support() {
         ModelId::Aifs,
         ModelId::WrfCptec7km,
         ModelId::BramsCptec8km,
+        ModelId::EtaCptec8km,
         ModelId::Rap,
         ModelId::Nam,
         ModelId::Hiresw,
@@ -732,7 +736,8 @@ fn temperature_700_recipe_tracks_model_support() {
                 | ModelId::RrfsPublic
                 | ModelId::RrfsFireWx
                 | ModelId::WrfCptec7km
-                | ModelId::BramsCptec8km => {
+                | ModelId::BramsCptec8km
+                | ModelId::EtaCptec8km => {
                     assert!(reason.contains("idx subsetting can stage the GRIB messages"));
                 }
                 ModelId::Refs => {
@@ -787,6 +792,64 @@ fn dewpoint_and_700mb_recipe_blockers_are_explicit() {
             reason: "700mb Dewpoint is not present in the ECMWF open-data 'oper' pressure product currently wired by rustwx-models; use RH/TMP or add derived dewpoint support for this model".to_string(),
         }]
     );
+}
+
+#[test]
+fn cptec_eta_plot_routes_fail_closed_to_the_pinned_native_inventory() {
+    assert!(selector_supported_for_model(
+        FieldSelector::isobaric(CanonicalField::RelativeHumidity, 700),
+        ModelId::EtaCptec8km
+    ));
+    assert!(selector_supported_for_model(
+        FieldSelector::surface(CanonicalField::TotalPrecipitation),
+        ModelId::EtaCptec8km
+    ));
+    assert!(!selector_supported_for_model(
+        FieldSelector::isobaric(CanonicalField::Dewpoint, 700),
+        ModelId::EtaCptec8km
+    ));
+    assert!(!selector_supported_for_model(
+        FieldSelector::isobaric(CanonicalField::AbsoluteVorticity, 850),
+        ModelId::EtaCptec8km
+    ));
+    assert!(!selector_supported_for_model(
+        FieldSelector::entire_atmosphere(CanonicalField::PrecipitableWater),
+        ModelId::EtaCptec8km
+    ));
+
+    for slug in [
+        "2m_temperature_10m_winds",
+        "mslp_10m_winds",
+        "700mb_rh_height_winds",
+    ] {
+        assert!(
+            plot_recipe_fetch_blockers(slug, ModelId::EtaCptec8km)
+                .unwrap()
+                .is_empty(),
+            "Eta should expose its exact native fields for {slug}"
+        );
+    }
+
+    for slug in [
+        "700mb_dewpoint_height_winds",
+        "850mb_absolute_vorticity_height_winds",
+        "total_qpf",
+        "composite_reflectivity",
+        "cloud_cover",
+    ] {
+        let blockers = plot_recipe_fetch_blockers(slug, ModelId::EtaCptec8km).unwrap();
+        assert!(!blockers.is_empty(), "Eta must fail closed for {slug}");
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.reason.contains("CPTEC Eta's pinned")),
+            "Eta blocker must identify the pinned publication boundary for {slug}: {blockers:?}"
+        );
+        assert!(matches!(
+            plot_recipe_fetch_plan(slug, ModelId::EtaCptec8km),
+            Err(ModelError::UnsupportedPlotRecipeModel { .. })
+        ));
+    }
 }
 
 #[test]
@@ -932,6 +995,29 @@ fn latest_available_run_probes_the_models_first_published_lead() {
     assert_eq!(latest.source, SourceId::Eccc);
     assert!(!probed.is_empty());
     assert!(probed.iter().all(|url| url.contains("PT003H")));
+}
+
+#[test]
+fn latest_available_eta_run_probes_f000_text_inventory_and_never_binary_idx() {
+    let mut probed = Vec::new();
+    let latest = latest_available_run_with_probe(
+        ModelId::EtaCptec8km,
+        Some(SourceId::Cptec),
+        "20260814",
+        |resolved| {
+            let url = resolved.availability_probe_url().to_string();
+            probed.push(url.clone());
+            url == "https://dataserver.cptec.inpe.br/dataserver_modelos/eta/ams_08km/brutos/2026/08/14/00/Eta_ams_08km_2026081400_2026081400.inv"
+        },
+    )
+    .unwrap();
+
+    assert_eq!(latest.model, ModelId::EtaCptec8km);
+    assert_eq!(latest.cycle, CycleSpec::new("20260814", 0).unwrap());
+    assert_eq!(latest.source, SourceId::Cptec);
+    assert!(!probed.is_empty());
+    assert!(probed.iter().all(|url| url.ends_with(".inv")));
+    assert!(probed.iter().all(|url| !url.ends_with(".grib2.idx")));
 }
 
 #[test]
@@ -1213,7 +1299,11 @@ fn cma_geps_cadence_and_urls_match_the_wis2_core_data_contract() {
 
 #[test]
 fn cptec_south_america_cadence_urls_and_text_inventory_suffix_are_exact() {
-    for model in [ModelId::WrfCptec7km, ModelId::BramsCptec8km] {
+    for model in [
+        ModelId::WrfCptec7km,
+        ModelId::BramsCptec8km,
+        ModelId::EtaCptec8km,
+    ] {
         assert!(supported_forecast_hours(model, 6).is_empty());
         assert_eq!(model_summary(model).sources, CPTEC_SOURCES);
         assert_eq!(
@@ -1232,6 +1322,10 @@ fn cptec_south_america_cadence_urls_and_text_inventory_suffix_are_exact() {
     assert_eq!(
         supported_forecast_hours(ModelId::BramsCptec8km, 0),
         (1..=180).collect::<Vec<u16>>()
+    );
+    assert_eq!(
+        supported_forecast_hours(ModelId::EtaCptec8km, 0),
+        (0..=264).collect::<Vec<u16>>()
     );
 
     let wrf = ModelRunRequest::new(
@@ -1278,6 +1372,32 @@ fn cptec_south_america_cadence_urls_and_text_inventory_suffix_are_exact() {
         Some(
             "https://dataserver.cptec.inpe.br/dataserver_modelos/brams/ams_08km/brutos/2026/08/13/00/BRAMS_ams_08km_2026081300_2026082012.inv"
         )
+    );
+
+    let eta = ModelRunRequest::new(
+        ModelId::EtaCptec8km,
+        CycleSpec::new("20260814", 0).unwrap(),
+        264,
+        "raw",
+    )
+    .unwrap();
+    let eta_urls = resolve_urls(&eta).unwrap();
+    assert_eq!(
+        eta_urls[0].grib_url,
+        "https://dataserver.cptec.inpe.br/dataserver_modelos/eta/ams_08km/brutos/2026/08/14/00/Eta_ams_08km_2026081400_2026082500.grib2"
+    );
+    assert_eq!(
+        eta_urls[0].idx_url.as_deref(),
+        Some(
+            "https://dataserver.cptec.inpe.br/dataserver_modelos/eta/ams_08km/brutos/2026/08/14/00/Eta_ams_08km_2026081400_2026082500.inv"
+        )
+    );
+    assert!(
+        !eta_urls[0]
+            .idx_url
+            .as_deref()
+            .unwrap()
+            .ends_with(".grib2.idx")
     );
 
     let off_cycle = ModelRunRequest::new(

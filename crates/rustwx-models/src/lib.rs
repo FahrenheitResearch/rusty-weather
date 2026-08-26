@@ -843,6 +843,16 @@ const MODELS: &[ModelSummary] = &[
         ensemble_mode: EnsembleMode::Deterministic,
     },
     ModelSummary {
+        id: ModelId::EtaCptec8km,
+        description: "CPTEC/INPE Eta 8 km South America deterministic forecast",
+        default_product: "raw",
+        cycle_hours_utc: CPTEC_CYCLE_HOURS,
+        max_forecast_hour: 264,
+        sources: CPTEC_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
         id: ModelId::Gdas,
         description: "GDAS global data-assimilation analysis/forecast grids",
         default_product: "pgrb2.0p25",
@@ -5929,7 +5939,7 @@ pub fn built_in_models() -> &'static [ModelSummary] {
 /// [`built_in_models`] remains linked (`ModelId` match arms thread through
 /// rustwx-products), but every user-facing enumeration must go through this
 /// list.
-pub fn supported_models() -> [ModelId; 26] {
+pub fn supported_models() -> [ModelId; 27] {
     [
         ModelId::Hrrr,
         ModelId::HrrrAk,
@@ -5947,6 +5957,7 @@ pub fn supported_models() -> [ModelId; 26] {
         ModelId::Geps,
         ModelId::WrfCptec7km,
         ModelId::BramsCptec8km,
+        ModelId::EtaCptec8km,
         ModelId::Gdas,
         ModelId::Gefs,
         ModelId::Aigfs,
@@ -5997,6 +6008,9 @@ pub fn selector_supported_for_model(selector: FieldSelector, model: ModelId) -> 
     }
     if model == ModelId::Reps {
         return reps_provider_selector_supported(selector);
+    }
+    if model == ModelId::EtaCptec8km {
+        return eta_cptec_selector_supported(selector);
     }
     if !selector.product.is_default() {
         match (model, selector.product) {
@@ -6161,6 +6175,37 @@ pub fn selector_supported_for_model(selector: FieldSelector, model: ModelId) -> 
         (CanonicalField::SimulatedInfraredBrightnessTemperature, VerticalSelector::NominalTop) => {
             matches!(model, ModelId::Hrrr | ModelId::HrrrAk)
         }
+        _ => false,
+    }
+}
+
+fn eta_cptec_selector_supported(selector: FieldSelector) -> bool {
+    if !selector.product.is_default() {
+        return false;
+    }
+
+    match (selector.field, selector.vertical) {
+        (
+            CanonicalField::GeopotentialHeight
+            | CanonicalField::Temperature
+            | CanonicalField::RelativeHumidity
+            | CanonicalField::UWind
+            | CanonicalField::VWind,
+            VerticalSelector::IsobaricHpa(level_hpa),
+        ) => is_supported_upper_air_level(level_hpa),
+        (
+            CanonicalField::Temperature
+            | CanonicalField::Dewpoint
+            | CanonicalField::RelativeHumidity,
+            VerticalSelector::HeightAboveGroundMeters(2),
+        ) => true,
+        (
+            CanonicalField::UWind | CanonicalField::VWind,
+            VerticalSelector::HeightAboveGroundMeters(10),
+        ) => true,
+        (CanonicalField::PressureReducedToMeanSeaLevel, VerticalSelector::MeanSeaLevel)
+        | (CanonicalField::Pressure, VerticalSelector::Surface)
+        | (CanonicalField::TotalPrecipitation, VerticalSelector::Surface) => true,
         _ => false,
     }
 }
@@ -6394,6 +6439,13 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
                 Vec::new()
             }
         }
+        ModelId::EtaCptec8km => {
+            if CPTEC_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=264).collect()
+            } else {
+                Vec::new()
+            }
+        }
         ModelId::Gdas => (0..=9).collect(),
         ModelId::Gefs => {
             let mut hours = (0..=240).step_by(3).collect::<Vec<u16>>();
@@ -6560,7 +6612,7 @@ fn default_canonical_bundle_product(
         (ModelId::IconRu, CanonicalBundleDescriptor::PressureAnalysis) => "rws-pressure",
         (ModelId::IconRu, CanonicalBundleDescriptor::NativeAnalysis) => "rws-surface",
         (ModelId::Geps, _) => "rws-published-statistics",
-        (ModelId::WrfCptec7km | ModelId::BramsCptec8km, _) => "raw",
+        (ModelId::WrfCptec7km | ModelId::BramsCptec8km | ModelId::EtaCptec8km, _) => "raw",
         (ModelId::Gdas, _) => "pgrb2.0p25",
         (ModelId::Gefs, _) => "pgrb2ap5/gec00",
         (ModelId::Aigfs, CanonicalBundleDescriptor::SurfaceAnalysis) => "sfc",
@@ -7098,7 +7150,7 @@ fn build_grib_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         ModelId::IconEu | ModelId::IconD2 => build_dwd_icon_url(source, request)?,
         ModelId::IconRu => build_icon_ru_url(source, request)?,
         ModelId::Geps => build_geps_url(source, request)?,
-        ModelId::WrfCptec7km | ModelId::BramsCptec8km => {
+        ModelId::WrfCptec7km | ModelId::BramsCptec8km | ModelId::EtaCptec8km => {
             build_cptec_south_america_url(source, request)?
         }
         ModelId::Gdas => build_gdas_url(source, request)?,
@@ -7640,6 +7692,9 @@ fn build_cptec_south_america_url(
                 ModelId::BramsCptec8km => {
                     "CPTEC/INPE BRAMS publishes one 00Z cycle; RWS admits f001-f180 because f000 collapses instantaneous/minimum/maximum 2 m temperature into indistinguishable analysis records"
                 }
+                ModelId::EtaCptec8km => {
+                    "CPTEC/INPE Eta South America publishes one 00Z cycle with hourly forecast leads f000-f264"
+                }
                 _ => unreachable!("CPTEC URL builder called for a non-CPTEC model"),
             }
             .to_string(),
@@ -7681,6 +7736,10 @@ fn build_cptec_south_america_url(
         ModelId::BramsCptec8km => (
             "brams/ams_08km",
             format!("BRAMS_ams_08km_{cycle}_{valid}.grib2"),
+        ),
+        ModelId::EtaCptec8km => (
+            "eta/ams_08km",
+            format!("Eta_ams_08km_{cycle}_{valid}.grib2"),
         ),
         _ => unreachable!("CPTEC URL builder called for a non-CPTEC model"),
     };
@@ -9456,7 +9515,7 @@ fn plot_recipe_fetch_defaults(
         (ModelId::IconRu, _, true) => ("rws-surface", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::IconRu, _, false) => ("rws-pressure", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::Geps, _, _) => ("rws-published-statistics", PlotRecipeFetchPolicy::WholeFile),
-        (ModelId::WrfCptec7km | ModelId::BramsCptec8km, _, _) => {
+        (ModelId::WrfCptec7km | ModelId::BramsCptec8km | ModelId::EtaCptec8km, _, _) => {
             ("raw", PlotRecipeFetchPolicy::PreferIndexedSubset)
         }
         (ModelId::Gdas, _, _) => ("pgrb2.0p25", PlotRecipeFetchPolicy::PreferIndexedSubset),
@@ -9601,6 +9660,22 @@ fn wrf_gdex_recipe_product_override(
 }
 
 fn native_field_gap_reason(field: &GribFieldSpec, model: ModelId) -> Option<String> {
+    // Native-family diagnostics reach this path before the pressure/surface
+    // gap checks, so CPTEC Eta needs its own explicit boundary here. Without
+    // it, convective and column products fall through to the generic
+    // "selector is not yet supported" text, which reads like an unfinished
+    // extractor rather than a deliberate publication limit.
+    if model == ModelId::EtaCptec8km
+        && !field
+            .selector
+            .is_some_and(|selector| eta_cptec_selector_supported(selector))
+    {
+        return Some(format!(
+            "{} is outside CPTEC Eta's pinned native inventory; the lane exposes only its allowlisted pressure and direct-surface messages, and native convective, smoke, or column diagnostics are never inferred",
+            field.label
+        ));
+    }
+
     match (field.key, model) {
         (key, ModelId::Href)
             if !key.starts_with("href_spread_")
@@ -9709,6 +9784,26 @@ fn native_field_gap_reason(field: &GribFieldSpec, model: ModelId) -> Option<Stri
 }
 
 fn model_specific_pressure_field_gap(field: &GribFieldSpec, model: ModelId) -> Option<String> {
+    if model == ModelId::EtaCptec8km
+        && !field.selector.is_some_and(|selector| {
+            selector.product.is_default()
+                && matches!(selector.vertical, VerticalSelector::IsobaricHpa(_))
+                && matches!(
+                    selector.field,
+                    CanonicalField::GeopotentialHeight
+                        | CanonicalField::Temperature
+                        | CanonicalField::RelativeHumidity
+                        | CanonicalField::UWind
+                        | CanonicalField::VWind
+                )
+        })
+    {
+        return Some(format!(
+            "{} is outside CPTEC Eta's pinned pressure inventory; only native HGT/TMP/RH/UGRD/VGRD isobaric messages are exposed, and pressure dewpoint or vorticity is never inferred",
+            field.label
+        ));
+    }
+
     match (model, field.key) {
         (model, key)
             if (key.starts_with("refs_spread_") || key.starts_with("refs_probability_"))
@@ -9842,6 +9937,32 @@ fn model_specific_pressure_field_gap(field: &GribFieldSpec, model: ModelId) -> O
 }
 
 fn model_specific_surface_field_gap(field: &GribFieldSpec, model: ModelId) -> Option<String> {
+    if model == ModelId::EtaCptec8km
+        && !field.selector.is_some_and(|selector| {
+            selector.product.is_default()
+                && matches!(
+                    (selector.field, selector.vertical),
+                    (
+                        CanonicalField::Temperature
+                            | CanonicalField::Dewpoint
+                            | CanonicalField::RelativeHumidity,
+                        VerticalSelector::HeightAboveGroundMeters(2)
+                    ) | (
+                        CanonicalField::UWind | CanonicalField::VWind,
+                        VerticalSelector::HeightAboveGroundMeters(10)
+                    ) | (
+                        CanonicalField::PressureReducedToMeanSeaLevel,
+                        VerticalSelector::MeanSeaLevel
+                    ) | (CanonicalField::Pressure, VerticalSelector::Surface)
+                )
+        })
+    {
+        return Some(format!(
+            "{} is outside CPTEC Eta's pinned direct-surface inventory; interval APCP remains `apcp_native_interval`, and ambiguous or absent native fields stay fail-closed",
+            field.label
+        ));
+    }
+
     match (model, field.key) {
         (model, key)
             if (key.starts_with("refs_spread_") || key.starts_with("refs_probability_"))

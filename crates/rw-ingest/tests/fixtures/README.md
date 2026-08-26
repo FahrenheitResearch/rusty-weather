@@ -35,6 +35,9 @@ remain available forever.
 | `reps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/ensemble/reps/10km/grib2/00/024/` | exact selected provider-statistics objects and decoded statistical/grid metadata from the 24,022-byte, 103-GRIB-object official listing; full-source SHA-256 `29B48053BEA61ED7EC6DF4C4EBB974C029183B17C6298A350C39A5831501F0CF`; three bounded payload SHA-256 identities plus a disabled raw-member contract identity |
 | `wrf-cptec-7km.20260814.t00z.f001.inv` | `https://dataserver.cptec.inpe.br/dataserver_modelos/wrf/ams_07km/brutos/2026/08/14/00/WRF_cpt_07KM_2026081400_2026081401.inv` | full 305-message CPTEC text inventory, SHA-256 `445A7D218A1A3772CB2DCBB69DD2D08D2F21D03D75E5A773335B35D107CCED91` |
 | `brams-cptec-8km.20260813.t00z.f001.inv` | `https://dataserver.cptec.inpe.br/dataserver_modelos/brams/ams_08km/brutos/2026/08/13/00/BRAMS_ams_08km_2026081300_2026081301.inv` | full 268-message CPTEC text inventory, SHA-256 `718D6D67C1D8550602624267E44CB04FC174EC8C1EAA18215281C57388479D0D` |
+| `eta-cptec-8km.20260814.t00z.f001.inv` | `https://dataserver.cptec.inpe.br/dataserver_modelos/eta/ams_08km/brutos/2026/08/14/00/Eta_ams_08km_2026081400_2026081401.inv` | full 258-message CPTEC text inventory, 13,277 bytes, SHA-256 `A5A98FB95C833D8CB85DE328DC4EA66587B2D7AE86F519AB97306CE068D55844` |
+| `eta-cptec-8km.20260814.t00z.ctl` | official 2026-08-14 00z Eta cycle control object | exact 265-hour/22-level/grid/46-role publication contract, 3,790 bytes, SHA-256 `BDE94E7DF0269E0BB76972FA8877CB156B931F3A197D6579FB27CE27655787C2` |
+| `eta-cptec-8km.20260814.decoder-goldens.txt` | official f000 T2 and f006 APCP `.inv` rows and bounded GRIB2 messages | exact byte ranges and message hashes plus independent ecCodes min/max/mean and float64-LE decoded-value hashes across 814,625 values per field; 2,014-byte evidence fixture SHA-256 `6D5BA5A30BCBAD81AE4FBC6663E78C34F9CB82FC7A33DEF0749C41896B9685C0` |
 | `cptec-south-america.time-semantics.txt` | official WRF/BRAMS f000/f001/f002/f024 `.inv` URLs recorded in-fixture | exact temperature/precipitation rows plus source inventory byte lengths/SHA-256 identities and decoded BRAMS f000 PDT evidence; 3,795-byte fixture SHA-256 `2E081856DB8A56764BF8735067E1797593F3DBDEDFC5DC1FB9134AAAABD7857C` |
 
 The SREF product is a run-wide file containing all native forecast steps, so
@@ -47,6 +50,9 @@ for byte-range acquisition. CPTEC also publishes a separate binary
 inventory, and the adapter deliberately never sends it through the text index
 parser. BRAMS local parameter 228 (`VAPMRT`) and its anomalous surface-labelled
 column water/cloud records are preserved as evidence but remain fail-closed.
+Eta likewise excludes three undocumented local-table parameters and its
+surface-labelled PWAT/cloud records. Its full f001 `.inv`, exact cycle control,
+and two ecCodes template-5.3 referees pin the safe publication boundary.
 
 The RRFS Public excerpts preserve one exact provider row for every selector
 used by each acquisition role. The surface excerpt also pins the published
@@ -181,12 +187,13 @@ writer `--verify` checks and both `rws validate --deep` runs passed:
 | --- | --- | --- |
 | CPTEC WRF South America 7 km, 2026-08-14 00z f001 | 89,714,669 selected bytes in 58 ranges from a 192,378,474-byte object; subset-cache SHA-256 `C4155D44428BEE76FF61A2C1A89D16C8D96D6FDD13739EE55368122F3F0CA110` | all 7 sounding surface fields and five 19-level pressure volumes; 12 variables, 21,900 chunks, 163,380,250 payload bytes |
 | CPTEC BRAMS South America 8 km, 2026-08-13 00z f001 | 81,837,751 selected bytes in 5 coalesced ranges from a 144,450,301-byte object; subset-cache SHA-256 `952AA272237035B4C47C1DB76B54215ACA39399CAB6BFC567F9FE7ADD80BC5CB` | all 7 sounding surface fields and five 24-level pressure volumes; 12 variables, 19,952 chunks, 182,188,508 payload bytes |
+| CPTEC Eta South America 8 km, 2026-08-14 00z f001 | 48,843,141 selected bytes in 4 coalesced ranges from a 95,471,540-byte object; subset-cache SHA-256 `73968DCCB713CE6212BC4B933D2D464A48DA3CF16F1163E68E593901911C082A` | 6/7 sounding surface fields (surface orography is not published) and five 19-level pressure volumes; 11 variables, 16,321 chunks, 144,654,249 payload bytes |
 
 The five pressure volumes are temperature, RH, earth-relative U/V, and
 geopotential height. Native RH remains `rh_iso`; the verifier did not invent a
 pressure-dewpoint volume. Each run manifest records `cptec-inpe` for both the
 surface and pressure roles. The proof covers the bounded canonical sounding
-contract, not every native field or every f000-f180 lead.
+contract, not every native field or every published lead.
 
 BRAMS uses GRIB2 template 5.3 with primary missing values. Its f001 2 m
 temperature was checked independently against ecCodes: the decoder reproduced

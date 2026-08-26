@@ -126,6 +126,10 @@ fn model_id_aliases_round_trip() {
         "cptec-brams".parse::<ModelId>().unwrap(),
         ModelId::BramsCptec8km
     );
+    assert_eq!(
+        "eta_ams_08km".parse::<ModelId>().unwrap(),
+        ModelId::EtaCptec8km
+    );
     assert_eq!("wrf".parse::<ModelId>().unwrap(), ModelId::WrfGdex);
     assert_eq!(ModelId::Hrrr.to_string(), "hrrr");
     assert_eq!(ModelId::Hgefs.to_string(), "hgefs");
@@ -137,6 +141,7 @@ fn model_id_aliases_round_trip() {
     assert_eq!(ModelId::IconD2.to_string(), "icon-d2");
     assert_eq!(ModelId::WrfCptec7km.to_string(), "wrf-cptec-7km");
     assert_eq!(ModelId::BramsCptec8km.to_string(), "brams-cptec-8km");
+    assert_eq!(ModelId::EtaCptec8km.to_string(), "eta-cptec-8km");
     assert_eq!("wrf-gdex".parse::<ModelId>().unwrap(), ModelId::WrfGdex);
     assert_eq!("gdex".parse::<SourceId>().unwrap(), SourceId::Gdex);
     assert_eq!(SourceId::Gdex.to_string(), "gdex");

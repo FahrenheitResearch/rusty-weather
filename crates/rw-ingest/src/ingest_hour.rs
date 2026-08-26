@@ -2613,6 +2613,9 @@ fn forecast_hour_cadence_note(model: ModelId, cycle_hour_utc: u8, max: u16) -> S
         ModelId::BramsCptec8km => {
             "CPTEC/INPE BRAMS South America is hourly from f001 through f180; f000 is fail-closed because duplicate 2 m temperature analysis records lose min/max identity".to_string()
         }
+        ModelId::EtaCptec8km => {
+            "CPTEC/INPE Eta South America 8 km is hourly from f000 through f264".to_string()
+        }
         ModelId::Gefs => {
             if cycle_hour_utc == 0 {
                 "GEFS is 3-hourly to f240, then 6-hourly to f840 on the 00z cycle".to_string()
@@ -3080,6 +3083,11 @@ mod tests {
         let refs = planned_store_variables(&surface, ModelId::Refs);
         assert!(refs.fields_2d.contains(&"apcp_native_interval".to_string()));
         assert!(!refs.fields_2d.contains(&"apcp_run_total".to_string()));
+
+        let eta_surface = IngestProfile::surface_for_model(ModelId::EtaCptec8km);
+        let eta = planned_store_variables(&eta_surface, ModelId::EtaCptec8km);
+        assert!(eta.fields_2d.contains(&"apcp_native_interval".to_string()));
+        assert!(!eta.fields_2d.contains(&"apcp_run_total".to_string()));
 
         let hiresw = planned_store_variables(&surface, ModelId::Hiresw);
         assert!(hiresw.fields_2d.contains(&"uh_2to5km_max_1h".to_string()));

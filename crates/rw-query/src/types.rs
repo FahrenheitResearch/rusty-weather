@@ -208,10 +208,10 @@ pub fn geps_provider_attribution() -> ProviderAttribution {
 pub fn cptec_provider_attribution() -> ProviderAttribution {
     ProviderAttribution {
         provider: "Center for Weather Forecast and Climate Studies (CPTEC) / National Institute for Space Research (INPE), Brazil".into(),
-        copyright_statement: "CPTEC/INPE is the producing and publishing organization for these operational WRF and BRAMS forecast files.".into(),
+        copyright_statement: "CPTEC/INPE is the producing and publishing organization for these operational WRF, BRAMS, and Eta forecast files.".into(),
         notice: "Data source: CPTEC/INPE; transported from the official CPTEC Data Server.".into(),
         source_url: "https://www3.cptec.inpe.br/dimnt/base-de-dados/previsoes-cptec/".into(),
-        license: "INPE's Open Data program describes Brazilian open-government data as freely reusable and not subject to licence, patent, or control restrictions; no model-directory-specific licence statement was observed, so users should verify current publisher terms for their use.".into(),
+        license: "INPE's Open Data Plan publishes Eta South America as daily open data under Brazil's Open Data Policy (Decreto 8.777/2016); no model-directory-specific licence statement was observed, so users should verify current publisher terms for their use.".into(),
         license_url: "https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/dados-abertos".into(),
         terms_url: "https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/dados-abertos".into(),
         modification_notice: "The CPTEC/INPE source messages have been byte-range selected, normalized, and re-encoded by this service; this output is not an official CPTEC/INPE product.".into(),
@@ -709,6 +709,8 @@ mod tests {
         assert_eq!(attributions, vec![cptec_provider_attribution()]);
         assert!(attributions[0].provider.contains("CPTEC"));
         assert!(attributions[0].notice.contains("CPTEC Data Server"));
+        assert!(attributions[0].copyright_statement.contains("Eta"));
+        assert!(attributions[0].license.contains("Decreto 8.777/2016"));
         assert!(
             attributions[0]
                 .license

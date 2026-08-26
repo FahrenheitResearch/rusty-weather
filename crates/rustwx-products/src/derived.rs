@@ -262,6 +262,7 @@ pub fn supported_derived_recipe_slugs(model: ModelId) -> Vec<String> {
         | ModelId::Geps
         | ModelId::WrfCptec7km
         | ModelId::BramsCptec8km
+        | ModelId::EtaCptec8km
         | ModelId::Rtma
         | ModelId::Urma
         | ModelId::Href

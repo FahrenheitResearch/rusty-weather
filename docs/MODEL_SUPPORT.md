@@ -35,6 +35,7 @@ not automatically presented as live-verified.
 | ECCC GEPS | Remote | Ingest beta | Provider-published 2-D statistics only, not raw ensemble members; 00/12z, 3-hourly f003-f192 then 6-hourly f198-f384; typed percentiles, mean, spread, and selected probabilities are live ingest/store verified; extended f936 Monday/Thursday products are not scheduled |
 | CPTEC/INPE WRF 7 km | Remote | Ingest beta | South America deterministic regular lat/lon feed; daily 00z, hourly f000-f180; official text `.inv` byte-range acquisition and a five-volume/7-surface-field sounding are live ingest/store verified; derived/heavy disabled |
 | CPTEC/INPE BRAMS 8 km | Remote | Ingest beta | South America deterministic regular lat/lon feed; daily 00z, hourly f001-f180; f000 is fail-closed because its instantaneous/min/max 2 m temperatures lose their statistical identity; official text `.inv` byte-range acquisition and a five-volume/7-surface-field sounding are live ingest/store verified; undocumented local and anomalously level-labelled fields remain fail-closed; derived/heavy disabled |
+| [CPTEC/INPE Eta 8 km](CPTEC_SOUTH_AMERICA.md) | Remote | Ingest beta | South America deterministic 875x931 regular lat/lon feed; daily 00z, hourly f000-f264; official text `.inv` byte-range acquisition, five sparse pressure volumes, and six unambiguous sounding surface fields; the pinned provider inventory and two template-5.3 decoder goldens are fixture verified against the live publication; precipitation remains `apcp_native_interval`, surface orography is absent, and provider-local or anomalously surface-labelled fields remain fail-closed; derived/heavy disabled |
 | RRFS-A | Remote | Verified | Deterministic NA source cropped during ingest |
 | RAP | Remote | Ingest beta | Grid-130 `awp130pgrb` (13 km); hourly f000-f021, with 03/09/15/21z extended through f051; live ingest/store verified |
 | NAM | Remote | Ingest beta | Ingest is pinned to grid-212 `awip3d` (40 km), not the registry's separate `awip12` plotting product; hourly f000-f036 then 3-hourly through f084; live ingest/store verified |
@@ -211,6 +212,26 @@ chunks, and 182,188,508 payload bytes. The separate binary `.grib2.idx` files
 are not treated as message indexes. See
 [the CPTEC adapter contract](CPTEC_SOUTH_AMERICA.md) for exact inventory,
 field, grid, and attribution boundaries.
+
+The Eta South America 8 km lane uses the same official text-inventory range
+path. Its acquisition contract was re-checked against the live publication on
+2026-08-25: the 2026-08-24 00z cycle directory carried 265 hourly `.grib2`
+leads (f000-f264) with matching `.inv` and GrADS `.ctl` sidecars, and that
+cycle's f001 text inventory matched the pinned 2026-08-14 fixture
+field-for-field and level-for-level, including the exact 22-level native
+pressure set from 50 through 1020 hPa. The pinned fixture itself still
+reproduces byte-for-byte from the provider (13,277 bytes, SHA-256
+`A5A98FB95C833D8CB85DE328DC4EA66587B2D7AE86F519AB97306CE068D55844`), as does
+the vendored f000 2 m temperature decoder golden (482,778 bytes at the pinned
+offset, SHA-256
+`DBFC1EBDD827FEF617D06FCA0338C846791DBDBCEE923B466E52CC782AD8E6E7`). A bounded
+ranged read of that message decoded to GRIB2 section 3 grid template 3.0 with
+814,625 points on an 875x931 regular lat/lon grid at 0.08 degrees spanning
+90W-20.08W and 55S-19.4N, originating centre 46, and earth-relative wind
+components. The lane is therefore reported as fixture verified: the provider
+contract and decoder referees are pinned and reproducible, but no store round
+trip is claimed here. Missing orography, three provider-local parameters, and
+anomalously surface-labelled column/cloud products remain fail-closed.
 
 For the NOAA deterministic wave, normalization follows the fields actually
 published. HRRR Alaska carries native pressure-level temperature, dewpoint,
