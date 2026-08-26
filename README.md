@@ -345,15 +345,15 @@ count matched the sum of bucket records.
 ## Model support
 
 The remote acquisition and ingest catalog currently covers HRRR/HRRR Alaska,
-RAP, GFS, ECCC GDPS/GDPS-GEML/RDPS/HRDPS/HRDPS-West, CMA GRAPES GEPS statistics, DWD
-ICON-EU/ICON-D2 regular grids, Roshydromet ICON-Ru13/6N29, CPTEC/INPE WRF
-7 km and BRAMS 8 km South America grids, GDAS, GEFS, NOAA
-AI-GFS/AI-GEFS/HGEFS, ECMWF IFS Open Data, ECMWF AIFS Single v2, NAM, RRFS-A,
-the public RRFS prototype, NBM, HIRESW, HREF, SREF, REFS, RTMA, and URMA.
-Local WRF/wrfout runs use the same store
-and exact-time query engine. Model-specific products, cadence, pressure
-levels, and verification maturity are intentionally reported independently;
-the service never substitutes a similarly named field or ensemble statistic.
+RAP, GFS, ECCC GDPS/GDPS-GEML/RDPS/HRDPS/HRDPS-West, CMA GRAPES GEPS
+statistics, DWD ICON-EU/ICON-D2 regular grids, Roshydromet ICON-Ru13/6N29,
+CPTEC/INPE WRF 7 km, BRAMS 8 km, and Eta 8 km South America grids, GDAS,
+GEFS, NOAA AI-GFS/AI-GEFS/HGEFS, ECMWF IFS Open Data, ECMWF AIFS Single v2,
+NAM, RRFS-A, the public RRFS prototype, NBM, HIRESW, HREF, SREF, REFS, RTMA,
+and URMA. Local WRF/wrfout runs use the same store and exact-time query
+engine. Model-specific products, cadence, pressure levels, and verification
+maturity are intentionally reported independently; the service never
+substitutes a similarly named field or ensemble statistic.
 
 See [the model capability matrix](docs/MODEL_SUPPORT.md) for the human-readable
 scope and use `GET /v1/models`, the authenticated no-store
