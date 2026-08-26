@@ -2107,6 +2107,10 @@ mod tests {
             },
             source_provenance: vec![SourceProvenance {
                 provider: "noaa-aws-public-data".to_owned(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["analysis".to_owned()],
                 products: vec!["hrrr".to_owned()],
             }],

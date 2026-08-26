@@ -1302,6 +1302,10 @@ mod tests {
                 grid_hash: "b".repeat(64),
                 source_provenance: vec![SourceProvenance {
                     provider: "noaa-aws-public-data".into(),
+                    forecast_producer: None,
+                    licensing_publisher: None,
+                    transport_provider: None,
+                    transport_is_mirror: false,
                     roles: vec!["surface".into()],
                     products: vec!["wrfsfc".into()],
                 }],

@@ -657,6 +657,10 @@ fn create_replication_request(
     ];
     let provenance = vec![SourceProvenance {
         provider: "simulation-owner".into(),
+        forecast_producer: None,
+        licensing_publisher: None,
+        transport_provider: None,
+        transport_is_mirror: false,
         roles: vec!["generation".into()],
         products: vec!["rws".into()],
     }];
@@ -1112,6 +1116,10 @@ fn request_for(descriptor: &RunDescriptor, public: &LabPublicState, recipe: &str
         },
         source_provenance: vec![SourceProvenance {
             provider: "simulation-owner".into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles: vec!["generation".into()],
             products: vec!["rws".into()],
         }],

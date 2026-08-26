@@ -4583,6 +4583,10 @@ mod tests {
             },
             source_provenance: vec![SourceProvenance {
                 provider: "noaa-aws-public-data".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["pressure".into(), "surface".into()],
                 products: vec!["wrfprs".into(), "wrfsfc".into()],
             }],
@@ -4777,6 +4781,10 @@ mod tests {
             },
             source_provenance: vec![SourceProvenance {
                 provider: "noaa-aws-public-data".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["surface".into()],
                 products: vec!["wrfsfc".into()],
             }],
@@ -4911,16 +4919,24 @@ mod tests {
             .join("run.json");
         let mut manifest = RwsRunManifest::load(&manifest_path).unwrap();
         manifest.hours.get_mut(&0).unwrap().source_provenance = vec![
-            RwsSourceProvenance::new(
+            RwsSourceProvenance::new_structured(
                 "ECMWF-OPEN-DATA",
+                "ECMWF",
+                "ECMWF",
+                "ECMWF-OPEN-DATA",
+                false,
                 vec!["pressure".into()],
                 vec!["oper".into()],
             )
             .unwrap(),
         ];
         manifest.hours.get_mut(&1).unwrap().source_provenance = vec![
-            RwsSourceProvenance::new(
+            RwsSourceProvenance::new_structured(
                 "ecmwf-open-data",
+                "ecmwf",
+                "ecmwf",
+                "ecmwf-open-data",
+                false,
                 vec!["surface".into()],
                 vec!["oper".into()],
             )
@@ -5089,6 +5105,10 @@ mod tests {
             },
             source_provenance: vec![SourceProvenance {
                 provider: "simulation-owner".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["generation".into()],
                 products: vec!["rws".into()],
             }],
@@ -7187,6 +7207,10 @@ mod tests {
             run["source_provenance"],
             serde_json::json!([{
                 "provider": "ecmwf-open-data",
+                "forecast_producer": "ecmwf",
+                "licensing_publisher": "ecmwf",
+                "transport_provider": "ecmwf-open-data",
+                "transport_is_mirror": false,
                 "roles": ["pressure", "surface"],
                 "products": ["oper"]
             }])

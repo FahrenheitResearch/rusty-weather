@@ -337,14 +337,14 @@ impl PublishCaseArtifactRequest {
                 "owner-published data requires attribution and license fields",
             );
         }
-        if self
-            .request
-            .source_provenance
-            .iter()
-            .any(|source| source.provider == "ecmwf-open-data")
-        {
+        if self.request.source_provenance.iter().any(|source| {
+            matches!(
+                source.licensing_publisher_identity(),
+                "ecmwf" | "ecmwf-open-data"
+            )
+        }) {
             let has_ecmwf = self.attributions.iter().any(|notice| {
-                notice.provider == "ecmwf-open-data"
+                matches!(notice.provider.as_str(), "ecmwf" | "ecmwf-open-data")
                     && notice.license.contains("CC BY 4.0")
                     && !notice.notice.trim().is_empty()
             });
@@ -484,6 +484,7 @@ impl RunGenerationPublicationManifest {
         }
         for source in &self.source_provenance {
             validate_id("source.provider", &source.provider, 96)?;
+            source.validate_identity()?;
             if source.roles.is_empty() || source.roles.len() > 64 || source.products.len() > 128 {
                 return invalid(
                     "source_provenance",
@@ -530,16 +531,18 @@ impl RunGenerationPublicationManifest {
                 "owner-published generation requires attribution and license fields",
             );
         }
-        if self
-            .source_provenance
+        if self.source_provenance.iter().any(|source| {
+            matches!(
+                source.licensing_publisher_identity(),
+                "ecmwf" | "ecmwf-open-data"
+            )
+        }) && (self.attributions.iter().all(|notice| {
+            !matches!(notice.provider.as_str(), "ecmwf" | "ecmwf-open-data")
+                || !notice.license.contains("CC BY 4.0")
+        }) || self
+            .modification_notices
             .iter()
-            .any(|source| source.provider == "ecmwf-open-data")
-            && (self.attributions.iter().all(|notice| {
-                notice.provider != "ecmwf-open-data" || !notice.license.contains("CC BY 4.0")
-            }) || self
-                .modification_notices
-                .iter()
-                .all(|notice| notice.trim().is_empty()))
+            .all(|notice| notice.trim().is_empty()))
         {
             return Err(ProtocolError::MissingEcmwfNotice);
         }
@@ -810,6 +813,10 @@ mod tests {
                 },
                 source_provenance: vec![SourceProvenance {
                     provider: "owner".into(),
+                    forecast_producer: None,
+                    licensing_publisher: None,
+                    transport_provider: None,
+                    transport_is_mirror: false,
                     roles: vec!["simulation".into()],
                     products: vec!["wrf".into()],
                 }],
@@ -868,6 +875,10 @@ mod tests {
         value.request.model = "hrrr".into();
         value.request.source_provenance = vec![SourceProvenance {
             provider: "noaa-aws-public-data".into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles: vec!["surface".into()],
             products: vec!["wrfsfcf".into()],
         }];
@@ -957,6 +968,10 @@ mod tests {
             },
             source_provenance: vec![SourceProvenance {
                 provider: "simulation-owner".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["generation".into()],
                 products: vec!["rws".into()],
             }],

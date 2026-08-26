@@ -69,15 +69,38 @@ pub struct TimePoint {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceProvenance {
+    /// Backward-compatible acquisition-lane identity.
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast_producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licensing_publisher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_provider: Option<String>,
+    #[serde(default)]
+    pub transport_is_mirror: bool,
     pub roles: Vec<String>,
     pub products: Vec<String>,
+}
+
+impl SourceProvenance {
+    /// Identity whose terms and attribution govern the acquired bytes. Legacy
+    /// manifests retain the historical `provider` fallback.
+    pub fn licensing_publisher_identity(&self) -> &str {
+        self.licensing_publisher
+            .as_deref()
+            .unwrap_or(&self.provider)
+    }
 }
 
 impl From<rw_store::RwsSourceProvenance> for SourceProvenance {
     fn from(value: rw_store::RwsSourceProvenance) -> Self {
         Self {
             provider: value.provider,
+            forecast_producer: value.forecast_producer,
+            licensing_publisher: value.licensing_publisher,
+            transport_provider: value.transport_provider,
+            transport_is_mirror: value.transport_is_mirror,
             roles: value.roles,
             products: value.products,
         }
@@ -234,16 +257,21 @@ pub fn provider_attributions_for_provenance(
     sources: &[SourceProvenance],
 ) -> Vec<ProviderAttribution> {
     let mut attributions = Vec::with_capacity(4);
-    if sources
-        .iter()
-        .any(|source| source.provider == "ecmwf-open-data")
-    {
+    if sources.iter().any(|source| {
+        matches!(
+            source.licensing_publisher_identity(),
+            "ecmwf" | "ecmwf-open-data"
+        )
+    }) {
         attributions.push(ecmwf_provider_attribution());
     }
     if sources.iter().any(|source| {
         matches!(
-            source.provider.as_str(),
-            "noaa-nomads"
+            source.licensing_publisher_identity(),
+            "noaa"
+                | "noaa-nws"
+                | "noaa-ncep"
+                | "noaa-nomads"
                 | "noaa-ncei"
                 | "noaa-aws-public-data"
                 | "noaa-google-public-data"
@@ -257,24 +285,35 @@ pub fn provider_attributions_for_provenance(
     }) {
         attributions.push(noaa_provider_attribution());
     }
-    if sources
-        .iter()
-        .any(|source| source.provider == "eccc-msc-datamart")
-    {
-        if sources.iter().any(|source| {
-            source.provider == "eccc-msc-datamart"
-                && source
-                    .products
-                    .iter()
-                    .any(|product| product == "rws-published-statistics")
+    if sources.iter().any(|source| {
+        matches!(
+            source.licensing_publisher_identity(),
+            "eccc" | "eccc-msc" | "eccc-msc-datamart"
+        )
+    }) {
+        if sources
+            .iter()
+            .any(|source| source.provider == "eccc-msc-gdps-geml-datamart")
+        {
+            attributions.push(gdps_geml_provider_attribution());
+        } else if sources.iter().any(|source| {
+            matches!(
+                source.licensing_publisher_identity(),
+                "eccc" | "eccc-msc" | "eccc-msc-datamart"
+            ) && source
+                .products
+                .iter()
+                .any(|product| product == "rws-published-statistics")
         }) {
             attributions.push(geps_provider_attribution());
         } else if sources.iter().any(|source| {
-            source.provider == "eccc-msc-datamart"
-                && source
-                    .products
-                    .iter()
-                    .any(|product| product == "rws-reps-provider-statistics")
+            matches!(
+                source.licensing_publisher_identity(),
+                "eccc" | "eccc-msc" | "eccc-msc-datamart"
+            ) && source
+                .products
+                .iter()
+                .any(|product| product == "rws-reps-provider-statistics")
         }) {
             attributions.push(reps_provider_attribution());
         } else {
@@ -287,25 +326,34 @@ pub fn provider_attributions_for_provenance(
     {
         attributions.push(gdps_geml_provider_attribution());
     }
-    if sources
-        .iter()
-        .any(|source| source.provider == "cma-wis2-core-data")
-    {
+    if sources.iter().any(|source| {
+        matches!(
+            source.licensing_publisher_identity(),
+            "cma" | "cma-wis2-core-data"
+        )
+    }) {
         attributions.push(cma_provider_attribution());
     }
-    if sources
-        .iter()
-        .any(|source| source.provider == "dwd-open-data")
-    {
+    if sources.iter().any(|source| {
+        matches!(
+            source.licensing_publisher_identity(),
+            "dwd" | "dwd-open-data"
+        )
+    }) {
         attributions.push(dwd_provider_attribution());
     }
-    if sources
-        .iter()
-        .any(|source| source.provider == "roshydromet-wipps-dc")
-    {
+    if sources.iter().any(|source| {
+        matches!(
+            source.licensing_publisher_identity(),
+            "roshydromet" | "roshydromet-wipps-dc"
+        )
+    }) {
         attributions.push(roshydromet_provider_attribution());
     }
-    if sources.iter().any(|source| source.provider == "cptec-inpe") {
+    if sources
+        .iter()
+        .any(|source| matches!(source.licensing_publisher_identity(), "cptec-inpe" | "inpe"))
+    {
         attributions.push(cptec_provider_attribution());
     }
     attributions
@@ -550,6 +598,10 @@ mod tests {
     fn provenance(provider: &str) -> SourceProvenance {
         SourceProvenance {
             provider: provider.into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles: vec!["surface".into()],
             products: vec!["product".into()],
         }
@@ -558,6 +610,10 @@ mod tests {
     fn provenance_with_product(provider: &str, product: &str) -> SourceProvenance {
         SourceProvenance {
             provider: provider.into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles: vec!["surface".into()],
             products: vec![product.into()],
         }
@@ -617,6 +673,10 @@ mod tests {
     fn reps_provenance_uses_the_exact_product_documentation_url() {
         let sources = [SourceProvenance {
             provider: "eccc-msc-datamart".into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles: vec!["surface".into()],
             products: vec!["rws-reps-provider-statistics".into()],
         }];
@@ -737,5 +797,27 @@ mod tests {
         );
         assert!(attributions[0].license.contains("version 2.1"));
         assert!(attributions[0].modification_notice.contains("normalized"));
+    }
+
+    #[test]
+    fn structured_publisher_drives_attribution_independently_of_transport() {
+        let sources = [SourceProvenance {
+            provider: "cloud-object-lane".into(),
+            forecast_producer: Some("noaa-ncep".into()),
+            licensing_publisher: Some("noaa".into()),
+            transport_provider: Some("aws-asdi".into()),
+            transport_is_mirror: true,
+            roles: vec!["surface".into()],
+            products: vec!["pgrb2".into()],
+        }];
+        let attributions = provider_attributions_for_provenance(&sources);
+        assert_eq!(attributions.len(), 1);
+        assert!(attributions[0].provider.contains("NOAA"));
+
+        let serialized = serde_json::to_value(&sources[0]).unwrap();
+        assert_eq!(serialized["forecast_producer"], "noaa-ncep");
+        assert_eq!(serialized["licensing_publisher"], "noaa");
+        assert_eq!(serialized["transport_provider"], "aws-asdi");
+        assert_eq!(serialized["transport_is_mirror"], true);
     }
 }

@@ -1281,6 +1281,37 @@ fn safe_provider_identity(model: ModelId, source: SourceId) -> &'static str {
     }
 }
 
+/// Explicit organization and transport identities for public acquisition
+/// lanes. This is a reviewed provider table, not a hostname-derived guess.
+/// Local/user-provided sources intentionally remain on the legacy identity
+/// shape until their owner supplies an explicit publication grant.
+fn structured_source_identity(
+    source: SourceId,
+) -> Option<(&'static str, &'static str, &'static str, bool)> {
+    match source {
+        SourceId::Aws => Some(("noaa-ncep", "noaa", "aws-asdi", true)),
+        SourceId::Nomads => Some(("noaa-ncep", "noaa", "noaa-nomads", false)),
+        SourceId::Google => Some(("noaa-ncep", "noaa", "google-cloud-public-data", true)),
+        SourceId::Azure => Some(("noaa-ncep", "noaa", "microsoft-azure-public-data", true)),
+        SourceId::Ecmwf => Some(("ecmwf", "ecmwf", "ecmwf-open-data", false)),
+        SourceId::Eccc => Some(("eccc-msc", "eccc", "eccc-datamart", false)),
+        SourceId::Cma => Some(("cma", "cma", "cma-wis2-node", false)),
+        SourceId::Dwd => Some(("dwd", "dwd", "dwd-open-data", false)),
+        SourceId::RoshydrometWis2Cache => {
+            Some(("roshydromet", "roshydromet", "wis2-global-cache", true))
+        }
+        SourceId::RoshydrometWis2Origin => Some((
+            "roshydromet",
+            "roshydromet",
+            "roshydromet-wis2-origin",
+            false,
+        )),
+        SourceId::Cptec => Some(("cptec-inpe", "cptec-inpe", "cptec-data-server", false)),
+        SourceId::Ncei => Some(("noaa-ncep", "noaa", "noaa-ncei", false)),
+        SourceId::Gdex | SourceId::AifsInference | SourceId::Earth2Archive => None,
+    }
+}
+
 fn safe_product_identity(product: &str) -> String {
     let mut safe = String::with_capacity(product.len());
     for byte in product.bytes() {
@@ -1328,14 +1359,18 @@ fn resolved_source_provenance(
         if product.surface_source {
             roles.push("surface".to_string());
         }
-        provenance.push(
-            RwsSourceProvenance::new(
-                safe_provider_identity(model, fetched.result.source),
-                roles,
-                vec![safe_product_identity(product.product)],
+        let provider = safe_provider_identity(model, fetched.result.source);
+        let products = vec![safe_product_identity(product.product)];
+        let source = if let Some((producer, publisher, transport, is_mirror)) =
+            structured_source_identity(fetched.result.source)
+        {
+            RwsSourceProvenance::new_structured(
+                provider, producer, publisher, transport, is_mirror, roles, products,
             )
-            .map_err(other)?,
-        );
+        } else {
+            RwsSourceProvenance::new(provider, roles, products)
+        };
+        provenance.push(source.map_err(other)?);
     }
     Ok(provenance)
 }
@@ -2747,6 +2782,16 @@ mod tests {
                 .unwrap();
         assert_eq!(provenance.len(), 2);
         assert_eq!(provenance[0].provider, "noaa-aws-public-data");
+        assert_eq!(
+            provenance[0].forecast_producer.as_deref(),
+            Some("noaa-ncep")
+        );
+        assert_eq!(provenance[0].licensing_publisher.as_deref(), Some("noaa"));
+        assert_eq!(
+            provenance[0].transport_provider.as_deref(),
+            Some("aws-asdi")
+        );
+        assert!(provenance[0].transport_is_mirror);
         assert_eq!(provenance[0].roles, vec!["pressure"]);
         assert_eq!(provenance[0].products, vec!["prs"]);
         assert_eq!(provenance[1].provider, "noaa-aws-public-data");
@@ -2755,6 +2800,9 @@ mod tests {
         let serialized = serde_json::to_string(&provenance).unwrap();
         assert!(!serialized.contains("example.invalid"));
         assert!(!serialized.contains("https://"));
+        assert!(serialized.contains("\"forecast_producer\":\"noaa-ncep\""));
+        assert!(serialized.contains("\"licensing_publisher\":\"noaa\""));
+        assert!(serialized.contains("\"transport_provider\":\"aws-asdi\""));
 
         let surface_only =
             resolved_source_provenance(ModelId::Hrrr, false, None, &fetched.sfc).unwrap();
@@ -3434,6 +3482,19 @@ mod tests {
         assert_eq!(
             safe_provider_identity(ModelId::IconRu, SourceId::RoshydrometWis2Origin),
             "roshydromet-wipps-dc"
+        );
+        assert_eq!(
+            structured_source_identity(SourceId::RoshydrometWis2Cache),
+            Some(("roshydromet", "roshydromet", "wis2-global-cache", true))
+        );
+        assert_eq!(
+            structured_source_identity(SourceId::RoshydrometWis2Origin),
+            Some((
+                "roshydromet",
+                "roshydromet",
+                "roshydromet-wis2-origin",
+                false
+            ))
         );
     }
 
