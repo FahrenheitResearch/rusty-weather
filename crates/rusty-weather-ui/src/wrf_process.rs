@@ -13,7 +13,7 @@ use rustwx_core::{
     CanonicalField, FieldSelector, GridProjection, GridShape, LatLonGrid, SelectedField2D,
 };
 use rw_store::{
-    DerivedFieldInput, WrittenHour, write_hour_from_grid_with_derived,
+    DerivedFieldInput, RwsExactTime, WrittenHour, write_hour_from_grid_with_derived,
     write_hour_from_grid_with_derived_exact,
 };
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,41 @@ use wrf_core::{ComputeOpts, VarOutput, WrfFile, getvar};
 pub struct WrfProcessTask {
     pub label: String,
     pub rx: Receiver<WrfProcessMessage>,
+}
+
+/// Stable destination for one independently published `wrfout` from a live
+/// simulation. Every frame from the same case carries the same case digest;
+/// exact physical time selects a deterministic store slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveWrfTarget {
+    pub case_sha256: String,
+    pub storage_slot: u16,
+    pub exact_time: RwsExactTime,
+}
+
+impl LiveWrfTarget {
+    fn run_name(&self, options: &WrfProcessOptions) -> Result<String, String> {
+        if self.case_sha256.len() != 64
+            || !self
+                .case_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("live simulation case identity must be a full SHA-256".to_string());
+        }
+        let origin = self.exact_time.origin_unix().ok_or_else(|| {
+            "live simulation exact time cannot represent its initialization".to_string()
+        })?;
+        let stamp = chrono::DateTime::from_timestamp(origin, 0)
+            .map(|time| time.format("%Y%m%d%H%M%S").to_string())
+            .ok_or_else(|| "live simulation initialization is out of range".to_string())?;
+        Ok(format!(
+            "simulation_{stamp}_{}_{}_{}",
+            &self.case_sha256[..16],
+            processing_profile_suffix(options),
+            crate::local_import::IMPORT_SCIENCE_SCHEMA_VERSION
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +286,24 @@ pub fn spawn_process_paths(
     store_root: PathBuf,
     options: WrfProcessOptions,
 ) -> WrfProcessTask {
+    spawn_process_paths_inner(paths, store_root, options, None)
+}
+
+pub fn spawn_process_live_path(
+    path: PathBuf,
+    store_root: PathBuf,
+    options: WrfProcessOptions,
+    target: LiveWrfTarget,
+) -> WrfProcessTask {
+    spawn_process_paths_inner(vec![path], store_root, options, Some(target))
+}
+
+fn spawn_process_paths_inner(
+    paths: Vec<PathBuf>,
+    store_root: PathBuf,
+    options: WrfProcessOptions,
+    live_target: Option<LiveWrfTarget>,
+) -> WrfProcessTask {
     let options = options.normalized();
     let label = if paths.len() == 1 {
         format!("Process WRF {}", display_name(&paths[0]))
@@ -266,7 +319,14 @@ pub fn spawn_process_paths(
             move || {
                 let result = isolate_panics("WRF processing worker", || {
                     lower_import_thread_priority();
-                    process_paths(&paths, &store_root, &options, &worker_tx).map_err(|err| {
+                    process_paths_with_target(
+                        &paths,
+                        &store_root,
+                        &options,
+                        &worker_tx,
+                        live_target.as_ref(),
+                    )
+                    .map_err(|err| {
                         if err.trim().is_empty() {
                             format!("{label} failed")
                         } else {
@@ -408,11 +468,22 @@ fn preflight_wrf_sources(
     Ok((plans, run))
 }
 
+#[cfg(test)]
 fn process_paths(
     paths: &[PathBuf],
     store_root: &Path,
     options: &WrfProcessOptions,
     tx: &Sender<WrfProcessMessage>,
+) -> Result<WrfProcessSummary, String> {
+    process_paths_with_target(paths, store_root, options, tx, None)
+}
+
+fn process_paths_with_target(
+    paths: &[PathBuf],
+    store_root: &Path,
+    options: &WrfProcessOptions,
+    tx: &Sender<WrfProcessMessage>,
+    live_target: Option<&LiveWrfTarget>,
 ) -> Result<WrfProcessSummary, String> {
     if paths.is_empty() {
         return Err("No WRF files selected".to_string());
@@ -441,9 +512,51 @@ fn process_paths(
     // an earlier default or heavy import of the exact same source files.
     let processing_profile = processing_profile_suffix(options);
     let model = "wrf".to_string();
-    let (plans, run) = preflight_wrf_sources(&files, source_identity, &processing_profile, tx)?;
-    let publisher = crate::local_import::RunStagingPublisher::new(store_root, &model, &run)?;
-    let staging_store_root = publisher.staging_store_root().to_path_buf();
+    let (mut plans, discovered_run) =
+        preflight_wrf_sources(&files, source_identity, &processing_profile, tx)?;
+    let run = if let Some(target) = live_target {
+        if plans.len() != 1 || plans[0].records.len() != 1 {
+            return Err(
+                "a live wrfout publication must contain exactly one source time".to_string(),
+            );
+        }
+        let record = &mut plans[0].records[0];
+        let source_lead = record
+            .exact_time
+            .map(|time| time.lead_seconds)
+            .unwrap_or_else(|| u64::from(record.storage_slot) * 3_600);
+        if record.valid_unix != target.exact_time.valid_unix
+            || source_lead != target.exact_time.lead_seconds
+        {
+            return Err(format!(
+                "live wrfout physical time does not match its supervised case target: source lead={} valid={}, target lead={} valid={}",
+                source_lead,
+                record.valid_unix,
+                target.exact_time.lead_seconds,
+                target.exact_time.valid_unix
+            ));
+        }
+        record.storage_slot = target.storage_slot;
+        record.exact_time = Some(target.exact_time);
+        target.run_name(options)?
+    } else {
+        discovered_run
+    };
+    // Whole selected-file imports publish one complete run directory. A live
+    // simulation instead appends one independently validated hour to a stable
+    // case run; rw-store's per-run lock, atomic hour writer, grid identity,
+    // exact-time remap guard, and manifest-last publication own that seam.
+    let publisher = if live_target.is_some() {
+        None
+    } else {
+        Some(crate::local_import::RunStagingPublisher::new(
+            store_root, &model, &run,
+        )?)
+    };
+    let staging_store_root = publisher
+        .as_ref()
+        .map(|publisher| publisher.staging_store_root().to_path_buf())
+        .unwrap_or_else(|| store_root.to_path_buf());
     let mut written = Vec::<WrittenHour>::new();
     let mut all_vars = Vec::<String>::new();
     let mut all_notes = Vec::<String>::new();
@@ -694,10 +807,16 @@ fn process_paths(
     all_notes.sort();
     all_notes.dedup();
     crate::local_import::verify_source_set_unchanged(&source_snapshot)?;
-    let _ = tx.send(WrfProcessMessage::Progress(format!(
-        "Publishing complete WRF run {model}/{run}"
-    )));
-    publisher.publish()?;
+    if let Some(publisher) = publisher {
+        let _ = tx.send(WrfProcessMessage::Progress(format!(
+            "Publishing complete WRF run {model}/{run}"
+        )));
+        publisher.publish()?;
+    } else {
+        let _ = tx.send(WrfProcessMessage::Progress(format!(
+            "Published live WRF timestep into {model}/{run}"
+        )));
+    }
     Ok(WrfProcessSummary {
         store_root: store_root.to_path_buf(),
         model,
@@ -1712,6 +1831,31 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_run_identity_is_case_stable_and_profile_scoped() {
+        let first = LiveWrfTarget {
+            case_sha256: "a".repeat(64),
+            storage_slot: 0,
+            exact_time: RwsExactTime::new(0, 1_700_000_000),
+        };
+        let later = LiveWrfTarget {
+            case_sha256: first.case_sha256.clone(),
+            storage_slot: 3,
+            exact_time: RwsExactTime::new(900, 1_700_000_900),
+        };
+        let options = WrfProcessOptions::default();
+        assert_eq!(first.run_name(&options), later.run_name(&options));
+        let mut core_only = options.clone();
+        core_only.diagnostics = false;
+        assert_ne!(first.run_name(&options), first.run_name(&core_only));
+        let mut different_case = first.clone();
+        different_case.case_sha256 = "b".repeat(64);
+        assert_ne!(first.run_name(&options), different_case.run_name(&options));
+        let mut not_hex = first.clone();
+        not_hex.case_sha256 = "z".repeat(64);
+        assert!(not_hex.run_name(&options).is_err());
+    }
 
     #[test]
     fn volume_omission_note_reports_only_the_actual_retained_2d_count() {
