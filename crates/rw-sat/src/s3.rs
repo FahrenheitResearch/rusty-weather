@@ -189,6 +189,28 @@ pub fn band_hour_prefix(
     )
 }
 
+/// The filename prefix for channel-less single-layer L2 products (the
+/// cloud suite: ACHA/ACM/ACTP/COD/CPS/CTP), e.g.
+/// `ABI-L2-ACHAC/2026/216/18/OR_ABI-L2-ACHAC-M6_G19_`. The
+/// [`band_hour_prefix`] twin for products whose filenames carry no
+/// `C{band}` token; mesoscale directory merging (`ACHAM1` -> `ACHAM/`)
+/// follows [`goes_hour_prefix`], with the sector digit kept in the
+/// filename token exactly as the bucket lays keys out.
+pub fn product_hour_prefix(
+    abi_product: &str,
+    satellite: &GoesSatellite,
+    mode: u8,
+    hour: DateTime<Utc>,
+) -> String {
+    format!(
+        "{}OR_{}-M{}_{}_",
+        goes_hour_prefix(abi_product, hour),
+        abi_product.trim().to_ascii_uppercase(),
+        mode,
+        satellite.as_str()
+    )
+}
+
 /// Whether a parsed filename product matches the requested one (a bare
 /// `...M` request accepts both mesoscale sectors).
 pub fn abi_filename_product_matches_request(actual_product: &str, requested_product: &str) -> bool {
