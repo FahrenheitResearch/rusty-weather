@@ -1682,6 +1682,7 @@ mod tests {
             scan_start_unix: channel.scan_start_unix,
             scan_end_unix: channel.scan_end_unix,
             channels: BTreeMap::from([(13, channel.clone())]),
+            l2_products: BTreeMap::new(),
         };
         let directory = rw_sat::native_archive_root(store_root)
             .join("g18")

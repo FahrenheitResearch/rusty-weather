@@ -7,7 +7,9 @@
 
 pub mod abi;
 pub mod archive;
+pub mod cloud;
 pub mod composite;
+pub mod cwp;
 pub mod enhancement;
 pub mod events;
 pub mod export;
@@ -28,10 +30,21 @@ pub mod tile;
 pub mod window;
 
 pub use archive::{
-    NATIVE_SOURCE_ARCHIVE_DIR, NativeArchivePruneReport, NativeSatelliteFrame,
-    ResolvedNativeSatelliteFrame, archive_goes_source, automatic_preview_stride,
-    list_native_frames, native_archive_root, native_frame_product_revision, prune_native_archive,
+    NATIVE_SOURCE_ARCHIVE_DIR, NativeArchivePruneReport, NativeL2ProductSource,
+    NativeSatelliteFrame, ResolvedNativeSatelliteFrame, archive_goes_l2_source,
+    archive_goes_source, automatic_preview_stride, list_native_cloud_frames, list_native_frames,
+    native_archive_root, native_frame_cloud_revision, native_frame_product_revision,
+    prune_native_archive, resolve_native_cloud_frame, resolve_native_cloud_frame_with_revision,
     resolve_native_frame, resolve_native_frame_with_revision,
+};
+pub use cloud::{
+    CLOUD_CATALOG_PREFIX, CloudProduct, CloudProductDescriptor, CloudProductField,
+    CloudSourceIdentity, CloudWindow, DEFAULT_CLOUD_PREVIEW_CELLS, DqfReport, DqfRule,
+    MAX_DENSE_CLOUD_PLANE_CELLS, cloud_product_catalog, read_archived_cloud_preview,
+    read_archived_cloud_window, read_cloud_product_field, read_cloud_product_field_window,
+};
+pub use cwp::{
+    CLOUD_WATER_PATH_INPUTS, CloudPhase, CwpCounts, cloud_water_path_g_m2, cloud_water_path_plane,
 };
 pub use enhancement::{SatelliteEnhancement, default_enhancement_for_channel};
 pub use events::{NEVER_CANCEL, SatError, SatEvent, print_event};
