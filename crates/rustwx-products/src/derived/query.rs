@@ -201,6 +201,7 @@ fn computed_recipe_slot<'a>(
         DerivedRecipe::Dcape => (&mut computed.dcape_jkg, "J/kg", "dcape_jkg"),
         DerivedRecipe::ThetaE2m10mWinds => (&mut computed.theta_e_2m_k, "K", "theta_e_2m_k"),
         DerivedRecipe::Vpd2m => (&mut computed.vpd_2m_hpa, "hPa", "vpd_2m_hpa"),
+        DerivedRecipe::Hdw => (&mut computed.hdw_hpa_ms, "hPa*m/s", "hdw_hpa_ms"),
         DerivedRecipe::DewpointDepression2m => (
             &mut computed.dewpoint_depression_2m_c,
             "degC",

@@ -173,6 +173,12 @@ const SUPPORTED_DERIVED_RECIPE_INVENTORY: &[DerivedRecipeInventoryEntry] = &[
         heavy: false,
     },
     DerivedRecipeInventoryEntry {
+        slug: "hdw",
+        title: "Hot-Dry-Windy Index",
+        experimental: false,
+        heavy: false,
+    },
+    DerivedRecipeInventoryEntry {
         slug: "dewpoint_depression_2m",
         title: "2 m Dewpoint Depression",
         experimental: false,
