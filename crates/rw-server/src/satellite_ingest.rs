@@ -451,6 +451,7 @@ mod tests {
             scan_start_unix: 1_787_450_600,
             scan_end_unix: 1_787_451_200,
             channels: std::collections::BTreeMap::from([(13, channel)]),
+            l2_products: std::collections::BTreeMap::new(),
         };
 
         log_follow_event(

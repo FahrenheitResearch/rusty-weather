@@ -1053,6 +1053,7 @@ mod tests {
             scan_start_unix: channel.scan_start_unix,
             scan_end_unix: channel.scan_end_unix,
             channels: std::collections::BTreeMap::from([(13, channel)]),
+            l2_products: std::collections::BTreeMap::new(),
         };
         let frame_root = rw_sat::native_archive_root(store_root)
             .join("g18")

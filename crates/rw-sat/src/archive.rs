@@ -20,6 +20,7 @@ use rw_store::lock::RunLock;
 use serde::{Deserialize, Serialize};
 
 use crate::abi::GoesAbiScene;
+use crate::cloud::CloudProduct;
 use crate::product::GoesAbiProduct;
 use crate::store::sector_slug;
 
@@ -43,6 +44,31 @@ pub struct NativeChannelSource {
     pub scan_end_unix: i64,
 }
 
+/// One archived channel-less ABI L2 granule (the cloud suite).
+///
+/// The ABI channel imagery of a frame is keyed by channel number; an L2
+/// retrieval has no channel, so it is keyed by its store slug
+/// ([`CloudProduct::slug`]) instead and lives beside the channels in the
+/// same exact-frame directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeL2ProductSource {
+    /// [`CloudProduct::slug`]; also this entry's key in the manifest.
+    pub product: String,
+    /// The NOAA filename product token the granule was published under,
+    /// e.g. `ABI-L2-ACHAC`. Sector-bearing, so the archived bytes can be
+    /// checked against the frame they were filed under.
+    pub abi_product: String,
+    pub object_key: String,
+    pub relative_path: String,
+    pub byte_size: u64,
+    /// BLAKE3 of the exact archived NetCDF bytes. Unlike the channel
+    /// sources there is no legacy digest-free form to upgrade: an L2
+    /// entry has carried its digest since it first existed.
+    pub content_blake3: String,
+    pub scan_start_unix: i64,
+    pub scan_end_unix: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeSatelliteFrame {
     pub schema: String,
@@ -52,6 +78,11 @@ pub struct NativeSatelliteFrame {
     pub scan_start_unix: i64,
     pub scan_end_unix: i64,
     pub channels: BTreeMap<u8, NativeChannelSource>,
+    /// Channel-less L2 granules of the same frame, keyed by
+    /// [`CloudProduct::slug`]. Skipped when empty, so a channel-only
+    /// manifest serializes exactly as it always has.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub l2_products: BTreeMap<String, NativeL2ProductSource>,
 }
 
 impl NativeSatelliteFrame {
@@ -62,6 +93,15 @@ impl NativeSatelliteFrame {
             .all(|channel| self.channels.contains_key(channel))
     }
 
+    /// Whether every requested L2 cloud product is archived in this frame.
+    /// An empty request is not "complete" — it would match every frame.
+    pub fn is_complete_for_cloud(&self, products: &[CloudProduct]) -> bool {
+        !products.is_empty()
+            && products
+                .iter()
+                .all(|product| self.l2_products.contains_key(product.slug()))
+    }
+
     pub fn channel_path(&self, store_root: &Path, channel: u8) -> io::Result<PathBuf> {
         let source = self.channels.get(&channel).ok_or_else(|| {
             io::Error::new(
@@ -69,6 +109,24 @@ impl NativeSatelliteFrame {
                 format!("native frame {} has no ABI C{channel:02}", self.frame_id),
             )
         })?;
+        contained_regular_file(store_root, &source.relative_path)
+    }
+
+    pub fn l2_product_source(&self, product: CloudProduct) -> io::Result<&NativeL2ProductSource> {
+        self.l2_products.get(product.slug()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "native frame {} has no {}",
+                    self.frame_id,
+                    product.catalog_id()
+                ),
+            )
+        })
+    }
+
+    pub fn l2_product_path(&self, store_root: &Path, product: CloudProduct) -> io::Result<PathBuf> {
+        let source = self.l2_product_source(product)?;
         contained_regular_file(store_root, &source.relative_path)
     }
 }
@@ -114,37 +172,8 @@ pub fn archive_goes_source(
     install_content_addressed_source(source_path, &target, source_size, &content_blake3)?;
 
     let manifest_path = frame_dir.join(FRAME_MANIFEST);
-    let mut manifest = if manifest_path.is_file() {
-        load_manifest(&manifest_path)?
-    } else {
-        NativeSatelliteFrame {
-            schema: NATIVE_FRAME_SCHEMA.to_string(),
-            platform: platform.clone(),
-            sector: sector.clone(),
-            frame_id: frame_id.clone(),
-            scan_start_unix: scene.start_time_utc.timestamp(),
-            scan_end_unix: scene.end_time_utc.timestamp(),
-            channels: BTreeMap::new(),
-        }
-    };
-    if manifest.schema != NATIVE_FRAME_SCHEMA
-        || manifest.platform != platform
-        || manifest.sector != sector
-        || manifest.frame_id != frame_id
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "native frame identity mismatch at {}",
-                manifest_path.display()
-            ),
-        ));
-    }
-    let relative_path = target
-        .strip_prefix(store_root)
-        .map_err(|_| io::Error::other("native archive target escaped the store root"))?
-        .to_string_lossy()
-        .replace('\\', "/");
+    let mut manifest = open_frame_manifest(&manifest_path, &platform, &sector, &frame_id, scene)?;
+    let relative_path = store_relative_path(store_root, &target)?;
     manifest.scan_start_unix = manifest
         .scan_start_unix
         .min(scene.start_time_utc.timestamp());
@@ -165,12 +194,140 @@ pub fn archive_goes_source(
     Ok(manifest)
 }
 
+/// Archive one channel-less ABI L2 cloud granule into the exact frame its
+/// scan start belongs to, alongside that frame's channel imagery.
+///
+/// The granule's own filename product token decides which cloud product
+/// this is, so a mislabelled call cannot file a COD granule as ACHA. The
+/// bytes are content-addressed exactly as channel sources are, and the
+/// frame identity (platform, sector, minute) is enforced against any
+/// manifest already there.
+pub fn archive_goes_l2_source(
+    store_root: &Path,
+    source_path: &Path,
+    scene: &GoesAbiScene,
+    object_key: &str,
+) -> io::Result<NativeSatelliteFrame> {
+    if scene.channel.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "channel imagery belongs in archive_goes_source, not the L2 archive",
+        ));
+    }
+    let (product, _sector) = CloudProduct::from_abi_product(&scene.product).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not an ABI L2 cloud product", scene.product),
+        )
+    })?;
+    let platform = scene.satellite.as_str().to_ascii_lowercase();
+    let sector = sector_slug(&scene.sector);
+    let frame_id = frame_id(scene.start_time_utc);
+    let day = &frame_id[..8];
+    let frame_dir = native_archive_root(store_root)
+        .join(&platform)
+        .join(&sector)
+        .join(day)
+        .join(&frame_id);
+    fs::create_dir_all(&frame_dir)?;
+    let _lock = RunLock::acquire(&frame_dir, ARCHIVE_LOCK_TIMEOUT)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+
+    let source_size = fs::metadata(source_path)?.len();
+    let content_blake3 = blake3_file(source_path)?;
+    let target = content_addressed_l2_path(&frame_dir, product, &content_blake3);
+    install_content_addressed_source(source_path, &target, source_size, &content_blake3)?;
+
+    let manifest_path = frame_dir.join(FRAME_MANIFEST);
+    let mut manifest = open_frame_manifest(&manifest_path, &platform, &sector, &frame_id, scene)?;
+    let relative_path = store_relative_path(store_root, &target)?;
+    manifest.scan_start_unix = manifest
+        .scan_start_unix
+        .min(scene.start_time_utc.timestamp());
+    manifest.scan_end_unix = manifest.scan_end_unix.max(scene.end_time_utc.timestamp());
+    manifest.l2_products.insert(
+        product.slug().to_string(),
+        NativeL2ProductSource {
+            product: product.slug().to_string(),
+            abi_product: scene.product.trim().to_ascii_uppercase(),
+            object_key: object_key.to_string(),
+            relative_path,
+            byte_size: source_size,
+            content_blake3,
+            scan_start_unix: scene.start_time_utc.timestamp(),
+            scan_end_unix: scene.end_time_utc.timestamp(),
+        },
+    );
+    save_manifest(&manifest_path, &manifest)?;
+    Ok(manifest)
+}
+
+fn open_frame_manifest(
+    manifest_path: &Path,
+    platform: &str,
+    sector: &str,
+    frame_id: &str,
+    scene: &GoesAbiScene,
+) -> io::Result<NativeSatelliteFrame> {
+    let manifest = if manifest_path.is_file() {
+        load_manifest(manifest_path)?
+    } else {
+        NativeSatelliteFrame {
+            schema: NATIVE_FRAME_SCHEMA.to_string(),
+            platform: platform.to_string(),
+            sector: sector.to_string(),
+            frame_id: frame_id.to_string(),
+            scan_start_unix: scene.start_time_utc.timestamp(),
+            scan_end_unix: scene.end_time_utc.timestamp(),
+            channels: BTreeMap::new(),
+            l2_products: BTreeMap::new(),
+        }
+    };
+    if manifest.schema != NATIVE_FRAME_SCHEMA
+        || manifest.platform != platform
+        || manifest.sector != sector
+        || manifest.frame_id != frame_id
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "native frame identity mismatch at {}",
+                manifest_path.display()
+            ),
+        ));
+    }
+    Ok(manifest)
+}
+
+fn store_relative_path(store_root: &Path, target: &Path) -> io::Result<String> {
+    Ok(target
+        .strip_prefix(store_root)
+        .map_err(|_| io::Error::other("native archive target escaped the store root"))?
+        .to_string_lossy()
+        .replace('\\', "/"))
+}
+
 pub fn list_native_frames(
     store_root: &Path,
     platform: &str,
     sector: &str,
     product: GoesAbiProduct,
     limit: usize,
+) -> io::Result<Vec<NativeSatelliteFrame>> {
+    list_frames_matching(store_root, platform, sector, limit, |manifest| {
+        manifest.is_complete_for(product)
+    })
+}
+
+/// Newest-first traversal of the retained frames of one platform/sector,
+/// returning those `accept` admits. Both the channel and the L2 listings
+/// walk the archive this way, so they retire frames in the same order.
+fn list_frames_matching(
+    store_root: &Path,
+    platform: &str,
+    sector: &str,
+    limit: usize,
+    accept: impl Fn(&NativeSatelliteFrame) -> bool,
 ) -> io::Result<Vec<NativeSatelliteFrame>> {
     let platform = normalize_component(platform)?;
     let sector = normalize_component(sector)?;
@@ -196,7 +353,7 @@ pub fn list_native_frames(
             let Ok(manifest) = load_manifest(&path) else {
                 continue;
             };
-            if manifest.is_complete_for(product) {
+            if accept(&manifest) {
                 manifests.push(manifest);
                 if manifests.len() >= requested {
                     return Ok(manifests);
@@ -317,6 +474,147 @@ pub fn native_frame_product_revision(
     Ok(hash.finalize().to_hex().to_string())
 }
 
+/// List retained frames that hold every requested L2 cloud product,
+/// newest first. The channel twin of this is [`list_native_frames`]; a
+/// frame satisfies both independently.
+pub fn list_native_cloud_frames(
+    store_root: &Path,
+    platform: &str,
+    sector: &str,
+    products: &[CloudProduct],
+    limit: usize,
+) -> io::Result<Vec<NativeSatelliteFrame>> {
+    list_frames_matching(store_root, platform, sector, limit, |manifest| {
+        manifest.is_complete_for_cloud(products)
+    })
+}
+
+/// Resolve one frame that holds every requested L2 cloud product, by
+/// exact `YYYYMMDDTHHMM` id or the `latest` alias.
+pub fn resolve_native_cloud_frame(
+    store_root: &Path,
+    platform: &str,
+    sector: &str,
+    products: &[CloudProduct],
+    frame: &str,
+) -> io::Result<NativeSatelliteFrame> {
+    if products.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no L2 cloud product requested",
+        ));
+    }
+    if frame.eq_ignore_ascii_case("latest") {
+        return list_native_cloud_frames(store_root, platform, sector, products, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "no retained satellite frame holds {}",
+                        products
+                            .iter()
+                            .map(|product| product.catalog_id())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+            });
+    }
+    if !valid_frame_id(frame) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "satellite frame id must be YYYYMMDDTHHMM",
+        ));
+    }
+    let platform = normalize_component(platform)?;
+    let sector = normalize_component(sector)?;
+    let manifest = load_manifest(&frame_manifest_path(store_root, &platform, &sector, frame))?;
+    if !manifest.is_complete_for_cloud(products) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "satellite frame {frame} is missing {}",
+                missing_cloud_products(&manifest, products).join(", ")
+            ),
+        ));
+    }
+    Ok(manifest)
+}
+
+/// Exact source identity for a set of L2 cloud products in one frame.
+/// The minute-granular frame id is not enough on its own: a republished
+/// granule keeps the minute and changes the bytes, and this digest
+/// changes with it.
+pub fn native_frame_cloud_revision(
+    manifest: &NativeSatelliteFrame,
+    products: &[CloudProduct],
+) -> io::Result<String> {
+    if products.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no L2 cloud product requested",
+        ));
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"rw-sat:native-l2-cloud-source-revision:v1\0");
+    update_hash_string(&mut hash, &manifest.platform);
+    update_hash_string(&mut hash, &manifest.sector);
+    update_hash_string(&mut hash, &manifest.frame_id);
+    let mut ordered = products.to_vec();
+    ordered.sort_unstable();
+    ordered.dedup();
+    for product in ordered {
+        let source = manifest.l2_product_source(product)?;
+        if !valid_blake3(&source.content_blake3) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "native frame {} {} has no validated content digest",
+                    manifest.frame_id,
+                    product.catalog_id()
+                ),
+            ));
+        }
+        update_hash_string(&mut hash, product.slug());
+        update_hash_string(&mut hash, &source.abi_product);
+        update_hash_string(&mut hash, &source.content_blake3);
+        update_hash_string(&mut hash, &source.object_key);
+        hash.update(&source.byte_size.to_le_bytes());
+        hash.update(&source.scan_start_unix.to_le_bytes());
+        hash.update(&source.scan_end_unix.to_le_bytes());
+    }
+    Ok(hash.finalize().to_hex().to_string())
+}
+
+/// [`resolve_native_cloud_frame`] plus its exact source revision.
+pub fn resolve_native_cloud_frame_with_revision(
+    store_root: &Path,
+    platform: &str,
+    sector: &str,
+    products: &[CloudProduct],
+    frame: &str,
+) -> io::Result<ResolvedNativeSatelliteFrame> {
+    let frame = resolve_native_cloud_frame(store_root, platform, sector, products, frame)?;
+    let source_revision = native_frame_cloud_revision(&frame, products)?;
+    Ok(ResolvedNativeSatelliteFrame {
+        frame,
+        source_revision,
+    })
+}
+
+fn missing_cloud_products(
+    manifest: &NativeSatelliteFrame,
+    products: &[CloudProduct],
+) -> Vec<String> {
+    products
+        .iter()
+        .filter(|product| !manifest.l2_products.contains_key(product.slug()))
+        .map(|product| product.catalog_id().to_string())
+        .collect()
+}
+
 fn upgrade_required_sources(
     store_root: &Path,
     observed: &NativeSatelliteFrame,
@@ -428,6 +726,14 @@ fn frame_manifest_path(store_root: &Path, platform: &str, sector: &str, frame: &
 
 fn content_addressed_channel_path(frame_dir: &Path, channel: u8, content_blake3: &str) -> PathBuf {
     frame_dir.join(format!("c{channel:02}-{content_blake3}.nc"))
+}
+
+fn content_addressed_l2_path(
+    frame_dir: &Path,
+    product: CloudProduct,
+    content_blake3: &str,
+) -> PathBuf {
+    frame_dir.join(format!("l2-{}-{content_blake3}.nc", product.slug()))
 }
 
 fn install_content_addressed_source(
@@ -670,6 +976,11 @@ fn load_manifest(path: &Path) -> io::Result<NativeSatelliteFrame> {
     if manifest.schema != NATIVE_FRAME_SCHEMA
         || !valid_frame_id(&manifest.frame_id)
         || manifest.channels.len() > 16
+        || manifest.l2_products.len() > CloudProduct::ALL.len()
+        || manifest
+            .l2_products
+            .iter()
+            .any(|(slug, source)| source.product != *slug || CloudProduct::parse(slug).is_none())
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -810,6 +1121,7 @@ mod tests {
                     scan_end_unix: 1_777_000_600,
                 },
             )]),
+            l2_products: BTreeMap::new(),
         };
         save_manifest(&frame_dir.join(FRAME_MANIFEST), &manifest).unwrap();
 
@@ -836,6 +1148,276 @@ mod tests {
             legacy_path.exists(),
             "legacy bytes remain available during migration"
         );
+    }
+
+    #[test]
+    fn l2_cloud_granules_land_in_the_same_exact_frame_as_the_channel_imagery() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_root = directory.path().join("store");
+        let channel_source = directory.path().join("c13.nc");
+        let cloud_source = directory.path().join("acha.nc");
+        fs::write(&channel_source, b"channel bytes").unwrap();
+        fs::write(&cloud_source, b"cloud bytes").unwrap();
+
+        let channel_scene = conus_scene(&channel_source, "ABI-L2-CMIPC", Some(13));
+        let cloud_scene = conus_scene(&cloud_source, "ABI-L2-ACHAC", None);
+        archive_goes_source(
+            &store_root,
+            &channel_source,
+            &channel_scene,
+            "ABI-L2-CMIPC/2026/216/18/OR_ABI-L2-CMIPC-M6C13_G19_s1_e2_c3.nc",
+        )
+        .unwrap();
+        let manifest = archive_goes_l2_source(
+            &store_root,
+            &cloud_source,
+            &cloud_scene,
+            "ABI-L2-ACHAC/2026/216/18/OR_ABI-L2-ACHAC-M6_G19_s1_e2_c3.nc",
+        )
+        .unwrap();
+
+        // One frame, both kinds of source, neither displacing the other.
+        assert!(manifest.channels.contains_key(&13));
+        assert!(manifest.is_complete_for_cloud(&[CloudProduct::CloudTopHeight]));
+        assert!(!manifest.is_complete_for_cloud(&[CloudProduct::OpticalDepth]));
+        assert!(
+            !manifest.is_complete_for_cloud(&[]),
+            "an empty request must never count as complete"
+        );
+
+        let source = manifest
+            .l2_product_source(CloudProduct::CloudTopHeight)
+            .unwrap();
+        assert_eq!(source.product, "acha");
+        assert_eq!(source.abi_product, "ABI-L2-ACHAC");
+        assert!(valid_blake3(&source.content_blake3));
+        assert!(
+            source
+                .relative_path
+                .contains(&format!("l2-acha-{}", source.content_blake3)),
+            "L2 sources are content addressed: {}",
+            source.relative_path
+        );
+        let path = manifest
+            .l2_product_path(&store_root, CloudProduct::CloudTopHeight)
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"cloud bytes");
+        let channel_path = manifest.channel_path(&store_root, 13).unwrap();
+        assert_eq!(
+            path.parent(),
+            channel_path.parent(),
+            "the L2 granule and the channel imagery share one frame directory"
+        );
+
+        // The manifest survives a round trip through disk unchanged.
+        let reloaded = resolve_native_cloud_frame(
+            &store_root,
+            "g19",
+            "conus",
+            &[CloudProduct::CloudTopHeight],
+            &manifest.frame_id,
+        )
+        .unwrap();
+        assert_eq!(reloaded, manifest);
+        assert_eq!(
+            list_native_cloud_frames(
+                &store_root,
+                "g19",
+                "conus",
+                &[CloudProduct::CloudTopHeight],
+                8
+            )
+            .unwrap(),
+            vec![manifest]
+        );
+    }
+
+    #[test]
+    fn republished_cloud_bytes_change_the_cloud_source_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_root = directory.path().join("store");
+        let first = directory.path().join("first.nc");
+        let second = directory.path().join("second.nc");
+        // Same length, same minute, different bytes: only a content
+        // digest can tell these apart.
+        fs::write(&first, b"AAAA").unwrap();
+        fs::write(&second, b"BBBB").unwrap();
+
+        let key = "ABI-L2-CODC/2026/216/18/OR_ABI-L2-CODC-M6_G19_s1_e2_c3.nc";
+        let scene = conus_scene(&first, "ABI-L2-CODC", None);
+        let before = archive_goes_l2_source(&store_root, &first, &scene, key).unwrap();
+        let before_revision =
+            native_frame_cloud_revision(&before, &[CloudProduct::OpticalDepth]).unwrap();
+        let before_path = before
+            .l2_product_path(&store_root, CloudProduct::OpticalDepth)
+            .unwrap();
+
+        let scene = conus_scene(&second, "ABI-L2-CODC", None);
+        let resolved = {
+            archive_goes_l2_source(&store_root, &second, &scene, key).unwrap();
+            resolve_native_cloud_frame_with_revision(
+                &store_root,
+                "g19",
+                "conus",
+                &[CloudProduct::OpticalDepth],
+                &before.frame_id,
+            )
+            .unwrap()
+        };
+
+        assert_ne!(resolved.source_revision, before_revision);
+        assert_eq!(
+            fs::read(&before_path).unwrap(),
+            b"AAAA",
+            "the superseded bytes stay addressable"
+        );
+        assert_eq!(
+            fs::read(
+                resolved
+                    .frame
+                    .l2_product_path(&store_root, CloudProduct::OpticalDepth)
+                    .unwrap()
+            )
+            .unwrap(),
+            b"BBBB"
+        );
+    }
+
+    /// The cloud-water-path derivation needs COD, CPS and ACTP from one
+    /// scan. A frame holding two of the three is not a CWP frame.
+    #[test]
+    fn a_multi_product_request_resolves_only_when_every_product_is_present() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_root = directory.path().join("store");
+        let trio = crate::cwp::CLOUD_WATER_PATH_INPUTS;
+        let mut frame_id = String::new();
+        for (index, (token, product)) in [
+            ("ABI-L2-CODC", CloudProduct::OpticalDepth),
+            ("ABI-L2-CPSC", CloudProduct::ParticleSize),
+            ("ABI-L2-ACTPC", CloudProduct::CloudTopPhase),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = directory.path().join(format!("{}.nc", product.slug()));
+            fs::write(&source, format!("bytes for {token}")).unwrap();
+            let scene = conus_scene(&source, token, None);
+            let manifest = archive_goes_l2_source(
+                &store_root,
+                &source,
+                &scene,
+                &format!("{token}/2026/216/18/OR_{token}-M6_G19_s1_e2_c3.nc"),
+            )
+            .unwrap();
+            frame_id = manifest.frame_id.clone();
+            let complete = index == 2;
+            assert_eq!(
+                manifest.is_complete_for_cloud(&trio),
+                complete,
+                "after {token} the trio is complete={complete}"
+            );
+        }
+
+        let resolved =
+            resolve_native_cloud_frame_with_revision(&store_root, "g19", "conus", &trio, "latest")
+                .unwrap();
+        assert_eq!(resolved.frame.frame_id, frame_id);
+        // Requesting the same three products in another order must name
+        // the same revision; requesting fewer must not.
+        let reordered = [
+            CloudProduct::CloudTopPhase,
+            CloudProduct::OpticalDepth,
+            CloudProduct::ParticleSize,
+        ];
+        assert_eq!(
+            native_frame_cloud_revision(&resolved.frame, &reordered).unwrap(),
+            resolved.source_revision
+        );
+        assert_ne!(
+            native_frame_cloud_revision(&resolved.frame, &[CloudProduct::OpticalDepth]).unwrap(),
+            resolved.source_revision
+        );
+
+        let missing = resolve_native_cloud_frame(
+            &store_root,
+            "g19",
+            "conus",
+            &[CloudProduct::CloudTopHeight],
+            &frame_id,
+        )
+        .expect_err("ACHA was never archived here");
+        assert!(
+            missing.to_string().contains("l2_cloud_top_height"),
+            "{missing}"
+        );
+    }
+
+    #[test]
+    fn the_l2_archive_refuses_channel_imagery_and_unknown_products() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_root = directory.path().join("store");
+        let source = directory.path().join("source.nc");
+        fs::write(&source, b"bytes").unwrap();
+
+        let channel_scene = conus_scene(&source, "ABI-L2-CMIPC", Some(13));
+        let error = archive_goes_l2_source(&store_root, &source, &channel_scene, "key")
+            .expect_err("channel imagery has its own archive door");
+        assert!(error.to_string().contains("archive_goes_source"), "{error}");
+
+        let other_l2 = conus_scene(&source, "ABI-L2-TPWC", None);
+        let error = archive_goes_l2_source(&store_root, &source, &other_l2, "key")
+            .expect_err("total precipitable water is not a cloud product");
+        assert!(
+            error.to_string().contains("not an ABI L2 cloud product"),
+            "{error}"
+        );
+    }
+
+    /// Channel-only frames — every manifest written before the cloud
+    /// suite existed — must load and re-save byte for byte.
+    #[test]
+    fn channel_only_manifests_round_trip_without_an_l2_field() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_root = directory.path().join("store");
+        let source = directory.path().join("c13.nc");
+        fs::write(&source, b"channel bytes").unwrap();
+        let scene = conus_scene(&source, "ABI-L2-CMIPC", Some(13));
+        let manifest = archive_goes_source(&store_root, &source, &scene, "key").unwrap();
+        assert!(manifest.l2_products.is_empty());
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(
+            !json.contains("l2_products"),
+            "an empty L2 map must not appear on disk: {json}"
+        );
+        let reloaded: NativeSatelliteFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded, manifest);
+    }
+
+    fn conus_scene(path: &Path, product: &str, channel: Option<u8>) -> GoesAbiScene {
+        let start_time_utc = Utc.with_ymd_and_hms(2026, 8, 4, 18, 1, 17).unwrap();
+        GoesAbiScene {
+            path: path.to_path_buf(),
+            product: product.into(),
+            sector: AbiSector::Conus,
+            channel,
+            satellite: GoesSatellite::G19,
+            start_time_utc,
+            end_time_utc: start_time_utc + chrono::Duration::seconds(155),
+            projection: GoesImagerProjection {
+                perspective_point_height_m: 35_786_023.0,
+                semi_major_axis_m: 6_378_137.0,
+                semi_minor_axis_m: 6_356_752.314_14,
+                longitude_of_projection_origin_deg: -75.0,
+                sweep_angle_axis: SweepAngleAxis::X,
+            },
+            fixed_grid: AbiFixedGrid {
+                nx: 1,
+                ny: 1,
+                x_scan_rad: vec![0.0],
+                y_scan_rad: vec![0.0],
+            },
+        }
     }
 
     fn fixture_scene(path: &Path) -> GoesAbiScene {
