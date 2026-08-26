@@ -44,6 +44,71 @@ fn effective_stp_applies_cin_and_ebwd_limits() {
     assert_close(effective_stp_value(1500.0, -50.0, 1000.0, 150.0, 40.0), 1.5);
 }
 
+/// EBWD must be measured from the effective inflow base to HALF the depth from
+/// that base to the MU parcel equilibrium level - Thompson, Mead & Edwards
+/// (2007), Wea. Forecasting 22, 102-115, Fig. 3 ("50% of the depth from the
+/// effective inflow base to mu parcel EL height"). It must NOT be measured to
+/// the effective inflow layer TOP; that is a different quantity, reported
+/// separately as `effective_inflow_layer_shear_ms`.
+///
+/// Hodograph: u = 0 at the surface, 10 m/s at 1 km, 30 m/s at 3 km, all v = 0.
+/// With base = 0 m and MU EL = 4000 m the EBWD top is 0 + 0.5*(4000-0) = 2000 m,
+/// where u = 20 m/s, so EBWD = 20 m/s. Mirrors the reference case in wrf-rust
+/// `effective_bulk_wind_difference_uses_half_el_depth`.
+#[test]
+fn ebwd_layer_top_is_half_depth_to_mu_equilibrium_level() {
+    let heights = [0.0, 1000.0, 3000.0];
+    let u = [0.0, 10.0, 30.0];
+    let v = [0.0, 0.0, 0.0];
+
+    let base_m = 0.0;
+    let mu_el_m = 4000.0;
+    let ebwd_top_m = base_m + 0.5 * (mu_el_m - base_m);
+    assert_close(ebwd_top_m, 2000.0);
+    assert_close(
+        bulk_wind_difference_ms(&heights, &u, &v, base_m, ebwd_top_m),
+        20.0,
+    );
+
+    // The effective inflow layer top (1000 m here) gives a materially different,
+    // and always smaller, answer - which is exactly the defect this guards.
+    assert_close(
+        bulk_wind_difference_ms(&heights, &u, &v, base_m, 1000.0),
+        10.0,
+    );
+}
+
+/// The MU equilibrium level is undefined when the parcel is still buoyant at the
+/// top of the supplied profile. EBWD is then NaN rather than silently falling
+/// back to the inflow-layer top, matching wrf-rust's `mu_el_h: None` branch.
+#[test]
+fn ebwd_is_missing_when_equilibrium_level_is_above_the_profile() {
+    let grid = GridShape::new(1, 1).unwrap();
+    let volume = EcapeVolumeInputs {
+        pressure_pa: &[95_000.0, 90_000.0, 85_000.0, 70_000.0, 50_000.0, 30_000.0],
+        temperature_c: &[26.0, 22.0, 18.0, 8.0, -10.0, -38.0],
+        qvapor_kgkg: &[0.016, 0.013, 0.010, 0.005, 0.0015, 0.0003],
+        height_agl_m: &[150.0, 800.0, 1500.0, 3000.0, 5600.0, 9200.0],
+        u_ms: &[6.0, 9.0, 12.0, 18.0, 26.0, 33.0],
+        v_ms: &[2.0, 5.0, 8.0, 13.0, 20.0, 28.0],
+        nz: 6,
+    };
+    let surface = SurfaceInputs {
+        psfc_pa: &[100_000.0],
+        t2_k: &[303.15],
+        q2_kgkg: &[0.018],
+        u10_ms: &[5.0],
+        v10_ms: &[1.5],
+    };
+
+    let eff = compute_effective_layer_diagnostics(grid, volume, surface, None).unwrap();
+    assert!(eff.effective_bulk_wind_difference_ms[0].is_nan());
+    // The inflow layer itself is still resolved, so its own shear is still
+    // reported - the two quantities are independent.
+    assert!(eff.effective_inflow_layer_shear_ms[0].is_finite());
+    assert!(eff.effective_srh_m2s2[0].is_finite());
+}
+
 #[test]
 fn effective_scp_uses_ebwd_thresholds() {
     assert_close(scp_effective_value(3000.0, 150.0, 8.0), 0.0);
@@ -152,14 +217,25 @@ fn bri_uses_brn_shear_and_zeroes_degenerate_denominator() {
 #[test]
 fn supported_severe_fields_reuse_fixed_and_proxy_component_math() {
     let grid = GridShape::new(1, 1).unwrap();
+    // Extends through the tropopause so the MU parcel equilibrium level - which
+    // sets the EBWD layer top (Thompson et al. 2007) - resolves inside the
+    // profile. A profile truncated at 300 hPa leaves the parcel still buoyant at
+    // the top, so the EL is undefined and EBWD is legitimately NaN.
     let volume = EcapeVolumeInputs {
-        pressure_pa: &[95_000.0, 90_000.0, 85_000.0, 70_000.0, 50_000.0, 30_000.0],
-        temperature_c: &[26.0, 22.0, 18.0, 8.0, -10.0, -38.0],
-        qvapor_kgkg: &[0.016, 0.013, 0.010, 0.005, 0.0015, 0.0003],
-        height_agl_m: &[150.0, 800.0, 1500.0, 3000.0, 5600.0, 9200.0],
-        u_ms: &[6.0, 9.0, 12.0, 18.0, 26.0, 33.0],
-        v_ms: &[2.0, 5.0, 8.0, 13.0, 20.0, 28.0],
-        nz: 6,
+        pressure_pa: &[
+            95_000.0, 90_000.0, 85_000.0, 70_000.0, 50_000.0, 30_000.0, 20_000.0, 15_000.0,
+            10_000.0,
+        ],
+        temperature_c: &[26.0, 22.0, 18.0, 8.0, -10.0, -38.0, -54.0, -64.0, -62.0],
+        qvapor_kgkg: &[
+            0.016, 0.013, 0.010, 0.005, 0.0015, 0.0003, 0.00008, 0.00004, 0.00002,
+        ],
+        height_agl_m: &[
+            150.0, 800.0, 1500.0, 3000.0, 5600.0, 9200.0, 11_800.0, 13_600.0, 16_200.0,
+        ],
+        u_ms: &[6.0, 9.0, 12.0, 18.0, 26.0, 33.0, 40.0, 44.0, 46.0],
+        v_ms: &[2.0, 5.0, 8.0, 13.0, 20.0, 28.0, 32.0, 36.0, 38.0],
+        nz: 9,
     };
     let surface = SurfaceInputs {
         psfc_pa: &[100_000.0],
@@ -279,18 +355,38 @@ fn cape_cin_levels_match_broadcast_pressure_path() {
 #[test]
 fn supported_severe_fields_levels_match_broadcast_pressure_path() {
     let grid = GridShape::new(2, 1).unwrap();
-    let pressure_levels_pa = [95_000.0, 85_000.0, 70_000.0, 50_000.0];
+    // Deep enough for the MU equilibrium level (and therefore EBWD) to resolve;
+    // see the note in supported_severe_fields_reuse_fixed_and_proxy_component_math.
+    let pressure_levels_pa = [
+        95_000.0, 85_000.0, 70_000.0, 50_000.0, 30_000.0, 20_000.0, 15_000.0, 10_000.0,
+    ];
     let volume_levels = EcapeVolumeInputs {
         pressure_pa: &pressure_levels_pa,
-        temperature_c: &[26.0, 24.0, 18.0, 16.0, 8.0, 6.0, -10.0, -12.0],
-        qvapor_kgkg: &[0.016, 0.015, 0.010, 0.009, 0.004, 0.0038, 0.0012, 0.0011],
-        height_agl_m: &[150.0, 200.0, 1400.0, 1500.0, 3000.0, 3200.0, 5600.0, 5800.0],
-        u_ms: &[6.0, 8.0, 12.0, 14.0, 20.0, 22.0, 28.0, 30.0],
-        v_ms: &[2.0, 3.0, 8.0, 9.0, 13.0, 14.0, 20.0, 21.0],
-        nz: 4,
+        temperature_c: &[
+            26.0, 24.0, 18.0, 16.0, 8.0, 6.0, -10.0, -12.0, -38.0, -40.0, -54.0, -56.0, -64.0,
+            -66.0, -62.0, -64.0,
+        ],
+        qvapor_kgkg: &[
+            0.016, 0.015, 0.010, 0.009, 0.004, 0.0038, 0.0012, 0.0011, 0.0003, 0.00028, 0.00008,
+            0.00007, 0.00004, 0.000035, 0.00002, 0.000018,
+        ],
+        height_agl_m: &[
+            150.0, 200.0, 1400.0, 1500.0, 3000.0, 3200.0, 5600.0, 5800.0, 9200.0, 9400.0, 11_800.0,
+            12_000.0, 13_600.0, 13_800.0, 16_200.0, 16_400.0,
+        ],
+        u_ms: &[
+            6.0, 8.0, 12.0, 14.0, 20.0, 22.0, 28.0, 30.0, 34.0, 36.0, 40.0, 42.0, 44.0, 46.0, 46.0,
+            48.0,
+        ],
+        v_ms: &[
+            2.0, 3.0, 8.0, 9.0, 13.0, 14.0, 20.0, 21.0, 26.0, 27.0, 32.0, 33.0, 36.0, 37.0, 38.0,
+            39.0,
+        ],
+        nz: 8,
     };
     let pressure_broadcast = [
-        95_000.0, 95_000.0, 85_000.0, 85_000.0, 70_000.0, 70_000.0, 50_000.0, 50_000.0,
+        95_000.0, 95_000.0, 85_000.0, 85_000.0, 70_000.0, 70_000.0, 50_000.0, 50_000.0, 30_000.0,
+        30_000.0, 20_000.0, 20_000.0, 15_000.0, 15_000.0, 10_000.0, 10_000.0,
     ];
     let volume_broadcast = EcapeVolumeInputs {
         pressure_pa: &pressure_broadcast,

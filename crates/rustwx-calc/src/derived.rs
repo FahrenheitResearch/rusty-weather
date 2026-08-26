@@ -26,6 +26,7 @@ pub struct SurfaceThermoOutputs {
     pub wetbulb_2m_c: Vec<f64>,
     pub dewpoint_depression_2m_c: Vec<f64>,
     pub vpd_2m_hpa: Vec<f64>,
+    pub hdw_hpa_ms: Vec<f64>,
     pub fire_weather_composite: Vec<f64>,
     pub apparent_temperature_2m_c: Vec<f64>,
     pub heat_index_2m_c: Vec<f64>,
@@ -46,6 +47,7 @@ struct SurfaceThermoState {
     wetbulb_2m_c: Vec<f64>,
     dewpoint_depression_2m_c: Vec<f64>,
     vpd_2m_hpa: Vec<f64>,
+    hdw_hpa_ms: Vec<f64>,
     fire_weather_composite: Vec<f64>,
     heat_index_2m_c: Vec<f64>,
     wind_chill_2m_c: Vec<f64>,
@@ -65,6 +67,7 @@ pub fn compute_surface_thermo(
         wetbulb_2m_c: state.wetbulb_2m_c,
         dewpoint_depression_2m_c: state.dewpoint_depression_2m_c,
         vpd_2m_hpa: state.vpd_2m_hpa,
+        hdw_hpa_ms: state.hdw_hpa_ms,
         fire_weather_composite: state.fire_weather_composite,
         apparent_temperature_2m_c: state.apparent_temperature_2m_c,
         heat_index_2m_c: state.heat_index_2m_c,
@@ -577,6 +580,7 @@ struct SurfaceThermoPoint {
     wetbulb_c: f64,
     dewpoint_depression_c: f64,
     vpd_hpa: f64,
+    hdw_hpa_ms: f64,
     fire_weather: f64,
     heat_index_c: f64,
     wind_chill_c: f64,
@@ -601,6 +605,12 @@ fn compute_surface_thermo_state(
                 + surface.v10_ms[idx] * surface.v10_ms[idx])
                 .sqrt();
             let vpd_hpa = vapor_pressure_deficit_hpa(temperature_c, dewpoint_c);
+            let hdw_hpa_ms = metrust::calc::hot_dry_windy(
+                temperature_c,
+                relative_humidity_pct,
+                wind_speed_ms,
+                vpd_hpa,
+            );
             SurfaceThermoPoint {
                 dewpoint_c,
                 relative_humidity_pct,
@@ -616,11 +626,12 @@ fn compute_surface_thermo_state(
                 ),
                 dewpoint_depression_c: (temperature_c - dewpoint_c).max(0.0),
                 vpd_hpa,
+                hdw_hpa_ms,
                 fire_weather: fire_weather_composite_value(
                     temperature_c,
                     relative_humidity_pct,
                     wind_speed_ms,
-                    vpd_hpa,
+                    hdw_hpa_ms,
                 ),
                 heat_index_c: metrust::calc::atmo::heat_index(temperature_c, relative_humidity_pct),
                 wind_chill_c: metrust::calc::atmo::windchill(temperature_c, wind_speed_ms),
@@ -643,6 +654,7 @@ fn compute_surface_thermo_state(
         wetbulb_2m_c: unzip(|p| p.wetbulb_c),
         dewpoint_depression_2m_c: unzip(|p| p.dewpoint_depression_c),
         vpd_2m_hpa: unzip(|p| p.vpd_hpa),
+        hdw_hpa_ms: unzip(|p| p.hdw_hpa_ms),
         fire_weather_composite: unzip(|p| p.fire_weather),
         heat_index_2m_c: unzip(|p| p.heat_index_c),
         wind_chill_2m_c: unzip(|p| p.wind_chill_c),
@@ -667,20 +679,18 @@ fn fire_weather_composite_value(
     temperature_c: f64,
     relative_humidity_pct: f64,
     wind_speed_ms: f64,
-    vpd_hpa: f64,
+    hdw_hpa_ms: f64,
 ) -> f64 {
     const MPH_PER_MS: f64 = 2.236_936_292_054_4;
 
     // Blend Fosberg and capped HDW so the public-facing composite stays on
-    // a stable 0-100 scale while still responding directly to VPD.
+    // a stable 0-100 scale while the raw HDW product keeps its native units.
     let fosberg = metrust::calc::fosberg_fire_weather_index(
         temperature_c * 9.0 / 5.0 + 32.0,
         relative_humidity_pct,
         wind_speed_ms * MPH_PER_MS,
     );
-    let hdw =
-        metrust::calc::hot_dry_windy(temperature_c, relative_humidity_pct, wind_speed_ms, vpd_hpa)
-            .clamp(0.0, 100.0);
+    let hdw = hdw_hpa_ms.clamp(0.0, 100.0);
 
     (0.5 * fosberg + 0.5 * hdw).clamp(0.0, 100.0)
 }
@@ -931,6 +941,7 @@ mod tests {
         assert_eq!(outputs.wetbulb_2m_c.len(), 2);
         assert_eq!(outputs.dewpoint_depression_2m_c.len(), 2);
         assert_eq!(outputs.vpd_2m_hpa.len(), 2);
+        assert_eq!(outputs.hdw_hpa_ms.len(), 2);
         assert_eq!(outputs.fire_weather_composite.len(), 2);
 
         for idx in 0..2 {
@@ -939,11 +950,13 @@ mod tests {
             assert!(outputs.wetbulb_2m_c[idx] >= outputs.dewpoint_2m_c[idx] - 1.0e-6);
             assert!(outputs.dewpoint_depression_2m_c[idx] >= 0.0);
             assert!(outputs.vpd_2m_hpa[idx] >= 0.0);
+            assert!(outputs.hdw_hpa_ms[idx] >= 0.0);
             assert!((0.0..=100.0).contains(&outputs.fire_weather_composite[idx]));
         }
 
         assert!(outputs.dewpoint_depression_2m_c[1] > outputs.dewpoint_depression_2m_c[0]);
         assert!(outputs.vpd_2m_hpa[1] > outputs.vpd_2m_hpa[0]);
+        assert!(outputs.hdw_hpa_ms[1] > outputs.hdw_hpa_ms[0]);
         assert!(outputs.fire_weather_composite[1] > outputs.fire_weather_composite[0]);
     }
 }
