@@ -46,16 +46,17 @@ pub use ptype::{
 };
 pub use rustwx_core::GridShape;
 pub use severe::{
-    BulkRichardsonInputs, CapeCinOutputs, CapeCinTriplet, EffectiveScpInputs,
-    EffectiveSevereInputs, EffectiveSevereOutputs, EffectiveStpInputs, FixedStpInputs,
-    ScpEhiInputs, ScpEhiOutputs, ShipInputs, SupportedSevereFields, TornadicBetaInputs,
-    TornadicBetaOutputs, VtpModInputs, WindDiagnosticsBundle, WindGridInputs, compute_bri,
-    compute_cape_cin, compute_cape_cin_triplet, compute_effective_severe, compute_ehi, compute_scp,
-    compute_scp_effective, compute_scp_ehi, compute_shear, compute_ship, compute_srh,
-    compute_srh_hemispheric, compute_stp, compute_stp_effective, compute_stp_fixed,
-    compute_supported_severe_fields, compute_supported_severe_fields_hemispheric,
-    compute_tornadic_beta, compute_vtp_mod, compute_wind_diagnostics_bundle, critical_angle,
-    significant_tornado_parameter, supercell_composite_parameter,
+    BulkRichardsonInputs, CapeCinOutputs, CapeCinTriplet, EffectiveLayerDiagnosticsBundle,
+    EffectiveScpInputs, EffectiveSevereInputs, EffectiveSevereOutputs, EffectiveStpInputs,
+    FixedStpInputs, ScpEhiInputs, ScpEhiOutputs, ShipInputs, SupportedSevereFields,
+    TornadicBetaInputs, TornadicBetaOutputs, VtpModInputs, WindDiagnosticsBundle, WindGridInputs,
+    compute_bri, compute_cape_cin, compute_cape_cin_triplet, compute_effective_layer_diagnostics,
+    compute_effective_severe, compute_ehi, compute_scp, compute_scp_effective, compute_scp_ehi,
+    compute_shear, compute_ship, compute_srh, compute_srh_hemispheric, compute_stp,
+    compute_stp_effective, compute_stp_fixed, compute_supported_severe_fields,
+    compute_supported_severe_fields_hemispheric, compute_tornadic_beta, compute_vtp_mod,
+    compute_wind_diagnostics_bundle, critical_angle, significant_tornado_parameter,
+    supercell_composite_parameter,
 };
 pub use windowed::{max_window_fields, sum_window_fields};
 

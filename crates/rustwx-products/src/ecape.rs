@@ -19,8 +19,9 @@ use rustwx_calc::{
     EcapeTripletFieldsWithFailureMask, EcapeTripletOptions, EcapeVolumeInputs, EffectiveStpInputs,
     ScpEhiInputs, SurfaceInputs, WindGridInputs,
     compute_analytic_ecape_triplet_with_failure_mask_from_parts,
-    compute_ecape_triplet_with_failure_mask_from_parts, compute_ehi, compute_mlcape_cin,
-    compute_scp_ehi, compute_stp_effective, compute_wind_diagnostics_bundle,
+    compute_ecape_triplet_with_failure_mask_from_parts, compute_effective_layer_diagnostics,
+    compute_ehi, compute_mlcape_cin, compute_scp_ehi, compute_stp_effective,
+    compute_wind_diagnostics_bundle,
 };
 use rustwx_core::{ModelId, SourceId};
 use rustwx_render::{
@@ -544,6 +545,8 @@ pub struct EcapeMapFieldsTiming {
     pub wind_diagnostics_ms: u128,
     /// The classic (non-entraining) ML parcel pass feeding the STP's LCL.
     pub ml_classic_ms: u128,
+    /// Effective inflow layer + effective SRH/EBWD, for the effective STP.
+    pub effective_layer_ms: u128,
     /// Elementwise composites + ratios (SCP/EHI/STP, derived/native ratios).
     pub composites_ms: u128,
 }
@@ -651,14 +654,76 @@ pub fn compute_ecape_map_fields_with_prepared_volume_timed(
         None,
     )?;
     timing.ml_classic_ms = ml_classic_start.elapsed().as_millis();
+
+    // Effective-layer kinematics for the effective STP.
+    //
+    // `compute_stp_effective` documents that its callers "must provide ...
+    // effective SRH and effective bulk wind difference from a profile-aware
+    // workflow". This call site used to hand it `srh_01km_m2s2` and
+    // `shear_06km_ms` — the FIXED-layer ingredients — which silently turned
+    // `ecape_stp` into a fixed-layer STP wearing the effective label. Neither
+    // substitute is the quantity the parameter is defined on: Thompson, Mead &
+    // Edwards (2007), Wea. Forecasting 22, 102-115 define both over the
+    // effective inflow layer, with the bulk shear taken from the inflow base to
+    // half the depth up to the MU parcel EL.
+    let effective_start = Instant::now();
+    let effective_layer = compute_effective_layer_diagnostics(
+        prepared.grid,
+        EcapeVolumeInputs {
+            pressure_pa: prepared
+                .pressure_3d_pa
+                .as_deref()
+                .unwrap_or(&prepared.pressure_levels_pa),
+            temperature_c: &pressure.temperature_c_3d,
+            qvapor_kgkg: &pressure.qvapor_kgkg_3d,
+            height_agl_m: &prepared.height_agl_3d,
+            u_ms: &pressure.u_ms_3d,
+            v_ms: &pressure.v_ms_3d,
+            nz: prepared.shape.nz,
+        },
+        SurfaceInputs {
+            psfc_pa: &surface.psfc_pa,
+            t2_k: &surface.t2_k,
+            q2_kgkg: &surface.q2_kgkg,
+            u10_ms: &surface.u10_ms,
+            v10_ms: &surface.v10_ms,
+        },
+        None,
+    )?;
+    timing.effective_layer_ms = effective_start.elapsed().as_millis();
+
+    // `compute_effective_layer_diagnostics` reports NaN for a column with no
+    // effective inflow layer (nothing in the profile clears the 100 J/kg CAPE /
+    // -250 J/kg CIN inflow test) and for a column whose MU equilibrium level is
+    // off the top of the profile. NaN is the right sentinel for a DIAGNOSTIC -
+    // it refuses to claim a value it does not have - but it is the wrong thing
+    // to hand a composite that is about to be rendered as a filled field: it
+    // would punch holes through most of a domain where the old wiring drew 0.
+    //
+    // For a COMPOSITE the absence of an effective inflow layer is a determinate
+    // statement, not a missing measurement: no parcel can sustain the inflow, so
+    // the effective-layer tornado parameter is zero, not unknown. Zero is also
+    // the conservative direction for the EBWD-missing case. This is the same
+    // choice the `wrf-rust` reference makes when the MU EL is unreachable.
+    let effective_srh_for_composite: Vec<f64> = effective_layer
+        .effective_srh_m2s2
+        .iter()
+        .map(|v| if v.is_finite() { *v } else { 0.0 })
+        .collect();
+    let effective_ebwd_for_composite: Vec<f64> = effective_layer
+        .effective_bulk_wind_difference_ms
+        .iter()
+        .map(|v| if v.is_finite() { *v } else { 0.0 })
+        .collect();
+
     let tail_start = Instant::now();
     let ecape_stp = compute_stp_effective(EffectiveStpInputs {
         grid: prepared.grid,
         mlcape_jkg: &analytic.ml.fields.ecape_jkg,
         mlcin_jkg: &entraining_path.ml.fields.cin_jkg,
         ml_lcl_m: &ml_classic.lcl_m,
-        effective_srh_m2s2: &wind_diagnostics.srh_01km_m2s2,
-        effective_bulk_wind_difference_ms: &wind_diagnostics.shear_06km_ms,
+        effective_srh_m2s2: &effective_srh_for_composite,
+        effective_bulk_wind_difference_ms: &effective_ebwd_for_composite,
     })?;
     let failure_count = combined_ecape_failure_count(&analytic, &entraining_path);
 
@@ -804,3 +869,6 @@ fn ecape_cape_ratio(ecape_jkg: &[f64], cape_jkg: &[f64]) -> Vec<f64> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests;
