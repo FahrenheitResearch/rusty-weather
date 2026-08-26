@@ -1270,6 +1270,10 @@ mod tests {
             },
             source_provenance: vec![SourceProvenance {
                 provider: "noaa-public".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["surface".into()],
                 products: vec!["hrrr-sfc".into()],
             }],

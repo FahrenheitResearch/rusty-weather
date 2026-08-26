@@ -94,14 +94,17 @@ layout when levels were requested.
 
 ## Canonical request identity
 
-The schema is `rw.community.request.v1`. A `ShareRequest` contains and binds:
+Legacy requests use `rw.community.request.v1`; structured source identity uses
+`rw.community.request.v2`. A `ShareRequest` contains and binds:
 
 - exact `model`, immutable `run`, `snapshot_id`, and `grid_hash`;
 - sorted, unique variables;
 - the complete tagged query and all query parameters;
 - exact single-object `valid_unix` or an exact time window, as applicable;
 - a recipe identifier, recipe version, and sorted recipe parameters;
-- normalized source provider, role, and product provenance;
+- normalized source acquisition lane, optional complete structured identity
+  (forecast producer, licensing publisher, transport, mirror status), role,
+  and product provenance;
 - the data-origin/publication policy facts.
 
 Coordinates are signed fixed-point integers in degrees times 10^7. They are
@@ -112,7 +115,8 @@ daylight-saving ambiguity.
 
 `canonical_request_bytes` writes one deterministic binary preimage:
 
-- domain prefix `rw-community-request-identity-v1\0`;
+- version-matched domain prefix (`rw-community-request-identity-v1\0` or
+  `rw-community-request-identity-v2\0`);
 - fixed field order;
 - one-byte enum discriminants;
 - big-endian fixed-width integers;
@@ -122,9 +126,13 @@ daylight-saving ambiguity.
 
 `request_sha256` is lowercase hex SHA-256 of that preimage. Changing the run,
 snapshot, grid, variable split, valid time/window, query, recipe, provenance,
-or publication facts MUST change the identity. New semantics require a new
-schema and domain prefix; fields MUST NOT be appended invisibly to the v1
-preimage.
+or publication facts MUST change the identity. V1 provenance bytes and golden
+signatures remain unchanged. V1 rejects structured fields; v2 requires all
+producer/publisher/transport fields for every source and signs them under both
+the v2 request domain and an explicit nested provenance-v2 domain. Older
+clients therefore continue to verify and deserialize legacy v1 objects, while
+structured objects are an explicit version negotiation rather than a silent
+v1 preimage change.
 
 ## Origin-signed object manifest
 

@@ -1010,6 +1010,10 @@ fn ingest_writer_persists_normalized_source_provenance() {
         manifest.hours[&6].source_provenance,
         vec![RwsSourceProvenance {
             provider: "ecmwf-open-data".into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles: vec!["pressure".into(), "surface".into()],
             products: vec!["oper".into()],
         }]

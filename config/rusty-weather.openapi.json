@@ -15804,10 +15804,23 @@
         "description": "Sanitized union of resolved providers represented in a run.",
         "required": [
           "provider",
+          "transport_is_mirror",
           "roles",
           "products"
         ],
         "properties": {
+          "forecast_producer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "licensing_publisher": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "products": {
             "type": "array",
             "items": {
@@ -15822,6 +15835,15 @@
             "items": {
               "type": "string"
             }
+          },
+          "transport_is_mirror": {
+            "type": "boolean"
+          },
+          "transport_provider": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },

@@ -2071,13 +2071,37 @@ fn protocol_attributions(descriptor: &rw_query::RunDescriptor) -> Vec<Attributio
                 .source_provenance
                 .iter()
                 .find(|source| {
-                    (attribution.provider.contains("ECMWF") && source.provider == "ecmwf-open-data")
+                    let publisher = source.licensing_publisher_identity();
+                    (attribution.provider.contains("ECMWF")
+                        && matches!(publisher, "ecmwf" | "ecmwf-open-data"))
                         || (attribution.provider.contains("NOAA")
-                            && source.provider.starts_with("noaa-"))
+                            && matches!(
+                                publisher,
+                                "noaa"
+                                    | "noaa-nws"
+                                    | "noaa-ncep"
+                                    | "noaa-nomads"
+                                    | "noaa-ncei"
+                                    | "noaa-aws-public-data"
+                                    | "noaa-google-public-data"
+                                    | "noaa-microsoft-azure-public-data"
+                            ))
+                        || (attribution
+                            .provider
+                            .contains("Environment and Climate Change Canada")
+                            && matches!(publisher, "eccc" | "eccc-msc" | "eccc-msc-datamart"))
                         || (attribution.provider.contains("DWD")
-                            && source.provider == "dwd-open-data")
+                            && matches!(publisher, "dwd" | "dwd-open-data"))
+                        || (attribution
+                            .provider
+                            .contains("China Meteorological Administration")
+                            && matches!(publisher, "cma" | "cma-wis2-core-data"))
+                        || (attribution.provider.contains("Roshydromet")
+                            && matches!(publisher, "roshydromet" | "roshydromet-wipps-dc"))
+                        || (attribution.provider.contains("CPTEC")
+                            && matches!(publisher, "cptec-inpe" | "inpe"))
                 })
-                .map(|source| source.provider.clone())
+                .map(|source| source.licensing_publisher_identity().to_owned())
                 .unwrap_or_else(|| attribution.provider.clone()),
             notice: attribution.notice.clone(),
             source_url: attribution.source_url.clone(),
@@ -2116,23 +2140,52 @@ fn validate_request_source(
         .iter()
         .map(|source| rw_community_protocol::SourceProvenance {
             provider: source.provider.clone(),
+            forecast_producer: source.forecast_producer.clone(),
+            licensing_publisher: source.licensing_publisher.clone(),
+            transport_provider: source.transport_provider.clone(),
+            transport_is_mirror: source.transport_is_mirror,
             roles: source.roles.clone(),
             products: source.products.clone(),
         })
         .collect::<Vec<_>>();
     for source in &mut expected {
         source.provider = source.provider.trim().to_ascii_lowercase();
+        source.forecast_producer = source
+            .forecast_producer
+            .take()
+            .map(|value| value.trim().to_ascii_lowercase());
+        source.licensing_publisher = source
+            .licensing_publisher
+            .take()
+            .map(|value| value.trim().to_ascii_lowercase());
+        source.transport_provider = source
+            .transport_provider
+            .take()
+            .map(|value| value.trim().to_ascii_lowercase());
         source.roles.sort();
         source.roles.dedup();
         source.products.sort();
         source.products.dedup();
     }
     expected.sort_by(|left, right| {
-        (&left.provider, &left.roles, &left.products).cmp(&(
-            &right.provider,
-            &right.roles,
-            &right.products,
-        ))
+        (
+            &left.provider,
+            &left.forecast_producer,
+            &left.licensing_publisher,
+            &left.transport_provider,
+            left.transport_is_mirror,
+            &left.roles,
+            &left.products,
+        )
+            .cmp(&(
+                &right.provider,
+                &right.forecast_producer,
+                &right.licensing_publisher,
+                &right.transport_provider,
+                right.transport_is_mirror,
+                &right.roles,
+                &right.products,
+            ))
     });
     expected.dedup();
     if request.source_provenance != expected {
@@ -2832,6 +2885,10 @@ mod tests {
                 },
                 source_provenance: vec![rw_community_protocol::SourceProvenance {
                     provider: "simulation-owner".into(),
+                    forecast_producer: None,
+                    licensing_publisher: None,
+                    transport_provider: None,
+                    transport_is_mirror: false,
                     roles: vec!["simulation".into()],
                     products: vec!["wrf".into()],
                 }],
@@ -3044,6 +3101,10 @@ mod tests {
         relabeled.request.model = "hrrr".into();
         relabeled.request.source_provenance = vec![rw_community_protocol::SourceProvenance {
             provider: "noaa-aws-public-data".into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles: vec!["surface".into()],
             products: vec!["wrfsfcf".into()],
         }];
@@ -3122,6 +3183,10 @@ mod tests {
         publication.request.model = "ifs".into();
         publication.request.source_provenance = vec![rw_community_protocol::SourceProvenance {
             provider: "ecmwf-open-data".into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles: vec!["pressure".into()],
             products: vec!["ifs".into()],
         }];
@@ -3644,6 +3709,10 @@ mod tests {
                 last_valid_unix: Some(0),
                 source_provenance: vec![rw_query::SourceProvenance {
                     provider: "owner-local".into(),
+                    forecast_producer: None,
+                    licensing_publisher: None,
+                    transport_provider: None,
+                    transport_is_mirror: false,
                     roles: vec!["pressure".into()],
                     products: vec!["wrfout".into()],
                 }],
@@ -3661,6 +3730,10 @@ mod tests {
             request.model = model.into();
             request.source_provenance = vec![rw_community_protocol::SourceProvenance {
                 provider: "owner-local".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["pressure".into()],
                 products: vec!["wrfout".into()],
             }];
@@ -3700,6 +3773,10 @@ mod tests {
             },
             source_provenance: vec![rw_community_protocol::SourceProvenance {
                 provider: "noaa-aws-public-data".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["pressure".into()],
                 products: vec!["wrfprs".into()],
             }],
