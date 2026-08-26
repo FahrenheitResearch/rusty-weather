@@ -194,8 +194,8 @@ fn ingest_derived_matches_direct_calc_kernels_bit_exactly() {
         .expect("derived precompute must succeed on the synthetic hour");
     assert_eq!(
         derived.len(),
-        29,
-        "all 29 non-heavy recipes must realize; got: {:?}",
+        30,
+        "all 30 non-heavy recipes must realize; got: {:?}",
         derived.iter().map(|grid| grid.name).collect::<Vec<_>>()
     );
     let take = |name: &str| {

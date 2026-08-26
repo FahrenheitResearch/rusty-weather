@@ -24,6 +24,7 @@ pub use publication::*;
 pub use replication::*;
 
 pub const REQUEST_SCHEMA: &str = "rw.community.request.v1";
+pub const REQUEST_SCHEMA_V2: &str = "rw.community.request.v2";
 pub const OBJECT_SCHEMA: &str = "rw.community.object.v1";
 pub const RESOLVE_SCHEMA: &str = "rw.community.resolve.v1";
 pub const CASE_SCHEMA: &str = "rw.community.case.v1";
@@ -55,7 +56,9 @@ pub const R2_MANIFEST_BLOB_KEY_TEMPLATE: &str = "v2/manifests/{manifest_sha256}.
 const OBJECT_SIGNATURE_DOMAIN: &[u8] = b"rw-community-object-signature-v1\0";
 const CASE_SIGNATURE_DOMAIN: &[u8] = b"rw-community-case-signature-v1\0";
 const REQUEST_HASH_DOMAIN: &[u8] = b"rw-community-request-identity-v1\0";
+const REQUEST_HASH_DOMAIN_V2: &[u8] = b"rw-community-request-identity-v2\0";
 const RELAY_CREDENTIAL_SIGNATURE_DOMAIN: &[u8] = b"rw-community-relay-credential-signature-v1\0";
+const SOURCE_PROVENANCE_V2_DOMAIN: &[u8] = b"\0rw-community-source-provenance-v2\0";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
@@ -185,11 +188,79 @@ pub struct PublicationGrant {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceProvenance {
+    /// Backward-compatible acquisition-lane identity.
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast_producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licensing_publisher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transport_is_mirror: bool,
     #[serde(default)]
     pub roles: Vec<String>,
     #[serde(default)]
     pub products: Vec<String>,
+}
+
+impl SourceProvenance {
+    pub fn has_structured_identity(&self) -> bool {
+        self.forecast_producer.is_some()
+            && self.licensing_publisher.is_some()
+            && self.transport_provider.is_some()
+    }
+
+    /// Identity whose terms and attribution govern the acquired bytes. Legacy
+    /// records retain the historical `provider` fallback.
+    pub fn licensing_publisher_identity(&self) -> &str {
+        self.licensing_publisher
+            .as_deref()
+            .unwrap_or(&self.provider)
+    }
+
+    fn normalize(&mut self) {
+        self.provider = self.provider.trim().to_ascii_lowercase();
+        normalize_optional_token(&mut self.forecast_producer);
+        normalize_optional_token(&mut self.licensing_publisher);
+        normalize_optional_token(&mut self.transport_provider);
+        normalize_tokens(&mut self.roles, true);
+        normalize_tokens(&mut self.products, true);
+    }
+
+    fn validate_identity(&self) -> Result<(), ProtocolError> {
+        validate_token("provider", &self.provider, 96, true)?;
+        match (
+            &self.forecast_producer,
+            &self.licensing_publisher,
+            &self.transport_provider,
+        ) {
+            (None, None, None) if !self.transport_is_mirror => Ok(()),
+            (Some(producer), Some(publisher), Some(transport)) => {
+                validate_token("forecast_producer", producer, 96, true)?;
+                validate_token("licensing_publisher", publisher, 96, true)?;
+                validate_token("transport_provider", transport, 96, true)
+            }
+            (None, None, None) => invalid(
+                "transport_is_mirror",
+                "requires complete structured source identity",
+            ),
+            _ => invalid(
+                "source_provenance",
+                "forecast_producer, licensing_publisher, and transport_provider must be supplied together",
+            ),
+        }
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn normalize_optional_token(value: &mut Option<String>) {
+    if let Some(value) = value {
+        *value = value.trim().to_ascii_lowercase();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -318,12 +389,27 @@ impl ShareRequest {
         self.recipe.recipe_id = self.recipe.recipe_id.trim().to_ascii_lowercase();
         self.recipe.recipe_version = self.recipe.recipe_version.trim().to_string();
         for source in &mut self.source_provenance {
-            source.provider = source.provider.trim().to_ascii_lowercase();
-            normalize_tokens(&mut source.roles, true);
-            normalize_tokens(&mut source.products, true);
+            source.normalize();
         }
         self.source_provenance.sort_by(|a, b| {
-            (&a.provider, &a.roles, &a.products).cmp(&(&b.provider, &b.roles, &b.products))
+            (
+                &a.provider,
+                &a.forecast_producer,
+                &a.licensing_publisher,
+                &a.transport_provider,
+                a.transport_is_mirror,
+                &a.roles,
+                &a.products,
+            )
+                .cmp(&(
+                    &b.provider,
+                    &b.forecast_producer,
+                    &b.licensing_publisher,
+                    &b.transport_provider,
+                    b.transport_is_mirror,
+                    &b.roles,
+                    &b.products,
+                ))
         });
         self.source_provenance.dedup();
         normalize_query(&mut self.query);
@@ -340,8 +426,32 @@ impl ShareRequest {
         if &normalized != self {
             return Err(ProtocolError::NonCanonical("share request"));
         }
-        if self.schema != REQUEST_SCHEMA {
-            return Err(ProtocolError::UnsupportedSchema(self.schema.clone()));
+        match self.schema.as_str() {
+            REQUEST_SCHEMA => {
+                if self
+                    .source_provenance
+                    .iter()
+                    .any(SourceProvenance::has_structured_identity)
+                {
+                    return invalid(
+                        "source_provenance",
+                        "structured source identity requires request schema v2",
+                    );
+                }
+            }
+            REQUEST_SCHEMA_V2 => {
+                if self
+                    .source_provenance
+                    .iter()
+                    .any(|source| !source.has_structured_identity())
+                {
+                    return invalid(
+                        "source_provenance",
+                        "request schema v2 requires complete structured identity for every source",
+                    );
+                }
+            }
+            _ => return Err(ProtocolError::UnsupportedSchema(self.schema.clone())),
         }
         validate_token("model", &self.model, 96, true)?;
         validate_text("run", &self.run, 128)?;
@@ -1029,7 +1139,11 @@ pub fn canonical_request_bytes(request: &ShareRequest) -> Result<Vec<u8>, Protoc
     normalized.normalize();
     normalized.validate(&ProtocolLimits::default())?;
     let mut out = Vec::with_capacity(512);
-    out.extend_from_slice(REQUEST_HASH_DOMAIN);
+    out.extend_from_slice(match normalized.schema.as_str() {
+        REQUEST_SCHEMA => REQUEST_HASH_DOMAIN,
+        REQUEST_SCHEMA_V2 => REQUEST_HASH_DOMAIN_V2,
+        _ => return Err(ProtocolError::UnsupportedSchema(normalized.schema)),
+    });
     encode_share_request(&mut out, &normalized);
     Ok(out)
 }
@@ -1292,14 +1406,17 @@ fn enforce_ecmwf_notice(
     attributions: &[AttributionNotice],
     modifications: &[String],
 ) -> Result<(), ProtocolError> {
-    let uses_ecmwf = provenance
-        .iter()
-        .any(|source| source.provider == "ecmwf-open-data");
+    let uses_ecmwf = provenance.iter().any(|source| {
+        matches!(
+            source.licensing_publisher_identity(),
+            "ecmwf" | "ecmwf-open-data"
+        )
+    });
     if !uses_ecmwf {
         return Ok(());
     }
     let has_attribution = attributions.iter().any(|notice| {
-        notice.provider == "ecmwf-open-data"
+        matches!(notice.provider.as_str(), "ecmwf" | "ecmwf-open-data")
             && notice.source_url == "https://www.ecmwf.int/"
             && notice.license.contains("CC BY 4.0")
             && notice.license_url == "https://creativecommons.org/licenses/by/4.0/"
@@ -1538,7 +1655,7 @@ fn validate_provenance(
         return invalid("source_provenance", "must be a bounded non-empty list");
     }
     for source in provenance {
-        validate_token("provider", &source.provider, 96, true)?;
+        source.validate_identity()?;
         if source.roles.len() > 16 || source.products.len() > 32 {
             return invalid("source_provenance", "too many role or product labels");
         }
@@ -1551,12 +1668,27 @@ fn validate_provenance(
     }
     let mut normalized = provenance.to_vec();
     for source in &mut normalized {
-        source.provider = source.provider.trim().to_ascii_lowercase();
-        normalize_tokens(&mut source.roles, true);
-        normalize_tokens(&mut source.products, true);
+        source.normalize();
     }
     normalized.sort_by(|a, b| {
-        (&a.provider, &a.roles, &a.products).cmp(&(&b.provider, &b.roles, &b.products))
+        (
+            &a.provider,
+            &a.forecast_producer,
+            &a.licensing_publisher,
+            &a.transport_provider,
+            a.transport_is_mirror,
+            &a.roles,
+            &a.products,
+        )
+            .cmp(&(
+                &b.provider,
+                &b.forecast_producer,
+                &b.licensing_publisher,
+                &b.transport_provider,
+                b.transport_is_mirror,
+                &b.roles,
+                &b.products,
+            ))
     });
     normalized.dedup();
     if normalized != provenance {
@@ -1893,11 +2025,32 @@ fn encode_window(out: &mut Vec<u8>, value: &TimeWindow) {
 }
 
 fn encode_provenance(out: &mut Vec<u8>, values: &[SourceProvenance]) {
+    // Preserve the original prefix byte-for-byte so signatures over legacy
+    // provenance remain verifiable.
     put_u32(out, values.len() as u32);
     for value in values {
         put_str(out, &value.provider);
         put_strings(out, &value.roles);
         put_strings(out, &value.products);
+    }
+    // Structured identity is signed under a distinct domain only when it is
+    // present. The per-entry tag keeps mixed legacy/v2 unions unambiguous.
+    if values.iter().any(SourceProvenance::has_structured_identity) {
+        out.extend_from_slice(SOURCE_PROVENANCE_V2_DOMAIN);
+        put_u32(out, values.len() as u32);
+        for value in values {
+            put_bool(out, value.has_structured_identity());
+            if let (Some(producer), Some(publisher), Some(transport)) = (
+                &value.forecast_producer,
+                &value.licensing_publisher,
+                &value.transport_provider,
+            ) {
+                put_str(out, producer);
+                put_str(out, publisher);
+                put_str(out, transport);
+                put_bool(out, value.transport_is_mirror);
+            }
+        }
     }
 }
 
@@ -2061,6 +2214,10 @@ mod tests {
             },
             source_provenance: vec![SourceProvenance {
                 provider: "noaa-aws-public-data".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["pressure".into()],
                 products: vec!["wrfprs".into()],
             }],
@@ -2243,6 +2400,55 @@ mod tests {
             signed.signature.signature_base64,
             "bkeEK8oZWWa6mSTO/aEWYajc4eYe+6JhbrJ/KVL9sKwtN0t8Nsa2Mjob2EnK1a+SAa9xDg8QhpQSvwG4Q+jJAw=="
         );
+    }
+
+    #[test]
+    fn structured_provenance_is_signed_while_legacy_bytes_remain_stable() {
+        let legacy = sample_request();
+        let legacy_bytes = canonical_request_bytes(&legacy).unwrap();
+        assert_eq!(legacy_bytes.len(), 587);
+        assert!(
+            !serde_json::to_string(&legacy)
+                .unwrap()
+                .contains("forecast_producer")
+        );
+
+        let mut structured = legacy.clone();
+        structured.schema = REQUEST_SCHEMA_V2.into();
+        let source = &mut structured.source_provenance[0];
+        source.forecast_producer = Some("NOAA-NCEP".into());
+        source.licensing_publisher = Some("NOAA".into());
+        source.transport_provider = Some("AWS-ASDI".into());
+        source.transport_is_mirror = true;
+        let structured_bytes = canonical_request_bytes(&structured).unwrap();
+        assert_ne!(structured_bytes, legacy_bytes);
+        assert!(
+            structured_bytes
+                .windows(SOURCE_PROVENANCE_V2_DOMAIN.len())
+                .any(|window| window == SOURCE_PROVENANCE_V2_DOMAIN)
+        );
+
+        for mutate in [
+            |source: &mut SourceProvenance| source.forecast_producer = Some("noaa-nws".into()),
+            |source: &mut SourceProvenance| source.licensing_publisher = Some("other".into()),
+            |source: &mut SourceProvenance| source.transport_provider = Some("google-cloud".into()),
+            |source: &mut SourceProvenance| source.transport_is_mirror = false,
+        ] {
+            let mut changed = structured.clone();
+            mutate(&mut changed.source_provenance[0]);
+            assert_ne!(
+                request_sha256(&changed).unwrap(),
+                request_sha256(&structured).unwrap()
+            );
+        }
+
+        let mut partial = legacy;
+        partial.source_provenance[0].forecast_producer = Some("noaa-ncep".into());
+        assert!(canonical_request_bytes(&partial).is_err());
+
+        let mut mislabeled_v1 = structured;
+        mislabeled_v1.schema = REQUEST_SCHEMA.into();
+        assert!(canonical_request_bytes(&mislabeled_v1).is_err());
     }
 
     #[test]
@@ -2494,8 +2700,10 @@ mod tests {
 
     #[test]
     fn unknown_versions_and_content_types_fail_closed() {
+        // v1 and v2 are both accepted request schemas; the fail-closed check
+        // has to name a version this build genuinely does not know.
         let mut request = sample_request();
-        request.schema = "rw.community.request.v2".into();
+        request.schema = "rw.community.request.v3".into();
         assert!(matches!(
             request.validate(&ProtocolLimits::default()),
             Err(ProtocolError::UnsupportedSchema(_))

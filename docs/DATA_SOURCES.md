@@ -8,15 +8,25 @@ The service maintains software capability separately from data-source policy:
 
 - a model may be technically supported but disabled by an operator;
 - credentials and provider agreements are never embedded in a store;
-- each stored hour may retain bounded provider identifiers plus coarse
-  pressure/surface roles and product labels; request URLs and credentials are
-  never persisted;
+- each newly acquired public-provider hour retains independent bounded
+  forecast-producer, licensing-publisher, and byte-transport identities plus
+  explicit mirror status, coarse pressure/surface roles, and product labels;
+  request URLs and credentials are never persisted;
 - run identity and exact valid times remain separate from written_unix, which
   records local processing/publication time rather than upstream retrieval;
 - public responses can include required source attribution without revealing
   credentials or private URLs;
-- derived products inherit their hour's provider-level provenance; the current
+- derived products inherit their hour's source-level provenance; the current
   format does not claim per-field source lineage.
+
+`provider` remains the legacy acquisition-lane field so existing `run.json`
+manifests remain readable without migration. Structured records add all three
+identities as one fail-closed group: partial producer/publisher/transport
+claims and mirror claims without a transport are rejected. The public query
+DTO exposes these fields directly, while attribution and licence URLs remain
+typed publisher records rather than being inferred from a hostname. Local
+GDEX, AIFS-inference, Earth2, WRF, and owner-upload sources stay on the legacy
+shape unless an owner supplies an explicit publication grant.
 
 Before enabling a source in a distributed package, record the authoritative
 provider page and endpoint, data license or public-domain status, attribution,
@@ -64,7 +74,9 @@ For all packaged NOAA lanes:
   registry; no provider credential is persisted;
 - indexed range requests and whole-file downloads may be cached locally, but
   the scheduler cache is disabled by default and has no implied retention;
-- stores and API responses preserve the resolved safe provider identifier;
+- stores and API responses preserve NOAA/NCEP as forecast producer, NOAA as
+  licensing publisher, the resolved safe transport identity, and whether a
+  commercial-cloud transport is a mirror;
 - run responses include NOAA/NWS attribution, a public-domain qualification,
   a no-endorsement notice, an explicit modification notice, and the NWS
   disclaimer link;
@@ -142,7 +154,8 @@ arising from use.
 The public ECCC lane reads the provider's anonymous
 [MSC Datamart](https://eccc-msc.github.io/open-data/msc-datamart/readme_en/).
 The packaged remote scheduler currently limits that lane to the GDPS, RDPS,
-and continental HRDPS products and cadences published in MODEL_SUPPORT.md.
+continental HRDPS, and experimental HRDPS-West products and cadences published
+in MODEL_SUPPORT.md.
 Those products are split into one GRIB2 object per field, level, lead, and
 cycle; Rusty Weather acquires an explicit bounded component inventory and
 records ECCC as the provider without persisting source-object URLs.
@@ -165,6 +178,16 @@ RDPS and HRDPS vector components are normalized from their declared rotated
 grid-relative axes into canonical earth-relative U/V; downstream output is a
 transformed Rusty Weather product and must not be represented as an unmodified
 official ECCC product.
+
+HRDPS-West uses ECCC's separate
+[DD-Alpha experimental distribution](https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart-alpha_en/),
+not the operational `today/` tree. ECCC describes DD-Alpha as a
+non-operational test service and documents only 24 hours of HRDPS-West source
+history. Rusty Weather therefore reports both `pre_operational_feed` and
+`short_source_retention`, probes terminal-lead surface and pressure sentinels
+before choosing a latest cycle, and makes no availability or archive
+guarantee. The same ECCC Data Servers End-use Licence v2.1 and required source
+notice apply.
 
 ## User-provided and local-only sources
 

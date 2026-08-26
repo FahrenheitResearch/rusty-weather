@@ -327,6 +327,7 @@ pub enum ApiIngestCapabilityLimitation {
     DerivedProductsDisabled,
     ConusOnly,
     PreOperationalFeed,
+    ShortSourceRetention,
     ExtendedRangeNotScheduled,
 }
 
@@ -347,6 +348,7 @@ impl From<IngestCapabilityLimitation> for ApiIngestCapabilityLimitation {
             IngestCapabilityLimitation::DerivedProductsDisabled => Self::DerivedProductsDisabled,
             IngestCapabilityLimitation::ConusOnly => Self::ConusOnly,
             IngestCapabilityLimitation::PreOperationalFeed => Self::PreOperationalFeed,
+            IngestCapabilityLimitation::ShortSourceRetention => Self::ShortSourceRetention,
             IngestCapabilityLimitation::ExtendedRangeNotScheduled => {
                 Self::ExtendedRangeNotScheduled
             }
@@ -382,6 +384,7 @@ fn provider_attributions(
             ModelId::Geps => rw_query::geps_provider_attribution(),
             ModelId::Reps => rw_query::reps_provider_attribution(),
             ModelId::GdpsGeml => rw_query::gdps_geml_provider_attribution(),
+            ModelId::HrdpsWest => rw_query::hrdps_west_provider_attribution(),
             _ => rw_query::eccc_provider_attribution(),
         };
         attributions.push(attribution.into());
@@ -4583,6 +4586,10 @@ mod tests {
             },
             source_provenance: vec![SourceProvenance {
                 provider: "noaa-aws-public-data".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["pressure".into(), "surface".into()],
                 products: vec!["wrfprs".into(), "wrfsfc".into()],
             }],
@@ -4777,6 +4784,10 @@ mod tests {
             },
             source_provenance: vec![SourceProvenance {
                 provider: "noaa-aws-public-data".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["surface".into()],
                 products: vec!["wrfsfc".into()],
             }],
@@ -4911,16 +4922,24 @@ mod tests {
             .join("run.json");
         let mut manifest = RwsRunManifest::load(&manifest_path).unwrap();
         manifest.hours.get_mut(&0).unwrap().source_provenance = vec![
-            RwsSourceProvenance::new(
+            RwsSourceProvenance::new_structured(
                 "ECMWF-OPEN-DATA",
+                "ECMWF",
+                "ECMWF",
+                "ECMWF-OPEN-DATA",
+                false,
                 vec!["pressure".into()],
                 vec!["oper".into()],
             )
             .unwrap(),
         ];
         manifest.hours.get_mut(&1).unwrap().source_provenance = vec![
-            RwsSourceProvenance::new(
+            RwsSourceProvenance::new_structured(
                 "ecmwf-open-data",
+                "ecmwf",
+                "ecmwf",
+                "ecmwf-open-data",
+                false,
                 vec!["surface".into()],
                 vec!["oper".into()],
             )
@@ -5089,6 +5108,10 @@ mod tests {
             },
             source_provenance: vec![SourceProvenance {
                 provider: "simulation-owner".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["generation".into()],
                 products: vec!["rws".into()],
             }],
@@ -5281,7 +5304,7 @@ mod tests {
         let body = to_bytes(allowed.into_body(), 1024 * 1024).await.unwrap();
         let models: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let models = models.as_array().expect("models response must be an array");
-        assert_eq!(models.len(), 34);
+        assert_eq!(models.len(), 36);
         assert!(models.iter().all(|model| model["id"] != "rrfs-firewx"));
         let wrf = models
             .iter()
@@ -5348,6 +5371,36 @@ mod tests {
                 "Data Source: Environment and Climate Change Canada"
             );
         }
+        let west = model("hrdps-west");
+        assert_eq!(west["ingest_status"], "ready");
+        assert_eq!(west["verification"], "fixture_verified");
+        assert_eq!(west["cycle_hours_utc"], serde_json::json!([0, 12]));
+        assert_eq!(west["max_forecast_hour"], 48);
+        assert_eq!(
+            west["limitations"],
+            serde_json::json!([
+                "sparse_pressure_levels",
+                "derived_products_disabled",
+                "pre_operational_feed",
+                "short_source_retention"
+            ])
+        );
+        assert_eq!(west["products"][0]["product"], "rws-pressure");
+        assert_eq!(west["products"][1]["product"], "rws-surface");
+        assert_eq!(
+            west["provider_attributions"][0]["notice"],
+            "Data Source: Environment and Climate Change Canada"
+        );
+        assert_eq!(
+            west["provider_attributions"][0]["source_url"],
+            "https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart-alpha_en/"
+        );
+        assert!(
+            west["provider_attributions"][0]["disclaimer"]
+                .as_str()
+                .unwrap()
+                .contains("24 hours")
+        );
         let geps = model("geps");
         assert_eq!(geps["ingest_status"], "ready");
         assert_eq!(geps["verification"], "live_verified");
@@ -5430,12 +5483,23 @@ mod tests {
             "Data source: Roshydromet WIPPS Designated Centre Moscow, distributed through WIS2."
         );
 
-        for id in ["wrf-cptec-7km", "brams-cptec-8km"] {
+        for (id, max_forecast_hour) in [
+            ("wrf-cptec-7km", 180),
+            ("brams-cptec-8km", 180),
+            ("eta-cptec-8km", 264),
+        ] {
             let cptec = model(id);
             assert_eq!(cptec["ingest_status"], "ready");
-            assert_eq!(cptec["verification"], "live_verified");
+            assert_eq!(
+                cptec["verification"],
+                if id == "eta-cptec-8km" {
+                    "fixture_verified"
+                } else {
+                    "live_verified"
+                }
+            );
             assert_eq!(cptec["cycle_hours_utc"], serde_json::json!([0]));
-            assert_eq!(cptec["max_forecast_hour"], 180);
+            assert_eq!(cptec["max_forecast_hour"], max_forecast_hour);
             assert_eq!(
                 cptec["limitations"],
                 serde_json::json!(["sparse_pressure_levels", "derived_products_disabled"])
@@ -7187,6 +7251,10 @@ mod tests {
             run["source_provenance"],
             serde_json::json!([{
                 "provider": "ecmwf-open-data",
+                "forecast_producer": "ecmwf",
+                "licensing_publisher": "ecmwf",
+                "transport_provider": "ecmwf-open-data",
+                "transport_is_mirror": false,
                 "roles": ["pressure", "surface"],
                 "products": ["oper"]
             }])

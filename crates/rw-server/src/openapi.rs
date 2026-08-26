@@ -48,6 +48,10 @@ use crate::{ArtifactRef, JobStatus, JobView};
 #[derive(utoipa::ToSchema)]
 struct SourceProvenanceResponse {
     provider: String,
+    forecast_producer: Option<String>,
+    licensing_publisher: Option<String>,
+    transport_provider: Option<String>,
+    transport_is_mirror: bool,
     roles: Vec<String>,
     products: Vec<String>,
 }
@@ -4528,6 +4532,20 @@ mod tests {
         let value = serde_json::to_value(document()).unwrap();
         let schemas = &value["components"]["schemas"];
         assert!(schemas["SourceProvenanceResponse"].is_object());
+        for field in [
+            "provider",
+            "forecast_producer",
+            "licensing_publisher",
+            "transport_provider",
+            "transport_is_mirror",
+            "roles",
+            "products",
+        ] {
+            assert!(
+                schemas["SourceProvenanceResponse"]["properties"][field].is_object(),
+                "missing structured provenance schema field {field}"
+            );
+        }
         assert!(schemas["ProviderAttributionResponse"].is_object());
         assert_eq!(
             schemas["RunDescriptorResponse"]["properties"]["source_provenance"]["items"]["$ref"],
@@ -4581,6 +4599,7 @@ mod tests {
                 "derived_products_disabled",
                 "conus_only",
                 "pre_operational_feed",
+                "short_source_retention",
                 "extended_range_not_scheduled"
             ])
         );

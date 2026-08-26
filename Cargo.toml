@@ -15,6 +15,7 @@ members = [
     "crates/rw-ops-protocol",
     "crates/rw-server",
     "crates/rw-scheduler",
+    "crates/rw-sim",
     "crates/rw-sat",
     "crates/rw-sat-check",
     "crates/rw-storm",

@@ -37,10 +37,21 @@ const MAX_SOURCE_TOKEN_BYTES: usize = 96;
 ///
 /// Values are bounded identifier tokens, never request URLs, object paths,
 /// query strings, headers, or credentials. Roles and products are optional
-/// coarse labels such as pressure, surface, or pgrb2.0p25.
+/// coarse labels such as pressure, surface, or pgrb2.0p25. `provider` remains
+/// the backward-compatible acquisition-lane identity. New records can also
+/// carry the complete producer/publisher/transport identity; partial identity
+/// is rejected rather than guessed from a hostname.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RwsSourceProvenance {
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast_producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licensing_publisher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transport_is_mirror: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -55,17 +66,96 @@ impl RwsSourceProvenance {
     ) -> RwResult<Self> {
         normalize_source_entry(Self {
             provider: provider.into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles,
             products,
         })
+    }
+
+    /// Build provenance whose forecast producer, licensing publisher, and
+    /// byte transport are explicit and independently queryable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_structured(
+        provider: impl Into<String>,
+        forecast_producer: impl Into<String>,
+        licensing_publisher: impl Into<String>,
+        transport_provider: impl Into<String>,
+        transport_is_mirror: bool,
+        roles: Vec<String>,
+        products: Vec<String>,
+    ) -> RwResult<Self> {
+        normalize_source_entry(Self {
+            provider: provider.into(),
+            forecast_producer: Some(forecast_producer.into()),
+            licensing_publisher: Some(licensing_publisher.into()),
+            transport_provider: Some(transport_provider.into()),
+            transport_is_mirror,
+            roles,
+            products,
+        })
+    }
+
+    pub fn has_structured_identity(&self) -> bool {
+        self.forecast_producer.is_some()
+    }
+
+    pub fn effective_forecast_producer(&self) -> &str {
+        self.forecast_producer.as_deref().unwrap_or(&self.provider)
+    }
+
+    pub fn effective_licensing_publisher(&self) -> &str {
+        self.licensing_publisher
+            .as_deref()
+            .unwrap_or(&self.provider)
+    }
+
+    pub fn effective_transport_provider(&self) -> &str {
+        self.transport_provider.as_deref().unwrap_or(&self.provider)
     }
 }
 
 fn normalize_source_entry(mut entry: RwsSourceProvenance) -> RwResult<RwsSourceProvenance> {
     entry.provider = normalize_source_token("provider", &entry.provider)?;
+    let structured_fields = [
+        entry.forecast_producer.is_some(),
+        entry.licensing_publisher.is_some(),
+        entry.transport_provider.is_some(),
+    ];
+    if structured_fields.iter().any(|present| *present)
+        && structured_fields.iter().any(|present| !*present)
+    {
+        return Err(RwStoreError::Meta(
+            "source provenance forecast_producer, licensing_publisher, and transport_provider must be supplied together"
+                .into(),
+        ));
+    }
+    if !structured_fields[0] && entry.transport_is_mirror {
+        return Err(RwStoreError::Meta(
+            "source provenance transport_is_mirror requires complete structured identity".into(),
+        ));
+    }
+    entry.forecast_producer =
+        normalize_optional_source_token("forecast_producer", entry.forecast_producer)?;
+    entry.licensing_publisher =
+        normalize_optional_source_token("licensing_publisher", entry.licensing_publisher)?;
+    entry.transport_provider =
+        normalize_optional_source_token("transport_provider", entry.transport_provider)?;
     entry.roles = normalize_source_tokens("role", entry.roles)?;
     entry.products = normalize_source_tokens("product", entry.products)?;
     Ok(entry)
+}
+
+fn normalize_optional_source_token(label: &str, value: Option<String>) -> RwResult<Option<String>> {
+    value
+        .map(|value| normalize_source_token(label, &value))
+        .transpose()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn normalize_source_tokens(label: &str, values: Vec<String>) -> RwResult<Vec<String>> {
@@ -104,10 +194,19 @@ fn normalize_source_token(label: &str, value: &str) -> RwResult<String> {
 pub(crate) fn normalize_source_provenance(
     entries: Vec<RwsSourceProvenance>,
 ) -> RwResult<Vec<RwsSourceProvenance>> {
-    let mut merged: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> = BTreeMap::new();
+    type SourceIdentity = (String, Option<String>, Option<String>, Option<String>, bool);
+    let mut merged: BTreeMap<SourceIdentity, (BTreeSet<String>, BTreeSet<String>)> =
+        BTreeMap::new();
     for entry in entries {
         let entry = normalize_source_entry(entry)?;
-        let (roles, products) = merged.entry(entry.provider).or_default();
+        let identity = (
+            entry.provider,
+            entry.forecast_producer,
+            entry.licensing_publisher,
+            entry.transport_provider,
+            entry.transport_is_mirror,
+        );
+        let (roles, products) = merged.entry(identity).or_default();
         roles.extend(entry.roles);
         products.extend(entry.products);
     }
@@ -120,7 +219,14 @@ pub(crate) fn normalize_source_provenance(
                 merged.len()
             ))
         })?;
-    for (provider, (roles, products)) in merged {
+    for (identity, (roles, products)) in merged {
+        let (
+            provider,
+            forecast_producer,
+            licensing_publisher,
+            transport_provider,
+            transport_is_mirror,
+        ) = identity;
         let mut normalized_roles = Vec::new();
         normalized_roles
             .try_reserve_exact(roles.len())
@@ -143,6 +249,10 @@ pub(crate) fn normalize_source_provenance(
         normalized_products.extend(products);
         normalized.push(RwsSourceProvenance {
             provider,
+            forecast_producer,
+            licensing_publisher,
+            transport_provider,
+            transport_is_mirror,
             roles: normalized_roles,
             products: normalized_products,
         });
@@ -762,6 +872,10 @@ mod tests {
             manifest.source_provenance().unwrap(),
             vec![RwsSourceProvenance {
                 provider: "ecmwf-open-data".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["pressure".into(), "surface".into()],
                 products: vec!["oper".into()],
             }]
@@ -806,6 +920,90 @@ mod tests {
             .expect("representable native geometry must not inherit the old byte policy");
         let coordinate_bytes = manifest.nx as u64 * manifest.ny as u64 * 4;
         assert!(coordinate_bytes > 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn structured_source_identity_is_complete_normalized_and_wire_compatible() {
+        let source = RwsSourceProvenance::new_structured(
+            "noaa-aws-public-data",
+            "NOAA-NCEP",
+            "NOAA",
+            "AWS-ASDI",
+            true,
+            vec!["Surface".into()],
+            vec!["PGRB2.0P25".into()],
+        )
+        .unwrap();
+        assert_eq!(source.effective_forecast_producer(), "noaa-ncep");
+        assert_eq!(source.effective_licensing_publisher(), "noaa");
+        assert_eq!(source.effective_transport_provider(), "aws-asdi");
+        assert!(source.transport_is_mirror);
+
+        let value = serde_json::to_value(&source).unwrap();
+        assert_eq!(value["forecast_producer"], "noaa-ncep");
+        assert_eq!(value["licensing_publisher"], "noaa");
+        assert_eq!(value["transport_provider"], "aws-asdi");
+        assert_eq!(value["transport_is_mirror"], true);
+
+        let legacy =
+            RwsSourceProvenance::new("noaa-nomads", vec!["surface".into()], vec!["pgrb2".into()])
+                .unwrap();
+        let legacy_value = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_value.get("forecast_producer").is_none());
+        assert!(legacy_value.get("licensing_publisher").is_none());
+        assert!(legacy_value.get("transport_provider").is_none());
+        assert!(legacy_value.get("transport_is_mirror").is_none());
+    }
+
+    #[test]
+    fn structured_source_identity_rejects_partial_or_mirror_only_claims() {
+        let partial = RwsSourceProvenance {
+            provider: "transport".into(),
+            forecast_producer: Some("producer".into()),
+            licensing_publisher: None,
+            transport_provider: Some("transport".into()),
+            transport_is_mirror: false,
+            roles: vec!["surface".into()],
+            products: Vec::new(),
+        };
+        assert!(normalize_source_provenance(vec![partial]).is_err());
+
+        let mirror_only = RwsSourceProvenance {
+            provider: "transport".into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: true,
+            roles: vec!["surface".into()],
+            products: Vec::new(),
+        };
+        assert!(normalize_source_provenance(vec![mirror_only]).is_err());
+    }
+
+    #[test]
+    fn provenance_union_never_collapses_distinct_transports() {
+        let direct = RwsSourceProvenance::new_structured(
+            "roshydromet-wipps-dc",
+            "roshydromet",
+            "roshydromet",
+            "roshydromet-wis2-origin",
+            false,
+            vec!["surface".into()],
+            vec!["rws-surface".into()],
+        )
+        .unwrap();
+        let mirror = RwsSourceProvenance::new_structured(
+            "roshydromet-wipps-dc",
+            "roshydromet",
+            "roshydromet",
+            "wis2-global-cache",
+            true,
+            vec!["pressure".into()],
+            vec!["rws-pressure".into()],
+        )
+        .unwrap();
+        let normalized = normalize_source_provenance(vec![mirror.clone(), direct.clone()]).unwrap();
+        assert_eq!(normalized, vec![direct, mirror]);
     }
 
     #[test]

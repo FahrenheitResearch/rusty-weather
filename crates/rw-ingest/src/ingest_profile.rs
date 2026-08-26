@@ -166,6 +166,18 @@ impl IngestProfile {
         }
     }
 
+    /// A sounding-shaped profile constrained to one model's verified surface
+    /// inventory. Eta replaces the generic seven-field surface set (which
+    /// includes unavailable orography) with its exact eight-field native
+    /// contract, while retaining the five canonical pressure volumes.
+    pub fn sounding_for_model(model: ModelId) -> Self {
+        let mut profile = Self::sounding();
+        if model == ModelId::EtaCptec8km {
+            profile.surface_fields = Self::surface_for_model(model).surface_fields;
+        }
+        profile
+    }
+
     /// The 2D map pack: every 2D field including derived grids, no
     /// volumes, no heavy stage.
     pub fn view() -> Self {
@@ -393,17 +405,18 @@ pub fn resolve_profile(
     apply_profile_overrides(preset, IngestProfile::preset(preset)?, overrides)
 }
 
-/// Resolve a preset for one model. Only `surface` is model-specialized; all
-/// other named profiles intentionally keep their established semantics.
+/// Resolve a preset for one model. `surface` follows the complete native 2-D
+/// contract; `sounding` replaces only known-incompatible surface sets while
+/// retaining the stable pressure-volume semantics.
 pub fn resolve_profile_for_model(
     preset: &str,
     overrides: &ProfileOverrides,
     model: ModelId,
 ) -> Result<IngestProfile, String> {
-    let profile = if preset == "surface" {
-        IngestProfile::surface_for_model(model)
-    } else {
-        IngestProfile::preset(preset)?
+    let profile = match preset {
+        "surface" => IngestProfile::surface_for_model(model),
+        "sounding" => IngestProfile::sounding_for_model(model),
+        _ => IngestProfile::preset(preset)?,
     };
     apply_profile_overrides(preset, profile, overrides)
 }
@@ -562,6 +575,48 @@ fn base_surface_plan() -> Vec<(&'static str, FieldSelector)> {
         (
             "simulated_ir",
             FieldSelector::nominal_top(CanonicalField::SimulatedInfraredBrightnessTemperature),
+        ),
+    ]
+}
+
+/// Exact unambiguous 2-D contract in CPTEC Eta lead files. APCP is a native
+/// one-hour interval after analysis (and an analysis record at f000), so the
+/// stable name remains interval-neutral instead of claiming a run total.
+/// Surface orography, provider-local fields, and surface-labelled column/cloud
+/// fields are absent by design rather than discovered opportunistically.
+fn cptec_eta_surface_plan() -> Vec<(&'static str, FieldSelector)> {
+    vec![
+        (
+            "temperature_2m",
+            FieldSelector::height_agl(CanonicalField::Temperature, 2),
+        ),
+        (
+            "dewpoint_2m",
+            FieldSelector::height_agl(CanonicalField::Dewpoint, 2),
+        ),
+        (
+            "u_10m",
+            FieldSelector::height_agl(CanonicalField::UWind, 10),
+        ),
+        (
+            "v_10m",
+            FieldSelector::height_agl(CanonicalField::VWind, 10),
+        ),
+        (
+            "mslp",
+            FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel),
+        ),
+        (
+            "rh_2m",
+            FieldSelector::height_agl(CanonicalField::RelativeHumidity, 2),
+        ),
+        (
+            "surface_pressure",
+            FieldSelector::surface(CanonicalField::Pressure),
+        ),
+        (
+            "apcp_native_interval",
+            FieldSelector::surface(CanonicalField::TotalPrecipitation),
         ),
     ]
 }
@@ -834,6 +889,7 @@ pub fn surface_plan() -> Vec<(&'static str, FieldSelector)> {
     let mut plan = base_surface_plan();
     plan.extend(cma_geps_statistics_surface_plan());
     plan.extend(reps_statistics_surface_plan());
+    plan.extend(cptec_eta_surface_plan());
     plan
 }
 
@@ -841,6 +897,7 @@ pub fn model_surface_plan(model: ModelId) -> Vec<(&'static str, FieldSelector)> 
     match model {
         ModelId::CmaGeps => cma_geps_statistics_surface_plan(),
         ModelId::Reps => reps_statistics_surface_plan(),
+        ModelId::EtaCptec8km => cptec_eta_surface_plan(),
         ModelId::GdpsGeml => vec![
             (
                 "temperature_2m",
@@ -978,6 +1035,30 @@ mod tests {
             )
         );
         surface.validate().expect("surface preset validates");
+    }
+
+    #[test]
+    fn cptec_eta_surface_profile_is_exact_and_keeps_precipitation_interval_neutral() {
+        let profile = IngestProfile::surface_for_model(ModelId::EtaCptec8km);
+        assert_eq!(
+            profile.surface_fields,
+            FieldSet::Named(
+                [
+                    "temperature_2m",
+                    "dewpoint_2m",
+                    "u_10m",
+                    "v_10m",
+                    "mslp",
+                    "rh_2m",
+                    "surface_pressure",
+                    "apcp_native_interval",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+            )
+        );
+        profile.validate().expect("Eta surface profile validates");
     }
 
     #[test]

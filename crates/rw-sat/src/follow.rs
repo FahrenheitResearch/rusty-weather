@@ -859,6 +859,7 @@ mod tests {
                     scan_end_unix: scan.timestamp() + 571,
                 },
             )]),
+            l2_products: std::collections::BTreeMap::new(),
         };
         std::fs::write(
             frame_dir.join("frame.json"),

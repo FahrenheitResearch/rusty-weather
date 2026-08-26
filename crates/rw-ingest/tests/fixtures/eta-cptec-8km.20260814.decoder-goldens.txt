@@ -1,0 +1,14 @@
+CONTRACT|official CPTEC/INPE Eta South America 8 km GRIB2 template 5.3 fields independently decoded with ecCodes
+GRID|regular_ll|nx=875|ny=931|count=814625|west=-90|east=-20.08|south=-55|north=19.4|increment=0.08
+SOURCE|f000|https://dataserver.cptec.inpe.br/dataserver_modelos/eta/ams_08km/brutos/2026/08/14/00/Eta_ams_08km_2026081400_2026081400.grib2|size=87375108
+INVENTORY|f000|https://dataserver.cptec.inpe.br/dataserver_modelos/eta/ams_08km/brutos/2026/08/14/00/Eta_ams_08km_2026081400_2026081400.inv|size=11192|sha256=f4d42b58dd7a3f47ecb6946e6ec25828bdb5d97c389b87498adc755b91c4f7ba
+ROW|f000|7:1616482:d=2026081400:TMP:2 m above ground:anl:
+NEXT|f000|8:2099260:d=2026081400:TMAX:surface:anl:
+REF|f000|field=t2|range=1616482-2099259|bytes=482778|message_sha256=dbfc1ebdd827fef617d06fca0338c846791dbdbcee923b466e52cc782ad8e6e7|drt=5.3|order=2|missing=0|count=814625|min=255.0915985107422|max=307.7478485107422|mean=290.0166320576196|f64le_sha256=e5d6aef32c995fbe3631822a39c63edca708345f71a2454d2aed904c0e856ffb
+SOURCE|f006|https://dataserver.cptec.inpe.br/dataserver_modelos/eta/ams_08km/brutos/2026/08/14/00/Eta_ams_08km_2026081400_2026081406.grib2
+INVENTORY|f006|https://dataserver.cptec.inpe.br/dataserver_modelos/eta/ams_08km/brutos/2026/08/14/00/Eta_ams_08km_2026081400_2026081406.inv|size=13279|sha256=5901f7f39fbc167517294c75b4d6f502dfb735b81b7aab571905019cddc6322e
+ROW|f006|16:7015788:d=2026081400:APCP:surface:5-6 hour acc:
+NEXT|f006|17:7392373:d=2026081400:ACPCP:surface:5-6 hour acc:
+REF|f006|field=apcp_5to6h|range=7015788-7392372|bytes=376585|message_sha256=e3bf49750ad2bbc794470d611dbe8d0e24c5323cb0ad5ae3979313a59e2c6735|drt=5.3|order=2|missing=0|count=814625|min=0|max=6.888671875|mean=0.13333162546|f64le_sha256=adbb6b76f9eb6bfcc2b0fbfc0f52d82ca0e5a8081187b97e10fe8a3aa73ae835
+POLICY|provider local parameters 0/2/238, 0/2/239, and 1/0/194 remain excluded; no semantic identity is guessed
+POLICY|the text .inv is the byte-range authority; the binary .grib2.idx is never parsed as an inventory

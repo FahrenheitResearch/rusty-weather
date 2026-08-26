@@ -92,6 +92,12 @@ local research files:
   kinematic products. If the required rotation metadata is absent, those
   products are withheld instead of silently treating grid-relative winds as
   true east/north winds.
+- **Live watch** follows a WRF run that is still in progress: point it at the
+  folder the model is writing and each finished `wrfout` frame is validated
+  against a fixed case contract and imported as it appears. The watch is
+  producer-independent and never launches or configures the run — see
+  [`docs/SIMULATION_OUTPUT_WATCH.md`](docs/SIMULATION_OUTPUT_WATCH.md), which
+  also states what is deliberately not included.
 - Multi-file local imports are preflighted as one run, written under a hidden
   same-filesystem staging tree, validated, and published only after every hour
   succeeds. Source content and file revisions are checked again before the
@@ -339,15 +345,15 @@ count matched the sum of bucket records.
 ## Model support
 
 The remote acquisition and ingest catalog currently covers HRRR/HRRR Alaska,
-RAP, GFS, ECCC GDPS/GDPS-GEML/RDPS/HRDPS, CMA GRAPES GEPS statistics, DWD
-ICON-EU/ICON-D2 regular grids, Roshydromet ICON-Ru13/6N29, CPTEC/INPE WRF
-7 km and BRAMS 8 km South America grids, GDAS, GEFS, NOAA
-AI-GFS/AI-GEFS/HGEFS, ECMWF IFS Open Data, ECMWF AIFS Single v2, NAM, RRFS-A,
-the public RRFS prototype, NBM, HIRESW, HREF, SREF, REFS, RTMA, and URMA.
-Local WRF/wrfout runs use the same store
-and exact-time query engine. Model-specific products, cadence, pressure
-levels, and verification maturity are intentionally reported independently;
-the service never substitutes a similarly named field or ensemble statistic.
+RAP, GFS, ECCC GDPS/GDPS-GEML/RDPS/HRDPS/HRDPS-West, CMA GRAPES GEPS
+statistics, DWD ICON-EU/ICON-D2 regular grids, Roshydromet ICON-Ru13/6N29,
+CPTEC/INPE WRF 7 km, BRAMS 8 km, and Eta 8 km South America grids, GDAS,
+GEFS, NOAA AI-GFS/AI-GEFS/HGEFS, ECMWF IFS Open Data, ECMWF AIFS Single v2,
+NAM, RRFS-A, the public RRFS prototype, NBM, HIRESW, HREF, SREF, REFS, RTMA,
+and URMA. Local WRF/wrfout runs use the same store and exact-time query
+engine. Model-specific products, cadence, pressure levels, and verification
+maturity are intentionally reported independently; the service never
+substitutes a similarly named field or ensemble statistic.
 
 See [the model capability matrix](docs/MODEL_SUPPORT.md) for the human-readable
 scope and use `GET /v1/models`, the authenticated no-store

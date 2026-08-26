@@ -1726,6 +1726,7 @@ pub enum ModelId {
     CmaGeps,
     Rdps,
     Hrdps,
+    HrdpsWest,
     Reps,
     IconEu,
     IconD2,
@@ -1733,6 +1734,7 @@ pub enum ModelId {
     Geps,
     WrfCptec7km,
     BramsCptec8km,
+    EtaCptec8km,
     Gdas,
     Gefs,
     Aigfs,
@@ -1766,6 +1768,7 @@ impl ModelId {
             Self::CmaGeps => "cma-geps",
             Self::Rdps => "rdps",
             Self::Hrdps => "hrdps",
+            Self::HrdpsWest => "hrdps-west",
             Self::Reps => "reps",
             Self::IconEu => "icon-eu",
             Self::IconD2 => "icon-d2",
@@ -1773,6 +1776,7 @@ impl ModelId {
             Self::Geps => "geps",
             Self::WrfCptec7km => "wrf-cptec-7km",
             Self::BramsCptec8km => "brams-cptec-8km",
+            Self::EtaCptec8km => "eta-cptec-8km",
             Self::Gdas => "gdas",
             Self::Gefs => "gefs",
             Self::Aigfs => "aigfs",
@@ -1824,6 +1828,9 @@ impl std::str::FromStr for ModelId {
             "hrdps" | "gem-high-resolution" | "gem_high_resolution" | "cmc-hrdps" | "cmc_hrdps" => {
                 Ok(Self::Hrdps)
             }
+            "hrdps-west" | "hrdps_west" | "hrdpswest" | "cmc-hrdps-west" | "cmc_hrdps_west" => {
+                Ok(Self::HrdpsWest)
+            }
             "reps"
             | "gem-regional-ensemble"
             | "gem_regional_ensemble"
@@ -1837,6 +1844,8 @@ impl std::str::FromStr for ModelId {
             | "wrf_ams_07km" => Ok(Self::WrfCptec7km),
             "brams-cptec-8km" | "brams_cptec_8km" | "cptec-brams" | "cptec_brams"
             | "brams-ams-08km" | "brams_ams_08km" => Ok(Self::BramsCptec8km),
+            "eta-cptec-8km" | "eta_cptec_8km" | "cptec-eta" | "cptec_eta" | "eta-ams-08km"
+            | "eta_ams_08km" => Ok(Self::EtaCptec8km),
             "gdas" | "gdas-0p25" | "gdas_0p25" | "gdas-0.25" | "gdas_0.25" => Ok(Self::Gdas),
             "gefs" | "gefs-ens" | "gefs_ens" | "gefs-ensemble" => Ok(Self::Gefs),
             "aigfs" | "ai-gfs" | "ai_gfs" => Ok(Self::Aigfs),

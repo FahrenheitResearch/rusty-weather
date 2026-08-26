@@ -6,12 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use rw_store::grid::{GridFile, GridLocator};
 use rw_store::reader::HourReader;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -56,6 +57,52 @@ struct PointSounding {
     dewpoint_c: Vec<f64>,
     u_ms: Vec<f64>,
     v_ms: Vec<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServeRequest {
+    request_id: u64,
+    action: String,
+    store_root: PathBuf,
+    model: String,
+    run: String,
+    forecast_hour: u16,
+    #[serde(default)]
+    lat: Option<f64>,
+    #[serde(default)]
+    lon: Option<f64>,
+    #[serde(default)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+struct ServeResponse {
+    request_id: u64,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    levels: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HourKey {
+    store_root: PathBuf,
+    model: String,
+    run: String,
+    forecast_hour: u16,
+}
+
+struct CachedHour {
+    key: HourKey,
+    grid: GridFile,
+    locator: GridLocator,
+    reader: HourReader,
+}
+
+#[derive(Default)]
+struct ServeState {
+    hour: Option<CachedHour>,
 }
 
 fn profile_map(
@@ -126,31 +173,28 @@ fn store_paths(root: &Path, model: &str, run: &str, fxx: u16) -> (PathBuf, PathB
     )
 }
 
-fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let (grid_path, hour_path) = store_paths(
-        &args.store_root,
-        &args.model.to_ascii_lowercase(),
-        &args.run,
-        args.forecast_hour,
-    );
-    let grid = GridFile::open(&grid_path)?;
-    let locator = GridLocator::build(&grid);
-    let (fx, fy) = locator.locate(args.lat, args.lon).ok_or_else(|| {
+fn build_sounding(
+    grid: &GridFile,
+    locator: &GridLocator,
+    reader: &HourReader,
+    lat: f64,
+    lon: f64,
+) -> Result<PointSounding, Box<dyn std::error::Error>> {
+    let (fx, fy) = locator.locate(lat, lon).ok_or_else(|| {
         format!(
             "requested point ({:.4}, {:.4}) is outside the stored model grid",
-            args.lat, args.lon
+            lat, lon
         )
     })?;
     let x = (fx.round() as usize).min(grid.nx - 1);
     let y = (fy.round() as usize).min(grid.ny - 1);
     let grid_index = y * grid.nx + x;
 
-    let reader = HourReader::open(&hour_path)?;
-    let temperature = profile_map(&reader, "temperature_iso", fx, fy)?;
-    let dewpoint = profile_map(&reader, "dewpoint_iso", fx, fy)?;
-    let height = profile_map(&reader, "height_iso", fx, fy)?;
-    let u = profile_map(&reader, "u_iso", fx, fy)?;
-    let v = profile_map(&reader, "v_iso", fx, fy)?;
+    let temperature = profile_map(reader, "temperature_iso", fx, fy)?;
+    let dewpoint = profile_map(reader, "dewpoint_iso", fx, fy)?;
+    let height = profile_map(reader, "height_iso", fx, fy)?;
+    let u = profile_map(reader, "u_iso", fx, fy)?;
+    let v = profile_map(reader, "v_iso", fx, fy)?;
 
     let mut rows: Vec<(f64, f64, f64, f64, f64, f64)> = temperature
         .iter()
@@ -174,18 +218,18 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // lowest isobaric level. This preserves the near-ground detail expected
     // by the existing skew-T and parcel calculations.
     let surface = (
-        surface_value(&reader, "surface_pressure", x, y)?.map(|value| {
+        surface_value(reader, "surface_pressure", x, y)?.map(|value| {
             if value > 2_000.0 {
                 value / 100.0
             } else {
                 value
             }
         }),
-        surface_value(&reader, "orography", x, y)?,
-        surface_value(&reader, "temperature_2m", x, y)?,
-        surface_value(&reader, "dewpoint_2m", x, y)?,
-        surface_value(&reader, "u_10m", x, y)?,
-        surface_value(&reader, "v_10m", x, y)?,
+        surface_value(reader, "orography", x, y)?,
+        surface_value(reader, "temperature_2m", x, y)?,
+        surface_value(reader, "dewpoint_2m", x, y)?,
+        surface_value(reader, "u_10m", x, y)?,
+        surface_value(reader, "v_10m", x, y)?,
     );
     if let (Some(p), Some(z), Some(t), Some(td), Some(su), Some(sv)) = surface {
         // Pressure surfaces at or below the terrain may still contain
@@ -219,10 +263,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         run: meta.run.clone(),
         forecast_hour: meta.forecast_hour,
         valid_unix: meta.valid_unix,
-        requested: Coordinate {
-            lat: args.lat,
-            lon: args.lon,
-        },
+        requested: Coordinate { lat, lon },
         selected: Coordinate {
             lat: f64::from(grid.lat[grid_index]),
             lon: f64::from(grid.lon[grid_index]),
@@ -242,11 +283,122 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         sounding.u_ms.push(su);
         sounding.v_ms.push(sv);
     }
+    Ok(sounding)
+}
 
-    if let Some(parent) = args.output.parent() {
+fn write_sounding(
+    output: &Path,
+    sounding: &PointSounding,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&args.output, serde_json::to_vec_pretty(&sounding)?)?;
+    fs::write(output, serde_json::to_vec_pretty(sounding)?)?;
+    Ok(())
+}
+
+impl CachedHour {
+    fn open(key: HourKey) -> Result<Self, Box<dyn std::error::Error>> {
+        let (grid_path, hour_path) =
+            store_paths(&key.store_root, &key.model, &key.run, key.forecast_hour);
+        let grid = GridFile::open(&grid_path)?;
+        let locator = GridLocator::build(&grid);
+        let reader = HourReader::open(&hour_path)?;
+        Ok(Self {
+            key,
+            grid,
+            locator,
+            reader,
+        })
+    }
+}
+
+impl ServeState {
+    fn handle(
+        &mut self,
+        request: &ServeRequest,
+    ) -> Result<Option<usize>, Box<dyn std::error::Error>> {
+        let key = HourKey {
+            store_root: request.store_root.clone(),
+            model: request.model.to_ascii_lowercase(),
+            run: request.run.clone(),
+            forecast_hour: request.forecast_hour,
+        };
+        if !matches!(&self.hour, Some(hour) if hour.key == key) {
+            self.hour = Some(CachedHour::open(key)?);
+        }
+        if request.action == "warm" {
+            return Ok(None);
+        }
+        if request.action != "export" {
+            return Err(format!("unsupported server action {:?}", request.action).into());
+        }
+        let lat = request
+            .lat
+            .ok_or("an export request requires a finite latitude")?;
+        let lon = request
+            .lon
+            .ok_or("an export request requires a finite longitude")?;
+        let output = request
+            .output
+            .as_deref()
+            .ok_or("an export request requires an output path")?;
+        let hour = self.hour.as_ref().expect("hour opened above");
+        let sounding = build_sounding(&hour.grid, &hour.locator, &hour.reader, lat, lon)?;
+        let levels = sounding.pressure_hpa.len();
+        write_sounding(output, &sounding)?;
+        Ok(Some(levels))
+    }
+}
+
+fn serve() -> Result<(), Box<dyn std::error::Error>> {
+    let stdin = io::stdin();
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    let mut state = ServeState::default();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        let parsed = serde_json::from_str::<ServeRequest>(&line);
+        let request_id = parsed.as_ref().map_or(0, |request| request.request_id);
+        let response = match parsed {
+            Ok(request) => match state.handle(&request) {
+                Ok(levels) => ServeResponse {
+                    request_id,
+                    ok: true,
+                    levels,
+                    error: None,
+                },
+                Err(error) => ServeResponse {
+                    request_id,
+                    ok: false,
+                    levels: None,
+                    error: Some(error.to_string()),
+                },
+            },
+            Err(error) => ServeResponse {
+                request_id,
+                ok: false,
+                levels: None,
+                error: Some(format!("invalid request JSON: {error}")),
+            },
+        };
+        serde_json::to_writer(&mut stdout, &response)?;
+        writeln!(&mut stdout)?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let key = HourKey {
+        store_root: args.store_root,
+        model: args.model.to_ascii_lowercase(),
+        run: args.run,
+        forecast_hour: args.forecast_hour,
+    };
+    let hour = CachedHour::open(key)?;
+    let sounding = build_sounding(&hour.grid, &hour.locator, &hour.reader, args.lat, args.lon)?;
+
+    write_sounding(&args.output, &sounding)?;
     println!(
         "exported {} levels at ({:.4}, {:.4}) to {}",
         sounding.pressure_hpa.len(),
@@ -258,6 +410,9 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args_os().any(|arg| arg == "--serve") {
+        return serve();
+    }
     run(Args::parse())
 }
 

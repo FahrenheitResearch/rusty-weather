@@ -32,6 +32,7 @@ rw-ingest = { path = "../rw-ingest" }
 rw-formula = { path = "../rw-formula" }
 rw-gdex = { path = "../rw-gdex" }
 rw-sat = { path = "../rw-sat" }
+rw-sim = { path = "../rw-sim" }
 rw-store = { path = "../rw-store" }
 rw-ui = { path = "../rw-ui" }
 # Deep profiling (feature "profiling", default off): puffin scopes across

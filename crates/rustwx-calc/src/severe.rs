@@ -128,7 +128,13 @@ pub struct TornadicBetaOutputs {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectiveLayerDiagnosticsBundle {
     pub effective_srh_m2s2: Vec<f64>,
+    /// Effective bulk wind difference (Thompson et al. 2007): effective inflow
+    /// base to half the depth from that base to the MU parcel equilibrium level.
+    /// This is the quantity SCP / STP / VTP take.
     pub effective_bulk_wind_difference_ms: Vec<f64>,
+    /// Bulk shear across the effective inflow layer itself (SHARPpy's
+    /// `eff_shear`). A display diagnostic only - never an input to a composite.
+    pub effective_inflow_layer_shear_ms: Vec<f64>,
     pub effective_inflow_bottom_m: Vec<f64>,
     pub effective_inflow_top_m: Vec<f64>,
 }
@@ -367,11 +373,13 @@ pub fn compute_effective_layer_diagnostics(
 
     let mut effective_srh_m2s2 = Vec::with_capacity(n2d);
     let mut effective_bulk_wind_difference_ms = Vec::with_capacity(n2d);
+    let mut effective_inflow_layer_shear_ms = Vec::with_capacity(n2d);
     let mut effective_inflow_bottom_m = Vec::with_capacity(n2d);
     let mut effective_inflow_top_m = Vec::with_capacity(n2d);
     for result in results {
         effective_srh_m2s2.push(result.effective_srh_m2s2);
         effective_bulk_wind_difference_ms.push(result.effective_bulk_wind_difference_ms);
+        effective_inflow_layer_shear_ms.push(result.effective_inflow_layer_shear_ms);
         effective_inflow_bottom_m.push(result.effective_inflow_bottom_m);
         effective_inflow_top_m.push(result.effective_inflow_top_m);
     }
@@ -379,6 +387,7 @@ pub fn compute_effective_layer_diagnostics(
     Ok(EffectiveLayerDiagnosticsBundle {
         effective_srh_m2s2,
         effective_bulk_wind_difference_ms,
+        effective_inflow_layer_shear_ms,
         effective_inflow_bottom_m,
         effective_inflow_top_m,
     })
@@ -985,8 +994,109 @@ struct EffectiveLayerColumn {
 struct EffectiveLayerColumnResult {
     effective_srh_m2s2: f64,
     effective_bulk_wind_difference_ms: f64,
+    effective_inflow_layer_shear_ms: f64,
     effective_inflow_bottom_m: f64,
     effective_inflow_top_m: f64,
+}
+
+/// Most-unstable parcel search depth (hPa) used for the EBWD equilibrium level.
+/// Matches SPC practice and `wx_math::thermo::get_most_unstable_parcel`, which
+/// the CAPE path in this file already calls with `mu_depth = 300`.
+const MU_SEARCH_DEPTH_HPA: f64 = 300.0;
+
+/// Height AGL of the most-unstable parcel's equilibrium level.
+///
+/// Ported from `wrf-rust` `crates/wrf-core/src/diag/cape.rs`
+/// (`equilibrium_level_height_from_parcel`): pick the highest-theta-e parcel in
+/// the lowest `MU_SEARCH_DEPTH_HPA`, lift it, and take the EL. `thermo::el`
+/// always lifts from the first level of the profile handed to it, so the profile
+/// is truncated at the parcel level before the call.
+fn mu_equilibrium_level_height_m(column: &EffectiveLayerColumn) -> Option<f64> {
+    let n = column.pressure_hpa.len();
+    if n < 3 {
+        return None;
+    }
+
+    let limit_p = column.pressure_hpa[0] - MU_SEARCH_DEPTH_HPA;
+    let mut best_idx = 0usize;
+    let mut max_thetae = f64::NEG_INFINITY;
+    for idx in 0..n {
+        if column.pressure_hpa[idx] < limit_p {
+            break;
+        }
+        let thetae = metrust::calc::thermo::thetae(
+            column.pressure_hpa[idx],
+            column.temperature_c[idx],
+            column.dewpoint_c[idx],
+        );
+        if thetae.is_finite() && thetae > max_thetae {
+            max_thetae = thetae;
+            best_idx = idx;
+        }
+    }
+    if n - best_idx < 3 {
+        return None;
+    }
+
+    let pressure_hpa = &column.pressure_hpa[best_idx..];
+    let temperature_c = &column.temperature_c[best_idx..];
+    let dewpoint_c = &column.dewpoint_c[best_idx..];
+    let heights = &column.height_agl_m[best_idx..];
+
+    let (el_pressure_hpa, _) = metrust::calc::thermo::el(pressure_hpa, temperature_c, dewpoint_c)?;
+    if !el_pressure_hpa.is_finite() || el_pressure_hpa <= 0.0 {
+        return None;
+    }
+
+    let el_height_m = interp_height_at_pressure(pressure_hpa, heights, el_pressure_hpa)?;
+    if !el_height_m.is_finite() {
+        return None;
+    }
+    Some(el_height_m)
+}
+
+/// Linear-in-pressure height lookup on a surface-first (decreasing pressure)
+/// profile. Mirrors `wx_math::thermo::get_height_at_pres`, which is what the
+/// reference `wrf-rust` implementation uses to turn the EL pressure into a
+/// height.
+fn interp_height_at_pressure(
+    pressure_hpa: &[f64],
+    heights_m: &[f64],
+    target_hpa: f64,
+) -> Option<f64> {
+    if pressure_hpa.len() != heights_m.len() || pressure_hpa.len() < 2 {
+        return None;
+    }
+    for idx in 0..pressure_hpa.len() - 1 {
+        let hi = pressure_hpa[idx];
+        let lo = pressure_hpa[idx + 1];
+        if hi >= target_hpa && target_hpa >= lo {
+            let dp = lo - hi;
+            if dp.abs() < 1.0e-12 {
+                return Some(heights_m[idx]);
+            }
+            let weight = (target_hpa - hi) / dp;
+            return Some(heights_m[idx] + weight * (heights_m[idx + 1] - heights_m[idx]));
+        }
+    }
+    None
+}
+
+/// Bulk wind difference magnitude between two heights AGL.
+fn bulk_wind_difference_ms(
+    heights: &[f64],
+    u: &[f64],
+    v: &[f64],
+    bottom_m: f64,
+    top_m: f64,
+) -> f64 {
+    let (Some((u_bot, v_bot)), Some((u_top, v_top))) = (
+        interp_wind_at_height(heights, u, v, bottom_m),
+        interp_wind_at_height(heights, u, v, top_m),
+    ) else {
+        return f64::NAN;
+    };
+    ((u_top - u_bot).powi(2) + (v_top - v_bot).powi(2)).sqrt()
 }
 
 fn build_effective_layer_column(
@@ -1071,6 +1181,7 @@ fn effective_layer_for_column(
     let missing = EffectiveLayerColumnResult {
         effective_srh_m2s2: f64::NAN,
         effective_bulk_wind_difference_ms: f64::NAN,
+        effective_inflow_layer_shear_ms: f64::NAN,
         effective_inflow_bottom_m: f64::NAN,
         effective_inflow_top_m: f64::NAN,
     };
@@ -1129,17 +1240,33 @@ fn effective_layer_for_column(
         srh = -srh;
     }
 
-    let Some((u_bot, v_bot)) = interp_wind_at_height(heights, u, v, bottom_m) else {
-        return missing;
+    // Shear across the effective inflow layer itself. SHARPpy computes this as a
+    // standalone diagnostic (`eff_shear`) and deliberately never feeds it to the
+    // composites; it is kept here for the same reason. See sharppyrs
+    // `src/derived.rs:271`.
+    let eil_shear = bulk_wind_difference_ms(heights, u, v, bottom_m, top_m);
+
+    // Effective bulk wind difference. Thompson, Mead & Edwards (2007), "Effective
+    // Storm-Relative Helicity and Bulk Shear in Supercell Thunderstorm
+    // Environments", Wea. Forecasting 22, 102-115, Fig. 3: the layer runs from the
+    // effective inflow base to "50% of the depth from the effective inflow base to
+    // MU parcel EL height ('storm depth')". The inflow-layer top plays no part.
+    let ebwd = match mu_equilibrium_level_height_m(column) {
+        Some(mu_el_m) if mu_el_m.is_finite() && mu_el_m > bottom_m => {
+            let ebwd_top_m = bottom_m + 0.5 * (mu_el_m - bottom_m);
+            if ebwd_top_m > bottom_m && ebwd_top_m <= heights[heights.len() - 1] {
+                bulk_wind_difference_ms(heights, u, v, bottom_m, ebwd_top_m)
+            } else {
+                f64::NAN
+            }
+        }
+        _ => f64::NAN,
     };
-    let Some((u_top, v_top)) = interp_wind_at_height(heights, u, v, top_m) else {
-        return missing;
-    };
-    let bwd = ((u_top - u_bot).powi(2) + (v_top - v_bot).powi(2)).sqrt();
 
     EffectiveLayerColumnResult {
         effective_srh_m2s2: srh,
-        effective_bulk_wind_difference_ms: bwd,
+        effective_bulk_wind_difference_ms: ebwd,
+        effective_inflow_layer_shear_ms: eil_shear,
         effective_inflow_bottom_m: bottom_m,
         effective_inflow_top_m: top_m,
     }

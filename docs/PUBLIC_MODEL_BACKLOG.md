@@ -5,8 +5,9 @@ document, not a claim that the feeds below are supported. Current support is
 reported only by [MODEL_SUPPORT.md](MODEL_SUPPORT.md) and the running service's
 `/v1/models` response.
 
-This inventory contains 78 deduplicated atmospheric model/domain lanes that
-are not represented as working remote lanes in the current capability matrix.
+This inventory contains 78 stable, deduplicated atmospheric model/domain
+discovery records. Rows remain here after implementation so their evidence and
+review identifiers do not churn; the `Class` column records current status.
 A lane is counted once even when it has both published statistics and raw
 members, or several delivery choices. Different resolutions of the same model
 are counted separately only when the provider treats them as different grids
@@ -162,9 +163,9 @@ current execution priority.
 | 73 | NOAA HAFS-A v2.1 parent atmosphere | P3 | Active tropical cyclones, four cycles/day; 1681x1361 regular 0.06-degree parent output, 3-hourly f000-f126 | Indexed GRIB2 is public on NOMADS. The parent output grid is fixed within a storm run, but the store run key must first include basin/storm or ATCF identity so concurrent storms cannot collide. The 1001x801 0.02-degree storm nest moves at every lead and remains separately gated. |
 | 74 | NOAA HAFS-B v2.1 parent atmosphere | P3 | Active tropical cyclones, four cycles/day; 1681x1361 regular 0.06-degree parent output, 3-hourly f000-f126 | Same fixed-parent-first contract as HAFS-A, with a distinct configuration/model identity and physics. Persist storm identity before ingest; do not merge HAFS-B with HAFS-A or treat its independently moving storm nest as one static grid. |
 | 75 | ECCC GDPS-GEML | P1/P2 | Global 1440x721 regular lat/lon at 0.25 degree, 00/12Z; 6-hourly f000-f240 | Experimental operational AI forecast, anonymously split into 82 one-message GRIB2 fields per lead. Start 2 m/10 m/MSLP plus its complete 13-level temperature, height, humidity, vertical-velocity, and vector-wind suite; precipitation and orography are not published. |
-| 76 | ECCC HRDPS West 1 km | P1/P2 | British Columbia and western Alberta, 1330x1180 rotated lat/lon near 1 km, 00/12Z; hourly f000-f048 | Experimental operational GEM lane on DD-Alpha, with 338 one-message GRIB2 field/level objects per lead and 28 pressure levels. Reuse the ECCC per-field adapter, preserve experimental status, and rotate grid-relative vectors. |
+| 76 | ECCC HRDPS West 1 km | Implemented (fixture verified) | British Columbia and western Alberta, 1330x1180 rotated lat/lon near 1 km, 00/12Z; hourly f000-f048 | Experimental, non-operational DD-Alpha lane with only 24 hours of source history; exact 2026-08-14 f024 inventory, 28-level common pressure contract, bounded ECCC component acquisition, provenance, scheduler/API capability, and strict paired grid-relative vector rotation are implemented. |
 | 77 | FMI SILAM global surface air quality | P2 | Global 1800x897 regular lat/lon at 0.2 degree, daily; 120 published hourly valid times ending at f168 of the underlying run | Anonymous NetCDF4/HDF5 on FMI-owned public S3, split into five 24-time files for CO, NO, NO2, O3, PM10, PM2.5, SO2, and air density. Trust the CF time coordinate rather than the availability-date folder and preserve concentration/species identity. |
-| 78 | CPTEC/INPE Eta South America 8 km | P1 | 90W-20.08W, 55S-19.4N on an 875x931 regular 0.08-degree grid, daily 00Z; hourly f000-f264 | Anonymous GRIB2 with text `.inv`, binary `.grib2.idx`, and GrADS control sidecars. Range-select a sparse surface and 22-level pressure suite; reject three unresolved provider-local fields and never fetch the roughly 24 GiB cycle by default. |
+| 78 | CPTEC/INPE Eta South America 8 km | Implemented (fixture verified) | 90W-20.08W, 55S-19.4N on an 875x931 regular 0.08-degree grid, daily 00Z; hourly f000-f264 | Anonymous GRIB2 with text `.inv`, binary `.grib2.idx`, and GrADS control sidecars. Range-select a sparse surface and 22-level pressure suite; reject three unresolved provider-local fields and never fetch the roughly 24 GiB cycle by default. Bounded text-inventory acquisition, the 22-level pressure suite, sounding-shaped auto profiling, provenance, and two template-5.3 decoder goldens are implemented and reproducible against the live publication. |
 
 ### Shared implementation sequence
 
@@ -282,7 +283,8 @@ process 47, north-to-south scan, and 1,038,240 points. Fixture a surface field,
 a scalar pressure field, and both components of one pressure wind before
 calling the role set complete.
 
-HRDPS West 1 km is an ECCC experimental operational GEM domain over most of
+HRDPS West 1 km is an ECCC experimental GEM domain, distributed through the
+non-operational DD-Alpha service, over most of
 British Columbia and western Alberta. It runs at 00/12Z with hourly f000-f048
 and only 24 hours of overwrite-style DD-Alpha history. Its 1330x1180 rotated
 grid has 0.00899-degree increments; the live f006 directory contained 338
@@ -1542,9 +1544,10 @@ Provider-specific minimum fixtures:
   official constituent-code table plus negative unknown-code and
   surface-versus-column cases. GDPS-GEML must assert exactly 82 roles, 13
   pressure levels, simple packing, 1440x721 geometry, and explicit absence of
-  precipitation/orography roles. HRDPS West must assert the 338-role listing,
-  28 pressure levels, 1330x1180 rotated geometry/vector rotation, experimental
-  status, and completeness inside its 24-hour overwrite window.
+  precipitation/orography roles. HRDPS West must assert its captured role
+  listing by component identity rather than by object count, plus 28 pressure
+  levels, 1330x1180 rotated geometry/vector rotation, experimental status, and
+  completeness inside its 24-hour overwrite window.
 - DWD: `.bz2` surface and pressure objects, decompression ceiling, grid-template
   assertion, and deterministic rejection of native-mesh files in structured
   lanes.

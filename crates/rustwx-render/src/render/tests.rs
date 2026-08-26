@@ -35,6 +35,7 @@ fn sample_projected_opts() -> RenderOpts {
         height: 160,
         cmap: sample_cmap(),
         background: Rgba::WHITE,
+        map_overlay: false,
         colorbar: false,
         title: Some("Projected".into()),
         subtitle_left: None,
@@ -1384,6 +1385,93 @@ fn render_to_png_suppresses_contours_when_overlay_data_is_nan() {
     assert_eq!(
         contour_pixels, 0,
         "NaN contour data should produce no contour lines"
+    );
+}
+
+#[test]
+fn map_overlay_uses_the_full_transparent_canvas() {
+    let mut opts = sample_projected_opts();
+    opts.width = 137;
+    opts.height = 83;
+    opts.map_overlay = true;
+    opts.background = Rgba::TRANSPARENT;
+    opts.cmap = sample_masked_cmap();
+
+    let png = render_to_png(&[f64::NAN; 4], 2, 2, &opts);
+    let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+        .unwrap()
+        .to_rgba8();
+
+    assert_eq!(image.dimensions(), (137, 83));
+    assert!(image.pixels().all(|pixel| pixel.0[3] == 0));
+}
+
+/// Layout-level statement of what the overlay mode changes: the map viewport
+/// becomes the entire canvas and no chrome slot is reserved, where the same
+/// canvas with chrome keeps margins the map never reaches.
+#[test]
+fn map_overlay_layout_takes_the_whole_canvas_and_reserves_no_chrome() {
+    let layout = compute_map_overlay_layout(137, 83);
+
+    assert_eq!((layout.map_x, layout.map_y), (0, 0));
+    assert_eq!((layout.map_w, layout.map_h), (137, 83));
+    assert_eq!(
+        (layout.cbar_x, layout.cbar_y, layout.cbar_w, layout.cbar_h),
+        (0, 0, 0, 0),
+        "the overlay reserved a colorbar slot"
+    );
+    assert_eq!((layout.title_y, layout.subtitle_y), (0, 0));
+    assert_eq!(layout.label_gap, 0);
+
+    // A degenerate canvas must still yield a usable viewport rather than a
+    // zero-area one.
+    let degenerate = compute_map_overlay_layout(0, 0);
+    assert_eq!((degenerate.map_w, degenerate.map_h), (1, 1));
+
+    // The chromed layout for the same canvas does reserve space, so the
+    // assertions above are not describing what every layout already does.
+    let chromed = compute_effective_layout(
+        137,
+        83,
+        true,
+        true,
+        RenderPresentation::for_mode(ProductVisualMode::FilledMeteorology),
+        ChromeScale::default(),
+        false,
+    );
+    assert!(
+        chromed.map_x > 0 || chromed.map_y > 0 || chromed.map_w < 137 || chromed.map_h < 83,
+        "the chromed layout consumed the whole canvas too, so the overlay claim is vacuous"
+    );
+}
+
+/// The positive pixel half: with real data the overlay surface carries the
+/// map all the way into every corner.
+#[test]
+fn map_overlay_draws_data_into_every_corner() {
+    let mut opts = sample_projected_opts();
+    opts.width = 120;
+    opts.height = 90;
+    opts.map_overlay = true;
+    opts.background = Rgba::TRANSPARENT;
+    opts.title = None;
+
+    let png = render_to_png(&[1.5; 4], 2, 2, &opts);
+    let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+        .unwrap()
+        .to_rgba8();
+
+    assert_eq!(image.dimensions(), (120, 90));
+    for (x, y) in [(0, 0), (119, 0), (0, 89), (119, 89)] {
+        assert_eq!(
+            image.get_pixel(x, y).0[3],
+            255,
+            "overlay corner ({x}, {y}) is not covered by the map surface"
+        );
+    }
+    assert!(
+        image.pixels().all(|pixel| pixel.0[3] == 255),
+        "the overlay left uncovered pixels despite data spanning the extent"
     );
 }
 

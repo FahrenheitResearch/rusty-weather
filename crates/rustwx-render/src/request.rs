@@ -804,6 +804,11 @@ pub struct MapRenderRequest {
     pub height: u32,
     pub scale: ColorScale,
     pub background: Color,
+    /// Render only the georeferenced map surface.  This removes all canvas
+    /// margins/chrome and is intended for transparent overlays consumed by
+    /// another map application.
+    #[serde(default)]
+    pub map_overlay: bool,
     pub colorbar: bool,
     pub title: Option<String>,
     pub subtitle_left: Option<String>,
@@ -866,6 +871,7 @@ impl MapRenderRequest {
             height: 850,
             scale,
             background: Color::WHITE,
+            map_overlay: false,
             colorbar: true,
             title: None,
             subtitle_left: None,
@@ -995,6 +1001,30 @@ impl MapRenderRequest {
             });
         self.product_metadata = Some(metadata.with_provenance(provenance.clone()));
         self.semantics = Some(provenance.into());
+        self
+    }
+
+    /// Convert a production plot request into a transparent, map-only
+    /// artifact while preserving the meteorological fill, contours, wind
+    /// barbs, and streamlines.
+    pub fn as_map_overlay(&mut self) -> &mut Self {
+        self.map_overlay = true;
+        self.background = Color::TRANSPARENT;
+        self.colorbar = false;
+        self.title = None;
+        self.subtitle_left = None;
+        self.subtitle_center = None;
+        self.subtitle_right = None;
+        self.domain_frame = None;
+        self.projected_polygons.clear();
+        self.projected_lines.clear();
+        self.projected_place_labels.clear();
+        self.projected_points.clear();
+        self
+    }
+
+    pub fn into_map_overlay(mut self) -> Self {
+        self.as_map_overlay();
         self
     }
 
@@ -1354,6 +1384,31 @@ mod tests {
         );
 
         assert!(request.projected_place_labels.is_empty());
+    }
+
+    #[test]
+    fn map_overlay_removes_chrome_without_removing_meteorology() {
+        let mut request = MapRenderRequest::new(
+            sample_render_field(),
+            ColorScale::Weather(crate::weather::WeatherPreset::Cape),
+        );
+        request.title = Some("Title".into());
+        request.subtitle_left = Some("Subtitle".into());
+        request.colorbar = true;
+        request.contours.push(ContourLayer::from_field(
+            &sample_render_field(),
+            vec![1.0],
+            ContourStyle::default(),
+        ));
+
+        request.as_map_overlay();
+
+        assert!(request.map_overlay);
+        assert_eq!(request.background, Color::TRANSPARENT);
+        assert!(!request.colorbar);
+        assert!(request.title.is_none());
+        assert!(request.subtitle_left.is_none());
+        assert_eq!(request.contours.len(), 1);
     }
 
     #[test]

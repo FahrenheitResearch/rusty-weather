@@ -2799,6 +2799,10 @@ mod tests {
             },
             source_provenance: vec![SourceProvenance {
                 provider: "simulation-owner".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["generation".into()],
                 products: vec!["rws".into()],
             }],
@@ -3677,6 +3681,10 @@ mod tests {
         let mut ecmwf = manifest.clone();
         ecmwf.source_provenance = vec![SourceProvenance {
             provider: "ecmwf-open-data".into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles: vec!["generation".into()],
             products: vec!["ifs".into()],
         }];

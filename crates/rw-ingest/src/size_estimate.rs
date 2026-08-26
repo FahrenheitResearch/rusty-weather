@@ -1157,11 +1157,13 @@ mod tests {
     fn estimate_full_profile_covers_every_builtin_variable() {
         let calibration = Calibration::builtin_default();
         let estimate = estimate(&IngestProfile::full(), ModelId::Hrrr, 1, &calibration);
-        // Every variable the 20260608 store realized must be priced: 110
+        // Every variable the 20260608 store realized must be priced: 111
         // 2D (26 surface-plan + 3 trailing + 5 vorticity + 31 direct
-        // planes + 29 derived + 16 heavy, as measured) + 5 volumes +
-        // the overhead entry = 115 + 1.
-        assert_eq!(estimate.breakdown.len(), 115 + 1);
+        // planes + 30 derived + 16 heavy, as measured) + 5 volumes +
+        // the overhead entry = 116 + 1. The 30th derived grid is the
+        // Hot-Dry-Windy index, promoted after the 20260608 measurement,
+        // so it prices at the builtin 2D mean rather than a measured row.
+        assert_eq!(estimate.breakdown.len(), 116 + 1);
         // Within bookkeeping noise of the real measured hours (~677 MB).
         let measured_avg = 709_779_736u64;
         let diff = estimate.per_hour_store_bytes.abs_diff(measured_avg);

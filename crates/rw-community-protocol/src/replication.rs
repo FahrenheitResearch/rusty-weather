@@ -19,6 +19,7 @@ use crate::{
 };
 
 pub const RUN_GENERATION_REPLICATION_SCHEMA: &str = "rw.community.run-generation-replication.v1";
+pub const RUN_GENERATION_REPLICATION_SCHEMA_V2: &str = "rw.community.run-generation-replication.v2";
 pub const RUN_GENERATION_FILE_SCHEMA: &str = "rw.community.run-generation-file.v1";
 pub const RUN_GENERATION_CHUNK_SCHEMA_V1: &str = "rw.community.run-generation-chunk.v1";
 pub const BEGIN_RUN_GENERATION_SCHEMA: &str = "rw.community.run-generation-begin.v1";
@@ -54,6 +55,7 @@ pub const MAX_RUN_GENERATION_MISSING_PAGE: usize = 1024;
 pub const MAX_RUN_GENERATION_OWNER_PAGE: usize = 100;
 
 const SIGNATURE_DOMAIN: &[u8] = b"rw-community-run-generation-signature-v1\0";
+const SIGNATURE_DOMAIN_V2: &[u8] = b"rw-community-run-generation-signature-v2\0";
 const CONTENT_ID_DOMAIN: &[u8] = b"rw-community-run-generation-content-v1\0";
 const ABSOLUTE_MAX_GENERATION_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 const ABSOLUTE_MAX_FILES: usize = 65_538;
@@ -352,8 +354,32 @@ pub struct CancelledRunGeneration {
 impl RunGenerationReplicationManifest {
     pub fn validate(&self, limits: &RunGenerationLimits) -> Result<(), ProtocolError> {
         limits.validate()?;
-        if self.schema != RUN_GENERATION_REPLICATION_SCHEMA {
-            return Err(ProtocolError::UnsupportedSchema(self.schema.clone()));
+        match self.schema.as_str() {
+            RUN_GENERATION_REPLICATION_SCHEMA => {
+                if self
+                    .source_provenance
+                    .iter()
+                    .any(SourceProvenance::has_structured_identity)
+                {
+                    return invalid(
+                        "source_provenance",
+                        "structured source identity requires run-generation schema v2",
+                    );
+                }
+            }
+            RUN_GENERATION_REPLICATION_SCHEMA_V2 => {
+                if self
+                    .source_provenance
+                    .iter()
+                    .any(|source| !source.has_structured_identity())
+                {
+                    return invalid(
+                        "source_provenance",
+                        "run-generation schema v2 requires complete structured identity for every source",
+                    );
+                }
+            }
+            _ => return Err(ProtocolError::UnsupportedSchema(self.schema.clone())),
         }
         validate_token("generation_id", &self.generation_id, 128, false)?;
         validate_token("model", &self.model, 96, true)?;
@@ -833,7 +859,11 @@ pub fn canonical_run_generation_bytes(
     manifest.validate(limits)?;
     validate_token("signing_key_id", signing_key_id, 128, false)?;
     let mut out = Vec::with_capacity(8192);
-    out.extend_from_slice(SIGNATURE_DOMAIN);
+    out.extend_from_slice(match manifest.schema.as_str() {
+        RUN_GENERATION_REPLICATION_SCHEMA => SIGNATURE_DOMAIN,
+        RUN_GENERATION_REPLICATION_SCHEMA_V2 => SIGNATURE_DOMAIN_V2,
+        _ => return Err(ProtocolError::UnsupportedSchema(manifest.schema.clone())),
+    });
     put_str(&mut out, signing_key_id);
     put_str(&mut out, &manifest.schema);
     put_str(&mut out, &manifest.generation_id);
@@ -848,12 +878,7 @@ pub fn canonical_run_generation_bytes(
         &mut out,
         manifest.publication.redistribution_rights_confirmed,
     );
-    put_u32(&mut out, checked_len(manifest.source_provenance.len())?);
-    for source in &manifest.source_provenance {
-        put_str(&mut out, &source.provider);
-        put_strings(&mut out, &source.roles)?;
-        put_strings(&mut out, &source.products)?;
-    }
+    crate::encode_provenance(&mut out, &manifest.source_provenance);
     put_u32(&mut out, checked_len(manifest.files.len())?);
     for file in &manifest.files {
         encode_file(&mut out, file)?;
@@ -989,7 +1014,7 @@ fn validate_provenance(
         return invalid("source_provenance", "must be bounded and non-empty");
     }
     for source in provenance {
-        validate_token("source.provider", &source.provider, 96, true)?;
+        source.validate_identity()?;
         if source.roles.is_empty() || source.roles.len() > 64 || source.products.len() > 128 {
             return invalid("source_provenance", "role or product collection is invalid");
         }
@@ -1006,8 +1031,23 @@ fn validate_provenance(
         }
     }
     if provenance.windows(2).any(|pair| {
-        (&pair[0].provider, &pair[0].roles, &pair[0].products)
-            >= (&pair[1].provider, &pair[1].roles, &pair[1].products)
+        (
+            &pair[0].provider,
+            &pair[0].forecast_producer,
+            &pair[0].licensing_publisher,
+            &pair[0].transport_provider,
+            pair[0].transport_is_mirror,
+            &pair[0].roles,
+            &pair[0].products,
+        ) >= (
+            &pair[1].provider,
+            &pair[1].forecast_producer,
+            &pair[1].licensing_publisher,
+            &pair[1].transport_provider,
+            pair[1].transport_is_mirror,
+            &pair[1].roles,
+            &pair[1].products,
+        )
     }) {
         return Err(ProtocolError::NonCanonical("source provenance"));
     }
@@ -1046,16 +1086,18 @@ fn validate_notices(
             "owner-published generations require license attribution",
         );
     }
-    if manifest
-        .source_provenance
+    if manifest.source_provenance.iter().any(|source| {
+        matches!(
+            source.licensing_publisher_identity(),
+            "ecmwf" | "ecmwf-open-data"
+        )
+    }) && (manifest.attributions.iter().all(|notice| {
+        !matches!(notice.provider.as_str(), "ecmwf" | "ecmwf-open-data")
+            || !notice.license.contains("CC BY 4.0")
+    }) || manifest
+        .modification_notices
         .iter()
-        .any(|source| source.provider == "ecmwf-open-data")
-        && (manifest.attributions.iter().all(|notice| {
-            notice.provider != "ecmwf-open-data" || !notice.license.contains("CC BY 4.0")
-        }) || manifest
-            .modification_notices
-            .iter()
-            .all(|notice| notice.trim().is_empty()))
+        .all(|notice| notice.trim().is_empty()))
     {
         return Err(ProtocolError::MissingEcmwfNotice);
     }
@@ -1272,6 +1314,10 @@ mod tests {
             },
             source_provenance: vec![SourceProvenance {
                 provider: "simulation-owner".into(),
+                forecast_producer: None,
+                licensing_publisher: None,
+                transport_provider: None,
+                transport_is_mirror: false,
                 roles: vec!["generation".into()],
                 products: vec!["rws".into()],
             }],
@@ -1323,6 +1369,37 @@ mod tests {
     }
 
     #[test]
+    fn structured_source_identity_is_bound_by_generation_signature() {
+        let limits = limits();
+        let key = SigningKey::from_bytes(&[19; 32]);
+        let mut value = manifest(DataOrigin::PrivateWrf);
+        value.schema = RUN_GENERATION_REPLICATION_SCHEMA_V2.into();
+        let source = &mut value.source_provenance[0];
+        source.forecast_producer = Some("simulation-owner".into());
+        source.licensing_publisher = Some("simulation-owner".into());
+        source.transport_provider = Some("owner-upload".into());
+        let signed = sign_run_generation(value, "origin-v2", &key, &limits).unwrap();
+        let trusted = TrustedSigningKeys::from([(
+            "origin-v2".into(),
+            VerifyingKey::from_bytes(&key.verifying_key().to_bytes()).unwrap(),
+        )]);
+        verify_signed_run_generation(&signed, 1_800_000_100, &trusted, &limits).unwrap();
+
+        for mutate in [
+            |source: &mut SourceProvenance| source.forecast_producer = Some("other-owner".into()),
+            |source: &mut SourceProvenance| source.licensing_publisher = Some("other-owner".into()),
+            |source: &mut SourceProvenance| source.transport_provider = Some("mirror".into()),
+            |source: &mut SourceProvenance| source.transport_is_mirror = true,
+        ] {
+            let mut tampered = signed.clone();
+            mutate(&mut tampered.manifest.source_provenance[0]);
+            assert!(
+                verify_signed_run_generation(&tampered, 1_800_000_100, &trusted, &limits).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn closed_files_chunks_rights_and_retention_fail_closed() {
         let limits = limits();
         let valid = manifest(DataOrigin::PrivateArwen);
@@ -1359,6 +1436,10 @@ mod tests {
         relabeled_public.model = "hrrr".into();
         relabeled_public.source_provenance = vec![SourceProvenance {
             provider: "noaa-aws-public-data".into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles: vec!["surface".into()],
             products: vec!["wrfsfcf".into()],
         }];
@@ -1373,6 +1454,10 @@ mod tests {
         let mut value = manifest(DataOrigin::UserProvided);
         value.source_provenance = vec![SourceProvenance {
             provider: "ecmwf-open-data".into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles: vec!["source".into()],
             products: vec!["ifs".into()],
         }];

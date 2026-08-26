@@ -160,6 +160,7 @@ pub(super) struct DerivedComputedFields {
     pub(super) dcape_jkg: Option<Vec<f64>>,
     pub(super) theta_e_2m_k: Option<Vec<f64>>,
     pub(super) vpd_2m_hpa: Option<Vec<f64>>,
+    pub(super) hdw_hpa_ms: Option<Vec<f64>>,
     pub(super) dewpoint_depression_2m_c: Option<Vec<f64>>,
     pub(super) wetbulb_2m_c: Option<Vec<f64>>,
     pub(super) fire_weather_composite: Option<Vec<f64>>,
@@ -487,6 +488,9 @@ where
         }
         if recipes.contains(&DerivedRecipe::Vpd2m) {
             computed.vpd_2m_hpa = Some(surface_thermo.vpd_2m_hpa);
+        }
+        if recipes.contains(&DerivedRecipe::Hdw) {
+            computed.hdw_hpa_ms = Some(surface_thermo.hdw_hpa_ms);
         }
         if recipes.contains(&DerivedRecipe::DewpointDepression2m) {
             computed.dewpoint_depression_2m_c = Some(surface_thermo.dewpoint_depression_2m_c);

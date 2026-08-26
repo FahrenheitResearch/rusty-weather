@@ -69,15 +69,38 @@ pub struct TimePoint {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceProvenance {
+    /// Backward-compatible acquisition-lane identity.
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forecast_producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licensing_publisher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_provider: Option<String>,
+    #[serde(default)]
+    pub transport_is_mirror: bool,
     pub roles: Vec<String>,
     pub products: Vec<String>,
+}
+
+impl SourceProvenance {
+    /// Identity whose terms and attribution govern the acquired bytes. Legacy
+    /// manifests retain the historical `provider` fallback.
+    pub fn licensing_publisher_identity(&self) -> &str {
+        self.licensing_publisher
+            .as_deref()
+            .unwrap_or(&self.provider)
+    }
 }
 
 impl From<rw_store::RwsSourceProvenance> for SourceProvenance {
     fn from(value: rw_store::RwsSourceProvenance) -> Self {
         Self {
             provider: value.provider,
+            forecast_producer: value.forecast_producer,
+            licensing_publisher: value.licensing_publisher,
+            transport_provider: value.transport_provider,
+            transport_is_mirror: value.transport_is_mirror,
             roles: value.roles,
             products: value.products,
         }
@@ -138,6 +161,18 @@ pub fn eccc_provider_attribution() -> ProviderAttribution {
         modification_notice: "The ECCC source objects have been selected, combined, normalized, and re-encoded by this service; this output is not an official ECCC/MSC product.".into(),
         disclaimer: "The source information is licensed as-is without warranties; ECCC and other contributors disclaim liability to the maximum extent permitted by the licence.".into(),
     }
+}
+
+/// Attribution and operational caveat for the experimental HRDPS-West 1 km
+/// feed on ECCC's non-operational DD-Alpha service.
+pub fn hrdps_west_provider_attribution() -> ProviderAttribution {
+    let mut attribution = eccc_provider_attribution();
+    attribution.source_url =
+        "https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart-alpha_en/"
+            .into();
+    attribution.disclaimer = "The source information is licensed as-is without warranties. HRDPS-West is published on ECCC's experimental, non-operational DD-Alpha service with only 24 hours of rolling source history; availability and completeness are not guaranteed."
+        .into();
+    attribution
 }
 
 /// Attribution for ECCC's Regional Ensemble Prediction System (REPS).
@@ -208,10 +243,10 @@ pub fn geps_provider_attribution() -> ProviderAttribution {
 pub fn cptec_provider_attribution() -> ProviderAttribution {
     ProviderAttribution {
         provider: "Center for Weather Forecast and Climate Studies (CPTEC) / National Institute for Space Research (INPE), Brazil".into(),
-        copyright_statement: "CPTEC/INPE is the producing and publishing organization for these operational WRF and BRAMS forecast files.".into(),
+        copyright_statement: "CPTEC/INPE is the producing and publishing organization for these operational WRF, BRAMS, and Eta forecast files.".into(),
         notice: "Data source: CPTEC/INPE; transported from the official CPTEC Data Server.".into(),
         source_url: "https://www3.cptec.inpe.br/dimnt/base-de-dados/previsoes-cptec/".into(),
-        license: "INPE's Open Data program describes Brazilian open-government data as freely reusable and not subject to licence, patent, or control restrictions; no model-directory-specific licence statement was observed, so users should verify current publisher terms for their use.".into(),
+        license: "INPE's Open Data Plan publishes Eta South America as daily open data under Brazil's Open Data Policy (Decreto 8.777/2016); no model-directory-specific licence statement was observed, so users should verify current publisher terms for their use.".into(),
         license_url: "https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/dados-abertos".into(),
         terms_url: "https://www.gov.br/inpe/pt-br/acesso-a-informacao/dados-abertos/dados-abertos".into(),
         modification_notice: "The CPTEC/INPE source messages have been byte-range selected, normalized, and re-encoded by this service; this output is not an official CPTEC/INPE product.".into(),
@@ -230,83 +265,76 @@ pub fn gdps_geml_provider_attribution() -> ProviderAttribution {
     attribution
 }
 
+/// The single attribution owed to one acquired source.
+///
+/// Resolution is deliberately most-specific-first and scoped to this one
+/// source: a source published on a feed that carries its own product page or
+/// operational caveat owes exactly that attribution, never the generic
+/// publisher attribution in addition to it. Whole-vector matching cannot
+/// express this, because it lets one source's specific feed identity suppress
+/// or duplicate another source's owed notice.
+fn provider_attribution_for_source(source: &SourceProvenance) -> Option<ProviderAttribution> {
+    // Model-specific feed identities remain carried on the acquisition-lane
+    // provider, so they are resolved before the publisher identity.
+    match source.provider.as_str() {
+        "eccc-msc-gdps-geml-datamart" => return Some(gdps_geml_provider_attribution()),
+        "eccc-msc-hrdps-west-dd-alpha" => return Some(hrdps_west_provider_attribution()),
+        _ => {}
+    }
+    match source.licensing_publisher_identity() {
+        "ecmwf" | "ecmwf-open-data" => Some(ecmwf_provider_attribution()),
+        "noaa"
+        | "noaa-nws"
+        | "noaa-ncep"
+        | "noaa-nomads"
+        | "noaa-ncei"
+        | "noaa-aws-public-data"
+        | "noaa-google-public-data"
+        | "noaa-microsoft-azure-public-data"
+        // Backward-compatible identities written by the first
+        // provenance-capable development snapshots.
+        | "aws-public-data"
+        | "google-public-data"
+        | "microsoft-azure-public-data" => Some(noaa_provider_attribution()),
+        "eccc" | "eccc-msc" | "eccc-msc-datamart" => {
+            if source
+                .products
+                .iter()
+                .any(|product| product == "rws-published-statistics")
+            {
+                Some(geps_provider_attribution())
+            } else if source
+                .products
+                .iter()
+                .any(|product| product == "rws-reps-provider-statistics")
+            {
+                Some(reps_provider_attribution())
+            } else {
+                Some(eccc_provider_attribution())
+            }
+        }
+        "cma" | "cma-wis2-core-data" => Some(cma_provider_attribution()),
+        "dwd" | "dwd-open-data" => Some(dwd_provider_attribution()),
+        "roshydromet" | "roshydromet-wipps-dc" => Some(roshydromet_provider_attribution()),
+        "cptec-inpe" | "inpe" => Some(cptec_provider_attribution()),
+        _ => None,
+    }
+}
+
+/// Every attribution owed by this run's acquired sources, in first-source
+/// order and without repeats. Sources that resolve to the same attribution
+/// contribute it exactly once.
 pub fn provider_attributions_for_provenance(
     sources: &[SourceProvenance],
 ) -> Vec<ProviderAttribution> {
-    let mut attributions = Vec::with_capacity(4);
-    if sources
-        .iter()
-        .any(|source| source.provider == "ecmwf-open-data")
-    {
-        attributions.push(ecmwf_provider_attribution());
-    }
-    if sources.iter().any(|source| {
-        matches!(
-            source.provider.as_str(),
-            "noaa-nomads"
-                | "noaa-ncei"
-                | "noaa-aws-public-data"
-                | "noaa-google-public-data"
-                | "noaa-microsoft-azure-public-data"
-                // Backward-compatible identities written by the first
-                // provenance-capable development snapshots.
-                | "aws-public-data"
-                | "google-public-data"
-                | "microsoft-azure-public-data"
-        )
-    }) {
-        attributions.push(noaa_provider_attribution());
-    }
-    if sources
-        .iter()
-        .any(|source| source.provider == "eccc-msc-datamart")
-    {
-        if sources.iter().any(|source| {
-            source.provider == "eccc-msc-datamart"
-                && source
-                    .products
-                    .iter()
-                    .any(|product| product == "rws-published-statistics")
-        }) {
-            attributions.push(geps_provider_attribution());
-        } else if sources.iter().any(|source| {
-            source.provider == "eccc-msc-datamart"
-                && source
-                    .products
-                    .iter()
-                    .any(|product| product == "rws-reps-provider-statistics")
-        }) {
-            attributions.push(reps_provider_attribution());
-        } else {
-            attributions.push(eccc_provider_attribution());
+    let mut attributions: Vec<ProviderAttribution> = Vec::with_capacity(4);
+    for source in sources {
+        let Some(attribution) = provider_attribution_for_source(source) else {
+            continue;
+        };
+        if !attributions.contains(&attribution) {
+            attributions.push(attribution);
         }
-    }
-    if sources
-        .iter()
-        .any(|source| source.provider == "eccc-msc-gdps-geml-datamart")
-    {
-        attributions.push(gdps_geml_provider_attribution());
-    }
-    if sources
-        .iter()
-        .any(|source| source.provider == "cma-wis2-core-data")
-    {
-        attributions.push(cma_provider_attribution());
-    }
-    if sources
-        .iter()
-        .any(|source| source.provider == "dwd-open-data")
-    {
-        attributions.push(dwd_provider_attribution());
-    }
-    if sources
-        .iter()
-        .any(|source| source.provider == "roshydromet-wipps-dc")
-    {
-        attributions.push(roshydromet_provider_attribution());
-    }
-    if sources.iter().any(|source| source.provider == "cptec-inpe") {
-        attributions.push(cptec_provider_attribution());
     }
     attributions
 }
@@ -550,6 +578,24 @@ mod tests {
     fn provenance(provider: &str) -> SourceProvenance {
         SourceProvenance {
             provider: provider.into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
+            roles: vec!["surface".into()],
+            products: vec!["product".into()],
+        }
+    }
+
+    /// The structured shape ingest actually writes for ECCC acquisitions: an
+    /// explicit licensing publisher alongside the acquisition-lane provider.
+    fn structured_eccc_provenance(provider: &str) -> SourceProvenance {
+        SourceProvenance {
+            provider: provider.into(),
+            forecast_producer: Some("eccc-msc".into()),
+            licensing_publisher: Some("eccc".into()),
+            transport_provider: Some("eccc-datamart".into()),
+            transport_is_mirror: false,
             roles: vec!["surface".into()],
             products: vec!["product".into()],
         }
@@ -558,6 +604,10 @@ mod tests {
     fn provenance_with_product(provider: &str, product: &str) -> SourceProvenance {
         SourceProvenance {
             provider: provider.into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles: vec!["surface".into()],
             products: vec![product.into()],
         }
@@ -617,6 +667,10 @@ mod tests {
     fn reps_provenance_uses_the_exact_product_documentation_url() {
         let sources = [SourceProvenance {
             provider: "eccc-msc-datamart".into(),
+            forecast_producer: None,
+            licensing_publisher: None,
+            transport_provider: None,
+            transport_is_mirror: false,
             roles: vec!["surface".into()],
             products: vec!["rws-reps-provider-statistics".into()],
         }];
@@ -709,6 +763,8 @@ mod tests {
         assert_eq!(attributions, vec![cptec_provider_attribution()]);
         assert!(attributions[0].provider.contains("CPTEC"));
         assert!(attributions[0].notice.contains("CPTEC Data Server"));
+        assert!(attributions[0].copyright_statement.contains("Eta"));
+        assert!(attributions[0].license.contains("Decreto 8.777/2016"));
         assert!(
             attributions[0]
                 .license
@@ -737,5 +793,113 @@ mod tests {
         );
         assert!(attributions[0].license.contains("version 2.1"));
         assert!(attributions[0].modification_notice.contains("normalized"));
+    }
+
+    #[test]
+    fn structured_publisher_drives_attribution_independently_of_transport() {
+        let sources = [SourceProvenance {
+            provider: "cloud-object-lane".into(),
+            forecast_producer: Some("noaa-ncep".into()),
+            licensing_publisher: Some("noaa".into()),
+            transport_provider: Some("aws-asdi".into()),
+            transport_is_mirror: true,
+            roles: vec!["surface".into()],
+            products: vec!["pgrb2".into()],
+        }];
+        let attributions = provider_attributions_for_provenance(&sources);
+        assert_eq!(attributions.len(), 1);
+        assert!(attributions[0].provider.contains("NOAA"));
+
+        let serialized = serde_json::to_value(&sources[0]).unwrap();
+        assert_eq!(serialized["forecast_producer"], "noaa-ncep");
+        assert_eq!(serialized["licensing_publisher"], "noaa");
+        assert_eq!(serialized["transport_provider"], "aws-asdi");
+        assert_eq!(serialized["transport_is_mirror"], true);
+    }
+
+    #[test]
+    fn hrdps_west_provenance_surfaces_dd_alpha_status_and_retention() {
+        let attributions =
+            provider_attributions_for_provenance(&[provenance("eccc-msc-hrdps-west-dd-alpha")]);
+        assert_eq!(attributions, vec![hrdps_west_provider_attribution()]);
+        assert_eq!(
+            attributions[0].source_url,
+            "https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart-alpha_en/"
+        );
+        assert_eq!(
+            attributions[0].notice,
+            "Data Source: Environment and Climate Change Canada"
+        );
+        assert!(attributions[0].license.contains("version 2.1"));
+        assert!(
+            attributions[0]
+                .disclaimer
+                .contains("non-operational DD-Alpha")
+        );
+        assert!(attributions[0].disclaimer.contains("24 hours"));
+    }
+
+    #[test]
+    fn structured_gdps_geml_identity_emits_the_experimental_attribution_once() {
+        let attributions = provider_attributions_for_provenance(&[structured_eccc_provenance(
+            "eccc-msc-gdps-geml-datamart",
+        )]);
+        assert_eq!(attributions, vec![gdps_geml_provider_attribution()]);
+        assert_eq!(
+            attributions
+                .iter()
+                .filter(|item| **item == gdps_geml_provider_attribution())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn structured_hrdps_west_identity_keeps_only_the_dd_alpha_attribution() {
+        let attributions = provider_attributions_for_provenance(&[structured_eccc_provenance(
+            "eccc-msc-hrdps-west-dd-alpha",
+        )]);
+        assert_eq!(attributions, vec![hrdps_west_provider_attribution()]);
+        assert!(!attributions.contains(&eccc_provider_attribution()));
+        assert!(
+            attributions[0]
+                .disclaimer
+                .contains("non-operational DD-Alpha")
+        );
+    }
+
+    #[test]
+    fn mixed_eccc_sources_keep_the_dd_alpha_caveat_and_one_generic_attribution() {
+        let attributions = provider_attributions_for_provenance(&[
+            structured_eccc_provenance("eccc-msc-hrdps-west-dd-alpha"),
+            structured_eccc_provenance("eccc-msc-datamart"),
+            structured_eccc_provenance("eccc-msc-datamart"),
+        ]);
+        assert_eq!(attributions.len(), 2);
+        assert_eq!(
+            attributions
+                .iter()
+                .filter(|item| **item == hrdps_west_provider_attribution())
+                .count(),
+            1
+        );
+        assert_eq!(
+            attributions
+                .iter()
+                .filter(|item| **item == eccc_provider_attribution())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_mixed_eccc_sources_resolve_the_same_two_attributions() {
+        let attributions = provider_attributions_for_provenance(&[
+            provenance("eccc-msc-hrdps-west-dd-alpha"),
+            provenance("eccc-msc-datamart"),
+        ]);
+        assert_eq!(attributions.len(), 2);
+        assert!(attributions.contains(&hrdps_west_provider_attribution()));
+        assert!(attributions.contains(&eccc_provider_attribution()));
     }
 }

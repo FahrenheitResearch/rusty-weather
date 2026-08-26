@@ -102,6 +102,40 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo +1.92.0 test --locked --manifest-path deploy/distributed-lab/labctl/Cargo.toml --all-targets
 
+  # The GRIB2 decoders live outside the workspace, so `cargo test --workspace`
+  # never touches them. Their own suites carry the named regressions that keep
+  # real files decoding - complex-packing spatial differencing when primary
+  # and secondary values are missing, sign-magnitude scale factors on both
+  # fixed surfaces, minute statistical ranges preserved without rounding - and
+  # until this job existed nothing in CI ran a single one of them. Every decode
+  # the product lanes perform rested on code no gate covered.
+  vendored-decoders:
+    name: Vendored decoder - ${{ matrix.crate.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - name: grib-core
+            manifest: vendor/grib-core/Cargo.toml
+          - name: wx-core
+            manifest: vendor/wx-core/Cargo.toml
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.92 with rustfmt
+        run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt
+
+      - name: Verify formatting
+        run: cargo +1.92.0 fmt --manifest-path ${{ matrix.crate.manifest }} -- --check
+
+      - name: Run the decoder test suite
+        run: cargo +1.92.0 test --locked --manifest-path ${{ matrix.crate.manifest }} --all-targets
+
   dependency-policy:
     name: Dependency policy - ${{ matrix.package.name }} - ${{ matrix.checks }}
     runs-on: ubuntu-24.04
@@ -168,7 +202,7 @@ jobs:
 
   distributed-lab:
     name: Isolated distributed protocol lab
-    needs: [validate, dependency-policy, r2-hot-gateway]
+    needs: [validate, vendored-decoders, dependency-policy, r2-hot-gateway]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -191,7 +225,7 @@ jobs:
 
   production-candidate-image:
     name: Unmodified production image smoke
-    needs: [validate, dependency-policy, r2-hot-gateway]
+    needs: [validate, vendored-decoders, dependency-policy, r2-hot-gateway]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:

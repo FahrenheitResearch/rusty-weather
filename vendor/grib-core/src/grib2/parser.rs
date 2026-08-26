@@ -80,6 +80,17 @@ pub struct ProductDefinition {
     pub time_range_unit: u8,
     pub level_type: u8,
     pub level_value: f64,
+    /// Type of the second fixed surface (Code Table 4.5), when one is
+    /// specified. `None` for a single-surface level, which Code Table 4.5
+    /// signals with type 255 ("missing").
+    pub second_level_type: Option<u8>,
+    /// Scaled value of the second fixed surface, when one is specified.
+    ///
+    /// Together with `level_type` / `level_value` this is what makes a bounded
+    /// layer - a 0-1 km AGL slab, a 180-0 hPa above-ground mixed layer - a
+    /// distinct identity from the single surface at its bottom edge. Without
+    /// it, every layer sharing a bottom edge decodes to the same level.
+    pub second_level_value: Option<f64>,
     /// Type of ensemble forecast (PDT 4.1, 4.11).
     pub ensemble_type: Option<u8>,
     /// Perturbation number — the "number" key (PDT 4.1, 4.11).
@@ -238,6 +249,8 @@ impl Default for ProductDefinition {
             time_range_unit: 0,
             level_type: 0,
             level_value: 0.0,
+            second_level_type: None,
+            second_level_value: None,
             ensemble_type: None,
             perturbation_number: None,
             num_forecasts_in_ensemble: None,
@@ -874,6 +887,23 @@ fn parse_grid_template_90(sec: &[u8], grid: &mut GridDefinition) -> Result<(), S
     Ok(())
 }
 
+/// Undo the decimal scaling on a fixed-surface value.
+///
+/// The scale factor octet is signed sign-magnitude, so 0x82 is -2, not -126 as
+/// a two's-complement reading would give. ECCC uses negative factors for
+/// ordinary isobaric pressures, which is where a two's-complement reading goes
+/// visibly wrong. Both fixed surfaces in Section 4 encode their value the same
+/// way, so they share this decoder rather than each carrying their own copy of
+/// the sign rule.
+fn decode_fixed_surface_value(scale_factor: u8, scaled_value: u32) -> f64 {
+    let scale_factor = if scale_factor & 0x80 == 0 {
+        i32::from(scale_factor)
+    } else {
+        -i32::from(scale_factor & 0x7f)
+    };
+    f64::from(scaled_value) * 10.0_f64.powi(-scale_factor)
+}
+
 /// Parse Section 4 (Product Definition).
 fn parse_section4(sec: &[u8]) -> Result<ProductDefinition, String> {
     if sec.len() < 11 {
@@ -892,17 +922,28 @@ fn parse_section4(sec: &[u8]) -> Result<ProductDefinition, String> {
         prod.forecast_time = read_u32(sec, 18)?;
 
         prod.level_type = read_u8(sec, 22)?;
-        let scale_factor = read_u8(sec, 23)?;
-        let scaled_value = read_u32(sec, 24)? as f64;
-        // Code Table 4.5 uses a signed sign-magnitude scale factor. 0x82 is
-        // therefore -2, not -126 as a two's-complement-style conversion would
-        // imply. ECCC uses negative factors for ordinary isobaric pressures.
-        let scale_factor = if scale_factor & 0x80 == 0 {
-            i32::from(scale_factor)
-        } else {
-            -i32::from(scale_factor & 0x7f)
-        };
-        prod.level_value = scaled_value * 10.0_f64.powi(-scale_factor);
+        prod.level_value = decode_fixed_surface_value(read_u8(sec, 23)?, read_u32(sec, 24)?);
+    }
+
+    // Second fixed surface, octets 29-34. Every product definition template
+    // this parser supports lays the first and second fixed surfaces out
+    // identically, immediately after the forecast time, so the pair can be read
+    // before the template-specific branch below.
+    //
+    // Code Table 4.5 type 255 means "missing": the product is defined on a
+    // single surface and there is no second one to read. Anything else makes
+    // the product a bounded layer, and the bound is part of its identity —
+    // without it a 0-1 km AGL layer and a 0-6 km AGL layer both decode to
+    // "height above ground, 0 m".
+    if sec.len() >= 34 {
+        let second_level_type = read_u8(sec, 28)?;
+        if second_level_type != 255 {
+            prod.second_level_type = Some(second_level_type);
+            prod.second_level_value = Some(decode_fixed_surface_value(
+                read_u8(sec, 29)?,
+                read_u32(sec, 30)?,
+            ));
+        }
     }
 
     // Template-specific parsing
@@ -1213,6 +1254,9 @@ mod tests {
         sec[22] = 103;
         sec[23] = 0;
         sec[24..28].copy_from_slice(&2u32.to_be_bytes());
+        // Code Table 4.5 "missing": a single surface, no bounding layer. A
+        // zeroed octet here would instead read as surface type 0.
+        sec[28] = 255;
     }
 
     fn seed_statistical_window(sec: &mut [u8], base: usize, length_hours: u32) {
@@ -1244,6 +1288,87 @@ mod tests {
         negative[23] = 0x82;
         negative[24..28].copy_from_slice(&5_u32.to_be_bytes());
         assert_eq!(parse_section4(&negative).unwrap().level_value, 500.0);
+    }
+
+    #[test]
+    fn parse_section4_captures_bounded_second_fixed_surface() {
+        let mut sec = vec![0u8; 34];
+        seed_common_section4(&mut sec, 0);
+        // The classic bounded soil layer: 0-0.1 m depth below land surface,
+        // Code Table 4.5 type 106 on both edges.
+        sec[22] = 106;
+        sec[23] = 1;
+        sec[24..28].copy_from_slice(&0u32.to_be_bytes());
+        sec[28] = 106;
+        sec[29] = 1;
+        sec[30..34].copy_from_slice(&1u32.to_be_bytes());
+
+        let product = parse_section4(&sec).expect("section 4 should parse");
+
+        assert_eq!(product.level_type, 106);
+        assert_eq!(product.level_value, 0.0);
+        assert_eq!(product.second_level_type, Some(106));
+        assert_eq!(product.second_level_value, Some(0.1));
+    }
+
+    /// Code Table 4.5 type 255 is "missing", not a surface type. A product on a
+    /// single surface must leave both second-surface fields unset rather than
+    /// reporting a bound of type 255.
+    #[test]
+    fn parse_section4_leaves_second_fixed_surface_unset_when_missing() {
+        let mut sec = vec![0u8; 34];
+        seed_common_section4(&mut sec, 0);
+        sec[29] = 3;
+        sec[30..34].copy_from_slice(&7u32.to_be_bytes());
+
+        let product = parse_section4(&sec).expect("section 4 should parse");
+
+        assert_eq!(product.level_type, 103);
+        assert_eq!(product.second_level_type, None);
+        assert_eq!(product.second_level_value, None);
+    }
+
+    /// The second surface's scale factor is the same signed sign-magnitude
+    /// octet as the first surface's, so 0x82 is -2. Reading it as two's
+    /// complement would make this 5 x 10^-126 instead of 500.
+    #[test]
+    fn second_fixed_surface_scale_factor_uses_grib_sign_magnitude() {
+        let mut sec = vec![0u8; 34];
+        seed_common_section4(&mut sec, 0);
+        sec[28] = 100;
+        sec[29] = 0x82;
+        sec[30..34].copy_from_slice(&5u32.to_be_bytes());
+
+        let product = parse_section4(&sec).expect("section 4 should parse");
+
+        assert_eq!(product.second_level_type, Some(100));
+        assert_eq!(product.second_level_value, Some(500.0));
+    }
+
+    /// The point of carrying the second surface: two layers that share a bottom
+    /// edge are different products. Before the second surface was decoded both
+    /// of these collapsed to "height above ground, 0 m".
+    #[test]
+    fn layers_sharing_a_bottom_edge_stay_distinguishable() {
+        let bounded_layer = |top_m: u32| {
+            let mut sec = vec![0u8; 34];
+            seed_common_section4(&mut sec, 0);
+            sec[22] = 103;
+            sec[23] = 0;
+            sec[24..28].copy_from_slice(&0u32.to_be_bytes());
+            sec[28] = 103;
+            sec[29] = 0;
+            sec[30..34].copy_from_slice(&top_m.to_be_bytes());
+            parse_section4(&sec).expect("section 4 should parse")
+        };
+
+        let shallow = bounded_layer(1000);
+        let deep = bounded_layer(6000);
+
+        assert_eq!(shallow.level_type, deep.level_type);
+        assert_eq!(shallow.level_value, deep.level_value);
+        assert_eq!(shallow.second_level_value, Some(1000.0));
+        assert_eq!(deep.second_level_value, Some(6000.0));
     }
 
     #[test]

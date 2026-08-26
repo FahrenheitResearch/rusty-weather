@@ -114,20 +114,6 @@ fn basemap_root_candidates() -> Vec<PathBuf> {
         }
     }
 
-    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|path| path.parent())
-        .map(Path::to_path_buf);
-    if let Some(workspace_root) = workspace_root {
-        push(workspace_root.join("assets").join("basemap"));
-        push(
-            workspace_root
-                .join("rustbox-fresh")
-                .join("assets")
-                .join("basemap"),
-        );
-    }
-
     candidates
 }
 
@@ -868,6 +854,55 @@ mod tests {
 
     fn role_index(layers: &[StyledLonLatLayer], role: LineworkRole) -> Option<usize> {
         layers.iter().position(|layer| layer.role == role)
+    }
+
+    /// Basemap discovery must depend only on runtime state — the two env
+    /// vars, the executable's ancestors, and the working directory's
+    /// ancestors. A candidate derived from the compile-time manifest
+    /// directory bakes the build machine's source layout into every shipped
+    /// binary and probes it on the user's disk, so the source must not
+    /// reference it here.
+    ///
+    /// The needles are assembled at runtime so this test does not match
+    /// itself through `include_str!`.
+    #[test]
+    fn basemap_discovery_does_not_probe_build_machine_paths() {
+        let source = include_str!("features.rs");
+        let compile_time_path = ["CARGO_MANIFEST", "_DIR"].concat();
+        assert!(
+            !source.contains(&compile_time_path),
+            "basemap discovery reintroduced a compile-time path"
+        );
+
+        // The stale sibling checkout name must not come back either.
+        let stale_checkout = ["rustbox", "-fresh"].concat();
+        assert!(
+            !source.contains(&stale_checkout),
+            "basemap discovery reintroduced a stale sibling checkout path"
+        );
+        assert!(
+            basemap_root_candidates()
+                .iter()
+                .all(|path| !path.to_string_lossy().contains(&stale_checkout)),
+            "a discovery candidate still points at the stale sibling checkout"
+        );
+    }
+
+    /// The remaining sources still have to produce something to search, and
+    /// an explicit override still has to win.
+    #[test]
+    fn basemap_discovery_keeps_its_runtime_sources() {
+        let candidates = basemap_root_candidates();
+        assert!(
+            !candidates.is_empty(),
+            "removing the compile-time candidates left nothing to search"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|path| path.ends_with(std::path::Path::new("assets").join("basemap"))),
+            "no assets/basemap candidate survived: {candidates:?}"
+        );
     }
 
     #[test]

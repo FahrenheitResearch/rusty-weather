@@ -376,10 +376,10 @@ impl SchedulerConfig {
             .map(String::as_str)
             .unwrap_or(&self.profile);
         let profile = if requested == "auto" {
-            if model == ModelId::GdpsGeml {
-                // GEML's complete native contract is the sounding-shaped
-                // six-volume/4-surface inventory; it has no inputs for the
-                // render-grade full-2D or derived stages.
+            if matches!(model, ModelId::GdpsGeml | ModelId::EtaCptec8km) {
+                // GEML and CPTEC Eta have complete, safe native contracts that
+                // are sounding-shaped. Their public lead files omit inputs
+                // required by the render-grade full-2D or derived stages.
                 IngestProfile::sounding()
             } else if capability
                 .limitations
