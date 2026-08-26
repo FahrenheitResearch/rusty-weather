@@ -4618,6 +4618,7 @@ dependencies = [
  "rw-gdex",
  "rw-ingest",
  "rw-sat",
+ "rw-sim",
  "rw-store",
  "rw-ui",
  "serde",
@@ -4928,6 +4929,13 @@ dependencies = [
  "ureq",
  "utoipa",
  "uuid",
+]
+
+[[package]]
+name = "rw-sim"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
 ]
 
 [[package]]

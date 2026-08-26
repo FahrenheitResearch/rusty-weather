@@ -92,6 +92,12 @@ local research files:
   kinematic products. If the required rotation metadata is absent, those
   products are withheld instead of silently treating grid-relative winds as
   true east/north winds.
+- **Live watch** follows a WRF run that is still in progress: point it at the
+  folder the model is writing and each finished `wrfout` frame is validated
+  against a fixed case contract and imported as it appears. The watch is
+  producer-independent and never launches or configures the run — see
+  [`docs/SIMULATION_OUTPUT_WATCH.md`](docs/SIMULATION_OUTPUT_WATCH.md), which
+  also states what is deliberately not included.
 - Multi-file local imports are preflighted as one run, written under a hidden
   same-filesystem staging tree, validated, and published only after every hour
   succeeds. Source content and file revisions are checked again before the

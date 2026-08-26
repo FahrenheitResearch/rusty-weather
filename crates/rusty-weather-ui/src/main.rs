@@ -40,6 +40,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod batch_render;
+mod external_watch;
 mod formula_lab;
 mod gdex_ui;
 mod grib_import;
@@ -53,14 +54,18 @@ mod sat_worker;
 mod wrf_process;
 mod wrf_volumes;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use batch_render::BatchRenderPanel;
 use eframe::egui;
+use external_watch::{
+    ExternalCompletionMode, ExternalProcessingMode, ExternalWatchSession, ExternalWatchSettings,
+    SimulationOutput,
+};
 use formula_lab::{
     FormulaLabPanel, FormulaLabSources, FormulaResultSource, FormulaSourceKind,
     RawWrfFormulaSource, StoreFormulaSource,
@@ -79,7 +84,9 @@ use rw_ui::{
 use sat_worker::{SatRequest, SatResponse, SatWorker};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use wrf_process::{WrfProcessMessage, WrfProcessOptions, WrfProcessSummary, WrfProcessTask};
+use wrf_process::{
+    LiveWrfTarget, WrfProcessMessage, WrfProcessOptions, WrfProcessSummary, WrfProcessTask,
+};
 
 // ---------------------------------------------------------------------------
 // Storage path resolution
@@ -93,6 +100,8 @@ const DOMAIN_STORAGE_KEY: &str = "rw.custom_domains";
 const STYLE_STORAGE_KEY: &str = "rw.style_overrides";
 /// eframe Storage key for local WRF processing options.
 const WRF_PROCESS_STORAGE_KEY: &str = "rw.wrf_process_options";
+/// Producer-independent live WRF output-folder watch settings.
+const EXTERNAL_WATCH_STORAGE_KEY: &str = "rw.external_watch.v1";
 /// eframe Storage key for the shared user-customizable sounding workspace.
 ///
 /// The value is deliberately opaque to the app shell. `rw-ui` owns the
@@ -1571,6 +1580,150 @@ fn light_import_size_warning(assessment: &ImportSizeAssessment) -> Option<String
     ))
 }
 
+#[derive(Debug, Clone)]
+struct ActiveExternalWatchOutput {
+    storage_slot: u16,
+    exact_time: rw_store::RwsExactTime,
+    follow_newest: bool,
+    session_generation: u64,
+}
+
+const LIVE_WRF_PROCESSED_HISTORY_LIMIT: usize = 4_096;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LiveWrfPathIdentity(String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LiveWrfFileSignature {
+    bytes: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LiveWrfPublicationIdentity {
+    path: LiveWrfPathIdentity,
+    signature: LiveWrfFileSignature,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedLiveWrfOutput {
+    output: SimulationOutput,
+    publication: LiveWrfPublicationIdentity,
+}
+
+/// Which exact `(path, size, mtime)` publications are queued, in flight, or
+/// already imported.
+///
+/// A watched producer may legitimately rewrite a path, and the watcher will
+/// offer it again once it restabilizes. Keying on the file signature rather
+/// than the path alone is what lets a genuine rewrite through while keeping a
+/// path that merely reappeared in a later scan from being imported twice.
+#[derive(Debug)]
+struct LiveWrfPublicationTracker {
+    in_flight: BTreeSet<LiveWrfPublicationIdentity>,
+    processed: BTreeSet<LiveWrfPublicationIdentity>,
+    processed_order: VecDeque<LiveWrfPublicationIdentity>,
+    processed_limit: usize,
+}
+
+impl Default for LiveWrfPublicationTracker {
+    fn default() -> Self {
+        Self::with_processed_limit(LIVE_WRF_PROCESSED_HISTORY_LIMIT)
+    }
+}
+
+impl LiveWrfPublicationTracker {
+    fn with_processed_limit(processed_limit: usize) -> Self {
+        Self {
+            in_flight: BTreeSet::new(),
+            processed: BTreeSet::new(),
+            processed_order: VecDeque::new(),
+            processed_limit: processed_limit.max(1),
+        }
+    }
+
+    fn accept(&mut self, publication: LiveWrfPublicationIdentity) -> bool {
+        if self.processed.contains(&publication) {
+            return false;
+        }
+        self.in_flight.insert(publication)
+    }
+
+    fn cancel(&mut self, publication: &LiveWrfPublicationIdentity) {
+        self.in_flight.remove(publication);
+    }
+
+    fn finish(&mut self, publication: LiveWrfPublicationIdentity, success: bool) {
+        self.in_flight.remove(&publication);
+        if !success || !self.processed.insert(publication.clone()) {
+            return;
+        }
+        self.processed_order.push_back(publication);
+        while self.processed_order.len() > self.processed_limit {
+            if let Some(expired) = self.processed_order.pop_front() {
+                self.processed.remove(&expired);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.in_flight.clear();
+        self.processed.clear();
+        self.processed_order.clear();
+    }
+}
+
+fn live_wrf_publication_identity(path: &Path) -> Result<LiveWrfPublicationIdentity, String> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "could not resolve live WRF publication {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = std::fs::metadata(&canonical).map_err(|error| {
+        format!(
+            "could not inspect live WRF publication {}: {error}",
+            canonical.display()
+        )
+    })?;
+    Ok(LiveWrfPublicationIdentity {
+        path: normalized_live_wrf_path_identity(&canonical),
+        signature: LiveWrfFileSignature {
+            bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+        },
+    })
+}
+
+fn normalized_live_wrf_path_identity(path: &Path) -> LiveWrfPathIdentity {
+    #[cfg(windows)]
+    {
+        LiveWrfPathIdentity(normalize_windows_path_alias(&path.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        LiveWrfPathIdentity(path.to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(windows)]
+fn normalize_windows_path_alias(value: &str) -> String {
+    let normalized_separators = value.replace('/', "\\");
+    let lowercase_prefix = normalized_separators.to_ascii_lowercase();
+    let without_extended_prefix = if lowercase_prefix.starts_with("\\\\?\\unc\\") {
+        format!("\\\\{}", &normalized_separators[8..])
+    } else if lowercase_prefix.starts_with("\\\\?\\") {
+        normalized_separators[4..].to_string()
+    } else {
+        normalized_separators
+    };
+    without_extended_prefix.to_lowercase()
+}
+
+fn should_follow_external_time(last_followed: Option<i64>, candidate_valid_unix: i64) -> bool {
+    last_followed.is_none_or(|valid| candidate_valid_unix > valid)
+}
+
 struct App {
     worker: StoreWorker,
     ingest: IngestWorker,
@@ -1656,6 +1809,29 @@ struct App {
     wrf_process: Option<WrfProcessTask>,
     /// Short WRF open/process status shown in the toolbar.
     wrf_process_status: Option<String>,
+    /// Persistent controls for watching an externally launched simulation.
+    external_watch_settings: ExternalWatchSettings,
+    /// Live watch session, present only while a folder is being followed.
+    external_watch_session: Option<ExternalWatchSession>,
+    /// Last watch message shown when no session is active.
+    external_watch_status: Option<String>,
+    show_external_watch: bool,
+    /// Accepted watch publications waiting for the single WRF processor.
+    pending_external_wrf_paths: VecDeque<QueuedLiveWrfOutput>,
+    /// Watch publication currently being processed, if any.
+    active_external_watch_output: Option<ActiveExternalWatchOutput>,
+    /// Bumped by every start, so a frame from a stopped session cannot steer
+    /// the selection of the session that replaced it.
+    external_watch_generation: u64,
+    /// Newest valid time the watch has already followed.
+    last_external_follow_valid_unix: Option<i64>,
+    /// Selection to apply once the store worker reports the new hour.
+    pending_external_selection: Option<HourKey>,
+    /// Queued/in-flight/imported live publications, keyed by file signature.
+    live_wrf_publications: LiveWrfPublicationTracker,
+    /// Publication owned by the running WRF processor, if it came from a watch.
+    active_live_wrf_publication: Option<LiveWrfPublicationIdentity>,
+    external_watch_next_poll: Instant,
     /// Persistent local WRF product-processing profile.
     wrf_options: WrfProcessOptions,
     /// Edit buffers for WRF product filters.
@@ -1839,6 +2015,11 @@ impl App {
             .unwrap_or_default()
             .normalized();
         let wrf_options_ui = WrfProcessSettingsUi::new(&wrf_options);
+        let external_watch_settings = cc
+            .storage
+            .and_then(|storage| storage.get_string(EXTERNAL_WATCH_STORAGE_KEY))
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
 
         // Model, adjusted, RAOB, and file soundings are distinct data
         // pipelines but one presentation workspace. Restore the saved view
@@ -1917,6 +2098,18 @@ impl App {
             formula_raw_path: None,
             wrf_process: None,
             wrf_process_status: None,
+            external_watch_settings,
+            external_watch_session: None,
+            external_watch_status: None,
+            show_external_watch: false,
+            pending_external_wrf_paths: VecDeque::new(),
+            active_external_watch_output: None,
+            external_watch_generation: 0,
+            last_external_follow_valid_unix: None,
+            pending_external_selection: None,
+            live_wrf_publications: LiveWrfPublicationTracker::default(),
+            active_live_wrf_publication: None,
+            external_watch_next_poll: Instant::now(),
             wrf_options,
             wrf_options_ui,
             show_wrf_options: false,
@@ -2049,6 +2242,386 @@ impl App {
                 ui.close();
             }
         });
+    }
+
+    fn show_external_watch_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_external_watch;
+        let active = self.external_watch_session.is_some();
+        let can_start = !active && self.active_external_watch_output.is_none();
+        let mut start_clicked = false;
+        let mut stop_clicked = false;
+        egui::Window::new("Watch Existing Simulation")
+            .open(&mut open)
+            .default_width(560.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Follow wrfout files from stock WRF or any other compatible producer. Rusty Weather only reads this folder; it never launches or configures the simulation.",
+                );
+                ui.small("Live watch currently requires one time record per file (WRF frames_per_outfile = 1). Growing multi-time files can still be opened after the run.");
+                ui.add_space(6.0);
+                ui.add_enabled_ui(!active, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Output folder");
+                        let mut root = self
+                            .external_watch_settings
+                            .root
+                            .to_string_lossy()
+                            .into_owned();
+                        if ui.text_edit_singleline(&mut root).changed() {
+                            self.external_watch_settings.root = PathBuf::from(root);
+                        }
+                        if ui.button("Browse...").clicked()
+                            && let Some(folder) = rfd::FileDialog::new()
+                                .set_title("Choose simulation output folder")
+                                .pick_folder()
+                        {
+                            self.external_watch_settings.root = folder;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Domain");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.external_watch_settings.domain)
+                                .desired_width(54.0)
+                                .hint_text("d01"),
+                        );
+                        ui.label("Output cadence");
+                        ui.add(
+                            egui::DragValue::new(
+                                &mut self.external_watch_settings.cadence_seconds,
+                            )
+                            .range(1..=86_400)
+                            .suffix(" s"),
+                        );
+                        for (label, seconds) in [("5m", 300), ("15m", 900), ("1h", 3_600)] {
+                            if ui.small_button(label).clicked() {
+                                self.external_watch_settings.cadence_seconds = seconds;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Completion");
+                        egui::ComboBox::from_id_salt("external-watch-completion")
+                            .selected_text(self.external_watch_settings.completion_mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in [
+                                    ExternalCompletionMode::Auto,
+                                    ExternalCompletionMode::StockWrf,
+                                    ExternalCompletionMode::RequireMarker,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.external_watch_settings.completion_mode,
+                                        mode,
+                                        mode.label(),
+                                    );
+                                }
+                            });
+                        ui.label("Products");
+                        egui::ComboBox::from_id_salt("external-watch-processing")
+                            .selected_text(self.external_watch_settings.processing_mode.label())
+                            .show_ui(ui, |ui| {
+                                for mode in [
+                                    ExternalProcessingMode::QuickLook,
+                                    ExternalProcessingMode::Full,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.external_watch_settings.processing_mode,
+                                        mode,
+                                        mode.label(),
+                                    );
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Completion attribute");
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.external_watch_settings.completion_attribute,
+                            )
+                            .desired_width(220.0)
+                            .hint_text("none (stock WRF)"),
+                        );
+                    });
+                    ui.checkbox(
+                        &mut self.external_watch_settings.follow_newest,
+                        "Follow each newly processed valid time",
+                    );
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(can_start, egui::Button::new("Start watching"))
+                        .clicked()
+                    {
+                        start_clicked = true;
+                    }
+                    if ui.add_enabled(active, egui::Button::new("Stop")).clicked() {
+                        stop_clicked = true;
+                    }
+                    if active {
+                        ui.spinner();
+                    } else if !can_start {
+                        ui.small("Waiting for the stopped session's active frame to finish");
+                    }
+                });
+                if let Some(session) = self.external_watch_session.as_ref() {
+                    let status = session.status();
+                    ui.label(&status.message);
+                    ui.small(format!(
+                        "{} accepted · {} processed · {} queued · {} retry · {} rejected · {} failed",
+                        status.emitted_frames,
+                        status.processed_frames,
+                        status.backlog,
+                        status.retry_count,
+                        status.rejected_count,
+                        status.processing_failures,
+                    ));
+                    if let Some(rejection) = status.last_rejection.as_deref() {
+                        ui.small(format!("Last rejected: {rejection}"));
+                    }
+                    if let Some(case) = session.case() {
+                        ui.small(format!(
+                            "Case {}… · {}×{}×{} · {:.0}×{:.0} m",
+                            &case.case_sha256[..12],
+                            case.nx,
+                            case.ny,
+                            case.nz,
+                            case.dx_m,
+                            case.dy_m,
+                        ));
+                    }
+                } else if let Some(status) = self.external_watch_status.as_deref() {
+                    ui.label(status);
+                }
+                ui.add_space(4.0);
+                ui.small(
+                    "Stock WRF publishes no completion marker, so Auto accepts a file after a stable-file/readability window. If your producer writes an integer \"finished\" global attribute, name it above; Auto then honors it when present and Require rejects any file without it.",
+                );
+            });
+        self.show_external_watch = open;
+
+        if stop_clicked && let Some(mut session) = self.external_watch_session.take() {
+            session.stop();
+            self.external_watch_status = Some(session.status().message.clone());
+            for queued in self.pending_external_wrf_paths.drain(..) {
+                self.live_wrf_publications.cancel(&queued.publication);
+            }
+            self.pending_external_selection = None;
+            self.last_external_follow_valid_unix = None;
+        }
+        if start_clicked && can_start {
+            match ExternalWatchSession::start(self.external_watch_settings.clone()) {
+                Ok(session) => {
+                    self.external_watch_settings = session.settings().clone();
+                    self.external_watch_generation =
+                        self.external_watch_generation.saturating_add(1);
+                    self.external_watch_next_poll = Instant::now();
+                    self.pending_external_selection = None;
+                    self.last_external_follow_valid_unix = None;
+                    self.external_watch_status = None;
+                    for queued in self.pending_external_wrf_paths.drain(..) {
+                        self.live_wrf_publications.cancel(&queued.publication);
+                    }
+                    self.external_watch_session = Some(session);
+                    ctx.request_repaint();
+                }
+                Err(error) => self.external_watch_status = Some(format!("Cannot watch: {error}")),
+            }
+        }
+    }
+
+    fn track_live_wrf_output(
+        &mut self,
+        output: SimulationOutput,
+    ) -> Result<Option<QueuedLiveWrfOutput>, String> {
+        let publication = live_wrf_publication_identity(&output.path)?;
+        if !self.live_wrf_publications.accept(publication.clone()) {
+            return Ok(None);
+        }
+        Ok(Some(QueuedLiveWrfOutput {
+            output,
+            publication,
+        }))
+    }
+
+    fn refresh_live_wrf_output(
+        &mut self,
+        queued: QueuedLiveWrfOutput,
+    ) -> Result<Option<QueuedLiveWrfOutput>, String> {
+        let current = match live_wrf_publication_identity(&queued.output.path) {
+            Ok(current) => current,
+            Err(error) => {
+                self.live_wrf_publications.cancel(&queued.publication);
+                return Err(error);
+            }
+        };
+        if current == queued.publication {
+            return Ok(Some(queued));
+        }
+
+        // The producer changed this path while it waited. Retire the stale
+        // publication, but do not synthesize a queue entry from a raw metadata
+        // read: the watcher must first apply its stability, completion-marker,
+        // time-axis, grid, and projection checks to the new signature.
+        self.live_wrf_publications.cancel(&queued.publication);
+        Ok(None)
+    }
+
+    fn launch_live_wrf_process(
+        &mut self,
+        queued: &QueuedLiveWrfOutput,
+        options: WrfProcessOptions,
+    ) -> bool {
+        if self.wrf_process.is_some()
+            || self.local_import.is_some()
+            || self.import_size_probe.is_some()
+            || self.download.is_running()
+            || self.download_start_pending
+            || self.formula_lab.busy()
+            || self.batch_render.is_running()
+            || self.pending_heavy_import.is_some()
+            || self.pending_light_import.is_some()
+        {
+            return false;
+        }
+        let target = LiveWrfTarget {
+            case_sha256: queued.output.case_sha256.clone(),
+            storage_slot: queued.output.storage_slot,
+            exact_time: queued.output.exact_time,
+        };
+        let task = wrf_process::spawn_process_live_path(
+            queued.output.path.clone(),
+            self.store_root.clone(),
+            options,
+            target,
+        );
+        self.wrf_process_status = Some(task.label.clone());
+        self.wrf_process = Some(task);
+        self.active_live_wrf_publication = Some(queued.publication.clone());
+        true
+    }
+
+    fn finish_external_watch_process(
+        &mut self,
+        success: bool,
+        summary: Option<&WrfProcessSummary>,
+    ) {
+        let Some(active) = self.active_external_watch_output.take() else {
+            return;
+        };
+        let same_session = active.session_generation == self.external_watch_generation;
+        if same_session && let Some(session) = self.external_watch_session.as_mut() {
+            session.record_processing_result(success);
+        }
+        if success
+            && same_session
+            && active.follow_newest
+            && self.external_watch_session.is_some()
+            && should_follow_external_time(
+                self.last_external_follow_valid_unix,
+                active.exact_time.valid_unix,
+            )
+            && let Some(summary) = summary
+        {
+            self.pending_external_selection = Some(HourKey {
+                model: summary.model.clone(),
+                run: summary.run.clone(),
+                hour: active.storage_slot,
+                exact_time: Some(active.exact_time),
+            });
+            self.last_external_follow_valid_unix = Some(active.exact_time.valid_unix);
+        }
+    }
+
+    fn finish_live_wrf_publication(&mut self, success: bool) {
+        if let Some(publication) = self.active_live_wrf_publication.take() {
+            self.live_wrf_publications.finish(publication, success);
+        }
+    }
+
+    /// Poll the watch session and hand every accepted frame to the single WRF
+    /// processor, one at a time.
+    fn drive_external_watch(&mut self, ctx: &egui::Context) {
+        let mut external_outputs = Vec::new();
+        if let Some(session) = self.external_watch_session.as_mut() {
+            session.set_backlog(
+                self.pending_external_wrf_paths.len(),
+                usize::from(self.active_external_watch_output.is_some()),
+            );
+            let now = Instant::now();
+            if now >= self.external_watch_next_poll {
+                self.external_watch_next_poll = now + session.poll_interval();
+                match session.poll() {
+                    Ok(outputs) => external_outputs = outputs,
+                    Err(error) => {
+                        self.external_watch_status = Some(format!("Watch failed: {error}"))
+                    }
+                }
+            }
+            ctx.request_repaint_after(
+                self.external_watch_next_poll
+                    .saturating_duration_since(Instant::now()),
+            );
+        }
+        for output in external_outputs {
+            match self.track_live_wrf_output(output) {
+                Ok(Some(queued)) => self.pending_external_wrf_paths.push_back(queued),
+                Ok(None) => {}
+                Err(error) => {
+                    self.external_watch_status =
+                        Some(format!("Watch output was not queued: {error}"))
+                }
+            }
+        }
+        if self.pending_external_wrf_paths.is_empty()
+            || self.local_import.is_some()
+            || self.wrf_process.is_some()
+            || self.import_size_probe.is_some()
+            || self.download.is_running()
+            || self.download_start_pending
+            || self.formula_lab.busy()
+            || self.batch_render.is_running()
+            || self.pending_heavy_import.is_some()
+            || self.pending_light_import.is_some()
+        {
+            return;
+        }
+        let queued = self
+            .pending_external_wrf_paths
+            .pop_front()
+            .expect("external queue was checked nonempty");
+        match self.refresh_live_wrf_output(queued) {
+            Ok(Some(queued)) => {
+                let (options, follow_newest) = self
+                    .external_watch_session
+                    .as_ref()
+                    .map(|session| {
+                        (
+                            session.settings().processing_mode.wrf_options(),
+                            session.settings().follow_newest,
+                        )
+                    })
+                    .unwrap_or_else(|| (WrfProcessOptions::default(), false));
+                let target = ActiveExternalWatchOutput {
+                    storage_slot: queued.output.storage_slot,
+                    exact_time: queued.output.exact_time,
+                    follow_newest,
+                    session_generation: self.external_watch_generation,
+                };
+                self.formula_raw_path = Some(queued.output.path.clone());
+                if self.launch_live_wrf_process(&queued, options) {
+                    self.active_external_watch_output = Some(target);
+                } else {
+                    self.pending_external_wrf_paths.push_front(queued);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.external_watch_status =
+                    Some(format!("Watch output changed or disappeared: {error}"));
+            }
+        }
     }
 
     fn pick_sounding_file(&mut self) {
@@ -2274,9 +2847,10 @@ impl App {
             || self.formula_lab.busy()
             || self.pending_heavy_import.is_some()
             || self.pending_light_import.is_some()
+            || self.external_watch_session.is_some()
         {
             self.local_import_status = Some(
-                "Wait for the active model download/import, Formula Lab evaluation, batch render, or confirmation before switching stores"
+                "Wait for the active model download/import, live watch, Formula Lab evaluation, batch render, or confirmation before switching stores"
                     .to_string(),
             );
             return;
@@ -2333,6 +2907,12 @@ impl App {
         self.recorded_sat_texture_ms = None;
         self.pending_wrf_paths.clear();
         self.pending_auto_imports.clear();
+        self.pending_external_wrf_paths.clear();
+        self.pending_external_selection = None;
+        self.last_external_follow_valid_unix = None;
+        self.live_wrf_publications.clear();
+        self.active_live_wrf_publication = None;
+        self.active_external_watch_output = None;
         self.import_size_probe = None;
         self.download_start_pending = false;
         self.pending_heavy_import = None;
@@ -2758,6 +3338,8 @@ impl App {
                     ctx.request_repaint_after(Duration::from_millis(250));
                 }
                 Ok(WrfProcessMessage::Done(Ok(summary))) => {
+                    self.finish_external_watch_process(true, Some(&summary));
+                    self.finish_live_wrf_publication(true);
                     self.wrf_process_status = Some(Self::wrf_process_summary_text(&summary));
                     self.pending_wrf_paths.clear();
                     self.worker.send(StoreRequest::Enumerate);
@@ -2765,6 +3347,8 @@ impl App {
                     break;
                 }
                 Ok(WrfProcessMessage::Done(Err(message))) => {
+                    self.finish_external_watch_process(false, None);
+                    self.finish_live_wrf_publication(false);
                     self.wrf_process_status = Some(format!("WRF process failed: {message}"));
                     finished = true;
                     break;
@@ -2774,6 +3358,8 @@ impl App {
                     break;
                 }
                 Err(TryRecvError::Disconnected) => {
+                    self.finish_external_watch_process(false, None);
+                    self.finish_live_wrf_publication(false);
                     self.wrf_process_status = Some("WRF processor stopped".to_string());
                     finished = true;
                     break;
@@ -2928,10 +3514,31 @@ impl App {
         while let Some(response) = self.worker.try_recv() {
             match response {
                 StoreResponse::Tree(tree) => {
+                    let followed_new_output = if let Some(target) =
+                        self.pending_external_selection.take()
+                    {
+                        if let Some(hour) = tree
+                            .run(&target.model, &target.run)
+                            .and_then(|run| run.hours.iter().find(|hour| hour.hour == target.hour))
+                        {
+                            self.browser.select(HourKey {
+                                model: target.model,
+                                run: target.run,
+                                hour: hour.hour,
+                                exact_time: hour.exact_time,
+                            });
+                            true
+                        } else {
+                            self.pending_external_selection = Some(target);
+                            false
+                        }
+                    } else {
+                        false
+                    };
                     // Refresh exact timing for the stable model/run/slot key.
                     // This also prevents a stale legacy selection from reaching
                     // hour-based tools after the run is replaced by exact v2.
-                    let selection_changed = self.browser.reconcile(&tree);
+                    let selection_changed = self.browser.reconcile(&tree) || followed_new_output;
                     self.tree = Some(tree);
                     if selection_changed {
                         self.viewer.clear();
@@ -3265,6 +3872,9 @@ impl eframe::App for App {
             SOUNDING_FLOAT_STORAGE_KEY,
             self.sounding_floating.to_string(),
         );
+        if let Ok(json) = serde_json::to_string(&self.external_watch_settings) {
+            storage.set_string(EXTERNAL_WATCH_STORAGE_KEY, json);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -3279,6 +3889,7 @@ impl eframe::App for App {
         self.handle_wrf_process_response(ui.ctx());
         self.handle_local_import_response(ui.ctx());
         self.handle_import_size_probe_response();
+        self.drive_external_watch(ui.ctx());
         if let Some(path) = self.gdex.poll(ui.ctx()) {
             self.pending_auto_imports.push_back(path);
         }
@@ -3339,6 +3950,10 @@ impl eframe::App for App {
                     }
                 }
                 ui.toggle_value(&mut self.show_download, "⬇ Download");
+                ui.toggle_value(&mut self.show_external_watch, "Live watch");
+                if self.external_watch_session.is_some() {
+                    ui.spinner();
+                }
                 ui.toggle_value(&mut self.show_satellite, "🛰 Satellite");
                 ui.toggle_value(&mut self.gdex.open, "GDEX");
                 ui.toggle_value(&mut self.formula_lab.open, "Formula Lab");
@@ -3563,6 +4178,10 @@ impl eframe::App for App {
                 });
             self.show_download = open;
             self.handle_download_events(events);
+        }
+
+        if self.show_external_watch {
+            self.show_external_watch_window(ui.ctx());
         }
 
         if self.show_batch_render {
@@ -3827,6 +4446,101 @@ fn lead_seconds_exact_in_f64(seconds: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn live_publication(
+        path: &str,
+        bytes: u64,
+        modified_seconds: u64,
+    ) -> LiveWrfPublicationIdentity {
+        LiveWrfPublicationIdentity {
+            path: LiveWrfPathIdentity(normalize_windows_path_alias(path)),
+            signature: LiveWrfFileSignature {
+                bytes,
+                modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(modified_seconds)),
+            },
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn live_publication(
+        path: &str,
+        bytes: u64,
+        modified_seconds: u64,
+    ) -> LiveWrfPublicationIdentity {
+        LiveWrfPublicationIdentity {
+            path: LiveWrfPathIdentity(path.to_string()),
+            signature: LiveWrfFileSignature {
+                bytes,
+                modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(modified_seconds)),
+            },
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_extended_and_case_aliases_share_one_publication_identity() {
+        let normal = live_publication(
+            r"C:\Users\Owner\Runs\Case A\wrfout_d01_2026-07-23_00:00:00",
+            100,
+            10,
+        );
+        let extended = live_publication(
+            r"\\?\c:\users\owner\runs\case a\wrfout_d01_2026-07-23_00:00:00",
+            100,
+            10,
+        );
+        assert_eq!(normal, extended);
+        let mut tracker = LiveWrfPublicationTracker::default();
+        assert!(tracker.accept(normal));
+        assert!(
+            !tracker.accept(extended),
+            "the alias must deduplicate while the canonical publication is active"
+        );
+
+        assert_eq!(
+            normalize_windows_path_alias(r"\\?\UNC\Server\Share\Run\wrfout_d01"),
+            normalize_windows_path_alias(r"\\server\share\run\WRFOUT_D01")
+        );
+    }
+
+    #[test]
+    fn live_publication_tracker_requeues_changes_and_suppresses_exact_delays() {
+        let mut tracker = LiveWrfPublicationTracker::with_processed_limit(2);
+        let first = live_publication(r"C:\run\wrfout_d01", 100, 10);
+        let changed = live_publication(r"C:\run\wrfout_d01", 101, 11);
+        let changed_again = live_publication(r"C:\run\wrfout_d01", 102, 12);
+
+        assert!(tracker.accept(first.clone()));
+        assert!(
+            tracker.accept(changed.clone()),
+            "a changed signature must queue behind the active publication"
+        );
+        assert!(!tracker.accept(changed.clone()));
+
+        tracker.finish(first, false);
+        tracker.finish(changed.clone(), true);
+        assert!(
+            !tracker.accept(changed),
+            "a delayed second watcher must not repeat a completed signature"
+        );
+        assert!(tracker.accept(changed_again.clone()));
+        tracker.finish(changed_again, true);
+
+        let newest = live_publication(r"C:\run\wrfout_d01", 103, 13);
+        assert!(tracker.accept(newest.clone()));
+        tracker.finish(newest, true);
+        assert_eq!(tracker.processed_order.len(), 2);
+        assert_eq!(tracker.processed.len(), 2);
+    }
+
+    #[test]
+    fn live_following_only_moves_forward_in_physical_time() {
+        assert!(should_follow_external_time(None, 1_000));
+        assert!(should_follow_external_time(Some(1_000), 1_001));
+        assert!(!should_follow_external_time(Some(1_000), 1_000));
+        assert!(!should_follow_external_time(Some(1_000), 999));
+    }
 
     #[test]
     fn sounding_observation_time_uses_exact_axis_or_legacy_run_plus_lead() {
