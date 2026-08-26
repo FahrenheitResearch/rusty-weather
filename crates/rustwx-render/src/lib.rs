@@ -684,6 +684,7 @@ fn with_render_state_profile_with_style<T>(
             height: request.height,
             cmap,
             background: request.background.into(),
+            map_overlay: request.map_overlay,
             colorbar: request.colorbar,
             title: request.title.clone().or(default_title),
             subtitle_left: request.subtitle_left.clone(),

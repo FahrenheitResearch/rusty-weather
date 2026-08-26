@@ -1527,3 +1527,101 @@ fn aifs_inference_direct_policy_uses_interpolated_raster_sampling() {
 
     assert_eq!(request.raster_sample_mode, RasterSampleMode::Linear);
 }
+
+#[test]
+fn web_mercator_aspect_ratio_makes_the_full_world_square() {
+    // The defining property of the Web-Mercator world tile: clamped to the
+    // +/-85.0511 deg cutoff, the whole globe is a square.
+    let ratio = web_mercator_bounds_aspect_ratio((-180.0, 180.0, -90.0, 90.0));
+    assert!(
+        (ratio - 1.0).abs() < 0.01,
+        "the clamped full world should be square, got {ratio}"
+    );
+    assert!(ratio.is_finite(), "pole clamping leaked an infinity");
+}
+
+#[test]
+fn web_mercator_aspect_ratio_narrows_as_bounds_move_poleward() {
+    // Mercator stretches latitude toward the poles, so an identical
+    // degree-box covers more projected height the farther north it sits and
+    // its width/height ratio has to shrink.
+    let equatorial = web_mercator_bounds_aspect_ratio((-10.0, 10.0, -10.0, 10.0));
+    let midlatitude = web_mercator_bounds_aspect_ratio((-10.0, 10.0, 30.0, 50.0));
+    let polar = web_mercator_bounds_aspect_ratio((-10.0, 10.0, 60.0, 80.0));
+
+    assert!(
+        (equatorial - 1.0).abs() < 0.02,
+        "a 20x20 deg box on the equator is nearly square in Mercator, got {equatorial}"
+    );
+    assert!(
+        equatorial > midlatitude && midlatitude > polar,
+        "ratios should decrease poleward: {equatorial} / {midlatitude} / {polar}"
+    );
+    assert!(polar > 0.0 && polar.is_finite());
+}
+
+#[test]
+fn web_mercator_aspect_ratio_falls_back_on_degenerate_bounds() {
+    // Zero-height bounds have no projected height to divide by.
+    assert_eq!(
+        web_mercator_bounds_aspect_ratio((-100.0, -90.0, 40.0, 40.0)),
+        1.0
+    );
+    assert_eq!(
+        web_mercator_bounds_aspect_ratio((-100.0, -90.0, f64::NAN, 40.0)),
+        1.0
+    );
+}
+
+#[test]
+fn map_overlay_projected_map_is_mercator_bare_and_frames_the_exact_bounds() {
+    let grid = regular_geographic_grid_3x3();
+    let bounds = (-101.0, -99.0, 34.0, 36.0);
+    let ratio = web_mercator_bounds_aspect_ratio(bounds);
+
+    let overlay =
+        build_map_overlay_projected_map(&grid.lat_deg, &grid.lon_deg, bounds, ratio).unwrap();
+
+    // No basemap: the host map supplies the base layer.
+    assert!(
+        overlay.lines.is_empty() && overlay.polygons.is_empty(),
+        "the overlay surface carried basemap geometry"
+    );
+    assert_eq!(overlay.projected_x.len(), grid.lat_deg.len());
+    assert_eq!(overlay.projected_y.len(), grid.lon_deg.len());
+
+    // The frame is the caller's bounds with no padding, so the corner grid
+    // points land on the extent edges.
+    let x_span = overlay.extent.x_max - overlay.extent.x_min;
+    let y_span = overlay.extent.y_max - overlay.extent.y_min;
+    assert!(x_span > 0.0 && y_span > 0.0);
+    let extent_ratio = x_span / y_span;
+    assert!(
+        (extent_ratio - ratio).abs() < 1e-6,
+        "extent aspect {extent_ratio} does not match the requested {ratio}, so the \
+         caller's chosen output size would letterbox"
+    );
+
+    // Mercator keeps meridians evenly spaced, so the three columns of the
+    // regular mesh stay equally spaced in projected x.
+    let (left, middle, right) = (
+        overlay.projected_x[0],
+        overlay.projected_x[1],
+        overlay.projected_x[2],
+    );
+    assert!(
+        ((middle - left) - (right - middle)).abs() < 1e-9,
+        "meridian spacing is not uniform; this is not a Mercator surface"
+    );
+
+    // Mercator stretches poleward, so the northern row gap exceeds the
+    // southern one on a mesh with equal latitude steps.
+    let south = overlay.projected_y[0];
+    let middle_row = overlay.projected_y[3];
+    let north = overlay.projected_y[6];
+    let (low_gap, high_gap) = ((middle_row - south).abs(), (north - middle_row).abs());
+    assert!(
+        high_gap > low_gap,
+        "latitude spacing did not stretch poleward ({low_gap} then {high_gap})"
+    );
+}
