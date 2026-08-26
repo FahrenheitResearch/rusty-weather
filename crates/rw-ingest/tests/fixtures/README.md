@@ -31,6 +31,7 @@ remain available forever.
 | `urma2p5_2dvaranl_ndfd.idx` | `https://noaa-urma-pds.s3.amazonaws.com/urma2p5.20260810/urma2p5.t00z.2dvaranl_ndfd.grb2_wexp.idx` | exact ingest-selected analysis rows, 706 bytes, fixture SHA-256 `32E16EDD8D78F06586E4AB171F4A20F0F8745BEBF362D68BA683950FE677BB79` |
 | `rdps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/model_rdps/10km/00/024/` | exact representative filename rows and decoded grid/vector metadata from the 100,669-byte, 414-GRIB-object official listing; full-source SHA-256 `87BD53259734E95AEFEFF1DA7BBCD83332A5BD3AC6124DC46BD5AD6675952F10`; 2,675-byte fixture SHA-256 `644E6A32A0BE5DBECBCFE141523A3E25E48B828435985DEE3783228F1D355F94` |
 | `hrdps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/model_hrdps/continental/2.5km/00/024/` | exact representative filename rows and decoded grid/vector metadata from the 91,816-byte, 414-GRIB-object official listing; full-source SHA-256 `AF42B19E5A3D44C00AB0FDA2E1F18E052A2043319B997D0E8263D4B7B957EF8E`; 2,695-byte fixture SHA-256 `C4263EB72B5EE25468C89C1D98D2CFF32B62A25645142E8ECFEFC05B026DBBFC` |
+| `hrdps-west.20260814.t00z.f024.inventory.txt` | `https://dd.alpha.weather.gc.ca/model_hrdps/west/1km/grib2/00/024/` | experimental DD-Alpha contract, representative filenames, exact f000/f001 component delta, terminal-lead completion sentinels, 24-hour retention, published/computational grid distinction, and decoded vector metadata from the 85,288-byte, 338-GRIB-object official f024 listing; full-source SHA-256 `ECFC5882FA64E585101B9BA85AEB32D00073450A11DD9F6850D004AD4DB52B9E`; 4,228-byte fixture SHA-256 `7B2440CE880FFB0E246E52E0470587B59AEC7462326DCCE95D7E62A712568662` |
 | `geps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/ensemble/geps/grib2/products/00/024/` | complete 36-object official listing plus exact identities for the bounded selected payloads; 9,714-byte source listing SHA-256 `ABC37D99EE4402ECDBDB30B5C46E8ECDC245EBE24BBCBCBFD64F7CF4C1E87E4E`; 5,839-byte fixture SHA-256 `53DB508A7970F50BF779ACE52E081DB599082F0A9B52F60550B4D4BA9E2219E4` |
 | `reps.20260814.t00z.f024.inventory.txt` | `https://dd.weather.gc.ca/today/ensemble/reps/10km/grib2/00/024/` | exact selected provider-statistics objects and decoded statistical/grid metadata from the 24,022-byte, 103-GRIB-object official listing; full-source SHA-256 `29B48053BEA61ED7EC6DF4C4EBB974C029183B17C6298A350C39A5831501F0CF`; three bounded payload SHA-256 identities plus a disabled raw-member contract identity |
 | `wrf-cptec-7km.20260814.t00z.f001.inv` | `https://dataserver.cptec.inpe.br/dataserver_modelos/wrf/ams_07km/brutos/2026/08/14/00/WRF_cpt_07KM_2026081400_2026081401.inv` | full 305-message CPTEC text inventory, SHA-256 `445A7D218A1A3772CB2DCBB69DD2D08D2F21D03D75E5A773335B35D107CCED91` |
@@ -145,6 +146,15 @@ every finite cell, RDPS compared 2,382,600 earth-relative components with
 components with 0.006831 m/s RMS and 0.043763 m/s maximum error. Those bounds
 include the provider's direction quantization (1 degree for RDPS and 0.1
 degree for HRDPS), rather than comparing the decoder against itself.
+
+The HRDPS-West fixture is deliberately separate from the operational regional
+fixtures. DD-Alpha exposes only a 24-hour rolling history and may create a new
+cycle directory before any payload objects arrive. The captured f024 listing
+contains 338 objects on the published 1330x1180 grid, while ECCC's technical
+specification describes a larger 1350x1200 computational grid. RWS uses the
+live published GRIB metadata as the decode authority and reports the source as
+experimental/non-operational; it does not infer completeness from directory
+existence or promise archival retention.
 
 The GEPS fixture pins the exact 00/12z operational inventory, invariant
 3-hourly f003-f192 and 6-hourly f198-f384 scheduler horizon, selected component

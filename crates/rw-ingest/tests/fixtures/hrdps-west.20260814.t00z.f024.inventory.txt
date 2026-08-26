@@ -1,0 +1,64 @@
+# Exact bounded excerpt from the official ECCC experimental HRDPS-West 1 km f024 directory listing.
+# source_url=https://dd.alpha.weather.gc.ca/model_hrdps/west/1km/grib2/00/024/
+# source_bytes=85288
+# source_sha256=ECFC5882FA64E585101B9BA85AEB32D00073450A11DD9F6850D004AD4DB52B9E
+# source_grib2_links=338
+# f000_source_grib2_links=333
+# f001_source_grib2_links=338
+# f048_source_grib2_links=338
+# f000_absent_vs_f001=APCP_SFC_0,HGT_SFC_0,PRATE_SFC_0,PTYPE_SFC_0,WEAFR_SFC_0,WEAPE_SFC_0,WEARN_SFC_0,WEASN_SFC_0
+# f000_only_vs_f001=ICEC_SFC_0,LAND_SFC_0,WTMP_SFC_0
+# completion_surface_sentinel_f048=TCDC_SFC_0|369629|HTTP-200
+# completion_pressure_sentinel_f048=VGRD_ISBL_1015|1049038|HTTP-200
+# same_day_12z_terminal_sentinels_at_capture=HTTP-404,HTTP-404
+# documentation_url=https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart-alpha_en/
+# licence_url=https://eccc-msc.github.io/open-data/licence/readme_en/
+# required_attribution=Data Source: Environment and Climate Change Canada
+# service_status=experimental-non-operational-dd-alpha
+# source_retention_hours=24
+# cadence_utc=00,12
+# forecast_hours=000-048-hourly
+# domain=most-of-British-Columbia-and-western-Alberta
+# documentation_grid=1330x1180
+# computational_grid=1350x1200
+# computational_grid_note=technical-specification-model-domain-not-the-published-DD-Alpha-GRIB-grid
+# live_decoded_grid=1330x1180
+# grid_template=1-rotated-latitude-longitude
+# grid_token=rotated_latlon0.009x0.009
+# live_grid_first_lat_lon=-5.295110,337.819605
+# live_grid_last_lat_lon=5.304100,349.767313
+# live_grid_step=0.008990,0.008990
+# scan_mode=0x40
+# resolution_and_component_flags=0x38
+# south_pole=-33.443381,266.463574
+# rotation_degrees=0.000000
+# data_representation_template=5.40-jpeg2000
+# common_five_field_isobaric_levels_hpa=50,100,150,175,200,225,250,275,300,350,400,450,500,550,600,650,700,750,800,850,875,900,925,950,970,985,1000,1015
+# u10_url=https://dd.alpha.weather.gc.ca/model_hrdps/west/1km/grib2/00/024/CMC_hrdps_west_UGRD_TGL_10_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+# u10_bytes=1030433
+# u10_sha256=4156BB3C856FCFDCBA67D47FB07C22397501BEC140BA5E9E71A24A6B4E5FA872
+# v10_url=https://dd.alpha.weather.gc.ca/model_hrdps/west/1km/grib2/00/024/CMC_hrdps_west_VGRD_TGL_10_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+# v10_bytes=828357
+# v10_sha256=1E1198F1B89A4E18BE5165E48D31DB069785FDD9E0648667DC2B9ABF4B79F8E5
+# wind10_url=https://dd.alpha.weather.gc.ca/model_hrdps/west/1km/grib2/00/024/CMC_hrdps_west_WIND_TGL_10_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+# wind10_bytes=1077052
+# wind10_sha256=C924C7008752096E8DA367FB9789541A390E1057C57640357C08394E85162714
+# wdir10_url=https://dd.alpha.weather.gc.ca/model_hrdps/west/1km/grib2/00/024/CMC_hrdps_west_WDIR_TGL_10_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+# wdir10_bytes=1294356
+# wdir10_sha256=0B291CBC2F8F4134425C76415F5A85C19AD3018F3AD617AE7975983BC01B1624
+CMC_hrdps_west_ABSV_ISBL_0250_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_APCP_SFC_0_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_DPT_TGL_2_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_HGT_ISBL_1000_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_HGT_SFC_0_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_PRES_SFC_0_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_PRMSL_MSL_0_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_RH_ISBL_0100_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_RH_TGL_2_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_TCDC_SFC_0_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_TMP_ISBL_0100_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_TMP_TGL_2_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_UGRD_ISBL_0100_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_UGRD_TGL_10_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_VGRD_ISBL_0100_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2
+CMC_hrdps_west_VGRD_TGL_10_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2

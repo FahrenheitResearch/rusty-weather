@@ -181,6 +181,38 @@ fn eccc_regional_plans_pin_logical_products_and_hourly_native_cadence() {
 }
 
 #[test]
+fn experimental_hrdps_west_plan_pins_short_lived_dd_alpha_contract() {
+    for cycle_hour in [0, 12] {
+        let plan = JobPlan::build(ModelId::HrdpsWest, cycle("20260814", cycle_hour)).unwrap();
+        assert_eq!(plan.expected_valid_times.len(), 49);
+        assert_eq!(plan.expected_valid_times.first().unwrap().forecast_hour, 0);
+        assert_eq!(plan.expected_valid_times.last().unwrap().forecast_hour, 48);
+        assert_eq!(
+            plan.ingest_products
+                .iter()
+                .map(|product| product.product.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rws-pressure", "rws-surface"]
+        );
+        assert!(!plan.ingest_profile.derived);
+        assert!(!plan.ingest_profile.heavy);
+        assert_eq!(
+            plan.capability_limitations,
+            vec![
+                "sparse_pressure_levels".to_string(),
+                "derived_products_disabled".to_string(),
+                "pre_operational_feed".to_string(),
+                "short_source_retention".to_string(),
+            ]
+        );
+        plan.validate().unwrap();
+    }
+    for cycle_hour in [6, 18] {
+        assert!(JobPlan::build(ModelId::HrdpsWest, cycle("20260814", cycle_hour)).is_err());
+    }
+}
+
+#[test]
 fn gdps_geml_plan_pins_six_hour_cadence_and_complete_native_profile() {
     let plan = JobPlan::build_with_profile_and_source(
         ModelId::GdpsGeml,
@@ -810,6 +842,7 @@ fn config_requires_an_allowlist_and_selects_limitation_safe_profiles() {
         ModelId::EcmwfOpenData,
         ModelId::Rdps,
         ModelId::Hrdps,
+        ModelId::HrdpsWest,
         ModelId::IconEu,
         ModelId::IconD2,
     ] {
@@ -1086,6 +1119,19 @@ fn production_origin_discovery_shape_separates_queryable_and_extended_hrrr() {
             .max()
             == Some(terminal)
     }));
+}
+
+#[test]
+fn hrdps_west_discovery_never_admits_an_incrementally_publishing_cycle() {
+    for selector in [
+        OriginLaneSelector::NewestAvailable,
+        OriginLaneSelector::NewestCompleteLongestHorizon,
+    ] {
+        let (probe_hour, cycles) =
+            executor::discovery_shape_for_selector(ModelId::HrdpsWest, selector).unwrap();
+        assert_eq!(probe_hour, 48);
+        assert_eq!(cycles, [0, 12].into_iter().collect());
+    }
 }
 
 #[test]
@@ -1430,7 +1476,7 @@ fn every_ready_model_has_a_valid_cadence_profile_and_remote_source() {
         );
         plan.validate().unwrap();
     }
-    assert_eq!(ready, 34);
+    assert_eq!(ready, 35);
 }
 
 #[test]

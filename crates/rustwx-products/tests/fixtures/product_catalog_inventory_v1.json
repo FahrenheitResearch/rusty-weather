@@ -364,7 +364,7 @@
       ],
       "aliases": [],
       "supported_targets": 25,
-      "blocked_targets": 11
+      "blocked_targets": 12
     },
     "direct:composite_reflectivity_uh": {
       "lane": "direct",
@@ -382,7 +382,7 @@
       ],
       "aliases": [],
       "supported_targets": 7,
-      "blocked_targets": 29
+      "blocked_targets": 30
     },
     "direct:mslp_10m_winds": {
       "lane": "direct",
@@ -400,7 +400,7 @@
       ],
       "aliases": [],
       "supported_targets": 25,
-      "blocked_targets": 11
+      "blocked_targets": 12
     },
     "direct:total_qpf": {
       "lane": "direct",
@@ -418,7 +418,7 @@
       ],
       "aliases": [],
       "supported_targets": 24,
-      "blocked_targets": 12
+      "blocked_targets": 13
     },
     "derived:fire_weather_composite": {
       "lane": "derived",
@@ -434,7 +434,7 @@
         "non_ecape_hour"
       ],
       "aliases": [],
-      "supported_targets": 36,
+      "supported_targets": 37,
       "blocked_targets": 0
     },
     "derived:scp_mu_0_3km_0_6km_proxy": {
@@ -453,7 +453,7 @@
         "non_ecape_hour"
       ],
       "aliases": [],
-      "supported_targets": 36,
+      "supported_targets": 37,
       "blocked_targets": 0
     },
     "derived:theta_e_2m_10m_winds": {
@@ -472,7 +472,7 @@
       "aliases": [
         "2m_theta_e_10m_winds"
       ],
-      "supported_targets": 36,
+      "supported_targets": 37,
       "blocked_targets": 0
     },
     "heavy:severe_proof_panel": {
@@ -492,7 +492,7 @@
         "hrrr_severe_proof"
       ],
       "aliases": [],
-      "supported_targets": 36,
+      "supported_targets": 37,
       "blocked_targets": 0
     },
     "windowed:2m_temp_0_24h_max": {

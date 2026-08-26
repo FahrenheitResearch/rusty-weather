@@ -400,6 +400,7 @@ const KNOWN_LIMITATION_SLUGS: &[&str] = &[
     "derived_products_disabled",
     "conus_only",
     "pre_operational_feed",
+    "short_source_retention",
     "extended_range_not_scheduled",
 ];
 
@@ -417,6 +418,7 @@ fn limitation_slug(limitation: IngestCapabilityLimitation) -> &'static str {
         IngestCapabilityLimitation::DerivedProductsDisabled => "derived_products_disabled",
         IngestCapabilityLimitation::ConusOnly => "conus_only",
         IngestCapabilityLimitation::PreOperationalFeed => "pre_operational_feed",
+        IngestCapabilityLimitation::ShortSourceRetention => "short_source_retention",
         IngestCapabilityLimitation::ExtendedRangeNotScheduled => "extended_range_not_scheduled",
     }
 }

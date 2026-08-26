@@ -2035,7 +2035,7 @@ pub fn extract_field_values_partial_from_model_bytes_at_forecast_hour(
 }
 
 fn regional_model_has_grid_relative_winds(model: ModelId) -> bool {
-    matches!(model, ModelId::Rdps | ModelId::Hrdps)
+    matches!(model, ModelId::Rdps | ModelId::Hrdps | ModelId::HrdpsWest)
 }
 
 fn is_horizontal_wind_component(selector: FieldSelector) -> bool {

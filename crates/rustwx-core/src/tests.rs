@@ -105,6 +105,8 @@ fn dense_volume_products_are_checked_by_addressability_not_the_old_policy() {
 
 #[test]
 fn model_id_aliases_round_trip() {
+    assert_eq!("hrdps_west".parse::<ModelId>().unwrap(), ModelId::HrdpsWest);
+    assert_eq!(ModelId::HrdpsWest.as_str(), "hrdps-west");
     assert_eq!("rrfs_a".parse::<ModelId>().unwrap(), ModelId::RrfsA);
     assert_eq!(
         "rrfs_public".parse::<ModelId>().unwrap(),

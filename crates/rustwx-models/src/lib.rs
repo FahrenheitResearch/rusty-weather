@@ -410,6 +410,7 @@ const GDPS_GEML_CYCLE_HOURS: &[u8] = &[0, 12];
 const CMA_GEPS_CYCLE_HOURS: &[u8] = &[0, 12];
 const RDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const HRDPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
+const HRDPS_WEST_CYCLE_HOURS: &[u8] = &[0, 12];
 const REPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const DWD_ICON_CYCLE_HOURS: &[u8] = &[0, 3, 6, 9, 12, 15, 18, 21];
 const ICON_RU_CYCLE_HOURS: &[u8] = &[0, 12];
@@ -543,6 +544,16 @@ const GDPS_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
     priority: 1,
     max_age_hours: Some(36),
     notes: "Environment and Climate Change Canada MSC Datamart",
+}];
+
+const HRDPS_WEST_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
+    id: SourceId::Eccc,
+    // DD-Alpha publishes one complete GRIB2 message per variable/level and
+    // deliberately retains only a 24-hour rolling source history.
+    idx_available: false,
+    priority: 1,
+    max_age_hours: Some(24),
+    notes: "Experimental ECCC MSC DD-Alpha feed; non-operational test service with 24-hour source retention",
 }];
 
 const CMA_GEPS_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
@@ -766,6 +777,16 @@ const MODELS: &[ModelSummary] = &[
         cycle_hours_utc: HRDPS_CYCLE_HOURS,
         max_forecast_hour: 48,
         sources: GDPS_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::HrdpsWest,
+        description: "Experimental ECCC HRDPS-West 1 km British Columbia / western Alberta rotated-grid deterministic forecast",
+        default_product: "rws-surface",
+        cycle_hours_utc: HRDPS_WEST_CYCLE_HOURS,
+        max_forecast_hour: 48,
+        sources: HRDPS_WEST_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::Deterministic,
     },
@@ -5939,7 +5960,7 @@ pub fn built_in_models() -> &'static [ModelSummary] {
 /// [`built_in_models`] remains linked (`ModelId` match arms thread through
 /// rustwx-products), but every user-facing enumeration must go through this
 /// list.
-pub fn supported_models() -> [ModelId; 27] {
+pub fn supported_models() -> [ModelId; 28] {
     [
         ModelId::Hrrr,
         ModelId::HrrrAk,
@@ -5950,6 +5971,7 @@ pub fn supported_models() -> [ModelId; 27] {
         ModelId::CmaGeps,
         ModelId::Rdps,
         ModelId::Hrdps,
+        ModelId::HrdpsWest,
         ModelId::Reps,
         ModelId::IconEu,
         ModelId::IconD2,
@@ -6382,6 +6404,13 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
                 Vec::new()
             }
         }
+        ModelId::HrdpsWest => {
+            if HRDPS_WEST_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=48).collect()
+            } else {
+                Vec::new()
+            }
+        }
         ModelId::Reps => {
             if REPS_CYCLE_HOURS.contains(&cycle_hour_utc) {
                 (3..=72).step_by(3).collect()
@@ -6592,12 +6621,13 @@ fn default_canonical_bundle_product(
         (ModelId::GdpsGeml, CanonicalBundleDescriptor::NativeAnalysis) => "rws-surface",
         (ModelId::CmaGeps, _) => "stats",
         (
-            ModelId::Rdps | ModelId::Hrdps,
+            ModelId::Rdps | ModelId::Hrdps | ModelId::HrdpsWest,
             CanonicalBundleDescriptor::SurfaceAnalysis | CanonicalBundleDescriptor::NativeAnalysis,
         ) => "rws-surface",
-        (ModelId::Rdps | ModelId::Hrdps, CanonicalBundleDescriptor::PressureAnalysis) => {
-            "rws-pressure"
-        }
+        (
+            ModelId::Rdps | ModelId::Hrdps | ModelId::HrdpsWest,
+            CanonicalBundleDescriptor::PressureAnalysis,
+        ) => "rws-pressure",
         (ModelId::Reps, _) => "rws-reps-provider-statistics",
         (ModelId::IconEu | ModelId::IconD2, CanonicalBundleDescriptor::SurfaceAnalysis) => {
             "rws-surface"
@@ -6816,12 +6846,21 @@ fn latest_available_run_with_probe<F>(
 where
     F: FnMut(&ResolvedUrl) -> bool,
 {
-    let forecast_hour = earliest_supported_forecast_hour(model)?;
+    let forecast_hour = availability_probe_forecast_hour(model)?;
+    let required_products = if model == ModelId::HrdpsWest {
+        // The experimental tree is published one object at a time. Requiring
+        // an independent sentinel from both logical families prevents the
+        // generic "latest" pointer from admitting a surface-only partial
+        // cycle while pressure objects are still arriving.
+        vec!["rws-pressure", "rws-surface"]
+    } else {
+        vec![model_summary(model).default_product]
+    };
     latest_available_run_for_products_with_probe_at_forecast_hour(
         model,
         source,
         date_yyyymmdd,
-        &[model_summary(model).default_product],
+        &required_products,
         forecast_hour,
         probe_available,
     )
@@ -6837,7 +6876,7 @@ fn latest_available_run_for_products_with_probe<F>(
 where
     F: FnMut(&ResolvedUrl) -> bool,
 {
-    let forecast_hour = earliest_supported_forecast_hour(model)?;
+    let forecast_hour = availability_probe_forecast_hour(model)?;
     latest_available_run_for_products_with_probe_at_forecast_hour(
         model,
         source,
@@ -6859,6 +6898,22 @@ fn earliest_supported_forecast_hour(model: ModelId) -> Result<u16, ModelError> {
         })
         .min()
         .ok_or(ModelError::NoAvailableRun { model })
+}
+
+/// Forecast lead used to decide whether a provider cycle is ready for normal
+/// acquisition. Most feeds are safely discoverable from their first lead.
+/// HRDPS-West is published incrementally on non-operational DD-Alpha, so its
+/// terminal lead is required before the cycle is treated as complete.
+pub fn availability_probe_forecast_hour(model: ModelId) -> Result<u16, ModelError> {
+    if model == ModelId::HrdpsWest {
+        return model_summary(model)
+            .cycle_hours_utc
+            .iter()
+            .flat_map(|cycle_hour| supported_forecast_hours(model, *cycle_hour))
+            .max()
+            .ok_or(ModelError::NoAvailableRun { model });
+    }
+    earliest_supported_forecast_hour(model)
 }
 
 fn latest_available_run_for_products_with_probe_at_forecast_hour<F>(
@@ -7146,6 +7201,7 @@ fn build_grib_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         ModelId::CmaGeps => build_cma_geps_url(source, request)?,
         ModelId::Rdps => build_rdps_url(source, request)?,
         ModelId::Hrdps => build_hrdps_url(source, request)?,
+        ModelId::HrdpsWest => build_hrdps_west_url(source, request)?,
         ModelId::Reps => build_reps_url(source, request)?,
         ModelId::IconEu | ModelId::IconD2 => build_dwd_icon_url(source, request)?,
         ModelId::IconRu => build_icon_ru_url(source, request)?,
@@ -7765,12 +7821,24 @@ const HRDPS_COMMON_ISOBARIC_LEVELS_HPA: &[u16] = &[
     850, 875, 900, 925, 950, 970, 985, 1000, 1015,
 ];
 
+/// Exact common TMP/RH/UGRD/VGRD/HGT inventory observed in the experimental
+/// HRDPS-West 1 km DD-Alpha feed. Keep this independent from continental
+/// HRDPS so either provider contract can evolve without speculative probes.
+const HRDPS_WEST_COMMON_ISOBARIC_LEVELS_HPA: &[u16] = &[
+    50, 100, 150, 175, 200, 225, 250, 275, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800,
+    850, 875, 900, 925, 950, 970, 985, 1000, 1015,
+];
+
 pub fn rdps_isobaric_levels_hpa() -> &'static [u16] {
     RDPS_COMMON_ISOBARIC_LEVELS_HPA
 }
 
 pub fn hrdps_isobaric_levels_hpa() -> &'static [u16] {
     HRDPS_COMMON_ISOBARIC_LEVELS_HPA
+}
+
+pub fn hrdps_west_isobaric_levels_hpa() -> &'static [u16] {
+    HRDPS_WEST_COMMON_ISOBARIC_LEVELS_HPA
 }
 
 fn exact_four_digit_level(product: &str, prefix: &str) -> Option<u16> {
@@ -7852,6 +7920,43 @@ fn hrdps_component_is_supported(product: &str) -> bool {
         .is_some_and(|level| matches!(level, 250 | 500 | 700 | 850 | 1000))
 }
 
+fn hrdps_west_component_is_supported(product: &str) -> bool {
+    const SURFACE_COMPONENTS: &[&str] = &[
+        "TMP_TGL_2",
+        "DPT_TGL_2",
+        "RH_TGL_2",
+        "UGRD_TGL_10",
+        "VGRD_TGL_10",
+        "WIND_TGL_10",
+        "WDIR_TGL_10",
+        "GUST_TGL_10",
+        "PRES_SFC_0",
+        "PRMSL_MSL_0",
+        "HGT_SFC_0",
+        "APCP_SFC_0",
+        "TCDC_SFC_0",
+    ];
+    if SURFACE_COMPONENTS.contains(&product) {
+        return true;
+    }
+    for prefix in [
+        "TMP_ISBL_",
+        "RH_ISBL_",
+        "SPFH_ISBL_",
+        "UGRD_ISBL_",
+        "VGRD_ISBL_",
+        "HGT_ISBL_",
+    ] {
+        if exact_four_digit_level(product, prefix)
+            .is_some_and(|level| HRDPS_WEST_COMMON_ISOBARIC_LEVELS_HPA.contains(&level))
+        {
+            return true;
+        }
+    }
+    exact_four_digit_level(product, "ABSV_ISBL_")
+        .is_some_and(|level| matches!(level, 250 | 500 | 700 | 850 | 1000))
+}
+
 fn build_rdps_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
     if source != SourceId::Eccc {
         return Ok(unsupported_source(source, request.model));
@@ -7916,6 +8021,49 @@ fn build_hrdps_url(source: SourceId, request: &ModelRunRequest) -> Result<String
         request.cycle.date_yyyymmdd,
         request.cycle.hour_utc,
         product,
+        request.forecast_hour,
+    ))
+}
+
+fn build_hrdps_west_url(source: SourceId, request: &ModelRunRequest) -> Result<String, ModelError> {
+    if source != SourceId::Eccc {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "experimental HRDPS-West publishes hourly f000-f048 for 00Z/12Z cycles"
+                .to_string(),
+        });
+    }
+    let product = match request.product.as_str() {
+        // Use independent late-inventory sentinels for discovery rather than
+        // treating the first temperature object as proof of bundle readiness.
+        "rws-surface" | "rws-sounding" => "TCDC_SFC_0",
+        "rws-pressure" => "VGRD_ISBL_1015",
+        product if hrdps_west_component_is_supported(product) => product,
+        _ => {
+            return Err(ModelError::UnsupportedProduct {
+                model: request.model,
+                product: request.product.clone(),
+            });
+        }
+    };
+    if request.forecast_hour == 0 && matches!(product, "APCP_SFC_0" | "HGT_SFC_0") {
+        return Err(ModelError::UnsupportedProduct {
+            model: request.model,
+            product: request.product.clone(),
+        });
+    }
+    Ok(format!(
+        "https://dd.alpha.weather.gc.ca/model_hrdps/west/1km/grib2/{:02}/{:03}/CMC_hrdps_west_{}_rotated_latlon0.009x0.009_{}T{:02}Z_P{:03}-00.grib2",
+        request.cycle.hour_utc,
+        request.forecast_hour,
+        product,
+        request.cycle.date_yyyymmdd,
+        request.cycle.hour_utc,
         request.forecast_hour,
     ))
 }
@@ -9367,6 +9515,7 @@ fn plot_recipe_field_blocker(
             | ModelId::CmaGeps
             | ModelId::Rdps
             | ModelId::Hrdps
+            | ModelId::HrdpsWest
             | ModelId::Reps
             | ModelId::IconEu
             | ModelId::IconD2
@@ -9376,6 +9525,7 @@ fn plot_recipe_field_blocker(
             ModelId::Gdps | ModelId::GdpsGeml | ModelId::Rdps | ModelId::Hrdps => {
                 "ECCC Datamart per-field component bundle"
             }
+            ModelId::HrdpsWest => "ECCC DD-Alpha per-field component bundle",
             ModelId::CmaGeps => "CMA WIS2 provider-specific acquisition contract",
             ModelId::Reps => "ECCC REPS provider-statistics component bundle",
             ModelId::IconEu => "DWD ICON-EU Open Data per-field component bundle",
@@ -9496,10 +9646,10 @@ fn plot_recipe_fetch_defaults(
         (ModelId::GdpsGeml, _, true) => ("rws-surface", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::GdpsGeml, _, false) => ("rws-pressure", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::CmaGeps, _, _) => ("stats", PlotRecipeFetchPolicy::WholeFile),
-        (ModelId::Rdps | ModelId::Hrdps, _, true) => {
+        (ModelId::Rdps | ModelId::Hrdps | ModelId::HrdpsWest, _, true) => {
             ("rws-surface", PlotRecipeFetchPolicy::WholeFile)
         }
-        (ModelId::Rdps | ModelId::Hrdps, _, false) => {
+        (ModelId::Rdps | ModelId::Hrdps | ModelId::HrdpsWest, _, false) => {
             ("rws-pressure", PlotRecipeFetchPolicy::WholeFile)
         }
         (ModelId::Reps, _, _) => (

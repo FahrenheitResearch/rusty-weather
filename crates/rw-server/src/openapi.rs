@@ -4581,6 +4581,7 @@ mod tests {
                 "derived_products_disabled",
                 "conus_only",
                 "pre_operational_feed",
+                "short_source_retention",
                 "extended_range_not_scheduled"
             ])
         );

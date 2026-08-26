@@ -90,7 +90,7 @@ fn provider_probe_agent_times_out_a_stalled_response_offline() {
 
 #[test]
 fn built_in_models_are_real() {
-    assert_eq!(built_in_models().len(), 36);
+    assert_eq!(built_in_models().len(), 37);
     assert_eq!(model_summary(ModelId::Gdps).default_product, "rws-surface");
     assert_eq!(model_summary(ModelId::CmaGeps).default_product, "stats");
     assert_eq!(model_summary(ModelId::CmaGeps).max_forecast_hour, 360);
@@ -98,6 +98,16 @@ fn built_in_models_are_real() {
     assert_eq!(model_summary(ModelId::Rdps).max_forecast_hour, 84);
     assert_eq!(model_summary(ModelId::Hrdps).default_product, "rws-surface");
     assert_eq!(model_summary(ModelId::Hrdps).max_forecast_hour, 48);
+    assert_eq!(
+        model_summary(ModelId::HrdpsWest).default_product,
+        "rws-surface"
+    );
+    assert_eq!(model_summary(ModelId::HrdpsWest).cycle_hours_utc, &[0, 12]);
+    assert_eq!(model_summary(ModelId::HrdpsWest).max_forecast_hour, 48);
+    assert_eq!(
+        model_summary(ModelId::HrdpsWest).sources[0].max_age_hours,
+        Some(24)
+    );
     assert_eq!(
         model_summary(ModelId::Reps).default_product,
         "rws-reps-provider-statistics"
@@ -184,6 +194,7 @@ fn catalog_exposes_the_user_facing_supported_models() {
         ModelId::CmaGeps,
         ModelId::Rdps,
         ModelId::Hrdps,
+        ModelId::HrdpsWest,
         ModelId::Reps,
         ModelId::IconEu,
         ModelId::IconD2,
@@ -683,6 +694,7 @@ fn temperature_700_recipe_tracks_model_support() {
                     | ModelId::CmaGeps
                     | ModelId::Rdps
                     | ModelId::Hrdps
+                    | ModelId::HrdpsWest
                     | ModelId::Reps
                     | ModelId::IconEu
                     | ModelId::IconD2
@@ -701,6 +713,9 @@ fn temperature_700_recipe_tracks_model_support() {
             match model {
                 ModelId::Gdps | ModelId::GdpsGeml | ModelId::Rdps | ModelId::Hrdps => {
                     assert!(reason.contains("Datamart per-field component bundle"));
+                }
+                ModelId::HrdpsWest => {
+                    assert!(reason.contains("DD-Alpha per-field component bundle"));
                 }
                 ModelId::IconEu | ModelId::IconD2 => {
                     assert!(reason.contains("per-field component bundle"));
@@ -1018,6 +1033,26 @@ fn latest_available_eta_run_probes_f000_text_inventory_and_never_binary_idx() {
     assert!(!probed.is_empty());
     assert!(probed.iter().all(|url| url.ends_with(".inv")));
     assert!(probed.iter().all(|url| !url.ends_with(".grib2.idx")));
+}
+
+#[test]
+fn hrdps_west_latest_discovery_requires_the_terminal_lead() {
+    let mut probed = Vec::new();
+    let latest =
+        latest_available_run_with_probe(ModelId::HrdpsWest, None, "20260814", |resolved| {
+            let url = resolved.availability_probe_url().to_string();
+            probed.push(url.clone());
+            url.contains("/00/048/")
+                && (url.contains("_TCDC_SFC_0_") || url.contains("_VGRD_ISBL_1015_"))
+        })
+        .unwrap();
+
+    assert_eq!(latest.cycle.hour_utc, 0);
+    assert_eq!(latest.source, SourceId::Eccc);
+    assert!(!probed.is_empty());
+    assert!(probed.iter().all(|url| url.contains("/048/")));
+    assert!(probed.iter().any(|url| url.contains("_TCDC_SFC_0_")));
+    assert!(probed.iter().any(|url| url.contains("_VGRD_ISBL_1015_")));
 }
 
 #[test]
@@ -1507,6 +1542,76 @@ fn eccc_regional_cadence_and_component_urls_match_the_msc_datamart_contract() {
 
     for (model, off_end) in [(ModelId::Rdps, 85), (ModelId::Hrdps, 49)] {
         let request = ModelRunRequest::new(model, cycle.clone(), off_end, "rws-surface").unwrap();
+        assert!(matches!(
+            build_grib_url(SourceId::Eccc, &request),
+            Err(ModelError::UnsupportedForecastHour { .. })
+        ));
+    }
+}
+
+#[test]
+fn experimental_hrdps_west_contract_is_exact_and_fails_closed() {
+    assert_eq!(hrdps_west_isobaric_levels_hpa().first(), Some(&50));
+    assert_eq!(hrdps_west_isobaric_levels_hpa().last(), Some(&1015));
+    assert_eq!(hrdps_west_isobaric_levels_hpa().len(), 28);
+    assert!(hrdps_west_isobaric_levels_hpa().contains(&875));
+
+    for cycle_hour in [0, 12] {
+        let hours = supported_forecast_hours(ModelId::HrdpsWest, cycle_hour);
+        assert_eq!(hours, (0..=48).collect::<Vec<_>>());
+    }
+    for cycle_hour in [1, 6, 18, 23] {
+        assert!(supported_forecast_hours(ModelId::HrdpsWest, cycle_hour).is_empty());
+    }
+
+    let cycle = CycleSpec::new("20260814", 0).unwrap();
+    let u850 =
+        ModelRunRequest::new(ModelId::HrdpsWest, cycle.clone(), 24, "UGRD_ISBL_0850").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::Eccc, &u850).unwrap(),
+        "https://dd.alpha.weather.gc.ca/model_hrdps/west/1km/grib2/00/024/CMC_hrdps_west_UGRD_ISBL_0850_rotated_latlon0.009x0.009_20260814T00Z_P024-00.grib2"
+    );
+    let surface_probe =
+        ModelRunRequest::new(ModelId::HrdpsWest, cycle.clone(), 0, "rws-surface").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::Eccc, &surface_probe).unwrap(),
+        "https://dd.alpha.weather.gc.ca/model_hrdps/west/1km/grib2/00/000/CMC_hrdps_west_TCDC_SFC_0_rotated_latlon0.009x0.009_20260814T00Z_P000-00.grib2"
+    );
+    assert_eq!(
+        availability_probe_forecast_hour(ModelId::HrdpsWest).unwrap(),
+        48
+    );
+
+    for product in ["APCP_SFC_0", "HGT_SFC_0"] {
+        let request = ModelRunRequest::new(ModelId::HrdpsWest, cycle.clone(), 0, product).unwrap();
+        assert!(matches!(
+            build_grib_url(SourceId::Eccc, &request),
+            Err(ModelError::UnsupportedProduct { .. })
+        ));
+    }
+
+    for product in [
+        "../UGRD_TGL_10",
+        "UGRD_AGL-10m",
+        "UGRD_ISBL_0010",
+        "UGRD_ISBL_0125",
+        "UGRD_ISBL_850",
+        "ABSV_ISBL_0200",
+    ] {
+        let request = ModelRunRequest::new(ModelId::HrdpsWest, cycle.clone(), 24, product).unwrap();
+        assert!(matches!(
+            build_grib_url(SourceId::Eccc, &request),
+            Err(ModelError::UnsupportedProduct { .. })
+        ));
+    }
+    for (cycle_hour, forecast_hour) in [(6, 24), (0, 49)] {
+        let request = ModelRunRequest::new(
+            ModelId::HrdpsWest,
+            CycleSpec::new("20260814", cycle_hour).unwrap(),
+            forecast_hour,
+            "rws-surface",
+        )
+        .unwrap();
         assert!(matches!(
             build_grib_url(SourceId::Eccc, &request),
             Err(ModelError::UnsupportedForecastHour { .. })

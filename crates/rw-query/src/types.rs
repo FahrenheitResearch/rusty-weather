@@ -140,6 +140,18 @@ pub fn eccc_provider_attribution() -> ProviderAttribution {
     }
 }
 
+/// Attribution and operational caveat for the experimental HRDPS-West 1 km
+/// feed on ECCC's non-operational DD-Alpha service.
+pub fn hrdps_west_provider_attribution() -> ProviderAttribution {
+    let mut attribution = eccc_provider_attribution();
+    attribution.source_url =
+        "https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart-alpha_en/"
+            .into();
+    attribution.disclaimer = "The source information is licensed as-is without warranties. HRDPS-West is published on ECCC's experimental, non-operational DD-Alpha service with only 24 hours of rolling source history; availability and completeness are not guaranteed."
+        .into();
+    attribution
+}
+
 /// Attribution for ECCC's Regional Ensemble Prediction System (REPS).
 pub fn reps_provider_attribution() -> ProviderAttribution {
     let mut attribution = eccc_provider_attribution();
@@ -280,6 +292,12 @@ pub fn provider_attributions_for_provenance(
         } else {
             attributions.push(eccc_provider_attribution());
         }
+    }
+    if sources
+        .iter()
+        .any(|source| source.provider == "eccc-msc-hrdps-west-dd-alpha")
+    {
+        attributions.push(hrdps_west_provider_attribution());
     }
     if sources
         .iter()
@@ -739,5 +757,27 @@ mod tests {
         );
         assert!(attributions[0].license.contains("version 2.1"));
         assert!(attributions[0].modification_notice.contains("normalized"));
+    }
+
+    #[test]
+    fn hrdps_west_provenance_surfaces_dd_alpha_status_and_retention() {
+        let attributions =
+            provider_attributions_for_provenance(&[provenance("eccc-msc-hrdps-west-dd-alpha")]);
+        assert_eq!(attributions, vec![hrdps_west_provider_attribution()]);
+        assert_eq!(
+            attributions[0].source_url,
+            "https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart-alpha_en/"
+        );
+        assert_eq!(
+            attributions[0].notice,
+            "Data Source: Environment and Climate Change Canada"
+        );
+        assert!(attributions[0].license.contains("version 2.1"));
+        assert!(
+            attributions[0]
+                .disclaimer
+                .contains("non-operational DD-Alpha")
+        );
+        assert!(attributions[0].disclaimer.contains("24 hours"));
     }
 }

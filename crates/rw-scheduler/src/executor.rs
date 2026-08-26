@@ -10,7 +10,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use chrono::{Days, TimeZone, Utc};
 use fs4::{FileExt, TryLockError};
 use rustwx_core::{CycleSpec, ModelId, ModelRunRequest, ResolvedUrl, SourceId};
-use rustwx_models::{model_summary, resolve_urls, supported_forecast_hours};
+use rustwx_models::{
+    availability_probe_forecast_hour, model_summary, resolve_urls, supported_forecast_hours,
+};
 use rw_ingest::{IngestConfig, ingest_hour_serial, model_ingest_capability};
 use serde::Serialize;
 
@@ -136,21 +138,7 @@ impl CycleDiscovery for ProviderCycleDiscovery {
             .iter()
             .map(|product| product.product)
             .collect::<Vec<_>>();
-        let summary = model_summary(model);
-        let representative_hour = summary
-            .cycle_hours_utc
-            .iter()
-            .filter_map(|cycle_hour| {
-                supported_forecast_hours(model, *cycle_hour)
-                    .first()
-                    .copied()
-            })
-            .min()
-            .ok_or_else(|| {
-                SchedulerError::InvalidConfig(format!(
-                    "model '{model}' has no schedulable forecast hours"
-                ))
-            })?;
+        let representative_hour = availability_probe_forecast_hour(model)?;
         let allowed_dates = (0..=rollback_days)
             .filter_map(|days| {
                 now.date_naive()
@@ -294,17 +282,11 @@ pub(crate) fn discovery_shape_for_selector(
         })?;
     match selector {
         OriginLaneSelector::NewestAvailable => {
-            let first = summary
-                .cycle_hours_utc
-                .iter()
-                .filter_map(|hour| supported_forecast_hours(model, *hour).into_iter().min())
-                .min()
-                .ok_or_else(|| {
-                    SchedulerError::InvalidConfig(format!(
-                        "model '{model}' has no schedulable forecast hours"
-                    ))
-                })?;
-            Ok((first, summary.cycle_hours_utc.iter().copied().collect()))
+            let probe_hour = availability_probe_forecast_hour(model)?;
+            Ok((
+                probe_hour,
+                summary.cycle_hours_utc.iter().copied().collect(),
+            ))
         }
         OriginLaneSelector::NewestCompleteLongestHorizon => Ok((
             longest,

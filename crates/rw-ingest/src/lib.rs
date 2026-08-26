@@ -151,6 +151,9 @@ pub enum IngestCapabilityLimitation {
     ConusOnly,
     /// The upstream provider labels this feed preliminary/pre-operational.
     PreOperationalFeed,
+    /// The upstream source keeps only a short rolling history, so the
+    /// scheduler must discover and ingest complete cycles promptly.
+    ShortSourceRetention,
     /// A provider-specific, date-dependent extended forecast exists, but the
     /// scheduler deliberately admits only the invariant operational horizon.
     ExtendedRangeNotScheduled,
@@ -171,6 +174,7 @@ impl IngestCapabilityLimitation {
             Self::DerivedProductsDisabled => "derived_products_disabled",
             Self::ConusOnly => "conus_only",
             Self::PreOperationalFeed => "pre_operational_feed",
+            Self::ShortSourceRetention => "short_source_retention",
             Self::ExtendedRangeNotScheduled => "extended_range_not_scheduled",
         }
     }
@@ -226,20 +230,22 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
         // These are logical extraction families: fetch_hour expands each into
         // an exact, profile-dependent ordered component bundle and caches both
         // the component objects and assembled message stream.
-        ModelId::Gdps | ModelId::GdpsGeml | ModelId::Rdps | ModelId::Hrdps => Ok(vec![
-            ProductFetch {
-                product: "rws-pressure",
-                surface_source: false,
-                pressure_source: true,
-                idx_patterns: &[],
-            },
-            ProductFetch {
-                product: "rws-surface",
-                surface_source: true,
-                pressure_source: false,
-                idx_patterns: &[],
-            },
-        ]),
+        ModelId::Gdps | ModelId::GdpsGeml | ModelId::Rdps | ModelId::Hrdps | ModelId::HrdpsWest => {
+            Ok(vec![
+                ProductFetch {
+                    product: "rws-pressure",
+                    surface_source: false,
+                    pressure_source: true,
+                    idx_patterns: &[],
+                },
+                ProductFetch {
+                    product: "rws-surface",
+                    surface_source: true,
+                    pressure_source: false,
+                    idx_patterns: &[],
+                },
+            ])
+        }
         ModelId::CmaGeps => Ok(vec![ProductFetch {
             product: "stats",
             surface_source: true,
@@ -875,7 +881,7 @@ pub fn validate_ingest_profile_for_model(
     }
     if matches!(
         model,
-        rustwx_core::ModelId::Rdps | rustwx_core::ModelId::Hrdps
+        rustwx_core::ModelId::Rdps | rustwx_core::ModelId::Hrdps | rustwx_core::ModelId::HrdpsWest
     ) && (profile.derived || profile.heavy)
     {
         return Err(events::other(format!(
@@ -1023,6 +1029,12 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
             IngestCapabilityLimitation::SparsePressureLevels,
             IngestCapabilityLimitation::DerivedProductsDisabled,
         ],
+        rustwx_core::ModelId::HrdpsWest => vec![
+            IngestCapabilityLimitation::SparsePressureLevels,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+            IngestCapabilityLimitation::PreOperationalFeed,
+            IngestCapabilityLimitation::ShortSourceRetention,
+        ],
         rustwx_core::ModelId::IconEu
         | rustwx_core::ModelId::IconD2
         | rustwx_core::ModelId::IconRu => vec![
@@ -1069,7 +1081,9 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 | rustwx_core::ModelId::IconD2
                 | rustwx_core::ModelId::WrfCptec7km
                 | rustwx_core::ModelId::BramsCptec8km => IngestVerificationLevel::LiveVerified,
-                rustwx_core::ModelId::EtaCptec8km => IngestVerificationLevel::FixtureVerified,
+                rustwx_core::ModelId::EtaCptec8km | rustwx_core::ModelId::HrdpsWest => {
+                    IngestVerificationLevel::FixtureVerified
+                }
                 rustwx_core::ModelId::HrrrAk
                 | rustwx_core::ModelId::Gdas
                 | rustwx_core::ModelId::Nbm
@@ -1168,6 +1182,10 @@ mod tests {
             IngestCapabilityLimitation::ExtendedRangeNotScheduled.as_str(),
             "extended_range_not_scheduled"
         );
+        assert_eq!(
+            IngestCapabilityLimitation::ShortSourceRetention.as_str(),
+            "short_source_retention"
+        );
     }
 
     #[test]
@@ -1183,6 +1201,7 @@ mod tests {
             ModelId::CmaGeps,
             ModelId::Rdps,
             ModelId::Hrdps,
+            ModelId::HrdpsWest,
             ModelId::Reps,
             ModelId::IconEu,
             ModelId::IconD2,
@@ -1437,6 +1456,19 @@ mod tests {
             );
         }
 
+        let west = model_ingest_capability(ModelId::HrdpsWest);
+        assert_eq!(west.status, IngestSupportStatus::Ready);
+        assert_eq!(west.verification, IngestVerificationLevel::FixtureVerified);
+        assert_eq!(
+            west.limitations,
+            vec![
+                IngestCapabilityLimitation::SparsePressureLevels,
+                IngestCapabilityLimitation::DerivedProductsDisabled,
+                IngestCapabilityLimitation::PreOperationalFeed,
+                IngestCapabilityLimitation::ShortSourceRetention,
+            ]
+        );
+
         let geps = model_ingest_capability(ModelId::Geps);
         assert_eq!(geps.status, IngestSupportStatus::Ready);
         assert_eq!(geps.verification, IngestVerificationLevel::LiveVerified);
@@ -1511,6 +1543,7 @@ mod tests {
                 ModelId::CmaGeps,
                 ModelId::Rdps,
                 ModelId::Hrdps,
+                ModelId::HrdpsWest,
                 ModelId::Reps,
                 ModelId::IconEu,
                 ModelId::IconD2,
@@ -2112,7 +2145,7 @@ mod tests {
     fn regional_eccc_models_accept_normalized_soundings_but_gate_derived_stages() {
         use rustwx_core::ModelId;
 
-        for model in [ModelId::Rdps, ModelId::Hrdps] {
+        for model in [ModelId::Rdps, ModelId::Hrdps, ModelId::HrdpsWest] {
             validate_ingest_profile_for_model(model, &ingest_profile::IngestProfile::sounding())
                 .expect("paired grid-relative winds are normalized for raw sounding ingest");
             let message =
@@ -2483,6 +2516,7 @@ mod tests {
             rustwx_core::ModelId::GdpsGeml,
             rustwx_core::ModelId::Rdps,
             rustwx_core::ModelId::Hrdps,
+            rustwx_core::ModelId::HrdpsWest,
         ] {
             let plan = fetch_plan(model).expect("ECCC component plan");
             assert_eq!(plan.len(), 2, "{model}");
@@ -2849,9 +2883,22 @@ mod tests {
     fn eccc_regional_fixtures_pin_inventory_grid_drift_and_vector_contract() {
         let rdps = include_str!("../tests/fixtures/rdps.20260814.t00z.f024.inventory.txt");
         let hrdps = include_str!("../tests/fixtures/hrdps.20260814.t00z.f024.inventory.txt");
+        let west = include_str!("../tests/fixtures/hrdps-west.20260814.t00z.f024.inventory.txt");
 
         assert_eq!(fixture_header(rdps, "source_grib2_links"), "414");
         assert_eq!(fixture_header(hrdps, "source_grib2_links"), "414");
+        assert_eq!(fixture_header(west, "source_grib2_links"), "338");
+        assert_eq!(fixture_header(west, "f000_source_grib2_links"), "333");
+        assert_eq!(fixture_header(west, "f001_source_grib2_links"), "338");
+        assert_eq!(fixture_header(west, "f048_source_grib2_links"), "338");
+        assert!(fixture_header(west, "f000_absent_vs_f001").contains("HGT_SFC_0"));
+        assert!(fixture_header(west, "f000_absent_vs_f001").contains("APCP_SFC_0"));
+        assert!(fixture_header(west, "completion_surface_sentinel_f048").contains("HTTP-200"));
+        assert!(fixture_header(west, "completion_pressure_sentinel_f048").contains("HTTP-200"));
+        assert_eq!(
+            fixture_header(west, "same_day_12z_terminal_sentinels_at_capture"),
+            "HTTP-404,HTTP-404"
+        );
         assert_eq!(
             fixture_header(rdps, "source_sha256"),
             "87BD53259734E95AEFEFF1DA7BBCD83332A5BD3AC6124DC46BD5AD6675952F10"
@@ -2859,6 +2906,10 @@ mod tests {
         assert_eq!(
             fixture_header(hrdps, "source_sha256"),
             "AF42B19E5A3D44C00AB0FDA2E1F18E052A2043319B997D0E8263D4B7B957EF8E"
+        );
+        assert_eq!(
+            fixture_header(west, "source_sha256"),
+            "ECFC5882FA64E585101B9BA85AEB32D00073450A11DD9F6850D004AD4DB52B9E"
         );
 
         assert_eq!(fixture_header(rdps, "documentation_grid"), "1102x1076");
@@ -2870,7 +2921,15 @@ mod tests {
         );
         assert_eq!(fixture_header(hrdps, "documentation_grid"), "2540x1290");
         assert_eq!(fixture_header(hrdps, "live_decoded_grid"), "2540x1290");
-        for fixture in [rdps, hrdps] {
+        assert_eq!(fixture_header(west, "documentation_grid"), "1330x1180");
+        assert_eq!(fixture_header(west, "computational_grid"), "1350x1200");
+        assert_eq!(fixture_header(west, "live_decoded_grid"), "1330x1180");
+        assert_eq!(fixture_header(west, "source_retention_hours"), "24");
+        assert_eq!(
+            fixture_header(west, "service_status"),
+            "experimental-non-operational-dd-alpha"
+        );
+        for fixture in [rdps, hrdps, west] {
             assert_eq!(fixture_header(fixture, "scan_mode"), "0x40");
             assert_eq!(
                 fixture_header(fixture, "resolution_and_component_flags"),
@@ -2897,12 +2956,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             rustwx_models::hrdps_isobaric_levels_hpa()
         );
+        assert_eq!(
+            fixture_header(west, "common_five_field_isobaric_levels_hpa")
+                .split(',')
+                .map(|level| level.parse::<u16>().unwrap())
+                .collect::<Vec<_>>(),
+            rustwx_models::hrdps_west_isobaric_levels_hpa()
+        );
         assert!(rdps.contains("_WindU_AGL-10m_"));
         assert!(rdps.contains("_WindV_AGL-10m_"));
         assert!(!rdps.contains("GeopotentialHeight_Sfc"));
         assert!(hrdps.contains("_UGRD_AGL-10m_"));
         assert!(hrdps.contains("_VGRD_AGL-10m_"));
         assert!(hrdps.contains("_HGT_Sfc_"));
+        assert!(west.contains("_UGRD_TGL_10_"));
+        assert!(west.contains("_VGRD_TGL_10_"));
+        assert!(west.contains("_HGT_SFC_0_"));
     }
 
     #[test]

@@ -28,6 +28,7 @@ not automatically presented as live-verified.
 | CMA GRAPES GEPS | Remote | Ingest beta | Global 0.25-degree provider-produced ensemble statistics; 00/12z, 3-hourly f000-f078 then 6-hourly to f360; mean/spread, percentile, and probability fields only—no raw member or deterministic sounding claim; live ingest/store verified |
 | ECCC RDPS | Remote | Ingest beta | North American 10 km rotated-grid deterministic forecast; 00/06/12/18z hourly f000-f084; bounded per-field acquisition and a 19-level sounding profile are live ingest/store verified; canonical U/V are paired and rotated to earth coordinates; derived/heavy disabled |
 | ECCC HRDPS continental | Remote | Ingest beta | Pan-Canadian 2.5 km rotated-grid deterministic forecast; 00/06/12/18z hourly f000-f048; bounded per-field acquisition and a 19-level sounding profile are live ingest/store verified; canonical U/V are paired and rotated to earth coordinates; derived/heavy disabled |
+| [ECCC HRDPS-West 1 km](ECCC_HRDPS_WEST.md) | Remote | Ingest beta | Experimental British Columbia / western Alberta rotated-grid forecast on non-operational DD-Alpha; 00/12z hourly f000-f048; published grid 1330x1180; exact bounded component and vector fixtures verified; 24-hour source retention, pre-operational status, strict paired U/V earth rotation, and disabled derived/heavy diagnostics are explicit capabilities |
 | ECCC REPS | Remote | Ingest beta | Regional 10 km provider-produced scalar ensemble statistics; 00/06/12/18z, three-hourly f003-f072; p10/p25/p50/p75/p90, spread, mean, min/max, and trailing 3-hour precipitation probabilities only; no raw members or grid-relative U/V claim; live ingest/store verified |
 | DWD ICON-EU regular | Remote | Ingest beta | European deterministic regular lat/lon feed; eight 3-hourly cycles, main-cycle f000-f120 and short-cycle f000-f048 native cadence; exact bzip2 component bundles and 18 schema-requested native pressure levels are live ingest/store verified; derived/heavy disabled |
 | DWD ICON-D2 regular | Remote | Ingest beta | Germany deterministic regular lat/lon feed; eight 3-hourly cycles and hourly f000-f048; exact bzip2 component bundles and all 11 native pressure levels are live ingest/store verified; quarter-hour messages retain exact time semantics; derived/heavy disabled |
@@ -88,6 +89,7 @@ The focused ingest fixtures pin inventories captured from the official
 [ECMWF Open Data](https://www.ecmwf.int/en/forecasts/datasets/open-data),
 [ECCC RDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_rdps/readme_rdps-datamart_en/), and
 [ECCC HRDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart_en/), and
+[ECCC HRDPS-West](https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart-alpha_en/), and
 [ECCC GDPS-GEML](https://eccc-msc.github.io/open-data/msc-data/nwp_gdps/readme_gdps-geml-datamart_en/), and
 [ECCC GEPS](https://eccc-msc.github.io/open-data/msc-data/nwp_geps/readme_geps-datamart_en/), and
 [ECCC REPS](https://eccc-msc.github.io/open-data/msc-data/nwp_reps/readme_reps-datamart_en/) feeds.
@@ -163,6 +165,38 @@ speed/direction objects covered 2,382,600 RDPS and 6,553,200 HRDPS components;
 RMS differences were 0.063552 and 0.006831 m/s respectively, within provider
 direction quantization. Derived/heavy diagnostics remain disabled until every
 diagnostic path is explicitly proven to consume the normalized vectors.
+
+HRDPS-West is a separate model identity from continental HRDPS. ECCC's
+experimental DD-Alpha contract publishes 49 hourly leads for 00/12z cycles,
+one GRIB2 message per field/level, and retains only 24 hours of source history.
+The public distribution documentation and captured live f024 objects agree on
+a 1330x1180 rotated grid; the technical specification's 1350x1200 value is the
+model computational grid and is not substituted for the published GRIB grid.
+The pinned 2026-08-14 f024 listing contains 338 objects and all 28 common
+TMP/RH/UGRD/VGRD/HGT pressure levels from 50 through 1015 hPa, including
+875 hPa. U/V objects set the grid-relative component flag, so the same strict
+paired-vector metadata and grid checks used by RDPS/continental HRDPS apply.
+An empty newly initialized DD-Alpha cycle is not considered available merely
+because its directory exists; discovery requires independent surface and
+pressure sentinels at f048 and falls back to the newest complete cycle.
+The f000 analysis directory has a distinct, smaller inventory: surface height
+and accumulated precipitation are absent there but present from f001. The
+component planner encodes that lead-specific contract rather than probing
+known-missing objects or inventing an analysis value.
+
+The acquisition contract was re-checked against the live publication on
+2026-08-25. All 49 lead directories f000-f048 were present for that day's 12z
+cycle; f000 listed 331 GRIB2 objects and f001 listed 336, with `HGT_SFC_0` and
+`APCP_SFC_0` absent at f000 and present at f001, and the 28-level pressure
+inventory unchanged. A bounded ranged read of the f001 500 hPa U-wind object
+decoded to GRIB2 section 3 grid template 3.1 with 1,569,400 points on the
+published 1330x1180 rotated grid, 0.00899-degree increments, and
+resolution/component flag byte `0x38`, whose set grid-relative bit is exactly
+what the paired rotation path requires. Because DD-Alpha is experimental, its
+per-lead object count is not an invariant: the vendored fixture records the
+2026-08-14 listing, and the ingest contract keys on component identity rather
+than on a fixed object count.
+
 ICON-EU and ICON-D2 regular-grid lanes were exercised against official
 [DWD Open Data](https://opendata.dwd.de/weather/nwp/) on 2026-08-14. Bounded
 00z f000 sounding ingests passed exact writer verification and deep store
