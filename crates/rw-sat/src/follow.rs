@@ -30,9 +30,8 @@ use crate::s3::{
     band_hour_prefix, bucket_for_satellite, build_agent, cached_object_path,
     download_object_with_control, list_s3_objects, object_filename, prune_object_cache,
 };
-use crate::store::{WrittenFrame, frame_time, write_band_frame};
+use crate::store::{WrittenFrame, write_band_frame};
 use crate::window::{WindowConfig, enforce_window};
-use rw_store::run::{RwsRunManifest, validate_store_component};
 
 /// Minutes after the top of the hour during which the previous hour's
 /// prefix keeps being polled (stragglers + clock skew).
@@ -200,10 +199,12 @@ fn scan_minute(start: DateTime<Utc>) -> DateTime<Utc> {
         .unwrap_or(start)
 }
 
-/// Dedup state rebuilt from both retained native manifests and compact `.rws`
-/// run manifests. Native manifests are authoritative when a derivative
-/// preview could not be written, so restarting cannot redownload the same
-/// successfully archived source.
+/// Dedup state rebuilt exclusively from retained native manifests.
+///
+/// Compact `.rws` previews are derivatives, not proof that the exact native
+/// source was retained. In particular, stores created before native archival
+/// can contain a legacy preview for a scan that still needs native backfill.
+/// Native manifests are therefore the only restart-dedup authority.
 pub fn primed_seen_scans(
     store_root: &std::path::Path,
     model: &str,
@@ -211,9 +212,6 @@ pub fn primed_seen_scans(
     bands: &[u8],
 ) -> SeenScans {
     let mut seen = SeenScans::default();
-    if validate_store_component("model", model).is_err() {
-        return seen;
-    }
     for &band in bands {
         if let Ok(frames) = list_native_frames(
             store_root,
@@ -226,58 +224,6 @@ pub fn primed_seen_scans(
                 if let Some(time) = DateTime::<Utc>::from_timestamp(frame.scan_start_unix, 0) {
                     seen.insert(band, time);
                 }
-            }
-        }
-    }
-    let Ok(root) = std::fs::canonicalize(store_root) else {
-        return seen;
-    };
-    let Ok(model_dir) = std::fs::canonicalize(store_root.join(model)) else {
-        return seen;
-    };
-    if !model_dir.starts_with(&root) {
-        return seen;
-    }
-    let Ok(entries) = std::fs::read_dir(&model_dir) else {
-        return seen;
-    };
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        let run_name = entry.file_name().to_string_lossy().to_string();
-        if validate_store_component("run", &run_name).is_err() {
-            continue;
-        }
-        // Run dirs are `<sector>_c<band>_<YYYYMMDD>[_<k>]`.
-        let Some(band) = bands
-            .iter()
-            .copied()
-            .find(|band| run_name.starts_with(&format!("{sector_slug}_c{band:02}_")))
-        else {
-            continue;
-        };
-        let Ok(run_dir) = std::fs::canonicalize(entry.path()) else {
-            continue;
-        };
-        if !run_dir.starts_with(&model_dir) {
-            continue;
-        }
-        let Ok(manifest_path) = std::fs::canonicalize(run_dir.join("run.json")) else {
-            continue;
-        };
-        if !manifest_path.starts_with(&run_dir) {
-            continue;
-        }
-        let Ok(manifest) = RwsRunManifest::load_for_run(&manifest_path, model, &run_name) else {
-            continue;
-        };
-        if manifest.is_exact_time_axis() {
-            continue;
-        }
-        for &hhmm in manifest.hours.keys() {
-            if let Some(time) = frame_time(&run_name, hhmm) {
-                seen.insert(band, time);
             }
         }
     }
@@ -953,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn priming_reads_run_manifests_per_band() {
+    fn legacy_preview_without_native_source_does_not_prime_restart_dedup() {
         use crate::store::test_support::{scan_start, synthetic_field};
         use crate::store::write_band_frame;
 
@@ -981,14 +927,16 @@ mod tests {
         .unwrap();
 
         let seen = primed_seen_scans(&dir, "g19", "conus", &[13]);
-        assert_eq!(seen.len(), 2, "only the followed band primes");
-        // The live listing carries seconds; the primed minute still hits.
-        assert!(seen.contains(13, scan_start(18, 51)));
-        assert!(seen.contains(13, scan_start(18, 56)));
+        assert!(
+            seen.is_empty(),
+            "legacy `.rws` previews must not suppress exact native backfill"
+        );
+        assert!(!seen.contains(13, scan_start(18, 51)));
+        assert!(!seen.contains(13, scan_start(18, 56)));
         assert!(!seen.contains(8, scan_start(18, 51)));
 
         let both = primed_seen_scans(&dir, "g19", "conus", &[8, 13]);
-        assert_eq!(both.len(), 3);
+        assert!(both.is_empty());
 
         let missing = primed_seen_scans(&dir, "g18", "conus", &[13]);
         assert!(missing.is_empty(), "absent model dir primes nothing");

@@ -86,11 +86,28 @@ pub struct NativeSatelliteFrame {
 }
 
 impl NativeSatelliteFrame {
+    /// Whether this frame contains every source required by `product`.
+    ///
+    /// A minute-granular `frame_id` is not enough to prove that
+    /// multiple channels belong to the same scan. For a multichannel product,
+    /// every required source must have identical exact start *and* end Unix
+    /// timestamps. A raw single-channel product remains complete whenever its
+    /// one requested source is present.
     pub fn is_complete_for(&self, product: GoesAbiProduct) -> bool {
-        product
-            .required_channels()
-            .iter()
-            .all(|channel| self.channels.contains_key(channel))
+        let Some((&reference_channel, remaining_channels)) =
+            product.required_channels().split_first()
+        else {
+            return false;
+        };
+        let Some(reference) = self.channels.get(&reference_channel) else {
+            return false;
+        };
+        remaining_channels.iter().all(|channel| {
+            self.channels.get(channel).is_some_and(|source| {
+                source.scan_start_unix == reference.scan_start_unix
+                    && source.scan_end_unix == reference.scan_end_unix
+            })
+        })
     }
 
     /// Whether every requested L2 cloud product is archived in this frame.
@@ -1020,6 +1037,94 @@ mod tests {
     }
 
     #[test]
+    fn multichannel_completeness_requires_exact_matching_scan_bounds() {
+        let start = Utc
+            .with_ymd_and_hms(2026, 8, 26, 16, 40, 21)
+            .unwrap()
+            .timestamp();
+        let end = start + 571;
+        let mut frame = native_test_frame(&[(1, start, end), (2, start, end), (3, start, end)]);
+
+        assert!(frame.is_complete_for(GoesAbiProduct::TrueColor));
+
+        frame.channels.get_mut(&3).unwrap().scan_start_unix += 1;
+        assert_eq!(
+            DateTime::<Utc>::from_timestamp(frame.channels[&3].scan_start_unix, 0)
+                .unwrap()
+                .format("%Y%m%dT%H%M")
+                .to_string(),
+            frame.frame_id,
+            "the regression must exercise a seconds mismatch hidden by the same frame minute"
+        );
+        assert!(!frame.is_complete_for(GoesAbiProduct::TrueColor));
+        assert!(
+            frame.is_complete_for(GoesAbiProduct::RawChannel(3)),
+            "a raw channel does not require cross-channel timestamp agreement"
+        );
+
+        frame.channels.get_mut(&3).unwrap().scan_start_unix = start;
+        frame.channels.get_mut(&3).unwrap().scan_end_unix += 1;
+        assert!(!frame.is_complete_for(GoesAbiProduct::TrueColor));
+        assert!(frame.is_complete_for(GoesAbiProduct::RawChannel(3)));
+    }
+
+    #[test]
+    fn resolution_rejects_same_minute_mixed_scan_channels() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_root = directory.path().join("store");
+        let start = Utc
+            .with_ymd_and_hms(2026, 8, 26, 16, 40, 21)
+            .unwrap()
+            .timestamp();
+        let end = start + 571;
+        let frame = native_test_frame(&[(1, start, end), (2, start + 1, end), (3, start, end)]);
+        let frame_dir = native_archive_root(&store_root)
+            .join("g19")
+            .join("fulldisk")
+            .join("20260826")
+            .join(&frame.frame_id);
+        fs::create_dir_all(&frame_dir).unwrap();
+        save_manifest(&frame_dir.join(FRAME_MANIFEST), &frame).unwrap();
+
+        assert!(
+            resolve_native_frame(
+                &store_root,
+                "g19",
+                "fulldisk",
+                GoesAbiProduct::RawChannel(2),
+                &frame.frame_id,
+            )
+            .is_ok(),
+            "the exact C02 source remains individually usable"
+        );
+        let exact_error = resolve_native_frame(
+            &store_root,
+            "g19",
+            "fulldisk",
+            GoesAbiProduct::TrueColor,
+            &frame.frame_id,
+        )
+        .expect_err("same-minute channels from different exact scans are not one product frame");
+        assert_eq!(exact_error.kind(), io::ErrorKind::NotFound);
+        assert!(exact_error.to_string().contains("incomplete"));
+
+        assert!(
+            list_native_frames(&store_root, "g19", "fulldisk", GoesAbiProduct::TrueColor, 8,)
+                .unwrap()
+                .is_empty()
+        );
+        let latest_error = resolve_native_frame(
+            &store_root,
+            "g19",
+            "fulldisk",
+            GoesAbiProduct::TrueColor,
+            "latest",
+        )
+        .expect_err("latest must not select a mixed-scan composite");
+        assert_eq!(latest_error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
     fn native_frame_listing_has_no_legacy_two_thousand_frame_ceiling() {
         assert_eq!(requested_frame_limit(0), 1);
         assert_eq!(requested_frame_limit(2_001), 2_001);
@@ -1392,6 +1497,45 @@ mod tests {
         );
         let reloaded: NativeSatelliteFrame = serde_json::from_str(&json).unwrap();
         assert_eq!(reloaded, manifest);
+    }
+
+    fn native_test_frame(channel_scans: &[(u8, i64, i64)]) -> NativeSatelliteFrame {
+        NativeSatelliteFrame {
+            schema: NATIVE_FRAME_SCHEMA.into(),
+            platform: "g19".into(),
+            sector: "fulldisk".into(),
+            frame_id: "20260826T1640".into(),
+            scan_start_unix: channel_scans
+                .iter()
+                .map(|(_, start, _)| *start)
+                .min()
+                .unwrap(),
+            scan_end_unix: channel_scans
+                .iter()
+                .map(|(_, _, end)| *end)
+                .max()
+                .unwrap(),
+            channels: channel_scans
+                .iter()
+                .map(|&(channel, scan_start_unix, scan_end_unix)| {
+                    (
+                        channel,
+                        NativeChannelSource {
+                            channel,
+                            object_key: format!("fixture/c{channel:02}.nc"),
+                            relative_path: format!(
+                                ".rw-satellite-sources/g19/fulldisk/20260826/20260826T1640/c{channel:02}.nc"
+                            ),
+                            byte_size: 1,
+                            content_blake3: None,
+                            scan_start_unix,
+                            scan_end_unix,
+                        },
+                    )
+                })
+                .collect(),
+            l2_products: BTreeMap::new(),
+        }
     }
 
     fn conus_scene(path: &Path, product: &str, channel: Option<u8>) -> GoesAbiScene {
