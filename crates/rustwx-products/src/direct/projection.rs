@@ -143,6 +143,49 @@ pub fn build_requested_projected_map_with_projection(
     Ok(projected)
 }
 
+/// Build an unadorned Web-Mercator map surface whose geographic frame is the
+/// caller's exact bounds. No basemap and no padding: the result is meant to
+/// be composited over a host map, which supplies its own base layer. The
+/// caller must choose an output aspect ratio that matches the projected
+/// bounds; [`web_mercator_bounds_aspect_ratio`] computes it.
+pub fn build_map_overlay_projected_map(
+    lat_deg: &[f32],
+    lon_deg: &[f32],
+    bounds: (f64, f64, f64, f64),
+    target_ratio: f64,
+) -> Result<ProjectedMap, Box<dyn std::error::Error>> {
+    let options = ProjectedMapBuildOptions::from_bounds(bounds, target_ratio)
+        .with_projection(rustwx_render::ProjectionSpec::Mercator {
+            latitude_of_true_scale_deg: 0.0,
+            central_meridian_deg: center_longitude_for_bounds(bounds),
+        })
+        .without_basemap();
+    rustwx_render::build_projected_map_with_options(lat_deg, lon_deg, &options)
+}
+
+/// Width/height ratio of geographic bounds in spherical Web Mercator.
+///
+/// Latitudes are clamped to the Web-Mercator pole cutoff before projection,
+/// so bounds reaching the poles yield a finite ratio rather than infinity.
+/// Longitude span comes from [`longitude_bounds_span_deg`], which already
+/// handles antimeridian-crossing frames.
+pub fn web_mercator_bounds_aspect_ratio(bounds: (f64, f64, f64, f64)) -> f64 {
+    const MAX_LATITUDE: f64 = 85.051_128_779_806_6;
+    let south = bounds.2.clamp(-MAX_LATITUDE, MAX_LATITUDE);
+    let north = bounds.3.clamp(-MAX_LATITUDE, MAX_LATITUDE);
+    let longitude_span = longitude_bounds_span_deg(bounds).to_radians();
+    let mercator_y = |latitude_deg: f64| {
+        let latitude = latitude_deg.to_radians();
+        (std::f64::consts::FRAC_PI_4 + latitude * 0.5).tan().ln()
+    };
+    let latitude_span = (mercator_y(north) - mercator_y(south)).abs();
+    if longitude_span.is_finite() && latitude_span.is_finite() && latitude_span > 0.0 {
+        longitude_span / latitude_span
+    } else {
+        1.0
+    }
+}
+
 pub fn build_natural_projected_map_with_projection(
     lat_deg: &[f32],
     lon_deg: &[f32],

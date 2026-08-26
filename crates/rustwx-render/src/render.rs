@@ -40,6 +40,7 @@ pub struct RenderOpts {
     pub height: u32,
     pub cmap: LeveledColormap,
     pub background: Rgba,
+    pub map_overlay: bool,
     pub colorbar: bool,
     pub title: Option<String>,
     pub subtitle_left: Option<String>,
@@ -160,6 +161,7 @@ impl Default for RenderOpts {
                 mask_below: None,
             },
             background: Rgba::WHITE,
+            map_overlay: false,
             colorbar: true,
             title: None,
             subtitle_left: None,
@@ -450,6 +452,23 @@ fn compute_layout(
         },
         text_scale,
         label_gap,
+    }
+}
+
+fn compute_map_overlay_layout(total_w: u32, total_h: u32) -> Layout {
+    Layout {
+        map_x: 0,
+        map_y: 0,
+        map_w: total_w.max(1),
+        map_h: total_h.max(1),
+        cbar_x: 0,
+        cbar_y: 0,
+        cbar_w: 0,
+        cbar_h: 0,
+        title_y: 0,
+        subtitle_y: 0,
+        text_scale: 1,
+        label_gap: 0,
     }
 }
 
@@ -4343,6 +4362,9 @@ fn draw_chrome_and_colorbar(
     projection_clip_mask_present: bool,
     _has_title: bool,
 ) -> (u128, u128) {
+    if opts.map_overlay {
+        return (0, 0);
+    }
     let chrome_start = Instant::now();
     let (chrome_left, chrome_right, chrome_center) =
         chrome_anchor_bounds(layout, opts.domain_frame, domain_frame_rect);
@@ -4690,23 +4712,29 @@ fn render_to_image_profile_inner(
         || opts.subtitle_left.is_some()
         || opts.subtitle_center.is_some()
         || opts.subtitle_right.is_some();
-    let mut layout = compute_effective_layout(
-        opts.width,
-        opts.height,
-        opts.colorbar,
-        has_title,
-        opts.presentation,
-        opts.chrome_scale,
-        opts.domain_frame.is_some(),
-    );
-    fit_map_viewport_layout_to_extent(
-        &mut layout,
-        opts.width,
-        opts.colorbar,
-        opts.presentation.colorbar.orientation,
-        opts.domain_frame,
-        opts.map_extent.as_ref(),
-    );
+    let mut layout = if opts.map_overlay {
+        compute_map_overlay_layout(opts.width, opts.height)
+    } else {
+        compute_effective_layout(
+            opts.width,
+            opts.height,
+            opts.colorbar,
+            has_title,
+            opts.presentation,
+            opts.chrome_scale,
+            opts.domain_frame.is_some(),
+        )
+    };
+    if !opts.map_overlay {
+        fit_map_viewport_layout_to_extent(
+            &mut layout,
+            opts.width,
+            opts.colorbar,
+            opts.presentation.colorbar.orientation,
+            opts.domain_frame,
+            opts.map_extent.as_ref(),
+        );
+    }
     let layout_ms = layout_start.elapsed().as_millis();
 
     let projected_pixel_start = Instant::now();
