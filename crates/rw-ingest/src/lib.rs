@@ -151,6 +151,9 @@ pub enum IngestCapabilityLimitation {
     ConusOnly,
     /// The upstream provider labels this feed preliminary/pre-operational.
     PreOperationalFeed,
+    /// The upstream source keeps only a short rolling history, so the
+    /// scheduler must discover and ingest complete cycles promptly.
+    ShortSourceRetention,
     /// A provider-specific, date-dependent extended forecast exists, but the
     /// scheduler deliberately admits only the invariant operational horizon.
     ExtendedRangeNotScheduled,
@@ -171,6 +174,7 @@ impl IngestCapabilityLimitation {
             Self::DerivedProductsDisabled => "derived_products_disabled",
             Self::ConusOnly => "conus_only",
             Self::PreOperationalFeed => "pre_operational_feed",
+            Self::ShortSourceRetention => "short_source_retention",
             Self::ExtendedRangeNotScheduled => "extended_range_not_scheduled",
         }
     }
@@ -226,20 +230,22 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
         // These are logical extraction families: fetch_hour expands each into
         // an exact, profile-dependent ordered component bundle and caches both
         // the component objects and assembled message stream.
-        ModelId::Gdps | ModelId::GdpsGeml | ModelId::Rdps | ModelId::Hrdps => Ok(vec![
-            ProductFetch {
-                product: "rws-pressure",
-                surface_source: false,
-                pressure_source: true,
-                idx_patterns: &[],
-            },
-            ProductFetch {
-                product: "rws-surface",
-                surface_source: true,
-                pressure_source: false,
-                idx_patterns: &[],
-            },
-        ]),
+        ModelId::Gdps | ModelId::GdpsGeml | ModelId::Rdps | ModelId::Hrdps | ModelId::HrdpsWest => {
+            Ok(vec![
+                ProductFetch {
+                    product: "rws-pressure",
+                    surface_source: false,
+                    pressure_source: true,
+                    idx_patterns: &[],
+                },
+                ProductFetch {
+                    product: "rws-surface",
+                    surface_source: true,
+                    pressure_source: false,
+                    idx_patterns: &[],
+                },
+            ])
+        }
         ModelId::CmaGeps => Ok(vec![ProductFetch {
             product: "stats",
             surface_source: true,
@@ -314,6 +320,12 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
             surface_source: true,
             pressure_source: true,
             idx_patterns: CPTEC_BRAMS_8KM_IDX_PATTERNS,
+        }]),
+        ModelId::EtaCptec8km => Ok(vec![ProductFetch {
+            product: "raw",
+            surface_source: true,
+            pressure_source: true,
+            idx_patterns: CPTEC_ETA_8KM_IDX_PATTERNS,
         }]),
         ModelId::Gefs => Ok(vec![ProductFetch {
             product: "pgrb2ap5/gec00",
@@ -536,6 +548,26 @@ const CPTEC_BRAMS_8KM_IDX_PATTERNS: &[&str] = &[
     "UGRD",
     "VGRD",
     "DPT:2 m above ground",
+    "PRES:surface",
+    "PRMSL:mean sea level",
+    "APCP:surface",
+];
+
+/// Canonical, unambiguous fields in CPTEC's operational Eta South America
+/// 8 km inventory. Exact level substrings deliberately exclude 100 m winds,
+/// surface-labelled PWAT/cloud fields, and three undocumented local-table
+/// parameters. Eta publishes no surface-orography message in each lead.
+const CPTEC_ETA_8KM_IDX_PATTERNS: &[&str] = &[
+    "HGT:mb",
+    "TMP:mb",
+    "RH:mb",
+    "UGRD:mb",
+    "VGRD:mb",
+    "TMP:2 m above ground",
+    "DPT:2 m above ground",
+    "RH:2 m above ground",
+    "UGRD:10 m above ground",
+    "VGRD:10 m above ground",
     "PRES:surface",
     "PRMSL:mean sea level",
     "APCP:surface",
@@ -825,7 +857,9 @@ pub fn validate_ingest_profile_for_model(
     }
     if matches!(
         model,
-        rustwx_core::ModelId::WrfCptec7km | rustwx_core::ModelId::BramsCptec8km
+        rustwx_core::ModelId::WrfCptec7km
+            | rustwx_core::ModelId::BramsCptec8km
+            | rustwx_core::ModelId::EtaCptec8km
     ) && (profile.derived || profile.heavy)
     {
         return Err(events::other(format!(
@@ -847,7 +881,7 @@ pub fn validate_ingest_profile_for_model(
     }
     if matches!(
         model,
-        rustwx_core::ModelId::Rdps | rustwx_core::ModelId::Hrdps
+        rustwx_core::ModelId::Rdps | rustwx_core::ModelId::Hrdps | rustwx_core::ModelId::HrdpsWest
     ) && (profile.derived || profile.heavy)
     {
         return Err(events::other(format!(
@@ -995,6 +1029,12 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
             IngestCapabilityLimitation::SparsePressureLevels,
             IngestCapabilityLimitation::DerivedProductsDisabled,
         ],
+        rustwx_core::ModelId::HrdpsWest => vec![
+            IngestCapabilityLimitation::SparsePressureLevels,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+            IngestCapabilityLimitation::PreOperationalFeed,
+            IngestCapabilityLimitation::ShortSourceRetention,
+        ],
         rustwx_core::ModelId::IconEu
         | rustwx_core::ModelId::IconD2
         | rustwx_core::ModelId::IconRu => vec![
@@ -1008,7 +1048,9 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
             IngestCapabilityLimitation::DerivedProductsDisabled,
             IngestCapabilityLimitation::ExtendedRangeNotScheduled,
         ],
-        rustwx_core::ModelId::WrfCptec7km | rustwx_core::ModelId::BramsCptec8km => vec![
+        rustwx_core::ModelId::WrfCptec7km
+        | rustwx_core::ModelId::BramsCptec8km
+        | rustwx_core::ModelId::EtaCptec8km => vec![
             IngestCapabilityLimitation::SparsePressureLevels,
             IngestCapabilityLimitation::DerivedProductsDisabled,
         ],
@@ -1039,6 +1081,9 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 | rustwx_core::ModelId::IconD2
                 | rustwx_core::ModelId::WrfCptec7km
                 | rustwx_core::ModelId::BramsCptec8km => IngestVerificationLevel::LiveVerified,
+                rustwx_core::ModelId::EtaCptec8km | rustwx_core::ModelId::HrdpsWest => {
+                    IngestVerificationLevel::FixtureVerified
+                }
                 rustwx_core::ModelId::HrrrAk
                 | rustwx_core::ModelId::Gdas
                 | rustwx_core::ModelId::Nbm
@@ -1137,6 +1182,10 @@ mod tests {
             IngestCapabilityLimitation::ExtendedRangeNotScheduled.as_str(),
             "extended_range_not_scheduled"
         );
+        assert_eq!(
+            IngestCapabilityLimitation::ShortSourceRetention.as_str(),
+            "short_source_retention"
+        );
     }
 
     #[test]
@@ -1152,6 +1201,7 @@ mod tests {
             ModelId::CmaGeps,
             ModelId::Rdps,
             ModelId::Hrdps,
+            ModelId::HrdpsWest,
             ModelId::Reps,
             ModelId::IconEu,
             ModelId::IconD2,
@@ -1159,6 +1209,7 @@ mod tests {
             ModelId::Geps,
             ModelId::WrfCptec7km,
             ModelId::BramsCptec8km,
+            ModelId::EtaCptec8km,
             ModelId::Gdas,
             ModelId::Gefs,
             ModelId::Aigfs,
@@ -1274,12 +1325,23 @@ mod tests {
             );
         }
 
-        for model in [ModelId::WrfCptec7km, ModelId::BramsCptec8km] {
+        for model in [
+            ModelId::WrfCptec7km,
+            ModelId::BramsCptec8km,
+            ModelId::EtaCptec8km,
+        ] {
             let capability = model_ingest_capability(model);
             assert_eq!(capability.status, IngestSupportStatus::Ready);
             assert_eq!(
                 capability.verification,
-                IngestVerificationLevel::LiveVerified
+                if model == ModelId::EtaCptec8km {
+                    // Eta's pinned provider inventory and template-5.3
+                    // decoder goldens are reproducible against the live
+                    // publication, but no store round trip is recorded here.
+                    IngestVerificationLevel::FixtureVerified
+                } else {
+                    IngestVerificationLevel::LiveVerified
+                }
             );
             assert_eq!(capability.products.len(), 1);
             assert_eq!(capability.products[0].product, "raw");
@@ -1394,6 +1456,19 @@ mod tests {
             );
         }
 
+        let west = model_ingest_capability(ModelId::HrdpsWest);
+        assert_eq!(west.status, IngestSupportStatus::Ready);
+        assert_eq!(west.verification, IngestVerificationLevel::FixtureVerified);
+        assert_eq!(
+            west.limitations,
+            vec![
+                IngestCapabilityLimitation::SparsePressureLevels,
+                IngestCapabilityLimitation::DerivedProductsDisabled,
+                IngestCapabilityLimitation::PreOperationalFeed,
+                IngestCapabilityLimitation::ShortSourceRetention,
+            ]
+        );
+
         let geps = model_ingest_capability(ModelId::Geps);
         assert_eq!(geps.status, IngestSupportStatus::Ready);
         assert_eq!(geps.verification, IngestVerificationLevel::LiveVerified);
@@ -1468,6 +1543,7 @@ mod tests {
                 ModelId::CmaGeps,
                 ModelId::Rdps,
                 ModelId::Hrdps,
+                ModelId::HrdpsWest,
                 ModelId::Reps,
                 ModelId::IconEu,
                 ModelId::IconD2,
@@ -1475,6 +1551,7 @@ mod tests {
                 ModelId::Geps,
                 ModelId::WrfCptec7km,
                 ModelId::BramsCptec8km,
+                ModelId::EtaCptec8km,
                 ModelId::Gdas,
                 ModelId::Gefs,
                 ModelId::Aigfs,
@@ -1764,31 +1841,48 @@ mod tests {
             50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 775, 800,
             825, 850, 875, 900, 925, 950, 975, 1000,
         ];
+        let eta_levels = vec![
+            50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850,
+            900, 925, 950, 1000,
+        ];
         let cases = [
             (
                 ModelId::WrfCptec7km,
                 CPTEC_WRF_7KM_IDX_PATTERNS,
                 include_str!("../tests/fixtures/wrf-cptec-7km.20260814.t00z.f001.inv"),
                 305,
+                levels.as_slice(),
             ),
             (
                 ModelId::BramsCptec8km,
                 CPTEC_BRAMS_8KM_IDX_PATTERNS,
                 include_str!("../tests/fixtures/brams-cptec-8km.20260813.t00z.f001.inv"),
                 268,
+                levels.as_slice(),
+            ),
+            (
+                ModelId::EtaCptec8km,
+                CPTEC_ETA_8KM_IDX_PATTERNS,
+                include_str!("../tests/fixtures/eta-cptec-8km.20260814.t00z.f001.inv"),
+                258,
+                eta_levels.as_slice(),
             ),
         ];
-        for (model, patterns, inventory, line_count) in cases {
+        for (model, patterns, inventory, line_count, expected_levels) in cases {
             assert_inventory_identity(
                 inventory,
                 line_count,
-                if model == ModelId::WrfCptec7km {
-                    "d=2026081400"
-                } else {
+                if model == ModelId::BramsCptec8km {
                     "d=2026081300"
+                } else {
+                    "d=2026081400"
                 },
             );
-            assert_eq!(pressure_levels(inventory, "TMP", 0), levels, "{model}");
+            assert_eq!(
+                pressure_levels(inventory, "TMP", 0),
+                expected_levels,
+                "{model}"
+            );
             let plan = fetch_plan(model).expect("CPTEC indexed plan");
             assert_eq!(plan.len(), 1, "{model}");
             assert_eq!(plan[0].product, "raw", "{model}");
@@ -1815,6 +1909,61 @@ mod tests {
                 .iter()
                 .any(|pattern| pattern.starts_with("PWAT"))
         );
+
+        let eta = cases[2].2;
+        assert!(idx_has_row(eta, "TMP", "1020 mb"));
+        assert_eq!(
+            pressure_levels(eta, "TMP", 0).len(),
+            21,
+            "the provider's 1020 hPa plane stays pinned in the fixture but outside the canonical <=1000 hPa volume"
+        );
+        for local in [
+            "parmcat=2 parm=238",
+            "parmcat=2 parm=239",
+            "parmcat=0 parm=194",
+        ] {
+            assert!(eta.contains(local), "Eta fixture must preserve {local}");
+        }
+        assert!(eta.contains(":PWAT:surface:"));
+        assert!(eta.contains(":LCDC:surface:"));
+        for excluded in ["var discipline=", "PWAT", "LCDC", "MCDC", "HCDC"] {
+            assert!(
+                !CPTEC_ETA_8KM_IDX_PATTERNS
+                    .iter()
+                    .any(|pattern| pattern.starts_with(excluded)),
+                "Eta ambiguous field {excluded} must remain fail-closed"
+            );
+        }
+
+        let control = include_str!("../tests/fixtures/eta-cptec-8km.20260814.t00z.ctl");
+        for contract in [
+            "ydef 931 linear -55.000000 0.08",
+            "xdef 875 linear 270.000000 0.08",
+            "tdef   265 linear 00Z14Aug2026 1hr",
+            "zdef 22 levels 102000 100000 95000 92500 90000 85000 80000 75000 70000 65000 60000 55000 50000 45000 40000 35000 30000 25000 20000 15000 10000 5000",
+            "vars 46",
+        ] {
+            assert!(
+                control.contains(contract),
+                "missing Eta control contract: {contract}"
+            );
+        }
+
+        let goldens = include_str!("../tests/fixtures/eta-cptec-8km.20260814.decoder-goldens.txt");
+        for evidence in [
+            "range=1616482-2099259|bytes=482778|message_sha256=dbfc1ebdd827fef617d06fca0338c846791dbdbcee923b466e52cc782ad8e6e7",
+            "drt=5.3|order=2|missing=0|count=814625|min=255.0915985107422|max=307.7478485107422|mean=290.0166320576196",
+            "f64le_sha256=e5d6aef32c995fbe3631822a39c63edca708345f71a2454d2aed904c0e856ffb",
+            "range=7015788-7392372|bytes=376585|message_sha256=e3bf49750ad2bbc794470d611dbe8d0e24c5323cb0ad5ae3979313a59e2c6735",
+            "drt=5.3|order=2|missing=0|count=814625|min=0|max=6.888671875|mean=0.13333162546",
+            "f64le_sha256=adbb6b76f9eb6bfcc2b0fbfc0f52d82ca0e5a8081187b97e10fe8a3aa73ae835",
+            "POLICY|the text .inv is the byte-range authority; the binary .grib2.idx is never parsed as an inventory",
+        ] {
+            assert!(
+                goldens.contains(evidence),
+                "missing Eta decoder evidence: {evidence}"
+            );
+        }
 
         let time_semantics =
             include_str!("../tests/fixtures/cptec-south-america.time-semantics.txt");
@@ -1996,7 +2145,7 @@ mod tests {
     fn regional_eccc_models_accept_normalized_soundings_but_gate_derived_stages() {
         use rustwx_core::ModelId;
 
-        for model in [ModelId::Rdps, ModelId::Hrdps] {
+        for model in [ModelId::Rdps, ModelId::Hrdps, ModelId::HrdpsWest] {
             validate_ingest_profile_for_model(model, &ingest_profile::IngestProfile::sounding())
                 .expect("paired grid-relative winds are normalized for raw sounding ingest");
             let message =
@@ -2367,6 +2516,7 @@ mod tests {
             rustwx_core::ModelId::GdpsGeml,
             rustwx_core::ModelId::Rdps,
             rustwx_core::ModelId::Hrdps,
+            rustwx_core::ModelId::HrdpsWest,
         ] {
             let plan = fetch_plan(model).expect("ECCC component plan");
             assert_eq!(plan.len(), 2, "{model}");
@@ -2733,9 +2883,22 @@ mod tests {
     fn eccc_regional_fixtures_pin_inventory_grid_drift_and_vector_contract() {
         let rdps = include_str!("../tests/fixtures/rdps.20260814.t00z.f024.inventory.txt");
         let hrdps = include_str!("../tests/fixtures/hrdps.20260814.t00z.f024.inventory.txt");
+        let west = include_str!("../tests/fixtures/hrdps-west.20260814.t00z.f024.inventory.txt");
 
         assert_eq!(fixture_header(rdps, "source_grib2_links"), "414");
         assert_eq!(fixture_header(hrdps, "source_grib2_links"), "414");
+        assert_eq!(fixture_header(west, "source_grib2_links"), "338");
+        assert_eq!(fixture_header(west, "f000_source_grib2_links"), "333");
+        assert_eq!(fixture_header(west, "f001_source_grib2_links"), "338");
+        assert_eq!(fixture_header(west, "f048_source_grib2_links"), "338");
+        assert!(fixture_header(west, "f000_absent_vs_f001").contains("HGT_SFC_0"));
+        assert!(fixture_header(west, "f000_absent_vs_f001").contains("APCP_SFC_0"));
+        assert!(fixture_header(west, "completion_surface_sentinel_f048").contains("HTTP-200"));
+        assert!(fixture_header(west, "completion_pressure_sentinel_f048").contains("HTTP-200"));
+        assert_eq!(
+            fixture_header(west, "same_day_12z_terminal_sentinels_at_capture"),
+            "HTTP-404,HTTP-404"
+        );
         assert_eq!(
             fixture_header(rdps, "source_sha256"),
             "87BD53259734E95AEFEFF1DA7BBCD83332A5BD3AC6124DC46BD5AD6675952F10"
@@ -2743,6 +2906,10 @@ mod tests {
         assert_eq!(
             fixture_header(hrdps, "source_sha256"),
             "AF42B19E5A3D44C00AB0FDA2E1F18E052A2043319B997D0E8263D4B7B957EF8E"
+        );
+        assert_eq!(
+            fixture_header(west, "source_sha256"),
+            "ECFC5882FA64E585101B9BA85AEB32D00073450A11DD9F6850D004AD4DB52B9E"
         );
 
         assert_eq!(fixture_header(rdps, "documentation_grid"), "1102x1076");
@@ -2754,7 +2921,15 @@ mod tests {
         );
         assert_eq!(fixture_header(hrdps, "documentation_grid"), "2540x1290");
         assert_eq!(fixture_header(hrdps, "live_decoded_grid"), "2540x1290");
-        for fixture in [rdps, hrdps] {
+        assert_eq!(fixture_header(west, "documentation_grid"), "1330x1180");
+        assert_eq!(fixture_header(west, "computational_grid"), "1350x1200");
+        assert_eq!(fixture_header(west, "live_decoded_grid"), "1330x1180");
+        assert_eq!(fixture_header(west, "source_retention_hours"), "24");
+        assert_eq!(
+            fixture_header(west, "service_status"),
+            "experimental-non-operational-dd-alpha"
+        );
+        for fixture in [rdps, hrdps, west] {
             assert_eq!(fixture_header(fixture, "scan_mode"), "0x40");
             assert_eq!(
                 fixture_header(fixture, "resolution_and_component_flags"),
@@ -2781,12 +2956,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             rustwx_models::hrdps_isobaric_levels_hpa()
         );
+        assert_eq!(
+            fixture_header(west, "common_five_field_isobaric_levels_hpa")
+                .split(',')
+                .map(|level| level.parse::<u16>().unwrap())
+                .collect::<Vec<_>>(),
+            rustwx_models::hrdps_west_isobaric_levels_hpa()
+        );
         assert!(rdps.contains("_WindU_AGL-10m_"));
         assert!(rdps.contains("_WindV_AGL-10m_"));
         assert!(!rdps.contains("GeopotentialHeight_Sfc"));
         assert!(hrdps.contains("_UGRD_AGL-10m_"));
         assert!(hrdps.contains("_VGRD_AGL-10m_"));
         assert!(hrdps.contains("_HGT_Sfc_"));
+        assert!(west.contains("_UGRD_TGL_10_"));
+        assert!(west.contains("_VGRD_TGL_10_"));
+        assert!(west.contains("_HGT_SFC_0_"));
     }
 
     #[test]

@@ -1019,7 +1019,7 @@ fn regional_wind_normalization_fails_closed_on_metadata_or_grid_drift() {
     let mut no_component_flag = regional_wind_message(2, &[1.0, 1.0]);
     no_component_flag.grid.resolution_flags = 0x30;
     let parsed = ParsedModelGrib {
-        model: ModelId::Hrdps,
+        model: ModelId::HrdpsWest,
         grib: Grib2File {
             messages: vec![no_component_flag, regional_wind_message(3, &[1.0, 1.0])],
         },
@@ -1104,7 +1104,20 @@ fn regional_wind_tangent_ignores_the_artificial_noncyclic_dateline_seam() {
 fn live_eccc_grid_wind_rotation_matches_provider_speed_and_direction() {
     let fixture_dir = std::env::var("RUSTWX_ECCC_WIND_FIXTURE_DIR")
         .expect("set RUSTWX_ECCC_WIND_FIXTURE_DIR to the bounded fixture directory");
-    for (model, prefix) in [(ModelId::Rdps, "rdps"), (ModelId::Hrdps, "hrdps")] {
+    let requested_model = std::env::var("RUSTWX_ECCC_WIND_MODEL").ok();
+    let mut models_compared = 0;
+    for (model, prefix) in [
+        (ModelId::Rdps, "rdps"),
+        (ModelId::Hrdps, "hrdps"),
+        (ModelId::HrdpsWest, "hrdps-west"),
+    ] {
+        if requested_model
+            .as_deref()
+            .is_some_and(|requested| requested != prefix && requested != model.as_str())
+        {
+            continue;
+        }
+        models_compared += 1;
         let read = |suffix: &str| {
             std::fs::read(PathBuf::from(&fixture_dir).join(format!("{prefix}-{suffix}.grib2")))
                 .unwrap_or_else(|error| panic!("read {prefix}-{suffix}: {error}"))
@@ -1219,6 +1232,10 @@ fn live_eccc_grid_wind_rotation_matches_provider_speed_and_direction() {
             "{model}: max component mismatch {max_component_error} m/s"
         );
     }
+    assert!(
+        models_compared > 0,
+        "requested ECCC wind model was not recognized"
+    );
 }
 
 #[test]

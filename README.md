@@ -339,7 +339,7 @@ count matched the sum of bucket records.
 ## Model support
 
 The remote acquisition and ingest catalog currently covers HRRR/HRRR Alaska,
-RAP, GFS, ECCC GDPS/GDPS-GEML/RDPS/HRDPS, CMA GRAPES GEPS statistics, DWD
+RAP, GFS, ECCC GDPS/GDPS-GEML/RDPS/HRDPS/HRDPS-West, CMA GRAPES GEPS statistics, DWD
 ICON-EU/ICON-D2 regular grids, Roshydromet ICON-Ru13/6N29, CPTEC/INPE WRF
 7 km and BRAMS 8 km South America grids, GDAS, GEFS, NOAA
 AI-GFS/AI-GEFS/HGEFS, ECMWF IFS Open Data, ECMWF AIFS Single v2, NAM, RRFS-A,

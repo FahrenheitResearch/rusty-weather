@@ -850,8 +850,8 @@ fn provider_component_products(
     logical_product: &str,
 ) -> Result<Option<Vec<String>>, IngestError> {
     match config.model {
-        ModelId::Gdps | ModelId::Rdps | ModelId::Hrdps => {
-            gdps_component_products(config, logical_product).map(Some)
+        ModelId::Gdps | ModelId::Rdps | ModelId::Hrdps | ModelId::HrdpsWest => {
+            gdps_component_products(config, forecast_hour, logical_product).map(Some)
         }
         ModelId::Reps => {
             if logical_product != "rws-reps-provider-statistics" {
@@ -973,6 +973,7 @@ fn gdps_geml_component_products(
 
 fn gdps_component_products(
     config: &IngestConfig<'_>,
+    forecast_hour: u16,
     logical_product: &str,
 ) -> Result<Vec<String>, IngestError> {
     let profile = config.profile;
@@ -986,6 +987,7 @@ fn gdps_component_products(
                 ModelId::Gdps => rustwx_models::gdps_isobaric_levels_hpa(),
                 ModelId::Rdps => rustwx_models::rdps_isobaric_levels_hpa(),
                 ModelId::Hrdps => rustwx_models::hrdps_isobaric_levels_hpa(),
+                ModelId::HrdpsWest => rustwx_models::hrdps_west_isobaric_levels_hpa(),
                 _ => unreachable!("ECCC component model was gated above"),
             };
             for level in profile
@@ -1005,7 +1007,7 @@ fn gdps_component_products(
                             components.push(format!("{family}_IsbL-{level:04}"));
                         }
                     }
-                    ModelId::Hrdps => {
+                    ModelId::Hrdps | ModelId::HrdpsWest => {
                         for family in ["TMP", "RH", "UGRD", "VGRD", "HGT"] {
                             components.push(format!("{family}_ISBL_{level:04}"));
                         }
@@ -1016,7 +1018,7 @@ fn gdps_component_products(
             if profile.includes_full_2d() {
                 let vorticity_levels: &[u16] = match config.model {
                     ModelId::Gdps => &[200, 250, 500, 700, 850],
-                    ModelId::Rdps | ModelId::Hrdps => &[250, 500, 700, 850],
+                    ModelId::Rdps | ModelId::Hrdps | ModelId::HrdpsWest => &[250, 500, 700, 850],
                     _ => unreachable!("ECCC component model was gated above"),
                 };
                 for level in vorticity_levels {
@@ -1024,7 +1026,7 @@ fn gdps_component_products(
                         ModelId::Gdps | ModelId::Rdps => {
                             components.push(format!("AbsoluteVorticity_IsbL-{level:04}"))
                         }
-                        ModelId::Hrdps => {
+                        ModelId::Hrdps | ModelId::HrdpsWest => {
                             components.push(format!("ABSV_ISBL_{level:04}"));
                         }
                         _ => unreachable!("ECCC component model was gated above"),
@@ -1071,15 +1073,34 @@ fn gdps_component_products(
                 ("apcp_run_total", "APCP_Sfc"),
                 ("cloud_cover_total", "TCDC_Sfc"),
             ];
+            const HRDPS_WEST_SURFACE_COMPONENTS: &[(&str, &str)] = &[
+                ("temperature_2m", "TMP_TGL_2"),
+                ("dewpoint_2m", "DPT_TGL_2"),
+                ("u_10m", "UGRD_TGL_10"),
+                ("v_10m", "VGRD_TGL_10"),
+                ("mslp", "PRMSL_MSL_0"),
+                ("rh_2m", "RH_TGL_2"),
+                ("wind_gust_10m", "GUST_TGL_10"),
+                ("surface_pressure", "PRES_SFC_0"),
+                ("orography", "HGT_SFC_0"),
+                ("apcp_run_total", "APCP_SFC_0"),
+                ("cloud_cover_total", "TCDC_SFC_0"),
+            ];
             let surface_components = match config.model {
                 ModelId::Gdps => GDPS_SURFACE_COMPONENTS,
                 ModelId::Rdps => RDPS_SURFACE_COMPONENTS,
                 ModelId::Hrdps => HRDPS_SURFACE_COMPONENTS,
+                ModelId::HrdpsWest => HRDPS_WEST_SURFACE_COMPONENTS,
                 _ => unreachable!("ECCC component model was gated above"),
             };
             components.extend(
                 surface_components
                     .iter()
+                    .filter(|(field, _)| {
+                        config.model != ModelId::HrdpsWest
+                            || forecast_hour != 0
+                            || !matches!(*field, "apcp_run_total" | "orography")
+                    })
                     .filter(|(field, _)| profile.includes_surface_field(field))
                     .map(|(_, component)| (*component).to_string()),
             );
@@ -1260,6 +1281,7 @@ const PASS_TRAILING: usize = 2;
 fn safe_provider_identity(model: ModelId, source: SourceId) -> &'static str {
     match (model, source) {
         (ModelId::GdpsGeml, SourceId::Eccc) => "eccc-msc-gdps-geml-datamart",
+        (ModelId::HrdpsWest, SourceId::Eccc) => "eccc-msc-hrdps-west-dd-alpha",
         (_, source) => match source {
             SourceId::Aws => "noaa-aws-public-data",
             SourceId::Nomads => "noaa-nomads",
@@ -2648,6 +2670,9 @@ fn forecast_hour_cadence_note(model: ModelId, cycle_hour_utc: u8, max: u16) -> S
         ModelId::BramsCptec8km => {
             "CPTEC/INPE BRAMS South America is hourly from f001 through f180; f000 is fail-closed because duplicate 2 m temperature analysis records lose min/max identity".to_string()
         }
+        ModelId::EtaCptec8km => {
+            "CPTEC/INPE Eta South America 8 km is hourly from f000 through f264".to_string()
+        }
         ModelId::Gefs => {
             if cycle_hour_utc == 0 {
                 "GEFS is 3-hourly to f240, then 6-hourly to f840 on the 00z cycle".to_string()
@@ -3129,6 +3154,11 @@ mod tests {
         assert!(refs.fields_2d.contains(&"apcp_native_interval".to_string()));
         assert!(!refs.fields_2d.contains(&"apcp_run_total".to_string()));
 
+        let eta_surface = IngestProfile::surface_for_model(ModelId::EtaCptec8km);
+        let eta = planned_store_variables(&eta_surface, ModelId::EtaCptec8km);
+        assert!(eta.fields_2d.contains(&"apcp_native_interval".to_string()));
+        assert!(!eta.fields_2d.contains(&"apcp_run_total".to_string()));
+
         let hiresw = planned_store_variables(&surface, ModelId::Hiresw);
         assert!(hiresw.fields_2d.contains(&"uh_2to5km_max_1h".to_string()));
         assert!(!hiresw.fields_2d.contains(&"uh_2to5km".to_string()));
@@ -3387,6 +3417,66 @@ mod tests {
                 "HGT_Sfc",
             ]
         );
+
+        config.model = ModelId::HrdpsWest;
+        config.model_slug = "hrdps-west";
+        let west_pressure = provider_component_products(&config, 0, "rws-pressure")
+            .unwrap()
+            .unwrap();
+        assert_eq!(west_pressure.len(), 24 * 5);
+        assert_eq!(west_pressure[0], "TMP_ISBL_0100");
+        assert_eq!(west_pressure[2], "UGRD_ISBL_0100");
+        assert_eq!(west_pressure[3], "VGRD_ISBL_0100");
+        assert_eq!(west_pressure.last().unwrap(), "HGT_ISBL_1000");
+        let west_surface = provider_component_products(&config, 0, "rws-surface")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            west_surface,
+            vec![
+                "TMP_TGL_2",
+                "DPT_TGL_2",
+                "UGRD_TGL_10",
+                "VGRD_TGL_10",
+                "PRMSL_MSL_0",
+                "PRES_SFC_0",
+            ]
+        );
+        let west_surface_f001 = provider_component_products(&config, 1, "rws-surface")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            west_surface_f001,
+            vec![
+                "TMP_TGL_2",
+                "DPT_TGL_2",
+                "UGRD_TGL_10",
+                "VGRD_TGL_10",
+                "PRMSL_MSL_0",
+                "PRES_SFC_0",
+                "HGT_SFC_0",
+            ]
+        );
+        assert_eq!(
+            safe_provider_identity(ModelId::HrdpsWest, SourceId::Eccc),
+            "eccc-msc-hrdps-west-dd-alpha"
+        );
+
+        let full_profile = IngestProfile::full();
+        let full_config = IngestConfig {
+            profile: &full_profile,
+            ..config
+        };
+        let full_f000 = provider_component_products(&full_config, 0, "rws-surface")
+            .unwrap()
+            .unwrap();
+        assert!(!full_f000.iter().any(|value| value == "APCP_SFC_0"));
+        assert!(!full_f000.iter().any(|value| value == "HGT_SFC_0"));
+        let full_f001 = provider_component_products(&full_config, 1, "rws-surface")
+            .unwrap()
+            .unwrap();
+        assert!(full_f001.iter().any(|value| value == "APCP_SFC_0"));
+        assert!(full_f001.iter().any(|value| value == "HGT_SFC_0"));
     }
 
     #[test]

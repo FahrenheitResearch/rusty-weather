@@ -154,7 +154,8 @@ arising from use.
 The public ECCC lane reads the provider's anonymous
 [MSC Datamart](https://eccc-msc.github.io/open-data/msc-datamart/readme_en/).
 The packaged remote scheduler currently limits that lane to the GDPS, RDPS,
-and continental HRDPS products and cadences published in MODEL_SUPPORT.md.
+continental HRDPS, and experimental HRDPS-West products and cadences published
+in MODEL_SUPPORT.md.
 Those products are split into one GRIB2 object per field, level, lead, and
 cycle; Rusty Weather acquires an explicit bounded component inventory and
 records ECCC as the provider without persisting source-object URLs.
@@ -177,6 +178,16 @@ RDPS and HRDPS vector components are normalized from their declared rotated
 grid-relative axes into canonical earth-relative U/V; downstream output is a
 transformed Rusty Weather product and must not be represented as an unmodified
 official ECCC product.
+
+HRDPS-West uses ECCC's separate
+[DD-Alpha experimental distribution](https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps-datamart-alpha_en/),
+not the operational `today/` tree. ECCC describes DD-Alpha as a
+non-operational test service and documents only 24 hours of HRDPS-West source
+history. Rusty Weather therefore reports both `pre_operational_feed` and
+`short_source_retention`, probes terminal-lead surface and pressure sentinels
+before choosing a latest cycle, and makes no availability or archive
+guarantee. The same ECCC Data Servers End-use Licence v2.1 and required source
+notice apply.
 
 ## User-provided and local-only sources
 
