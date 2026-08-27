@@ -34,8 +34,9 @@ pub use ingest_hour::size_estimate;
 pub use events::{IngestError, IngestEvent, IngestStage, NEVER_CANCEL, print_event};
 pub use ingest_hour::{
     FetchedHour, IngestConfig, IngestedHour, PlannedStoreVariables, SpilledFetchedHour,
-    VolumeSummary, cache_state, fetch_hour, ingest_hour as ingest_hour_serial, parse_hours,
-    planned_store_variables, process_fetched_hour, validate_forecast_hours,
+    VolumeSummary, availability_probe_products, cache_state, fetch_hour,
+    ingest_hour as ingest_hour_serial, parse_hours, planned_store_variables, process_fetched_hour,
+    validate_forecast_hours,
 };
 
 /// Short git SHA (plus `-dirty`) of the build that produced this crate, the
@@ -226,6 +227,35 @@ pub fn fetch_plan(model: rustwx_core::ModelId) -> Result<Vec<ProductFetch>, Inge
             pressure_source: true,
             idx_patterns: &[],
         }]),
+        // Meteo-France publishes AROME-France as bounded package families
+        // rather than one monolithic forecast file. The 0.01-degree feed is
+        // deliberately surface/near-ground only; its HP1 package contains
+        // height-AGL fields, not an isobaric sounding coordinate. The
+        // 0.025-degree feed's IP1 package carries the complete published
+        // T/RH/U/V/Z pressure state on 24 levels. `ingest_hour` expands these
+        // logical roles into the exact package objects needed by the selected
+        // profile, and the ordinary forecast-hour matcher selects one hour
+        // from the 0.025-degree six-hour package.
+        ModelId::AromeFrance001 => Ok(vec![ProductFetch {
+            product: "rws-arome-surface",
+            surface_source: true,
+            pressure_source: false,
+            idx_patterns: &[],
+        }]),
+        ModelId::AromeFrance0025 => Ok(vec![
+            ProductFetch {
+                product: "rws-arome-pressure",
+                surface_source: false,
+                pressure_source: true,
+                idx_patterns: &[],
+            },
+            ProductFetch {
+                product: "rws-arome-surface",
+                surface_source: true,
+                pressure_source: false,
+                idx_patterns: &[],
+            },
+        ]),
         // ECCC publishes GDPS as one complete GRIB2 object per field/level.
         // These are logical extraction families: fetch_hour expands each into
         // an exact, profile-dependent ordered component bundle and caches both
@@ -888,6 +918,15 @@ pub fn validate_ingest_profile_for_model(
             "model '{model}' publishes winds relative to its rotated grid; the paired U/V ingest lane safely rotates stored canonical winds, but derived/heavy diagnostics remain disabled until every diagnostic path consumes that normalized pair; use --profile sounding or disable both derived and heavy",
         )));
     }
+    if matches!(
+        model,
+        rustwx_core::ModelId::AromeFrance001 | rustwx_core::ModelId::AromeFrance0025
+    ) && (profile.derived || profile.heavy)
+    {
+        return Err(events::other(format!(
+            "model '{model}' public packages expose a bounded direct-field contract; derived/heavy diagnostics remain disabled until every required native thermo and static input is published and live-validated; use --profile surface, --profile sounding for the 0.025-degree feed, or disable both derived and heavy",
+        )));
+    }
     Ok(())
 }
 
@@ -1054,6 +1093,16 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
             IngestCapabilityLimitation::SparsePressureLevels,
             IngestCapabilityLimitation::DerivedProductsDisabled,
         ],
+        rustwx_core::ModelId::AromeFrance001 => vec![
+            IngestCapabilityLimitation::SurfaceOnly,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+            IngestCapabilityLimitation::ShortSourceRetention,
+        ],
+        rustwx_core::ModelId::AromeFrance0025 => vec![
+            IngestCapabilityLimitation::SparsePressureLevels,
+            IngestCapabilityLimitation::DerivedProductsDisabled,
+            IngestCapabilityLimitation::ShortSourceRetention,
+        ],
         _ => Vec::new(),
     };
     match fetch_plan(model) {
@@ -1080,7 +1129,9 @@ pub fn model_ingest_capability(model: rustwx_core::ModelId) -> ModelIngestCapabi
                 | rustwx_core::ModelId::IconEu
                 | rustwx_core::ModelId::IconD2
                 | rustwx_core::ModelId::WrfCptec7km
-                | rustwx_core::ModelId::BramsCptec8km => IngestVerificationLevel::LiveVerified,
+                | rustwx_core::ModelId::BramsCptec8km
+                | rustwx_core::ModelId::AromeFrance001
+                | rustwx_core::ModelId::AromeFrance0025 => IngestVerificationLevel::LiveVerified,
                 rustwx_core::ModelId::EtaCptec8km | rustwx_core::ModelId::HrdpsWest => {
                     IngestVerificationLevel::FixtureVerified
                 }
@@ -1206,6 +1257,8 @@ mod tests {
             ModelId::IconEu,
             ModelId::IconD2,
             ModelId::IconRu,
+            ModelId::AromeFrance001,
+            ModelId::AromeFrance0025,
             ModelId::Geps,
             ModelId::WrfCptec7km,
             ModelId::BramsCptec8km,
@@ -1503,6 +1556,48 @@ mod tests {
             ]
         );
 
+        let arome_001 = model_ingest_capability(ModelId::AromeFrance001);
+        assert_eq!(arome_001.status, IngestSupportStatus::Ready);
+        assert_eq!(
+            arome_001.verification,
+            IngestVerificationLevel::LiveVerified
+        );
+        assert_eq!(arome_001.products.len(), 1);
+        assert_eq!(arome_001.products[0].product, "rws-arome-surface");
+        assert!(arome_001.products[0].surface_source);
+        assert!(!arome_001.products[0].pressure_source);
+        assert_eq!(
+            arome_001.limitations,
+            vec![
+                IngestCapabilityLimitation::SurfaceOnly,
+                IngestCapabilityLimitation::DerivedProductsDisabled,
+                IngestCapabilityLimitation::ShortSourceRetention,
+            ]
+        );
+
+        let arome_0025 = model_ingest_capability(ModelId::AromeFrance0025);
+        assert_eq!(arome_0025.status, IngestSupportStatus::Ready);
+        assert_eq!(
+            arome_0025.verification,
+            IngestVerificationLevel::LiveVerified
+        );
+        assert_eq!(
+            arome_0025
+                .products
+                .iter()
+                .map(|product| product.product)
+                .collect::<Vec<_>>(),
+            vec!["rws-arome-pressure", "rws-arome-surface"]
+        );
+        assert_eq!(
+            arome_0025.limitations,
+            vec![
+                IngestCapabilityLimitation::SparsePressureLevels,
+                IngestCapabilityLimitation::DerivedProductsDisabled,
+                IngestCapabilityLimitation::ShortSourceRetention,
+            ]
+        );
+
         let unsupported = model_ingest_capability(ModelId::WrfGdex);
         assert_eq!(unsupported.status, IngestSupportStatus::Unsupported);
         assert_eq!(
@@ -1548,6 +1643,8 @@ mod tests {
                 ModelId::IconEu,
                 ModelId::IconD2,
                 ModelId::IconRu,
+                ModelId::AromeFrance001,
+                ModelId::AromeFrance0025,
                 ModelId::Geps,
                 ModelId::WrfCptec7km,
                 ModelId::BramsCptec8km,
@@ -1615,6 +1712,66 @@ mod tests {
         assert!(model_crop_box(ModelId::Gfs).is_none());
         assert!(model_crop_box(ModelId::Gdas).is_none());
         assert!(model_crop_box(ModelId::Nam).is_none());
+    }
+
+    #[test]
+    fn arome_fetch_plans_profiles_and_eight_cycle_cadence_are_exact() {
+        use rustwx_core::ModelId;
+
+        let fine = fetch_plan(ModelId::AromeFrance001).expect("AROME 0.01 plan");
+        assert_eq!(fine.len(), 1);
+        assert_eq!(fine[0].product, "rws-arome-surface");
+        assert!(fine[0].surface_source && !fine[0].pressure_source);
+        assert!(fine[0].idx_patterns.is_empty());
+
+        let standard = fetch_plan(ModelId::AromeFrance0025).expect("AROME 0.025 plan");
+        assert_eq!(standard.len(), 2);
+        assert_eq!(standard[0].product, "rws-arome-pressure");
+        assert!(standard[0].pressure_source && !standard[0].surface_source);
+        assert_eq!(standard[1].product, "rws-arome-surface");
+        assert!(standard[1].surface_source && !standard[1].pressure_source);
+        assert!(
+            standard
+                .iter()
+                .all(|product| product.idx_patterns.is_empty())
+        );
+
+        let fine_surface =
+            ingest_profile::IngestProfile::surface_for_model(ModelId::AromeFrance001);
+        validate_ingest_profile_for_model(ModelId::AromeFrance001, &fine_surface)
+            .expect("0.01-degree direct surface ingest is supported");
+        let fine_error = validate_ingest_profile_for_model(
+            ModelId::AromeFrance001,
+            &ingest_profile::IngestProfile::sounding_for_model(ModelId::AromeFrance001),
+        )
+        .expect_err("0.01-degree HP1 is height-AGL, not a pressure sounding")
+        .to_string();
+        assert!(fine_error.contains("surface-only"), "got: {fine_error}");
+
+        validate_ingest_profile_for_model(
+            ModelId::AromeFrance0025,
+            &ingest_profile::IngestProfile::sounding_for_model(ModelId::AromeFrance0025),
+        )
+        .expect("0.025-degree IP1 publishes the complete sounding state");
+        for model in [ModelId::AromeFrance001, ModelId::AromeFrance0025] {
+            let message =
+                validate_ingest_profile_for_model(model, &ingest_profile::IngestProfile::full())
+                    .expect_err("derived/heavy AROME stages are intentionally gated")
+                    .to_string();
+            if model == ModelId::AromeFrance001 {
+                assert!(message.contains("surface-only"), "got: {message}");
+            } else {
+                assert!(message.contains("derived/heavy"), "got: {message}");
+            }
+
+            for cycle in [0, 3, 6, 9, 12, 15, 18, 21] {
+                assert_eq!(
+                    rustwx_models::supported_forecast_hours(model, cycle),
+                    (0..=51).collect::<Vec<_>>(),
+                    "{model} {cycle:02}z"
+                );
+            }
+        }
     }
 
     #[test]

@@ -350,6 +350,55 @@ pub struct ModelSummary {
     pub ensemble_mode: EnsembleMode,
 }
 
+/// Provider-published regular latitude/longitude grid metadata. This is kept
+/// separate from [`ModelSummary`] so adding precise native-grid facts does not
+/// change the serialized catalog contract for every existing model.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct RegularLatLonModelGrid {
+    pub spacing_degrees: f64,
+    pub nx: u32,
+    pub ny: u32,
+    pub west_longitude: f64,
+    pub east_longitude: f64,
+    pub south_latitude: f64,
+    pub north_latitude: f64,
+}
+
+pub const AROME_FRANCE_001_GRID: RegularLatLonModelGrid = RegularLatLonModelGrid {
+    spacing_degrees: 0.01,
+    nx: 2_801,
+    ny: 1_791,
+    west_longitude: -12.0,
+    east_longitude: 16.0,
+    south_latitude: 37.5,
+    north_latitude: 55.4,
+};
+
+pub const AROME_FRANCE_0025_GRID: RegularLatLonModelGrid = RegularLatLonModelGrid {
+    spacing_degrees: 0.025,
+    nx: 1_121,
+    ny: 717,
+    west_longitude: -12.0,
+    east_longitude: 16.0,
+    south_latitude: 37.5,
+    north_latitude: 55.4,
+};
+
+/// Exact isobaric coordinate published by the AROME-France 0.025-degree IP1
+/// package. The 0.01-degree feed has no isobaric package at all.
+pub const AROME_FRANCE_0025_ISOBARIC_LEVELS_HPA: &[u16] = &[
+    100, 125, 150, 175, 200, 225, 250, 275, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800,
+    850, 900, 925, 950, 1000,
+];
+
+pub fn arome_france_grid(model: ModelId) -> Option<&'static RegularLatLonModelGrid> {
+    match model {
+        ModelId::AromeFrance001 => Some(&AROME_FRANCE_001_GRID),
+        ModelId::AromeFrance0025 => Some(&AROME_FRANCE_0025_GRID),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatestRun {
     pub model: ModelId,
@@ -414,6 +463,7 @@ const HRDPS_WEST_CYCLE_HOURS: &[u8] = &[0, 12];
 const REPS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
 const DWD_ICON_CYCLE_HOURS: &[u8] = &[0, 3, 6, 9, 12, 15, 18, 21];
 const ICON_RU_CYCLE_HOURS: &[u8] = &[0, 12];
+const AROME_FRANCE_CYCLE_HOURS: &[u8] = &[0, 3, 6, 9, 12, 15, 18, 21];
 const GEPS_CYCLE_HOURS: &[u8] = &[0, 12];
 const CPTEC_CYCLE_HOURS: &[u8] = &[0];
 const GDAS_CYCLE_HOURS: &[u8] = &[0, 6, 12, 18];
@@ -605,6 +655,19 @@ const CPTEC_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
     priority: 1,
     max_age_hours: None,
     notes: "CPTEC/INPE operational model data server",
+}];
+
+const AROME_FRANCE_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
+    id: SourceId::MeteoFrancePnt,
+    // Météo-France publishes self-contained GRIB2 package objects without
+    // a companion message index. The 0.01-degree lane is one object per lead;
+    // the 0.025-degree lane groups forecast leads into six-hour packages.
+    idx_available: false,
+    priority: 1,
+    // The public PNT object tree is a rolling 15-day service rather than an
+    // archive (live boundary verified against official objects).
+    max_age_hours: Some(24 * 15),
+    notes: "Météo-France PNT anonymous public object storage (Open Licence 2.0)",
 }];
 
 const GEFS_SOURCES: &[SourceDescriptor] = &[
@@ -830,6 +893,26 @@ const MODELS: &[ModelSummary] = &[
         cycle_hours_utc: ICON_RU_CYCLE_HOURS,
         max_forecast_hour: 72,
         sources: ICON_RU_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::AromeFrance001,
+        description: "Météo-France AROME-France 0.01 degree (~1.3 km) deterministic forecast; 2801x1791 regular lat/lon domain 37.5-55.4N, 12W-16E",
+        default_product: "SP1",
+        cycle_hours_utc: AROME_FRANCE_CYCLE_HOURS,
+        max_forecast_hour: 51,
+        sources: AROME_FRANCE_SOURCES,
+        runtime_family: ModelRuntimeFamily::Grib2Forecast,
+        ensemble_mode: EnsembleMode::Deterministic,
+    },
+    ModelSummary {
+        id: ModelId::AromeFrance0025,
+        description: "Météo-France AROME-France 0.025 degree (~2.5 km) deterministic forecast; 1121x717 regular lat/lon domain 37.5-55.4N, 12W-16E",
+        default_product: "SP1",
+        cycle_hours_utc: AROME_FRANCE_CYCLE_HOURS,
+        max_forecast_hour: 51,
+        sources: AROME_FRANCE_SOURCES,
         runtime_family: ModelRuntimeFamily::Grib2Forecast,
         ensemble_mode: EnsembleMode::Deterministic,
     },
@@ -5960,7 +6043,7 @@ pub fn built_in_models() -> &'static [ModelSummary] {
 /// [`built_in_models`] remains linked (`ModelId` match arms thread through
 /// rustwx-products), but every user-facing enumeration must go through this
 /// list.
-pub fn supported_models() -> [ModelId; 28] {
+pub fn supported_models() -> [ModelId; 30] {
     [
         ModelId::Hrrr,
         ModelId::HrrrAk,
@@ -5976,6 +6059,8 @@ pub fn supported_models() -> [ModelId; 28] {
         ModelId::IconEu,
         ModelId::IconD2,
         ModelId::IconRu,
+        ModelId::AromeFrance001,
+        ModelId::AromeFrance0025,
         ModelId::Geps,
         ModelId::WrfCptec7km,
         ModelId::BramsCptec8km,
@@ -6025,6 +6110,9 @@ pub fn plot_recipe_fetch_blockers(
 }
 
 pub fn selector_supported_for_model(selector: FieldSelector, model: ModelId) -> bool {
+    if matches!(model, ModelId::AromeFrance001 | ModelId::AromeFrance0025) {
+        return arome_france_selector_supported(selector, model);
+    }
     if model == ModelId::Geps {
         return geps_published_selector_supported(selector);
     }
@@ -6197,6 +6285,82 @@ pub fn selector_supported_for_model(selector: FieldSelector, model: ModelId) -> 
         (CanonicalField::SimulatedInfraredBrightnessTemperature, VerticalSelector::NominalTop) => {
             matches!(model, ModelId::Hrrr | ModelId::HrrrAk)
         }
+        _ => false,
+    }
+}
+
+fn arome_france_selector_supported(selector: FieldSelector, model: ModelId) -> bool {
+    if !selector.product.is_default() {
+        return false;
+    }
+    if model == ModelId::AromeFrance0025 {
+        if let VerticalSelector::IsobaricHpa(level_hpa) = selector.vertical {
+            return AROME_FRANCE_0025_ISOBARIC_LEVELS_HPA.contains(&level_hpa)
+                && matches!(
+                    selector.field,
+                    CanonicalField::Temperature
+                        | CanonicalField::RelativeHumidity
+                        | CanonicalField::UWind
+                        | CanonicalField::VWind
+                        | CanonicalField::GeopotentialHeight
+                );
+        }
+    }
+    match (model, selector.field, selector.vertical) {
+        (
+            ModelId::AromeFrance001,
+            CanonicalField::Temperature | CanonicalField::RelativeHumidity,
+            VerticalSelector::HeightAboveGroundMeters(2),
+        )
+        | (
+            ModelId::AromeFrance001,
+            CanonicalField::UWind | CanonicalField::VWind,
+            VerticalSelector::HeightAboveGroundMeters(10),
+        )
+        | (
+            ModelId::AromeFrance001,
+            CanonicalField::Pressure
+            | CanonicalField::GeopotentialHeight
+            | CanonicalField::CompositeReflectivity
+            | CanonicalField::LowCloudCover
+            | CanonicalField::MiddleCloudCover
+            | CanonicalField::HighCloudCover
+            | CanonicalField::SimulatedInfraredBrightnessTemperature,
+            VerticalSelector::Surface,
+        ) => true,
+        (
+            ModelId::AromeFrance0025,
+            CanonicalField::Temperature
+            | CanonicalField::Dewpoint
+            | CanonicalField::RelativeHumidity,
+            VerticalSelector::HeightAboveGroundMeters(2),
+        )
+        | (
+            ModelId::AromeFrance0025,
+            CanonicalField::UWind | CanonicalField::VWind | CanonicalField::WindGust,
+            VerticalSelector::HeightAboveGroundMeters(10),
+        )
+        | (
+            ModelId::AromeFrance0025,
+            CanonicalField::Pressure
+            | CanonicalField::GeopotentialHeight
+            | CanonicalField::TotalPrecipitation
+            | CanonicalField::LowCloudCover
+            | CanonicalField::MiddleCloudCover
+            | CanonicalField::HighCloudCover
+            | CanonicalField::TotalCloudCover,
+            VerticalSelector::Surface,
+        )
+        | (
+            ModelId::AromeFrance0025,
+            CanonicalField::PressureReducedToMeanSeaLevel,
+            VerticalSelector::MeanSeaLevel,
+        )
+        | (
+            ModelId::AromeFrance0025,
+            CanonicalField::PrecipitableWater,
+            VerticalSelector::EntireAtmosphere,
+        ) => true,
         _ => false,
     }
 }
@@ -6446,6 +6610,13 @@ pub fn supported_forecast_hours(model: ModelId, cycle_hour_utc: u8) -> Vec<u16> 
                 Vec::new()
             }
         }
+        ModelId::AromeFrance001 | ModelId::AromeFrance0025 => {
+            if AROME_FRANCE_CYCLE_HOURS.contains(&cycle_hour_utc) {
+                (0..=51).collect()
+            } else {
+                Vec::new()
+            }
+        }
         ModelId::WrfCptec7km => {
             if CPTEC_CYCLE_HOURS.contains(&cycle_hour_utc) {
                 (0..=180).collect()
@@ -6641,6 +6812,14 @@ fn default_canonical_bundle_product(
         (ModelId::IconRu, CanonicalBundleDescriptor::SurfaceAnalysis) => "rws-surface",
         (ModelId::IconRu, CanonicalBundleDescriptor::PressureAnalysis) => "rws-pressure",
         (ModelId::IconRu, CanonicalBundleDescriptor::NativeAnalysis) => "rws-surface",
+        (
+            ModelId::AromeFrance001 | ModelId::AromeFrance0025,
+            CanonicalBundleDescriptor::SurfaceAnalysis | CanonicalBundleDescriptor::NativeAnalysis,
+        ) => "SP1",
+        (ModelId::AromeFrance001, CanonicalBundleDescriptor::PressureAnalysis) => {
+            "unsupported-pressure"
+        }
+        (ModelId::AromeFrance0025, CanonicalBundleDescriptor::PressureAnalysis) => "IP1",
         (ModelId::Geps, _) => "rws-published-statistics",
         (ModelId::WrfCptec7km | ModelId::BramsCptec8km | ModelId::EtaCptec8km, _) => "raw",
         (ModelId::Gdas, _) => "pgrb2.0p25",
@@ -6793,11 +6972,12 @@ pub fn latest_available_run_at_forecast_hour(
     forecast_hour: u16,
 ) -> Result<LatestRun, ModelError> {
     let agent = build_agent();
+    let required_products = default_availability_products(model);
     latest_available_run_for_products_with_probe_at_forecast_hour(
         model,
         source,
         date_yyyymmdd,
-        &[model_summary(model).default_product],
+        &required_products,
         forecast_hour,
         |resolved| availability_probe_ok(&agent, resolved),
     )
@@ -6847,15 +7027,7 @@ where
     F: FnMut(&ResolvedUrl) -> bool,
 {
     let forecast_hour = availability_probe_forecast_hour(model)?;
-    let required_products = if model == ModelId::HrdpsWest {
-        // The experimental tree is published one object at a time. Requiring
-        // an independent sentinel from both logical families prevents the
-        // generic "latest" pointer from admitting a surface-only partial
-        // cycle while pressure objects are still arriving.
-        vec!["rws-pressure", "rws-surface"]
-    } else {
-        vec![model_summary(model).default_product]
-    };
+    let required_products = default_availability_products(model);
     latest_available_run_for_products_with_probe_at_forecast_hour(
         model,
         source,
@@ -6864,6 +7036,25 @@ where
         forecast_hour,
         probe_available,
     )
+}
+
+/// Physical sentinel objects required before the generic latest-run API may
+/// advertise a cycle. Package-based providers publish objects independently;
+/// probing only the catalog's display/default product can expose a cycle that
+/// the normal bounded ingest lane cannot yet load.
+fn default_availability_products(model: ModelId) -> Vec<&'static str> {
+    match model {
+        // The experimental tree is published one object at a time. Requiring
+        // one sentinel from each logical family rejects a surface-only cycle.
+        ModelId::HrdpsWest => vec!["rws-pressure", "rws-surface"],
+        // The fine AROME lane needs all three surface package families for its
+        // complete direct-field profile (SP3 carries IR and static orography).
+        ModelId::AromeFrance001 => vec!["SP1", "SP2", "SP3"],
+        // IP1 carries the sounding coordinate; SP1/SP2 carry the surface
+        // anchors. Do not advertise a pressure-incomplete package cycle.
+        ModelId::AromeFrance0025 => vec!["IP1", "SP1", "SP2"],
+        _ => vec![model_summary(model).default_product],
+    }
 }
 
 fn latest_available_run_for_products_with_probe<F>(
@@ -6967,7 +7158,7 @@ where
         return Err(ModelError::NoAvailableRun { model });
     }
     let required_products = if products.is_empty() {
-        vec![summary.default_product]
+        default_availability_products(model)
     } else {
         let mut deduped = Vec::new();
         for product in products {
@@ -7205,6 +7396,9 @@ fn build_grib_url(source: SourceId, request: &ModelRunRequest) -> Result<String,
         ModelId::Reps => build_reps_url(source, request)?,
         ModelId::IconEu | ModelId::IconD2 => build_dwd_icon_url(source, request)?,
         ModelId::IconRu => build_icon_ru_url(source, request)?,
+        ModelId::AromeFrance001 | ModelId::AromeFrance0025 => {
+            build_arome_france_url(source, request)?
+        }
         ModelId::Geps => build_geps_url(source, request)?,
         ModelId::WrfCptec7km | ModelId::BramsCptec8km | ModelId::EtaCptec8km => {
             build_cptec_south_america_url(source, request)?
@@ -7510,6 +7704,129 @@ fn build_gfs_url(source: SourceId, request: &ModelRunRequest) -> Result<String, 
         }
         other => unsupported_source(other, request.model),
     })
+}
+
+const AROME_FRANCE_001_PACKAGES: &[&str] = &["HP1", "SP1", "SP2", "SP3"];
+const AROME_FRANCE_0025_PACKAGES: &[&str] = &[
+    "HP1", "HP2", "HP3", "IP1", "IP2", "IP3", "IP4", "IP5", "SP1", "SP2", "SP3",
+];
+
+/// Exact provider package codes available for an AROME-France grid. The
+/// 0.01-degree feed publishes four per-lead packages; the 0.025-degree feed
+/// publishes eleven six-hour lead-group packages.
+pub fn arome_france_packages(model: ModelId) -> &'static [&'static str] {
+    match model {
+        ModelId::AromeFrance001 => AROME_FRANCE_001_PACKAGES,
+        ModelId::AromeFrance0025 => AROME_FRANCE_0025_PACKAGES,
+        _ => &[],
+    }
+}
+
+/// Map one requested forecast hour onto the provider's inclusive lead group
+/// for the 0.025-degree package feed.
+pub fn arome_france_0025_lead_group(forecast_hour: u16) -> Option<(u16, u16)> {
+    if forecast_hour > 51 {
+        return None;
+    }
+    if forecast_hour <= 6 {
+        return Some((0, 6));
+    }
+    let start = ((forecast_hour - 1) / 6) * 6 + 1;
+    Some((start, (start + 5).min(51)))
+}
+
+fn arome_france_package(model: ModelId, product: &str) -> Option<&'static str> {
+    let token = normalize_token(product);
+    if token == "sp3_static" && model != ModelId::AromeFrance001 {
+        return None;
+    }
+    if token == "sp2_static" && model != ModelId::AromeFrance0025 {
+        return None;
+    }
+    let requested = match token.as_str() {
+        "surface" | "sfc" | "rws_surface" => "SP1",
+        "pressure" | "prs" | "sounding" | "rws_pressure" | "rws_sounding"
+            if model == ModelId::AromeFrance0025 =>
+        {
+            "IP1"
+        }
+        "hp1" => "HP1",
+        "hp2" => "HP2",
+        "hp3" => "HP3",
+        "ip1" => "IP1",
+        "ip2" => "IP2",
+        "ip3" => "IP3",
+        "ip4" => "IP4",
+        "ip5" => "IP5",
+        "sp1" => "SP1",
+        "sp2" | "sp2_static" => "SP2",
+        "sp3" | "sp3_static" => "SP3",
+        _ => return None,
+    };
+    arome_france_packages(model)
+        .contains(&requested)
+        .then_some(requested)
+}
+
+fn build_arome_france_url(
+    source: SourceId,
+    request: &ModelRunRequest,
+) -> Result<String, ModelError> {
+    if source != SourceId::MeteoFrancePnt {
+        return Ok(unsupported_source(source, request.model));
+    }
+    if !forecast_hour_supported(request.model, request.cycle.hour_utc, request.forecast_hour) {
+        return Err(ModelError::UnsupportedForecastHour {
+            model: request.model,
+            cycle_hour: request.cycle.hour_utc,
+            forecast_hour: request.forecast_hour,
+            reason: "AROME-France publishes hourly f000-f051 at 00/03/06/09/12/15/18/21Z"
+                .to_string(),
+        });
+    }
+    let package = arome_france_package(request.model, &request.product).ok_or_else(|| {
+        ModelError::UnsupportedProduct {
+            model: request.model,
+            product: request.product.clone(),
+        }
+    })?;
+
+    let grid = match request.model {
+        ModelId::AromeFrance001 => "001",
+        ModelId::AromeFrance0025 => "0025",
+        _ => unreachable!("AROME-France URL builder called for a non-AROME model"),
+    };
+    let lead = match request.model {
+        // SP3 drops the time-invariant orography message after analysis time.
+        // The explicit `SP3-static` component therefore always resolves to
+        // the cycle's f000 SP3 object even when ingesting a later lead.
+        ModelId::AromeFrance001 if normalize_token(&request.product) == "sp3_static" => {
+            "00H".to_string()
+        }
+        ModelId::AromeFrance001 => format!("{:02}H", request.forecast_hour),
+        // Only the first bundled SP2 object carries the cycle-static
+        // orography plane. Later lead groups join this explicit component.
+        ModelId::AromeFrance0025 if normalize_token(&request.product) == "sp2_static" => {
+            "00H06H".to_string()
+        }
+        ModelId::AromeFrance0025 => {
+            let (start, end) = arome_france_0025_lead_group(request.forecast_hour)
+                .expect("validated AROME-France forecast hour has a package group");
+            format!("{start:02}H{end:02}H")
+        }
+        _ => unreachable!("AROME-France URL builder called for a non-AROME model"),
+    };
+    let day = &request.cycle.date_yyyymmdd;
+    let run = format!(
+        "{}-{}-{}T{:02}:00:00Z",
+        &day[0..4],
+        &day[4..6],
+        &day[6..8],
+        request.cycle.hour_utc
+    );
+    Ok(format!(
+        "https://meteofrance-pnt.s3.rbx.io.cloud.ovh.net/pnt/{run}/arome/{grid}/{package}/arome__{grid}__{package}__{lead}__{run}.grib2"
+    ))
 }
 
 /// The exact isobaric levels published by the GDPS 15 km Datamart feed.
@@ -9520,6 +9837,8 @@ fn plot_recipe_field_blocker(
             | ModelId::IconEu
             | ModelId::IconD2
             | ModelId::IconRu
+            | ModelId::AromeFrance001
+            | ModelId::AromeFrance0025
     ) {
         let provider = match model {
             ModelId::Gdps | ModelId::GdpsGeml | ModelId::Rdps | ModelId::Hrdps => {
@@ -9531,6 +9850,8 @@ fn plot_recipe_field_blocker(
             ModelId::IconEu => "DWD ICON-EU Open Data per-field component bundle",
             ModelId::IconD2 => "DWD ICON-D2 Open Data per-field component bundle",
             ModelId::IconRu => "Roshydromet WIS2 per-bulletin component bundle",
+            ModelId::AromeFrance001 => "Météo-France AROME 0.01-degree package bundle",
+            ModelId::AromeFrance0025 => "Météo-France AROME 0.025-degree multi-lead package bundle",
             _ => unreachable!(),
         };
         return Some(PlotRecipeBlocker {
@@ -9664,6 +9985,13 @@ fn plot_recipe_fetch_defaults(
         }
         (ModelId::IconRu, _, true) => ("rws-surface", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::IconRu, _, false) => ("rws-pressure", PlotRecipeFetchPolicy::WholeFile),
+        (ModelId::AromeFrance001 | ModelId::AromeFrance0025, _, true) => {
+            ("SP1", PlotRecipeFetchPolicy::WholeFile)
+        }
+        (ModelId::AromeFrance001, _, false) => {
+            ("unsupported-pressure", PlotRecipeFetchPolicy::WholeFile)
+        }
+        (ModelId::AromeFrance0025, _, false) => ("IP1", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::Geps, _, _) => ("rws-published-statistics", PlotRecipeFetchPolicy::WholeFile),
         (ModelId::WrfCptec7km | ModelId::BramsCptec8km | ModelId::EtaCptec8km, _, _) => {
             ("raw", PlotRecipeFetchPolicy::PreferIndexedSubset)

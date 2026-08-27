@@ -1755,6 +1755,12 @@ pub enum ModelId {
     Refs,
     RrfsFireWx,
     WrfGdex,
+    /// Météo-France AROME-France deterministic forecast on the native
+    /// 0.01 degree (~1.3 km) regular latitude/longitude grid.
+    AromeFrance001,
+    /// Météo-France AROME-France deterministic forecast on the bundled
+    /// 0.025 degree (~2.5 km) regular latitude/longitude grid.
+    AromeFrance0025,
 }
 
 impl ModelId {
@@ -1773,6 +1779,8 @@ impl ModelId {
             Self::IconEu => "icon-eu",
             Self::IconD2 => "icon-d2",
             Self::IconRu => "icon-ru",
+            Self::AromeFrance001 => "arome-france-0p01",
+            Self::AromeFrance0025 => "arome-france-0p025",
             Self::Geps => "geps",
             Self::WrfCptec7km => "wrf-cptec-7km",
             Self::BramsCptec8km => "brams-cptec-8km",
@@ -1839,6 +1847,12 @@ impl std::str::FromStr for ModelId {
             "icon-eu" | "icon_eu" | "iconeu" | "dwd-icon-eu" | "dwd_icon_eu" => Ok(Self::IconEu),
             "icon-d2" | "icon_d2" | "icond2" | "dwd-icon-d2" | "dwd_icon_d2" => Ok(Self::IconD2),
             "icon-ru" | "icon_ru" | "iconru" | "icon-ru13" | "icon_ru13" => Ok(Self::IconRu),
+            "arome-france-0p01" | "arome_france_0p01" | "arome-france-0.01"
+            | "arome_france_0.01" | "arome-0p01" | "arome_0p01" | "arome-0.01" | "arome_0.01"
+            | "arome-france" | "arome" => Ok(Self::AromeFrance001),
+            "arome-france-0p025" | "arome_france_0p025" | "arome-france-0.025"
+            | "arome_france_0.025" | "arome-0p025" | "arome_0p025" | "arome-0.025"
+            | "arome_0.025" => Ok(Self::AromeFrance0025),
             "geps" | "gem-ensemble" | "gem_ensemble" | "cmc-geps" | "cmc_geps" => Ok(Self::Geps),
             "wrf-cptec-7km" | "wrf_cptec_7km" | "cptec-wrf" | "cptec_wrf" | "wrf-ams-07km"
             | "wrf_ams_07km" => Ok(Self::WrfCptec7km),
@@ -2040,6 +2054,9 @@ pub enum SourceId {
     /// Local NetCDF archive populated by data-driven weather-model inference.
     /// Layout: `$RUSTWX_EARTH2_ARCHIVE/{model}/{YYYYMMDD}T{HH}Z/lead{HHH}.nc`.
     Earth2Archive,
+    /// Anonymous Météo-France numerical-prediction package storage on
+    /// the OVH public object store (`meteofrance-pnt`).
+    MeteoFrancePnt,
 }
 
 impl SourceId {
@@ -2056,6 +2073,7 @@ impl SourceId {
             Self::RoshydrometWis2Cache => "roshydromet-wis2-cache",
             Self::RoshydrometWis2Origin => "roshydromet-wis2-origin",
             Self::Cptec => "cptec",
+            Self::MeteoFrancePnt => "meteo-france-pnt",
             Self::Ncei => "ncei",
             Self::Gdex => "gdex",
             Self::AifsInference => "aifs-inference",
@@ -2090,6 +2108,10 @@ impl std::str::FromStr for SourceId {
                 Ok(Self::RoshydrometWis2Origin)
             }
             "cptec" | "cptec-inpe" | "cptec_inpe" | "inpe" => Ok(Self::Cptec),
+            "meteo-france-pnt" | "meteo_france_pnt" | "meteofrance-pnt" | "meteofrance_pnt"
+            | "meteo-france" | "meteo_france" | "meteofrance" | "mf-pnt" | "mf_pnt" => {
+                Ok(Self::MeteoFrancePnt)
+            }
             "ncei" => Ok(Self::Ncei),
             "gdex" => Ok(Self::Gdex),
             "aifs-inference" | "aifs_inference" | "aifsinference" | "inferenced-aifs"

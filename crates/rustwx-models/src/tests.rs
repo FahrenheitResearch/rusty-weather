@@ -90,7 +90,7 @@ fn provider_probe_agent_times_out_a_stalled_response_offline() {
 
 #[test]
 fn built_in_models_are_real() {
-    assert_eq!(built_in_models().len(), 37);
+    assert_eq!(built_in_models().len(), 39);
     assert_eq!(model_summary(ModelId::Gdps).default_product, "rws-surface");
     assert_eq!(model_summary(ModelId::CmaGeps).default_product, "stats");
     assert_eq!(model_summary(ModelId::CmaGeps).max_forecast_hour, 360);
@@ -127,6 +127,15 @@ fn built_in_models_are_real() {
     );
     assert_eq!(model_summary(ModelId::IconRu).cycle_hours_utc, &[0, 12]);
     assert_eq!(model_summary(ModelId::IconRu).max_forecast_hour, 72);
+    for model in [ModelId::AromeFrance001, ModelId::AromeFrance0025] {
+        let summary = model_summary(model);
+        assert_eq!(summary.default_product, "SP1");
+        assert_eq!(summary.cycle_hours_utc, AROME_FRANCE_CYCLE_HOURS);
+        assert_eq!(summary.max_forecast_hour, 51);
+        assert_eq!(summary.sources, AROME_FRANCE_SOURCES);
+        assert_eq!(summary.runtime_family, ModelRuntimeFamily::Grib2Forecast);
+        assert_eq!(summary.ensemble_mode, EnsembleMode::Deterministic);
+    }
     assert_eq!(
         model_summary(ModelId::Geps).default_product,
         "rws-published-statistics"
@@ -199,6 +208,8 @@ fn catalog_exposes_the_user_facing_supported_models() {
         ModelId::IconEu,
         ModelId::IconD2,
         ModelId::IconRu,
+        ModelId::AromeFrance001,
+        ModelId::AromeFrance0025,
         ModelId::Geps,
         ModelId::WrfCptec7km,
         ModelId::BramsCptec8km,
@@ -225,6 +236,210 @@ fn catalog_exposes_the_user_facing_supported_models() {
 }
 
 #[test]
+fn arome_france_catalog_pins_native_grid_and_package_contracts() {
+    assert_eq!(
+        arome_france_grid(ModelId::AromeFrance001),
+        Some(&AROME_FRANCE_001_GRID)
+    );
+    assert_eq!(AROME_FRANCE_001_GRID.spacing_degrees, 0.01);
+    assert_eq!(AROME_FRANCE_001_GRID.nx, 2_801);
+    assert_eq!(AROME_FRANCE_001_GRID.ny, 1_791);
+    assert_eq!(AROME_FRANCE_001_GRID.west_longitude, -12.0);
+    assert_eq!(AROME_FRANCE_001_GRID.east_longitude, 16.0);
+    assert_eq!(AROME_FRANCE_001_GRID.south_latitude, 37.5);
+    assert_eq!(AROME_FRANCE_001_GRID.north_latitude, 55.4);
+
+    assert_eq!(
+        arome_france_grid(ModelId::AromeFrance0025),
+        Some(&AROME_FRANCE_0025_GRID)
+    );
+    assert_eq!(AROME_FRANCE_0025_GRID.spacing_degrees, 0.025);
+    assert_eq!(AROME_FRANCE_0025_GRID.nx, 1_121);
+    assert_eq!(AROME_FRANCE_0025_GRID.ny, 717);
+    assert_eq!(arome_france_grid(ModelId::Gfs), None);
+
+    assert_eq!(
+        arome_france_packages(ModelId::AromeFrance001),
+        &["HP1", "SP1", "SP2", "SP3"]
+    );
+    assert_eq!(arome_france_packages(ModelId::AromeFrance0025).len(), 11);
+    assert!(arome_france_packages(ModelId::AromeFrance0025).contains(&"IP5"));
+    assert_eq!(arome_france_packages(ModelId::Gfs), &[] as &[&str]);
+    assert_eq!(
+        model_summary(ModelId::AromeFrance001).sources[0].max_age_hours,
+        Some(24 * 15)
+    );
+    assert_eq!(
+        model_summary(ModelId::AromeFrance0025).sources[0].max_age_hours,
+        Some(24 * 15)
+    );
+    assert_eq!(
+        AROME_FRANCE_0025_ISOBARIC_LEVELS_HPA,
+        &[
+            100, 125, 150, 175, 200, 225, 250, 275, 300, 350, 400, 450, 500, 550, 600, 650, 700,
+            750, 800, 850, 900, 925, 950, 1000,
+        ]
+    );
+}
+
+#[test]
+fn arome_selector_contract_rejects_dead_pressure_and_unpublished_fields() {
+    assert!(selector_supported_for_model(
+        FieldSelector::height_agl(CanonicalField::Temperature, 2),
+        ModelId::AromeFrance001
+    ));
+    assert!(selector_supported_for_model(
+        FieldSelector::surface(CanonicalField::CompositeReflectivity),
+        ModelId::AromeFrance001
+    ));
+    for selector in [
+        FieldSelector::isobaric(CanonicalField::Temperature, 500),
+        FieldSelector::isobaric(CanonicalField::UWind, 850),
+        FieldSelector::surface(CanonicalField::TotalPrecipitation),
+        FieldSelector::height_agl(CanonicalField::WindGust, 10),
+    ] {
+        assert!(!selector_supported_for_model(
+            selector,
+            ModelId::AromeFrance001
+        ));
+    }
+
+    for field in [
+        CanonicalField::Temperature,
+        CanonicalField::RelativeHumidity,
+        CanonicalField::UWind,
+        CanonicalField::VWind,
+        CanonicalField::GeopotentialHeight,
+    ] {
+        assert!(selector_supported_for_model(
+            FieldSelector::isobaric(field, 925),
+            ModelId::AromeFrance0025
+        ));
+    }
+    for selector in [
+        FieldSelector::isobaric(CanonicalField::Dewpoint, 925),
+        FieldSelector::isobaric(CanonicalField::AbsoluteVorticity, 500),
+        FieldSelector::isobaric(CanonicalField::Temperature, 325),
+        FieldSelector::surface(CanonicalField::Visibility),
+    ] {
+        assert!(!selector_supported_for_model(
+            selector,
+            ModelId::AromeFrance0025
+        ));
+    }
+}
+
+#[test]
+fn arome_france_official_object_urls_are_deterministic() {
+    let cycle = CycleSpec::new("20260826", 21).unwrap();
+    let fine_surface =
+        ModelRunRequest::new(ModelId::AromeFrance001, cycle.clone(), 0, "SP1").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::MeteoFrancePnt, &fine_surface).unwrap(),
+        "https://meteofrance-pnt.s3.rbx.io.cloud.ovh.net/pnt/2026-08-26T21:00:00Z/arome/001/SP1/arome__001__SP1__00H__2026-08-26T21:00:00Z.grib2"
+    );
+
+    let fine_pressure =
+        ModelRunRequest::new(ModelId::AromeFrance001, cycle.clone(), 51, "HP1").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::MeteoFrancePnt, &fine_pressure).unwrap(),
+        "https://meteofrance-pnt.s3.rbx.io.cloud.ovh.net/pnt/2026-08-26T21:00:00Z/arome/001/HP1/arome__001__HP1__51H__2026-08-26T21:00:00Z.grib2"
+    );
+
+    let bundled_pressure =
+        ModelRunRequest::new(ModelId::AromeFrance0025, cycle.clone(), 37, "rws-pressure").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::MeteoFrancePnt, &bundled_pressure).unwrap(),
+        "https://meteofrance-pnt.s3.rbx.io.cloud.ovh.net/pnt/2026-08-26T21:00:00Z/arome/0025/IP1/arome__0025__IP1__37H42H__2026-08-26T21:00:00Z.grib2"
+    );
+
+    let fine_static =
+        ModelRunRequest::new(ModelId::AromeFrance001, cycle.clone(), 37, "SP3-static").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::MeteoFrancePnt, &fine_static).unwrap(),
+        "https://meteofrance-pnt.s3.rbx.io.cloud.ovh.net/pnt/2026-08-26T21:00:00Z/arome/001/SP3/arome__001__SP3__00H__2026-08-26T21:00:00Z.grib2"
+    );
+
+    let bundled_static =
+        ModelRunRequest::new(ModelId::AromeFrance0025, cycle.clone(), 37, "SP2-static").unwrap();
+    assert_eq!(
+        build_grib_url(SourceId::MeteoFrancePnt, &bundled_static).unwrap(),
+        "https://meteofrance-pnt.s3.rbx.io.cloud.ovh.net/pnt/2026-08-26T21:00:00Z/arome/0025/SP2/arome__0025__SP2__00H06H__2026-08-26T21:00:00Z.grib2"
+    );
+
+    for (forecast_hour, expected_group) in [
+        (0, "00H06H"),
+        (6, "00H06H"),
+        (7, "07H12H"),
+        (36, "31H36H"),
+        (37, "37H42H"),
+        (51, "49H51H"),
+    ] {
+        let bundled = ModelRunRequest::new(
+            ModelId::AromeFrance0025,
+            cycle.clone(),
+            forecast_hour,
+            "SP2",
+        )
+        .unwrap();
+        assert_eq!(
+            build_grib_url(SourceId::MeteoFrancePnt, &bundled).unwrap(),
+            format!(
+                "https://meteofrance-pnt.s3.rbx.io.cloud.ovh.net/pnt/2026-08-26T21:00:00Z/arome/0025/SP2/arome__0025__SP2__{expected_group}__2026-08-26T21:00:00Z.grib2"
+            )
+        );
+    }
+
+    let resolved = resolve_urls(&fine_surface).unwrap();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].source, SourceId::MeteoFrancePnt);
+    assert_eq!(resolved[0].idx_url, None);
+}
+
+#[test]
+fn arome_france_rejects_nonexistent_packages_cycles_and_leads() {
+    let cycle = CycleSpec::new("20260826", 21).unwrap();
+    let unavailable_package =
+        ModelRunRequest::new(ModelId::AromeFrance001, cycle.clone(), 0, "IP1").unwrap();
+    assert!(matches!(
+        build_grib_url(SourceId::MeteoFrancePnt, &unavailable_package),
+        Err(ModelError::UnsupportedProduct {
+            model: ModelId::AromeFrance001,
+            ..
+        })
+    ));
+
+    let unsupported_pressure =
+        ModelRunRequest::new(ModelId::AromeFrance001, cycle.clone(), 0, "rws-pressure").unwrap();
+    assert!(matches!(
+        build_grib_url(SourceId::MeteoFrancePnt, &unsupported_pressure),
+        Err(ModelError::UnsupportedProduct {
+            model: ModelId::AromeFrance001,
+            ..
+        })
+    ));
+
+    let off_cycle = ModelRunRequest::new(
+        ModelId::AromeFrance001,
+        CycleSpec::new("20260826", 20).unwrap(),
+        0,
+        "SP1",
+    )
+    .unwrap();
+    assert!(matches!(
+        build_grib_url(SourceId::MeteoFrancePnt, &off_cycle),
+        Err(ModelError::UnsupportedForecastHour { .. })
+    ));
+
+    let past_horizon = ModelRunRequest::new(ModelId::AromeFrance0025, cycle, 52, "SP1").unwrap();
+    assert!(matches!(
+        build_grib_url(SourceId::MeteoFrancePnt, &past_horizon),
+        Err(ModelError::UnsupportedForecastHour { .. })
+    ));
+    assert_eq!(arome_france_0025_lead_group(52), None);
+}
+
+#[test]
 fn canonical_bundle_products_resolve_through_model_adapter() {
     let hrrr_surface = resolve_canonical_bundle_product(
         ModelId::Hrrr,
@@ -241,6 +456,25 @@ fn canonical_bundle_products_resolve_through_model_adapter() {
     );
     assert_eq!(hrrr_pressure.family, CanonicalDataFamily::Pressure);
     assert_eq!(hrrr_pressure.native_product, "prs");
+
+    let arome_fine_surface = resolve_canonical_bundle_product(
+        ModelId::AromeFrance001,
+        CanonicalBundleDescriptor::SurfaceAnalysis,
+        None,
+    );
+    assert_eq!(arome_fine_surface.native_product, "SP1");
+    let arome_fine_pressure = resolve_canonical_bundle_product(
+        ModelId::AromeFrance001,
+        CanonicalBundleDescriptor::PressureAnalysis,
+        None,
+    );
+    assert_eq!(arome_fine_pressure.native_product, "unsupported-pressure");
+    let arome_bundled_pressure = resolve_canonical_bundle_product(
+        ModelId::AromeFrance0025,
+        CanonicalBundleDescriptor::PressureAnalysis,
+        None,
+    );
+    assert_eq!(arome_bundled_pressure.native_product, "IP1");
 
     let nam_surface = resolve_canonical_bundle_product(
         ModelId::Nam,
@@ -729,6 +963,10 @@ fn temperature_700_recipe_tracks_model_support() {
                 ModelId::IconRu => {
                     assert!(reason.contains("WIS2 per-bulletin component bundle"));
                 }
+                ModelId::AromeFrance001 | ModelId::AromeFrance0025 => {
+                    assert!(reason.contains("AROME"));
+                    assert!(reason.contains("package bundle"));
+                }
                 ModelId::Geps => {
                     assert!(reason.contains("cannot imply a deterministic or raw-member field"))
                 }
@@ -1053,6 +1291,55 @@ fn hrdps_west_latest_discovery_requires_the_terminal_lead() {
     assert!(probed.iter().all(|url| url.contains("/048/")));
     assert!(probed.iter().any(|url| url.contains("_TCDC_SFC_0_")));
     assert!(probed.iter().any(|url| url.contains("_VGRD_ISBL_1015_")));
+}
+
+#[test]
+fn arome_latest_discovery_rejects_partial_package_cycles() {
+    let mut fine_probes = Vec::new();
+    let fine = latest_available_run_with_probe(
+        ModelId::AromeFrance001,
+        Some(SourceId::MeteoFrancePnt),
+        "20260825",
+        |resolved| {
+            let url = resolved.availability_probe_url().to_string();
+            fine_probes.push(url.clone());
+            if url.contains("2026-08-25T21:00:00Z") {
+                !url.contains("/SP3/")
+            } else {
+                url.contains("2026-08-25T18:00:00Z")
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(fine.cycle.hour_utc, 18);
+    assert!(
+        fine_probes
+            .iter()
+            .any(|url| url.contains("2026-08-25T21:00:00Z") && url.contains("/SP3/"))
+    );
+
+    let mut standard_probes = Vec::new();
+    let standard = latest_available_run_with_probe(
+        ModelId::AromeFrance0025,
+        Some(SourceId::MeteoFrancePnt),
+        "20260825",
+        |resolved| {
+            let url = resolved.availability_probe_url().to_string();
+            standard_probes.push(url.clone());
+            if url.contains("2026-08-25T21:00:00Z") {
+                !url.contains("/IP1/")
+            } else {
+                url.contains("2026-08-25T18:00:00Z")
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(standard.cycle.hour_utc, 18);
+    assert!(
+        standard_probes
+            .iter()
+            .any(|url| url.contains("2026-08-25T21:00:00Z") && url.contains("/IP1/"))
+    );
 }
 
 #[test]

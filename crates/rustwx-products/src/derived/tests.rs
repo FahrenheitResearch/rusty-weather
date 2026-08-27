@@ -285,6 +285,16 @@ fn cma_provider_statistics_do_not_imply_deterministic_derived_products() {
 }
 
 #[test]
+fn arome_package_lane_does_not_advertise_unwired_direct_derived_products() {
+    for model in [ModelId::AromeFrance001, ModelId::AromeFrance0025] {
+        assert!(
+            supported_derived_recipe_slugs(model).is_empty(),
+            "{model} must use normalized ingest/query until its package-aware derived loader is wired"
+        );
+    }
+}
+
+#[test]
 fn native_contour_config_covers_multiple_real_products() {
     for recipe in [
         DerivedRecipe::StpFixed,

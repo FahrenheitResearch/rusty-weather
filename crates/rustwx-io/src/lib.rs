@@ -190,48 +190,178 @@ pub fn available_forecast_hours_for_candidates(
 ) -> Result<Vec<u16>, IoError> {
     let client = client()?;
     let summary = model_summary(model);
-
     let parallelize = candidates.len() <= 48
         || should_parallelize_hour_availability_probes(source_override, summary);
-    let available = if parallelize {
-        candidates
-            .par_iter()
-            .filter_map(|&forecast_hour| {
-                let cycle = rustwx_core::CycleSpec::new(date_yyyymmdd, hour_utc).ok()?;
-                let fetch = FetchRequest {
-                    request: ModelRunRequest::new(model, cycle, forecast_hour, product).ok()?,
-                    source_override,
-                    variable_patterns: Vec::new(),
-                };
-                if fetch_request_is_available(&client, &fetch).ok()? {
-                    Some(forecast_hour)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-    } else {
-        candidates
-            .iter()
-            .filter_map(|&forecast_hour| {
-                let cycle = rustwx_core::CycleSpec::new(date_yyyymmdd, hour_utc).ok()?;
-                let fetch = FetchRequest {
-                    request: ModelRunRequest::new(model, cycle, forecast_hour, product).ok()?,
-                    source_override,
-                    variable_patterns: Vec::new(),
-                };
-                if fetch_request_is_available(&client, &fetch).ok()? {
-                    Some(forecast_hour)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-    };
+    available_forecast_hours_for_candidates_with_probe(
+        model,
+        date_yyyymmdd,
+        hour_utc,
+        product,
+        source_override,
+        candidates,
+        parallelize,
+        |resolved| probe_availability(&client, resolved),
+    )
+}
 
-    let mut available = available;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AvailabilityProbeMethod {
+    Head,
+    NomadsFirstByte,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AvailabilityProbeKey {
+    method: AvailabilityProbeMethod,
+    url: String,
+}
+
+fn availability_probe_key(resolved: &ResolvedUrl) -> AvailabilityProbeKey {
+    if resolved.source == SourceId::Nomads {
+        AvailabilityProbeKey {
+            method: AvailabilityProbeMethod::NomadsFirstByte,
+            url: resolved.grib_url.clone(),
+        }
+    } else {
+        AvailabilityProbeKey {
+            method: AvailabilityProbeMethod::Head,
+            url: resolved.availability_probe_url().to_string(),
+        }
+    }
+}
+
+fn available_forecast_hours_for_candidates_with_probe<F>(
+    model: ModelId,
+    date_yyyymmdd: &str,
+    hour_utc: u8,
+    product: &str,
+    source_override: Option<SourceId>,
+    candidates: &[u16],
+    parallelize: bool,
+    probe: F,
+) -> Result<Vec<u16>, IoError>
+where
+    F: Fn(&ResolvedUrl) -> bool + Sync,
+{
+    let resolved_candidates = candidates
+        .iter()
+        .map(|&forecast_hour| {
+            let urls = (|| {
+                let cycle = rustwx_core::CycleSpec::new(date_yyyymmdd, hour_utc).ok()?;
+                let fetch = FetchRequest {
+                    request: ModelRunRequest::new(model, cycle, forecast_hour, product).ok()?,
+                    source_override,
+                    variable_patterns: Vec::new(),
+                };
+                filtered_urls(&fetch).ok()
+            })()
+            .unwrap_or_default();
+            (forecast_hour, urls)
+        })
+        .collect::<Vec<_>>();
+
+    let mut probe_results = HashMap::<AvailabilityProbeKey, bool>::new();
+    let mut available = if parallelize {
+        available_resolved_candidate_hours_parallel(resolved_candidates, &mut probe_results, &probe)
+    } else {
+        available_resolved_candidate_hours_serial(resolved_candidates, &mut probe_results, &probe)
+    };
     available.sort_unstable();
     Ok(available)
+}
+
+fn available_resolved_candidate_hours_serial<F>(
+    candidates: Vec<(u16, Vec<ResolvedUrl>)>,
+    probe_results: &mut HashMap<AvailabilityProbeKey, bool>,
+    probe: &F,
+) -> Vec<u16>
+where
+    F: Fn(&ResolvedUrl) -> bool,
+{
+    candidates
+        .into_iter()
+        .filter_map(|(forecast_hour, sources)| {
+            sources
+                .iter()
+                .any(|resolved| {
+                    let key = availability_probe_key(resolved);
+                    *probe_results.entry(key).or_insert_with(|| probe(resolved))
+                })
+                .then_some(forecast_hour)
+        })
+        .collect()
+}
+
+fn available_resolved_candidate_hours_parallel<F>(
+    candidates: Vec<(u16, Vec<ResolvedUrl>)>,
+    probe_results: &mut HashMap<AvailabilityProbeKey, bool>,
+    probe: &F,
+) -> Vec<u16>
+where
+    F: Fn(&ResolvedUrl) -> bool + Sync,
+{
+    struct CandidateState {
+        forecast_hour: u16,
+        sources: Vec<ResolvedUrl>,
+        next_source: usize,
+        available: bool,
+    }
+
+    let mut states = candidates
+        .into_iter()
+        .map(|(forecast_hour, sources)| CandidateState {
+            forecast_hour,
+            sources,
+            next_source: 0,
+            available: false,
+        })
+        .collect::<Vec<_>>();
+
+    loop {
+        // Consume every cached result in source-catalog order. A failed
+        // primary advances exactly one candidate to its next fallback; a
+        // successful source completes that candidate immediately.
+        for state in &mut states {
+            while !state.available && state.next_source < state.sources.len() {
+                let key = availability_probe_key(&state.sources[state.next_source]);
+                match probe_results.get(&key).copied() {
+                    Some(true) => state.available = true,
+                    Some(false) => state.next_source += 1,
+                    None => break,
+                }
+            }
+        }
+
+        // Deduplicate the next unresolved network operation across every
+        // candidate. Grouped model products (AROME 00H06H, for example)
+        // therefore issue one HEAD whose result fans out to all valid hours.
+        let mut seen = HashSet::new();
+        let mut pending = Vec::new();
+        for state in &states {
+            if state.available || state.next_source >= state.sources.len() {
+                continue;
+            }
+            let resolved = &state.sources[state.next_source];
+            let key = availability_probe_key(resolved);
+            if seen.insert(key.clone()) {
+                pending.push((key, resolved.clone()));
+            }
+        }
+        if pending.is_empty() {
+            break;
+        }
+
+        let completed = pending
+            .par_iter()
+            .map(|(key, resolved)| (key.clone(), probe(resolved)))
+            .collect::<Vec<_>>();
+        probe_results.extend(completed);
+    }
+
+    states
+        .into_iter()
+        .filter_map(|state| state.available.then_some(state.forecast_hour))
+        .collect()
 }
 
 pub fn mrms_latest_product_url(product: &str) -> Result<String, IoError> {
@@ -1739,7 +1869,7 @@ pub fn extract_fields_from_grib2_partial(
     grib: &Grib2File,
     selectors: &[FieldSelector],
 ) -> Result<PartialExtraction, IoError> {
-    extract_fields_from_grib2_partial_inner(grib, selectors, None)
+    extract_fields_from_grib2_partial_inner(grib, selectors, None, None)
 }
 
 pub fn extract_fields_from_grib2_partial_at_forecast_hour(
@@ -1747,13 +1877,14 @@ pub fn extract_fields_from_grib2_partial_at_forecast_hour(
     selectors: &[FieldSelector],
     forecast_hour: u16,
 ) -> Result<PartialExtraction, IoError> {
-    extract_fields_from_grib2_partial_inner(grib, selectors, Some(forecast_hour))
+    extract_fields_from_grib2_partial_inner(grib, selectors, Some(forecast_hour), None)
 }
 
 fn extract_fields_from_grib2_partial_inner(
     grib: &Grib2File,
     selectors: &[FieldSelector],
     forecast_hour: Option<u16>,
+    model: Option<ModelId>,
 ) -> Result<PartialExtraction, IoError> {
     let mut extracted = Vec::new();
     let mut missing = Vec::new();
@@ -1765,7 +1896,10 @@ fn extract_fields_from_grib2_partial_inner(
     let prepared = selectors
         .iter()
         .copied()
-        .map(PreparedSelector::new)
+        .map(|selector| match model {
+            Some(model) => PreparedSelector::new_for_model(model, selector),
+            None => PreparedSelector::new(selector),
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let matched = match_prepared_selectors(grib, &prepared, forecast_hour);
 
@@ -1796,7 +1930,7 @@ fn match_prepared_selectors<'a>(
     let mut matched: Vec<Option<(&Grib2Message, u8)>> = vec![None; prepared.len()];
     for message in &grib.messages {
         for (index, prepared_selector) in prepared.iter().enumerate() {
-            if prepared_selector.message.matches(message) {
+            if prepared_selector.matches(message) {
                 let Some(score) = prepared_selector.match_score(message, forecast_hour) else {
                     continue;
                 };
@@ -1895,7 +2029,7 @@ impl ParsedModelGrib {
             let prepared = selectors
                 .iter()
                 .copied()
-                .map(PreparedSelector::new)
+                .map(|selector| PreparedSelector::new_for_model(self.model, selector))
                 .collect::<Result<Vec<_>, _>>()?;
             let matched = match_prepared_selectors(&self.grib, &prepared, forecast_hour);
             for (prepared_selector, message) in prepared.iter().zip(matched.into_iter()) {
@@ -1954,7 +2088,7 @@ impl ParsedModelGrib {
         let prepared = selectors
             .iter()
             .copied()
-            .map(PreparedSelector::new)
+            .map(|selector| PreparedSelector::new_for_model(self.model, selector))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(prepared
             .iter()
@@ -1995,11 +2129,12 @@ pub fn extract_fields_partial_from_model_bytes_at_forecast_hour(
         _ => {
             let grib =
                 Grib2File::from_bytes(bytes).map_err(|err| IoError::Grib(err.to_string()))?;
-            let mut partial = if let Some(forecast_hour) = forecast_hour {
-                extract_fields_from_grib2_partial_at_forecast_hour(&grib, selectors, forecast_hour)?
-            } else {
-                extract_fields_from_grib2_partial(&grib, selectors)?
-            };
+            let mut partial = extract_fields_from_grib2_partial_inner(
+                &grib,
+                selectors,
+                forecast_hour,
+                Some(model),
+            )?;
             validate_regional_grid_relative_wind_messages(model, &grib, selectors, forecast_hour)?;
             rotate_regional_grid_relative_wind_fields(model, &mut partial.extracted)?;
             if model_uses_specific_humidity_for_pressure_moisture(model) {
@@ -2663,6 +2798,7 @@ fn specific_humidity_message<'a>(
             level: LevelMatch::IsobaricHpa(level_hpa),
             units: "kg/kg",
         },
+        model: None,
     }];
     match_prepared_selectors(grib, &prepared, forecast_hour)
         .into_iter()
@@ -2868,16 +3004,6 @@ fn prefer_subset_capable_sources(fetch: &FetchRequest, urls: Vec<ResolvedUrl>) -
     subset_capable.into_iter().chain(rest).collect()
 }
 
-fn fetch_request_is_available(
-    client: &DownloadClient,
-    fetch: &FetchRequest,
-) -> Result<bool, IoError> {
-    let urls = filtered_urls(fetch)?;
-    Ok(any_source_available(&urls, |resolved| {
-        probe_availability(client, resolved)
-    }))
-}
-
 fn probe_availability(client: &DownloadClient, resolved: &ResolvedUrl) -> bool {
     if matches!(resolved.source, SourceId::Nomads) {
         client.get_range(&resolved.grib_url, 0, 0).is_ok()
@@ -2886,6 +3012,7 @@ fn probe_availability(client: &DownloadClient, resolved: &ResolvedUrl) -> bool {
     }
 }
 
+#[cfg(test)]
 fn any_source_available<F>(resolved: &[ResolvedUrl], mut probe: F) -> bool
 where
     F: FnMut(&ResolvedUrl) -> bool,
@@ -3238,6 +3365,11 @@ struct StructuredMessageSelector {
 struct PreparedSelector {
     selector: FieldSelector,
     message: StructuredMessageSelector,
+    /// Some providers publish documented local-table parameters or vertical
+    /// labels that cannot safely be added to the process-wide WMO alias
+    /// table. Retain model identity only on the model-aware extraction path
+    /// so those aliases stay scoped to the originating feed.
+    model: Option<ModelId>,
 }
 
 const PARAMETER_HGT: &[ParameterCode] = &[
@@ -3467,6 +3599,16 @@ const PARAMETER_SIMULATED_IR: &[ParameterCode] = &[ParameterCode {
     category: 192,
     number: 7,
 }];
+const PARAMETER_AROME_COMPOSITE_REFLECTIVITY: &[ParameterCode] = &[ParameterCode {
+    discipline: 0,
+    category: 16,
+    number: 193,
+}];
+const PARAMETER_AROME_SIMULATED_IR: &[ParameterCode] = &[ParameterCode {
+    discipline: 0,
+    category: 5,
+    number: 7,
+}];
 const PARAMETER_RADAR_REFLECTIVITY: &[ParameterCode] = &[
     // MRMS ReflectivityAtLowestAltitude.
     ParameterCode {
@@ -3546,19 +3688,195 @@ impl PreparedSelector {
         Ok(Self {
             selector,
             message: StructuredMessageSelector::try_from(selector)?,
+            model: None,
         })
     }
 
+    fn new_for_model(model: ModelId, selector: FieldSelector) -> Result<Self, IoError> {
+        let message = StructuredMessageSelector::try_from(selector)
+            .or_else(|err| model_local_structured_selector(model, selector).ok_or(err))?;
+        Ok(Self {
+            selector,
+            message,
+            model: Some(model),
+        })
+    }
+
+    fn matches(self, message: &Grib2Message) -> bool {
+        self.message.matches(message)
+            || self
+                .model
+                .is_some_and(|model| model_parameter_alias_matches(model, self.selector, message))
+    }
+
     fn match_score(self, message: &Grib2Message, forecast_hour: Option<u16>) -> Option<u8> {
-        let product_score = product_template_match_score(self.selector, message)?;
+        let product_score = model_product_template_match_score(self.model, self.selector, message)
+            .or_else(|| product_template_match_score(self.selector, message))?;
         let forecast_score = if let Some(forecast_hour) = forecast_hour {
-            forecast_hour_match_score(message, forecast_hour).or_else(|| {
-                static_surface_field_match_score(self.selector, message, forecast_hour)
-            })?
+            if model_uses_statistical_interval_end_validity(self.model, self.selector, message) {
+                statistical_interval_end_match_score(message, forecast_hour)?
+            } else {
+                forecast_hour_match_score(message, forecast_hour).or_else(|| {
+                    static_surface_field_match_score(self.selector, message, forecast_hour)
+                })?
+            }
         } else {
             0
         };
         Some(product_score.saturating_add(forecast_score))
+    }
+}
+
+/// AROME 0.025-degree packages carry several forecast hours together. Gust
+/// records are one-hour maxima whose GRIB forecast time is the interval start,
+/// and accumulated precipitation records start at analysis. Their canonical
+/// validity is therefore the statistical interval end; using the generic
+/// start-or-end matcher would select the *next* gust window and invent an
+/// analysis value from the 0-1 h interval.
+fn model_uses_statistical_interval_end_validity(
+    model: Option<ModelId>,
+    selector: FieldSelector,
+    message: &Grib2Message,
+) -> bool {
+    model == Some(ModelId::AromeFrance0025)
+        && message.product.time_range_length.is_some()
+        && matches!(
+            selector.field,
+            CanonicalField::WindGust | CanonicalField::TotalPrecipitation
+        )
+}
+
+fn statistical_interval_end_match_score(message: &Grib2Message, expected_hour: u16) -> Option<u8> {
+    let expected_seconds = u64::from(expected_hour).checked_mul(3_600)?;
+    let start_seconds = time_value_to_seconds(
+        message.product.time_range_unit,
+        message.product.forecast_time,
+    )?;
+    let end_seconds = message
+        .product
+        .statistical_time_range_seconds()
+        .and_then(|length| start_seconds.checked_add(length))?;
+    (end_seconds == expected_seconds).then_some(0)
+}
+
+/// Complete the structured selector only for provider-local canonical
+/// aliases whose vertical shape is intentionally unsupported globally.
+/// Construction itself is model-scoped, so these local table codes can never
+/// leak into an unrelated model's matching path.
+fn model_local_structured_selector(
+    model: ModelId,
+    selector: FieldSelector,
+) -> Option<StructuredMessageSelector> {
+    match (model, selector.field, selector.vertical) {
+        (
+            ModelId::AromeFrance001,
+            CanonicalField::CompositeReflectivity,
+            VerticalSelector::Surface,
+        ) => Some(StructuredMessageSelector {
+            parameters: PARAMETER_AROME_COMPOSITE_REFLECTIVITY,
+            level: LevelMatch::Surface,
+            units: "dBZ",
+        }),
+        (
+            ModelId::AromeFrance001,
+            CanonicalField::SimulatedInfraredBrightnessTemperature,
+            VerticalSelector::Surface,
+        ) => Some(StructuredMessageSelector {
+            parameters: PARAMETER_AROME_SIMULATED_IR,
+            level: LevelMatch::Surface,
+            units: "K",
+        }),
+        (
+            ModelId::AromeFrance001 | ModelId::AromeFrance0025,
+            CanonicalField::LowCloudCover,
+            VerticalSelector::Surface,
+        ) => Some(StructuredMessageSelector {
+            parameters: PARAMETER_LOW_CLOUD_COVER,
+            level: LevelMatch::Surface,
+            units: "%",
+        }),
+        (
+            ModelId::AromeFrance001 | ModelId::AromeFrance0025,
+            CanonicalField::MiddleCloudCover,
+            VerticalSelector::Surface,
+        ) => Some(StructuredMessageSelector {
+            parameters: PARAMETER_MIDDLE_CLOUD_COVER,
+            level: LevelMatch::Surface,
+            units: "%",
+        }),
+        (
+            ModelId::AromeFrance001 | ModelId::AromeFrance0025,
+            CanonicalField::HighCloudCover,
+            VerticalSelector::Surface,
+        ) => Some(StructuredMessageSelector {
+            parameters: PARAMETER_HIGH_CLOUD_COVER,
+            level: LevelMatch::Surface,
+            units: "%",
+        }),
+        _ => None,
+    }
+}
+
+/// Provider-scoped product-definition templates that carry an otherwise
+/// canonical field. AROME-France 0.01 publishes its simulated infrared
+/// brightness temperature with PDT 4.32 (satellite-derived product), while
+/// the general forecast selector deliberately accepts only forecast PDTs.
+/// Keep that exception as narrow as the local parameter alias itself.
+fn model_product_template_match_score(
+    model: Option<ModelId>,
+    selector: FieldSelector,
+    message: &Grib2Message,
+) -> Option<u8> {
+    matches!(
+        (
+            model,
+            selector.field,
+            selector.vertical,
+            message.product.template
+        ),
+        (
+            Some(ModelId::AromeFrance001),
+            CanonicalField::SimulatedInfraredBrightnessTemperature,
+            VerticalSelector::Surface,
+            32,
+        )
+    )
+    .then_some(0)
+}
+
+/// Documented Météo-France local-table identities used by the public
+/// AROME package feed. These aliases are deliberately model-scoped: the same
+/// local parameter numbers can mean something else at another originating
+/// centre, so adding them to the global WMO parameter arrays would silently
+/// corrupt unrelated products.
+fn model_parameter_alias_matches(
+    model: ModelId,
+    selector: FieldSelector,
+    message: &Grib2Message,
+) -> bool {
+    let code = (
+        message.discipline,
+        message.product.parameter_category,
+        message.product.parameter_number,
+    );
+    let surface = message.product.level_type == 1;
+    match (model, selector.field, selector.vertical) {
+        (
+            ModelId::AromeFrance001,
+            CanonicalField::CompositeReflectivity,
+            VerticalSelector::Surface,
+        ) => code == (0, 16, 193) && surface,
+        (
+            ModelId::AromeFrance001,
+            CanonicalField::SimulatedInfraredBrightnessTemperature,
+            VerticalSelector::Surface,
+        ) => code == (0, 5, 7) && surface,
+        (
+            ModelId::AromeFrance0025,
+            CanonicalField::PrecipitableWater,
+            VerticalSelector::EntireAtmosphere,
+        ) => code == (0, 1, 64) && surface,
+        _ => false,
     }
 }
 

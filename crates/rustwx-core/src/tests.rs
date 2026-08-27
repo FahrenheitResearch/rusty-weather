@@ -141,6 +141,16 @@ fn model_id_aliases_round_trip() {
     assert_eq!(ModelId::WrfGdex.to_string(), "wrf");
     assert_eq!(ModelId::IconEu.to_string(), "icon-eu");
     assert_eq!(ModelId::IconD2.to_string(), "icon-d2");
+    assert_eq!(ModelId::AromeFrance001.to_string(), "arome-france-0p01");
+    assert_eq!(ModelId::AromeFrance0025.to_string(), "arome-france-0p025");
+    assert_eq!(
+        "arome-france".parse::<ModelId>().unwrap(),
+        ModelId::AromeFrance001
+    );
+    assert_eq!(
+        "arome-0.025".parse::<ModelId>().unwrap(),
+        ModelId::AromeFrance0025
+    );
     assert_eq!(ModelId::WrfCptec7km.to_string(), "wrf-cptec-7km");
     assert_eq!(ModelId::BramsCptec8km.to_string(), "brams-cptec-8km");
     assert_eq!(ModelId::EtaCptec8km.to_string(), "eta-cptec-8km");
@@ -151,6 +161,15 @@ fn model_id_aliases_round_trip() {
     assert_eq!(SourceId::Dwd.to_string(), "dwd");
     assert_eq!("cptec-inpe".parse::<SourceId>().unwrap(), SourceId::Cptec);
     assert_eq!(SourceId::Cptec.to_string(), "cptec");
+    assert_eq!(
+        "meteofrance-pnt".parse::<SourceId>().unwrap(),
+        SourceId::MeteoFrancePnt
+    );
+    assert_eq!(
+        "mf-pnt".parse::<SourceId>().unwrap(),
+        SourceId::MeteoFrancePnt
+    );
+    assert_eq!(SourceId::MeteoFrancePnt.to_string(), "meteo-france-pnt");
     assert_eq!(
         "aifsv2-inference".parse::<SourceId>().unwrap(),
         SourceId::AifsInference

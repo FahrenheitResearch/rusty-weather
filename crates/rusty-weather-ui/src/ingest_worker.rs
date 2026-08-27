@@ -25,7 +25,7 @@ use std::thread::JoinHandle;
 use rustwx_core::{CycleSpec, ModelId, SourceId};
 use rustwx_models::supported_models;
 use rw_ingest::ingest_profile::IngestProfile;
-use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate};
+use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate_for_hours};
 use rw_ingest::{
     IngestConfig, IngestError, IngestEvent, IngestStage, fetch_plan, parse_hours, throttle,
     validate_forecast_hours,
@@ -278,7 +278,7 @@ fn compute_estimate(
             .unwrap_or_else(|_| Calibration::builtin_for_model(model))
     };
     let hour_count = hours.len() as u16;
-    let estimate = estimate(&profile, model, hour_count, &calibration);
+    let estimate = estimate_for_hours(&profile, model, &hours, &calibration);
     Ok(EstimateView {
         profile_summary: profile.describe(),
         hour_count,

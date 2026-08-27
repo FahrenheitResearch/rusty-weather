@@ -260,6 +260,8 @@ pub fn supported_derived_recipe_slugs(model: ModelId) -> Vec<String> {
         | ModelId::IconEu
         | ModelId::IconD2
         | ModelId::IconRu
+        | ModelId::AromeFrance001
+        | ModelId::AromeFrance0025
         | ModelId::Geps
         | ModelId::WrfCptec7km
         | ModelId::BramsCptec8km

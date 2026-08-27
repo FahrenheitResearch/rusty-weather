@@ -24,7 +24,7 @@
 //! subset fetch would shrink downloads dramatically for small profiles —
 //! noted as a future refinement, not priced here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::Path;
@@ -371,6 +371,69 @@ const GFS_BUILTIN_GRID_FILE_BYTES: u64 = 7_370;
 /// surface and pressure roles — no separate prs/sfc split.
 const GFS_BUILTIN_PGRB2_FILE_BYTES: u64 = 542_140_336;
 
+// ─── Météo-France AROME-France builtin calibration ─────────────────────────
+//
+// Official 2026-08-26 21z payloads and bit-exact verified stores. Package
+// constants are raw network bytes; store constants come from the f001
+// surface/sounding `.rws` chunk indexes. The 0.025-degree feed groups six or
+// seven valid hours into one physical package, so [`estimate_for_hours`]
+// counts distinct package groups instead of multiplying these bytes per hour.
+const AROME_001_BUILTIN_BYTES_2D: &[(&str, u64)] = &[
+    ("temperature_2m", 9_112_068),
+    ("rh_2m", 6_417_247),
+    ("u_10m", 6_444_257),
+    ("v_10m", 6_176_104),
+    ("surface_pressure", 7_082_585),
+    ("orography", 8_148_711),
+    ("composite_reflectivity", 941_507),
+    ("cloud_cover_low", 1_709_897),
+    ("cloud_cover_mid", 1_309_064),
+    ("cloud_cover_high", 1_513_018),
+    ("simulated_ir", 6_415_704),
+];
+const AROME_001_GRID_FILE_BYTES: u64 = 25_181;
+const AROME_001_META_BYTES_PER_VAR: u64 = 198;
+const AROME_001_SP1_F000_BYTES: u64 = 15_584_547;
+const AROME_001_SP2_F000_BYTES: u64 = 9_467_676;
+const AROME_001_SP3_F000_BYTES: u64 = 7_469_007;
+const AROME_001_SP1_HOURLY_BYTES: u64 = 23_131_909;
+const AROME_001_SP2_HOURLY_BYTES: u64 = 17_873_413;
+const AROME_001_SP3_HOURLY_BYTES: u64 = 3_877_330;
+
+const AROME_0025_BUILTIN_BYTES_2D: &[(&str, u64)] = &[
+    ("temperature_2m", 1_602_064),
+    ("dewpoint_2m", 905_616),
+    ("rh_2m", 1_201_645),
+    ("u_10m", 1_257_393),
+    ("v_10m", 1_239_881),
+    ("wind_gust_10m", 1_231_261),
+    ("mslp", 890_968),
+    ("surface_pressure", 1_295_364),
+    ("orography", 1_445_597),
+    ("apcp_run_total", 211_848),
+    ("pwat", 1_179_489),
+    ("cloud_cover_low", 359_088),
+    ("cloud_cover_mid", 280_013),
+    ("cloud_cover_high", 320_515),
+    ("cloud_cover_total", 404_856),
+];
+const AROME_0025_BUILTIN_BYTES_3D_PER_LEVEL: &[(&str, u64)] = &[
+    ("temperature_iso", 1_260_660),
+    // IP1 publishes relative humidity rather than dewpoint. The planner uses
+    // the stable dewpoint slot; live ingest resolves it to `rh_iso`.
+    ("dewpoint_iso", 1_286_973),
+    ("rh_iso", 1_286_973),
+    ("u_iso", 1_328_186),
+    ("v_iso", 1_329_594),
+    ("height_iso", 848_752),
+];
+const AROME_0025_GRID_FILE_BYTES: u64 = 7_683;
+const AROME_0025_META_BYTES_PER_VAR: u64 = 232;
+const AROME_0025_IP1_GROUP_BYTES: u64 = 530_658_659;
+const AROME_0025_SP1_GROUP_BYTES: u64 = 56_917_567;
+const AROME_0025_SP2_GROUP_BYTES: u64 = 46_842_068;
+const AROME_0025_SP3_GROUP_BYTES: u64 = 58_126_316;
+
 // ─── RRFS-A builtin calibration ──────────────────────────────────────────────
 //
 // Source: `out/rrfs_store/rrfs_a/20260611_16z` FULL-profile crop-at-ingest
@@ -585,6 +648,55 @@ impl Calibration {
         }
     }
 
+    /// Live-calibrated AROME-France 0.01-degree surface store and package
+    /// sizes from the official 2026-08-26 21z feed.
+    pub fn builtin_arome_001_default() -> Self {
+        Self {
+            source: "built-in defaults (Météo-France AROME 0.01°, official 2026-08-26 21z f001 surface ingest; 2801x1791)".to_string(),
+            nx: 2801,
+            ny: 1791,
+            bytes_2d: AROME_001_BUILTIN_BYTES_2D
+                .iter()
+                .map(|(name, bytes)| ((*name).to_string(), *bytes))
+                .collect(),
+            bytes_3d_per_level: BTreeMap::new(),
+            meta_bytes_per_var: AROME_001_META_BYTES_PER_VAR,
+            grid_file_bytes: AROME_001_GRID_FILE_BYTES,
+            prs_file_bytes: 0,
+            // Conservative single-hour shape: valid SP1+SP2+SP3 plus the
+            // f000 SP3 static-terrain join. Exact multi-hour accounting is
+            // performed by `estimate_for_hours`.
+            sfc_file_bytes: AROME_001_SP1_HOURLY_BYTES
+                + AROME_001_SP2_HOURLY_BYTES
+                + AROME_001_SP3_HOURLY_BYTES
+                + AROME_001_SP3_F000_BYTES,
+        }
+    }
+
+    /// Live-calibrated AROME-France 0.025-degree store and grouped package
+    /// sizes from the official 2026-08-26 21z feed.
+    pub fn builtin_arome_0025_default() -> Self {
+        Self {
+            source: "built-in defaults (Météo-France AROME 0.025°, official 2026-08-26 21z f001 surface+sounding ingests; 1121x717; downloads grouped 00–06/07–12/...)".to_string(),
+            nx: 1121,
+            ny: 717,
+            bytes_2d: AROME_0025_BUILTIN_BYTES_2D
+                .iter()
+                .map(|(name, bytes)| ((*name).to_string(), *bytes))
+                .collect(),
+            bytes_3d_per_level: AROME_0025_BUILTIN_BYTES_3D_PER_LEVEL
+                .iter()
+                .map(|(name, bytes)| ((*name).to_string(), *bytes))
+                .collect(),
+            meta_bytes_per_var: AROME_0025_META_BYTES_PER_VAR,
+            grid_file_bytes: AROME_0025_GRID_FILE_BYTES,
+            prs_file_bytes: AROME_0025_IP1_GROUP_BYTES,
+            sfc_file_bytes: AROME_0025_SP1_GROUP_BYTES
+                + AROME_0025_SP2_GROUP_BYTES
+                + AROME_0025_SP3_GROUP_BYTES,
+        }
+    }
+
     /// The measured 2026-06-11 16z RRFS-A defaults (see the `RRFS_A_BUILTIN_*`
     /// consts above), from the full-profile crop-at-ingest store. RRFS-A keeps
     /// the two-file prs+sfc plan shape (`prs-na` + `nat-na`), so the standard
@@ -615,12 +727,13 @@ impl Calibration {
         }
     }
 
-    /// Select the appropriate built-in calibration for `model`: GFS and RRFS-A
-    /// use their measured tables; everything else falls back to the HRRR table.
+    /// Select the appropriate measured built-in calibration for `model`.
     pub fn builtin_for_model(model: ModelId) -> Self {
         match model {
             ModelId::Gfs => Self::builtin_gfs_default(),
             ModelId::RrfsA => Self::builtin_rrfs_a_default(),
+            ModelId::AromeFrance001 => Self::builtin_arome_001_default(),
+            ModelId::AromeFrance0025 => Self::builtin_arome_0025_default(),
             _ => Self::builtin_default(),
         }
     }
@@ -767,6 +880,74 @@ pub struct SizeEstimate {
 /// Breakdown label for the modeled non-payload bytes of each hour file.
 pub const OVERHEAD_LABEL: &str = "hour overhead (header+meta+index)";
 
+fn arome_0025_group_start(hour: u16) -> u16 {
+    if hour <= 6 {
+        0
+    } else {
+        ((hour - 7) / 6) * 6 + 7
+    }
+}
+
+fn arome_download_bytes_for_hours(
+    profile: &IngestProfile,
+    model: ModelId,
+    hours: &[u16],
+) -> Option<u64> {
+    let unique_hours = hours.iter().copied().collect::<BTreeSet<_>>();
+    match model {
+        ModelId::AromeFrance001 => {
+            let needs_ir = profile.includes_surface_field("simulated_ir");
+            let needs_orography = profile.includes_surface_field("orography");
+            let has_f000 = unique_hours.contains(&0);
+            let mut bytes = 0u64;
+            for hour in &unique_hours {
+                if *hour == 0 {
+                    bytes += AROME_001_SP1_F000_BYTES + AROME_001_SP2_F000_BYTES;
+                    if needs_ir || needs_orography {
+                        bytes += AROME_001_SP3_F000_BYTES;
+                    }
+                } else {
+                    bytes += AROME_001_SP1_HOURLY_BYTES + AROME_001_SP2_HOURLY_BYTES;
+                    if needs_ir {
+                        bytes += AROME_001_SP3_HOURLY_BYTES;
+                    }
+                }
+            }
+            if needs_orography && unique_hours.iter().any(|hour| *hour > 0) && !has_f000 {
+                // The f000 SP3 object is shared by every later-hour static
+                // join and therefore transfers only once through raw cache.
+                bytes += AROME_001_SP3_F000_BYTES;
+            }
+            Some(bytes)
+        }
+        ModelId::AromeFrance0025 => {
+            let groups = unique_hours
+                .iter()
+                .copied()
+                .map(arome_0025_group_start)
+                .collect::<BTreeSet<_>>();
+            let mut bytes_per_group = AROME_0025_SP1_GROUP_BYTES + AROME_0025_SP2_GROUP_BYTES;
+            if profile.needs_prs() {
+                bytes_per_group += AROME_0025_IP1_GROUP_BYTES;
+            }
+            if profile.includes_surface_field("pwat") {
+                bytes_per_group += AROME_0025_SP3_GROUP_BYTES;
+            }
+            let mut bytes = bytes_per_group * groups.len() as u64;
+            if profile.includes_surface_field("orography")
+                && groups.iter().any(|start| *start >= 7)
+                && !groups.contains(&0)
+            {
+                // Later SP2 groups omit terrain; the shared 00H06H SP2
+                // static object is one additional transfer, never one/hour.
+                bytes += AROME_0025_SP2_GROUP_BYTES;
+            }
+            Some(bytes)
+        }
+        _ => None,
+    }
+}
+
 /// PREDICTIVE mode: price a profile against a calibration table.
 pub fn estimate(
     profile: &IngestProfile,
@@ -816,7 +997,16 @@ pub fn estimate(
     // and prs only when the profile needs isobaric volumes or planes (the
     // historical rule).  Unknown/unsupported models fall back to the HRRR
     // rule so callers can still get a rough estimate.
-    let per_hour_download_bytes = match fetch_plan(model).ok().as_deref() {
+    let per_hour_download_bytes = arome_download_bytes_for_hours(
+        profile,
+        model,
+        &[if model == ModelId::AromeFrance001 {
+            1
+        } else {
+            7
+        }],
+    )
+    .unwrap_or_else(|| match fetch_plan(model).ok().as_deref() {
         Some([single]) => {
             // One physical file: dual-role forecast products are calibrated
             // in the prs slot; explicitly surface-only analyses use the sfc
@@ -836,7 +1026,7 @@ pub fn estimate(
                     0
                 }
         }
-    };
+    });
 
     breakdown.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     SizeEstimate {
@@ -847,6 +1037,32 @@ pub fn estimate(
         grid_file_bytes: calibration.grid_file_bytes,
         breakdown,
     }
+}
+
+/// Predictive estimate using the exact requested forecast-hour set.
+///
+/// Store bytes remain one hour file per requested lead. Download bytes are
+/// normally the same per-hour multiplication as [`estimate`], but the
+/// Météo-France package feeds are priced by unique physical object: the
+/// 0.025-degree 00–06/07–12/... group is paid once regardless of how many
+/// valid hours inside it are requested, and each cycle-static terrain object
+/// is paid once rather than once per joined hour.
+pub fn estimate_for_hours(
+    profile: &IngestProfile,
+    model: ModelId,
+    hours: &[u16],
+    calibration: &Calibration,
+) -> SizeEstimate {
+    let mut estimate = estimate(profile, model, hours.len() as u16, calibration);
+    if let Some(download_bytes) = arome_download_bytes_for_hours(profile, model, hours) {
+        estimate.download_bytes = download_bytes;
+        estimate.per_hour_download_bytes = if hours.is_empty() {
+            0
+        } else {
+            download_bytes.div_ceil(hours.len() as u64)
+        };
+    }
+    estimate
 }
 
 #[cfg(test)]
@@ -1150,6 +1366,91 @@ mod tests {
                 .breakdown
                 .windows(2)
                 .all(|pair| pair[0].1 >= pair[1].1)
+        );
+    }
+
+    #[test]
+    fn arome_estimates_use_live_calibration_and_unique_physical_packages() {
+        let fine_profile = IngestProfile::surface_for_model(ModelId::AromeFrance001);
+        let fine_calibration = Calibration::builtin_for_model(ModelId::AromeFrance001);
+        assert_eq!((fine_calibration.nx, fine_calibration.ny), (2801, 1791));
+        assert_eq!(fine_calibration.grid_file_bytes, 25_181);
+        assert_eq!(
+            estimate_for_hours(
+                &fine_profile,
+                ModelId::AromeFrance001,
+                &[1, 2],
+                &fine_calibration,
+            )
+            .download_bytes,
+            97_234_311,
+            "two hourly package trios plus one shared f000 SP3 terrain object"
+        );
+        assert_eq!(
+            estimate_for_hours(
+                &fine_profile,
+                ModelId::AromeFrance001,
+                &[0, 1],
+                &fine_calibration,
+            )
+            .download_bytes,
+            77_403_882,
+            "the requested f000 SP3 is reused as the f001 static join"
+        );
+
+        let standard_calibration = Calibration::builtin_for_model(ModelId::AromeFrance0025);
+        assert_eq!(
+            (standard_calibration.nx, standard_calibration.ny),
+            (1121, 717)
+        );
+        assert_eq!(standard_calibration.grid_file_bytes, 7_683);
+
+        let surface = IngestProfile::surface_for_model(ModelId::AromeFrance0025);
+        assert_eq!(
+            estimate_for_hours(
+                &surface,
+                ModelId::AromeFrance0025,
+                &[0, 1, 6],
+                &standard_calibration,
+            )
+            .download_bytes,
+            161_885_951,
+            "three requested hours share one SP1+SP2+SP3 package group"
+        );
+        assert_eq!(
+            estimate_for_hours(
+                &surface,
+                ModelId::AromeFrance0025,
+                &[7, 12],
+                &standard_calibration,
+            )
+            .download_bytes,
+            208_728_019,
+            "one later group plus one shared 00H06H static SP2"
+        );
+
+        let sounding = IngestProfile::sounding_for_model(ModelId::AromeFrance0025);
+        assert_eq!(
+            estimate_for_hours(
+                &sounding,
+                ModelId::AromeFrance0025,
+                &[0, 1, 6],
+                &standard_calibration,
+            )
+            .download_bytes,
+            634_418_294,
+            "f000/f001/f006 share one IP1+SP1+SP2 package group"
+        );
+        assert_eq!(
+            estimate_for_hours(
+                &sounding,
+                ModelId::AromeFrance0025,
+                &[0, 1, 6, 7, 12],
+                &standard_calibration,
+            )
+            .download_bytes,
+            1_268_836_588,
+            "two physical groups are paid twice, not five logical hours"
         );
     }
 

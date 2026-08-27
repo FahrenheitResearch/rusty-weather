@@ -16,7 +16,7 @@ use rustwx_core::{CycleSpec, ModelId, SourceId};
 use rustwx_products::cache::{default_proof_cache_dir, ensure_dir};
 
 use rw_ingest::ingest_profile::{IngestProfile, ProfileOverrides, resolve_profile_for_model};
-use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate};
+use rw_ingest::size_estimate::{Calibration, default_calibration_paths, estimate_for_hours};
 use rw_ingest::throttle;
 use rw_ingest::{IngestConfig, NEVER_CANCEL, cache_state, parse_hours, print_event};
 
@@ -231,7 +231,7 @@ fn mb(bytes: u64) -> f64 {
 fn print_estimate(
     args: &Args,
     profile: &IngestProfile,
-    hour_count: u16,
+    hours: &[u16],
     model_slug: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let paths = calibration_paths(args, model_slug);
@@ -246,7 +246,8 @@ fn print_estimate(
             }
         }
     };
-    let estimate = estimate(profile, args.model, hour_count, &calibration);
+    let hour_count = hours.len() as u16;
+    let estimate = estimate_for_hours(profile, args.model, hours, &calibration);
 
     println!(
         "estimate: profile {} ({})",
@@ -262,31 +263,39 @@ fn print_estimate(
     println!();
     // Download detail depends on the physical fetch plan and its roles.
     let fetch_plan = rw_ingest::fetch_plan(args.model);
-    let download_detail = match fetch_plan.as_deref() {
-        Ok([single]) if single.pressure_source && single.surface_source => format!(
-            "{} {:.1} MB, single file (both roles)",
-            single.product,
-            mb(calibration.prs_file_bytes),
-        ),
-        Ok([single]) => format!(
-            "{} {:.1} MB, single surface-only file",
-            single.product,
-            mb(calibration.sfc_file_bytes),
-        ),
-        _ => {
-            if profile.needs_prs() {
-                format!(
-                    "prs {:.1} MB + sfc {:.1} MB, full files",
-                    mb(calibration.prs_file_bytes),
-                    mb(calibration.sfc_file_bytes)
-                )
-            } else {
-                format!(
-                    "sfc {:.1} MB full file only",
-                    mb(calibration.sfc_file_bytes)
-                )
-            }
+    let download_detail = match args.model {
+        ModelId::AromeFrance001 => {
+            "hourly SP1/SP2/SP3 objects; shared f000 terrain object counted once".to_string()
         }
+        ModelId::AromeFrance0025 => {
+            "unique 00-06/07-12/... package groups; shared static terrain counted once".to_string()
+        }
+        _ => match fetch_plan.as_deref() {
+            Ok([single]) if single.pressure_source && single.surface_source => format!(
+                "{} {:.1} MB, single file (both roles)",
+                single.product,
+                mb(calibration.prs_file_bytes),
+            ),
+            Ok([single]) => format!(
+                "{} {:.1} MB, single surface-only file",
+                single.product,
+                mb(calibration.sfc_file_bytes),
+            ),
+            _ => {
+                if profile.needs_prs() {
+                    format!(
+                        "prs {:.1} MB + sfc {:.1} MB, full files",
+                        mb(calibration.prs_file_bytes),
+                        mb(calibration.sfc_file_bytes)
+                    )
+                } else {
+                    format!(
+                        "sfc {:.1} MB full file only",
+                        mb(calibration.sfc_file_bytes)
+                    )
+                }
+            }
+        },
     };
     println!(
         "per hour: store {:.1} MB | download {:.1} MB ({})",
@@ -319,7 +328,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     rw_ingest::validate_forecast_hours(args.model, args.cycle, &hours)?;
     let model_slug = args.model.as_str().replace('-', "_");
     if args.estimate {
-        return print_estimate(args, &profile, hours.len() as u16, &model_slug);
+        return print_estimate(args, &profile, &hours, &model_slug);
     }
     let cache_root = args
         .cache_dir

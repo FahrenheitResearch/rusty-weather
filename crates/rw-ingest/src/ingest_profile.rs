@@ -621,6 +621,133 @@ fn cptec_eta_surface_plan() -> Vec<(&'static str, FieldSelector)> {
     ]
 }
 
+/// Exact direct-field contract in Météo-France's hourly 0.01-degree
+/// AROME-France packages. SP1 carries the 2 m/10 m state, SP2 carries
+/// pressure/clouds/column-maximum reflectivity, and SP3 carries brightness
+/// temperature plus cycle-static orography. The feed publishes no isobaric
+/// coordinate, dewpoint, MSLP, or total (all-phase) precipitation, so none is
+/// inferred here.
+fn arome_france_001_surface_plan() -> Vec<(&'static str, FieldSelector)> {
+    vec![
+        (
+            "temperature_2m",
+            FieldSelector::height_agl(CanonicalField::Temperature, 2),
+        ),
+        (
+            "rh_2m",
+            FieldSelector::height_agl(CanonicalField::RelativeHumidity, 2),
+        ),
+        (
+            "u_10m",
+            FieldSelector::height_agl(CanonicalField::UWind, 10),
+        ),
+        (
+            "v_10m",
+            FieldSelector::height_agl(CanonicalField::VWind, 10),
+        ),
+        (
+            "surface_pressure",
+            FieldSelector::surface(CanonicalField::Pressure),
+        ),
+        (
+            "orography",
+            FieldSelector::surface(CanonicalField::GeopotentialHeight),
+        ),
+        (
+            "composite_reflectivity",
+            FieldSelector::surface(CanonicalField::CompositeReflectivity),
+        ),
+        (
+            "cloud_cover_low",
+            FieldSelector::surface(CanonicalField::LowCloudCover),
+        ),
+        (
+            "cloud_cover_mid",
+            FieldSelector::surface(CanonicalField::MiddleCloudCover),
+        ),
+        (
+            "cloud_cover_high",
+            FieldSelector::surface(CanonicalField::HighCloudCover),
+        ),
+        (
+            "simulated_ir",
+            FieldSelector::surface(CanonicalField::SimulatedInfraredBrightnessTemperature),
+        ),
+    ]
+}
+
+/// Exact direct-field contract admitted from the 0.025-degree AROME-France
+/// surface packages. SP1 supplies the primary state, run-total all-phase
+/// precipitation, MSLP, gust and total cloud; SP2 supplies dewpoint, surface
+/// pressure, static orography and layer clouds; SP3 supplies total-column
+/// water vapour. Provider-local CAPE, flux, rain/snow/graupel components and
+/// min/max temperature records remain fail-closed until the canonical store
+/// has distinct identities for their temporal semantics.
+fn arome_france_0025_surface_plan() -> Vec<(&'static str, FieldSelector)> {
+    vec![
+        (
+            "temperature_2m",
+            FieldSelector::height_agl(CanonicalField::Temperature, 2),
+        ),
+        (
+            "dewpoint_2m",
+            FieldSelector::height_agl(CanonicalField::Dewpoint, 2),
+        ),
+        (
+            "rh_2m",
+            FieldSelector::height_agl(CanonicalField::RelativeHumidity, 2),
+        ),
+        (
+            "u_10m",
+            FieldSelector::height_agl(CanonicalField::UWind, 10),
+        ),
+        (
+            "v_10m",
+            FieldSelector::height_agl(CanonicalField::VWind, 10),
+        ),
+        (
+            "wind_gust_10m",
+            FieldSelector::height_agl(CanonicalField::WindGust, 10),
+        ),
+        (
+            "mslp",
+            FieldSelector::mean_sea_level(CanonicalField::PressureReducedToMeanSeaLevel),
+        ),
+        (
+            "surface_pressure",
+            FieldSelector::surface(CanonicalField::Pressure),
+        ),
+        (
+            "orography",
+            FieldSelector::surface(CanonicalField::GeopotentialHeight),
+        ),
+        (
+            "apcp_run_total",
+            FieldSelector::surface(CanonicalField::TotalPrecipitation),
+        ),
+        (
+            "pwat",
+            FieldSelector::entire_atmosphere(CanonicalField::PrecipitableWater),
+        ),
+        (
+            "cloud_cover_low",
+            FieldSelector::surface(CanonicalField::LowCloudCover),
+        ),
+        (
+            "cloud_cover_mid",
+            FieldSelector::surface(CanonicalField::MiddleCloudCover),
+        ),
+        (
+            "cloud_cover_high",
+            FieldSelector::surface(CanonicalField::HighCloudCover),
+        ),
+        (
+            "cloud_cover_total",
+            FieldSelector::surface(CanonicalField::TotalCloudCover),
+        ),
+    ]
+}
+
 /// Direct 2-D fields normalized for one model. Most deterministic models use
 /// the long-standing surface plan above. CMA GRAPES GEPS publishes only
 /// provider-computed ensemble statistics, so its plan names and selects every
@@ -890,6 +1017,8 @@ pub fn surface_plan() -> Vec<(&'static str, FieldSelector)> {
     plan.extend(cma_geps_statistics_surface_plan());
     plan.extend(reps_statistics_surface_plan());
     plan.extend(cptec_eta_surface_plan());
+    plan.extend(arome_france_001_surface_plan());
+    plan.extend(arome_france_0025_surface_plan());
     plan
 }
 
@@ -898,6 +1027,8 @@ pub fn model_surface_plan(model: ModelId) -> Vec<(&'static str, FieldSelector)> 
         ModelId::CmaGeps => cma_geps_statistics_surface_plan(),
         ModelId::Reps => reps_statistics_surface_plan(),
         ModelId::EtaCptec8km => cptec_eta_surface_plan(),
+        ModelId::AromeFrance001 => arome_france_001_surface_plan(),
+        ModelId::AromeFrance0025 => arome_france_0025_surface_plan(),
         ModelId::GdpsGeml => vec![
             (
                 "temperature_2m",
@@ -1059,6 +1190,100 @@ mod tests {
             )
         );
         profile.validate().expect("Eta surface profile validates");
+    }
+
+    #[test]
+    fn arome_surface_profiles_are_exact_official_package_contracts() {
+        let plan_001 = model_surface_plan(ModelId::AromeFrance001);
+        assert_eq!(
+            plan_001.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec![
+                "temperature_2m",
+                "rh_2m",
+                "u_10m",
+                "v_10m",
+                "surface_pressure",
+                "orography",
+                "composite_reflectivity",
+                "cloud_cover_low",
+                "cloud_cover_mid",
+                "cloud_cover_high",
+                "simulated_ir",
+            ]
+        );
+        for unavailable in ["dewpoint_2m", "mslp", "apcp_run_total", "pwat"] {
+            assert!(
+                !plan_001.iter().any(|(name, _)| *name == unavailable),
+                "0.01-degree packages do not publish {unavailable} canonically"
+            );
+        }
+        assert!(plan_001.contains(&(
+            "composite_reflectivity",
+            FieldSelector::surface(CanonicalField::CompositeReflectivity),
+        )));
+        assert!(plan_001.contains(&(
+            "simulated_ir",
+            FieldSelector::surface(CanonicalField::SimulatedInfraredBrightnessTemperature),
+        )));
+        let surface_001 = IngestProfile::surface_for_model(ModelId::AromeFrance001);
+        assert_eq!(
+            surface_001.surface_fields,
+            FieldSet::Named(
+                plan_001
+                    .iter()
+                    .map(|(name, _)| (*name).to_string())
+                    .collect()
+            )
+        );
+        surface_001
+            .validate()
+            .expect("AROME 0.01 surface validates");
+
+        let plan_0025 = model_surface_plan(ModelId::AromeFrance0025);
+        assert_eq!(
+            plan_0025.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec![
+                "temperature_2m",
+                "dewpoint_2m",
+                "rh_2m",
+                "u_10m",
+                "v_10m",
+                "wind_gust_10m",
+                "mslp",
+                "surface_pressure",
+                "orography",
+                "apcp_run_total",
+                "pwat",
+                "cloud_cover_low",
+                "cloud_cover_mid",
+                "cloud_cover_high",
+                "cloud_cover_total",
+            ]
+        );
+        assert!(plan_0025.contains(&(
+            "pwat",
+            FieldSelector::entire_atmosphere(CanonicalField::PrecipitableWater),
+        )));
+        for (name, field) in [
+            ("cloud_cover_low", CanonicalField::LowCloudCover),
+            ("cloud_cover_mid", CanonicalField::MiddleCloudCover),
+            ("cloud_cover_high", CanonicalField::HighCloudCover),
+            ("cloud_cover_total", CanonicalField::TotalCloudCover),
+        ] {
+            assert!(plan_0025.contains(&(name, FieldSelector::surface(field))));
+        }
+
+        let sounding = IngestProfile::sounding_for_model(ModelId::AromeFrance0025);
+        sounding
+            .validate()
+            .expect("AROME 0.025 sounding has all seven required surface fields");
+        for name in SOUNDING_SURFACE_FIELDS {
+            assert!(sounding.includes_surface_field(name), "missing {name}");
+            assert!(
+                plan_0025.iter().any(|(have, _)| *have == name),
+                "missing {name}"
+            );
+        }
     }
 
     #[test]

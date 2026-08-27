@@ -110,6 +110,16 @@ fn volume_plan(profile: &IngestProfile, model: ModelId) -> Vec<(CanonicalField, 
 }
 
 fn pressure_levels(profile: &IngestProfile, model: ModelId) -> Vec<u16> {
+    if model == ModelId::AromeFrance0025 {
+        // Official IP1 inventory: 25 hPa spacing through 300 hPa, 50 hPa
+        // spacing thereafter, plus 925 hPa. Never plan the generic 25 hPa
+        // levels that the provider does not publish.
+        return rustwx_models::AROME_FRANCE_0025_ISOBARIC_LEVELS_HPA
+            .iter()
+            .copied()
+            .filter(|level| (*level - 100) % profile.level_step_hpa == 0)
+            .collect();
+    }
     if model != ModelId::GdpsGeml {
         return profile.candidate_levels();
     }
@@ -817,8 +827,18 @@ fn fetch_product(
     idx_patterns: &[&str],
     stage: IngestStage,
 ) -> Result<(CachedFetchResult, u128), IngestError> {
+    // AROME 0.025-degree objects contain one six-hour lead group. Normalize
+    // the acquisition request to the group's first lead so all six extracted
+    // hours share one component/logical cache identity instead of storing the
+    // same 0.5 GiB IP1 object six times. `FetchedHour.hour` remains the user's
+    // original hour and therefore still selects the correct messages below.
+    let request_hour = if config.model == ModelId::AromeFrance0025 {
+        arome_0025_group_start(hour)
+    } else {
+        hour
+    };
     let fetch = FetchRequest {
-        request: ModelRunRequest::new(config.model, config.cycle.clone(), hour, product)
+        request: ModelRunRequest::new(config.model, config.cycle.clone(), request_hour, product)
             .map_err(other)?,
         source_override: config.source_override,
         variable_patterns: idx_patterns.iter().map(|p| p.to_string()).collect(),
@@ -827,8 +847,35 @@ fn fetch_product(
     let fetch_started = Instant::now();
     let components = provider_component_products(config, hour, product)?;
     let fetched = if let Some(components) = components {
-        fetch_component_bundle_with_cache(&fetch, &components, config.cache_root, config.use_cache)
+        // IP1 is already a self-contained multi-message package and has been
+        // observed live at 530,658,659 bytes, barely below the component
+        // bundle's defensive 512 MiB assembly ceiling. Fetch the singleton
+        // directly: this avoids a meaningless reassembly/copy, removes that
+        // fragile headroom, and keys the raw cache once by the normalized
+        // six-hour package URL.
+        if config.model == ModelId::AromeFrance0025 && components.len() == 1 {
+            let component_fetch = FetchRequest {
+                request: ModelRunRequest::new(
+                    config.model,
+                    config.cycle.clone(),
+                    request_hour,
+                    &components[0],
+                )
+                .map_err(other)?,
+                source_override: config.source_override,
+                variable_patterns: Vec::new(),
+            };
+            fetch_bytes_with_cache(&component_fetch, config.cache_root, config.use_cache)
+                .map_err(other)?
+        } else {
+            fetch_component_bundle_with_cache(
+                &fetch,
+                &components,
+                config.cache_root,
+                config.use_cache,
+            )
             .map_err(other)?
+        }
     } else {
         fetch_bytes_with_cache(&fetch, config.cache_root, config.use_cache).map_err(other)?
     };
@@ -839,6 +886,103 @@ fn fetch_product(
         ms: fetch_ms,
     });
     Ok((fetched, fetch_ms))
+}
+
+/// First lead in Météo-France's inclusive 0.025-degree package groups:
+/// 00-06, 07-12, 13-18, ..., 43-48, 49-51.
+fn arome_0025_group_start(forecast_hour: u16) -> u16 {
+    if forecast_hour <= 6 {
+        0
+    } else {
+        ((forecast_hour - 7) / 6) * 6 + 7
+    }
+}
+
+fn arome_provider_component_products(
+    model: ModelId,
+    profile: &IngestProfile,
+    forecast_hour: u16,
+    logical_product: &str,
+) -> Result<Vec<String>, IngestError> {
+    match model {
+        ModelId::AromeFrance001 => {
+            if logical_product != "rws-arome-surface" {
+                return Err(other(format!(
+                    "{model} fetch plan contains unknown logical product '{logical_product}'"
+                )));
+            }
+            let mut components = vec!["SP1".to_string(), "SP2".to_string()];
+            let needs_brightness_temperature = profile.includes_surface_field("simulated_ir");
+            let needs_orography = profile.includes_surface_field("orography");
+            if needs_brightness_temperature || (needs_orography && forecast_hour == 0) {
+                components.push("SP3".to_string());
+            }
+            if needs_orography && forecast_hour > 0 {
+                // Hourly SP3 drops ALTITUDE after f000; join its DRT42 f000
+                // field while retaining the valid-hour SP3 brightness temp.
+                components.push("SP3-static".to_string());
+            }
+            Ok(components)
+        }
+        ModelId::AromeFrance0025 => match logical_product {
+            "rws-arome-pressure" => Ok(vec!["IP1".to_string()]),
+            "rws-arome-surface" => {
+                let mut components = vec!["SP1".to_string(), "SP2".to_string()];
+                if profile.includes_surface_field("pwat") {
+                    components.push("SP3".to_string());
+                }
+                if profile.includes_surface_field("orography") && forecast_hour >= 7 {
+                    // Only the first 00H06H SP2 package carries the f000
+                    // static terrain record. Later six-hour groups need an
+                    // explicit cycle-static join to keep sounding AGL and
+                    // surface displays anchored honestly.
+                    components.push("SP2-static".to_string());
+                }
+                Ok(components)
+            }
+            unknown => Err(other(format!(
+                "{model} fetch plan contains unknown logical product '{unknown}'"
+            ))),
+        },
+        _ => Err(other(format!(
+            "{model} is not an AROME-France package model"
+        ))),
+    }
+}
+
+/// Resolve the physical product tokens an availability/latest probe must
+/// require for one model/profile/hour.
+///
+/// Most model fetch plans already name physical objects and therefore pass
+/// through unchanged. AROME-France plans intentionally expose logical
+/// pressure/surface roles, so this expands them through the exact same
+/// profile- and lead-aware package function used by [`fetch_product`]. This
+/// prevents a successful SP1 HEAD from falsely declaring an hour available
+/// when SP2, SP3, the f000 static join, or IP1 has not landed yet.
+pub fn availability_probe_products(
+    model: ModelId,
+    profile: &IngestProfile,
+    forecast_hour: u16,
+) -> Result<Vec<String>, IngestError> {
+    validate_ingest_profile_for_model(model, profile)?;
+    let needs_pressure = profile.needs_prs();
+    let mut products = Vec::new();
+    for logical in fetch_plan(model)? {
+        if logical.pressure_source && !logical.surface_source && !needs_pressure {
+            continue;
+        }
+        if matches!(model, ModelId::AromeFrance001 | ModelId::AromeFrance0025) {
+            products.extend(arome_provider_component_products(
+                model,
+                profile,
+                forecast_hour,
+                logical.product,
+            )?);
+        } else {
+            products.push(logical.product.to_string());
+        }
+    }
+    Ok(products)
 }
 
 /// Expand provider logical extraction families into exact ordered per-object
@@ -910,6 +1054,13 @@ fn provider_component_products(
             }));
             Ok(Some(components))
         }
+        ModelId::AromeFrance001 | ModelId::AromeFrance0025 => arome_provider_component_products(
+            config.model,
+            config.profile,
+            forecast_hour,
+            logical_product,
+        )
+        .map(Some),
         _ => Ok(None),
     }
 }
@@ -1295,6 +1446,7 @@ fn safe_provider_identity(model: ModelId, source: SourceId) -> &'static str {
                 "roshydromet-wipps-dc"
             }
             SourceId::Cptec => "cptec-inpe",
+            SourceId::MeteoFrancePnt => "meteo-france-pnt",
             SourceId::Ncei => "noaa-ncei",
             SourceId::Gdex => "ucar-gdex",
             SourceId::AifsInference => "local-aifs-inference",
@@ -1329,6 +1481,12 @@ fn structured_source_identity(
             false,
         )),
         SourceId::Cptec => Some(("cptec-inpe", "cptec-inpe", "cptec-data-server", false)),
+        SourceId::MeteoFrancePnt => Some((
+            "meteo-france",
+            "meteo-france",
+            "ovh-public-object-storage",
+            false,
+        )),
         SourceId::Ncei => Some(("noaa-ncep", "noaa", "noaa-ncei", false)),
         SourceId::Gdex | SourceId::AifsInference | SourceId::Earth2Archive => None,
     }
@@ -3201,6 +3359,201 @@ mod tests {
         assert_eq!(view_profiles.fields_2d, view.fields_2d);
         assert_eq!(view_profiles.derived, view.derived);
         assert!(view_profiles.heavy.is_empty(), "heavy stays off");
+    }
+
+    #[test]
+    fn arome_0025_package_group_starts_match_the_official_inclusive_windows() {
+        for (hour, expected_start) in [
+            (0, 0),
+            (1, 0),
+            (6, 0),
+            (7, 7),
+            (12, 7),
+            (13, 13),
+            (48, 43),
+            (49, 49),
+            (51, 49),
+        ] {
+            assert_eq!(arome_0025_group_start(hour), expected_start, "f{hour:03}");
+        }
+        assert_eq!(
+            [0, 1, 6].map(arome_0025_group_start),
+            [0, 0, 0],
+            "f000/f001/f006 must share the exact 00H06H cache identity"
+        );
+    }
+
+    #[test]
+    fn arome_package_components_are_profile_and_lead_bounded() {
+        let cycle = CycleSpec::new("20260826", 21).unwrap();
+        let cancel = AtomicBool::new(false);
+        let sink = |_event: IngestEvent| {};
+
+        let surface_001 = IngestProfile::surface_for_model(ModelId::AromeFrance001);
+        let config_001 = IngestConfig {
+            model: ModelId::AromeFrance001,
+            cycle: &cycle,
+            source_override: Some(SourceId::MeteoFrancePnt),
+            cache_root: Path::new("unused-cache"),
+            use_cache: true,
+            store_root: Path::new("unused-store"),
+            model_slug: "arome-france-0p01",
+            run_slug: "20260826-21",
+            profile: &surface_001,
+            verify: true,
+            progress: &sink,
+            cancel: &cancel,
+        };
+        assert_eq!(
+            provider_component_products(&config_001, 0, "rws-arome-surface")
+                .unwrap()
+                .unwrap(),
+            vec!["SP1", "SP2", "SP3"]
+        );
+        assert_eq!(
+            provider_component_products(&config_001, 1, "rws-arome-surface")
+                .unwrap()
+                .unwrap(),
+            vec!["SP1", "SP2", "SP3", "SP3-static"]
+        );
+        assert_eq!(
+            availability_probe_products(ModelId::AromeFrance001, &surface_001, 0).unwrap(),
+            vec!["SP1", "SP2", "SP3"]
+        );
+        assert_eq!(
+            availability_probe_products(ModelId::AromeFrance001, &surface_001, 1).unwrap(),
+            vec!["SP1", "SP2", "SP3", "SP3-static"]
+        );
+
+        let sounding_0025 = IngestProfile::sounding_for_model(ModelId::AromeFrance0025);
+        let config_0025 = IngestConfig {
+            model: ModelId::AromeFrance0025,
+            cycle: &cycle,
+            source_override: Some(SourceId::MeteoFrancePnt),
+            cache_root: Path::new("unused-cache"),
+            use_cache: true,
+            store_root: Path::new("unused-store"),
+            model_slug: "arome-france-0p025",
+            run_slug: "20260826-21",
+            profile: &sounding_0025,
+            verify: true,
+            progress: &sink,
+            cancel: &cancel,
+        };
+        assert_eq!(
+            provider_component_products(&config_0025, 1, "rws-arome-pressure")
+                .unwrap()
+                .unwrap(),
+            vec!["IP1"]
+        );
+        assert_eq!(
+            provider_component_products(&config_0025, 1, "rws-arome-surface")
+                .unwrap()
+                .unwrap(),
+            vec!["SP1", "SP2"]
+        );
+        assert_eq!(
+            availability_probe_products(ModelId::AromeFrance0025, &sounding_0025, 1).unwrap(),
+            vec!["IP1", "SP1", "SP2"]
+        );
+        assert_eq!(
+            availability_probe_products(ModelId::AromeFrance0025, &sounding_0025, 7).unwrap(),
+            vec!["IP1", "SP1", "SP2", "SP2-static"],
+            "later groups must require the cycle-static 00H06H terrain package"
+        );
+
+        let surface_0025 = IngestProfile::surface_for_model(ModelId::AromeFrance0025);
+        let surface_config_0025 = IngestConfig {
+            profile: &surface_0025,
+            ..config_0025
+        };
+        assert_eq!(
+            provider_component_products(&surface_config_0025, 1, "rws-arome-surface")
+                .unwrap()
+                .unwrap(),
+            vec!["SP1", "SP2", "SP3"]
+        );
+        assert_eq!(
+            availability_probe_products(ModelId::AromeFrance0025, &surface_0025, 1).unwrap(),
+            vec!["SP1", "SP2", "SP3"]
+        );
+        assert_eq!(
+            availability_probe_products(ModelId::AromeFrance0025, &surface_0025, 7).unwrap(),
+            vec!["SP1", "SP2", "SP3", "SP2-static"]
+        );
+
+        let hrrr_surface = IngestProfile::surface_for_model(ModelId::Hrrr);
+        assert_eq!(
+            availability_probe_products(ModelId::Hrrr, &hrrr_surface, 1).unwrap(),
+            vec!["sfc"],
+            "ordinary physical fetch-plan products pass through and unused pressure roles drop"
+        );
+    }
+
+    #[test]
+    fn arome_store_plans_preserve_only_published_fields_and_pressure_levels() {
+        let surface_001 = IngestProfile::surface_for_model(ModelId::AromeFrance001);
+        let plan_001 = planned_store_variables(&surface_001, ModelId::AromeFrance001);
+        assert!(plan_001.volumes.is_empty());
+        assert_eq!(
+            plan_001.fields_2d,
+            vec![
+                "temperature_2m",
+                "rh_2m",
+                "u_10m",
+                "v_10m",
+                "surface_pressure",
+                "orography",
+                "composite_reflectivity",
+                "cloud_cover_low",
+                "cloud_cover_mid",
+                "cloud_cover_high",
+                "simulated_ir",
+            ]
+        );
+        assert!(plan_001.derived.is_empty() && plan_001.heavy.is_empty());
+
+        let sounding_0025 = IngestProfile::sounding_for_model(ModelId::AromeFrance0025);
+        assert_eq!(
+            pressure_levels(&sounding_0025, ModelId::AromeFrance0025),
+            vec![
+                100, 125, 150, 175, 200, 225, 250, 275, 300, 350, 400, 450, 500, 550, 600, 650,
+                700, 750, 800, 850, 900, 925, 950, 1000,
+            ]
+        );
+        let sounding_plan = planned_store_variables(&sounding_0025, ModelId::AromeFrance0025);
+        assert_eq!(
+            sounding_plan.volumes,
+            vec![
+                ("temperature_iso", 24),
+                ("dewpoint_iso", 24),
+                ("u_iso", 24),
+                ("v_iso", 24),
+                ("height_iso", 24),
+            ]
+        );
+        assert_eq!(
+            sounding_plan.fields_2d,
+            vec![
+                "temperature_2m",
+                "dewpoint_2m",
+                "u_10m",
+                "v_10m",
+                "mslp",
+                "surface_pressure",
+                "orography",
+            ]
+        );
+
+        let mut coarse = sounding_0025;
+        coarse.level_step_hpa = 50;
+        assert_eq!(
+            pressure_levels(&coarse, ModelId::AromeFrance0025),
+            vec![
+                100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850,
+                900, 950, 1000,
+            ]
+        );
     }
 
     #[test]

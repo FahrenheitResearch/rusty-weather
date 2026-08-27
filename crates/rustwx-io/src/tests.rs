@@ -832,6 +832,288 @@ fn ieee_f32_message(
 }
 
 #[test]
+fn meteo_france_local_parameters_are_model_scoped_canonical_aliases() {
+    let cases = [
+        (
+            ModelId::AromeFrance001,
+            ParameterCode {
+                discipline: 0,
+                category: 16,
+                number: 193,
+            },
+            FieldSelector::surface(CanonicalField::CompositeReflectivity),
+        ),
+        (
+            ModelId::AromeFrance001,
+            ParameterCode {
+                discipline: 0,
+                category: 5,
+                number: 7,
+            },
+            FieldSelector::surface(CanonicalField::SimulatedInfraredBrightnessTemperature),
+        ),
+        (
+            ModelId::AromeFrance0025,
+            ParameterCode {
+                discipline: 0,
+                category: 1,
+                number: 64,
+            },
+            FieldSelector::entire_atmosphere(CanonicalField::PrecipitableWater),
+        ),
+    ];
+
+    for (model, parameter, selector) in cases {
+        let message = ieee_f32_message(parameter, 1, 0.0, &[12.0, 34.0], -5.0, -4.0);
+        let parsed = ParsedModelGrib {
+            model,
+            grib: Grib2File {
+                messages: vec![message.clone()],
+            },
+        };
+        let extracted = parsed
+            .extract_field_values_partial_at_forecast_hour(&[selector], None)
+            .expect("documented AROME local alias extracts");
+        assert!(extracted.missing.is_empty(), "{model} {selector:?}");
+        assert_eq!(extracted.extracted.len(), 1);
+        assert_eq!(extracted.extracted[0].values, vec![12.0, 34.0]);
+
+        let wrong_model = ParsedModelGrib {
+            model: ModelId::Hrrr,
+            grib: Grib2File {
+                messages: vec![message],
+            },
+        };
+        match wrong_model.extract_field_values_partial_at_forecast_hour(&[selector], None) {
+            Ok(rejected) => {
+                assert!(rejected.extracted.is_empty());
+                assert_eq!(rejected.missing, vec![selector]);
+            }
+            Err(IoError::UnsupportedStructuredSelector { selector: rejected }) => {
+                assert_eq!(rejected, selector);
+            }
+            Err(err) => panic!("unrelated model failed unexpectedly: {err}"),
+        }
+    }
+}
+
+#[test]
+fn arome_001_simulated_ir_accepts_live_pdt32_only_on_its_model_lane() {
+    let selector = FieldSelector::surface(CanonicalField::SimulatedInfraredBrightnessTemperature);
+    let mut message = ieee_f32_message(
+        ParameterCode {
+            discipline: 0,
+            category: 5,
+            number: 7,
+        },
+        1,
+        0.0,
+        &[247.5, 263.25],
+        -5.0,
+        -4.0,
+    );
+    // Shape observed in the official 0.01-degree SP3 f001 package:
+    // PDT 4.32, surface level, one-hour forecast time.
+    message.product.template = 32;
+    message.product.forecast_time = 1;
+    message.product.time_range_unit = 1;
+
+    let parsed = ParsedModelGrib {
+        model: ModelId::AromeFrance001,
+        grib: Grib2File {
+            messages: vec![message.clone()],
+        },
+    };
+    let extracted = parsed
+        .extract_field_values_partial_at_forecast_hour(&[selector], Some(1))
+        .expect("live-shaped AROME PDT32 simulated IR extracts");
+    assert!(extracted.missing.is_empty());
+    assert_eq!(extracted.extracted[0].values, vec![247.5, 263.25]);
+
+    let wrong_model = ParsedModelGrib {
+        model: ModelId::Hrrr,
+        grib: Grib2File {
+            messages: vec![message],
+        },
+    };
+    match wrong_model.extract_field_values_partial_at_forecast_hour(&[selector], Some(1)) {
+        Err(IoError::UnsupportedStructuredSelector { selector: rejected }) => {
+            assert_eq!(rejected, selector);
+        }
+        Ok(rejected) => {
+            assert!(rejected.extracted.is_empty());
+            assert_eq!(rejected.missing, vec![selector]);
+        }
+        Err(err) => panic!("unrelated model failed unexpectedly: {err}"),
+    }
+}
+
+#[test]
+fn arome_surface_layer_clouds_accept_provider_surface_vertical_only_on_arome_lanes() {
+    let cases = [
+        (CanonicalField::LowCloudCover, 3),
+        (CanonicalField::MiddleCloudCover, 4),
+        (CanonicalField::HighCloudCover, 5),
+    ];
+    for model in [ModelId::AromeFrance001, ModelId::AromeFrance0025] {
+        for (field, parameter_number) in cases {
+            let selector = FieldSelector::surface(field);
+            let mut message = ieee_f32_message(
+                ParameterCode {
+                    discipline: 0,
+                    category: 6,
+                    number: parameter_number,
+                },
+                1,
+                0.0,
+                &[35.0, 80.0],
+                -5.0,
+                -4.0,
+            );
+            message.product.forecast_time = 1;
+            message.product.time_range_unit = 1;
+            let parsed = ParsedModelGrib {
+                model,
+                grib: Grib2File {
+                    messages: vec![message],
+                },
+            };
+            let extracted = parsed
+                .extract_field_values_partial_at_forecast_hour(&[selector], Some(1))
+                .expect("AROME surface cloud selector constructs and extracts");
+            assert!(extracted.missing.is_empty(), "{model} {field:?}");
+            assert_eq!(extracted.extracted[0].values, vec![35.0, 80.0]);
+        }
+    }
+
+    let selector = FieldSelector::surface(CanonicalField::LowCloudCover);
+    let wrong_model = ParsedModelGrib {
+        model: ModelId::Hrrr,
+        grib: Grib2File { messages: vec![] },
+    };
+    assert!(matches!(
+        wrong_model.extract_field_values_partial_at_forecast_hour(&[selector], Some(1)),
+        Err(IoError::UnsupportedStructuredSelector { .. })
+    ));
+}
+
+#[test]
+fn arome_0025_statistical_fields_use_interval_end_as_valid_hour() {
+    let interval_message = |parameter: ParameterCode,
+                            level_type: u8,
+                            level_value: f64,
+                            start_hour: u32,
+                            length_hours: u32,
+                            process: u8,
+                            values: &[f32]| {
+        let mut message = ieee_f32_message(parameter, level_type, level_value, values, -5.0, -4.0);
+        message.product.template = 8;
+        message.product.forecast_time = start_hour;
+        message.product.time_range_unit = 1;
+        message.product.statistical_process_type = Some(process);
+        message.product.statistical_time_range_unit = Some(1);
+        message.product.time_range_length = Some(length_hours);
+        message
+    };
+
+    let gust = FieldSelector::height_agl(CanonicalField::WindGust, 10);
+    let gust_0_1 = interval_message(
+        ParameterCode {
+            discipline: 0,
+            category: 2,
+            number: 22,
+        },
+        103,
+        10.0,
+        0,
+        1,
+        2,
+        &[11.0, 12.0],
+    );
+    let gust_1_2 = interval_message(
+        ParameterCode {
+            discipline: 0,
+            category: 2,
+            number: 22,
+        },
+        103,
+        10.0,
+        1,
+        1,
+        2,
+        &[21.0, 22.0],
+    );
+    let parsed_gust = ParsedModelGrib {
+        model: ModelId::AromeFrance0025,
+        grib: Grib2File {
+            messages: vec![gust_0_1, gust_1_2],
+        },
+    };
+    let f000 = parsed_gust
+        .extract_field_values_partial_at_forecast_hour(&[gust], Some(0))
+        .unwrap();
+    assert_eq!(f000.missing, vec![gust], "0-1 h maximum is not f000");
+    let f001 = parsed_gust
+        .extract_field_values_partial_at_forecast_hour(&[gust], Some(1))
+        .unwrap();
+    assert_eq!(f001.extracted[0].values, vec![11.0, 12.0]);
+    let f002 = parsed_gust
+        .extract_field_values_partial_at_forecast_hour(&[gust], Some(2))
+        .unwrap();
+    assert_eq!(f002.extracted[0].values, vec![21.0, 22.0]);
+
+    let precipitation = FieldSelector::surface(CanonicalField::TotalPrecipitation);
+    let total_0_1 = interval_message(
+        ParameterCode {
+            discipline: 0,
+            category: 1,
+            number: 52,
+        },
+        1,
+        0.0,
+        0,
+        1,
+        1,
+        &[1.0, 2.0],
+    );
+    let total_0_2 = interval_message(
+        ParameterCode {
+            discipline: 0,
+            category: 1,
+            number: 52,
+        },
+        1,
+        0.0,
+        0,
+        2,
+        1,
+        &[3.0, 4.0],
+    );
+    let parsed_precipitation = ParsedModelGrib {
+        model: ModelId::AromeFrance0025,
+        grib: Grib2File {
+            messages: vec![total_0_1, total_0_2],
+        },
+    };
+    let f000 = parsed_precipitation
+        .extract_field_values_partial_at_forecast_hour(&[precipitation], Some(0))
+        .unwrap();
+    assert_eq!(
+        f000.missing,
+        vec![precipitation],
+        "0-1 h accumulation is not f000"
+    );
+    let f001 = parsed_precipitation
+        .extract_field_values_partial_at_forecast_hour(&[precipitation], Some(1))
+        .unwrap();
+    assert_eq!(f001.extracted[0].values, vec![1.0, 2.0]);
+    let f002 = parsed_precipitation
+        .extract_field_values_partial_at_forecast_hour(&[precipitation], Some(2))
+        .unwrap();
+    assert_eq!(f002.extracted[0].values, vec![3.0, 4.0]);
+}
+
+#[test]
 fn parsed_model_grib_repeated_passes_match_fresh_parse_results() {
     use wx_core::grib2::{
         Grib2Writer, GridDefinition as WxGridDefinition, MessageBuilder, PackingMethod,
@@ -1559,6 +1841,78 @@ fn candidate_hours_match_model_rules() {
     assert_eq!(nbm.last().copied(), Some(264));
     assert!(!nbm.contains(&37));
     assert!(!nbm.contains(&195));
+}
+
+#[test]
+fn arome_grouped_availability_probes_one_url_and_fans_out_to_all_hours() {
+    let candidates = (0..=6).collect::<Vec<_>>();
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let seen = std::sync::Mutex::new(Vec::new());
+    let available = available_forecast_hours_for_candidates_with_probe(
+        ModelId::AromeFrance0025,
+        "20260826",
+        21,
+        "SP1",
+        Some(SourceId::MeteoFrancePnt),
+        &candidates,
+        true,
+        |resolved| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            seen.lock()
+                .unwrap()
+                .push(resolved.availability_probe_url().to_string());
+            true
+        },
+    )
+    .unwrap();
+
+    assert_eq!(available, candidates);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "00H06H must issue one physical availability request, not seven"
+    );
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].contains("SP1"));
+    assert!(seen[0].contains("00H06H"));
+}
+
+#[test]
+fn ordinary_hourly_availability_still_probes_one_distinct_url_per_hour() {
+    let candidates = vec![0, 1, 2];
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let seen = std::sync::Mutex::new(Vec::new());
+    let available = available_forecast_hours_for_candidates_with_probe(
+        ModelId::Hrrr,
+        "20260826",
+        21,
+        "sfc",
+        Some(SourceId::Aws),
+        &candidates,
+        true,
+        |resolved| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let url = resolved.availability_probe_url().to_string();
+            let available = !url.contains("wrfsfcf01");
+            seen.lock().unwrap().push(url);
+            available
+        },
+    )
+    .unwrap();
+
+    assert_eq!(available, vec![0, 2]);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        candidates.len()
+    );
+    let unique = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique.len(), candidates.len());
 }
 
 #[test]
