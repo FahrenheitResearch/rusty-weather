@@ -29,6 +29,14 @@ pub const NATIVE_FRAME_SCHEMA: &str = "rw-sat.native-frame.v1";
 const FRAME_MANIFEST: &str = "frame.json";
 const ARCHIVE_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+/// ABI Full Disk channels that belong to one provider scan share the exact
+/// scan-start timestamp, but NOAA's channel files do not always report an
+/// identical scan end.  For example, the operational GOES-18 M6 C01/C02/C03
+/// files ending at `...49525` pair with C13 ending at `...49536` (1.1 s
+/// later).  Timestamps in the native manifest are whole seconds, so a
+/// two-second end tolerance admits that real scan without allowing adjacent
+/// ten-minute Full Disk scans to be mixed.
+const ABI_COMPONENT_END_TOLERANCE_SECONDS: i64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeChannelSource {
@@ -88,11 +96,12 @@ pub struct NativeSatelliteFrame {
 impl NativeSatelliteFrame {
     /// Whether this frame contains every source required by `product`.
     ///
-    /// A minute-granular `frame_id` is not enough to prove that
-    /// multiple channels belong to the same scan. For a multichannel product,
-    /// every required source must have identical exact start *and* end Unix
-    /// timestamps. A raw single-channel product remains complete whenever its
-    /// one requested source is present.
+    /// A minute-granular `frame_id` is not enough to prove that multiple
+    /// channels belong to the same scan. For a multichannel product, every
+    /// required source must have the provider-identical start time and an end
+    /// time within the documented ABI component tolerance. A raw
+    /// single-channel product remains complete whenever its one requested
+    /// source is present.
     pub fn is_complete_for(&self, product: GoesAbiProduct) -> bool {
         let Some((&reference_channel, remaining_channels)) =
             product.required_channels().split_first()
@@ -105,7 +114,8 @@ impl NativeSatelliteFrame {
         remaining_channels.iter().all(|channel| {
             self.channels.get(channel).is_some_and(|source| {
                 source.scan_start_unix == reference.scan_start_unix
-                    && source.scan_end_unix == reference.scan_end_unix
+                    && source.scan_end_unix.abs_diff(reference.scan_end_unix)
+                        <= ABI_COMPONENT_END_TOLERANCE_SECONDS as u64
             })
         })
     }
@@ -1037,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn multichannel_completeness_requires_exact_matching_scan_bounds() {
+    fn multichannel_completeness_uses_exact_start_and_provider_end_tolerance() {
         let start = Utc
             .with_ymd_and_hms(2026, 8, 26, 16, 40, 21)
             .unwrap()
@@ -1064,8 +1074,36 @@ mod tests {
 
         frame.channels.get_mut(&3).unwrap().scan_start_unix = start;
         frame.channels.get_mut(&3).unwrap().scan_end_unix += 1;
-        assert!(!frame.is_complete_for(GoesAbiProduct::TrueColor));
+        assert!(
+            frame.is_complete_for(GoesAbiProduct::TrueColor),
+            "real ABI component channels can end about one second apart"
+        );
+        frame.channels.get_mut(&3).unwrap().scan_end_unix += 2;
+        assert!(
+            !frame.is_complete_for(GoesAbiProduct::TrueColor),
+            "an end mismatch beyond the provider tolerance must fail closed"
+        );
         assert!(frame.is_complete_for(GoesAbiProduct::RawChannel(3)));
+    }
+
+    #[test]
+    fn operational_geocolor_c13_end_offset_is_one_complete_scan() {
+        let start = Utc
+            .with_ymd_and_hms(2026, 8, 27, 1, 40, 21)
+            .unwrap()
+            .timestamp();
+        // NOAA GOES-18 M6 Full Disk C01/C02/C03 ended at 01:49:52.5Z
+        // while C13 ended at 01:49:53.6Z for this real scan. Whole-second
+        // manifests retain that as a one-second component-end difference.
+        let common_end = start + 571;
+        let frame = native_test_frame(&[
+            (1, start, common_end),
+            (2, start, common_end),
+            (3, start, common_end),
+            (13, start, common_end + 1),
+        ]);
+
+        assert!(frame.is_complete_for(GoesAbiProduct::GeoColor));
     }
 
     #[test]
