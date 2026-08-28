@@ -18,12 +18,21 @@ pub enum SatEvent {
         band: u8,
         prefixes: Vec<String>,
     },
-    /// One poll cycle finished; `new_keys` is the number of previously
-    /// unseen objects discovered across the polled prefixes.
+    /// One band poll finished. `new_keys` counts successfully ingested
+    /// provider objects; `retained_keys` counts current scans skipped because
+    /// their channel/minute slot was already present in the native archive.
     PollDone {
         band: u8,
         new_keys: usize,
+        retained_keys: usize,
         ms: u128,
+    },
+    /// A current provider scan matched this channel/minute in the retained
+    /// native archive, so the follow loop intentionally skipped a duplicate
+    /// source download. This is distinct from a raw-object cache hit.
+    AlreadyRetained {
+        key: String,
+        bytes: u64,
     },
     /// An object download began (`bytes` is the listed S3 size).
     DownloadStarted {
@@ -89,8 +98,18 @@ pub fn print_event(event: &SatEvent) {
         SatEvent::PollStarted { band, prefixes } => {
             println!("poll C{band:02}: {}", prefixes.join(" + "));
         }
-        SatEvent::PollDone { band, new_keys, ms } => {
-            println!("poll C{band:02}: {new_keys} new object(s) in {ms} ms");
+        SatEvent::PollDone {
+            band,
+            new_keys,
+            retained_keys,
+            ms,
+        } => {
+            println!(
+                "poll C{band:02}: {new_keys} new object(s), {retained_keys} scan(s) already retained in {ms} ms"
+            );
+        }
+        SatEvent::AlreadyRetained { key, bytes } => {
+            println!("scan already retained: {key} ({bytes} bytes)");
         }
         SatEvent::DownloadStarted { key, bytes } => {
             println!("get {key} ({bytes} bytes)");

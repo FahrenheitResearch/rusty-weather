@@ -3710,9 +3710,21 @@ impl App {
                         self.sat_panel.set_spec_status(Err(message));
                     }
                 }
-                SatResponse::PollDone { band, new_keys, ms } => {
+                SatResponse::PollStarted { band } => {
+                    self.sat_panel.apply_poll_started(band);
+                }
+                SatResponse::PollDone {
+                    band,
+                    new_keys,
+                    retained_keys,
+                    ms,
+                } => {
                     self.worker.stats().record("sat.poll", ms as f32);
-                    self.sat_panel.apply_poll_done(band, new_keys, ms);
+                    self.sat_panel
+                        .apply_poll_done(band, new_keys, retained_keys, ms);
+                }
+                SatResponse::AlreadyRetained { id, label, bytes } => {
+                    self.sat_panel.apply_already_retained(id, label, bytes);
                 }
                 SatResponse::DownloadStarted { id, label, bytes } => {
                     self.sat_panel.apply_download_started(id, label, bytes);

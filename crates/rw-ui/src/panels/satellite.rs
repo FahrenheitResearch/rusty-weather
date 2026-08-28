@@ -13,6 +13,7 @@
 //! boundaries and between bounded download reads; frame writes and object
 //! installs are atomic, so no partial files.
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use egui::{Color32, ComboBox, DragValue, RichText, ScrollArea, TextEdit, Ui};
@@ -134,6 +135,9 @@ pub enum SatFollowState {
 /// Per-frame ingest progress.
 #[derive(Debug, Clone, PartialEq)]
 enum SatFrameStage {
+    AlreadyRetained {
+        source_bytes: u64,
+    },
     Downloading {
         received_bytes: u64,
         total_bytes: u64,
@@ -160,6 +164,16 @@ struct SatFrameRow {
     stage: SatFrameStage,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SatBandPollStatus {
+    Polling,
+    Done {
+        new_keys: usize,
+        retained_keys: usize,
+        ms: u128,
+    },
+}
+
 /// Host-pushed live disk usage of the followed band(s).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SatDiskUsage {
@@ -184,7 +198,7 @@ pub struct SatellitePanel {
     spec_error: Option<String>,
     state: SatFollowState,
     rows: Vec<SatFrameRow>,
-    last_poll: Option<String>,
+    band_polls: BTreeMap<u8, SatBandPollStatus>,
     /// When the follow engine went to sleep and for how long (countdown).
     sleeping: Option<(Instant, u64)>,
     polls: u32,
@@ -206,7 +220,7 @@ impl SatellitePanel {
             spec_error: None,
             state: SatFollowState::Idle,
             rows: Vec::new(),
-            last_poll: None,
+            band_polls: BTreeMap::new(),
             sleeping: None,
             polls: 0,
             frames_ingested: 0,
@@ -263,7 +277,7 @@ impl SatellitePanel {
     pub fn begin_follow(&mut self) {
         self.rows.clear();
         self.notes.clear();
-        self.last_poll = None;
+        self.band_polls.clear();
         self.sleeping = None;
         self.polls = 0;
         self.frames_ingested = 0;
@@ -282,10 +296,39 @@ impl SatellitePanel {
         };
     }
 
-    pub fn apply_poll_done(&mut self, band: u8, new_keys: usize, ms: u128) {
+    pub fn apply_poll_started(&mut self, band: u8) {
+        self.sleeping = None;
+        self.band_polls.insert(band, SatBandPollStatus::Polling);
+    }
+
+    pub fn apply_poll_done(&mut self, band: u8, new_keys: usize, retained_keys: usize, ms: u128) {
         self.polls += 1;
         self.sleeping = None;
-        self.last_poll = Some(format!("poll C{band:02}: {new_keys} new in {ms} ms"));
+        self.band_polls.insert(
+            band,
+            SatBandPollStatus::Done {
+                new_keys,
+                retained_keys,
+                ms,
+            },
+        );
+    }
+
+    pub fn apply_already_retained(&mut self, id: String, label: String, source_bytes: u64) {
+        if let Some(row) = self.rows.iter_mut().rev().find(|row| row.id == id) {
+            row.label = label;
+            row.stage = SatFrameStage::AlreadyRetained { source_bytes };
+            return;
+        }
+        self.rows.push(SatFrameRow {
+            id,
+            label,
+            stage: SatFrameStage::AlreadyRetained { source_bytes },
+        });
+        if self.rows.len() > MAX_FRAME_ROWS {
+            let drop = self.rows.len() - MAX_FRAME_ROWS;
+            self.rows.drain(..drop);
+        }
     }
 
     pub fn apply_download_started(&mut self, id: String, label: String, bytes: u64) {
@@ -633,6 +676,7 @@ impl SatellitePanel {
 
     fn session_ui(&mut self, ui: &mut Ui) {
         let has_session = self.polls > 0
+            || !self.band_polls.is_empty()
             || !self.rows.is_empty()
             || self.frames_ingested > 0
             || self.disk.is_some();
@@ -641,19 +685,32 @@ impl SatellitePanel {
         }
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            let mut status = format!(
-                "polls {} · frames {} · evicted {} ({})",
+            let status = format!(
+                "band polls {} · new previews {} · evicted {} ({})",
                 self.polls,
                 self.frames_ingested,
                 self.evicted_frames,
                 format_bytes(self.evicted_bytes)
             );
-            if let Some(poll) = &self.last_poll {
-                status.push_str(" · ");
-                status.push_str(poll);
-            }
             ui.label(RichText::new(status).small().weak());
         });
+        if !self.band_polls.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for (&band, status) in &self.band_polls {
+                    let text = match status {
+                        SatBandPollStatus::Polling => format!("C{band:02} polling…"),
+                        SatBandPollStatus::Done {
+                            new_keys,
+                            retained_keys,
+                            ms,
+                        } => format!(
+                            "C{band:02} {new_keys} new · {retained_keys} retained · {ms} ms"
+                        ),
+                    };
+                    ui.label(RichText::new(text).small().monospace());
+                }
+            });
+        }
         if let Some(disk) = &self.disk {
             let budget = match (self.spec.max_age_minutes(), self.spec.max_bytes()) {
                 (Some(minutes), Some(bytes)) => format!(
@@ -710,6 +767,16 @@ fn frame_row_ui(ui: &mut Ui, row: &SatFrameRow) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(&row.label).small().monospace());
         match &row.stage {
+            SatFrameStage::AlreadyRetained { source_bytes } => {
+                ui.label(
+                    RichText::new(format!(
+                        "✓ scan already retained · {} native source",
+                        format_bytes(*source_bytes)
+                    ))
+                    .small()
+                    .color(Color32::from_rgb(96, 192, 96)),
+                );
+            }
             SatFrameStage::Downloading {
                 received_bytes,
                 total_bytes,
@@ -909,6 +976,45 @@ mod tests {
     }
 
     #[test]
+    fn already_retained_row_upserts_without_counting_a_new_preview() {
+        let mut panel = panel();
+        panel.begin_follow();
+        panel.apply_already_retained("key".to_string(), "C02 16:40:21Z".to_string(), 414_400_000);
+        panel.apply_already_retained("key".to_string(), "C02 16:40:21Z".to_string(), 414_500_000);
+
+        assert_eq!(panel.rows.len(), 1, "the same provider object is upserted");
+        assert_eq!(panel.frames_ingested, 0);
+        assert!(matches!(
+            panel.rows[0].stage,
+            SatFrameStage::AlreadyRetained {
+                source_bytes: 414_500_000
+            }
+        ));
+    }
+
+    #[test]
+    fn per_band_poll_statuses_do_not_get_overwritten_by_c13() {
+        let mut panel = panel();
+        panel.begin_follow();
+        for band in [1_u8, 2, 3, 13] {
+            panel.apply_poll_started(band);
+            panel.apply_poll_done(band, 0, 5, u128::from(band));
+        }
+
+        assert_eq!(panel.band_polls.len(), 4);
+        for band in [1_u8, 2, 3, 13] {
+            assert_eq!(
+                panel.band_polls.get(&band),
+                Some(&SatBandPollStatus::Done {
+                    new_keys: 0,
+                    retained_keys: 5,
+                    ms: u128::from(band),
+                })
+            );
+        }
+    }
+
+    #[test]
     fn follow_lifecycle_states_are_distinct() {
         let mut panel = panel();
         assert!(!panel.is_running());
@@ -930,7 +1036,7 @@ mod tests {
     fn begin_follow_resets_session_counters() {
         let mut panel = panel();
         panel.begin_follow();
-        panel.apply_poll_done(13, 2, 800);
+        panel.apply_poll_done(13, 2, 0, 800);
         panel.apply_evicted(2, 16_000_000);
         panel.apply_note("warning: x".to_string());
         panel.apply_download_started("k".to_string(), "l".to_string(), 1);
@@ -943,6 +1049,7 @@ mod tests {
         assert_eq!(panel.evicted_bytes, 0);
         assert!(panel.rows.is_empty());
         assert!(panel.notes.is_empty());
+        assert!(panel.band_polls.is_empty());
     }
 
     #[test]
@@ -966,7 +1073,7 @@ mod tests {
         panel.apply_sleeping(30_000);
         let secs = panel.next_poll_secs().expect("countdown active");
         assert!((0.0..=30.0).contains(&secs), "got {secs}");
-        panel.apply_poll_done(13, 0, 100);
+        panel.apply_poll_done(13, 0, 0, 100);
         assert_eq!(panel.next_poll_secs(), None, "poll clears the countdown");
     }
 

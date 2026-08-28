@@ -54,5 +54,8 @@ pub use product::{
     SatelliteSectorDescriptor, product_catalog, sector_catalog,
 };
 pub use store::{StoredFrame, WrittenFrame, read_frame, write_band_frame};
-pub use tile::{DEFAULT_TILE_SIZE, MAXIMUM_TILE_ZOOM, NativeSatelliteTile, render_native_xyz_tile};
+pub use tile::{
+    DEFAULT_TILE_SIZE, MAXIMUM_TILE_ZOOM, NativeSatelliteRgbaTile, NativeSatelliteTile,
+    PreparedNativeSatelliteTileRenderer, render_native_xyz_tile,
+};
 pub use window::{EvictionReport, WindowConfig, enforce_window};

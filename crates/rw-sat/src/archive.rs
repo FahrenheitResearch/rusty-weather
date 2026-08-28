@@ -36,7 +36,7 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 /// later).  Timestamps in the native manifest are whole seconds, so a
 /// two-second end tolerance admits that real scan without allowing adjacent
 /// ten-minute Full Disk scans to be mixed.
-const ABI_COMPONENT_END_TOLERANCE_SECONDS: i64 = 2;
+pub const ABI_COMPONENT_END_TOLERANCE_SECONDS: i64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeChannelSource {
@@ -111,12 +111,18 @@ impl NativeSatelliteFrame {
         let Some(reference) = self.channels.get(&reference_channel) else {
             return false;
         };
-        remaining_channels.iter().all(|channel| {
-            self.channels.get(channel).is_some_and(|source| {
-                source.scan_start_unix == reference.scan_start_unix
-                    && source.scan_end_unix.abs_diff(reference.scan_end_unix)
-                        <= ABI_COMPONENT_END_TOLERANCE_SECONDS as u64
-            })
+        let ends = remaining_channels.iter().try_fold(
+            (reference.scan_end_unix, reference.scan_end_unix),
+            |(earliest, latest), channel| {
+                let source = self.channels.get(channel)?;
+                (source.scan_start_unix == reference.scan_start_unix).then_some((
+                    earliest.min(source.scan_end_unix),
+                    latest.max(source.scan_end_unix),
+                ))
+            },
+        );
+        ends.is_some_and(|(earliest, latest)| {
+            latest.saturating_sub(earliest) <= ABI_COMPONENT_END_TOLERANCE_SECONDS
         })
     }
 
@@ -1084,6 +1090,13 @@ mod tests {
             "an end mismatch beyond the provider tolerance must fail closed"
         );
         assert!(frame.is_complete_for(GoesAbiProduct::RawChannel(3)));
+
+        let spread_around_reference =
+            native_test_frame(&[(1, start, end), (2, start, end - 2), (3, start, end + 2)]);
+        assert!(
+            !spread_around_reference.is_complete_for(GoesAbiProduct::TrueColor),
+            "the total component-end spread must stay inside the two-second tolerance"
+        );
     }
 
     #[test]

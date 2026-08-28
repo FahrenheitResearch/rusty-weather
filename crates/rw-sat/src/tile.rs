@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use image::ImageEncoder;
 
@@ -17,7 +18,7 @@ use crate::abi::{
     read_goes_abi_field_area_filtered_window_from_scene, read_goes_abi_field_window_from_scene,
     read_goes_abi_scene_with_identity,
 };
-use crate::archive::resolve_native_frame;
+use crate::archive::{NativeSatelliteFrame, resolve_native_frame};
 use crate::composite::{
     TRANSPARENT, bilinear_f32, bracket_axis, validate_variance_encoding_grids, variance_encode_2x2,
 };
@@ -46,6 +47,30 @@ pub struct NativeSatelliteTile {
     pub product: String,
     pub platform: String,
     pub sector: String,
+}
+
+/// An unencoded native XYZ tile for in-process consumers such as BowEcho.
+/// HTTP callers still use [`NativeSatelliteTile`], while desktop callers avoid
+/// a PNG encode immediately followed by a PNG decode.
+#[derive(Debug, Clone)]
+pub struct NativeSatelliteRgbaTile {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub frame_id: String,
+    pub valid_unix: i64,
+    pub product: String,
+    pub platform: String,
+    pub sector: String,
+}
+
+/// A resolved frame/product whose manifest and ABI fixed-grid metadata are
+/// reused across every XYZ tile in a map viewport.
+#[derive(Debug)]
+pub struct PreparedNativeSatelliteTileRenderer {
+    manifest: NativeSatelliteFrame,
+    product: GoesAbiProduct,
+    scenes: BTreeMap<u8, Arc<GoesAbiScene>>,
 }
 
 pub fn render_native_xyz_tile(
@@ -78,7 +103,7 @@ pub fn render_native_xyz_tile(
                 manifest.frame_id, channel_source.object_key
             )));
         }
-        let window = ChannelWindow::open(source, &coordinates, zoom, tile_size)?;
+        let window = ChannelWindow::open(Arc::new(source), &coordinates, zoom, tile_size)?;
         windows.insert(channel, window);
     }
 
@@ -167,8 +192,166 @@ pub fn render_native_xyz_tile(
     })
 }
 
+impl PreparedNativeSatelliteTileRenderer {
+    pub fn open(
+        store_root: &Path,
+        platform: &str,
+        sector: &str,
+        product: GoesAbiProduct,
+        frame: &str,
+    ) -> Result<Self, Box<dyn Error>> {
+        let manifest = resolve_native_frame(store_root, platform, sector, product, frame)?;
+        let mut scenes = BTreeMap::new();
+        for &channel in product.required_channels() {
+            let channel_source = manifest.channels.get(&channel).ok_or_else(|| {
+                boxed_error(format!(
+                    "native frame {} has no ABI C{channel:02}",
+                    manifest.frame_id
+                ))
+            })?;
+            let path = manifest.channel_path(store_root, channel)?;
+            let scene = read_goes_abi_scene_with_identity(&path, &channel_source.object_key)?;
+            if scene.channel != Some(channel) {
+                return Err(boxed_error(format!(
+                    "native frame {} maps ABI C{channel:02} to object {}",
+                    manifest.frame_id, channel_source.object_key
+                )));
+            }
+            scenes.insert(channel, Arc::new(scene));
+        }
+        Ok(Self {
+            manifest,
+            product,
+            scenes,
+        })
+    }
+
+    pub fn render_rgba_xyz_tile(
+        &self,
+        zoom: u8,
+        tile_x: u32,
+        tile_y: u32,
+        tile_size: u32,
+    ) -> Result<NativeSatelliteRgbaTile, Box<dyn Error>> {
+        validate_tile(zoom, tile_x, tile_y, tile_size)?;
+        let coordinates = tile_coordinates(zoom, tile_x, tile_y, tile_size);
+        let mut windows = BTreeMap::<u8, ChannelWindow>::new();
+        for &channel in self.product.required_channels() {
+            let source = self.scenes.get(&channel).ok_or_else(|| {
+                boxed_error(format!(
+                    "native frame {} has no prepared ABI C{channel:02}",
+                    self.manifest.frame_id
+                ))
+            })?;
+            let window = ChannelWindow::open(source.clone(), &coordinates, zoom, tile_size)?;
+            windows.insert(channel, window);
+        }
+
+        let variance_sharpen_day = matches!(
+            self.product,
+            GoesAbiProduct::GeoColor
+                | GoesAbiProduct::OpenGeoColorV1
+                | GoesAbiProduct::SharpenedTrueColor
+        ) && windows.values().all(ChannelWindow::uses_exact_native);
+        if variance_sharpen_day {
+            let c02 = windows
+                .get(&2)
+                .ok_or_else(|| boxed_error("variance-sharpened color requires ABI C02"))?;
+            for channel in [1, 3] {
+                let coarse = windows.get(&channel).ok_or_else(|| {
+                    boxed_error(format!(
+                        "variance-sharpened color requires ABI C{channel:02}"
+                    ))
+                })?;
+                validate_variance_encoding_grids(&coarse.source_scene, &c02.source_scene)?;
+            }
+        }
+
+        let mut sampled = BTreeMap::<u8, Vec<f32>>::new();
+        for (&channel, window) in &windows {
+            let values = if variance_sharpen_day && matches!(channel, 1 | 3) {
+                let c02 = windows
+                    .get(&2)
+                    .ok_or_else(|| boxed_error("variance-sharpened color requires ABI C02"))?;
+                window.sample_all_variance_encoded(c02, &coordinates)
+            } else {
+                window.sample_all(&coordinates)
+            };
+            sampled.insert(channel, values);
+        }
+
+        let mut pixels = vec![0u8; coordinates.len() * 4];
+        for (index, &(latitude, longitude)) in coordinates.iter().enumerate() {
+            let color = if !(latitude.is_finite() && longitude.is_finite()) {
+                TRANSPARENT
+            } else if self.product.daylight_only()
+                && solar_elevation_deg(
+                    self.manifest.scan_start_unix,
+                    f64::from(latitude),
+                    f64::from(longitude),
+                )
+                .is_none_or(|elevation| elevation <= -3.0)
+            {
+                TRANSPARENT
+            } else {
+                render_product_pixel(
+                    self.product,
+                    self.manifest.scan_start_unix,
+                    f64::from(latitude),
+                    f64::from(longitude),
+                    |channel| {
+                        sampled
+                            .get(&channel)
+                            .and_then(|values| values.get(index))
+                            .copied()
+                            .ok_or_else(|| missing_band_error(channel))
+                    },
+                )
+                .unwrap_or(TRANSPARENT)
+            };
+            pixels[index * 4..index * 4 + 4].copy_from_slice(&color);
+        }
+
+        Ok(NativeSatelliteRgbaTile {
+            rgba: pixels,
+            width: tile_size,
+            height: tile_size,
+            frame_id: self.manifest.frame_id.clone(),
+            valid_unix: self.manifest.scan_start_unix,
+            product: self.product.slug(),
+            platform: self.manifest.platform.clone(),
+            sector: self.manifest.sector.clone(),
+        })
+    }
+
+    pub fn render_xyz_tile(
+        &self,
+        zoom: u8,
+        tile_x: u32,
+        tile_y: u32,
+        tile_size: u32,
+    ) -> Result<NativeSatelliteTile, Box<dyn Error>> {
+        let rendered = self.render_rgba_xyz_tile(zoom, tile_x, tile_y, tile_size)?;
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png).write_image(
+            &rendered.rgba,
+            rendered.width,
+            rendered.height,
+            image::ExtendedColorType::Rgba8,
+        )?;
+        Ok(NativeSatelliteTile {
+            png,
+            frame_id: rendered.frame_id,
+            valid_unix: rendered.valid_unix,
+            product: rendered.product,
+            platform: rendered.platform,
+            sector: rendered.sector,
+        })
+    }
+}
+
 struct ChannelWindow {
-    source_scene: GoesAbiScene,
+    source_scene: Arc<GoesAbiScene>,
     field: Option<GoesAbiField>,
     x_start: usize,
     y_start: usize,
@@ -208,7 +391,7 @@ impl TileSampling {
 
 impl ChannelWindow {
     fn open(
-        source_scene: GoesAbiScene,
+        source_scene: Arc<GoesAbiScene>,
         coordinates: &[(f32, f32)],
         zoom: u8,
         tile_size: u32,
@@ -563,6 +746,50 @@ mod tests {
     const FULL_DISK_C02_OBJECT_KEY: &str = "ABI-L2-CMIPF/2026/235/02/OR_ABI-L2-CMIPF-M6C02_G18_s20262350240211_e20262350249519_c20262350249572.nc";
 
     #[test]
+    fn prepared_native_renderer_is_safe_for_bounded_parallel_tile_reads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PreparedNativeSatelliteTileRenderer>();
+    }
+
+    #[test]
+    #[ignore = "requires RUSTWX_SATELLITE_STORE and RUSTWX_SAT_TILE_BENCH_FRAME"]
+    fn benchmark_prepared_conus_geocolor_tiles() {
+        use rayon::prelude::*;
+
+        let root = std::env::var_os("RUSTWX_SATELLITE_STORE")
+            .map(std::path::PathBuf::from)
+            .expect("set RUSTWX_SATELLITE_STORE");
+        let frame =
+            std::env::var("RUSTWX_SAT_TILE_BENCH_FRAME").expect("set RUSTWX_SAT_TILE_BENCH_FRAME");
+        let prepared = PreparedNativeSatelliteTileRenderer::open(
+            &root,
+            "g18",
+            "conus",
+            GoesAbiProduct::OpenGeoColorV1,
+            &frame,
+        )
+        .unwrap();
+        let keys = (19..=28)
+            .flat_map(|y| (8..=21).map(move |x| (x, y)))
+            .collect::<Vec<_>>();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        pool.install(|| {
+            keys.par_iter().for_each(|&(x, y)| {
+                prepared.render_rgba_xyz_tile(6, x, y, 256).unwrap();
+            });
+        });
+        eprintln!(
+            "prepared OpenGeoColor CONUS: {} tiles / 4 workers in {:.3}s",
+            keys.len(),
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    #[test]
     fn xyz_coordinate_grid_is_bounded() {
         let coordinates = tile_coordinates(0, 0, 0, 16);
         assert_eq!(coordinates.len(), 256);
@@ -736,6 +963,18 @@ mod tests {
             .to_rgba8();
         let visible = rgba.pixels().filter(|pixel| pixel.0[3] > 0).count();
         assert!(visible > 0, "retained Full Disk C02 tile was transparent");
+
+        let prepared = PreparedNativeSatelliteTileRenderer::open(
+            &root,
+            "g18",
+            "fulldisk",
+            GoesAbiProduct::RawChannel(2),
+            &manifest.frame_id,
+        )
+        .unwrap();
+        let raw = prepared.render_rgba_xyz_tile(4, 2, 5, 64).unwrap();
+        assert_eq!((raw.width, raw.height), rgba.dimensions());
+        assert_eq!(raw.rgba, rgba.into_raw());
 
         std::fs::remove_dir_all(root).unwrap();
     }

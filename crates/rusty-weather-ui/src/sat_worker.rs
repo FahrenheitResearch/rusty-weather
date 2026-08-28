@@ -59,10 +59,19 @@ pub enum SatResponse {
     FollowStarted,
     /// The session ended: `Ok` = clean stop, `Err` = failure.
     FollowFinished(Result<String, String>),
+    PollStarted {
+        band: u8,
+    },
     PollDone {
         band: u8,
         new_keys: usize,
+        retained_keys: usize,
         ms: u128,
+    },
+    AlreadyRetained {
+        id: String,
+        label: String,
+        bytes: u64,
     },
     DownloadStarted {
         id: String,
@@ -505,10 +514,25 @@ fn load_frame(
 /// frame row keeps one id end to end.
 fn map_event(event: SatEvent, current_key: &mut Option<String>) -> Vec<SatResponse> {
     match event {
-        SatEvent::PollStarted { .. } => Vec::new(),
-        SatEvent::PollDone { band, new_keys, ms } => {
-            vec![SatResponse::PollDone { band, new_keys, ms }]
+        SatEvent::PollStarted { band, .. } => vec![SatResponse::PollStarted { band }],
+        SatEvent::PollDone {
+            band,
+            new_keys,
+            retained_keys,
+            ms,
+        } => {
+            vec![SatResponse::PollDone {
+                band,
+                new_keys,
+                retained_keys,
+                ms,
+            }]
         }
+        SatEvent::AlreadyRetained { key, bytes } => vec![SatResponse::AlreadyRetained {
+            label: download_label(&key),
+            id: key,
+            bytes,
+        }],
         SatEvent::DownloadStarted { key, bytes } => {
             *current_key = Some(key.clone());
             let label = download_label(&key);
@@ -919,6 +943,55 @@ mod tests {
         );
         assert_eq!(label, "C13 19:21:18Z");
         assert_eq!(download_label("not/a/goes-key.nc"), "goes-key.nc");
+    }
+
+    #[test]
+    fn poll_and_retained_events_keep_per_channel_identity() {
+        let mut current = None;
+        assert!(matches!(
+            map_event(
+                SatEvent::PollStarted {
+                    band: 2,
+                    prefixes: vec!["prefix".to_string()],
+                },
+                &mut current,
+            )
+            .as_slice(),
+            [SatResponse::PollStarted { band: 2 }]
+        ));
+
+        let key = "ABI-L2-CMIPF/2026/239/16/OR_ABI-L2-CMIPF-M6C02_G18_s20262391640211_e20262391649519_c20262391649578.nc".to_string();
+        assert!(matches!(
+            map_event(
+                SatEvent::AlreadyRetained {
+                    key: key.clone(),
+                    bytes: 414_400_000,
+                },
+                &mut current,
+            )
+            .as_slice(),
+            [SatResponse::AlreadyRetained { id, label, bytes: 414_400_000 }]
+                if id == &key && label == "C02 16:40:21Z"
+        ));
+
+        assert!(matches!(
+            map_event(
+                SatEvent::PollDone {
+                    band: 2,
+                    new_keys: 0,
+                    retained_keys: 5,
+                    ms: 21,
+                },
+                &mut current,
+            )
+            .as_slice(),
+            [SatResponse::PollDone {
+                band: 2,
+                new_keys: 0,
+                retained_keys: 5,
+                ms: 21,
+            }]
+        ));
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //! stragglers and local clock skew cannot drop frames. Frame timestamps
 //! come from the key's `s` (scan start) time, never the local clock.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -19,8 +19,8 @@ use chrono::{DateTime, Timelike, Utc};
 
 use crate::abi::{read_goes_abi_field_strided_from_scene, read_goes_abi_scene};
 use crate::archive::{
-    NativeSatelliteFrame, archive_goes_source, automatic_preview_stride, list_native_frames,
-    prune_native_archive,
+    ABI_COMPONENT_END_TOLERANCE_SECONDS, NativeSatelliteFrame, archive_goes_source,
+    automatic_preview_stride, list_native_frames, prune_native_archive,
 };
 use crate::events::{NEVER_CANCEL, SatError, SatEvent, other};
 use crate::goes::{GoesSatellite, parse_goes_abi_filename};
@@ -36,6 +36,11 @@ use crate::window::{WindowConfig, enforce_window};
 /// Minutes after the top of the hour during which the previous hour's
 /// prefix keeps being polled (stragglers + clock skew).
 const HOUR_ROLLOVER_GRACE_MINUTES: u32 = 5;
+/// A Full Disk scan itself takes roughly ten minutes. Keep the prior hour
+/// available long enough that a one-poll "latest" request at HH:05-HH:10 can
+/// still find HH-1:50 instead of returning an empty result while HH:00 is
+/// incomplete.
+const FULL_DISK_ROLLOVER_GRACE_MINUTES: u32 = 15;
 /// Backoff cap after consecutive poll errors.
 const MAX_BACKOFF_SECS: u64 = 300;
 /// Ingest attempts before a repeatedly failing object is skipped for good
@@ -69,6 +74,10 @@ pub struct FollowConfig {
     pub max_polls: Option<u32>,
     /// Stop once this many frames have been ingested.
     pub max_frames: Option<u32>,
+    /// Fill older complete scans from the startup prefixes after securing the
+    /// newest scan. When false, startup history is skipped, but every complete
+    /// scan that arrives after bootstrap is still followed.
+    pub backfill_history: bool,
     pub use_cache: bool,
 }
 
@@ -87,6 +96,7 @@ impl FollowConfig {
             window: WindowConfig::default(),
             max_polls: None,
             max_frames: None,
+            backfill_history: true,
             use_cache: true,
         }
     }
@@ -127,7 +137,12 @@ pub fn poll_prefixes(
     now: DateTime<Utc>,
 ) -> Vec<String> {
     let mut prefixes = Vec::with_capacity(2);
-    if now.minute() < HOUR_ROLLOVER_GRACE_MINUTES {
+    let rollover_grace = if abi_product.trim().to_ascii_uppercase().ends_with("CMIPF") {
+        FULL_DISK_ROLLOVER_GRACE_MINUTES
+    } else {
+        HOUR_ROLLOVER_GRACE_MINUTES
+    };
+    if now.minute() < rollover_grace {
         let previous = now - chrono::Duration::hours(1);
         prefixes.push(band_hour_prefix(
             abi_product,
@@ -156,30 +171,100 @@ pub fn poll_delay(
     Duration::from_secs_f64(backoff.min(MAX_BACKOFF_SECS as f64).max(0.05))
 }
 
-/// Bounded dedup of already-ingested scans, keyed by (band, scan-start
-/// MINUTE). Minute granularity matches the store's `tHHMM.rws` frame
-/// slots, so entries primed from run manifests (which only know HHMM)
-/// dedup live keys (whose `s` token carries seconds + tenths) exactly.
-/// Re-listed keys (page overlap, prefix rollover, a session restart) are
-/// dropped here even if `start-after` state was lost.
+/// Bounded dedup of already-ingested scans, keyed by (band, provider scan
+/// start SECOND). Native channel manifests retain that exact source second;
+/// minute-only identity is insufficient because distinct or republished scans
+/// can share one `tHHMM` store slot.
 #[derive(Debug, Default)]
 pub struct SeenScans {
-    seen: BTreeSet<(u8, DateTime<Utc>)>,
+    seen: BTreeMap<(u8, DateTime<Utc>), SeenScan>,
+}
+
+#[derive(Debug)]
+struct SeenScan {
+    end_unix: i64,
+    /// Exact provider object retained for this channel/scan. `None` is kept
+    /// only for the small public/test insertion helpers that predate source
+    /// identity; archive priming and live ingest always set this.
+    object_key: Option<String>,
 }
 
 impl SeenScans {
-    /// Record (band, start minute). Returns `false` when already seen.
+    /// Record (band, provider start second). Returns `false` when already seen.
     pub fn insert(&mut self, band: u8, start: DateTime<Utc>) -> bool {
-        self.seen.insert((band, scan_minute(start)))
+        self.insert_window(band, start, start)
+    }
+
+    pub fn insert_window(&mut self, band: u8, start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
+        self.insert_source_window(band, start, end, None)
+    }
+
+    fn insert_object_window(
+        &mut self,
+        band: u8,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        object_key: &str,
+    ) -> bool {
+        self.insert_source_window(band, start, end, Some(object_key.to_owned()))
+    }
+
+    fn insert_source_window(
+        &mut self,
+        band: u8,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        object_key: Option<String>,
+    ) -> bool {
+        let slot = (band, scan_second(start));
+        if let Some(previous) = self.seen.get_mut(&slot) {
+            // An identity-free compatibility insertion must never erase the
+            // exact source identity established by archive priming or ingest.
+            if object_key.is_some() || previous.object_key.is_none() {
+                *previous = SeenScan {
+                    end_unix: end.timestamp(),
+                    object_key,
+                };
+            }
+            false
+        } else {
+            self.seen.insert(
+                slot,
+                SeenScan {
+                    end_unix: end.timestamp(),
+                    object_key,
+                },
+            );
+            true
+        }
     }
 
     pub fn contains(&self, band: u8, start: DateTime<Utc>) -> bool {
-        self.seen.contains(&(band, scan_minute(start)))
+        self.seen.contains_key(&(band, scan_second(start)))
+    }
+
+    fn end_unix(&self, band: u8, start: DateTime<Utc>) -> Option<i64> {
+        self.seen
+            .get(&(band, scan_second(start)))
+            .map(|scan| scan.end_unix)
+    }
+
+    /// Whether this exact provider publication is already retained. Entries
+    /// created through the legacy identity-free helpers remain wildcard seen
+    /// values so their established public behavior does not change.
+    fn contains_object(&self, band: u8, start: DateTime<Utc>, object_key: &str) -> bool {
+        self.seen
+            .get(&(band, scan_second(start)))
+            .is_some_and(|scan| {
+                scan.object_key
+                    .as_deref()
+                    .is_none_or(|retained| retained == object_key)
+            })
     }
 
     /// Drop entries older than `cutoff` (call with `now - window`).
     pub fn prune_older_than(&mut self, cutoff: DateTime<Utc>) {
-        self.seen.retain(|&(_, start)| start >= cutoff);
+        self.seen.retain(|&(_, start), _| start >= cutoff);
     }
 
     pub fn len(&self) -> usize {
@@ -221,8 +306,13 @@ pub fn primed_seen_scans(
             usize::MAX,
         ) {
             for frame in frames {
-                if let Some(time) = DateTime::<Utc>::from_timestamp(frame.scan_start_unix, 0) {
-                    seen.insert(band, time);
+                let Some(source) = frame.channels.get(&band) else {
+                    continue;
+                };
+                if let Some(time) = DateTime::<Utc>::from_timestamp(source.scan_start_unix, 0) {
+                    if let Some(end) = DateTime::<Utc>::from_timestamp(source.scan_end_unix, 0) {
+                        seen.insert_object_window(band, time, end, &source.object_key);
+                    }
                 }
             }
         }
@@ -407,8 +497,53 @@ fn bounded_preview_stride(nx: usize, ny: usize, requested: usize) -> usize {
 /// ([`MAX_INGEST_ATTEMPTS`]) so one poisoned object cannot stall its
 /// prefix forever. `seen` is only marked on success.
 ///
-/// Returns the warning messages to emit; every entry also means "this
-/// poll failed" for backoff purposes.
+/// Returns already-retained provider scans plus warning messages to emit;
+/// every warning also means "this poll failed" for backoff purposes.
+#[derive(Debug, Default)]
+struct ProcessListedReport {
+    warnings: Vec<String>,
+    retained: Vec<S3Object>,
+    consumed_keys: Vec<String>,
+    retry_blocked: bool,
+}
+
+/// Native manifests store Unix seconds, while ABI filenames include tenths.
+/// Canonicalizing only the subsecond component preserves exact scan identity
+/// across the listing/archive boundary without collapsing distinct seconds.
+fn scan_second(start: DateTime<Utc>) -> DateTime<Utc> {
+    start.with_nanosecond(0).unwrap_or(start)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ListedScanIdentity {
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    created: DateTime<Utc>,
+}
+
+fn listed_scan_identity(
+    object: &S3Object,
+    band: u8,
+    abi_product: &str,
+    stale_cutoff: Option<DateTime<Utc>>,
+) -> Option<ListedScanIdentity> {
+    parse_goes_abi_filename(object_filename(&object.key))
+        .ok()
+        .filter(|parsed| {
+            object.key.ends_with(".nc")
+                && abi_filename_product_matches_request(&parsed.product, abi_product)
+                && parsed.channel == Some(band)
+                // Never ingest a scan the rolling window would evict on the
+                // spot: a restart can re-list a whole hour prefix.
+                && stale_cutoff.is_none_or(|cutoff| parsed.start_time_utc >= cutoff)
+        })
+        .map(|parsed| ListedScanIdentity {
+            start: parsed.start_time_utc,
+            end: parsed.end_time_utc,
+            created: parsed.created_time_utc,
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_listed_objects(
     prefix: &str,
@@ -421,35 +556,27 @@ fn process_listed_objects(
     last_key: &mut HashMap<String, String>,
     cancel: &AtomicBool,
     ingest: &mut dyn FnMut(&S3Object) -> Result<(), SatError>,
-) -> Result<Vec<String>, SatError> {
-    let mut warnings = Vec::new();
+) -> Result<ProcessListedReport, SatError> {
+    let mut report = ProcessListedReport::default();
     for object in objects {
         check_cancel(cancel)?;
-        let scan_start = parse_goes_abi_filename(object_filename(&object.key))
-            .ok()
-            .filter(|parsed| {
-                object.key.ends_with(".nc")
-                    && abi_filename_product_matches_request(&parsed.product, abi_product)
-                    && parsed.channel == Some(band)
-                    // Never ingest a scan the rolling window would evict
-                    // on the spot: a (re)start re-lists the whole hour
-                    // prefix, which can hold frames older than the window
-                    // — pure download/encode/evict churn otherwise.
-                    && stale_cutoff.is_none_or(|cutoff| parsed.start_time_utc >= cutoff)
-            })
-            .map(|parsed| parsed.start_time_utc);
-        let Some(scan_start) = scan_start else {
+        let scan = listed_scan_identity(object, band, abi_product, stale_cutoff);
+        let Some(scan) = scan else {
+            report.consumed_keys.push(object.key.clone());
             last_key.insert(prefix.to_string(), object.key.clone());
             continue;
         };
-        if seen.contains(band, scan_start) {
+        if seen.contains_object(band, scan.start, &object.key) {
+            report.retained.push(object.clone());
+            report.consumed_keys.push(object.key.clone());
             last_key.insert(prefix.to_string(), object.key.clone());
             continue;
         }
         match ingest(object) {
             Ok(()) => {
-                seen.insert(band, scan_start);
+                seen.insert_object_window(band, scan.start, scan.end, &object.key);
                 attempts.remove(&object.key);
+                report.consumed_keys.push(object.key.clone());
                 last_key.insert(prefix.to_string(), object.key.clone());
             }
             Err(SatError::Cancelled) => return Err(SatError::Cancelled),
@@ -460,17 +587,19 @@ fn process_listed_objects(
                     *entry
                 };
                 if tried >= MAX_INGEST_ATTEMPTS {
-                    warnings.push(format!(
+                    report.warnings.push(format!(
                         "ingest {}: {err} (attempt {tried}/{MAX_INGEST_ATTEMPTS}, giving up on this object)",
                         object.key
                     ));
                     attempts.remove(&object.key);
+                    report.consumed_keys.push(object.key.clone());
                     last_key.insert(prefix.to_string(), object.key.clone());
                 } else {
-                    warnings.push(format!(
+                    report.warnings.push(format!(
                         "ingest {}: {err} (attempt {tried}/{MAX_INGEST_ATTEMPTS}, will retry after re-listing)",
                         object.key
                     ));
+                    report.retry_blocked = true;
                     // Hold the watermark before this object: the next
                     // poll re-lists it and everything after it.
                     break;
@@ -478,7 +607,240 @@ fn process_listed_objects(
             }
         }
     }
-    Ok(warnings)
+    Ok(report)
+}
+
+#[derive(Debug, Clone)]
+struct PolledFollowObject {
+    prefix: String,
+    band: u8,
+    object: S3Object,
+    scan_start: Option<DateTime<Utc>>,
+    scan_end: Option<DateTime<Utc>>,
+    scan_created: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ScanMajorPlan {
+    newest_complete: Option<DateTime<Utc>>,
+    /// Complete scan slots, newest first; entries inside each slot follow the
+    /// configured channel order so the product becomes displayable promptly.
+    batches: Vec<Vec<usize>>,
+    /// Older publications of the same exact channel/scan. These must be
+    /// consumed without ingest so an obsolete correction cannot pin the
+    /// prefix watermark ahead of the selected newest publication.
+    superseded: Vec<usize>,
+    /// Older provider objects intentionally consumed when history backfill is
+    /// disabled. Newer incomplete scans remain pending for the next poll.
+    skipped_history: Vec<usize>,
+    /// Incomplete scans older than a newer complete scan cannot contribute a
+    /// product frame and must not permanently pin every prefix watermark.
+    skipped_incomplete: Vec<usize>,
+}
+
+fn exact_scan_slot_complete(
+    slot: DateTime<Utc>,
+    by_band: &HashMap<u8, usize>,
+    objects: &[PolledFollowObject],
+    bands: &[u8],
+    seen: &SeenScans,
+) -> bool {
+    let mut earliest_end = i64::MAX;
+    let mut latest_end = i64::MIN;
+    for &band in bands {
+        // A listed correction is the candidate we would actually ingest, so
+        // its scan end must outrank stale metadata from the retained object.
+        let end = by_band
+            .get(&band)
+            .and_then(|&index| objects[index].scan_end)
+            .map(|end| end.timestamp())
+            .or_else(|| seen.end_unix(band, slot));
+        let Some(end) = end else {
+            return false;
+        };
+        earliest_end = earliest_end.min(end);
+        latest_end = latest_end.max(end);
+    }
+    latest_end.saturating_sub(earliest_end) <= ABI_COMPONENT_END_TOLERANCE_SECONDS
+}
+
+fn scan_major_plan(
+    objects: &[PolledFollowObject],
+    bands: &[u8],
+    seen: &SeenScans,
+    backfill_history: bool,
+) -> ScanMajorPlan {
+    let mut slots: BTreeMap<DateTime<Utc>, HashMap<u8, usize>> = BTreeMap::new();
+    let mut superseded = Vec::new();
+    for (index, listed) in objects.iter().enumerate() {
+        let Some(scan_start) = listed.scan_start else {
+            continue;
+        };
+        let by_band = slots.entry(scan_second(scan_start)).or_default();
+        if let Some(selected) = by_band.get_mut(&listed.band) {
+            let current = &objects[*selected];
+            let replace = listed
+                .scan_created
+                .cmp(&current.scan_created)
+                .then_with(|| listed.object.key.cmp(&current.object.key))
+                .is_gt();
+            if replace {
+                superseded.push(*selected);
+                *selected = index;
+            } else {
+                superseded.push(index);
+            }
+        } else {
+            by_band.insert(listed.band, index);
+        }
+    }
+
+    let newest_complete = slots.iter().rev().find_map(|(&slot, by_band)| {
+        exact_scan_slot_complete(slot, by_band, objects, bands, seen).then_some(slot)
+    });
+    let mut plan = ScanMajorPlan {
+        newest_complete,
+        superseded,
+        ..ScanMajorPlan::default()
+    };
+    let Some(newest_complete) = newest_complete else {
+        return plan;
+    };
+
+    for (&slot, by_band) in slots.iter().rev() {
+        let complete = exact_scan_slot_complete(slot, by_band, objects, bands, seen);
+        if complete && (backfill_history || slot == newest_complete) {
+            let mut batch = Vec::new();
+            for &band in bands {
+                if let Some(&index) = by_band.get(&band) {
+                    batch.push(index);
+                }
+            }
+            plan.batches.push(batch);
+        } else if slot < newest_complete {
+            let skipped = if complete {
+                &mut plan.skipped_history
+            } else {
+                &mut plan.skipped_incomplete
+            };
+            for &band in bands {
+                if let Some(&index) = by_band.get(&band) {
+                    skipped.push(index);
+                }
+            }
+        }
+    }
+    plan
+}
+
+fn backfill_enabled_for_poll(configured: bool, bootstrap_complete: bool) -> bool {
+    configured || bootstrap_complete
+}
+
+fn advance_consumed_watermarks(
+    objects: &[PolledFollowObject],
+    consumed_keys: &HashSet<String>,
+    last_key: &mut HashMap<String, String>,
+) {
+    let mut by_prefix: BTreeMap<&str, Vec<&S3Object>> = BTreeMap::new();
+    for listed in objects {
+        by_prefix
+            .entry(&listed.prefix)
+            .or_default()
+            .push(&listed.object);
+    }
+    for (prefix, listed) in by_prefix {
+        for object in listed {
+            if !consumed_keys.contains(&object.key) {
+                break;
+            }
+            last_key.insert(prefix.to_string(), object.key.clone());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_follow_object(
+    agent: &ureq::Agent,
+    bucket: &str,
+    config: &FollowConfig,
+    band: u8,
+    object: &S3Object,
+    cancel: &AtomicBool,
+    summary: &mut FollowSummary,
+    sink: &mut dyn FnMut(SatEvent),
+) -> Result<(), SatError> {
+    let written_unix = Utc::now().timestamp().max(0) as u64;
+    let result = fetch_and_ingest_with_cancel(
+        agent,
+        bucket,
+        &config.cache_dir,
+        &config.store_root,
+        object,
+        config.downsample,
+        config.use_cache,
+        written_unix,
+        cancel,
+        sink,
+    );
+    // The retained native source is the artifact of record; the raw staging
+    // copy never helps this session again. A failed source ingest must refetch
+    // rather than replay a corrupt size-matched body.
+    if !matches!(result, Err(SatError::Cancelled)) {
+        let _ = std::fs::remove_file(cached_object_path(&config.cache_dir, bucket, &object.key));
+    }
+    let outcome = result?;
+    let model = outcome.native_frame.platform.clone();
+    summary.downloaded_keys.push(object.key.clone());
+    if let Some(frame) = outcome.preview_frame {
+        summary.frames.push(frame.clone());
+        let run_prefix = format!("{}_c{band:02}", config.sector.slug());
+        match enforce_window(
+            &config.store_root,
+            &frame.model,
+            &run_prefix,
+            Utc::now(),
+            &config.window,
+        ) {
+            Ok(report) if report.removed_frames > 0 => {
+                summary.evicted_frames += report.removed_frames;
+                summary.evicted_bytes += report.removed_bytes;
+                sink(SatEvent::Evicted {
+                    model: frame.model.clone(),
+                    frames: report.removed_frames,
+                    bytes: report.removed_bytes,
+                });
+            }
+            Ok(_) => {}
+            Err(err) => sink(SatEvent::Warning {
+                message: format!("window eviction: {err}"),
+            }),
+        }
+    }
+    let archive_max_bytes = config
+        .window
+        .max_bytes
+        .map(|bytes| bytes.saturating_mul(config.bands.len().max(1) as u64));
+    match prune_native_archive(
+        &config.store_root,
+        &model,
+        config.sector.slug(),
+        Utc::now(),
+        config.window.max_age_minutes,
+        archive_max_bytes,
+    ) {
+        Ok(report) if report.removed_frames > 0 => sink(SatEvent::Info {
+            message: format!(
+                "native archive pruned: {} frame(s), {} bytes",
+                report.removed_frames, report.removed_bytes
+            ),
+        }),
+        Ok(_) => {}
+        Err(err) => sink(SatEvent::Warning {
+            message: format!("native archive eviction: {err}"),
+        }),
+    }
+    Ok(())
 }
 
 /// Run a follow session. Returns when `max_polls`/`max_frames` is reached;
@@ -523,7 +885,7 @@ pub fn follow(
     if !seen.is_empty() {
         sink(SatEvent::Info {
             message: format!(
-                "dedup primed from store manifests: {} frame(s) already ingested",
+                "dedup primed from store manifests: {} native channel scan(s) already retained",
                 seen.len()
             ),
         });
@@ -533,20 +895,34 @@ pub fn follow(
     // Failed-ingest retry counts per S3 key (bounded: pruned with `seen`).
     let mut ingest_attempts: HashMap<String, u32> = HashMap::new();
     let mut consecutive_errors: u32 = 0;
+    // `backfill_history = false` is a startup policy, not a permanent
+    // latest-only mode. Once one exact complete scan is secured, every later
+    // complete scan is ingested even when several accumulated between polls.
+    let mut bootstrap_complete = config.backfill_history;
 
     loop {
         check_cancel(cancel)?;
         let mut poll_failed = false;
+        let poll_now = Utc::now();
+        let stale_cutoff = config
+            .window
+            .max_age_minutes
+            .map(|minutes| poll_now - chrono::Duration::minutes(i64::from(minutes)));
+        let mut poll_started_by_band = HashMap::new();
+        let mut polled_objects = Vec::new();
+
+        // List every requested channel before downloading anything. The old
+        // band-major loop downloaded a whole hour of C01, then C02, then C03;
+        // no RGB scan could become complete until the final channel caught
+        // up. A single cross-channel inventory lets us schedule by scan.
         for &band in &config.bands {
             check_cancel(cancel)?;
-            let now = Utc::now();
-            let prefixes = poll_prefixes(abi_product, &satellite, config.mode, band, now);
+            let prefixes = poll_prefixes(abi_product, &satellite, config.mode, band, poll_now);
             sink(SatEvent::PollStarted {
                 band,
                 prefixes: prefixes.clone(),
             });
-            let poll_started = Instant::now();
-            let mut ingested_this_poll = 0usize;
+            poll_started_by_band.insert(band, Instant::now());
             for prefix in &prefixes {
                 let start_after = last_key.get(prefix).map(String::as_str);
                 let objects = match list_s3_objects(&agent, &bucket, prefix, start_after) {
@@ -559,113 +935,191 @@ pub fn follow(
                         continue;
                     }
                 };
-                let stale_cutoff = config
-                    .window
-                    .max_age_minutes
-                    .map(|minutes| Utc::now() - chrono::Duration::minutes(i64::from(minutes)));
+                for object in objects {
+                    let scan = listed_scan_identity(&object, band, abi_product, stale_cutoff);
+                    polled_objects.push(PolledFollowObject {
+                        scan_start: scan.map(|identity| identity.start),
+                        scan_end: scan.map(|identity| identity.end),
+                        scan_created: scan.map(|identity| identity.created),
+                        prefix: prefix.clone(),
+                        band,
+                        object,
+                    });
+                }
+            }
+        }
+
+        let backfill_this_poll =
+            backfill_enabled_for_poll(config.backfill_history, bootstrap_complete);
+        let plan = scan_major_plan(&polled_objects, &config.bands, &seen, backfill_this_poll);
+        let mut consumed_keys: HashSet<String> = polled_objects
+            .iter()
+            .filter(|listed| listed.scan_start.is_none())
+            .map(|listed| listed.object.key.clone())
+            .collect();
+        for &index in &plan.skipped_history {
+            consumed_keys.insert(polled_objects[index].object.key.clone());
+        }
+        for &index in &plan.skipped_incomplete {
+            consumed_keys.insert(polled_objects[index].object.key.clone());
+        }
+        for &index in &plan.superseded {
+            consumed_keys.insert(polled_objects[index].object.key.clone());
+        }
+        if !plan.skipped_history.is_empty() {
+            sink(SatEvent::Info {
+                message: format!(
+                    "loop backfill disabled: skipped {} older component object(s)",
+                    plan.skipped_history.len()
+                ),
+            });
+        }
+        if !plan.skipped_incomplete.is_empty() {
+            sink(SatEvent::Info {
+                message: format!(
+                    "skipped {} component object(s) from incomplete scans older than the newest complete scan",
+                    plan.skipped_incomplete.len()
+                ),
+            });
+        }
+
+        let mut execution_order = Vec::new();
+        let mut scheduled = HashSet::new();
+        for batch in &plan.batches {
+            for &index in batch {
+                if scheduled.insert(index) {
+                    execution_order.push(index);
+                }
+            }
+        }
+        // Seen members of an incomplete provider scan are safe to consume and
+        // should still surface as retained rows; unseen members remain behind
+        // the per-prefix watermark until the missing channels appear.
+        for (index, listed) in polled_objects.iter().enumerate() {
+            if scheduled.contains(&index)
+                || plan.skipped_history.contains(&index)
+                || plan.skipped_incomplete.contains(&index)
+                || plan.superseded.contains(&index)
+                || listed.scan_start.is_none_or(|scan_start| {
+                    !seen.contains_object(listed.band, scan_start, &listed.object.key)
+                })
+            {
+                continue;
+            }
+            execution_order.push(index);
+        }
+
+        if let Some(first_batch) = plan.batches.first()
+            && let Some(&first_index) = first_batch.first()
+            && first_batch.iter().any(|&index| {
+                let listed = &polled_objects[index];
+                listed.scan_start.is_some_and(|scan_start| {
+                    !seen.contains_object(listed.band, scan_start, &listed.object.key)
+                })
+            })
+        {
+            let scan = scan_minute(
+                polled_objects[first_index]
+                    .scan_start
+                    .expect("planned objects have scan starts"),
+            );
+            sink(SatEvent::Info {
+                message: if backfill_this_poll {
+                    format!(
+                        "prioritizing newest complete multichannel scan {} before loop backfill",
+                        scan.format("%H:%MZ")
+                    )
+                } else {
+                    format!(
+                        "prioritizing newest complete multichannel scan {}; loop backfill disabled",
+                        scan.format("%H:%MZ")
+                    )
+                },
+            });
+        }
+
+        let mut ingested_by_band: HashMap<u8, usize> = HashMap::new();
+        let mut retained_by_band: HashMap<u8, usize> = HashMap::new();
+        let mut retry_blocked_slots = HashSet::new();
+        for index in execution_order {
+            check_cancel(cancel)?;
+            let listed = &polled_objects[index];
+            let slot = scan_second(
+                listed
+                    .scan_start
+                    .expect("execution objects have scan starts"),
+            );
+            if retry_blocked_slots.contains(&(listed.band, slot)) {
+                continue;
+            }
+            let mut discarded_watermark = HashMap::new();
+            let report = {
                 let mut ingest = |object: &S3Object| -> Result<(), SatError> {
-                    let written_unix = Utc::now().timestamp().max(0) as u64;
-                    let result = fetch_and_ingest_with_cancel(
+                    let result = ingest_follow_object(
                         &agent,
                         &bucket,
-                        &config.cache_dir,
-                        &config.store_root,
+                        config,
+                        listed.band,
                         object,
-                        config.downsample,
-                        config.use_cache,
-                        written_unix,
                         cancel,
+                        &mut summary,
                         &mut *sink,
                     );
-                    // The retained native source is the artifact of record;
-                    // the raw staging copy never helps this session again.
-                    // Dropping it on failure makes retryable download/scene/
-                    // archive failures refetch rather than replay corrupt
-                    // size-matched bytes. Preview-only failures are returned
-                    // as successful native ingests and are not retried.
-                    if !matches!(result, Err(SatError::Cancelled)) {
-                        let _ = std::fs::remove_file(cached_object_path(
-                            &config.cache_dir,
-                            &bucket,
-                            &object.key,
-                        ));
+                    if result.is_ok() {
+                        *ingested_by_band.entry(listed.band).or_default() += 1;
                     }
-                    let outcome = result?;
-                    let model = outcome.native_frame.platform.clone();
-                    summary.downloaded_keys.push(object.key.clone());
-                    ingested_this_poll += 1;
-                    if let Some(frame) = outcome.preview_frame {
-                        summary.frames.push(frame.clone());
-                        // Scope preview eviction to this followed band's runs.
-                        let run_prefix = format!("{}_c{band:02}", config.sector.slug());
-                        match enforce_window(
-                            &config.store_root,
-                            &frame.model,
-                            &run_prefix,
-                            Utc::now(),
-                            &config.window,
-                        ) {
-                            Ok(report) if report.removed_frames > 0 => {
-                                summary.evicted_frames += report.removed_frames;
-                                summary.evicted_bytes += report.removed_bytes;
-                                sink(SatEvent::Evicted {
-                                    model: frame.model.clone(),
-                                    frames: report.removed_frames,
-                                    bytes: report.removed_bytes,
-                                });
-                            }
-                            Ok(_) => {}
-                            Err(err) => sink(SatEvent::Warning {
-                                message: format!("window eviction: {err}"),
-                            }),
-                        }
-                    }
-                    let archive_max_bytes = config
-                        .window
-                        .max_bytes
-                        .map(|bytes| bytes.saturating_mul(config.bands.len().max(1) as u64));
-                    match prune_native_archive(
-                        &config.store_root,
-                        &model,
-                        config.sector.slug(),
-                        Utc::now(),
-                        config.window.max_age_minutes,
-                        archive_max_bytes,
-                    ) {
-                        Ok(report) if report.removed_frames > 0 => sink(SatEvent::Info {
-                            message: format!(
-                                "native archive pruned: {} frame(s), {} bytes",
-                                report.removed_frames, report.removed_bytes
-                            ),
-                        }),
-                        Ok(_) => {}
-                        Err(err) => sink(SatEvent::Warning {
-                            message: format!("native archive eviction: {err}"),
-                        }),
-                    }
-                    Ok(())
+                    result
                 };
-                let warnings = process_listed_objects(
-                    prefix,
-                    &objects,
-                    band,
+                process_listed_objects(
+                    &listed.prefix,
+                    std::slice::from_ref(&listed.object),
+                    listed.band,
                     abi_product,
                     stale_cutoff,
                     &mut seen,
                     &mut ingest_attempts,
-                    &mut last_key,
+                    &mut discarded_watermark,
                     cancel,
                     &mut ingest,
-                )?;
-                for message in warnings {
-                    poll_failed = true;
-                    sink(SatEvent::Warning { message });
-                }
+                )?
+            };
+            consumed_keys.extend(report.consumed_keys);
+            *retained_by_band.entry(listed.band).or_default() += report.retained.len();
+            for object in report.retained {
+                sink(SatEvent::AlreadyRetained {
+                    key: object.key,
+                    bytes: object.size_bytes,
+                });
             }
+            if report.retry_blocked {
+                retry_blocked_slots.insert((listed.band, slot));
+            }
+            for message in report.warnings {
+                poll_failed = true;
+                sink(SatEvent::Warning { message });
+            }
+        }
+        advance_consumed_watermarks(&polled_objects, &consumed_keys, &mut last_key);
+
+        if !bootstrap_complete
+            && let Some(slot) = plan.newest_complete
+            && config.bands.iter().all(|&band| seen.contains(band, slot))
+        {
+            let empty = HashMap::new();
+            bootstrap_complete =
+                exact_scan_slot_complete(slot, &empty, &polled_objects, &config.bands, &seen);
+        }
+
+        for &band in &config.bands {
             sink(SatEvent::PollDone {
                 band,
-                new_keys: ingested_this_poll,
-                ms: poll_started.elapsed().as_millis(),
+                new_keys: ingested_by_band.get(&band).copied().unwrap_or(0),
+                retained_keys: retained_by_band.get(&band).copied().unwrap_or(0),
+                ms: poll_started_by_band
+                    .get(&band)
+                    .map(Instant::elapsed)
+                    .unwrap_or_default()
+                    .as_millis(),
             });
         }
         // Keep the per-prefix bookkeeping bounded: drop start-after
@@ -840,6 +1294,19 @@ mod tests {
             ]
         );
 
+        let full_disk_still_finishing = Utc.with_ymd_and_hms(2026, 6, 10, 19, 10, 0).unwrap();
+        let prefixes = poll_prefixes("ABI-L2-CMIPF", &satellite, 6, 13, full_disk_still_finishing);
+        assert_eq!(
+            prefixes.len(),
+            2,
+            "Full Disk keeps the prior complete scan available"
+        );
+        let full_disk_settled = Utc.with_ymd_and_hms(2026, 6, 10, 19, 15, 0).unwrap();
+        assert_eq!(
+            poll_prefixes("ABI-L2-CMIPF", &satellite, 6, 13, full_disk_settled).len(),
+            1
+        );
+
         // Day (and year-prefix) rollover comes for free from chrono.
         let new_day = Utc.with_ymd_and_hms(2026, 6, 11, 0, 0, 0).unwrap();
         let prefixes = poll_prefixes("ABI-L2-CMIPC", &satellite, 6, 13, new_day);
@@ -885,17 +1352,21 @@ mod tests {
     }
 
     #[test]
-    fn seen_scans_key_on_the_scan_minute() {
+    fn seen_scans_key_on_the_exact_second_and_ignore_filename_tenths() {
         let mut seen = SeenScans::default();
         let listed = Utc.with_ymd_and_hms(2026, 6, 10, 18, 51, 18).unwrap()
             + chrono::Duration::milliseconds(100);
-        let manifest_slot = Utc.with_ymd_and_hms(2026, 6, 10, 18, 51, 0).unwrap();
-        assert!(seen.insert(13, manifest_slot), "primed from a manifest");
+        let manifest_start = Utc.with_ymd_and_hms(2026, 6, 10, 18, 51, 18).unwrap();
+        assert!(seen.insert(13, manifest_start), "primed from a manifest");
         assert!(
             seen.contains(13, listed),
-            "live key with seconds dedups against the primed minute"
+            "filename tenths dedup against the manifest's exact whole second"
         );
         assert!(!seen.insert(13, listed));
+        assert!(
+            !seen.contains(13, manifest_start + chrono::Duration::seconds(1)),
+            "distinct starts in the same HHMM cannot be collapsed"
+        );
     }
 
     #[test]
@@ -954,11 +1425,327 @@ mod tests {
         }
     }
 
+    fn planned_object(band: u8, minute: u32) -> PolledFollowObject {
+        planned_object_window(band, minute, 18, 0)
+    }
+
+    fn planned_object_window(
+        band: u8,
+        minute: u32,
+        second: u32,
+        end_offset_seconds: i64,
+    ) -> PolledFollowObject {
+        let start = Utc
+            .with_ymd_and_hms(2026, 8, 27, 2, minute, second)
+            .unwrap();
+        PolledFollowObject {
+            prefix: format!("band-{band}"),
+            band,
+            object: listed_object(format!("c{band:02}-{minute:02}")),
+            scan_start: Some(start),
+            scan_end: Some(start + chrono::Duration::seconds(300 + end_offset_seconds)),
+            scan_created: Some(start + chrono::Duration::seconds(360)),
+        }
+    }
+
+    fn planned_publication(
+        band: u8,
+        minute: u32,
+        created_offset_seconds: i64,
+        suffix: &str,
+    ) -> PolledFollowObject {
+        let mut listed = planned_object(band, minute);
+        let start = listed.scan_start.expect("planned scan start");
+        listed.object = listed_object(format!("c{band:02}-{minute:02}-{suffix}"));
+        listed.scan_created = Some(start + chrono::Duration::seconds(created_offset_seconds));
+        listed
+    }
+
+    fn planned_keys(plan: &ScanMajorPlan, objects: &[PolledFollowObject]) -> Vec<Vec<String>> {
+        plan.batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .map(|&index| objects[index].object.key.clone())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scan_major_plan_finishes_newest_product_before_history() {
+        // Provider listings arrive band-major and oldest-first.
+        let objects = vec![
+            planned_object(1, 10),
+            planned_object(1, 20),
+            planned_object(2, 10),
+            planned_object(2, 20),
+            planned_object(3, 10),
+            planned_object(3, 20),
+        ];
+        let plan = scan_major_plan(&objects, &[1, 2, 3], &SeenScans::default(), true);
+
+        assert_eq!(
+            planned_keys(&plan, &objects),
+            vec![
+                vec!["c01-20", "c02-20", "c03-20"],
+                vec!["c01-10", "c02-10", "c03-10"],
+            ]
+        );
+        assert!(plan.skipped_history.is_empty());
+        assert!(plan.skipped_incomplete.is_empty());
+    }
+
+    #[test]
+    fn scan_major_plan_selects_newest_publication_and_consumes_superseded_key() {
+        let objects = vec![
+            planned_publication(1, 20, 330, "original"),
+            planned_publication(1, 20, 390, "corrected"),
+            planned_publication(2, 20, 360, "only"),
+            planned_publication(3, 20, 360, "only"),
+        ];
+        let plan = scan_major_plan(&objects, &[1, 2, 3], &SeenScans::default(), true);
+
+        assert_eq!(
+            planned_keys(&plan, &objects),
+            vec![vec!["c01-20-corrected", "c02-20-only", "c03-20-only"]]
+        );
+        assert_eq!(plan.superseded, vec![0]);
+
+        let consumed = plan
+            .superseded
+            .iter()
+            .map(|&index| objects[index].object.key.clone())
+            .collect::<HashSet<_>>();
+        let mut last_key = HashMap::new();
+        advance_consumed_watermarks(&objects, &consumed, &mut last_key);
+        assert_eq!(
+            last_key.get("band-1"),
+            Some(&objects[0].object.key),
+            "the obsolete publication advances the watermark up to the selected correction"
+        );
+    }
+
+    #[test]
+    fn selected_correction_end_time_overrides_stale_seen_metadata() {
+        let correction = planned_object_window(3, 20, 18, 3);
+        let start = correction.scan_start.expect("correction start");
+        let retained_end = start + chrono::Duration::seconds(300);
+        let mut seen = SeenScans::default();
+        for band in [1_u8, 2, 3] {
+            seen.insert_object_window(band, start, retained_end, &format!("retained-c{band:02}"));
+        }
+
+        let plan = scan_major_plan(&[correction], &[1, 2, 3], &seen, true);
+        assert!(
+            plan.batches.is_empty(),
+            "the selected correction's out-of-tolerance end must not be hidden by stale seen data"
+        );
+    }
+
+    #[test]
+    fn newest_incomplete_scan_waits_while_newest_complete_scan_runs_first() {
+        let objects = vec![
+            planned_object(1, 20),
+            planned_object(2, 20),
+            planned_object(3, 20),
+            planned_object(1, 30),
+            planned_object(2, 30),
+        ];
+        let plan = scan_major_plan(&objects, &[1, 2, 3], &SeenScans::default(), true);
+
+        assert_eq!(
+            planned_keys(&plan, &objects),
+            vec![vec!["c01-20", "c02-20", "c03-20"]]
+        );
+        assert!(
+            [3_usize, 4].iter().all(|index| !plan
+                .batches
+                .iter()
+                .flatten()
+                .any(|item| item == index)),
+            "newer partial scan remains pending for a future poll"
+        );
+    }
+
+    #[test]
+    fn same_minute_different_provider_starts_never_form_a_complete_batch() {
+        let objects = vec![
+            planned_object_window(1, 20, 18, 0),
+            planned_object_window(2, 20, 19, 0),
+            planned_object_window(3, 20, 18, 0),
+        ];
+        let plan = scan_major_plan(&objects, &[1, 2, 3], &SeenScans::default(), true);
+
+        assert!(plan.batches.is_empty());
+        assert!(plan.skipped_history.is_empty());
+    }
+
+    #[test]
+    fn provider_end_skew_beyond_archive_tolerance_is_not_complete() {
+        let objects = vec![
+            planned_object_window(1, 20, 18, 0),
+            planned_object_window(2, 20, 18, 0),
+            planned_object_window(3, 20, 18, 3),
+        ];
+        let plan = scan_major_plan(&objects, &[1, 2, 3], &SeenScans::default(), true);
+
+        assert!(plan.batches.is_empty());
+
+        let spread_around_first = vec![
+            planned_object_window(1, 20, 18, 0),
+            planned_object_window(2, 20, 18, -2),
+            planned_object_window(3, 20, 18, 2),
+        ];
+        assert!(
+            scan_major_plan(
+                &spread_around_first,
+                &[1, 2, 3],
+                &SeenScans::default(),
+                true,
+            )
+            .batches
+            .is_empty(),
+            "the complete provider-end spread, not only distance from the first band, is bounded"
+        );
+    }
+
+    #[test]
+    fn retained_exact_channels_join_a_listed_remaining_channel() {
+        let listed = planned_object_window(3, 20, 18, 1);
+        let start = listed.scan_start.unwrap();
+        let mut seen = SeenScans::default();
+        seen.insert_window(1, start, start + chrono::Duration::seconds(300));
+        seen.insert_window(2, start, start + chrono::Duration::seconds(300));
+        let objects = vec![listed];
+
+        let plan = scan_major_plan(&objects, &[1, 2, 3], &seen, true);
+
+        assert_eq!(planned_keys(&plan, &objects), vec![vec!["c03-20"]]);
+    }
+
+    #[test]
+    fn partial_success_retries_remaining_channels_without_restart() {
+        let retained = planned_object_window(1, 20, 18, 0);
+        let start = retained.scan_start.unwrap();
+        let end = retained.scan_end.unwrap();
+        let mut seen = SeenScans::default();
+        seen.insert_window(1, start, end);
+        let remaining = vec![
+            planned_object_window(2, 20, 18, 0),
+            planned_object_window(3, 20, 18, 1),
+        ];
+
+        let next_poll = scan_major_plan(&remaining, &[1, 2, 3], &seen, true);
+
+        assert_eq!(
+            planned_keys(&next_poll, &remaining),
+            vec![vec!["c02-20", "c03-20"]]
+        );
+    }
+
+    #[test]
+    fn no_backfill_consumes_older_history_but_not_newer_partial_scan() {
+        let objects = vec![
+            planned_object(1, 10),
+            planned_object(2, 10),
+            planned_object(3, 10),
+            planned_object(1, 20),
+            planned_object(2, 20),
+            planned_object(3, 20),
+            planned_object(1, 30),
+            planned_object(2, 30),
+        ];
+        let plan = scan_major_plan(&objects, &[1, 2, 3], &SeenScans::default(), false);
+
+        assert_eq!(
+            planned_keys(&plan, &objects),
+            vec![vec!["c01-20", "c02-20", "c03-20"]]
+        );
+        assert_eq!(plan.skipped_history, vec![0, 1, 2]);
+        assert!(plan.skipped_incomplete.is_empty());
+        assert!(
+            [6_usize, 7]
+                .iter()
+                .all(|index| !plan.skipped_history.contains(index)),
+            "newer partial scan cannot be skipped or it would never complete"
+        );
+    }
+
+    #[test]
+    fn future_complete_scans_all_run_after_latest_only_bootstrap() {
+        assert!(!backfill_enabled_for_poll(false, false));
+        assert!(backfill_enabled_for_poll(false, true));
+        let future = vec![
+            planned_object(1, 30),
+            planned_object(2, 30),
+            planned_object(3, 30),
+            planned_object(1, 40),
+            planned_object(2, 40),
+            planned_object(3, 40),
+        ];
+
+        let plan = scan_major_plan(
+            &future,
+            &[1, 2, 3],
+            &SeenScans::default(),
+            backfill_enabled_for_poll(false, true),
+        );
+
+        assert_eq!(
+            planned_keys(&plan, &future),
+            vec![
+                vec!["c01-40", "c02-40", "c03-40"],
+                vec!["c01-30", "c02-30", "c03-30"],
+            ],
+            "a poll gap after bootstrap must not collapse to newest-only"
+        );
+        assert!(plan.skipped_history.is_empty());
+    }
+
+    #[test]
+    fn incomplete_scan_older_than_complete_history_does_not_pin_watermark() {
+        let objects = vec![
+            planned_object(1, 10),
+            planned_object(1, 20),
+            planned_object(2, 20),
+            planned_object(3, 20),
+        ];
+        let plan = scan_major_plan(&objects, &[1, 2, 3], &SeenScans::default(), true);
+
+        assert_eq!(
+            planned_keys(&plan, &objects),
+            vec![vec!["c01-20", "c02-20", "c03-20"]]
+        );
+        assert_eq!(plan.skipped_incomplete, vec![0]);
+    }
+
+    #[test]
+    fn consumed_watermark_stops_before_retry_barrier() {
+        let objects = vec![
+            planned_object(1, 10),
+            planned_object(1, 20),
+            planned_object(1, 30),
+        ];
+        let consumed =
+            HashSet::from([objects[0].object.key.clone(), objects[2].object.key.clone()]);
+        let mut last_key = HashMap::new();
+
+        advance_consumed_watermarks(&objects, &consumed, &mut last_key);
+
+        assert_eq!(last_key.get("band-1"), Some(&objects[0].object.key));
+    }
+
     /// A C13 CONUS key under [`TEST_PREFIX`] starting at 18:`minute`.
     fn c13_key(minute: u32) -> String {
         format!(
             "{TEST_PREFIX}s202616118{minute:02}176_e202616118{minute:02}549_c202616118{minute:02}590.nc"
         )
+    }
+
+    fn c13_start(minute: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 6, 10, 18, minute, 17).unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -969,7 +1756,7 @@ mod tests {
         attempts: &mut HashMap<String, u32>,
         last_key: &mut HashMap<String, String>,
         ingest: &mut dyn FnMut(&S3Object) -> Result<(), SatError>,
-    ) -> Vec<String> {
+    ) -> ProcessListedReport {
         let cancel = AtomicBool::new(false);
         process_listed_objects(
             TEST_PREFIX,
@@ -1001,7 +1788,7 @@ mod tests {
                 Ok(())
             }
         };
-        let warnings = run_process(
+        let report = run_process(
             &objects,
             None,
             &mut seen,
@@ -1009,8 +1796,13 @@ mod tests {
             &mut last_key,
             &mut fail_first,
         );
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("will retry"), "{}", warnings[0]);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(
+            report.warnings[0].contains("will retry"),
+            "{}",
+            report.warnings[0]
+        );
+        assert!(report.retained.is_empty());
         assert!(
             !last_key.contains_key(TEST_PREFIX),
             "watermark held before the failed key so the next poll re-lists it"
@@ -1020,7 +1812,7 @@ mod tests {
 
         // Next poll re-lists both keys (held watermark) and succeeds.
         let mut ok = |_object: &S3Object| Ok(());
-        let warnings = run_process(
+        let report = run_process(
             &objects,
             None,
             &mut seen,
@@ -1028,7 +1820,8 @@ mod tests {
             &mut last_key,
             &mut ok,
         );
-        assert!(warnings.is_empty());
+        assert!(report.warnings.is_empty());
+        assert!(report.retained.is_empty());
         assert_eq!(seen.len(), 2, "both scans ingested after the retry");
         assert_eq!(
             last_key.get(TEST_PREFIX),
@@ -1053,7 +1846,7 @@ mod tests {
         };
 
         for attempt in 1..MAX_INGEST_ATTEMPTS {
-            let warnings = run_process(
+            let report = run_process(
                 &objects,
                 None,
                 &mut seen,
@@ -1061,7 +1854,12 @@ mod tests {
                 &mut last_key,
                 &mut ingest,
             );
-            assert!(warnings[0].contains("will retry"), "{}", warnings[0]);
+            assert!(
+                report.warnings[0].contains("will retry"),
+                "{}",
+                report.warnings[0]
+            );
+            assert!(report.retained.is_empty());
             assert!(!last_key.contains_key(TEST_PREFIX));
             assert_eq!(attempts.get(objects[0].key.as_str()), Some(&attempt));
             assert!(
@@ -1071,7 +1869,7 @@ mod tests {
         }
 
         // Final attempt: give up on the bad object, unblock the prefix.
-        let warnings = run_process(
+        let report = run_process(
             &objects,
             None,
             &mut seen,
@@ -1079,11 +1877,16 @@ mod tests {
             &mut last_key,
             &mut ingest,
         );
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("giving up"), "{}", warnings[0]);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(
+            report.warnings[0].contains("giving up"),
+            "{}",
+            report.warnings[0]
+        );
+        assert!(report.retained.is_empty());
         assert!(attempts.is_empty(), "no counter leak after giving up");
         assert_eq!(seen.len(), 1, "the 18:56 frame finally ingested");
-        assert!(seen.contains(13, Utc.with_ymd_and_hms(2026, 6, 10, 18, 56, 0).unwrap()));
+        assert!(seen.contains(13, c13_start(56)));
         assert_eq!(
             last_key.get(TEST_PREFIX),
             Some(&objects[1].key),
@@ -1108,7 +1911,7 @@ mod tests {
             listed_object(already_seen.clone()),
         ];
         let mut seen = SeenScans::default();
-        seen.insert(13, Utc.with_ymd_and_hms(2026, 6, 10, 18, 51, 0).unwrap());
+        seen.insert(13, c13_start(51));
         let mut attempts = HashMap::new();
         let mut last_key = HashMap::new();
         let mut ingest_calls = 0usize;
@@ -1117,7 +1920,7 @@ mod tests {
             Ok(())
         };
 
-        let warnings = run_process(
+        let report = run_process(
             &objects,
             Some(stale_cutoff),
             &mut seen,
@@ -1125,13 +1928,82 @@ mod tests {
             &mut last_key,
             &mut ingest,
         );
-        assert!(warnings.is_empty());
+        assert!(report.warnings.is_empty());
+        assert_eq!(
+            report.retained,
+            vec![listed_object(already_seen.clone())],
+            "only the filtered, current scan is reported as retained"
+        );
         assert_eq!(ingest_calls, 0, "every object was skipped on purpose");
         assert_eq!(
             last_key.get(TEST_PREFIX),
             Some(&already_seen),
             "skips advance the watermark so they are never re-listed"
         );
+    }
+
+    #[test]
+    fn mixed_listing_reports_retained_scan_and_ingests_only_new_scan() {
+        let retained = listed_object(c13_key(51));
+        let fresh = listed_object(c13_key(56));
+        let objects = vec![retained.clone(), fresh.clone()];
+        let mut seen = SeenScans::default();
+        seen.insert(13, c13_start(51));
+        let mut attempts = HashMap::new();
+        let mut last_key = HashMap::new();
+        let mut ingested = Vec::new();
+        let mut ingest = |object: &S3Object| -> Result<(), SatError> {
+            ingested.push(object.key.clone());
+            Ok(())
+        };
+
+        let report = run_process(
+            &objects,
+            None,
+            &mut seen,
+            &mut attempts,
+            &mut last_key,
+            &mut ingest,
+        );
+
+        assert!(report.warnings.is_empty());
+        assert_eq!(report.retained, vec![retained]);
+        assert_eq!(ingested, vec![fresh.key.clone()]);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(last_key.get(TEST_PREFIX), Some(&fresh.key));
+    }
+
+    #[test]
+    fn changed_object_key_reingests_same_scan_correction() {
+        let retained = listed_object(c13_key(51));
+        let corrected = listed_object(retained.key.replace("590.nc", "591.nc"));
+        let start = c13_start(51);
+        let end = start + chrono::Duration::seconds(37);
+        let mut seen = SeenScans::default();
+        seen.insert_object_window(13, start, end, &retained.key);
+        let mut attempts = HashMap::new();
+        let mut last_key = HashMap::new();
+        let mut ingested = Vec::new();
+        let mut ingest = |object: &S3Object| -> Result<(), SatError> {
+            ingested.push(object.key.clone());
+            Ok(())
+        };
+
+        let report = run_process(
+            &[retained.clone(), corrected.clone()],
+            None,
+            &mut seen,
+            &mut attempts,
+            &mut last_key,
+            &mut ingest,
+        );
+
+        assert_eq!(report.retained, vec![retained.clone()]);
+        assert_eq!(ingested, vec![corrected.key.clone()]);
+        assert!(seen.contains_object(13, start, &corrected.key));
+        assert!(!seen.contains_object(13, start, &retained.key));
+        assert_eq!(seen.len(), 1, "the correction replaces the same scan slot");
+        assert_eq!(last_key.get(TEST_PREFIX), Some(&corrected.key));
     }
 
     #[test]

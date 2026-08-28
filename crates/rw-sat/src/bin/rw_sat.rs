@@ -126,6 +126,10 @@ enum Command {
         /// Evict oldest frames beyond this total size per followed band.
         #[arg(long)]
         max_bytes_mb: Option<u64>,
+        /// Keep only the newest complete scan from startup history; future
+        /// live scans are still followed normally.
+        #[arg(long)]
+        no_backfill: bool,
     },
     /// Export one stored frame as a PNG.
     Export {
@@ -333,6 +337,7 @@ fn main() {
             interval_secs,
             max_age_minutes,
             max_bytes_mb,
+            no_backfill,
         } => run_follow(
             &source,
             polls,
@@ -340,6 +345,7 @@ fn main() {
             interval_secs,
             max_age_minutes,
             max_bytes_mb,
+            no_backfill,
         ),
         Command::Export {
             store,
@@ -1257,6 +1263,7 @@ fn run_follow(
     interval_secs: Option<u64>,
     max_age_minutes: Option<u32>,
     max_bytes_mb: Option<u64>,
+    no_backfill: bool,
 ) -> Result<(), Box<dyn Error>> {
     let sector = parse_sector(&source.sector)?;
     let mut config = FollowConfig::new(&source.satellite, sector, source.bands.clone());
@@ -1267,6 +1274,7 @@ fn run_follow(
     config.poll_interval = interval_secs.map(Duration::from_secs);
     config.max_polls = polls;
     config.max_frames = max_frames;
+    config.backfill_history = !no_backfill;
     config.window = WindowConfig {
         max_age_minutes,
         max_bytes: max_bytes_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
